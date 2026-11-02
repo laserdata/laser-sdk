@@ -22,7 +22,7 @@ async fn main() -> Result<(), LaserError> {
     fresh_run(&laser, &stream, async {
         phase("write two messages, then read them back");
         let topic = laser.topic(TOPIC);
-        topic.ensure(2).await?;
+        topic.ensure(2, None).await?;
 
         for reading in [
             Reading {

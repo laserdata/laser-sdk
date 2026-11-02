@@ -21,6 +21,8 @@ const STARTUP_ATTEMPTS: usize = 5;
 const IGGY_SERVER_ENV: &str = "LASER_TEST_IGGY_SERVER";
 const CLUSTER_SIZE: usize = 3;
 const TMPFS: &str = "/dev/shm";
+const LEADER_TIMEOUT: Duration = Duration::from_secs(60);
+const LEADER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 static DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
@@ -33,26 +35,43 @@ struct ClusterNodeProcess {
 pub struct TestIggyCluster {
     binary: PathBuf,
     nodes: Vec<ClusterNodeProcess>,
-    tcp_ports: [u16; CLUSTER_SIZE],
-    replica_ports: [u16; CLUSTER_SIZE],
+    tcp_ports: Vec<u16>,
+    replica_ports: Vec<u16>,
     proxy_port: u16,
     proxy_target: Arc<AtomicU16>,
     proxy_task: tokio::task::JoinHandle<()>,
+    node_env: Vec<Vec<(String, String)>>,
 }
 
 impl TestIggyCluster {
     pub async fn start() -> Self {
+        Self::start_with(|_| Vec::new()).await
+    }
+
+    /// A cluster whose node `replica_id` also takes the `IGGY_*` settings
+    /// `env(replica_id)` returns, again on every restart.
+    pub async fn start_with(env: impl Fn(usize) -> Vec<(String, String)>) -> Self {
+        Self::start_sized(CLUSTER_SIZE, env).await
+    }
+
+    /// [`start_with`](Self::start_with) on `size` nodes.
+    pub async fn start_sized(size: usize, env: impl Fn(usize) -> Vec<(String, String)>) -> Self {
         let binary = resolve_server_binary();
-        let ports = free_host_ports(CLUSTER_SIZE * 2 + 1);
-        let tcp_ports: [u16; CLUSTER_SIZE] = ports[..CLUSTER_SIZE].try_into().expect("TCP ports");
-        let replica_ports: [u16; CLUSTER_SIZE] = ports[CLUSTER_SIZE..CLUSTER_SIZE * 2]
-            .try_into()
-            .expect("replica ports");
-        let proxy_port = ports[CLUSTER_SIZE * 2];
+        let node_env: Vec<Vec<(String, String)>> = (0..size).map(env).collect();
+        let mut tcp_ports = free_host_ports(size * 2);
+        let replica_ports = tcp_ports.split_off(size);
+        // Bound at once, so no other process takes the port in between.
+        let proxy = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind stable cluster endpoint");
+        let proxy_port = proxy
+            .local_addr()
+            .expect("stable cluster endpoint address")
+            .port();
         let proxy_target = Arc::new(AtomicU16::new(tcp_ports[0]));
-        let proxy_task = spawn_stable_proxy(proxy_port, proxy_target.clone()).await;
+        let proxy_task = spawn_stable_proxy(proxy, proxy_target.clone());
         let mut nodes = Vec::with_capacity(CLUSTER_SIZE);
-        for replica_id in 0..CLUSTER_SIZE {
+        for (replica_id, env) in node_env.iter().enumerate() {
             let data_dir = tempfile::tempdir_in(data_root()).expect("cluster node data directory");
             let log_path = data_dir.path().join("test-server.log");
             let child = spawn_cluster_node(
@@ -62,6 +81,7 @@ impl TestIggyCluster {
                 replica_id,
                 &tcp_ports,
                 &replica_ports,
+                env,
             );
             nodes.push(ClusterNodeProcess {
                 child,
@@ -77,6 +97,7 @@ impl TestIggyCluster {
             proxy_port,
             proxy_target,
             proxy_task,
+            node_env,
         };
         cluster.wait_for_mesh(None).await;
         cluster
@@ -86,8 +107,21 @@ impl TestIggyCluster {
         format!("127.0.0.1:{}", self.proxy_port)
     }
 
+    /// The root connection string through the stable endpoint, with links
+    /// redialed without a limit so a client outlives every node restart.
+    pub fn connection_string(&self) -> String {
+        format!(
+            "iggy+tcp://{DEFAULT_ROOT_USERNAME}:{DEFAULT_ROOT_PASSWORD}@{}?reconnection_retries=unlimited&reconnection_interval=100ms",
+            self.endpoint(),
+        )
+    }
+
     pub fn node_endpoint(&self, replica_id: usize) -> String {
         format!("127.0.0.1:{}", self.tcp_ports[replica_id])
+    }
+
+    pub fn size(&self) -> usize {
+        self.nodes.len()
     }
 
     pub fn route_endpoint_to(&self, replica_id: usize) {
@@ -100,6 +134,13 @@ impl TestIggyCluster {
         graceful_stop(&mut node.child);
     }
 
+    /// Kill node `replica_id` without a graceful shutdown, as a crash does.
+    pub fn kill_node(&mut self, replica_id: usize) {
+        let node = self.nodes.get_mut(replica_id).expect("cluster node");
+        node.child.kill().expect("kill cluster node");
+        node.child.wait().expect("reap cluster node");
+    }
+
     pub async fn start_node(&mut self, replica_id: usize) {
         let node = self.nodes.get_mut(replica_id).expect("cluster node");
         node.child = spawn_cluster_node(
@@ -109,6 +150,7 @@ impl TestIggyCluster {
             replica_id,
             &self.tcp_ports,
             &self.replica_ports,
+            &self.node_env[replica_id],
         );
         self.wait_for_mesh(Some(replica_id)).await;
     }
@@ -118,6 +160,30 @@ impl TestIggyCluster {
         self.start_node(replica_id).await;
     }
 
+    /// The metadata leader as node `via` reports it and the leader itself
+    /// confirms. A follower reports the primary from its local view, so right
+    /// after the leader stops it still names the dead node until the view
+    /// change lands. A stopped node refuses the connection and a demoted one
+    /// names its successor.
+    pub async fn leader(&self, via: usize) -> usize {
+        let deadline = tokio::time::Instant::now() + LEADER_TIMEOUT;
+        loop {
+            if let Some(candidate) = reported_leader(&self.node_endpoint(via)).await
+                && let Some(confirmed) = reported_leader(&self.node_endpoint(candidate)).await
+                && confirmed == candidate
+            {
+                return candidate;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cluster did not elect a leader before the deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    // The nodes inherit the environment, so a `RUST_LOG` that silences the
+    // server's info lines never shows the marker.
     async fn wait_for_mesh(&self, node: Option<usize>) {
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
         loop {
@@ -135,10 +201,28 @@ impl TestIggyCluster {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "Iggy cluster did not form its replica mesh before the deadline"
+                "Iggy cluster did not form its replica mesh before the deadline, node logs:\n{}",
+                self.log_tails()
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+}
+
+impl TestIggyCluster {
+    // The last lines of each node's log, for a failure message.
+    fn log_tails(&self) -> String {
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(replica_id, node)| {
+                let log = std::fs::read_to_string(&node.log_path).unwrap_or_default();
+                let lines: Vec<&str> = log.lines().collect();
+                let tail = lines[lines.len().saturating_sub(40)..].join("\n");
+                format!("node {replica_id}:\n{tail}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -152,13 +236,39 @@ impl Drop for TestIggyCluster {
     }
 }
 
-async fn spawn_stable_proxy(
-    proxy_port: u16,
+// The probe never reconnects and is bounded, so a stopped node answers `None`
+// quickly instead of holding discovery in the client's unlimited retry loop.
+async fn reported_leader(endpoint: &str) -> Option<usize> {
+    let discovery = IggyClientBuilder::from_connection_string(&format!(
+        "iggy+tcp://{DEFAULT_ROOT_USERNAME}:{DEFAULT_ROOT_PASSWORD}@{endpoint}?reconnection_retries=0",
+    ))
+    .expect("connection string")
+    .build()
+    .expect("discovery client");
+    let leader = async {
+        discovery.connect().await?;
+        discovery
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await?;
+        let metadata = discovery.get_cluster_metadata().await?;
+        Ok::<_, IggyError>(
+            metadata
+                .nodes
+                .iter()
+                .find(|node| node.role == ClusterNodeRole::Leader)
+                .and_then(|node| node.name.strip_prefix("node-"))
+                .and_then(|value| value.parse::<usize>().ok()),
+        )
+    };
+    let leader = tokio::time::timeout(LEADER_PROBE_TIMEOUT, leader).await;
+    let _ = discovery.disconnect().await;
+    leader.ok()?.ok()?
+}
+
+fn spawn_stable_proxy(
+    listener: tokio::net::TcpListener,
     target: Arc<AtomicU16>,
 ) -> tokio::task::JoinHandle<()> {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", proxy_port))
-        .await
-        .expect("bind stable cluster endpoint");
     tokio::spawn(async move {
         while let Ok((mut incoming, _)) = listener.accept().await {
             let target_port = target.load(Ordering::Acquire);
@@ -385,8 +495,9 @@ fn spawn_cluster_node(
     data_dir: &Path,
     log_path: &Path,
     replica_id: usize,
-    tcp_ports: &[u16; CLUSTER_SIZE],
-    replica_ports: &[u16; CLUSTER_SIZE],
+    tcp_ports: &[u16],
+    replica_ports: &[u16],
+    env: &[(String, String)],
 ) -> OwnedServer {
     let stdout = File::create(log_path).expect("create cluster node log");
     let stderr = stdout.try_clone().expect("clone cluster node log");
@@ -409,9 +520,10 @@ fn spawn_cluster_node(
         .env("IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL", "200 ms")
         // An uncommitted group handoff waits this long, the default outlasts every read bound.
         .env("IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT", "1s")
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    for node in 0..CLUSTER_SIZE {
+    for (node, (tcp_port, replica_port)) in tcp_ports.iter().zip(replica_ports).enumerate() {
         command
             .env(
                 format!("IGGY_CLUSTER_NODES_{node}_NAME"),
@@ -424,11 +536,11 @@ fn spawn_cluster_node(
             )
             .env(
                 format!("IGGY_CLUSTER_NODES_{node}_PORTS_TCP"),
-                tcp_ports[node].to_string(),
+                tcp_port.to_string(),
             )
             .env(
                 format!("IGGY_CLUSTER_NODES_{node}_PORTS_TCP_REPLICA"),
-                replica_ports[node].to_string(),
+                replica_port.to_string(),
             );
     }
     OwnedServer::new(command.spawn().expect("spawn Iggy cluster node"))

@@ -244,6 +244,13 @@ pub const AGDX_DELIVERY_BASE: u32 = AGDX_COMMAND_BASE + 800;
 pub const AGDX_FILTERED_POLL_CODE: u32 = AGDX_DELIVERY_BASE;
 /// Server-native command code: acknowledge a page under its current group policy.
 pub const AGDX_FILTERED_ACK_CODE: u32 = AGDX_DELIVERY_BASE + 1;
+/// Server-native command code: hold until one of a reader's partitions has a
+/// record at or after its offset, or the wait ends. Served when the filter
+/// announcement names a non-zero `max_wait_ms`.
+pub const AGDX_FILTERED_WAIT_CODE: u32 = AGDX_DELIVERY_BASE + 5;
+/// Server-native command code: end filtered waits this connection holds,
+/// named by their `wait_id`.
+pub const AGDX_FILTERED_WAIT_CANCEL_CODE: u32 = AGDX_DELIVERY_BASE + 6;
 /// Server-native command code: preview a filter over stored records without
 /// joining a consumer group or storing an offset.
 pub const AGDX_FILTER_PREVIEW_CODE: u32 = AGDX_DELIVERY_BASE + 2;

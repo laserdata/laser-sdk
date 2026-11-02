@@ -57,7 +57,7 @@ async fn publish_governed(world: &mut LaserWorld, payload: String) {
     let governed = world.governed.as_ref().expect("a governed laser");
     governed
         .topic("business.audit")
-        .ensure(1)
+        .ensure(1, None)
         .await
         .expect("business topic ready");
     let provenance = Provenance::builder()

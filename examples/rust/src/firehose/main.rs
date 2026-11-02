@@ -192,7 +192,7 @@ async fn main() -> Result<(), LaserError> {
         // query phases, while the raw streaming load works against Apache Iggy.
         phase("provisioning topics and indexes");
         for topic in &topics {
-            laser.topic(topic).ensure(config.partitions).await?;
+            laser.topic(topic).ensure(config.partitions, None).await?;
         }
         if config.register && query_available {
             for (topic, index) in topics.iter().zip(&indexes) {

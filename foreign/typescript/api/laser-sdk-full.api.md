@@ -181,6 +181,9 @@ type Addressee = {
 };
 
 // @public
+const ADDRESSEE_FILTER_NAME = "agent-addressee";
+
+// @public
 function addresseeFilter(me: AgentId_2): ConsumerFilter;
 
 // @public
@@ -288,6 +291,12 @@ const AGDX_FILTERED_ACK_CODE: number;
 
 // @public (undocumented)
 const AGDX_FILTERED_POLL_CODE: number;
+
+// @public
+const AGDX_FILTERED_WAIT_CANCEL_CODE: number;
+
+// @public
+const AGDX_FILTERED_WAIT_CODE: number;
 
 // @public (undocumented)
 const AGDX_FORK_BASE: number;
@@ -609,13 +618,12 @@ export class AgentBuilder {
     maxQueuedBytes(value: number): this;
     // (undocumented)
     maxQueuedRecords(value: number): this;
+    maxWait(waitMs: number): this;
     // (undocumented)
     middleware(middleware: AgentMiddleware): this;
     // (undocumented)
     onDeadLetter(sink: DeadLetterSink): this;
     operations(operations: readonly string[]): this;
-    // (undocumented)
-    pollInterval(intervalMs: number): this;
     // (undocumented)
     respondOn(topic: string): this;
     // (undocumented)
@@ -2511,7 +2519,6 @@ export interface ConsumerGroupInfo {
 export class ConsumerGroupName {
     // (undocumented)
     asStr(): string;
-    // (undocumented)
     static forAgent(agent: AgentId): ConsumerGroupName;
     // (undocumented)
     static new(name: string): ConsumerGroupName;
@@ -2548,7 +2555,6 @@ export interface ConsumerMessage extends Message {
 // @public (undocumented)
 export interface ConsumerOptions {
     readonly allowReplay?: boolean;
-    readonly autoJoinGroup?: boolean;
     readonly batchLength?: number;
     readonly commitPolicy?: CommitPolicy;
     readonly createGroup?: boolean;
@@ -2556,9 +2562,10 @@ export interface ConsumerOptions {
         readonly retries: number;
         readonly intervalMs: number;
     };
+    readonly maxBytes?: number;
+    readonly maxWaitMs?: number;
+    readonly minCount?: number;
     readonly pollingRetryIntervalMs?: number;
-    readonly pollIntervalMs?: number;
-    // (undocumented)
     readonly startAt?: ConsumerStart;
 }
 
@@ -2969,6 +2976,7 @@ export class CrashContext {
 // @public (undocumented)
 export interface CreateConsumerGroupOptions {
     readonly filter?: ConsumerFilter;
+    readonly filterName?: string;
     readonly operationId?: bigint;
     readonly policy?: GroupFilterSpec;
 }
@@ -3289,6 +3297,12 @@ function decodeFilteredPollRequest(value: unknown, context: string): FilteredPol
 function decodeFilteredStart(value: unknown, context: string): FilteredStart;
 
 // @public (undocumented)
+function decodeFilteredWaitCancel(value: unknown, context: string): FilteredWaitCancel;
+
+// @public (undocumented)
+function decodeFilteredWaitRequest(value: unknown, context: string): FilteredWaitRequest;
+
+// @public (undocumented)
 function decodeFilterError(value: unknown, context: string): FilterError;
 
 // @public (undocumented)
@@ -3299,6 +3313,9 @@ function decodeFilterGroupIdentity(value: unknown, context: string): FilterGroup
 
 // @public (undocumented)
 function decodeFilterGroupRef(value: unknown, context: string): FilterGroupRef;
+
+// @public (undocumented)
+function decodeFilterListQuery(params: URLSearchParams): FilterListQuery;
 
 // @public (undocumented)
 function decodeFilterMutation(value: unknown, context: string): FilterMutation;
@@ -4648,6 +4665,12 @@ function encodeFilteredPollRequest(request: FilteredPollRequest): Map<string, un
 function encodeFilteredStart(start: FilteredStart): unknown;
 
 // @public (undocumented)
+function encodeFilteredWaitCancel(request: FilteredWaitCancel): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeFilteredWaitRequest(request: FilteredWaitRequest): Map<string, unknown>;
+
+// @public (undocumented)
 function encodeFilterError(error: FilterError): Map<string, unknown>;
 
 // @public (undocumented)
@@ -5518,6 +5541,7 @@ export interface FilterAnnounce {
     readonly codecs: readonly FilterCodec[];
     // (undocumented)
     readonly evaluatorVersion: number;
+    readonly maxWaitMs: number;
 }
 
 // @public
@@ -5566,6 +5590,7 @@ export interface FilterCaps {
     readonly catalog: boolean;
     readonly evaluation?: FilterAnnounce;
     readonly groupPolicyReads: boolean;
+    readonly maxWaitMs: number;
     readonly native: boolean;
 }
 
@@ -5795,6 +5820,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     partitions(): readonly number[];
     readRound(): Promise<readonly [MatchedPage | undefined, boolean]>;
     tryNextPage(): Promise<MatchedPage | undefined>;
+    waitForRecords(): Promise<void>;
 }
 
 // @public
@@ -5807,6 +5833,7 @@ export class FilteredReaderBuilder {
     maxExamined(records: number): this;
     maxReplyBytes(bytes: number): this;
     maxUnackedPages(pages: number): this;
+    maxWait(waitMs: number): this;
     partition(partitionId: number): this;
     start(start: FilteredStart): this;
 }
@@ -5828,6 +5855,50 @@ export type FilteredStart = {
     readonly kind: "continue";
     readonly continuation: Continuation;
 };
+
+// @public
+interface FilteredWaitCancel {
+    // (undocumented)
+    readonly v: number;
+    // (undocumented)
+    readonly waitIds: readonly bigint[];
+}
+
+// @public
+interface FilteredWaitCancelled {
+    // (undocumented)
+    readonly cancelled: readonly bigint[];
+}
+
+// @public
+interface FilteredWaitPartition {
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+}
+
+// @public
+interface FilteredWaitRequest {
+    // (undocumented)
+    readonly consumer: FilterConsumer;
+    // (undocumented)
+    readonly maxWaitMs: number;
+    // (undocumented)
+    readonly partitions: readonly FilteredWaitPartition[];
+    // (undocumented)
+    readonly source: FilterSource;
+    // (undocumented)
+    readonly v: number;
+    // (undocumented)
+    readonly waitId: bigint;
+}
+
+// @public
+interface FilteredWaitResult {
+    // (undocumented)
+    readonly ready: readonly number[];
+}
 
 // @public
 export interface FilterError {
@@ -5971,6 +6042,38 @@ export interface FilterHeader {
 }
 
 // @public
+interface FilterListQuery {
+    readonly beforeId?: number;
+    // (undocumented)
+    readonly nameContains?: string;
+    // (undocumented)
+    readonly ownerGroupId?: bigint;
+    // (undocumented)
+    readonly ownerStreamCreatedAtMicros?: bigint;
+    // (undocumented)
+    readonly ownerStreamId?: number;
+    // (undocumented)
+    readonly ownerTopicCreatedAtMicros?: bigint;
+    // (undocumented)
+    readonly ownerTopicId?: number;
+    // (undocumented)
+    readonly page?: number;
+    // (undocumented)
+    readonly pageSize?: number;
+    // (undocumented)
+    readonly state?: FilterState;
+}
+
+// @public
+function filterListQueryOf(identity: FilterGroupIdentity): FilterListQuery;
+
+// @public
+function filterListQueryOwner(query: FilterListQuery): FilterGroupIdentity | undefined;
+
+// @public (undocumented)
+function filterListQueryParams(query: FilterListQuery): URLSearchParams;
+
+// @public
 type FilterLiteral = string | number | bigint | boolean | null | TypedValue | readonly FilterLiteral[];
 
 // @public (undocumented)
@@ -6105,6 +6208,12 @@ type FilterOutcome = {
 } | {
     readonly kind: "validated";
     readonly validation: FilterValidation;
+} | {
+    readonly kind: "ready";
+    readonly result: FilteredWaitResult;
+} | {
+    readonly kind: "cancelled";
+    readonly result: FilteredWaitCancelled;
 };
 
 // @public
@@ -6114,6 +6223,14 @@ export class FilterOversizedRecordError extends LaserError {
     readonly offset: bigint;
     // (undocumented)
     readonly partitionId: number;
+}
+
+// @public
+interface FilterOwner {
+    // (undocumented)
+    readonly group: FilterGroupRef;
+    // (undocumented)
+    readonly identity: FilterGroupIdentity;
 }
 
 // @public (undocumented)
@@ -6315,6 +6432,7 @@ interface FilterSummary {
     readonly latestRevision: number;
     // (undocumented)
     readonly name: string;
+    readonly owner?: FilterOwner;
     // (undocumented)
     readonly state: FilterState;
     // (undocumented)
@@ -7152,7 +7270,7 @@ const GraphUpsertCommand: ManagedCommand<GraphUpsert, GraphReply>;
 
 // @public
 export class GroupFilter {
-    configure(filter: ConsumerFilter): Promise<FilterBinding>;
+    configure(name: string, filter: ConsumerFilter): Promise<FilterBinding>;
     configureAs(operationId: bigint | undefined, policy: GroupFilterSpec): Promise<FilterBinding>;
     configureWith(policy: GroupFilterSpec): Promise<FilterBinding>;
     delete(): Promise<boolean>;
@@ -7162,12 +7280,14 @@ export class GroupFilter {
     revise(expectedRevision: number, filter: ConsumerFilter): Promise<FilterRevisionRef>;
     revisions(page?: number, pageSize?: number): Promise<FilterRevisionPage>;
     setRevisionEnabled(revision: number, enabled: boolean): Promise<void>;
+    summary(): Promise<FilterSummary | undefined>;
     test(payload: Uint8Array | string, headers?: readonly FilterHeader[]): Promise<FilterTestResult>;
 }
 
 // @public
 export type GroupFilterSpec = {
     readonly kind: "definition";
+    readonly name: string;
     readonly filter: ConsumerFilter;
 } | {
     readonly kind: "revision";
@@ -8780,6 +8900,7 @@ interface ListFilters {
     readonly beforeId?: number;
     // (undocumented)
     readonly nameContains?: string;
+    readonly owner?: FilterGroupIdentity;
     // (undocumented)
     readonly page: number;
     // (undocumented)
@@ -9290,6 +9411,15 @@ const MAX_FILTERED_PAGE_EXAMINED = 100000;
 // @public (undocumented)
 const MAX_FILTERED_PAGE_RECORDS = 1000;
 
+// @public
+const MAX_FILTERED_WAIT_CANCEL_IDS = 64;
+
+// @public
+const MAX_FILTERED_WAIT_MS = 20000;
+
+// @public
+const MAX_FILTERED_WAIT_PARTITIONS = 1024;
+
 // @public (undocumented)
 const MAX_FIXED_BYTES = 1048576;
 
@@ -9298,6 +9428,9 @@ const MAX_FORK_ID_BYTES = 128;
 
 // @public (undocumented)
 const MAX_FRAME_BYTES: number;
+
+// @public
+const MAX_GRAPH_LABEL_BYTES = 128;
 
 // @public (undocumented)
 const MAX_GRAPH_NAME_BYTES = 128;
@@ -9323,6 +9456,9 @@ const MAX_IDEMPOTENCY_KEY_BYTES = 64;
 // @public (undocumented)
 const MAX_INDEX_ENTRIES_PER_RECORD = 32;
 
+// @public
+const MAX_INDEX_FIELD_BYTES = 255;
+
 // @public (undocumented)
 const MAX_KEY_BYTES = 512;
 
@@ -9346,6 +9482,9 @@ const MAX_MANIFEST_IDENTITY_BYTES = 4096;
 
 // @public (undocumented)
 const MAX_MEMORY_BODY_BYTES: number;
+
+// @public
+const MAX_MEMORY_ID_BYTES = 255;
 
 // @public (undocumented)
 const MAX_MEMORY_TAG_BYTES = 64;
@@ -9376,6 +9515,12 @@ const MAX_OPERATOR_ASSERTION_TTL_MICROS = 300000000n;
 
 // @public (undocumented)
 const MAX_PAGE_SIZE = 1000;
+
+// @public (undocumented)
+const MAX_PROJECTION_ID_BYTES = 255;
+
+// @public (undocumented)
+const MAX_PROJECTION_NAME_BYTES = 255;
 
 // @public (undocumented)
 const MAX_PROJECTOR_PAYLOAD_BYTES: number;
@@ -9410,6 +9555,9 @@ const MAX_REGEX_PREDICATES = 4;
 // @public (undocumented)
 const MAX_REPAIR_DETAIL_BYTES = 4096;
 
+// @public
+export const MAX_REPLICATION_FACTOR = 32;
+
 // @public (undocumented)
 const MAX_ROLE_NAME_BYTES = 64;
 
@@ -9417,7 +9565,16 @@ const MAX_ROLE_NAME_BYTES = 64;
 const MAX_SCAN_LIMIT = 1000;
 
 // @public (undocumented)
+const MAX_SCHEMA_NAME_BYTES = 255;
+
+// @public
+const MAX_SESSION_CURSOR_BYTES = 512;
+
+// @public (undocumented)
 const MAX_SESSION_LABEL_BYTES = 256;
+
+// @public
+const MAX_SESSION_TEXT_QUERY_BYTES = 1024;
 
 // @public (undocumented)
 const MAX_SOURCE_PARTITIONS = 65536;
@@ -10725,6 +10882,7 @@ export interface ProducerOptions {
     readonly maxTopicBytes?: bigint;
     readonly neverExpire?: boolean;
     readonly partitions?: number;
+    readonly replicationFactor?: number;
     readonly retries?: number;
     readonly retryBackoffMs?: number;
     // (undocumented)
@@ -12005,13 +12163,12 @@ export interface ReliableConsumerOptions {
     readonly maxQueuedBytes?: number;
     // (undocumented)
     readonly maxQueuedRecords?: number;
+    readonly maxWaitMs?: number;
     // (undocumented)
     readonly middleware?: readonly AgentMiddleware[];
     // (undocumented)
     readonly onDeadLetter?: DeadLetterSink;
     readonly operations?: readonly string[];
-    // (undocumented)
-    readonly pollIntervalMs?: number;
     // (undocumented)
     readonly respondOn?: string;
     // (undocumented)
@@ -12112,6 +12269,9 @@ export interface Reranker {
     // (undocumented)
     rerank(query: string, items: readonly MemoryItem[]): Promise<readonly MemoryItem[]>;
 }
+
+// @public
+const RESERVED_PROJECTION_ID_PREFIX = "index:";
 
 // @public
 export function resolveBody(store: BlobStore, payload: Uint8Array): Promise<Uint8Array>;
@@ -14209,7 +14369,7 @@ export class Topic {
     consumer(name: string, partitionId: number, options?: ConsumerOptions): Consumer;
     consumerGroup(name: string): ConsumerGroup;
     consumerGroupId(id: bigint | number): ConsumerGroup;
-    ensure(partitions?: number): Promise<void>;
+    ensure(partitions?: number, replicationFactor?: number): Promise<void>;
     ensureConsumerGroup(name: string): Promise<void>;
     // (undocumented)
     json<T>(codec: Codec<T>): TypedTopic<T>;
@@ -14440,6 +14600,9 @@ function validateCheckpointRequest(value: CheckpointRequestEnvelope): void;
 // @public (undocumented)
 function validateConsumerFilter(filter: ConsumerFilter): void;
 
+// @public
+function validateControlCommand(command: ControlCommand): void;
+
 // @public (undocumented)
 function validateDestinationCheckpointStatus(value: DestinationCheckpointStatus): void;
 
@@ -14479,6 +14642,12 @@ function validateFilteredAck(request: FilteredAck): void;
 function validateFilteredPollRequest(request: FilteredPollRequest): void;
 
 // @public (undocumented)
+function validateFilteredWaitCancel(request: FilteredWaitCancel): void;
+
+// @public (undocumented)
+function validateFilteredWaitRequest(request: FilteredWaitRequest): void;
+
+// @public (undocumented)
 function validateFilterGroupRef(group: FilterGroupRef): void;
 
 // @public (undocumented)
@@ -14486,6 +14655,9 @@ function validateFilterMutation(mutation: FilterMutation): void;
 
 // @public (undocumented)
 function validateFilterMutationRequest(request: FilterMutationRequest): void;
+
+// @public
+function validateFilterName(name: string): void;
 
 // @public (undocumented)
 function validateFilterPreviewRequest(request: FilterPreviewRequest): void;
@@ -14502,11 +14674,20 @@ function validateForkId(forkId: string): void;
 // @public (undocumented)
 function validateGraphName(name: string): void;
 
+// @public
+function validateGraphUpsert(upsert: GraphUpsert): void;
+
+// @public
+function validateListFilters(request: ListFilters): void;
+
 // @public (undocumented)
 function validateLogicalSchema(schema: LogicalSchema): void;
 
 // @public (undocumented)
 function validateMaterializationDestination(value: MaterializationDestination): void;
+
+// @public
+function validateMemoryRecord(record: MemoryRecord): void;
 
 // @public (undocumented)
 function validateNamespace(namespace: string): void;
@@ -14516,6 +14697,12 @@ export function validateOperatorAssertion(value: OperatorActorAssertion): void;
 
 // @public
 function validatePolicyIdentity(mode: ExecutionMode, digest: Uint8Array | undefined): void;
+
+// @public
+function validateProjection(projection: Projection): void;
+
+// @public
+function validateProjectionId(value: string): void;
 
 // @public (undocumented)
 function validatePublicCheckpointMutation(value: PublicCheckpointMutation): void;
@@ -14552,6 +14739,12 @@ function validateResultFields(fields: readonly LogicalField[]): void;
 
 // @public (undocumented)
 export function validateRoleName(name: string): void;
+
+// @public
+function validateSchemaName(name: string | undefined): void;
+
+// @public
+function validateSessionList(request: SessionList): void;
 
 // @public
 function validateSessionParking(parking: SessionParking): void;
@@ -15251,6 +15444,8 @@ declare namespace wire {
         AGDX_FILTER_PREVIEW_CODE,
         AGDX_FILTER_TEST_CODE,
         AGDX_FILTER_VALIDATE_CODE,
+        AGDX_FILTERED_WAIT_CODE,
+        AGDX_FILTERED_WAIT_CANCEL_CODE,
         AGDX_FILTER_MUTATE_CODE,
         AGDX_GET_FILTER_CODE,
         AGDX_LIST_FILTERS_CODE,
@@ -15403,7 +15598,12 @@ declare namespace wire {
         DisplayType,
         Dispatch,
         HandledOperations,
+        ADDRESSEE_FILTER_NAME,
         parseProjectionId,
+        validateProjectionId,
+        validateProjection,
+        validateSchemaName,
+        validateControlCommand,
         projectionKindIsRow,
         schemaDefContentType,
         encodeControlStamp,
@@ -15434,6 +15634,7 @@ declare namespace wire {
         decodeControlCommand,
         encodeControlEnvelope,
         decodeControlEnvelope,
+        RESERVED_PROJECTION_ID_PREFIX,
         FieldType,
         IndexField,
         IndexSchema,
@@ -15480,11 +15681,15 @@ declare namespace wire {
         filterErrorCheckVersion,
         validateFilteredAck,
         validateFilteredPollRequest,
+        validateFilteredWaitRequest,
+        validateFilteredWaitCancel,
         validatePolicyIdentity,
         validateFilterPreviewRequest,
         validateFilterTestRequest,
         validateFilterGroupRef,
         validateFilterMutation,
+        validateFilterName,
+        validateListFilters,
         validateFilterMutationRequest,
         validateCatalogPage,
         encodeFilterExpr,
@@ -15500,6 +15705,8 @@ declare namespace wire {
         encodeFilteredAck,
         decodeFilteredAck,
         encodeFilteredPollRequest,
+        encodeFilteredWaitRequest,
+        encodeFilteredWaitCancel,
         encodeFilterPreviewRequest,
         encodeHeaderScalar,
         encodeFilterTestRequest,
@@ -15528,6 +15735,8 @@ declare namespace wire {
         decodeAckContext,
         decodeFilteredStart,
         decodeFilteredPollRequest,
+        decodeFilteredWaitRequest,
+        decodeFilteredWaitCancel,
         decodeFilteredPage,
         decodeFilterError,
         decodeFilterReply,
@@ -15571,6 +15780,11 @@ declare namespace wire {
         FilteredStart,
         FilteredAck,
         AckReceipt,
+        FilteredWaitRequest,
+        FilteredWaitCancel,
+        FilteredWaitCancelled,
+        FilteredWaitPartition,
+        FilteredWaitResult,
         FilteredPollRequest,
         StopReason,
         FaultReason,
@@ -15596,6 +15810,7 @@ declare namespace wire {
         FilterState,
         FilterGroupIdentity,
         FilterGroupRef,
+        FilterOwner,
         FilterRevisionInfo,
         FilterSummary,
         FilterBinding,
@@ -15705,6 +15920,7 @@ declare namespace wire {
         decodePath,
         encodeGraphResult,
         decodeGraphResult,
+        validateGraphUpsert,
         encodeGraphUpsert,
         decodeGraphUpsert,
         encodeGraphUpsertFrame,
@@ -15813,6 +16029,10 @@ declare namespace wire {
         FilterAnnounce,
         schemaListQueryParams,
         schemaQueryParams,
+        filterListQueryOf,
+        filterListQueryOwner,
+        filterListQueryParams,
+        decodeFilterListQuery,
         sessionsQueryParams,
         decodeSessionsQuery,
         sessionEventsQueryParams,
@@ -15890,6 +16110,7 @@ declare namespace wire {
         PARAM_NAME_CONTAINS,
         SchemaListQuery,
         SchemaQuery,
+        FilterListQuery,
         SessionsQuery,
         SessionEventsQuery,
         SessionStateQuery,
@@ -16097,6 +16318,8 @@ declare namespace wire {
         DEFAULT_NAMESPACE,
         MAX_NAMESPACE_BYTES,
         MAX_SESSION_LABEL_BYTES,
+        MAX_SESSION_TEXT_QUERY_BYTES,
+        MAX_SESSION_CURSOR_BYTES,
         MAX_HEARTBEAT_SESSIONS,
         MAX_STATE_PATCH_OPS,
         MAX_STATE_DOCUMENT_BYTES,
@@ -16109,6 +16332,10 @@ declare namespace wire {
         MAX_FRAME_BYTES,
         MAX_QUERY_REPLY_BYTES,
         MAX_QUERY_NAME_BYTES,
+        MAX_PROJECTION_ID_BYTES,
+        MAX_PROJECTION_NAME_BYTES,
+        MAX_INDEX_FIELD_BYTES,
+        MAX_SCHEMA_NAME_BYTES,
         MAX_RAW_SQL_BYTES,
         MAX_QUERY_PARAMETERS,
         MAX_QUERY_CURSOR_BYTES,
@@ -16131,10 +16358,12 @@ declare namespace wire {
         DEFAULT_RECALL_LIMIT,
         MAX_MEMORY_TAGS,
         MAX_MEMORY_TAG_BYTES,
+        MAX_MEMORY_ID_BYTES,
         MAX_GRAPH_NAME_BYTES,
         MAX_GRAPH_TRAVERSE_DEPTH,
         MAX_GRAPH_RESULT_ELEMENTS,
         MAX_GRAPH_NODE_LABELS,
+        MAX_GRAPH_LABEL_BYTES,
         MAX_SOURCE_REF_BYTES,
         MAX_FILTER_BYTES,
         MAX_FILTER_NODES,
@@ -16149,6 +16378,9 @@ declare namespace wire {
         MAX_FILTERED_PAGE_RECORDS,
         MAX_FILTERED_PAGE_BYTES,
         MAX_FILTERED_PAGE_EXAMINED,
+        MAX_FILTERED_WAIT_MS,
+        MAX_FILTERED_WAIT_PARTITIONS,
+        MAX_FILTERED_WAIT_CANCEL_IDS,
         MAX_FILTER_PREVIEW_EXAMINED,
         MAX_FILTER_PREVIEW_RECORDS,
         MAX_FILTER_PREVIEW_PAYLOAD_BYTES,
@@ -16160,6 +16392,7 @@ declare namespace wire {
         MAX_FILTER_SCHEMA_DEPTH,
         encodeMemoryRecord,
         decodeMemoryRecord,
+        validateMemoryRecord,
         encodeMemoryRecordFrame,
         MemoryRecord,
         encodeManagedRequestEnvelope,
@@ -16347,6 +16580,7 @@ declare namespace wire {
         TypedValue,
         FieldValue,
         MapEntry,
+        validateSessionList,
         encodeSessionList,
         decodeSessionList,
         encodeSessionEvents,
@@ -16574,7 +16808,7 @@ export interface WorkflowOutcome {
 
 // Warnings were encountered during analysis:
 //
-// src/client/laser.ts:766:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point full.d.ts
+// src/client/laser.ts:770:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point full.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point full.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point full.d.ts
 

@@ -1,8 +1,13 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
-import { CancelledError, InvalidError, TimeoutError } from "../../src/client/errors.js"
-import type { LaserTransport } from "../../src/iggy/apache-iggy.js"
+import {
+  CancelledError,
+  InvalidError,
+  TimeoutError,
+  TransportError
+} from "../../src/client/errors.js"
+import type { LaserTransport, PollWait } from "../../src/iggy/apache-iggy.js"
 import type { FilteredReader, MatchedPage, MatchedRecord } from "../../src/managed/filters.js"
 import { Consumer } from "../../src/stream/consumer.js"
 import { withMessageJson } from "../../src/stream/message.js"
@@ -58,6 +63,7 @@ void test("given_a_group_backlog_without_matches_when_next_times_out_then_should
   }, 1)
   const reader = {
     owns: () => true,
+    wake: () => undefined,
     readRound: () => {
       rounds += 1
       return Promise.resolve([undefined, true] as const)
@@ -68,7 +74,7 @@ void test("given_a_group_backlog_without_matches_when_next_times_out_then_should
     "stream",
     "topic",
     { kind: "group", name: "workers" },
-    { commitPolicy: { kind: "disabled" }, pollIntervalMs: 60_000 },
+    { commitPolicy: { kind: "disabled" } },
     reader
   )
   try {
@@ -88,6 +94,7 @@ void test("given_a_stalled_group_poll_when_next_times_out_then_should_keep_one_p
   })
   const reader = {
     owns: () => true,
+    wake: () => undefined,
     readRound: () => {
       rounds += 1
       return pending
@@ -119,6 +126,7 @@ void test(
     })
     const reader = {
       owns: () => true,
+      wake: () => undefined,
       readRound: () => pending,
       close: () => Promise.resolve()
     } as unknown as FilteredReader
@@ -152,6 +160,7 @@ void test("given_a_stalled_group_poll_when_aborted_then_should_resume_its_late_r
   })
   const reader = {
     owns: () => true,
+    wake: () => undefined,
     readRound: () => pending,
     close: () => Promise.resolve()
   } as unknown as FilteredReader
@@ -177,6 +186,7 @@ void test("given_a_group_poll_when_aborted_before_delivery_then_should_keep_the_
   const handled: bigint[] = []
   const reader = {
     owns: () => true,
+    wake: () => undefined,
     readRound: () => {
       controller.abort()
       return Promise.resolve([matchedPage([matched(0n)]), false] as const)
@@ -204,6 +214,7 @@ void test("given_an_automatic_group_consumer_when_shutdown_with_buffered_records
   const handled: bigint[] = []
   const reader = {
     owns: () => true,
+    wake: () => undefined,
     readRound: () =>
       Promise.resolve([matchedPage([matched(0n), matched(1n), matched(2n)]), false] as const),
     handled: (record: MatchedRecord) => handled.push(record.offset),
@@ -305,10 +316,14 @@ void test("given_anonymous_consumers_when_polling_then_should_use_distinct_uncom
   )
 })
 
-void test("given_group_replay_when_reading_several_partitions_then_should_keep_independent_offsets", async () => {
+void test("given_a_group_started_at_first_when_partitions_are_assigned_at_join_and_on_a_rebalance_then_should_read_each_after_the_stored_offset", async () => {
   const starts: unknown[] = []
+  let syncs = 0
   const transport = {
-    syncConsumerGroup: () => Promise.resolve({ generation: 1n, partitions: [0, 1] }),
+    syncConsumerGroup: () => {
+      syncs += 1
+      return Promise.resolve({ generation: 1n, partitions: syncs <= 2 ? [0, 1] : [0, 1, 2] })
+    },
     pollMessages(
       _stream: string,
       _topic: string,
@@ -320,7 +335,7 @@ void test("given_group_replay_when_reading_several_partitions_then_should_keep_i
         {
           payload: new Uint8Array(),
           partitionId: target.partitionId,
-          offset: start.value ?? 0n,
+          offset: start.value ?? 4n,
           headers: new Map()
         }
       ])
@@ -331,14 +346,14 @@ void test("given_group_replay_when_reading_several_partitions_then_should_keep_i
     "stream",
     "topic",
     { kind: "group", name: "replay" },
-    { startAt: { kind: "offset", value: 4n }, commitPolicy: { kind: "disabled" } }
+    { startAt: { kind: "first" }, commitPolicy: { kind: "disabled" } }
   )
   for (let index = 0; index < 4; index += 1) await consumer.nextWithin(100)
   assert.deepEqual(starts, [
-    [0, { kind: "offset", value: 4n }],
-    [1, { kind: "offset", value: 4n }],
-    [0, { kind: "offset", value: 5n }],
-    [1, { kind: "offset", value: 5n }]
+    [0, { kind: "next" }],
+    [1, { kind: "next" }],
+    [2, { kind: "next" }],
+    [0, { kind: "offset", value: 5n }]
   ])
 })
 
@@ -354,6 +369,7 @@ void test("given_group_commit_policies_when_records_are_delivered_then_should_st
     let served = false
     const reader = {
       owns: () => true,
+      wake: () => undefined,
       handled: () => undefined,
       flushCompleted: () => {
         stored += 1
@@ -367,6 +383,7 @@ void test("given_group_commit_policies_when_records_are_delivered_then_should_st
           false
         ] as const)
       },
+      waitForRecordsWithin: () => new Promise((resolve) => setTimeout(resolve, 1)),
       close: () => Promise.resolve()
     } as unknown as FilteredReader
     const consumer = Consumer.create(
@@ -389,7 +406,7 @@ void test("given_group_commit_policies_when_records_are_delivered_then_should_st
   }
 })
 
-void test("given_a_native_group_consumer_that_did_not_join_when_shut_down_then_should_not_leave_the_group", async () => {
+void test("given_a_native_group_consumer_when_shut_down_then_should_leave_the_group_it_joined", async () => {
   let left = 0
   const transport = {
     leaveConsumerGroup: () => {
@@ -397,21 +414,11 @@ void test("given_a_native_group_consumer_that_did_not_join_when_shut_down_then_s
       return Promise.resolve()
     }
   } as unknown as LaserTransport
-  const joined = Consumer.create(transport, "s", "t", { kind: "group", name: "workers" })
-  const detached = Consumer.create(
-    transport,
-    "s",
-    "t",
-    { kind: "group", name: "workers" },
-    { autoJoinGroup: false }
-  )
-  await detached.shutdown()
-  assert.equal(left, 0)
-  await joined.shutdown()
+  await Consumer.create(transport, "s", "t", { kind: "group", name: "workers" }).shutdown()
   assert.equal(left, 1)
 })
 
-void test("given_no_poll_interval_when_a_native_poll_is_empty_then_should_poll_again_without_waiting", async () => {
+void test("given_an_empty_native_poll_when_polled_again_then_should_leave_the_wait_to_the_server", async () => {
   let polls = 0
   const transport = {
     pollMessages: () => {
@@ -419,13 +426,228 @@ void test("given_no_poll_interval_when_a_native_poll_is_empty_then_should_poll_a
       return Promise.resolve([])
     }
   } as unknown as LaserTransport
+  const consumer = Consumer.create(
+    transport,
+    "s",
+    "t",
+    { kind: "single", partitionId: 0, name: "metrics" },
+    { maxWaitMs: 0 }
+  )
+  await assert.rejects(consumer.nextWithin(50), TimeoutError)
+  assert.ok(polls > 5, `polled ${String(polls)} times in 50 ms`)
+  await consumer.shutdown()
+})
+
+void test("given_out_of_range_wait_options_when_a_consumer_is_built_then_should_refuse_them", () => {
+  const cases: readonly [Parameters<typeof Consumer.create>[4], string][] = [
+    [{ maxWaitMs: 600_001 }, "consumer maxWaitMs must be 0..=600000"],
+    [{ maxWaitMs: -1 }, "consumer maxWaitMs must be 0..=600000"],
+    [{ minCount: 0 }, "consumer minCount must be 1..=batchLength"],
+    [{ batchLength: 10, minCount: 11 }, "consumer minCount must be 1..=batchLength"],
+    [{ maxBytes: 343 }, "consumer maxBytes must be at least 344"]
+  ]
+  for (const [options, message] of cases) {
+    assert.throws(
+      () =>
+        Consumer.create(
+          {} as LaserTransport,
+          "s",
+          "t",
+          { kind: "single", partitionId: 0 },
+          options
+        ),
+      new InvalidError(message)
+    )
+  }
+  Consumer.create(
+    {} as LaserTransport,
+    "s",
+    "t",
+    { kind: "single", partitionId: 0 },
+    { maxWaitMs: 600_000, batchLength: 10, minCount: 10, maxBytes: 344 }
+  )
+})
+
+void test("given_a_single_partition_consumer_when_polling_then_should_hold_each_read_for_the_whole_wait", async () => {
+  const waits: (PollWait | undefined)[] = []
+  const transport = {
+    pollMessages(
+      _stream: string,
+      _topic: string,
+      _target: unknown,
+      _start: unknown,
+      _count: number,
+      _commit: boolean,
+      wait?: PollWait
+    ) {
+      waits.push(wait)
+      return Promise.resolve([])
+    }
+  } as unknown as LaserTransport
   const consumer = Consumer.create(transport, "s", "t", {
     kind: "single",
     partitionId: 0,
-    name: "metrics"
+    name: "r"
   })
-  await assert.rejects(consumer.nextWithin(50), TimeoutError)
-  assert.ok(polls > 5, `polled ${String(polls)} times in 50 ms`)
+  await assert.rejects(consumer.nextWithin(5), TimeoutError)
+  await consumer.shutdown()
+  assert.deepEqual(waits[0], { maxWaitMs: 5_000, minCount: 1, maxBytes: 1_048_576 })
+})
+
+void test("given_a_group_consumer_over_three_partitions_when_a_pass_is_idle_then_should_hold_each_read_for_a_third_of_the_wait", async () => {
+  const waits: number[] = []
+  let offset = 0n
+  let deliverAt = 6
+  const transport = {
+    syncConsumerGroup: () => Promise.resolve({ generation: 1n, partitions: [0, 1, 2] }),
+    leaveConsumerGroup: () => Promise.resolve(),
+    storeOffset: () => Promise.resolve(),
+    pollMessages(
+      _stream: string,
+      _topic: string,
+      target: { readonly partitionId?: number },
+      _start: unknown,
+      _count: number,
+      _commit: boolean,
+      wait?: PollWait
+    ) {
+      waits.push(wait?.maxWaitMs ?? -1)
+      deliverAt -= 1
+      return Promise.resolve(
+        deliverAt === 0
+          ? [
+              {
+                payload: new Uint8Array(),
+                partitionId: target.partitionId ?? 0,
+                offset: offset++,
+                headers: new Map()
+              }
+            ]
+          : []
+      )
+    }
+  } as unknown as LaserTransport
+  const consumer = Consumer.create(
+    transport,
+    "s",
+    "t",
+    { kind: "group", name: "workers" },
+    { startAt: { kind: "first" }, maxWaitMs: 3_000 }
+  )
+  await consumer.nextWithin(1_000)
+  deliverAt = Number.MAX_SAFE_INTEGER
+  await assert.rejects(consumer.nextWithin(5), TimeoutError)
+  await consumer.shutdown()
+  assert.deepEqual(waits.slice(0, 6), [0, 0, 0, 1_000, 1_000, 1_000])
+  assert.equal(waits[6], 0, "a delivered record starts a pass that answers at once")
+})
+
+void test("given_a_policy_aware_group_consumer_when_a_round_is_idle_then_should_wait_through_the_reader", async () => {
+  let idles = 0
+  let rounds = 0
+  const reader = {
+    owns: () => true,
+    wake: () => undefined,
+    readRound: () => {
+      rounds += 1
+      return Promise.resolve(
+        rounds === 3
+          ? ([matchedPage([matched(0n)]), false] as const)
+          : ([undefined, false] as const)
+      )
+    },
+    waitForRecordsWithin: () => {
+      idles += 1
+      return Promise.resolve()
+    },
+    close: () => Promise.resolve()
+  } as unknown as FilteredReader
+  const consumer = Consumer.create(
+    {} as LaserTransport,
+    "stream",
+    "topic",
+    { kind: "group", name: "workers" },
+    { commitPolicy: { kind: "disabled" } },
+    reader
+  )
+  assert.equal((await consumer.nextWithin(1_000)).position.offset, 0n)
+  assert.equal(idles, 2, "each idle round waits once through the reader")
+  await consumer.shutdown()
+})
+
+void test("given_a_held_native_poll_when_the_consumer_shuts_down_then_should_cancel_it", async () => {
+  let cancelled = false
+  const transport = {
+    pollMessages(
+      _stream: string,
+      _topic: string,
+      _target: unknown,
+      _start: unknown,
+      _count: number,
+      _commit: boolean,
+      _wait?: PollWait,
+      signal?: AbortSignal
+    ) {
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          cancelled = true
+          reject(new Error("cancelled"))
+        })
+      })
+    }
+  } as unknown as LaserTransport
+  const consumer = Consumer.create(transport, "s", "t", {
+    kind: "single",
+    partitionId: 0,
+    name: "r"
+  })
+  await assert.rejects(consumer.nextWithin(5), TimeoutError)
+  await consumer.shutdown()
+  assert.equal(cancelled, true, "shutdown cancels the read the server holds")
+})
+
+void test("given_a_lasting_refusal_when_polling_then_should_report_it_once_per_six_refused_polls_in_a_row", async () => {
+  let polls = 0
+  let refusing = true
+  const transport = {
+    pollMessages() {
+      polls += 1
+      if (!refusing)
+        return Promise.resolve([
+          { payload: new Uint8Array(), partitionId: 0, offset: 0n, headers: new Map() }
+        ])
+      return Promise.reject(
+        new TransportError("poll refused", false, {
+          cause: Object.assign(new Error("topic not found"), { errorCode: 2010 })
+        })
+      )
+    }
+  } as unknown as LaserTransport
+  const consumer = Consumer.create(
+    transport,
+    "s",
+    "t",
+    { kind: "single", partitionId: 0, name: "r" },
+    { commitPolicy: { kind: "disabled" }, pollingRetryIntervalMs: 5, allowReplay: true }
+  )
+  const pollsAtReports: number[] = []
+  const readUntilReported = async (reports: number): Promise<void> => {
+    while (pollsAtReports.length < reports && polls < 40) {
+      try {
+        await consumer.nextWithin(50)
+      } catch (error) {
+        if (!(error instanceof TimeoutError)) pollsAtReports.push(polls)
+      }
+    }
+  }
+  await readUntilReported(2)
+  assert.deepEqual(pollsAtReports, [6, 12], "the sixth refusal in a row is reported, then six more")
+  refusing = false
+  assert.equal((await consumer.nextWithin(500)).position.offset, 0n)
+  refusing = true
+  const recovered = polls
+  await readUntilReported(3)
+  assert.equal(pollsAtReports[2], recovered + 6, "a delivered poll starts the count again")
   await consumer.shutdown()
 })
 

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// One logical agent defaults to one Iggy consumer group.
 ///
@@ -49,8 +49,9 @@ pub struct Agent<H> {
     /// inbox). Set [`InboxRoute::Fixed`] for a workflow topic the caller owns.
     #[builder(default)]
     pub inbox_route: InboxRoute,
-    /// Override the consumer poll interval (default: the runtime's reactive 10ms).
-    pub poll_interval: Option<Duration>,
+    /// How long the server holds a read that finds nothing new before it
+    /// answers. A record ends the wait at once. Default 5 s.
+    pub max_wait: Option<Duration>,
     /// How long [`AgentHandle::shutdown`] waits for the in-flight message to
     /// finish draining before the consumer is dropped. [`AgentHandle::abort`] is
     /// the unconditional hard stop. Defaults to the consumer's 30s grace.
@@ -162,9 +163,7 @@ where
         let id = self.id.clone();
         let listen_on = self.listen_on.clone();
         let capabilities = self.capabilities;
-        let group = self
-            .consumer_group
-            .unwrap_or_else(|| ConsumerGroupName::for_agent(&id));
+        let consumer_group = self.consumer_group;
         // The agent's session configuration declares its stream's layout on
         // this connection, so the agent reads and routes by it.
         if let Some(config) = &self.sessions {
@@ -180,7 +179,7 @@ where
         let respond_on = self.respond_on;
         let inbox_route = self.inbox_route;
         let ack_on_pickup = self.ack_on_pickup;
-        let poll_interval = self.poll_interval;
+        let max_wait = self.max_wait;
         let warm_dedup = self.warm_dedup;
         let deduplicator = self.deduplicator;
         let shutdown_grace = self.shutdown_grace;
@@ -211,43 +210,55 @@ where
             _ => None,
         };
         let task = tokio::spawn(async move {
-            if zero_period {
-                return Err(LaserError::Config(
-                    "consolidate_every must be greater than zero",
-                ));
+            let agent = id.clone();
+            let outcome = async move {
+                if zero_period {
+                    return Err(LaserError::Config(
+                        "consolidate_every must be greater than zero",
+                    ));
+                }
+                let group = match consumer_group {
+                    Some(group) => group,
+                    None => ConsumerGroupName::for_agent(&id)?,
+                };
+                if !capabilities.is_empty() {
+                    advertise(&laser, &id, &listen_on, capabilities).await?;
+                }
+                let consumer = ReliableConsumer::builder()
+                    .group(group)
+                    .agent(id)
+                    .topic(topic)
+                    .maybe_respond_on(respond_on)
+                    .inbox_route(inbox_route)
+                    .ack_on_pickup(ack_on_pickup)
+                    .maybe_max_wait(max_wait)
+                    .maybe_shutdown_grace(shutdown_grace)
+                    .maybe_concurrency(concurrency)
+                    .maybe_max_queued_records(max_queued_records)
+                    .maybe_max_queued_bytes(max_queued_bytes)
+                    .warm_dedup(warm_dedup)
+                    .maybe_deduplicator(deduplicator)
+                    .maybe_dedup_window(dedup_window)
+                    .maybe_retry(retry)
+                    .understood_features(understood_features)
+                    .middleware(middleware)
+                    .maybe_on_dead_letter(on_dead_letter)
+                    .maybe_operations(operations)
+                    .maybe_sessions(sessions);
+                #[cfg(feature = "sign")]
+                let consumer = consumer
+                    .maybe_verifier(verifier)
+                    .maybe_signing_key(signing_key);
+                consumer
+                    .build()
+                    .run(&laser, handler, ready_tx, shutdown_rx)
+                    .await
             }
-            if !capabilities.is_empty() {
-                advertise(&laser, &id, &listen_on, capabilities).await?;
+            .await;
+            if let Err(error) = &outcome {
+                error!(%error, agent = %agent, "Agent {agent} stopped with an error: {error}");
             }
-            let consumer = ReliableConsumer::builder()
-                .group(group)
-                .agent(id)
-                .topic(topic)
-                .maybe_respond_on(respond_on)
-                .inbox_route(inbox_route)
-                .ack_on_pickup(ack_on_pickup)
-                .maybe_poll_interval(poll_interval)
-                .maybe_shutdown_grace(shutdown_grace)
-                .maybe_concurrency(concurrency)
-                .maybe_max_queued_records(max_queued_records)
-                .maybe_max_queued_bytes(max_queued_bytes)
-                .warm_dedup(warm_dedup)
-                .maybe_deduplicator(deduplicator)
-                .maybe_dedup_window(dedup_window)
-                .maybe_retry(retry)
-                .understood_features(understood_features)
-                .middleware(middleware)
-                .maybe_on_dead_letter(on_dead_letter)
-                .maybe_operations(operations)
-                .maybe_sessions(sessions);
-            #[cfg(feature = "sign")]
-            let consumer = consumer
-                .maybe_verifier(verifier)
-                .maybe_signing_key(signing_key);
-            consumer
-                .build()
-                .run(&laser, handler, ready_tx, shutdown_rx)
-                .await
+            outcome
         });
         AgentHandle {
             shutdown: Some(shutdown),

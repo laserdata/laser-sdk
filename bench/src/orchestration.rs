@@ -321,7 +321,7 @@ async fn prepare_stream(
         laser
             .stream(&stream)
             .topic(topic.topic_string())
-            .ensure(case.partitions)
+            .ensure(case.partitions, None)
             .await
             .map_err(|error| sdk_error(&error))?;
     }
@@ -385,7 +385,6 @@ async fn start_workers(
                 payload: payload.clone(),
                 ledger: Arc::clone(&ledger),
             })
-            .poll_interval(Duration::ZERO)
             .build()
             .spawn(worker_laser);
         handle.ready().await.map_err(|error| sdk_error(&error))?;
@@ -413,7 +412,6 @@ async fn start_orchestrator(
             ledger,
             timeout,
         })
-        .poll_interval(Duration::ZERO)
         .build()
         .spawn(laser.clone());
     handle.ready().await.map_err(|error| sdk_error(&error))?;

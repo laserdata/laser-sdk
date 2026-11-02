@@ -212,7 +212,7 @@ async fn given_an_enforcing_governor_when_a_business_publish_is_blocked_then_sho
     let laser = laser().await;
     laser
         .topic("business.audit")
-        .ensure(1)
+        .ensure(1, None)
         .await
         .expect("topic ready");
     let governed = laser.with_governor(Arc::new(BlockBusinessWires), GovernorMode::Enforce);

@@ -96,6 +96,10 @@ def test_given_this_build_when_asked_what_it_serves_then_should_evaluate_its_own
         served.evaluates(ls.FILTER_EVALUATOR_VERSION, "xml")
 
 
+def test_given_a_client_build_when_asked_for_its_filtered_wait_then_should_serve_none():
+    assert ls.FilterAnnounce.served().max_wait_ms == 0
+
+
 def test_given_an_untrusted_path_when_building_presence_then_should_raise_invalid_for_a_bad_path():
     assert ls.FilterExpr.try_present("after.mode") == ls.FilterExpr.present("after.mode")
     assert ls.FilterExpr.try_absent("after.mode") == ls.FilterExpr.absent("after.mode")

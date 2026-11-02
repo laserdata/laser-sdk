@@ -21,9 +21,9 @@ The [`laser-wire`](https://crates.io/crates/laser-wire) crate defines encoded me
 
 ```toml
 [dependencies]
-laser-sdk = "0.9.0-dev.1" # typed streaming plus provenance
+laser-sdk = "0.9.0-dev.2" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "0.9.0-dev.1", features = ["agent", "managed"] }
+laser-sdk = { version = "0.9.0-dev.2", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -46,7 +46,7 @@ let api_calls = laser
     .stream("api-metrics")
     .topic("api_calls")
     .json::<ApiCall>();
-api_calls.topic().ensure(4).await?;
+api_calls.topic().ensure(4, None).await?;
 
 let committed = api_calls.publish(&ApiCall {
         endpoint:   "/v1/items".into(),
@@ -66,6 +66,8 @@ while let Some(record) = records.next().await {
 
 This example uses only the default `streaming` and `provenance` features and runs against Apache Iggy. One connection addresses every stream on the server. `Laser::connect_with_stream` only pins a default stream so `laser.topic(name)` can be used as a shortcut. It does not limit the connection to that stream. `Laser::connect_env()` reads `LASER_CONNECTION_STRING` and the optional `LASER_STREAM`, and `Laser::local()` targets local Apache Iggy. A connection string is `user:password@host[:port]` or `token@host[:port]`, optionally prefixed with `iggy://` or `iggy+tcp://`, and the port defaults to 8090. Credentials are required. Other schemes, unknown or repeated options, and malformed credentials or ports return `LaserError::Config` before dialing.
 
+`Topic::ensure(partitions, replication_factor)` creates the topic when absent. `None` takes the server's default replication factor, `Some(factor)` stores each partition on that many nodes, 1 to `MAX_REPLICATION_FACTOR` (32) and at most the cluster's node count. `ProducerBuilder::replication_factor(factor)` does the same for a topic the producer creates. An out-of-range factor fails with `LaserError::Invalid` before anything is sent, and the server's refusal of a factor above the node count surfaces as `LaserError::Iggy`. Reads and writes go to each partition's primary, which always stores it. See [client behavior](../docs/client-behavior.md#publication-and-reads).
+
 Direct producers, topic sends, and publish builders return `SendMessagesResponse`. Each confirmation identifies the stream, topic, partition, and first offset in a batch. A server that does not report offsets returns an empty list. Completion follows the topic durability policy. An offset identifies a position only within its stream, topic, and partition.
 
 Apache Iggy retries a failed dial and reconnects a dropped connection, by default without limit at one-second intervals. The 30-second connect budget described under [Connect and publish limits](#connect-and-publish-limits) stops the retries of the initial connect. Use `reconnection_retries=<count|unlimited>` and `reconnection_interval=<duration>` to change the reconnect behavior. After reconnecting, the client reapplies the credentials from the connection string.
@@ -76,7 +78,7 @@ A connection string's own `tls_ca_file=<path>` turns TLS on without `tls=true`, 
 
 ## Batch and any payload
 
-`publish_batch` groups typed records for sending. A service can use `topic.producer()` for batching, delays, retries, and routing. `.background(BackgroundConfig::builder()..)` selects buffered sends through Apache Iggy. Before dropping a background producer, call `Producer::shutdown()` to flush its messages. Otherwise, unflushed messages can be lost. `topic.consumer_group(name)` selects a group. `group.consumer().build().await` starts continuous reads with offsets stored on the server.
+`publish_batch` groups typed records for sending. A service can use `topic.producer()` for batching, delays, retries, and routing. `.background(BackgroundConfig::builder()..)` selects buffered sends through Apache Iggy. Before dropping a background producer, call `Producer::shutdown()` to flush its messages. Otherwise, unflushed messages can be lost. `topic.consumer_group(name)` selects a group. `group.consumer().build().await` starts continuous reads with offsets stored on the server. The server holds each poll for up to `max_wait` (5 seconds by default, zero answers at once) and answers as soon as `min_count` records (default 1) land, with at most `max_bytes` of records (default 1 MiB).
 
 A replay cursor reads a bounded set of records and keeps its offsets in the client. Save those offsets to resume later. Failed or canceled polls do not advance the saved offsets. Each partition read returns at most 10,000 messages, even when the configured request batch is larger.
 
@@ -259,7 +261,7 @@ if let Some(decision) = decide(&intent, &[vote], now)? {
 
 Every primitive is an accessor on the connected client. The accessor is free and synchronous, IO happens at the terminal verb.
 
-`AgentId` identifies an agent for routing and attribution. `ConsumerGroupName` selects the Apache Iggy consumer group that shares work. `PrincipalId` identifies the authenticated user for access decisions. `Agent::builder` derives the default group name from the agent ID. `.consumer_group(..)` changes the group without changing the agent identity.
+`AgentId` identifies an agent for routing and attribution. `ConsumerGroupName` selects the Apache Iggy consumer group that shares work. `PrincipalId` identifies the authenticated user for access decisions. `Agent::builder` derives the default group name from the agent ID. `.consumer_group(..)` changes the group without changing the agent identity. An agent ID can be 256 bytes and a group name at most 255, so an agent with a 256-byte ID sets its group explicitly.
 
 One connection can advertise one agent. A second advertisement receives `LaserError::PresenceConflict`. `Router::to_principal(..)` and `CapabilitySelector::principal(..)` require live presence to match the authenticated `PrincipalId`. A mismatch returns `RoutePrincipalMismatch`. With a verifier, contract replies require a valid signature from the selected identity. `AgentMessage::verified_principal` records the responder, including each `ScatterReport` branch.
 
@@ -321,7 +323,7 @@ Choose the read API that provides the behavior your application needs.
 
 | Rung | Call | You get |
 | --- | --- | --- |
-| live consumer | `topic.consumer(..)` / `topic.consumer_group(..).consumer()` | a Laser async `Stream` over Apache Iggy with batching, polling, replay, retries, groups, automatic or explicit server offset commits, and `next_within(timeout)` for a bounded single-record wait |
+| live consumer | `topic.consumer(..)` / `topic.consumer_group(..).consumer()` | a Laser async `Stream` over Apache Iggy with batching, polling, replay, retries, groups, automatic or explicit server offset commits, and `next_within(timeout)` for a bounded single-record wait. A group consumer always resumes after the group's stored offset, and `start_at` only seeds partitions the group never stored ([client behavior](../docs/client-behavior.md#consumers-and-polling)) |
 | replay | `topic.replay()` | a resumable `Cursor` by explicit offsets: bounded, restartable, nothing consumed (`topic.json::<T>().records(reader_name)` is the same rung, typed) |
 | change feed | `laser.watch()` | lightweight advancement records, so feed-poll-then-query replaces repeated blind queries |
 | reliable consumer | `Agent::builder` / `ReliableConsumer` | consumer-group delivery plus dedup, retry, deadline, and dead-lettering |
@@ -347,7 +349,11 @@ async fn main() -> Result<(), LaserError> {
     ]));
     let topic = laser.stream("agent-telemetry").topic("inferences");
     let setup = topic.consumer_group("on-call-review");
-    let created = setup.create().filter(slow_or_failed).build().await?;
+    let created = setup
+        .create()
+        .filter("slow-or-failed", slow_or_failed)
+        .build()
+        .await?;
 
     let group = topic.consumer_group_id(u64::from(created.id));
     let mut consumer = group.consumer()
@@ -362,9 +368,9 @@ async fn main() -> Result<(), LaserError> {
 }
 ```
 
-Use `group.create().build().await` for a plain group, and `group.filter().configure(filter).await` to configure it afterward. The advanced `group.reader()?.build().await` also resolves the group's policy and accepts an unbound group. `next_page` and `ack_page` handle its batches, while `ack_through` stores a checkpoint inside a page. `CompiledFilter`, with the optional `filters` feature, runs the evaluator locally. Fault, foreign-codec and type-mismatch policies decide whether an unevaluable record stops the read, is dropped or is delivered with `evaluated == false`.
+Use `group.create().build().await` for a plain group, and `group.filter().configure(name, filter).await` to configure it afterward. The name is the caller's label for the group's own filter: it follows the saved filter name rule (1 to 128 bytes of ASCII letters, digits, `.`, `_` and `-`), need not be unique, and the same digest configured under another name renames it. `group.filter().summary()` returns that filter's catalog row with its name and owning group, or `None`, and `group.filter().delete()` removes it, bound or released. The advanced `group.reader()?.build().await` also resolves the group's policy and accepts an unbound group. `next_page` and `ack_page` handle its batches, while `ack_through` stores a checkpoint inside a page. `CompiledFilter`, with the optional `filters` feature, runs the evaluator locally. Fault, foreign-codec and type-mismatch policies decide whether an unevaluable record stops the read, is dropped or is delivered with `evaluated == false`.
 
-**A normal consumer's `batch_length(100)` examines at most 100 source records per partition request and returns zero to 100 matches.** The iterator continues through empty selections without sleeping until it reaches visible data's end. The advanced reader has separate `count` and `max_examined` limits for match-oriented scans.
+**A normal consumer's `batch_length(100)` examines at most 100 source records per partition request and returns zero to 100 matches.** The iterator continues through empty selections without sleeping until it reaches visible data's end. Once a whole round finds nothing new, it waits on the server for the next record, up to the consumer's `max_wait`, when the server announces filtered waits (`Capabilities.filters.max_wait_ms`). The advanced reader has separate `count` and `max_examined` limits for match-oriented scans and its own `max_wait`, 5 seconds by default. A reader holds one wait per serving node and cancels the others as soon as one answers, when its assignment changes, and when it closes or is dropped.
 
 ## Consumer filter groups and offsets
 

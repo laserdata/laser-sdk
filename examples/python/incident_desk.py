@@ -608,27 +608,23 @@ async def main() -> None:
             ls.AgentTopic.Sessions,
             make_triage(llm, TICKETS_INDEX),
             respond_on=ls.AgentTopic.Sessions,
-            poll_interval_ms=10,
         )
         specialist = laser.spawn_agent(
             "specialist",
             ls.AgentTopic.Sessions,
             make_specialist(llm, semantic),
             respond_on=ls.AgentTopic.Sessions,
-            poll_interval_ms=10,
         )
         approver_agent = laser.spawn_agent(
             "approver",
             ls.AgentTopic.Sessions,
             approver,
             respond_on=ls.AgentTopic.Sessions,
-            poll_interval_ms=10,
         )
         resolver = laser.spawn_agent(
             "resolver",
             ls.AgentTopic.Sessions,
             make_resolver(grants_namespace),
-            poll_interval_ms=10,
             dedup=make_kv_deduplicator(laser, dedup_namespace, DEDUP_TTL),
         )
         agents = [triage, specialist, approver_agent, resolver]

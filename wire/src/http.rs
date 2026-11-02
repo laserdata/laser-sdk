@@ -5,6 +5,8 @@ use crate::checkpoint::{
 use crate::destination::{
     DestinationId, DestinationOperationId, MaterializationDestination, QueryRoute,
 };
+use crate::error::InvalidError;
+use crate::filter::FilterGroupIdentity;
 use crate::fork::{ForkError, ForkKind};
 use crate::graph::SourceRef;
 use crate::hello::{BackendDescriptor, FilterAnnounce, OpVersions};
@@ -1406,10 +1408,65 @@ pub struct FilterListQuery {
     /// Only filters with a lower id, for stable paging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_id: Option<u32>,
+    /// The owner filter is the five fields of a group identity, all or none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_stream_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_stream_created_at_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_topic_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_topic_created_at_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_group_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<u32>,
+}
+
+impl FilterListQuery {
+    /// The owner filter, refused unless all five identity fields are set or none.
+    pub fn owner(&self) -> Result<Option<FilterGroupIdentity>, InvalidError> {
+        match (
+            self.owner_stream_id,
+            self.owner_stream_created_at_micros,
+            self.owner_topic_id,
+            self.owner_topic_created_at_micros,
+            self.owner_group_id,
+        ) {
+            (None, None, None, None, None) => Ok(None),
+            (
+                Some(stream_id),
+                Some(stream_created_at_micros),
+                Some(topic_id),
+                Some(topic_created_at_micros),
+                Some(group_id),
+            ) => Ok(Some(FilterGroupIdentity {
+                stream_id,
+                stream_created_at_micros,
+                topic_id,
+                topic_created_at_micros,
+                group_id,
+            })),
+            _ => Err(InvalidError::new(
+                "the owner filter needs owner_stream_id, owner_stream_created_at_micros, owner_topic_id, owner_topic_created_at_micros and owner_group_id together",
+            )),
+        }
+    }
+}
+
+impl From<FilterGroupIdentity> for FilterListQuery {
+    fn from(identity: FilterGroupIdentity) -> Self {
+        Self {
+            owner_stream_id: Some(identity.stream_id),
+            owner_stream_created_at_micros: Some(identity.stream_created_at_micros),
+            owner_topic_id: Some(identity.topic_id),
+            owner_topic_created_at_micros: Some(identity.topic_created_at_micros),
+            owner_group_id: Some(identity.group_id),
+            ..Self::default()
+        }
+    }
 }
 
 /// `GET /agdx/filters/{id}/revisions` query parameters.
@@ -1591,6 +1648,26 @@ pub struct CasCommittedView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_a_filter_list_query_when_the_owner_is_complete_or_partial_then_should_resolve_or_refuse()
+     {
+        let identity = FilterGroupIdentity {
+            stream_id: 1,
+            stream_created_at_micros: 10,
+            topic_id: 2,
+            topic_created_at_micros: 20,
+            group_id: 3,
+        };
+        let query = FilterListQuery::from(identity);
+        assert_eq!(query.owner().expect("complete owner"), Some(identity));
+        assert_eq!(FilterListQuery::default().owner().expect("no owner"), None);
+        let partial = FilterListQuery {
+            owner_group_id: None,
+            ..query
+        };
+        assert!(partial.owner().is_err());
+    }
 
     #[test]
     fn given_path_builders_when_rendered_then_should_match_the_router() {

@@ -7,12 +7,19 @@ use bytes::Bytes;
 use dashmap::DashMap;
 #[cfg(feature = "streaming")]
 use iggy::prelude::*;
+use iggy_common::MAX_REPLICATION_FACTOR;
 use laser_wire::framing::decode_named;
 use laser_wire::validate::Validate;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tokio::time::{Duration, sleep};
+use tracing::Instrument;
+
+// Each publish chunk boxes its send, because inline the driver's deep future
+// would push every caller past the layout and `Send` query limits.
+type SendFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Result<SendMessagesResponse, IggyError>> + Send + 'a>>;
 
 /// How long a managed mutation keeps repeating its frame while its outcome is
 /// unknown, the shared client contract deadline.
@@ -320,7 +327,7 @@ impl Laser {
     /// # async fn run() -> Result<(), LaserError> {
     /// let laser = Laser::connect_with_stream("iggy:iggy@127.0.0.1:8090", "agent-telemetry").await?;
     /// // publishes to the "agent-telemetry" stream
-    /// laser.topic("inferences").ensure(4).await?;
+    /// laser.topic("inferences").ensure(4, None).await?;
     /// laser.topic("inferences").publish().payload(b"...".to_vec()).send().await?;
     /// # Ok(()) }
     /// ```
@@ -910,33 +917,31 @@ impl Laser {
         }
     }
 
-    /// Idempotently creates `topic` on `stream` with `partitions`, creating the
-    /// stream first if needed. Used for the `_agdx` ops stream, which is separate
-    /// from this laser's data stream.
-    pub(crate) async fn ensure_topic_on(
-        &self,
-        stream: &str,
-        topic: &str,
-        partitions: u32,
-    ) -> Result<(), LaserError> {
-        let client = self.client();
-        ensure_stream(&client, stream).await?;
-        ensure_topic(&client, stream, topic, partitions).await
-    }
-
-    /// Like [`ensure_topic_on`](Self::ensure_topic_on) with an explicit
-    /// message-expiry, for the configurable memory topic.
-    #[cfg(feature = "agent")]
+    /// Idempotently creates `topic` on `stream` with `partitions`, an explicit
+    /// message expiry and an optional replication factor (the server default
+    /// when `None`), creating the stream first if needed.
     pub(crate) async fn ensure_topic_on_with(
         &self,
         stream: &str,
         topic: &str,
         partitions: u32,
         expiry: IggyExpiry,
+        replication_factor: Option<u32>,
     ) -> Result<(), LaserError> {
+        if let Some(factor) = replication_factor {
+            validate_replication_factor(factor)?;
+        }
         let client = self.client();
         ensure_stream(&client, stream).await?;
-        ensure_topic_with(&client, stream, topic, partitions, expiry).await
+        ensure_topic_with(
+            &client,
+            stream,
+            topic,
+            partitions,
+            expiry,
+            replication_factor,
+        )
+        .await
     }
 
     /// Low-level send: one message with explicit user-headers, on the default
@@ -997,48 +1002,52 @@ impl Laser {
 
     /// Like [`send_batch`](Self::send_batch) but targets `stream` instead of this
     /// laser's data stream. Used for the `_agdx` ops stream.
-    #[tracing::instrument(target = "laser", level = "debug", skip_all, fields(topic = %topic, operation = "publish"))]
-    pub(crate) async fn send_batch_on(
-        &self,
-        stream: &str,
-        topic: &str,
+    // A plain function over the batch send, since every async layer here
+    // deepens each publish future that callers have to lay out.
+    pub(crate) fn send_batch_on<'a>(
+        &'a self,
+        stream: &'a str,
+        topic: &'a str,
         messages: Vec<IggyMessage>,
         partition_key: Option<&str>,
-    ) -> Result<SendMessagesResponse, LaserError> {
-        if messages.is_empty() {
-            return Ok(SendMessagesResponse {
-                confirmations: Vec::new(),
-            });
-        }
-        let partitioning = match partition_key {
-            Some(key) => Partitioning::messages_key_str(key)?,
-            None => Partitioning::balanced(),
-        };
-        self.send_batch_partitioned_on(stream, topic, messages, partitioning)
-            .await
+    ) -> impl Future<Output = Result<SendMessagesResponse, LaserError>> + 'a {
+        let span = tracing::debug_span!(target: "laser", "send_batch_on", topic = %topic, operation = "publish");
+        let partitioning = partition_key.map_or_else(
+            || Ok(Partitioning::balanced()),
+            |key| Partitioning::messages_key_str(key).map_err(LaserError::from),
+        );
+        self.send_batch_partitioned_on_checked(stream, topic, messages, partitioning, || async {
+            Ok(None)
+        })
+        .instrument(span)
     }
 
     /// Like [`send_batch_on`](Self::send_batch_on) with an explicit
     /// `partitioning`, such as one declared partition.
-    pub(crate) async fn send_batch_partitioned_on(
-        &self,
-        stream: &str,
-        topic: &str,
+    #[cfg(feature = "agent")]
+    pub(crate) fn send_batch_partitioned_on<'a>(
+        &'a self,
+        stream: &'a str,
+        topic: &'a str,
         messages: Vec<IggyMessage>,
         partitioning: Partitioning,
-    ) -> Result<SendMessagesResponse, LaserError> {
-        self.send_batch_partitioned_on_checked(stream, topic, messages, partitioning, || async {
-            Ok(None)
-        })
-        .await
+    ) -> impl Future<Output = Result<SendMessagesResponse, LaserError>> + 'a {
+        self.send_batch_partitioned_on_checked(
+            stream,
+            topic,
+            messages,
+            Ok(partitioning),
+            || async { Ok(None) },
+        )
     }
 
+    // An empty batch is sent as nothing, before `partitioning` is checked.
     pub(crate) async fn send_batch_partitioned_on_checked<F, Fut>(
         &self,
         stream: &str,
         topic: &str,
         mut messages: Vec<IggyMessage>,
-        partitioning: Partitioning,
+        partitioning: Result<Partitioning, LaserError>,
         check: F,
     ) -> Result<SendMessagesResponse, LaserError>
     where
@@ -1050,9 +1059,9 @@ impl Laser {
                 confirmations: Vec::new(),
             });
         }
+        let partitioning = Arc::new(partitioning?);
         let first = std::sync::Mutex::new(Some(check().await?));
         prepare_publish_messages(&mut messages);
-        let partitioning = Arc::new(partitioning);
         let mut confirmations = Vec::new();
         let observed = std::sync::atomic::AtomicU64::new(0);
         for (index, chunk) in messages.chunks(PUBLISH_BATCH_LENGTH).enumerate() {
@@ -1073,22 +1082,19 @@ impl Laser {
                         if let Some((stream_id, topic_id, route)) = source {
                             let mut batch: Vec<_> = chunk.iter().map(clone_iggy_message).collect();
                             let client = self.client();
-                            // Boxed so the driver's deep future does not
-                            // push every caller past the layout query limit.
-                            return Ok(Box::pin(client.send_messages(
-                                &Identifier::numeric(stream_id)?,
-                                &Identifier::numeric(topic_id)?,
-                                &route,
-                                &mut batch,
-                            ))
-                            .await?);
+                            let stream_id = Identifier::numeric(stream_id)?;
+                            let topic_id = Identifier::numeric(topic_id)?;
+                            let sent: SendFuture<'_> = Box::pin(
+                                client.send_messages(&stream_id, &topic_id, &route, &mut batch),
+                            );
+                            return Ok(sent.await?);
                         }
                         let producer = self.producer_on(stream, topic).await?;
-                        let sent = Box::pin(producer.send_with_partitioning(
+                        let sent: SendFuture<'_> = Box::pin(producer.send_with_partitioning(
                             chunk.iter().map(clone_iggy_message).collect(),
                             Some(partitioning.clone()),
-                        ))
-                        .await;
+                        ));
+                        let sent = sent.await;
                         match sent {
                             // A cached producer can outlive a deleted and
                             // recreated stream or topic. Rebuild it once.
@@ -1096,11 +1102,12 @@ impl Laser {
                                 self.reconnect_for_publish(self.publish_generation())
                                     .await?;
                                 let producer = self.producer_on(stream, topic).await?;
-                                Ok(Box::pin(producer.send_with_partitioning(
-                                    chunk.iter().map(clone_iggy_message).collect(),
-                                    Some(partitioning.clone()),
-                                ))
-                                .await?)
+                                let resent: SendFuture<'_> =
+                                    Box::pin(producer.send_with_partitioning(
+                                        chunk.iter().map(clone_iggy_message).collect(),
+                                        Some(partitioning.clone()),
+                                    ));
+                                Ok(resent.await?)
                             }
                             other => Ok(other?),
                         }
@@ -1305,7 +1312,7 @@ impl Laser {
     /// Send an already-framed managed command: the caller built (and holds)
     /// the `ManagedRequestEnvelope`, so nothing is wrapped here and a retry
     /// can reuse the exact bytes under the same operation id. The KV
-    /// coordination client is the caller; every other path uses
+    /// coordination client is the caller. Every other path uses
     /// [`send_raw_with_response`](Self::send_raw_with_response), which mints a
     /// fresh operation id per call.
     #[cfg(feature = "kv")]
@@ -1381,7 +1388,10 @@ impl Laser {
         topic: &str,
         partition: u32,
     ) -> Result<IggyConsumerBuilder, LaserError> {
-        Ok(self.client().consumer(name, stream, topic, partition)?)
+        Ok(self
+            .client()
+            .consumer(name, stream, topic)?
+            .partitions([partition]))
     }
 
     /// A Iggy `IggyConsumerBuilder` for a consumer-group consumer over
@@ -1464,7 +1474,7 @@ fn claim_presence_slot(
 
 // `pending` is the failed chunk followed by every record after it, and
 // `attempted` is that chunk's length. Apache Iggy reports which records of the
-// chunk it did not confirm, so only those join the unsent tail; a timeout
+// chunk it did not confirm, so only those join the unsent tail. A timeout
 // leaves the whole chunk unconfirmed.
 pub(crate) fn publish_failure(
     error: LaserError,
@@ -2013,6 +2023,10 @@ fn merge_announcement(
             .filters
             .evaluation
             .clone_from(&announce.filters);
+        capabilities.filters.max_wait_ms = announce
+            .filters
+            .as_ref()
+            .map_or(0, |filters| filters.max_wait_ms);
     }
     if announce.ready {
         capabilities.managed = true;
@@ -2133,6 +2147,37 @@ mod announcement_tests {
         assert!(capabilities.filters.native);
         assert!(!capabilities.filters.catalog);
         assert!(!capabilities.managed);
+    }
+
+    #[test]
+    fn given_an_announced_filtered_wait_when_merged_then_should_expose_its_limit() {
+        let announce = BackendAnnounce::new(
+            OpVersions::new(0, 0, 0, 0)
+                .with_features(feature::CONSUMER_FILTERS | feature::GROUP_POLICY_READS),
+        )
+        .with_filters(laser_wire::hello::FilterAnnounce {
+            max_wait_ms: 20_000,
+            ..laser_wire::hello::FilterAnnounce::served()
+        })
+        .unavailable();
+        let mut capabilities = Capabilities::OPEN;
+
+        merge_announcement(&mut capabilities, &announce);
+
+        assert_eq!(capabilities.filters.max_wait_ms, 20_000);
+    }
+
+    #[test]
+    fn given_filters_announced_without_a_wait_when_merged_then_should_serve_no_filtered_wait() {
+        let announce = BackendAnnounce::new(
+            OpVersions::new(0, 0, 0, 0).with_features(feature::CONSUMER_FILTERS),
+        )
+        .unavailable();
+        let mut capabilities = Capabilities::OPEN;
+
+        merge_announcement(&mut capabilities, &announce);
+
+        assert_eq!(capabilities.filters.max_wait_ms, 0);
     }
 
     #[test]
@@ -2671,23 +2716,34 @@ pub(crate) async fn delete_stream(laser: &Laser, stream: &str) -> Result<bool, L
     Ok(existed)
 }
 
+#[cfg(feature = "agent")]
 pub(crate) async fn ensure_topic(
     client: &IggyClient,
     stream: &str,
     topic: &str,
     partitions: u32,
 ) -> Result<(), LaserError> {
-    ensure_topic_with(client, stream, topic, partitions, IggyExpiry::NeverExpire).await
+    ensure_topic_with(
+        client,
+        stream,
+        topic,
+        partitions,
+        IggyExpiry::NeverExpire,
+        None,
+    )
+    .await
 }
 
 /// Idempotently create `topic` with an explicit message-expiry, so a caller
-/// (the memory topic) can bound how long records live.
+/// (the memory topic) can bound how long records live, and an optional
+/// replication factor.
 pub(crate) async fn ensure_topic_with(
     client: &IggyClient,
     stream: &str,
     topic: &str,
     partitions: u32,
     expiry: IggyExpiry,
+    replication_factor: Option<u32>,
 ) -> Result<(), LaserError> {
     ensure_topic_retained(
         client,
@@ -2696,11 +2752,13 @@ pub(crate) async fn ensure_topic_with(
         partitions,
         expiry,
         MaxTopicSize::ServerDefault,
+        replication_factor,
     )
     .await
 }
 
-/// Idempotently create `topic` with an explicit expiry and size bound.
+/// Idempotently create `topic` with an explicit expiry, size bound and
+/// replication factor. `None` leaves the factor to the server's default.
 pub(crate) async fn ensure_topic_retained(
     client: &IggyClient,
     stream: &str,
@@ -2708,7 +2766,11 @@ pub(crate) async fn ensure_topic_retained(
     partitions: u32,
     expiry: IggyExpiry,
     max_size: MaxTopicSize,
+    replication_factor: Option<u32>,
 ) -> Result<(), LaserError> {
+    if let Some(factor) = replication_factor {
+        validate_replication_factor(factor)?;
+    }
     let stream_id = Identifier::named(stream)?;
     let topic_id = Identifier::named(topic)?;
     if client.get_topic(&stream_id, &topic_id).await?.is_some() {
@@ -2719,6 +2781,7 @@ pub(crate) async fn ensure_topic_retained(
         compression_algorithm: Some(CompressionAlgorithm::default()),
         message_expiry: Some(expiry),
         max_topic_size: Some(max_size),
+        replication_factor,
         ..TopicCreateOptions::default()
     };
     let result = client.create_topic(&stream_id, topic, &options).await;
@@ -2728,6 +2791,17 @@ pub(crate) async fn ensure_topic_retained(
         return Err(error.into());
     }
     Ok(())
+}
+
+/// Refuse a replication factor the server never accepts, before anything is
+/// sent. The server also caps it at the cluster's node count.
+pub(crate) fn validate_replication_factor(factor: u32) -> Result<(), LaserError> {
+    if (1..=MAX_REPLICATION_FACTOR).contains(&factor) {
+        return Ok(());
+    }
+    Err(LaserError::Invalid(format!(
+        "replication factor must be 1..={MAX_REPLICATION_FACTOR}"
+    )))
 }
 
 #[cfg(test)]

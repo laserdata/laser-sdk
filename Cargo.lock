@@ -1695,9 +1695,9 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.11.1-edge.4"
+version = "0.11.1-edge.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9fc5e5f9e7fabb5285059b2f9be2171b35fa2f86f34b0a6aa2c2f72512a210f"
+checksum = "2c9b83c24f73c6cd17f0b2a364dbfe0cad895eba5bb32b32fc2c5e1df2d84aee"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -1733,9 +1733,9 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.11.1-edge.3"
+version = "0.11.1-edge.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d321043322fc82fa261abc37431cb9a7ebd0c1c510a7ae1ab42106e626baea8"
+checksum = "100cfadd4d45558876544a8eed23a86d730c66d550deef18a42d239d3c7e03bb"
 dependencies = [
  "bytemuck",
  "bytes",
@@ -1749,9 +1749,9 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.11.1-edge.4"
+version = "0.11.1-edge.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d7d4fa0be64597fa9b2f4c79e36cccab20f28b85fa867e83103ca269e5ae377"
+checksum = "788e55b79b0a750f0a1326937ce34b51828dda3cc7fbf09f81a9b99cce1e24a1"
 dependencies = [
  "aes-gcm",
  "aes-gcm-siv",
@@ -1769,6 +1769,7 @@ dependencies = [
  "humantime",
  "iggy_binary_protocol",
  "papaya",
+ "pin-project-lite",
  "ring",
  "secrecy",
  "serde",
@@ -2046,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "laser-examples"
-version = "0.9.0-dev.1"
+version = "0.9.0-dev.2"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -2064,7 +2065,7 @@ dependencies = [
 
 [[package]]
 name = "laser-sdk"
-version = "0.9.0-dev.1"
+version = "0.9.0-dev.2"
 dependencies = [
  "apache-avro",
  "async-trait",
@@ -2079,6 +2080,7 @@ dependencies = [
  "iggy_binary_protocol",
  "iggy_common",
  "jsonschema",
+ "laser-test-support",
  "laser-wire",
  "libc",
  "prost",
@@ -2098,8 +2100,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "laser-test-support"
+version = "0.9.0-dev.2"
+dependencies = [
+ "iggy",
+ "iggy_binary_protocol",
+ "iggy_common",
+ "laser-wire",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "laser-wire"
-version = "0.9.0-dev.1"
+version = "0.9.0-dev.2"
 dependencies = [
  "apache-avro",
  "bon",

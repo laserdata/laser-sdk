@@ -4,6 +4,7 @@ use laser_wire::codes::{AGDX_CONTROL_PUBLISH_CODE, CONTROL_OP_VERSION};
 use laser_wire::control::{ControlCommand, ControlEnvelope};
 use laser_wire::framing::encode_named;
 use laser_wire::result::{CommandError, ResultCode};
+use laser_wire::validate::Validate;
 
 impl Laser {
     /// Submit one control command through the authenticated managed endpoint.
@@ -20,6 +21,7 @@ impl Laser {
         command: ControlCommand,
         stream: Option<&str>,
     ) -> Result<(), LaserError> {
+        command.validate()?;
         let capabilities = self.capabilities().await;
         if !capabilities.managed {
             return Err(LaserError::unsupported(

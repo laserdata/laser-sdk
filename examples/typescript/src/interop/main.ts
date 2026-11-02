@@ -48,7 +48,6 @@ async function spawnWorker(laser: Laser, id: string): Promise<AgentHandle> {
   const handle = Agent.builder()
     .id(agent)
     .listenOn(AgentTopic.Sessions)
-    .pollInterval(5)
     .handler({
       async handle(message, context): Promise<void> {
         const envelope = message.envelope
@@ -102,7 +101,6 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<InteropSu
     Agent.builder()
       .id(AgentId.new("approver"))
       .listenOn(AgentTopic.Sessions)
-      .pollInterval(5)
       .handler({
         handle(_message, context): Promise<void> {
           return context.respondInput(AgentTopic.Sessions, utf8("approved"))

@@ -1,4 +1,4 @@
-import { CodecError } from "../client/errors.js"
+import { CodecError, InvalidError } from "../client/errors.js"
 import {
   decodeProjectionInfo,
   decodeSchemaInfo,
@@ -8,7 +8,12 @@ import {
   type SchemaInfo
 } from "./browse.js"
 import { type CborMap, expectMap, expectString, field } from "./cbor.js"
-import { type FilterCodec, decodeFilterCodec } from "./filter.js"
+import {
+  type FilterCodec,
+  type FilterGroupIdentity,
+  type FilterState,
+  decodeFilterCodec
+} from "./filter.js"
 import { decodeSchemaDef, encodeSchemaDef, type SchemaDef } from "./control.js"
 import { decodeForkInfo, encodeForkInfo, type ForkInfo } from "./fork.js"
 import {
@@ -148,6 +153,111 @@ export function schemaQueryParams(query: SchemaQuery): URLSearchParams {
   const params = new URLSearchParams()
   setParam(params, PARAM_STREAM, query.stream)
   return params
+}
+
+/** `GET /agdx/filters` query. The owner filter is the five fields of a group
+ * identity, all or none. */
+export interface FilterListQuery {
+  readonly nameContains?: string
+  readonly state?: FilterState
+  /** Only filters with a lower id, for stable paging. */
+  readonly beforeId?: number
+  readonly ownerStreamId?: number
+  readonly ownerStreamCreatedAtMicros?: bigint
+  readonly ownerTopicId?: number
+  readonly ownerTopicCreatedAtMicros?: bigint
+  readonly ownerGroupId?: bigint
+  readonly page?: number
+  readonly pageSize?: number
+}
+
+const FILTER_STATES: ReadonlySet<string> = new Set<FilterState>(["active", "archived", "dropped"])
+
+/** The list query that selects the own filter of `identity`, as Rust `From<FilterGroupIdentity>`. */
+export function filterListQueryOf(identity: FilterGroupIdentity): FilterListQuery {
+  return {
+    ownerStreamId: identity.streamId,
+    ownerStreamCreatedAtMicros: identity.streamCreatedAtMicros,
+    ownerTopicId: identity.topicId,
+    ownerTopicCreatedAtMicros: identity.topicCreatedAtMicros,
+    ownerGroupId: identity.groupId
+  }
+}
+
+/** The owner filter of `query`, refused unless all five identity fields are set or none. */
+export function filterListQueryOwner(query: FilterListQuery): FilterGroupIdentity | undefined {
+  const fields = [
+    query.ownerStreamId,
+    query.ownerStreamCreatedAtMicros,
+    query.ownerTopicId,
+    query.ownerTopicCreatedAtMicros,
+    query.ownerGroupId
+  ]
+  if (fields.every((value) => value === undefined)) return undefined
+  if (
+    query.ownerStreamId === undefined ||
+    query.ownerStreamCreatedAtMicros === undefined ||
+    query.ownerTopicId === undefined ||
+    query.ownerTopicCreatedAtMicros === undefined ||
+    query.ownerGroupId === undefined
+  ) {
+    throw new InvalidError(
+      "the owner filter needs owner_stream_id, owner_stream_created_at_micros, owner_topic_id, owner_topic_created_at_micros and owner_group_id together"
+    )
+  }
+  return {
+    streamId: query.ownerStreamId,
+    streamCreatedAtMicros: query.ownerStreamCreatedAtMicros,
+    topicId: query.ownerTopicId,
+    topicCreatedAtMicros: query.ownerTopicCreatedAtMicros,
+    groupId: query.ownerGroupId
+  }
+}
+
+export function filterListQueryParams(query: FilterListQuery): URLSearchParams {
+  const params = new URLSearchParams()
+  setParam(params, PARAM_NAME_CONTAINS, query.nameContains)
+  setParam(params, "state", query.state)
+  setParam(params, "before_id", query.beforeId)
+  setParam(params, "owner_stream_id", query.ownerStreamId)
+  setParam(params, "owner_stream_created_at_micros", query.ownerStreamCreatedAtMicros?.toString())
+  setParam(params, "owner_topic_id", query.ownerTopicId)
+  setParam(params, "owner_topic_created_at_micros", query.ownerTopicCreatedAtMicros?.toString())
+  setParam(params, "owner_group_id", query.ownerGroupId?.toString())
+  setParam(params, "page", query.page)
+  setParam(params, "page_size", query.pageSize)
+  return params
+}
+
+export function decodeFilterListQuery(params: URLSearchParams): FilterListQuery {
+  const state = params.get("state")
+  if (state !== null && !FILTER_STATES.has(state)) {
+    throw new CodecError(
+      "query parameter state must be active, archived or dropped",
+      "query",
+      "state"
+    )
+  }
+  const beforeId = u32Param(params, "before_id")
+  const ownerStreamId = u32Param(params, "owner_stream_id")
+  const ownerStreamCreatedAtMicros = u64Param(params, "owner_stream_created_at_micros")
+  const ownerTopicId = u32Param(params, "owner_topic_id")
+  const ownerTopicCreatedAtMicros = u64Param(params, "owner_topic_created_at_micros")
+  const ownerGroupId = u64Param(params, "owner_group_id")
+  const page = u32Param(params, "page")
+  const pageSize = u32Param(params, "page_size")
+  return {
+    ...stringParam(params, PARAM_NAME_CONTAINS, "nameContains"),
+    ...(state !== null ? { state: state as FilterState } : {}),
+    ...(beforeId !== undefined ? { beforeId } : {}),
+    ...(ownerStreamId !== undefined ? { ownerStreamId } : {}),
+    ...(ownerStreamCreatedAtMicros !== undefined ? { ownerStreamCreatedAtMicros } : {}),
+    ...(ownerTopicId !== undefined ? { ownerTopicId } : {}),
+    ...(ownerTopicCreatedAtMicros !== undefined ? { ownerTopicCreatedAtMicros } : {}),
+    ...(ownerGroupId !== undefined ? { ownerGroupId } : {}),
+    ...(page !== undefined ? { page } : {}),
+    ...(pageSize !== undefined ? { pageSize } : {})
+  }
 }
 
 /** Filters for `GET /agdx/sessions/{stream}`. The stream is the path segment.
@@ -317,6 +427,15 @@ function u32Param(params: URLSearchParams, key: string): number | undefined {
     throw new CodecError(`query parameter ${key} must be an unsigned 32-bit integer`, "query", key)
   }
   return Number(raw)
+}
+
+function u64Param(params: URLSearchParams, key: string): bigint | undefined {
+  const raw = params.get(key)
+  if (raw === null) return undefined
+  if (!/^\d+$/.test(raw) || BigInt(raw) > 0xffff_ffff_ffff_ffffn) {
+    throw new CodecError(`query parameter ${key} must be an unsigned 64-bit integer`, "query", key)
+  }
+  return BigInt(raw)
 }
 
 function boolParam(params: URLSearchParams, key: string): boolean {

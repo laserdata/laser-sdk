@@ -84,7 +84,6 @@ async def main() -> None:
         await receive_all(
             topic.consumer_group("auto-workers").consumer(
                 batch_length=BATCH,
-                poll_interval_ms=5,
                 polling="first",
                 auto_commit="each",
                 commit_interval_ms=1000,
@@ -97,7 +96,6 @@ async def main() -> None:
         await receive_all(
             topic.consumer_group("manual-workers").consumer(
                 batch_length=BATCH,
-                poll_interval_ms=5,
                 polling="first",
                 auto_commit="disabled",
                 allow_replay=True,

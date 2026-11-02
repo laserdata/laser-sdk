@@ -52,6 +52,16 @@ pub struct FilterGroupRef {
     pub group: String,
 }
 
+/// The consumer group a group policy filter belongs to: the exact incarnation
+/// and its names when the policy was configured. Iggy has no group rename, so
+/// the group name stays current. Stream and topic names can change, so a
+/// reader resolves them live from the identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterOwner {
+    pub identity: FilterGroupIdentity,
+    pub group: FilterGroupRef,
+}
+
 /// One immutable revision of a saved filter.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FilterRevisionInfo {
@@ -81,6 +91,10 @@ pub struct FilterSummary {
     pub bindings: u32,
     pub created_at_micros: u64,
     pub updated_at_micros: u64,
+    /// The consumer group whose own policy this filter is. Absent for a
+    /// registered filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<FilterOwner>,
 }
 
 /// A saved filter with its latest revision and bindings.
@@ -129,12 +143,20 @@ pub struct CatalogPosition {
 }
 
 /// The policy a group is configured with in one step: a definition saved for
-/// this group alone, or a revision that already exists.
+/// this group alone under the caller's name, or a revision that already
+/// exists. The name follows the registered filter name rule and need not be
+/// unique, since every read returns the owning group with it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupFilterSpec {
-    Definition(ConsumerFilter),
-    Revision { filter_id: u32, revision: u32 },
+    Definition {
+        name: String,
+        filter: ConsumerFilter,
+    },
+    Revision {
+        filter_id: u32,
+        revision: u32,
+    },
 }
 
 /// A verified consumer group that has no filter policy. Readers of the group
@@ -189,9 +211,10 @@ pub enum FilterMutation {
         expected_identity: Option<FilterGroupIdentity>,
     },
     /// Configure a group's policy in one catalog transaction: save the
-    /// definition under a name derived from the group's verified identity,
-    /// or take an existing revision, then bind the group to it. A repeat with
-    /// the same digest returns the existing binding.
+    /// definition as the group's own filter under the caller's name, or take
+    /// an existing revision, then bind the group to it. A repeat with the same
+    /// digest returns the existing binding, and renames the group's own filter
+    /// when the name differs.
     ConfigureGroup {
         group: FilterGroupRef,
         policy: GroupFilterSpec,
@@ -341,6 +364,9 @@ pub struct ListFilters {
     /// next page stably, while registrations and drops land in between.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_id: Option<u32>,
+    /// Only the own filter of this consumer group incarnation, bound or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<FilterGroupIdentity>,
     #[serde(default)]
     pub page: u32,
     pub page_size: u32,
@@ -519,6 +545,21 @@ fn validate_page_size(page_size: u32) -> Result<(), InvalidError> {
     Ok(())
 }
 
+/// A saved filter's name, registered or a group policy's: 1 to
+/// `MAX_FILTER_NAME_BYTES` bytes of ASCII letters, digits, `-`, `_` and `.`.
+pub fn validate_filter_name(name: &str) -> Result<(), InvalidError> {
+    validate_safelisted_name("filter name", name, MAX_FILTER_NAME_BYTES)
+}
+
+fn validate_group_id(identity: &FilterGroupIdentity) -> Result<(), InvalidError> {
+    if identity.group_id > u64::from(u32::MAX) {
+        return Err(InvalidError::new(
+            "consumer group id exceeds the native offset-key range",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_description(description: &str) -> Result<(), InvalidError> {
     if description.len() > MAX_FILTER_DESCRIPTION_BYTES {
         return Err(InvalidError::new(format!(
@@ -544,7 +585,7 @@ impl Validate for FilterMutation {
                 description,
                 filter,
             } => {
-                validate_safelisted_name("filter name", name, MAX_FILTER_NAME_BYTES)?;
+                validate_filter_name(name)?;
                 validate_description(description)?;
                 filter.validate()
             }
@@ -573,14 +614,14 @@ impl Validate for FilterMutation {
                 expected_identity,
             } => {
                 group.validate()?;
-                if expected_identity.is_some_and(|identity| identity.group_id > u64::from(u32::MAX))
-                {
-                    return Err(InvalidError::new(
-                        "consumer group id exceeds the native offset-key range",
-                    ));
+                if let Some(identity) = expected_identity {
+                    validate_group_id(identity)?;
                 }
                 match policy {
-                    GroupFilterSpec::Definition(filter) => filter.validate(),
+                    GroupFilterSpec::Definition { name, filter } => {
+                        validate_filter_name(name)?;
+                        filter.validate()
+                    }
                     GroupFilterSpec::Revision { revision, .. } => {
                         if *revision == 0 {
                             Err(InvalidError::new("revision must be positive"))
@@ -612,6 +653,9 @@ impl Validate for ListFilters {
             && fragment.len() > MAX_FILTER_NAME_BYTES
         {
             return Err(InvalidError::new("name filter exceeds the name cap"));
+        }
+        if let Some(owner) = &self.owner {
+            validate_group_id(owner)?;
         }
         Ok(())
     }
@@ -727,6 +771,149 @@ mod tests {
         }
     }
 
+    fn identity() -> FilterGroupIdentity {
+        FilterGroupIdentity {
+            stream_id: 1,
+            stream_created_at_micros: 10,
+            topic_id: 2,
+            topic_created_at_micros: 20,
+            group_id: 3,
+        }
+    }
+
+    fn configure_named(name: &str) -> FilterMutationRequest {
+        FilterMutationRequest {
+            v: FILTER_OP_VERSION,
+            operation_id: 7,
+            mutation: FilterMutation::ConfigureGroup {
+                group: FilterGroupRef {
+                    stream: "orbit".to_owned(),
+                    topic: "fleet".to_owned(),
+                    group: "desk".to_owned(),
+                },
+                policy: GroupFilterSpec::Definition {
+                    name: name.to_owned(),
+                    filter: ConsumerFilter::json(FilterExpr::pred(
+                        "table",
+                        CmpOp::Eq,
+                        "satellites",
+                    )),
+                },
+                expected_identity: Some(identity()),
+            },
+        }
+    }
+
+    #[test]
+    fn given_a_named_group_definition_when_encoded_as_json_then_should_round_trip_with_the_name() {
+        let request = configure_named("safe-mode");
+        request.validate().expect("valid");
+        let json = serde_json::to_value(&request).expect("request encodes");
+        assert_eq!(
+            json["mutation"]["configure_group"]["policy"]["definition"]["name"],
+            "safe-mode"
+        );
+        assert_eq!(
+            serde_json::from_value::<FilterMutationRequest>(json).expect("request decodes"),
+            request
+        );
+    }
+
+    #[cfg(feature = "cbor")]
+    #[test]
+    fn given_a_named_group_definition_when_encoded_as_cbor_then_should_round_trip() {
+        let request = configure_named("safe-mode");
+        let bytes = crate::framing::encode_named(&request).expect("request encodes");
+        assert_eq!(
+            crate::framing::decode_named::<FilterMutationRequest>(&bytes).expect("request decodes"),
+            request
+        );
+    }
+
+    #[test]
+    fn given_a_group_definition_with_a_bad_name_when_validated_then_should_be_rejected() {
+        let too_long = "a".repeat(MAX_FILTER_NAME_BYTES + 1);
+        for name in ["", "has space", "colon:name", too_long.as_str()] {
+            assert!(
+                configure_named(name).validate().is_err(),
+                "{name:?} must be rejected"
+            );
+        }
+        configure_named(&"a".repeat(MAX_FILTER_NAME_BYTES))
+            .validate()
+            .expect("a name at the cap is valid");
+    }
+
+    #[test]
+    fn given_a_group_definition_without_a_name_when_decoded_then_should_be_rejected() {
+        let unnamed = r#"{"v":1,"operation_id":"7","mutation":{"configure_group":{"group":{"stream":"orbit","topic":"fleet","group":"desk"},"policy":{"definition":{"v":1,"evaluator_version":1,"expr":{"present":"table"},"codec":"json","fault_policy":"stop"}}}}}"#;
+        assert!(serde_json::from_str::<FilterMutationRequest>(unnamed).is_err());
+    }
+
+    #[test]
+    fn given_a_summary_with_an_owner_when_encoded_then_should_round_trip_and_omit_an_absent_owner()
+    {
+        let owned = FilterSummary {
+            id: 4,
+            name: "safe-mode".to_owned(),
+            description: String::new(),
+            state: FilterState::Active,
+            latest_revision: 1,
+            latest_digest: Digest32(vec![1; 32]),
+            codec: FilterCodec::Json,
+            bindings: 1,
+            created_at_micros: 1,
+            updated_at_micros: 2,
+            owner: Some(FilterOwner {
+                identity: identity(),
+                group: FilterGroupRef {
+                    stream: "orbit".to_owned(),
+                    topic: "fleet".to_owned(),
+                    group: "desk".to_owned(),
+                },
+            }),
+        };
+        let json = serde_json::to_value(&owned).expect("summary encodes");
+        assert_eq!(json["owner"]["group"]["group"], "desk");
+        assert_eq!(
+            serde_json::from_value::<FilterSummary>(json).expect("summary decodes"),
+            owned
+        );
+        let named = FilterSummary {
+            owner: None,
+            ..owned
+        };
+        let json = serde_json::to_value(&named).expect("summary encodes");
+        assert!(json.get("owner").is_none());
+        assert_eq!(
+            serde_json::from_value::<FilterSummary>(json).expect("summary decodes"),
+            named
+        );
+    }
+
+    #[test]
+    fn given_a_list_request_with_an_owner_when_validated_then_should_accept_only_a_native_group_id()
+    {
+        let list = ListFilters {
+            v: FILTER_OP_VERSION,
+            name_contains: None,
+            state: None,
+            before_id: None,
+            owner: Some(identity()),
+            page: 0,
+            page_size: 20,
+        };
+        list.validate().expect("valid");
+        let oversized = ListFilters {
+            owner: Some(FilterGroupIdentity {
+                group_id: u64::from(u32::MAX) + 1,
+                ..identity()
+            }),
+            ..list
+        };
+        assert!(oversized.validate().is_err());
+    }
+
     #[test]
     fn given_list_requests_when_page_size_is_out_of_range_then_should_be_rejected() {
         let list = ListFilters {
@@ -734,6 +921,7 @@ mod tests {
             name_contains: None,
             state: Some(FilterState::Active),
             before_id: None,
+            owner: None,
             page: 0,
             page_size: MAX_FILTER_CATALOG_PAGE + 1,
         };

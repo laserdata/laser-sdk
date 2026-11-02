@@ -217,13 +217,22 @@ __all__ = [
     "MAX_FILTER_NAME_BYTES",
     "MAX_FILTER_PREVIEW_EXAMINED",
     "MAX_FILTER_PREVIEW_RECORDS",
+    "MAX_GRAPH_LABEL_BYTES",
     "MAX_HOLDER_ID_BYTES",
     "MAX_INDEX_ENTRIES_PER_RECORD",
+    "MAX_INDEX_FIELD_BYTES",
     "MAX_KEY_BYTES",
     "MAX_LEASE_TTL_MICROS",
+    "MAX_MEMORY_ID_BYTES",
     "MAX_PAGE_SIZE",
+    "MAX_PROJECTION_ID_BYTES",
+    "MAX_PROJECTION_NAME_BYTES",
+    "MAX_REPLICATION_FACTOR",
     "MAX_ROLE_NAME_BYTES",
     "MAX_SCAN_LIMIT",
+    "MAX_SCHEMA_NAME_BYTES",
+    "MAX_SESSION_CURSOR_BYTES",
+    "MAX_SESSION_TEXT_QUERY_BYTES",
     "MAX_VALUE_BYTES",
     "MIN_LEASE_TTL_MICROS",
     "MIN_LINGER_MS",
@@ -583,13 +592,22 @@ MAX_FILTER_CATALOG_PAGE: builtins.int = 200
 MAX_FILTER_NAME_BYTES: builtins.int = 128
 MAX_FILTER_PREVIEW_EXAMINED: builtins.int = 10000
 MAX_FILTER_PREVIEW_RECORDS: builtins.int = 100
+MAX_GRAPH_LABEL_BYTES: builtins.int = 128
 MAX_HOLDER_ID_BYTES: builtins.int = 128
 MAX_INDEX_ENTRIES_PER_RECORD: builtins.int = 32
+MAX_INDEX_FIELD_BYTES: builtins.int = 255
 MAX_KEY_BYTES: builtins.int = 512
 MAX_LEASE_TTL_MICROS: builtins.int = 300000000
+MAX_MEMORY_ID_BYTES: builtins.int = 255
 MAX_PAGE_SIZE: builtins.int = 1000
+MAX_PROJECTION_ID_BYTES: builtins.int = 255
+MAX_PROJECTION_NAME_BYTES: builtins.int = 255
+MAX_REPLICATION_FACTOR: builtins.int = 32
 MAX_ROLE_NAME_BYTES: builtins.int = 64
 MAX_SCAN_LIMIT: builtins.int = 1000
+MAX_SCHEMA_NAME_BYTES: builtins.int = 255
+MAX_SESSION_CURSOR_BYTES: builtins.int = 512
+MAX_SESSION_TEXT_QUERY_BYTES: builtins.int = 1024
 MAX_VALUE_BYTES: builtins.int = 8388608
 MIN_LEASE_TTL_MICROS: builtins.int = 1000000
 MIN_LINGER_MS: builtins.int = 1
@@ -2318,11 +2336,13 @@ class ConsumerGroup:
         r"""
         The topic this group consumes.
         """
-    def create(self, *, filter: typing.Optional[ConsumerFilter] = None, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None, operation_id: typing.Optional[builtins.int] = None) -> typing.Any:
+    def create(self, *, filter: typing.Optional[ConsumerFilter] = None, filter_name: typing.Optional[builtins.str] = None, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None, operation_id: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
         Create the group, with an optional filter policy configured in the
-        same call: a `filter` definition saved as the group's own filter, or
-        one of its own revisions as `filter_id` and `revision`. Idempotent: an
+        same call: a `filter` definition saved as the group's own filter under
+        `filter_name`, or one of its own revisions as `filter_id` and
+        `revision`. `filter_name` is required with `filter`, follows the
+        registered filter name rule and need not be unique. Idempotent: an
         existing group is kept and the same policy keeps its binding. A group
         that runs another policy raises `FilterError` with reason `conflict`.
         Pass `operation_id` to resume the same configuration after a crash.
@@ -2337,18 +2357,27 @@ class ConsumerGroup:
         The group's filter policy: configure it, inspect it, draft and pause
         revisions, release it, preview and sample-test it.
         """
-    def consumer(self, *, batch_length: builtins.int = 1000, poll_interval_ms: typing.Optional[builtins.int] = None, polling: builtins.str = 'next', offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: builtins.str = 'polling', commit_interval_ms: builtins.int = 0, commit_every: typing.Optional[builtins.int] = None, auto_join_group: builtins.bool = True, create_group: builtins.bool = True, polling_retry_interval_ms: builtins.int = 1000, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.int = 1000, allow_replay: builtins.bool = False) -> Consumer:
+    def consumer(self, *, batch_length: builtins.int = 1000, max_wait_ms: builtins.int = 5000, min_count: builtins.int = 1, max_bytes: builtins.int = 1048576, polling: builtins.str = 'next', offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: builtins.str = 'polling', commit_interval_ms: builtins.int = 0, commit_every: typing.Optional[builtins.int] = None, create_group: builtins.bool = True, polling_retry_interval_ms: builtins.int = 1000, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.int = 1000, allow_replay: builtins.bool = False) -> Consumer:
         r"""
         Build a live, load-balanced consumer of this group with server-backed
         offsets. On a server that resolves group policies the consumer runs
         the group's filter, or none, and commits through the group's fenced
-        acknowledgments. On Apache Iggy it is the native group consumer. It
-        supports the same polling, batching, replay, retry, and commit modes
-        as the Rust builder. Use `auto_commit="disabled"` plus
-        `commit(message)` for commit-after-handle delivery. `batch_length`
-        also bounds the source records one partition poll examines.
+        acknowledgments. On Apache Iggy it is the native group consumer, which
+        always joins the group. It supports the same polling, batching,
+        replay, retry, and commit modes as the Rust builder. Use
+        `auto_commit="disabled"` plus `commit(message)` for
+        commit-after-handle delivery. `batch_length` also bounds the source
+        records one partition poll examines. The server holds a poll that
+        finds fewer than `min_count` new records for up to `max_wait_ms`
+        (0 to 600000, 0 answers at once), and `max_bytes` caps the record
+        bytes of one reply. The consumer always resumes after the group's
+        stored offset. Its `polling`, `offset` or `timestamp_micros` start
+        only seeds a partition the group never stored, before its first read
+        (the native consumer only those it holds when it joins), and a refused
+        seed, such as an offset past a partition's end, fails `init` or the
+        first `next` with the Iggy error.
         """
-    def reader(self, *, start: typing.Optional[typing.Any] = None, count: typing.Optional[builtins.int] = None, max_examined: typing.Optional[builtins.int] = None, max_reply_bytes: typing.Optional[builtins.int] = None, max_unacked_pages: typing.Optional[builtins.int] = None, local_guard: builtins.bool = False, idle_interval_ms: typing.Optional[builtins.float] = None, partitions: typing.Optional[typing.Sequence[builtins.int]] = None) -> typing.Any:
+    def reader(self, *, start: typing.Optional[typing.Any] = None, count: typing.Optional[builtins.int] = None, max_examined: typing.Optional[builtins.int] = None, max_reply_bytes: typing.Optional[builtins.int] = None, max_unacked_pages: typing.Optional[builtins.int] = None, local_guard: builtins.bool = False, idle_interval_ms: typing.Optional[builtins.float] = None, max_wait_ms: typing.Optional[builtins.float] = None, partitions: typing.Optional[typing.Sequence[builtins.int]] = None) -> typing.Any:
         r"""
         Pages selected by the group's policy with original offsets, an independent
         scan budget, and explicit acknowledgments. An unbound group returns every
@@ -2360,7 +2389,11 @@ class ConsumerGroup:
         `max_reply_bytes` bounds record bytes per page.
         `max_unacked_pages` bounds outstanding pages per partition, default 1024.
         `local_guard` checks delivered records against the filter locally.
-        `idle_interval_ms` is milliseconds, finite and non-negative.
+        `max_wait_ms` is how long the server may hold one filtered wait after
+        a round that found nothing new, at most what it announces, default
+        5000. A record ends the wait at once. `idle_interval_ms` paces idle
+        rounds on a server that holds no filtered wait. Both are milliseconds,
+        finite and non-negative.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -2560,7 +2593,7 @@ class ContextMessage:
     @property
     def timestamp_micros(self) -> builtins.int:
         r"""
-        The broker's append time in microseconds.
+        The streaming server's append time in microseconds.
         """
     @property
     def stream_id(self) -> builtins.int:
@@ -3059,12 +3092,19 @@ class Filter:
 @typing.final
 class FilterAnnounce:
     r"""
-    Consumer-filter evaluator version and codecs advertised by the server.
+    Consumer-filter evaluator version, codecs, and filtered wait advertised by
+    the server.
     """
     @property
     def evaluator_version(self) -> builtins.int: ...
     @property
     def codecs(self) -> builtins.list[builtins.str]: ...
+    @property
+    def max_wait_ms(self) -> builtins.int:
+        r"""
+        Longest filtered wait the server holds, in milliseconds. Zero means it
+        serves no filtered wait, so a reader paces idle rounds itself.
+        """
     @staticmethod
     def served() -> FilterAnnounce:
         r"""
@@ -3103,6 +3143,12 @@ class FilterCaps:
         r"""
         The evaluator version and codecs the server announced, or `None` from
         a server that predates the announcement.
+        """
+    @property
+    def max_wait_ms(self) -> builtins.int:
+        r"""
+        The longest filtered wait the server holds, in milliseconds. Zero when
+        it serves none, so a filtered reader paces idle rounds itself.
         """
     def evaluates(self, evaluator_version: builtins.int, codec: builtins.str) -> builtins.bool:
         r"""
@@ -3222,8 +3268,10 @@ class FilteredReader:
     """
     def next_page(self) -> typing.Any:
         r"""
-        The next page with at least one match. Waits while nothing is new,
-        without holding the reader, so `ack` and `close` run meanwhile.
+        The next page with at least one match. While nothing is new it waits
+        the way the Rust reader does, in a filtered wait the server holds or
+        one idle interval on a server that holds none. `ack` and `close` end
+        that wait, so they run meanwhile.
         """
     def try_next_page(self) -> typing.Any:
         r"""
@@ -3233,6 +3281,15 @@ class FilteredReader:
         r"""
         One bounded round without an idle wait. Returns (page, more).
         Read examined_in_round() for the count of source records examined.
+        """
+    def wait_for_records(self) -> typing.Any:
+        r"""
+        Wait after a round that found nothing new, for a caller that drives
+        `try_next_page` or `read_round` itself. The server holds one filtered
+        wait until one of this reader's partitions has a new record, at most
+        `max_wait_ms` and what it announces, and the next round reads only the
+        ready partitions. On a server that holds no filtered wait it sleeps one
+        idle interval. Any other call on the reader ends the wait.
         """
     def examined_in_round(self) -> builtins.int:
         r"""
@@ -3262,7 +3319,8 @@ class FilteredReader:
         """
     def idle_interval_ms(self) -> typing.Any:
         r"""
-        How long this reader waits, in milliseconds, when nothing is new.
+        How long this reader waits, in milliseconds, when nothing is new on a
+        server that holds no filtered wait.
         """
     def owns(self, page: MatchedPage) -> typing.Any:
         r"""
@@ -3619,20 +3677,22 @@ class GroupFilter:
     Every verb needs a managed backend that serves the filter catalog. Catalog
     replies are dicts in the wire shape.
     """
-    def configure(self, filter: ConsumerFilter) -> typing.Any:
+    def configure(self, name: builtins.str, filter: ConsumerFilter) -> typing.Any:
         r"""
         Give the group `filter` as its policy. The definition is saved as the
-        group's own filter and the group is bound to it in one catalog
-        transaction. The same digest again keeps the binding. Another digest on
-        a group that runs a policy raises `FilterError` with reason `conflict`:
-        create a new group for another policy. Returns the binding dict.
+        group's own filter under `name` and the group is bound to it in one
+        catalog transaction. The name follows the registered filter name rule
+        and need not be unique. The same digest again keeps the binding and
+        renames the own filter when `name` differs. Another digest on a group
+        that runs a policy raises `FilterError` with reason `conflict`: create
+        a new group for another policy. Returns the binding dict.
         """
-    def configure_with(self, *, filter: typing.Optional[ConsumerFilter] = None, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None) -> typing.Any:
+    def configure_with(self, *, filter: typing.Optional[ConsumerFilter] = None, filter_name: typing.Optional[builtins.str] = None, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
-        `configure` with a `filter` definition or one of the group's own
-        revisions, named by `filter_id` and `revision`.
+        `configure` with a `filter` definition saved under `filter_name`, or
+        one of the group's own revisions, named by `filter_id` and `revision`.
         """
-    def configure_as(self, operation_id: typing.Optional[builtins.int], *, filter: typing.Optional[ConsumerFilter] = None, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None) -> typing.Any:
+    def configure_as(self, operation_id: typing.Optional[builtins.int], *, filter: typing.Optional[ConsumerFilter] = None, filter_name: typing.Optional[builtins.str] = None, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
         `configure_with` under a caller-chosen `operation_id`, so a caller that
         records the id first resumes the same configuration after a crash and
@@ -3656,6 +3716,12 @@ class GroupFilter:
         Pause or resume a revision of the group's own filter. A paused active
         revision refuses new reads, while records already delivered can still
         be acknowledged.
+        """
+    def summary(self) -> typing.Any:
+        r"""
+        The group's own filter as a catalog row dict, bound or released: the
+        caller's `name`, state, latest revision and the owning group under
+        `owner`. `None` when the group has no filter of its own.
         """
     def delete(self) -> typing.Any:
         r"""
@@ -4457,7 +4523,7 @@ class Laser:
         `attempts` an int, `detail` an optional string, and `payload` the
         poison message's raw bytes.
         """
-    def spawn_agent(self, agent_id: typing.Optional[builtins.str], listen_on: builtins.str, handler: typing.Any, *, consumer_group: typing.Optional[builtins.str] = None, respond_on: typing.Optional[builtins.str] = None, fixed_inbox: typing.Optional[builtins.str] = None, poll_interval_ms: typing.Optional[builtins.int] = None, warm_dedup: builtins.bool = False, dedup: typing.Optional[typing.Any] = None, dedup_window: typing.Optional[builtins.int] = None, consolidate_every_ms: typing.Optional[builtins.int] = None, consolidator: typing.Optional[typing.Any] = None, capabilities: typing.Optional[typing.Sequence[typing.Any]] = None, ack_on_pickup: builtins.bool = False, health: typing.Optional[builtins.str] = None, max_partitions: typing.Optional[builtins.int] = None, max_queued_records: typing.Optional[builtins.int] = None, max_queued_bytes: typing.Optional[builtins.int] = None, understood_features: builtins.int = 0, shutdown_grace_ms: typing.Optional[builtins.int] = None, dead_letter: typing.Optional[typing.Any] = None, middleware: typing.Optional[typing.Sequence[typing.Any]] = None, retry_max_attempts: typing.Optional[builtins.int] = None, retry_base_delay_ms: typing.Optional[builtins.int] = None, governor: typing.Optional[typing.Any] = None, governor_mode: builtins.str = 'enforce', governor_retention: typing.Optional[tuple[builtins.int, builtins.float]] = None, signing_key: typing.Optional[SigningKey] = None, verifier: typing.Optional[KeyRegistry] = None, operations: typing.Optional[typing.Sequence[builtins.str]] = None, sessions: typing.Optional[Sessions] = None) -> AgentHandle:
+    def spawn_agent(self, agent_id: typing.Optional[builtins.str], listen_on: builtins.str, handler: typing.Any, *, consumer_group: typing.Optional[builtins.str] = None, respond_on: typing.Optional[builtins.str] = None, fixed_inbox: typing.Optional[builtins.str] = None, max_wait_ms: typing.Optional[builtins.int] = None, warm_dedup: builtins.bool = False, dedup: typing.Optional[typing.Any] = None, dedup_window: typing.Optional[builtins.int] = None, consolidate_every_ms: typing.Optional[builtins.int] = None, consolidator: typing.Optional[typing.Any] = None, capabilities: typing.Optional[typing.Sequence[typing.Any]] = None, ack_on_pickup: builtins.bool = False, health: typing.Optional[builtins.str] = None, max_partitions: typing.Optional[builtins.int] = None, max_queued_records: typing.Optional[builtins.int] = None, max_queued_bytes: typing.Optional[builtins.int] = None, understood_features: builtins.int = 0, shutdown_grace_ms: typing.Optional[builtins.int] = None, dead_letter: typing.Optional[typing.Any] = None, middleware: typing.Optional[typing.Sequence[typing.Any]] = None, retry_max_attempts: typing.Optional[builtins.int] = None, retry_base_delay_ms: typing.Optional[builtins.int] = None, governor: typing.Optional[typing.Any] = None, governor_mode: builtins.str = 'enforce', governor_retention: typing.Optional[tuple[builtins.int, builtins.float]] = None, signing_key: typing.Optional[SigningKey] = None, verifier: typing.Optional[KeyRegistry] = None, operations: typing.Optional[typing.Sequence[builtins.str]] = None, sessions: typing.Optional[Sessions] = None) -> AgentHandle:
         r"""
         Spawn an agent: join `consumer_group` (default `agent_id`) over
         `listen_on` and drive `handler` for each message, with at-least-once
@@ -4473,6 +4539,8 @@ class Laser:
         keys. `max_partitions` runs one ordered worker lane per partition up
         to that many concurrent lanes (omit for strict serial). `shutdown_grace_ms`
         bounds how long a graceful stop waits for the in-flight message.
+        `max_wait_ms` is how long the server holds a read that finds nothing
+        new before it answers, default 5000. A record ends the wait at once.
         The dead-letter hook receives the complete capsule dictionary and a typed SDK exception when publication fails.
         `middleware` has optional `before_handle(message)` and `after_handle(message, result, attempt)` hooks.
         The result dictionary contains `ok` and `error`.
@@ -7746,7 +7814,7 @@ class Sessions:
         """
     def events(self, id: builtins.str, *, cursor: typing.Optional[builtins.str] = None, limit: builtins.int = 0, fixed_frontier: builtins.bool = False) -> typing.Any:
         r"""
-        A page of one session's events in broker time order, as a
+        A page of one session's events in server append time order, as a
         `SessionEventsPage` dict. `fixed_frontier=True` pins the fold frontier
         of the first page for a historical walk.
         """
@@ -8174,7 +8242,7 @@ class Topic:
         r"""
         Start a batch publish that flushes 1..N records in a single Iggy send.
         """
-    def producer(self, *, batch_length: builtins.int = 1000, linger_ms: builtins.float = 0.0, retries: typing.Optional[builtins.int] = None, retry_interval_ms: typing.Optional[builtins.int] = None, key: typing.Optional[typing.Any] = None, partition: typing.Optional[builtins.int] = None, create_stream: builtins.bool = False, create_topic: builtins.bool = True, partitions: builtins.int = 1, expire_after_ms: typing.Optional[builtins.float] = None, never_expire: builtins.bool = False, max_topic_bytes: typing.Optional[builtins.int] = None, unlimited_topic_size: builtins.bool = False, background: typing.Optional[typing.Any] = None) -> Producer:
+    def producer(self, *, batch_length: builtins.int = 1000, linger_ms: builtins.float = 0.0, retries: typing.Optional[builtins.int] = None, retry_interval_ms: typing.Optional[builtins.int] = None, key: typing.Optional[typing.Any] = None, partition: typing.Optional[builtins.int] = None, create_stream: builtins.bool = False, create_topic: builtins.bool = True, partitions: builtins.int = 1, replication_factor: typing.Optional[builtins.int] = None, expire_after_ms: typing.Optional[builtins.float] = None, never_expire: builtins.bool = False, max_topic_bytes: typing.Optional[builtins.int] = None, unlimited_topic_size: builtins.bool = False, background: typing.Optional[typing.Any] = None) -> Producer:
         r"""
         Build a Laser direct producer. This is the full streaming hot path
         below the typed publish API: tune batching/linger/retries,
@@ -8188,13 +8256,19 @@ class Topic:
         takes `expire_after_ms` (milliseconds) or `never_expire=True`, else the
         server default, and `max_topic_bytes` or `unlimited_topic_size=True`,
         else the server default. Setting both of a pair raises `InvalidError`.
+        `replication_factor` stores each partition of a topic this producer
+        creates on that many nodes, 1 to `MAX_REPLICATION_FACTOR` and at most
+        the cluster's node count, else the server default.
         """
-    def consumer(self, name: builtins.str, *, partition: builtins.int = 0, batch_length: builtins.int = 1000, poll_interval_ms: typing.Optional[builtins.int] = None, polling: builtins.str = 'next', offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: builtins.str = 'polling', commit_interval_ms: builtins.int = 0, commit_every: typing.Optional[builtins.int] = None, polling_retry_interval_ms: builtins.int = 1000, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.int = 1000, allow_replay: builtins.bool = False) -> Consumer:
+    def consumer(self, name: builtins.str, *, partition: builtins.int = 0, batch_length: builtins.int = 1000, max_wait_ms: builtins.int = 5000, min_count: builtins.int = 1, max_bytes: builtins.int = 1048576, polling: builtins.str = 'next', offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: builtins.str = 'polling', commit_interval_ms: builtins.int = 0, commit_every: typing.Optional[builtins.int] = None, polling_retry_interval_ms: builtins.int = 1000, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.int = 1000, allow_replay: builtins.bool = False) -> Consumer:
         r"""
         Build a Laser reader for one partition. It is an async iterator
         and supports the same polling, batching, replay, retry, and commit modes
         as the Rust builder. Use `auto_commit="disabled"` plus
-        `commit(message)` for commit-after-handle delivery.
+        `commit(message)` for commit-after-handle delivery. The server holds a
+        poll that finds fewer than `min_count` new records for up to
+        `max_wait_ms` (0 to 600000, 0 answers at once), and `max_bytes` caps
+        the record bytes of one reply.
         """
     def consumer_group(self, group: builtins.str) -> ConsumerGroup:
         r"""
@@ -8214,10 +8288,12 @@ class Topic:
         ordered by timestamp. Persist `offsets` and pass them back as
         `from_offsets=` to resume.
         """
-    def ensure(self, partitions: builtins.int) -> typing.Any:
+    def ensure(self, partitions: builtins.int, replication_factor: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
         Idempotently create this topic with `partitions`, creating the stream
-        first when needed.
+        first when needed. `replication_factor` is how many nodes store each
+        partition, 1 to `MAX_REPLICATION_FACTOR` and at most the cluster's node
+        count, the server default when `None`. An existing topic is left as it is.
         """
     def ensure_consumer_group(self, name: builtins.str) -> typing.Any:
         r"""

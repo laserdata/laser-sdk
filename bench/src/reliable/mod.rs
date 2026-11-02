@@ -277,7 +277,7 @@ pub async fn run_reliable_evidence(
         .stream(&stream)
         .topic(AgentTopic::Sessions.topic_string());
     topic
-        .ensure(case.partitions)
+        .ensure(case.partitions, None)
         .await
         .map_err(|error| sdk_error(&error))?;
     let scoped = laser.with_default_stream(&stream);
@@ -362,7 +362,6 @@ async fn start_consumer(
             .consumer_group("laser-bench-plain")
             .consumer()
             .batch_length(128)
-            .without_poll_interval()
             .commit_policy(CommitPolicy::Disabled)
             .build()
             .await
@@ -416,7 +415,6 @@ async fn start_consumer(
             attempts: Arc::clone(&counters.attempts),
             attempted: tokio::sync::Mutex::new(BTreeSet::new()),
         })
-        .poll_interval(Duration::ZERO)
         .concurrency(ConcurrencyPolicy::SerialPerPartition {
             max_partitions: usize::try_from(case.partitions).map_err(|_| {
                 BenchError::Invalid("reliable partition count exceeds usize".to_owned())

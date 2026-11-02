@@ -1,5 +1,7 @@
 use crate::error::LaserError;
 use iggy::prelude::*;
+#[cfg(feature = "agent")]
+use std::collections::BTreeMap;
 use tokio::time::{Duration, sleep};
 
 // Ceiling on the messages one drain accumulates in memory before returning.
@@ -24,6 +26,89 @@ pub(crate) struct PartitionBatch {
     pub next_offset: u64,
 }
 
+/// Follows known partitions of one topic from their next offsets with reads
+/// the server holds until a record lands, so an idle follower costs one held
+/// fetch per primary instead of a poll per partition and interval. Offsets
+/// are never stored.
+#[cfg(feature = "agent")]
+pub(crate) struct TopicFollower {
+    reader: PartitionReader,
+    next: BTreeMap<u32, u64>,
+}
+
+#[cfg(feature = "agent")]
+impl TopicFollower {
+    pub(crate) async fn start(
+        client: &IggyClient,
+        stream: &Identifier,
+        topic: &Identifier,
+        consumer: &Consumer,
+        next: BTreeMap<u32, u64>,
+        batch: u32,
+        max_wait: Duration,
+    ) -> Result<Self, LaserError> {
+        // Every partition starts at or before its position, so the fetch in
+        // flight when the seeks land answers as soon as a record does.
+        let mut reader = client
+            .reader(stream, topic, consumer)
+            .partitions(next.keys().copied())
+            .start(PollingStrategy::offset(0))
+            .options(PollOptions {
+                count: batch.max(1),
+                max_wait: max_wait.into(),
+                ..PollOptions::default()
+            })
+            .build()
+            .await?;
+        for (partition, offset) in &next {
+            reader
+                .seek(*partition, PollingStrategy::offset(*offset))
+                .await?;
+        }
+        Ok(Self { reader, next })
+    }
+
+    /// The next records of one partition, `None` when `idle` passed without
+    /// any. A partition whose history was replaced reads its new history from
+    /// the start, and a record that does not decode is read past.
+    pub(crate) async fn next(
+        &mut self,
+        idle: Duration,
+    ) -> Result<Option<(u32, Vec<IggyMessage>)>, LaserError> {
+        loop {
+            let error = match tokio::time::timeout(idle, self.reader.next()).await {
+                Err(_) => return Ok(None),
+                Ok(Ok(batch)) => {
+                    if let Some(last) = batch.messages.last() {
+                        self.next
+                            .insert(batch.partition_id, last.header.offset.saturating_add(1));
+                    }
+                    return Ok(Some((batch.partition_id, batch.messages)));
+                }
+                Ok(Err(error)) => error,
+            };
+            let resume = match (error.partition_id, &error.error, error.skip) {
+                (Some(partition), IggyError::HistoryUnavailable, None) => {
+                    Some((partition, PollingStrategy::offset(0), 0))
+                }
+                (Some(partition), _, Some(skip)) => Some((partition, skip, skip.value)),
+                _ => None,
+            };
+            let Some((partition, start, offset)) = resume else {
+                return Err(error.error.into());
+            };
+            tracing::debug!(target: "laser", partition_id = partition, error = %error.error, "The followed partition {partition} resumes at {offset}.");
+            self.reader.seek(partition, start).await?;
+            self.next.insert(partition, offset);
+        }
+    }
+
+    /// Where each partition reads next.
+    pub(crate) fn positions(&self) -> &BTreeMap<u32, u64> {
+        &self.next
+    }
+}
+
 // The offset a bounded read should start from so its window ends at the
 // partition tail instead of being cut off at the head. A reader that wants the
 // most recent records (context assembly, a `LastN` policy) must not be handed
@@ -42,11 +127,13 @@ pub(crate) async fn tail_anchored_offset(
         .poll_messages(
             stream,
             topic,
-            Some(partition),
+            partition,
             consumer,
             &PollingStrategy::last(),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await?;
     let Some(last) = polled.messages.last() else {
@@ -123,11 +210,13 @@ pub(crate) async fn drain_partition(
                 .poll_messages(
                     stream,
                     topic,
-                    Some(partition),
+                    partition,
                     consumer,
                     &PollingStrategy::offset(offset),
-                    count,
-                    false,
+                    PollOptions {
+                        count,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
             {
@@ -148,7 +237,7 @@ pub(crate) async fn drain_partition(
             break;
         };
         offset = last.header.offset.saturating_add(1);
-        let received_count = polled.messages.len();
+        let current_offset = polled.current_offset;
         let mut received = polled.messages;
         if let Some(end) = end
             && let Some(cut) = received
@@ -161,7 +250,9 @@ pub(crate) async fn drain_partition(
             break;
         }
         messages.extend(received);
-        if (received_count as u32) < count {
+        // A reply can stop short of `count` at its byte cap, so only the
+        // partition's current offset proves the tail.
+        if offset > current_offset {
             break;
         }
         if messages.len() >= MAX_DRAIN_MESSAGES {
@@ -179,7 +270,6 @@ pub(crate) async fn drain_partition(
 
 // The next offset one partition will write: one past its last message, or 0
 // when it is empty. This is what a `Checkpoint` records.
-#[cfg(feature = "agent")]
 pub(crate) async fn current_tail_offset(
     client: &IggyClient,
     stream: &Identifier,
@@ -191,11 +281,13 @@ pub(crate) async fn current_tail_offset(
         .poll_messages(
             stream,
             topic,
-            Some(partition),
+            partition,
             consumer,
             &PollingStrategy::last(),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await?;
     Ok(polled

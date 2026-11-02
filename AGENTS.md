@@ -85,8 +85,12 @@ wire/                   the laser-wire crate: the wire CONTRACT, data + pure fun
                         AGENT_STREAMS / AGENT_HEARTBEATS / AGENT_CONTROL / AGENT_MEMORY / AGENT_DLQ /
                         AGENT_AUDIT / AGENT_JOURNAL / AGENT_REGISTRY
     limits.rs           page / KV / frame / agent-envelope / session / consumer-filter caps (MAX_FILTER_*,
-                        MAX_FILTERED_PAGE_*, MAX_SESSION_LABEL_BYTES, MAX_HEARTBEAT_SESSIONS,
-                        MAX_STATE_PATCH_OPS, MAX_STATE_DOCUMENT_BYTES, MAX_MANIFEST_FRAGMENTS)
+                        MAX_FILTERED_PAGE_*, MAX_SESSION_LABEL_BYTES, MAX_SESSION_TEXT_QUERY_BYTES,
+                        MAX_SESSION_CURSOR_BYTES, MAX_HEARTBEAT_SESSIONS, MAX_STATE_PATCH_OPS,
+                        MAX_STATE_DOCUMENT_BYTES, MAX_MANIFEST_FRAGMENTS) and the caller-chosen
+                        name caps (MAX_PROJECTION_ID_BYTES, MAX_PROJECTION_NAME_BYTES,
+                        MAX_INDEX_FIELD_BYTES, MAX_SCHEMA_NAME_BYTES, MAX_GRAPH_LABEL_BYTES,
+                        MAX_MEMORY_ID_BYTES)
     content.rs          ContentType + the agdx.ct u8 dictionary
     hello.rs            HelloReply / OpVersions (AGDX_HELLO probe body, additive `agent` field + `features` capability bitset: feature::{KV_CAS,READ_YOUR_WRITES,STRONG_CONSISTENCY,KV_CAS_FENCED,KEYWORD_SEARCH,WATCH,AUTHZ,DESTINATIONS,KV_FENCED_LEASES,CONSUMER_FILTERS,GROUP_POLICY_READS,SESSIONS}, AGENT_WORKFLOW = 1 << 4 retired and never set) + BackendAnnounce (backend->streaming-server capability announce, AGDX_BACKEND_HELLO_CODE)
     query.rs            query IR (incl. Consistency level) + QueryEnvelope/QueryReply/Row/QueryError (incl. Stale)
@@ -124,7 +128,8 @@ wire/                   the laser-wire crate: the wire CONTRACT, data + pure fun
     dispatch.rs         (feature cbor) display_type over SessionRecord -> DisplayType, the
                         classify / classify_generic -> Dispatch {Work, Observational, Reply,
                         Lifecycle, Control, Foreign} table, control operation names,
-                        addressee_filter(me) / broadcast_filter(), pinned by
+                        addressee_filter(me) / broadcast_filter() and
+                        ADDRESSEE_FILTER_NAME ("agent-addressee"), pinned by
                         fixtures/dispatch_cases.json
     forward.rs          forwarded ForwardedQuery / ForwardedCommand frames + the server-stamped
                         ForwardedScope { stream_id, stream, stream_created_at_micros }
@@ -180,13 +185,15 @@ sdk/src/
                       <-> wire id, AgentId::wire_id = the name verbatim)
   provenance/         keys.rs re-exports the wire header dictionary, runtime.rs
                       (Provenance <-> headers) + topic.rs (AgentTopic) behind `provenance`
-  poll.rs             shared partition drain helper (context + reply + cursor paths)
+  poll.rs             shared partition drain helper (context + cursor paths, reads until
+                      empty or past the current offset) and TopicFollower, the held-read
+                      follower over the upstream PartitionReader (reply hub, control follower)
   stream.rs           the Log accessors: Laser::stream(name) -> Stream (real Iggy stream,
                       ensure/topic) and Laser::topic(name) -> Topic (default-stream shortcut,
                       publish()/publish_batch() fluent, send/batch raw (impl Into<Vec<u8>>,
                       matching PublishRequest/BatchPublishRequest), all returning Iggy's
                       SendMessagesResponse commit positions, replay() -> Cursor,
-                      ensure(partitions), producer/consumer/consumer_group, plus the raw
+                      ensure(partitions, replication_factor), producer/consumer/consumer_group, plus the raw
                       iggy_producer/iggy_consumer/iggy_consumer_group escape hatch)
                       Iggy provides the VSR transport. Standard Iggy commands and managed reads use the
                       non-replicated extension path, and authorization writes use dedicated
@@ -196,7 +203,8 @@ sdk/src/
                       Laser-native direct Producer plus live futures::Stream Consumer/
                       ConsumerMessage path - ProducerMessage/ConsumerMessage keep `bytes::Bytes`
                       (zero-copy clone) on this hot path specifically, including routing,
-                      polling/replay, group lifecycle, retries, exact headers, automatic commits,
+                      server-held polls (max_wait/min_count/max_bytes), read-error recovery,
+                      replay, group lifecycle, retries, exact headers, automatic commits,
                       explicit commit-after-success, producer commit confirmations, consumer
                       offsets, and next_within(timeout) for
                       a bounded single-record wait
@@ -314,7 +322,7 @@ sdk/src/
     memory_handler.rs MemoryHandler<H>: wraps an AgentHandler so a successfully handled message is
                       remembered under its conversation, auto_remember selects the MemoryKind
     builder.rs        Agent::builder + AgentHandle (ready/shutdown=graceful drain/join/abort), capabilities +
-                      ack_on_pickup + inbox_route + signing_key + retry/verifier/dedup_window/shutdown_grace/concurrency/
+                      ack_on_pickup + inbox_route + max_wait + signing_key + retry/verifier/dedup_window/shutdown_grace/concurrency/
                       middleware/on_dead_letter, self-advertises card + presence on spawn
     ctx.rs            AgentCtx handed to a handler: respond/reply_on/send/request/respond_input,
                       fan_out (per-agent Gather under GatherPolicy), approval_gate, spawn_subconversation
@@ -361,6 +369,8 @@ sdk/src/
 sdk/tests/integration/  one shared Apache Iggy, one stream per test, BDD-named cases
 sdk/tests/support/      test_iggy.rs (native Iggy process harness, test-only, not shipped)
                         + owned_server.rs
+test-support/           laser-test-support (publish = false): the stand-in catalog (lib catalog.rs,
+                        bin laser-test-catalog) and bin laser-test-routes (partition primaries)
 foreign/python/         the Python SDK (outside the workspace): PyO3 bindings over the
                         laser-sdk crate (cdylib lib laser_sdk_py, import name laser_sdk),
                         src/ one module per area + bin/stub_gen.rs, tests/ pytest
@@ -431,8 +441,8 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 - Unit tests live next to the code (`#[cfg(test)] mod tests`).
 - `wire_fixtures` compares encoded bytes with `wire/fixtures/`. Regenerate through `just fixtures-regen` only for an intentional wire change. Update every affected client and implementation together. `constants.rs` fixes codes, keys, topics, and limits. Negative cases define input that every client must reject.
-- Integration tests (`sdk/tests/integration/`) run against Apache Iggy via a native `TestIggy` process. One process is shared. Each test gets its own data stream and ops stream, so the suite stays isolated and parallel. Set `LASER_TEST_IGGY_SERVER` to test a local Iggy binary instead of the R2 artifact.
-- `streaming.rs` tests publication and consumption through Laser APIs. It covers batches, headers, routing, delivery, commits, group rejoin, uncommitted redelivery, and replay.
+- Integration tests (`sdk/tests/integration/`) run against Apache Iggy via a native `TestIggy` process. One process is shared. Each test gets its own data stream and ops stream, so the suite stays isolated and parallel. Set `LASER_TEST_IGGY_SERVER` to test a local Iggy binary instead of the R2 artifact. Set `LASER_TEST_IGGY_CLUSTER=1` to run the shared server, and the stand-in catalog server of `filters_group.rs`, as a three-node cluster reached through its metadata leader (`SharedIggy` in `sdk/tests/integration/harness.rs`). Tests with `cluster` in their name start a `TestIggyCluster` of their own, three nodes by default (`sdk/tests/support/test_iggy.rs`: `start_with` per-node settings, `start_sized` for another node count such as the five-node replication factor tests, `leader`, `stop_node`, `kill_node`, `start_node`, `restart_node`, `route_endpoint_to`) and run one at a time. `harness::http_settings` serves a node's HTTP API with a shared JWT key, and `harness::held_requests` reads the server's count of parked requests (`deferred_poll_pending`) to prove what a client holds. The stand-in catalog lives in `test-support/`: `filters_group.rs` runs `laser_test_support::catalog` in process, and Python cluster tests run the `laser-test-catalog <socket>...` binary (one socket per node, each node started with `IGGY_PLANE_ENABLED=true` and its `IGGY_PLANE_SOCKET_PATH`, ready once it prints `ready`, stopped with SIGTERM) and ask `laser-test-routes` for partition primaries.
+- `streaming.rs` tests publication and consumption through Laser APIs. It covers batches, headers, routing, delivery, commits, group rejoin, group start seeds and rebalance resume on both group paths, uncommitted redelivery, and replay.
 - `harness::eventually` polls instead of fixed sleeps. Iggy visibility is eventual.
 - The test runner pins `FORK_VERSION`. `LASER_TEST_IGGY_SERVER` overrides the downloaded R2 binary for local validation.
 - Full query, KV, and fork execution requires LaserData Cloud or Laser Stack. SDK tests use reference files for encoded data and managed deployments for execution. `laser_bdd::query_engine` tests query behavior locally through `query.feature`. Original Apache Iggy returns `Unsupported` for these managed commands. Do not add a query worker or request-topic fallback to the SDK.
@@ -441,7 +451,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-This inventory describes the `0.9.0-dev.1` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.9.0-dev.2` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
 Capabilities identify managed support such as queries, key-value, forks, graphs, and an A2A gateway, plus native consumer filters served by the streaming server. Every capability flag maps to a hello feature bit or an op version. Memory combines query and graph operations and has no separate managed command group.
 
@@ -453,7 +463,7 @@ The open SDK supports provenance, causality, context, memory, routing, sessions,
 
 Streaming provides producers and continuous partition or consumer-group readers with exact headers, routing, retries, commits, and server offsets. Apache Iggy controls stream and topic access. Its builders remain available for detailed configuration. Python exposes the same underlying streaming implementation.
 
-Consumer filters belong to consumer groups. `topic.consumer_group(name)` (`sdk/src/stream/consumer_group.rs`) is the handle: `create().filter(..).build()` creates the group with its policy, `filter()` configures, inspects, revises, pauses, releases, previews and sample-tests it, `consumer()` is the normal consumer that runs whatever the group holds on a server with `group_policy_reads`, and `reader()` is the match-oriented reader with independent `count` and `max_examined`. The reader (`sdk/src/filters/reader.rs`) delivers `MatchedRecord`s with their original offsets, stores progress only through fenced acknowledgments (`ack`, `ack_through`, `ack_page`), and bounds outstanding pages per partition (`max_unacked_pages`, default 1024). Filters are `ConsumerFilter` over JSON, CBOR, Avro, Protobuf, or headers only, with fault, foreign, and mismatch policies. An unbound group receives every record. The `filters` feature only adds the local guard evaluator, the group transport lives in `streaming`. TypeScript (`foreign/typescript/src/stream/consumer-group.ts`, `managed/filters.ts`) and Python (`foreign/python/src/consumer_group.rs`, `filters.rs`) carry the same surface, and `wire/tests/filter_eval_corpus.rs` pins identical verdicts across the three.
+Consumer filters belong to consumer groups. `topic.consumer_group(name)` (`sdk/src/stream/consumer_group.rs`) is the handle: `create().filter(name, filter).build()` creates the group with its policy saved under the caller's name, `filter()` configures (`configure(name, filter)`), inspects (`get`, `summary` with the caller's name and owning group), revises, pauses, releases, deletes, previews and sample-tests it, and finds the group's own filter by its owner identity, never by name, `consumer()` is the normal consumer that runs whatever the group holds on a server with `group_policy_reads`, and `reader()` is the match-oriented reader with independent `count` and `max_examined`. The reader (`sdk/src/filters/reader.rs`) delivers `MatchedRecord`s with their original offsets, stores progress only through fenced acknowledgments (`ack`, `ack_through`, `ack_page`), and bounds outstanding pages per partition (`max_unacked_pages`, default 1024). After a round that found nothing new it holds one `AGDX_FILTERED_WAIT` per serving node for up to `max_wait` (default 5 s, lowered to the announced `Capabilities.filters.max_wait_ms`), each with a process-unique `wait_id`, reads its assignment again every 2 s while the waits hold, cancels the waits still held on other nodes (`AGDX_FILTERED_WAIT_CANCEL`) when one answers ready, the assignment changes, or the reader closes or drops, and sleeps `idle_interval` only on a server that announces no wait. A node that does not store a partition refuses its filtered reads, acks and waits with `NotPrimary`, and the reader looks the route up again. Filters are `ConsumerFilter` over JSON, CBOR, Avro, Protobuf, or headers only, with fault, foreign, and mismatch policies. An unbound group receives every record. The `filters` feature only adds the local guard evaluator, the group transport lives in `streaming`. TypeScript (`foreign/typescript/src/stream/consumer-group.ts`, `managed/filters.ts`) and Python (`foreign/python/src/consumer_group.rs`, `filters.rs`) carry the same surface, and `wire/tests/filter_eval_corpus.rs` pins identical verdicts across the three.
 
 `sdk/src/govern.rs` defines `ActionGovernor` under `agent`. `Laser::with_governor` applies it before publication, AGDX operations, and memory writes. `Verdict` values are `Allow`, `Observe`, `Block`, `StepUp`, `Modify`, and `Defer`. `GovernorMode::Observe` records decisions without enforcing them and warns on evidence failure. `Enforce` applies the decision and rejects effects if required evidence cannot be stored.
 

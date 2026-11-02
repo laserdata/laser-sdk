@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
+import { serializeDeferredPollOptions } from "apache-iggy/dist/wire/message/deferred-poll.utils.js"
 import { serializePollMessages } from "apache-iggy/dist/wire/message/poll.utils.js"
 import { Consumer as IggyConsumer, PollingStrategy } from "apache-iggy"
 
@@ -20,14 +21,21 @@ import { Producer, ProducerMessage } from "../../src/stream/producer.js"
 import { BatchPublishRequest } from "../../src/stream/publish.js"
 import { Record, recordHeaders } from "../../src/stream/record.js"
 import { Routing } from "../../src/stream/routing.js"
-import type { Topic } from "../../src/stream/topic.js"
+import { Topic } from "../../src/stream/topic.js"
 import { Msgpack } from "../../src/stream/codecs.js"
 import { ContentType, contentTypeCode } from "../../src/wire/content.js"
+import { MAX_REPLICATION_FACTOR } from "../../src/index.js"
 import { CONTENT_TYPE, PROJECTION_REF } from "../../src/wire/headers.js"
 
 interface SentRecord {
   readonly payload: Uint8Array
   readonly headers: ReadonlyMap<string, unknown>
+}
+
+interface TopicCreateRequest {
+  readonly name: string
+  readonly partitionCount: number
+  readonly replicationFactor?: number
 }
 
 function recordingTopic(): { topic: Topic; sent: SentRecord[][] } {
@@ -200,12 +208,15 @@ void test("given_a_timestamp_start_when_polling_then_should_send_the_iggy_timest
   const requests: Uint8Array[] = []
   // An empty polled body: the 40-byte head and no records.
   const empty = new Uint8Array(40)
-  const client = {
-    clientProvider: () => Promise.resolve({}),
-    sendBinaryRequest: (_code: number, payload: Buffer) => {
+  const raw = {
+    sendCommand: (_code: number, payload: Buffer) => {
       requests.push(new Uint8Array(payload))
-      return Promise.resolve(Buffer.from(empty))
-    },
+      const data = Buffer.from(empty)
+      return Promise.resolve({ status: 0, length: data.byteLength, data })
+    }
+  }
+  const client = {
+    clientProvider: () => Promise.resolve(raw),
     destroy: () => Promise.resolve()
   } as unknown as IggyClient
   const transport = await ApacheIggyTransport.fromClient(client)
@@ -221,15 +232,23 @@ void test("given_a_timestamp_start_when_polling_then_should_send_the_iggy_timest
   assert.deepEqual(
     requests[0],
     new Uint8Array(
-      serializePollMessages(
-        "fleet",
-        "readings",
-        { kind: IggyConsumer.Single.kind, id: "metrics" },
-        3,
-        PollingStrategy.Timestamp(1_700_000_000_000_000n),
-        10,
-        false
-      )
+      Buffer.concat([
+        serializePollMessages(
+          "fleet",
+          "readings",
+          { kind: IggyConsumer.Single.kind, id: "metrics" },
+          3,
+          PollingStrategy.Timestamp(1_700_000_000_000_000n),
+          10,
+          false
+        ),
+        serializeDeferredPollOptions({
+          maxWait: 0,
+          minCount: 1,
+          maxBytes: 1_048_576,
+          requestTimeout: 10_000
+        })
+      ])
     )
   )
 })
@@ -275,13 +294,15 @@ void test("given_a_json_record_when_a_cursor_polls_then_should_decode_its_payloa
           payload: new TextEncoder().encode('{"n":1}'),
           partitionId: target.partitionId ?? 0,
           offset: 0n,
-          headers: new Map()
+          headers: new Map(),
+          currentOffset: 1n
         },
         {
           payload: new Uint8Array([0xff]),
           partitionId: target.partitionId ?? 0,
           offset: 1n,
-          headers: new Map()
+          headers: new Map(),
+          currentOffset: 1n
         }
       ]
       return Promise.resolve(records)
@@ -306,5 +327,85 @@ void test("given_both_unlimited_and_bounded_topic_size_when_configured_then_shou
         maxTopicBytes: 1_024n
       }),
     InvalidError
+  )
+})
+
+void test("given_a_replication_factor_when_a_producer_provisions_then_should_create_the_topic_with_it", async () => {
+  const { transport, created } = recordingProducerTransport()
+  await Producer.create(transport, "fleet", "readings", { replicationFactor: 3 }).send(
+    new Uint8Array([1])
+  )
+  assert.deepEqual(created, [{ replicationFactor: 3 }])
+})
+
+void test("given_a_replication_factor_out_of_range_when_a_producer_is_built_then_should_refuse_it_before_sending", () => {
+  const { transport, created } = recordingProducerTransport()
+  assert.equal(MAX_REPLICATION_FACTOR, 32)
+  for (const replicationFactor of [0, MAX_REPLICATION_FACTOR + 1, 1.5]) {
+    assert.throws(
+      () => Producer.create(transport, "fleet", "readings", { replicationFactor }),
+      new InvalidError("replication factor must be 1..=32")
+    )
+  }
+  assert.deepEqual(created, [])
+})
+
+void test("given_a_replication_factor_when_a_topic_is_ensured_then_should_forward_it_to_topic_creation", async () => {
+  const ensured: unknown[][] = []
+  const transport = {
+    ensureStream: () => Promise.resolve(),
+    ensureTopic: (...args: unknown[]) => {
+      ensured.push(["ensureTopic", ...args])
+      return Promise.resolve()
+    },
+    ensureTopicWithExpiry: (...args: unknown[]) => {
+      ensured.push(["ensureTopicWithExpiry", ...args])
+      return Promise.resolve()
+    }
+  } as unknown as LaserTransport
+  const topic = Topic.create(transport, "fleet", "readings")
+  await topic.ensure(3, 2)
+  await topic.ensure()
+  await topic.ensureWithExpiry(4, 60_000_000n, 5)
+  assert.deepEqual(ensured, [
+    ["ensureTopic", "fleet", "readings", 3, 2],
+    ["ensureTopic", "fleet", "readings", 1, undefined],
+    ["ensureTopicWithExpiry", "fleet", "readings", 4, 60_000_000n, 5]
+  ])
+})
+
+void test("given_a_replication_factor_when_the_transport_creates_a_topic_then_should_send_it_and_refuse_one_out_of_range_unsent", async () => {
+  const creates: TopicCreateRequest[] = []
+  const client = {
+    clientProvider: () => Promise.resolve({}),
+    destroy: () => Promise.resolve(),
+    topic: {
+      get: () => Promise.resolve(null),
+      create: (request: TopicCreateRequest) => {
+        creates.push(request)
+        return Promise.resolve({ partitionsCount: request.partitionCount })
+      }
+    }
+  } as unknown as IggyClient
+  const transport = await ApacheIggyTransport.fromClient(client)
+  await transport.ensureTopic("fleet", "readings", 3, 2)
+  await transport.ensureTopicWithExpiry("fleet", "replies", 1, 5_000_000n, 3)
+  await transport.ensureTopic("fleet", "events", 1)
+  await assert.rejects(
+    transport.createTopicIfAbsent("fleet", "wide", 1, { replicationFactor: 33 }),
+    new InvalidError("replication factor must be 1..=32")
+  )
+  assert.deepEqual(
+    creates.map((request) => [request.name, request.replicationFactor]),
+    [
+      ["readings", 2],
+      ["replies", 3],
+      ["events", undefined]
+    ]
+  )
+  assert.equal(
+    "replicationFactor" in (creates[2] ?? {}),
+    false,
+    "no factor leaves the server default"
   )
 })

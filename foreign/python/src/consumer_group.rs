@@ -67,22 +67,25 @@ impl PyConsumerGroup {
     }
 
     /// Create the group, with an optional filter policy configured in the
-    /// same call: a `filter` definition saved as the group's own filter, or
-    /// one of its own revisions as `filter_id` and `revision`. Idempotent: an
+    /// same call: a `filter` definition saved as the group's own filter under
+    /// `filter_name`, or one of its own revisions as `filter_id` and
+    /// `revision`. `filter_name` is required with `filter`, follows the
+    /// registered filter name rule and need not be unique. Idempotent: an
     /// existing group is kept and the same policy keeps its binding. A group
     /// that runs another policy raises `FilterError` with reason `conflict`.
     /// Pass `operation_id` to resume the same configuration after a crash.
     /// Returns the `ConsumerGroupInfo`.
-    #[pyo3(signature = (*, filter=None, filter_id=None, revision=None, operation_id=None))]
+    #[pyo3(signature = (*, filter=None, filter_name=None, filter_id=None, revision=None, operation_id=None))]
     fn create<'py>(
         &self,
         py: Python<'py>,
         filter: Option<PyConsumerFilter>,
+        filter_name: Option<String>,
         filter_id: Option<u32>,
         revision: Option<u32>,
         operation_id: Option<u128>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let policy = group_policy(filter, filter_id, revision)?;
+        let policy = group_policy(filter, filter_name, filter_id, revision)?;
         let group = self.group.clone();
         future_into_py(py, async move {
             let mut create = group.create();
@@ -117,24 +120,34 @@ impl PyConsumerGroup {
     /// Build a live, load-balanced consumer of this group with server-backed
     /// offsets. On a server that resolves group policies the consumer runs
     /// the group's filter, or none, and commits through the group's fenced
-    /// acknowledgments. On Apache Iggy it is the native group consumer. It
-    /// supports the same polling, batching, replay, retry, and commit modes
-    /// as the Rust builder. Use `auto_commit="disabled"` plus
-    /// `commit(message)` for commit-after-handle delivery. `batch_length`
-    /// also bounds the source records one partition poll examines.
-    #[pyo3(signature = (*, batch_length=1000, poll_interval_ms=None, polling="next", offset=None, timestamp_micros=None, auto_commit="polling", commit_interval_ms=0, commit_every=None, auto_join_group=true, create_group=true, polling_retry_interval_ms=1000, init_retries=None, init_retry_interval_ms=1000, allow_replay=false))]
+    /// acknowledgments. On Apache Iggy it is the native group consumer, which
+    /// always joins the group. It supports the same polling, batching,
+    /// replay, retry, and commit modes as the Rust builder. Use
+    /// `auto_commit="disabled"` plus `commit(message)` for
+    /// commit-after-handle delivery. `batch_length` also bounds the source
+    /// records one partition poll examines. The server holds a poll that
+    /// finds fewer than `min_count` new records for up to `max_wait_ms`
+    /// (0 to 600000, 0 answers at once), and `max_bytes` caps the record
+    /// bytes of one reply. The consumer always resumes after the group's
+    /// stored offset. Its `polling`, `offset` or `timestamp_micros` start
+    /// only seeds a partition the group never stored, before its first read
+    /// (the native consumer only those it holds when it joins), and a refused
+    /// seed, such as an offset past a partition's end, fails `init` or the
+    /// first `next` with the Iggy error.
+    #[pyo3(signature = (*, batch_length=1000, max_wait_ms=5000, min_count=1, max_bytes=1048576, polling="next", offset=None, timestamp_micros=None, auto_commit="polling", commit_interval_ms=0, commit_every=None, create_group=true, polling_retry_interval_ms=1000, init_retries=None, init_retry_interval_ms=1000, allow_replay=false))]
     #[allow(clippy::too_many_arguments)]
     fn consumer(
         &self,
         batch_length: u32,
-        poll_interval_ms: Option<u64>,
+        max_wait_ms: u64,
+        min_count: u32,
+        max_bytes: u32,
         polling: &str,
         offset: Option<u64>,
         timestamp_micros: Option<u64>,
         auto_commit: &str,
         commit_interval_ms: u64,
         commit_every: Option<u32>,
-        auto_join_group: bool,
         create_group: bool,
         polling_retry_interval_ms: u64,
         init_retries: Option<u32>,
@@ -146,14 +159,15 @@ impl PyConsumerGroup {
             label(&self.group),
             ConsumerConfig {
                 batch_length,
-                poll_interval_ms,
+                max_wait_ms,
+                min_count,
+                max_bytes,
                 polling,
                 offset,
                 timestamp_micros,
                 auto_commit,
                 commit_interval_ms,
                 commit_every,
-                auto_join_group,
                 create_group,
                 polling_retry_interval_ms,
                 init_retries,
@@ -174,7 +188,11 @@ impl PyConsumerGroup {
     /// `max_reply_bytes` bounds record bytes per page.
     /// `max_unacked_pages` bounds outstanding pages per partition, default 1024.
     /// `local_guard` checks delivered records against the filter locally.
-    /// `idle_interval_ms` is milliseconds, finite and non-negative.
+    /// `max_wait_ms` is how long the server may hold one filtered wait after
+    /// a round that found nothing new, at most what it announces, default
+    /// 5000. A record ends the wait at once. `idle_interval_ms` paces idle
+    /// rounds on a server that holds no filtered wait. Both are milliseconds,
+    /// finite and non-negative.
     #[pyo3(signature = (
         *,
         start=None,
@@ -184,6 +202,7 @@ impl PyConsumerGroup {
         max_unacked_pages=None,
         local_guard=false,
         idle_interval_ms=None,
+        max_wait_ms=None,
         partitions=None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -197,6 +216,7 @@ impl PyConsumerGroup {
         max_unacked_pages: Option<usize>,
         local_guard: bool,
         idle_interval_ms: Option<f64>,
+        max_wait_ms: Option<f64>,
         partitions: Option<Vec<u32>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let start = start
@@ -205,6 +225,9 @@ impl PyConsumerGroup {
             .unwrap_or(FilteredStart::Next);
         let idle_interval = idle_interval_ms
             .map(|ms| duration_ms(ms, "idle_interval_ms"))
+            .transpose()?;
+        let max_wait = max_wait_ms
+            .map(|ms| duration_ms(ms, "max_wait_ms"))
             .transpose()?;
         let group = self.group.clone();
         future_into_py(py, async move {
@@ -230,6 +253,9 @@ impl PyConsumerGroup {
             }
             if let Some(idle_interval) = idle_interval {
                 builder = builder.idle_interval(idle_interval);
+            }
+            if let Some(max_wait) = max_wait {
+                builder = builder.max_wait(max_wait);
             }
             let reader = builder.build().await.map_err(to_pyerr)?;
             Ok(PyFilteredReader::new(reader))
@@ -301,59 +327,75 @@ impl PyGroupFilter {
     }
 }
 
-// A definition or a revision, exactly one of them.
+// A named definition or a revision, exactly one of them.
 fn required_policy(
     filter: Option<PyConsumerFilter>,
+    filter_name: Option<String>,
     filter_id: Option<u32>,
     revision: Option<u32>,
 ) -> PyResult<GroupFilterSpec> {
-    group_policy(filter, filter_id, revision)?
-        .ok_or_else(|| InvalidError::new_err("pass `filter`, or both `filter_id` and `revision`"))
+    group_policy(filter, filter_name, filter_id, revision)?.ok_or_else(|| {
+        InvalidError::new_err(
+            "pass `filter` with `filter_name`, or both `filter_id` and `revision`",
+        )
+    })
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyGroupFilter {
     /// Give the group `filter` as its policy. The definition is saved as the
-    /// group's own filter and the group is bound to it in one catalog
-    /// transaction. The same digest again keeps the binding. Another digest on
-    /// a group that runs a policy raises `FilterError` with reason `conflict`:
-    /// create a new group for another policy. Returns the binding dict.
+    /// group's own filter under `name` and the group is bound to it in one
+    /// catalog transaction. The name follows the registered filter name rule
+    /// and need not be unique. The same digest again keeps the binding and
+    /// renames the own filter when `name` differs. Another digest on a group
+    /// that runs a policy raises `FilterError` with reason `conflict`: create
+    /// a new group for another policy. Returns the binding dict.
     fn configure<'py>(
         &self,
         py: Python<'py>,
+        name: String,
         filter: PyConsumerFilter,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.configure_policy(py, None, GroupFilterSpec::Definition(filter.inner))
+        self.configure_policy(
+            py,
+            None,
+            GroupFilterSpec::Definition {
+                name,
+                filter: filter.inner,
+            },
+        )
     }
 
-    /// `configure` with a `filter` definition or one of the group's own
-    /// revisions, named by `filter_id` and `revision`.
-    #[pyo3(signature = (*, filter=None, filter_id=None, revision=None))]
+    /// `configure` with a `filter` definition saved under `filter_name`, or
+    /// one of the group's own revisions, named by `filter_id` and `revision`.
+    #[pyo3(signature = (*, filter=None, filter_name=None, filter_id=None, revision=None))]
     fn configure_with<'py>(
         &self,
         py: Python<'py>,
         filter: Option<PyConsumerFilter>,
+        filter_name: Option<String>,
         filter_id: Option<u32>,
         revision: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let policy = required_policy(filter, filter_id, revision)?;
+        let policy = required_policy(filter, filter_name, filter_id, revision)?;
         self.configure_policy(py, None, policy)
     }
 
     /// `configure_with` under a caller-chosen `operation_id`, so a caller that
     /// records the id first resumes the same configuration after a crash and
     /// reads its first outcome. `None` mints a fresh id.
-    #[pyo3(signature = (operation_id, *, filter=None, filter_id=None, revision=None))]
+    #[pyo3(signature = (operation_id, *, filter=None, filter_name=None, filter_id=None, revision=None))]
     fn configure_as<'py>(
         &self,
         py: Python<'py>,
         operation_id: Option<u128>,
         filter: Option<PyConsumerFilter>,
+        filter_name: Option<String>,
         filter_id: Option<u32>,
         revision: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let policy = required_policy(filter, filter_id, revision)?;
+        let policy = required_policy(filter, filter_name, filter_id, revision)?;
         self.configure_policy(py, operation_id, policy)
     }
 
@@ -423,6 +465,20 @@ impl PyGroupFilter {
                 .set_revision_enabled(revision, enabled)
                 .await
                 .map_err(to_pyerr)
+        })
+    }
+
+    /// The group's own filter as a catalog row dict, bound or released: the
+    /// caller's `name`, state, latest revision and the owning group under
+    /// `owner`. `None` when the group has no filter of its own.
+    fn summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let group = self.group.clone();
+        future_into_py(py, async move {
+            let summary = group.filter().summary().await.map_err(to_pyerr)?;
+            Python::attach(|py| match summary {
+                Some(summary) => ser_to_py(py, &summary),
+                None => Ok(py.None()),
+            })
         })
     }
 
@@ -513,18 +569,25 @@ fn label(group: &ConsumerGroup) -> String {
 
 fn group_policy(
     filter: Option<PyConsumerFilter>,
+    filter_name: Option<String>,
     filter_id: Option<u32>,
     revision: Option<u32>,
 ) -> PyResult<Option<GroupFilterSpec>> {
-    match (filter, filter_id, revision) {
-        (Some(filter), None, None) => Ok(Some(GroupFilterSpec::Definition(filter.inner))),
-        (None, Some(filter_id), Some(revision)) => Ok(Some(GroupFilterSpec::Revision {
+    match (filter, filter_name, filter_id, revision) {
+        (Some(filter), Some(name), None, None) => Ok(Some(GroupFilterSpec::Definition {
+            name,
+            filter: filter.inner,
+        })),
+        (Some(_), None, None, None) => Err(InvalidError::new_err(
+            "`filter_name` is required with `filter`",
+        )),
+        (None, None, Some(filter_id), Some(revision)) => Ok(Some(GroupFilterSpec::Revision {
             filter_id,
             revision,
         })),
-        (None, None, None) => Ok(None),
+        (None, None, None, None) => Ok(None),
         _ => Err(InvalidError::new_err(
-            "pass either `filter`, or both `filter_id` and `revision`",
+            "pass either `filter` with `filter_name`, or both `filter_id` and `revision`",
         )),
     }
 }

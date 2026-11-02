@@ -30,7 +30,11 @@ function record(offset: bigint, conversation: ConversationId, state: string): Po
   }
 }
 
-function storeOver(log: readonly PolledMessage[], stream: string | null = "orbit") {
+function storeOver(
+  log: readonly PolledMessage[],
+  stream: string | null = "orbit",
+  replyCap = Number.MAX_SAFE_INTEGER
+) {
   const reads: (bigint | "last")[] = []
   const transport = {
     findTopicPartitionCount: () => Promise.resolve(1),
@@ -47,7 +51,9 @@ function storeOver(log: readonly PolledMessage[], stream: string | null = "orbit
       }
       const from = strategy.kind === "offset" ? strategy.value : 0n
       reads.push(from)
-      return Promise.resolve(log.filter((message) => message.offset >= from).slice(0, count))
+      return Promise.resolve(
+        log.filter((message) => message.offset >= from).slice(0, Math.min(count, replyCap))
+      )
     }
   }
   const laser = {
@@ -91,7 +97,7 @@ void test("given_no_snapshot_or_no_stream_when_the_latest_is_read_then_should_an
   await assert.rejects(storeOver([], null).store.latest(mine), NoStreamError)
 })
 
-void test("given_snapshots_on_two_partitions_when_read_then_should_use_broker_time", async () => {
+void test("given_snapshots_on_two_partitions_when_read_then_should_use_server_time", async () => {
   const partitions = [
     [{ ...record(100n, mine, "older"), timestampMicros: 10n, partitionId: 0 }],
     [{ ...record(2n, mine, "newer"), timestampMicros: 20n, partitionId: 1 }]
@@ -147,4 +153,15 @@ void test("given_two_folds_in_one_conversation_when_saved_then_should_keep_both_
   assert.equal(new TextDecoder().decode((await planner.latest(mine))?.state), "planned")
   assert.equal(new TextDecoder().decode((await worker.latest(mine))?.state), "worked")
   assert.equal(values.size, 2)
+})
+
+void test("given_window_replies_cut_short_by_the_byte_cap_when_the_latest_is_read_then_should_read_the_whole_window", async () => {
+  const { store, reads } = storeOver(
+    topicOf(600, new Map([[500n, "late in the window"]])),
+    "orbit",
+    50
+  )
+  const latest = await store.latest(mine)
+  assert.equal(new TextDecoder().decode(latest?.state), "late in the window")
+  assert.deepEqual(reads.slice(0, 2), ["last", 344n], "the tail window is read first")
 })

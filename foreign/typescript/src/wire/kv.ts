@@ -21,6 +21,7 @@ import {
   MAX_VALUE_BYTES,
   MIN_LEASE_TTL_MICROS
 } from "./limits.js"
+import { hasControlCharacter } from "./validate.js"
 import {
   decodeMutationPosition,
   encodeMutationPosition,
@@ -302,6 +303,8 @@ function validateHolderId(holderId: string): void {
       `lease holder id is ${String(bytes.byteLength)}B, exceeds cap ${String(MAX_HOLDER_ID_BYTES)}B`
     )
   }
+  if (hasControlCharacter(holderId))
+    throw new InvalidError("lease holder id contains a control character")
 }
 
 function validateKvCasFenced(cas: KvCasFenced): void {

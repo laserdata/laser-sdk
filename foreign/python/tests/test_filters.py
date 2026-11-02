@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import laser_sdk as ls
@@ -35,6 +36,9 @@ GROUND_STATION = json.dumps(
         "after": {"id": "svalbard", "status": "online"},
     }
 )
+
+
+POLICY = "safe-mode"
 
 
 def safe_mode_filter():
@@ -75,7 +79,7 @@ async def bound_group(laser, name, definition=None):
         pytest.skip("a consumer group filter needs a managed backend")
     await laser.topic(TOPIC).ensure(1)
     group = laser.topic(TOPIC).consumer_group(name)
-    await group.create(filter=definition or safe_mode_filter())
+    await group.create(filter=definition or safe_mode_filter(), filter_name=POLICY)
     return group
 
 
@@ -132,10 +136,14 @@ async def test_given_no_catalog_when_a_group_is_created_with_a_filter_then_shoul
     group = laser.topic(TOPIC).consumer_group("anomaly-desk")
 
     with pytest.raises(ls.UnsupportedError):
-        await group.create(filter=safe_mode_filter())
+        await group.create(filter=safe_mode_filter(), filter_name=POLICY)
     await group.create()
     with pytest.raises(ls.UnsupportedError):
-        await group.filter().configure(safe_mode_filter())
+        await group.filter().configure(POLICY, safe_mode_filter())
+    for verb in (group.filter().summary, group.filter().delete):
+        with pytest.raises(ls.UnsupportedError) as refused:
+            await verb()
+        assert (refused.value.surface, refused.value.feature) == ("filters", "catalog")
 
     plain = await group.create()
     assert plain.name == "anomaly-desk"
@@ -147,15 +155,190 @@ async def test_given_no_catalog_when_a_group_is_created_with_a_filter_then_shoul
     assert (await by_id.info()).name == "anomaly-desk"
 
 
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"filter": "definition"},
+        {"filter_name": POLICY},
+        {"filter_name": POLICY, "filter_id": 1, "revision": 1},
+        {"filter": "definition", "filter_name": POLICY, "filter_id": 1, "revision": 1},
+        {"filter_id": 1},
+    ],
+)
+async def test_given_an_incomplete_policy_when_configuring_a_group_then_should_refuse_it_locally(
+    laser, policy
+):
+    group = laser.topic(TOPIC).consumer_group("incomplete-policy")
+    options = {
+        name: safe_mode_filter() if value == "definition" else value
+        for name, value in policy.items()
+    }
+
+    for configure in (
+        group.create,
+        group.filter().configure_with,
+        lambda **options: group.filter().configure_as(None, **options),
+    ):
+        with pytest.raises(ls.InvalidError) as refused:
+            await configure(**options)
+        assert "filter_name" in str(refused.value) or "filter_id" in str(refused.value)
+    with pytest.raises(ls.InvalidError):
+        await group.filter().configure_with()
+
+
+@pytest.mark.parametrize(
+    "name", ["", "safe mode", "desk/safe", "x" * (ls.MAX_FILTER_NAME_BYTES + 1)]
+)
+async def test_given_an_invalid_policy_name_when_a_group_is_configured_then_should_refuse_it(
+    laser, name
+):
+    await laser.topic(TOPIC).ensure(1)
+    group = laser.topic(TOPIC).consumer_group("invalid-policy-name")
+
+    with pytest.raises(ls.InvalidError) as refused:
+        await group.create(filter=safe_mode_filter(), filter_name=name)
+    assert "filter name" in str(refused.value)
+    info = await group.create()
+    for configure in (
+        lambda: group.filter().configure(name, safe_mode_filter()),
+        lambda: group.filter().configure_with(filter=safe_mode_filter(), filter_name=name),
+        lambda: group.filter().configure_as(7, filter=safe_mode_filter(), filter_name=name),
+    ):
+        with pytest.raises(ls.InvalidError) as refused:
+            await configure()
+        assert "filter name" in str(refused.value)
+    assert (await group.info()).identity == info.identity
+    assert info.filter is None
+
+
+async def test_given_the_longest_policy_name_when_a_group_is_created_then_should_accept_it(laser):
+    name = "a" * ls.MAX_FILTER_NAME_BYTES
+    group = await bound_group(laser, "longest-policy-name")
+    await group.filter().delete()
+
+    binding = await group.filter().configure(name, safe_mode_filter())
+
+    assert binding["digest"] == safe_mode_filter().digest
+    assert (await group.filter().summary())["name"] == name
+    assert await group.filter().delete() is True
+
+
+async def test_given_a_named_policy_when_summarized_then_should_report_the_name_and_owner(laser):
+    group = await bound_group(laser, "named-desk")
+    info = await group.info()
+
+    summary = await group.filter().summary()
+
+    assert summary["name"] == POLICY
+    assert summary["id"] == info.filter["filter_id"]
+    assert summary["latest_digest"] == safe_mode_filter().digest
+    assert summary["owner"] == {
+        "identity": info.identity,
+        "group": {"stream": laser.default_stream, "topic": TOPIC, "group": "named-desk"},
+    }
+    assert not any(part.startswith("group:") for part in summary["name"].split("/"))
+    renamed = await group.filter().configure("safe-mode-v2", safe_mode_filter())
+    kept = ("filter_id", "revision", "digest", "policy_generation")
+    assert [renamed[key] for key in kept] == [info.filter[key] for key in kept]
+    assert (await group.filter().summary())["name"] == "safe-mode-v2"
+    assert await group.filter().delete() is True
+    assert await group.filter().summary() is None
+
+
+async def test_given_a_revision_policy_when_a_group_is_created_then_should_need_no_name(laser):
+    group = await bound_group(laser, "revision-desk")
+    binding = await group.filter().get()
+    await group.filter().release()
+
+    restored = await group.filter().configure_with(
+        filter_id=binding["filter_id"], revision=binding["revision"]
+    )
+
+    assert restored["digest"] == binding["digest"]
+    assert (await group.filter().summary())["name"] == POLICY
+    assert await group.filter().delete() is True
+
+
+async def test_given_a_server_when_asked_for_its_filtered_wait_then_should_report_the_announcement(
+    laser,
+):
+    filters = (await laser.capabilities()).filters
+    announced = 0 if filters.evaluation is None else filters.evaluation.max_wait_ms
+    assert filters.max_wait_ms == announced
+
+
+async def held_wait_reader(laser, name):
+    filters = (await laser.capabilities()).filters
+    if not (filters.group_policy_reads and filters.max_wait_ms):
+        pytest.skip("the server holds no filtered wait")
+    await publish(laser, [SAFE_MODE])
+    group = laser.topic(TOPIC).consumer_group(name)
+    await group.create()
+    filtered = await group.reader(start="first", idle_interval_ms=60_000, max_wait_ms=30_000)
+    # The first rounds run before the group assignment arrives and would sleep
+    # the idle interval, so they are driven here without it.
+    async with asyncio.timeout(READ_TIMEOUT):
+        while (first := await filtered.try_next_page()) is None:
+            await asyncio.sleep(0.02)
+    await filtered.ack_page(first)
+    return filtered
+
+
+async def test_given_an_idle_reader_when_a_record_lands_then_should_deliver_it_from_the_held_wait(
+    laser,
+):
+    filtered = await held_wait_reader(laser, "held-wait-desk")
+    try:
+        pending = asyncio.ensure_future(filtered.next_record())
+        await asyncio.sleep(0.5)
+        assert not pending.done(), "nothing new was published yet"
+        started = time.monotonic()
+        await publish(laser, [DECOMMISSION])
+        record = await asyncio.wait_for(pending, READ_TIMEOUT)
+        assert (record.offset, record.message.payload) == (1, DECOMMISSION.encode())
+        assert time.monotonic() - started < READ_TIMEOUT, "the wait answered, not the idle interval"
+        await filtered.ack(record)
+    finally:
+        await filtered.close()
+
+
+async def test_given_a_caller_driven_reader_when_it_waits_for_records_then_should_wake_on_arrival(
+    laser,
+):
+    filtered = await held_wait_reader(laser, "held-wait-loop")
+    try:
+        assert await filtered.try_next_page() is None
+        waiting = asyncio.ensure_future(filtered.wait_for_records())
+        await asyncio.sleep(0.5)
+        assert not waiting.done(), "nothing new was published yet"
+        await publish(laser, [DECOMMISSION])
+        await asyncio.wait_for(waiting, READ_TIMEOUT)
+        page = await filtered.try_next_page()
+        assert page is not None
+        assert offsets(page) == [1]
+        await filtered.ack_page(page)
+    finally:
+        await filtered.close()
+
+
+async def test_given_a_reader_in_a_held_wait_when_closed_then_should_not_wait_for_the_server(laser):
+    filtered = await held_wait_reader(laser, "held-wait-close")
+    pending = asyncio.ensure_future(filtered.next_record())
+    await asyncio.sleep(0.5)
+    started = time.monotonic()
+    await asyncio.wait_for(filtered.close(), 5)
+    assert time.monotonic() - started < 5
+    pending.cancel()
+    await asyncio.gather(pending, return_exceptions=True)
+
+
 @pytest.mark.parametrize("allow_replay", [False, True])
 async def test_given_an_unbound_group_when_consumed_then_should_deliver_every_record(
     laser, allow_replay
 ):
     await publish(laser, [SAFE_MODE, GROUND_STATION, DECOMMISSION])
     group = laser.topic(TOPIC).consumer_group("plain-desk")
-    consumer = group.consumer(
-        polling="first", auto_commit="disabled", poll_interval_ms=5, allow_replay=allow_replay
-    )
+    consumer = group.consumer(polling="first", auto_commit="disabled", allow_replay=allow_replay)
     try:
         delivered = []
         for _ in range(3):
@@ -328,7 +511,7 @@ async def test_given_cancelled_polling_delivery_when_shutdown_then_should_follow
 async def test_given_a_group_with_a_filter_when_consumed_then_should_deliver_only_matches(laser):
     group = await bound_group(laser, "anomaly-desk")
     await publish(laser, [SAFE_MODE, GROUND_STATION, DECOMMISSION])
-    consumer = group.consumer(polling="first", auto_commit="disabled", poll_interval_ms=5)
+    consumer = group.consumer(polling="first", auto_commit="disabled")
     try:
         delivered = []
         for _ in range(2):
@@ -342,7 +525,9 @@ async def test_given_a_group_with_a_filter_when_consumed_then_should_deliver_onl
     assert binding["digest"] == safe_mode_filter().digest
     assert binding["policy_generation"] == 1
     with pytest.raises(ls.FilterError) as conflict:
-        await group.filter().configure(ls.ConsumerFilter.json(ls.FilterExpr.present("kind")))
+        await group.filter().configure(
+            POLICY, ls.ConsumerFilter.json(ls.FilterExpr.present("kind"))
+        )
     assert conflict.value.reason == "conflict"
     released = await group.filter().release()
     assert released["digest"] == binding["digest"]
@@ -355,7 +540,7 @@ async def test_given_a_group_filter_when_deleted_then_should_release_the_group_a
     assert await group.filter().delete() is True
     assert await group.filter().get() is None
     assert await group.filter().delete() is False, "nothing left to delete"
-    again = await group.filter().configure(safe_mode_filter())
+    again = await group.filter().configure(POLICY, safe_mode_filter())
     assert again["filter_id"] != before["filter_id"], "the id is not reused"
     assert again["digest"] == before["digest"]
     assert await group.filter().delete() is True
@@ -376,9 +561,9 @@ async def test_given_group_9_and_groups_90_to_97_when_deleted_then_should_find_t
         info = await candidate.create()
         if info.id == 9:
             group = candidate
-            before = await group.filter().configure(safe_mode_filter())
+            before = await group.filter().configure(POLICY, safe_mode_filter())
         elif 90 <= info.id <= 97:
-            binding = await candidate.filter().configure(safe_mode_filter())
+            binding = await candidate.filter().configure(POLICY, safe_mode_filter())
             collisions.append((candidate, binding))
         if info.id == 97:
             break
@@ -388,7 +573,7 @@ async def test_given_group_9_and_groups_90_to_97_when_deleted_then_should_find_t
     assert await group.filter().delete() is True
     assert await group.filter().get() is None
     assert await group.filter().delete() is False
-    again = await group.filter().configure(safe_mode_filter())
+    again = await group.filter().configure(POLICY, safe_mode_filter())
     assert again["filter_id"] != before["filter_id"]
     assert again["digest"] == before["digest"]
     assert await group.filter().delete() is True
@@ -773,7 +958,7 @@ async def test_given_a_binary_group_filter_when_configured_then_should_preview_g
         payload = bytes.fromhex(case["payload_hex"])
         filter = ls.ConsumerFilter.from_dict(definition)
         await laser.topic(TOPIC).producer(partition=0, partitions=1).send(payload, headers=headers)
-        created = await group.create(filter=filter)
+        created = await group.create(filter=filter, filter_name=f"safe-mode-{codec}")
         binding = created.filter
         assert binding["revision"] == 1
         sample = await group.filter().test(payload, headers=headers)

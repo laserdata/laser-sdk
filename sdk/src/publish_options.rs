@@ -86,14 +86,22 @@ impl PublishOptions {
         let mut needs_recovery = false;
         let mut attempt = 0;
         loop {
-            let result = tokio::time::timeout(self.timeout, async {
-                if needs_recovery {
-                    recover().await?;
-                }
-                send().await
-            })
-            .await
-            .unwrap_or(Err(LaserError::Timeout("Iggy publish response")));
+            // One deadline covers the recovery and the send. Two awaits instead
+            // of one async block keep each publish future one layer shallower.
+            let deadline = tokio::time::Instant::now() + self.timeout;
+            let recovered = if needs_recovery {
+                tokio::time::timeout_at(deadline, recover())
+                    .await
+                    .unwrap_or(Err(LaserError::Timeout("Iggy publish response")))
+            } else {
+                Ok(())
+            };
+            let result = match recovered {
+                Ok(()) => tokio::time::timeout_at(deadline, send())
+                    .await
+                    .unwrap_or(Err(LaserError::Timeout("Iggy publish response"))),
+                Err(error) => Err(error),
+            };
             match result {
                 Ok(value) => return Ok(value),
                 Err(error) => {

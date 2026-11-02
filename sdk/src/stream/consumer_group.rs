@@ -5,18 +5,14 @@ use crate::laser::Laser;
 use crate::stream::Topic;
 use crate::stream::transport::ConsumerBuilder;
 use iggy::prelude::{ConsumerGroupClient, ConsumerGroupDetails, Identifier, IggyError};
-use laser_wire::authz::scoped_resource;
 use laser_wire::filter::{
     CatalogPosition, ConsumerFilter, FilterBinding, FilterConsumer, FilterError, FilterErrorReason,
     FilterGroupIdentity, FilterGroupRef, FilterHeader, FilterMutation, FilterRef,
-    FilterRevisionPage, FilterRevisionRef, FilterSource, FilterTestResult, GroupFilterSpec,
+    FilterRevisionPage, FilterRevisionRef, FilterSource, FilterSummary, FilterTestResult,
+    GroupFilterSpec,
 };
 use laser_wire::validate::Validate;
 use std::sync::{Arc, Mutex};
-
-// Filters whose name contains a group's own filter name: the name is unique,
-// so the first page holds it when it exists.
-const GROUP_FILTER_LOOKUP_PAGE: u32 = 8;
 
 /// A consumer group by name or by its native numeric id.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -290,10 +286,14 @@ pub struct CreateConsumerGroup {
 
 impl CreateConsumerGroup {
     /// Configure the group with `filter` once it exists. The definition is
-    /// saved as the group's own filter.
+    /// saved as the group's own filter under `name`, which follows the
+    /// registered filter name rule and need not be unique.
     #[must_use]
-    pub fn filter(mut self, filter: ConsumerFilter) -> Self {
-        self.policy = Some(GroupFilterSpec::Definition(filter));
+    pub fn filter(mut self, name: impl Into<String>, filter: ConsumerFilter) -> Self {
+        self.policy = Some(GroupFilterSpec::Definition {
+            name: name.into(),
+            filter,
+        });
         self
     }
 
@@ -374,13 +374,25 @@ pub struct GroupFilter {
 
 impl GroupFilter {
     /// Give the group `filter` as its policy. The definition is saved as the
-    /// group's own filter and the group is bound to it in one catalog
-    /// transaction. The same digest again keeps the binding. Another digest
-    /// on a group that runs a policy is a typed conflict: create a new group
-    /// for another policy.
-    pub async fn configure(&self, filter: ConsumerFilter) -> Result<FilterBinding, LaserError> {
-        self.configure_as(None, GroupFilterSpec::Definition(filter))
-            .await
+    /// group's own filter under `name` and the group is bound to it in one
+    /// catalog transaction. The name follows the registered filter name rule
+    /// and need not be unique. The same digest again keeps the binding and
+    /// renames the own filter when `name` differs. Another digest on a group
+    /// that runs a policy is a typed conflict: create a new group for another
+    /// policy.
+    pub async fn configure(
+        &self,
+        name: impl Into<String>,
+        filter: ConsumerFilter,
+    ) -> Result<FilterBinding, LaserError> {
+        self.configure_as(
+            None,
+            GroupFilterSpec::Definition {
+                name: name.into(),
+                filter,
+            },
+        )
+        .await
     }
 
     /// [`configure`](Self::configure) with a definition or one of the group's
@@ -494,48 +506,27 @@ impl GroupFilter {
             .await
     }
 
+    /// The group's own filter as a catalog row, bound or released: the
+    /// caller's name, state, latest revision and the owning group. `None`
+    /// when the group has no filter of its own.
+    pub async fn summary(&self) -> Result<Option<FilterSummary>, LaserError> {
+        self.group.laser().filters().catalog_capabilities().await?;
+        let details = self.group.native().await?;
+        let identity = self.group.identity_of(details.id).await?;
+        self.group.laser().filters().owned(identity).await
+    }
+
     /// Delete the group's own filter with every revision. A bound group is
     /// released first, so its consumers receive every record from their next
     /// poll. Nothing of the filter stays in the catalog. `Ok(false)` when the
     /// group has no filter of its own.
     pub async fn delete(&self) -> Result<bool, LaserError> {
-        self.group.laser().filters().catalog_capabilities().await?;
-        let details = self.group.native().await?;
-        let identity = self.group.identity_of(details.id).await?;
-        let name = group_filter_name(&identity);
-        let scoped_name = scoped_resource(&self.group.source()?.stream, &name);
-        let filters = self.group.laser().filters();
-        let mut before_id = None;
-        loop {
-            let page = filters
-                .list_before(&name, before_id, GROUP_FILTER_LOOKUP_PAGE)
-                .await?;
-            let next = page.items.last().map(|summary| summary.id);
-            let count = page.items.len();
-            if let Some(own) = page
-                .items
-                .into_iter()
-                .find(|summary| summary.name == name || summary.name == scoped_name)
-            {
-                let position = filters.drop_filter(own.id).await?;
-                self.group.remember_position(position);
-                return Ok(true);
-            }
-            let Some(next) = next else {
-                return Ok(false);
-            };
-            if before_id.is_some_and(|before| next >= before) {
-                return Err(FilterError::new(
-                    FilterErrorReason::CatalogUnavailable,
-                    "the catalog lookup cursor did not advance",
-                )
-                .into());
-            }
-            if count as u64 >= u64::from(page.total) {
-                return Ok(false);
-            }
-            before_id = Some(next);
-        }
+        let Some(own) = self.summary().await? else {
+            return Ok(false);
+        };
+        let position = self.group.laser().filters().drop_filter(own.id).await?;
+        self.group.remember_position(position);
+        Ok(true)
     }
 
     /// Release the group's policy. Its readers then receive every record. A
@@ -595,18 +586,4 @@ impl GroupFilter {
             .into()
         })
     }
-}
-
-// The catalog names a group's own filter by the ids of the group incarnation
-// it was configured for. A catalog that scopes names to streams prefixes it
-// with the group's stream.
-fn group_filter_name(identity: &FilterGroupIdentity) -> String {
-    format!(
-        "group:{}:{}:{}:{}:{}",
-        identity.stream_id,
-        identity.stream_created_at_micros,
-        identity.topic_id,
-        identity.topic_created_at_micros,
-        identity.group_id
-    )
 }

@@ -35,7 +35,7 @@ export interface ContextMessage {
   readonly envelope?: AgentEnvelope
   /** The name of the topic the message was read from. */
   readonly topic: string
-  /** The broker's append time in microseconds. */
+  /** The streaming server's append time in microseconds. */
   readonly timestampMicros: bigint
   /** The numeric id of the stream the message was read from. */
   readonly streamId: number

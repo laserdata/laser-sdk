@@ -111,6 +111,7 @@ streaming = [
     "dep:serde_json",
     "dep:tokio",
     "dep:tracing",
+    "dep:trait-variant",
     "laser-wire/codecs",
 ]
 # The materialized-view change feed: `Laser::watch()` over the `ChangeRecord`s
@@ -148,6 +149,7 @@ apache-avro = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 iggy = { workspace = true }
+laser-test-support = { workspace = true }
 laser-wire = { workspace = true, features = ["builders", "cbor", "fixtures"] }
 libc = "0.2"
 prost = { workspace = true }

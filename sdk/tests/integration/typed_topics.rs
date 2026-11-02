@@ -13,7 +13,7 @@ async fn given_typed_publishes_when_read_back_then_should_yield_values_and_skip_
     let laser = harness::laser().await;
     laser
         .topic("samples")
-        .ensure(1)
+        .ensure(1, None)
         .await
         .expect("topic exists");
     let samples = laser.topic("samples").json::<Sample>();
@@ -92,7 +92,11 @@ async fn given_typed_publishes_when_read_back_then_should_yield_values_and_skip_
 #[serial_test::serial(integration)]
 async fn given_the_cbor_form_when_round_tripped_then_should_decode_with_positions() {
     let laser = harness::laser().await;
-    laser.topic("ticks").ensure(1).await.expect("topic exists");
+    laser
+        .topic("ticks")
+        .ensure(1, None)
+        .await
+        .expect("topic exists");
     let ticks = laser.topic("ticks").cbor::<Sample>();
     ticks
         .publish(&Sample {

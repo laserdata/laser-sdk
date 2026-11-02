@@ -17,7 +17,7 @@ async fn given_a_multi_topic_snapshot_when_resumed_then_should_read_each_topic_a
         .expect("agent topics exist");
     laser
         .topic("agent.snapshots")
-        .ensure(1)
+        .ensure(1, None)
         .await
         .expect("snapshot topic exists");
     let conversation = ConversationId::new();

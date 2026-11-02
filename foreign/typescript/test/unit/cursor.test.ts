@@ -3,7 +3,7 @@ import { test } from "node:test"
 import { CancelledError, InvalidError } from "../../src/client/errors.js"
 import type { LaserTransport, PolledMessage } from "../../src/iggy/apache-iggy.js"
 import { Json } from "../../src/stream/codecs.js"
-import { Cursor } from "../../src/stream/cursor.js"
+import { Cursor, heldRead, readThrough } from "../../src/stream/cursor.js"
 import { TypedRecords } from "../../src/stream/typed-topic.js"
 
 void test("given_later_partition_failure_when_polling_then_should_preserve_all_offsets", async () => {
@@ -58,7 +58,7 @@ void test("given_large_batches_when_polling_then_should_bound_reads_and_resume_w
       const offset = Number(strategy.value)
       return Promise.resolve(
         Array.from({ length: Math.min(count, 10_001 - offset) }, (_, index) =>
-          message(0, BigInt(offset + index))
+          message(0, BigInt(offset + index), 10_000n)
         )
       )
     }
@@ -171,7 +171,7 @@ void test("given_the_default_batch_when_a_partition_holds_more_than_one_request_
       const offset = Number(strategy.value)
       return Promise.resolve(
         Array.from({ length: Math.max(0, Math.min(count, 2_500 - offset)) }, (_, index) =>
-          message(0, BigInt(offset + index))
+          message(0, BigInt(offset + index), 2_499n)
         )
       )
     }
@@ -297,8 +297,15 @@ void test("given_records_buffered_by_next_when_polling_then_should_return_them_b
   assert.equal(polls, 1)
 })
 
-function message(partitionId: number, offset: bigint): PolledMessage {
-  return { partitionId, offset, payload: new Uint8Array([1]), headers: new Map() }
+// A polled record with the partition head the server reports beside it.
+function message(partitionId: number, offset: bigint, head = offset): PolledMessage {
+  return {
+    partitionId,
+    offset,
+    payload: new Uint8Array([1]),
+    headers: new Map(),
+    currentOffset: head
+  }
 }
 
 function stamped(partitionId: number, offset: bigint, timestampMicros: bigint): PolledMessage {
@@ -308,3 +315,102 @@ function stamped(partitionId: number, offset: bigint, timestampMicros: bigint): 
 function json(offset: bigint, value: unknown): PolledMessage {
   return { ...message(0, offset), payload: new TextEncoder().encode(JSON.stringify(value)) }
 }
+
+void test("given_replies_cut_short_by_the_byte_cap_when_draining_then_should_read_on_to_the_partition_head", async () => {
+  const counts: number[] = []
+  const transport = {
+    pollMessages(_stream, _topic, _target, strategy, count) {
+      assert.equal(strategy.kind, "offset")
+      counts.push(count)
+      const offset = Number(strategy.value)
+      // Two records fit under the reply byte cap, whatever the batch asks.
+      return Promise.resolve(
+        Array.from({ length: Math.max(0, Math.min(2, 5 - offset)) }, (_, index) =>
+          message(0, BigInt(offset + index), 4n)
+        )
+      )
+    }
+  } satisfies Pick<LaserTransport, "pollMessages">
+  const cursor = Cursor.create(transport as unknown as LaserTransport, "test", "events", [0])
+  assert.equal((await cursor.poll()).length, 5, "a short reply is not the end of the partition")
+  assert.equal(counts.length, 3, "the read stops once it passed the head the replies reported")
+  assert.deepEqual(cursor.offsets, new Map([[0, 5n]]))
+})
+
+void test("given_a_range_read_cut_short_by_the_byte_cap_when_read_through_an_offset_then_should_return_the_whole_range", async () => {
+  const counts: number[] = []
+  const transport = {
+    pollMessages(_stream, _topic, _target, strategy, count) {
+      assert.equal(strategy.kind, "offset")
+      counts.push(count)
+      const offset = Number(strategy.value)
+      return Promise.resolve(
+        Array.from({ length: Math.max(0, Math.min(3, 20 - offset)) }, (_, index) =>
+          message(0, BigInt(offset + index), 19n)
+        )
+      )
+    }
+  } satisfies Pick<LaserTransport, "pollMessages">
+  const read = await readThrough(
+    transport as unknown as LaserTransport,
+    "test",
+    "events",
+    { kind: "single", partitionId: 0 },
+    2n,
+    9n
+  )
+  assert.deepEqual(
+    read.map((record) => record.offset),
+    [2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n]
+  )
+  assert.deepEqual(counts, [8, 5, 2], "each read asks only for what is left of the range")
+})
+
+void test("given_partitions_grouped_by_primary_when_holding_reads_then_should_hold_one_fetch_per_primary_and_no_read_per_partition", async () => {
+  const fetches: number[][] = []
+  const transport = {
+    pollMessages() {
+      return Promise.reject(new Error("a held read goes through the fetch of its primary"))
+    },
+    primaryGroups(_stream, _topic, partitions) {
+      return Promise.resolve([
+        partitions.filter((partition) => partition % 2 === 0),
+        partitions.filter((partition) => partition % 2 === 1)
+      ])
+    },
+    fetchHeld(_stream, _topic, offsets, _count, wait, signal) {
+      fetches.push([...offsets.keys()])
+      assert.equal(wait.maxWaitMs, 5_000)
+      if (offsets.has(69))
+        return Promise.resolve([{ partitionId: 69, messages: [message(69, 3n)] }])
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            reject(new CancelledError("the losing fetch is cancelled"))
+          },
+          { once: true }
+        )
+      })
+    }
+  } satisfies Pick<LaserTransport, "pollMessages" | "primaryGroups" | "fetchHeld">
+  const offsets = new Map(Array.from({ length: 70 }, (_, partition) => [partition, 3n] as const))
+  const held = await heldRead(
+    transport as unknown as LaserTransport,
+    "test",
+    "replies",
+    offsets,
+    200,
+    {
+      maxWaitMs: 5_000,
+      minCount: 1,
+      maxBytes: 1_048_576
+    }
+  )
+  assert.deepEqual(held, { partitionId: 69, messages: [message(69, 3n)] })
+  assert.equal(fetches.length, 2, "one fetch per primary, however many partitions")
+  assert.deepEqual(
+    fetches.flat().sort((left, right) => left - right),
+    [...offsets.keys()]
+  )
+})

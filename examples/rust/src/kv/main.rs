@@ -125,7 +125,7 @@ async fn main() -> Result<(), LaserError> {
         if capabilities.forks {
             phase("fork: a branch of the same state, promoted or thrown away");
             let table = index_for(NAMESPACE);
-            laser.topic(NAMESPACE).ensure(PARTITIONS).await?;
+            laser.topic(NAMESPACE).ensure(PARTITIONS, None).await?;
             ensure_view(&laser, NAMESPACE, &table, ContentType::Json, &["log_level"]).await?;
             let fork = laser.fork(FORK);
             fork.squash().await?;

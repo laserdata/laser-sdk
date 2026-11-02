@@ -20,6 +20,7 @@ mod router;
 mod scope;
 mod session;
 mod session_reads;
+pub use laser_wire::limits::{MAX_SESSION_CURSOR_BYTES, MAX_SESSION_TEXT_QUERY_BYTES};
 pub use session_reads::{SessionChange, SessionEventsRequest, SessionListRequest, SessionWatch};
 pub(crate) mod session_ops;
 pub use session_ops::{

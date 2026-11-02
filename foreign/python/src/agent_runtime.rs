@@ -534,6 +534,8 @@ impl PyLaser {
     /// keys. `max_partitions` runs one ordered worker lane per partition up
     /// to that many concurrent lanes (omit for strict serial). `shutdown_grace_ms`
     /// bounds how long a graceful stop waits for the in-flight message.
+    /// `max_wait_ms` is how long the server holds a read that finds nothing
+    /// new before it answers, default 5000. A record ends the wait at once.
     /// The dead-letter hook receives the complete capsule dictionary and a typed SDK exception when publication fails.
     /// `middleware` has optional `before_handle(message)` and `after_handle(message, result, attempt)` hooks.
     /// The result dictionary contains `ok` and `error`.
@@ -549,7 +551,7 @@ impl PyLaser {
     /// `agent_id=None` opens an unscoped reliable consumer and requires `consumer_group`. It cannot advertise capabilities.
     /// `operations` lists the command operations the handler serves. Omit it to serve every operation.
     /// `sessions` is a `Sessions` factory whose config the runtime applies: the lens `ctx.session()` opens and whether a dead letter fails its session.
-    #[pyo3(signature = (agent_id, listen_on, handler, *, consumer_group=None, respond_on=None, fixed_inbox=None, poll_interval_ms=None, warm_dedup=false, dedup=None, dedup_window=None, consolidate_every_ms=None, consolidator=None, capabilities=None, ack_on_pickup=false, health=None, max_partitions=None, max_queued_records=None, max_queued_bytes=None, understood_features=0, shutdown_grace_ms=None, dead_letter=None, middleware=None, retry_max_attempts=None, retry_base_delay_ms=None, governor=None, governor_mode="enforce", governor_retention=None, signing_key=None, verifier=None, operations=None, sessions=None))]
+    #[pyo3(signature = (agent_id, listen_on, handler, *, consumer_group=None, respond_on=None, fixed_inbox=None, max_wait_ms=None, warm_dedup=false, dedup=None, dedup_window=None, consolidate_every_ms=None, consolidator=None, capabilities=None, ack_on_pickup=false, health=None, max_partitions=None, max_queued_records=None, max_queued_bytes=None, understood_features=0, shutdown_grace_ms=None, dead_letter=None, middleware=None, retry_max_attempts=None, retry_base_delay_ms=None, governor=None, governor_mode="enforce", governor_retention=None, signing_key=None, verifier=None, operations=None, sessions=None))]
     #[allow(clippy::too_many_arguments)]
     fn spawn_agent(
         &self,
@@ -560,7 +562,7 @@ impl PyLaser {
         consumer_group: Option<String>,
         respond_on: Option<String>,
         fixed_inbox: Option<String>,
-        poll_interval_ms: Option<u64>,
+        max_wait_ms: Option<u64>,
         warm_dedup: bool,
         dedup: Option<&Bound<'_, PyAny>>,
         dedup_window: Option<usize>,
@@ -624,7 +626,8 @@ impl PyLaser {
                 .map(laser_sdk::types::ConsumerGroupName::for_agent)
                 .ok_or_else(|| {
                     InvalidError::new_err("an unscoped reliable consumer requires consumer_group")
-                })?,
+                })?
+                .map_err(|error| to_pyerr(error.into()))?,
         };
         let signing_key = signing_key.map(|key| key.inner.clone());
         let py_handler = PyHandler {
@@ -679,7 +682,7 @@ impl PyLaser {
             )),
         };
         let respond_topic = respond_on.map(static_topic).transpose()?;
-        let poll = poll_interval_ms.map(Duration::from_millis);
+        let max_wait = max_wait_ms.map(Duration::from_millis);
         let shutdown_grace = shutdown_grace_ms.map(Duration::from_millis);
         let verifier = verifier.map(PyKeyRegistry::snapshot);
         // Skills the agent advertises: a capability card published on start, the
@@ -768,7 +771,7 @@ impl PyLaser {
                 .maybe_agent(agent)
                 .topic(listen_on)
                 .maybe_respond_on(respond_topic)
-                .maybe_poll_interval(poll)
+                .maybe_max_wait(max_wait)
                 .maybe_shutdown_grace(shutdown_grace)
                 .concurrency(concurrency)
                 .maybe_max_queued_records(max_queued_records)

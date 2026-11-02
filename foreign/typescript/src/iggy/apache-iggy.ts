@@ -3,6 +3,10 @@ import { JOIN_GROUP } from "apache-iggy/dist/wire/consumer-group/join-group.comm
 import { SYNC_GROUP } from "apache-iggy/dist/wire/consumer-group/sync-group.command.js"
 import { GET_STREAM } from "apache-iggy/dist/wire/stream/get-stream.command.js"
 import { GET_TOPIC } from "apache-iggy/dist/wire/topic/get-topic.command.js"
+import {
+  FETCH_MESSAGES,
+  fetchSectionError
+} from "apache-iggy/dist/wire/message/fetch-messages.command.js"
 import { connectOptions } from "../client/connect-options.js"
 import {
   publishOptions,
@@ -13,11 +17,17 @@ import {
 import {
   Consumer,
   DeserializeError,
+  FetchProgressUncertainError,
   HeaderKeyFactory,
   HeaderValue as IggyHeaderValueFactory,
+  LaneBlockedError,
+  NotConnectedError,
+  OperationNotRetainedError,
+  OperationUncertainError,
   Partitioning,
   PollingStrategy as IggyPollingStrategy,
   SimpleClient,
+  VsrResponseTimeoutError,
   getRawClient
 } from "apache-iggy"
 import type {
@@ -25,14 +35,17 @@ import type {
   ClientCredentials,
   PartitionContext,
   RawClient,
+  SendCommandOptions,
   SendMessagesConfirmation,
   SendMessagesResponse
 } from "apache-iggy"
 import { readFileSync } from "node:fs"
 import { Socket, isIP } from "node:net"
+import { setTimeout as sleep } from "node:timers/promises"
 import { TLSSocket } from "node:tls"
 import {
   AmbiguousMutationError,
+  CancelledError,
   ConfigError,
   SessionError,
   InvalidError,
@@ -99,11 +112,17 @@ export type { SendMessagesConfirmation, SendMessagesResponse }
 
 /** Settings applied only when a topic is created. `maxTopicSize` is in bytes,
  * `UNLIMITED_TOPIC_SIZE` lifts the limit, and leaving it out keeps the server
- * default. */
+ * default. `replicationFactor` is how many nodes store each partition,
+ * 1..=`MAX_REPLICATION_FACTOR` and at most the cluster's node count, the
+ * server's default when left out. */
 export interface TopicCreateSettings {
   readonly messageExpiryMicros?: bigint
   readonly maxTopicSize?: bigint
+  readonly replicationFactor?: number
 }
+
+/** The most nodes one partition can be stored on, Apache Iggy's cap. */
+export const MAX_REPLICATION_FACTOR = 32
 
 /** The `maxTopicSize` value that lifts the topic size limit (u64 max). */
 export const UNLIMITED_TOPIC_SIZE = 18_446_744_073_709_551_615n
@@ -119,7 +138,7 @@ const UNAUTHENTICATED = 40
 // `InvalidJsonResponse` and `InvalidBytesResponse`: the batch committed and only
 // its confirmation was lost.
 const LOST_CONFIRMATION_CODES: ReadonlySet<number> = new Set([302, 303])
-const POLL_MESSAGES_CODE = 100
+const POLL_MESSAGES_DEFERRED_CODE = 106
 const PUBLISH_BATCH_LENGTH = 1_000
 const NUMERIC_IDENTIFIER = 1
 const STRING_IDENTIFIER = 2
@@ -127,6 +146,8 @@ const STRING_IDENTIFIER = 2
 // commit or admit, and a partition the node could not read or find yet.
 const TRANSIENT_SERVER_CODES: ReadonlySet<number> = new Set([57, 58, 3004, 3007, 10002])
 const DEFAULT_RECONNECT_INTERVAL_MS = 1_000
+// Apache Iggy's spelling of `reconnection_retries=unlimited`, u32::MAX.
+const UNLIMITED_RECONNECT_RETRIES = 4_294_967_295
 // The Apache Iggy TCP default port, as in Rust.
 const DEFAULT_TCP_PORT = 8090
 const ACCEPT_STAGE = "Iggy server to accept the connection"
@@ -137,6 +158,19 @@ const VSR_HEARTBEAT_INTERVAL_MS = 5_000
 export const POLLED_HEAD_BYTES = 40
 const BATCH_HEADER_BYTES = 256
 const FRAME_HEADER_BYTES = 48
+/** The smallest poll reply byte cap that can hold one record: the polled head,
+ * one batch header and one frame header, as Apache Iggy
+ * `MIN_DEFERRED_POLL_MAX_BYTES`. */
+export const MIN_DEFERRED_POLL_MAX_BYTES =
+  POLLED_HEAD_BYTES + BATCH_HEADER_BYTES + FRAME_HEADER_BYTES
+/** The longest server wait of a deferred poll, 600 s. */
+export const MAX_DEFERRED_POLL_WAIT_MS = 600_000
+/** The poll reply byte cap Apache Iggy uses by default. */
+export const DEFAULT_POLL_MAX_BYTES = 1_048_576
+// The client gives a deferred poll its wait plus this long for the final read
+// and the reply, as the Apache Iggy clients do.
+const DEFERRED_POLL_REPLY_MARGIN_MS = 10_000
+const US_PER_MS = 1_000n
 const STRING_HEADER_KIND = 2
 const CONTENT_TYPE_HEADER = "agdx.ct"
 const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true })
@@ -181,12 +215,38 @@ interface GroupCursor {
   partitions: readonly number[]
   position: number
   synchronizedAt: number
+  // Consecutive reads that found nothing, so a whole idle pass holds the next reads.
+  idle: number
 }
 interface GroupPollState {
   readonly cursors: Map<string, GroupCursor>
   sessionGeneration: number
 }
 const GROUP_POLL_STATES = new WeakMap<RawClient, GroupPollState>()
+
+/**
+ * How the server holds a poll: up to `maxWaitMs` for `minCount` new records,
+ * answering with at most `maxBytes` of records. A record larger than the cap
+ * comes alone.
+ */
+export interface PollWait {
+  readonly maxWaitMs: number
+  readonly minCount: number
+  readonly maxBytes: number
+}
+
+/** The records one partition of a held fetch answered with. */
+export interface HeldPartition {
+  readonly partitionId: number
+  readonly messages: readonly PolledMessage[]
+}
+
+/** A read that answers at once, under the default reply byte cap. */
+export const ONE_SHOT_POLL: PollWait = Object.freeze({
+  maxWaitMs: 0,
+  minCount: 1,
+  maxBytes: DEFAULT_POLL_MAX_BYTES
+})
 
 export type ConsumerTarget =
   | { readonly kind: "single"; readonly partitionId: number; readonly name?: string }
@@ -215,6 +275,9 @@ export interface ManagedSendOptions {
   readonly retryAfterReconnect?: boolean
   /** The node the request goes to, when not the one its code picks. */
   readonly target?: ManagedTarget
+  /** When the call gives up, as an epoch time in milliseconds, for a request
+   * the server may hold. Defaults to the client's 30 second call bound. */
+  readonly deadline?: number
   /** Overrides the mutation deadline, for tests.
    * @internal */
   readonly mutationDeadlineMs?: number
@@ -256,13 +319,19 @@ export interface LaserTransport {
   seenPositions?(): AppliedFrontier
   ensureStream(name: string): Promise<void>
   deleteStream(name: string): Promise<boolean>
-  ensureTopic(streamId: string, topicId: string, partitions: number): Promise<void>
+  ensureTopic(
+    streamId: string,
+    topicId: string,
+    partitions: number,
+    replicationFactor?: number
+  ): Promise<void>
   ensureConsumerGroup(streamId: string, topicId: string, name: string): Promise<void>
   ensureTopicWithExpiry?(
     streamId: string,
     topicId: string,
     partitions: number,
-    messageExpiryMicros: bigint
+    messageExpiryMicros: bigint,
+    replicationFactor?: number
   ): Promise<void>
   /** Creates the topic with these settings when it is absent. An existing
    * topic is left as it is, like Rust `create_topic_if_not_exists`. */
@@ -327,14 +396,44 @@ export interface LaserTransport {
       }>
     }
   ): Promise<SendMessagesResponse>
+  /**
+   * One poll, held on the server as `wait` says. A one-shot read when absent.
+   * A group poll without a partition reads the member's partitions in turn
+   * and holds a read only after a whole pass found nothing, each for at most
+   * `wait.maxWaitMs / partitions`.
+   */
   pollMessages(
     streamId: string,
     topicId: string,
     target: ConsumerTarget,
     strategy: ConsumerStart,
     count: number,
-    autoCommit: boolean
+    autoCommit: boolean,
+    wait?: PollWait,
+    signal?: AbortSignal
   ): Promise<readonly PolledMessage[]>
+  /** The partitions grouped by their primary, each group small enough for
+   * one fetch. `undefined` when the client cannot route a fetch. */
+  primaryGroups?(
+    streamId: string,
+    topicId: string,
+    partitions: readonly number[]
+  ): Promise<readonly (readonly number[])[] | undefined>
+  /**
+   * One read the server holds on partitions that share a primary, answered
+   * once any of them has a record at or after its offset or `wait` elapses.
+   * It takes one of the client's 64 deferred request slots, however many
+   * partitions it names.
+   */
+  fetchHeld?(
+    streamId: string,
+    topicId: string,
+    offsets: ReadonlyMap<number, bigint>,
+    count: number,
+    wait: PollWait,
+    signal?: AbortSignal,
+    reader?: string
+  ): Promise<readonly HeldPartition[]>
   storeOffset(
     streamId: string,
     topicId: string,
@@ -404,9 +503,22 @@ export interface NodeConnection {
  * `Laser`'s nodes.
  */
 export interface CoordinatorConnection extends NodeConnection {
-  sendManagedTo(code: number, payload: Uint8Array, target: ManagedTarget): Promise<ManagedAnswer>
+  sendManagedTo(
+    code: number,
+    payload: Uint8Array,
+    target: ManagedTarget,
+    options?: { readonly deadline?: number }
+  ): Promise<ManagedAnswer>
   partitionPrimary(streamId: string, topicId: string, partitionId: number): Promise<number>
   storePosition(position: FencedPosition): Promise<void>
+  /** Stores a group offset as this connection's member, which owns the partition. */
+  storeOffset?(
+    streamId: string,
+    topicId: string,
+    target: ConsumerTarget,
+    partitionId: number,
+    offset: bigint
+  ): Promise<void>
   joinConsumerGroup(streamId: string, topicId: string, name: string | number): Promise<void>
   leaveConsumerGroup(streamId: string, topicId: string, name: string | number): Promise<void>
 }
@@ -419,8 +531,10 @@ function toIggyConsumer(target: ConsumerTarget) {
     : Consumer.Group(target.name)
 }
 
-// The poll command body: consumer, stream, topic, partition, strategy,
-// count, and the auto-commit flag, laid out as the Apache Iggy client lays it.
+// The deferred poll body: the plain poll's consumer, stream, topic,
+// partition, strategy, count and auto-commit flag, then the wait, the minimum
+// count, the reply byte cap and the request timeout, laid out as the Apache
+// Iggy client lays them.
 function encodePollRequest(
   streamId: string,
   topicId: string,
@@ -428,7 +542,8 @@ function encodePollRequest(
   partitionId: number,
   strategy: ConsumerStart,
   count: number,
-  autoCommit: boolean
+  autoCommit: boolean,
+  wait: PollWait
 ): Uint8Array {
   const consumer =
     target.kind === "group" ? encodeIdentifier(target.name) : encodeIdentifier(target.name ?? 0)
@@ -448,6 +563,13 @@ function encodePollRequest(
   view.setUint32(14, count, true)
   view.setUint8(18, autoCommit ? 1 : 0)
   parts.push(tail)
+  const deferred = new Uint8Array(24)
+  const options = new DataView(deferred.buffer)
+  options.setBigUint64(0, BigInt(wait.maxWaitMs) * US_PER_MS, true)
+  options.setUint32(8, wait.minCount, true)
+  options.setUint32(12, wait.maxBytes, true)
+  options.setBigUint64(16, BigInt(wait.maxWaitMs + DEFERRED_POLL_REPLY_MARGIN_MS) * US_PER_MS, true)
+  parts.push(deferred)
   const request = new Uint8Array(parts.reduce((size, part) => size + part.byteLength, 0))
   let offset = 0
   for (const part of parts) {
@@ -587,6 +709,13 @@ function toIggyHeaderValue(value: HeaderValue) {
 }
 
 /** The Iggy error code a server reply carried, through any transport wrapping. */
+/** Refuses a replication factor the server never accepts, before anything is
+ * sent. The server also caps it at the cluster's node count. */
+export function validateReplicationFactor(factor: number): void {
+  if (!Number.isInteger(factor) || factor < 1 || factor > MAX_REPLICATION_FACTOR)
+    throw new InvalidError(`replication factor must be 1..=${String(MAX_REPLICATION_FACTOR)}`)
+}
+
 export function serverErrorCode(error: unknown): number | undefined {
   let current = error
   for (let depth = 0; depth < 8; depth += 1) {
@@ -1029,8 +1158,20 @@ interface ConnectedClient {
 
 async function connectSimpleClient(
   parsed: ParsedConnectionString,
-  deadline?: number
+  deadline?: number,
+  signal?: AbortSignal
 ): Promise<ConnectedClient> {
+  if (signal?.aborted === true) throw new TransportError("transport is closed", false)
+  // The client redials a dropped replica link and resumes the session on it,
+  // with the policy of the connection string, as Rust hands it to its client.
+  const reconnect = {
+    enabled: true,
+    interval: Math.max(1, parsed.reconnection.intervalMs),
+    maxRetries: Math.min(
+      parsed.reconnection.maxRetries ?? UNLIMITED_RECONNECT_RETRIES,
+      UNLIMITED_RECONNECT_RETRIES
+    )
+  }
   const config: ClientConfig = parsed.tls
     ? {
         heartbeatInterval: parsed.heartbeatIntervalMs ?? VSR_HEARTBEAT_INTERVAL_MS,
@@ -1047,7 +1188,7 @@ async function connectSimpleClient(
           ...(parsed.ca !== undefined ? { ca: parsed.ca } : {})
         },
         credentials: parsed.credentials,
-        reconnect: { enabled: false, interval: 0, maxRetries: 0 }
+        reconnect
       }
     : {
         heartbeatInterval: parsed.heartbeatIntervalMs ?? VSR_HEARTBEAT_INTERVAL_MS,
@@ -1058,7 +1199,7 @@ async function connectSimpleClient(
           ...(parsed.noDelay !== undefined ? { noDelay: parsed.noDelay } : {})
         },
         credentials: parsed.credentials,
-        reconnect: { enabled: false, interval: 0, maxRetries: 0 }
+        reconnect
       }
 
   let raw: RawClient | undefined
@@ -1072,27 +1213,46 @@ async function connectSimpleClient(
     const ready = client.client.getMe()
     void ready.catch(() => undefined)
     let timer: ReturnType<typeof setTimeout> | undefined
+    let closing: (() => void) | undefined
     try {
-      await (deadline === undefined
-        ? ready
-        : Promise.race([
-            ready,
-            new Promise<never>((_, reject) => {
-              timer = setTimeout(
-                () => {
-                  reject(new TimeoutError(transportUp(raw) ? LOGIN_STAGE : ACCEPT_STAGE))
-                },
-                Math.max(0, deadline - Date.now())
-              )
-            })
-          ]))
+      await Promise.race([
+        ready,
+        ...(deadline === undefined
+          ? []
+          : [
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                  () => {
+                    reject(new TimeoutError(transportUp(raw) ? LOGIN_STAGE : ACCEPT_STAGE))
+                  },
+                  Math.max(0, deadline - Date.now())
+                )
+              })
+            ]),
+        ...(signal === undefined
+          ? []
+          : [
+              new Promise<never>((_, reject) => {
+                closing = () => {
+                  reject(new TransportError("transport is closed", false))
+                }
+                signal.addEventListener("abort", closing, { once: true })
+              })
+            ])
+      ])
     } finally {
       clearTimeout(timer)
+      if (closing !== undefined) signal?.removeEventListener("abort", closing)
     }
     return { client, raw }
   } catch (cause) {
     raw.destroy()
-    if (cause instanceof TimeoutError || cause instanceof UnsupportedError) throw cause
+    if (
+      cause instanceof TimeoutError ||
+      cause instanceof UnsupportedError ||
+      (cause instanceof TransportError && !cause.retryable)
+    )
+      throw cause
     throw new TransportError(`failed to connect to ${parsed.host}:${String(parsed.port)}`, true, {
       cause
     })
@@ -1141,27 +1301,21 @@ async function connectWithRetry(
   parsed: ParsedConnectionString,
   deadline: number
 ): Promise<ConnectedClient> {
-  let retries = 0
   let lastError: unknown
-  while (
-    parsed.reconnection.maxRetries === undefined ||
-    retries <= parsed.reconnection.maxRetries
-  ) {
+  for (;;) {
     try {
       return await connectSimpleClient(parsed, deadline)
     } catch (error) {
       if (error instanceof ConfigError || error instanceof TimeoutError) throw error
       lastError = error
-      if (serverResponseError(error) !== undefined) {
-        break
-      }
+      // The client spends a bounded retry budget on its own dials. An unlimited
+      // one outlasts its 30-second call, so only the connect budget ends it.
       if (
-        parsed.reconnection.maxRetries !== undefined &&
-        retries >= parsed.reconnection.maxRetries
+        serverResponseError(error) !== undefined ||
+        parsed.reconnection.maxRetries !== undefined
       ) {
         break
       }
-      retries += 1
       const remaining = deadline - Date.now()
       if (remaining <= 0) throw new TimeoutError(ACCEPT_STAGE, { cause: error })
       await new Promise((resolve) =>
@@ -1256,7 +1410,8 @@ export class Nodes {
     run: Runner,
     code: number,
     payload: Uint8Array,
-    target: ManagedTarget
+    target: ManagedTarget,
+    deadline?: number
   ): Promise<ManagedAnswer> {
     const buffer = toNodeBuffer(payload)
     switch (target.kind) {
@@ -1264,7 +1419,10 @@ export class Nodes {
         return {
           reply: fromNodeBuffer(
             await run(
-              (client) => client.sendBinaryRequest(code, buffer),
+              (client) =>
+                deadline === undefined
+                  ? client.sendBinaryRequest(code, buffer)
+                  : sendWithin(client, code, buffer, { deadline }),
               `managed command ${String(code)} failed`
             )
           )
@@ -1273,14 +1431,17 @@ export class Nodes {
         return {
           reply: fromNodeBuffer(
             await run(
-              (client) => client.sendBinaryRequestToReplica(code, buffer, target.replica),
+              (client) =>
+                deadline === undefined
+                  ? client.sendBinaryRequestToReplica(code, buffer, target.replica)
+                  : sendWithin(client, code, buffer, { deadline, replica: target.replica }),
               `managed command ${String(code)} to replica ${String(target.replica)} failed`
             )
           ),
           replica: target.replica
         }
       case "caller":
-        return this.sendToCaller(run, code, buffer)
+        return this.sendToCaller(run, code, buffer, deadline)
     }
   }
 
@@ -1329,14 +1490,22 @@ export class Nodes {
     return pinned === undefined ? { kind: "caller" } : { kind: "replica", replica: pinned.replica }
   }
 
-  private async sendToCaller(run: Runner, code: number, buffer: Buffer): Promise<ManagedAnswer> {
+  private async sendToCaller(
+    run: Runner,
+    code: number,
+    buffer: Buffer,
+    deadline: number | undefined
+  ): Promise<ManagedAnswer> {
     let rosterRead = false
     let failedLinks = 0
     for (;;) {
       const { replica, nodes } = await this.callerNode(run)
       try {
         const reply = await run(
-          (client) => client.sendBinaryRequestToReplica(code, buffer, replica),
+          (client) =>
+            deadline === undefined
+              ? client.sendBinaryRequestToReplica(code, buffer, replica)
+              : sendWithin(client, code, buffer, { deadline, replica }),
           `managed command ${String(code)} to replica ${String(replica)} failed`
         )
         if (backendUnavailable(reply)) {
@@ -1363,6 +1532,20 @@ export class Nodes {
     const replica = pickNode(this.roster, this.callerKey, this.moved)
     return replica === undefined ? undefined : { replica, nodes: this.roster.length }
   }
+}
+
+// A raw command bounded by the caller's deadline instead of the client's
+// default call bound, for a request the server may hold.
+async function sendWithin(
+  client: SimpleClient,
+  code: number,
+  payload: Buffer,
+  options: SendCommandOptions
+): Promise<Buffer> {
+  const response = await (
+    await client.clientProvider()
+  ).sendCommand(code, Buffer.from(payload), options)
+  return response.length <= 1 ? Buffer.alloc(0) : response.data
 }
 
 function backendUnavailable(reply: Uint8Array): boolean {
@@ -1471,6 +1654,11 @@ export class ApacheIggyTransport implements LaserTransport {
   >()
   private readonly partitionCounts = new Map<string, number>()
   private readonly balancedCursors = new Map<string, number>()
+  // Sends of the current client whose outcome is unknown. Each one blocks its
+  // partition lane until a later send resolves it.
+  private readonly uncertainSends = new Set<bigint>()
+  // Ends a redial that `close` overtakes, so a closed transport keeps no client.
+  private readonly lifetime = new AbortController()
   private closed = false
 
   private constructor(
@@ -1538,7 +1726,8 @@ export class ApacheIggyTransport implements LaserTransport {
   private async execute<Value>(
     operation: (client: SimpleClient) => Promise<Value>,
     message: string,
-    retryAfterReconnect = true
+    retryAfterReconnect = true,
+    signal?: AbortSignal
   ): Promise<Value> {
     if (this.closed) throw new TransportError("transport is closed", false)
     const stale = this.client
@@ -1553,6 +1742,23 @@ export class ApacheIggyTransport implements LaserTransport {
     try {
       return await operation(stale)
     } catch (firstCause) {
+      // A call its caller cancelled, such as the losing reads of a raced held
+      // read, says nothing about the link.
+      if (signal?.aborted === true) {
+        throw new CancelledError(`${message}: cancelled`, { cause: firstCause })
+      }
+      // The client could not prove the outcome, or no node took the command.
+      // Neither is cleared by another connection, and a resend could apply it
+      // twice, so the caller decides.
+      if (unprovenOutcome(firstCause) !== undefined) {
+        if (!retryAfterReconnect) {
+          throw new AmbiguousMutationError(`${message}: outcome is unknown`, { cause: firstCause })
+        }
+        throw new TransportError(message, true, { cause: firstCause })
+      }
+      if (cause(firstCause, NotConnectedError) !== undefined) {
+        throw new TransportError(message, true, { cause: firstCause })
+      }
       if (!this.disconnected.has(stale) && serverResponseError(firstCause) === undefined) {
         this.disconnected.add(stale)
       }
@@ -1585,17 +1791,17 @@ export class ApacheIggyTransport implements LaserTransport {
         throw new TransportError("an injected client cannot be reconnected by Laser", false)
       }
       await stale.destroy().catch(() => undefined)
-      let retries = 0
       let lastError: unknown
-      while (
-        this.connection.reconnection.maxRetries === undefined ||
-        retries <= this.connection.reconnection.maxRetries
-      ) {
+      for (;;) {
         try {
           const remaining = deadline === undefined ? undefined : deadline - Date.now()
           if (remaining !== undefined && remaining <= 0)
             throw new TimeoutError("Iggy publish reconnect")
-          const connected = await connectSimpleClient(this.connection, deadline)
+          const connected = await connectSimpleClient(
+            this.connection,
+            deadline,
+            this.lifetime.signal
+          )
           try {
             for (const [key, group] of [...this.consumerGroups]) {
               const join: Promise<unknown> =
@@ -1619,35 +1825,35 @@ export class ApacheIggyTransport implements LaserTransport {
                 ? join
                 : publishWithin(join, Math.max(1, deadline - Date.now())))
             }
+            if (this.lifetime.signal.aborted) throw new TransportError("transport is closed", false)
           } catch (cause) {
             await connected.client.destroy().catch(() => undefined)
             throw cause
           }
           this.client = connected.client
+          this.uncertainSends.clear()
           return
         } catch (error) {
           lastError = error
+          if (this.lifetime.signal.aborted)
+            throw new TransportError("transport is closed", false, { cause: error })
           if (deadline !== undefined && Date.now() >= deadline)
             throw new TimeoutError("Iggy publish reconnect", { cause: error })
-          if (serverResponseError(error) !== undefined) {
-            break
-          }
+          // A bounded retry budget went to the client's own dials.
           if (
-            this.connection.reconnection.maxRetries !== undefined &&
-            retries >= this.connection.reconnection.maxRetries
+            serverResponseError(error) !== undefined ||
+            this.connection.reconnection.maxRetries !== undefined
           ) {
             break
           }
-          retries += 1
-          await new Promise((resolve) =>
-            setTimeout(
-              resolve,
-              Math.min(
-                this.connection?.reconnection.intervalMs ?? 0,
-                deadline === undefined ? Infinity : Math.max(0, deadline - Date.now())
-              )
-            )
-          )
+          await sleep(
+            Math.min(
+              this.connection.reconnection.intervalMs,
+              deadline === undefined ? Infinity : Math.max(0, deadline - Date.now())
+            ),
+            undefined,
+            { signal: this.lifetime.signal }
+          ).catch(() => undefined)
         }
       }
       const responseError = serverResponseError(lastError)
@@ -1685,7 +1891,8 @@ export class ApacheIggyTransport implements LaserTransport {
         this.runner(options),
         code,
         this.readFrame(code, payload),
-        target
+        target,
+        options?.deadline
       )
       return { ...answer, reply: this.takePositioned(answer.reply) }
     }
@@ -1829,9 +2036,15 @@ export class ApacheIggyTransport implements LaserTransport {
 
   /** Creates the topic when it is absent, keeping records until retention
    * removes them like Rust `ensure_topic`. An existing topic is left as it is. */
-  async ensureTopic(streamId: string, topicId: string, partitions: number): Promise<void> {
+  async ensureTopic(
+    streamId: string,
+    topicId: string,
+    partitions: number,
+    replicationFactor?: number
+  ): Promise<void> {
     await this.createTopicIfAbsent(streamId, topicId, partitions, {
-      messageExpiryMicros: NEVER_EXPIRE
+      messageExpiryMicros: NEVER_EXPIRE,
+      ...(replicationFactor === undefined ? {} : { replicationFactor })
     })
   }
 
@@ -1841,9 +2054,13 @@ export class ApacheIggyTransport implements LaserTransport {
     streamId: string,
     topicId: string,
     partitions: number,
-    messageExpiryMicros: bigint
+    messageExpiryMicros: bigint,
+    replicationFactor?: number
   ): Promise<void> {
-    await this.createTopicIfAbsent(streamId, topicId, partitions, { messageExpiryMicros })
+    await this.createTopicIfAbsent(streamId, topicId, partitions, {
+      messageExpiryMicros,
+      ...(replicationFactor === undefined ? {} : { replicationFactor })
+    })
   }
 
   async createTopicIfAbsent(
@@ -1852,6 +2069,8 @@ export class ApacheIggyTransport implements LaserTransport {
     partitions: number,
     settings: TopicCreateSettings
   ): Promise<void> {
+    if (settings.replicationFactor !== undefined)
+      validateReplicationFactor(settings.replicationFactor)
     const partitionCount = await this.execute(async (client) => {
       const existing = await client.topic.get({ streamId, topicId })
       if (existing !== null) return existing.partitionsCount
@@ -1864,7 +2083,10 @@ export class ApacheIggyTransport implements LaserTransport {
           ...(settings.messageExpiryMicros === undefined
             ? {}
             : { messageExpiry: settings.messageExpiryMicros }),
-          ...(settings.maxTopicSize === undefined ? {} : { maxTopicSize: settings.maxTopicSize })
+          ...(settings.maxTopicSize === undefined ? {} : { maxTopicSize: settings.maxTopicSize }),
+          ...(settings.replicationFactor === undefined
+            ? {}
+            : { replicationFactor: settings.replicationFactor })
         })
         return created.partitionsCount
       } catch (error) {
@@ -2017,10 +2239,24 @@ export class ApacheIggyTransport implements LaserTransport {
             await publishWithin(this.reconnect(used, Date.now() + recovery), recovery)
             used = this.client
           }
-          return await publishWithin(operation(used), Math.max(1, deadline - Date.now()))
+          return await publishWithin(
+            this.sendPastBlocker(operation, used, deadline),
+            Math.max(1, deadline - Date.now())
+          )
         })
       } catch (cause) {
         if (cause instanceof SessionError) throw cause
+        // A send that may have committed is never resent and keeps the
+        // connection, as the Apache Iggy producer leaves it to its caller.
+        const unproven = unprovenOutcome(cause)
+        if (
+          unproven instanceof OperationUncertainError ||
+          unproven instanceof OperationNotRetainedError
+        ) {
+          if (unproven instanceof OperationUncertainError && unproven.operationId !== undefined)
+            this.uncertainSends.add(unproven.operationId)
+          throw new TransportError("Iggy publish failed", false, { cause })
+        }
         const response = serverResponseError(cause)
         const code = serverErrorCode(cause)
         const transient = code !== undefined && TRANSIENT_SERVER_CODES.has(code)
@@ -2061,6 +2297,29 @@ export class ApacheIggyTransport implements LaserTransport {
       }
     }
     throw new TransportError("publish attempts exhausted", true)
+  }
+
+  // A send blocked by an earlier uncertain send of this transport resolves
+  // that send first, then goes out once within the same deadline, as the
+  // Apache Iggy producer does. The earlier send is never submitted again.
+  private async sendPastBlocker(
+    operation: (client: SimpleClient) => Promise<SendMessagesResponse>,
+    client: SimpleClient,
+    deadline: number
+  ): Promise<SendMessagesResponse> {
+    try {
+      return await operation(client)
+    } catch (error) {
+      const blocker = cause(error, LaneBlockedError)?.operationId
+      if (blocker === undefined || !this.uncertainSends.has(blocker)) throw error
+      try {
+        await client.resolveOperation(blocker, { deadline })
+      } catch (resolution) {
+        if (cause(resolution, OperationUncertainError) !== undefined) throw error
+      }
+      this.uncertainSends.delete(blocker)
+      return await operation(client)
+    }
   }
 
   async sendMessages(
@@ -2213,54 +2472,104 @@ export class ApacheIggyTransport implements LaserTransport {
     target: ConsumerTarget,
     strategy: ConsumerStart,
     count: number,
-    autoCommit: boolean
+    autoCommit: boolean,
+    wait: PollWait = ONE_SHOT_POLL,
+    signal?: AbortSignal
+  ): Promise<readonly PolledMessage[]> {
+    try {
+      return await this.poll(streamId, topicId, target, strategy, count, autoCommit, wait, signal)
+    } catch (error) {
+      await this.abandonBlocked(error)
+      throw error
+    }
+  }
+
+  private async poll(
+    streamId: string,
+    topicId: string,
+    target: ConsumerTarget,
+    strategy: ConsumerStart,
+    count: number,
+    autoCommit: boolean,
+    wait: PollWait,
+    signal: AbortSignal | undefined
   ): Promise<readonly PolledMessage[]> {
     const partitionId = target.partitionId
     if (partitionId === undefined) {
       if (target.kind !== "group") throw new InvalidError("a single consumer needs a partition")
-      return this.execute(async (client) => {
-        const raw = await client.clientProvider()
-        const release = raw.hold?.()
-        try {
-          const state = groupPollState(raw)
-          for (;;) {
-            const generation = state.sessionGeneration
-            try {
-              return await pollGroupRecords(
-                raw,
-                state,
-                streamId,
-                topicId,
-                target,
-                strategy,
-                count,
-                autoCommit
-              )
-            } catch (error) {
-              if (
-                state.sessionGeneration === generation ||
-                serverErrorCode(error) === TRANSIENT_NOT_COMMITTED
-              )
-                throw error
+      return this.execute(
+        async (client) => {
+          const raw = await client.clientProvider()
+          const release = raw.hold?.()
+          try {
+            const state = groupPollState(raw)
+            for (;;) {
+              const generation = state.sessionGeneration
+              try {
+                return await pollGroupRecords(
+                  raw,
+                  state,
+                  streamId,
+                  topicId,
+                  target,
+                  strategy,
+                  count,
+                  autoCommit,
+                  wait,
+                  signal
+                )
+              } catch (error) {
+                if (
+                  state.sessionGeneration === generation ||
+                  serverErrorCode(error) === TRANSIENT_NOT_COMMITTED ||
+                  unprovenOutcome(error) !== undefined
+                )
+                  throw error
+              }
             }
+          } finally {
+            release?.()
           }
-        } finally {
-          release?.()
-        }
-      }, `failed to poll topic \`${topicId}\``)
+        },
+        `failed to poll topic \`${topicId}\``,
+        true,
+        signal
+      )
     }
     const request = toNodeBuffer(
-      encodePollRequest(streamId, topicId, target, partitionId, strategy, count, autoCommit)
+      encodePollRequest(streamId, topicId, target, partitionId, strategy, count, autoCommit, wait)
     )
     const body = await this.execute(
-      (client) => client.sendBinaryRequest(POLL_MESSAGES_CODE, request),
-      `failed to poll topic \`${topicId}\``
+      async (client) => {
+        const response = await (
+          await client.clientProvider()
+        ).sendCommand(POLL_MESSAGES_DEFERRED_CODE, request, signal === undefined ? {} : { signal })
+        return response.length <= 1 ? Buffer.alloc(0) : response.data
+      },
+      `failed to poll topic \`${topicId}\``,
+      true,
+      signal
     )
     // The stored records exactly: microsecond times, message ids, and a
     // header block that does not decode marked rather than failing the poll.
     return body.byteLength === 0
       ? []
       : decodePolledBody(new Uint8Array(body.buffer, body.byteOffset, body.byteLength))
+  }
+
+  // A committing read whose outcome the client could not prove keeps its lane
+  // blocked until it is abandoned. The read is never replayed: the reader
+  // resumes after the stored offset, whatever the lost read stored.
+  private async abandonBlocked(error: unknown): Promise<void> {
+    const blocked =
+      cause(error, LaneBlockedError)?.operationId ??
+      cause(error, FetchProgressUncertainError)?.operationId
+    if (blocked === undefined) return
+    try {
+      await this.client.abandonOperation(blocked)
+    } catch {
+      // Not retained means already released. Anything else the next read reports.
+    }
   }
 
   async storeOffset(
@@ -2281,6 +2590,80 @@ export class ApacheIggyTransport implements LaserTransport {
         }),
       `failed to store offset for topic \`${topicId}\``
     )
+  }
+
+  async primaryGroups(
+    streamId: string,
+    topicId: string,
+    partitions: readonly number[]
+  ): Promise<readonly (readonly number[])[] | undefined> {
+    return this.execute(async (client) => {
+      const raw = await client.clientProvider()
+      return raw.readinessGroups?.(streamId, topicId, [...partitions])
+    }, `failed to route the partitions of topic \`${topicId}\``)
+  }
+
+  async fetchHeld(
+    streamId: string,
+    topicId: string,
+    offsets: ReadonlyMap<number, bigint>,
+    count: number,
+    wait: PollWait,
+    signal?: AbortSignal,
+    reader?: string
+  ): Promise<readonly HeldPartition[]> {
+    const request = FETCH_MESSAGES.serialize({
+      streamId,
+      topicId,
+      consumer: reader === undefined ? Consumer.Single : { ...Consumer.Single, id: reader },
+      targets: [...offsets].map(([partitionId, offset]) => ({
+        partitionId,
+        pollingStrategy: IggyPollingStrategy.Offset(offset)
+      })),
+      count,
+      autocommit: false,
+      options: {
+        maxWait: wait.maxWaitMs,
+        minCount: wait.minCount,
+        maxBytes: wait.maxBytes,
+        requestTimeout: wait.maxWaitMs + DEFERRED_POLL_REPLY_MARGIN_MS
+      }
+    })
+    const sections = await this.execute(
+      async (client) =>
+        FETCH_MESSAGES.deserialize(
+          await (
+            await client.clientProvider()
+          ).sendCommand(FETCH_MESSAGES.code, request, signal === undefined ? {} : { signal })
+        ),
+      `failed to read topic \`${topicId}\``,
+      true,
+      signal
+    )
+    const held: HeldPartition[] = []
+    let refused: Error | undefined
+    for (const section of sections) {
+      if (section.status !== 0) {
+        refused ??= fetchSectionError(section)
+        continue
+      }
+      if (section.messagesCount === 0) continue
+      // A section carries its records as a poll reply does, after the head.
+      const body = new Uint8Array(POLLED_HEAD_BYTES + section.records.byteLength)
+      const head = new DataView(body.buffer)
+      head.setUint32(0, section.partitionId, true)
+      head.setBigUint64(4, section.currentOffset, true)
+      head.setUint32(12, section.messagesCount, true)
+      head.setBigUint64(16, section.context.incarnation, true)
+      head.setBigUint64(24, section.context.ownerGeneration, true)
+      head.setBigUint64(32, section.context.metadataOp, true)
+      body.set(section.records, POLLED_HEAD_BYTES)
+      held.push({ partitionId: section.partitionId, messages: decodePolledBody(body) })
+    }
+    if (held.length === 0 && refused !== undefined) {
+      throw new TransportError(`failed to read topic \`${topicId}\``, true, { cause: refused })
+    }
+    return held
   }
 
   /**
@@ -2478,11 +2861,13 @@ export class ApacheIggyTransport implements LaserTransport {
         )
         return answer.reply
       },
-      sendManagedTo: (code, payload, target) =>
-        nodes.send(coordinator.runner(), code, payload, target),
+      sendManagedTo: (code, payload, target, options) =>
+        nodes.send(coordinator.runner(), code, payload, target, options?.deadline),
       partitionPrimary: (streamId, topicId, partitionId) =>
         coordinator.partitionPrimary(streamId, topicId, partitionId),
       storePosition: (position) => coordinator.storePosition(position),
+      storeOffset: (streamId, topicId, target, partitionId, offset) =>
+        coordinator.storeOffset(streamId, topicId, target, partitionId, offset),
       async joinConsumerGroup(
         streamId: string,
         topicId: string,
@@ -2509,6 +2894,7 @@ export class ApacheIggyTransport implements LaserTransport {
 
   async close(): Promise<void> {
     this.closed = true
+    this.lifetime.abort()
     this.consumerGroups.clear()
     if (this.ownership === "owned") await this.client.destroy()
   }
@@ -2568,7 +2954,9 @@ async function pollGroupRecords(
   target: Extract<ConsumerTarget, { readonly kind: "group" }>,
   strategy: ConsumerStart,
   count: number,
-  autoCommit: boolean
+  autoCommit: boolean,
+  wait: PollWait,
+  signal: AbortSignal | undefined
 ): Promise<readonly PolledMessage[]> {
   const key = `${streamId}\0${topicId}\0${target.name}`
   for (let attempt = 0; attempt < GROUP_POLL_MAX_ATTEMPTS; attempt += 1) {
@@ -2600,7 +2988,8 @@ async function pollGroupRecords(
           cursor.position < assignment.partitions.length
             ? cursor.position
             : 0,
-        synchronizedAt: Date.now()
+        synchronizedAt: Date.now(),
+        idle: cursor?.generation === assignment.generation ? cursor.idle : 0
       }
       state.cursors.set(key, cursor)
     }
@@ -2610,10 +2999,20 @@ async function pollGroupRecords(
     let body: Uint8Array
     try {
       const response = await client.sendCommand(
-        POLL_MESSAGES_CODE,
+        POLL_MESSAGES_DEFERRED_CODE,
         toNodeBuffer(
-          encodePollRequest(streamId, topicId, target, partition, strategy, count, autoCommit)
-        )
+          encodePollRequest(
+            streamId,
+            topicId,
+            target,
+            partition,
+            strategy,
+            count,
+            autoCommit,
+            passWait(wait, cursor.partitions.length, cursor.idle)
+          )
+        ),
+        signal === undefined ? {} : { signal }
       )
       body = new Uint8Array(
         response.data.buffer,
@@ -2636,7 +3035,61 @@ async function pollGroupRecords(
       state.cursors.delete(key)
       continue
     }
-    return decodePolledBody(body)
+    const messages = decodePolledBody(body)
+    cursor.idle = messages.length === 0 ? cursor.idle + 1 : 0
+    return messages
   }
   return []
+}
+
+/**
+ * The server wait of one read in a pass over `partitions`: none until a whole
+ * pass found nothing, then at most `wait.maxWaitMs / partitions` each, so a
+ * record on another partition waits at most one pass. A single partition
+ * always waits.
+ * @internal
+ */
+export function passWait(wait: PollWait, partitions: number, idleReads: number): PollWait {
+  if (partitions <= 1) return wait
+  if (idleReads < partitions || wait.maxWaitMs === 0) return { ...wait, maxWaitMs: 0 }
+  return { ...wait, maxWaitMs: Math.max(1, Math.floor(wait.maxWaitMs / partitions)) }
+}
+
+/** The first error of type `type` in the cause chain of `error`. */
+function cause<Type>(
+  error: unknown,
+  type: abstract new (...args: never[]) => Type
+): Type | undefined {
+  let current = error
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (current instanceof type) return current
+    if (typeof current !== "object" || current === null || !("cause" in current)) return undefined
+    current = (current as { readonly cause?: unknown }).cause
+  }
+  return undefined
+}
+
+// An outcome the client could not prove: a reply lost after the command may
+// have applied, an abandoned operation, a call past its deadline, or a lane an
+// uncertain read blocks.
+function unprovenOutcome(error: unknown): Error | undefined {
+  return (
+    cause(error, OperationUncertainError) ??
+    cause(error, OperationNotRetainedError) ??
+    cause(error, VsrResponseTimeoutError) ??
+    cause(error, LaneBlockedError)
+  )
+}
+
+/**
+ * Whether a poll failed on a partition lane an uncertain read blocked. The
+ * transport abandoned that read, so the consumer resumes the partition after
+ * its stored offset, as Rust seeks it to `PollingStrategy::next()`.
+ * @internal
+ */
+export function resumesAfterStoredOffset(error: unknown): boolean {
+  return (
+    cause(error, LaneBlockedError) !== undefined ||
+    cause(error, FetchProgressUncertainError) !== undefined
+  )
 }

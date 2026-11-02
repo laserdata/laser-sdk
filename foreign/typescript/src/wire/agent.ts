@@ -39,6 +39,7 @@ import {
   MAX_STATE_DOCUMENT_BYTES,
   MAX_STATE_PATCH_OPS
 } from "./limits.js"
+import { hasControlCharacter } from "./validate.js"
 import { type Value, decodeValue, encodeValue } from "./value.js"
 
 export const AgentKind = {
@@ -78,6 +79,8 @@ export function parseIdempotencyKey(value: string): IdempotencyKey {
       `idempotency key is ${String(bytes)}B, exceeds cap ${String(MAX_IDEMPOTENCY_KEY_BYTES)}B`
     )
   }
+  if (hasControlCharacter(value))
+    throw new InvalidError("idempotency key contains a control character")
   return value as IdempotencyKey
 }
 

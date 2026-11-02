@@ -4,7 +4,17 @@ import {
   INTERNAL_RETURN_DELIVERY
 } from "../client/internals.js"
 import { mintUlidValue } from "../runtime/ulid.js"
-import type { ConsumerTarget, LaserTransport, PolledMessage } from "../iggy/apache-iggy.js"
+import {
+  type ConsumerTarget,
+  DEFAULT_POLL_MAX_BYTES,
+  type LaserTransport,
+  MAX_DEFERRED_POLL_WAIT_MS,
+  MIN_DEFERRED_POLL_MAX_BYTES,
+  type PollWait,
+  type PolledMessage,
+  passWait,
+  resumesAfterStoredOffset
+} from "../iggy/apache-iggy.js"
 import {
   CancelledError,
   FilterExecutionError,
@@ -16,7 +26,7 @@ import {
 import type { FilteredReader, MatchedRecord } from "../managed/filters.js"
 import type { MessageId } from "../types/ids.js"
 import { Json } from "./codecs.js"
-import type { ConsumerStart } from "./consumer-start.js"
+import { type ConsumerStart, storeSeeds } from "./consumer-start.js"
 import type { Message } from "./message.js"
 
 /** A message a live consumer delivered, with its stored header like the Rust
@@ -79,14 +89,22 @@ export interface ConsumerOptions {
   readonly batchLength?: number
   /** Defaults to `polling`, and to `disabled` for a consumer without a name. */
   readonly commitPolicy?: CommitPolicy
+  /** Where reading starts, `next` by default. A group consumer always resumes
+   * after the group's stored offset: its start only seeds the partitions the
+   * group never stored, taken when it joins. */
   readonly startAt?: ConsumerStart
-  /** How long the consumer waits after a poll that found nothing new.
-   * Defaults to no wait, like Rust. A policy-aware group consumer keeps the
-   * group reader's short idle wait unless this is set. */
-  readonly pollIntervalMs?: number
-  /** Native group consumers only: join the group when the consumer is built.
-   * Defaults to `true`. A policy-aware group consumer always joins. */
-  readonly autoJoinGroup?: boolean
+  /** How long the server holds a poll that finds fewer than `minCount` new
+   * records before it answers with what it has. Defaults to 5 seconds, at most
+   * 600 seconds. Zero answers at once. A policy-aware group consumer holds its
+   * idle rounds as long, within the server's filtered wait. */
+  readonly maxWaitMs?: number
+  /** How many new records end a held poll early. Defaults to 1, at most
+   * `batchLength`. Native only: a policy-aware group consumer holds its idle
+   * rounds through the group reader. */
+  readonly minCount?: number
+  /** Most record bytes one poll returns. Defaults to 1 MiB. A record larger
+   * than the cap comes alone, so a poll always makes progress. Native only. */
+  readonly maxBytes?: number
   /** Create the consumer group when it does not exist. Defaults to `true`. */
   readonly createGroup?: boolean
   /** How long a failed poll waits before it is retried. Must be positive.
@@ -98,14 +116,24 @@ export interface ConsumerOptions {
   readonly initRetries?: { readonly retries: number; readonly intervalMs: number }
   /** Native only: deliver records at or below an offset already consumed,
    * for example after moving the start back. Without it, such records are
-   * skipped. A policy-aware group consumer honors its start as given. */
+   * skipped. */
   readonly allowReplay?: boolean
 }
 
 const DEFAULT_BATCH_LENGTH = 1000
-const DEFAULT_POLL_INTERVAL_MS = 0
+const DEFAULT_MAX_WAIT_MS = 5_000
+const DEFAULT_MIN_COUNT = 1
 const DEFAULT_POLLING_RETRY_INTERVAL_MS = 1_000
 const DEFAULT_START_AT: ConsumerStart = { kind: "next" }
+// Refusals that last until an operator acts, on which the Apache Iggy reader
+// stops a partition: invalid command, feature unavailable, unauthorized, a
+// missing stream, topic or partition, and a partition the member no longer owns.
+const LASTING_REFUSALS = new Set([3, 5, 41, 1009, 1010, 2010, 2011, 3007, 5009])
+// The refusals that mean the partition's history is gone.
+const HISTORY_GONE = new Set([1009, 1010, 2010, 2011, 3007])
+// Refused polls in a row on one partition before the refusal is reported,
+// the count after which the Apache Iggy reader stops a partition.
+const REFUSALS_PER_REPORT = 6
 
 function throwIfAborted(signal: AbortSignal | undefined, message: string): void {
   if (signal?.aborted === true) throw new CancelledError(message, { cause: signal.reason })
@@ -144,8 +172,9 @@ export interface ResolvedConsumerOptions {
   readonly autoCommit: boolean
   readonly commitPolicy: CommitPolicy
   readonly startAt: ConsumerStart
-  readonly pollIntervalMs: number
-  readonly autoJoinGroup: boolean
+  readonly maxWaitMs: number
+  readonly minCount: number
+  readonly maxBytes: number
   readonly createGroup: boolean
   readonly pollingRetryIntervalMs: number
   readonly initRetries: { readonly retries: number; readonly intervalMs: number }
@@ -180,8 +209,9 @@ export function resolveConsumerOptions(
     autoCommit: commitPolicy.kind !== "disabled",
     commitPolicy,
     startAt: options.startAt ?? DEFAULT_START_AT,
-    pollIntervalMs: options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
-    autoJoinGroup: options.autoJoinGroup ?? true,
+    maxWaitMs: options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS,
+    minCount: options.minCount ?? DEFAULT_MIN_COUNT,
+    maxBytes: options.maxBytes ?? DEFAULT_POLL_MAX_BYTES,
     createGroup: options.createGroup ?? true,
     pollingRetryIntervalMs: options.pollingRetryIntervalMs ?? DEFAULT_POLLING_RETRY_INTERVAL_MS,
     initRetries,
@@ -203,8 +233,28 @@ export function resolveConsumerOptions(
   if (!Number.isSafeInteger(resolved.batchLength) || resolved.batchLength < 1) {
     throw new InvalidError("consumer batchLength must be a positive safe integer")
   }
-  if (!Number.isFinite(resolved.pollIntervalMs) || resolved.pollIntervalMs < 0) {
-    throw new InvalidError("consumer pollIntervalMs must be a non-negative finite number")
+  if (
+    !Number.isSafeInteger(resolved.maxWaitMs) ||
+    resolved.maxWaitMs < 0 ||
+    resolved.maxWaitMs > MAX_DEFERRED_POLL_WAIT_MS
+  ) {
+    throw new InvalidError(`consumer maxWaitMs must be 0..=${String(MAX_DEFERRED_POLL_WAIT_MS)}`)
+  }
+  if (
+    !Number.isSafeInteger(resolved.minCount) ||
+    resolved.minCount < 1 ||
+    resolved.minCount > resolved.batchLength
+  ) {
+    throw new InvalidError("consumer minCount must be 1..=batchLength")
+  }
+  if (
+    !Number.isSafeInteger(resolved.maxBytes) ||
+    resolved.maxBytes < MIN_DEFERRED_POLL_MAX_BYTES ||
+    resolved.maxBytes > 0xffff_ffff
+  ) {
+    throw new InvalidError(
+      `consumer maxBytes must be at least ${String(MIN_DEFERRED_POLL_MAX_BYTES)}`
+    )
   }
   if (
     (resolved.startAt.kind === "offset" || resolved.startAt.kind === "timestampMicros") &&
@@ -227,7 +277,7 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
   private readonly autoCommit: boolean
   private readonly commitPolicy: CommitPolicy
   private readonly startAt: ConsumerStart
-  private readonly pollIntervalMs: number
+  private readonly wait: PollWait
   private readonly pollingRetryIntervalMs: number
   private readonly allowReplay: boolean
   private buffer: PolledMessage[] = []
@@ -261,8 +311,23 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
   private assignedPartitions = new Set<number>()
   private assignmentSeen = false
   private partitionCursor = 0
-  private readonly gainedPartitions = new Set<number>()
-  private started = false
+  // The offsets a group's start seeds, taken at the join, each stored when
+  // this member first owns its partition. Every group read resumes after the
+  // stored offset.
+  private readonly seeds: Map<number, bigint>
+  // Partitions whose uncertain committing read was abandoned. They resume
+  // after the stored offset, whatever the lost read stored.
+  private readonly resumeAfterStored = new Set<number>()
+  // A lasting refusal holds the next native poll until then, so a caller
+  // that reads on through it never spins.
+  private refusedUntil = 0
+  // Refused polls in a row by partition, the server-picked one under -1.
+  private readonly refusals = new Map<number, number>()
+  // Consecutive native polls that found nothing, so a whole idle pass over a
+  // group's partitions holds its next reads on the server.
+  private idleReads = 0
+  // Cancels the native poll the server holds when the consumer shuts down.
+  private readonly pollAbort = new AbortController()
   private shuttingDown = false
   private polling: Promise<void> | undefined
   // A native group consumer leaves at shutdown only the group it joined.
@@ -275,7 +340,8 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     private readonly target: ConsumerTarget,
     options: ConsumerOptions = {},
     private readonly reader?: FilteredReader,
-    private readonly pollFailures: "retry" | "propagate" = "retry"
+    private readonly pollFailures: "retry" | "propagate" = "retry",
+    seeds: ReadonlyMap<number, bigint> = new Map()
   ) {
     const anonymous = target.kind === "single" && target.name === undefined
     if (anonymous) this.target = { ...target, name: `anonymous-${mintUlidValue().toString(16)}` }
@@ -290,10 +356,15 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     this.autoCommit = resolved.autoCommit
     this.commitPolicy = resolved.commitPolicy
     this.startAt = resolved.startAt
-    this.pollIntervalMs = resolved.pollIntervalMs
+    this.seeds = new Map(seeds)
+    this.wait = {
+      maxWaitMs: resolved.maxWaitMs,
+      minCount: resolved.minCount,
+      maxBytes: resolved.maxBytes
+    }
     this.pollingRetryIntervalMs = resolved.pollingRetryIntervalMs
     this.allowReplay = resolved.allowReplay
-    this.leavesGroup = this.target.kind === "group" && resolved.autoJoinGroup
+    this.leavesGroup = this.target.kind === "group"
   }
 
   /** @internal */
@@ -304,9 +375,19 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     target: ConsumerTarget,
     options: ConsumerOptions = {},
     reader?: FilteredReader,
-    pollFailures: "retry" | "propagate" = "retry"
+    pollFailures: "retry" | "propagate" = "retry",
+    seeds: ReadonlyMap<number, bigint> = new Map()
   ): Consumer {
-    return new Consumer(transport, streamName, topicName, target, options, reader, pollFailures)
+    return new Consumer(
+      transport,
+      streamName,
+      topicName,
+      target,
+      options,
+      reader,
+      pollFailures,
+      seeds
+    )
   }
 
   /**
@@ -335,9 +416,9 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
       throwIfAborted(options.signal, "nextWithin aborted")
       if (this.stopped()) throw new InvalidError("the live consumer stream ended")
       if (this.pending()) continue
-      const remaining = deadline - Date.now()
-      if (remaining <= 0) throw new TimeoutError("the live consumer to yield a record")
-      await delay(this.moreScanned ? 0 : Math.min(this.pollIntervalMs, remaining), options.signal)
+      if (deadline - Date.now() <= 0) throw new TimeoutError("the live consumer to yield a record")
+      // A busy scan yields to timers and cancellation between bounded rounds.
+      if (this.moreScanned) await delay(0, options.signal)
     }
   }
 
@@ -358,9 +439,7 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
       await this.pollOnce(options.signal)
       throwIfAborted(options.signal, "consumer stream aborted")
       if (this.stopped()) return
-      if (!this.pending()) {
-        await delay(this.moreScanned ? 0 : this.pollIntervalMs, options.signal)
-      }
+      if (!this.pending() && this.moreScanned) await delay(0, options.signal)
     }
   }
 
@@ -528,8 +607,14 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
       clearInterval(this.commitTimer)
       this.commitTimer = undefined
     }
+    if (this.reader === undefined) {
+      this.pollAbort.abort()
+      await this.polling?.catch(() => undefined)
+      this.polling = undefined
+    }
     if (this.reader !== undefined) {
       try {
+        this.reader.wake()
         if (this.deferred.length > 0) await this.polling?.catch(() => undefined)
         this.polling = undefined
         await this.finishDelivery()
@@ -671,9 +756,22 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
   private async pollOnce(signal?: AbortSignal, deadline?: number): Promise<void> {
     this.startCommitTimer()
     try {
+      if (this.polling === undefined) {
+        const held = this.refusedUntil - Date.now()
+        if (held > 0) {
+          await delay(deadline === undefined ? held : Math.min(held, deadline - Date.now()), signal)
+          if (Date.now() < this.refusedUntil) return
+        }
+      }
       this.polling ??= this.fillBuffer()
       await this.waitForPoll(this.polling, signal, deadline)
     } catch (error) {
+      // A lasting refusal reaches the caller, also when the client reported
+      // it as a read of unknown progress, and paces the reads after it.
+      if (lastingRefusal(error) !== undefined && !this.stopped()) {
+        this.refusedUntil = Date.now() + this.pollingRetryIntervalMs
+        throw error
+      }
       if (
         this.pollFailures === "propagate" ||
         !(error instanceof TransportError) ||
@@ -829,6 +927,24 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     this.lastFlushAt = Date.now()
   }
 
+  // Store the seed of each owned partition the group still stored nothing on,
+  // so its first read begins at the record the start named at the join.
+  private async storeSeeds(group: string, partitions: readonly number[]): Promise<boolean> {
+    const read = this.transport.getConsumerOffset?.bind(this.transport)
+    if (read === undefined)
+      throw new UnsupportedError("this transport cannot read a group's stored offsets", {
+        surface: "stream"
+      })
+    const target = { kind: "group" as const, name: group }
+    return storeSeeds(
+      this.seeds,
+      partitions,
+      (partitionId) => read(this.streamName, this.topicName, target, partitionId),
+      (partitionId, seed) =>
+        this.transport.storeOffset(this.streamName, this.topicName, target, partitionId, seed)
+    )
+  }
+
   // One group poll. A policy that stores at the poll stores the delivered
   // prefix first, so a crash redelivers the current batch instead of
   // skipping it.
@@ -839,6 +955,14 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     this.groupRead = true
     this.moreScanned = more
     if (page !== undefined) this.records.push(...page.records)
+    else if (!more) {
+      // An interval policy stores the handled prefix on time while the
+      // partitions stay idle.
+      const interval = commitInterval(this.commitPolicy)
+      await reader.waitForRecordsWithin(
+        interval === undefined ? undefined : Math.max(0, interval - (Date.now() - this.lastFlushAt))
+      )
+    }
   }
 
   private async fillBuffer(signal?: AbortSignal): Promise<void> {
@@ -868,16 +992,12 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
         this.assignedPartitions.clear()
       }
       const assigned = new Set(assignment.partitions)
+      // A partition not yet installed for this member keeps its seed, and the
+      // round reads nothing until a later sync stores it.
+      if (this.seeds.size > 0 && !(await this.storeSeeds(target.name, assignment.partitions)))
+        return
       for (const partition of this.assignedPartitions) {
-        if (!assigned.has(partition)) {
-          this.nextOffsets.delete(partition)
-          this.gainedPartitions.delete(partition)
-        }
-      }
-      if (this.assignmentSeen) {
-        for (const partition of assigned) {
-          if (!this.assignedPartitions.has(partition)) this.gainedPartitions.add(partition)
-        }
+        if (!assigned.has(partition)) this.nextOffsets.delete(partition)
       }
       this.assignedPartitions = assigned
       this.assignmentSeen = true
@@ -892,25 +1012,55 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     const strategy =
       next !== undefined
         ? { kind: "offset" as const, value: next }
-        : partition !== undefined
-          ? this.gainedPartitions.has(partition)
-            ? { kind: "next" as const }
-            : this.startAt
-          : this.started
-            ? { kind: "next" as const }
-            : this.startAt
+        : target.kind === "group" ||
+            (partition !== undefined && this.resumeAfterStored.has(partition))
+          ? { kind: "next" as const }
+          : this.startAt
     const commitOnPoll =
       this.commitPolicy.kind === "polling" || this.commitPolicy.kind === "intervalOrPolling"
-    const polled = await this.transport.pollMessages(
-      this.streamName,
-      this.topicName,
-      target,
-      strategy,
-      this.batchLength,
-      commitOnPoll
-    )
-    this.started = true
-    for (const message of polled) this.nextOffsets.set(message.partitionId, message.offset + 1n)
+    // The consumer picks a group partition itself only on the synced path,
+    // and then holds its reads after a whole idle pass. The transport does the
+    // same when it picks the partition.
+    const passes =
+      target.kind === "group" && partition !== undefined ? this.assignedPartitions.size : 1
+    let polled: readonly PolledMessage[]
+    try {
+      polled = await this.transport.pollMessages(
+        this.streamName,
+        this.topicName,
+        target,
+        strategy,
+        this.batchLength,
+        commitOnPoll,
+        passWait(this.wait, passes, this.idleReads),
+        this.pollAbort.signal
+      )
+    } catch (error) {
+      const refusal = lastingRefusal(error)
+      if (partition !== undefined && (resumesAfterStoredOffset(error) || refusal !== undefined)) {
+        this.nextOffsets.delete(partition)
+        this.resumeAfterStored.add(partition)
+        // The records of a recreated stream or topic are a new history.
+        if (refusal !== undefined && HISTORY_GONE.has(refusal))
+          this.consumedOffsets.delete(partition)
+      }
+      if (refusal !== undefined) {
+        const refused = (this.refusals.get(partition ?? -1) ?? 0) + 1
+        if (refused < REFUSALS_PER_REPORT) {
+          this.refusals.set(partition ?? -1, refused)
+          this.refusedUntil = Date.now() + this.pollingRetryIntervalMs
+          return
+        }
+        this.refusals.delete(partition ?? -1)
+      }
+      throw error
+    }
+    this.refusals.delete(partition ?? -1)
+    this.idleReads = polled.length === 0 ? this.idleReads + 1 : 0
+    for (const message of polled) {
+      this.nextOffsets.set(message.partitionId, message.offset + 1n)
+      this.resumeAfterStored.delete(message.partitionId)
+    }
     const fresh = this.allowReplay
       ? polled
       : polled.filter((message) => {
@@ -1000,4 +1150,16 @@ function commitDue(
     case "intervalOrEvery":
       return (delivered && yielded >= policy.count) || elapsedMs >= policy.intervalMs
   }
+}
+
+// The lasting refusal code anywhere in the cause chain of a failed poll.
+function lastingRefusal(error: unknown): number | undefined {
+  let current = error
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (typeof current !== "object" || current === null) return undefined
+    const code = (current as { readonly errorCode?: unknown }).errorCode
+    if (typeof code === "number" && LASTING_REFUSALS.has(code)) return code
+    current = "cause" in current ? (current as { readonly cause?: unknown }).cause : undefined
+  }
+  return undefined
 }

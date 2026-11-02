@@ -1,7 +1,7 @@
 import { INTERNAL_TRANSPORT } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import { CONTEXT_READ_WINDOW, LastN } from "../context.js"
-import type { LaserTransport, PolledMessage } from "../iggy/apache-iggy.js"
+import type { LaserTransport, PollWait, PolledMessage } from "../iggy/apache-iggy.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
 import type { ConversationId } from "../types/ids.js"
 import {
@@ -263,7 +263,8 @@ export async function readWindow(
   }
 }
 
-/** Read one partition from `from` until no record is left.
+/** Read one partition from `from` until no record is left. The first read
+ * waits on the server as `wait` says, the rest answer at once.
  * @internal */
 export async function drainPartition(
   transport: LaserTransport,
@@ -271,7 +272,9 @@ export async function drainPartition(
   topic: string,
   reader: string,
   partition: number,
-  from: bigint
+  from: bigint,
+  wait?: PollWait,
+  signal?: AbortSignal
 ): Promise<{ readonly messages: readonly PolledMessage[]; readonly nextOffset: bigint }> {
   const target = { kind: "single", partitionId: partition, name: reader } as const
   const messages: PolledMessage[] = []
@@ -283,7 +286,9 @@ export async function drainPartition(
       target,
       { kind: "offset", value: next },
       READ_BATCH,
-      false
+      false,
+      messages.length === 0 ? wait : undefined,
+      signal
     )
     const fresh = batch.filter((message) => message.offset >= next)
     if (fresh.length === 0) return { messages, nextOffset: next }

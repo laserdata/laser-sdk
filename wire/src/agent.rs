@@ -363,6 +363,11 @@ impl TryFrom<String> for IdempotencyKey {
                 crate::limits::MAX_IDEMPOTENCY_KEY_BYTES
             )));
         }
+        if value.chars().any(char::is_control) {
+            return Err(InvalidError::new(
+                "idempotency key contains a control character",
+            ));
+        }
         Ok(Self(value))
     }
 }
@@ -2641,6 +2646,16 @@ mod tests {
         assert!("job-123-attempt-2".parse::<IdempotencyKey>().is_ok());
         assert!("".parse::<IdempotencyKey>().is_err());
         assert!("x".repeat(65).parse::<IdempotencyKey>().is_err());
+    }
+
+    #[test]
+    fn given_an_idempotency_key_with_a_control_character_when_parsed_then_should_refuse_it() {
+        assert!("job-123\nattempt-2".parse::<IdempotencyKey>().is_err());
+        assert!("job-123\u{7f}".parse::<IdempotencyKey>().is_err());
+        assert!(
+            serde_json::from_str::<IdempotencyKey>("\"job\\u0000\"").is_err(),
+            "a decoded key is checked too"
+        );
     }
 
     #[test]

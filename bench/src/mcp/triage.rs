@@ -86,7 +86,7 @@ pub async fn run_agdx_triage_evidence(
     for topic in [AgentTopic::Sessions, AgentTopic::Sessions] {
         scoped
             .topic(topic.topic_string())
-            .ensure(case.partitions)
+            .ensure(case.partitions, None)
             .await
             .map_err(sdk_error)?;
     }
@@ -104,7 +104,6 @@ pub async fn run_agdx_triage_evidence(
         .handler(TriageEcho {
             source: worker.wire_id(),
         })
-        .poll_interval(Duration::ZERO)
         .build()
         .spawn(worker_laser);
     agent.ready().await.map_err(sdk_error)?;

@@ -136,6 +136,9 @@ pub struct FilterCaps {
     /// server that predates the announcement, which then evaluates as this
     /// build does.
     pub evaluation: Option<FilterAnnounce>,
+    /// The longest filtered wait the server holds, in milliseconds. Zero when
+    /// it serves none, so a filtered reader paces idle rounds itself.
+    pub max_wait_ms: u32,
 }
 
 impl FilterCaps {
@@ -206,6 +209,7 @@ impl Capabilities {
             catalog: false,
             group_policy_reads: false,
             evaluation: None,
+            max_wait_ms: 0,
         },
         versions: None,
         backends: Vec::new(),
@@ -384,6 +388,7 @@ impl Capabilities {
             catalog,
             group_policy_reads: native,
             evaluation: None,
+            max_wait_ms: 0,
         };
         self
     }

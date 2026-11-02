@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { test } from "node:test"
-import { Agent } from "../../src/agent/builder.js"
+import { Agent, type AgentHandle } from "../../src/agent/builder.js"
 import type {
   AgentMessage,
   AgentMiddleware,
@@ -64,6 +64,20 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+// Every agent a test starts, stopped in the test's finally before its
+// connection closes, so a failed assertion cannot leave one running.
+const running = new Set<AgentHandle>()
+
+function started(handle: AgentHandle): AgentHandle {
+  running.add(handle)
+  return handle
+}
+
+async function stopStarted(): Promise<void> {
+  for (const handle of running) await handle.shutdown().catch(() => undefined)
+  running.clear()
+}
+
 async function readFixture(name: string): Promise<Uint8Array> {
   const buffer = await readFile(path.join(FIXTURES_DIR, name))
   return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
@@ -96,21 +110,23 @@ void test("given_a_transient_handler_failure_when_retried_then_should_reply_and_
         return Promise.resolve()
       }
     }
-    const handle = Agent.builder()
-      .id(AgentId.new("retry-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .respondOn(AgentTopic.Sessions)
-      .handler({
-        async handle(_message, context): Promise<void> {
-          attempts += 1
-          if (attempts === 1) throw new TransportError("temporary", true)
-          await context.respond(new TextEncoder().encode("complete"))
-        }
-      })
-      .retry({ maxAttempts: 2, baseDelayMs: 1 })
-      .middleware(middleware)
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("retry-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .respondOn(AgentTopic.Sessions)
+        .handler({
+          async handle(_message, context): Promise<void> {
+            attempts += 1
+            if (attempts === 1) throw new TransportError("temporary", true)
+            await context.respond(new TextEncoder().encode("complete"))
+          }
+        })
+        .retry({ maxAttempts: 2, baseDelayMs: 1 })
+        .middleware(middleware)
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
 
     const reply = await laser
@@ -123,6 +139,9 @@ void test("given_a_transient_handler_failure_when_retried_then_should_reply_and_
         2_000
       )
     assert.equal(new TextDecoder().decode(reply.payload), "complete")
+    // The reply can reach the requester before the worker records the outcome
+    // of the attempt that sent it.
+    for (let attempt = 0; attempt < 160 && after.length < 2; attempt += 1) await delay(10)
     assert.equal(attempts, 2)
     assert.equal(before, 1)
     assert.deepEqual(
@@ -145,6 +164,7 @@ void test("given_a_transient_handler_failure_when_retried_then_should_reply_and_
       await rejoined.shutdown()
     }
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -188,14 +208,16 @@ void test("given_invalid_and_unmet_agdx_records_when_consumed_then_should_reject
         return Promise.resolve()
       }
     }
-    const first = Agent.builder()
-      .id(AgentId.new("strict-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler(handler)
-      .middleware(middleware)
-      .onDeadLetter(sink)
-      .build()
-      .spawn(laser)
+    const first = started(
+      Agent.builder()
+        .id(AgentId.new("strict-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler(handler)
+        .middleware(middleware)
+        .onDeadLetter(sink)
+        .build()
+        .spawn(laser)
+    )
     await first.ready()
 
     for (const name of invalidFixtures) await sendAgentFixture(laser, await readFixture(name))
@@ -217,13 +239,15 @@ void test("given_invalid_and_unmet_agdx_records_when_consumed_then_should_reject
     assert.equal(publishFailures, 0)
     await first.shutdown()
 
-    const second = Agent.builder()
-      .id(AgentId.new("strict-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler(handler)
-      .understoodFeatures(required.mustUnderstand)
-      .build()
-      .spawn(laser)
+    const second = started(
+      Agent.builder()
+        .id(AgentId.new("strict-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler(handler)
+        .understoodFeatures(required.mustUnderstand)
+        .build()
+        .spawn(laser)
+    )
     await second.ready()
     // An event is observational and never reaches a handler, so the accepted
     // case is a command that demands the same features.
@@ -243,6 +267,7 @@ void test("given_invalid_and_unmet_agdx_records_when_consumed_then_should_reject
     assert.equal(handled.length, 1)
     await second.shutdown()
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -253,21 +278,23 @@ void test("given_periodic_memory_consolidation_when_an_agent_runs_then_should_ti
   try {
     await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     let consolidations = 0
-    const handle = Agent.builder()
-      .id(AgentId.new("consolidating-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({ handle: () => Promise.resolve() })
-      .consolidateEvery(10)
-      .consolidator({
-        consolidate(scope) {
-          assert.deepEqual(Object.keys(scope), ["agent"])
-          assert.equal(scope.agent?.asStr(), "consolidating-worker")
-          consolidations += 1
-          return Promise.resolve({ summarized: 0, reweighted: 0, pruned: 0, derived: 0 })
-        }
-      })
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("consolidating-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({ handle: () => Promise.resolve() })
+        .consolidateEvery(10)
+        .consolidator({
+          consolidate(scope) {
+            assert.deepEqual(Object.keys(scope), ["agent"])
+            assert.equal(scope.agent?.asStr(), "consolidating-worker")
+            consolidations += 1
+            return Promise.resolve({ summarized: 0, reweighted: 0, pruned: 0, derived: 0 })
+          }
+        })
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
     for (let attempt = 0; attempt < 50 && consolidations < 2; attempt += 1) await delay(10)
     assert.ok(consolidations >= 2)
@@ -276,6 +303,7 @@ void test("given_periodic_memory_consolidation_when_an_agent_runs_then_should_ti
     await delay(30)
     assert.equal(consolidations, stoppedAt)
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -299,17 +327,19 @@ void test("given_a_permanent_handler_rejection_when_consumed_then_should_publish
         return Promise.resolve()
       }
     }
-    const handle = Agent.builder()
-      .id(AgentId.new("rejecting-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({
-        handle(): Promise<void> {
-          return Promise.reject(new RejectedError("policy refused"))
-        }
-      })
-      .onDeadLetter(sink)
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("rejecting-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          handle(): Promise<void> {
+            return Promise.reject(new RejectedError("policy refused"))
+          }
+        })
+        .onDeadLetter(sink)
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
 
     const payload = new TextEncoder().encode("poison-body")
@@ -347,6 +377,7 @@ void test("given_a_permanent_handler_rejection_when_consumed_then_should_publish
     assert.deepEqual(observed.capsule, capsule)
     await handle.shutdown()
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -361,20 +392,22 @@ void test("given_partition_lanes_when_one_blocks_then_should_run_other_partition
     const slow = new Promise<void>((resolve) => {
       releaseSlow = resolve
     })
-    const handle = Agent.builder()
-      .id(AgentId.new("parallel-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({
-        async handle(message): Promise<void> {
-          const body = new TextDecoder().decode(message.payload)
-          events.push(`start-${String(message.id.partitionId)}-${body}`)
-          if (body === "slow") await slow
-          events.push(`end-${String(message.id.partitionId)}-${body}`)
-        }
-      })
-      .concurrency({ kind: "serial-per-partition", maxPartitions: 2 })
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("parallel-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          async handle(message): Promise<void> {
+            const body = new TextDecoder().decode(message.payload)
+            events.push(`start-${String(message.id.partitionId)}-${body}`)
+            if (body === "slow") await slow
+            events.push(`end-${String(message.id.partitionId)}-${body}`)
+          }
+        })
+        .concurrency({ kind: "serial-per-partition", maxPartitions: 2 })
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
 
     const transport = laser[INTERNAL_TRANSPORT]()
@@ -421,6 +454,7 @@ void test("given_partition_lanes_when_one_blocks_then_should_run_other_partition
       ["start-0-slow", "end-0-slow", "start-0-after", "end-0-after"]
     )
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -436,24 +470,26 @@ void test("given_sustained_partition_churn_when_consumed_then_should_bound_concu
     let active = 0
     let maxActive = 0
     const received = new Map<number, number[]>()
-    const handle = Agent.builder()
-      .id(AgentId.new("churn-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({
-        async handle(message): Promise<void> {
-          active += 1
-          maxActive = Math.max(maxActive, active)
-          const sequence = Number(new TextDecoder().decode(message.payload).split(":")[1])
-          await delay(1)
-          const lane = received.get(message.id.partitionId) ?? []
-          lane.push(sequence)
-          received.set(message.id.partitionId, lane)
-          active -= 1
-        }
-      })
-      .concurrency({ kind: "serial-per-partition", maxPartitions: concurrency })
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("churn-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          async handle(message): Promise<void> {
+            active += 1
+            maxActive = Math.max(maxActive, active)
+            const sequence = Number(new TextDecoder().decode(message.payload).split(":")[1])
+            await delay(1)
+            const lane = received.get(message.id.partitionId) ?? []
+            lane.push(sequence)
+            received.set(message.id.partitionId, lane)
+            active -= 1
+          }
+        })
+        .concurrency({ kind: "serial-per-partition", maxPartitions: concurrency })
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
 
     const transport = laser[INTERNAL_TRANSPORT]()
@@ -491,6 +527,7 @@ void test("given_sustained_partition_churn_when_consumed_then_should_bound_concu
       )
     }
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -505,18 +542,20 @@ void test("given_ack_on_pickup_when_an_agdx_command_arrives_then_should_emit_wor
     const handlerGate = new Promise<void>((resolve) => {
       releaseHandler = resolve
     })
-    const handle = Agent.builder()
-      .id(AgentId.new("contract-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .respondOn(AgentTopic.Sessions)
-      .ackOnPickup()
-      .handler({
-        handle(): Promise<void> {
-          return handlerGate
-        }
-      })
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("contract-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .respondOn(AgentTopic.Sessions)
+        .ackOnPickup()
+        .handler({
+          handle(): Promise<void> {
+            return handlerGate
+          }
+        })
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
 
     await laser
@@ -544,6 +583,7 @@ void test("given_ack_on_pickup_when_an_agdx_command_arrives_then_should_emit_wor
     releaseHandler()
     await handle.shutdown()
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -556,23 +596,25 @@ void test("given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_be
     await laser.topic(AgentTopic.Sessions).ensure()
     let published: Error | undefined
     let sinkCalls = 0
-    const handle = Agent.builder()
-      .id(AgentId.new("dlq-failure-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({
-        handle(): Promise<void> {
-          return Promise.reject(new RejectedError("reject"))
-        }
-      })
-      .onDeadLetter({
-        onDeadLetter(_message, _capsule, publishError): Promise<void> {
-          sinkCalls += 1
-          published = publishError
-          return Promise.resolve()
-        }
-      })
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("dlq-failure-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          handle(): Promise<void> {
+            return Promise.reject(new RejectedError("reject"))
+          }
+        })
+        .onDeadLetter({
+          onDeadLetter(_message, _capsule, publishError): Promise<void> {
+            sinkCalls += 1
+            published = publishError
+            return Promise.resolve()
+          }
+        })
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
     await laser.sendAgent(AgentTopic.Sessions, new TextEncoder().encode("poison"), {
       conversationId: ConversationId.new()
@@ -590,23 +632,25 @@ void test("given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_be
     await laser.topic(AgentTopic.Dlq).ensure()
     const dlq = await laser.topic(AgentTopic.Dlq).replay()
     let durableSinkCalls = 0
-    const replacement = Agent.builder()
-      .id(AgentId.new("dlq-failure-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({
-        handle(): Promise<void> {
-          return Promise.reject(new RejectedError("reject"))
-        }
-      })
-      .onDeadLetter({
-        onDeadLetter(_message, _capsule, publishError): Promise<void> {
-          assert.equal(publishError, undefined)
-          durableSinkCalls += 1
-          return Promise.resolve()
-        }
-      })
-      .build()
-      .spawn(laser)
+    const replacement = started(
+      Agent.builder()
+        .id(AgentId.new("dlq-failure-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          handle(): Promise<void> {
+            return Promise.reject(new RejectedError("reject"))
+          }
+        })
+        .onDeadLetter({
+          onDeadLetter(_message, _capsule, publishError): Promise<void> {
+            assert.equal(publishError, undefined)
+            durableSinkCalls += 1
+            return Promise.resolve()
+          }
+        })
+        .build()
+        .spawn(laser)
+    )
     await replacement.ready()
     let record
     for (let attempt = 0; attempt < 80 && record === undefined; attempt += 1) {
@@ -630,6 +674,7 @@ void test("given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_be
       await rejoined.shutdown()
     }
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -641,18 +686,20 @@ void test("given_a_retryable_handler_that_never_succeeds_when_consumed_then_shou
     await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     const dlq = await laser.topic(AgentTopic.Dlq).replay()
     let attempts = 0
-    const handle = Agent.builder()
-      .id(AgentId.new("exhausted-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({
-        handle(): Promise<void> {
-          attempts += 1
-          return Promise.reject(new TransportError("still unavailable", true))
-        }
-      })
-      .retry({ maxAttempts: 3, baseDelayMs: 1 })
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("exhausted-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          handle(): Promise<void> {
+            attempts += 1
+            return Promise.reject(new TransportError("still unavailable", true))
+          }
+        })
+        .retry({ maxAttempts: 3, baseDelayMs: 1 })
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
     await laser.sendAgent(AgentTopic.Sessions, new TextEncoder().encode("retry-me"), {
       conversationId: ConversationId.new()
@@ -686,6 +733,7 @@ void test("given_a_retryable_handler_that_never_succeeds_when_consumed_then_shou
       await rejoined.shutdown()
     }
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -700,17 +748,19 @@ void test("given_an_inflight_message_when_hard_aborted_then_should_redeliver_to_
     const firstGate = new Promise<void>((resolve) => {
       releaseFirst = resolve
     })
-    const first = Agent.builder()
-      .id(AgentId.new("abort-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({
-        handle(): Promise<void> {
-          firstEvents.push("started")
-          return firstGate
-        }
-      })
-      .build()
-      .spawn(laser)
+    const first = started(
+      Agent.builder()
+        .id(AgentId.new("abort-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          handle(): Promise<void> {
+            firstEvents.push("started")
+            return firstGate
+          }
+        })
+        .build()
+        .spawn(laser)
+    )
     await first.ready()
     await laser.sendAgent(AgentTopic.Sessions, new TextEncoder().encode("uncommitted"), {
       conversationId: ConversationId.new()
@@ -723,17 +773,19 @@ void test("given_an_inflight_message_when_hard_aborted_then_should_redeliver_to_
     await first.join()
 
     let replacementBody: string | undefined
-    const replacement = Agent.builder()
-      .id(AgentId.new("abort-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({
-        handle(message): Promise<void> {
-          replacementBody = new TextDecoder().decode(message.payload)
-          return Promise.resolve()
-        }
-      })
-      .build()
-      .spawn(laser)
+    const replacement = started(
+      Agent.builder()
+        .id(AgentId.new("abort-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          handle(message): Promise<void> {
+            replacementBody = new TextDecoder().decode(message.payload)
+            return Promise.resolve()
+          }
+        })
+        .build()
+        .spawn(laser)
+    )
     await replacement.ready()
     for (let attempt = 0; attempt < 80 && replacementBody === undefined; attempt += 1) {
       await delay(10)
@@ -742,6 +794,7 @@ void test("given_an_inflight_message_when_hard_aborted_then_should_redeliver_to_
     releaseFirst()
     await replacement.shutdown()
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -752,17 +805,19 @@ void test("given_committed_history_when_a_warmed_agent_restarts_then_should_supp
   try {
     await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     let initialCalls = 0
-    const first = Agent.builder()
-      .id(AgentId.new("warm-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({
-        handle(): Promise<void> {
-          initialCalls += 1
-          return Promise.resolve()
-        }
-      })
-      .build()
-      .spawn(laser)
+    const first = started(
+      Agent.builder()
+        .id(AgentId.new("warm-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          handle(): Promise<void> {
+            initialCalls += 1
+            return Promise.resolve()
+          }
+        })
+        .build()
+        .spawn(laser)
+    )
     await first.ready()
     const conversationId = ConversationId.new()
     await laser.sendAgent(AgentTopic.Sessions, new TextEncoder().encode("first"), {
@@ -782,18 +837,20 @@ void test("given_committed_history_when_a_warmed_agent_restarts_then_should_supp
       idempotencyKey: "new-key"
     })
     const restartedBodies: string[] = []
-    const restarted = Agent.builder()
-      .id(AgentId.new("warm-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .warmDedup()
-      .handler({
-        handle(message): Promise<void> {
-          restartedBodies.push(new TextDecoder().decode(message.payload))
-          return Promise.resolve()
-        }
-      })
-      .build()
-      .spawn(laser)
+    const restarted = started(
+      Agent.builder()
+        .id(AgentId.new("warm-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .warmDedup()
+        .handler({
+          handle(message): Promise<void> {
+            restartedBodies.push(new TextDecoder().decode(message.payload))
+            return Promise.resolve()
+          }
+        })
+        .build()
+        .spawn(laser)
+    )
     await restarted.ready()
     for (let attempt = 0; attempt < 80 && restartedBodies.length === 0; attempt += 1) {
       await delay(10)
@@ -801,6 +858,7 @@ void test("given_committed_history_when_a_warmed_agent_restarts_then_should_supp
     assert.deepEqual(restartedBodies, ["new"])
     await restarted.shutdown()
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -811,18 +869,19 @@ void test("given_lost_group_membership_when_polling_then_should_rejoin_and_conti
   try {
     await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     let body: string | undefined
-    const handle = Agent.builder()
-      .id(AgentId.new("rejoin-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .pollInterval(5)
-      .handler({
-        handle(message): Promise<void> {
-          body = new TextDecoder().decode(message.payload)
-          return Promise.resolve()
-        }
-      })
-      .build()
-      .spawn(await nativeLaser(laser, stream))
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("rejoin-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          handle(message): Promise<void> {
+            body = new TextDecoder().decode(message.payload)
+            return Promise.resolve()
+          }
+        })
+        .build()
+        .spawn(await nativeLaser(laser, stream))
+    )
     await handle.ready()
     await laser.client.group.leave({
       streamId: stream,
@@ -836,6 +895,7 @@ void test("given_lost_group_membership_when_polling_then_should_rejoin_and_conti
     assert.equal(body, "after-rejoin")
     await handle.shutdown()
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -847,17 +907,19 @@ void test("given_deadline_fence_and_dedup_records_when_consumed_then_should_appl
     await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     const handled: string[] = []
     const dlq = await laser.topic(AgentTopic.Dlq).replay()
-    const handle = Agent.builder()
-      .id(AgentId.new("gated-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({
-        handle(message): Promise<void> {
-          handled.push(new TextDecoder().decode(message.payload))
-          return Promise.resolve()
-        }
-      })
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("gated-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          handle(message): Promise<void> {
+            handled.push(new TextDecoder().decode(message.payload))
+            return Promise.resolve()
+          }
+        })
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
     const fencedConversation = ConversationId.new()
     const duplicateConversation = ConversationId.new()
@@ -898,6 +960,7 @@ void test("given_deadline_fence_and_dedup_records_when_consumed_then_should_appl
     assert.equal(capsule.reason.name, "DeadlineExceeded")
     await handle.shutdown()
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -914,20 +977,22 @@ void test("given_a_verified_agent_when_signed_and_unsigned_commands_arrive_then_
     const workers = new KeyRegistry()
     workers.enroll("worker-principal", workerKey.verifyingKey())
     const handledPrincipals: string[] = []
-    const handle = Agent.builder()
-      .id(AgentId.new("signed-worker"))
-      .listenOn(AgentTopic.Sessions)
-      .respondOn(AgentTopic.Sessions)
-      .verifier(callers)
-      .signingKey(workerKey)
-      .handler({
-        async handle(message, context): Promise<void> {
-          handledPrincipals.push(message.verifiedPrincipal ?? "missing")
-          await context.respond(new TextEncoder().encode("signed-response"))
-        }
-      })
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("signed-worker"))
+        .listenOn(AgentTopic.Sessions)
+        .respondOn(AgentTopic.Sessions)
+        .verifier(callers)
+        .signingKey(workerKey)
+        .handler({
+          async handle(message, context): Promise<void> {
+            handledPrincipals.push(message.verifiedPrincipal ?? "missing")
+            await context.respond(new TextEncoder().encode("signed-response"))
+          }
+        })
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
     const responses = await laser.topic(AgentTopic.Sessions).replay()
     const dlq = await laser.topic(AgentTopic.Dlq).replay()
@@ -976,12 +1041,13 @@ void test("given_a_verified_agent_when_signed_and_unsigned_commands_arrive_then_
     assert.equal(rejected.detail, "signature verification failed")
     await handle.shutdown()
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
 
 // A signed command encoded exactly as the AGDX producer would publish it, so a
-// test can vary the broker headers independently of the signed context.
+// test can vary the transport headers independently of the signed context.
 function signedCommand(key: SigningKey, conversation: bigint, correlation: bigint): Uint8Array {
   const envelope = commandEnvelope(
     RecordId.fromU128(correlation | 0x1000n),
@@ -1013,7 +1079,7 @@ async function publishWithHeaders(
   await laser.topic(AgentTopic.Sessions).send(payload, { headers })
 }
 
-void test("given_a_verified_agent_when_broker_headers_are_mutated_then_should_dead_letter_before_dispatch", async () => {
+void test("given_a_verified_agent_when_transport_headers_are_mutated_then_should_dead_letter_before_dispatch", async () => {
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
   try {
@@ -1030,25 +1096,27 @@ void test("given_a_verified_agent_when_broker_headers_are_mutated_then_should_de
         return Promise.resolve()
       }
     }
-    const handle = Agent.builder()
-      .id(AgentId.new("header-strict"))
-      .listenOn(AgentTopic.Sessions)
-      .verifier(callers)
-      .handler({
-        handle(message: AgentMessage): Promise<void> {
-          handledPrincipals.push(message.verifiedPrincipal)
-          return Promise.resolve()
-        }
-      })
-      .middleware(middleware)
-      .onDeadLetter({
-        onDeadLetter(_message, capsule): Promise<void> {
-          deadLetters.push(capsule)
-          return Promise.resolve()
-        }
-      })
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("header-strict"))
+        .listenOn(AgentTopic.Sessions)
+        .verifier(callers)
+        .handler({
+          handle(message: AgentMessage): Promise<void> {
+            handledPrincipals.push(message.verifiedPrincipal)
+            return Promise.resolve()
+          }
+        })
+        .middleware(middleware)
+        .onDeadLetter({
+          onDeadLetter(_message, capsule): Promise<void> {
+            deadLetters.push(capsule)
+            return Promise.resolve()
+          }
+        })
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
 
     // The signature binds `agdx.ct = cbor` and the current `agdx.av`. Republish
@@ -1098,11 +1166,12 @@ void test("given_a_verified_agent_when_broker_headers_are_mutated_then_should_de
     assert.deepEqual(handledPrincipals, ["caller"])
     await handle.shutdown()
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
 
-void test("given_lifecycle_bound_keys_when_verified_at_the_broker_timestamp_then_should_gate_by_validity", async () => {
+void test("given_lifecycle_bound_keys_when_verified_at_the_server_timestamp_then_should_gate_by_validity", async () => {
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
   try {
@@ -1125,27 +1194,29 @@ void test("given_lifecycle_bound_keys_when_verified_at_the_broker_timestamp_then
 
     const handledPrincipals: (string | undefined)[] = []
     const deadLetters: AgentDeadLetter[] = []
-    const handle = Agent.builder()
-      .id(AgentId.new("window-strict"))
-      .listenOn(AgentTopic.Sessions)
-      .verifier(registry)
-      .handler({
-        handle(message: AgentMessage): Promise<void> {
-          handledPrincipals.push(message.verifiedPrincipal)
-          return Promise.resolve()
-        }
-      })
-      .onDeadLetter({
-        onDeadLetter(_message, capsule): Promise<void> {
-          deadLetters.push(capsule)
-          return Promise.resolve()
-        }
-      })
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("window-strict"))
+        .listenOn(AgentTopic.Sessions)
+        .verifier(registry)
+        .handler({
+          handle(message: AgentMessage): Promise<void> {
+            handledPrincipals.push(message.verifiedPrincipal)
+            return Promise.resolve()
+          }
+        })
+        .onDeadLetter({
+          onDeadLetter(_message, capsule): Promise<void> {
+            deadLetters.push(capsule)
+            return Promise.resolve()
+          }
+        })
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
 
-    // Each key signs an otherwise identical command. The broker stamps the
+    // Each key signs an otherwise identical command. The streaming server stamps the
     // record timestamp on ingest, so only the key whose window covers that
     // stamp may pass, and the future, expired, and revoked keys dead-letter.
     const conversation = ConversationId.new()
@@ -1174,6 +1245,7 @@ void test("given_lifecycle_bound_keys_when_verified_at_the_broker_timestamp_then
     )
     await handle.shutdown()
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -1196,15 +1268,17 @@ void test("given_a_verifier_when_input_replies_are_forged_then_should_resume_onl
 
     // An unsigned approver answers every interrupt, but its response cannot
     // verify, so the paused caller must keep waiting and time out.
-    const faker = Agent.builder()
-      .id(AgentId.new("faker"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({
-        handle: (_message, context) =>
-          context.respondInput(AgentTopic.Sessions, new TextEncoder().encode("forged"))
-      })
-      .build()
-      .spawn(laser)
+    const faker = started(
+      Agent.builder()
+        .id(AgentId.new("faker"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          handle: (_message, context) =>
+            context.respondInput(AgentTopic.Sessions, new TextEncoder().encode("forged"))
+        })
+        .build()
+        .spawn(laser)
+    )
     await faker.ready()
 
     const orchestrator = caller.agdx(
@@ -1219,16 +1293,18 @@ void test("given_a_verifier_when_input_replies_are_forged_then_should_resume_onl
 
     // A signing approver resumes the caller: `respondInput` signs with the
     // agent's key, so the verified reader accepts exactly this decision.
-    const approver = Agent.builder()
-      .id(AgentId.new("approver"))
-      .listenOn(AgentTopic.Sessions)
-      .signingKey(approverKey)
-      .handler({
-        handle: (_message, context) =>
-          context.respondInput(AgentTopic.Sessions, new TextEncoder().encode("approved-signed"))
-      })
-      .build()
-      .spawn(laser)
+    const approver = started(
+      Agent.builder()
+        .id(AgentId.new("approver"))
+        .listenOn(AgentTopic.Sessions)
+        .signingKey(approverKey)
+        .handler({
+          handle: (_message, context) =>
+            context.respondInput(AgentTopic.Sessions, new TextEncoder().encode("approved-signed"))
+        })
+        .build()
+        .spawn(laser)
+    )
     await approver.ready()
 
     const decision = await orchestrator.requestInput(
@@ -1240,6 +1316,7 @@ void test("given_a_verifier_when_input_replies_are_forged_then_should_resume_onl
     await faker.shutdown()
     await approver.shutdown()
   } finally {
+    await stopStarted()
     for (const caller of callers) await caller.close()
     await laser.close()
   }
@@ -1276,15 +1353,16 @@ void test("given_a_blocked_partition_when_the_record_bound_fills_then_should_sta
     const entered = new Promise<void>((resolve) => {
       announceEntered = resolve
     })
-    const handle = Agent.builder()
-      .id(AgentId.new("bounded"))
-      .listenOn(AgentTopic.Sessions)
-      .concurrency({ kind: "serial-per-partition", maxPartitions: 4 })
-      .maxQueuedRecords(3)
-      .pollInterval(5)
-      .handler(gatedHandler(handled, gate, announceEntered))
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("bounded"))
+        .listenOn(AgentTopic.Sessions)
+        .concurrency({ kind: "serial-per-partition", maxPartitions: 4 })
+        .maxQueuedRecords(3)
+        .handler(gatedHandler(handled, gate, announceEntered))
+        .build()
+        .spawn(laser)
+    )
     stopAgent = async () => {
       releaseGate()
       await handle.shutdown()
@@ -1356,6 +1434,7 @@ void test("given_a_blocked_partition_when_the_record_bound_fills_then_should_sta
     )
   } finally {
     await stopAgent()
+    await stopStarted()
     await laser.close()
   }
 })
@@ -1374,14 +1453,16 @@ void test("given_a_blocked_partition_when_the_byte_bound_fills_then_should_stall
     const entered = new Promise<void>((resolve) => {
       announceEntered = resolve
     })
-    const handle = Agent.builder()
-      .id(AgentId.new("byte-bounded"))
-      .listenOn(AgentTopic.Sessions)
-      .concurrency({ kind: "serial-per-partition", maxPartitions: 4 })
-      .maxQueuedBytes(64 * 1024)
-      .handler(gatedHandler(handled, gate, announceEntered))
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("byte-bounded"))
+        .listenOn(AgentTopic.Sessions)
+        .concurrency({ kind: "serial-per-partition", maxPartitions: 4 })
+        .maxQueuedBytes(64 * 1024)
+        .handler(gatedHandler(handled, gate, announceEntered))
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
 
     // Hold the lane open, then queue payloads that overflow the byte bound:
@@ -1416,6 +1497,7 @@ void test("given_a_blocked_partition_when_the_byte_bound_fills_then_should_stall
     assert.equal(handled.length, 5)
     await handle.shutdown()
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -1437,20 +1519,22 @@ void test("given_a_failed_lane_when_successors_are_queued_then_should_not_commit
     // A escapes `consume` as a lane failure while B queues behind it. The
     // partition must fence and reconnect without committing B past failed A.
     let failObserve = true
-    const handle = Agent.builder()
-      .id(AgentId.new("fenced-lane"))
-      .listenOn(AgentTopic.Sessions)
-      .concurrency({ kind: "serial-per-partition", maxPartitions: 2 })
-      .deduplicator({
-        observe(): Promise<boolean> {
-          if (!failObserve) return Promise.resolve(true)
-          failObserve = false
-          return Promise.reject(new TransportError("dedup store unavailable", true))
-        }
-      })
-      .handler(recorder)
-      .build()
-      .spawn(laser)
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("fenced-lane"))
+        .listenOn(AgentTopic.Sessions)
+        .concurrency({ kind: "serial-per-partition", maxPartitions: 2 })
+        .deduplicator({
+          observe(): Promise<boolean> {
+            if (!failObserve) return Promise.resolve(true)
+            failObserve = false
+            return Promise.reject(new TransportError("dedup store unavailable", true))
+          }
+        })
+        .handler(recorder)
+        .build()
+        .spawn(laser)
+    )
     await handle.ready()
     await laser.sendAgent(AgentTopic.Sessions, new TextEncoder().encode("a"), {
       conversationId: conversation,
@@ -1464,6 +1548,7 @@ void test("given_a_failed_lane_when_successors_are_queued_then_should_not_commit
     assert.deepEqual(handled, ["a", "b"])
     await handle.shutdown()
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -1474,17 +1559,19 @@ void test("given_a_permanent_transport_rejection_when_polling_then_should_stop_w
   try {
     await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     const handled: string[] = []
-    const handle = Agent.builder()
-      .id(AgentId.new("classified"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({
-        handle(message: AgentMessage): Promise<void> {
-          handled.push(new TextDecoder().decode(message.payload))
-          return Promise.resolve()
-        }
-      })
-      .build()
-      .spawn(await nativeLaser(laser, stream))
+    const handle = started(
+      Agent.builder()
+        .id(AgentId.new("classified"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          handle(message: AgentMessage): Promise<void> {
+            handled.push(new TextDecoder().decode(message.payload))
+            return Promise.resolve()
+          }
+        })
+        .build()
+        .spawn(await nativeLaser(laser, stream))
+    )
     await handle.ready()
     await laser.sendAgent(AgentTopic.Sessions, new TextEncoder().encode("live"), {
       conversationId: ConversationId.new()
@@ -1505,6 +1592,7 @@ void test("given_a_permanent_transport_rejection_when_polling_then_should_stop_w
       (error: unknown) => error instanceof TransportError && !error.retryable
     )
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -1522,18 +1610,20 @@ void test("given_a_connected_runtime_when_records_are_handled_then_should_commit
     ] as const) {
       const target = AgentId.new(id)
       let firstCount = 0
-      const first = Agent.builder()
-        .id(target)
-        .listenOn(AgentTopic.Sessions)
-        .concurrency(concurrency)
-        .handler({
-          handle(): Promise<void> {
-            firstCount += 1
-            return Promise.resolve()
-          }
-        })
-        .build()
-        .spawn(laser)
+      const first = started(
+        Agent.builder()
+          .id(target)
+          .listenOn(AgentTopic.Sessions)
+          .concurrency(concurrency)
+          .handler({
+            handle(): Promise<void> {
+              firstCount += 1
+              return Promise.resolve()
+            }
+          })
+          .build()
+          .spawn(laser)
+      )
       await first.ready()
       for (let index = 0; index < 3; index += 1) {
         await laser.sendAgent(AgentTopic.Sessions, new TextEncoder().encode("work"), {
@@ -1546,18 +1636,20 @@ void test("given_a_connected_runtime_when_records_are_handled_then_should_commit
       await first.shutdown()
 
       let secondCount = 0
-      const second = Agent.builder()
-        .id(target)
-        .listenOn(AgentTopic.Sessions)
-        .concurrency(concurrency)
-        .handler({
-          handle(): Promise<void> {
-            secondCount += 1
-            return Promise.resolve()
-          }
-        })
-        .build()
-        .spawn(laser)
+      const second = started(
+        Agent.builder()
+          .id(target)
+          .listenOn(AgentTopic.Sessions)
+          .concurrency(concurrency)
+          .handler({
+            handle(): Promise<void> {
+              secondCount += 1
+              return Promise.resolve()
+            }
+          })
+          .build()
+          .spawn(laser)
+      )
       await second.ready()
       await laser.sendAgent(AgentTopic.Sessions, new TextEncoder().encode("work"), {
         conversationId: ConversationId.new(),
@@ -1569,6 +1661,7 @@ void test("given_a_connected_runtime_when_records_are_handled_then_should_commit
       await second.shutdown()
     }
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -1598,26 +1691,30 @@ void test("given_a_failed_dead_letter_in_a_lane_when_the_worker_stops_then_shoul
         return Promise.resolve()
       }
     }
-    const first = Agent.builder()
-      .id(target)
-      .listenOn(AgentTopic.Sessions)
-      .concurrency({ kind: "serial-per-partition", maxPartitions: 4 })
-      .handler(worker)
-      .build()
-      .spawn(laser)
+    const first = started(
+      Agent.builder()
+        .id(target)
+        .listenOn(AgentTopic.Sessions)
+        .concurrency({ kind: "serial-per-partition", maxPartitions: 4 })
+        .handler(worker)
+        .build()
+        .spawn(laser)
+    )
     await assert.rejects(first.join(), PublishFailedError)
     assert.deepEqual(handled, [], "the lane stops before its queued successor")
 
     await laser.topic(AgentTopic.Dlq).ensure(4)
     const restarted = await Laser.connectWithStream(CONNECTION_STRING, stream)
     try {
-      const second = Agent.builder()
-        .id(target)
-        .listenOn(AgentTopic.Sessions)
-        .concurrency({ kind: "serial-per-partition", maxPartitions: 4 })
-        .handler(worker)
-        .build()
-        .spawn(restarted)
+      const second = started(
+        Agent.builder()
+          .id(target)
+          .listenOn(AgentTopic.Sessions)
+          .concurrency({ kind: "serial-per-partition", maxPartitions: 4 })
+          .handler(worker)
+          .build()
+          .spawn(restarted)
+      )
       await second.ready()
       for (let attempt = 0; attempt < 300 && handled.length < 1; attempt += 1) await delay(10)
       assert.deepEqual(handled, ["after"])
@@ -1636,9 +1733,11 @@ void test("given_a_failed_dead_letter_in_a_lane_when_the_worker_stops_then_shoul
       assert.deepEqual(capsule.payload, new TextEncoder().encode("reject"))
       await second.shutdown()
     } finally {
+      await stopStarted()
       await restarted.close()
     }
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })
@@ -1649,17 +1748,19 @@ void test("given_an_undecodable_record_with_a_conversation_header_when_dead_lett
   try {
     await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     let handled = 0
-    const worker = Agent.builder()
-      .id(AgentId.new("decoder"))
-      .listenOn(AgentTopic.Sessions)
-      .handler({
-        handle(): Promise<void> {
-          handled += 1
-          return Promise.resolve()
-        }
-      })
-      .build()
-      .spawn(laser)
+    const worker = started(
+      Agent.builder()
+        .id(AgentId.new("decoder"))
+        .listenOn(AgentTopic.Sessions)
+        .handler({
+          handle(): Promise<void> {
+            handled += 1
+            return Promise.resolve()
+          }
+        })
+        .build()
+        .spawn(laser)
+    )
     await worker.ready()
     const conversation = ConversationId.new()
     const dlq = await laser.topic(AgentTopic.Dlq).replay()
@@ -1690,6 +1791,7 @@ void test("given_an_undecodable_record_with_a_conversation_header_when_dead_lett
     assert.equal(handled, 0)
     await worker.shutdown()
   } finally {
+    await stopStarted()
     await laser.close()
   }
 })

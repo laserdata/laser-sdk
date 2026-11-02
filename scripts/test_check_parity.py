@@ -66,6 +66,15 @@ class TypeScriptInheritanceTests(unittest.TestCase):
         self.assertIn("asU128", lookup.members("RecordId"))
         self.assertNotIn("WireId", surface.decls)
 
+    def test_given_a_combined_peer_spelling_when_resolving_then_should_claim_every_part_and_fail_on_a_missing_one(self):
+        surface = parity.TsSurface()
+        parity.parse_report("export interface CreateOptions {\n    readonly filter?: string;\n    readonly filterName?: string;\n}\n", surface)
+        lookup = parity.Lookup("TypeScript", surface, {}, {}, set(), {})
+        found, accepted, _, _ = lookup.resolve("CreateOptions.filter + CreateOptions.filterName")
+        self.assertTrue(found and accepted)
+        self.assertTrue({"CreateOptions.filter", "CreateOptions.filterName"} <= lookup.claims)
+        self.assertFalse(lookup.resolve("CreateOptions.filter + CreateOptions.missing")[0])
+
     def test_given_an_interface_and_companion_const_in_two_reports_when_extracting_then_should_keep_both_member_sets(self):
         surface = parity.TsSurface()
         report = 'export interface Filter {\n    readonly expr: string;\n}\nexport const Filter: {\n    readonly json: (expr: string) => Filter;\n};\n'

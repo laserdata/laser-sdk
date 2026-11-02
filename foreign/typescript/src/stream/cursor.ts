@@ -1,5 +1,11 @@
-import type { LaserTransport } from "../iggy/apache-iggy.js"
-import { CancelledError, InvalidError } from "../client/errors.js"
+import type {
+  ConsumerTarget,
+  HeldPartition,
+  LaserTransport,
+  PollWait,
+  PolledMessage
+} from "../iggy/apache-iggy.js"
+import { CancelledError, InvalidError, TransportError } from "../client/errors.js"
 import type { ConsumerStart } from "./consumer-start.js"
 import { type Message, withMessageJson } from "./message.js"
 
@@ -172,9 +178,151 @@ export class Cursor {
         offset = message.offset + 1n
         drained += 1
       }
-      if (polled.length < count || drained >= MAX_DRAIN_RECORDS) break
+      // A reply under the byte cap can hold fewer records than asked, so only
+      // an empty reply or the head it reported ends the partition.
+      const head = polled.at(-1)?.currentOffset
+      if (
+        polled.length === 0 ||
+        drained >= MAX_DRAIN_RECORDS ||
+        (head !== undefined && offset > head)
+      )
+        break
     }
     return offset
+  }
+}
+
+/** Read one partition from `from` through `through`, stopping early at an
+ * empty reply. A reply under the byte cap can hold fewer records than asked.
+ * @internal */
+export async function readThrough(
+  transport: LaserTransport,
+  stream: string,
+  topic: string,
+  target: ConsumerTarget,
+  from: bigint,
+  through: bigint
+): Promise<readonly PolledMessage[]> {
+  const messages: PolledMessage[] = []
+  let next = from
+  while (next <= through) {
+    const batch = await transport.pollMessages(
+      stream,
+      topic,
+      target,
+      { kind: "offset", value: next },
+      Number(through - next + 1n),
+      false
+    )
+    const fresh = batch.filter((message) => message.offset >= next && message.offset <= through)
+    if (fresh.length === 0) break
+    messages.push(...fresh)
+    next = (fresh.at(-1)?.offset ?? next) + 1n
+  }
+  return messages
+}
+
+/**
+ * The records of the first partition of `offsets` that holds one at or after
+ * its offset, with one read that the server holds up to `wait` per partition
+ * primary, or per partition when the client cannot route a fetch. One client
+ * parks at most 64 such reads, so a fetch per primary keeps a topic of any
+ * partition count from queueing behind them. The other reads are cancelled
+ * once one answers with records. They store no offset, so nothing is lost.
+ * `undefined` when every read ended empty.
+ * @internal
+ */
+export async function heldRead(
+  transport: LaserTransport,
+  stream: string,
+  topic: string,
+  offsets: ReadonlyMap<number, bigint>,
+  count: number,
+  wait: PollWait,
+  signal?: AbortSignal,
+  reader?: string
+): Promise<HeldPartition | undefined> {
+  const cancel = new AbortController()
+  const stop = (): void => {
+    cancel.abort()
+  }
+  signal?.addEventListener("abort", stop, { once: true })
+  try {
+    const fetchHeld = transport.fetchHeld?.bind(transport)
+    const groups =
+      fetchHeld === undefined || offsets.size === 0
+        ? undefined
+        : await transport.primaryGroups?.(stream, topic, [...offsets.keys()])
+    const reads: (() => Promise<readonly HeldPartition[]>)[] =
+      fetchHeld === undefined || groups === undefined
+        ? [...offsets].map(([partitionId, offset]) => async () => {
+            const target: ConsumerTarget = {
+              kind: "single",
+              partitionId,
+              ...(reader !== undefined ? { name: reader } : {})
+            }
+            const messages = await transport.pollMessages(
+              stream,
+              topic,
+              target,
+              { kind: "offset", value: offset },
+              count,
+              false,
+              wait,
+              cancel.signal
+            )
+            return [{ partitionId, messages }]
+          })
+        : groups.map(
+            (group) => () =>
+              fetchHeld(
+                stream,
+                topic,
+                new Map(group.map((partitionId) => [partitionId, offsets.get(partitionId) ?? 0n])),
+                count,
+                wait,
+                cancel.signal,
+                reader
+              )
+          )
+    return await new Promise((resolve, reject) => {
+      let open = reads.length
+      let failure: unknown
+      const settle = (): void => {
+        open -= 1
+        if (open > 0) return
+        if (failure === undefined) resolve(undefined)
+        else
+          reject(
+            failure instanceof Error
+              ? failure
+              : new TransportError("a held read failed", true, { cause: failure })
+          )
+      }
+      if (open === 0) resolve(undefined)
+      for (const read of reads) {
+        read().then(
+          (answered) => {
+            for (const { partitionId, messages } of answered) {
+              const from = offsets.get(partitionId) ?? 0n
+              const fresh = messages.filter((message) => message.offset >= from)
+              if (fresh.length > 0) {
+                resolve({ partitionId, messages: fresh })
+                break
+              }
+            }
+            settle()
+          },
+          (error: unknown) => {
+            failure ??= error
+            settle()
+          }
+        )
+      }
+    })
+  } finally {
+    signal?.removeEventListener("abort", stop)
+    cancel.abort()
   }
 }
 

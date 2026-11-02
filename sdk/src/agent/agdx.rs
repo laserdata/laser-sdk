@@ -268,7 +268,7 @@ impl Agdx {
                 self.laser.stream_required()?,
                 destination.as_deref().unwrap_or(&self.topic),
                 vec![message],
-                partitioning.clone(),
+                Ok(partitioning.clone()),
                 || async {
                     if destination.is_some() {
                         return Ok(None);

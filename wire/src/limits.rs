@@ -52,6 +52,10 @@ pub const DEFAULT_NAMESPACE: &str = "default";
 pub const MAX_NAMESPACE_BYTES: usize = 128;
 /// Maximum UTF-8 byte length of a session label.
 pub const MAX_SESSION_LABEL_BYTES: usize = 256;
+/// Maximum UTF-8 bytes of a session list's text filter.
+pub const MAX_SESSION_TEXT_QUERY_BYTES: usize = 1024;
+/// Maximum UTF-8 bytes of a session list's opaque page cursor.
+pub const MAX_SESSION_CURSOR_BYTES: usize = 512;
 /// Most session ids one heartbeat record lists. A process with more leases in
 /// one stream splits them over several records.
 pub const MAX_HEARTBEAT_SESSIONS: usize = 2048;
@@ -116,6 +120,14 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_QUERY_REPLY_BYTES: usize = MAX_FRAME_BYTES;
 /// Maximum UTF-8 bytes in an operational index name or query engine label.
 pub const MAX_QUERY_NAME_BYTES: usize = 255;
+/// Maximum UTF-8 bytes in a projection id.
+pub const MAX_PROJECTION_ID_BYTES: usize = 255;
+/// Maximum UTF-8 bytes in a projection's human-readable name.
+pub const MAX_PROJECTION_NAME_BYTES: usize = 255;
+/// Maximum UTF-8 bytes in an index field's name, JSON pointer, or vector field pointer.
+pub const MAX_INDEX_FIELD_BYTES: usize = 255;
+/// Maximum UTF-8 bytes in a writer schema's name.
+pub const MAX_SCHEMA_NAME_BYTES: usize = 255;
 /// Maximum UTF-8 bytes in one read-only raw SQL statement.
 pub const MAX_RAW_SQL_BYTES: usize = 64 * 1024;
 /// Maximum number of positional raw SQL parameters.
@@ -182,6 +194,8 @@ pub const DEFAULT_RECALL_LIMIT: usize = DEFAULT_STREAM_PAGE_SIZE;
 pub const MAX_MEMORY_TAGS: usize = 16;
 /// Max bytes in one memory tag.
 pub const MAX_MEMORY_TAG_BYTES: usize = 64;
+/// Max bytes in a memory item id, its kind word, or a forget or feedback target.
+pub const MAX_MEMORY_ID_BYTES: usize = 255;
 /// Maximum graph name length, in bytes. Bounded and control-character-free
 /// like a namespace: the name keys the projection registry and every
 /// traversal request.
@@ -192,6 +206,8 @@ pub const MAX_GRAPH_TRAVERSE_DEPTH: u32 = 8;
 pub const MAX_GRAPH_RESULT_ELEMENTS: usize = 10_000;
 /// Max labels on one graph node.
 pub const MAX_GRAPH_NODE_LABELS: usize = 16;
+/// Max bytes in one graph node label or edge type.
+pub const MAX_GRAPH_LABEL_BYTES: usize = 128;
 /// Max encoded bytes of a node or edge `source` provenance reference. A source
 /// names a stream, topic, key, or id, all of which are bounded inputs already,
 /// so this is a defensive ceiling against a hostile or buggy upsert inflating
@@ -237,6 +253,12 @@ pub const MAX_FILTERED_PAGE_BYTES: u32 = 8 * 1024 * 1024;
 /// Max source records one filtered page may ask to examine. The server
 /// lowers it to its own budget.
 pub const MAX_FILTERED_PAGE_EXAMINED: u32 = 100_000;
+/// Max milliseconds a filtered wait is held by the server.
+pub const MAX_FILTERED_WAIT_MS: u32 = 20_000;
+/// Max partitions one filtered wait names.
+pub const MAX_FILTERED_WAIT_PARTITIONS: usize = 1024;
+/// Max waits one filtered wait cancel names.
+pub const MAX_FILTERED_WAIT_CANCEL_IDS: usize = 64;
 /// Max records one preview may examine.
 pub const MAX_FILTER_PREVIEW_EXAMINED: u32 = 10_000;
 /// Max records one preview returns.

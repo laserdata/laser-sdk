@@ -1,5 +1,7 @@
 use crate::test_iggy::{TestIggy, TestIggyCluster};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -7,18 +9,11 @@ use tokio::time::Instant;
 #[serial_test::serial(integration)]
 async fn given_three_node_cluster_when_follower_and_leader_restart_then_same_sdk_handle_should_continue_streaming()
  {
-    use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
     let mut cluster = TestIggyCluster::start().await;
-    let leader = discover_leader(&cluster, 0).await;
+    let leader = cluster.leader(0).await;
     let follower = (0..3).find(|node| *node != leader).expect("follower");
     cluster.route_endpoint_to(leader);
-    let connection = format!(
-        "iggy+tcp://{DEFAULT_ROOT_USERNAME}:{DEFAULT_ROOT_PASSWORD}@{}?reconnection_retries=unlimited&reconnection_interval=100ms",
-        cluster.endpoint(),
-    );
+    let connection = cluster.connection_string();
     // A short attempt timeout keeps every stall inside the SDK's own recovery
     // path. An external cancel would drop the send mid-flight and leave its
     // late reply frame on the shared connection for the next send to misread.
@@ -36,7 +31,7 @@ async fn given_three_node_cluster_when_follower_and_leader_restart_then_same_sdk
         .ensure()
         .await
         .expect("stream");
-    laser.topic("pulse").ensure(1).await.expect("topic");
+    laser.topic("pulse").ensure(1, None).await.expect("topic");
 
     let stop = Arc::new(AtomicBool::new(false));
     let sent = Arc::new(AtomicU64::new(0));
@@ -74,7 +69,7 @@ async fn given_three_node_cluster_when_follower_and_leader_restart_then_same_sdk
     // leadership. Re-route before the old leader is back: it rejoins as a
     // follower, and a connection parked on a follower never sees a reply.
     cluster.stop_node(leader);
-    let new_leader = discover_leader(&cluster, follower).await;
+    let new_leader = cluster.leader(follower).await;
     cluster.route_endpoint_to(new_leader);
     cluster.start_node(leader).await;
     let after_leader = sent.load(Ordering::Acquire);
@@ -88,64 +83,9 @@ async fn given_three_node_cluster_when_follower_and_leader_restart_then_same_sdk
     );
 }
 
-// A follower reports the primary from its local view, so right after the
-// leader stops it still names the dead node until the view change lands.
-// Ask `via` for the leader, then make that node confirm the role itself: a
-// stopped node refuses the connection and a demoted one names its successor.
-async fn discover_leader(cluster: &TestIggyCluster, via: usize) -> usize {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Some(candidate) = reported_leader(&cluster.node_endpoint(via)).await
-            && let Some(confirmed) = reported_leader(&cluster.node_endpoint(candidate)).await
-            && confirmed == candidate
-        {
-            return candidate;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the cluster did not elect a leader before the deadline"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-// The probe never reconnects and is bounded, so a stopped node answers `None`
-// quickly instead of holding discovery in the client's unlimited retry loop.
-async fn reported_leader(endpoint: &str) -> Option<usize> {
-    use iggy::prelude::{
-        Client, ClusterClient, ClusterNodeRole, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME,
-        IggyClientBuilder, IggyError, UserClient,
-    };
-
-    let discovery = IggyClientBuilder::from_connection_string(&format!(
-        "iggy+tcp://{DEFAULT_ROOT_USERNAME}:{DEFAULT_ROOT_PASSWORD}@{endpoint}?reconnection_retries=0",
-    ))
-    .expect("connection string")
-    .build()
-    .expect("discovery client");
-    let leader = async {
-        discovery.connect().await?;
-        discovery
-            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
-            .await?;
-        let metadata = discovery.get_cluster_metadata().await?;
-        Ok::<_, IggyError>(
-            metadata
-                .nodes
-                .iter()
-                .find(|node| node.role == ClusterNodeRole::Leader)
-                .and_then(|node| node.name.strip_prefix("node-"))
-                .and_then(|value| value.parse::<usize>().ok()),
-        )
-    };
-    let leader = tokio::time::timeout(Duration::from_secs(5), leader).await;
-    let _ = discovery.disconnect().await;
-    leader.ok()?.ok()?
-}
-
-async fn wait_for_progress(counter: &std::sync::atomic::AtomicU64, expected: u64, phase: &str) {
+async fn wait_for_progress(counter: &AtomicU64, expected: u64, phase: &str) {
     let deadline = Instant::now() + Duration::from_secs(90);
-    while counter.load(std::sync::atomic::Ordering::Acquire) < expected {
+    while counter.load(Ordering::Acquire) < expected {
         assert!(
             Instant::now() < deadline,
             "streaming did not resume after {phase}"
@@ -176,7 +116,7 @@ async fn given_a_server_restart_when_reusing_the_same_client_then_should_publish
         .await
         .expect("stream exists");
     let topic = laser.topic("pulse");
-    topic.ensure(1).await.expect("topic exists");
+    topic.ensure(1, None).await.expect("topic exists");
     topic
         .send(&b"before-restart"[..], BTreeMap::new(), None)
         .await
@@ -194,7 +134,7 @@ async fn given_a_server_restart_when_reusing_the_same_client_then_should_publish
     loop {
         let recovered = tokio::time::timeout(Duration::from_secs(3), async {
             laser.stream("reconnect_it").ensure().await?;
-            topic.ensure(1).await?;
+            topic.ensure(1, None).await?;
             topic
                 .send(&b"after-restart"[..], BTreeMap::new(), None)
                 .await

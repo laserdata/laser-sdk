@@ -1,6 +1,6 @@
 [workspace]
 exclude = ["bdd/rust", "bench", "foreign/python", "fuzz"]
-members = ["examples/rust", "sdk", "wire"]
+members = ["examples/rust", "sdk", "test-support", "wire"]
 resolver = "2"
 
 [workspace.package]
@@ -8,7 +8,7 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/laserdata/laser-sdk"
 rust-version = "1.98.0"
-version = "0.9.0-dev.1"
+version = "0.9.0-dev.2"
 
 [workspace.dependencies]
 apache-avro = { version = "0.22.0" }
@@ -23,13 +23,14 @@ colored = { version = "3.1.1" }
 dashmap = { version = "6.2.1" }
 ed25519-dalek = { version = "3.0.0" }
 futures = { version = "0.3.34" }
-iggy = { version = "0.11.1-edge.4" }
-iggy_binary_protocol = { version = "0.11.1-edge.3" }
-iggy_common = { version = "0.11.1-edge.4" }
+iggy = { version = "0.11.1-edge.9" }
+iggy_binary_protocol = { version = "0.11.1-edge.8" }
+iggy_common = { version = "0.11.1-edge.10" }
 json-patch = { version = "4.2.0" }
 jsonschema = { version = "0.60.1", default-features = false }
 laser-sdk = { path = "sdk" }
-laser-wire = { path = "wire", version = "0.9.0-dev.1" }
+laser-test-support = { path = "test-support" }
+laser-wire = { path = "wire", version = "0.9.0-dev.2" }
 memchr = { version = "2.8.3" }
 ouroboros = { version = "0.18.5" }
 prost = { version = "0.14.4" }

@@ -153,6 +153,8 @@ PY_PEERS = {
     ("SessionListRequest", "fetch"): ("Sessions.list", "one-call"),
     ("SessionEventsRequest", None): ("Sessions.events", "keywords"),
     ("SessionEventsRequest", "fetch"): ("Sessions.events", "one-call"),
+    ("FilterSummary", None): ("dict:GroupFilter.summary", "serde-dict"),
+    ("FilterOwner", None): ("dict:GroupFilter.summary", "serde-dict"),
     ("SessionInfo", None): ("dict:Sessions.get", "serde-dict"),
     ("SessionFlags", None): ("dict:Sessions.get", "serde-dict"),
     ("SessionPage", None): ("dict:Sessions.list", "serde-dict"),
@@ -297,11 +299,9 @@ PY_PEERS = {
     ("LaserError", "is_version_skew"): ("LaserError.version_skew", "property"),
     ("PublishFailure", None): ("PublishFailedError", "error-class"),
     ("PublishFailure", "source"): ("PublishFailedError", "protocol"),
-    ("ConsumerBuilder", "auto_join_group"): ("ConsumerGroup.consumer(auto_join_group=)", "keywords"),
     ("ConsumerBuilder", "create_group"): ("ConsumerGroup.consumer(create_group=)", "keywords"),
     ("ConsumerBuilder", "commit_policy"): ("Topic.consumer(auto_commit=, commit_interval_ms=, commit_every=)", "keywords"),
     ("ConsumerBuilder", "start_at"): ("Topic.consumer(polling=, offset=, timestamp_micros=)", "keywords"),
-    ("ConsumerBuilder", "without_poll_interval"): ("Topic.consumer(poll_interval_ms=)", "overload"),
     ("ProducerBuilder", "expire_after"): ("Topic.producer(message_expiry=)", "keywords"),
     ("ProducerBuilder", "never_expire"): ("Topic.producer(message_expiry=)", "keywords"),
     ("ProducerBuilder", "max_topic_bytes"): ("Topic.producer(max_topic_size=)", "keywords"),
@@ -810,7 +810,7 @@ TS_PEERS = {
     ("LaserError", "ConsumerGroupSetup.name"): ("ConsumerGroupSetupError.groupName", "name-collision"),
     ("PublishFailure", None): ("PublishFailedError", "error-class"),
     ("PublishFailure", "source"): ("PublishFailedError.publishCause", "error-class"),
-    ("ConsumerBuilder", "without_poll_interval"): ("ConsumerOptions.pollIntervalMs", "overload"),
+    ("CreateConsumerGroup", "filter"): ("CreateConsumerGroupOptions.filter + CreateConsumerGroupOptions.filterName", "keywords"),
     ("RecordBuilder", "build"): ("new:Record", "one-call"),
     ("Topic", "iggy_consumer"): ("-", "rust-crate"),
     ("Topic", "iggy_consumer_group"): ("-", "rust-crate"),
@@ -1474,6 +1474,9 @@ class Lookup:
 
     def resolve(self, spelling):
         """(found, keywords accepted, params, member info) for a spelling. Claims what it finds."""
+        if " + " in spelling:
+            parts = [self.resolve(part) for part in spelling.split(" + ")]
+            return all(part[0] for part in parts), all(part[1] for part in parts), parts[0][2], parts[0][3]
         if spelling.startswith("new:"):
             cls, kws = split_call(spelling[4:])
             params = self.constructor(cls) if self.has_type(cls) else None

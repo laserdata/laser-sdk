@@ -53,7 +53,6 @@ void test("given_an_mcp_tool_call_when_bridged_then_should_return_the_correlated
     handle = Agent.builder()
       .id(worker)
       .listenOn(AgentTopic.Sessions)
-      .pollInterval(5)
       .handler({
         async handle(message, context): Promise<void> {
           const envelope = message.envelope
@@ -139,7 +138,6 @@ void test("given_a_tools_call_in_a_parent_session_when_the_tool_replies_then_sho
     await using tool = Agent.builder()
       .id(worker)
       .listenOn(AgentTopic.Sessions)
-      .pollInterval(5)
       .handler({
         async handle(message, context): Promise<void> {
           const command = message.envelope
@@ -215,7 +213,6 @@ void test("given_two_tool_workers_when_a_call_is_addressed_to_one_then_only_that
       const handle = Agent.builder()
         .id(worker)
         .listenOn(AgentTopic.Sessions)
-        .pollInterval(5)
         .handler({
           async handle(message, context): Promise<void> {
             const envelope = message.envelope

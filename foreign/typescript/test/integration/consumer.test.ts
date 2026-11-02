@@ -1,13 +1,17 @@
 import assert from "node:assert/strict"
 import { randomUUID } from "node:crypto"
 import { test } from "node:test"
+import { UserStatus } from "apache-iggy"
 import { Laser } from "../../src/client/laser.js"
 import { CancelledError, TimeoutError } from "../../src/client/errors.js"
+import type { Consumer, ConsumerMessage } from "../../src/stream/consumer.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
 const utf8 = (text: string) => new TextEncoder().encode(text)
 const decodeUtf8 = (bytes: Uint8Array) => new TextDecoder().decode(bytes)
+
+type UserPermissions = Parameters<Laser["client"]["user"]["updatePermissions"]>[0]["permissions"]
 
 async function freshTopic(laser: Laser) {
   const streamName = `laser-ts-test-${randomUUID()}`
@@ -86,7 +90,7 @@ void test("given_no_messages_when_polling_with_next_within_then_should_fail_with
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
-    const consumer = topic.consumer(0, { startAt: { kind: "first" }, pollIntervalMs: 50 })
+    const consumer = topic.consumer(0, { startAt: { kind: "first" } })
     await assert.rejects(consumer.nextWithin(200), TimeoutError)
   } finally {
     await laser.close()
@@ -127,7 +131,7 @@ void test("given_a_live_consumer_when_iterated_with_for_await_then_should_yield_
     await topic.send(utf8("alpha"))
     await topic.send(utf8("beta"))
 
-    const consumer = topic.consumer(0, { startAt: { kind: "first" }, pollIntervalMs: 50 })
+    const consumer = topic.consumer(0, { startAt: { kind: "first" } })
     const seen: string[] = []
     for await (const message of consumer) {
       seen.push(decodeUtf8(message.payload))
@@ -164,7 +168,7 @@ void test("given_an_aborted_consumer_stream_when_waiting_then_should_fail_as_can
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
-    const consumer = topic.consumer("cancelled-reader", 0, { pollIntervalMs: 10 })
+    const consumer = topic.consumer("cancelled-reader", 0)
     const controller = new AbortController()
     controller.abort("stop")
     const iterator = consumer.stream({ signal: controller.signal })[Symbol.asyncIterator]()
@@ -180,7 +184,7 @@ void test("given_invalid_consumer_controls_when_created_then_should_reject_befor
     const topic = await freshTopic(laser)
     assert.throws(() => topic.consumer(-1), /partition/)
     assert.throws(() => topic.consumer(0, { batchLength: 0 }), /batchLength/)
-    assert.throws(() => topic.consumer(0, { pollIntervalMs: -1 }), /pollIntervalMs/)
+    assert.throws(() => topic.consumer(0, { maxWaitMs: -1 }), /maxWaitMs/)
     assert.throws(
       () => topic.consumer(0, { startAt: { kind: "timestampMicros", value: -1n } }),
       /start/
@@ -231,3 +235,147 @@ void test("given_default_polling_when_shutdown_after_offset_zero_then_should_res
     await laser.close()
   }
 })
+
+void test("given_a_deleted_topic_when_it_returns_then_should_report_the_refusal_and_read_on", async () => {
+  const laser = await Laser.connect(CONNECTION_STRING)
+  const streamName = `laser-ts-test-${randomUUID()}`
+  try {
+    await laser.stream(streamName).ensure()
+    const topic = laser.stream(streamName).topic("events")
+    await topic.ensure(1)
+    await topic.send(utf8("before"))
+    const consumer = topic.consumer("outlasting", 0, {
+      startAt: { kind: "first" },
+      maxWaitMs: 200,
+      pollingRetryIntervalMs: 200
+    })
+    try {
+      assert.equal(decodeUtf8((await consumer.nextWithin(3_000)).payload), "before")
+      await laser.client.topic.delete({
+        streamId: streamName,
+        topicId: "events",
+        partitionsCount: 1
+      })
+      const outage = await readFor(consumer, 3_000)
+      assert.ok(outage.refusals > 0, "the refusal reaches the application")
+      assert.ok(outage.reads <= 12, `the application read ${String(outage.reads)} times in 3 s`)
+      await topic.ensure(1)
+      await topic.send(utf8("after"))
+      assert.equal(decodeUtf8((await nextRecord(consumer, 15_000)).payload), "after")
+    } finally {
+      await consumer.shutdown().catch(() => undefined)
+    }
+  } finally {
+    await laser
+      .stream(streamName)
+      .delete()
+      .catch(() => false)
+    await laser.close()
+  }
+})
+
+void test("given_revoked_poll_permission_when_restored_then_should_report_the_refusal_and_read_on", async () => {
+  const admin = await Laser.connect(CONNECTION_STRING)
+  const streamName = `laser-ts-test-${randomUUID()}`
+  const username = `reader-${randomUUID().slice(0, 8)}`
+  const password = `secret-${randomUUID()}`
+  let reader: Laser | undefined
+  try {
+    await admin.stream(streamName).ensure()
+    const topic = admin.stream(streamName).topic("events")
+    await topic.ensure(1)
+    await topic.send(utf8("before"))
+    await admin.client.user.create({
+      username,
+      password,
+      status: UserStatus.Active,
+      permissions: readerPermissions(true)
+    })
+    reader = await Laser.connect(CONNECTION_STRING.replace(/^[^@]*@/u, `${username}:${password}@`))
+    const consumer = reader
+      .stream(streamName)
+      .topic("events")
+      .consumer("outlasting", 0, {
+        startAt: { kind: "first" },
+        maxWaitMs: 200,
+        pollingRetryIntervalMs: 200
+      })
+    try {
+      assert.equal(decodeUtf8((await consumer.nextWithin(3_000)).payload), "before")
+      await admin.client.user.updatePermissions({
+        userId: username,
+        permissions: readerPermissions(false)
+      })
+      const outage = await readFor(consumer, 3_000)
+      assert.ok(outage.refusals > 0, "the refusal reaches the application")
+      assert.ok(outage.reads <= 12, `the application read ${String(outage.reads)} times in 3 s`)
+      await admin.client.user.updatePermissions({
+        userId: username,
+        permissions: readerPermissions(true)
+      })
+      await topic.send(utf8("after"))
+      assert.equal(decodeUtf8((await nextRecord(consumer, 15_000)).payload), "after")
+    } finally {
+      await consumer.shutdown().catch(() => undefined)
+    }
+  } finally {
+    await reader?.close().catch(() => undefined)
+    await admin.client.user.delete({ userId: username }).catch(() => false)
+    await admin
+      .stream(streamName)
+      .delete()
+      .catch(() => false)
+    await admin.close()
+  }
+})
+
+// An application that reads on through failures for `durationMs`, without a
+// pause of its own between reads.
+async function readFor(
+  consumer: Consumer,
+  durationMs: number
+): Promise<{ readonly reads: number; readonly refusals: number }> {
+  const deadline = Date.now() + durationMs
+  let reads = 0
+  let refusals = 0
+  while (Date.now() < deadline) {
+    reads += 1
+    try {
+      await consumer.nextWithin(500)
+      assert.fail("nothing is readable while the cause lasts")
+    } catch (error) {
+      if (error instanceof assert.AssertionError) throw error
+      if (!(error instanceof TimeoutError)) refusals += 1
+    }
+  }
+  return { reads, refusals }
+}
+
+async function nextRecord(consumer: Consumer, timeoutMs: number): Promise<ConsumerMessage> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    try {
+      return await consumer.nextWithin(500)
+    } catch (error) {
+      if (Date.now() >= deadline) throw error
+    }
+  }
+}
+
+function readerPermissions(poll: boolean): UserPermissions {
+  return {
+    global: {
+      ManageServers: false,
+      ReadServers: false,
+      ManageUsers: false,
+      ReadUsers: false,
+      ManageStreams: false,
+      ReadStreams: poll,
+      ManageTopics: false,
+      ReadTopics: poll,
+      PollMessages: poll,
+      SendMessages: false
+    },
+    streams: []
+  }
+}

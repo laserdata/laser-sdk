@@ -81,6 +81,14 @@ export const AGDX_FILTERED_ACK_CODE = AGDX_DELIVERY_BASE + 1
 export const AGDX_FILTER_PREVIEW_CODE = AGDX_DELIVERY_BASE + 2
 export const AGDX_FILTER_TEST_CODE = AGDX_DELIVERY_BASE + 3
 export const AGDX_FILTER_VALIDATE_CODE = AGDX_DELIVERY_BASE + 4
+/**
+ * Hold until one of a reader's partitions has a record at or after its
+ * offset, or the wait ends. Served when the filter announcement names a
+ * non-zero `max_wait_ms`.
+ */
+export const AGDX_FILTERED_WAIT_CODE = AGDX_DELIVERY_BASE + 5
+/** End filtered waits this connection holds, named by their `wait_id`. */
+export const AGDX_FILTERED_WAIT_CANCEL_CODE = AGDX_DELIVERY_BASE + 6
 export const AGDX_FILTER_MUTATE_CODE = AGDX_DELIVERY_BASE + 10
 export const AGDX_GET_FILTER_CODE = AGDX_DELIVERY_BASE + 11
 export const AGDX_LIST_FILTERS_CODE = AGDX_DELIVERY_BASE + 12

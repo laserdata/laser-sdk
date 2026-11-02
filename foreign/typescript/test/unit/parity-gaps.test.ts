@@ -764,7 +764,7 @@ void test("given_no_messages_when_consolidated_with_a_summarizer_then_should_not
 void test("given_filter_capabilities_when_checking_evaluation_then_should_match_the_announced_contract", () => {
   const announced = {
     ...OPEN_CAPABILITIES.filters,
-    evaluation: { evaluatorVersion: 2, codecs: ["json", "cbor"] as const }
+    evaluation: { evaluatorVersion: 2, codecs: ["json", "cbor"] as const, maxWaitMs: 0 }
   }
   assert.equal(filterCapsEvaluates(announced, 2, "json"), true)
   assert.equal(filterCapsEvaluates(announced, 2, "avro"), false)

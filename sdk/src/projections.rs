@@ -14,7 +14,13 @@ use laser_wire::control::{
 };
 use laser_wire::framing::encode_named;
 use laser_wire::query::QueryError;
+use laser_wire::validate::Validate;
 use serde::Serialize;
+
+pub use laser_wire::limits::{
+    MAX_INDEX_FIELD_BYTES, MAX_PROJECTION_ID_BYTES, MAX_PROJECTION_NAME_BYTES,
+    MAX_SCHEMA_NAME_BYTES,
+};
 
 impl Laser {
     /// Handle to the projection registry: `.register(projection)`,
@@ -404,6 +410,7 @@ impl RegisterSchemaRequest<'_> {
             version: self.version,
             stream: self.laser.resource_stream().map(str::to_owned),
         };
+        request.validate()?;
         match self
             .laser
             .execute_browse(AGDX_REGISTER_SCHEMA_CODE, &request)
@@ -503,9 +510,11 @@ impl<'a> ProjectionsRequest<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::LaserError;
     use crate::laser::{Laser, ResourceNaming};
     use laser_wire::browse::ProjectionInfo;
-    use laser_wire::control::{Projection, ProjectionBinding};
+    use laser_wire::control::{Projection, ProjectionBinding, SchemaSource};
+    use laser_wire::limits::{MAX_PROJECTION_ID_BYTES, MAX_SCHEMA_NAME_BYTES};
 
     fn laser() -> Laser {
         Laser::from_client(crate::iggy::prelude::IggyClient::default()).with_default_stream("acme")
@@ -550,6 +559,61 @@ mod tests {
             "reading.v1"
         );
         assert_eq!(info.bindings[0].index, "readings_rows");
+    }
+
+    #[tokio::test]
+    async fn given_a_scoped_projection_id_over_the_wire_cap_when_dropped_then_should_refuse_it_before_sending()
+     {
+        let laser = laser();
+        let local_cap = MAX_PROJECTION_ID_BYTES - "stream:acme/".len();
+        let error = laser
+            .projections()
+            .drop("p".repeat(local_cap + 1))
+            .await
+            .expect_err("a scoped id over the cap is refused");
+        assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
+        let error = laser
+            .bindings()
+            .apply(
+                ProjectionBinding::builder()
+                    .source("acme", "readings")
+                    .allow("reading\n.v1")
+                    .build(),
+            )
+            .await
+            .expect_err("a projection id with a control character is refused");
+        assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
+        let error = laser
+            .projections()
+            .drop("p".repeat(local_cap))
+            .await
+            .expect_err("an offline Laser has no managed backend");
+        assert!(matches!(error, LaserError::Unsupported { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn given_a_schema_name_over_the_cap_when_registered_then_should_refuse_it_before_sending()
+    {
+        let laser = laser();
+        let source = || SchemaSource::JsonSchema {
+            schema: "{}".to_owned(),
+        };
+        let error = laser
+            .schemas()
+            .register(source())
+            .name("s".repeat(MAX_SCHEMA_NAME_BYTES + 1))
+            .send()
+            .await
+            .expect_err("an over-long schema name is refused");
+        assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
+        let error = laser
+            .schemas()
+            .register(source())
+            .name("reading")
+            .send()
+            .await
+            .expect_err("an offline Laser has no managed backend");
+        assert!(matches!(error, LaserError::Unsupported { .. }), "{error:?}");
     }
 
     #[test]

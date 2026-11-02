@@ -1,12 +1,24 @@
 import {
   type FilterCatalogCommand,
   decodeFilterCatalogCommand,
-  encodeFilterCatalogCommand
+  encodeFilterCatalogCommand,
+  validateFilterMutation
 } from "./filter.js"
 import { CodecError, InvalidError } from "../client/errors.js"
 import { type CborMap, expectMap, expectString, field, singleVariantTag } from "./cbor.js"
 import { ContentType, type ContentType as ContentTypeValue } from "./content.js"
 import { type BackendBinding, decodeBackendBinding, encodeBackendBinding } from "./destination.js"
+import {
+  MAX_GRAPH_LABEL_BYTES,
+  MAX_INDEX_FIELD_BYTES,
+  MAX_PROJECTION_ID_BYTES,
+  MAX_PROJECTION_NAME_BYTES,
+  MAX_SCHEMA_NAME_BYTES
+} from "./limits.js"
+import { validateBoundedText } from "./validate.js"
+
+/** Prefix no projection id may start with: activity keys an index-only binding under it. */
+export const RESERVED_PROJECTION_ID_PREFIX = "index:"
 
 export type FieldType = "text" | "int" | "float" | "bool"
 
@@ -63,8 +75,75 @@ export class IndexSchemaBuilder {
 export type ProjectionId = string & { readonly __projectionId: unique symbol }
 
 export function parseProjectionId(value: string): ProjectionId {
-  if (value.length === 0) throw new InvalidError("projection id must not be empty")
+  validateProjectionId(value)
   return value as ProjectionId
+}
+
+/** 1 to `MAX_PROJECTION_ID_BYTES` bytes without a control character, never under `RESERVED_PROJECTION_ID_PREFIX`. */
+export function validateProjectionId(value: string): void {
+  validateBoundedText("projection id", value, MAX_PROJECTION_ID_BYTES)
+  if (value.startsWith(RESERVED_PROJECTION_ID_PREFIX))
+    throw new InvalidError(`projection id must not start with "${RESERVED_PROJECTION_ID_PREFIX}"`)
+}
+
+/** Rust `Projection::validate`: the id, an optional name, index fields, and entity labels. */
+export function validateProjection(projection: Projection): void {
+  validateProjectionId(projection.id)
+  if (projection.name.length > 0)
+    validateBoundedText("projection name", projection.name, MAX_PROJECTION_NAME_BYTES)
+  for (const indexField of projection.extraction.fields) {
+    validateBoundedText("index field name", indexField.name, MAX_INDEX_FIELD_BYTES)
+    validateBoundedText("index field pointer", indexField.pointer, MAX_INDEX_FIELD_BYTES)
+  }
+  if (projection.extraction.vectorField !== undefined)
+    validateBoundedText(
+      "index vector field",
+      projection.extraction.vectorField,
+      MAX_INDEX_FIELD_BYTES
+    )
+  for (const node of projection.entitySchema?.nodes ?? [])
+    validateBoundedText("graph node label", node.label, MAX_GRAPH_LABEL_BYTES)
+  for (const edge of projection.entitySchema?.edges ?? [])
+    validateBoundedText("graph edge type", edge.edgeType, MAX_GRAPH_LABEL_BYTES)
+}
+
+/** Rust `SchemaDef::validate`: a name, when present, is bounded text. */
+export function validateSchemaName(name: string | undefined): void {
+  if (name !== undefined) validateBoundedText("schema name", name, MAX_SCHEMA_NAME_BYTES)
+}
+
+/** Rust `ControlCommand::validate`, checked before a command is published. */
+export function validateControlCommand(command: ControlCommand): void {
+  switch (command.kind) {
+    case "registerProjection":
+    case "registerGraph":
+      validateProjection(command.projection)
+      return
+    case "dropProjection":
+    case "dropGraph":
+      validateProjectionId(command.id)
+      return
+    case "applyBinding":
+      for (const projection of command.binding.allowedProjections) validateProjectionId(projection)
+      if (command.binding.defaultProjection !== undefined)
+        validateProjectionId(command.binding.defaultProjection)
+      return
+    case "removeBinding":
+      if (command.projectionRef !== undefined) validateProjectionId(command.projectionRef)
+      return
+    case "registerSchema":
+      validateSchemaName(command.schema.name)
+      return
+    case "filterCatalog":
+      validateFilterMutation(command.command.mutation)
+      return
+    case "dropSchema":
+    case "registerSessionSource":
+    case "removeSessionSource":
+    case "acceptGap":
+    case "skipRecord":
+      return
+  }
 }
 
 function projectionIdFromWire(value: string): ProjectionId {

@@ -3,7 +3,9 @@ use crate::context::ContextMessage;
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::types::ConversationId;
-use iggy::prelude::{Consumer, Identifier, MessageClient, PollingStrategy, TopicClient};
+use iggy::prelude::{
+    Consumer, Identifier, MessageClient, PollOptions, PollingStrategy, TopicClient,
+};
 use laser_wire::codes::{
     AGDX_SESSION_CHANGES_CODE, AGDX_SESSION_EVENTS_CODE, AGDX_SESSION_GET_CODE,
     AGDX_SESSION_LINKS_CODE, AGDX_SESSION_LIST_CODE, AGDX_SESSION_SOURCES_CODE,
@@ -15,6 +17,7 @@ use laser_wire::session::{
     LinkSurface, SessionChanges, SessionEventsPage, SessionInfo, SessionLinksView, SessionOutcome,
     SessionPage, SessionReply, SessionSources, SessionStateView,
 };
+use laser_wire::validate::Validate;
 use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
@@ -47,7 +50,7 @@ impl Sessions {
         }
     }
 
-    /// A page of one session's events in broker time order. Chain the paging
+    /// A page of one session's events in server append time order. Chain the paging
     /// and finish with [`fetch`](SessionEventsRequest::fetch).
     pub fn events(&self, id: ConversationId) -> SessionEventsRequest {
         SessionEventsRequest {
@@ -287,6 +290,7 @@ impl SessionListRequest {
             limit: self.limit,
             want_total: self.total,
         };
+        request.validate()?;
         match self.sessions.read(AGDX_SESSION_LIST_CODE, &request).await? {
             SessionOutcome::Page(page) => Ok(page),
             _ => Err(unexpected("list")),
@@ -459,11 +463,13 @@ impl Laser {
                     .poll_messages(
                         &stream_id,
                         &topic_id,
-                        Some(*partition),
+                        *partition,
                         &consumer,
                         &PollingStrategy::offset(*offset),
-                        1,
-                        false,
+                        PollOptions {
+                            count: 1,
+                            ..PollOptions::default()
+                        },
                     )
                     .await?;
                 Ok(polled
@@ -531,8 +537,39 @@ fn unexpected(read: &str) -> LaserError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iggy::prelude::IggyClient;
+    use laser_wire::limits::{MAX_SESSION_CURSOR_BYTES, MAX_SESSION_TEXT_QUERY_BYTES};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[tokio::test]
+    async fn given_a_session_list_over_its_caps_when_fetched_then_should_refuse_it_before_sending()
+    {
+        let laser = Laser::from_client(IggyClient::default()).with_default_stream("agents");
+        let error = laser
+            .sessions()
+            .list()
+            .text("t".repeat(MAX_SESSION_TEXT_QUERY_BYTES + 1))
+            .fetch()
+            .await
+            .expect_err("an over-long text filter is refused");
+        assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
+        let error = laser
+            .sessions()
+            .list()
+            .cursor("c".repeat(MAX_SESSION_CURSOR_BYTES + 1))
+            .fetch()
+            .await
+            .expect_err("an over-long cursor is refused");
+        assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
+        let error = laser
+            .sessions()
+            .list()
+            .fetch()
+            .await
+            .expect_err("an offline Laser does not index sessions");
+        assert!(matches!(error, LaserError::Unsupported { .. }), "{error:?}");
+    }
 
     #[tokio::test]
     async fn given_a_source_recreated_during_read_at_when_polled_then_should_discard_replacement_bytes()

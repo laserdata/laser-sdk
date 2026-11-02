@@ -82,7 +82,7 @@ pub async fn run_rust_client_startup(
     let before = capture_processes(monitored_processes)?;
     let started = Instant::now();
     topic
-        .ensure(partitions)
+        .ensure(partitions, None)
         .await
         .map_err(|error| startup_error("topology setup", &error))?;
     let topology_setup_ns = elapsed_ns(started);

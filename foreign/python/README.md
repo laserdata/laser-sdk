@@ -4,7 +4,7 @@ This package provides the Python Laser SDK for Apache Iggy. [LaserData, Inc.](ht
 
 Rust and Python share the data contract and Rust implementation. The bindings expose Python forms of the SDK operations, configuration, and errors. Shared examples and behavior scenarios cover language-neutral behavior.
 
-> This source tree targets `0.8.0`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+> This source tree targets `0.9.0-dev.2`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 `spawn_agent(agent_id, ..., consumer_group=None)` separates agent identity from its consumer group. The default group uses the agent ID spelling. Set `consumer_group` when the deployment needs a different group.
 
@@ -46,7 +46,7 @@ Python uses the Rust client reconnect policy. TCP connections retry a failed dia
 
 `Laser.connect` calls Rust `Laser::connect`. Hosts under `*.laserdata.cloud` and `*.laserdata.com` use TLS with the bundled LaserData root CA. `LASER_TLS_CERT=<path>` selects an explicit certificate. `LASER_NO_TLS=1` disables automatic TLS. Other hosts retain their connection-string configuration.
 
-LaserData Cloud and Laser Stack enable managed surfaces only when their backend announcement reports ready. `await laser.refresh_capabilities()` re-probes a long-lived connection after startup or a backend restart. The returned `Capabilities` groups each managed surface: `caps.query` is a `QueryCaps` (`available`, `consistency`), `caps.kv` a `KvCaps` (`available`, `cas`, `fenced_leases`), `caps.filters` a `FilterCaps`, and `caps.destinations` a `DestinationCaps`. It also carries `versions: OpVersions | None` and the advertised backends. Apache Iggy keeps every managed surface off and reports no operation versions.
+LaserData Cloud and Laser Stack enable managed surfaces only when their backend announcement reports ready. `await laser.refresh_capabilities()` re-probes a long-lived connection after startup or a backend restart. The returned `Capabilities` groups each managed surface: `caps.query` is a `QueryCaps` (`available`, `consistency`), `caps.kv` a `KvCaps` (`available`, `cas`, `fenced_leases`), `caps.filters` a `FilterCaps` (`native`, `catalog`, `group_policy_reads`, `evaluation`, and `max_wait_ms`, the longest filtered wait the server holds, zero when it holds none), and `caps.destinations` a `DestinationCaps`. It also carries `versions: OpVersions | None` and the advertised backends. Apache Iggy keeps every managed surface off and reports no operation versions.
 
 ## Connect timeout
 
@@ -72,6 +72,8 @@ print(committed.confirmations)
 ```
 
 Producers and publish builders return `SendMessagesResponse`. Each `SendMessagesConfirmationResponse` identifies a committed batch by stream, topic, partition, and first offset. The list can be empty when the server does not report offsets. Completion follows the topic durability policy.
+
+On a cluster, `replication_factor` sets how many nodes store each partition of a topic the call creates, as in `readings.ensure(4, replication_factor=2)` or `readings.producer(partitions=4, replication_factor=2)`. It must be 1 to `MAX_REPLICATION_FACTOR` (32) and at most the node count. Without it the server's default applies, and an existing topic keeps its own. A factor outside 1 to 32 raises `InvalidError` before anything is sent, and the server's refusal of a factor above its node count raises `TransportError`.
 
 ## Batch and any payload
 
@@ -107,7 +109,7 @@ batch_committed = await producer.send_batch(
 
 consumer = topic.consumer_group("workers").consumer(
     batch_length=1000,
-    poll_interval_ms=5,
+    max_wait_ms=5000,
     auto_commit="disabled",
 )
 await consumer.init()
@@ -120,7 +122,9 @@ finally:
     await consumer.shutdown()
 ```
 
-Header values accept ordinary Python scalar values. For an exact Apache Iggy numeric type, pass `(kind, value)`. `ConsumerMessage.header_kinds` reports the received types. The default `auto_commit="polling"` with `commit_interval_ms=0` matches the Rust default `Polling` policy. The other modes are `"all"`, `"each"`, `"every"` with `commit_every=`, `"interval"`, and `"disabled"`. A `commit_interval_ms` above zero adds a timer to the chosen mode, so `auto_commit="each"` with `commit_interval_ms=1000` stores on each message or each second. `"interval"` requires `commit_interval_ms` above zero. `next_within(wait_secs)` waits a bounded time and raises `TimeoutError` when nothing arrives, like Rust `next_within`.
+Header values accept ordinary Python scalar values. For an exact Apache Iggy numeric type, pass `(kind, value)`. `ConsumerMessage.header_kinds` reports the received types. The default `auto_commit="polling"` with `commit_interval_ms=0` matches the Rust default `Polling` policy. The other modes are `"all"`, `"each"`, `"every"` with `commit_every=`, `"interval"`, and `"disabled"`. A `commit_interval_ms` above zero adds a timer to the chosen mode, so `auto_commit="each"` with `commit_interval_ms=1000` stores on each message or each second. `"interval"` requires `commit_interval_ms` above zero. `next_within(wait_secs)` waits a bounded time and raises `TimeoutError` when nothing arrives, like Rust `next_within`. A group consumer always resumes after the group's stored offset. Its `polling`, `offset` or `timestamp_micros` start only seeds a partition the group never stored, before its first read, and the native consumer of a server without group policy reads seeds only the partitions it holds when it joins, as [client behavior](../../docs/client-behavior.md#consumers-and-polling) describes.
+
+Polls are held on the server. `max_wait_ms` (default 5000, 0 to 600000) is how long the server holds a poll that finds fewer than `min_count` new records (default 1, at most `batch_length`), and `max_bytes` (default 1048576) caps the record bytes of one reply. A new record ends the wait at once, so a caught-up consumer sees it without client-side polling. A group consumer always joins its group.
 
 With automatic commits disabled, call `commit(message)` after successful handling. `shutdown()` does not advance the offset past that commit. `Consumer` waits for new records. A `replay()` cursor reads retained records in bounded polls and stops its iterator when caught up.
 
@@ -326,7 +330,7 @@ safe_mode = ls.ConsumerFilter.json(
 )
 topic = laser.stream("orbit").topic("fleet_changes")
 group = topic.consumer_group("anomaly-desk")
-info = await group.create(filter=safe_mode)  # Run once during setup.
+info = await group.create(filter=safe_mode, filter_name="safe-mode")  # Run once during setup.
 
 # Every consumer instance needs only the group name or info.id.
 consumer = group.consumer(batch_length=100, auto_commit="disabled")
@@ -340,13 +344,13 @@ finally:
 
 `batch_length=100` examines at most 100 source records per partition request. It may deliver fewer matches, including none. An empty scan advances over rejected records and does not mean end of stream. The consumer continues bounded scans and waits only when caught up. Manual `commit(record)` stores safe contiguous progress after processing. Automatic policies commit the delivered prefix at their configured cadence and at shutdown. The native Apache Iggy path retains its own documented commit timing.
 
-For batch handling, build `await group.reader(count=100, max_examined=1000)`, then use `next_page()` and `ack_page()`. `start=` takes `"next"`, `"first"`, `"last"`, `{"offset": n}`, or `{"timestamp": micros}`. Here `count` limits returned records, while `max_examined` independently limits the scan. Each reader joins as a member, and Iggy distributes partitions across instances. Acknowledgments preserve pending earlier work and reject stale source or policy generations. A reader keeps at most 1024 unacknowledged record-bearing pages per partition by default, so a reader that never acknowledges stops at that bound instead of growing without limit. Set `max_unacked_pages=` to change it.
+For batch handling, build `await group.reader(count=100, max_examined=1000)`, then use `next_page()` and `ack_page()`. `start=` takes `"next"`, `"first"`, `"last"`, `{"offset": n}`, or `{"timestamp": micros}`. Here `count` limits returned records, while `max_examined` independently limits the scan. Each reader joins as a member, and Iggy distributes partitions across instances. Acknowledgments preserve pending earlier work and reject stale source or policy generations. A reader keeps at most 1024 unacknowledged record-bearing pages per partition by default, so a reader that never acknowledges stops at that bound instead of growing without limit. Set `max_unacked_pages=` to change it. After a round that found nothing new, the reader waits in a filtered wait the server holds until one of its partitions has a new record, at most `max_wait_ms` (default 5000) and the server's `caps.filters.max_wait_ms`. On a server that holds no filtered wait it sleeps `idle_interval_ms` instead. `ack`, `close` and the other reader calls end that wait, so they never wait for the server.
 
 For an application checkpoint inside a filtered page, call `await reader.ack_through(record)` after persisting the checkpoint and processing all preceding records on that partition. Later records in the same page stay pending. Use `ack_page` when the whole page is complete.
 
 Use separate groups for A/B revisions so their offsets remain independent, and pause or resume a revision with `set_revision_enabled`. A fresh named consumer with the default `polling="next"` starts at the first retained record, and a stable name resumes durable progress. On the native Apache Iggy path the default `auto_commit="polling"` commits each polled batch before delivery, so a later consumer can resume after records the application did not process. Disable auto-commit and commit after successful processing when that matters.
 
-`group.filter()` provides `configure`, `get`, `revisions`, `revise`, `set_revision_enabled`, `release`, `delete`, `preview` and `test`. `delete()` removes the group's own filter with every revision and releases the group first. Pass `operation_id` to configuration when setup must resume with the same operation ID after a lost reply. `topic.consumer_group_id(id)` addresses the saved group by numeric ID. Catalog failures, denied reads and paused revisions never broaden into unfiltered delivery. Original Apache Iggy uses native group consumption, while an older managed server without group-aware reads returns an explicit upgrade error.
+`filter_name` is required with `filter`. It names the group's own filter in the catalog, follows the registered filter name rule (1 to 128 bytes of ASCII letters, digits, `-`, `_` and `.`) and need not be unique. `group.filter()` provides `configure(name, filter)`, `configure_with` and `configure_as` (`filter=` with `filter_name=`, or `filter_id=` with `revision=`), `get`, `summary`, `revisions`, `revise`, `set_revision_enabled`, `release`, `delete`, `preview` and `test`. Configuring the same digest under another name keeps the binding and renames the filter. `summary()` returns the group's own filter as a catalog row dict with the caller's `name` and the owning group under `owner`, or `None`. `delete()` removes the group's own filter with every revision and releases the group first. Pass `operation_id` to configuration when setup must resume with the same operation ID after a lost reply. `topic.consumer_group_id(id)` addresses the saved group by numeric ID. Catalog failures, denied reads and paused revisions never broaden into unfiltered delivery. Original Apache Iggy uses native group consumption, while an older managed server without group-aware reads returns an explicit upgrade error.
 
 Filters support JSON, CBOR, Avro, Protobuf and typed headers. Avro and Protobuf filters use registered writer schemas, immutable schema IDs in the filter, and the `agdx.sid` header on each record. Headers-only filters work with any payload format and never decode the payload. `CompiledFilter.compile(filter).evaluate(payload)` runs the evaluator locally, and `explain(payload)` returns its verdict tree. `FilterExpr.text(field, kind, pattern)` matches case-sensitively, and chaining `.case_insensitive()` ignores case. `with_fault_policy`, `with_foreign_policy` and `with_mismatch_policy` control invalid records. Passed invalid records and unfiltered records have `evaluated` false. Failures raise `FilterError` with a `reason`, and every `LaserError` carries `filter_reason`. A fault or oversized stop also sets `partition_id` and `offset`. Unknown header value kinds remain raw bytes. Malformed entries set `headers_malformed` while valid headers and the payload remain readable. A structurally truncated block has empty headers. A `next_record` call cancelled after it read a record yields that record again on the next call.
 
@@ -405,6 +409,8 @@ print(bytes(reply.payload).decode())
 
 await handle_agent.shutdown()
 ```
+
+The agent's reads are held on the server: `max_wait_ms` (default 5000) is how long a read that finds nothing new waits before it answers, and a record ends the wait at once.
 
 Keep the handle until `shutdown()` or `join()`. Dropping it signals a graceful stop and cancels periodic consolidation, and `abort()` stops the agent immediately. `async with laser.spawn_agent(...) as handle:` waits for readiness and stops the agent on exit.
 
@@ -751,7 +757,7 @@ later = await session.turns_since(ls.Checkpoint.from_json(saved))
 
 `laser.context(conversation)` returns a `ContextScope`. Its `fetch(n=50, token_budget=)` and `block` read `agent.sessions` unless `topics=` names others, and return `ContextMessage` records (`id`, `provenance`, `payload`, `envelope`, `topic`). `fetch_with(topics, Chain([LastN(20), TokenBudget(4_000)]))` takes the policy objects `LastN`, `TokenBudget(max_tokens, estimator=None)`, `RoleFilter(agents)`, and `Chain`. `state(topics, init, fold, last_n=|from_offsets=|from_checkpoint=|at=|full=True)`, `state_with(store, topics, init, fold)`, and `checkpoint(topics)` fold the conversation log like Rust. `context_checkpoint(laser, topics)` captures a checkpoint without a conversation, and `ConversationState.load(laser, conversation, topics, init, fold)` folds one directly with the same bounds. Each read covers at most the newest `CONTEXT_READ_WINDOW` (10,000) messages per partition.
 
-`ContextMessage` also carries `timestamp_micros`, the broker append time, and the numeric `stream_id` and `topic_id`. `LastN`, `TokenBudget`, `RoleFilter`, and `Chain` report `name`, `version`, and `selection(history)`, which a context manifest records. A custom policy can set `name` and `version` attributes. Every SDK estimates tokens the same way: the byte count divided by four, rounded up.
+`ContextMessage` also carries `timestamp_micros`, the server append time, and the numeric `stream_id` and `topic_id`. `LastN`, `TokenBudget`, `RoleFilter`, and `Chain` report `name`, `version`, and `selection(history)`, which a context manifest records. A custom policy can set `name` and `version` attributes. Every SDK estimates tokens the same way: the byte count divided by four, rounded up.
 
 ## Memory and state
 

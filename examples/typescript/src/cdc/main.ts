@@ -117,7 +117,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<boolean> 
 
   phase("create the anomaly desk group with its filter")
   const desk = topic.consumerGroup(`${GROUP}-${runToken()}`)
-  const created = await desk.create({ filter: safeModeFilter() })
+  const created = await desk.create({ filter: safeModeFilter(), filterName: "safe-mode" })
   const binding = created.filter
   if (binding === undefined) throw new Error("the group was created unbound")
   console.log(
@@ -206,7 +206,8 @@ async function routeAlerts(laser: Laser, stream: string): Promise<void> {
   }
   const pagerGroup = alerts.consumerGroup(`${GROUP}-pager-${runToken()}`)
   await pagerGroup.create({
-    filter: ConsumerFilter.headersOnly(FilterExpr.header("priority", "eq", CRITICAL))
+    filter: ConsumerFilter.headersOnly(FilterExpr.header("priority", "eq", CRITICAL)),
+    filterName: "critical-alerts"
   })
   const pager = await pagerGroup.reader().start({ kind: "first" }).build()
   try {
@@ -245,7 +246,10 @@ async function manageRevisions(
   const variantName = `${GROUP}-transitions-${runToken()}`
   const variant = laser.stream(stream).topic(TOPIC).consumerGroup(variantName)
   const variantBinding = (
-    await variant.create({ filter: ConsumerFilter.json(safeModeTransition()) })
+    await variant.create({
+      filter: ConsumerFilter.json(safeModeTransition()),
+      filterName: "safe-mode-transitions"
+    })
   ).filter
   if (variantBinding === undefined) throw new Error("the variant was created unbound")
   const reader = await variant.reader().count(1).localGuard(true).start({ kind: "first" }).build()
@@ -276,7 +280,9 @@ async function manageRevisions(
 
   phase("a group that runs a policy cannot be switched to another one")
   try {
-    await desk.filter().configure(ConsumerFilter.json(safeModeTransition()))
+    await desk
+      .filter()
+      .configure("safe-mode-transitions", ConsumerFilter.json(safeModeTransition()))
     throw new Error("a running policy was replaced")
   } catch (error) {
     if (!(error instanceof FilterExecutionError) || error.detail.reason !== "conflict") throw error

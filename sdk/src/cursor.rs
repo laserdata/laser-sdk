@@ -215,7 +215,7 @@ mod tests {
     use iggy::http::http_client::HttpClient;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
     use tokio::task::JoinHandle;
@@ -270,6 +270,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn given_replies_cut_short_by_the_byte_cap_when_polling_then_should_read_to_the_tail() {
+        let server = TestServer::start(1, 25).await;
+        server.state.reply_cap.store(4, Ordering::SeqCst);
+        let mut cursor = server.cursor().batch(10);
+
+        let messages = cursor.poll().await.expect("drain past short replies");
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id.offset)
+                .collect::<Vec<_>>(),
+            (0..25).collect::<Vec<_>>()
+        );
+        assert_eq!(cursor.offsets(), &[25]);
+    }
+
     struct TestServer {
         url: String,
         state: Arc<TestState>,
@@ -279,6 +297,9 @@ mod tests {
     struct TestState {
         partitions: u32,
         messages: u64,
+        // Most messages one reply carries, as a byte cap would cut it. Zero
+        // leaves the count alone.
+        reply_cap: AtomicU64,
         fail: AtomicBool,
         block: AtomicBool,
         waiting: Notify,
@@ -290,6 +311,7 @@ mod tests {
             let state = Arc::new(TestState {
                 partitions,
                 messages,
+                reply_cap: AtomicU64::new(0),
                 fail: AtomicBool::new(false),
                 block: AtomicBool::new(false),
                 waiting: Notify::new(),
@@ -297,7 +319,7 @@ mod tests {
             });
             let app = Router::new()
                 .route("/streams/test/topics/events", get(topic))
-                .route("/streams/test/topics/events/messages", get(poll))
+                .route("/streams/test/topics/events/messages/deferred", get(poll))
                 .with_state(state.clone());
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
@@ -363,6 +385,10 @@ mod tests {
         }
         let offset: u64 = query["value"].parse().expect("poll offset");
         let count: u64 = query["count"].parse().expect("poll count");
+        let count = match state.reply_cap.load(Ordering::SeqCst) {
+            0 => count,
+            cap => count.min(cap),
+        };
         let messages: Vec<_> = (offset..(offset + count).min(state.messages))
             .map(|offset| {
                 let mut message = IggyMessage::builder()
@@ -374,13 +400,13 @@ mod tests {
                 message
             })
             .collect();
-        Json(PolledMessages {
-            context: PartitionContext::default(),
-            partition_id: partition,
-            current_offset: state.messages.saturating_sub(1),
-            count: messages.len() as u32,
+        Json(PolledMessages::new(
+            PartitionContext::default(),
+            partition,
+            state.messages.saturating_sub(1),
+            messages.len() as u32,
             messages,
-        })
+        ))
         .into_response()
     }
 }

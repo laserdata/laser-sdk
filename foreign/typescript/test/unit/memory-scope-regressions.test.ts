@@ -304,7 +304,7 @@ void test("given_turns_in_two_conversations_when_consolidated_then_should_store_
   }
 })
 
-void test("given_content_ids_out_of_arrival_order_when_recalled_from_the_view_then_should_keep_the_latest_broker_time", async () => {
+void test("given_content_ids_out_of_arrival_order_when_recalled_from_the_view_then_should_keep_the_latest_append_time", async () => {
   const conversation = ConversationId.derive("arrival")
   const stamped = (id: bigint, partition: number, timestampMicros: bigint): KvEntry => {
     const base = entry(id, conversation, "reader", "diagnostics")

@@ -108,6 +108,7 @@ export { agentMessageResolveBody, checkIn, resolveBody } from "./blob.js"
 export type { BlobStore } from "./blob.js"
 export { Laser, LaserBuilder } from "./client/laser.js"
 export type { SendMessagesConfirmation, SendMessagesResponse } from "./iggy/apache-iggy.js"
+export { MAX_REPLICATION_FACTOR } from "./iggy/apache-iggy.js"
 export type { Capabilities, FilterCaps } from "./client/capabilities.js"
 export {
   backend,

@@ -1,4 +1,3 @@
-import { scopedResource } from "../wire/authz.js"
 import type { ResourceScope } from "../client/resource-scope.js"
 import type { Capabilities } from "../client/capabilities.js"
 import { isStreamOrTopicNotFound, isUnavailable } from "../client/error-classify.js"
@@ -15,25 +14,27 @@ import {
   FilteredReaderBuilder,
   Filters,
   nativeGroup,
+  sameGroupIdentity,
   type FilterPreviewOptions,
   type FilterTransport,
   type NativeGroup
 } from "../managed/filters.js"
-import type {
-  CatalogPosition,
-  ConsumerFilter,
-  FilterBinding,
-  FilterConsumer,
-  FilterGroupIdentity,
-  FilterGroupRef,
-  FilterHeader,
-  FilterPreview,
-  FilterRef,
-  FilterRevisionPage,
-  FilterRevisionRef,
-  FilterTestResult,
-  FilteredStart,
-  GroupFilterSpec
+import {
+  type CatalogPosition,
+  type ConsumerFilter,
+  type FilterBinding,
+  type FilterConsumer,
+  type FilterGroupIdentity,
+  type FilterGroupRef,
+  type FilterHeader,
+  type FilterPreview,
+  type FilterRef,
+  type FilterRevisionPage,
+  type FilterRevisionRef,
+  type FilterSummary,
+  type FilterTestResult,
+  type GroupFilterSpec,
+  validateFilterMutation
 } from "../wire/filter.js"
 import {
   Consumer,
@@ -41,7 +42,7 @@ import {
   type ConsumerOptions,
   type PollFailures
 } from "./consumer.js"
-import type { ConsumerStart } from "./consumer-start.js"
+import { joinSeeds, storeSeeds } from "./consumer-start.js"
 import type { Topic } from "./topic.js"
 
 /** What a consumer group needs beyond the stream transport to reach its filter policy. */
@@ -74,8 +75,13 @@ export interface ConsumerGroupInfo {
 }
 
 export interface CreateConsumerGroupOptions {
-  /** Configure the group with this definition, saved as the group's own filter. */
+  /** Configure the group with this definition, saved as the group's own filter under `filterName`. */
   readonly filter?: ConsumerFilter
+  /**
+   * The name `filter` is saved under, required with it. It follows the
+   * registered filter name rule and need not be unique.
+   */
+  readonly filterName?: string
   /** Configure the group with a definition or one of its own revisions. */
   readonly policy?: GroupFilterSpec
   /**
@@ -156,10 +162,22 @@ export class ConsumerGroup {
     if (options.filter !== undefined && options.policy !== undefined) {
       throw new InvalidError("pass either `filter` or `policy`")
     }
+    if ((options.filter === undefined) !== (options.filterName === undefined)) {
+      throw new InvalidError("pass `filterName` with `filter`")
+    }
     const policy: GroupFilterSpec | undefined =
       options.policy ??
-      (options.filter !== undefined ? { kind: "definition", filter: options.filter } : undefined)
-    if (policy !== undefined) await this.filters().requireCatalog()
+      (options.filter !== undefined && options.filterName !== undefined
+        ? { kind: "definition", name: options.filterName, filter: options.filter }
+        : undefined)
+    if (policy !== undefined) {
+      validateFilterMutation({
+        kind: "configure_group",
+        group: { stream: this.streamName, topic: this.topicName, group: this.target.name },
+        policy
+      })
+      await this.filters().requireCatalog()
+    }
     await this.transport.ensureConsumerGroup(this.streamName, this.topicName, this.target.name)
     const native = await this.native()
     if (policy === undefined) return this.described(native)
@@ -230,26 +248,33 @@ export class ConsumerGroup {
       return this[INTERNAL_NATIVE_CONSUMER](options)
     }
     const resolved = resolveConsumerOptions(options, false)
-    if (!resolved.autoJoinGroup) {
-      throw new InvalidError(
-        "a policy-aware group consumer always joins its group, remove autoJoinGroup: false"
-      )
-    }
     if (this.target.kind === "name" && resolved.createGroup) {
       await this.transport.ensureConsumerGroup(this.streamName, this.topicName, this.target.name)
     }
     const name = this.target.kind === "name" ? this.target.name : (await this.native()).name
-    let builder = this.readerWith({ kind: "group" })
-      .start(filteredStart(resolved.startAt))
+    const seeds = await joinSeeds(
+      this.transport,
+      this.streamName,
+      this.topicName,
+      name,
+      resolved.startAt
+    )
+    const builder = this.readerWith({ kind: "group" })
+      .seedStart(name, seeds)
       .count(resolved.batchLength)
       .maxExamined(resolved.batchLength)
-    if (options.pollIntervalMs !== undefined)
-      builder = builder.idleInterval(resolved.pollIntervalMs)
+      .maxWait(resolved.maxWaitMs)
     const reader = await withInitRetries(
       resolved.initRetries,
       (error) => isUnavailable(error) || error instanceof TimeoutError,
       () => builder.build()
     )
+    try {
+      await reader.storeOwnedSeeds()
+    } catch (error) {
+      await reader.close().catch(() => undefined)
+      throw error
+    }
     return Consumer.create(
       this.transport,
       this.streamName,
@@ -281,23 +306,33 @@ export class ConsumerGroup {
   ): Promise<Consumer> {
     const resolved = resolveConsumerOptions(options, false)
     const name = this.target.kind === "name" ? this.target.name : (await this.native()).name
-    if (resolved.autoJoinGroup) {
-      await withInitRetries(resolved.initRetries, isStreamOrTopicNotFound, async () => {
-        if (resolved.createGroup) {
-          await this.transport.joinConsumerGroup(this.streamName, this.topicName, name)
-          return
-        }
-        if (this.transport.joinExistingConsumerGroup === undefined) {
-          throw new UnsupportedError("this transport cannot join a group without creating it", {
-            surface: "stream"
-          })
-        }
-        await this.transport.joinExistingConsumerGroup(this.streamName, this.topicName, name)
-      })
-    } else if (resolved.createGroup) {
-      await withInitRetries(resolved.initRetries, isStreamOrTopicNotFound, () =>
-        this.transport.ensureConsumerGroup(this.streamName, this.topicName, name)
+    await withInitRetries(resolved.initRetries, isStreamOrTopicNotFound, async () => {
+      if (resolved.createGroup) {
+        await this.transport.joinConsumerGroup(this.streamName, this.topicName, name)
+        return
+      }
+      if (this.transport.joinExistingConsumerGroup === undefined) {
+        throw new UnsupportedError("this transport cannot join a group without creating it", {
+          surface: "stream"
+        })
+      }
+      await this.transport.joinExistingConsumerGroup(this.streamName, this.topicName, name)
+    })
+    let seeds: Map<number, bigint>
+    try {
+      seeds = await joinSeeds(
+        this.transport,
+        this.streamName,
+        this.topicName,
+        name,
+        resolved.startAt
       )
+      await this.storeHeldSeeds(name, seeds)
+    } catch (error) {
+      await this.transport
+        .leaveConsumerGroup(this.streamName, this.topicName, name)
+        .catch(() => undefined)
+      throw error
     }
     return Consumer.create(
       this.transport,
@@ -306,7 +341,29 @@ export class ConsumerGroup {
       { kind: "group", name },
       options,
       undefined,
-      pollFailures
+      pollFailures,
+      seeds
+    )
+  }
+
+  // Store the seeds of the partitions the native member holds after its join,
+  // so a refused seed fails the start.
+  private async storeHeldSeeds(group: string, seeds: Map<number, bigint>): Promise<void> {
+    const read = this.transport.getConsumerOffset?.bind(this.transport)
+    if (seeds.size === 0 || read === undefined || this.transport.syncConsumerGroup === undefined)
+      return
+    const assignment = await this.transport.syncConsumerGroup(
+      this.streamName,
+      this.topicName,
+      group
+    )
+    const target = { kind: "group" as const, name: group }
+    await storeSeeds(
+      seeds,
+      assignment?.partitions ?? [],
+      (partitionId) => read(this.streamName, this.topicName, target, partitionId),
+      (partitionId, offset) =>
+        this.transport.storeOffset(this.streamName, this.topicName, target, partitionId, offset)
     )
   }
 
@@ -413,13 +470,15 @@ export class GroupFilter {
 
   /**
    * Give the group `filter` as its policy. The definition is saved as the
-   * group's own filter and the group is bound to it in one catalog
-   * transaction. The same digest again keeps the binding. Another digest on a
-   * group that runs a policy throws with reason `conflict`: create a new group
-   * for another policy.
+   * group's own filter under `name` and the group is bound to it in one
+   * catalog transaction. The name follows the registered filter name rule and
+   * need not be unique. The same digest again keeps the binding and renames
+   * the own filter when `name` differs. Another digest on a group that runs a
+   * policy throws with reason `conflict`: create a new group for another
+   * policy.
    */
-  configure(filter: ConsumerFilter): Promise<FilterBinding> {
-    return this.configureAs(undefined, { kind: "definition", filter })
+  configure(name: string, filter: ConsumerFilter): Promise<FilterBinding> {
+    return this.configureAs(undefined, { kind: "definition", name, filter })
   }
 
   /** `configure` with a definition or one of the group's own revisions. */
@@ -436,6 +495,7 @@ export class GroupFilter {
     operationId: bigint | undefined,
     policy: GroupFilterSpec
   ): Promise<FilterBinding> {
+    validateFilterMutation({ kind: "configure_group", group: await this.group.groupRef(), policy })
     const native = await this.group.native()
     const configured = await this.group
       .filters()
@@ -500,37 +560,27 @@ export class GroupFilter {
   }
 
   /**
+   * The group's own filter as a catalog row, bound or released: the caller's
+   * name, state, latest revision and the owning group. `undefined` when the
+   * group has no filter of its own.
+   */
+  async summary(): Promise<FilterSummary | undefined> {
+    await this.group.filters().requireCatalog()
+    const native = await this.group.native()
+    return this.group.filters().owned(native.identity)
+  }
+
+  /**
    * Delete the group's own filter with every revision. A bound group is
    * released first, so its consumers receive every record from their next
    * poll. Nothing of the filter stays in the catalog. `false` when the group
    * has no filter of its own.
    */
   async delete(): Promise<boolean> {
-    await this.group.filters().requireCatalog()
-    const native = await this.group.native()
-    const name = groupFilterName(native.identity)
-    const scopedName = scopedResource(this.group.streamName, name)
-    const filters = this.group.filters()
-    let beforeId: number | undefined
-    for (;;) {
-      const page = await filters.list(name, { pageSize: GROUP_FILTER_LOOKUP_PAGE }, beforeId)
-      const own = page.items.find((summary) => summary.name === name || summary.name === scopedName)
-      if (own !== undefined) {
-        this.group.remember(await filters.dropFilter(own.id))
-        return true
-      }
-      const next = page.items.at(-1)?.id
-      if (next === undefined) return false
-      if (beforeId !== undefined && next >= beforeId) {
-        throw new FilterExecutionError("the catalog lookup cursor did not advance", {
-          code: { kind: "known", name: "Unavailable" },
-          reason: "catalog_unavailable",
-          message: "the catalog lookup cursor did not advance"
-        })
-      }
-      if (page.items.length >= page.total) return false
-      beforeId = next
-    }
+    const own = await this.summary()
+    if (own === undefined) return false
+    this.group.remember(await this.group.filters().dropFilter(own.id))
+    return true
   }
 
   /**
@@ -591,22 +641,8 @@ export class GroupFilter {
   }
 }
 
-// The catalog names a group's own filter by the ids of the group incarnation
-// it was configured for. The name is unique, so the first page holds it.
-const GROUP_FILTER_LOOKUP_PAGE = 8
-
-function groupFilterName(identity: FilterGroupIdentity): string {
-  return `group:${String(identity.streamId)}:${identity.streamCreatedAtMicros.toString()}:${String(identity.topicId)}:${identity.topicCreatedAtMicros.toString()}:${identity.groupId.toString()}`
-}
-
 function requireSameGroup(expected: FilterGroupIdentity, actual: FilterGroupIdentity): void {
-  if (
-    expected.streamId !== actual.streamId ||
-    expected.streamCreatedAtMicros !== actual.streamCreatedAtMicros ||
-    expected.topicId !== actual.topicId ||
-    expected.topicCreatedAtMicros !== actual.topicCreatedAtMicros ||
-    expected.groupId !== actual.groupId
-  ) {
+  if (!sameGroupIdentity(expected, actual)) {
     throw new FilterExecutionError("the group incarnation changed while its policy was resolved", {
       code: { kind: "known", name: "StaleGeneration" },
       reason: "source_changed",
@@ -637,19 +673,6 @@ export function policyAware(capabilities: Capabilities): boolean {
     )
   }
   return false
-}
-
-function filteredStart(start: ConsumerStart): FilteredStart {
-  switch (start.kind) {
-    case "first":
-    case "last":
-    case "next":
-      return { kind: start.kind }
-    case "offset":
-      return { kind: "offset", offset: start.value }
-    case "timestampMicros":
-      return { kind: "timestamp", micros: start.value }
-  }
 }
 
 // Builds a consumer with the configured init retries: the first attempt plus

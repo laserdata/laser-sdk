@@ -1,8 +1,17 @@
 use crate::content::ContentType;
 use crate::destination::BackendBinding;
 use crate::error::InvalidError;
+use crate::limits::{
+    MAX_GRAPH_LABEL_BYTES, MAX_INDEX_FIELD_BYTES, MAX_PROJECTION_ID_BYTES,
+    MAX_PROJECTION_NAME_BYTES, MAX_SCHEMA_NAME_BYTES,
+};
+use crate::validate::{Validate, validate_bounded_text};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+
+/// Prefix no projection id may start with: activity keys an index-only
+/// binding under it, so it must never name a projection.
+pub const RESERVED_PROJECTION_ID_PREFIX: &str = "index:";
 
 /// One indexed scalar: the index key `name` and the RFC-6901 JSON `pointer` into
 /// the payload it is extracted from.
@@ -192,9 +201,7 @@ impl FromStr for ProjectionId {
     type Err = InvalidError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.is_empty() {
-            return Err(InvalidError::new("projection id must not be empty"));
-        }
+        validate_projection_id(s)?;
         Ok(Self(s.to_owned()))
     }
 }
@@ -852,7 +859,7 @@ pub enum ControlCommand {
     },
     /// One consumer-filter catalog mutation, stamped by the streaming server.
     /// Its outcome (applied or rejected) is recorded under the operation id.
-    FilterCatalog(crate::filter::FilterCatalogCommand),
+    FilterCatalog(Box<crate::filter::FilterCatalogCommand>),
     /// An operator accepts that one source partition lost history to
     /// retention. A projection that resumes past the gap continues, and keeps
     /// the gap as a record that its history is incomplete. Only the managed
@@ -984,9 +991,284 @@ pub struct ControlStreamGeneration {
     pub created_at_micros: u64,
 }
 
+impl Validate for ProjectionId {
+    fn validate(&self) -> Result<(), InvalidError> {
+        validate_projection_id(&self.0)
+    }
+}
+
+impl Validate for Projection {
+    fn validate(&self) -> Result<(), InvalidError> {
+        self.id.validate()?;
+        if !self.name.is_empty() {
+            validate_bounded_text("projection name", &self.name, MAX_PROJECTION_NAME_BYTES)?;
+        }
+        for field in &self.extraction.fields {
+            validate_bounded_text("index field name", &field.name, MAX_INDEX_FIELD_BYTES)?;
+            validate_bounded_text("index field pointer", &field.pointer, MAX_INDEX_FIELD_BYTES)?;
+        }
+        if let Some(vector_field) = &self.extraction.vector_field {
+            validate_bounded_text("index vector field", vector_field, MAX_INDEX_FIELD_BYTES)?;
+        }
+        if let Some(entity_schema) = &self.entity_schema {
+            for node in &entity_schema.nodes {
+                validate_bounded_text("graph node label", &node.label, MAX_GRAPH_LABEL_BYTES)?;
+            }
+            for edge in &entity_schema.edges {
+                validate_bounded_text("graph edge type", &edge.edge_type, MAX_GRAPH_LABEL_BYTES)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Validate for ProjectionBinding {
+    fn validate(&self) -> Result<(), InvalidError> {
+        for projection in &self.allowed_projections {
+            projection.validate()?;
+        }
+        if let Some(projection) = &self.default_projection {
+            projection.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl Validate for SchemaDef {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if let Some(name) = &self.name {
+            validate_bounded_text("schema name", name, MAX_SCHEMA_NAME_BYTES)?;
+        }
+        Ok(())
+    }
+}
+
+impl Validate for ControlCommand {
+    fn validate(&self) -> Result<(), InvalidError> {
+        match self {
+            Self::RegisterProjection(projection) | Self::RegisterGraph(projection) => {
+                projection.validate()
+            }
+            Self::DropProjection(id) | Self::DropGraph(id) => validate_projection_id(id),
+            Self::ApplyBinding(binding) => binding.validate(),
+            Self::RemoveBinding { projection_ref, .. } => projection_ref
+                .as_deref()
+                .map_or(Ok(()), validate_projection_id),
+            Self::RegisterSchema(schema) => schema.validate(),
+            Self::FilterCatalog(command) => command.mutation.validate(),
+            Self::DropSchema(_)
+            | Self::RegisterSessionSource { .. }
+            | Self::RemoveSessionSource { .. }
+            | Self::AcceptGap(_)
+            | Self::SkipRecord(_) => Ok(()),
+        }
+    }
+}
+
+fn validate_projection_id(id: &str) -> Result<(), InvalidError> {
+    validate_bounded_text("projection id", id, MAX_PROJECTION_ID_BYTES)?;
+    if id.starts_with(RESERVED_PROJECTION_ID_PREFIX) {
+        return Err(InvalidError::new(format!(
+            "projection id must not start with {RESERVED_PROJECTION_ID_PREFIX:?}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::destination::ProjectionRef;
+    use crate::limits::{
+        MAX_GRAPH_LABEL_BYTES, MAX_INDEX_FIELD_BYTES, MAX_PROJECTION_ID_BYTES,
+        MAX_PROJECTION_NAME_BYTES, MAX_SCHEMA_NAME_BYTES,
+    };
+
+    #[test]
+    fn given_an_invalid_projection_id_when_any_command_names_it_then_should_refuse_it() {
+        let projection = |id: &str| {
+            Projection::builder(id)
+                .name("reading")
+                .field("host")
+                .build()
+        };
+        let at_cap = "p".repeat(MAX_PROJECTION_ID_BYTES);
+        projection(&at_cap)
+            .validate()
+            .expect("a projection id at the cap is valid");
+        ControlCommand::DropProjection(at_cap.clone())
+            .validate()
+            .expect("a drop of a projection id at the cap is valid");
+        ControlCommand::RemoveBinding {
+            source: SourceSelector::new("fleet", "readings"),
+            projection_ref: None,
+        }
+        .validate()
+        .expect("a whole-binding removal names no projection");
+        for invalid in [
+            String::new(),
+            "p".repeat(MAX_PROJECTION_ID_BYTES + 1),
+            "reading\n.v1".to_owned(),
+            format!("{RESERVED_PROJECTION_ID_PREFIX}reading"),
+        ] {
+            assert!(projection(&invalid).validate().is_err(), "{invalid:?}");
+            assert!(
+                ControlCommand::RegisterProjection(projection(&invalid))
+                    .validate()
+                    .is_err()
+            );
+            assert!(
+                ControlCommand::DropProjection(invalid.clone())
+                    .validate()
+                    .is_err()
+            );
+            assert!(
+                ControlCommand::DropGraph(invalid.clone())
+                    .validate()
+                    .is_err()
+            );
+            let allowed = ProjectionBinding::builder()
+                .source("fleet", "readings")
+                .allow(invalid.as_str())
+                .build();
+            assert!(ControlCommand::ApplyBinding(allowed).validate().is_err());
+            let defaulted = ProjectionBinding::builder()
+                .source("fleet", "readings")
+                .default_projection(invalid.as_str())
+                .build();
+            assert!(defaulted.validate().is_err());
+            assert!(
+                ControlCommand::RemoveBinding {
+                    source: SourceSelector::new("fleet", "readings"),
+                    projection_ref: Some(invalid.clone()),
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                ProjectionRef {
+                    id: ProjectionId::new(invalid.clone()),
+                    version: 1,
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(invalid.parse::<ProjectionId>().is_err());
+        }
+    }
+
+    #[test]
+    fn given_a_projection_name_over_the_cap_when_validated_then_should_refuse_it_and_accept_none() {
+        let named = |name: &str| Projection::builder("reading.v1").name(name).build();
+        named("").validate().expect("a projection name is optional");
+        named(&"n".repeat(MAX_PROJECTION_NAME_BYTES))
+            .validate()
+            .expect("a projection name at the cap is valid");
+        assert!(
+            named(&"n".repeat(MAX_PROJECTION_NAME_BYTES + 1))
+                .validate()
+                .is_err()
+        );
+        assert!(named("read\ting").validate().is_err());
+    }
+
+    #[test]
+    fn given_an_invalid_index_field_when_a_projection_is_validated_then_should_refuse_it() {
+        let with_field = |name: &str, pointer: &str| {
+            Projection::builder("reading.v1")
+                .field_at(name, pointer)
+                .build()
+        };
+        with_field("host", "/host")
+            .validate()
+            .expect("a plain index field is valid");
+        let long = "f".repeat(MAX_INDEX_FIELD_BYTES + 1);
+        assert!(with_field(&long, "/host").validate().is_err());
+        assert!(with_field("host", &long).validate().is_err());
+        assert!(with_field("", "/host").validate().is_err());
+        assert!(with_field("host", "").validate().is_err());
+        assert!(with_field("ho\u{7}st", "/host").validate().is_err());
+        assert!(
+            Projection::builder("reading.v1")
+                .vector_field(long)
+                .build()
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Projection::builder("reading.v1")
+                .vector_field("")
+                .build()
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn given_an_invalid_schema_name_when_registered_then_should_refuse_it() {
+        let schema = |name: Option<String>| SchemaDef {
+            id: 7,
+            source: SchemaSource::JsonSchema {
+                schema: "{}".to_owned(),
+            },
+            name,
+            version: None,
+        };
+        schema(None)
+            .validate()
+            .expect("a schema without a name is valid");
+        ControlCommand::RegisterSchema(schema(Some("s".repeat(MAX_SCHEMA_NAME_BYTES))))
+            .validate()
+            .expect("a schema name at the cap is valid");
+        for invalid in [
+            String::new(),
+            "s".repeat(MAX_SCHEMA_NAME_BYTES + 1),
+            "read\ning".to_owned(),
+        ] {
+            assert!(schema(Some(invalid.clone())).validate().is_err());
+            assert!(
+                ControlCommand::RegisterSchema(schema(Some(invalid)))
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn given_an_invalid_graph_label_when_a_graph_projection_is_validated_then_should_refuse_it() {
+        let graph = |label: &str, edge_type: &str| {
+            Projection::builder("people.v1")
+                .graph(EntitySchema {
+                    nodes: vec![NodeExtract {
+                        label: label.to_owned(),
+                        value_pointer: "/name".to_owned(),
+                        embedding_pointer: None,
+                    }],
+                    edges: vec![EdgeExtract {
+                        edge_type: edge_type.to_owned(),
+                        from_pointer: "/name".to_owned(),
+                        to_pointer: "/company".to_owned(),
+                        valid_from_pointer: None,
+                        valid_to_pointer: None,
+                    }],
+                })
+                .build()
+        };
+        let at_cap = "l".repeat(MAX_GRAPH_LABEL_BYTES);
+        ControlCommand::RegisterGraph(graph(&at_cap, &at_cap))
+            .validate()
+            .expect("a label and an edge type at the cap are valid");
+        let long = "l".repeat(MAX_GRAPH_LABEL_BYTES + 1);
+        assert!(graph(&long, "works_at").validate().is_err());
+        assert!(graph("Person", &long).validate().is_err());
+        assert!(graph("", "works_at").validate().is_err());
+        assert!(graph("Person", "").validate().is_err());
+        assert!(
+            ControlCommand::RegisterGraph(graph("Per\nson", "works_at"))
+                .validate()
+                .is_err()
+        );
+    }
 
     #[test]
     fn given_a_binding_that_skips_rejected_records_when_encoded_then_should_carry_the_opt_in_only_when_set()

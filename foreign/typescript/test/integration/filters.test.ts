@@ -124,7 +124,7 @@ async function boundGroup(
 ): Promise<ConsumerGroup> {
   if (!(await laser.capabilities()).filters.catalog) throw new NeedsCatalog()
   const group = laser.stream(stream).topic(TOPIC).consumerGroup(name)
-  await group.create({ filter: definition })
+  await group.create({ filter: definition, filterName: "safe-mode" })
   return group
 }
 
@@ -306,10 +306,13 @@ void test("given_no_catalog_when_a_group_is_created_with_a_filter_then_should_re
     }
     const topic = laser.stream(stream).topic(TOPIC)
     const group = topic.consumerGroup("anomaly-desk")
-    await assert.rejects(group.create({ filter: safeModeFilter() }), UnsupportedError)
+    await assert.rejects(
+      group.create({ filter: safeModeFilter(), filterName: "safe-mode" }),
+      UnsupportedError
+    )
 
     const plain = await group.create()
-    await assert.rejects(group.filter().configure(safeModeFilter()), UnsupportedError)
+    await assert.rejects(group.filter().configure("safe-mode", safeModeFilter()), UnsupportedError)
     assert.equal(plain.name, "anomaly-desk")
     assert.equal(plain.filter, undefined)
     assert.equal(plain.identity.groupId, BigInt(plain.id))
@@ -330,7 +333,6 @@ void test("given_an_unbound_group_when_consumed_then_should_deliver_every_record
       const consumer = await group.consumer({
         startAt: { kind: "first" },
         commitPolicy: { kind: "disabled" },
-        pollIntervalMs: 5,
         allowReplay
       })
       try {
@@ -370,8 +372,7 @@ void test("given_a_group_with_a_filter_when_consumed_then_should_deliver_only_ma
     await publish(laser, stream, [SAFE_MODE, GROUND_STATION, DECOMMISSION])
     const consumer = await group.consumer({
       startAt: { kind: "first" },
-      commitPolicy: { kind: "disabled" },
-      pollIntervalMs: 5
+      commitPolicy: { kind: "disabled" }
     })
     try {
       const delivered: bigint[] = []
@@ -389,7 +390,7 @@ void test("given_a_group_with_a_filter_when_consumed_then_should_deliver_only_ma
     assert.deepEqual(binding.digest, consumerFilterDigest(safeModeFilter()))
     assert.equal(binding.policyGeneration, 1n)
     await assert.rejects(
-      group.filter().configure(ConsumerFilter.json(FilterExpr.present("kind"))),
+      group.filter().configure("kind-present", ConsumerFilter.json(FilterExpr.present("kind"))),
       (error: unknown) =>
         error instanceof FilterExecutionError && error.detail.reason === "conflict"
     )
@@ -525,8 +526,7 @@ void test(
       const consumer = await topic.consumerGroup("cluster-desk").consumer({
         startAt: { kind: "first" },
         commitPolicy: { kind: "disabled" },
-        batchLength: 1,
-        pollIntervalMs: 5
+        batchLength: 1
       })
       try {
         const seen = new Set<number>()
@@ -622,8 +622,11 @@ void test("given_a_group_with_a_filter_when_deleted_then_should_release_it_and_r
     assert.equal(await group.filter().delete(), true)
     assert.equal(await group.filter().get(), undefined)
     assert.equal(await group.filter().delete(), false, "a second delete finds no filter")
-    const again = await group.filter().configure(safeModeFilter())
+    const again = await group.filter().configure("safe-mode", safeModeFilter())
     assert.notEqual(again.filterId, before?.filterId, "the id is not reused")
+    const summary = await group.filter().summary()
+    assert.equal(summary?.name, "safe-mode")
+    assert.deepEqual(summary.owner?.identity, (await group.info()).identity)
     assert.deepEqual(again.digest, before?.digest)
     assert.equal(await group.filter().delete(), true)
   })
@@ -641,9 +644,12 @@ void test("given_group_9_and_groups_90_to_97_when_deleted_then_should_find_the_e
       const info = await group.create()
       if (info.id === 9) {
         target = group
-        before = await group.filter().configure(safeModeFilter())
+        before = await group.filter().configure("safe-mode", safeModeFilter())
       } else if (info.id >= 90 && info.id <= 97) {
-        collisions.push({ group, binding: await group.filter().configure(safeModeFilter()) })
+        collisions.push({
+          group,
+          binding: await group.filter().configure("safe-mode", safeModeFilter())
+        })
       }
       if (info.id === 97) break
     }
@@ -653,7 +659,7 @@ void test("given_group_9_and_groups_90_to_97_when_deleted_then_should_find_the_e
     assert.equal(await target.filter().delete(), true)
     assert.equal(await target.filter().get(), undefined)
     assert.equal(await target.filter().delete(), false)
-    const again = await target.filter().configure(safeModeFilter())
+    const again = await target.filter().configure("safe-mode", safeModeFilter())
     assert.notEqual(again.filterId, before.filterId)
     assert.deepEqual(again.digest, before.digest)
     assert.equal(await target.filter().delete(), true)
@@ -699,7 +705,10 @@ void test("given_a_group_filter_when_members_rejoin_then_should_resume_and_refus
         await resumed.close()
       }
       await assert.rejects(
-        group.create({ filter: ConsumerFilter.json(FilterExpr.present("other")) }),
+        group.create({
+          filter: ConsumerFilter.json(FilterExpr.present("other")),
+          filterName: "other-present"
+        }),
         (error: unknown) =>
           error instanceof ConsumerGroupSetupError && filterReason(error.cause) === "conflict"
       )
@@ -728,7 +737,7 @@ void test("given_a_recreated_topic_when_a_numeric_member_rejoins_then_should_lea
     try {
       await native.topic.delete({ streamId: stream, topicId: TOPIC, partitionsCount: 1 })
       await laser.stream(stream).topic(TOPIC).ensure(1)
-      const current = await group.create({ filter: safeModeFilter() })
+      const current = await group.create({ filter: safeModeFilter(), filterName: "safe-mode" })
       recreated = true
       assert.equal(current.id, old.id)
       assert.notDeepEqual(
@@ -835,7 +844,10 @@ void test("given_a_filtering_server_when_an_agent_spawns_on_the_session_topic_th
 
 void test("given_a_role_group_bound_to_another_filter_when_an_agent_spawns_then_should_refuse_to_run", async (context) => {
   await withAgentStream(context, async (laser) => {
-    await laser.topic(AGENT_SESSIONS).consumerGroup("auditor").create({ filter: broadcastFilter() })
+    await laser
+      .topic(AGENT_SESSIONS)
+      .consumerGroup("auditor")
+      .create({ filter: broadcastFilter(), filterName: "broadcast" })
     const agent = Agent.builder()
       .id(AgentId.new("auditor"))
       .listenOn(AgentTopic.Sessions)
@@ -865,6 +877,34 @@ void test("given_a_released_policy_when_acknowledging_its_page_then_should_refus
       const current = await filtered.nextPage({ timeoutMs: READ_TIMEOUT_MS })
       assert.equal(current.records[0]?.offset, 0n)
       await filtered.ackPage(current)
+    } finally {
+      await filtered.close()
+    }
+  })
+})
+
+void test("given_an_idle_group_reader_on_a_server_that_holds_waits_when_a_match_lands_then_should_wake_before_the_wait_ends", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    if ((await laser.capabilities()).filters.maxWaitMs === 0) {
+      context.skip("the server holds no filtered wait")
+      return
+    }
+    const filtered = await reader(laser, stream, "safe-mode-held", (builder) =>
+      builder.start({ kind: "first" }).maxWait(10_000)
+    )
+    try {
+      assert.deepEqual(await filtered.readRound(), [undefined, false])
+      const started = performance.now()
+      const waiting = filtered.waitForRecords()
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      await publish(laser, stream, [SAFE_MODE])
+      await waiting
+      assert.ok(performance.now() - started < 8_000, "a landed record ends the held wait")
+      const [page] = await filtered.readRound()
+      assert.deepEqual(
+        page?.records.map((record) => record.offset),
+        [0n]
+      )
     } finally {
       await filtered.close()
     }

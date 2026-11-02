@@ -16,12 +16,13 @@ use laser_wire::result::CommandError;
 #[cfg(feature = "query")]
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::time::Instant;
 
 #[cfg(feature = "query")]
 const PINNED_QUERIES: usize = 1024;
 
 /// The node a managed request goes to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Target {
     /// The metadata primary, the only node that submits the replicated
     /// authorization writes.
@@ -90,18 +91,48 @@ impl Nodes {
         payload: Bytes,
         target: Target,
     ) -> Result<Answered, IggyError> {
+        self.send_until(client, code, payload, target, None).await
+    }
+
+    /// [`send`](Self::send) for a request the server may hold, bounded by
+    /// `deadline` instead of the client's default operation timeout.
+    pub(crate) async fn send_held(
+        &self,
+        client: &IggyClient,
+        code: u32,
+        payload: Bytes,
+        target: Target,
+        deadline: Instant,
+    ) -> Result<Answered, IggyError> {
+        self.send_until(client, code, payload, target, Some(deadline))
+            .await
+    }
+
+    async fn send_until(
+        &self,
+        client: &IggyClient,
+        code: u32,
+        payload: Bytes,
+        target: Target,
+        deadline: Option<Instant>,
+    ) -> Result<Answered, IggyError> {
         match target {
             Target::MetadataPrimary => Ok(Answered {
-                reply: client.send_binary_request(code, payload).await?,
+                reply: match deadline {
+                    Some(deadline) => {
+                        client
+                            .send_binary_request_with_deadline(code, payload, deadline)
+                            .await?
+                    }
+                    None => client.send_binary_request(code, payload).await?,
+                },
                 replica: None,
             }),
             Target::Replica(replica) => Ok(Answered {
-                reply: client
-                    .send_binary_request_to_replica(code, payload, replica)
-                    .await?,
+                reply: send_to_replica(client, code, payload, replica, deadline).await?,
                 replica: Some(replica),
             }),
-            Target::Caller => self.send_to_caller(client, code, payload).await,
+            Target::Caller => self.send_to_caller(client, code, payload, deadline).await,
         }
     }
 
@@ -110,15 +141,13 @@ impl Nodes {
         client: &IggyClient,
         code: u32,
         payload: Bytes,
+        deadline: Option<Instant>,
     ) -> Result<Answered, IggyError> {
         let mut roster_read = false;
         let mut failed_links = 0;
         loop {
             let (replica, nodes) = self.caller_node(client).await?;
-            match client
-                .send_binary_request_to_replica(code, payload.clone(), replica)
-                .await
-            {
+            match send_to_replica(client, code, payload.clone(), replica, deadline).await {
                 Ok(reply) => {
                     if decode_named::<CommandError>(&reply)
                         .is_ok_and(|error| error.code.is_backend_unavailable())
@@ -231,6 +260,27 @@ pub(crate) async fn partition_primary(
     PartitionRouteResponse::decode_from(&reply)
         .map(|route| route.primary_replica)
         .map_err(|_| IggyError::InvalidFormat)
+}
+
+async fn send_to_replica(
+    client: &IggyClient,
+    code: u32,
+    payload: Bytes,
+    replica: u8,
+    deadline: Option<Instant>,
+) -> Result<Bytes, IggyError> {
+    match deadline {
+        Some(deadline) => {
+            client
+                .send_binary_request_to_replica_with_deadline(code, payload, replica, deadline)
+                .await
+        }
+        None => {
+            client
+                .send_binary_request_to_replica(code, payload, replica)
+                .await
+        }
+    }
 }
 
 /// Whether the node a partition request went to no longer leads the

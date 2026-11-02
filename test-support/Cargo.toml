@@ -1,0 +1,22 @@
+[package]
+name = "laser-test-support"
+edition.workspace = true
+license.workspace = true
+publish = false
+version.workspace = true
+
+[[bin]]
+name = "laser-test-catalog"
+path = "src/bin/catalog.rs"
+
+[[bin]]
+name = "laser-test-routes"
+path = "src/bin/routes.rs"
+
+[dependencies]
+iggy = { workspace = true }
+iggy_binary_protocol = { workspace = true }
+iggy_common = { workspace = true }
+laser-wire = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net"] }

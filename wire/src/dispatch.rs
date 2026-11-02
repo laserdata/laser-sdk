@@ -332,6 +332,10 @@ pub fn classify(
     }
 }
 
+/// The name an agent's consumer group policy is saved under. Each group owns
+/// its policy, so one name serves every agent.
+pub const ADDRESSEE_FILTER_NAME: &str = "agent-addressee";
+
 /// The headers-only group filter that selects records addressed to `me` or to
 /// every agent. Its digest differs per agent identity.
 pub fn addressee_filter(me: &AgentId) -> ConsumerFilter {

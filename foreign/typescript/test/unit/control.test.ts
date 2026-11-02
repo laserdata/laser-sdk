@@ -12,7 +12,8 @@ import {
   xxh32
 } from "../../src/agent/control.js"
 import { SessionFacts, isWork, parkedOf } from "../../src/agent/lane-scan.js"
-import { RoleState } from "../../src/agent/pause.js"
+import { ControlFollower, RoleState } from "../../src/agent/pause.js"
+import type { LaserTransport, PollWait, PolledMessage } from "../../src/iggy/apache-iggy.js"
 import { ConversationId } from "../../src/types/ids.js"
 import {
   type AgentEnvelope,
@@ -237,4 +238,64 @@ void test("given_a_request_off_the_control_route_when_recorded_then_should_flag_
   assert.deepEqual(folded.flags, state.flags, "the log fold agrees with the book")
   book.reset()
   assert.equal(book.state(session), undefined, "a reset book folds again from the log")
+})
+
+void test("given_an_idle_control_topic_when_followed_then_should_hold_one_read_per_partition_and_stop_at_once", async () => {
+  const waits: number[] = []
+  let cancelled = 0
+  const transport = {
+    pollMessages(
+      _stream: string,
+      _topic: string,
+      _target: unknown,
+      _start: unknown,
+      _count: number,
+      _commit: boolean,
+      wait?: PollWait,
+      signal?: AbortSignal
+    ): Promise<readonly PolledMessage[]> {
+      waits.push(wait?.maxWaitMs ?? 0)
+      const held = wait?.maxWaitMs ?? 0
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => {
+            resolve([])
+          },
+          held === 0 ? 1 : held
+        )
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timer)
+          if (held > 0) cancelled += 1
+          reject(new Error("cancelled"))
+        })
+      })
+    }
+  } as unknown as LaserTransport
+  const follower = new ControlFollower(
+    transport,
+    "orbit",
+    {
+      streamId: 1,
+      topicId: 2,
+      next: new Map([
+        [0, 0n],
+        [1, 0n]
+      ]),
+      truncated: false
+    },
+    undefined,
+    new ControlBook(),
+    undefined,
+    4_000
+  )
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const started = performance.now()
+  await follower.stop()
+  assert.ok(performance.now() - started < 1_000, "stopping cancels the held read")
+  assert.deepEqual(
+    waits.slice(0, 4),
+    [0, 0, 4_000, 4_000],
+    "an idle pass holds one read per partition"
+  )
+  assert.equal(cancelled, waits.filter((wait) => wait > 0).length, "no held read outlives the stop")
 })

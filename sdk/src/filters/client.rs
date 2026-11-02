@@ -15,11 +15,12 @@ use laser_wire::codes::{
 };
 use laser_wire::filter::{
     CatalogPosition, ConsumerFilter, FilterBinding, FilterCatalogOutcome, FilterCatalogReply,
-    FilterError, FilterErrorReason, FilterGroupRef, FilterHeader, FilterMutation,
-    FilterMutationOutcome, FilterMutationRequest, FilterMutationResult, FilterMutationStatus,
-    FilterOutcome, FilterPage, FilterPreview, FilterPreviewRequest, FilterRef, FilterReply,
-    FilterRevisionPage, FilterRevisionRef, FilterSource, FilterTestRequest, FilterTestResult,
-    GetFilterBinding, GetFilterOperation, GroupFilterSpec, ListFilterRevisions, ListFilters,
+    FilterError, FilterErrorReason, FilterGroupIdentity, FilterGroupRef, FilterHeader,
+    FilterMutation, FilterMutationOutcome, FilterMutationRequest, FilterMutationResult,
+    FilterMutationStatus, FilterOutcome, FilterPreview, FilterPreviewRequest, FilterRef,
+    FilterReply, FilterRevisionPage, FilterRevisionRef, FilterSource, FilterSummary,
+    FilterTestRequest, FilterTestResult, GetFilterBinding, GetFilterOperation, GroupFilterSpec,
+    ListFilterRevisions, ListFilters,
 };
 #[cfg(feature = "filters")]
 use laser_wire::filter::{FilterBindingPage, ListFilterBindings};
@@ -131,25 +132,31 @@ impl<'a> Filters<'a> {
         }
     }
 
-    /// One page of saved filters whose name contains `name_contains`, newest
-    /// first.
-    pub(crate) async fn list_before(
+    /// The own filter of one consumer group incarnation, bound or released,
+    /// `None` when it has none.
+    pub(crate) async fn owned(
         &self,
-        name_contains: &str,
-        before_id: Option<u32>,
-        page_size: u32,
-    ) -> Result<FilterPage, LaserError> {
+        owner: FilterGroupIdentity,
+    ) -> Result<Option<FilterSummary>, LaserError> {
         let request = ListFilters {
             v: FILTER_OP_VERSION,
-            name_contains: Some(name_contains.to_owned()),
+            name_contains: None,
             state: None,
-            before_id,
+            before_id: None,
+            owner: Some(owner),
             page: 0,
-            page_size,
+            page_size: 1,
         };
         request.validate()?;
         match self.catalog(AGDX_LIST_FILTERS_CODE, &request).await? {
-            FilterCatalogOutcome::Filters(filters) => Ok(filters),
+            FilterCatalogOutcome::Filters(filters) => {
+                Ok(filters.items.into_iter().find(|summary| {
+                    summary
+                        .owner
+                        .as_ref()
+                        .is_some_and(|own| own.identity == owner)
+                }))
+            }
             _ => Err(unexpected("filters")),
         }
     }
@@ -251,13 +258,14 @@ impl<'a> Filters<'a> {
         group: FilterGroupRef,
         policy: GroupFilterSpec,
         operation_id: Option<u128>,
-        expected_identity: laser_wire::filter::FilterGroupIdentity,
+        expected_identity: FilterGroupIdentity,
     ) -> Result<(FilterBinding, Option<CatalogPosition>), LaserError> {
         let operation_id = operation_id.unwrap_or_else(|| u128::from(ulid::Ulid::generate()));
         let policy = match policy {
-            GroupFilterSpec::Definition(filter) => {
-                GroupFilterSpec::Definition(self.scoped_filter(filter))
-            }
+            GroupFilterSpec::Definition { name, filter } => GroupFilterSpec::Definition {
+                name,
+                filter: self.scoped_filter(filter),
+            },
             other => other,
         };
         let applied = self

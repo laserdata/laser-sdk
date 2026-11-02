@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
-import { CodecError } from "../../src/client/errors.js"
+import { CodecError, InvalidError } from "../../src/client/errors.js"
 import { INTERNAL_GOVERN, INTERNAL_TRANSPORT } from "../../src/client/internals.js"
 import type { Laser } from "../../src/client/laser.js"
 import type { HeaderValue } from "../../src/stream/header-value.js"
@@ -258,4 +258,13 @@ void test("given_scoped_tombstones_and_feedback_when_folded_then_should_touch_on
   assert.equal(kept[0]?.score, 2)
   await memory.forget({ conversation: owner }, id)
   assert.deepEqual(await memory.recallFolded({}, {}), [])
+})
+
+void test("given_a_named_key_over_the_memory_id_cap_when_written_then_should_refuse_it_before_sending", async () => {
+  const topic = new FakeTopic()
+  const memory = topic.memory()
+  const key = "k".repeat(256)
+  await assert.rejects(memory.setNamed(key, encoder.encode("value")), InvalidError)
+  await assert.rejects(memory.forgetNamed(key), InvalidError)
+  assert.equal(await memory.fetchNamedFolded(key), undefined, "nothing reached the topic")
 })

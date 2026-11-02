@@ -5,13 +5,15 @@ use crate::filter::expr::ConsumerFilter;
 use crate::limits::{
     MAX_FILTER_PREVIEW_EXAMINED, MAX_FILTER_PREVIEW_RECORDS, MAX_FILTER_SAMPLE_BYTES,
     MAX_FILTER_SAMPLE_HEADERS, MAX_FILTER_SOURCE_NAME_BYTES, MAX_FILTERED_PAGE_BYTES,
-    MAX_FILTERED_PAGE_EXAMINED, MAX_FILTERED_PAGE_RECORDS,
+    MAX_FILTERED_PAGE_EXAMINED, MAX_FILTERED_PAGE_RECORDS, MAX_FILTERED_WAIT_CANCEL_IDS,
+    MAX_FILTERED_WAIT_MS, MAX_FILTERED_WAIT_PARTITIONS,
 };
 use crate::result::ResultCode;
 use crate::schema::Digest32;
 use crate::validate::Validate;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeSet;
 use std::fmt;
 
 /// The stream and topic a filtered read or preview addresses, by name.
@@ -110,7 +112,7 @@ pub enum FilteredStart {
     First,
     Last,
     Offset(u64),
-    /// Records at or after this broker timestamp, in microseconds.
+    /// Records at or after this server append timestamp, in microseconds.
     Timestamp(u64),
     /// Continue exactly where the previous page stopped.
     Continue(Continuation),
@@ -194,6 +196,50 @@ pub struct Continuation {
     /// independent consumer.
     #[serde(default)]
     pub policy_generation: u64,
+}
+
+/// Hold until one of `partitions` has a record at or after its offset, or
+/// `max_wait_ms` passes. The server lowers the wait to its announced limit and
+/// reads nothing: the reader then sends a filtered poll to the ready ones.
+/// `wait_id` names the wait on its connection so a [`FilteredWaitCancel`] can
+/// end it early.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteredWaitRequest {
+    pub v: u32,
+    pub source: FilterSource,
+    pub consumer: FilterConsumer,
+    pub partitions: Vec<FilteredWaitPartition>,
+    pub max_wait_ms: u32,
+    pub wait_id: u64,
+}
+
+/// End the filtered waits this connection holds under `wait_ids`. Each
+/// cancelled wait answers at once with no ready partition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteredWaitCancel {
+    pub v: u32,
+    pub wait_ids: Vec<u64>,
+}
+
+/// The waits a [`FilteredWaitCancel`] ended. A wait that had already answered
+/// or was never held is left out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteredWaitCancelled {
+    pub cancelled: Vec<u64>,
+}
+
+/// One partition of a filtered wait and the offset its next read starts at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteredWaitPartition {
+    pub partition_id: u32,
+    pub offset: u64,
+}
+
+/// The partitions that hold a record at or after their offset. Empty when the
+/// wait ended first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteredWaitResult {
+    pub ready: Vec<u32>,
 }
 
 /// Read one bounded page of matching records from one partition.
@@ -694,6 +740,8 @@ pub enum FilterOutcome {
     Preview(FilterPreview),
     Tested(FilterTestResult),
     Validated(FilterValidation),
+    Ready(FilteredWaitResult),
+    Cancelled(FilteredWaitCancelled),
 }
 
 /// The reply to every server-native consumer-filter command.
@@ -750,6 +798,53 @@ impl Validate for FilterRef {
             Self::Inline(filter) => filter.validate(),
             Self::Revision { .. } | Self::Bound | Self::Group => Ok(()),
         }
+    }
+}
+
+impl Validate for FilteredWaitRequest {
+    fn validate(&self) -> Result<(), InvalidError> {
+        validate_version(self.v)?;
+        self.source.validate()?;
+        self.consumer.validate()?;
+        if self.partitions.is_empty() || self.partitions.len() > MAX_FILTERED_WAIT_PARTITIONS {
+            return Err(InvalidError::new(format!(
+                "a filtered wait names 1..={MAX_FILTERED_WAIT_PARTITIONS} partitions"
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        if !self
+            .partitions
+            .iter()
+            .all(|partition| seen.insert(partition.partition_id))
+        {
+            return Err(InvalidError::new(
+                "a filtered wait names each partition once",
+            ));
+        }
+        if self.max_wait_ms > MAX_FILTERED_WAIT_MS {
+            return Err(InvalidError::new(format!(
+                "max_wait_ms must be 0..={MAX_FILTERED_WAIT_MS}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for FilteredWaitCancel {
+    fn validate(&self) -> Result<(), InvalidError> {
+        validate_version(self.v)?;
+        if self.wait_ids.is_empty() || self.wait_ids.len() > MAX_FILTERED_WAIT_CANCEL_IDS {
+            return Err(InvalidError::new(format!(
+                "a filtered wait cancel names 1..={MAX_FILTERED_WAIT_CANCEL_IDS} waits"
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        if !self.wait_ids.iter().all(|wait_id| seen.insert(*wait_id)) {
+            return Err(InvalidError::new(
+                "a filtered wait cancel names each wait once",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -889,6 +984,124 @@ mod tests {
     use super::*;
     use crate::filter::expr::FilterExpr;
     use crate::query::CmpOp;
+
+    fn wait_request() -> FilteredWaitRequest {
+        FilteredWaitRequest {
+            v: FILTER_OP_VERSION,
+            source: FilterSource {
+                stream: "orbit".to_owned(),
+                topic: "fleet".to_owned(),
+            },
+            consumer: FilterConsumer::Group("desk".to_owned()),
+            partitions: vec![
+                FilteredWaitPartition {
+                    partition_id: 0,
+                    offset: 12,
+                },
+                FilteredWaitPartition {
+                    partition_id: 1,
+                    offset: 0,
+                },
+            ],
+            max_wait_ms: 5_000,
+            wait_id: 9,
+        }
+    }
+
+    #[test]
+    fn given_a_wait_cancel_when_encoded_as_json_then_should_round_trip_with_its_reply() {
+        let cancel = FilteredWaitCancel {
+            v: FILTER_OP_VERSION,
+            wait_ids: vec![9, 11],
+        };
+        cancel.validate().expect("valid");
+        let json = serde_json::to_string(&cancel).expect("encodes");
+        assert_eq!(
+            serde_json::from_str::<FilteredWaitCancel>(&json).expect("decodes"),
+            cancel
+        );
+        let cancelled = FilterReply::Ok(FilterOutcome::Cancelled(FilteredWaitCancelled {
+            cancelled: vec![9],
+        }));
+        let json = serde_json::to_string(&cancelled).expect("encodes");
+        assert_eq!(
+            serde_json::from_str::<FilterReply>(&json).expect("decodes"),
+            cancelled
+        );
+    }
+
+    #[test]
+    fn given_wait_cancels_out_of_range_when_validated_then_should_be_rejected() {
+        let cancel = |wait_ids: Vec<u64>| FilteredWaitCancel {
+            v: FILTER_OP_VERSION,
+            wait_ids,
+        };
+        let too_many = cancel((0..=MAX_FILTERED_WAIT_CANCEL_IDS as u64).collect());
+        let old_version = FilteredWaitCancel {
+            v: FILTER_OP_VERSION + 1,
+            ..cancel(vec![1])
+        };
+        for request in [
+            cancel(Vec::new()),
+            cancel(vec![4, 4]),
+            too_many,
+            old_version,
+        ] {
+            assert!(request.validate().is_err(), "{request:?} must be rejected");
+        }
+        cancel((0..MAX_FILTERED_WAIT_CANCEL_IDS as u64).collect())
+            .validate()
+            .expect("the cap is accepted");
+    }
+
+    #[test]
+    fn given_a_wait_request_when_encoded_as_json_then_should_round_trip() {
+        let request = wait_request();
+        request.validate().expect("valid");
+        let json = serde_json::to_string(&request).expect("encodes");
+        assert_eq!(
+            serde_json::from_str::<FilteredWaitRequest>(&json).expect("decodes"),
+            request
+        );
+        let ready = FilterReply::Ok(FilterOutcome::Ready(FilteredWaitResult { ready: vec![1] }));
+        let json = serde_json::to_string(&ready).expect("encodes");
+        assert_eq!(
+            serde_json::from_str::<FilterReply>(&json).expect("decodes"),
+            ready
+        );
+    }
+
+    #[test]
+    fn given_wait_requests_out_of_range_when_validated_then_should_be_rejected() {
+        let no_partitions = FilteredWaitRequest {
+            partitions: Vec::new(),
+            ..wait_request()
+        };
+        let too_long = FilteredWaitRequest {
+            max_wait_ms: MAX_FILTERED_WAIT_MS + 1,
+            ..wait_request()
+        };
+        let mut repeated = wait_request();
+        repeated.partitions[1].partition_id = 0;
+        let too_many = FilteredWaitRequest {
+            partitions: (0..=MAX_FILTERED_WAIT_PARTITIONS as u32)
+                .map(|partition_id| FilteredWaitPartition {
+                    partition_id,
+                    offset: 0,
+                })
+                .collect(),
+            ..wait_request()
+        };
+        for request in [no_partitions, too_long, repeated, too_many] {
+            assert!(request.validate().is_err(), "{request:?} must be rejected");
+        }
+        FilteredWaitRequest {
+            max_wait_ms: 0,
+            ..wait_request()
+        }
+        .validate()
+        .expect("a zero wait answers at once");
+    }
 
     fn generation() -> SourceGeneration {
         SourceGeneration {

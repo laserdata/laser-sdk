@@ -30,7 +30,6 @@ void test("given_a_completed_workflow_when_resumed_then_should_replay_without_re
       .id(worker)
       .listenOn(AgentTopic.Sessions)
       .respondOn(AgentTopic.Sessions)
-      .pollInterval(5)
       .handler({
         handle(message, context): Promise<void> {
           calls += 1
@@ -84,7 +83,6 @@ void test("given_a_later_verifier_failure_when_running_then_should_compensate_co
       .id(worker)
       .listenOn(AgentTopic.Sessions)
       .respondOn(AgentTopic.Sessions)
-      .pollInterval(5)
       .handler({
         handle(message, context): Promise<void> {
           const body = textDecoder.decode(message.envelope?.body)
@@ -154,7 +152,6 @@ void test("given_a_workflow_when_run_then_should_record_the_run_as_a_root_sessio
       .id(worker)
       .listenOn(AgentTopic.Sessions)
       .respondOn(AgentTopic.Sessions)
-      .pollInterval(5)
       .handler({ handle: (_message, context) => context.respond(textEncoder.encode("triaged")) })
       .build()
       .spawn(laser)

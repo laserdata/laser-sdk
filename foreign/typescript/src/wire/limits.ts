@@ -10,6 +10,10 @@ export const DEFAULT_SCAN_LIMIT = 100
 export const DEFAULT_NAMESPACE = "default"
 export const MAX_NAMESPACE_BYTES = 128
 export const MAX_SESSION_LABEL_BYTES = 256
+/** Max UTF-8 bytes of a session list's text filter. */
+export const MAX_SESSION_TEXT_QUERY_BYTES = 1024
+/** Max UTF-8 bytes of a session list's opaque page cursor. */
+export const MAX_SESSION_CURSOR_BYTES = 512
 /** Most session ids one heartbeat record lists. A process with more leases in
  * one stream splits them over several records. */
 export const MAX_HEARTBEAT_SESSIONS = 2048
@@ -27,6 +31,11 @@ export const MAX_ROLE_NAME_BYTES = 64
 export const MAX_FRAME_BYTES = 64 * 1024 * 1024
 export const MAX_QUERY_REPLY_BYTES = MAX_FRAME_BYTES
 export const MAX_QUERY_NAME_BYTES = 255
+export const MAX_PROJECTION_ID_BYTES = 255
+export const MAX_PROJECTION_NAME_BYTES = 255
+/** Max UTF-8 bytes in an index field's name, JSON pointer, or vector field pointer. */
+export const MAX_INDEX_FIELD_BYTES = 255
+export const MAX_SCHEMA_NAME_BYTES = 255
 export const MAX_RAW_SQL_BYTES = 64 * 1024
 export const MAX_QUERY_PARAMETERS = 1024
 export const MAX_QUERY_CURSOR_BYTES = 512
@@ -53,10 +62,14 @@ export const MAX_TEXT_QUERY_BYTES = 1024
 export const DEFAULT_RECALL_LIMIT = DEFAULT_STREAM_PAGE_SIZE
 export const MAX_MEMORY_TAGS = 16
 export const MAX_MEMORY_TAG_BYTES = 64
+/** Max bytes in a memory item id, its kind word, or a forget or feedback target. */
+export const MAX_MEMORY_ID_BYTES = 255
 export const MAX_GRAPH_NAME_BYTES = 128
 export const MAX_GRAPH_TRAVERSE_DEPTH = 8
 export const MAX_GRAPH_RESULT_ELEMENTS = 10_000
 export const MAX_GRAPH_NODE_LABELS = 16
+/** Max bytes in one graph node label or edge type. */
+export const MAX_GRAPH_LABEL_BYTES = 128
 export const MAX_SOURCE_REF_BYTES = 2 * MAX_KEY_BYTES
 
 export const MAX_FILTER_BYTES = 8192
@@ -73,6 +86,12 @@ export const MAX_FILTERED_PAGE_RECORDS = 1000
 export const MAX_FILTERED_PAGE_BYTES = 8 * 1024 * 1024
 /** Max source records one filtered page may ask to examine. */
 export const MAX_FILTERED_PAGE_EXAMINED = 100_000
+/** Max milliseconds a filtered wait is held by the server. */
+export const MAX_FILTERED_WAIT_MS = 20_000
+/** Max partitions one filtered wait names. */
+export const MAX_FILTERED_WAIT_PARTITIONS = 1024
+/** Max waits one filtered wait cancel names. */
+export const MAX_FILTERED_WAIT_CANCEL_IDS = 64
 export const MAX_FILTER_PREVIEW_EXAMINED = 10_000
 export const MAX_FILTER_PREVIEW_RECORDS = 100
 export const MAX_FILTER_PREVIEW_PAYLOAD_BYTES = 4096

@@ -25,6 +25,8 @@ import { decodeOne, encodeNamed } from "../../src/wire/cbor.js"
 import {
   AGDX_FILTERED_ACK_CODE,
   AGDX_FILTERED_POLL_CODE,
+  AGDX_FILTERED_WAIT_CANCEL_CODE,
+  AGDX_FILTERED_WAIT_CODE,
   FILTER_OP_VERSION
 } from "../../src/wire/codes.js"
 import {
@@ -33,10 +35,14 @@ import {
   consumerFilterDigest,
   decodeFilteredPollRequest,
   decodeFilteredAck,
+  decodeFilteredWaitCancel,
+  decodeFilteredWaitRequest,
   encodeFilterReply,
   type FilteredPage,
   type FilteredPollRequest,
-  type FilteredStart
+  type FilteredStart,
+  type FilteredWaitCancel,
+  type FilteredWaitRequest
 } from "../../src/wire/filter.js"
 
 const SYNC_CONSUMER_GROUP_CODE = 606
@@ -57,7 +63,7 @@ const generation = {
 const ackContext = { ownerGeneration: 4n, metadataOp: 40n }
 const capabilities: Capabilities = {
   ...OPEN_CAPABILITIES,
-  filters: { native: true, catalog: false, groupPolicyReads: true }
+  filters: { native: true, catalog: false, groupPolicyReads: true, maxWaitMs: 0 }
 }
 
 // The polled head: partition, current offset, count, then the partition context.
@@ -195,30 +201,75 @@ function baseTransport(sendManaged: FilterTransport["sendManaged"]): FilterTrans
 interface Coordinator {
   readonly connection: CoordinatorConnection
   readonly polls: { readonly target: ManagedTarget; readonly request: FilteredPollRequest }[]
+  readonly waits: {
+    readonly target: ManagedTarget
+    readonly request: FilteredWaitRequest
+    readonly deadline?: number
+  }[]
   readonly stored: FencedPosition[]
   readonly lookups: number[]
+  readonly acks: { readonly target: ManagedTarget; readonly offset: bigint }[]
+  readonly cancels: { readonly target: ManagedTarget; readonly request: FilteredWaitCancel }[]
 }
 
 /**
  * A coordinator whose polls `poll` answers. The route lookup names replica 1
  * unless `primary` says otherwise. Stores succeed unless `store` says
- * otherwise. Group syncs answer with `sync`.
+ * otherwise. Group syncs answer with `sync`. A wait cancel ends the named
+ * waits held on its node with an empty ready answer, as the server does,
+ * unless `cancel` answers it.
  */
 function coordinatorOf(spec: {
   readonly poll: (request: FilteredPollRequest, target: ManagedTarget) => Promise<Uint8Array>
   readonly primary?: (partitionId: number) => Promise<number>
   readonly store?: (position: FencedPosition) => Promise<void>
   readonly sync?: () => Promise<Uint8Array>
+  readonly wait?: (request: FilteredWaitRequest, target: ManagedTarget) => Promise<Uint8Array>
+  // Answers an acknowledgment with its own reply, or stores it when undefined.
+  readonly ack?: (offset: bigint, target: ManagedTarget) => Promise<Uint8Array | undefined>
+  readonly cancel?: (request: FilteredWaitCancel, target: ManagedTarget) => Promise<Uint8Array>
 }): Coordinator {
   const polls: Coordinator["polls"] = []
+  const waits: Coordinator["waits"] = []
   const stored: FencedPosition[] = []
   const lookups: number[] = []
+  const acks: Coordinator["acks"] = []
+  const cancels: Coordinator["cancels"] = []
+  const held = new Map<string, () => void>()
   const connection: CoordinatorConnection = {
     send: (code) => {
       assert.equal(code, SYNC_CONSUMER_GROUP_CODE, "only the group sync rides the plain send")
       return spec.sync === undefined ? Promise.resolve(assignment(1n, [0])) : spec.sync()
     },
-    sendManagedTo: async (code, payload, target) => {
+    sendManagedTo: async (code, payload, target, options) => {
+      if (code === AGDX_FILTERED_WAIT_CODE) {
+        const request = decodeFilteredWaitRequest(decodeOne(payload, "wait"), "wait")
+        waits.push({
+          target,
+          request,
+          ...(options?.deadline === undefined ? {} : { deadline: options.deadline })
+        })
+        assert.ok(spec.wait !== undefined, "this server holds no filtered wait")
+        const key = heldKey(target, request.waitId)
+        const cancelled = new Promise<Uint8Array>((resolve) => {
+          held.set(key, () => {
+            resolve(readyReply([]))
+          })
+        })
+        try {
+          return { reply: await Promise.race([spec.wait(request, target), cancelled]) }
+        } finally {
+          held.delete(key)
+        }
+      }
+      if (code === AGDX_FILTERED_WAIT_CANCEL_CODE) {
+        const request = decodeFilteredWaitCancel(decodeOne(payload, "cancel"), "cancel")
+        cancels.push({ target, request })
+        if (spec.cancel !== undefined) return { reply: await spec.cancel(request, target) }
+        const ended = request.waitIds.filter((waitId) => held.has(heldKey(target, waitId)))
+        for (const waitId of ended) held.get(heldKey(target, waitId))?.()
+        return { reply: cancelledReply(ended) }
+      }
       if (code === AGDX_FILTERED_ACK_CODE) {
         const ack = decodeFilteredAck(decodeOne(payload, "acknowledgment"), "acknowledgment")
         const position: FencedPosition = {
@@ -239,6 +290,9 @@ function coordinatorOf(spec: {
             metadataOp: ack.ackContext.metadataOp
           }
         }
+        acks.push({ target, offset: ack.offset })
+        const answered = spec.ack === undefined ? undefined : await spec.ack(ack.offset, target)
+        if (answered !== undefined) return { reply: answered }
         if (spec.store !== undefined) await spec.store(position)
         stored.push(position)
         return {
@@ -274,7 +328,11 @@ function coordinatorOf(spec: {
     leaveConsumerGroup: () => Promise.resolve(),
     close: () => Promise.resolve()
   }
-  return { connection, polls, stored, lookups }
+  return { connection, polls, waits, stored, lookups, acks, cancels }
+}
+
+function heldKey(target: ManagedTarget, waitId: bigint): string {
+  return `${target.kind === "replica" ? String(target.replica) : target.kind}:${String(waitId)}`
 }
 
 function reader(
@@ -284,12 +342,14 @@ function reader(
     readonly partitionIds?: readonly number[]
     readonly idleIntervalMs?: number
     readonly maxUnackedPages?: number
+    readonly maxWaitMs?: number
+    readonly start?: FilteredStart
   } = {}
 ): FilteredReader {
   const transport = baseTransport(() =>
     Promise.reject(new Error("the shared transport is not used"))
   )
-  const start: FilteredStart = { kind: "first" }
+  const start: FilteredStart = layout.start ?? { kind: "first" }
   return FilteredReader.create({
     transport,
     filters: new Filters(transport, () => Promise.resolve(capabilities)),
@@ -306,6 +366,7 @@ function reader(
     },
     start,
     idleIntervalMs: layout.idleIntervalMs ?? 1,
+    ...(layout.maxWaitMs === undefined ? {} : { maxWaitMs: layout.maxWaitMs }),
     ...(layout.maxUnackedPages === undefined ? {} : { maxUnackedPages: layout.maxUnackedPages }),
     guard: layout.guarded === undefined ? undefined : CompiledFilter.compile(layout.guarded),
     membership: undefined,
@@ -313,15 +374,15 @@ function reader(
   })
 }
 
-function groupReader(coordinator: Coordinator) {
+function groupReader(coordinator: Coordinator, served: Capabilities = capabilities) {
   const transport: FilterTransport = {
     ...baseTransport(() => Promise.reject(new Error("the shared transport is not used"))),
     openCoordinator: () => Promise.resolve(coordinator.connection)
   }
   return FilteredReaderBuilder.create(
     transport,
-    () => Promise.resolve(capabilities),
-    new Filters(transport, () => Promise.resolve(capabilities)),
+    () => Promise.resolve(served),
+    new Filters(transport, () => Promise.resolve(served)),
     { stream: "orbit", topic: "fleet_changes" },
     { kind: "group", name: "anomaly-desk" },
     { kind: "bound" }
@@ -338,7 +399,7 @@ void test("given_a_server_without_group_reads_when_an_automatic_reader_is_built_
   const outdated = (): Promise<Capabilities> =>
     Promise.resolve({
       ...capabilities,
-      filters: { native: true, catalog: false, groupPolicyReads: false }
+      filters: { native: true, catalog: false, groupPolicyReads: false, maxWaitMs: 0 }
     })
   const automatic = FilteredReaderBuilder.create(
     transport,
@@ -371,7 +432,7 @@ void test("given_a_server_without_native_filters_when_a_bound_reader_is_built_th
   const withoutNative = (): Promise<Capabilities> =>
     Promise.resolve({
       ...capabilities,
-      filters: { native: false, catalog: false, groupPolicyReads: true }
+      filters: { native: false, catalog: false, groupPolicyReads: true, maxWaitMs: 0 }
     })
   const bound = FilteredReaderBuilder.create(
     transport,
@@ -482,7 +543,7 @@ void test("given_group_policy_reads_without_an_evaluator_when_an_automatic_reade
   const withoutEvaluator = (): Promise<Capabilities> =>
     Promise.resolve({
       ...capabilities,
-      filters: { native: false, catalog: false, groupPolicyReads: true }
+      filters: { native: false, catalog: false, groupPolicyReads: true, maxWaitMs: 0 }
     })
   const automatic = FilteredReaderBuilder.create(
     transport,
@@ -678,14 +739,33 @@ void test("given_a_route_stale_twice_when_reading_then_should_surface_the_refusa
   await filtered.close()
 })
 
-void test("given_a_read_on_the_callers_node_when_it_fails_then_should_not_resend_it_here", async () => {
+void test("given_a_read_on_the_callers_node_when_its_link_fails_then_should_not_resend_it_here", async () => {
   const coordinator = coordinatorOf({
     primary: () => Promise.reject(refusal(1002)),
-    poll: () => Promise.reject(refusal(NOT_PRIMARY))
+    poll: () => Promise.reject(new TransportError("the link to the replica was lost", true))
   })
   const filtered = reader(coordinator)
   await assert.rejects(filtered.tryNextPage(), TransportError)
   assert.equal(coordinator.polls.length, 1, "the caller's node moves on inside the node choice")
+  await filtered.close()
+})
+
+void test("given_a_read_on_the_callers_node_refused_as_not_primary_when_reading_then_should_look_the_route_up_again_and_resend_once", async () => {
+  let lookups = 0
+  const coordinator = coordinatorOf({
+    primary: () => (lookups++ === 0 ? Promise.reject(refusal(1002)) : Promise.resolve(2)),
+    poll: (_request, target) =>
+      target.kind === "caller"
+        ? Promise.reject(refusal(NOT_PRIMARY))
+        : Promise.resolve(pageReply(page({ offsets: [0n] })))
+  })
+  const filtered = reader(coordinator)
+  assert.equal((await filtered.tryNextPage())?.records[0]?.offset, 0n)
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.target),
+    [{ kind: "caller" }, { kind: "replica", replica: 2 }],
+    "a node that does not store the partition sends the read to its primary"
+  )
   await filtered.close()
 })
 
@@ -732,14 +812,14 @@ void test("given_a_group_page_when_acknowledged_then_should_store_under_the_nume
   await filtered.close()
 })
 
-void test("given_a_lost_store_reply_when_the_next_ack_runs_then_should_store_the_same_target_again", async () => {
-  let failures = 2
+void test("given_a_refused_store_when_the_next_ack_runs_then_should_store_the_same_target_again", async () => {
+  let failures = 1
   const coordinator = coordinatorOf({
     poll: () => Promise.resolve(pageReply(page({ offsets: [0n, 1n], nextScanOffset: 2n }))),
     store: (position) => {
       if (position.offset === 1n && failures > 0) {
         failures -= 1
-        return Promise.reject(new TransportError("the reply was lost", true))
+        return Promise.reject(new TransportError("the reply was lost", false))
       }
       return Promise.resolve()
     }
@@ -1005,3 +1085,735 @@ void test("given_an_injected_client_without_targeted_requests_when_reading_then_
   await assert.rejects(built.tryNextPage(), ConfigError)
   await built.close()
 })
+
+function readyReply(ready: readonly number[]): Uint8Array {
+  return encodeNamed(
+    encodeFilterReply({ kind: "ok", outcome: { kind: "ready", result: { ready } } })
+  )
+}
+
+function cancelledReply(cancelled: readonly bigint[]): Uint8Array {
+  return encodeNamed(
+    encodeFilterReply({ kind: "ok", outcome: { kind: "cancelled", result: { cancelled } } })
+  )
+}
+
+void test("given_an_idle_round_on_a_server_that_holds_waits_when_waiting_then_should_send_one_wait_per_node_and_read_only_the_ready_partitions", async () => {
+  let held: ((reply: Uint8Array) => void) | undefined
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    primary: (partitionId) => Promise.resolve(partitionId === 1 ? 2 : 1),
+    wait: (_request, target) =>
+      target.kind === "replica" && target.replica === 1
+        ? Promise.resolve(readyReply([2]))
+        : new Promise((resolve) => {
+            held = resolve
+          })
+  })
+  const filtered = reader(coordinator, { partitionIds: [0, 1, 2], maxWaitMs: 2_000 })
+  assert.deepEqual(await filtered.readRound(), [undefined, false])
+  const before = Date.now()
+  await filtered.waitForRecords()
+  assert.equal(coordinator.waits.length, 2, "one wait per serving node")
+  const byNode = new Map(
+    coordinator.waits.map((wait) => [
+      wait.target.kind === "replica" ? wait.target.replica : -1,
+      wait.request
+    ])
+  )
+  assert.deepEqual(byNode.get(1)?.partitions, [
+    { partitionId: 0, offset: 5n },
+    { partitionId: 2, offset: 5n }
+  ])
+  assert.deepEqual(byNode.get(2)?.partitions, [{ partitionId: 1, offset: 5n }])
+  assert.equal(byNode.get(1)?.maxWaitMs, 2_000)
+  assert.equal(byNode.get(1)?.consumer.kind, "consumer")
+  for (const wait of coordinator.waits) {
+    assert.ok((wait.deadline ?? 0) >= before + 2_000 + 5_000, "the call outlives the server wait")
+  }
+  const polled = coordinator.polls.length
+  await filtered.readRound()
+  assert.deepEqual(
+    coordinator.polls.slice(polled).map((poll) => poll.request.partitionId),
+    [2],
+    "only the ready partition is read"
+  )
+  held?.(readyReply([]))
+  await filtered.close()
+})
+
+void test("given_a_server_that_refuses_waits_as_unsupported_when_idle_then_should_stop_waiting", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: () =>
+      Promise.resolve(
+        encodeNamed(
+          encodeFilterReply({
+            kind: "err",
+            error: {
+              code: { kind: "known", name: "Unsupported" },
+              reason: "unsupported",
+              message: "no filtered wait"
+            }
+          })
+        )
+      )
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 2_000 })
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  assert.equal(coordinator.waits.length, 1, "an unsupported wait is not sent again")
+  await filtered.close()
+})
+
+void test("given_a_server_without_filtered_waits_when_idle_then_should_pace_with_the_idle_interval", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n })))
+  })
+  const filtered = reader(coordinator, { idleIntervalMs: 30 })
+  await filtered.readRound()
+  const started = performance.now()
+  await filtered.waitForRecords()
+  assert.ok(performance.now() - started >= 25, "an idle round sleeps the idle interval")
+  assert.equal(coordinator.waits.length, 0)
+  await filtered.close()
+})
+
+void test("given_an_empty_wait_answer_long_before_its_deadline_when_idle_then_should_also_sleep_the_idle_interval", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: () => Promise.resolve(readyReply([]))
+  })
+  const filtered = reader(coordinator, { idleIntervalMs: 30, maxWaitMs: 2_000 })
+  await filtered.readRound()
+  const started = performance.now()
+  await filtered.waitForRecords()
+  assert.equal(coordinator.waits.length, 1)
+  assert.ok(
+    performance.now() - started >= 25,
+    "an early empty answer falls back to the idle interval"
+  )
+  await filtered.close()
+})
+
+void test("given_a_builder_wait_longer_than_the_announced_one_when_built_then_should_wait_the_announced_cap", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(
+        pageReply(groupPage({ partitionId: request.partitionId, nextScanOffset: 5n }))
+      ),
+    wait: () => Promise.resolve(readyReply([0]))
+  })
+  assert.throws(() => groupReader(coordinator).maxWait(-1), InvalidError)
+  const filtered = await groupReader(coordinator, {
+    ...capabilities,
+    filters: { ...capabilities.filters, maxWaitMs: 3_000 }
+  }).build()
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  const [first] = coordinator.waits
+  assert.ok(first !== undefined)
+  assert.equal(first.request.maxWaitMs, 3_000)
+  assert.deepEqual(first.request.consumer, { kind: "group", name: "anomaly-desk" })
+  await filtered.close()
+})
+
+void test("given_pages_without_a_continuation_when_waiting_then_should_wait_past_the_head_or_from_zero_and_keep_one_wait_per_node", async () => {
+  let rounds = 0
+  const coordinator = coordinatorOf({
+    poll: (request) => {
+      rounds += 1
+      const frontier = request.partitionId === 0 ? 1_000n : 0n
+      const {
+        safeAckOffset: _safe,
+        nextScanOffset: _next,
+        ...rest
+      } = page({
+        partitionId: request.partitionId,
+        frontier
+      })
+      return Promise.resolve(pageReply({ ...rest, examined: 0 }))
+    },
+    primary: (partitionId) => Promise.resolve(partitionId === 0 ? 1 : 2),
+    wait: (_request, target) =>
+      target.kind === "replica" && target.replica === 2
+        ? Promise.resolve(readyReply([1]))
+        : new Promise(() => undefined)
+  })
+  const filtered = reader(coordinator, {
+    partitionIds: [0, 1],
+    maxWaitMs: 2_000,
+    idleIntervalMs: 30,
+    start: { kind: "next" }
+  })
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  assert.deepEqual(
+    coordinator.waits.map((wait) => wait.request.partitions),
+    [[{ partitionId: 0, offset: 1_001n }], [{ partitionId: 1, offset: 0n }]],
+    "past a head of 1000, from 0 at a head of 0"
+  )
+  assert.equal(rounds, 2)
+  await filtered.readRound()
+  const paced = performance.now()
+  await filtered.waitForRecords()
+  assert.ok(performance.now() - paced >= 25, "a ready answer the round could not confirm is paced")
+  assert.equal(coordinator.waits.length, 2, "a node that still holds a wait gets no other")
+  await filtered.close()
+})
+
+void test("given_a_backup_refusing_a_read_as_unavailable_when_reading_then_should_forget_the_route_and_resend_once", async () => {
+  const leaders = [1, 2]
+  const coordinator = coordinatorOf({
+    primary: () => Promise.resolve(leaders.shift() ?? 2),
+    poll: (_request, target) =>
+      Promise.resolve(
+        target.kind === "replica" && target.replica === 1
+          ? unavailableReply()
+          : pageReply(page({ offsets: [0n] }))
+      )
+  })
+  const filtered = reader(coordinator)
+  assert.equal((await filtered.tryNextPage())?.records[0]?.offset, 0n)
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.target),
+    [
+      { kind: "replica", replica: 1 },
+      { kind: "replica", replica: 2 }
+    ]
+  )
+  assert.deepEqual(coordinator.lookups, [0, 0], "the refused route is looked up again")
+  await filtered.close()
+})
+
+void test("given_every_node_refusing_a_read_as_unavailable_when_reading_then_should_resend_once_and_surface_the_refusal", async () => {
+  const coordinator = coordinatorOf({ poll: () => Promise.resolve(unavailableReply()) })
+  const filtered = reader(coordinator, { idleIntervalMs: 0 })
+  await assert.rejects(filtered.tryNextPage(), FilterExecutionError)
+  assert.equal(coordinator.polls.length, 2, "one resend after a fresh lookup")
+  await filtered.close()
+})
+
+void test("given_a_cached_primary_that_stops_answering_when_reading_then_should_follow_the_new_primary_after_a_route_recheck", async () => {
+  let stopped = false
+  const coordinator = coordinatorOf({
+    primary: () => Promise.resolve(stopped ? 2 : 1),
+    poll: (request, target) => {
+      if (stopped && target.kind === "replica" && target.replica === 1)
+        return new Promise(() => undefined)
+      return Promise.resolve(
+        pageReply(
+          stopped
+            ? page({ partitionId: request.partitionId, offsets: [0n] })
+            : idlePage(request.partitionId, 0n)
+        )
+      )
+    }
+  })
+  const filtered = reader(coordinator, { partitionIds: [0, 1] })
+  assert.equal(await filtered.tryNextPage(), undefined)
+  stopped = true
+  const started = performance.now()
+  const found = await within(filtered.tryNextPage(), 5_000)
+  const elapsed = performance.now() - started
+  assert.equal(found?.partitionId, 0)
+  assert.ok(elapsed >= 900 && elapsed < 2_500, `followed the move after ${String(elapsed)} ms`)
+  const lookups = coordinator.lookups.length
+  assert.equal((await filtered.tryNextPage())?.partitionId, 1)
+  assert.deepEqual(
+    coordinator.lookups.slice(lookups),
+    [1],
+    "every route through the old node is read again"
+  )
+  assert.deepEqual(
+    coordinator.polls.slice(-3).map((poll) => [poll.request.partitionId, poll.target]),
+    [
+      [0, { kind: "replica", replica: 1 }],
+      [0, { kind: "replica", replica: 2 }],
+      [1, { kind: "replica", replica: 2 }]
+    ]
+  )
+  await filtered.close()
+})
+
+void test("given_a_primary_that_fails_at_once_and_a_route_that_still_names_it_when_reading_then_should_recheck_the_route_while_the_resend_waits", async () => {
+  // The crashed primary drops the first read at once, the route still names
+  // it for two lookups, and the resend to it would wait out the call bound.
+  const primaries = [1, 1, 1, 2]
+  let attempts = 0
+  const coordinator = coordinatorOf({
+    primary: () => Promise.resolve(primaries.shift() ?? 2),
+    poll: (_request, target) => {
+      if (target.kind === "replica" && target.replica === 2)
+        return Promise.resolve(pageReply(page({ offsets: [0n] })))
+      attempts += 1
+      return attempts === 1
+        ? Promise.reject(new TransportError("the link to the replica was lost", true))
+        : new Promise(() => undefined)
+    }
+  })
+  const filtered = reader(coordinator)
+  const found = await within(filtered.tryNextPage(), 5_000)
+  assert.equal(found?.records[0]?.offset, 0n)
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.target),
+    [
+      { kind: "replica", replica: 1 },
+      { kind: "replica", replica: 1 },
+      { kind: "replica", replica: 2 }
+    ]
+  )
+  await filtered.close()
+})
+
+void test("given_a_slow_but_healthy_primary_when_reading_then_should_keep_waiting_for_its_answer", async () => {
+  const coordinator = coordinatorOf({
+    primary: () => Promise.resolve(1),
+    poll: () =>
+      new Promise((resolve) => {
+        setTimeout(() => {
+          resolve(pageReply(page({ offsets: [0n] })))
+        }, 2_300)
+      })
+  })
+  const filtered = reader(coordinator)
+  assert.equal((await within(filtered.tryNextPage(), 5_000))?.records[0]?.offset, 0n)
+  assert.equal(coordinator.polls.length, 1, "the read was never abandoned")
+  assert.ok(coordinator.lookups.length >= 3, "the route was checked while the read was slow")
+  await filtered.close()
+})
+
+for (const [label, refuse] of [
+  ["not_primary", () => Promise.reject(refusal(NOT_PRIMARY))],
+  ["unavailable", () => Promise.resolve(unavailableReply())]
+] as const) {
+  void test(`given_no_primary_answering_an_ack_with_${label}_when_acknowledging_then_should_send_the_same_target_until_it_is_stored`, async () => {
+    let refusals = 3
+    const coordinator = coordinatorOf({
+      poll: () => Promise.resolve(pageReply(page({ offsets: [0n, 1n], nextScanOffset: 2n }))),
+      ack: () => {
+        if (refusals === 0) return Promise.resolve(undefined)
+        refusals -= 1
+        return refuse()
+      }
+    })
+    const filtered = reader(coordinator)
+    const found = await filtered.tryNextPage()
+    assert.ok(found !== undefined)
+    await within(filtered.ackPage(found), 5_000)
+    assert.ok(coordinator.acks.length >= 4, "each refused store is sent again")
+    assert.deepEqual(
+      [...new Set(coordinator.acks.map((ack) => ack.offset))],
+      [1n],
+      "every repeat names the same delivered target"
+    )
+    assert.deepEqual(
+      coordinator.stored.map((position) => position.offset),
+      [1n]
+    )
+    await filtered.close()
+  })
+}
+
+void test("given_an_empty_page_when_its_store_finds_no_primary_then_should_send_it_once_and_end_the_round", async () => {
+  let refusing = true
+  const coordinator = coordinatorOf({
+    poll: () => Promise.resolve(pageReply(page({ nextScanOffset: 5n }))),
+    ack: () => (refusing ? Promise.reject(refusal(NOT_PRIMARY)) : Promise.resolve(undefined))
+  })
+  const filtered = reader(coordinator)
+  const started = performance.now()
+  assert.equal(await filtered.tryNextPage(), undefined)
+  assert.ok(performance.now() - started < 1_000, "the round never waits for a primary")
+  assert.equal(coordinator.acks.length, 2, "one store and its one resend after a fresh lookup")
+  refusing = false
+  await filtered.close()
+})
+
+void test("given_a_woken_page_that_examined_records_when_the_next_round_is_idle_then_should_hold_a_wait_instead_of_sleeping", async () => {
+  let pending = false
+  let next = 0n
+  const coordinator = coordinatorOf({
+    poll: () => {
+      if (!pending) return Promise.resolve(pageReply(idlePage(0, next)))
+      pending = false
+      const offset = next
+      next += 1n
+      return Promise.resolve(pageReply(page({ offsets: [offset], nextScanOffset: offset + 1n })))
+    },
+    wait: () =>
+      new Promise((resolve) => {
+        setTimeout(() => {
+          pending = true
+          resolve(readyReply([0]))
+        }, 50)
+      })
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 2_000, idleIntervalMs: 30_000 })
+  await filtered.ackPage(await within(filtered.nextPage(), 5_000))
+  const started = performance.now()
+  const second = await within(filtered.nextPage(), 5_000)
+  assert.equal(second.records[0]?.offset, 1n)
+  assert.ok(performance.now() - started < 2_000, "the idle round after a page held a wait")
+  assert.equal(coordinator.waits.length, 2)
+  await filtered.close()
+})
+
+void test("given_held_waits_when_the_assignment_changes_meanwhile_then_should_end_the_wait_and_read_the_gained_partition", async () => {
+  let syncs = 0
+  const coordinator = coordinatorOf({
+    sync: () => {
+      syncs += 1
+      return Promise.resolve(syncs === 1 ? assignment(1n, [0]) : assignment(2n, [0, 1]))
+    },
+    poll: (request) =>
+      Promise.resolve(
+        pageReply(
+          request.partitionId === 1
+            ? groupPage({ partitionId: 1, offsets: [0n] })
+            : unscanned(request.partitionId)
+        )
+      ),
+    wait: () => new Promise(() => undefined)
+  })
+  const filtered = await groupReader(coordinator, waitingCapabilities).build()
+  const started = performance.now()
+  const found = await within(filtered.nextPage(), 6_000)
+  const elapsed = performance.now() - started
+  assert.equal(found.partitionId, 1)
+  assert.ok(
+    elapsed >= 1_500 && elapsed < 4_000,
+    `read the gained partition after ${String(elapsed)} ms`
+  )
+  assert.equal(coordinator.waits.length, 1, "the wait was never answered")
+  await until(() => coordinator.cancels.length > 0, 1_000)
+  assert.deepEqual(
+    coordinator.cancels.map((cancel) => cancel.request.waitIds),
+    [[coordinator.waits[0]?.request.waitId]],
+    "the wait over the old assignment was cancelled"
+  )
+  await filtered.close()
+})
+
+void test("given_held_waits_when_the_assignment_stays_the_same_then_should_keep_awaiting_the_same_waits", async () => {
+  let syncs = 0
+  let syncsWhileHeld = 0
+  let pending = false
+  const coordinator = coordinatorOf({
+    sync: () => {
+      syncs += 1
+      return Promise.resolve(assignment(1n, [0]))
+    },
+    poll: () => Promise.resolve(pageReply(pending ? groupPage({ offsets: [0n] }) : unscanned(0))),
+    wait: () =>
+      new Promise((resolve) => {
+        setTimeout(() => {
+          syncsWhileHeld = syncs
+          pending = true
+          resolve(readyReply([0]))
+        }, 2_600)
+      })
+  })
+  const filtered = await groupReader(coordinator, waitingCapabilities).build()
+  const found = await within(filtered.nextPage(), 6_000)
+  assert.equal(found.records[0]?.offset, 0n)
+  assert.equal(syncsWhileHeld, 2, "the assignment was read again while the wait held")
+  assert.equal(coordinator.waits.length, 1, "the same wait kept holding")
+  assert.deepEqual(coordinator.cancels, [], "a kept wait is not cancelled")
+  await filtered.close()
+})
+
+void test("given_a_held_wait_on_a_node_when_a_round_finds_its_partition_left_the_assignment_then_should_cancel_it", async () => {
+  let syncs = 0
+  const coordinator = coordinatorOf({
+    sync: () => {
+      syncs += 1
+      return Promise.resolve(syncs === 1 ? assignment(1n, [0, 1]) : assignment(2n, [0]))
+    },
+    primary: (partitionId) => Promise.resolve(partitionId === 1 ? 2 : 1),
+    poll: (request) => Promise.resolve(pageReply(unscanned(request.partitionId))),
+    // Node 1 answers empty at once, so each round sleeps while node 2 keeps its wait.
+    wait: (_request, target) =>
+      target.kind === "replica" && target.replica === 1
+        ? Promise.resolve(readyReply([]))
+        : new Promise(() => undefined)
+  })
+  const filtered = await groupReader(coordinator, waitingCapabilities)
+    .idleInterval(100)
+    .maxWait(2_000)
+    .build()
+  await filtered.nextPage({ timeoutMs: 3_500 }).catch(() => undefined)
+  const held = coordinator.waits.find(
+    (wait) => wait.target.kind === "replica" && wait.target.replica === 2
+  )
+  assert.ok(held !== undefined, "node 2 held a wait")
+  assert.deepEqual(
+    coordinator.cancels,
+    [
+      { target: { kind: "replica", replica: 2 }, request: { v: 1, waitIds: [held.request.waitId] } }
+    ],
+    "the wait naming the lost partition was cancelled when the round read the assignment"
+  )
+  await filtered.close()
+  assert.equal(coordinator.cancels.length, 1, "close finds no wait left to cancel")
+})
+
+void test("given_a_wait_refused_as_not_primary_when_idle_then_should_forget_its_route_and_wait_on_the_new_primary_at_once", async () => {
+  const primaries = [1, 2]
+  const coordinator = coordinatorOf({
+    primary: () => Promise.resolve(primaries.shift() ?? 2),
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: (_request, target) =>
+      target.kind === "replica" && target.replica === 1
+        ? Promise.reject(refusal(NOT_PRIMARY))
+        : Promise.resolve(readyReply([0]))
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 2_000, idleIntervalMs: 30_000 })
+  await filtered.readRound()
+  await within(filtered.waitForRecords(), 2_000)
+  await filtered.readRound()
+  await within(filtered.waitForRecords(), 2_000)
+  assert.deepEqual(
+    coordinator.waits.map((wait) => wait.target),
+    [
+      { kind: "replica", replica: 1 },
+      { kind: "replica", replica: 2 }
+    ]
+  )
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.target),
+    [
+      { kind: "replica", replica: 1 },
+      { kind: "replica", replica: 2 }
+    ],
+    "the read after the refused wait looks the route up again"
+  )
+  await filtered.close()
+})
+
+void test("given_a_wait_refused_as_unavailable_when_idle_then_should_wait_again_at_once_and_pace_a_second_refusal", async () => {
+  let refusals = 2
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: () => {
+      if (refusals === 0) return Promise.resolve(readyReply([0]))
+      refusals -= 1
+      return Promise.resolve(unavailableReply())
+    }
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 2_000, idleIntervalMs: 400 })
+  await filtered.readRound()
+  const first = performance.now()
+  await filtered.waitForRecords()
+  assert.ok(performance.now() - first < 200, "the first refusal waits again at once")
+  await filtered.readRound()
+  assert.equal(coordinator.lookups.length, 2, "the refused wait's route is looked up again")
+  const second = performance.now()
+  await filtered.waitForRecords()
+  assert.ok(performance.now() - second >= 350, "a second refusal in a row is paced")
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  assert.equal(coordinator.waits.length, 3)
+  await filtered.close()
+})
+
+void test("given_a_node_holding_a_wait_when_another_partition_moves_to_it_then_should_replace_the_wait_with_one_naming_both", async () => {
+  // Partition 1 moves from node 2 to node 1, which already holds a wait for partition 0.
+  const routes = new Map([[1, [2, 1]]])
+  let node1Waits = 0
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    primary: (partitionId) => Promise.resolve(routes.get(partitionId)?.shift() ?? 1),
+    wait: (_request, target) => {
+      if (target.kind === "replica" && target.replica === 2)
+        return Promise.resolve(unavailableReply())
+      node1Waits += 1
+      return node1Waits === 1 ? new Promise(() => undefined) : Promise.resolve(readyReply([1]))
+    }
+  })
+  const filtered = reader(coordinator, { partitionIds: [0, 1], maxWaitMs: 2_000 })
+  await filtered.readRound()
+  await within(filtered.waitForRecords(), 2_000)
+  await filtered.readRound()
+  await within(filtered.waitForRecords(), 2_000)
+  const [kept, , replacing] = coordinator.waits
+  assert.ok(kept !== undefined && replacing !== undefined)
+  assert.deepEqual(replacing.target, { kind: "replica", replica: 1 })
+  assert.deepEqual(
+    replacing.request.partitions.map((partition) => partition.partitionId),
+    [0, 1],
+    "the new wait names every partition node 1 leads now"
+  )
+  await until(() => coordinator.cancels.length > 0, 1_000)
+  assert.deepEqual(coordinator.cancels[0], {
+    target: { kind: "replica", replica: 1 },
+    request: { v: 1, waitIds: [kept.request.waitId] }
+  })
+  await filtered.close()
+})
+
+void test("given_one_node_answering_ready_when_another_node_holds_a_wait_then_should_cancel_it_by_its_wait_id", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    primary: (partitionId) => Promise.resolve(partitionId === 1 ? 2 : 1),
+    wait: (_request, target) =>
+      target.kind === "replica" && target.replica === 1
+        ? Promise.resolve(readyReply([0]))
+        : new Promise(() => undefined)
+  })
+  const filtered = reader(coordinator, { partitionIds: [0, 1], maxWaitMs: 2_000 })
+  const onNode = (replica: number) =>
+    coordinator.waits.filter(
+      (wait) => wait.target.kind === "replica" && wait.target.replica === replica
+    )
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  const [first] = onNode(2)
+  assert.ok(first !== undefined, "node 2 held a wait")
+  await until(() => coordinator.cancels.length === 1, 1_000)
+  assert.deepEqual(coordinator.cancels, [
+    { target: { kind: "replica", replica: 2 }, request: { v: 1, waitIds: [first.request.waitId] } }
+  ])
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  const [, second] = onNode(2)
+  assert.ok(second !== undefined, "a cancelled wait is not reused, the node gets a new one")
+  await until(() => coordinator.cancels.length === 2, 1_000)
+  assert.deepEqual(coordinator.cancels[1]?.request.waitIds, [second.request.waitId])
+  const ids = coordinator.waits.map((wait) => wait.request.waitId)
+  assert.equal(new Set(ids).size, ids.length, "every wait has its own id")
+  await filtered.close()
+  assert.equal(coordinator.cancels.length, 2, "close finds no wait left to cancel")
+})
+
+void test("given_a_held_wait_when_the_reader_closes_then_should_cancel_it_and_end_the_idle_wait", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: () => new Promise(() => undefined)
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 20_000, idleIntervalMs: 30_000 })
+  await filtered.readRound()
+  const idle = filtered.waitForRecords()
+  await until(() => coordinator.waits.length === 1, 1_000)
+  await filtered.close()
+  assert.deepEqual(
+    coordinator.cancels.map((cancel) => cancel.request.waitIds),
+    [[coordinator.waits[0]?.request.waitId]]
+  )
+  await within(idle, 1_000)
+})
+
+void test("given_a_held_wait_when_the_reader_is_woken_then_should_cancel_it", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: () => new Promise(() => undefined)
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 20_000 })
+  await filtered.readRound()
+  const idle = filtered.waitForRecords()
+  await until(() => coordinator.waits.length === 1, 1_000)
+  filtered.wake()
+  await within(idle, 1_000)
+  await until(() => coordinator.cancels.length === 1, 1_000)
+  assert.deepEqual(coordinator.cancels[0]?.request.waitIds, [coordinator.waits[0]?.request.waitId])
+  await filtered.close()
+  assert.equal(coordinator.cancels.length, 1, "a cancelled wait is not cancelled again")
+})
+
+void test("given_a_cancel_that_fails_when_a_wait_ends_then_should_warn_and_keep_reading", async () => {
+  const warnings: string[] = []
+  const listener = (warning: Error): void => {
+    warnings.push(warning.message)
+  }
+  process.on("warning", listener)
+  try {
+    const coordinator = coordinatorOf({
+      poll: (request) =>
+        Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+      primary: (partitionId) => Promise.resolve(partitionId === 1 ? 2 : 1),
+      wait: (_request, target) =>
+        target.kind === "replica" && target.replica === 1
+          ? Promise.resolve(readyReply([0]))
+          : new Promise(() => undefined),
+      cancel: () => Promise.reject(new TransportError("the link to node 2 is down", true))
+    })
+    const filtered = reader(coordinator, { partitionIds: [0, 1], maxWaitMs: 2_000 })
+    await filtered.readRound()
+    await filtered.waitForRecords()
+    await until(() => warnings.length > 0, 1_000)
+    assert.match(warnings[0] ?? "", /cancelling a filtered wait on replica 2 failed/)
+    const polled = coordinator.polls.length
+    await filtered.readRound()
+    assert.deepEqual(
+      coordinator.polls.slice(polled).map((poll) => poll.request.partitionId),
+      [0],
+      "the reader reads on"
+    )
+    await filtered.close()
+  } finally {
+    process.off("warning", listener)
+  }
+})
+
+const waitingCapabilities: Capabilities = {
+  ...capabilities,
+  filters: { ...capabilities.filters, maxWaitMs: 20_000 }
+}
+
+// A backup's refusal of a partition it no longer leads.
+function unavailableReply(): Uint8Array {
+  return encodeNamed(
+    encodeFilterReply({
+      kind: "err",
+      error: {
+        code: { kind: "known", name: "Unavailable" },
+        reason: "unavailable",
+        message: "Request not accepted by a backup replica"
+      }
+    })
+  )
+}
+
+// A page that examined nothing past `at`, where the read started.
+function idlePage(partitionId: number, at: bigint): FilteredPage {
+  const { safeAckOffset: _safe, ...rest } = page({ partitionId })
+  return { ...rest, examined: 0, nextScanOffset: at }
+}
+
+async function until(condition: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = performance.now() + timeoutMs
+  while (!condition()) {
+    if (performance.now() >= deadline) throw new Error(`not true within ${String(timeoutMs)} ms`)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
+
+function within<Value>(pending: Promise<Value>, timeoutMs: number): Promise<Value> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`not settled within ${String(timeoutMs)} ms`))
+    }, timeoutMs)
+    pending.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error: unknown) => {
+        clearTimeout(timer)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
+    )
+  })
+}

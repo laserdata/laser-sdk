@@ -73,12 +73,19 @@ import {
 } from "../wire/agent.js"
 import { resultCodeIsRetryable } from "../wire/result.js"
 import { encodeNamed } from "../wire/cbor.js"
-import { type Dispatch, addresseeFilter, classify, classifyGeneric } from "../wire/dispatch.js"
+import {
+  ADDRESSEE_FILTER_NAME,
+  type Dispatch,
+  addresseeFilter,
+  classify,
+  classifyGeneric
+} from "../wire/dispatch.js"
 import { CONVERSATION_ID } from "../wire/headers.js"
 import { type LogPosition, crockfordEncode } from "../wire/ids.js"
 import { AGENT_CONTROL, AGENT_SESSIONS } from "../wire/topics.js"
 import type { Consumer, ConsumerMessage } from "../stream/consumer.js"
 import { policyAware } from "../stream/consumer-group.js"
+import { readThrough } from "../stream/cursor.js"
 import { AgentCtx } from "./context.js"
 import {
   type AgentMessage,
@@ -113,6 +120,8 @@ const FENCE_SWEEP_INTERVAL_MICROS = 1_000_000n
 const VERIFIED_RECORD_WINDOW = 16_384
 // The addressee an agentless consumer classifies an untargeted record as.
 const ANONYMOUS_AGENT = "anonymous"
+// How long the server holds a read that finds nothing new, as Rust.
+const DEFAULT_MAX_WAIT_MS = 5_000
 
 export {
   agentMessageBody,
@@ -244,7 +253,10 @@ export interface ReliableConsumerOptions {
   readonly agent?: AgentId
   readonly dedupWindow?: number
   readonly retry?: RetryPolicy
-  readonly pollIntervalMs?: number
+  /** How long the server holds a read that finds nothing new before it
+   * answers. A record ends the wait at once. Defaults to 5 seconds, at most
+   * 600 seconds. */
+  readonly maxWaitMs?: number
   /** Bounds active work after shutdown is requested. Defaults to 30 seconds. */
   readonly shutdownGraceMs?: number
   readonly concurrency?: ConcurrencyPolicy
@@ -991,14 +1003,14 @@ export class ReliableConsumer {
   ): Promise<void> {
     const stream = laser.defaultStream
     if (stream === undefined) throw new NoStreamError("ReliableConsumer.run() requires a stream")
-    const pollIntervalMs = this.options.pollIntervalMs ?? 10
+    const maxWaitMs = this.options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS
     const deduplicator =
       this.options.deduplicator ?? new SlidingWindow(this.options.dedupWindow ?? 10_000)
     const engine = await resolveEngine(laser)
     const group = this.options.group.asStr()
     const me = this.options.agent?.wireId()
     if (me !== undefined) await bindAddressee(laser, engine, this.options.topic, group, me)
-    const opener = new Opener(laser, this.options.topic, group, pollIntervalMs, engine.native)
+    const opener = new Opener(laser, this.options.topic, group, maxWaitMs, engine.native)
     const consumer = await opener.open()
     let follower: ControlFollower | LateControlFollower | undefined
     let started = false
@@ -1049,7 +1061,7 @@ export class ReliableConsumer {
             : (session) => {
                 requests.request(session)
               },
-          pollIntervalMs
+          maxWaitMs
         )
       } else if (this.options.topic !== AGENT_CONTROL) {
         // No control topic yet. Keep looking for it, so operator requests
@@ -1063,7 +1075,7 @@ export class ReliableConsumer {
           stream,
           me,
           book,
-          pollIntervalMs,
+          maxWaitMs,
           agent === undefined
             ? undefined
             : async (found) => {
@@ -1144,7 +1156,7 @@ export class ReliableConsumer {
     }
   ): Promise<void> {
     let consumer = first
-    const pollIntervalMs = opener.pollIntervalMs
+    const maxWaitMs = opener.maxWaitMs
     const { sessions, book, requests, late, pause } = sessionRuntime
     const shutdown = shutdownControl(control, this.options.shutdownGraceMs ?? 30_000)
     const runtime = shutdown.runtime
@@ -1194,7 +1206,7 @@ export class ReliableConsumer {
           const concurrency = this.options.concurrency ?? SERIAL_CONCURRENCY
           const running =
             concurrency.kind === "serial"
-              ? this.runSerial(consumer, worker, runtime, pollIntervalMs)
+              ? this.runSerial(consumer, worker, runtime, maxWaitMs)
               : this.runPerPartition(
                   consumer,
                   worker,
@@ -1205,7 +1217,7 @@ export class ReliableConsumer {
                     probeIntervalMs: sessions.config.heartbeatValue
                   },
                   runtime,
-                  pollIntervalMs
+                  maxWaitMs
                 )
           await consumeUntilDone(running, runtime.hardSignal)
           if (shutdown.expired()) throw new TimeoutError("agent shutdown drain")
@@ -1268,10 +1280,10 @@ export class ReliableConsumer {
     consumer: Consumer,
     worker: ReliableWorker,
     control: ReliableConsumerControl,
-    pollIntervalMs: number
+    maxWaitMs: number
   ): Promise<void> {
     while (control.signal?.aborted !== true) {
-      const message = await nextOrIdle(consumer, pollIntervalMs, control.signal)
+      const message = await nextOrIdle(consumer, maxWaitMs, control.signal)
       if (message === undefined) continue
       worker.observeAssignment(consumer)
       if (!(await consumeUntilDone(worker.consume(received(message)), control.hardSignal))) return
@@ -1290,7 +1302,7 @@ export class ReliableConsumer {
     worker: ReliableWorker,
     limits: LaneLimits,
     control: ReliableConsumerControl,
-    pollIntervalMs: number
+    maxWaitMs: number
   ): Promise<void> {
     const lanes = new Map<number, Promise<void>>()
     const retiring = new Map<number, Promise<void>>()
@@ -1301,13 +1313,20 @@ export class ReliableConsumer {
     let failure: LaserError | undefined
     let probedAt = Date.now()
     const currentFailure = (): LaserError | undefined => failure
+    // A failed lane ends the read in progress, as Rust selects the read against
+    // a lane completion, so the consumer reopens without waiting out a held read.
+    const laneFailed = new AbortController()
+    const readSignal =
+      control.signal === undefined
+        ? laneFailed.signal
+        : AbortSignal.any([control.signal, laneFailed.signal])
     try {
       while (control.signal?.aborted !== true && failure === undefined) {
         if (Date.now() - probedAt >= limits.probeIntervalMs) {
           probedAt = Date.now()
           dropRevoked(consumer, lanes, retiring)
         }
-        const message = await nextOrIdle(consumer, pollIntervalMs, control.signal)
+        const message = await nextOrIdle(consumer, maxWaitMs, readSignal)
         if (message === undefined) continue
         worker.observeAssignment(consumer)
         const position = `${String(message.partitionId)}:${message.position.offset.toString()}`
@@ -1343,6 +1362,7 @@ export class ReliableConsumer {
           })
           .catch((error: unknown) => {
             failure ??= handlerError(error)
+            laneFailed.abort()
           })
           .finally(() => {
             scheduled.delete(position)
@@ -1377,16 +1397,15 @@ export class ReliableConsumer {
       if (offset === undefined) continue
       const span = BigInt(Math.max(depth - 1, 0))
       const start = offset.storedOffset > span ? offset.storedOffset - span : 0n
-      const messages = await transport.pollMessages(
+      const messages = await readThrough(
+        transport,
         stream,
         this.options.topic,
         { kind: "single", partitionId },
-        { kind: "offset", value: start },
-        Number(offset.storedOffset - start + 1n),
-        false
+        start,
+        offset.storedOffset
       )
       for (const received of messages) {
-        if (received.offset > offset.storedOffset) continue
         const decoded = decodeAgentMessage(received)
         if (decoded.kind !== "message") continue
         const key = dedupKey(decoded.message.provenance)
@@ -1471,7 +1490,7 @@ async function bindAddressee(
   await laser
     .topic(topic)
     .consumerGroup(group)
-    .create({ filter: addresseeFilter(me) })
+    .create({ filter: addresseeFilter(me), filterName: ADDRESSEE_FILTER_NAME })
 }
 
 // Opens the runtime's consumer of one topic, again after a recoverable failure.
@@ -1480,7 +1499,7 @@ class Opener {
     private readonly laser: Laser,
     readonly topic: string,
     private readonly group: string,
-    readonly pollIntervalMs: number,
+    readonly maxWaitMs: number,
     private readonly native: boolean
   ) {}
 
@@ -1488,7 +1507,7 @@ class Opener {
     const group = this.laser.topic(this.topic).consumerGroup(this.group)
     const options = {
       commitPolicy: { kind: "disabled" },
-      pollIntervalMs: this.pollIntervalMs
+      maxWaitMs: this.maxWaitMs
     } as const
     return this.native
       ? group[INTERNAL_NATIVE_CONSUMER](options, "propagate")

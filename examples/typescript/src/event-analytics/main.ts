@@ -348,8 +348,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   if (capabilities.query.available) await registerProjection(laser, TOPIC, INDEX)
 
   await using live = await laser.topic(TOPIC).consumerGroup(LIVE_GROUP).consumer({
-    batchLength: 100,
-    pollIntervalMs: 5
+    batchLength: 100
   })
   const publishing = publishClickstream(laser, events)
   phase("hot path: a live reader tails the stream while the producer runs")

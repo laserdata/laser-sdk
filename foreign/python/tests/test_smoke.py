@@ -1,6 +1,7 @@
 import struct
 import time
 
+import iggy_test_server
 import laser_sdk as ls
 import pytest
 
@@ -275,3 +276,33 @@ async def test_given_invalid_publish_settings_when_connecting_then_should_reject
 
     with pytest.raises(laser_sdk.ConfigError):
         await laser_sdk.Laser.connect("iggy:iggy@127.0.0.1:1", **options)
+
+
+def test_given_built_binaries_and_no_cargo_when_resolved_then_should_use_the_cargo_target_dir(
+    tmp_path, monkeypatch
+):
+    built = tmp_path / "debug"
+    built.mkdir()
+    for name in iggy_test_server.TEST_SUPPORT_BINARIES:
+        (built / name).write_text("")
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(tmp_path))
+    monkeypatch.setattr(iggy_test_server.shutil, "which", lambda _: None)
+    iggy_test_server._test_support_binaries.cache_clear()
+    try:
+        binaries = iggy_test_server._test_support_binaries()
+    finally:
+        iggy_test_server._test_support_binaries.cache_clear()
+    assert binaries == {name: str(built / name) for name in iggy_test_server.TEST_SUPPORT_BINARIES}
+
+
+def test_given_no_cargo_and_no_built_binaries_when_resolved_then_should_name_the_build_command(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(tmp_path))
+    monkeypatch.setattr(iggy_test_server.shutil, "which", lambda _: None)
+    iggy_test_server._test_support_binaries.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="cargo build -p laser-test-support --bins"):
+            iggy_test_server._test_support_binaries()
+    finally:
+        iggy_test_server._test_support_binaries.cache_clear()
