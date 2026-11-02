@@ -18,8 +18,24 @@ const CONCURRENCY = 16
 // other dependency is weakened. Keep this list as short as the pins require.
 const SERVER_LOCKSTEP_COOLDOWN_EXEMPT = new Set(["apache-iggy"])
 
-function exemptFromCooldown({ name }) {
-  return SERVER_LOCKSTEP_COOLDOWN_EXEMPT.has(name)
+// Versions that fix a published advisory skip the cooldown, as a Dependabot
+// cooldown skips security updates: a known vulnerability in the lockfile is the
+// certain risk, a compromised fresh release the hypothetical one. Each entry is
+// one exact version naming the advisory it fixes or was pulled in by, so the
+// next bump of that package waits again. Drop an entry once its version is
+// older than the cooldown.
+const ADVISORY_FIX_COOLDOWN_EXEMPT = new Map([
+  ["minimatch@11.0.3", "GHSA-g3hv-75wg-m249"],
+  ["@isaacs/nonrecursive-glob-match@1.0.3", "GHSA-g3hv-75wg-m249"],
+  ["glob@14.0.3", "GHSA-3g3m-2fjr-6pw4"],
+  ["path-scurry@3.0.0", "GHSA-3g3m-2fjr-6pw4"]
+])
+
+function exemptFromCooldown({ name, version }) {
+  return (
+    SERVER_LOCKSTEP_COOLDOWN_EXEMPT.has(name) ||
+    ADVISORY_FIX_COOLDOWN_EXEMPT.has(`${name}@${version}`)
+  )
 }
 
 // True when `resolved` is served by the public npm registry. The parsed origin
@@ -102,7 +118,12 @@ if (tooYoung.length > 0) {
 // The exemptions are named on every run: a skipped check that prints nothing
 // reads as a check that passed.
 for (const { name, version } of exempted) {
-  console.log(`release-age:check exempt, ${name}@${version} is pinned in step with the server`)
+  const advisory = ADVISORY_FIX_COOLDOWN_EXEMPT.get(`${name}@${version}`)
+  console.log(
+    advisory === undefined
+      ? `release-age:check exempt, ${name}@${version} is pinned in step with the server`
+      : `release-age:check exempt, ${name}@${version} fixes ${advisory}`
+  )
 }
 
 console.log(

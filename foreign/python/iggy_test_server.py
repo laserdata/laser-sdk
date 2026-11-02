@@ -225,6 +225,22 @@ class IggyTestCluster:
         )
         return json.loads(resolved.stdout)
 
+    def settled_primaries(self, stream, topic, partitions):
+        """Each partition's primary once no node leads more than one partition above another."""
+        # Right after creation every partition can be led by the metadata
+        # leader, the one node counted ready. The cluster then moves one
+        # primary at a time until no node leads two more partitions than
+        # another, so that spread is final.
+        deadline = time.monotonic() + 60
+        while True:
+            primaries = self.partition_primaries(stream, topic, partitions)
+            led = [primaries.count(node) for node in range(3)]
+            if max(led) - min(led) <= 1:
+                return primaries
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"the primaries never settled within 60s: {primaries}")
+            time.sleep(0.5)
+
     def leader_and_follower(self, via=0):
         deadline = time.monotonic() + 30
         while True:

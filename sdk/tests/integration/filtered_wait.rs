@@ -49,7 +49,8 @@ async fn given_a_group_reader_holding_a_filtered_wait_on_each_node_of_a_cluster_
         .ensure(WAIT_PARTITIONS, None)
         .await
         .expect("the topic exists");
-    let primaries = harness::partition_primaries(&laser, WAIT_TOPIC, WAIT_PARTITIONS).await;
+    let primaries =
+        harness::settled_primaries(&laser, WAIT_TOPIC, WAIT_PARTITIONS, cluster.size()).await;
     let serving: BTreeSet<usize> = primaries
         .iter()
         .map(|primary| usize::from(*primary))

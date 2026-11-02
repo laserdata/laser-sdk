@@ -187,7 +187,7 @@ async fn pauses_across_nodes(cluster: &mut TestIggyCluster, stream: &str) {
         .ensure(CLUSTER_PARTITIONS, None)
         .await
         .expect("provisioning creates the control topic");
-    let primaries = harness::partition_primaries(&laser, AGENT_CONTROL, CLUSTER_PARTITIONS).await;
+    let primaries = harness::spread_primaries(&laser, AGENT_CONTROL, CLUSTER_PARTITIONS).await;
     assert!(
         primaries.iter().collect::<BTreeSet<_>>().len() > 1,
         "the control partitions are led by different nodes: {primaries:?}"
