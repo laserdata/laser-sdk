@@ -249,6 +249,10 @@ export function classify(
   }
 }
 
+/** The name an agent's consumer group policy is saved under. Each group owns
+ * its policy, so one name serves every agent. */
+export const ADDRESSEE_FILTER_NAME = "agent-addressee"
+
 /**
  * The headers-only group filter that selects records addressed to `me` or to
  * every agent. Its digest differs per agent identity.

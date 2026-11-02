@@ -14,6 +14,7 @@ mod contract;
 mod deadletter;
 mod decomposition;
 mod fanout;
+mod filtered_wait;
 #[cfg(feature = "filters")]
 mod filters;
 #[cfg(feature = "filters")]

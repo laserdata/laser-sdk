@@ -1,9 +1,8 @@
+use laser_wire::limits::{MAX_AGENT_STRING_BYTES, MAX_FILTER_SOURCE_NAME_BYTES};
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 use ulid::Ulid;
-
-const MAX_ID_LEN: usize = 255;
 
 // Versioned FNV-1a so derived ids stay stable across compiler/std versions.
 // Bumping DERIVE_VERSION deliberately remaps every derived conversation id.
@@ -146,7 +145,7 @@ impl From<IntentId> for String {
 }
 
 /// An agent's stable logical name. Almost any string: the only rules are that it
-/// is non-empty, at most 255 bytes, and free of ASCII control characters because
+/// is non-empty, at most 256 bytes, and free of ASCII control characters because
 /// it rides as a message header value. So plain labels (`planner`), email-like
 /// federated identities (`planner@acme.example`), URLs, and namespaced names
 /// (`team/planner`) are all valid. Construct with [`new`](Self::new), or by
@@ -157,11 +156,11 @@ pub struct AgentId(String);
 
 impl AgentId {
     /// Build an agent id from any string that satisfies the rules (non-empty,
-    /// ≤ 255 bytes, no ASCII control characters), or an [`IdError`] saying which
-    /// rule it broke.
+    /// at most 256 bytes, no ASCII control characters), or an [`IdError`]
+    /// saying which rule it broke.
     pub fn new(name: impl Into<String>) -> Result<Self, IdError> {
         let name = name.into();
-        validate_id(&name)?;
+        validate_id(&name, MAX_AGENT_STRING_BYTES)?;
         Ok(Self(name))
     }
 
@@ -217,18 +216,15 @@ impl ConsumerGroupName {
     /// Validate a non-empty Iggy group name that fits the 255-byte name limit.
     pub fn new(name: impl Into<String>) -> Result<Self, IdError> {
         let name = name.into();
-        validate_id(&name)?;
+        validate_id(&name, MAX_FILTER_SOURCE_NAME_BYTES)?;
         Ok(Self(name))
     }
 
-    /// Use the logical agent spelling as its default deployment group.
-    /// Infallible by a deliberate invariant: a group name today has exactly an
-    /// agent id's rules (`validate_id`), so every valid id is a valid group.
-    /// If group syntax ever diverges, this must become fallible in the same
-    /// change.
-    pub fn for_agent(agent: &AgentId) -> Self {
-        debug_assert!(validate_id(agent.as_str()).is_ok());
-        Self(agent.as_str().to_owned())
+    /// Use the logical agent spelling as its default deployment group. An
+    /// agent id may be one byte longer than a group name, and such an id
+    /// needs an explicit group.
+    pub fn for_agent(agent: &AgentId) -> Result<Self, IdError> {
+        Self::new(agent.as_str())
     }
 
     pub fn as_str(&self) -> &str {
@@ -250,8 +246,10 @@ impl FromStr for ConsumerGroupName {
     }
 }
 
-impl From<&AgentId> for ConsumerGroupName {
-    fn from(agent: &AgentId) -> Self {
+impl TryFrom<&AgentId> for ConsumerGroupName {
+    type Error = IdError;
+
+    fn try_from(agent: &AgentId) -> Result<Self, Self::Error> {
         Self::for_agent(agent)
     }
 }
@@ -358,15 +356,12 @@ fn is_canonical_digits(s: &str) -> bool {
     payload.iter().all(u8::is_ascii_digit)
 }
 
-fn validate_id(s: &str) -> Result<(), IdError> {
+fn validate_id(s: &str, max: usize) -> Result<(), IdError> {
     if s.is_empty() {
         return Err(IdError::Empty);
     }
-    if s.len() > MAX_ID_LEN {
-        return Err(IdError::TooLong {
-            got: s.len(),
-            max: MAX_ID_LEN,
-        });
+    if s.len() > max {
+        return Err(IdError::TooLong { got: s.len(), max });
     }
     // Both agent ids and consumer-group names reject control characters. Agent
     // ids ride in headers, and keeping group names printable makes logs and
@@ -453,6 +448,44 @@ mod tests {
     }
 
     #[test]
+    fn given_an_agent_id_at_the_wire_cap_when_parsing_then_should_accept_it_and_refuse_one_byte_more()
+     {
+        let at_cap = "a".repeat(MAX_AGENT_STRING_BYTES);
+        let parsed = at_cap
+            .parse::<AgentId>()
+            .expect("an agent id at the wire cap is valid");
+        assert_eq!(parsed.as_str(), at_cap);
+        assert_eq!(parsed.wire_id().as_str(), at_cap);
+        assert_eq!(
+            "a".repeat(MAX_AGENT_STRING_BYTES + 1).parse::<AgentId>(),
+            Err(IdError::TooLong {
+                got: MAX_AGENT_STRING_BYTES + 1,
+                max: MAX_AGENT_STRING_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn given_an_agent_id_longer_than_a_group_name_when_deriving_its_group_then_should_refuse_it() {
+        let agent = AgentId::new("a".repeat(MAX_AGENT_STRING_BYTES))
+            .expect("an agent id at the wire cap is valid");
+        assert_eq!(
+            ConsumerGroupName::for_agent(&agent),
+            Err(IdError::TooLong {
+                got: MAX_AGENT_STRING_BYTES,
+                max: MAX_FILTER_SOURCE_NAME_BYTES,
+            })
+        );
+        assert_eq!(
+            ConsumerGroupName::new("g".repeat(MAX_FILTER_SOURCE_NAME_BYTES + 1)),
+            Err(IdError::TooLong {
+                got: MAX_FILTER_SOURCE_NAME_BYTES + 1,
+                max: MAX_FILTER_SOURCE_NAME_BYTES,
+            })
+        );
+    }
+
+    #[test]
     fn given_a_message_id_when_round_tripped_then_should_be_equal() {
         let id = MessageId::new(3, 42);
         assert_eq!(id.to_string(), "3:42");
@@ -471,7 +504,7 @@ mod tests {
     #[test]
     fn given_an_agent_when_deriving_its_default_group_then_should_keep_distinct_types() {
         let agent = AgentId::new("planner").expect("planner is a valid agent id");
-        let group = ConsumerGroupName::for_agent(&agent);
+        let group = ConsumerGroupName::for_agent(&agent).expect("planner is a valid group name");
         assert_eq!(group.as_str(), agent.as_str());
         assert_eq!(group.to_string(), "planner");
     }

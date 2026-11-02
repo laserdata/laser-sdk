@@ -1,5 +1,7 @@
 use crate::harness;
-use iggy::prelude::{Consumer, Identifier, MessageClient, PollingStrategy, TopicClient};
+use iggy::prelude::{
+    Consumer, Identifier, MessageClient, PollOptions, PollingStrategy, TopicClient,
+};
 use laser_sdk::agent::{PendingControl, SessionConfig, derive_session_id};
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{
@@ -165,11 +167,13 @@ async fn given_a_held_lease_when_the_interval_passes_then_should_list_the_sessio
                 .poll_messages(
                     &stream,
                     &topic,
-                    Some(partition),
+                    partition,
                     &reader,
                     &PollingStrategy::offset(0),
-                    100,
-                    false,
+                    PollOptions {
+                        count: 100,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
                 .ok()?;
@@ -404,7 +408,7 @@ async fn given_operator_control_when_sent_then_should_ride_the_control_topic() {
     let laser = harness::laser().await;
     laser
         .topic(AgentTopic::Control.topic_string())
-        .ensure(4)
+        .ensure(4, None)
         .await
         .expect("provisioning creates the control topic");
     let session = ConversationId::new();
@@ -863,7 +867,7 @@ async fn given_operator_control_when_a_handler_reads_its_session_then_should_see
     let laser = harness::laser().await;
     laser
         .topic(AgentTopic::Control.topic_string())
-        .ensure(4)
+        .ensure(4, None)
         .await
         .expect("provisioning creates the control topic");
     let stream = laser.default_stream().expect("stream").to_owned();

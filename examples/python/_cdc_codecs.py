@@ -77,7 +77,7 @@ async def run_codecs(laser: ls.Laser) -> None:
                 else getattr(ls.ConsumerFilter, codec)(expr, [schema_id])
             )
             group = topic.consumer_group(f"safe-{codec}")
-            await group.create(filter=filter)
+            await group.create(filter=filter, filter_name=f"safe-mode-{codec}")
             reader = await group.reader(start="first", local_guard=True)
             try:
                 record = await asyncio.wait_for(reader.next_record(), 15)

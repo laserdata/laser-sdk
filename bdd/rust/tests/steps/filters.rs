@@ -16,6 +16,11 @@ use std::time::Duration;
 const TOPIC: &str = "fleet_changes";
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
+// A group policy is saved under a filter name, which allows no spaces.
+fn policy_name(fixture: &str) -> String {
+    fixture.replace(' ', "-")
+}
+
 fn evaluate(world: &mut LaserWorld, payload: &[u8], headers: &[FilterHeader]) {
     let compiled = CompiledFilter::compile(world.filter.as_ref().expect("a filter was chosen"))
         .expect("the filter compiles");
@@ -85,7 +90,7 @@ async fn fresh_feed(world: &mut LaserWorld) {
     fresh
         .laser
         .topic(TOPIC)
-        .ensure(1)
+        .ensure(1, None)
         .await
         .expect("the feed topic is created");
     let producer = fresh
@@ -115,7 +120,7 @@ async fn read_feed(world: &mut LaserWorld, name: String) {
     let group = laser.topic(TOPIC).consumer_group("anomaly-desk");
     group
         .create()
-        .filter(filter(&name))
+        .filter(policy_name(&name), filter(&name))
         .build()
         .await
         .expect("group policy configured");
@@ -178,14 +183,14 @@ async fn managed_group(world: &mut LaserWorld) {
     let operation_id = laser_sdk::wire::agent::RecordId::mint().as_u128();
     let first = named
         .create()
-        .filter(filter("safe mode"))
+        .filter(policy_name("safe mode"), filter("safe mode"))
         .operation_id(operation_id)
         .build()
         .await
         .expect("configure group");
     let retry = named
         .create()
-        .filter(filter("safe mode"))
+        .filter(policy_name("safe mode"), filter("safe mode"))
         .operation_id(operation_id)
         .build()
         .await
@@ -197,7 +202,10 @@ async fn managed_group(world: &mut LaserWorld) {
         .filter()
         .configure_as(
             Some(operation_id),
-            GroupFilterSpec::Definition(filter("safe mode")),
+            GroupFilterSpec::Definition {
+                name: policy_name("safe mode"),
+                filter: filter("safe mode"),
+            },
         )
         .await
         .expect("repeat saved operation");
@@ -364,7 +372,7 @@ async fn hundred_non_matches(world: &mut LaserWorld) {
     let group = topic.consumer_group("sparse-desk");
     group
         .create()
-        .filter(filter("safe mode"))
+        .filter(policy_name("safe mode"), filter("safe mode"))
         .build()
         .await
         .expect("configured group");
@@ -438,7 +446,7 @@ async fn hundred_non_matches_consumer(world: &mut LaserWorld) {
     let group = topic.consumer_group("normal-sparse-desk");
     group
         .create()
-        .filter(filter("safe mode"))
+        .filter(policy_name("safe mode"), filter("safe mode"))
         .build()
         .await
         .expect("configured group");
@@ -482,7 +490,7 @@ async fn reject_old_policy(world: &mut LaserWorld) {
     let group = laser.topic(TOPIC).consumer_group("policy-ack");
     group
         .create()
-        .filter(filter("safe mode"))
+        .filter(policy_name("safe mode"), filter("safe mode"))
         .build()
         .await
         .expect("group");

@@ -8,6 +8,8 @@ import {
   type ProducerInfo,
   type SourceRef
 } from "./graph.js"
+import { MAX_MEMORY_ID_BYTES } from "./limits.js"
+import { validateBoundedText } from "./validate.js"
 
 export type MemoryRecord =
   | {
@@ -106,7 +108,18 @@ export function decodeMemoryRecord(value: unknown, context: string): MemoryRecor
   }
 }
 
+/** Rust `MemoryRecord::validate`: ids, kind words and targets are bounded text. */
+export function validateMemoryRecord(record: MemoryRecord): void {
+  if (record.kind === "item") {
+    validateBoundedText("memory item id", record.id, MAX_MEMORY_ID_BYTES)
+    validateBoundedText("memory item kind", record.memoryKind, MAX_MEMORY_ID_BYTES)
+  } else {
+    validateBoundedText("memory target", record.target, MAX_MEMORY_ID_BYTES)
+  }
+}
+
 export function encodeMemoryRecordFrame(record: MemoryRecord): Uint8Array {
+  validateMemoryRecord(record)
   return encodeNamed(encodeMemoryRecord(record), { forceFloatNumbers: true })
 }
 

@@ -29,7 +29,6 @@ void test("given_a_directed_contract_when_the_agent_replies_then_should_complete
       .listenOn(AgentTopic.Sessions)
       .respondOn(AgentTopic.Sessions)
       .ackOnPickup()
-      .pollInterval(5)
       .handler({
         handle(_message, context): Promise<void> {
           return context.respond(new TextEncoder().encode("completed"))
@@ -87,7 +86,6 @@ void test("given_a_picked_up_contract_without_a_reply_when_deadline_elapses_then
       .listenOn(AgentTopic.Sessions)
       .respondOn(AgentTopic.Sessions)
       .ackOnPickup()
-      .pollInterval(5)
       .handler({ handle: () => Promise.resolve() })
       .build()
       .spawn(laser)
@@ -123,7 +121,6 @@ void test("given_a_verified_contract_when_the_target_signs_then_should_bind_the_
       .listenOn(AgentTopic.Sessions)
       .respondOn(AgentTopic.Sessions)
       .signingKey(key)
-      .pollInterval(5)
       .handler({
         handle(_message, context): Promise<void> {
           return context.respond(new TextEncoder().encode("authenticated"))

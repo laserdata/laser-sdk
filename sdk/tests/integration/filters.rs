@@ -50,14 +50,14 @@ async fn given_no_catalog_when_a_group_is_created_with_a_filter_then_should_refu
     assert!(!laser.capabilities().await.filters.catalog);
     laser
         .topic(TOPIC)
-        .ensure(1)
+        .ensure(1, None)
         .await
         .expect("the topic exists");
     let group = laser.topic(TOPIC).consumer_group("anomaly-desk");
 
     let refused = group
         .create()
-        .filter(safe_mode_filter())
+        .filter("safe-mode", safe_mode_filter())
         .build()
         .await
         .expect_err("a policy needs the catalog");
@@ -93,7 +93,6 @@ async fn given_no_catalog_when_a_group_consumes_then_should_read_every_record_un
         .consumer()
         .start_at(ConsumerStart::First)
         .commit_policy(CommitPolicy::Disabled)
-        .poll_interval(Duration::from_millis(5))
         .build()
         .await
         .expect("a group consumer builds without a catalog");

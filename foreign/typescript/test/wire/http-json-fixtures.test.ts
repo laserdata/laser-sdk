@@ -52,6 +52,10 @@ import {
   pathSegment,
   sessionsQueryParams,
   decodeSessionsQuery,
+  decodeFilterListQuery,
+  filterListQueryOf,
+  filterListQueryOwner,
+  filterListQueryParams,
   decodeSessionEventsQuery,
   decodeSessionChangesQuery,
   decodeSessionStateQuery,
@@ -67,7 +71,7 @@ import {
 } from "../../src/wire/http.js"
 import { ConversationId } from "../../src/wire/ids.js"
 import { STREAM_RESOURCE_PREFIX, streamResource } from "../../src/wire/authz.js"
-import { CodecError } from "../../src/client/errors.js"
+import { CodecError, InvalidError } from "../../src/client/errors.js"
 import { decodeOne } from "../../src/wire/cbor.js"
 import { parseCanonicalJson } from "../../src/wire/filter.js"
 import { decodeSessionReply, type SessionPage } from "../../src/wire/session.js"
@@ -300,5 +304,31 @@ void test("given_a_legacy_json_id_array_when_decoded_then_should_reject_it", () 
         "submitted_at_micros": 1717171717000000
       }`),
     /operation_id.*Crockford base32 id/
+  )
+})
+
+void test("given_a_filter_list_query_when_the_owner_is_complete_or_partial_then_should_resolve_or_refuse", () => {
+  const identity = {
+    streamId: 1,
+    streamCreatedAtMicros: 10n,
+    topicId: 2,
+    topicCreatedAtMicros: 20n,
+    groupId: 3n
+  }
+  const query = filterListQueryOf(identity)
+  assert.deepEqual(filterListQueryOwner(query), identity)
+  assert.equal(filterListQueryOwner({}), undefined)
+  const params = filterListQueryParams(query)
+  assert.equal(
+    params.toString(),
+    "owner_stream_id=1&owner_stream_created_at_micros=10&owner_topic_id=2&owner_topic_created_at_micros=20&owner_group_id=3"
+  )
+  assert.deepEqual(decodeFilterListQuery(params), query)
+  const { ownerGroupId: _dropped, ...partial } = query
+  assert.throws(
+    () => filterListQueryOwner(partial),
+    new InvalidError(
+      "the owner filter needs owner_stream_id, owner_stream_created_at_micros, owner_topic_id, owner_topic_created_at_micros and owner_group_id together"
+    )
   )
 })

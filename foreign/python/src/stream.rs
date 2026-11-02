@@ -292,7 +292,10 @@ impl PyTopic {
     /// takes `expire_after_ms` (milliseconds) or `never_expire=True`, else the
     /// server default, and `max_topic_bytes` or `unlimited_topic_size=True`,
     /// else the server default. Setting both of a pair raises `InvalidError`.
-    #[pyo3(signature = (*, batch_length=1000, linger_ms=0.0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=false, create_topic=true, partitions=1, expire_after_ms=None, never_expire=false, max_topic_bytes=None, unlimited_topic_size=false, background=None))]
+    /// `replication_factor` stores each partition of a topic this producer
+    /// creates on that many nodes, 1 to `MAX_REPLICATION_FACTOR` and at most
+    /// the cluster's node count, else the server default.
+    #[pyo3(signature = (*, batch_length=1000, linger_ms=0.0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=false, create_topic=true, partitions=1, replication_factor=None, expire_after_ms=None, never_expire=false, max_topic_bytes=None, unlimited_topic_size=false, background=None))]
     #[allow(clippy::too_many_arguments)]
     fn producer(
         &self,
@@ -305,6 +308,7 @@ impl PyTopic {
         create_stream: bool,
         create_topic: bool,
         partitions: u32,
+        replication_factor: Option<u32>,
         expire_after_ms: Option<f64>,
         never_expire: bool,
         max_topic_bytes: Option<u64>,
@@ -353,6 +357,7 @@ impl PyTopic {
             create_stream,
             create_topic,
             partitions,
+            replication_factor,
             expiry: match (expire_after_ms, never_expire) {
                 (Some(_), true) => {
                     return Err(InvalidError::new_err(
@@ -395,15 +400,20 @@ impl PyTopic {
     /// Build a Laser reader for one partition. It is an async iterator
     /// and supports the same polling, batching, replay, retry, and commit modes
     /// as the Rust builder. Use `auto_commit="disabled"` plus
-    /// `commit(message)` for commit-after-handle delivery.
-    #[pyo3(signature = (name, *, partition=0, batch_length=1000, poll_interval_ms=None, polling="next", offset=None, timestamp_micros=None, auto_commit="polling", commit_interval_ms=0, commit_every=None, polling_retry_interval_ms=1000, init_retries=None, init_retry_interval_ms=1000, allow_replay=false))]
+    /// `commit(message)` for commit-after-handle delivery. The server holds a
+    /// poll that finds fewer than `min_count` new records for up to
+    /// `max_wait_ms` (0 to 600000, 0 answers at once), and `max_bytes` caps
+    /// the record bytes of one reply.
+    #[pyo3(signature = (name, *, partition=0, batch_length=1000, max_wait_ms=5000, min_count=1, max_bytes=1048576, polling="next", offset=None, timestamp_micros=None, auto_commit="polling", commit_interval_ms=0, commit_every=None, polling_retry_interval_ms=1000, init_retries=None, init_retry_interval_ms=1000, allow_replay=false))]
     #[allow(clippy::too_many_arguments)]
     fn consumer(
         &self,
         name: &str,
         partition: u32,
         batch_length: u32,
-        poll_interval_ms: Option<u64>,
+        max_wait_ms: u64,
+        min_count: u32,
+        max_bytes: u32,
         polling: &str,
         offset: Option<u64>,
         timestamp_micros: Option<u64>,
@@ -424,14 +434,15 @@ impl PyTopic {
             name.to_owned(),
             ConsumerConfig {
                 batch_length,
-                poll_interval_ms,
+                max_wait_ms,
+                min_count,
+                max_bytes,
                 polling,
                 offset,
                 timestamp_micros,
                 auto_commit,
                 commit_interval_ms,
                 commit_every,
-                auto_join_group: false,
                 create_group: false,
                 polling_retry_interval_ms,
                 init_retries,
@@ -479,8 +490,16 @@ impl PyTopic {
     }
 
     /// Idempotently create this topic with `partitions`, creating the stream
-    /// first when needed.
-    fn ensure<'py>(&self, py: Python<'py>, partitions: u32) -> PyResult<Bound<'py, PyAny>> {
+    /// first when needed. `replication_factor` is how many nodes store each
+    /// partition, 1 to `MAX_REPLICATION_FACTOR` and at most the cluster's node
+    /// count, the server default when `None`. An existing topic is left as it is.
+    #[pyo3(signature = (partitions, replication_factor=None))]
+    fn ensure<'py>(
+        &self,
+        py: Python<'py>,
+        partitions: u32,
+        replication_factor: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let stream = self.stream.clone();
         let name = self.name.clone();
@@ -489,7 +508,10 @@ impl PyTopic {
                 Some(stream) => laser.stream(stream.clone()).topic(&*name),
                 None => laser.topic(&*name),
             };
-            handle.ensure(partitions).await.map_err(to_pyerr)
+            handle
+                .ensure(partitions, replication_factor)
+                .await
+                .map_err(to_pyerr)
         })
     }
 

@@ -28,7 +28,7 @@ pub use laser_wire::limits::{
 #[cfg(feature = "streaming")]
 pub(crate) mod client;
 #[cfg(feature = "streaming")]
-mod group;
+pub(crate) mod group;
 #[cfg(feature = "filters")]
 mod guard;
 #[cfg(feature = "streaming")]

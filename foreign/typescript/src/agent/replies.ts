@@ -1,8 +1,15 @@
+import { setTimeout as sleep } from "node:timers/promises"
 import { CancelledError, TimeoutError } from "../client/errors.js"
-import type { ConsumerTarget, LaserTransport, PolledMessage } from "../iggy/apache-iggy.js"
+import {
+  type ConsumerTarget,
+  type LaserTransport,
+  ONE_SHOT_POLL,
+  type PollWait,
+  type PolledMessage
+} from "../iggy/apache-iggy.js"
 import { NOOP_OBSERVER, type LaserObserver } from "../observe.js"
 import type { KeyRegistry } from "../signing.js"
-import { Cursor } from "../stream/cursor.js"
+import { Cursor, heldRead } from "../stream/cursor.js"
 import { AgentKind, type AgentEnvelope } from "../wire/agent.js"
 import type { CorrelationId } from "../wire/ids.js"
 import type { ConversationId, MessageId } from "../types/ids.js"
@@ -14,7 +21,9 @@ import {
 import { longTimeout } from "./timer.js"
 
 const REPLY_BATCH = 200
-const REPLY_POLL_INTERVAL_MS = 20
+// How long the server holds a read of an idle reply topic, as Rust.
+const REPLY_WAIT: PollWait = { ...ONE_SHOT_POLL, maxWaitMs: 5_000 }
+const REPLY_RETRY_INTERVAL_MS = 20
 
 // A point lookup reads at most this many batches per partition, like Rust.
 const MAX_LOOKUP_PASSES = 32
@@ -25,8 +34,9 @@ const LOOKUP_BATCH = 1_000
 const MAX_QUEUED_REPLIES = 1_000
 const MAX_PENDING_REQUEST_REPLIES = 64
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+// A pause that a stopping hub ends early, so a stopped hub keeps no timer.
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return sleep(ms, undefined, { signal }).catch(() => undefined)
 }
 
 function raceWithTimeout<T>(
@@ -76,9 +86,14 @@ export interface ReplyStreamTicket {
   cancel(): void
 }
 
+interface PendingReply {
+  readonly settle: (message: AgentMessage) => void
+  readonly fail: (error: Error) => void
+}
+
 interface StreamWaiter {
   readonly queued: AgentMessage[]
-  readonly pending: ((message: AgentMessage) => void)[]
+  readonly pending: PendingReply[]
   readonly expectedSigner?: string
 }
 
@@ -104,8 +119,7 @@ function accepts(expected: ExpectedReply, message: AgentMessage): boolean {
   return expected.requester === undefined || expected.requester === addressee
 }
 
-interface ReplyWaiter {
-  readonly settle: (message: AgentMessage) => void
+interface ReplyWaiter extends PendingReply {
   readonly expectedSigner?: string
   readonly expected?: ExpectedReply
   readonly deferred: boolean
@@ -161,9 +175,14 @@ export class ReplyHub {
   private readonly waiters = new Map<string, ReplyWaiter>()
   private readonly streamWaiters = new Map<string, StreamWaiter>()
   private stopped = false
+  // Cancels the read the server holds when the hub stops.
+  private readonly stopper = new AbortController()
   // Resolves the parked dispatcher. Set only while nobody waits, so an idle
   // hub does not poll the reply topic.
   private wake: (() => void) | undefined
+  // Cancels the held read once the last waiter leaves, so an idle hub holds
+  // no request on any node.
+  private holding: AbortController | undefined
 
   private constructor(
     private readonly transport: LaserTransport,
@@ -212,11 +231,16 @@ export class ReplyHub {
     expected?: ExpectedReply
   ): ReplyTicket {
     let settle: ((message: AgentMessage) => void) | undefined
-    const reply = new Promise<AgentMessage>((resolve) => {
+    let fail: ((error: Error) => void) | undefined
+    const reply = new Promise<AgentMessage>((resolve, reject) => {
       settle = resolve
+      fail = reject
     })
+    // A hub that stops before the caller waits must not leave an unhandled rejection.
+    reply.catch(() => undefined)
     const waiter: ReplyWaiter = {
       settle: settle as (message: AgentMessage) => void,
+      fail: fail as (error: Error) => void,
       ...(expectedSigner !== undefined ? { expectedSigner } : {}),
       ...(expected !== undefined ? { expected } : {}),
       deferred: deferUntilArmed,
@@ -227,7 +251,7 @@ export class ReplyHub {
     this.wake?.()
     return {
       wait: (timeoutMs: number, signal?: AbortSignal) =>
-        raceWithTimeout(reply, timeoutMs, () => this.waiters.delete(correlation), signal),
+        raceWithTimeout(reply, timeoutMs, () => this.release(correlation), signal),
       arm: (request?: MessageId) => {
         if (this.waiters.get(correlation) !== waiter) return
         waiter.armed = true
@@ -237,11 +261,11 @@ export class ReplyHub {
         )
         waiter.pending.length = 0
         if (found !== undefined) {
-          this.waiters.delete(correlation)
+          this.release(correlation)
           waiter.settle(found)
         }
       },
-      cancel: () => this.waiters.delete(correlation)
+      cancel: () => this.release(correlation)
     }
   }
 
@@ -257,11 +281,14 @@ export class ReplyHub {
       next: (timeoutMs: number, signal?: AbortSignal) => {
         const queued = waiter.queued.shift()
         if (queued !== undefined) return Promise.resolve(queued)
-        let settle: ((message: AgentMessage) => void) | undefined
-        const reply = new Promise<AgentMessage>((resolve) => {
+        if (this.stopped) return Promise.reject(new TimeoutError("reply"))
+        let settle: (message: AgentMessage) => void = () => undefined
+        let fail: (error: Error) => void = () => undefined
+        const reply = new Promise<AgentMessage>((resolve, reject) => {
           settle = resolve
+          fail = reject
         })
-        const pending = settle as (message: AgentMessage) => void
+        const pending: PendingReply = { settle, fail }
         waiter.pending.push(pending)
         return raceWithTimeout(
           reply,
@@ -273,13 +300,36 @@ export class ReplyHub {
           signal
         )
       },
-      cancel: () => this.streamWaiters.delete(correlation)
+      cancel: () => {
+        const removed = this.streamWaiters.delete(correlation)
+        this.releaseIfIdle()
+        return removed
+      }
     }
   }
 
+  private release(correlation: string): boolean {
+    const removed = this.waiters.delete(correlation)
+    this.releaseIfIdle()
+    return removed
+  }
+
+  private releaseIfIdle(): void {
+    if (this.waiters.size === 0 && this.streamWaiters.size === 0) this.holding?.abort()
+  }
+
+  // Every wait ends at once with a reply timeout, as when Rust drops the hub.
   stop(): void {
     this.stopped = true
+    this.stopper.abort()
+    this.holding?.abort()
     this.wake?.()
+    for (const waiter of this.waiters.values()) waiter.fail(new TimeoutError("reply"))
+    this.waiters.clear()
+    for (const waiter of this.streamWaiters.values()) {
+      for (const pending of waiter.pending) pending.fail(new TimeoutError("reply"))
+    }
+    this.streamWaiters.clear()
   }
 
   private async seedTailOffsets(): Promise<bigint[]> {
@@ -302,6 +352,10 @@ export class ReplyHub {
     return offsets
   }
 
+  // Every pass reads each partition once and answers at once. After a pass
+  // that found nothing, the server holds one fetch per partition primary
+  // until a reply lands on any of them or the last waiter leaves, so a reply
+  // arrives at once and an idle hub holds nothing.
   private async runDispatchLoop(initialOffsets: readonly bigint[]): Promise<void> {
     let offsets = [...initialOffsets]
     while (!this.stopped) {
@@ -320,25 +374,67 @@ export class ReplyHub {
       try {
         partitionCount = await this.transport.findTopicPartitionCount(this.stream, this.topic)
       } catch {
-        await delay(REPLY_POLL_INTERVAL_MS)
+        await delay(REPLY_RETRY_INTERVAL_MS, this.stopper.signal)
         continue
       }
       if (partitionCount === undefined) {
-        await delay(REPLY_POLL_INTERVAL_MS)
+        await delay(REPLY_RETRY_INTERVAL_MS, this.stopper.signal)
         continue
       }
       if (offsets.length < partitionCount) {
         offsets = [...offsets, ...new Array<bigint>(partitionCount - offsets.length).fill(0n)]
       }
-      let dispatched = false
+      let failed = false
+      let read = false
       for (let partitionId = 0; partitionId < partitionCount; partitionId += 1) {
-        dispatched = (await this.dispatchPartition(partitionId, offsets)) || dispatched
+        const outcome = await this.dispatchPartition(partitionId, offsets, ONE_SHOT_POLL)
+        failed ||= outcome === "failed"
+        read ||= outcome === "records"
       }
-      if (!dispatched) await delay(REPLY_POLL_INTERVAL_MS)
+      if (failed) {
+        await delay(REPLY_RETRY_INTERVAL_MS, this.stopper.signal)
+        continue
+      }
+      if (read) continue
+      // Checked with no await before the hold, so a waiter that left during
+      // the pass, or a stop that cleared them, never leaves a read held.
+      if (this.waiters.size === 0 && this.streamWaiters.size === 0) continue
+      const holding = new AbortController()
+      this.holding = holding
+      let held: Awaited<ReturnType<typeof heldRead>>
+      try {
+        held = await heldRead(
+          this.transport,
+          this.stream,
+          this.topic,
+          new Map(offsets.map((offset, partitionId) => [partitionId, offset] as const)),
+          REPLY_BATCH,
+          REPLY_WAIT,
+          holding.signal
+        )
+      } catch {
+        if (!holding.signal.aborted) await delay(REPLY_RETRY_INTERVAL_MS, this.stopper.signal)
+        continue
+      } finally {
+        if (this.holding === holding) this.holding = undefined
+      }
+      // An idle wait yields to timers even when the reads answer at once.
+      if (held === undefined) {
+        await delay(0, this.stopper.signal)
+        continue
+      }
+      for (const message of held.messages) {
+        offsets[held.partitionId] = message.offset + 1n
+        this.dispatchMessage(held.partitionId, message)
+      }
     }
   }
 
-  private async dispatchPartition(partitionId: number, offsets: bigint[]): Promise<boolean> {
+  private async dispatchPartition(
+    partitionId: number,
+    offsets: bigint[],
+    wait: PollWait
+  ): Promise<"records" | "empty" | "failed"> {
     const target: ConsumerTarget = { kind: "single", partitionId }
     const from = offsets[partitionId] ?? 0n
     let batch: readonly PolledMessage[]
@@ -349,17 +445,18 @@ export class ReplyHub {
         target,
         { kind: "offset", value: from },
         REPLY_BATCH,
-        false
+        false,
+        wait,
+        this.stopper.signal
       )
     } catch {
-      return false
+      return "failed"
     }
-    let dispatched = false
     for (const message of batch) {
       offsets[partitionId] = message.offset + 1n
-      if (this.dispatchMessage(partitionId, message)) dispatched = true
+      this.dispatchMessage(partitionId, message)
     }
-    return dispatched
+    return batch.length > 0 ? "records" : "empty"
   }
 
   private dispatchMessage(partitionId: number, message: PolledMessage): boolean {
@@ -403,7 +500,7 @@ export class ReplyHub {
         waiter.pending.push(reply)
         if (waiter.pending.length > MAX_PENDING_REQUEST_REPLIES) waiter.pending.shift()
       } else if (waiter.request === undefined || !sameAddress(reply.id, waiter.request)) {
-        this.waiters.delete(correlation)
+        this.release(correlation)
         waiter.settle(reply)
       }
     }
@@ -415,7 +512,7 @@ export class ReplyHub {
         // newest.
         streamWaiter.queued.push(reply)
         if (streamWaiter.queued.length > MAX_QUEUED_REPLIES) streamWaiter.queued.shift()
-      } else pending(reply)
+      } else pending.settle(reply)
     }
     return waiter !== undefined || streamWaiter !== undefined
   }

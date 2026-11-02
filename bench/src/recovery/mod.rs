@@ -229,6 +229,10 @@ pub async fn run_recovery_evidence(run: RecoveryRun<'_>) -> Result<RecoveryEvide
 /// # Errors
 ///
 /// Returns an error when setup, shutdown, unavailability probing, restart, telemetry, replay, or append validation fails.
+#[allow(
+    clippy::large_futures,
+    reason = "a Laser publish awaits the upstream IggyProducer send future inline, 16 080 bytes in debug"
+)]
 pub async fn run_iggy_recovery(
     laser: Laser,
     server: NativeIggy,
@@ -247,7 +251,7 @@ pub async fn run_iggy_recovery(
     let stream = format!("bench-iggy-recovery-{seed:016x}");
     let topic = laser.stream(&stream).topic(scenario);
     topic
-        .ensure(1)
+        .ensure(1, None)
         .await
         .map_err(|error| recovery_error("create Iggy recovery topic", &error))?;
     let payload = seeded_payload(case.payload_bytes, seed);
@@ -383,6 +387,10 @@ fn iggy_recovery_summary(
 /// # Errors
 ///
 /// Returns an error when topology setup, baseline delivery, publishing, consumer shutdown, or resumed-consumer construction fails.
+#[allow(
+    clippy::large_futures,
+    reason = "a Laser publish awaits the upstream IggyProducer send future inline, 16 080 bytes in debug"
+)]
 pub async fn run_consumer_recovery(
     laser: &Laser,
     case: &RecoveryCase,
@@ -398,7 +406,7 @@ pub async fn run_consumer_recovery(
     let stream = format!("bench-recovery-{seed:016x}");
     let topic = laser.stream(&stream).topic(scenario);
     topic
-        .ensure(1)
+        .ensure(1, None)
         .await
         .map_err(|error| recovery_error("create recovery topic", &error))?;
     let producer = recovery_producer(&topic).await?;
@@ -532,7 +540,6 @@ async fn build_recovery_consumer(
     topic
         .consumer(consumer_id, 0)
         .batch_length(100)
-        .without_poll_interval()
         .start_at(start)
         .commit_policy(CommitPolicy::Disabled)
         .allow_replay()
@@ -553,6 +560,10 @@ async fn recovery_producer(topic: &Topic) -> Result<Producer, BenchError> {
         .map_err(|error| recovery_error("build recovery producer", &error))
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "a Laser publish awaits the upstream IggyProducer send future inline, 16 080 bytes in debug"
+)]
 async fn publish_recovery_records(
     producer: &Producer,
     payload: &Bytes,

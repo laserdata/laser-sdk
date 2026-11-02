@@ -44,7 +44,7 @@ async fn main() -> Result<(), LaserError> {
         phase("publish a busy fleet change feed, keyed by satellite");
         let feed = fleet_feed();
         let topic = laser.topic(TOPIC);
-        topic.ensure(PARTITIONS).await?;
+        topic.ensure(PARTITIONS, None).await?;
         let mut published_bytes = 0;
         let mut by_key = BTreeMap::<&str, Vec<&FleetChange>>::new();
         for change in &feed.records {
@@ -75,7 +75,11 @@ async fn main() -> Result<(), LaserError> {
         phase("create the anomaly desk group with its filter");
         let desk_name = format!("{GROUP}-{}", run_token());
         let desk = topic.consumer_group(&desk_name);
-        let created = desk.create().filter(safe_mode_filter()).build().await?;
+        let created = desk
+            .create()
+            .filter("safe-mode", safe_mode_filter())
+            .build()
+            .await?;
         let binding = created
             .filter
             .clone()
@@ -170,7 +174,7 @@ async fn main() -> Result<(), LaserError> {
 // so the alert topic can hold any format.
 async fn route_alerts(laser: &Laser, stream: &str) -> Result<(), LaserError> {
     let alerts = laser.stream(stream).topic(ALERTS);
-    alerts.ensure(1).await?;
+    alerts.ensure(1, None).await?;
     let producer = alerts.producer().build().await?;
     for (priority, satellite_id) in [
         (ROUTINE, "sat-001"),
@@ -189,11 +193,14 @@ async fn route_alerts(laser: &Laser, stream: &str) -> Result<(), LaserError> {
     let pager_group = alerts.consumer_group(format!("{GROUP}-pager-{}", run_token()));
     pager_group
         .create()
-        .filter(ConsumerFilter::headers_only(FilterExpr::header(
-            "priority",
-            CmpOp::Eq,
-            i32::from(CRITICAL),
-        )))
+        .filter(
+            "critical-alerts",
+            ConsumerFilter::headers_only(FilterExpr::header(
+                "priority",
+                CmpOp::Eq,
+                i32::from(CRITICAL),
+            )),
+        )
         .build()
         .await?;
     let mut pager = pager_group
@@ -248,7 +255,10 @@ async fn manage_revisions(
     let variant = laser.topic(TOPIC).consumer_group(&variant_name);
     let variant_created = variant
         .create()
-        .filter(ConsumerFilter::json(safe_mode_transition()))
+        .filter(
+            "safe-mode-transitions",
+            ConsumerFilter::json(safe_mode_transition()),
+        )
         .build()
         .await?;
     let variant_binding = variant_created
@@ -300,7 +310,10 @@ async fn manage_revisions(
     phase("a group that runs a policy cannot be switched to another one");
     match desk
         .filter()
-        .configure(ConsumerFilter::json(safe_mode_transition()))
+        .configure(
+            "safe-mode-transitions",
+            ConsumerFilter::json(safe_mode_transition()),
+        )
         .await
     {
         Err(error) if error.filter_reason() == Some(FilterErrorReason::Conflict) => {

@@ -62,8 +62,9 @@ void test("given_valid_and_invalid_agent_id_strings_when_constructed_then_should
   assert.throws(() => AgentId.new("bad\tname"), {
     message: "identifier contains invalid character `\t`"
   })
-  const tooLong = "x".repeat(256)
-  assert.throws(() => AgentId.new(tooLong), { message: "identifier length 256B exceeds max 255B" })
+  assert.equal(AgentId.new("x".repeat(256)).asStr().length, 256, "the wire agent id cap")
+  const tooLong = "x".repeat(257)
+  assert.throws(() => AgentId.new(tooLong), { message: "identifier length 257B exceeds max 256B" })
 })
 
 void test("given_an_agent_id_when_used_for_a_consumer_group_then_should_share_its_spelling", () => {

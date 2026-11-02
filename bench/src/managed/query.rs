@@ -203,7 +203,7 @@ pub(crate) async fn prepare_projection(
         .map_err(|error| setup_error("create query stream", &error))?;
     let topic = stream.topic(&names.topic);
     topic
-        .ensure(case.partitions)
+        .ensure(case.partitions, None)
         .await
         .map_err(|error| setup_error("create query topic", &error))?;
     let scoped = laser.with_default_stream(&names.stream);

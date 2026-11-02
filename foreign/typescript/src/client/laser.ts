@@ -106,7 +106,11 @@ import {
   QueryPageCommand,
   QueryStatusCommand
 } from "../wire/commands.js"
-import { encodeControlEnvelope, type ControlCommand } from "../wire/control.js"
+import {
+  encodeControlEnvelope,
+  type ControlCommand,
+  validateControlCommand
+} from "../wire/control.js"
 import type { ForkInfo } from "../wire/fork.js"
 import { decodeBackendAnnounce } from "../wire/hello.js"
 import type { KvNamespaceInfo } from "../wire/kv.js"
@@ -1916,6 +1920,10 @@ export class Laser implements AsyncDisposable {
         ...(transport.storePosition !== undefined
           ? { storePosition: transport.storePosition.bind(transport) }
           : {}),
+        storeOffset: transport.storeOffset.bind(transport),
+        ...(transport.getConsumerOffset !== undefined
+          ? { getConsumerOffset: transport.getConsumerOffset.bind(transport) }
+          : {}),
         ...(transport.openCoordinator !== undefined
           ? { openCoordinator: transport.openCoordinator.bind(transport) }
           : {}),
@@ -2094,6 +2102,7 @@ export class Laser implements AsyncDisposable {
         `control wire version must be ${String(CONTROL_OP_VERSION)}, got ${String(capabilities.versions.control)}`
       )
     }
+    validateControlCommand(command)
     const envelope = {
       v: CONTROL_OP_VERSION,
       timestampMicros: 0n,

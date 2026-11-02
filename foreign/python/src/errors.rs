@@ -1542,3 +1542,42 @@ fn provenance_kind(error: &laser_sdk::provenance::ProvenanceError) -> &'static s
         Provenance::Id(_) => "id",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{TransportError, to_pyerr_ref};
+    use iggy::prelude::IggyError;
+    use laser_sdk::LaserError as SdkError;
+    use pyo3::prelude::*;
+
+    #[test]
+    fn given_a_read_error_that_stops_a_partition_when_raised_then_should_carry_the_rust_retry_verdict()
+     {
+        Python::initialize();
+        Python::attach(|py| {
+            for error in [
+                IggyError::PartitionLaneBlocked(3, 7),
+                IggyError::FetchProgressUncertain(7),
+                IggyError::Disconnected,
+            ] {
+                let code = error.as_code();
+                let error = SdkError::Iggy(error);
+                let raised = to_pyerr_ref(&error);
+                assert!(raised.is_instance_of::<TransportError>(py));
+                let value = raised.value(py);
+                let retryable = value
+                    .getattr("retryable")
+                    .and_then(|flag| flag.extract::<bool>())
+                    .expect("a retryable flag");
+                assert_eq!(retryable, error.is_retryable(), "{error}");
+                let iggy_code = value
+                    .getattr("iggy_error_code")
+                    .and_then(|code| code.extract::<Option<u32>>())
+                    .expect("an iggy error code");
+                assert_eq!(iggy_code, Some(code));
+            }
+            assert!(!SdkError::Iggy(IggyError::PartitionLaneBlocked(3, 7)).is_retryable());
+            assert!(!SdkError::Iggy(IggyError::FetchProgressUncertain(7)).is_retryable());
+        });
+    }
+}

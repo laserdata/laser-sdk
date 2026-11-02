@@ -550,7 +550,7 @@ pub async fn run_publish_evidence(
     let typed_topic = laser.stream(&stream).topic("typed");
     for topic in [&bare_topic, &provenance_topic, &typed_topic] {
         topic
-            .ensure(case.partitions)
+            .ensure(case.partitions, None)
             .await
             .map_err(|error| sdk_error(&error))?;
     }
@@ -643,7 +643,7 @@ pub async fn run_request_reply_evidence(
         .topic(AgentTopic::Sessions.topic_string());
     for topic in [&command_topic, &response_topic] {
         topic
-            .ensure(case.partitions)
+            .ensure(case.partitions, None)
             .await
             .map_err(|error| sdk_error(&error))?;
     }
@@ -667,7 +667,6 @@ pub async fn run_request_reply_evidence(
             tracker: tracker.clone(),
             source: worker.wire_id(),
         })
-        .poll_interval(Duration::ZERO)
         .concurrency(ConcurrencyPolicy::SerialPerPartition { max_partitions })
         .build()
         .spawn(worker_laser);
@@ -745,7 +744,7 @@ pub async fn run_stream_evidence(
         .stream(&stream_name)
         .topic(AgentTopic::Sessions.topic_string());
     topic
-        .ensure(case.partitions)
+        .ensure(case.partitions, None)
         .await
         .map_err(|error| sdk_error(&error))?;
     let scoped = laser.with_default_stream(&stream_name);
@@ -870,7 +869,6 @@ async fn start_stream_pumps(
         let consumer = topic
             .consumer(format!("laser-bench-stream-{partition}"), partition)
             .batch_length(128)
-            .without_poll_interval()
             .start_at(ConsumerStart::Offset(0))
             .commit_policy(CommitPolicy::Disabled)
             .allow_replay()
@@ -1036,7 +1034,6 @@ async fn start_response_pumps(
         let consumer = topic
             .consumer(format!("laser-bench-response-{partition}"), partition)
             .batch_length(128)
-            .without_poll_interval()
             .start_at(ConsumerStart::Offset(0))
             .commit_policy(CommitPolicy::Disabled)
             .allow_replay()

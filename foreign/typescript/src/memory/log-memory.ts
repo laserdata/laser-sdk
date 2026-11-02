@@ -506,9 +506,9 @@ function parseKind(word: string): MemoryKind {
 
 // Rebuild a memory item from a read-view row, or `undefined` when the key is a
 // named-item key rather than a recall id, or the row carries no memory scope.
-// Arrival order of a memory view row across partitions: the broker append time,
+// Arrival order of a memory view row across partitions: the server append time,
 // then the source address, then the id. Offsets from different topics or
-// partitions are never compared alone. A row without a broker time sorts as the
+// partitions are never compared alone. A row without an append time sorts as the
 // oldest.
 type ArrivalKey = readonly [bigint, number, number, bigint, bigint]
 

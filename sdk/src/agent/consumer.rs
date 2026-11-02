@@ -7,6 +7,7 @@ use crate::agent::session::{SessionConfig, Sessions};
 use crate::capabilities::HelloOutcome;
 use crate::error::LaserError;
 use crate::laser::Laser;
+use crate::poll::{DrainRange, drain_partition};
 use crate::provenance::{AgentTopic, LlmUsage, Provenance};
 use crate::stream::{CommitPolicy, Consumer, ConsumerMessage, Headers};
 use crate::types::{AgentId, ConsumerGroupName, ConversationId, MessageId};
@@ -20,13 +21,15 @@ use laser_wire::agent::{
 use laser_wire::codes::AGENT_OP_VERSION;
 use laser_wire::content::ContentType;
 use laser_wire::dispatch::{
-    Dispatch, HandledOperations, addressee_filter, classify, classify_generic,
+    ADDRESSEE_FILTER_NAME, Dispatch, HandledOperations, addressee_filter, classify,
+    classify_generic,
 };
 use laser_wire::framing::{decode_named, encode_named};
 use laser_wire::headers::{AGENT_VERSION, CONTENT_TYPE, CONVERSATION_ID, FENCE};
 use laser_wire::topics::{AGENT_CONTROL, AGENT_SESSIONS};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -66,10 +69,11 @@ const FENCE_ENTRY_TTL_MICROS: u64 = 600_000_000;
 /// this often under load instead of on every accepted fence.
 const FENCE_SWEEP_INTERVAL_MICROS: u64 = 1_000_000;
 
-// Iggy defaults to a one-second poll, tuned for throughput. An agent runtime is
-// latency-bound, so each hop would wait up to a second. Override per agent with
-// `Agent::builder().poll_interval(..)`.
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
+// The server answers a held read as soon as a record lands, so the wait bounds
+// only an idle read.
+const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(5);
+// Records one warmer poll asks for. The drain reads on until the stored offset.
+const WARM_DEDUP_BATCH: u32 = 1000;
 
 // How long a graceful shutdown waits for the in-flight message (its handler and
 // any retry backoff) to finish before dropping the consumer. `abort` is the
@@ -235,7 +239,7 @@ pub(crate) fn decode_agent_record(
     )
 }
 
-// Decode one record from its header map, payload, and broker timestamp.
+// Decode one record from its header map, payload, and server append timestamp.
 fn decode_record_parts(
     headers: &Headers,
     payload: &[u8],
@@ -430,9 +434,10 @@ pub struct ReliableConsumer {
     /// requiring any other bit are dead-lettered before dispatch.
     #[builder(default = features::NONE)]
     pub understood_features: u64,
-    /// Poll interval, default a reactive 10ms. Raise for throughput-bound work.
-    #[builder(default = POLL_INTERVAL)]
-    pub poll_interval: Duration,
+    /// How long the server holds a read that finds nothing new before it
+    /// answers. A record ends the wait at once. Default 5 s.
+    #[builder(default = DEFAULT_MAX_WAIT)]
+    pub max_wait: Duration,
     /// How long a graceful shutdown waits for the in-flight message to finish
     /// before dropping the consumer. `run` returns [`LaserError::Timeout`] if the
     /// grace elapses with a message still in flight. Default 30s.
@@ -508,6 +513,19 @@ impl ReliableConsumer {
     /// stays unbound and records are classified on the client. A capability
     /// probe that established nothing is an error.
     pub async fn run<H>(
+        self,
+        laser: &Laser,
+        handler: H,
+        ready: oneshot::Sender<()>,
+        shutdown: oneshot::Receiver<()>,
+    ) -> Result<(), LaserError>
+    where
+        H: AgentHandler + Sync + Send + 'static,
+    {
+        self.serve(laser, handler, ready, shutdown).await
+    }
+
+    async fn serve<H>(
         mut self,
         laser: &Laser,
         handler: H,
@@ -530,7 +548,7 @@ impl ReliableConsumer {
             stream: stream.clone(),
             topic: self.topic.clone(),
             group: self.group.as_str().to_owned(),
-            poll_interval: self.poll_interval,
+            max_wait: self.max_wait,
             native: engine.native,
         };
         let consumer = opener.open().await?;
@@ -621,7 +639,7 @@ impl ReliableConsumer {
                         me.clone(),
                         Arc::clone(&control),
                         pause.is_some().then(|| reconcile.clone()),
-                        self.poll_interval,
+                        self.max_wait,
                         stopped,
                     ));
                     Some((stop, task))
@@ -731,7 +749,7 @@ impl ReliableConsumer {
                 me.clone(),
                 Arc::clone(&reliable.control),
                 start_pause,
-                self.poll_interval,
+                self.max_wait,
                 stopped,
             ));
             control_follower = Some((stop, task));
@@ -950,7 +968,7 @@ impl DeliveryEngine {
             .topic(topic)
             .consumer_group(group)
             .create()
-            .filter(addressee_filter(me))
+            .filter(ADDRESSEE_FILTER_NAME, addressee_filter(me))
             .build()
             .await
             .map(|_| ())
@@ -965,7 +983,7 @@ struct Opener {
     stream: String,
     topic: String,
     group: String,
-    poll_interval: Duration,
+    max_wait: Duration,
     native: bool,
 }
 
@@ -978,7 +996,7 @@ impl Opener {
             .consumer_group(&self.group)
             .consumer()
             .commit_policy(CommitPolicy::Disabled)
-            .poll_interval(self.poll_interval)
+            .max_wait(self.max_wait)
             .create_group(true);
         let builder = if self.native {
             builder.native()
@@ -1157,9 +1175,9 @@ where
                 return match drained {
                     Ok(Ok(())) => {
                         // Every lane finished and committed, so the member can
-                        // leave its group. On a drain timeout the lanes may
-                        // hold unhandled records, and the membership is left
-                        // to the connection close instead.
+                        // leave its group. On a drain timeout the lanes are
+                        // stopped with their unhandled records, and the
+                        // membership is left to the connection close instead.
                         if let Err(error) = consumer.shutdown().await {
                             warn!(%error, "failed to leave the consumer group on shutdown");
                         }
@@ -1218,6 +1236,9 @@ struct LaneDrain {
     completions: tokio::sync::mpsc::Receiver<Result<ConsumerMessage, LaserError>>,
     /// Whether the pass delivered any record, which resets the failure count.
     delivered: bool,
+    // Raised when the drain ends before the lanes do, read by each lane
+    // before its next record.
+    stop: Arc<AtomicBool>,
 }
 
 impl LaneDrain {
@@ -1225,23 +1246,52 @@ impl LaneDrain {
     // The first lane failure stops further commits.
     async fn finish(
         mut self,
-        consumer: &Consumer,
+        consumer: &impl DrainCommit,
         tolerate_commits: bool,
     ) -> Result<(), LaserError> {
-        for lane in self.lanes {
+        // Read while the lanes run: a lane blocks on the bounded channel until
+        // its completions are read. The channel closes once every lane ends.
+        let mut outcome = Ok(());
+        while let Some(completion) = self.completions.recv().await {
+            if outcome.is_err() {
+                continue;
+            }
+            outcome = match completion {
+                Ok(message) => match consumer.commit(&message).await {
+                    Err(error) if tolerate_commits => {
+                        debug!(%error, source = %message.position, "a handled record could not be committed, it is read again");
+                        Ok(())
+                    }
+                    committed => committed,
+                },
+                Err(error) => Err(error),
+            };
+        }
+        for lane in &mut self.lanes {
             let _ = lane.await;
         }
-        while let Some(completion) = self.completions.recv().await {
-            let message = completion?;
-            match consumer.commit(&message).await {
-                Ok(()) => {}
-                Err(error) if tolerate_commits => {
-                    debug!(%error, source = %message.position, "a handled record could not be committed, it is read again");
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
+        outcome
+    }
+}
+
+impl Drop for LaneDrain {
+    // A drain dropped before its lanes end, when the grace elapsed, lets each
+    // lane finish the record in its hands and stops it before the next, so no
+    // further record is handled without a commit.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+// The commit a lane drain sends for each handled record.
+#[trait_variant::make(Send)]
+trait DrainCommit {
+    async fn commit(&self, message: &ConsumerMessage) -> Result<(), LaserError>;
+}
+
+impl DrainCommit for Consumer {
+    async fn commit(&self, message: &ConsumerMessage) -> Result<(), LaserError> {
+        Consumer::commit(self, message).await
     }
 }
 
@@ -1266,6 +1316,7 @@ where
         Result<ConsumerMessage, LaserError>,
     >(limits.max_partitions * 2);
     let notify = Arc::new(tokio::sync::Notify::new());
+    let lane_stop = Arc::new(AtomicBool::new(false));
     let record_capacity = Arc::new(tokio::sync::Semaphore::new(limits.max_queued_records));
     let byte_capacity = Arc::new(tokio::sync::Semaphore::new(limits.max_queued_bytes));
     let mut probe = tokio::time::interval(limits.probe_interval);
@@ -1319,6 +1370,7 @@ where
                             limits.max_queued_records,
                             commit_tx.clone(),
                             Arc::clone(&notify),
+                            Arc::clone(&lane_stop),
                         )
                     });
                     let buffered_bytes = message.payload.len()
@@ -1369,6 +1421,7 @@ where
             lanes: tasks,
             completions: commit_rx,
             delivered,
+            stop: lane_stop,
         },
     )
 }
@@ -1379,29 +1432,57 @@ fn spawn_lane<H>(
     capacity: usize,
     commits: tokio::sync::mpsc::Sender<Result<ConsumerMessage, LaserError>>,
     notify: Arc<tokio::sync::Notify>,
+    stop: Arc<AtomicBool>,
 ) -> Lane
 where
     H: AgentHandler + Sync + Send + 'static,
 {
-    let (sender, mut queue) = tokio::sync::mpsc::channel::<QueuedMessage>(capacity);
+    let (sender, queue) = tokio::sync::mpsc::channel::<QueuedMessage>(capacity);
     let worker = Arc::clone(worker);
-    let task = tokio::spawn(async move {
-        if let Some(predecessor) = predecessor {
-            let _ = predecessor.await;
-        }
-        while let Some(queued) = queue.recv().await {
-            let result = worker.consume(&queued.message).await;
-            drop(queued.record_permit);
-            drop(queued.byte_permit);
-            let failed = result.is_err();
-            let _ = commits.send(result.map(|()| queued.message)).await;
-            notify.notify_one();
-            if failed {
-                break;
-            }
-        }
-    });
+    let handle = move |message: ConsumerMessage| {
+        let worker = Arc::clone(&worker);
+        async move { worker.consume(&message).await.map(|()| message) }
+    };
+    let task = tokio::spawn(run_lane(predecessor, queue, handle, commits, notify, stop));
     Lane { sender, task }
+}
+
+// A lane: one partition's records handled in order, each reported to the
+// drain. It ends with its queue, after its first failure, or before its next
+// record once its drain stopped it.
+async fn run_lane<F, Fut>(
+    predecessor: Option<tokio::task::JoinHandle<()>>,
+    mut queue: tokio::sync::mpsc::Receiver<QueuedMessage>,
+    handle: F,
+    commits: tokio::sync::mpsc::Sender<Result<ConsumerMessage, LaserError>>,
+    notify: Arc<tokio::sync::Notify>,
+    stop: Arc<AtomicBool>,
+) where
+    F: Fn(ConsumerMessage) -> Fut,
+    Fut: std::future::Future<Output = Result<ConsumerMessage, LaserError>>,
+{
+    if let Some(predecessor) = predecessor {
+        let _ = predecessor.await;
+    }
+    while let Some(queued) = queue.recv().await {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let QueuedMessage {
+            message,
+            record_permit,
+            byte_permit,
+        } = queued;
+        let result = handle(message).await;
+        drop(record_permit);
+        drop(byte_permit);
+        let failed = result.is_err();
+        let _ = commits.send(result).await;
+        notify.notify_one();
+        if failed {
+            break;
+        }
+    }
 }
 
 // The assignment probe. A lane of a partition this member no longer reads is
@@ -2194,34 +2275,32 @@ async fn warm_dedup_window(
             continue;
         };
         let stored = offset.stored_offset;
-        let start = stored.saturating_sub(depth.saturating_sub(1));
-        let count =
-            u32::try_from(stored.saturating_sub(start).saturating_add(1)).unwrap_or(u32::MAX);
-        let polled = laser
-            .client()
-            .poll_messages(
+        let mut from = stored.saturating_sub(depth.saturating_sub(1));
+        while from <= stored {
+            let batch = drain_partition(
+                &laser.client(),
                 &stream,
                 &topic_id,
-                Some(partition),
                 &reader,
-                &PollingStrategy::offset(start),
-                count,
-                false,
+                DrainRange::until(partition, from, stored),
+                WARM_DEDUP_BATCH,
             )
             .await?;
-        for message in polled.messages {
-            if message.header.offset > stored {
-                continue;
+            if batch.messages.is_empty() {
+                break;
             }
-            if let Some(key) = warm_dedup_key(
-                &message,
-                settings.agent.as_ref(),
-                settings.understood_features,
-                #[cfg(feature = "sign")]
-                settings.verifier.as_deref(),
-            ) {
-                dedup.observe(&key).await;
+            for message in batch.messages {
+                if let Some(key) = warm_dedup_key(
+                    &message,
+                    settings.agent.as_ref(),
+                    settings.understood_features,
+                    #[cfg(feature = "sign")]
+                    settings.verifier.as_deref(),
+                ) {
+                    dedup.observe(&key).await;
+                }
             }
+            from = batch.next_offset;
         }
     }
     Ok(())
@@ -2319,6 +2398,167 @@ impl DedupWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const DRAIN_BOUND: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn given_lanes_holding_more_completions_than_the_completion_channel_fits_when_draining_then_should_commit_every_one_and_end()
+     {
+        let (commits, completions) = tokio::sync::mpsc::channel(2);
+        let lanes = (0..2)
+            .map(|partition_id| {
+                let commits = commits.clone();
+                tokio::spawn(async move {
+                    for offset in 0..4 {
+                        let _ = commits.send(Ok(handled(partition_id, offset))).await;
+                    }
+                })
+            })
+            .collect();
+        drop(commits);
+        let drain = LaneDrain {
+            lanes,
+            completions,
+            delivered: true,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let committed = RecordingCommits::default();
+
+        let drained = tokio::time::timeout(DRAIN_BOUND, drain.finish(&committed, false)).await;
+
+        assert!(
+            matches!(drained, Ok(Ok(()))),
+            "the drain ends once the lanes are done: {drained:?}"
+        );
+        let mut positions = committed.positions();
+        positions.sort_by_key(|position| (position.partition_id, position.offset));
+        let expected: Vec<MessageId> = (0..2)
+            .flat_map(|partition_id| (0..4).map(move |offset| MessageId::new(partition_id, offset)))
+            .collect();
+        assert_eq!(positions, expected);
+    }
+
+    #[tokio::test]
+    async fn given_a_lane_with_queued_records_when_its_drain_is_dropped_then_should_finish_the_record_in_hand_and_handle_no_more()
+     {
+        let (queue_sender, queue) = tokio::sync::mpsc::channel(4);
+        let (commits, mut completions) = tokio::sync::mpsc::channel(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (release, released) = oneshot::channel::<()>();
+        let (started, in_hand) = oneshot::channel::<()>();
+        let held = Arc::new(Mutex::new(Some((started, released))));
+        let offsets = Arc::new(Mutex::new(Vec::new()));
+        let handler_offsets = Arc::clone(&offsets);
+        let lane = tokio::spawn(run_lane(
+            None,
+            queue,
+            move |message: ConsumerMessage| {
+                let held = Arc::clone(&held);
+                let offsets = Arc::clone(&handler_offsets);
+                async move {
+                    let first = held.lock().expect("held lock").take();
+                    if let Some((started, released)) = first {
+                        let _ = started.send(());
+                        let _ = released.await;
+                    }
+                    offsets
+                        .lock()
+                        .expect("offsets lock")
+                        .push(message.position.offset);
+                    Ok(message)
+                }
+            },
+            commits,
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::clone(&stop),
+        ));
+        let permits = Arc::new(tokio::sync::Semaphore::new(4));
+        for offset in 0..2 {
+            let queued = QueuedMessage {
+                message: handled(0, offset),
+                record_permit: Arc::clone(&permits)
+                    .acquire_owned()
+                    .await
+                    .expect("record permit"),
+                byte_permit: Arc::clone(&permits)
+                    .acquire_owned()
+                    .await
+                    .expect("byte permit"),
+            };
+            queue_sender.send(queued).await.expect("queue the record");
+        }
+        drop(queue_sender);
+        in_hand.await.expect("the lane takes the first record");
+        let (_unused, unread) = tokio::sync::mpsc::channel(1);
+
+        drop(LaneDrain {
+            lanes: Vec::new(),
+            completions: unread,
+            delivered: true,
+            stop,
+        });
+        release.send(()).expect("release the record in hand");
+        tokio::time::timeout(DRAIN_BOUND, lane)
+            .await
+            .expect("the lane ends once stopped")
+            .expect("the lane task ends cleanly");
+
+        assert_eq!(*offsets.lock().expect("offsets lock"), vec![0]);
+        let completed = completions
+            .recv()
+            .await
+            .expect("the handled record is reported");
+        assert_eq!(completed.expect("handled").position.offset, 0);
+        assert!(
+            completions.try_recv().is_err(),
+            "the queued record after the stop is neither handled nor reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_lane_failure_among_more_completions_than_the_channel_fits_when_draining_then_should_stop_committing_at_it_and_wait_for_the_lane()
+     {
+        let (commits, completions) = tokio::sync::mpsc::channel(1);
+        let finished = Arc::new(AtomicBool::new(false));
+        let lane_finished = Arc::clone(&finished);
+        let lane = tokio::spawn(async move {
+            let completed = [
+                Ok(handled(0, 0)),
+                Ok(handled(0, 1)),
+                Err(LaserError::Invalid("the lane failed".to_owned())),
+                Ok(handled(0, 3)),
+                Ok(handled(0, 4)),
+            ];
+            for completion in completed {
+                let _ = commits.send(completion).await;
+            }
+            lane_finished.store(true, Ordering::SeqCst);
+        });
+        let drain = LaneDrain {
+            lanes: vec![lane],
+            completions,
+            delivered: true,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let committed = RecordingCommits::default();
+
+        let drained = tokio::time::timeout(DRAIN_BOUND, drain.finish(&committed, false)).await;
+
+        assert!(
+            matches!(&drained, Ok(Err(LaserError::Invalid(message))) if message == "the lane failed"),
+            "the drain reports the lane failure: {drained:?}"
+        );
+        assert_eq!(
+            committed.positions(),
+            vec![MessageId::new(0, 0), MessageId::new(0, 1)]
+        );
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the lane finished its queue before the drain ended"
+        );
+    }
 
     #[test]
     fn given_consumer_failures_when_backing_off_then_should_jitter_within_the_upper_half() {
@@ -2490,5 +2730,33 @@ mod tests {
         assert!(accept_fence(&high_water, &sweep, task_a, 2, 103));
         // A different task keeps its own high water, so a low fence there is fine.
         assert!(accept_fence(&high_water, &sweep, task_b, 1, 104));
+    }
+
+    fn handled(partition_id: u32, offset: u64) -> ConsumerMessage {
+        let mut message = IggyMessage::builder()
+            .payload(Bytes::from_static(b"handled"))
+            .build()
+            .expect("a valid record");
+        message.header.offset = offset;
+        ConsumerMessage::of(message, partition_id, offset, None)
+    }
+
+    #[derive(Default)]
+    struct RecordingCommits(Mutex<Vec<MessageId>>);
+
+    impl RecordingCommits {
+        fn positions(&self) -> Vec<MessageId> {
+            self.0.lock().expect("commit log lock").clone()
+        }
+    }
+
+    impl DrainCommit for RecordingCommits {
+        async fn commit(&self, message: &ConsumerMessage) -> Result<(), LaserError> {
+            self.0
+                .lock()
+                .expect("commit log lock")
+                .push(message.position);
+            Ok(())
+        }
     }
 }

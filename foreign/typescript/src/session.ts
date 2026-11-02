@@ -589,7 +589,7 @@ export class Sessions {
     return SessionListRequest.create(this.laser, this.stream())
   }
 
-  /** A page of one session's events in broker time order. Chain the paging
+  /** A page of one session's events in server append time order. Chain the paging
    * and finish with `fetch`. */
   events(id: ConversationId): SessionEventsRequest {
     return SessionEventsRequest.create(this.laser, this.stream(), wireConversation(id))

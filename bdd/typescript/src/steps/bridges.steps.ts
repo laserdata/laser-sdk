@@ -208,7 +208,6 @@ Given(
       const responder = Agent.builder()
         .id(AgentId.new(name))
         .listenOn(AgentTopic.Sessions)
-        .pollInterval(5)
         .handler({
           async handle(message, context): Promise<void> {
             const envelope = message.envelope;

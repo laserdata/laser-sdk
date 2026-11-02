@@ -1,4 +1,5 @@
 use crate::harness;
+use crate::test_iggy::TestIggyCluster;
 use async_trait::async_trait;
 use iggy::prelude::{Identifier, StreamClient, TopicClient};
 use laser_sdk::agent::{ParkedRecords, SessionControl};
@@ -12,10 +13,21 @@ use laser_sdk::wire::content::ContentType;
 use laser_sdk::wire::dispatch::OPERATION_SESSION_PAUSE;
 use laser_sdk::wire::framing::{decode_named, encode_named};
 use laser_sdk::wire::graph::SourceRef;
-use std::collections::HashSet;
+use laser_sdk::wire::topics::AGENT_CONTROL;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::time::Instant;
+
+const CLUSTER_PARTITIONS: u32 = 3;
+const CLUSTER_SESSIONS: usize = 6;
+const CONTROL_HOLD: Duration = Duration::from_secs(20);
+// A follower woken by the request acknowledges in moments, one that waited out
+// its hold takes `CONTROL_HOLD`, so half of it tells the two apart.
+const PROMPT: Duration = Duration::from_secs(CONTROL_HOLD.as_secs() / 2);
+const RECOVERY: Duration = Duration::from_secs(90);
+const FIVE_NODES: usize = 5;
 
 fn worker_id() -> AgentId {
     "pauser".parse().expect("valid agent id")
@@ -134,11 +146,146 @@ impl ActionGovernor for Faults {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_control_partitions_led_by_different_nodes_on_a_cluster_when_sessions_are_paused_then_the_control_follower_should_acknowledge_each_without_waiting_out_its_hold_also_after_a_node_restart()
+ {
+    let mut cluster = TestIggyCluster::start().await;
+    pauses_across_nodes(&mut cluster, "cluster_pause").await;
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_control_partitions_stored_on_three_of_five_nodes_on_a_cluster_when_sessions_are_paused_then_the_control_follower_should_read_them_from_their_members_also_after_a_member_restart()
+ {
+    let mut cluster = TestIggyCluster::start_sized(FIVE_NODES, |_| {
+        vec![(
+            "IGGY_CLUSTER_DEFAULT_REPLICATION_FACTOR".to_owned(),
+            "3".to_owned(),
+        )]
+    })
+    .await;
+    pauses_across_nodes(&mut cluster, "cluster_pause_rf3").await;
+}
+
+// Pauses and resumes over control partitions of different primaries are
+// acknowledged promptly, also while and after a node that leads one of them
+// restarts.
+async fn pauses_across_nodes(cluster: &mut TestIggyCluster, stream: &str) {
+    let leader = cluster.leader(0).await;
+    cluster.route_endpoint_to(leader);
+    let laser = harness::cluster_laser(cluster, stream).await;
+    laser
+        .bootstrap(
+            CLUSTER_PARTITIONS,
+            laser_sdk::agent::TopicRetention::expire_after(Duration::from_secs(86_400)),
+        )
+        .await
+        .expect("bootstrap");
+    laser
+        .topic(AgentTopic::Control.topic_string())
+        .ensure(CLUSTER_PARTITIONS, None)
+        .await
+        .expect("provisioning creates the control topic");
+    let primaries = harness::partition_primaries(&laser, AGENT_CONTROL, CLUSTER_PARTITIONS).await;
+    assert!(
+        primaries.iter().collect::<BTreeSet<_>>().len() > 1,
+        "the control partitions are led by different nodes: {primaries:?}"
+    );
+    let members = harness::partition_members(&laser, AGENT_CONTROL).await;
+    for (partition, primary) in (0..CLUSTER_PARTITIONS).zip(&primaries) {
+        assert!(
+            members[&partition].contains(primary),
+            "control partition {partition} is led by a member: {primary} of {members:?}"
+        );
+    }
+    let seen = Seen::default();
+    let mut worker = Agent::builder()
+        .id(worker_id().as_str().parse().expect("valid agent id"))
+        .listen_on(AgentTopic::Sessions)
+        .max_wait(CONTROL_HOLD)
+        .handler(Recorder {
+            seen: seen.clone(),
+            hang: None,
+        })
+        .build()
+        .spawn(laser.clone());
+    worker.ready().await.expect("the worker is ready");
+
+    let paused_on = pause_round(&laser, &seen, "before", PROMPT).await;
+    let nodes: BTreeSet<u8> = paused_on
+        .iter()
+        .map(|partition| primaries[*partition as usize])
+        .collect();
+    assert!(
+        nodes.len() > 1,
+        "the pause requests landed on partitions of different primaries: {paused_on:?} over {primaries:?}"
+    );
+
+    let restarted = (0..cluster.size())
+        .filter(|node| *node != leader)
+        .find(|node| {
+            primaries
+                .iter()
+                .any(|primary| usize::from(*primary) == *node)
+        })
+        .unwrap_or_else(|| (leader + 1) % cluster.size());
+    cluster.restart_node(restarted).await;
+    pause_round(&laser, &seen, "recovering", RECOVERY).await;
+    pause_round(&laser, &seen, "after", PROMPT).await;
+    worker.shutdown().await.expect("the worker stops");
+}
+
+// Give each of `CLUSTER_SESSIONS` new sessions one record of work, then pause
+// and resume each one. Every acknowledgment arrives within `bound` of its
+// request. Returns the control partition of each pause.
+async fn pause_round(laser: &Laser, seen: &Seen, body: &str, bound: Duration) -> Vec<u32> {
+    let sessions: Vec<ConversationId> = (0..CLUSTER_SESSIONS)
+        .map(|_| ConversationId::new())
+        .collect();
+    for session in &sessions {
+        send_work(laser, *session, body).await;
+    }
+    wait_seen(seen, body, CLUSTER_SESSIONS).await;
+    let mut partitions = Vec::new();
+    for session in sessions {
+        let control = control(laser, session);
+        let started = Instant::now();
+        let pause = position(control.pause().await.expect("pause is sent"));
+        wait_acknowledged_within(laser, session, TaskState::Paused, pause, started, bound).await;
+        let started = Instant::now();
+        let resume = position(control.resume().await.expect("resume is sent"));
+        wait_acknowledged_within(laser, session, TaskState::Working, resume, started, bound).await;
+        partitions.push(pause.0);
+    }
+    partitions
+}
+
+async fn wait_acknowledged_within(
+    laser: &Laser,
+    session: ConversationId,
+    state: TaskState,
+    request: (u32, u64),
+    started: Instant,
+    bound: Duration,
+) {
+    while !acknowledgments(laser, session)
+        .await
+        .contains(&(state, request))
+    {
+        assert!(
+            started.elapsed() < bound,
+            "the {state:?} request at {request:?} was not acknowledged within {bound:?}, the control follower waited out its hold"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn setup() -> Laser {
     let laser = harness::laser().await;
     laser
         .topic(AgentTopic::Control.topic_string())
-        .ensure(4)
+        .ensure(4, None)
         .await
         .expect("provisioning creates the control topic");
     laser
@@ -348,7 +495,7 @@ async fn given_the_group_engine_and_partition_lanes_when_paused_and_resumed_then
     let laser = harness::connected_laser().await;
     laser
         .topic(AgentTopic::Control.topic_string())
-        .ensure(1)
+        .ensure(1, None)
         .await
         .expect("provisioning creates the control topic");
     pause_cycles(
@@ -788,7 +935,7 @@ async fn given_a_control_topic_created_after_start_when_paused_then_should_hold_
     let worker = spawn(&laser, &seen, None, ConcurrencyPolicy::Serial).await;
     laser
         .topic(AgentTopic::Control.topic_string())
-        .ensure(4)
+        .ensure(4, None)
         .await
         .expect("provisioning creates the control topic late");
     let session = ConversationId::new();

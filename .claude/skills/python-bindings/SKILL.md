@@ -38,7 +38,7 @@ Default `recall` reads the managed KV view. `recall(folded=True)` and `fetch_fol
 Graph traversals, queries, and KV scans scope with `.conversation(id)`. Build borrowed Rust handles for each Python call and retain owned state between calls. The local vector backend shares its items through `Arc`.
 
 - `src/bin/stub_gen.rs` - generates `laser_sdk.pyi` and appends the exception hierarchy (which `create_exception!` does not expose to the stub gatherer).
-- `tests/` - pytest. `test_smoke.py`, `test_parity.py`, `test_parity_helpers.py`, `test_coordination_client.py`, and `test_readme_snippets.py` need no server. `test_integration.py`, `test_filters.py`, `test_publish_failures.py`, `test_resume_parity.py`, and the callback suites (`test_trait_hooks.py`, `test_snapshot_callbacks.py`, `test_workflow_callbacks.py`) use the shared native Iggy fixture. `test_connect_timeout.py`, `test_rbac.py`, and `test_reconnect.py` cover connection behavior.
+- `tests/` - pytest. `test_smoke.py`, `test_parity.py`, `test_parity_helpers.py`, `test_coordination_client.py`, and `test_readme_snippets.py` need no server. `test_cluster.py` and `test_cluster_filters.py` run three-node clusters through `IggyTestCluster` in `iggy_test_server.py` (`set_node_environment`, `kill_node`, `partition_primaries`, `topic_details`), and `test_cluster_filters.py` binds group policies through `StandInCatalog`, which builds and launches the `laser-test-catalog` and `laser-test-routes` binaries of the `test-support/` crate with cargo on first use. `test_integration.py`, `test_filters.py`, `test_publish_failures.py`, `test_resume_parity.py`, and the callback suites (`test_trait_hooks.py`, `test_snapshot_callbacks.py`, `test_workflow_callbacks.py`) use the shared native Iggy fixture. `test_connect_timeout.py`, `test_rbac.py`, and `test_reconnect.py` cover connection behavior.
 - `bdd/python/` - the Python BDD runner over the shared Gherkin in `bdd/scenarios/`. Streaming, capabilities, provenance, and agent run against Iggy. Query and key-value CAS use the transport-free reference engine.
 
 ## Data stack parity
@@ -79,7 +79,7 @@ Pass `MutationPosition { topic_generation, partition, offset }` to `Kv.get_entry
 ## Versioning and naming
 
 - The Python package is `laser-sdk` on PyPI, imported as `laser_sdk`. The internal Rust crate is `laser-sdk-python` (`publish = false`) with cdylib lib `laser_sdk_py`, named to avoid clashing with the `laser_sdk` dependency crate. Maturin renames the built module to `laser_sdk` via `module-name`.
-- Python follows the shared workspace version, currently `0.9.0-dev.1`. Its dependency must select the matching Rust `laser-sdk` crate.
+- Python follows the shared workspace version, currently `0.9.0-dev.2`. Its dependency must select the matching Rust `laser-sdk` crate.
 
 ## Working on it
 
@@ -90,6 +90,8 @@ Pass `MutationPosition { topic_generation, partition, offset }` to `Kv.get_entry
 - Tests: `pytest -q` against the versioned Iggy server, plus the BDD suite in `bdd/python`. `LASER_TEST_IGGY_SERVER` selects a local Iggy binary for development.
 - After a Rust API or wire change, update Python bindings and regenerate stubs. Update the corresponding tests and documentation in the same authorized change.
 - After any public surface change, regenerate `docs/parity.md` with `python3 scripts/check-parity.py --write`, then run `just parity-check`.
+
+`Topic.ensure(partitions, replication_factor=None)` and `Topic.producer(..., replication_factor=None)` set a topic's replication factor on create, `None` the server default. The module constant `MAX_REPLICATION_FACTOR` is 32. Rust validates the range and raises `InvalidError`, and the server's refusal of a factor above the node count is a `TransportError` carrying `iggy_error_code`.
 
 ## Publish recovery
 

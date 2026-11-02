@@ -288,7 +288,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Agent.handler` | `Laser.spawn_agent(handler=)` | `AgentBuilder.handler` | keywords |
 | `Agent.respond_on` | `Laser.spawn_agent(respond_on=)` | `AgentBuilder.respondOn` | keywords |
 | `Agent.inbox_route` | `Laser.spawn_agent(fixed_inbox=)` | `AgentBuilder.inboxRoute` | keywords |
-| `Agent.poll_interval` | `Laser.spawn_agent(poll_interval_ms=)` | `AgentBuilder.pollInterval` | keywords |
+| `Agent.max_wait` | `Laser.spawn_agent(max_wait_ms=)` | `AgentBuilder.maxWait` | keywords |
 | `Agent.shutdown_grace` | `Laser.spawn_agent(shutdown_grace_ms=)` | `AgentBuilder.shutdownGrace` | keywords |
 | `Agent.concurrency` | `Laser.spawn_agent(max_partitions=)` | `AgentBuilder.concurrency` | keywords |
 | `Agent.max_queued_records` | `Laser.spawn_agent(max_queued_records=)` | `AgentBuilder.maxQueuedRecords` | keywords |
@@ -330,6 +330,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AgentBuilder::listen_on` | `Laser.spawn_agent(listen_on=)` | `AgentBuilder.listenOn` | keywords |
 | `AgentBuilder::max_queued_bytes` | `Laser.spawn_agent(max_queued_bytes=)` | `AgentBuilder.maxQueuedBytes` | keywords |
 | `AgentBuilder::max_queued_records` | `Laser.spawn_agent(max_queued_records=)` | `AgentBuilder.maxQueuedRecords` | keywords |
+| `AgentBuilder::max_wait` | `Laser.spawn_agent(max_wait_ms=)` | `AgentBuilder.maxWait` | keywords |
 | `AgentBuilder::maybe_ack_on_pickup` | `Laser.spawn_agent(ack_on_pickup=)` | `AgentBuilder.ackOnPickup` | keywords |
 | `AgentBuilder::maybe_capabilities` | `Laser.spawn_agent(capabilities=)` | `AgentBuilder.capabilities` | keywords |
 | `AgentBuilder::maybe_concurrency` | `Laser.spawn_agent(max_partitions=)` | `AgentBuilder.concurrency` | keywords |
@@ -343,10 +344,10 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AgentBuilder::maybe_inbox_route` | `Laser.spawn_agent(fixed_inbox=)` | `AgentBuilder.inboxRoute` | keywords |
 | `AgentBuilder::maybe_max_queued_bytes` | `Laser.spawn_agent(max_queued_bytes=)` | `AgentBuilder.maxQueuedBytes` | keywords |
 | `AgentBuilder::maybe_max_queued_records` | `Laser.spawn_agent(max_queued_records=)` | `AgentBuilder.maxQueuedRecords` | keywords |
+| `AgentBuilder::maybe_max_wait` | `Laser.spawn_agent(max_wait_ms=)` | `AgentBuilder.maxWait` | keywords |
 | `AgentBuilder::maybe_middleware` | `Laser.spawn_agent(middleware=)` | `AgentBuilder.middleware` | keywords |
 | `AgentBuilder::maybe_on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `AgentBuilder.onDeadLetter` | keywords |
 | `AgentBuilder::maybe_operations` | `Laser.spawn_agent(operations=)` | `AgentBuilder.operations` | keywords |
-| `AgentBuilder::maybe_poll_interval` | `Laser.spawn_agent(poll_interval_ms=)` | `AgentBuilder.pollInterval` | keywords |
 | `AgentBuilder::maybe_respond_on` | `Laser.spawn_agent(respond_on=)` | `AgentBuilder.respondOn` | keywords |
 | `AgentBuilder::maybe_retry` | `Laser.spawn_agent(retry_max_attempts=, retry_base_delay_ms=)` | `AgentBuilder.retry` | keywords |
 | `AgentBuilder::maybe_sessions` | `Laser.spawn_agent(sessions=)` | `AgentBuilder.sessions` | keywords |
@@ -358,7 +359,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AgentBuilder::middleware` | `Laser.spawn_agent(middleware=)` | `AgentBuilder.middleware` | keywords |
 | `AgentBuilder::on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `AgentBuilder.onDeadLetter` | keywords |
 | `AgentBuilder::operations` | `Laser.spawn_agent(operations=)` | `AgentBuilder.operations` | keywords |
-| `AgentBuilder::poll_interval` | `Laser.spawn_agent(poll_interval_ms=)` | `AgentBuilder.pollInterval` | keywords |
 | `AgentBuilder::respond_on` | `Laser.spawn_agent(respond_on=)` | `AgentBuilder.respondOn` | keywords |
 | `AgentBuilder::retry` | `Laser.spawn_agent(retry_max_attempts=, retry_base_delay_ms=)` | `AgentBuilder.retry` | keywords |
 | `AgentBuilder::sessions` | `Laser.spawn_agent(sessions=)` | `AgentBuilder.sessions` | keywords |
@@ -672,6 +672,8 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `LocalAgentHandler` | `Laser.spawn_agent(handler=)` | `AgentHandler` | callback, trait-variant |
 | `LocalAgentHandler::handle` | `Laser.spawn_agent(handler=)` | `AgentHandler.handle` | callback, keywords |
 | `agent::MAX_CHUNK_BODY_BYTES` | `const:MAX_CHUNK_BODY_BYTES` | `const:MAX_CHUNK_BODY_BYTES` |  |
+| `agent::MAX_SESSION_CURSOR_BYTES` | `const:MAX_SESSION_CURSOR_BYTES` | `const:MAX_SESSION_CURSOR_BYTES` |  |
+| `agent::MAX_SESSION_TEXT_QUERY_BYTES` | `const:MAX_SESSION_TEXT_QUERY_BYTES` | `const:MAX_SESSION_TEXT_QUERY_BYTES` |  |
 | `MemoryHandler` | `MemoryHandler` | `MemoryHandler` |  |
 | `MemoryHandler::auto_remember` | `MemoryHandler.auto_remember` | `MemoryHandler.autoRemember` |  |
 | `MemoryHandler::new` | `new MemoryHandler()` | `new MemoryHandler()` | constructor |
@@ -723,7 +725,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ReliableConsumer.dedup_window` | `Laser.spawn_agent(dedup_window=)` | `ReliableConsumerOptions.dedupWindow` | keywords |
 | `ReliableConsumer.retry` | `Laser.spawn_agent(retry_max_attempts=, retry_base_delay_ms=)` | `ReliableConsumerOptions.retry` | keywords |
 | `ReliableConsumer.understood_features` | `Laser.spawn_agent(understood_features=)` | `ReliableConsumerOptions.understoodFeatures` | keywords |
-| `ReliableConsumer.poll_interval` | `Laser.spawn_agent(poll_interval_ms=)` | `ReliableConsumerOptions.pollIntervalMs` | keywords |
+| `ReliableConsumer.max_wait` | `Laser.spawn_agent(max_wait_ms=)` | `ReliableConsumerOptions.maxWaitMs` | keywords |
 | `ReliableConsumer.shutdown_grace` | `Laser.spawn_agent(shutdown_grace_ms=)` | `ReliableConsumerOptions.shutdownGraceMs` | keywords |
 | `ReliableConsumer.concurrency` | `Laser.spawn_agent(max_partitions=)` | `ReliableConsumerOptions.concurrency` | keywords |
 | `ReliableConsumer.max_queued_records` | `Laser.spawn_agent(max_queued_records=)` | `ReliableConsumerOptions.maxQueuedRecords` | keywords |
@@ -752,6 +754,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ReliableConsumerBuilder::inbox_route` | `Laser.spawn_agent(fixed_inbox=)` | `ReliableConsumerOptions.inboxRoute` | keywords |
 | `ReliableConsumerBuilder::max_queued_bytes` | `Laser.spawn_agent(max_queued_bytes=)` | `ReliableConsumerOptions.maxQueuedBytes` | keywords |
 | `ReliableConsumerBuilder::max_queued_records` | `Laser.spawn_agent(max_queued_records=)` | `ReliableConsumerOptions.maxQueuedRecords` | keywords |
+| `ReliableConsumerBuilder::max_wait` | `Laser.spawn_agent(max_wait_ms=)` | `ReliableConsumerOptions.maxWaitMs` | keywords |
 | `ReliableConsumerBuilder::maybe_ack_on_pickup` | `Laser.spawn_agent(ack_on_pickup=)` | `ReliableConsumerOptions.ackOnPickup` | keywords |
 | `ReliableConsumerBuilder::maybe_agent` | `Laser.spawn_agent(agent_id=)` | `ReliableConsumerOptions.agent` | keywords |
 | `ReliableConsumerBuilder::maybe_concurrency` | `Laser.spawn_agent(max_partitions=)` | `ReliableConsumerOptions.concurrency` | keywords |
@@ -760,10 +763,10 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ReliableConsumerBuilder::maybe_inbox_route` | `Laser.spawn_agent(fixed_inbox=)` | `ReliableConsumerOptions.inboxRoute` | keywords |
 | `ReliableConsumerBuilder::maybe_max_queued_bytes` | `Laser.spawn_agent(max_queued_bytes=)` | `ReliableConsumerOptions.maxQueuedBytes` | keywords |
 | `ReliableConsumerBuilder::maybe_max_queued_records` | `Laser.spawn_agent(max_queued_records=)` | `ReliableConsumerOptions.maxQueuedRecords` | keywords |
+| `ReliableConsumerBuilder::maybe_max_wait` | `Laser.spawn_agent(max_wait_ms=)` | `ReliableConsumerOptions.maxWaitMs` | keywords |
 | `ReliableConsumerBuilder::maybe_middleware` | `Laser.spawn_agent(middleware=)` | `ReliableConsumerOptions.middleware` | keywords |
 | `ReliableConsumerBuilder::maybe_on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `ReliableConsumerOptions.onDeadLetter` | keywords |
 | `ReliableConsumerBuilder::maybe_operations` | `Laser.spawn_agent(operations=)` | `ReliableConsumerOptions.operations` | keywords |
-| `ReliableConsumerBuilder::maybe_poll_interval` | `Laser.spawn_agent(poll_interval_ms=)` | `ReliableConsumerOptions.pollIntervalMs` | keywords |
 | `ReliableConsumerBuilder::maybe_respond_on` | `Laser.spawn_agent(respond_on=)` | `ReliableConsumerOptions.respondOn` | keywords |
 | `ReliableConsumerBuilder::maybe_retry` | `Laser.spawn_agent(retry_max_attempts=, retry_base_delay_ms=)` | `ReliableConsumerOptions.retry` | keywords |
 | `ReliableConsumerBuilder::maybe_sessions` | `Laser.spawn_agent(sessions=)` | `ReliableConsumerOptions.sessions` | keywords |
@@ -775,7 +778,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ReliableConsumerBuilder::middleware` | `Laser.spawn_agent(middleware=)` | `ReliableConsumerOptions.middleware` | keywords |
 | `ReliableConsumerBuilder::on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `ReliableConsumerOptions.onDeadLetter` | keywords |
 | `ReliableConsumerBuilder::operations` | `Laser.spawn_agent(operations=)` | `ReliableConsumerOptions.operations` | keywords |
-| `ReliableConsumerBuilder::poll_interval` | `Laser.spawn_agent(poll_interval_ms=)` | `ReliableConsumerOptions.pollIntervalMs` | keywords |
 | `ReliableConsumerBuilder::respond_on` | `Laser.spawn_agent(respond_on=)` | `ReliableConsumerOptions.respondOn` | keywords |
 | `ReliableConsumerBuilder::retry` | `Laser.spawn_agent(retry_max_attempts=, retry_base_delay_ms=)` | `ReliableConsumerOptions.retry` | keywords |
 | `ReliableConsumerBuilder::sessions` | `Laser.spawn_agent(sessions=)` | `ReliableConsumerOptions.sessions` | keywords |
@@ -1347,6 +1349,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `FilterAnnounce` | `FilterAnnounce` | `FilterAnnounce` |  |
 | `FilterAnnounce.evaluator_version` | `FilterAnnounce.evaluator_version` | `FilterAnnounce.evaluatorVersion` | keywords |
 | `FilterAnnounce.codecs` | `FilterAnnounce.codecs` | `FilterAnnounce.codecs` | keywords |
+| `FilterAnnounce.max_wait_ms` | `FilterAnnounce.max_wait_ms` | `FilterAnnounce.maxWaitMs` | keywords |
 | `FilterAnnounce::evaluates` | `FilterAnnounce.evaluates` | `fn:filterAnnounceEvaluates` | free-function |
 | `FilterAnnounce::served` | `FilterAnnounce.served` | `fn:filterAnnounceServed` | free-function |
 | `FilterCaps` | `FilterCaps` | `FilterCaps` |  |
@@ -1354,6 +1357,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `FilterCaps.catalog` | `FilterCaps.catalog` | `FilterCaps.catalog` | keywords |
 | `FilterCaps.group_policy_reads` | `FilterCaps.group_policy_reads` | `FilterCaps.groupPolicyReads` | keywords |
 | `FilterCaps.evaluation` | `FilterCaps.evaluation` | `FilterCaps.evaluation` | keywords |
+| `FilterCaps.max_wait_ms` | `FilterCaps.max_wait_ms` | `FilterCaps.maxWaitMs` | keywords |
 | `FilterCaps::evaluates` | `FilterCaps.evaluates` | `fn:filterCapsEvaluates` | free-function |
 | `HelloOutcome` | omitted | `HelloOutcome` | plain-value |
 | `HelloOutcome::Unknown` | omitted | `HelloOutcome` | plain-value |
@@ -1838,6 +1842,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `FilteredReader::partitions` | `FilteredReader.partitions` | `FilteredReader.partitions` |  |
 | `FilteredReader::read_round` | `FilteredReader.read_round` | `FilteredReader.readRound` |  |
 | `FilteredReader::try_next_page` | `FilteredReader.try_next_page` | `FilteredReader.tryNextPage` |  |
+| `FilteredReader::wait_for_records` | `FilteredReader.wait_for_records` | `FilteredReader.waitForRecords` |  |
 | `FilteredReaderBuilder` | `ConsumerGroup.reader` | `FilteredReaderBuilder` | keywords |
 | `FilteredReaderBuilder::build` | `ConsumerGroup.reader` | `FilteredReaderBuilder.build` | one-call |
 | `FilteredReaderBuilder::count` | `ConsumerGroup.reader(count=)` | `FilteredReaderBuilder.count` | keywords |
@@ -1846,6 +1851,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `FilteredReaderBuilder::max_examined` | `ConsumerGroup.reader(max_examined=)` | `FilteredReaderBuilder.maxExamined` | keywords |
 | `FilteredReaderBuilder::max_reply_bytes` | `ConsumerGroup.reader(max_reply_bytes=)` | `FilteredReaderBuilder.maxReplyBytes` | keywords |
 | `FilteredReaderBuilder::max_unacked_pages` | `ConsumerGroup.reader(max_unacked_pages=)` | `FilteredReaderBuilder.maxUnackedPages` | keywords |
+| `FilteredReaderBuilder::max_wait` | `ConsumerGroup.reader(max_wait_ms=)` | `FilteredReaderBuilder.maxWait` | keywords |
 | `FilteredReaderBuilder::partition` | `ConsumerGroup.reader(partitions=)` | `FilteredReaderBuilder.partition` | keywords |
 | `FilteredReaderBuilder::start` | `ConsumerGroup.reader(start=)` | `FilteredReaderBuilder.start` | keywords |
 | `FilteredStart` | dict via `ConsumerGroup.reader` | `FilteredStart` | serde-dict |
@@ -2149,6 +2155,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `GraphHandle::start_nearest` | `GraphHandle.start_nearest` | `GraphHandle.startNearest` |  |
 | `GraphHandle::unlink` | `GraphHandle.unlink` | `GraphHandle.unlink` |  |
 | `GraphHandle::upsert` | `GraphHandle.upsert` | `GraphHandle.upsert` |  |
+| `graph::MAX_GRAPH_LABEL_BYTES` | `const:MAX_GRAPH_LABEL_BYTES` | `const:MAX_GRAPH_LABEL_BYTES` |  |
 
 ## intent
 
@@ -2617,6 +2624,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `LogMemory::recall_folded` | `MemoryHandle.recall(folded=)` | `LogMemory.recallFolded` | overload |
 | `LogMemory::set_named` | `LogMemory.set_named` | `LogMemory.setNamed` |  |
 | `LogMemory::update_named` | `LogMemory.update_named` | `LogMemory.updateNamed` |  |
+| `memory::MAX_MEMORY_ID_BYTES` | `const:MAX_MEMORY_ID_BYTES` | `const:MAX_MEMORY_ID_BYTES` |  |
 | `MaybeEmbedder` | omitted | omitted | shared-ownership |
 | `Memory` | `Laser.memory_custom(backend=)` | `Memory` | callback |
 | `Memory::remember` | `Laser.memory_custom(backend=)` | `Memory.remember` | callback, keywords |
@@ -3354,6 +3362,10 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Bindings` | `Bindings` | `Bindings` |  |
 | `Bindings::apply` | `Bindings.apply` | `Bindings.apply` |  |
 | `Bindings::remove` | `Bindings.remove` | `Bindings.remove` |  |
+| `projections::MAX_INDEX_FIELD_BYTES` | `const:MAX_INDEX_FIELD_BYTES` | `const:MAX_INDEX_FIELD_BYTES` |  |
+| `projections::MAX_PROJECTION_ID_BYTES` | `const:MAX_PROJECTION_ID_BYTES` | `const:MAX_PROJECTION_ID_BYTES` |  |
+| `projections::MAX_PROJECTION_NAME_BYTES` | `const:MAX_PROJECTION_NAME_BYTES` | `const:MAX_PROJECTION_NAME_BYTES` |  |
+| `projections::MAX_SCHEMA_NAME_BYTES` | `const:MAX_SCHEMA_NAME_BYTES` | `const:MAX_SCHEMA_NAME_BYTES` |  |
 | `Projections` | `Projections` | `Projections` |  |
 | `Projections::drop` | `Projections.drop` | `Projections.drop` |  |
 | `Projections::drop_graph` | `Projections.drop_graph` | `Projections.dropGraph` |  |
@@ -4405,16 +4417,16 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Consumer::stored_offset` | `Consumer.stored_offset` | `Consumer.storedOffset` |  |
 | `ConsumerBuilder` | `Topic.consumer` | `ConsumerOptions` | keywords |
 | `ConsumerBuilder::allow_replay` | `Topic.consumer(allow_replay=)` | `ConsumerOptions.allowReplay` | keywords |
-| `ConsumerBuilder::auto_join_group` | `ConsumerGroup.consumer(auto_join_group=)` | `ConsumerOptions.autoJoinGroup` | keywords |
 | `ConsumerBuilder::batch_length` | `Topic.consumer(batch_length=)` | `ConsumerOptions.batchLength` | keywords |
 | `ConsumerBuilder::build` | `Topic.consumer` | `Topic.consumer` | one-call |
 | `ConsumerBuilder::commit_policy` | `Topic.consumer(auto_commit=, commit_interval_ms=, commit_every=)` | `ConsumerOptions.commitPolicy` | keywords |
 | `ConsumerBuilder::create_group` | `ConsumerGroup.consumer(create_group=)` | `ConsumerOptions.createGroup` | keywords |
 | `ConsumerBuilder::init_retries` | `Topic.consumer(init_retries=)` | `ConsumerOptions.initRetries` | keywords |
-| `ConsumerBuilder::poll_interval` | `Topic.consumer(poll_interval_ms=)` | `ConsumerOptions.pollIntervalMs` | keywords |
+| `ConsumerBuilder::max_bytes` | `Topic.consumer(max_bytes=)` | `ConsumerOptions.maxBytes` | keywords |
+| `ConsumerBuilder::max_wait` | `Topic.consumer(max_wait_ms=)` | `ConsumerOptions.maxWaitMs` | keywords |
+| `ConsumerBuilder::min_count` | `Topic.consumer(min_count=)` | `ConsumerOptions.minCount` | keywords |
 | `ConsumerBuilder::polling_retry_interval` | `Topic.consumer(polling_retry_interval_ms=)` | `ConsumerOptions.pollingRetryIntervalMs` | keywords |
 | `ConsumerBuilder::start_at` | `Topic.consumer(polling=, offset=, timestamp_micros=)` | `ConsumerOptions.startAt` | keywords |
-| `ConsumerBuilder::without_poll_interval` | `Topic.consumer(poll_interval_ms=)` | `ConsumerOptions.pollIntervalMs` | overload |
 | `ConsumerGroup` | `ConsumerGroup` | `ConsumerGroup` |  |
 | `ConsumerGroup::consumer` | `ConsumerGroup.consumer` | `ConsumerGroup.consumer` |  |
 | `ConsumerGroup::create` | `ConsumerGroup.create` | `ConsumerGroup.create` |  |
@@ -4464,7 +4476,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ContentType::is_raw` | `fn:content_type_is_raw` | `fn:isRawContentType` | free-function |
 | `CreateConsumerGroup` | `ConsumerGroup.create` | `CreateConsumerGroupOptions` | keywords |
 | `CreateConsumerGroup::build` | `ConsumerGroup.create` | `ConsumerGroup.create` | one-call |
-| `CreateConsumerGroup::filter` | `ConsumerGroup.create(filter=)` | `CreateConsumerGroupOptions.filter` | keywords |
+| `CreateConsumerGroup::filter` | `ConsumerGroup.create(filter=)` | `CreateConsumerGroupOptions.filter + CreateConsumerGroupOptions.filterName` | keywords |
 | `CreateConsumerGroup::operation_id` | `ConsumerGroup.create(operation_id=)` | `CreateConsumerGroupOptions.operationId` | keywords |
 | `CreateConsumerGroup::policy` | `ConsumerGroup.create(filter_id=, revision=)` | `CreateConsumerGroupOptions.policy` | keywords |
 | `DecodeError` | omitted | omitted | converted-error |
@@ -4475,6 +4487,21 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Decoder` | `KvEntry.decode_value_with(codec=)` | `Decoder` | callback |
 | `Decoder::decode` | `KvEntry.decode_value_with(codec=)` | `Decoder.decode` | callback, keywords |
 | `DirectConfig` | omitted | omitted | rust-crate |
+| `FilterOwner` | dict via `GroupFilter.summary` | `wire.FilterOwner` | serde-dict |
+| `FilterOwner.identity` | dict key | `wire.FilterOwner.identity` | serde-dict, keywords |
+| `FilterOwner.group` | dict key | `wire.FilterOwner.group` | serde-dict, keywords |
+| `FilterSummary` | dict via `GroupFilter.summary` | `wire.FilterSummary` | serde-dict |
+| `FilterSummary.id` | dict key | `wire.FilterSummary.id` | serde-dict, keywords |
+| `FilterSummary.name` | dict key | `wire.FilterSummary.name` | serde-dict, keywords |
+| `FilterSummary.description` | dict key | `wire.FilterSummary.description` | serde-dict, keywords |
+| `FilterSummary.state` | dict key | `wire.FilterSummary.state` | serde-dict, keywords |
+| `FilterSummary.latest_revision` | dict key | `wire.FilterSummary.latestRevision` | serde-dict, keywords |
+| `FilterSummary.latest_digest` | dict key | `wire.FilterSummary.latestDigest` | serde-dict, keywords |
+| `FilterSummary.codec` | dict key | `wire.FilterSummary.codec` | serde-dict, keywords |
+| `FilterSummary.bindings` | dict key | `wire.FilterSummary.bindings` | serde-dict, keywords |
+| `FilterSummary.created_at_micros` | dict key | `wire.FilterSummary.createdAtMicros` | serde-dict, keywords |
+| `FilterSummary.updated_at_micros` | dict key | `wire.FilterSummary.updatedAtMicros` | serde-dict, keywords |
+| `FilterSummary.owner` | dict key | `wire.FilterSummary.owner` | serde-dict, keywords |
 | `GroupFilter` | `GroupFilter` | `GroupFilter` |  |
 | `GroupFilter::configure` | `GroupFilter.configure` | `GroupFilter.configure` |  |
 | `GroupFilter::configure_as` | `GroupFilter.configure_as` | `GroupFilter.configureAs` |  |
@@ -4486,6 +4513,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `GroupFilter::revise` | `GroupFilter.revise` | `GroupFilter.revise` |  |
 | `GroupFilter::revisions` | `GroupFilter.revisions` | `GroupFilter.revisions` |  |
 | `GroupFilter::set_revision_enabled` | `GroupFilter.set_revision_enabled` | `GroupFilter.setRevisionEnabled` |  |
+| `GroupFilter::summary` | `GroupFilter.summary` | `GroupFilter.summary` |  |
 | `GroupFilter::test` | `GroupFilter.test` | `GroupFilter.test` |  |
 | `HeaderKey` | omitted | omitted | rust-crate |
 | `HeaderValue` | omitted | `HeaderValue` | rust-crate |
@@ -4497,6 +4525,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `IggyProducerBuilder` | omitted | omitted | rust-crate |
 | `Json` | `Json` | `Json` |  |
 | `stream::LOGICAL_SCHEMA_FINGERPRINT` | `const:LOGICAL_SCHEMA_FINGERPRINT` | `const:LOGICAL_SCHEMA_FINGERPRINT` |  |
+| `stream::MAX_REPLICATION_FACTOR` | `const:MAX_REPLICATION_FACTOR` | `const:MAX_REPLICATION_FACTOR` |  |
 | `Msgpack` | `Msgpack` | `Msgpack` |  |
 | `OrderedSharding` | omitted | omitted | rust-crate |
 | `Producer` | `Producer` | `Producer` |  |
@@ -4519,6 +4548,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ProducerBuilder::max_topic_bytes` | `Topic.producer(max_topic_bytes=)` | `ProducerOptions.maxTopicBytes` | keywords |
 | `ProducerBuilder::never_expire` | `Topic.producer(never_expire=)` | `ProducerOptions.neverExpire` | keywords |
 | `ProducerBuilder::partitions` | `Topic.producer(partitions=)` | `ProducerOptions.partitions` | keywords |
+| `ProducerBuilder::replication_factor` | `Topic.producer(replication_factor=)` | `ProducerOptions.replicationFactor` | keywords |
 | `ProducerBuilder::retries` | `Topic.producer(retries=)` | `ProducerOptions.retries` | keywords |
 | `ProducerBuilder::retry_backoff` | `Topic.producer(retry_interval_ms=)` | `ProducerOptions.retryBackoffMs` | keywords |
 | `ProducerBuilder::routing` | `Topic.producer(key=, partition=)` | `ProducerOptions.routing` | keywords |

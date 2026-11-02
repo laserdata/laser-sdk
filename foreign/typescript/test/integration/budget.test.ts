@@ -109,7 +109,6 @@ void test("given_a_run_over_its_token_budget_when_the_next_step_starts_then_shou
     .id(spender)
     .listenOn(AgentTopic.Sessions)
     .respondOn(AgentTopic.Sessions)
-    .pollInterval(5)
     .handler({
       async handle(message, context): Promise<void> {
         const body = textDecoder.decode(message.envelope?.body)

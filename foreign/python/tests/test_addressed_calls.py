@@ -17,7 +17,7 @@ async def _workers(laser, names, seen):
             seen.append((name, bytes(envelope["body"])))
             await ctx.respond_input(ls.AgentTopic.Sessions, name.encode())
 
-        agent = laser.spawn_agent(name, ls.AgentTopic.Sessions, handle, poll_interval_ms=10)
+        agent = laser.spawn_agent(name, ls.AgentTopic.Sessions, handle)
         await agent.ready()
         agents.append(agent)
     return agents

@@ -558,11 +558,76 @@ def test_given_a_provenance_when_reading_the_partition_key_then_should_be_the_co
 
 def test_given_a_group_filter_when_inspected_then_should_mirror_the_rust_configure_verbs():
     configure = inspect.signature(ls.GroupFilter.configure)
-    assert list(configure.parameters)[1:] == ["filter"]
+    assert list(configure.parameters)[1:] == ["name", "filter"]
     configure_with = inspect.signature(ls.GroupFilter.configure_with)
-    assert list(configure_with.parameters)[1:] == ["filter", "filter_id", "revision"]
+    assert list(configure_with.parameters)[1:] == ["filter", "filter_name", "filter_id", "revision"]
     configure_as = inspect.signature(ls.GroupFilter.configure_as)
-    assert list(configure_as.parameters)[1:] == ["operation_id", "filter", "filter_id", "revision"]
+    assert list(configure_as.parameters)[1:] == [
+        "operation_id",
+        "filter",
+        "filter_name",
+        "filter_id",
+        "revision",
+    ]
+    assert keywords("ConsumerGroup", "create") == {
+        "filter",
+        "filter_name",
+        "filter_id",
+        "revision",
+        "operation_id",
+    }
+    assert list(inspect.signature(ls.GroupFilter.summary).parameters)[1:] == []
+
+
+@pytest.mark.parametrize(
+    ("class_name", "method"), [("Topic", "consumer"), ("ConsumerGroup", "consumer")]
+)
+def test_given_a_consumer_builder_when_inspected_then_should_offer_the_deferred_poll_knobs(
+    class_name, method
+):
+    parameters = inspect.signature(getattr(getattr(ls, class_name), method)).parameters
+    knobs = {name: parameters[name].default for name in ("max_wait_ms", "min_count", "max_bytes")}
+    assert knobs == {"max_wait_ms": 5_000, "min_count": 1, "max_bytes": 1_048_576}
+    assert "poll_interval_ms" not in parameters
+    assert "auto_join_group" not in parameters
+
+
+def test_given_a_topic_when_inspected_then_should_take_an_optional_replication_factor():
+    ensure = inspect.signature(ls.Topic.ensure).parameters
+    producer = inspect.signature(ls.Topic.producer).parameters
+    assert ensure["partitions"].default is inspect.Parameter.empty
+    assert ensure["replication_factor"].default is None
+    assert producer["replication_factor"].default is None
+    assert ls.MAX_REPLICATION_FACTOR == 32
+
+
+def test_given_the_name_limits_when_read_then_should_match_the_wire():
+    assert {
+        name: getattr(ls, name)
+        for name in (
+            "MAX_PROJECTION_ID_BYTES",
+            "MAX_PROJECTION_NAME_BYTES",
+            "MAX_INDEX_FIELD_BYTES",
+            "MAX_SCHEMA_NAME_BYTES",
+            "MAX_GRAPH_LABEL_BYTES",
+            "MAX_MEMORY_ID_BYTES",
+            "MAX_SESSION_TEXT_QUERY_BYTES",
+            "MAX_SESSION_CURSOR_BYTES",
+        )
+    } == {
+        "MAX_PROJECTION_ID_BYTES": 255,
+        "MAX_PROJECTION_NAME_BYTES": 255,
+        "MAX_INDEX_FIELD_BYTES": 255,
+        "MAX_SCHEMA_NAME_BYTES": 255,
+        "MAX_GRAPH_LABEL_BYTES": 128,
+        "MAX_MEMORY_ID_BYTES": 255,
+        "MAX_SESSION_TEXT_QUERY_BYTES": 1024,
+        "MAX_SESSION_CURSOR_BYTES": 512,
+    }
+
+
+def test_given_a_group_reader_when_inspected_then_should_take_the_filtered_wait():
+    assert {"idle_interval_ms", "max_wait_ms"} <= keywords("ConsumerGroup", "reader")
 
 
 def test_given_the_agdx_verbs_when_inspected_then_should_offer_every_rust_send_refinement():

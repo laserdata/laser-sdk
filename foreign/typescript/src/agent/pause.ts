@@ -1,8 +1,9 @@
 import { CONSUMER, CONTROL_DISCOVERY_MAX_MS, backoffDelay, jittered } from "../retry.js"
 import { INTERNAL_TRANSPORT } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
-import type { LaserTransport, PolledMessage } from "../iggy/apache-iggy.js"
+import { type LaserTransport, ONE_SHOT_POLL, type PolledMessage } from "../iggy/apache-iggy.js"
 import type { Session, Sessions } from "../session.js"
+import { heldRead } from "../stream/cursor.js"
 import { type AgentId, ConversationId } from "../types/ids.js"
 import {
   type AgentId as WireAgentId,
@@ -170,7 +171,7 @@ export class LateControlFollower {
     private readonly stream: string,
     private readonly me: WireAgentId | undefined,
     private readonly book: ControlBook,
-    private readonly pollIntervalMs: number,
+    private readonly maxWaitMs: number,
     private readonly onFeed?: (
       feed: ControlFeed
     ) => Promise<((session: string) => void) | undefined>
@@ -194,7 +195,7 @@ export class LateControlFollower {
   private async discover(): Promise<void> {
     const signal = this.stopper.signal
     const stopped = (): boolean => signal.aborted
-    let delay = Math.max(this.pollIntervalMs, 100)
+    let delay = CONTROL_DISCOVERY_START_MS
     while (!stopped()) {
       await pause(jittered(delay), signal)
       if (stopped()) return
@@ -222,7 +223,7 @@ export class LateControlFollower {
           this.me,
           this.book,
           notify,
-          this.pollIntervalMs
+          this.maxWaitMs
         )
         return
       }
@@ -231,11 +232,12 @@ export class LateControlFollower {
   }
 }
 
-/** The control follower: polls every `agent.control` partition from where the
- * startup read ended and records each request for `me` in the book, so every
- * instance of a role sees every request whatever partitions its consumer group
- * assigns it. Each request is handed to `notify`. When the follower stops, the
- * book stops claiming to be current and every read folds the log.
+/** The control follower: reads every `agent.control` partition from where the
+ * startup read ended, and after a pass that found nothing holds one read per
+ * partition on the server until a request lands on any of them, and records
+ * each request for `me` in the book, so every instance of a role sees every
+ * request whatever partitions its consumer group assigns it. Each request is handed to `notify`. When the follower stops, the book
+ * stops claiming to be current and every read folds the log.
  * @internal */
 export class ControlFollower {
   private readonly stopper = new AbortController()
@@ -248,7 +250,7 @@ export class ControlFollower {
     private readonly me: WireAgentId | undefined,
     private readonly book: ControlBook,
     private readonly notify: ((session: string) => void) | undefined,
-    private readonly pollIntervalMs: number
+    private readonly maxWaitMs: number
   ) {
     book.setLive(true)
     this.done = this.follow()
@@ -267,6 +269,7 @@ export class ControlFollower {
 
   private async follow(): Promise<void> {
     const signal = this.stopper.signal
+    const wait = { ...ONE_SHOT_POLL, maxWaitMs: this.maxWaitMs }
     let failures = 0
     let checked = Date.now()
     try {
@@ -280,11 +283,31 @@ export class ControlFollower {
               AGENT_CONTROL,
               CONTROL_READER,
               partition,
-              next
+              next,
+              ONE_SHOT_POLL,
+              signal
             )
             read ||= batch.messages.length > 0
             for (const message of batch.messages) this.observe(message, partition)
             this.feed.next.set(partition, batch.nextOffset)
+          }
+          if (!read) {
+            const held = await heldRead(
+              this.transport,
+              this.stream,
+              AGENT_CONTROL,
+              this.feed.next,
+              CONTROL_HELD_BATCH,
+              wait,
+              signal,
+              CONTROL_READER
+            )
+            if (held !== undefined) {
+              read = true
+              for (const message of held.messages) this.observe(message, held.partitionId)
+              const last = held.messages.at(-1)
+              if (last !== undefined) this.feed.next.set(held.partitionId, last.offset + 1n)
+            }
           }
           failures = 0
         } catch {
@@ -294,6 +317,8 @@ export class ControlFollower {
           continue
         }
         if (!read) {
+          // An idle pass yields to timers even when the reads answer at once.
+          await pause(0, signal)
           // A recreated agent.control starts every session's control history
           // again, so the book starts again from the new topic.
           if (Date.now() - checked >= CONTROL_TOPIC_CHECK_MS) {
@@ -311,7 +336,6 @@ export class ControlFollower {
               continue
             }
           }
-          await pause(this.pollIntervalMs, signal)
         }
       }
     } finally {
@@ -344,6 +368,10 @@ export class ControlFollower {
 /** How often an idle control follower checks that agent.control is still the
  * topic it reads. */
 const CONTROL_TOPIC_CHECK_MS = 5_000
+/** The first wait between looks for an `agent.control` topic, as Rust. */
+const CONTROL_DISCOVERY_START_MS = 100
+/** Most records one held read of a control partition returns. */
+const CONTROL_HELD_BATCH = 1_000
 
 // Capped exponential backoff between consecutive read failures: 50ms, 100ms,
 // 200ms, up to one second, spread over its upper half as Rust `backoff_for`.

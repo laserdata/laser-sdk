@@ -11,6 +11,7 @@ import {
   type SendMessagesConfirmation,
   type SendMessagesResponse,
   UNLIMITED_TOPIC_SIZE,
+  validateReplicationFactor,
   withMessageIds,
   xxHash32
 } from "../iggy/apache-iggy.js"
@@ -55,6 +56,10 @@ export interface ProducerOptions {
   readonly maxTopicBytes?: bigint
   /** Create the topic without a size limit. Set this or `maxTopicBytes`, not both. */
   readonly unlimitedTopicSize?: boolean
+  /** How many nodes store each partition of a topic this producer creates,
+   * 1..=`MAX_REPLICATION_FACTOR` and at most the cluster's node count. Leave
+   * it out for the server default. An existing topic keeps its own. */
+  readonly replicationFactor?: number
   /** Buffered background mode instead of the default direct mode. A send
    * returns once its records are queued, with no confirmations. Call
    * `shutdown()` to wait for the writes. */
@@ -327,6 +332,8 @@ export class Producer implements AsyncDisposable {
     if (options.maxTopicBytes !== undefined && options.maxTopicBytes <= 0n) {
       throw new InvalidError("producer maxTopicBytes must be greater than zero")
     }
+    if (options.replicationFactor !== undefined)
+      validateReplicationFactor(options.replicationFactor)
     const background = options.background
     this.onError = background?.onError
     this.background = background === undefined ? undefined : backgroundSettings(background)
@@ -410,14 +417,16 @@ export class Producer implements AsyncDisposable {
           : millisToMicros(this.options.expireAfterMs)
     const maxTopicSize =
       this.options.unlimitedTopicSize === true ? UNLIMITED_TOPIC_SIZE : this.options.maxTopicBytes
+    const replicationFactor = this.options.replicationFactor
     if (this.transport.createTopicIfAbsent !== undefined) {
       await this.transport.createTopicIfAbsent(this.streamName, this.topicName, partitions, {
         ...(maxTopicSize === undefined ? {} : { maxTopicSize }),
-        ...(expiry === undefined ? {} : { messageExpiryMicros: expiry })
+        ...(expiry === undefined ? {} : { messageExpiryMicros: expiry }),
+        ...(replicationFactor === undefined ? {} : { replicationFactor })
       })
       return
     }
-    if (maxTopicSize !== undefined || expiry !== undefined)
+    if (maxTopicSize !== undefined || expiry !== undefined || replicationFactor !== undefined)
       throw new InvalidError("this transport cannot set topic provisioning settings")
     await this.transport.ensureTopic(this.streamName, this.topicName, partitions)
   }

@@ -4,12 +4,15 @@ use crate::provenance::{AgentTopic, Provenance};
 use crate::types::{AgentId, ConversationId, IdError};
 use iggy::prelude::*;
 use laser_wire::graph::SourceRef;
+use laser_wire::validate::Validate;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 use tokio::sync::Mutex;
 use ulid::Ulid;
+
+pub use laser_wire::limits::MAX_MEMORY_ID_BYTES;
 
 // Per-partition poll size when `LogMemory` catches its projection up to the tail.
 const READ_BATCH: u32 = 1000;
@@ -1069,6 +1072,7 @@ impl LogMemory {
             kind: "fact".to_owned(),
             body: body.clone(),
         };
+        record.validate()?;
         let payload = laser_wire::framing::encode_named(&record)
             .map_err(|error| LaserError::Codec(format!("encode named memory item: {error}")))?;
         let scope = MemoryScope::default();
@@ -1096,6 +1100,7 @@ impl LogMemory {
             target: id.clone(),
             conversation: None,
         };
+        record.validate()?;
         let payload = laser_wire::framing::encode_named(&record)
             .map_err(|error| LaserError::Codec(format!("encode named memory forget: {error}")))?;
         let scope = MemoryScope::default();
@@ -1274,7 +1279,7 @@ impl LogMemory {
     /// Recall by reading the managed key-value read view. Scans the memory
     /// namespace narrowed to the scope's conversation (the lens the fold stamps),
     /// rebuilds each item from the stored scope, filters by agent/user/app, and
-    /// returns the most recent by broker append time and source address. Backs the default [`recall`](Memory::recall).
+    /// returns the most recent by server append time and source address. Backs the default [`recall`](Memory::recall).
     #[cfg(feature = "kv")]
     async fn recall_kv(
         &self,
@@ -1345,9 +1350,9 @@ where
     Ok(selected.into_values().rev().collect())
 }
 
-// Arrival order of a memory view row across partitions: the broker append time,
+// Arrival order of a memory view row across partitions: the server append time,
 // then the source address. Offsets from different topics or partitions are never
-// compared alone. A row without a broker time sorts as the oldest.
+// compared alone. A row without an append time sorts as the oldest.
 #[cfg(feature = "kv")]
 fn arrival_key(entry: &laser_wire::kv::KvEntry) -> (u64, u32, u32, u64) {
     let scope = entry.scope.as_deref();
@@ -2301,7 +2306,7 @@ impl MemoryTopicBuilder {
             None => IggyExpiry::NeverExpire,
         };
         self.laser
-            .ensure_topic_on_with(&stream, &self.topic, self.partitions, expiry)
+            .ensure_topic_on_with(&stream, &self.topic, self.partitions, expiry, None)
             .await?;
         let topic = Identifier::named(&self.topic)?;
         Ok(MemoryHandle::Log(LogMemory::on_stream_topic(
@@ -3223,6 +3228,25 @@ impl<'a> std::future::IntoFuture for RecallBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use laser_wire::limits::MAX_MEMORY_ID_BYTES;
+
+    #[tokio::test]
+    async fn given_a_named_key_over_the_memory_id_cap_when_written_then_should_refuse_it_before_sending()
+     {
+        let laser = Laser::from_client(IggyClient::default()).with_default_stream("acme");
+        let memory = LogMemory::in_namespace(laser, "notes");
+        let key = "k".repeat(MAX_MEMORY_ID_BYTES + 1 - "notes/".len());
+        let error = memory
+            .set_named(&key, b"value".to_vec())
+            .await
+            .expect_err("an over-long named id is refused");
+        assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
+        let error = memory
+            .forget_named(&key)
+            .await
+            .expect_err("an over-long named target is refused");
+        assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
+    }
 
     #[test]
     fn given_a_default_stream_when_naming_the_memory_namespace_then_should_scope_it_to_the_record_stream()
@@ -4421,7 +4445,7 @@ mod tests {
 
     #[cfg(feature = "kv")]
     #[tokio::test]
-    async fn given_content_ids_out_of_arrival_order_when_recalled_from_the_view_then_should_keep_the_latest_broker_time()
+    async fn given_content_ids_out_of_arrival_order_when_recalled_from_the_view_then_should_keep_the_latest_append_time()
      {
         let conversation = ConversationId::new();
         let stamped = |id: u128, partition: u32, timestamp: u64| {

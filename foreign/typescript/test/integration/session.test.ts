@@ -330,7 +330,6 @@ void test("given_a_submitted_session_when_its_agent_picks_it_up_then_should_move
     await using worker = Agent.builder()
       .id(AgentId.new("worker"))
       .listenOn(AgentTopic.Sessions)
-      .pollInterval(5)
       .handler({ handle: (_message, context) => context.session().end() })
       .build()
       .spawn(laser)

@@ -49,9 +49,7 @@ async def main() -> None:
             await ctx.respond_input(ls.AgentTopic.Sessions, b"approved")
 
         async def spawn(agent_id, handler):
-            handle = laser.spawn_agent(
-                agent_id, ls.AgentTopic.Sessions, handler, poll_interval_ms=10
-            )
+            handle = laser.spawn_agent(agent_id, ls.AgentTopic.Sessions, handler)
             await handle.ready()
             return handle
 

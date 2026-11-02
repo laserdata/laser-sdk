@@ -8,6 +8,7 @@ import {
   TransportError
 } from "../../src/client/errors.js"
 import { publishOptions } from "../../src/client/publish-options.js"
+import { LaneBlockedError, OperationUncertainError } from "apache-iggy"
 import { Laser } from "../../src/client/laser.js"
 import { ApacheIggyTransport, type IggyClient } from "../../src/iggy/apache-iggy.js"
 import { isPermissionDenied } from "../../src/client/error-classify.js"
@@ -391,4 +392,94 @@ void test("given_background_retry_timing_when_the_confirmation_is_lost_then_shou
     PublishFailedError
   )
   assert.equal(attempts, 1)
+})
+
+void test("given_an_uncertain_send_when_a_later_publish_is_blocked_by_it_then_should_resolve_it_first_and_never_resend_it", async () => {
+  const sent: number[] = []
+  const resolved: bigint[] = []
+  const client = {
+    clientProvider: () => Promise.resolve({}),
+    message: {
+      send: (request: Parameters<Send>[0]) => {
+        sent.push(request.messages.length)
+        if (sent.length === 1)
+          return Promise.reject(
+            new OperationUncertainError(7n, Object.assign(new Error("lost"), { errorCode: 58 }))
+          )
+        return resolved.length === 0
+          ? Promise.reject(new LaneBlockedError(7n))
+          : Promise.resolve({ confirmations: [] })
+      }
+    },
+    resolveOperation: (operationId: bigint) => {
+      resolved.push(operationId)
+      return Promise.resolve()
+    },
+    destroy: () => Promise.resolve()
+  } as unknown as IggyClient
+  const adapted = await ApacheIggyTransport.fromClient(client, "owned", {
+    timeoutMs: 1_000,
+    maxRetries: 3,
+    retryBackoffMs: 1
+  })
+  const send = () =>
+    adapted.sendMessages("stream", "topic", [new Uint8Array([1])], {
+      kind: "partition",
+      partition: 0
+    })
+  await assert.rejects(
+    send(),
+    (error: unknown) =>
+      error instanceof PublishFailedError &&
+      error.publishCause() instanceof TransportError &&
+      !(error.publishCause() as TransportError).retryable
+  )
+  assert.equal(sent.length, 1, "a send that may have committed is never resent")
+  await send()
+  assert.deepEqual(resolved, [7n])
+  assert.equal(sent.length, 3, "the blocked send goes out once more after the resolve")
+})
+
+void test("given_a_blocker_that_stays_uncertain_or_belongs_to_another_caller_when_publishing_then_should_report_the_blocked_lane", async () => {
+  for (const blocker of [7n, 9n]) {
+    let sends = 0
+    const resolved: bigint[] = []
+    const client = {
+      clientProvider: () => Promise.resolve({}),
+      message: {
+        send: () => {
+          sends += 1
+          return Promise.reject(
+            sends === 1
+              ? new OperationUncertainError(7n, new Error("lost"))
+              : new LaneBlockedError(blocker)
+          )
+        }
+      },
+      resolveOperation: (operationId: bigint) => {
+        resolved.push(operationId)
+        return Promise.reject(new OperationUncertainError(operationId, new Error("still lost")))
+      },
+      destroy: () => Promise.resolve()
+    } as unknown as IggyClient
+    const adapted = await ApacheIggyTransport.fromClient(client, "owned", {
+      timeoutMs: 1_000,
+      maxRetries: 3,
+      retryBackoffMs: 1
+    })
+    const send = () =>
+      adapted.sendMessages("stream", "topic", [new Uint8Array([1])], {
+        kind: "partition",
+        partition: 0
+      })
+    await assert.rejects(send(), PublishFailedError)
+    await assert.rejects(
+      send(),
+      (error: unknown) =>
+        error instanceof PublishFailedError &&
+        (error.publishCause() as TransportError).cause instanceof LaneBlockedError
+    )
+    assert.deepEqual(resolved, blocker === 7n ? [7n] : [], "only an own uncertain send is resolved")
+    assert.equal(sends, 2, "a lane that stays blocked sends nothing more")
+  }
 })

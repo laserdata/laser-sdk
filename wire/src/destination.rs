@@ -40,9 +40,7 @@ pub struct ProjectionRef {
 
 impl Validate for ProjectionRef {
     fn validate(&self) -> Result<(), InvalidError> {
-        if self.id.as_str().is_empty() {
-            return Err(InvalidError::new("projection id must not be empty"));
-        }
+        self.id.validate()?;
         if self.version == 0 {
             return Err(InvalidError::new("projection version must be nonzero"));
         }

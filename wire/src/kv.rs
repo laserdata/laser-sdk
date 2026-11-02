@@ -28,7 +28,7 @@ pub struct MemoryRowScope {
     /// while it is still on the log. Absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<crate::graph::SourceRef>,
-    /// The broker append time of the source record in microseconds. With the
+    /// The server append time of the source record in microseconds. With the
     /// source address, it orders items remembered on different partitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_micros: Option<u64>,

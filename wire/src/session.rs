@@ -1,8 +1,14 @@
 use crate::agent::{
     AgentId, Budget, ConversationId, CorrelationId, LogPosition, SdkInfo, SessionStatus, TokenUsage,
 };
+use crate::error::InvalidError;
 use crate::graph::SourceRef;
+use crate::limits::{
+    MAX_FILTER_SOURCE_NAME_BYTES, MAX_HEARTBEAT_SESSIONS, MAX_SESSION_CURSOR_BYTES,
+    MAX_SESSION_LABEL_BYTES, MAX_SESSION_TEXT_QUERY_BYTES,
+};
 use crate::schema::Digest32;
+use crate::validate::Validate;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -493,12 +499,36 @@ pub struct SessionHeartbeat {
     pub sessions: Vec<ConversationId>,
 }
 
-impl crate::validate::Validate for SessionHeartbeat {
-    fn validate(&self) -> Result<(), crate::error::InvalidError> {
-        if self.sessions.len() > crate::limits::MAX_HEARTBEAT_SESSIONS {
-            return Err(crate::error::InvalidError::new(
-                "heartbeat lists too many sessions",
-            ));
+impl Validate for request::SessionList {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if self.stream.is_empty() || self.stream.len() > MAX_FILTER_SOURCE_NAME_BYTES {
+            return Err(InvalidError::new(format!(
+                "session list stream must be 1..={MAX_FILTER_SOURCE_NAME_BYTES} bytes"
+            )));
+        }
+        let bounded = [
+            ("label prefix", &self.label_prefix, MAX_SESSION_LABEL_BYTES),
+            ("text", &self.text, MAX_SESSION_TEXT_QUERY_BYTES),
+            ("cursor", &self.cursor, MAX_SESSION_CURSOR_BYTES),
+        ];
+        for (label, value, cap) in bounded {
+            if let Some(value) = value
+                && value.len() > cap
+            {
+                return Err(InvalidError::new(format!(
+                    "session list {label} is {}B, exceeds cap {cap}B",
+                    value.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Validate for SessionHeartbeat {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if self.sessions.len() > MAX_HEARTBEAT_SESSIONS {
+            return Err(InvalidError::new("heartbeat lists too many sessions"));
         }
         Ok(())
     }
@@ -507,4 +537,65 @@ impl crate::validate::Validate for SessionHeartbeat {
 #[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip predicate")]
 fn is_zero_series(series: &u64) -> bool {
     *series == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_a_session_list_over_its_caps_when_validated_then_should_refuse_it() {
+        let list = request::SessionList {
+            stream: "agents".to_owned(),
+            status: None,
+            root: None,
+            label_prefix: None,
+            agent: None,
+            text: None,
+            cursor: None,
+            limit: 0,
+            want_total: false,
+        };
+        list.validate().expect("a plain session list is valid");
+        request::SessionList {
+            stream: "s".repeat(MAX_FILTER_SOURCE_NAME_BYTES),
+            label_prefix: Some("l".repeat(MAX_SESSION_LABEL_BYTES)),
+            text: Some("t".repeat(MAX_SESSION_TEXT_QUERY_BYTES)),
+            cursor: Some("c".repeat(MAX_SESSION_CURSOR_BYTES)),
+            ..list.clone()
+        }
+        .validate()
+        .expect("every filter at its cap is valid");
+        request::SessionList {
+            text: Some(String::new()),
+            cursor: Some(String::new()),
+            ..list.clone()
+        }
+        .validate()
+        .expect("an empty text and cursor are within their caps");
+        for invalid in [
+            request::SessionList {
+                stream: String::new(),
+                ..list.clone()
+            },
+            request::SessionList {
+                stream: "s".repeat(MAX_FILTER_SOURCE_NAME_BYTES + 1),
+                ..list.clone()
+            },
+            request::SessionList {
+                label_prefix: Some("l".repeat(MAX_SESSION_LABEL_BYTES + 1)),
+                ..list.clone()
+            },
+            request::SessionList {
+                text: Some("t".repeat(MAX_SESSION_TEXT_QUERY_BYTES + 1)),
+                ..list.clone()
+            },
+            request::SessionList {
+                cursor: Some("c".repeat(MAX_SESSION_CURSOR_BYTES + 1)),
+                ..list.clone()
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?}");
+        }
+    }
 }

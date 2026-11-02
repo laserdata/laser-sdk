@@ -282,13 +282,12 @@ export class AgentBuilder {
     maxQueuedBytes(value: number): this;
     // (undocumented)
     maxQueuedRecords(value: number): this;
+    maxWait(waitMs: number): this;
     // (undocumented)
     middleware(middleware: AgentMiddleware): this;
     // (undocumented)
     onDeadLetter(sink: DeadLetterSink): this;
     operations(operations: readonly string[]): this;
-    // (undocumented)
-    pollInterval(intervalMs: number): this;
     // (undocumented)
     respondOn(topic: string): this;
     // (undocumented)
@@ -1661,7 +1660,6 @@ export interface ConsumerGroupInfo {
 export class ConsumerGroupName {
     // (undocumented)
     asStr(): string;
-    // (undocumented)
     static forAgent(agent: AgentId): ConsumerGroupName;
     // (undocumented)
     static new(name: string): ConsumerGroupName;
@@ -1698,7 +1696,6 @@ export interface ConsumerMessage extends Message {
 // @public (undocumented)
 export interface ConsumerOptions {
     readonly allowReplay?: boolean;
-    readonly autoJoinGroup?: boolean;
     readonly batchLength?: number;
     readonly commitPolicy?: CommitPolicy;
     readonly createGroup?: boolean;
@@ -1706,9 +1703,10 @@ export interface ConsumerOptions {
         readonly retries: number;
         readonly intervalMs: number;
     };
+    readonly maxBytes?: number;
+    readonly maxWaitMs?: number;
+    readonly minCount?: number;
     readonly pollingRetryIntervalMs?: number;
-    readonly pollIntervalMs?: number;
-    // (undocumented)
     readonly startAt?: ConsumerStart;
 }
 
@@ -1963,6 +1961,7 @@ export class CrashContext {
 // @public (undocumented)
 export interface CreateConsumerGroupOptions {
     readonly filter?: ConsumerFilter;
+    readonly filterName?: string;
     readonly operationId?: bigint;
     readonly policy?: GroupFilterSpec;
 }
@@ -2530,6 +2529,7 @@ export interface FilterAnnounce {
     readonly codecs: readonly FilterCodec[];
     // (undocumented)
     readonly evaluatorVersion: number;
+    readonly maxWaitMs: number;
 }
 
 // @public
@@ -2563,6 +2563,7 @@ export interface FilterCaps {
     readonly catalog: boolean;
     readonly evaluation?: FilterAnnounce;
     readonly groupPolicyReads: boolean;
+    readonly maxWaitMs: number;
     readonly native: boolean;
 }
 
@@ -2594,6 +2595,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     partitions(): readonly number[];
     readRound(): Promise<readonly [MatchedPage | undefined, boolean]>;
     tryNextPage(): Promise<MatchedPage | undefined>;
+    waitForRecords(): Promise<void>;
 }
 
 // @public
@@ -2606,6 +2608,7 @@ export class FilteredReaderBuilder {
     maxExamined(records: number): this;
     maxReplyBytes(bytes: number): this;
     maxUnackedPages(pages: number): this;
+    maxWait(waitMs: number): this;
     partition(partitionId: number): this;
     start(start: FilteredStart): this;
 }
@@ -3213,7 +3216,7 @@ export function graphReturnIsNodes(value: GraphReturn): boolean;
 
 // @public
 export class GroupFilter {
-    configure(filter: ConsumerFilter): Promise<FilterBinding>;
+    configure(name: string, filter: ConsumerFilter): Promise<FilterBinding>;
     configureAs(operationId: bigint | undefined, policy: GroupFilterSpec): Promise<FilterBinding>;
     configureWith(policy: GroupFilterSpec): Promise<FilterBinding>;
     delete(): Promise<boolean>;
@@ -3223,12 +3226,15 @@ export class GroupFilter {
     revise(expectedRevision: number, filter: ConsumerFilter): Promise<FilterRevisionRef>;
     revisions(page?: number, pageSize?: number): Promise<FilterRevisionPage>;
     setRevisionEnabled(revision: number, enabled: boolean): Promise<void>;
+    // Warning: (ae-forgotten-export) The symbol "FilterSummary" needs to be exported by the entry point index.d.ts
+    summary(): Promise<FilterSummary | undefined>;
     test(payload: Uint8Array | string, headers?: readonly FilterHeader[]): Promise<FilterTestResult>;
 }
 
 // @public
 export type GroupFilterSpec = {
     readonly kind: "definition";
+    readonly name: string;
     readonly filter: ConsumerFilter;
 } | {
     readonly kind: "revision";
@@ -4586,6 +4592,9 @@ export interface MaterializationDestination {
 // @public (undocumented)
 export const MAX_CHUNK_BODY_BYTES: number;
 
+// @public
+export const MAX_REPLICATION_FACTOR = 32;
+
 // @public (undocumented)
 export class McpBridge {
     constructor(laser: Laser, source: AgentId, toolTopic: string, replyTopic: string, serverName: string);
@@ -5356,6 +5365,7 @@ export interface ProducerOptions {
     readonly maxTopicBytes?: bigint;
     readonly neverExpire?: boolean;
     readonly partitions?: number;
+    readonly replicationFactor?: number;
     readonly retries?: number;
     readonly retryBackoffMs?: number;
     // (undocumented)
@@ -6285,13 +6295,12 @@ export interface ReliableConsumerOptions {
     readonly maxQueuedBytes?: number;
     // (undocumented)
     readonly maxQueuedRecords?: number;
+    readonly maxWaitMs?: number;
     // (undocumented)
     readonly middleware?: readonly AgentMiddleware[];
     // (undocumented)
     readonly onDeadLetter?: DeadLetterSink;
     readonly operations?: readonly string[];
-    // (undocumented)
-    readonly pollIntervalMs?: number;
     // (undocumented)
     readonly respondOn?: string;
     // (undocumented)
@@ -7523,7 +7532,7 @@ export class Topic {
     consumer(name: string, partitionId: number, options?: ConsumerOptions): Consumer;
     consumerGroup(name: string): ConsumerGroup;
     consumerGroupId(id: bigint | number): ConsumerGroup;
-    ensure(partitions?: number): Promise<void>;
+    ensure(partitions?: number, replicationFactor?: number): Promise<void>;
     ensureConsumerGroup(name: string): Promise<void>;
     // (undocumented)
     json<T>(codec: Codec<T>): TypedTopic<T>;
@@ -7914,20 +7923,20 @@ export interface WorkflowOutcome {
 
 // Warnings were encountered during analysis:
 //
-// src/client/laser.ts:483:7 - (ae-forgotten-export) The symbol "Dispatch" needs to be exported by the entry point index.d.ts
-// src/client/laser.ts:766:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point index.d.ts
+// src/client/laser.ts:487:7 - (ae-forgotten-export) The symbol "Dispatch" needs to be exported by the entry point index.d.ts
+// src/client/laser.ts:770:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point index.d.ts
-// src/wire/agent.ts:106:31 - (ae-forgotten-export) The symbol "TaskStateName" needs to be exported by the entry point index.d.ts
-// src/wire/agent.ts:852:31 - (ae-forgotten-export) The symbol "AgentErrorCodeName" needs to be exported by the entry point index.d.ts
-// src/wire/agent.ts:882:31 - (ae-forgotten-export) The symbol "DeadLetterReasonName" needs to be exported by the entry point index.d.ts
-// src/wire/agent.ts:909:31 - (ae-forgotten-export) The symbol "HealthName" needs to be exported by the entry point index.d.ts
+// src/wire/agent.ts:109:31 - (ae-forgotten-export) The symbol "TaskStateName" needs to be exported by the entry point index.d.ts
+// src/wire/agent.ts:855:31 - (ae-forgotten-export) The symbol "AgentErrorCodeName" needs to be exported by the entry point index.d.ts
+// src/wire/agent.ts:885:31 - (ae-forgotten-export) The symbol "DeadLetterReasonName" needs to be exported by the entry point index.d.ts
+// src/wire/agent.ts:912:31 - (ae-forgotten-export) The symbol "HealthName" needs to be exported by the entry point index.d.ts
 // src/wire/authz.ts:734:36 - (ae-forgotten-export) The symbol "Tenancy" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:398:7 - (ae-forgotten-export) The symbol "CheckpointRequestId" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:399:7 - (ae-forgotten-export) The symbol "DestinationId" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:404:7 - (ae-forgotten-export) The symbol "CheckpointOwnerLease" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:409:7 - (ae-forgotten-export) The symbol "QueryRouteId" needs to be exported by the entry point index.d.ts
-// src/wire/filter.ts:299:40 - (ae-forgotten-export) The symbol "FilterLiteral" needs to be exported by the entry point index.d.ts
+// src/wire/filter.ts:302:40 - (ae-forgotten-export) The symbol "FilterLiteral" needs to be exported by the entry point index.d.ts
 // src/wire/result.ts:26:31 - (ae-forgotten-export) The symbol "ResultCodeName" needs to be exported by the entry point index.d.ts
 
 // (No @packageDocumentation comment for this package)

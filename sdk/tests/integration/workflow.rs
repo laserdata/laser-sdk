@@ -387,7 +387,7 @@ async fn given_a_cancel_request_on_the_control_topic_when_a_workflow_runs_then_s
     let laser = harness::laser().await;
     laser
         .topic(AgentTopic::Control.topic_string())
-        .ensure(4)
+        .ensure(4, None)
         .await
         .expect("provisioning creates the control topic");
     let run = ConversationId::new();

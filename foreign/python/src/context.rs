@@ -381,7 +381,7 @@ impl PyContextMessage {
         self.inner.topic.clone()
     }
 
-    /// The broker's append time in microseconds.
+    /// The streaming server's append time in microseconds.
     #[getter]
     fn timestamp_micros(&self) -> u64 {
         self.inner.timestamp_micros

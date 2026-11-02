@@ -58,6 +58,8 @@ Rust reconnects the existing shared Iggy client. Consumers and reply readers kee
 
 TypeScript closes a failed socket and rejoins registered consumer groups on the replacement. Apache Iggy can replace its own socket during a leader change or while trying the cluster nodes. TypeScript does not treat that replacement as a lost connection, so the current send can finish.
 
+A TypeScript send whose outcome the client could not prove is never resent and keeps the connection. The next send to that partition resolves it first and then goes out, as the Apache Iggy producer does for Rust. The transport hands the connection string's reconnection policy (`reconnection_interval`, `reconnection_retries`) to the Apache Iggy client, which redials each replica link and resumes the session.
+
 TypeScript runs one publish attempt per connection at a time. The Apache Iggy client resends every queued command when it changes nodes. A second queued send causes two authentication attempts per node change. The second login returns the connection to the metadata leader. One queued send lets the connection stay on the partition primary that accepts the message. The client already runs commands one at a time, so this restriction does not reduce throughput.
 
 A supplied TypeScript client has no connection recipe. After a connection failure, its owner must replace it. The SDK closes a socket that times out even when the client belongs to the caller. Its pending response prevents safe reuse.

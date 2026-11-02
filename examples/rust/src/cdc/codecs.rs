@@ -62,7 +62,7 @@ pub async fn run(laser: &Laser, stream: &str) -> Result<(), LaserError> {
             };
             let topic_name = format!("fleet_{codec}");
             let topic = laser.topic(&topic_name);
-            topic.ensure(1).await?;
+            topic.ensure(1, None).await?;
             for (mode, battery) in [("nominal", 80), ("safe", 20), ("nominal", 60)] {
                 let reading = Reading {
                     satellite: "sat-042".to_owned(),
@@ -103,7 +103,11 @@ pub async fn run(laser: &Laser, stream: &str) -> Result<(), LaserError> {
                 .stream(stream)
                 .topic(&topic_name)
                 .consumer_group(format!("safe-{codec}"));
-            group.create().filter(filter).build().await?;
+            group
+                .create()
+                .filter(format!("safe-mode-{codec}"), filter)
+                .build()
+                .await?;
             let mut reader = group
                 .reader()?
                 .start(FilteredStart::First)

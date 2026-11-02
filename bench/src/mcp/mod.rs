@@ -164,7 +164,7 @@ async fn prepare_stream(laser: &Laser, case: &AgdxCase, seed: u64) -> Result<Las
     for topic in [AgentTopic::Sessions, AgentTopic::Sessions] {
         scoped
             .topic(topic.topic_string())
-            .ensure(case.partitions)
+            .ensure(case.partitions, None)
             .await
             .map_err(sdk_error)?;
     }
@@ -184,7 +184,6 @@ fn start_agent(laser: &Laser, partitions: u32) -> Result<AgentHandle, BenchError
         .id(worker)
         .listen_on(AgentTopic::Sessions)
         .handler(EchoTool { source })
-        .poll_interval(Duration::ZERO)
         .concurrency(ConcurrencyPolicy::SerialPerPartition { max_partitions })
         .build()
         .spawn(laser.clone()))

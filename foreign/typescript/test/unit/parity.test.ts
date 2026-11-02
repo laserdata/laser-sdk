@@ -280,7 +280,7 @@ void test("given_an_each_policy_when_records_are_yielded_then_should_store_each_
     "fleet",
     "readings",
     { kind: "single", partitionId: 0, name: "metrics" },
-    { commitPolicy: { kind: "each" }, pollIntervalMs: 0 }
+    { commitPolicy: { kind: "each" }, maxWaitMs: 0 }
   )
   const first = await consumer.nextWithin(100)
   assert.deepEqual(first.json(), { host: "node-1" })
@@ -301,7 +301,7 @@ void test("given_a_native_consumer_when_offsets_are_stored_and_deleted_then_shou
       "fleet",
       "readings",
       { kind: "single", partitionId: 0, name: "metrics" },
-      { commitPolicy: { kind: "disabled" }, pollIntervalMs: 0, allowReplay }
+      { commitPolicy: { kind: "disabled" }, maxWaitMs: 0, allowReplay }
     )
     const message = await consumer.nextWithin(100)
     await consumer.storeOffset(7n)
@@ -351,7 +351,7 @@ void test("given_a_returned_delivery_when_reading_again_then_should_yield_it_fir
     "fleet",
     "readings",
     { kind: "single", partitionId: 0, name: "metrics" },
-    { commitPolicy: { kind: "disabled" }, pollIntervalMs: 0 }
+    { commitPolicy: { kind: "disabled" }, maxWaitMs: 0 }
   )
   const first = await consumer.nextWithin(100)
   consumer[INTERNAL_RETURN_DELIVERY](first)
@@ -380,7 +380,7 @@ void test("given_records_at_or_below_the_consumed_offset_when_polled_again_then_
       "fleet",
       "readings",
       { kind: "single", partitionId: 0, name: "metrics" },
-      { commitPolicy: { kind: "disabled" }, pollIntervalMs: 0, allowReplay }
+      { commitPolicy: { kind: "disabled" }, maxWaitMs: 0, allowReplay }
     )
     const offsets: bigint[] = []
     while (offsets.length < expected.length)
@@ -612,7 +612,7 @@ void test("given_a_failed_offset_store_when_a_record_is_yielded_then_should_deli
     "fleet",
     "readings",
     { kind: "single", partitionId: 0, name: "metrics" },
-    { commitPolicy: { kind: "each" }, pollIntervalMs: 0 }
+    { commitPolicy: { kind: "each" }, maxWaitMs: 0 }
   )
   assert.equal((await consumer.nextWithin(100)).position.offset, 0n)
   assert.equal(consumer.lastStoredOffset(0), undefined)
@@ -628,7 +628,7 @@ void test("given_a_deleted_offset_when_shutting_down_then_should_not_store_it_ag
     "fleet",
     "readings",
     { kind: "single", partitionId: 0, name: "metrics" },
-    { commitPolicy: { kind: "each" }, pollIntervalMs: 0 }
+    { commitPolicy: { kind: "each" }, maxWaitMs: 0 }
   )
   await consumer.nextWithin(100)
   await consumer.deleteOffset()
@@ -646,7 +646,7 @@ void test("given_a_failing_poll_when_the_deadline_is_short_then_should_time_out_
     "fleet",
     "readings",
     { kind: "single", partitionId: 0, name: "metrics" },
-    { commitPolicy: { kind: "disabled" }, pollIntervalMs: 0 }
+    { commitPolicy: { kind: "disabled" }, maxWaitMs: 0 }
   )
   const started = Date.now()
   await assert.rejects(consumer.nextWithin(30), TimeoutError)

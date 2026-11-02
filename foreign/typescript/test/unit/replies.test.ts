@@ -1,7 +1,12 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { TimeoutError } from "../../src/client/errors.js"
-import type { ConsumerTarget, LaserTransport, PolledMessage } from "../../src/iggy/apache-iggy.js"
+import type {
+  ConsumerTarget,
+  LaserTransport,
+  PollWait,
+  PolledMessage
+} from "../../src/iggy/apache-iggy.js"
 import type { HeaderValue } from "../../src/stream/header-value.js"
 import { agentMessageBody } from "../../src/agent/reliable-consumer.js"
 import { ReplyHub, findAgdxReply } from "../../src/agent/replies.js"
@@ -190,7 +195,7 @@ void test("given_a_stream_waiter_when_two_replies_arrive_then_should_deliver_bot
 })
 
 // An AGDX response echoing `correlation`, optionally signed, carried exactly as
-// the broker would deliver it: named-CBOR payload, AGDX headers, a record
+// the streaming server would deliver it: named-CBOR payload, AGDX headers, a record
 // timestamp for the key-lifecycle check.
 function agdxReply(
   correlation: CorrelationId,
@@ -464,3 +469,164 @@ void test("given_no_waiter_when_the_hub_is_idle_then_should_not_poll_until_a_sub
     hub.stop()
   }
 })
+
+void test("given_an_idle_pass_over_two_reply_partitions_when_a_reply_lands_on_one_then_should_deliver_it_while_the_other_read_is_held", async () => {
+  const waits: number[] = []
+  let cancelled = 0
+  let held = 0
+  const transport = fakeTransport([])
+  Object.assign(transport, {
+    findTopicPartitionCount: () => Promise.resolve(2),
+    pollMessages(
+      _streamId: string,
+      _topicId: string,
+      target: ConsumerTarget,
+      strategy: ConsumerStart,
+      _count: number,
+      _commit: boolean,
+      wait?: PollWait,
+      signal?: AbortSignal
+    ): Promise<readonly PolledMessage[]> {
+      if (strategy.kind !== "offset") return Promise.resolve([])
+      waits.push(wait?.maxWaitMs ?? 0)
+      if ((wait?.maxWaitMs ?? 0) === 0)
+        return new Promise((resolve) =>
+          setTimeout(() => {
+            resolve([])
+          }, 1)
+        )
+      held += 1
+      if (target.partitionId === 1 && held <= 2) {
+        return new Promise((resolve) =>
+          setTimeout(() => {
+            resolve([{ ...replyMessage("corr-held", 0n), partitionId: 1 }])
+          }, 10)
+        )
+      }
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          cancelled += 1
+          reject(new Error("cancelled"))
+        })
+      })
+    }
+  })
+  const hub = await ReplyHub.create(transport, "stream", "held")
+  try {
+    const started = performance.now()
+    const reply = await hub.subscribe("corr-held").wait(2_000)
+    assert.equal(reply.provenance.correlationId, "corr-held")
+    assert.ok(
+      performance.now() - started < 1_000,
+      "the reply arrives without waiting out the other read"
+    )
+  } finally {
+    hub.stop()
+  }
+  assert.deepEqual(
+    waits.slice(0, 4),
+    [0, 0, 5_000, 5_000],
+    "an idle pass holds one read per partition"
+  )
+  assert.ok(cancelled >= 1, "the read still held is cancelled")
+})
+
+void test("given_a_hub_holding_reads_for_a_waiter_when_stopped_then_should_cancel_every_read_end_the_wait_and_keep_no_timer", async () => {
+  let holding = 0
+  let cancelled = 0
+  let allHeld: () => void = () => undefined
+  const held = new Promise<void>((resolve) => {
+    allHeld = resolve
+  })
+  const transport = fakeTransport([])
+  Object.assign(transport, {
+    findTopicPartitionCount: () => Promise.resolve(2),
+    pollMessages(
+      _streamId: string,
+      _topicId: string,
+      _target: ConsumerTarget,
+      strategy: ConsumerStart,
+      _count: number,
+      _commit: boolean,
+      wait?: PollWait,
+      signal?: AbortSignal
+    ): Promise<readonly PolledMessage[]> {
+      if (strategy.kind !== "offset" || (wait?.maxWaitMs ?? 0) === 0) return Promise.resolve([])
+      holding += 1
+      if (holding === 2) allHeld()
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          cancelled += 1
+          reject(new Error("cancelled"))
+        })
+      })
+    }
+  })
+  const timers = (): number =>
+    process.getActiveResourcesInfo().filter((resource) => resource === "Timeout").length
+  const before = timers()
+  const hub = await ReplyHub.create(transport, "stream", "closing")
+  const reply = hub.subscribe("corr-closing").wait(60_000)
+  await held
+  const started = performance.now()
+  hub.stop()
+  await assert.rejects(reply, TimeoutError)
+  assert.ok(performance.now() - started < 1_000, "the wait ends with the hub, not at its timeout")
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(cancelled, 2, "every held read is cancelled")
+  assert.equal(timers(), before, "a stopped hub keeps no timer")
+})
+
+void test("given_held_reads_for_reply_waiters_when_the_last_waiter_leaves_then_should_cancel_them_and_hold_nothing_while_idle", async () => {
+  let holding = 0
+  let cancelled = 0
+  const transport = fakeTransport([])
+  Object.assign(transport, {
+    findTopicPartitionCount: () => Promise.resolve(2),
+    pollMessages(
+      _streamId: string,
+      _topicId: string,
+      _target: ConsumerTarget,
+      strategy: ConsumerStart,
+      _count: number,
+      _commit: boolean,
+      wait?: PollWait,
+      signal?: AbortSignal
+    ): Promise<readonly PolledMessage[]> {
+      if (strategy.kind !== "offset" || (wait?.maxWaitMs ?? 0) === 0) return Promise.resolve([])
+      holding += 1
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          cancelled += 1
+          reject(new Error("cancelled"))
+        })
+      })
+    }
+  })
+  const open = (): number => holding - cancelled
+  const hub = await ReplyHub.create(transport, "stream", "released")
+  try {
+    const first = hub.subscribe("corr-first")
+    const second = hub.subscribe("corr-second")
+    await until(() => open() === 2, 1_000)
+    await assert.rejects(first.wait(20), TimeoutError)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(open(), 2, "a remaining waiter keeps the reads held")
+    second.cancel()
+    await until(() => open() === 0, 1_000)
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.equal(holding, 2, "an idle hub holds nothing")
+    hub.subscribe("corr-third")
+    await until(() => open() === 2, 1_000)
+  } finally {
+    hub.stop()
+  }
+})
+
+async function until(condition: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = performance.now() + timeoutMs
+  while (!condition()) {
+    if (performance.now() >= deadline) throw new Error(`not true within ${String(timeoutMs)} ms`)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}

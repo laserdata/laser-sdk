@@ -5,6 +5,7 @@ import type { ConversationId } from "./wire/ids.js"
 import { NoStreamError, ProtocolError } from "./client/errors.js"
 import { INTERNAL_TRANSPORT } from "./client/internals.js"
 import type { Laser } from "./client/laser.js"
+import { readThrough } from "./stream/cursor.js"
 
 export const DEFAULT_SNAPSHOT_NAMESPACE = "agent.snapshots"
 export const DEFAULT_SNAPSHOT_TOPIC = "agent.snapshots"
@@ -73,14 +74,7 @@ export class TopicSnapshotStore implements SnapshotStore {
       // wins, so the walk stops at the conversation's latest checkpoint.
       while (end > 0n) {
         const start = end > SCAN_BATCH ? end - SCAN_BATCH : 0n
-        const window = await transport.pollMessages(
-          stream,
-          this.topic,
-          target,
-          { kind: "offset", value: start },
-          Number(SCAN_BATCH),
-          false
-        )
+        const window = await readThrough(transport, stream, this.topic, target, start, end - 1n)
         const found = newestMatch(window, end, conversation, stream, this.fold, partitionId)
         if (found !== undefined) {
           if (
@@ -186,7 +180,7 @@ function newestMatch(
       snapshot.fold === fold
     ) {
       if (message.timestampMicros === undefined)
-        throw new ProtocolError("snapshot record has no broker timestamp")
+        throw new ProtocolError("snapshot record has no append timestamp")
       return { timestamp: message.timestampMicros, partition, offset: message.offset, snapshot }
     }
   }

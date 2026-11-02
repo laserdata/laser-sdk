@@ -631,6 +631,10 @@ pub struct FilterAnnounce {
     pub evaluator_version: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub codecs: Vec<FilterCodec>,
+    /// Longest filtered wait the server holds. Zero means it serves no
+    /// filtered wait, so a reader paces idle rounds itself.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_wait_ms: u32,
 }
 
 impl FilterAnnounce {
@@ -645,6 +649,7 @@ impl FilterAnnounce {
                 FilterCodec::Protobuf,
                 FilterCodec::Cbor,
             ],
+            max_wait_ms: 0,
         }
     }
 
@@ -899,4 +904,7 @@ mod tests {
         let older: BackendAnnounce = decode_named(&plain).expect("deserializes");
         assert_eq!(older.filters, None);
     }
+}
+const fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }

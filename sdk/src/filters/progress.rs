@@ -20,6 +20,8 @@ pub(crate) struct PartitionProgress {
     retry_at: Option<Instant>,
     first_sequence: Option<u64>,
     settled_sequence: u64,
+    // The first offset no page examined yet, as the last page reported it.
+    wait_from: Option<u64>,
 }
 
 /// The offset a completed prefix of pages makes safe to store, with the
@@ -58,6 +60,7 @@ impl PartitionProgress {
             retry_at: None,
             first_sequence: None,
             settled_sequence: 0,
+            wait_from: None,
         }
     }
 
@@ -78,6 +81,16 @@ impl PartitionProgress {
 
     pub(crate) const fn blocked(&self) -> Option<Blocked> {
         self.blocked
+    }
+
+    /// The offset a filtered wait holds this partition from: the first record
+    /// no page examined, else the start offset of an unread partition.
+    pub(crate) const fn wait_offset(&self) -> u64 {
+        match (self.wait_from, &self.original) {
+            (Some(offset), _) => offset,
+            (None, FilteredStart::Offset(offset)) => *offset,
+            (None, _) => 0,
+        }
     }
 
     /// Pages read but not yet fully handled.
@@ -109,6 +122,14 @@ impl PartitionProgress {
         self.retry_at = None;
         self.first_sequence.get_or_insert(sequence);
         self.start = page.next_start(&self.original);
+        // A page that examined nothing saw the head as its frontier, so the
+        // next record lands after it. A head of 0 may also be an empty
+        // partition, whose next record is 0.
+        self.wait_from = Some(match page.next_scan_offset {
+            Some(next) => next,
+            None if page.frontier == 0 => 0,
+            None => page.frontier.saturating_add(1),
+        });
         self.blocked = match (page.stop, page.fault) {
             (StopReason::Fault, Some(fault)) => Some(Blocked::Fault {
                 offset: fault.offset,
@@ -332,6 +353,42 @@ mod tests {
         assert_eq!(target.offset, 499);
         progress.stored(&target);
         assert_eq!(progress.unstored(), None);
+    }
+
+    #[test]
+    fn given_an_unread_partition_when_waiting_then_should_hold_from_its_start_offset() {
+        assert_eq!(
+            PartitionProgress::new(FilteredStart::Offset(7)).wait_offset(),
+            7
+        );
+        assert_eq!(PartitionProgress::new(FilteredStart::Next).wait_offset(), 0);
+    }
+
+    #[test]
+    fn given_a_scanned_page_when_waiting_then_should_hold_from_the_first_unexamined_record() {
+        let mut progress = PartitionProgress::new(FilteredStart::Next);
+        progress.record(1, &page(Some(42), StopReason::EndOfVisible), []);
+
+        assert_eq!(progress.wait_offset(), 42);
+    }
+
+    #[test]
+    fn given_a_page_that_examined_nothing_when_waiting_then_should_hold_past_the_head_it_saw() {
+        let mut progress = PartitionProgress::new(FilteredStart::Next);
+        let mut caught_up = page(None, StopReason::EndOfVisible);
+        caught_up.safe_ack_offset = None;
+        progress.record(1, &caught_up, []);
+        assert_eq!(progress.wait_offset(), 101);
+
+        let mut empty = page(None, StopReason::EndOfVisible);
+        empty.safe_ack_offset = None;
+        empty.frontier = 0;
+        progress.record(2, &empty, []);
+        assert_eq!(
+            progress.wait_offset(),
+            0,
+            "an empty partition and one holding only offset 0 share a head of 0"
+        );
     }
 
     #[test]

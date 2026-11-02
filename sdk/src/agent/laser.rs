@@ -69,6 +69,7 @@ impl Laser {
             partitions,
             retention.expiry(),
             retention.max_size(),
+            None,
         )
         .await?;
         ensure_topic_retained(
@@ -78,6 +79,7 @@ impl Laser {
             partitions,
             IggyExpiry::ExpireDuration(IggyDuration::from(HEARTBEAT_EXPIRY_MICROS)),
             MaxTopicSize::ServerDefault,
+            None,
         )
         .await?;
         for topic in SATELLITE_TOPICS {
@@ -221,11 +223,13 @@ impl Laser {
             .poll_messages(
                 &stream,
                 &topic,
-                Some(source.partition_id),
+                source.partition_id,
                 &reader,
                 &PollingStrategy::offset(source.offset),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await?;
         let original = polled
@@ -585,11 +589,13 @@ impl Laser {
             .poll_messages(
                 &stream,
                 &topic,
-                Some(at.partition_id),
+                at.partition_id,
                 &reader,
                 &PollingStrategy::offset(at.offset),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await?;
         let Some(message) = polled
@@ -745,11 +751,13 @@ impl AgentReplyReader {
                 .poll_messages(
                     &reader.stream,
                     &reader.topic,
-                    Some(partition),
+                    partition,
                     &reader.consumer,
                     &PollingStrategy::last(),
-                    1,
-                    false,
+                    PollOptions {
+                        count: 1,
+                        ..PollOptions::default()
+                    },
                 )
                 .await?;
             // Resume after the last existing record. An empty partition stays at 0.

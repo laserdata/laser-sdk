@@ -1352,6 +1352,10 @@ mod tests {
                 .await,
             Err(LaserError::Invalid(_))
         ));
+        assert!(matches!(
+            kv.lease("key", "node\n1", Duration::from_secs(1)).await,
+            Err(LaserError::Invalid(_))
+        ));
     }
 
     #[tokio::test]

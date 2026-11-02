@@ -77,7 +77,7 @@ export async function runCodecs(laser: Laser, stream: string): Promise<void> {
             ? ConsumerFilter.avro(expr, schemaRefs)
             : ConsumerFilter.protobuf(expr, schemaRefs)
       const group = laser.stream(stream).topic(topicName).consumerGroup(`safe-${codec}`)
-      await group.create({ filter })
+      await group.create({ filter, filterName: `safe-mode-${codec}` })
       try {
         await using reader = await group.reader().start({ kind: "first" }).localGuard(true).build()
         const record = await reader.nextRecord({ timeoutMs: 15_000 })

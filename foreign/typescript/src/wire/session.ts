@@ -26,7 +26,13 @@ import {
   singleVariantTag
 } from "./cbor.js"
 import { type SourceRef, decodeSourceRef, encodeSourceRef } from "./graph.js"
-import { MAX_HEARTBEAT_SESSIONS } from "./limits.js"
+import {
+  MAX_FILTER_SOURCE_NAME_BYTES,
+  MAX_HEARTBEAT_SESSIONS,
+  MAX_SESSION_CURSOR_BYTES,
+  MAX_SESSION_LABEL_BYTES,
+  MAX_SESSION_TEXT_QUERY_BYTES
+} from "./limits.js"
 import type { ResultCode, ResultCodeName } from "./result.js"
 import {
   ConversationId,
@@ -35,6 +41,8 @@ import {
   logPositionFromBytes,
   logPositionToBytes
 } from "./ids.js"
+
+const UTF8 = new TextEncoder()
 
 export type LinkSurface = "memory" | "kv" | "graph_node" | "graph_edge" | "projection" | "child"
 
@@ -102,6 +110,29 @@ export interface SessionList {
   /** The page size. Zero leaves it to the server. */
   readonly limit: number
   readonly wantTotal: boolean
+}
+
+/** Rust `SessionList::validate`, checked before the request is sent. */
+export function validateSessionList(request: SessionList): void {
+  const stream = UTF8.encode(request.stream).byteLength
+  if (stream === 0 || stream > MAX_FILTER_SOURCE_NAME_BYTES) {
+    throw new InvalidError(
+      `session list stream must be 1..=${String(MAX_FILTER_SOURCE_NAME_BYTES)} bytes`
+    )
+  }
+  const bounded: readonly (readonly [string, string | undefined, number])[] = [
+    ["label prefix", request.labelPrefix, MAX_SESSION_LABEL_BYTES],
+    ["text", request.text, MAX_SESSION_TEXT_QUERY_BYTES],
+    ["cursor", request.cursor, MAX_SESSION_CURSOR_BYTES]
+  ]
+  for (const [label, value, cap] of bounded) {
+    const bytes = value === undefined ? 0 : UTF8.encode(value).byteLength
+    if (bytes > cap) {
+      throw new InvalidError(
+        `session list ${label} is ${String(bytes)}B, exceeds cap ${String(cap)}B`
+      )
+    }
+  }
 }
 
 export function encodeSessionList(request: SessionList): Map<string, unknown> {

@@ -1,6 +1,7 @@
 import { HandlerConfigError, TimeoutError } from "../client/errors.js"
 import { INTERNAL_LAYOUTS } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
+import { MAX_DEFERRED_POLL_WAIT_MS } from "../iggy/apache-iggy.js"
 import { ConsumerGroupName, type AgentId } from "../types/ids.js"
 import type { ActionGovernor, GovernorMode, GovernorRetention } from "../govern.js"
 import type { SessionConfig } from "../session.js"
@@ -28,7 +29,8 @@ export interface AgentDefinition {
   readonly handler: AgentHandler
   readonly respondOn?: string
   readonly inboxRoute?: InboxRoute
-  readonly pollIntervalMs?: number
+  /** How long the server holds a read that finds nothing new. Defaults to 5 seconds. */
+  readonly maxWaitMs?: number
   readonly shutdownGraceMs: number
   readonly concurrency?: ConcurrencyPolicy
   readonly maxQueuedRecords?: number
@@ -237,9 +239,7 @@ export class AgentHandle implements AsyncDisposable {
         shutdownGraceMs: definition.shutdownGraceMs,
         ...(definition.respondOn !== undefined ? { respondOn: definition.respondOn } : {}),
         ...(definition.inboxRoute !== undefined ? { inboxRoute: definition.inboxRoute } : {}),
-        ...(definition.pollIntervalMs !== undefined
-          ? { pollIntervalMs: definition.pollIntervalMs }
-          : {}),
+        ...(definition.maxWaitMs !== undefined ? { maxWaitMs: definition.maxWaitMs } : {}),
         ...(definition.concurrency !== undefined ? { concurrency: definition.concurrency } : {}),
         ...(definition.maxQueuedRecords !== undefined
           ? { maxQueuedRecords: definition.maxQueuedRecords }
@@ -288,7 +288,7 @@ export class AgentBuilder {
   private replyTopic: string | undefined
   private agentHandler: AgentHandler | undefined
   private route: InboxRoute | undefined
-  private pollMs: number | undefined
+  private waitMs: number | undefined
   private graceMs = 30_000
   private concurrencyPolicy: ConcurrencyPolicy | undefined
   private queuedRecords: number | undefined
@@ -342,8 +342,11 @@ export class AgentBuilder {
     return this
   }
 
-  pollInterval(intervalMs: number): this {
-    this.pollMs = intervalMs
+  /** How long the server holds a read that finds nothing new before it
+   * answers, at most 600 seconds. A record ends the wait at once. Defaults to
+   * 5 seconds. */
+  maxWait(waitMs: number): this {
+    this.waitMs = waitMs
     return this
   }
 
@@ -476,7 +479,7 @@ export class AgentBuilder {
       handler: this.agentHandler,
       ...(this.replyTopic !== undefined ? { respondOn: this.replyTopic } : {}),
       ...(this.route !== undefined ? { inboxRoute: this.route } : {}),
-      ...(this.pollMs !== undefined ? { pollIntervalMs: this.pollMs } : {}),
+      ...(this.waitMs !== undefined ? { maxWaitMs: this.waitMs } : {}),
       shutdownGraceMs: this.graceMs,
       ...(this.concurrencyPolicy !== undefined ? { concurrency: this.concurrencyPolicy } : {}),
       ...(this.queuedRecords !== undefined ? { maxQueuedRecords: this.queuedRecords } : {}),
@@ -510,10 +513,14 @@ function validateDefinition(definition: AgentDefinition): void {
     throw new HandlerConfigError("shutdownGrace must be a non-negative finite number")
   }
   if (
-    definition.pollIntervalMs !== undefined &&
-    (!Number.isFinite(definition.pollIntervalMs) || definition.pollIntervalMs < 0)
+    definition.maxWaitMs !== undefined &&
+    (!Number.isSafeInteger(definition.maxWaitMs) ||
+      definition.maxWaitMs < 0 ||
+      definition.maxWaitMs > MAX_DEFERRED_POLL_WAIT_MS)
   ) {
-    throw new HandlerConfigError("pollInterval must be a non-negative finite number")
+    throw new HandlerConfigError(
+      `maxWait must be 0..=${String(MAX_DEFERRED_POLL_WAIT_MS)} milliseconds`
+    )
   }
   if (
     definition.consolidateEveryMs !== undefined &&

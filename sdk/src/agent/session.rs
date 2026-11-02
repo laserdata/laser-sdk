@@ -445,6 +445,7 @@ impl Sessions {
                 partitions,
                 retention.expiry(),
                 retention.max_size(),
+                None,
             )
             .await?;
         }

@@ -17,8 +17,7 @@ async function receive(
     .consumer({
       batchLength: Math.min(100, expected),
       commitPolicy: { kind: manualCommit ? "disabled" : "polling" },
-      startAt: { kind: "first" },
-      pollIntervalMs: 5
+      startAt: { kind: "first" }
     })
   let seen = 0
   while (seen < expected && !signal.aborted) {

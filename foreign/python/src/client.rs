@@ -125,13 +125,22 @@ constants! {
     "MAX_FILTER_NAME_BYTES": usize = laser_sdk::wire::limits::MAX_FILTER_NAME_BYTES,
     "MAX_FILTER_PREVIEW_EXAMINED": u32 = laser_sdk::wire::limits::MAX_FILTER_PREVIEW_EXAMINED,
     "MAX_FILTER_PREVIEW_RECORDS": u32 = laser_sdk::wire::limits::MAX_FILTER_PREVIEW_RECORDS,
+    "MAX_GRAPH_LABEL_BYTES": usize = laser_sdk::wire::limits::MAX_GRAPH_LABEL_BYTES,
     "MAX_HOLDER_ID_BYTES": usize = laser_sdk::wire::limits::MAX_HOLDER_ID_BYTES,
     "MAX_INDEX_ENTRIES_PER_RECORD": usize = laser_sdk::wire::limits::MAX_INDEX_ENTRIES_PER_RECORD,
+    "MAX_INDEX_FIELD_BYTES": usize = laser_sdk::wire::limits::MAX_INDEX_FIELD_BYTES,
     "MAX_KEY_BYTES": usize = laser_sdk::wire::limits::MAX_KEY_BYTES,
     "MAX_LEASE_TTL_MICROS": u64 = laser_sdk::wire::limits::MAX_LEASE_TTL_MICROS,
+    "MAX_MEMORY_ID_BYTES": usize = laser_sdk::wire::limits::MAX_MEMORY_ID_BYTES,
     "MAX_PAGE_SIZE": usize = laser_sdk::wire::limits::MAX_PAGE_SIZE,
+    "MAX_PROJECTION_ID_BYTES": usize = laser_sdk::wire::limits::MAX_PROJECTION_ID_BYTES,
+    "MAX_PROJECTION_NAME_BYTES": usize = laser_sdk::wire::limits::MAX_PROJECTION_NAME_BYTES,
     "MAX_ROLE_NAME_BYTES": usize = laser_sdk::wire::limits::MAX_ROLE_NAME_BYTES,
+    "MAX_REPLICATION_FACTOR": u32 = laser_sdk::stream::MAX_REPLICATION_FACTOR,
     "MAX_SCAN_LIMIT": usize = laser_sdk::wire::limits::MAX_SCAN_LIMIT,
+    "MAX_SCHEMA_NAME_BYTES": usize = laser_sdk::wire::limits::MAX_SCHEMA_NAME_BYTES,
+    "MAX_SESSION_CURSOR_BYTES": usize = laser_sdk::wire::limits::MAX_SESSION_CURSOR_BYTES,
+    "MAX_SESSION_TEXT_QUERY_BYTES": usize = laser_sdk::wire::limits::MAX_SESSION_TEXT_QUERY_BYTES,
     "MAX_VALUE_BYTES": usize = laser_sdk::wire::limits::MAX_VALUE_BYTES,
     "MIN_LEASE_TTL_MICROS": u64 = laser_sdk::wire::limits::MIN_LEASE_TTL_MICROS,
     "AGENT_ID": &str = laser_sdk::wire::headers::AGENT_ID,
@@ -605,7 +614,8 @@ impl PyLaser {
     }
 }
 
-/// Consumer-filter evaluator version and codecs advertised by the server.
+/// Consumer-filter evaluator version, codecs, and filtered wait advertised by
+/// the server.
 #[gen_stub_pyclass]
 #[pyclass(name = "FilterAnnounce", frozen, skip_from_py_object)]
 #[derive(Clone)]
@@ -614,6 +624,10 @@ pub struct PyFilterAnnounce {
     pub evaluator_version: u32,
     #[pyo3(get)]
     pub codecs: Vec<String>,
+    /// Longest filtered wait the server holds, in milliseconds. Zero means it
+    /// serves no filtered wait, so a reader paces idle rounds itself.
+    #[pyo3(get)]
+    pub max_wait_ms: u32,
     inner: laser_sdk::capabilities::FilterAnnounce,
 }
 
@@ -622,6 +636,7 @@ impl From<laser_sdk::capabilities::FilterAnnounce> for PyFilterAnnounce {
         Self {
             evaluator_version: value.evaluator_version,
             codecs: value.codecs.iter().map(ToString::to_string).collect(),
+            max_wait_ms: value.max_wait_ms,
             inner: value,
         }
     }
@@ -815,6 +830,10 @@ pub struct PyFilterCaps {
     /// a server that predates the announcement.
     #[pyo3(get)]
     pub evaluation: Option<PyFilterAnnounce>,
+    /// The longest filtered wait the server holds, in milliseconds. Zero when
+    /// it serves none, so a filtered reader paces idle rounds itself.
+    #[pyo3(get)]
+    pub max_wait_ms: u32,
     inner: laser_sdk::capabilities::FilterCaps,
 }
 
@@ -825,6 +844,7 @@ impl From<laser_sdk::capabilities::FilterCaps> for PyFilterCaps {
             catalog: value.catalog,
             group_policy_reads: value.group_policy_reads,
             evaluation: value.evaluation.clone().map(PyFilterAnnounce::from),
+            max_wait_ms: value.max_wait_ms,
             inner: value,
         }
     }

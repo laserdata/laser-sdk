@@ -180,9 +180,7 @@ def responders(world, first, second):
 
     async def spawn(name):
         answered = []
-        agent = world.laser.spawn_agent(
-            name, ls.AgentTopic.Sessions, responder(name, answered), poll_interval_ms=10
-        )
+        agent = world.laser.spawn_agent(name, ls.AgentTopic.Sessions, responder(name, answered))
         await agent.ready()
         world.answered[name] = answered
         world.responders.append(agent)

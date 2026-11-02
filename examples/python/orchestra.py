@@ -192,7 +192,6 @@ async def spawn(agent_id: str, skill: str, health: str, delay: float):
         # expired one, which is what makes the expiry phase legible.
         ack_on_pickup=True,
         health=health,
-        poll_interval_ms=10,
     )
     await handle.ready()
     return handle

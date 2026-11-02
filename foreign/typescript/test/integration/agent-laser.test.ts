@@ -187,7 +187,6 @@ void test("given_a_correlated_reply_addressed_to_another_agent_when_requesting_t
     await using tool = Agent.builder()
       .id(AgentId.new("tool"))
       .listenOn(AgentTopic.Sessions)
-      .pollInterval(5)
       .handler({
         async handle(message, context): Promise<void> {
           if (decoder.decode(message.payload) !== "search") return

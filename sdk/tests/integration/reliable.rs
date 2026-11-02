@@ -304,7 +304,7 @@ async fn given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_befo
 
     laser
         .topic(AgentTopic::Dlq.topic_string())
-        .ensure(4)
+        .ensure(4, None)
         .await
         .expect("the DLQ topic is restored");
     let restarted = harness::reconnect(&laser).await;
@@ -858,7 +858,7 @@ async fn given_a_failed_dead_letter_in_a_lane_when_the_worker_stops_then_should_
 
     laser
         .topic(AgentTopic::Dlq.topic_string())
-        .ensure(4)
+        .ensure(4, None)
         .await
         .expect("the DLQ topic is restored");
     let restarted = harness::reconnect(&laser).await;

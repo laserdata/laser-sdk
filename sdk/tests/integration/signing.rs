@@ -74,7 +74,7 @@ fn now_micros() -> u64 {
 }
 
 // A signed command encoded exactly as the AGDX producer would publish it, so a
-// test can vary the broker headers independently of the signed context.
+// test can vary the transport headers independently of the signed context.
 fn signed_command(key: &SigningKey, conversation: u128, correlation: u128) -> Vec<u8> {
     let mut envelope = AgentEnvelope::command(
         WireRecordId::from_u128(correlation | 0x1000),
@@ -124,7 +124,7 @@ async fn publish_with_headers(
 
 #[tokio::test]
 #[serial_test::serial(integration)]
-async fn given_a_verified_consumer_when_broker_headers_are_mutated_then_should_dead_letter_before_dispatch()
+async fn given_a_verified_consumer_when_transport_headers_are_mutated_then_should_dead_letter_before_dispatch()
  {
     let laser = harness::laser().await;
     let caller_key = SigningKey::from_bytes(&[21u8; 32]);
@@ -239,7 +239,7 @@ async fn given_a_verified_consumer_when_broker_headers_are_mutated_then_should_d
 
 #[tokio::test]
 #[serial_test::serial(integration)]
-async fn given_lifecycle_bound_keys_when_verified_at_the_broker_timestamp_then_should_gate_by_validity()
+async fn given_lifecycle_bound_keys_when_verified_at_the_server_timestamp_then_should_gate_by_validity()
  {
     let laser = harness::laser().await;
     let now = now_micros();
@@ -275,7 +275,7 @@ async fn given_lifecycle_bound_keys_when_verified_at_the_broker_timestamp_then_s
         .spawn(laser.clone());
     worker.ready().await.expect("the worker should be ready");
 
-    // Each key signs an otherwise identical command. The broker stamps the
+    // Each key signs an otherwise identical command. The streaming server stamps the
     // record timestamp on ingest, so only the key whose window covers that
     // stamp may pass; the future, expired, and revoked keys must dead-letter.
     let conversation = WireConversationId::from_u128(0x0190_3c1f_aa00_0000_0000_0000_0000_0102u128);
@@ -526,7 +526,7 @@ async fn given_an_expired_key_when_replaying_a_record_signed_in_its_window_then_
 
     // The record lands on the log while the key is valid. By the time the
     // consumer replays it the key has expired, so acceptance proves the
-    // lifecycle check reads the broker-stamped record time, not the wall clock.
+    // lifecycle check reads the server-stamped record time, not the wall clock.
     laser
         .agdx(
             AgentTopic::Sessions,

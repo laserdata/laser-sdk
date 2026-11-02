@@ -78,15 +78,19 @@ export class Topic {
   }
 
   /** Idempotently creates this topic with `partitions`, creating its stream
-   * first if needed, so one call is enough to address a fresh server. */
-  async ensure(partitions: number = DEFAULT_PARTITIONS): Promise<void> {
-    await this.ensureWithExpiry(partitions)
+   * first if needed, so one call is enough to address a fresh server.
+   * `replicationFactor` is how many nodes store each partition,
+   * 1..=`MAX_REPLICATION_FACTOR` and at most the cluster's node count, the
+   * server's default when left out. An existing topic is left as it is. */
+  async ensure(partitions: number = DEFAULT_PARTITIONS, replicationFactor?: number): Promise<void> {
+    await this.ensureWithExpiry(partitions, undefined, replicationFactor)
   }
 
   /** @internal `ensure` that also sets the message expiry of the topic. */
   async ensureWithExpiry(
     partitions: number = DEFAULT_PARTITIONS,
-    messageExpiryMicros?: bigint
+    messageExpiryMicros?: bigint,
+    replicationFactor?: number
   ): Promise<void> {
     await this.observed("ensure", { partitions }, async () => {
       await this.transport.ensureStream(this.streamName)
@@ -95,11 +99,12 @@ export class Topic {
           this.streamName,
           this.name,
           partitions,
-          messageExpiryMicros
+          messageExpiryMicros,
+          replicationFactor
         )
         return
       }
-      await this.transport.ensureTopic(this.streamName, this.name, partitions)
+      await this.transport.ensureTopic(this.streamName, this.name, partitions, replicationFactor)
     })
   }
 

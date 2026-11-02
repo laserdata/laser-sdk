@@ -31,7 +31,7 @@ pub struct ContextMessage {
     pub envelope: Option<laser_wire::agent::AgentEnvelope>,
     /// The name of the topic the message was read from.
     pub topic: String,
-    /// The broker's append time in microseconds.
+    /// The streaming server's append time in microseconds.
     pub timestamp_micros: u64,
     /// The numeric id of the stream the message was read from.
     pub stream_id: u32,

@@ -4,7 +4,12 @@ import type { Laser } from "../client/laser.js"
 import { ActionKind } from "../govern.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
 import { decodeOne } from "../wire/cbor.js"
-import { decodeMemoryRecord, encodeMemoryRecordFrame, type MemoryRecord } from "../wire/memory.js"
+import {
+  decodeMemoryRecord,
+  encodeMemoryRecordFrame,
+  type MemoryRecord,
+  validateMemoryRecord
+} from "../wire/memory.js"
 import {
   Lifetime,
   MemoryId,
@@ -222,6 +227,7 @@ export class VectorMemory implements Memory {
     if (this.laser === undefined) return record
     const stream = this.laser.defaultStream
     if (stream === undefined) throw new NoStreamError("governed vector memory requires a stream")
+    validateMemoryRecord(record)
     const encoded = record.kind === "item" ? record.body : encodeMemoryRecordFrame(record)
     const payload = await this.laser[INTERNAL_GOVERN]({
       kind: ActionKind.MemoryWrite,

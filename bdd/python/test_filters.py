@@ -23,6 +23,10 @@ RECORDS = {
 FEED = _FIXTURES["feed"]
 
 
+def policy_name(fixture: str) -> str:
+    return fixture.replace(" ", "-")
+
+
 def safe_mode() -> ls.ConsumerFilter:
     def satellites() -> ls.FilterExpr:
         return ls.FilterExpr.pred("table", "eq", "satellites")
@@ -126,7 +130,7 @@ def fresh_feed(world):
 def read_feed(world, name):
     async def read():
         group = world.laser.topic(TOPIC).consumer_group("anomaly-desk")
-        await group.create(filter=FILTERS[name]())
+        await group.create(filter=FILTERS[name](), filter_name=policy_name(name))
         reader = await group.reader(start="first")
         page = await asyncio.wait_for(reader.next_page(), READ_TIMEOUT)
         await reader.ack_page(page)
@@ -159,8 +163,9 @@ def managed_group(world):
         topic = world.laser.topic(TOPIC)
         group = topic.consumer_group("managed-desk")
         operation_id = uuid.uuid4().int
-        first = await group.create(filter=safe_mode(), operation_id=operation_id)
-        assert await group.create(filter=safe_mode(), operation_id=operation_id) == first
+        policy = {"filter": safe_mode(), "filter_name": policy_name("safe mode")}
+        first = await group.create(**policy, operation_id=operation_id)
+        assert await group.create(**policy, operation_id=operation_id) == first
         binding = first.filter
         by_id = topic.consumer_group_id(first.id)
         consumer = by_id.consumer(auto_commit="disabled")
@@ -268,7 +273,7 @@ def read_bounded_scan(world):
             [RECORDS["ground station update"]] * 100 + [RECORDS["mode update"]]
         )
         group = topic.consumer_group("bounded-readers")
-        await group.create(filter=safe_mode())
+        await group.create(filter=safe_mode(), filter_name=policy_name("safe mode"))
         reader = await group.reader(start="first", count=1, max_examined=100)
         try:
             async with asyncio.timeout(READ_TIMEOUT):
@@ -306,7 +311,7 @@ def consume_bounded_scan(world):
             [RECORDS["ground station update"]] * 100 + [RECORDS["mode update"]]
         )
         group = topic.consumer_group("sparse-consumers")
-        await group.create(filter=safe_mode())
+        await group.create(filter=safe_mode(), filter_name=policy_name("safe mode"))
         consumer = group.consumer(batch_length=100, auto_commit="disabled", polling="first")
         try:
             record = await asyncio.wait_for(consumer.next(), READ_TIMEOUT)
@@ -324,7 +329,7 @@ def consume_bounded_scan(world):
 def reject_old_policy(world):
     async def run():
         group = world.laser.topic(TOPIC).consumer_group("policy-ack")
-        await group.create(filter=safe_mode())
+        await group.create(filter=safe_mode(), filter_name=policy_name("safe mode"))
         reader = await group.reader(start="first")
         try:
             page = await asyncio.wait_for(reader.next_page(), READ_TIMEOUT)

@@ -202,7 +202,6 @@ async function spawnDesk(
     .listenOn(AgentTopic.Sessions)
     .respondOn(AgentTopic.Sessions)
     .inboxRoute(fixedTools)
-    .pollInterval(5)
     .handler({
       async handle(message, context): Promise<void> {
         const incident = decodeUtf8(message.envelope?.body ?? message.payload)
@@ -230,7 +229,6 @@ async function spawnDesk(
     .id(AgentId.new("specialist"))
     .listenOn(AgentTopic.Sessions)
     .respondOn(AgentTopic.Sessions)
-    .pollInterval(5)
     .handler({
       async handle(message, context): Promise<void> {
         const prompt = decodeUtf8(message.envelope?.body ?? message.payload)
@@ -253,7 +251,6 @@ async function spawnDesk(
     .id(AgentId.new("approver"))
     .listenOn(AgentTopic.Sessions)
     .respondOn(AgentTopic.Sessions)
-    .pollInterval(5)
     .handler({
       handle(_message, context): Promise<void> {
         return context.respond(utf8("approved"))
@@ -265,7 +262,6 @@ async function spawnDesk(
   const resolver = Agent.builder()
     .id(AgentId.new("resolver"))
     .listenOn(AgentTopic.Sessions)
-    .pollInterval(5)
     .deduplicator(new KvDeduplicator(laser, dedupNamespace))
     .handler({
       async handle(message, context): Promise<void> {

@@ -107,8 +107,7 @@ void test(
       await within(topic.ensure(1), 3_000)
       consumer = await topic.consumerGroup("restart-workers").consumer({
         batchLength: 10,
-        startAt: { kind: "first" },
-        pollIntervalMs: 10
+        startAt: { kind: "first" }
       })
       await within(topic.send(new TextEncoder().encode("before-restart")), 3_000)
       const before = await consumer.nextWithin(3_000)
@@ -134,8 +133,7 @@ void test(
       )
       consumer = await topic.consumerGroup("restart-workers").consumer({
         batchLength: 10,
-        startAt: { kind: "next" },
-        pollIntervalMs: 10
+        startAt: { kind: "next" }
       })
       const after = await within(consumer.nextWithin(5_000), 6_000)
       assert.equal(new TextDecoder().decode(after.payload), "after-restart")
@@ -146,6 +144,79 @@ void test(
       } finally {
         await iggy.close()
       }
+    }
+  }
+)
+
+void test(
+  "given_a_stopped_server_when_the_laser_closes_while_its_client_redials_then_should_settle_and_keep_no_timer_or_socket",
+  { timeout: 60_000 },
+  async () => {
+    const iggy = await TestIggy.start()
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+    process.on("unhandledRejection", onUnhandled)
+    const held = (): number =>
+      process
+        .getActiveResourcesInfo()
+        .filter((resource) => resource === "Timeout" || resource === "TCPSocketWrap").length
+    try {
+      // The harness's readiness probe socket closes on a later tick.
+      await delay(200)
+      const baseline = held()
+      const stream = "close_redial"
+      const laser = await Laser.connectWithStream(
+        `${iggy.endpoint}?reconnection_retries=unlimited&reconnection_interval=200ms`,
+        stream
+      )
+      await within(laser.stream(stream).ensure(), 3_000)
+      const topic = laser.topic("pulse")
+      await within(topic.ensure(1), 3_000)
+      await within(topic.send(new TextEncoder().encode("before-stop")), 3_000)
+      await iggy.stop()
+      let settled = 0
+      const sent = topic.send(new TextEncoder().encode("while-stopped")).then(
+        () => "sent",
+        (error: unknown) => error
+      )
+      const polled = topic
+        .consumer("redial", 0, { startAt: { kind: "first" } })
+        .nextWithin(30_000)
+        .then(
+          () => "polled",
+          (error: unknown) => error
+        )
+      for (const call of [sent, polled]) {
+        void call.then(() => {
+          settled += 1
+        })
+      }
+      await delay(1_500)
+      assert.equal(settled, 0, "both calls wait on the redial")
+      const started = performance.now()
+      await within(laser.close(), 5_000)
+      const closedMs = performance.now() - started
+      assert.ok(closedMs < 5_000, `close settled after ${String(closedMs)} ms`)
+      const outcomes = await within(Promise.all([sent, polled]), 35_000)
+      for (const outcome of outcomes) {
+        assert.ok(
+          outcome instanceof Error,
+          `a call made while the server was gone ended with ${String(outcome)}`
+        )
+      }
+      // A redial that outlived the close would now connect and keep a socket.
+      await iggy.restart()
+      await delay(1_000)
+      const deadline = performance.now() + 5_000
+      while (held() > baseline && performance.now() < deadline) await delay(50)
+      assert.equal(held(), baseline, `left ${JSON.stringify(process.getActiveResourcesInfo())}`)
+      await new Promise((resolve) => setImmediate(resolve))
+      assert.deepEqual(unhandled, [], "no rejection went unhandled")
+    } finally {
+      process.off("unhandledRejection", onUnhandled)
+      await iggy.close()
     }
   }
 )

@@ -16,6 +16,7 @@ import {
 } from "../../src/wire/agent.js"
 import { encodeNamed } from "../../src/wire/cbor.js"
 import {
+  ADDRESSEE_FILTER_NAME,
   type HandledOperations,
   type SessionRecord,
   addresseeFilter,
@@ -24,7 +25,7 @@ import {
   classifyGeneric,
   displayType
 } from "../../src/wire/dispatch.js"
-import { consumerFilterDigest } from "../../src/wire/filter.js"
+import { consumerFilterDigest, validateFilterName } from "../../src/wire/filter.js"
 import { ConversationId } from "../../src/wire/ids.js"
 
 interface Case {
@@ -168,4 +169,9 @@ void test("given_the_shared_estimates_when_computed_then_should_match_every_row"
     assert.equal(estimateTokens(bytes), BigInt(tokens), `${String(bytes)} bytes`)
   }
   assert.throws(() => estimateTokens(-1))
+})
+
+void test("given_the_addressee_filter_name_when_validated_then_should_be_the_pinned_valid_name", () => {
+  assert.equal(ADDRESSEE_FILTER_NAME, "agent-addressee")
+  validateFilterName(ADDRESSEE_FILTER_NAME)
 })

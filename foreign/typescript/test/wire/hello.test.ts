@@ -2,9 +2,12 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { FILTER_EVALUATOR_VERSION } from "../../src/wire/filter.js"
 import { BackendResourceId } from "../../src/wire/ids.js"
+import { decodeOne, expectMap } from "../../src/wire/cbor.js"
 import {
   feature,
   backendDescriptorHasCapability,
+  decodeBackendAnnounce,
+  encodeBackendAnnounce,
   backendReadinessNotReady,
   filterAnnounceEvaluates,
   filterAnnounceServed,
@@ -61,4 +64,21 @@ void test("the served filter announcement evaluates every built-in codec at this
     assert.equal(filterAnnounceEvaluates(served, FILTER_EVALUATOR_VERSION, codec), true, codec)
   }
   assert.equal(filterAnnounceEvaluates(served, FILTER_EVALUATOR_VERSION + 1, "json"), false)
+})
+
+void test("given_a_filter_announcement_when_encoded_then_should_carry_a_non_zero_wait_and_omit_zero", () => {
+  const versions = newOpVersions(2, 2, 1, 1)
+  for (const maxWaitMs of [20_000, 0]) {
+    const announce = {
+      ...newBackendAnnounce(versions),
+      filters: { ...filterAnnounceServed(), maxWaitMs }
+    }
+    const bytes = encodeBackendAnnounce(announce)
+    const filters = expectMap(
+      expectMap(decodeOne(bytes, "announce"), "announce").get("filters"),
+      "filters"
+    )
+    assert.equal(filters.has("max_wait_ms"), maxWaitMs !== 0)
+    assert.equal(decodeBackendAnnounce(bytes).filters?.maxWaitMs, maxWaitMs)
+  }
 })

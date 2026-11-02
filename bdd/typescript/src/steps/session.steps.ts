@@ -311,7 +311,6 @@ Given(
     const builder = Agent.builder()
       .id(AgentId.new(name))
       .listenOn(AgentTopic.Sessions)
-      .pollInterval(5)
       .handler({ handle: (_message, context) => context.session().end() });
     const config = native(this).config;
     const worker = (config === undefined ? builder : builder.sessions(config))
@@ -783,7 +782,6 @@ Given(
       const agent = Agent.builder()
         .id(AgentId.new(name))
         .listenOn(AgentTopic.Sessions)
-        .pollInterval(5)
         .handler({
           handle: (message) => {
             seen.push(

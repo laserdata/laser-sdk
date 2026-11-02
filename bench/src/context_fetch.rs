@@ -100,7 +100,7 @@ pub async fn run_context_fetch_evidence(
     laser
         .stream(&stream)
         .topic(AgentTopic::Sessions.topic_string())
-        .ensure(case.partitions)
+        .ensure(case.partitions, None)
         .await
         .map_err(|error| sdk_error(&error))?;
     let scoped = laser.with_default_stream(&stream);

@@ -83,6 +83,8 @@ fn given_managed_command_codes_when_compared_then_should_match_the_dictionary() 
     assert_eq!(AGDX_DELIVERY_BASE, 1_000_800);
     assert_eq!(AGDX_FILTERED_POLL_CODE, 1_000_800);
     assert_eq!(AGDX_FILTERED_ACK_CODE, 1_000_801);
+    assert_eq!(AGDX_FILTERED_WAIT_CODE, 1_000_805);
+    assert_eq!(AGDX_FILTERED_WAIT_CANCEL_CODE, 1_000_806);
     assert_eq!(AGDX_FILTER_PREVIEW_CODE, 1_000_802);
     assert_eq!(AGDX_FILTER_TEST_CODE, 1_000_803);
     assert_eq!(AGDX_FILTER_VALIDATE_CODE, 1_000_804);
@@ -229,6 +231,9 @@ fn given_limits_when_compared_then_should_match_the_pinned_values() {
     assert_eq!(limits::MAX_FILTER_SOURCE_NAME_BYTES, 255);
     assert_eq!(limits::MAX_FILTERED_PAGE_RECORDS, 1000);
     assert_eq!(limits::MAX_FILTERED_PAGE_BYTES, 8_388_608);
+    assert_eq!(limits::MAX_FILTERED_WAIT_MS, 20_000);
+    assert_eq!(limits::MAX_FILTERED_WAIT_PARTITIONS, 1024);
+    assert_eq!(limits::MAX_FILTERED_WAIT_CANCEL_IDS, 64);
     assert_eq!(limits::MAX_FILTER_PREVIEW_EXAMINED, 10_000);
     assert_eq!(limits::MAX_FILTER_PREVIEW_RECORDS, 100);
     assert_eq!(limits::MAX_FILTER_PREVIEW_PAYLOAD_BYTES, 4096);
@@ -263,6 +268,16 @@ fn given_limits_when_compared_then_should_match_the_pinned_values() {
     assert_eq!(limits::MAX_BODY_REFERENCE_BYTES, 1024);
     assert_eq!(limits::MAX_CARD_CAPABILITIES, 64);
     assert_eq!(limits::MAX_CLIENT_METADATA, 64 * 1024);
+    assert_eq!(limits::MAX_PROJECTION_ID_BYTES, 255);
+    assert_eq!(limits::MAX_PROJECTION_NAME_BYTES, 255);
+    assert_eq!(limits::MAX_INDEX_FIELD_BYTES, 255);
+    assert_eq!(limits::MAX_SCHEMA_NAME_BYTES, 255);
+    assert_eq!(limits::MAX_GRAPH_LABEL_BYTES, 128);
+    assert_eq!(limits::MAX_MEMORY_ID_BYTES, 255);
+    assert_eq!(limits::MAX_SESSION_LABEL_BYTES, 256);
+    assert_eq!(limits::MAX_SESSION_TEXT_QUERY_BYTES, 1024);
+    assert_eq!(limits::MAX_SESSION_CURSOR_BYTES, 512);
+    assert_eq!(limits::MAX_HOLDER_ID_BYTES, 128);
 }
 
 #[test]

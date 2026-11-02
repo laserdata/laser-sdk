@@ -10,7 +10,8 @@ import {
   WireId,
   type SessionRef
 } from "./ids.js"
-import { MAX_GRAPH_NAME_BYTES } from "./limits.js"
+import { MAX_GRAPH_LABEL_BYTES, MAX_GRAPH_NAME_BYTES } from "./limits.js"
+import { validateBoundedText } from "./validate.js"
 import {
   consistencyToWord,
   decodeFilter,
@@ -680,6 +681,17 @@ export interface GraphUpsert {
   readonly session?: SessionRef
   readonly nodes: readonly GraphNode[]
   readonly edges: readonly GraphEdge[]
+}
+
+/** The node labels and edge types of an upsert, 1 to `MAX_GRAPH_LABEL_BYTES`
+ * bytes without a control character, as Rust `GraphUpsert::validate`. */
+export function validateGraphUpsert(upsert: GraphUpsert): void {
+  for (const node of upsert.nodes) {
+    for (const label of node.labels)
+      validateBoundedText("graph node label", label, MAX_GRAPH_LABEL_BYTES)
+  }
+  for (const edge of upsert.edges)
+    validateBoundedText("graph edge type", edge.edgeType, MAX_GRAPH_LABEL_BYTES)
 }
 
 export function encodeGraphUpsert(upsert: GraphUpsert): Map<string, unknown> {

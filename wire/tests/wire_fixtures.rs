@@ -57,7 +57,8 @@ use laser_wire::filter::{
     FilterMutation, FilterMutationOutcome, FilterMutationRequest, FilterMutationResult,
     FilterMutationStatus, FilterOutcome, FilterRef, FilterReply, FilterRevisionRef, FilterSource,
     FilterValidation, FilteredAck, FilteredPage, FilteredPollRequest, FilteredStart,
-    GroupFilterSpec, GroupPolicyUnbound, SourceGeneration, StopReason,
+    FilteredWaitCancel, FilteredWaitCancelled, FilteredWaitPartition, FilteredWaitRequest,
+    FilteredWaitResult, GroupFilterSpec, GroupPolicyUnbound, SourceGeneration, StopReason,
 };
 use laser_wire::fork::{
     ForkCreate, ForkInfo, ForkKind, ForkOutcome, ForkPut, ForkReply, ForkStatus,
@@ -113,6 +114,7 @@ use laser_wire::session::{
 use laser_wire::snapshot::{FoldSnapshot, SnapshotOffset};
 use laser_wire::source::{PhysicalClusterIncarnation, SourceIncarnation, SourceScope};
 use laser_wire::topology::WireTopology;
+use laser_wire::validate::Validate;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -3541,6 +3543,46 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
         },
     );
     assert_frame(
+        "filter_wait_request.bin",
+        &FilteredWaitRequest {
+            v: laser_wire::codes::FILTER_OP_VERSION,
+            source: FilterSource {
+                stream: "orbit".to_owned(),
+                topic: "fleet_changes".to_owned(),
+            },
+            consumer: FilterConsumer::Group("anomaly-desk".to_owned()),
+            partitions: vec![
+                FilteredWaitPartition {
+                    partition_id: 0,
+                    offset: 7,
+                },
+                FilteredWaitPartition {
+                    partition_id: 1,
+                    offset: 0,
+                },
+            ],
+            max_wait_ms: 5_000,
+            wait_id: 9,
+        },
+    );
+    assert_frame(
+        "filter_reply_ready.bin",
+        &FilterReply::Ok(FilterOutcome::Ready(FilteredWaitResult { ready: vec![1] })),
+    );
+    assert_frame(
+        "filter_wait_cancel.bin",
+        &FilteredWaitCancel {
+            v: laser_wire::codes::FILTER_OP_VERSION,
+            wait_ids: vec![9, 11],
+        },
+    );
+    assert_frame(
+        "filter_reply_cancelled.bin",
+        &FilterReply::Ok(FilterOutcome::Cancelled(FilteredWaitCancelled {
+            cancelled: vec![9],
+        })),
+    );
+    assert_frame(
         "filter_poll_request_group_id.bin",
         &FilteredPollRequest {
             v: laser_wire::codes::FILTER_OP_VERSION,
@@ -3699,7 +3741,10 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
         operation_id: 11,
         mutation: FilterMutation::ConfigureGroup {
             group: canonical_group(),
-            policy: GroupFilterSpec::Definition(filter.clone()),
+            policy: GroupFilterSpec::Definition {
+                name: "safe-mode".to_owned(),
+                filter: filter.clone(),
+            },
             expected_identity: Some(canonical_identity()),
         },
     };
@@ -3799,7 +3844,7 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
         &ControlEnvelope {
             v: CONTROL_OP_VERSION,
             timestamp_micros: TIMESTAMP_MICROS,
-            command: ControlCommand::FilterCatalog(FilterCatalogCommand {
+            command: ControlCommand::FilterCatalog(Box::new(FilterCatalogCommand {
                 limits: Some(laser_wire::filter::FilterCatalogLimits::default()),
                 operation_id: 9,
                 actor_user_id: 1,
@@ -3811,7 +3856,7 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
                 identity: Some(canonical_identity()),
                 filter_id: None,
                 grants: Vec::new(),
-            }),
+            })),
             stream: None,
             stamp: None,
         },
@@ -4250,4 +4295,75 @@ fn given_a_memory_view_entry_when_encoded_then_should_match_golden_fixture() {
             source: None,
         },
     );
+}
+
+#[test]
+fn given_the_corpus_records_the_name_limits_govern_when_validated_then_should_all_pass() {
+    fn decoded<T: DeserializeOwned>(name: &str) -> T {
+        let golden = std::fs::read(fixture_path(name)).expect("read fixture");
+        decode_named(&golden).expect("fixture frame decodes")
+    }
+    for (name, _) in laser_wire::fixtures::ALL
+        .iter()
+        .filter(|(name, _)| name.starts_with("control_"))
+    {
+        decoded::<ControlEnvelope>(name)
+            .command
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    for name in ["graph_upsert.bin", "graph_upsert_session.bin"] {
+        decoded::<GraphUpsert>(name)
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    for name in [
+        "graph_node.bin",
+        "graph_node_sourced.bin",
+        "graph_node_conversation.bin",
+        "graph_node_producer.bin",
+    ] {
+        decoded::<GraphNode>(name)
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    for name in [
+        "graph_edge.bin",
+        "graph_edge_sourced.bin",
+        "graph_edge_conversation.bin",
+        "graph_edge_producer.bin",
+    ] {
+        decoded::<GraphEdge>(name)
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    for name in [
+        "memory_item_origin.bin",
+        "memory_forget_scoped.bin",
+        "memory_feedback_scoped.bin",
+    ] {
+        decoded::<MemoryRecord>(name)
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    decoded::<session_request::SessionList>("session_list.bin")
+        .validate()
+        .expect("session_list.bin validates");
+    decoded::<KvLease>("kv_lease.bin")
+        .validate()
+        .expect("kv_lease.bin validates");
+    decoded::<KvLeaseRenew>("kv_lease_renew.bin")
+        .validate()
+        .expect("kv_lease_renew.bin validates");
+    decoded::<KvRelease>("kv_release.bin")
+        .validate()
+        .expect("kv_release.bin validates");
+    decoded::<RegisterSchema>("register_schema_managed.bin")
+        .validate()
+        .expect("register_schema_managed.bin validates");
+    let schema: SchemaDef = serde_json::from_slice(
+        &std::fs::read(fixture_path("schema_def.json")).expect("read fixture"),
+    )
+    .expect("schema_def.json decodes");
+    schema.validate().expect("schema_def.json validates");
 }

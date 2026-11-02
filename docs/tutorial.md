@@ -56,7 +56,7 @@ async fn main() -> Result<(), LaserError> {
     let laser = Laser::connect("iggy:iggy@127.0.0.1:8090").await?;
     let inferences = laser.stream("agent-telemetry").topic("inferences");
 
-    inferences.ensure(4).await?;
+    inferences.ensure(4, None).await?;
     inferences.publish()
         .json(&Inference {
             model:      "gpt-4o".into(),
@@ -770,7 +770,7 @@ use laser_sdk::query::CmpOp;
 let topic = laser.stream("agent-telemetry").topic("inferences");
 let group = topic.consumer_group("on-call-review");
 let policy = ConsumerFilter::json(FilterExpr::pred("latency_ms", CmpOp::Gt, 2_000));
-let info = group.create().filter(policy).build().await?;
+let info = group.create().filter("slow-inferences", policy).build().await?;
 
 let mut consumer = topic.consumer_group_id(u64::from(info.id))
     .consumer()
@@ -790,7 +790,7 @@ The setup can run separately from every consumer instance. The consumer needs no
 
 **Batch length 100 examines at most 100 source records per partition request.** It can deliver zero through 100 records. Empty selections retain progress and do not mean end of stream. The advanced `group.reader()` uses a separate matching-record `count` and `max_examined` scan budget. It also supports unbound groups. Its acknowledgment includes skipped records only through completed work.
 
-Use `group.filter().configure(...)` for later setup and its `preview`, `test`, `revisions`, `revise` and `set_revision_enabled` methods for diagnostics and administration. A draft revision does not replace a group's active policy. Use another group for a different A/B policy.
+The name is the caller's label for the group's own filter. It follows the saved filter name rule and need not be unique. Use `group.filter().configure(name, filter)` for later setup, `summary()` to read the group's own filter row with its name and owner, and its `preview`, `test`, `revisions`, `revise` and `set_revision_enabled` methods for diagnostics and administration. A draft revision does not replace a group's active policy. Use another group for a different A/B policy.
 
 **The recorded CDC example saves 98.5% of payload transfer:** 4 of 240 records and 424 of 27,953 payload bytes. The example exists in Rust, Python and TypeScript. It demonstrates change evidence, numeric headers and JSON, CBOR, Avro and Protobuf policies.
 

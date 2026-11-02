@@ -1,18 +1,24 @@
 use crate::capabilities::{Capabilities, HelloOutcome};
 use crate::error::LaserError;
+use crate::filters::group::settled_assignment;
 use crate::filters::reader::{DEFAULT_IDLE_INTERVAL, Delivery, FilteredReader, MatchedRecord};
+use crate::laser::{ensure_stream, ensure_topic_retained, validate_replication_factor};
+use crate::poll::current_tail_offset;
 use crate::stream::consumer_group::ConsumerGroup;
 use crate::stream::{HeaderKey, HeaderValue, Topic};
 use crate::types::MessageId;
 use bytes::Bytes;
 use futures::Stream;
+use futures::future::{Either, ready};
 use iggy::prelude::{
-    AutoCommit, AutoCommitWhen, BackgroundConfig, ConsumerGroupClient, ConsumerOffsetClient,
-    DirectConfig, Identifier, IggyConsumer, IggyConsumerBuilder, IggyExpiry, IggyMessage,
-    IggyProducer, IggyTimestamp, MaxTopicSize, Partitioning, PollingStrategy, ReceivedMessage,
+    AutoCommit, BackgroundConfig, Client, CommitAfter, CommitEvery, ConsumerGroupClient,
+    ConsumerOffsetClient, DEFAULT_POLL_MAX_BYTES, DirectConfig, Identifier, IggyClient,
+    IggyConsumer, IggyConsumerBuilder, IggyError, IggyExpiry, IggyMessage, IggyProducer,
+    IggyTimestamp, MAX_DEFERRED_POLL_WAIT_US, MIN_DEFERRED_POLL_MAX_BYTES, MaxTopicSize,
+    MessageClient, Partitioning, PollOptions, PollingStrategy, ReadError, ReceivedMessage,
     SendMessagesResponse,
 };
-use laser_wire::filter::{FilterRef, FilteredStart};
+use laser_wire::filter::FilterRef;
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -24,6 +30,8 @@ use tokio::time::{Instant, sleep};
 
 const DEFAULT_BATCH_LENGTH: u32 = 1000;
 const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(5);
+const DEFAULT_MIN_COUNT: u32 = 1;
 
 /// Exact Apache Iggy user headers, preserving each value's wire type.
 pub type Headers = BTreeMap<HeaderKey, HeaderValue>;
@@ -72,14 +80,10 @@ pub enum ConsumerStart {
 }
 
 impl ConsumerStart {
-    const fn into_filtered(self) -> FilteredStart {
-        match self {
-            Self::First => FilteredStart::First,
-            Self::Last => FilteredStart::Last,
-            Self::Next => FilteredStart::Next,
-            Self::Offset(offset) => FilteredStart::Offset(offset),
-            Self::TimestampMicros(timestamp) => FilteredStart::Timestamp(timestamp),
-        }
+    // Whether a group that never stored a partition must store this start
+    // before its `Next` read begins where the start names.
+    const fn seeds(self) -> bool {
+        !matches!(self, Self::First | Self::Next | Self::Offset(0))
     }
 
     fn into_polling(self) -> PollingStrategy {
@@ -126,43 +130,43 @@ pub enum CommitPolicy {
     IntervalOrEvery(Duration, u32),
 }
 
-impl CommitPolicy {
-    fn into_auto_commit(self) -> Result<AutoCommit, LaserError> {
-        let every = |messages: u32| {
-            if messages == 0 {
-                Err(LaserError::Invalid(
-                    "commit frequency must be greater than zero".to_owned(),
-                ))
-            } else {
-                Ok(AutoCommitWhen::ConsumingEveryNthMessage(messages))
-            }
+impl TryFrom<CommitPolicy> for iggy::prelude::CommitPolicy {
+    type Error = LaserError;
+
+    fn try_from(commit: CommitPolicy) -> Result<Self, Self::Error> {
+        let interval = |duration: Duration| {
+            positive_duration(duration, "commit interval must be greater than zero")
         };
-        Ok(match self {
-            Self::Disabled => AutoCommit::Disabled,
-            Self::Interval(duration) => AutoCommit::Interval(positive_duration(
-                duration,
-                "commit interval must be greater than zero",
-            )?),
-            Self::Polling => AutoCommit::When(AutoCommitWhen::PollingMessages),
-            Self::IntervalOrPolling(duration) => AutoCommit::IntervalOrWhen(
-                positive_duration(duration, "commit interval must be greater than zero")?,
-                AutoCommitWhen::PollingMessages,
-            ),
-            Self::All => AutoCommit::When(AutoCommitWhen::ConsumingAllMessages),
-            Self::IntervalOrAll(duration) => AutoCommit::IntervalOrWhen(
-                positive_duration(duration, "commit interval must be greater than zero")?,
-                AutoCommitWhen::ConsumingAllMessages,
-            ),
-            Self::Each => AutoCommit::When(AutoCommitWhen::ConsumingEachMessage),
-            Self::IntervalOrEach(duration) => AutoCommit::IntervalOrWhen(
-                positive_duration(duration, "commit interval must be greater than zero")?,
-                AutoCommitWhen::ConsumingEachMessage,
-            ),
-            Self::Every(messages) => AutoCommit::When(every(messages)?),
-            Self::IntervalOrEvery(duration, messages) => AutoCommit::IntervalOrWhen(
-                positive_duration(duration, "commit interval must be greater than zero")?,
-                every(messages)?,
-            ),
+        let every = |messages: u32| {
+            std::num::NonZeroU32::new(messages)
+                .map(CommitEvery::Messages)
+                .ok_or_else(|| {
+                    LaserError::Invalid("commit frequency must be greater than zero".to_owned())
+                })
+        };
+        let auto = |interval, every| {
+            Self::Auto(AutoCommit {
+                interval,
+                every,
+                after: CommitAfter::Processing,
+            })
+        };
+        Ok(match commit {
+            CommitPolicy::Disabled => Self::Manual,
+            CommitPolicy::Polling | CommitPolicy::IntervalOrPolling(_) => Self::OnRead,
+            CommitPolicy::Interval(duration) => auto(Some(interval(duration)?), None),
+            CommitPolicy::All => auto(None, Some(CommitEvery::Batch)),
+            CommitPolicy::IntervalOrAll(duration) => {
+                auto(Some(interval(duration)?), Some(CommitEvery::Batch))
+            }
+            CommitPolicy::Each => auto(None, Some(CommitEvery::Message)),
+            CommitPolicy::IntervalOrEach(duration) => {
+                auto(Some(interval(duration)?), Some(CommitEvery::Message))
+            }
+            CommitPolicy::Every(messages) => auto(None, Some(every(messages)?)),
+            CommitPolicy::IntervalOrEvery(duration, messages) => {
+                auto(Some(interval(duration)?), Some(every(messages)?))
+            }
         })
     }
 }
@@ -230,6 +234,7 @@ pub struct ProducerBuilder {
     create_stream: bool,
     create_topic: bool,
     partitions: u32,
+    replication_factor: Option<u32>,
     expire_after: Option<Duration>,
     never_expire: bool,
     max_topic_bytes: Option<u64>,
@@ -253,6 +258,7 @@ impl ProducerBuilder {
             create_stream: false,
             create_topic: true,
             partitions: 1,
+            replication_factor: None,
             expire_after: None,
             never_expire: false,
             max_topic_bytes: None,
@@ -310,6 +316,17 @@ impl ProducerBuilder {
     #[must_use]
     pub fn partitions(mut self, partitions: u32) -> Self {
         self.partitions = partitions;
+        self
+    }
+
+    /// Creates the topic with each partition stored on `factor` nodes,
+    /// 1..=[`MAX_REPLICATION_FACTOR`](crate::stream::MAX_REPLICATION_FACTOR) and
+    /// at most the cluster's node count. Without it the server's default
+    /// applies. An existing topic keeps its
+    /// own.
+    #[must_use]
+    pub fn replication_factor(mut self, factor: u32) -> Self {
+        self.replication_factor = Some(factor);
         self
     }
 
@@ -409,6 +426,12 @@ impl ProducerBuilder {
                 "topic partition count must be greater than zero".to_owned(),
             ));
         }
+        if let Some(factor) = self.replication_factor {
+            validate_replication_factor(factor)?;
+        }
+        // The upstream producer creates a topic without a replication factor,
+        // so a topic that needs one is created here first.
+        let replicated_topic = self.replication_factor.filter(|_| self.create_topic);
         let background = self.background.is_some();
         let mut publish_options = self.topic.laser.publish_options();
         publish_options.max_retries = self.retries.unwrap_or(0);
@@ -432,7 +455,7 @@ impl ProducerBuilder {
         } else {
             builder.do_not_create_stream_if_not_exists()
         };
-        builder = if self.create_topic {
+        builder = if self.create_topic && replicated_topic.is_none() {
             builder.create_topic_if_not_exists(self.partitions, expiry, max_topic_size)
         } else {
             builder.do_not_create_topic_if_not_exists()
@@ -446,6 +469,23 @@ impl ProducerBuilder {
                         self.topic.laser.publish_generation(),
                         std::sync::atomic::Ordering::Release,
                     );
+                    if let Some(factor) = replicated_topic {
+                        let client = self.topic.laser.client();
+                        let stream = self.topic.stream()?;
+                        if self.create_stream {
+                            ensure_stream(&client, stream).await?;
+                        }
+                        ensure_topic_retained(
+                            &client,
+                            stream,
+                            &self.topic.name,
+                            self.partitions,
+                            expiry,
+                            max_topic_size,
+                            Some(factor),
+                        )
+                        .await?;
+                    }
                     Ok(crate::laser::init_producer(&producer).await?)
                 },
                 || {
@@ -489,81 +529,96 @@ pub struct Producer {
 
 impl Producer {
     /// Send one record without user headers using the configured routing.
-    pub async fn send(
+    pub fn send(
         &self,
         payload: impl Into<Bytes>,
-    ) -> Result<SendMessagesResponse, LaserError> {
-        self.send_message(ProducerMessage::new(payload)).await
+    ) -> impl Future<Output = Result<SendMessagesResponse, LaserError>> + Send + '_ {
+        self.send_message(ProducerMessage::new(payload))
     }
 
     /// Send one record using the configured routing.
-    pub async fn send_message(
+    pub fn send_message(
         &self,
         message: ProducerMessage,
-    ) -> Result<SendMessagesResponse, LaserError> {
-        self.send_iggy(vec![message.into_iggy()?], None).await
+    ) -> impl Future<Output = Result<SendMessagesResponse, LaserError>> + Send + '_ {
+        self.publish_converted(message.into_iggy().map(|message| vec![message]), Ok(None))
     }
 
     /// Send one record with a per-call routing override.
-    pub async fn send_with_routing(
+    pub fn send_with_routing(
         &self,
         message: ProducerMessage,
         routing: Routing,
-    ) -> Result<SendMessagesResponse, LaserError> {
-        self.send_iggy(
-            vec![message.into_iggy()?],
-            Some(Arc::new(routing.into_partitioning()?)),
+    ) -> impl Future<Output = Result<SendMessagesResponse, LaserError>> + Send + '_ {
+        self.publish_converted(
+            message.into_iggy().map(|message| vec![message]),
+            routing
+                .into_partitioning()
+                .map(|partitioning| Some(Arc::new(partitioning))),
         )
-        .await
     }
 
     /// Send one record with a per-call partition key.
-    pub async fn send_keyed(
+    pub fn send_keyed(
         &self,
         message: ProducerMessage,
         key: impl Into<Vec<u8>>,
-    ) -> Result<SendMessagesResponse, LaserError> {
-        self.send_with_routing(message, Routing::key(key)).await
+    ) -> impl Future<Output = Result<SendMessagesResponse, LaserError>> + Send + '_ {
+        self.send_with_routing(message, Routing::key(key))
     }
 
     /// Send one record to a specific partition.
-    pub async fn send_to_partition(
+    pub fn send_to_partition(
         &self,
         message: ProducerMessage,
         partition: u32,
-    ) -> Result<SendMessagesResponse, LaserError> {
+    ) -> impl Future<Output = Result<SendMessagesResponse, LaserError>> + Send + '_ {
         self.send_with_routing(message, Routing::Partition(partition))
-            .await
     }
 
     /// Send a batch using the configured routing.
-    pub async fn send_batch(
+    pub fn send_batch(
         &self,
         messages: impl IntoIterator<Item = ProducerMessage>,
-    ) -> Result<SendMessagesResponse, LaserError> {
-        self.send_batch_with_routing(messages, None).await
+    ) -> impl Future<Output = Result<SendMessagesResponse, LaserError>> + Send + '_ {
+        self.send_batch_with_routing(messages, None)
     }
 
     /// Send a batch with an optional per-call routing override.
-    pub async fn send_batch_with_routing(
+    pub fn send_batch_with_routing(
         &self,
         messages: impl IntoIterator<Item = ProducerMessage>,
         routing: Option<Routing>,
-    ) -> Result<SendMessagesResponse, LaserError> {
-        let messages = messages
-            .into_iter()
-            .map(ProducerMessage::into_iggy)
-            .collect::<Result<Vec<_>, _>>()?;
-        if messages.is_empty() {
-            return Ok(SendMessagesResponse {
-                confirmations: Vec::new(),
-            });
+    ) -> impl Future<Output = Result<SendMessagesResponse, LaserError>> + Send + '_ {
+        self.publish_converted(
+            messages
+                .into_iter()
+                .map(ProducerMessage::into_iggy)
+                .collect::<Result<Vec<_>, _>>(),
+            routing
+                .map(Routing::into_partitioning)
+                .transpose()
+                .map(|partitioning| partitioning.map(Arc::new)),
+        )
+    }
+
+    // Every send converts its arguments before the publish future starts, so
+    // no send keeps them across the publish's awaits.
+    fn publish_converted(
+        &self,
+        messages: Result<Vec<IggyMessage>, LaserError>,
+        routing: Result<Option<Arc<Partitioning>>, LaserError>,
+    ) -> impl Future<Output = Result<SendMessagesResponse, LaserError>> + Send + '_ {
+        match (messages, routing) {
+            (Err(error), _) => Either::Right(ready(Err(error))),
+            (Ok(messages), _) if messages.is_empty() => {
+                Either::Right(ready(Ok(SendMessagesResponse {
+                    confirmations: Vec::new(),
+                })))
+            }
+            (Ok(_), Err(error)) => Either::Right(ready(Err(error))),
+            (Ok(messages), Ok(routing)) => Either::Left(self.send_iggy(messages, routing)),
         }
-        let routing = routing
-            .map(Routing::into_partitioning)
-            .transpose()?
-            .map(Arc::new);
-        self.send_iggy(messages, routing).await
     }
 
     async fn send_iggy(
@@ -589,7 +644,7 @@ impl Producer {
         routing: Option<Arc<Partitioning>>,
     ) -> Result<SendMessagesResponse, LaserError> {
         if self.background {
-            return Ok(Box::pin(self.inner.send_with_partitioning(messages, routing)).await?);
+            return Ok(self.inner.send_with_partitioning(messages, routing).await?);
         }
         crate::laser::prepare_publish_messages(&mut messages);
         let mut confirmations = Vec::new();
@@ -603,11 +658,13 @@ impl Producer {
                             self.laser.publish_generation(),
                             std::sync::atomic::Ordering::Release,
                         );
-                        Ok(Box::pin(self.inner.send_with_partitioning(
-                            chunk.iter().map(crate::laser::clone_iggy_message).collect(),
-                            routing.clone(),
-                        ))
-                        .await?)
+                        Ok(self
+                            .inner
+                            .send_with_partitioning(
+                                chunk.iter().map(crate::laser::clone_iggy_message).collect(),
+                                routing.clone(),
+                            )
+                            .await?)
                     },
                     || {
                         self.laser.reconnect_for_publish(
@@ -636,7 +693,7 @@ impl Producer {
     /// Flushes buffered `background`-mode messages and stops the worker. A
     /// `direct`-mode producer has nothing to flush, so this is a cheap
     /// no-op for it. Requires this to be the last live handle to the
-    /// producer, since Apache Iggy's shutdown takes ownership; fails if
+    /// producer, since Apache Iggy's shutdown takes ownership. Fails if
     /// other clones of this `Producer` are still alive.
     pub async fn shutdown(self) -> Result<(), LaserError> {
         match Arc::try_unwrap(self.inner) {
@@ -670,10 +727,11 @@ pub struct ConsumerBuilder {
     topic: Topic,
     target: ConsumerTarget,
     batch_length: u32,
-    poll_interval: Option<Duration>,
+    max_wait: Duration,
+    min_count: u32,
+    max_bytes: u32,
     start: ConsumerStart,
     commit: CommitPolicy,
-    auto_join_group: bool,
     create_group: bool,
     polling_retry_interval: Duration,
     init_retries: Option<(u32, Duration)>,
@@ -704,10 +762,11 @@ impl ConsumerBuilder {
             topic,
             target,
             batch_length: DEFAULT_BATCH_LENGTH,
-            poll_interval: None,
+            max_wait: DEFAULT_MAX_WAIT,
+            min_count: DEFAULT_MIN_COUNT,
+            max_bytes: DEFAULT_POLL_MAX_BYTES,
             start: ConsumerStart::Next,
             commit: CommitPolicy::Polling,
-            auto_join_group: true,
             create_group: true,
             polling_retry_interval: DEFAULT_RETRY_INTERVAL,
             init_retries: None,
@@ -735,21 +794,41 @@ impl ConsumerBuilder {
         self
     }
 
-    /// How long the consumer waits after a poll that found nothing new.
+    /// How long the server holds a poll that finds fewer than `min_count`
+    /// new records before it answers with what it has. Default 5 s, at most
+    /// 600 s. Zero answers at once. A policy-aware group consumer holds its
+    /// filtered wait at most this long and at most what the server announces.
     #[must_use]
-    pub fn poll_interval(mut self, poll_interval: Duration) -> Self {
-        self.poll_interval = Some(poll_interval);
+    pub const fn max_wait(mut self, max_wait: Duration) -> Self {
+        self.max_wait = max_wait;
         self
     }
 
-    /// Poll again at once after an empty poll. A policy-aware group consumer
-    /// keeps a short wait so an idle partition is not spun on.
+    /// How many new records end a held poll early. Default 1, at most the
+    /// batch length. Native only.
     #[must_use]
-    pub fn without_poll_interval(mut self) -> Self {
-        self.poll_interval = None;
+    pub const fn min_count(mut self, min_count: u32) -> Self {
+        self.min_count = min_count;
         self
     }
 
+    /// Most record bytes one poll returns. Default 1 MiB. A record larger
+    /// than the cap comes alone, so a poll always makes progress. Native only.
+    #[must_use]
+    pub const fn max_bytes(mut self, max_bytes: u32) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// Where reading begins. A partition consumer starts there. A group
+    /// consumer always resumes after the group's stored offset: the start
+    /// only seeds a partition the group never stored, so its first read
+    /// begins at the record the start names. A policy-aware consumer seeds
+    /// every such partition it gains before reading it. A native consumer
+    /// seeds only those it holds when it joins, so one it gains later with
+    /// nothing stored begins at its first record. A seed the server refuses,
+    /// such as an offset past a partition's end, fails `build` and leaves the
+    /// group, or fails the first read of a partition gained later.
     #[must_use]
     pub fn start_at(mut self, start: ConsumerStart) -> Self {
         self.start = start;
@@ -759,13 +838,6 @@ impl ConsumerBuilder {
     #[must_use]
     pub fn commit_policy(mut self, commit: CommitPolicy) -> Self {
         self.commit = commit;
-        self
-    }
-
-    /// Native only. A policy-aware group consumer always joins its group.
-    #[must_use]
-    pub fn auto_join_group(mut self, auto_join: bool) -> Self {
-        self.auto_join_group = auto_join;
         self
     }
 
@@ -796,11 +868,35 @@ impl ConsumerBuilder {
         self
     }
 
+    // A group reads `Next` everywhere, because upstream applies any other
+    // start again to every partition a rebalance hands the member.
+    fn reader_start(&self) -> ConsumerStart {
+        match self.target {
+            ConsumerTarget::Group(_) => ConsumerStart::Next,
+            ConsumerTarget::Partition { .. } => self.start,
+        }
+    }
+
     pub async fn build(self) -> Result<Consumer, LaserError> {
         if self.batch_length == 0 {
             return Err(LaserError::Invalid(
                 "consumer batch length must be greater than zero".to_owned(),
             ));
+        }
+        if self.min_count == 0 || self.min_count > self.batch_length {
+            return Err(LaserError::Invalid(
+                "consumer min_count must be 1..=batch_length".to_owned(),
+            ));
+        }
+        if self.max_wait.as_micros() > u128::from(MAX_DEFERRED_POLL_WAIT_US) {
+            return Err(LaserError::Invalid(
+                "consumer max_wait must be at most 600 s".to_owned(),
+            ));
+        }
+        if (self.max_bytes as usize) < MIN_DEFERRED_POLL_MAX_BYTES {
+            return Err(LaserError::Invalid(format!(
+                "consumer max_bytes must be at least {MIN_DEFERRED_POLL_MAX_BYTES}"
+            )));
         }
         if let ConsumerTarget::Group(group) = &self.target
             && !self.native
@@ -818,13 +914,7 @@ impl ConsumerBuilder {
     }
 
     async fn build_group(self, group: ConsumerGroup) -> Result<Consumer, LaserError> {
-        self.commit.into_auto_commit()?;
-        if !self.auto_join_group {
-            return Err(LaserError::Invalid(
-                "a policy-aware group consumer always joins its group, remove auto_join_group(false)"
-                    .to_owned(),
-            ));
-        }
+        iggy::prelude::CommitPolicy::try_from(self.commit)?;
         if self.create_group && group.name().is_some() {
             group.ensure_native().await?;
         }
@@ -836,10 +926,11 @@ impl ConsumerBuilder {
         let reader = loop {
             let built = group
                 .reader_with(FilterRef::Group)?
-                .start(self.start.into_filtered())
+                .seeded(self.start)
                 .count(self.batch_length)
                 .max_examined(self.batch_length)
-                .idle_interval(self.poll_interval.unwrap_or(DEFAULT_IDLE_INTERVAL))
+                .idle_interval(DEFAULT_IDLE_INTERVAL)
+                .max_wait(self.max_wait)
                 .retry_interval(polling_retry_interval)
                 .build()
                 .await;
@@ -885,8 +976,9 @@ impl ConsumerBuilder {
                 },
             )))),
             manual_commit: self.commit == CommitPolicy::Disabled,
+            allow_replay: self.allow_replay,
             shutdown_target: None,
-            next_future: std::sync::Mutex::new(None),
+            group_reads: std::sync::Mutex::new(GroupReads::default()),
             offsets: Some(offsets),
             deferred: Some(deferred),
             returned_native: std::sync::Mutex::new(VecDeque::new()),
@@ -901,16 +993,14 @@ impl ConsumerBuilder {
             ConsumerTarget::Partition { .. } => None,
         };
         let shutdown_target = match &self.target {
-            ConsumerTarget::Group(_) if manual_commit && self.auto_join_group => {
-                Some(ConsumerGroupTarget {
-                    laser: self.topic.laser.clone(),
-                    stream: self.topic.stream()?.to_owned(),
-                    topic: self.topic.name.clone(),
-                    group: native_group
-                        .clone()
-                        .ok_or(LaserError::Config("consumer group name is absent"))?,
-                })
-            }
+            ConsumerTarget::Group(_) if manual_commit => Some(ConsumerGroupTarget {
+                laser: self.topic.laser.clone(),
+                stream: self.topic.stream()?.to_owned(),
+                topic: self.topic.name.clone(),
+                group: native_group
+                    .clone()
+                    .ok_or(LaserError::Config("consumer group name is absent"))?,
+            }),
             _ => None,
         };
         let offset_owner = OffsetOwner {
@@ -940,24 +1030,22 @@ impl ConsumerBuilder {
                     .ok_or(LaserError::Config("consumer group name is absent"))?,
             )?,
         };
+        let poll_options = PollOptions {
+            count: self.batch_length,
+            max_wait: self.max_wait.into(),
+            min_count: self.min_count,
+            max_bytes: self.max_bytes,
+            commit: iggy::prelude::CommitPolicy::try_from(self.commit)?,
+        };
+        let reader_start = self.reader_start();
         builder = builder
-            .batch_length(self.batch_length)
-            .polling_strategy(self.start.into_polling())
-            .auto_commit(self.commit.into_auto_commit()?)
+            .poll_options(poll_options)
+            .polling_strategy(reader_start.into_polling())
             .polling_retry_interval(positive_duration(
                 self.polling_retry_interval,
                 "consumer polling retry interval must be greater than zero",
             )?);
-        builder = match self.poll_interval {
-            Some(interval) => builder.poll_interval(interval.into()),
-            None => builder.without_poll_interval(),
-        };
         if group {
-            builder = if self.auto_join_group {
-                builder.auto_join_consumer_group()
-            } else {
-                builder.do_not_auto_join_consumer_group()
-            };
             builder = if self.create_group {
                 builder.create_consumer_group_if_not_exists()
             } else {
@@ -976,19 +1064,293 @@ impl ConsumerBuilder {
         if self.allow_replay {
             builder = builder.allow_replay();
         }
+        let seeds = group && self.start.seeds();
+        if seeds {
+            if let ConsumerTarget::Group(handle) = &self.target
+                && self.create_group
+                && handle.name().is_some()
+            {
+                handle.ensure_native().await?;
+            }
+            seed_group_start(&offset_owner, self.start).await?;
+        }
         let mut consumer = builder.build();
-        consumer.init().await?;
+        if let Err(error) = consumer.init().await {
+            if seeds {
+                leave_seeded_group(&offset_owner).await;
+            }
+            return Err(error.into());
+        }
         Ok(Consumer {
             yielded_zero: BTreeSet::new(),
             inner: Some(ConsumerInner::Native(Box::new(consumer))),
             manual_commit,
+            allow_replay: self.allow_replay,
             shutdown_target,
-            next_future: std::sync::Mutex::new(None),
+            group_reads: std::sync::Mutex::new(GroupReads::default()),
             offsets: None,
             deferred: None,
             returned_native: std::sync::Mutex::new(VecDeque::new()),
             offset_owner,
         })
+    }
+}
+
+/// How the native consumer resumes a partition that a read error stopped,
+/// as the upstream connector sink does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ReadRecovery {
+    /// A read with an unknown outcome blocks the partition. Its operation is
+    /// abandoned and the partition resumes after its stored offset.
+    Abandon { partition_id: u32, operation: u64 },
+    /// A record does not decode. It is reported once and read past.
+    Skip {
+        partition_id: u32,
+        start: PollingStrategy,
+    },
+    /// The partition has a new history. It resumes after its stored offset.
+    Resume { partition_id: u32 },
+    /// The reader stopped the partition after lasting refusals (permission,
+    /// ownership, a missing stream, topic or partition). The refusal is
+    /// reported and the partition resumes after its stored offset.
+    Stopped { partition_id: u32 },
+    /// The reader retries by itself, the error is only reported.
+    Report,
+}
+
+impl From<&ReadError> for ReadRecovery {
+    fn from(error: &ReadError) -> Self {
+        match (error.partition_id, &error.error, error.skip) {
+            (
+                Some(partition_id),
+                IggyError::FetchProgressUncertain(operation)
+                | IggyError::PartitionLaneBlocked(_, operation),
+                _,
+            ) => Self::Abandon {
+                partition_id,
+                operation: *operation,
+            },
+            (Some(partition_id), _, Some(start)) => Self::Skip {
+                partition_id,
+                start,
+            },
+            (Some(partition_id), IggyError::HistoryUnavailable, None) => {
+                Self::Resume { partition_id }
+            }
+            (Some(partition_id), _, None) if error.is_lasting_refusal() => {
+                Self::Stopped { partition_id }
+            }
+            _ => Self::Report,
+        }
+    }
+}
+
+// Seed the partitions this member holds that the group never stored. Only a
+// holder may store a group offset, so the member joins first, and leaves
+// again when a seed fails.
+async fn seed_group_start(owner: &OffsetOwner, start: ConsumerStart) -> Result<(), LaserError> {
+    let client = owner.laser.client();
+    let stream = Identifier::named(&owner.stream)?;
+    let topic = Identifier::named(&owner.topic)?;
+    let group = &owner.consumer.id;
+    client.join_consumer_group(&stream, &topic, group).await?;
+    let seeded = async {
+        let held = settled_assignment(&client, &stream, &topic, group)
+            .await?
+            .ok_or_else(|| {
+                IggyError::ConsumerGroupMemberNotFound(0, group.clone(), topic.clone())
+            })?;
+        for partition in held.partitions {
+            seed_group_partition(
+                &client,
+                &owner.consumer,
+                (&stream, &topic, partition),
+                start,
+            )
+            .await?;
+        }
+        Ok::<(), LaserError>(())
+    }
+    .await;
+    if seeded.is_err() {
+        leave_seeded_group(owner).await;
+    }
+    seeded
+}
+
+/// Store `start` on a partition the group never stored, so the group's
+/// `Next` read begins at the record the start names.
+pub(crate) async fn seed_group_partition(
+    client: &IggyClient,
+    group: &iggy::prelude::Consumer,
+    (stream, topic, partition): (&Identifier, &Identifier, u32),
+    start: ConsumerStart,
+) -> Result<(), LaserError> {
+    if !start.seeds()
+        || client
+            .get_consumer_offset(group, stream, topic, Some(partition))
+            .await?
+            .is_some()
+    {
+        return Ok(());
+    }
+    let probe = iggy::prelude::Consumer::new(Identifier::named("laser-group-start")?);
+    let found = match start {
+        ConsumerStart::TimestampMicros(timestamp) => client
+            .poll_messages(
+                stream,
+                topic,
+                partition,
+                &probe,
+                &PollingStrategy::timestamp(IggyTimestamp::from(timestamp)),
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
+            )
+            .await?
+            .messages
+            .first()
+            .map(|message| message.header.offset),
+        _ => None,
+    };
+    let tail = match (start, found) {
+        (ConsumerStart::Last, _) | (ConsumerStart::TimestampMicros(_), None) => {
+            current_tail_offset(client, stream, topic, &probe, partition).await?
+        }
+        _ => 0,
+    };
+    if let Some(offset) = group_seed(start, tail, found) {
+        client
+            .store_consumer_offset(group, stream, topic, Some(partition), offset)
+            .await?;
+    }
+    Ok(())
+}
+
+// The offset a group stores on a partition it never stored, so `Next` begins
+// at the record `start` names. `tail` is the offset the partition writes next
+// and `found` the first one at or after a timestamp start.
+fn group_seed(start: ConsumerStart, tail: u64, found: Option<u64>) -> Option<u64> {
+    let first = match start {
+        ConsumerStart::First | ConsumerStart::Next => 0,
+        ConsumerStart::Offset(offset) => offset,
+        ConsumerStart::Last => tail.saturating_sub(1),
+        ConsumerStart::TimestampMicros(_) => found.unwrap_or(tail),
+    };
+    first.checked_sub(1)
+}
+
+// A joined session without a reader would hold its partitions until the
+// session ends.
+async fn leave_seeded_group(owner: &OffsetOwner) {
+    let group = &owner.consumer.id;
+    let left = match (
+        Identifier::named(&owner.stream),
+        Identifier::named(&owner.topic),
+    ) {
+        (Ok(stream), Ok(topic)) => owner
+            .laser
+            .client()
+            .leave_consumer_group(&stream, &topic, group)
+            .await
+            .map_err(LaserError::from),
+        (Err(error), _) | (_, Err(error)) => Err(LaserError::from(error)),
+    };
+    if let Err(error) = left {
+        tracing::debug!(target: "laser", %error, "Leaving consumer group {group} after a failed start failed.");
+    }
+}
+
+// The two calls a recovery makes on the reader and its client.
+#[trait_variant::make(Send)]
+trait PartitionRecovery {
+    async fn abandon_operation(&mut self, operation: u64) -> Result<(), IggyError>;
+    async fn seek(&mut self, partition_id: u32, start: PollingStrategy) -> Result<(), IggyError>;
+}
+
+struct NativeRecoveryTarget<'a> {
+    client: &'a IggyClient,
+    consumer: &'a mut IggyConsumer,
+}
+
+impl PartitionRecovery for NativeRecoveryTarget<'_> {
+    async fn abandon_operation(&mut self, operation: u64) -> Result<(), IggyError> {
+        self.client.abandon_operation(operation).await
+    }
+
+    async fn seek(&mut self, partition_id: u32, start: PollingStrategy) -> Result<(), IggyError> {
+        self.consumer.seek(partition_id, start).await
+    }
+}
+
+fn group_reads(engine: Arc<tokio::sync::Mutex<GroupEngine>>) -> GroupReadStream {
+    Box::pin(futures::stream::unfold(engine, |engine| async move {
+        let item = engine.lock().await.next().await;
+        item.map(|item| (item, engine))
+    }))
+}
+
+async fn recover_native(
+    client: Arc<IggyClient>,
+    mut consumer: Box<IggyConsumer>,
+    error: ReadError,
+) -> NativeRecovered {
+    let mut target = NativeRecoveryTarget {
+        client: &client,
+        consumer: &mut consumer,
+    };
+    let reported = recover_read(&mut target, error).await;
+    NativeRecovered { consumer, reported }
+}
+
+// Resume the partition a read error stopped after its stored offset and return
+// the error the caller still sees: an undecodable record, a failed seek, or an
+// error the reader retries by itself.
+async fn recover_read(target: &mut impl PartitionRecovery, error: ReadError) -> Option<LaserError> {
+    let (partition_id, start, reported) = match ReadRecovery::from(&error) {
+        ReadRecovery::Abandon {
+            partition_id,
+            operation,
+        } => {
+            tracing::warn!(target: "laser", partition_id, operation, error = %error.error, "Abandoning operation {operation} with an unknown outcome, which blocks partition {partition_id}. The partition resumes after its stored offset.");
+            match target.abandon_operation(operation).await {
+                // The reader reports a lost fetch for each of its partitions,
+                // and the first abandon frees the operation for all of them.
+                Ok(()) | Err(IggyError::OperationNotRetained(_)) => {}
+                Err(abandon_error) => {
+                    tracing::warn!(target: "laser", partition_id, operation, error = %abandon_error, "Abandoning operation {operation} failed.");
+                }
+            }
+            (partition_id, PollingStrategy::next(), None)
+        }
+        ReadRecovery::Skip {
+            partition_id,
+            start,
+        } => {
+            tracing::warn!(target: "laser", partition_id, error = %error.error, "Skipping a record that does not decode in partition {partition_id}.");
+            (partition_id, start, Some(LaserError::from(error.error)))
+        }
+        ReadRecovery::Resume { partition_id } => {
+            tracing::warn!(target: "laser", partition_id, error = %error.error, "Partition {partition_id} has a new history. It resumes after its stored offset.");
+            (partition_id, PollingStrategy::next(), None)
+        }
+        ReadRecovery::Stopped { partition_id } => {
+            tracing::warn!(target: "laser", partition_id, error = %error.error, "The reader stopped partition {partition_id} after lasting refusals. It resumes after its stored offset.");
+            (
+                partition_id,
+                PollingStrategy::next(),
+                Some(LaserError::from(error.error)),
+            )
+        }
+        ReadRecovery::Report => return Some(LaserError::from(error.error)),
+    };
+    match target.seek(partition_id, start).await {
+        Ok(()) => reported,
+        Err(seek_error) => {
+            tracing::warn!(target: "laser", partition_id, error = %seek_error, "Resuming partition {partition_id} failed.");
+            Some(reported.unwrap_or_else(|| LaserError::from(seek_error)))
+        }
     }
 }
 
@@ -1039,6 +1401,22 @@ enum CommitPoint {
     Delivered { last_of_page: bool },
     /// The next poll is about to start.
     Poll,
+}
+
+/// The interval an automatic commit policy stores on, if it has one.
+const fn commit_interval(commit: CommitPolicy) -> Option<Duration> {
+    match commit {
+        CommitPolicy::Interval(interval)
+        | CommitPolicy::IntervalOrPolling(interval)
+        | CommitPolicy::IntervalOrAll(interval)
+        | CommitPolicy::IntervalOrEach(interval)
+        | CommitPolicy::IntervalOrEvery(interval, _) => Some(interval),
+        CommitPolicy::Disabled
+        | CommitPolicy::Polling
+        | CommitPolicy::All
+        | CommitPolicy::Each
+        | CommitPolicy::Every(_) => None,
+    }
 }
 
 /// Whether an automatic commit policy stores the handled prefix now.
@@ -1148,10 +1526,12 @@ pub struct Consumer {
     yielded_zero: BTreeSet<u32>,
     inner: Option<ConsumerInner>,
     manual_commit: bool,
+    // Native only: whether a stored offset may move back.
+    allow_replay: bool,
     shutdown_target: Option<ConsumerGroupTarget>,
-    // The group engine's read in flight. Behind a lock only so the consumer
-    // stays `Sync`: it is reached through `&mut self` alone.
-    next_future: std::sync::Mutex<Option<NextFuture>>,
+    // The group engine's reads. Behind a lock only so the consumer stays
+    // `Sync`: they are reached through `&mut self` alone.
+    group_reads: std::sync::Mutex<GroupReads>,
     offsets: Option<Arc<std::sync::Mutex<GroupOffsets>>>,
     // Handled deliveries the group engine acknowledges before its next read.
     #[cfg_attr(not(feature = "agent"), allow(dead_code))]
@@ -1172,10 +1552,40 @@ pub struct StoredOffset {
     pub current_offset: u64,
 }
 
-type NextFuture = Pin<Box<dyn Future<Output = Option<Result<ConsumerMessage, LaserError>>> + Send>>;
+// One stream for the consumer's life, so a group read allocates nothing per
+// record.
+type GroupReadStream = Pin<Box<dyn Stream<Item = Result<ConsumerMessage, LaserError>> + Send>>;
+
+#[derive(Default)]
+struct GroupReads {
+    stream: Option<GroupReadStream>,
+    // The last poll answered `Pending`, so the read may hold the engine lock.
+    in_flight: bool,
+}
+
+impl GroupReads {
+    // Ends a read in flight so the caller can take the engine lock.
+    fn interrupt(&mut self) {
+        if self.in_flight {
+            *self = Self::default();
+        }
+    }
+}
+
+// A native consumer resuming a partition that a read error stopped, and the
+// error to report once it is back.
+type NativeRecovery = Pin<Box<dyn Future<Output = NativeRecovered> + Send>>;
+
+// A finished native recovery: the consumer and the error the caller still sees.
+struct NativeRecovered {
+    consumer: Box<IggyConsumer>,
+    reported: Option<LaserError>,
+}
 
 enum ConsumerInner {
     Native(Box<IggyConsumer>),
+    // Behind a lock only so the consumer stays `Sync`, like the group read.
+    Recovering(std::sync::Mutex<NativeRecovery>),
     Group(Arc<tokio::sync::Mutex<GroupEngine>>),
 }
 
@@ -1265,7 +1675,10 @@ impl GroupEngine {
                 match self.reader.read_round().await {
                     Ok((Some(page), _)) => break page,
                     Ok((None, true)) => {}
-                    Ok((None, false)) => sleep(self.reader.idle_interval()).await,
+                    Ok((None, false)) => {
+                        let limit = self.commit_due_in();
+                        self.reader.wait_for_records_within(limit).await;
+                    }
                     Err(error) => {
                         self.sync_stored();
                         return Some(Err(error));
@@ -1275,6 +1688,16 @@ impl GroupEngine {
             self.sync_stored();
             self.buffered.extend(page.records);
         }
+    }
+
+    // How long an idle wait may hold before an interval policy has to store
+    // the handled prefix. `None` with nothing handled to store.
+    fn commit_due_in(&self) -> Option<Duration> {
+        if self.yielded_since_flush == 0 {
+            return None;
+        }
+        commit_interval(self.commit)
+            .map(|interval| interval.saturating_sub(self.last_flush.elapsed()))
     }
 
     async fn finish_delivery(&mut self) -> Result<(), LaserError> {
@@ -1392,10 +1815,10 @@ impl Consumer {
     pub async fn return_delivery(&self, message: ConsumerMessage) -> Result<(), LaserError> {
         match self.inner.as_ref() {
             Some(ConsumerInner::Group(engine)) => {
-                *self
-                    .next_future
+                self.group_reads
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .interrupt();
                 let mut engine = engine.lock().await;
                 let pending = engine.pending_delivery.as_ref().ok_or_else(|| {
                     LaserError::Invalid(
@@ -1416,7 +1839,7 @@ impl Consumer {
                 engine.returned.push_front((message, last_of_page));
                 Ok(())
             }
-            Some(ConsumerInner::Native(_)) => {
+            Some(ConsumerInner::Native(_) | ConsumerInner::Recovering(_)) => {
                 self.returned_native
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1460,10 +1883,10 @@ impl Consumer {
                         "the record was not delivered by this group consumer".to_owned(),
                     )
                 })?;
-                *self
-                    .next_future
+                self.group_reads
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .interrupt();
                 engine.lock().await.commit(delivery).await
             }
             _ => {
@@ -1512,13 +1935,26 @@ impl Consumer {
 
     /// Store an explicit server offset. Native only: a policy-aware group
     /// consumer refuses it, because an arbitrary offset bypasses the group's
-    /// acknowledgment contract. Commit a delivered record instead.
+    /// acknowledgment contract. Commit a delivered record instead. Without
+    /// [`allow_replay`](ConsumerBuilder::allow_replay) an offset at or below
+    /// the one this consumer stored last is not sent, so the stored offset
+    /// never moves back.
     pub async fn store_offset(
         &self,
         offset: u64,
         partition: Option<u32>,
     ) -> Result<(), LaserError> {
-        self.native()?.store_offset(offset, partition).await?;
+        let consumer = self.native()?;
+        if !self.allow_replay {
+            let partition_id = partition.unwrap_or_else(|| consumer.partition_id());
+            if consumer
+                .get_last_stored_offset(partition_id)
+                .is_some_and(|stored| stored >= offset)
+            {
+                return Ok(());
+            }
+        }
+        consumer.store_offset(offset, partition).await?;
         Ok(())
     }
 
@@ -1533,6 +1969,7 @@ impl Consumer {
     pub fn last_consumed_offset(&self, partition: u32) -> Option<u64> {
         match self.inner.as_ref() {
             Some(ConsumerInner::Native(consumer)) => consumer.get_last_consumed_offset(partition),
+            Some(ConsumerInner::Recovering(_)) => None,
             Some(ConsumerInner::Group(_)) => self.offsets.as_ref().and_then(|offsets| {
                 offsets
                     .lock()
@@ -1552,6 +1989,7 @@ impl Consumer {
     pub fn last_stored_offset(&self, partition: u32) -> Option<u64> {
         match self.inner.as_ref() {
             Some(ConsumerInner::Native(consumer)) => consumer.get_last_stored_offset(partition),
+            Some(ConsumerInner::Recovering(_)) => None,
             Some(ConsumerInner::Group(_)) => self.offsets.as_ref().and_then(|offsets| {
                 offsets
                     .lock()
@@ -1593,9 +2031,9 @@ impl Consumer {
     /// preserves the last explicit commit.
     pub async fn shutdown(&mut self) -> Result<(), LaserError> {
         *self
-            .next_future
+            .group_reads
             .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = GroupReads::default();
         match self.inner.take() {
             None => Ok(()),
             Some(ConsumerInner::Group(engine)) => {
@@ -1612,43 +2050,59 @@ impl Consumer {
                 let closed = engine.reader.close().await;
                 completed.and(closed)
             }
-            Some(ConsumerInner::Native(mut consumer)) => {
-                if self.manual_commit {
-                    drop(consumer);
-                    if let Some(target) = self.shutdown_target.take() {
-                        target
-                            .laser
-                            .client()
-                            .leave_consumer_group(
-                                &Identifier::try_from(target.stream)?,
-                                &Identifier::try_from(target.topic)?,
-                                &Identifier::try_from(target.group)?,
-                            )
-                            .await?;
-                    }
-                    return Ok(());
+            Some(ConsumerInner::Native(consumer)) => self.shutdown_native(consumer).await,
+            Some(ConsumerInner::Recovering(recovery)) => {
+                let recovery = recovery
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let recovered = recovery.await;
+                if let Some(error) = recovered.reported {
+                    tracing::debug!(target: "laser", %error, "a read error arrived while the consumer shut down");
                 }
-                let mut stored = Ok(());
-                for partition in &self.yielded_zero {
-                    if consumer
-                        .get_last_stored_offset(*partition)
-                        .is_none_or(|offset| offset == 0)
-                    {
-                        // The native shutdown treats an unset stored offset as zero.
-                        // Explicitly store a delivered zero for automatic policies.
-                        stored = stored.and(consumer.store_offset(0, Some(*partition)).await);
-                    }
-                }
-                let stopped = consumer.shutdown().await;
-                self.shutdown_target.take();
-                stored.and(stopped).map_err(Into::into)
+                self.shutdown_native(recovered.consumer).await
             }
         }
+    }
+
+    async fn shutdown_native(&mut self, mut consumer: Box<IggyConsumer>) -> Result<(), LaserError> {
+        if self.manual_commit {
+            drop(consumer);
+            if let Some(target) = self.shutdown_target.take() {
+                target
+                    .laser
+                    .client()
+                    .leave_consumer_group(
+                        &Identifier::try_from(target.stream)?,
+                        &Identifier::try_from(target.topic)?,
+                        &Identifier::try_from(target.group)?,
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+        let mut stored = Ok(());
+        for partition in &self.yielded_zero {
+            if consumer
+                .get_last_stored_offset(*partition)
+                .is_none_or(|offset| offset == 0)
+            {
+                // The native shutdown treats an unset stored offset as zero.
+                // Explicitly store a delivered zero for automatic policies.
+                stored = stored.and(consumer.store_offset(0, Some(*partition)).await);
+            }
+        }
+        let stopped = consumer.shutdown().await;
+        self.shutdown_target.take();
+        stored.and(stopped).map_err(Into::into)
     }
 
     fn native(&self) -> Result<&IggyConsumer, LaserError> {
         match self.inner.as_ref() {
             Some(ConsumerInner::Native(consumer)) => Ok(consumer),
+            Some(ConsumerInner::Recovering(_)) => Err(LaserError::Invalid(
+                "the consumer is resuming a partition a read error stopped, read its next record first"
+                    .to_owned(),
+            )),
             Some(ConsumerInner::Group(_)) => Err(LaserError::Invalid(
                 "explicit offsets bypass the group's acknowledgment contract, commit a delivered record instead"
                     .to_owned(),
@@ -1664,19 +2118,35 @@ impl Stream for Consumer {
     type Item = Result<ConsumerMessage, LaserError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if matches!(self.inner, Some(ConsumerInner::Native(_)))
-            && let Some(message) = self
-                .returned_native
-                .get_mut()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop_front()
+        if matches!(
+            self.inner,
+            Some(ConsumerInner::Native(_) | ConsumerInner::Recovering(_))
+        ) && let Some(message) = self
+            .returned_native
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
         {
             return Poll::Ready(Some(Ok(message)));
         }
-        let engine = match self.inner.as_mut() {
-            None => return Poll::Ready(None),
-            Some(ConsumerInner::Native(inner)) => {
-                return match Pin::new(inner).poll_next(context) {
+        let engine = loop {
+            match self.inner.as_mut() {
+                None => return Poll::Ready(None),
+                Some(ConsumerInner::Recovering(recovery)) => match recovery
+                    .get_mut()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                    .poll(context)
+                {
+                    Poll::Ready(recovered) => {
+                        self.inner = Some(ConsumerInner::Native(recovered.consumer));
+                        if let Some(error) = recovered.reported {
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                Some(ConsumerInner::Native(inner)) => match Pin::new(inner).poll_next(context) {
                     Poll::Ready(Some(Ok(message))) => {
                         let message = ConsumerMessage::from(message);
                         if message.position.offset == 0 {
@@ -1684,27 +2154,51 @@ impl Stream for Consumer {
                         } else {
                             self.yielded_zero.remove(&message.partition_id);
                         }
-                        Poll::Ready(Some(Ok(message)))
+                        return Poll::Ready(Some(Ok(message)));
                     }
-                    Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
-                    Poll::Ready(None) => Poll::Ready(None),
-                    Poll::Pending => Poll::Pending,
-                };
+                    Poll::Ready(Some(Err(error))) => {
+                        let recovery = ReadRecovery::from(&error);
+                        if recovery == ReadRecovery::Report {
+                            return Poll::Ready(Some(Err(error.error.into())));
+                        }
+                        match self.inner.take() {
+                            Some(ConsumerInner::Native(consumer)) => {
+                                let client = self.offset_owner.laser.client();
+                                self.inner =
+                                    Some(ConsumerInner::Recovering(std::sync::Mutex::new(
+                                        Box::pin(recover_native(client, consumer, error)),
+                                    )));
+                            }
+                            other => {
+                                self.inner = other;
+                                return Poll::Ready(Some(Err(error.error.into())));
+                            }
+                        }
+                    }
+                    Poll::Ready(None) => return Poll::Ready(None),
+                    Poll::Pending => return Poll::Pending,
+                },
+                Some(ConsumerInner::Group(engine)) => break Arc::clone(engine),
             }
-            Some(ConsumerInner::Group(engine)) => Arc::clone(engine),
         };
-        let in_flight = self
-            .next_future
+        let reads = self
+            .group_reads
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let next = in_flight
-            .get_or_insert_with(|| Box::pin(async move { engine.lock().await.next().await }));
-        match next.as_mut().poll(context) {
-            Poll::Ready(item) => {
-                *in_flight = None;
-                Poll::Ready(item)
+        let stream = reads.stream.get_or_insert_with(|| group_reads(engine));
+        match stream.as_mut().poll_next(context) {
+            Poll::Pending => {
+                reads.in_flight = true;
+                Poll::Pending
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(item)) => {
+                reads.in_flight = false;
+                Poll::Ready(Some(item))
+            }
+            Poll::Ready(None) => {
+                *reads = GroupReads::default();
+                Poll::Ready(None)
+            }
         }
     }
 }
@@ -1712,6 +2206,9 @@ impl Stream for Consumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::MAX_REPLICATION_FACTOR;
+    use iggy::prelude::NonZeroIggyDuration;
+    use std::num::NonZeroU32;
 
     fn producer_builder() -> ProducerBuilder {
         let laser = crate::laser::Laser::from_client(iggy::prelude::IggyClient::default());
@@ -1759,6 +2256,33 @@ mod tests {
         assert!(matches!(result, Err(LaserError::Invalid(_))));
         let result = producer_builder().max_topic_bytes(0).build().await;
         assert!(matches!(result, Err(LaserError::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn given_a_replication_factor_outside_one_to_thirty_two_when_building_a_producer_then_should_refuse_it_before_sending()
+     {
+        for factor in [0, MAX_REPLICATION_FACTOR + 1] {
+            let result = producer_builder().replication_factor(factor).build().await;
+            assert!(
+                matches!(&result, Err(LaserError::Invalid(message)) if message == "replication factor must be 1..=32"),
+                "factor {factor}: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_replication_factor_outside_one_to_thirty_two_when_ensuring_a_topic_then_should_refuse_it_before_sending()
+     {
+        let laser = crate::laser::Laser::from_client(iggy::prelude::IggyClient::default());
+        let topic = laser.stream("fleet").topic("readings");
+        for factor in [0, MAX_REPLICATION_FACTOR + 1] {
+            let result = topic.ensure(1, Some(factor)).await;
+            assert!(
+                matches!(&result, Err(LaserError::Invalid(message)) if message == "replication factor must be 1..=32"),
+                "factor {factor}: {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -1932,34 +2456,296 @@ mod tests {
     }
 
     #[test]
-    fn given_every_start_when_mapped_to_a_group_read_then_should_keep_its_meaning() {
-        assert_eq!(ConsumerStart::First.into_filtered(), FilteredStart::First);
-        assert_eq!(ConsumerStart::Last.into_filtered(), FilteredStart::Last);
-        assert_eq!(ConsumerStart::Next.into_filtered(), FilteredStart::Next);
-        assert_eq!(
-            ConsumerStart::Offset(7).into_filtered(),
-            FilteredStart::Offset(7)
-        );
-        assert_eq!(
-            ConsumerStart::TimestampMicros(9).into_filtered(),
-            FilteredStart::Timestamp(9)
-        );
-    }
-
-    #[test]
     fn given_zero_frequency_when_building_commit_policy_then_should_reject_it() {
-        let error = CommitPolicy::Every(0)
-            .into_auto_commit()
+        let error = iggy::prelude::CommitPolicy::try_from(CommitPolicy::Every(0))
             .expect_err("zero cannot be a commit frequency");
         assert!(matches!(error, LaserError::Invalid(_)));
     }
 
     #[test]
     fn given_zero_interval_when_building_commit_policy_then_should_reject_it() {
-        let error = CommitPolicy::Interval(Duration::ZERO)
-            .into_auto_commit()
+        let error = iggy::prelude::CommitPolicy::try_from(CommitPolicy::Interval(Duration::ZERO))
             .expect_err("zero cannot be a commit interval");
         assert!(matches!(error, LaserError::Invalid(_)));
+    }
+
+    #[test]
+    fn given_each_commit_policy_when_mapped_to_the_native_reader_then_should_keep_its_cadence() {
+        let second = Duration::from_secs(1);
+        let interval = Some(NonZeroIggyDuration::new(second).expect("one second is non-zero"));
+        let auto = |interval, every| {
+            iggy::prelude::CommitPolicy::Auto(AutoCommit {
+                interval,
+                every,
+                after: CommitAfter::Processing,
+            })
+        };
+        let three = CommitEvery::Messages(NonZeroU32::new(3).expect("three is non-zero"));
+        let cases = [
+            (CommitPolicy::Disabled, iggy::prelude::CommitPolicy::Manual),
+            (CommitPolicy::Polling, iggy::prelude::CommitPolicy::OnRead),
+            (
+                CommitPolicy::IntervalOrPolling(second),
+                iggy::prelude::CommitPolicy::OnRead,
+            ),
+            (CommitPolicy::Interval(second), auto(interval, None)),
+            (CommitPolicy::All, auto(None, Some(CommitEvery::Batch))),
+            (
+                CommitPolicy::IntervalOrAll(second),
+                auto(interval, Some(CommitEvery::Batch)),
+            ),
+            (CommitPolicy::Each, auto(None, Some(CommitEvery::Message))),
+            (
+                CommitPolicy::IntervalOrEach(second),
+                auto(interval, Some(CommitEvery::Message)),
+            ),
+            (CommitPolicy::Every(3), auto(None, Some(three))),
+            (
+                CommitPolicy::IntervalOrEvery(second, 3),
+                auto(interval, Some(three)),
+            ),
+        ];
+        for (policy, expected) in cases {
+            assert_eq!(
+                iggy::prelude::CommitPolicy::try_from(policy).expect("a valid policy maps"),
+                expected,
+                "{policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_each_commit_policy_when_an_idle_group_read_waits_then_should_bound_it_by_its_interval()
+    {
+        let second = Duration::from_secs(1);
+        for policy in [
+            CommitPolicy::Interval(second),
+            CommitPolicy::IntervalOrPolling(second),
+            CommitPolicy::IntervalOrAll(second),
+            CommitPolicy::IntervalOrEach(second),
+            CommitPolicy::IntervalOrEvery(second, 3),
+        ] {
+            assert_eq!(commit_interval(policy), Some(second), "{policy:?}");
+        }
+        for policy in [
+            CommitPolicy::Disabled,
+            CommitPolicy::Polling,
+            CommitPolicy::All,
+            CommitPolicy::Each,
+            CommitPolicy::Every(3),
+        ] {
+            assert_eq!(commit_interval(policy), None, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn given_each_read_error_when_classified_then_should_pick_its_recovery() {
+        let skip = PollingStrategy::offset(8);
+        let cases = [
+            (
+                read_error(Some(2), IggyError::FetchProgressUncertain(7), None),
+                ReadRecovery::Abandon {
+                    partition_id: 2,
+                    operation: 7,
+                },
+            ),
+            (
+                read_error(Some(2), IggyError::PartitionLaneBlocked(2, 7), Some(skip)),
+                ReadRecovery::Abandon {
+                    partition_id: 2,
+                    operation: 7,
+                },
+            ),
+            (
+                read_error(Some(2), IggyError::InvalidMessagePayloadLength, Some(skip)),
+                ReadRecovery::Skip {
+                    partition_id: 2,
+                    start: skip,
+                },
+            ),
+            (
+                read_error(Some(2), IggyError::HistoryUnavailable, None),
+                ReadRecovery::Resume { partition_id: 2 },
+            ),
+            (
+                read_error(Some(2), IggyError::Unauthorized, None),
+                ReadRecovery::Stopped { partition_id: 2 },
+            ),
+            (
+                read_error(
+                    Some(2),
+                    IggyError::TopicNameNotFound("orbit".to_owned(), "fleet".to_owned()),
+                    None,
+                ),
+                ReadRecovery::Stopped { partition_id: 2 },
+            ),
+            (
+                read_error(None, IggyError::Unauthorized, None),
+                ReadRecovery::Report,
+            ),
+            (
+                read_error(Some(2), IggyError::TransientNotAccepted, None),
+                ReadRecovery::Report,
+            ),
+            (
+                read_error(None, IggyError::FetchProgressUncertain(7), None),
+                ReadRecovery::Report,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(ReadRecovery::from(&error), expected, "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn given_an_uncertain_fetch_when_recovered_then_should_abandon_it_and_resume_after_the_stored_offset()
+     {
+        for abandoned in [Ok(()), Err(IggyError::OperationNotRetained(7))] {
+            let mut target = RecordingRecovery::answering(abandoned, Ok(()));
+            let error = read_error(Some(2), IggyError::FetchProgressUncertain(7), None);
+
+            let reported = recover_read(&mut target, error).await;
+
+            assert!(reported.is_none(), "{reported:?}");
+            assert_eq!(target.abandoned, vec![7]);
+            assert_eq!(target.seeks, vec![(2, PollingStrategy::next())]);
+        }
+    }
+
+    #[test]
+    fn given_each_start_when_configuring_the_native_reader_then_should_read_next_for_a_group_and_the_start_for_a_partition()
+     {
+        let laser = crate::laser::Laser::from_client(iggy::prelude::IggyClient::default());
+        let topic = laser.stream("fleet").topic("readings");
+        for start in [
+            ConsumerStart::First,
+            ConsumerStart::Last,
+            ConsumerStart::Next,
+            ConsumerStart::Offset(7),
+            ConsumerStart::TimestampMicros(9),
+        ] {
+            let group = topic.consumer_group("workers").consumer().start_at(start);
+            let partition = topic.consumer("audit", 0).start_at(start);
+
+            assert_eq!(group.reader_start(), ConsumerStart::Next, "{start:?}");
+            assert_eq!(partition.reader_start(), start, "{start:?}");
+        }
+    }
+
+    #[test]
+    fn given_each_start_when_a_group_partition_has_nothing_stored_then_should_seed_the_offset_before_the_record_it_names()
+     {
+        let cases = [
+            (ConsumerStart::First, 10, None, None),
+            (ConsumerStart::Next, 10, None, None),
+            (ConsumerStart::Offset(0), 10, None, None),
+            (ConsumerStart::Offset(7), 10, None, Some(6)),
+            (ConsumerStart::Offset(7), 0, None, Some(6)),
+            (ConsumerStart::Last, 10, None, Some(8)),
+            (ConsumerStart::Last, 1, None, None),
+            (ConsumerStart::Last, 0, None, None),
+            (ConsumerStart::TimestampMicros(9), 10, Some(5), Some(4)),
+            (ConsumerStart::TimestampMicros(9), 10, Some(0), None),
+            (ConsumerStart::TimestampMicros(9), 10, None, Some(9)),
+            (ConsumerStart::TimestampMicros(9), 0, None, None),
+        ];
+        for (start, tail, found, expected) in cases {
+            assert_eq!(
+                group_seed(start, tail, found),
+                expected,
+                "{start:?} tail {tail} found {found:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_partition_the_reader_stopped_after_lasting_refusals_when_recovered_then_should_report_the_refusal_and_resume_after_the_stored_offset()
+     {
+        let mut target = RecordingRecovery::answering(Ok(()), Ok(()));
+        let error = read_error(Some(2), IggyError::Unauthorized, None);
+
+        let reported = recover_read(&mut target, error).await;
+
+        assert!(
+            matches!(reported, Some(LaserError::Iggy(IggyError::Unauthorized))),
+            "{reported:?}"
+        );
+        assert!(target.abandoned.is_empty());
+        assert_eq!(target.seeks, vec![(2, PollingStrategy::next())]);
+    }
+
+    #[tokio::test]
+    async fn given_a_failed_abandon_when_recovered_then_should_still_resume_the_partition() {
+        let mut target = RecordingRecovery::answering(Err(IggyError::Disconnected), Ok(()));
+        let error = read_error(Some(2), IggyError::PartitionLaneBlocked(2, 7), None);
+
+        let reported = recover_read(&mut target, error).await;
+
+        assert!(reported.is_none(), "{reported:?}");
+        assert_eq!(target.seeks, vec![(2, PollingStrategy::next())]);
+    }
+
+    #[tokio::test]
+    async fn given_a_new_partition_history_when_recovered_then_should_resume_after_the_stored_offset()
+     {
+        let mut target = RecordingRecovery::answering(Ok(()), Ok(()));
+        let error = read_error(Some(3), IggyError::HistoryUnavailable, None);
+
+        let reported = recover_read(&mut target, error).await;
+
+        assert!(reported.is_none(), "{reported:?}");
+        assert!(target.abandoned.is_empty());
+        assert_eq!(target.seeks, vec![(3, PollingStrategy::next())]);
+    }
+
+    #[tokio::test]
+    async fn given_an_undecodable_record_when_recovered_then_should_report_it_once_and_seek_past_it()
+     {
+        let skip = PollingStrategy::offset(9);
+        let mut target = RecordingRecovery::answering(Ok(()), Ok(()));
+        let error = read_error(Some(1), IggyError::InvalidMessagePayloadLength, Some(skip));
+
+        let reported = recover_read(&mut target, error).await;
+
+        assert!(
+            matches!(
+                reported,
+                Some(LaserError::Iggy(IggyError::InvalidMessagePayloadLength))
+            ),
+            "{reported:?}"
+        );
+        assert_eq!(target.seeks, vec![(1, skip)]);
+    }
+
+    #[tokio::test]
+    async fn given_a_failed_seek_when_resuming_a_partition_then_should_report_the_seek_error() {
+        let mut target = RecordingRecovery::answering(Ok(()), Err(IggyError::InvalidCommand));
+        let error = read_error(Some(2), IggyError::HistoryUnavailable, None);
+
+        let reported = recover_read(&mut target, error).await;
+
+        assert!(
+            matches!(reported, Some(LaserError::Iggy(IggyError::InvalidCommand))),
+            "{reported:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_any_other_read_error_when_recovered_then_should_report_it_without_a_seek() {
+        let mut target = RecordingRecovery::answering(Ok(()), Ok(()));
+        let error = read_error(Some(2), IggyError::TransientNotAccepted, None);
+
+        let reported = recover_read(&mut target, error).await;
+
+        assert!(
+            matches!(
+                reported,
+                Some(LaserError::Iggy(IggyError::TransientNotAccepted))
+            ),
+            "{reported:?}"
+        );
+        assert!(target.abandoned.is_empty());
+        assert!(target.seeks.is_empty());
     }
 
     #[test]
@@ -1999,5 +2785,56 @@ mod tests {
             .expect("the producer message should lower to Iggy");
 
         assert_eq!(message.payload.as_ptr(), payload.as_ptr());
+    }
+
+    fn read_error(
+        partition_id: Option<u32>,
+        error: IggyError,
+        skip: Option<PollingStrategy>,
+    ) -> ReadError {
+        ReadError {
+            partition_id,
+            error,
+            skip,
+            offset: None,
+            record: None,
+        }
+    }
+
+    struct RecordingRecovery {
+        abandon_answer: Result<(), IggyError>,
+        seek_answer: Result<(), IggyError>,
+        abandoned: Vec<u64>,
+        seeks: Vec<(u32, PollingStrategy)>,
+    }
+
+    impl RecordingRecovery {
+        fn answering(
+            abandon_answer: Result<(), IggyError>,
+            seek_answer: Result<(), IggyError>,
+        ) -> Self {
+            Self {
+                abandon_answer,
+                seek_answer,
+                abandoned: Vec::new(),
+                seeks: Vec::new(),
+            }
+        }
+    }
+
+    impl PartitionRecovery for RecordingRecovery {
+        async fn abandon_operation(&mut self, operation: u64) -> Result<(), IggyError> {
+            self.abandoned.push(operation);
+            self.abandon_answer.clone()
+        }
+
+        async fn seek(
+            &mut self,
+            partition_id: u32,
+            start: PollingStrategy,
+        ) -> Result<(), IggyError> {
+            self.seeks.push((partition_id, start));
+            self.seek_answer.clone()
+        }
     }
 }

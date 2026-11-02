@@ -444,7 +444,7 @@ void test("given_a_versioned_entry_when_round_tripped_then_should_preserve_versi
   assert.equal(unversionedBack.version, 0n, "version 0 must be omitted")
 })
 
-void test("given_the_memory_view_entry_fixture_when_decoded_then_should_keep_broker_time", async () => {
+void test("given_the_memory_view_entry_fixture_when_decoded_then_should_keep_server_time", async () => {
   const bytes = await readFixture("kv_entry_memory_scope.bin")
   const entry = decodeKvEntry(expectMap(decodeOne(bytes, "kv_entry"), "kv_entry"), "kv_entry")
   const scope = entry.scope

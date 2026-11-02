@@ -24,6 +24,8 @@ import {
   decodeFilteredAck,
   encodeFilteredAck,
   decodeFilteredPollRequest,
+  decodeFilteredWaitCancel,
+  decodeFilteredWaitRequest,
   decodeHeaderScalar,
   encodeConsumerFilter,
   encodeCatalogPosition,
@@ -31,12 +33,30 @@ import {
   encodeFilterMutationRequest,
   encodeFilterReply,
   encodeFilteredPollRequest,
+  encodeFilteredWaitCancel,
+  encodeFilteredWaitRequest,
+  encodeListFilters,
+  type FilterCatalogReply,
+  type FilterMutationRequest,
+  type FilteredWaitCancel,
+  type FilteredWaitRequest,
   parseCanonicalJson,
   rustDouble,
   timestampFormatMicrosFromText,
   validateConsumerFilter,
-  validateFilterTestRequest
+  validateFilterMutationRequest,
+  validateFilterName,
+  validateFilterTestRequest,
+  validateFilteredWaitCancel,
+  validateFilteredWaitRequest,
+  validateListFilters
 } from "../../src/wire/filter.js"
+import {
+  MAX_FILTERED_WAIT_CANCEL_IDS,
+  MAX_FILTERED_WAIT_MS,
+  MAX_FILTERED_WAIT_PARTITIONS,
+  MAX_FILTER_NAME_BYTES
+} from "../../src/wire/limits.js"
 
 const FIXTURES_DIR = path.resolve(process.cwd(), "../../wire/fixtures")
 
@@ -102,6 +122,11 @@ void test("given_the_rust_filter_fixtures_when_decoded_then_should_re_encode_byt
     encodeFilterMutationRequest
   )
   assert.equal(configure.mutation.kind, "configure_group")
+  if (configure.mutation.policy.kind === "definition") {
+    assert.equal(configure.mutation.policy.name, "safe-mode")
+  } else {
+    assert.fail("the configure fixture saves a named definition")
+  }
   const configureJson = decodeFilterMutationRequest(
     parseCanonicalJson(await readText("filter_mutation_configure_group.json")),
     "configure group"
@@ -141,6 +166,40 @@ void test("given_the_rust_filter_fixtures_when_decoded_then_should_re_encode_byt
   } else {
     assert.fail("the unfiltered fixture is a page")
   }
+  const wait = await assertRoundTrip(
+    "filter_wait_request.bin",
+    decodeFilteredWaitRequest,
+    encodeFilteredWaitRequest
+  )
+  validateFilteredWaitRequest(wait)
+  assert.deepEqual(wait.partitions, [
+    { partitionId: 0, offset: 7n },
+    { partitionId: 1, offset: 0n }
+  ])
+  assert.equal(wait.maxWaitMs, 5_000)
+  assert.equal(wait.waitId, 9n)
+  const ready = await assertRoundTrip(
+    "filter_reply_ready.bin",
+    decodeFilterReply,
+    encodeFilterReply
+  )
+  assert.deepEqual(ready, { kind: "ok", outcome: { kind: "ready", result: { ready: [1] } } })
+  const cancel = await assertRoundTrip(
+    "filter_wait_cancel.bin",
+    decodeFilteredWaitCancel,
+    encodeFilteredWaitCancel
+  )
+  validateFilteredWaitCancel(cancel)
+  assert.deepEqual(cancel, { v: 1, waitIds: [9n, 11n] })
+  const cancelled = await assertRoundTrip(
+    "filter_reply_cancelled.bin",
+    decodeFilterReply,
+    encodeFilterReply
+  )
+  assert.deepEqual(cancelled, {
+    kind: "ok",
+    outcome: { kind: "cancelled", result: { cancelled: [9n] } }
+  })
   for (const name of ["filter_reply_revision_disabled.bin", "filter_reply_error.bin"]) {
     await assertRoundTrip(name, decodeFilterReply, encodeFilterReply)
   }
@@ -418,4 +477,179 @@ void test("given_server_regex_syntax_when_validated_then_should_not_require_java
       )
     }, InvalidError)
   }
+})
+
+function waitRequest(): FilteredWaitRequest {
+  return {
+    v: 1,
+    source: { stream: "orbit", topic: "fleet" },
+    consumer: { kind: "group", name: "desk" },
+    partitions: [
+      { partitionId: 0, offset: 12n },
+      { partitionId: 1, offset: 0n }
+    ],
+    maxWaitMs: 5_000,
+    waitId: 9n
+  }
+}
+
+void test("given_wait_requests_out_of_range_when_validated_then_should_be_rejected", () => {
+  const tooMany = {
+    ...waitRequest(),
+    partitions: Array.from({ length: MAX_FILTERED_WAIT_PARTITIONS + 1 }, (_, partitionId) => ({
+      partitionId,
+      offset: 0n
+    }))
+  }
+  const cases: readonly [FilteredWaitRequest, string][] = [
+    [{ ...waitRequest(), partitions: [] }, "a filtered wait names 1..=1024 partitions"],
+    [{ ...waitRequest(), maxWaitMs: MAX_FILTERED_WAIT_MS + 1 }, "max_wait_ms must be 0..=20000"],
+    [
+      {
+        ...waitRequest(),
+        partitions: [
+          { partitionId: 0, offset: 1n },
+          { partitionId: 0, offset: 2n }
+        ]
+      },
+      "a filtered wait names each partition once"
+    ],
+    [tooMany, "a filtered wait names 1..=1024 partitions"],
+    [{ ...waitRequest(), waitId: -1n }, "wait_id must be an unsigned 64-bit integer"],
+    [{ ...waitRequest(), waitId: 1n << 64n }, "wait_id must be an unsigned 64-bit integer"]
+  ]
+  for (const [request, message] of cases) {
+    assert.throws(() => {
+      validateFilteredWaitRequest(request)
+    }, new InvalidError(message))
+  }
+  validateFilteredWaitRequest({ ...waitRequest(), maxWaitMs: 0 })
+})
+
+void test("given_wait_cancels_out_of_range_when_validated_then_should_be_rejected", () => {
+  const cancel = (waitIds: readonly bigint[]): FilteredWaitCancel => ({ v: 1, waitIds })
+  const ids = (count: number) => Array.from({ length: count }, (_, index) => BigInt(index))
+  const cases: readonly [FilteredWaitCancel, string][] = [
+    [cancel([]), "a filtered wait cancel names 1..=64 waits"],
+    [cancel([4n, 4n]), "a filtered wait cancel names each wait once"],
+    [cancel(ids(MAX_FILTERED_WAIT_CANCEL_IDS + 1)), "a filtered wait cancel names 1..=64 waits"],
+    [cancel([1n << 64n]), "wait_id must be an unsigned 64-bit integer"]
+  ]
+  for (const [request, message] of cases) {
+    assert.throws(() => {
+      validateFilteredWaitCancel(request)
+    }, new InvalidError(message))
+  }
+  assert.throws(() => {
+    validateFilteredWaitCancel({ ...cancel([1n]), v: 2 })
+  }, InvalidError)
+  validateFilteredWaitCancel(cancel(ids(MAX_FILTERED_WAIT_CANCEL_IDS)))
+})
+
+function configureNamed(name: string): FilterMutationRequest {
+  return {
+    v: 1,
+    operationId: 7n,
+    mutation: {
+      kind: "configure_group",
+      group: { stream: "orbit", topic: "fleet", group: "desk" },
+      policy: {
+        kind: "definition",
+        name,
+        filter: ConsumerFilter.json(FilterExpr.pred("table", "eq", "satellites"))
+      },
+      expectedIdentity: {
+        streamId: 1,
+        streamCreatedAtMicros: 10n,
+        topicId: 2,
+        topicCreatedAtMicros: 20n,
+        groupId: 3n
+      }
+    }
+  }
+}
+
+void test("given_a_group_definition_with_a_bad_name_when_validated_then_should_be_rejected", () => {
+  const cases: readonly [string, string][] = [
+    ["", "filter name must not be empty"],
+    [
+      "has space",
+      "filter name has a disallowed byte 0x20: allowed are ASCII letters, digits, '-', '_', '.'"
+    ],
+    [
+      "colon:name",
+      "filter name has a disallowed byte 0x3a: allowed are ASCII letters, digits, '-', '_', '.'"
+    ],
+    ["a".repeat(MAX_FILTER_NAME_BYTES + 1), "filter name is 129B, exceeds cap 128B"]
+  ]
+  for (const [name, message] of cases) {
+    assert.throws(() => {
+      validateFilterMutationRequest(configureNamed(name))
+    }, new InvalidError(message))
+    assert.throws(() => {
+      validateFilterName(name)
+    }, new InvalidError(message))
+  }
+  validateFilterMutationRequest(configureNamed("a".repeat(MAX_FILTER_NAME_BYTES)))
+})
+
+void test("given_a_group_definition_without_a_name_when_decoded_then_should_be_rejected", () => {
+  const unnamed =
+    '{"v":1,"operation_id":"7","mutation":{"configure_group":{"group":{"stream":"orbit","topic":"fleet","group":"desk"},"policy":{"definition":{"v":1,"evaluator_version":1,"expr":{"present":"table"},"codec":"json","fault_policy":"stop"}}}}}'
+  assert.throws(() => decodeFilterMutationRequest(parseCanonicalJson(unnamed), "unnamed"))
+})
+
+void test("given_a_summary_with_an_owner_when_encoded_then_should_round_trip_and_omit_an_absent_owner", () => {
+  const owner = {
+    identity: {
+      streamId: 1,
+      streamCreatedAtMicros: 10n,
+      topicId: 2,
+      topicCreatedAtMicros: 20n,
+      groupId: 3n
+    },
+    group: { stream: "orbit", topic: "fleet", group: "desk" }
+  }
+  const summary = {
+    id: 4,
+    name: "safe-mode",
+    description: "",
+    state: "active" as const,
+    latestRevision: 1,
+    latestDigest: new Uint8Array(32).fill(1),
+    codec: "json" as const,
+    bindings: 1,
+    createdAtMicros: 1n,
+    updatedAtMicros: 2n
+  }
+  for (const item of [{ ...summary, owner }, summary]) {
+    const reply: FilterCatalogReply = {
+      kind: "ok",
+      outcome: { kind: "filters", page: { items: [item], page: 0, pageSize: 20, total: 1 } }
+    }
+    const encoded = encodeFilterCatalogReply(reply)
+    const filters = expectMap(expectMap(encoded.get("ok"), "ok").get("filters"), "filters")
+    const [row] = filters.get("items") as readonly Map<string, unknown>[]
+    assert.equal(row?.has("owner"), item === summary ? false : true)
+    assert.deepEqual(
+      decodeFilterCatalogReply(decodeOne(encodeNamed(encoded), "reply"), "reply"),
+      reply
+    )
+  }
+})
+
+void test("given_a_list_request_with_an_owner_when_validated_then_should_accept_only_a_native_group_id", () => {
+  const owner = {
+    streamId: 1,
+    streamCreatedAtMicros: 10n,
+    topicId: 2,
+    topicCreatedAtMicros: 20n,
+    groupId: 3n
+  }
+  const list = { v: 1, owner, page: 0, pageSize: 20 }
+  validateListFilters(list)
+  assert.deepEqual([...encodeListFilters(list).keys()], ["v", "owner", "page", "page_size"])
+  assert.throws(() => {
+    validateListFilters({ ...list, owner: { ...owner, groupId: 0x1_0000_0000n } })
+  }, new InvalidError("consumer group id exceeds the native offset-key range"))
 })

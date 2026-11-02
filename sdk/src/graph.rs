@@ -2,6 +2,8 @@ use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::types::ConversationId;
 
+pub use laser_wire::limits::MAX_GRAPH_LABEL_BYTES;
+
 impl Laser {
     /// A handle to the knowledge-graph surface `name`. Traversals require the
     /// `graph` capability (LaserData Cloud) and ride the managed binary

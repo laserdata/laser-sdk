@@ -44,7 +44,7 @@ use laser_sdk::prelude::*;
 async fn main() -> Result<(), LaserError> {
     let laser = Laser::connect("iggy:iggy@127.0.0.1").await?;
     let topic = laser.stream("telemetry").topic("inferences");
-    topic.ensure(4).await?;
+    topic.ensure(4, None).await?;
     topic.publish().json(&serde_json::json!({ "latency_ms": 42 }))?.send().await?;
 
     let messages = topic.replay()?.poll().await?;
@@ -127,8 +127,8 @@ let readings = laser.stream("fleet").topic("readings");
 let audit = laser.stream("audit").topic("events");
 
 // Log: streams group topics, topics carry your records.
-readings.ensure(4).await?;
-audit.ensure(4).await?;
+readings.ensure(4, None).await?;
+audit.ensure(4, None).await?;
 readings.publish().json(&reading)?.send().await?;
 audit.publish().json(&event)?.send().await?;
 let mut replay = readings.replay()?;

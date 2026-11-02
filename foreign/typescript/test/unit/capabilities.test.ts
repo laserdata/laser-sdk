@@ -218,14 +218,19 @@ void test("given_a_seeded_surface_when_a_ready_announcement_merges_then_should_k
     ...OPEN_CAPABILITIES,
     a2aGateway: true,
     destinations: { available: true, consistency: "potentially_stale" as const },
-    filters: { native: true, catalog: false, groupPolicyReads: false }
+    filters: { native: true, catalog: false, groupPolicyReads: false, maxWaitMs: 0 }
   }
   const announce = {
     versions: { ...newOpVersions(1, 1, 1, 1), filter: 1 },
     backends: [],
-    filters: { evaluatorVersion: 1, codecs: [] }
+    filters: { evaluatorVersion: 1, codecs: [], maxWaitMs: 20_000 }
   }
   const merged = mergeCapabilities(seed, managedCapabilitiesFrom(announce))
+  assert.equal(
+    merged.filters.maxWaitMs,
+    20_000,
+    "the announced filtered wait reaches the capabilities"
+  )
   assert.equal(merged.a2aGateway, true)
   assert.equal(merged.hello, "answered")
   assert.equal(merged.destinations.consistency, "linearizable")

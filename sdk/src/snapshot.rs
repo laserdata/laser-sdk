@@ -1,4 +1,10 @@
 use crate::error::LaserError;
+#[cfg(feature = "agent")]
+use crate::poll::{DrainRange, bounded_partitions, drain_partition};
+#[cfg(feature = "agent")]
+use iggy::prelude::{
+    Consumer, Identifier, MessageClient, PollOptions, PollingStrategy, TopicClient,
+};
 use laser_wire::framing::{decode_named, encode_named};
 pub use laser_wire::snapshot::FoldSnapshot;
 use laser_wire::validate::Validate;
@@ -145,7 +151,6 @@ impl SnapshotStore for TopicSnapshotStore {
         &self,
         conversation: laser_wire::agent::ConversationId,
     ) -> Result<Option<FoldSnapshot>, LaserError> {
-        use iggy::prelude::*;
         let stream_name = self.laser.stream_required()?.to_owned();
         let stream = Identifier::named(&stream_name)?;
         let topic = Identifier::named(&self.topic)?;
@@ -156,16 +161,18 @@ impl SnapshotStore for TopicSnapshotStore {
             return Ok(None);
         };
         let mut newest: Option<((u64, u32, u64), FoldSnapshot)> = None;
-        for partition in 0..crate::poll::bounded_partitions(details.partitions_count) {
+        for partition in 0..bounded_partitions(details.partitions_count) {
             let tail = client
                 .poll_messages(
                     &stream,
                     &topic,
-                    Some(partition),
+                    partition,
                     &consumer,
                     &PollingStrategy::last(),
-                    1,
-                    false,
+                    PollOptions {
+                        count: 1,
+                        ..PollOptions::default()
+                    },
                 )
                 .await?;
             let Some(last) = tail.messages.last() else {
@@ -177,34 +184,25 @@ impl SnapshotStore for TopicSnapshotStore {
             // the conversation's most recent checkpoint.
             while end > 0 {
                 let start = end.saturating_sub(u64::from(SNAPSHOT_SCAN_BATCH));
-                let window = client
-                    .poll_messages(
-                        &stream,
-                        &topic,
-                        Some(partition),
-                        &consumer,
-                        &PollingStrategy::offset(start),
-                        SNAPSHOT_SCAN_BATCH,
-                        false,
-                    )
-                    .await?;
-                let found = window
-                    .messages
-                    .iter()
-                    .rev()
-                    .filter(|message| message.header.offset < end)
-                    .find_map(|message| {
-                        decode(&message.payload)
-                            .ok()
-                            .filter(|snapshot| {
-                                snapshot.conversation == conversation
-                                    && snapshot.fold == self.fold
-                                    && snapshot.stream == stream_name
-                            })
-                            .map(|snapshot| {
-                                (message.header.timestamp, message.header.offset, snapshot)
-                            })
-                    });
+                let window = drain_partition(
+                    &client,
+                    &stream,
+                    &topic,
+                    &consumer,
+                    DrainRange::until(partition, start, end - 1),
+                    SNAPSHOT_SCAN_BATCH,
+                )
+                .await?;
+                let found = window.messages.iter().rev().find_map(|message| {
+                    decode(&message.payload)
+                        .ok()
+                        .filter(|snapshot| {
+                            snapshot.conversation == conversation
+                                && snapshot.fold == self.fold
+                                && snapshot.stream == stream_name
+                        })
+                        .map(|snapshot| (message.header.timestamp, message.header.offset, snapshot))
+                });
                 if let Some((timestamp, offset, snapshot)) = found {
                     let position = (timestamp, partition, offset);
                     if newest.as_ref().is_none_or(|(best, _)| position > *best) {

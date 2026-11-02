@@ -32,7 +32,10 @@ import {
   MAX_FILTER_CATALOG_PAGE,
   MAX_FILTERED_PAGE_BYTES,
   MAX_FILTERED_PAGE_EXAMINED,
-  MAX_FILTERED_PAGE_RECORDS
+  MAX_FILTERED_PAGE_RECORDS,
+  MAX_FILTERED_WAIT_CANCEL_IDS,
+  MAX_FILTERED_WAIT_MS,
+  MAX_FILTERED_WAIT_PARTITIONS
 } from "./limits.js"
 import type { CmpOp, Predicate } from "./query.js"
 import { RustRegex } from "./regex.js"
@@ -1182,6 +1185,43 @@ export interface AckReceipt {
   readonly generation: SourceGeneration
 }
 
+/**
+ * Hold until one of `partitions` has a record at or after its offset, or
+ * `maxWaitMs` passes. The server lowers the wait to its announced limit and
+ * reads nothing: the reader then sends a filtered poll to the ready ones.
+ * `waitId` names the wait on its connection so a `FilteredWaitCancel` can end it early.
+ */
+export interface FilteredWaitRequest {
+  readonly v: number
+  readonly source: FilterSource
+  readonly consumer: FilterConsumer
+  readonly partitions: readonly FilteredWaitPartition[]
+  readonly maxWaitMs: number
+  readonly waitId: bigint
+}
+
+/** End the filtered waits this connection holds under `waitIds`. Each one answers at once with no ready partition. */
+export interface FilteredWaitCancel {
+  readonly v: number
+  readonly waitIds: readonly bigint[]
+}
+
+/** The waits a `FilteredWaitCancel` ended. A wait that had already answered or was never held is left out. */
+export interface FilteredWaitCancelled {
+  readonly cancelled: readonly bigint[]
+}
+
+/** One partition of a filtered wait and the offset its next read starts at. */
+export interface FilteredWaitPartition {
+  readonly partitionId: number
+  readonly offset: bigint
+}
+
+/** The partitions that hold a record at or after their offset. Empty when the wait ended first. */
+export interface FilteredWaitResult {
+  readonly ready: readonly number[]
+}
+
 export interface FilteredPollRequest {
   readonly v: number
   readonly source: FilterSource
@@ -1426,6 +1466,8 @@ export type FilterOutcome =
   | { readonly kind: "preview"; readonly preview: FilterPreview }
   | { readonly kind: "tested"; readonly result: FilterTestResult }
   | { readonly kind: "validated"; readonly validation: FilterValidation }
+  | { readonly kind: "ready"; readonly result: FilteredWaitResult }
+  | { readonly kind: "cancelled"; readonly result: FilteredWaitCancelled }
 
 export type FilterReply =
   | { readonly kind: "ok"; readonly outcome: FilterOutcome }
@@ -1447,6 +1489,17 @@ export interface FilterGroupRef {
   readonly group: string
 }
 
+/**
+ * The consumer group a group policy filter belongs to: the exact incarnation
+ * and its names when the policy was configured. The group name stays current,
+ * while stream and topic names can change, so a reader resolves them from the
+ * identity.
+ */
+export interface FilterOwner {
+  readonly identity: FilterGroupIdentity
+  readonly group: FilterGroupRef
+}
+
 export interface FilterRevisionInfo {
   readonly enabled: boolean
   readonly revision: number
@@ -1466,6 +1519,8 @@ export interface FilterSummary {
   readonly bindings: number
   readonly createdAtMicros: bigint
   readonly updatedAtMicros: bigint
+  /** The consumer group whose own policy this filter is. Absent for a registered filter. */
+  readonly owner?: FilterOwner
 }
 
 export interface FilterBinding {
@@ -1479,9 +1534,14 @@ export interface FilterBinding {
   readonly policyGeneration: bigint
 }
 
-/** The policy a group is configured with in one step. */
+/**
+ * The policy a group is configured with in one step: a definition saved for
+ * this group alone under the caller's name, or a revision that already
+ * exists. The name follows the registered filter name rule and need not be
+ * unique, since every read returns the owning group with it.
+ */
 export type GroupFilterSpec =
-  | { readonly kind: "definition"; readonly filter: ConsumerFilter }
+  | { readonly kind: "definition"; readonly name: string; readonly filter: ConsumerFilter }
   | { readonly kind: "revision"; readonly filterId: number; readonly revision: number }
 
 /** A verified consumer group without a filter policy: every record is delivered. */
@@ -1615,6 +1675,8 @@ export interface ListFilters {
   readonly state?: FilterState
   /** Only filters with a lower id, so paging stays stable while the catalog changes. */
   readonly beforeId?: number
+  /** Only the own filter of this consumer group incarnation, bound or not. */
+  readonly owner?: FilterGroupIdentity
   readonly page: number
   readonly pageSize: number
 }
@@ -1799,6 +1861,56 @@ export function validateFilteredPollRequest(request: FilteredPollRequest): void 
   }
 }
 
+export function validateFilteredWaitRequest(request: FilteredWaitRequest): void {
+  validateVersion(request.v)
+  validateSource(request.source)
+  validateConsumer(request.consumer)
+  if (request.partitions.length === 0 || request.partitions.length > MAX_FILTERED_WAIT_PARTITIONS) {
+    throw new InvalidError(
+      `a filtered wait names 1..=${String(MAX_FILTERED_WAIT_PARTITIONS)} partitions`
+    )
+  }
+  const seen = new Set<number>()
+  for (const partition of request.partitions) {
+    if (
+      !Number.isInteger(partition.partitionId) ||
+      partition.partitionId < 0 ||
+      partition.partitionId > 0xffff_ffff
+    )
+      throw new InvalidError("partition must be an unsigned 32-bit integer")
+    if (partition.offset < 0n || partition.offset > U64_MAX)
+      throw new InvalidError("offset must be an unsigned 64-bit integer")
+    if (seen.has(partition.partitionId))
+      throw new InvalidError("a filtered wait names each partition once")
+    seen.add(partition.partitionId)
+  }
+  if (
+    !Number.isInteger(request.maxWaitMs) ||
+    request.maxWaitMs < 0 ||
+    request.maxWaitMs > MAX_FILTERED_WAIT_MS
+  ) {
+    throw new InvalidError(`max_wait_ms must be 0..=${String(MAX_FILTERED_WAIT_MS)}`)
+  }
+  validateWaitId(request.waitId)
+}
+
+export function validateFilteredWaitCancel(request: FilteredWaitCancel): void {
+  validateVersion(request.v)
+  if (request.waitIds.length === 0 || request.waitIds.length > MAX_FILTERED_WAIT_CANCEL_IDS) {
+    throw new InvalidError(
+      `a filtered wait cancel names 1..=${String(MAX_FILTERED_WAIT_CANCEL_IDS)} waits`
+    )
+  }
+  for (const waitId of request.waitIds) validateWaitId(waitId)
+  if (new Set(request.waitIds).size !== request.waitIds.length)
+    throw new InvalidError("a filtered wait cancel names each wait once")
+}
+
+function validateWaitId(waitId: bigint): void {
+  if (waitId < 0n || waitId > U64_MAX)
+    throw new InvalidError("wait_id must be an unsigned 64-bit integer")
+}
+
 /** A filtered policy names its digest and an unfiltered one has none. */
 export function validatePolicyIdentity(mode: ExecutionMode, digest: Uint8Array | undefined): void {
   if (mode === "filtered") {
@@ -1890,19 +2002,54 @@ export function validateFilterMutation(mutation: FilterMutation): void {
       return
     case "configure_group":
       validateFilterGroupRef(mutation.group)
-      if (mutation.policy.kind === "definition") validateConsumerFilter(mutation.policy.filter)
+      if (
+        mutation.expectedIdentity !== undefined &&
+        mutation.expectedIdentity.groupId > 0xffff_ffffn
+      )
+        throw new InvalidError("consumer group id exceeds the native offset-key range")
+      if (mutation.policy.kind === "definition") {
+        validateFilterName(mutation.policy.name)
+        validateConsumerFilter(mutation.policy.filter)
+      } else if (mutation.policy.revision === 0) {
+        throw new InvalidError("revision must be positive")
+      }
   }
 }
 
-function validateFilterName(name: string): void {
-  const bytes = UTF8.encode(name).byteLength
-  if (bytes === 0 || bytes > MAX_FILTER_NAME_BYTES) {
-    throw new InvalidError(`a filter name must be 1..=${String(MAX_FILTER_NAME_BYTES)} bytes`)
-  }
-  if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+/**
+ * A saved filter's name, registered or a group policy's: 1 to
+ * `MAX_FILTER_NAME_BYTES` bytes of ASCII letters, digits, `-`, `_` and `.`.
+ */
+export function validateFilterName(name: string): void {
+  const bytes = UTF8.encode(name)
+  if (bytes.byteLength === 0) throw new InvalidError("filter name must not be empty")
+  if (bytes.byteLength > MAX_FILTER_NAME_BYTES) {
     throw new InvalidError(
-      "a filter name has a disallowed byte: allowed are ASCII letters, digits, '-', '_', '.'"
+      `filter name is ${String(bytes.byteLength)}B, exceeds cap ${String(MAX_FILTER_NAME_BYTES)}B`
     )
+  }
+  const bad = bytes.find((byte) => !SAFELISTED_NAME_BYTE.test(String.fromCharCode(byte)))
+  if (bad !== undefined) {
+    throw new InvalidError(
+      `filter name has a disallowed byte 0x${bad.toString(16).padStart(2, "0")}: allowed are ASCII letters, digits, '-', '_', '.'`
+    )
+  }
+}
+
+const SAFELISTED_NAME_BYTE = /^[A-Za-z0-9._-]$/
+
+/** Rust `ListFilters::validate`: the page size, the name fragment, and an owner's native group id. */
+export function validateListFilters(request: ListFilters): void {
+  validateVersion(request.v)
+  validateCatalogPage(request.page, request.pageSize)
+  if (
+    request.nameContains !== undefined &&
+    UTF8.encode(request.nameContains).byteLength > MAX_FILTER_NAME_BYTES
+  ) {
+    throw new InvalidError("name filter exceeds the name cap")
+  }
+  if (request.owner !== undefined && request.owner.groupId > 0xffff_ffffn) {
+    throw new InvalidError("consumer group id exceeds the native offset-key range")
   }
 }
 
@@ -2231,6 +2378,32 @@ export function encodeFilteredPollRequest(request: FilteredPollRequest): Map<str
   ])
 }
 
+export function encodeFilteredWaitRequest(request: FilteredWaitRequest): Map<string, unknown> {
+  return mapOf([
+    ["v", request.v],
+    ["source", encodeFilterSource(request.source)],
+    ["consumer", encodeFilterConsumer(request.consumer)],
+    [
+      "partitions",
+      request.partitions.map((partition) =>
+        mapOf([
+          ["partition_id", partition.partitionId],
+          ["offset", partition.offset]
+        ])
+      )
+    ],
+    ["max_wait_ms", request.maxWaitMs],
+    ["wait_id", request.waitId]
+  ])
+}
+
+export function encodeFilteredWaitCancel(request: FilteredWaitCancel): Map<string, unknown> {
+  return mapOf([
+    ["v", request.v],
+    ["wait_ids", [...request.waitIds]]
+  ])
+}
+
 export function encodeFilterPreviewRequest(request: FilterPreviewRequest): Map<string, unknown> {
   return mapOf([
     ["v", request.v],
@@ -2380,6 +2553,10 @@ function encodeFilterOutcome(outcome: FilterOutcome): Map<string, unknown> {
       ])
     case "preview":
       return mapOf([["preview", encodeFilterPreview(outcome.preview)]])
+    case "ready":
+      return mapOf([["ready", mapOf([["ready", [...outcome.result.ready]]])]])
+    case "cancelled":
+      return mapOf([["cancelled", mapOf([["cancelled", [...outcome.result.cancelled]]])]])
   }
 }
 
@@ -2540,7 +2717,15 @@ export function encodeFilterMutation(mutation: FilterMutation): Map<string, unkn
 function encodeGroupFilterSpec(spec: GroupFilterSpec): Map<string, unknown> {
   switch (spec.kind) {
     case "definition":
-      return mapOf([["definition", encodeConsumerFilter(spec.filter)]])
+      return mapOf([
+        [
+          "definition",
+          mapOf([
+            ["name", spec.name],
+            ["filter", encodeConsumerFilter(spec.filter)]
+          ])
+        ]
+      ])
     case "revision":
       return mapOf([
         [
@@ -2557,7 +2742,12 @@ function encodeGroupFilterSpec(spec: GroupFilterSpec): Map<string, unknown> {
 function decodeGroupFilterSpec(value: unknown, context: string): GroupFilterSpec {
   const [tag, inner] = singleVariantTag(value, context)
   if (tag === "definition") {
-    return { kind: "definition", filter: decodeConsumerFilter(inner, `${context}.definition`) }
+    const map = expectMap(inner, `${context}.definition`)
+    return {
+      kind: "definition",
+      name: field.requiredString(map, "name", `${context}.definition`),
+      filter: decodeConsumerFilter(map.get("filter"), `${context}.definition.filter`)
+    }
   }
   if (tag === "revision") {
     const map = expectMap(inner, `${context}.revision`)
@@ -2621,6 +2811,7 @@ export function encodeListFilters(request: ListFilters): Map<string, unknown> {
   setIf(map, "name_contains", request.nameContains)
   setIf(map, "state", request.state)
   setIf(map, "before_id", request.beforeId)
+  if (request.owner !== undefined) map.set("owner", encodeFilterGroupIdentity(request.owner))
   map.set("page", request.page)
   map.set("page_size", request.pageSize)
   return map
@@ -2736,8 +2927,15 @@ function encodeRevisionInfo(info: FilterRevisionInfo): Map<string, unknown> {
   ])
 }
 
-function encodeSummary(summary: FilterSummary): Map<string, unknown> {
+function encodeFilterOwner(owner: FilterOwner): Map<string, unknown> {
   return mapOf([
+    ["identity", encodeFilterGroupIdentity(owner.identity)],
+    ["group", encodeFilterGroupRef(owner.group)]
+  ])
+}
+
+function encodeSummary(summary: FilterSummary): Map<string, unknown> {
+  const map = mapOf([
     ["id", summary.id],
     ["name", summary.name],
     ["description", summary.description],
@@ -2749,6 +2947,8 @@ function encodeSummary(summary: FilterSummary): Map<string, unknown> {
     ["created_at_micros", summary.createdAtMicros],
     ["updated_at_micros", summary.updatedAtMicros]
   ])
+  if (summary.owner !== undefined) map.set("owner", encodeFilterOwner(summary.owner))
+  return map
 }
 
 function encodeCatalogOutcome(outcome: FilterCatalogOutcome): Map<string, unknown> {
@@ -3196,6 +3396,35 @@ export function decodeFilteredPollRequest(value: unknown, context: string): Filt
   }
 }
 
+export function decodeFilteredWaitRequest(value: unknown, context: string): FilteredWaitRequest {
+  const map = expectMap(value, context)
+  return {
+    v: requiredU32(map, "v", context),
+    source: decodeFilterSource(map.get("source"), `${context}.source`),
+    consumer: decodeFilterConsumer(map.get("consumer"), `${context}.consumer`),
+    partitions: field.requiredArray(map, "partitions", context, (item, index) => {
+      const itemContext = `${context}.partitions[${String(index)}]`
+      const partition = expectMap(item, itemContext)
+      return {
+        partitionId: requiredU32(partition, "partition_id", itemContext),
+        offset: field.requiredU64(partition, "offset", itemContext)
+      }
+    }),
+    maxWaitMs: requiredU32(map, "max_wait_ms", context),
+    waitId: field.requiredU64(map, "wait_id", context)
+  }
+}
+
+export function decodeFilteredWaitCancel(value: unknown, context: string): FilteredWaitCancel {
+  const map = expectMap(value, context)
+  return {
+    v: requiredU32(map, "v", context),
+    waitIds: field.requiredArray(map, "wait_ids", context, (item, index) =>
+      expectU64(item, `${context}.wait_ids[${String(index)}]`)
+    )
+  }
+}
+
 function decodeAppliedPolicy(value: unknown, context: string): AppliedPolicy {
   const map = expectMap(value, context)
   const filterId = optionalU32(map, "filter_id", context)
@@ -3371,6 +3600,28 @@ function decodeFilterOutcome(value: unknown, context: string): FilterOutcome {
           digest: requiredBytes(map, "digest", context),
           readsPayload: field.requiredBoolean(map, "reads_payload", context),
           readsHeaders: field.requiredBoolean(map, "reads_headers", context)
+        }
+      }
+    }
+    case "ready": {
+      const map = expectMap(inner, `${context}.ready`)
+      return {
+        kind: "ready",
+        result: {
+          ready: field.requiredArray(map, "ready", `${context}.ready`, (item, index) =>
+            u32(item, `${context}.ready.ready[${String(index)}]`)
+          )
+        }
+      }
+    }
+    case "cancelled": {
+      const map = expectMap(inner, `${context}.cancelled`)
+      return {
+        kind: "cancelled",
+        result: {
+          cancelled: field.requiredArray(map, "cancelled", `${context}.cancelled`, (item, index) =>
+            expectU64(item, `${context}.cancelled.cancelled[${String(index)}]`)
+          )
         }
       }
     }
@@ -3663,7 +3914,18 @@ function decodeSummary(value: unknown, context: string): FilterSummary {
     codec: decodeFilterCodec(map.get("codec"), `${context}.codec`),
     bindings: requiredU32(map, "bindings", context),
     createdAtMicros: field.requiredU64(map, "created_at_micros", context),
-    updatedAtMicros: field.requiredU64(map, "updated_at_micros", context)
+    updatedAtMicros: field.requiredU64(map, "updated_at_micros", context),
+    ...(map.get("owner") === undefined
+      ? {}
+      : { owner: decodeFilterOwner(map.get("owner"), `${context}.owner`) })
+  }
+}
+
+function decodeFilterOwner(value: unknown, context: string): FilterOwner {
+  const map = expectMap(value, context)
+  return {
+    identity: decodeFilterGroupIdentity(map.get("identity"), `${context}.identity`),
+    group: decodeFilterGroupRef(map.get("group"), `${context}.group`)
   }
 }
 

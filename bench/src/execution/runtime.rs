@@ -125,6 +125,10 @@ pub(crate) fn scenario_requires_backend(scenario: &laser_bench::manifest::Scenar
             .is_ok_and(RecoveryDriver::requires_backend)
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "awaits the native run future, about 20 KB in debug"
+)]
 pub(crate) async fn execute_scenario(
     manifest: &SuiteManifest,
     scenario: &laser_bench::manifest::Scenario,
@@ -147,7 +151,7 @@ pub(crate) async fn execute_scenario(
         &output.join("resolved-stack.json"),
         &serde_json::to_value(&stack)?,
     )?;
-    Box::pin(execute_native_run(DirectExecution {
+    execute_native_run(DirectExecution {
         stack: &stack,
         manifest,
         scenario,
@@ -157,7 +161,7 @@ pub(crate) async fn execute_scenario(
             seed: 1,
         },
         output,
-    }))
+    })
     .await?;
     let host_audit = HostAudit::finish(
         host_before,
@@ -189,6 +193,10 @@ pub(crate) async fn execute_scenario(
     Ok(())
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "awaits the started or composed run future, about 20 KB in debug"
+)]
 pub(crate) async fn execute_native_run(
     execution: DirectExecution<'_>,
 ) -> Result<Option<DirectPairSummary>, BenchError> {
@@ -198,7 +206,7 @@ pub(crate) async fn execute_native_run(
         source,
     })?;
     if execution.stack.mode == laser_bench::manifest::ProvisionMode::Compose {
-        return Box::pin(execute_compose_run(execution, &services)).await;
+        return execute_compose_run(execution, &services).await;
     }
     let server_manifest = execution
         .stack
@@ -218,15 +226,13 @@ pub(crate) async fn execute_native_run(
     )
     .await?;
     let backend = start_backend(execution, &services, &server, backend_socket).await?;
-    Box::pin(execute_started_run(
-        execution,
-        server,
-        backend,
-        Some(server_manifest),
-    ))
-    .await
+    execute_started_run(execution, server, backend, Some(server_manifest)).await
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "awaits the started run future, about 20 KB in debug"
+)]
 pub(crate) async fn execute_compose_run(
     execution: DirectExecution<'_>,
     services: &Path,
@@ -262,7 +268,7 @@ pub(crate) async fn execute_compose_run(
         scenario_requires_backend(execution.scenario),
         execution.manifest.environment.backend_profile,
     )?;
-    let result = Box::pin(execute_started_run(execution, server, backend, None)).await;
+    let result = execute_started_run(execution, server, backend, None).await;
     let shutdown = compose.shutdown();
     result.and_then(|result| shutdown.map(|()| result))
 }

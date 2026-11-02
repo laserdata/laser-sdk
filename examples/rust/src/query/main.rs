@@ -29,7 +29,7 @@ async fn main() -> Result<(), LaserError> {
         }
 
         phase("keep a queryable view of a topic, then query it");
-        laser.topic(TOPIC).ensure(PARTITIONS).await?;
+        laser.topic(TOPIC).ensure(PARTITIONS, None).await?;
         // Declare this run's `readings_v1_<token>` view over `readings`. From here the
         // view maintains itself: every record published to the topic lands in the
         // table, and the per-run name means the counts below are this run's alone.

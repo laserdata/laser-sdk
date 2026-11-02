@@ -114,7 +114,7 @@ async fn main() -> Result<(), LaserError> {
 
     let laser = laser(&stream_for("event-analytics"), Capabilities::OPEN).await?;
     fresh_run(&laser, &stream_for("event-analytics"), async {
-        laser.topic(TOPIC).ensure(PARTITIONS).await?;
+        laser.topic(TOPIC).ensure(PARTITIONS, None).await?;
         let query_available = laser.capabilities().await.query.available;
 
         let events = clickstream();
@@ -266,7 +266,6 @@ async fn live_monitor(laser: &Laser, expected: usize) -> Result<(), LaserError> 
         .consumer()
         .commit_policy(CommitPolicy::Polling)
         .start_at(ConsumerStart::Next)
-        .poll_interval(Duration::from_millis(5))
         .batch_length(100)
         .build()
         .await?;
@@ -525,7 +524,7 @@ async fn run_guarded_ingest(laser: &Laser) -> Result<(), LaserError> {
         .await?;
     info!("LaserData Cloud allocated writer-schema id {schema_id} for the Event guard");
 
-    laser.topic(GUARDED_TOPIC).ensure(PARTITIONS).await?;
+    laser.topic(GUARDED_TOPIC).ensure(PARTITIONS, None).await?;
     let index = index_for(GUARDED_TOPIC);
     let projection = format!("{index}.v1");
     laser

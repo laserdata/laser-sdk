@@ -90,7 +90,7 @@ impl PySessions {
         })
     }
 
-    /// A page of one session's events in broker time order, as a
+    /// A page of one session's events in server append time order, as a
     /// `SessionEventsPage` dict. `fixed_frontier=True` pins the fold frontier
     /// of the first page for a historical walk.
     #[pyo3(signature = (id, *, cursor=None, limit=0, fixed_frontier=false))]

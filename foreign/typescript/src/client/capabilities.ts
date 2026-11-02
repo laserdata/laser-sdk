@@ -53,6 +53,9 @@ export interface FilterCaps {
   /** The evaluator version and codecs the server announced. Absent from a
    * server that predates the announcement, which evaluates as this build does. */
   readonly evaluation?: FilterAnnounce
+  /** The longest filtered wait the server holds, in milliseconds. Zero when it
+   * serves none, so a group reader paces idle rounds itself. */
+  readonly maxWaitMs: number
 }
 
 /**
@@ -118,7 +121,7 @@ export const OPEN_CAPABILITIES: Capabilities = Object.freeze({
   streamTenancy: false,
   watch: false,
   authz: false,
-  filters: Object.freeze({ native: false, catalog: false, groupPolicyReads: false }),
+  filters: Object.freeze({ native: false, catalog: false, groupPolicyReads: false, maxWaitMs: 0 }),
   backends: Object.freeze([]),
   hello: "unknown"
 })
@@ -185,6 +188,7 @@ export function isOpenOnly(capabilities: Capabilities): boolean {
     filters.catalog === open.filters.catalog &&
     filters.groupPolicyReads === open.filters.groupPolicyReads &&
     filters.evaluation === undefined &&
+    filters.maxWaitMs === open.filters.maxWaitMs &&
     capabilities.versions === undefined &&
     capabilities.backends.length === 0
   )
@@ -306,7 +310,8 @@ function foldAnnouncement(capabilities: Capabilities, announce: BackendAnnounce)
       native,
       catalog: capabilities.filters.catalog,
       groupPolicyReads,
-      ...(evaluation !== undefined ? { evaluation } : {})
+      ...(evaluation !== undefined ? { evaluation } : {}),
+      maxWaitMs: evaluation?.maxWaitMs ?? capabilities.filters.maxWaitMs
     },
     hello: "answered"
   }

@@ -303,7 +303,6 @@ Given(
       .id(AgentId.new(name))
       .listenOn(AgentTopic.Sessions)
       .respondOn(AgentTopic.Sessions)
-      .pollInterval(5)
       .handler({
         handle: (_message, context) =>
           context.respond(encoder.encode('{"ok":true}')),
@@ -1067,7 +1066,6 @@ Given(
       .id(AgentId.new(name))
       .listenOn(AgentTopic.Sessions)
       .respondOn(AgentTopic.Sessions)
-      .pollInterval(5)
       .handler({
         handle: (message, context) => {
           // Records the session of every work record it is handed.

@@ -25,6 +25,19 @@ async def test_given_an_absent_stream_when_a_producer_starts_then_should_require
         await laser.close()
 
 
+@pytest.mark.parametrize("factor", [0, ls.MAX_REPLICATION_FACTOR + 1])
+async def test_given_a_replication_factor_outside_one_to_thirty_two_when_creating_a_topic_then_should_refuse_it_before_sending(  # noqa: E501
+    laser, factor
+):
+    topic = laser.topic("replicated")
+    with pytest.raises(ls.InvalidError, match=r"^invalid: replication factor must be 1\.\.=32$"):
+        await topic.ensure(3, replication_factor=factor)
+    with pytest.raises(ls.InvalidError, match=r"^invalid: replication factor must be 1\.\.=32$"):
+        await topic.producer(partitions=3, replication_factor=factor).init()
+    with pytest.raises(ls.TransportError, match="was not found"):
+        await topic.producer(create_topic=False).init()
+
+
 def test_given_signing_keys_when_enrolled_then_should_expose_their_identity():
     key = ls.SigningKey(bytes(range(32)))
     operator_key = ls.SigningKey(bytes(reversed(range(32))))
@@ -434,7 +447,6 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
     assert batch_send.confirmations[0].base_offset > first_send.confirmations[0].base_offset
 
     uncommitted = topic.consumer_group("uncommitted-workers").consumer(
-        poll_interval_ms=1,
         polling="next",
         auto_commit="disabled",
     )
@@ -443,7 +455,6 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
     finally:
         await uncommitted.shutdown()
     uncommitted = topic.consumer_group("uncommitted-workers").consumer(
-        poll_interval_ms=1,
         polling="next",
         auto_commit="disabled",
     )
@@ -459,7 +470,6 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
 
     consumer = topic.consumer_group("manual-workers").consumer(
         batch_length=32,
-        poll_interval_ms=1,
         polling="first",
         auto_commit="disabled",
         allow_replay=True,
@@ -482,7 +492,6 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
 
     await producer.send(b"manual-resumed")
     resumed = topic.consumer_group("manual-workers").consumer(
-        poll_interval_ms=1,
         polling="next",
         auto_commit="disabled",
     )
@@ -494,7 +503,6 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
 
     auto_consumer = topic.consumer_group("auto-workers").consumer(
         batch_length=32,
-        poll_interval_ms=1,
         polling="first",
         auto_commit="each",
         commit_interval_ms=10,
@@ -521,7 +529,6 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
 
     await producer.send(b"auto-resumed")
     resumed = topic.consumer_group("auto-workers").consumer(
-        poll_interval_ms=1,
         polling="next",
         auto_commit="disabled",
     )
@@ -636,7 +643,6 @@ async def test_given_an_echo_agent_when_requesting_then_should_reply_in_the_conv
         "agent.sessions",
         handle,
         respond_on="agent.sessions",
-        poll_interval_ms=10,
     )
     try:
         await agent.ready()
@@ -665,7 +671,6 @@ async def test_given_an_agent_context_manager_when_requesting_then_should_reply(
         ls.AgentTopic.Sessions,
         handle,
         respond_on=ls.AgentTopic.Sessions,
-        poll_interval_ms=10,
     )
     async with spawned:
         reply = await laser.request(
@@ -685,9 +690,7 @@ async def test_given_a_request_reply_when_assembling_context_then_should_replay_
     async def handle(ctx, message):
         await ctx.respond(b"pong")
 
-    agent = laser.spawn_agent(
-        "ponger", "agent.sessions", handle, respond_on="agent.sessions", poll_interval_ms=10
-    )
+    agent = laser.spawn_agent("ponger", "agent.sessions", handle, respond_on="agent.sessions")
     try:
         await agent.ready()
         provenance = ls.Provenance(agent="caller")
@@ -1176,7 +1179,7 @@ async def test_given_an_a2a_task_when_a_python_agent_answers_then_should_leave_w
     async def worker(ctx, message):
         await ctx.respond_input("agent.sessions", b"answered")
 
-    agent = laser.spawn_agent("a2a-worker", "agent.sessions", worker, poll_interval_ms=10)
+    agent = laser.spawn_agent("a2a-worker", "agent.sessions", worker)
     try:
         await agent.ready()
         bridge = ls.A2aBridge(laser, "a2a-gw", "agent.sessions", "agent.sessions")
@@ -1209,9 +1212,7 @@ async def test_given_a_custom_deduplicator_when_a_key_repeats_then_should_drop_t
     async def handle(ctx, message):
         handled.append(message.payload.decode())
 
-    agent = laser.spawn_agent(
-        "dedup-worker", "agent.sessions", handle, poll_interval_ms=10, dedup=dedup
-    )
+    agent = laser.spawn_agent("dedup-worker", "agent.sessions", handle, dedup=dedup)
     try:
         await agent.ready()
         provenance = ls.Provenance(agent="caller", idempotency_key="dupe-key")
@@ -1380,7 +1381,6 @@ async def test_given_capable_agents_when_fanning_out_then_should_gather_every_re
             capabilities=[
                 {"skill_id": "diagnose", "cost_class": 2, "latency_class": 1, "load": 10}
             ],
-            poll_interval_ms=10,
         )
         await agent.ready()
         workers.append(agent)
@@ -1396,7 +1396,6 @@ async def test_given_capable_agents_when_fanning_out_then_should_gather_every_re
         orchestrate,
         respond_on="agent.sessions",
         fixed_inbox="agent.sessions",
-        poll_interval_ms=10,
     )
     try:
         await orchestrator.ready()
@@ -1423,7 +1422,7 @@ async def test_given_an_approval_gate_when_a_human_answers_then_should_resume_th
     async def approve(ctx, message):
         await ctx.respond_input("agent.sessions", b"approved")
 
-    approver = laser.spawn_agent("approver", "agent.sessions", approve, poll_interval_ms=10)
+    approver = laser.spawn_agent("approver", "agent.sessions", approve)
 
     async def gatekeeper_handle(ctx, message):
         decision = await ctx.approval_gate(
@@ -1436,7 +1435,6 @@ async def test_given_an_approval_gate_when_a_human_answers_then_should_resume_th
         "agent.sessions",
         gatekeeper_handle,
         respond_on="agent.sessions",
-        poll_interval_ms=10,
     )
     try:
         await approver.ready()
@@ -1470,9 +1468,7 @@ async def test_given_a_verifying_agent_when_commands_arrive_then_should_dispatch
     async def handle(ctx, message):
         principals.append(message.verified_principal)
 
-    agent = laser.spawn_agent(
-        "verified-worker", ls.AgentTopic.Sessions, handle, poll_interval_ms=10, verifier=registry
-    )
+    agent = laser.spawn_agent("verified-worker", ls.AgentTopic.Sessions, handle, verifier=registry)
     try:
         await agent.ready()
         conversation = ls.Provenance(agent="caller").conversation_id
@@ -1510,7 +1506,7 @@ async def test_given_a_verifying_caller_when_requesting_input_then_should_resume
 
     # An unsigned approver answers every interrupt, but its response cannot
     # verify, so the paused caller must keep waiting and time out.
-    faker = caller.spawn_agent("faker", ls.AgentTopic.Sessions, forge, poll_interval_ms=10)
+    faker = caller.spawn_agent("faker", ls.AgentTopic.Sessions, forge)
     approver = None
     try:
         await faker.ready()
@@ -1528,7 +1524,6 @@ async def test_given_a_verifying_caller_when_requesting_input_then_should_resume
             "approver",
             ls.AgentTopic.Sessions,
             approve,
-            poll_interval_ms=10,
             signing_key=approver_key,
         )
         await approver.ready()
@@ -1738,6 +1733,47 @@ async def test_given_each_commit_policy_when_shutdown_after_zero_then_should_res
         await resumed.shutdown()
 
 
+@pytest.mark.parametrize("native", [False, True], ids=["policy_aware", "native"])
+async def test_given_a_stored_offset_when_a_group_starts_at_last_then_should_resume_after_it(
+    laser, native
+):
+    if native:
+        laser = await laser.with_capabilities(filters=False, filters_group_policy_reads=False)
+    topic = laser.topic("group-last-start")
+    await topic.ensure(1)
+    producer = topic.producer(partition=0, partitions=1)
+    for value in range(10):
+        await producer.send(str(value).encode())
+
+    handled = topic.consumer_group("tail-workers").consumer(auto_commit="disabled")
+    try:
+        received = [await asyncio.wait_for(handled.next(), timeout=10) for _ in range(5)]
+        await handled.commit(received[-1])
+    finally:
+        await handled.shutdown()
+
+    resumed = topic.consumer_group("tail-workers").consumer(
+        polling="last", batch_length=2, auto_commit="disabled"
+    )
+    try:
+        offsets = [
+            (await asyncio.wait_for(resumed.next(), timeout=10)).position.offset for _ in range(5)
+        ]
+        assert offsets == [5, 6, 7, 8, 9]
+    finally:
+        await resumed.shutdown()
+
+    fresh = topic.consumer_group("tail-fresh").consumer(polling="last", auto_commit="disabled")
+    try:
+        await fresh.init()
+        message = await asyncio.wait_for(fresh.next(), timeout=10)
+        assert message.position.offset == 9
+        stored = await fresh.stored_offset(0)
+        assert stored is not None and stored.stored_offset == 8
+    finally:
+        await fresh.shutdown()
+
+
 async def test_given_pending_reads_when_inspected_then_should_allow_cancel_and_shutdown(
     laser,
 ):
@@ -1781,6 +1817,111 @@ async def test_given_pending_reads_when_inspected_then_should_allow_cancel_and_s
         await consumer.shutdown()
 
 
+def local_projection_cap(laser):
+    return ls.MAX_PROJECTION_ID_BYTES - len(f"stream:{laser.default_stream}/")
+
+
+@pytest.mark.parametrize(
+    ("rule", "send"),
+    [
+        (
+            "projection id is",
+            lambda laser: laser.projections().drop("p" * (local_projection_cap(laser) + 1)),
+        ),
+        (
+            "projection id contains a control character",
+            lambda laser: laser.bindings().apply(
+                ls.ProjectionBindingBuilder()
+                .source("acme", "readings")
+                .allow("reading\n.v1")
+                .build()
+            ),
+        ),
+        (
+            "projection name is",
+            lambda laser: laser.projections().register(
+                ls.ProjectionBuilder("readings")
+                .name("n" * (ls.MAX_PROJECTION_NAME_BYTES + 1))
+                .build()
+            ),
+        ),
+        (
+            "index field name is",
+            lambda laser: laser.projections().register(
+                ls.ProjectionBuilder("readings").field("f" * (ls.MAX_INDEX_FIELD_BYTES + 1)).build()
+            ),
+        ),
+        (
+            "graph node label is",
+            lambda laser: laser.projections().register_graph(
+                ls.ProjectionBuilder("fleet")
+                .graph(
+                    {
+                        "nodes": [
+                            {
+                                "label": "l" * (ls.MAX_GRAPH_LABEL_BYTES + 1),
+                                "value_pointer": "/host",
+                            }
+                        ]
+                    }
+                )
+                .build()
+            ),
+        ),
+        (
+            "schema name is",
+            lambda laser: laser.schemas().register(
+                {"kind": "json_schema", "schema": "{}"}, name="s" * (ls.MAX_SCHEMA_NAME_BYTES + 1)
+            ),
+        ),
+        (
+            "memory item id is",
+            lambda laser: ls.LogMemory.in_namespace(laser, "notes").set_named(
+                "k" * (ls.MAX_MEMORY_ID_BYTES + 1 - len("notes/")), b"v"
+            ),
+        ),
+        (
+            "memory target is",
+            lambda laser: ls.LogMemory.in_namespace(laser, "notes").forget_named(
+                "k" * (ls.MAX_MEMORY_ID_BYTES + 1 - len("notes/"))
+            ),
+        ),
+        (
+            "session list text is",
+            lambda laser: laser.sessions().list(text="t" * (ls.MAX_SESSION_TEXT_QUERY_BYTES + 1)),
+        ),
+        (
+            "session list cursor is",
+            lambda laser: laser.sessions().list(cursor="c" * (ls.MAX_SESSION_CURSOR_BYTES + 1)),
+        ),
+        (
+            "session list label prefix is",
+            lambda laser: laser.sessions().list(label_prefix="l" * 257),
+        ),
+        (
+            "session list stream must be",
+            lambda laser: laser.sessions(stream="s" * 256).list(),
+        ),
+    ],
+)
+async def test_given_a_name_over_its_wire_rule_when_sent_then_should_refuse_it_before_the_backend(
+    laser, rule, send
+):
+    with pytest.raises(ls.InvalidError, match=rule):
+        await send(laser)
+
+
+async def test_given_an_agent_id_at_the_wire_cap_when_spawned_then_should_need_an_explicit_group(
+    laser,
+):
+    longest = "a" * 256
+    assert laser.agent(longest).id == longest
+    with pytest.raises(ls.IdError):
+        laser.agent(longest + "a")
+    with pytest.raises(ls.IdError):
+        laser.spawn_agent(longest, ls.AgentTopic.Sessions, lambda ctx, message: None)
+
+
 async def test_given_a_kv_precondition_when_sending_then_should_raise_invalid(laser):
     request = laser.kv("config").set("service:auth").json({"log_level": "debug"}).expect_absent()
     with pytest.raises(ls.InvalidError):
@@ -1794,6 +1935,62 @@ async def test_given_a_quiet_topic_when_reading_next_within_then_should_raise_ti
     try:
         with pytest.raises(ls.TimeoutError):
             await consumer.next_within(500)
+    finally:
+        await consumer.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("knobs", "reason"),
+    [
+        ({"max_wait_ms": 600_001}, "max_wait must be at most 600 s"),
+        ({"min_count": 0}, r"min_count must be 1\.\.=batch_length"),
+        ({"batch_length": 4, "min_count": 5}, r"min_count must be 1\.\.=batch_length"),
+        ({"max_bytes": 0}, "max_bytes must be at least"),
+    ],
+)
+@pytest.mark.parametrize("group", [False, True])
+async def test_given_an_out_of_range_poll_knob_when_a_consumer_starts_then_should_refuse_it(
+    laser, knobs, reason, group
+):
+    topic = laser.topic("poll-knobs")
+    await topic.ensure(partitions=1)
+    consumer = (
+        topic.consumer_group("poll-knobs").consumer(**knobs)
+        if group
+        else topic.consumer("poll-knobs", **knobs)
+    )
+    with pytest.raises(ls.InvalidError, match=reason):
+        await consumer.init()
+
+
+async def test_given_the_widest_poll_knobs_when_a_consumer_starts_then_should_accept_them(laser):
+    topic = laser.topic("poll-knob-bounds")
+    await topic.ensure(partitions=1)
+    consumer = topic.consumer(
+        "poll-knob-bounds", batch_length=8, max_wait_ms=600_000, min_count=8, max_bytes=2**32 - 1
+    )
+    try:
+        await consumer.init()
+    finally:
+        await consumer.shutdown()
+
+
+async def test_given_a_held_poll_when_a_record_lands_then_should_deliver_it_before_the_wait_ends(
+    laser,
+):
+    topic = laser.topic("held-poll")
+    await topic.ensure(partitions=1)
+    consumer = topic.consumer("held-reader", polling="first", max_wait_ms=30_000)
+    try:
+        await consumer.init()
+        pending = asyncio.ensure_future(consumer.next())
+        await asyncio.sleep(0.2)
+        assert not pending.done(), "nothing was published yet"
+        started = time.monotonic()
+        await topic.send(b"landed")
+        record = await asyncio.wait_for(pending, 10)
+        assert record.payload == b"landed"
+        assert time.monotonic() - started < 10, "the server answered the held poll on arrival"
     finally:
         await consumer.shutdown()
 

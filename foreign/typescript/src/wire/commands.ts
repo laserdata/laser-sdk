@@ -16,8 +16,10 @@ import {
   encodeSessionLinks,
   encodeSessionList,
   encodeSessionSources,
-  encodeSessionState
+  encodeSessionState,
+  validateSessionList
 } from "./session.js"
+import { validateSchemaName } from "./control.js"
 import {
   type AuthzHistoryReq,
   type AuthzReply,
@@ -204,7 +206,8 @@ import {
   decodeGraphReply,
   encodeGraphNeighbors,
   encodeGraphQueryFrame,
-  encodeGraphUpsertFrame
+  encodeGraphUpsertFrame,
+  validateGraphUpsert
 } from "./graph.js"
 import {
   type KvCas,
@@ -529,13 +532,18 @@ export const ListSchemasCommand = framed<ListSchemas, BrowseReply>(
   decodeBrowseReply,
   queryVersion
 )
-export const RegisterSchemaCommand = framed<RegisterSchema, BrowseReply>(
-  AGDX_REGISTER_SCHEMA_CODE,
-  "managed",
-  encodeRegisterSchema,
-  decodeBrowseReply,
-  queryVersion
-)
+export const RegisterSchemaCommand: ManagedCommand<RegisterSchema, BrowseReply> = {
+  ...framed<RegisterSchema, BrowseReply>(
+    AGDX_REGISTER_SCHEMA_CODE,
+    "managed",
+    encodeRegisterSchema,
+    decodeBrowseReply,
+    queryVersion
+  ),
+  validate: (request) => {
+    validateSchemaName(request.name)
+  }
+}
 export const DecodeRecordCommand = framed<DecodeRecord, BrowseReply>(
   AGDX_DECODE_RECORD_CODE,
   "managed",
@@ -699,12 +707,15 @@ export const SessionGetCommand = framed<SessionGet, SessionReply>(
   encodeSessionGet,
   decodeSessionReply
 )
-export const SessionListCommand = framed<SessionList, SessionReply>(
-  AGDX_SESSION_LIST_CODE,
-  "sessions",
-  encodeSessionList,
-  decodeSessionReply
-)
+export const SessionListCommand: ManagedCommand<SessionList, SessionReply> = {
+  ...framed<SessionList, SessionReply>(
+    AGDX_SESSION_LIST_CODE,
+    "sessions",
+    encodeSessionList,
+    decodeSessionReply
+  ),
+  validate: validateSessionList
+}
 export const SessionEventsCommand = framed<SessionEvents, SessionReply>(
   AGDX_SESSION_EVENTS_CODE,
   "sessions",
@@ -764,6 +775,7 @@ export const GraphUpsertCommand: ManagedCommand<GraphUpsert, GraphReply> = {
   code: AGDX_GRAPH_UPSERT_CODE,
   surface: "graph",
   version: graphVersion,
+  validate: validateGraphUpsert,
   encode: encodeGraphUpsertFrame,
   decode: (reply) => decodeGraphReply(decodeOne(reply, "graph upsert reply"), "graph upsert reply")
 }

@@ -33,7 +33,6 @@ def _worker(laser, seen, max_partitions=None):
         WORKER,
         ls.AgentTopic.Sessions,
         handle,
-        poll_interval_ms=10,
         max_partitions=max_partitions,
     )
 

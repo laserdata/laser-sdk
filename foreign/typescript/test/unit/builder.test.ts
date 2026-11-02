@@ -20,7 +20,8 @@ function builder(): AgentBuilder {
 }
 
 void test("given_invalid_numeric_policies_when_building_then_should_reject_before_io", () => {
-  assert.throws(() => builder().pollInterval(-1).build(), /pollInterval/)
+  assert.throws(() => builder().maxWait(-1).build(), /maxWait/)
+  assert.throws(() => builder().maxWait(600_001).build(), /maxWait/)
   assert.throws(() => builder().shutdownGrace(Number.NaN).build(), /shutdownGrace/)
   assert.throws(() => builder().dedupWindow(0).build(), /dedupWindow/)
   assert.throws(() => builder().retry({ maxAttempts: 0, baseDelayMs: 1 }).build(), /maxAttempts/)

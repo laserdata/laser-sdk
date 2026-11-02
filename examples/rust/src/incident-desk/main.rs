@@ -154,7 +154,7 @@ async fn main() -> Result<(), LaserError> {
     let laser = laser(&stream_for("incident-desk"), Capabilities::OPEN).await?;
     fresh_run(&laser, &stream_for("incident-desk"), async {
         laser.bootstrap(PARTITIONS, laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(86_400))).await?;
-        laser.topic(TICKETS_TOPIC).ensure(PARTITIONS).await?;
+        laser.topic(TICKETS_TOPIC).ensure(PARTITIONS, None).await?;
         let capabilities = laser.capabilities().await;
         if !managed_feature_ready(capabilities.managed, "the agentic desk", "incident-desk") {
             return Ok(());

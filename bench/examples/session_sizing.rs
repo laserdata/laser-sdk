@@ -13,7 +13,7 @@ use laser_sdk::agent::{Session, SessionConfig, Sessions, TopicRetention};
 use laser_sdk::filters::FilteredStart;
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{AgentEnvelope, AgentId, CorrelationId, RecordId, SessionStatus};
-use laser_sdk::wire::dispatch::addressee_filter;
+use laser_sdk::wire::dispatch::{ADDRESSEE_FILTER_NAME, addressee_filter};
 use serde_json::json;
 use std::time::{Duration, Instant};
 
@@ -139,7 +139,7 @@ async fn read_role(laser: &Laser, role: &str, group: &str, expected: u64) -> Rol
         .consumer_group(group);
     group
         .create()
-        .filter(addressee_filter(&agent(role)))
+        .filter(ADDRESSEE_FILTER_NAME, addressee_filter(&agent(role)))
         .build()
         .await
         .expect("group policy");

@@ -1,15 +1,25 @@
 use crate::agent::consumer::{AgentMessage, decode_agent_record};
 use crate::error::LaserError;
+use crate::poll::{TopicFollower, bounded_partitions};
 use crate::types::MessageId;
 use dashmap::DashMap;
 use iggy::prelude::*;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::oneshot;
+use tracing::debug;
 
 const REPLY_BATCH: u32 = 200;
-const REPLY_POLL_INTERVAL: Duration = Duration::from_millis(20);
+// How long the server holds the hub's read while no reply lands. A reply ends
+// the wait at once.
+const REPLY_MAX_WAIT: Duration = Duration::from_secs(5);
+// How long the hub waits before it looks again for a reply topic that does not
+// exist yet or a read that failed.
+const REPLY_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 const PENDING_REPLY_LIMIT: usize = 64;
+/// How often a parked dispatcher checks that its hub still exists.
+const IDLE_HUB_CHECK: Duration = Duration::from_secs(5);
 
 /// One shared reply consumer per `(stream, reply topic)`. It decodes each record
 /// once and completes the one waiter whose correlation matches, so N concurrent
@@ -28,6 +38,10 @@ struct ReplyHubInner {
     // Woken by every subscribe, so an idle dispatcher parks instead of
     // polling the reply topic with nobody waiting.
     subscribed: tokio::sync::Notify,
+    // Woken when the last waiter leaves, so the dispatcher ends its held
+    // reads at once instead of when they answer. Shared with the dispatcher
+    // without keeping the hub alive.
+    emptied: Arc<tokio::sync::Notify>,
     task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     #[cfg(feature = "sign")]
     verifier: Option<Arc<crate::sign::KeyRegistry>>,
@@ -86,6 +100,15 @@ impl ExpectedReply {
     }
 }
 
+impl ReplyHubInner {
+    fn forget(&self, correlation: &str) {
+        self.waiters.remove(correlation);
+        if self.waiters.is_empty() {
+            self.emptied.notify_waiters();
+        }
+    }
+}
+
 impl Drop for ReplyHubInner {
     fn drop(&mut self) {
         if let Some(task) = self
@@ -113,30 +136,36 @@ impl ReplyHub {
     ) -> Result<Self, LaserError> {
         let stream_id = Identifier::named(&stream)?;
         let consumer = Consumer::new(Identifier::named("laser-reply-hub")?);
-        let mut offsets: Vec<u64> = Vec::new();
+        let mut offsets = BTreeMap::new();
         if let Some(details) = client.get_topic(&stream_id, &topic).await? {
-            let partitions = crate::poll::bounded_partitions(details.partitions_count);
-            offsets = vec![0u64; partitions as usize];
-            for partition in 0..partitions {
+            for partition in 0..bounded_partitions(details.partitions_count) {
                 let polled = client
                     .poll_messages(
                         &stream_id,
                         &topic,
-                        Some(partition),
+                        partition,
                         &consumer,
                         &PollingStrategy::last(),
-                        1,
-                        false,
+                        PollOptions {
+                            count: 1,
+                            ..PollOptions::default()
+                        },
                     )
                     .await?;
-                if let Some(last) = polled.messages.last() {
-                    offsets[partition as usize] = last.header.offset.saturating_add(1);
-                }
+                offsets.insert(
+                    partition,
+                    polled
+                        .messages
+                        .last()
+                        .map_or(0, |last| last.header.offset.saturating_add(1)),
+                );
             }
         }
+        let emptied = Arc::new(tokio::sync::Notify::new());
         let inner = Arc::new(ReplyHubInner {
             waiters: DashMap::new(),
             subscribed: tokio::sync::Notify::new(),
+            emptied: Arc::clone(&emptied),
             task: std::sync::Mutex::new(None),
             #[cfg(feature = "sign")]
             verifier,
@@ -148,6 +177,7 @@ impl ReplyHub {
             consumer,
             offsets,
             Arc::downgrade(&inner),
+            emptied,
         ));
         *inner
             .task
@@ -220,7 +250,7 @@ impl ReplyTicket {
         drop(state);
         drop(waiter);
         if let (Some(sender), Some(reply)) = (sender, reply) {
-            hub.waiters.remove(&self.correlation);
+            hub.forget(&self.correlation);
             let _ = sender.send(reply);
         }
     }
@@ -239,32 +269,40 @@ impl ReplyTicket {
 impl Drop for ReplyTicket {
     fn drop(&mut self) {
         if let Some(hub) = self.hub.upgrade() {
-            hub.waiters.remove(&self.correlation);
+            hub.forget(&self.correlation);
         }
     }
 }
 
-// Poll the reply topic forward and dispatch each record to its waiter. Holds only
-// a `Weak` to the hub, upgrading per pass, so the task exits once the last `Laser`
-// clone (and any outstanding ticket) is gone.
-/// How often a parked dispatcher checks that its hub still exists.
-const IDLE_HUB_CHECK: std::time::Duration = std::time::Duration::from_secs(5);
-
+// Follow the reply topic with held reads and dispatch each record to its
+// waiter. Holds only a `Weak` to the hub, upgrading per batch, so the task
+// exits once the last `Laser` clone (and any outstanding ticket) is gone.
+// The held reads exist only while a waiter does: the last waiter leaving
+// drops them, which cancels them on the server.
 async fn dispatch_loop(
     client: Arc<IggyClient>,
     stream: Identifier,
     topic: Identifier,
     consumer: Consumer,
-    mut offsets: Vec<u64>,
+    mut offsets: BTreeMap<u32, u64>,
     hub: Weak<ReplyHubInner>,
+    emptied: Arc<tokio::sync::Notify>,
 ) {
+    let mut follower: Option<TopicFollower> = None;
     loop {
+        // Registered before the emptiness check, so a waiter leaving after
+        // it still ends the held read below.
+        let last_waiter_left = emptied.notified();
+        tokio::pin!(last_waiter_left);
+        last_waiter_left.as_mut().enable();
         let Some(inner) = hub.upgrade() else {
             return;
         };
-        // Nobody waits: park until a subscribe. The permit `notify_one`
-        // stores covers a subscribe that lands before this wait starts.
+        // Nobody waits: stop the held read and park until a subscribe. The
+        // permit `notify_one` stores covers a subscribe that lands before
+        // this wait starts.
         if inner.waiters.is_empty() {
+            follower = None;
             let parked = async {
                 inner.subscribed.notified().await;
             };
@@ -273,116 +311,157 @@ async fn dispatch_loop(
             drop(inner);
             continue;
         }
-        // The reply topic may not exist at creation (a fan-out reply topic is
-        // created by the first reply), so resolve partitions each pass until it is.
-        let partitions = match client.get_topic(&stream, &topic).await {
-            Ok(Some(details)) => crate::poll::bounded_partitions(details.partitions_count),
-            _ => {
-                drop(inner);
-                tokio::time::sleep(REPLY_POLL_INTERVAL).await;
-                continue;
-            }
+        drop(inner);
+        let active = match follower.as_mut() {
+            Some(active) => active,
+            None => match follow_replies(&client, &stream, &topic, &consumer, &mut offsets).await {
+                Some(started) => follower.insert(started),
+                None => {
+                    tokio::time::sleep(REPLY_RETRY_INTERVAL).await;
+                    continue;
+                }
+            },
         };
-        if (offsets.len() as u32) < partitions {
-            offsets.resize(partitions as usize, 0);
+        let next = tokio::select! {
+            outcome = active.next(REPLY_MAX_WAIT) => Some(outcome),
+            () = &mut last_waiter_left => None,
+        };
+        let Some(outcome) = next else {
+            offsets.clone_from(active.positions());
+            follower = None;
+            continue;
+        };
+        match outcome {
+            Ok(Some((partition, messages))) => {
+                offsets.clone_from(active.positions());
+                let Some(inner) = hub.upgrade() else {
+                    return;
+                };
+                dispatch_batch(&inner, partition, messages);
+            }
+            // An idle wait also notices a reply topic that gained partitions.
+            Ok(None) => {
+                if let Ok(Some(details)) = client.get_topic(&stream, &topic).await
+                    && bounded_partitions(details.partitions_count) as usize > offsets.len()
+                {
+                    follower = None;
+                }
+            }
+            Err(error) => {
+                debug!(%error, "following the reply topic failed, reading it again");
+                offsets.clone_from(active.positions());
+                follower = None;
+                tokio::time::sleep(REPLY_RETRY_INTERVAL).await;
+            }
         }
-        let mut dispatched = false;
-        for partition in 0..partitions {
-            let from = offsets[partition as usize];
-            let batch = match crate::poll::drain_partition(
-                &client,
-                &stream,
-                &topic,
-                &consumer,
-                crate::poll::DrainRange::open(partition, from),
-                REPLY_BATCH,
-            )
-            .await
-            {
-                Ok(batch) => batch,
-                Err(_) => continue,
-            };
-            offsets[partition as usize] = batch.next_offset;
-            for message in batch.messages {
-                let Ok(decoded) = decode_agent_record(&message, laser_wire::agent::features::NONE)
+    }
+}
+
+// Start following every partition of the reply topic from `offsets`, a
+// partition the hub has not read from its first record. `None` while the
+// topic does not exist, since a fan-out reply topic is created by its first
+// reply.
+async fn follow_replies(
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    consumer: &Consumer,
+    offsets: &mut BTreeMap<u32, u64>,
+) -> Option<TopicFollower> {
+    let details = client.get_topic(stream, topic).await.ok()??;
+    for partition in 0..bounded_partitions(details.partitions_count) {
+        offsets.entry(partition).or_insert(0);
+    }
+    match TopicFollower::start(
+        client,
+        stream,
+        topic,
+        consumer,
+        offsets.clone(),
+        REPLY_BATCH,
+        REPLY_MAX_WAIT,
+    )
+    .await
+    {
+        Ok(follower) => Some(follower),
+        Err(error) => {
+            debug!(%error, "starting the reply topic read failed, trying again");
+            None
+        }
+    }
+}
+
+// Complete the waiter of each reply in one partition's batch.
+fn dispatch_batch(inner: &ReplyHubInner, partition: u32, messages: Vec<IggyMessage>) {
+    for message in messages {
+        let Ok(decoded) = decode_agent_record(&message, laser_wire::agent::features::NONE) else {
+            continue;
+        };
+        let provenance = decoded.provenance;
+        let Some(correlation) = provenance.correlation_id.clone() else {
+            continue;
+        };
+        let Some(waiter) = inner.waiters.get(&correlation) else {
+            continue;
+        };
+        #[cfg(feature = "sign")]
+        let verified_principal = match &inner.verifier {
+            Some(registry) => {
+                let Some(envelope) = decoded.envelope.as_ref() else {
+                    continue;
+                };
+                let Some(context) = decoded.signature_context.as_ref() else {
+                    continue;
+                };
+                let Ok(verified) =
+                    registry.verify_observed_at(envelope, context, decoded.observed_at_micros)
                 else {
                     continue;
                 };
-                let provenance = decoded.provenance;
-                let Some(correlation) = provenance.correlation_id.clone() else {
-                    continue;
-                };
-                let Some(waiter) = inner.waiters.get(&correlation) else {
-                    continue;
-                };
-                #[cfg(feature = "sign")]
-                let verified_principal = match &inner.verifier {
-                    Some(registry) => {
-                        let Some(envelope) = decoded.envelope.as_ref() else {
-                            continue;
-                        };
-                        let Some(context) = decoded.signature_context.as_ref() else {
-                            continue;
-                        };
-                        let Ok(verified) = registry.verify_observed_at(
-                            envelope,
-                            context,
-                            decoded.observed_at_micros,
-                        ) else {
-                            continue;
-                        };
-                        if waiter
-                            .expected_signer
-                            .as_deref()
-                            .is_some_and(|expected| expected != verified.principal.as_str())
-                        {
-                            continue;
-                        }
-                        Some(verified.principal)
-                    }
-                    None => None,
-                };
-                #[cfg(not(feature = "sign"))]
-                let verified_principal = None;
-                let reply = AgentMessage {
-                    provenance,
-                    id: MessageId::new(partition, message.header.offset),
-                    payload: message.payload.to_vec(),
-                    envelope: decoded.envelope,
-                    content_type: decoded.content_type,
-                    verified_principal,
-                };
-                if !waiter.expected.accepts(&reply) {
+                if waiter
+                    .expected_signer
+                    .as_deref()
+                    .is_some_and(|expected| expected != verified.principal.as_str())
+                {
                     continue;
                 }
-                let mut state = waiter
-                    .state
-                    .lock()
-                    .expect("reply waiter lock is not poisoned");
-                let Some(request) = state.request else {
-                    if state.pending.len() == PENDING_REPLY_LIMIT {
-                        state.pending.remove(0);
-                    }
-                    state.pending.push(reply);
-                    dispatched = true;
-                    continue;
-                };
-                if request.is_some_and(|address| reply.id == address) {
-                    continue;
-                }
-                let sender = state.sender.take();
-                drop(state);
-                drop(waiter);
-                if let Some(sender) = sender {
-                    inner.waiters.remove(&correlation);
-                    let _ = sender.send(reply);
-                    dispatched = true;
-                }
+                Some(verified.principal)
             }
+            None => None,
+        };
+        #[cfg(not(feature = "sign"))]
+        let verified_principal = None;
+        let reply = AgentMessage {
+            provenance,
+            id: MessageId::new(partition, message.header.offset),
+            payload: message.payload.to_vec(),
+            envelope: decoded.envelope,
+            content_type: decoded.content_type,
+            verified_principal,
+        };
+        if !waiter.expected.accepts(&reply) {
+            continue;
         }
-        drop(inner);
-        if !dispatched {
-            tokio::time::sleep(REPLY_POLL_INTERVAL).await;
+        let mut state = waiter
+            .state
+            .lock()
+            .expect("reply waiter lock is not poisoned");
+        let Some(request) = state.request else {
+            if state.pending.len() == PENDING_REPLY_LIMIT {
+                state.pending.remove(0);
+            }
+            state.pending.push(reply);
+            continue;
+        };
+        if request.is_some_and(|address| reply.id == address) {
+            continue;
+        }
+        let sender = state.sender.take();
+        drop(state);
+        drop(waiter);
+        if let Some(sender) = sender {
+            inner.forget(&correlation);
+            let _ = sender.send(reply);
         }
     }
 }

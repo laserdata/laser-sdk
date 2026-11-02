@@ -30,7 +30,6 @@ async def test_given_async_workflow_callbacks_when_run_then_should_await_build_a
         ls.AgentTopic.Sessions,
         handle,
         respond_on=ls.AgentTopic.Sessions,
-        poll_interval_ms=10,
     )
     try:
         await agent.ready()
@@ -65,7 +64,6 @@ async def test_given_async_compensation_when_a_later_build_fails_then_should_awa
         ls.AgentTopic.Sessions,
         handle,
         respond_on=ls.AgentTopic.Sessions,
-        poll_interval_ms=10,
     )
     try:
         await agent.ready()
@@ -98,7 +96,6 @@ async def test_given_async_verifier_error_when_a_step_replies_then_should_keep_t
         ls.AgentTopic.Sessions,
         handle,
         respond_on=ls.AgentTopic.Sessions,
-        poll_interval_ms=10,
     )
     try:
         await agent.ready()

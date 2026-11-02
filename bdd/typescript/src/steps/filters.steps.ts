@@ -61,6 +61,11 @@ function safeMode(): ConsumerFilter {
   );
 }
 
+// The saved policy name of a fixture filter, as the Rust runner derives it.
+function policyName(fixture: string): string {
+  return fixture.replaceAll(" ", "-");
+}
+
 const FILTERS: Readonly<Record<string, () => ConsumerFilter>> = {
   "mode present": () => ConsumerFilter.json(FilterExpr.present("fields.mode")),
   "safe mode": safeMode,
@@ -176,7 +181,10 @@ When(
     const group = this.requireLaser()
       .topic(TOPIC)
       .consumerGroup("anomaly-desk");
-    await group.create({ filter: named(FILTERS, name)() });
+    await group.create({
+      filter: named(FILTERS, name)(),
+      filterName: policyName(name),
+    });
     const reader = await group.reader().start({ kind: "first" }).build();
     const page = await reader.nextPage({ timeoutMs: READ_TIMEOUT_MS });
     await reader.ackPage(page);
@@ -224,9 +232,17 @@ When(
     const topic = this.requireLaser().topic(TOPIC);
     const group = topic.consumerGroup("managed-desk");
     const operationId = BigInt(`0x${randomUUID().replaceAll("-", "")}`);
-    const first = await group.create({ filter: safeMode(), operationId });
+    const first = await group.create({
+      filter: safeMode(),
+      filterName: policyName("safe mode"),
+      operationId,
+    });
     assert.deepEqual(
-      await group.create({ filter: safeMode(), operationId }),
+      await group.create({
+        filter: safeMode(),
+        filterName: policyName("safe mode"),
+        operationId,
+      }),
       first,
     );
     const binding = first.filter;
@@ -354,7 +370,10 @@ When(
       await topic.send(nonmatch, { partition: 0 });
     await topic.send(named(RECORDS, "mode update"), { partition: 0 });
     const group = topic.consumerGroup("bounded-readers");
-    await group.create({ filter: safeMode() });
+    await group.create({
+      filter: safeMode(),
+      filterName: policyName("safe mode"),
+    });
     await using reader = await group
       .reader()
       .start({ kind: "first" })
@@ -404,7 +423,10 @@ When(
       });
     await topic.send(named(RECORDS, "mode update"), { partition: 0 });
     const group = topic.consumerGroup("sparse-consumers");
-    await group.create({ filter: safeMode() });
+    await group.create({
+      filter: safeMode(),
+      filterName: policyName("safe mode"),
+    });
     const consumer = await group.consumer({
       batchLength: 100,
       commitPolicy: { kind: "disabled" },
@@ -425,7 +447,10 @@ When(
 
 When("the anomaly desk rejects a page after releasing its policy", async function (this: LaserWorld) {
   const group = this.requireLaser().topic(TOPIC).consumerGroup("policy-ack");
-  await group.create({ filter: safeMode() });
+  await group.create({
+    filter: safeMode(),
+    filterName: policyName("safe mode"),
+  });
   await using reader = await group.reader().start({ kind: "first" }).build();
   const page = await reader.nextPage({ timeoutMs: READ_TIMEOUT_MS });
   await group.filter().release();

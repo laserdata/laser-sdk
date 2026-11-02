@@ -369,7 +369,7 @@ async fn operator_cancel(world: &mut LaserWorld, operator: String, label: String
     let laser = world.laser().clone();
     laser
         .topic(AgentTopic::Control.topic_string())
-        .ensure(1)
+        .ensure(1, None)
         .await
         .expect("provisioning creates the control topic");
     let stream = laser.default_stream().expect("a stream").to_owned();
