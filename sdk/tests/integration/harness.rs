@@ -11,7 +11,7 @@ use laser_sdk::iggy::prelude::{
 use laser_sdk::prelude::full::*;
 #[cfg(feature = "sign")]
 use laser_sdk::sign::KeyRegistry;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -174,6 +174,58 @@ pub async fn partition_primaries(laser: &Laser, topic: &str, partitions: u32) ->
         primaries.push(primary);
     }
     primaries
+}
+
+/// The replica that leads each partition of `topic`, by partition id, once more
+/// than one node leads one. Creation can lead every partition on the one node
+/// counted ready, and the cluster moves primaries one at a time afterwards.
+pub async fn spread_primaries(laser: &Laser, topic: &str, partitions: u32) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let primaries = partition_primaries(laser, topic, partitions).await;
+        if primaries.iter().collect::<BTreeSet<_>>().len() > 1 {
+            return primaries;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the primaries never spread: {primaries:?}"
+        );
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// The replica that leads each partition of `topic`, by partition id, once no
+/// node leads two more partitions than another. The cluster balances the
+/// partitions of every topic together, so only the one topic of its cluster
+/// settles this way.
+pub async fn settled_primaries(
+    laser: &Laser,
+    topic: &str,
+    partitions: u32,
+    nodes: usize,
+) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let primaries = partition_primaries(laser, topic, partitions).await;
+        let led: Vec<usize> = (0..nodes)
+            .map(|node| {
+                primaries
+                    .iter()
+                    .filter(|primary| usize::from(**primary) == node)
+                    .count()
+            })
+            .collect();
+        let most = led.iter().copied().max().unwrap_or(0);
+        let fewest = led.iter().copied().min().unwrap_or(0);
+        if most - fewest <= 1 {
+            return primaries;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the primaries never settled: {primaries:?}"
+        );
+        sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// The replicas that store each partition of `topic` on the default stream,

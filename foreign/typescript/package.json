@@ -98,5 +98,9 @@
     "prettier": "3.9.8",
     "typescript": "^6.0.3",
     "typescript-eslint": "8.70.0"
+  },
+  "overrides": {
+    "glob": "14.0.3",
+    "minimatch": "11.0.3"
   }
 }

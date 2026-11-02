@@ -701,7 +701,7 @@ async fn given_a_three_node_cluster_when_a_follower_restarts_and_the_leader_fail
         .ensure(CLUSTER_PARTITIONS, None)
         .await
         .expect("the topic exists");
-    let primaries = harness::partition_primaries(&laser, PULSE, CLUSTER_PARTITIONS).await;
+    let primaries = harness::spread_primaries(&laser, PULSE, CLUSTER_PARTITIONS).await;
     assert!(
         primaries.iter().collect::<BTreeSet<_>>().len() > 1,
         "the partitions are led by different nodes: {primaries:?}"
@@ -965,7 +965,7 @@ async fn given_a_five_node_cluster_with_topics_of_replication_factor_three_and_o
         );
     }
     let members = harness::partition_members(&laser, REPLICATED).await;
-    let primaries = harness::partition_primaries(&laser, REPLICATED, CLUSTER_PARTITIONS).await;
+    let primaries = harness::spread_primaries(&laser, REPLICATED, CLUSTER_PARTITIONS).await;
     for (partition, primary) in (0..CLUSTER_PARTITIONS).zip(&primaries) {
         assert!(
             members[&partition].contains(primary),

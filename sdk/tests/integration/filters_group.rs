@@ -1820,7 +1820,8 @@ async fn given_a_three_node_cluster_when_an_idle_group_reader_waits_then_should_
         capabilities.filters.max_wait_ms > 0,
         "the cluster holds filtered waits"
     );
-    let primaries = harness::partition_primaries(&laser, TOPIC, CLUSTER_PARTITIONS).await;
+    let primaries =
+        harness::settled_primaries(&laser, TOPIC, CLUSTER_PARTITIONS, _cluster.size()).await;
     assert!(
         primaries.iter().collect::<BTreeSet<_>>().len() > 1,
         "the partitions are led by different nodes: {primaries:?}"
@@ -1928,7 +1929,7 @@ async fn given_a_page_read_before_its_primary_crashes_on_a_cluster_when_acknowle
     let (mut cluster, _sockets, _state) = start_catalog_cluster(None).await;
     let stream = "cluster_ack";
     let laser = cluster_catalog_laser(&cluster, stream).await;
-    let primaries = harness::partition_primaries(&laser, TOPIC, CLUSTER_PARTITIONS).await;
+    let primaries = harness::spread_primaries(&laser, TOPIC, CLUSTER_PARTITIONS).await;
     let leader = cluster.leader(0).await;
     let partition = (0..CLUSTER_PARTITIONS)
         .find(|partition| usize::from(primaries[*partition as usize]) != leader)

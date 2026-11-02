@@ -6,8 +6,11 @@ import laser_sdk as ls
 import pytest
 from iggy_test_server import IggyTestCluster
 
+# A test settles the primaries, restarts nodes and fails over, so the 60 s
+# default is too short.
 pytestmark = [
     pytest.mark.integration,
+    pytest.mark.timeout(300),
 ]
 
 RECONNECT = "?reconnection_retries=unlimited&reconnection_interval=100ms"
@@ -15,7 +18,6 @@ MAX_WAIT_MS = 5_000
 # The reply hub holds its reads as long, so a reply that lands well before
 # this was delivered by a held read, not by the next read after the wait.
 REPLY_WAIT_MS = 5_000
-CLUSTER_NODES = 3
 # The server's refusals of a replication factor it cannot place.
 INVALID_REPLICATION_FACTOR = 2018
 INVALID_OPTION_VALUE = 4042
@@ -204,8 +206,13 @@ async def test_given_replies_across_nodes_and_a_restart_when_asking_then_should_
                 )
                 received = time.monotonic()
                 assert bytes(reply.payload) == question
-                published = replied.get(question)
-                assert published is not None, "the worker answered"
+                # A held read can hand the reply over before the worker's
+                # respond call returns.
+                deadline = time.monotonic() + 10
+                while question not in replied:
+                    assert time.monotonic() < deadline, "the worker never recorded its reply"
+                    await asyncio.sleep(0.05)
+                published = replied[question]
                 trips.append((reply.id.partition_id, max(0.0, (received - published) * 1000)))
             return trips
 
@@ -256,7 +263,7 @@ async def test_given_an_idle_group_reader_when_any_node_gets_a_record_then_shoul
         await topic.ensure(partitions=6)
         # The cluster moves new primaries one at a time, and a wait refused
         # twice in a row by moving primaries is paced by the idle interval.
-        await _settled_primaries(cluster, stream, "fleet", 6)
+        await asyncio.to_thread(cluster.settled_primaries, stream, "fleet", 6)
         producer = topic.producer(partitions=6)
         await producer.init()
         group = topic.consumer_group("fleet-desk")
@@ -436,18 +443,6 @@ def _refused_membership(task):
         return False
     error = task.exception()
     return isinstance(error, ls.FilterError) and error.reason == "membership_stale"
-
-
-async def _settled_primaries(cluster, stream, topic, partitions):
-    """Each partition's primary once no node leads more than one partition above another."""
-    deadline = time.monotonic() + 60
-    while True:
-        primaries = await asyncio.to_thread(cluster.partition_primaries, stream, topic, partitions)
-        led = [primaries.count(node) for node in range(CLUSTER_NODES)]
-        if max(led) - min(led) <= 1:
-            return primaries
-        assert time.monotonic() < deadline, f"the primaries never settled: {primaries}"
-        await asyncio.sleep(0.5)
 
 
 async def _partition_members(cluster, stream, topic, partitions):

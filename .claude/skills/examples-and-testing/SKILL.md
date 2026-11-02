@@ -42,7 +42,7 @@ The helpers call `laser.projections().register(..)` and `laser.bindings().apply(
 
 ## Integration tests (`sdk/tests/integration/`)
 
-- `main.rs` registers each scenario as a module. `harness.rs` owns `TestIggy` (shared `OnceCell` process) and `laser()` (a fresh bootstrapped `Laser` on a unique stream per test). `eventually(...)` polls instead of fixed sleeps.
+- `main.rs` registers each scenario as a module. `harness.rs` owns `TestIggy` (shared `OnceCell` process) and `laser()` (a fresh bootstrapped `Laser` on a unique stream per test). `eventually(...)` polls instead of fixed sleeps. A cluster test never reads `partition_primaries(...)` right after creation: a fresh cluster can lead every new partition on its one ready node and spreads them afterwards. `spread_primaries(...)` waits until more than one node leads the topic. `settled_primaries(...)` waits for a per-node balance and fits only the one topic of its cluster, because the cluster balances every topic's partitions together.
 - `tests/support/test_iggy.rs` is the native Iggy process wrapper. It resolves the versioned artifact or `LASER_TEST_IGGY_SERVER`, and is test-only.
 - `decomposition.rs` tests a contract as one targeted AGDX command and scatter as one command per selected agent. Correlations remain distinct per branch. `context(..).append` preserves the body and conversation metadata in an ordinary record.
 - `runtime.rs` tests graceful drain, dead-letter callbacks, middleware, and `ConcurrencyPolicy::SerialPerPartition`. It requires a real server. Unit tests cover the error classifier and local testing helpers.

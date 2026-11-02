@@ -8,8 +8,11 @@ import laser_sdk as ls
 import pytest
 from iggy_test_server import IggyTestCluster, StandInCatalog
 
+# A test settles the primaries, then fails over or recovers a node, so the
+# 60 s default is too short.
 pytestmark = [
     pytest.mark.integration,
+    pytest.mark.timeout(300),
 ]
 
 RECONNECT = "?reconnection_retries=unlimited&reconnection_interval=100ms"
@@ -66,7 +69,7 @@ async def test_given_a_three_node_cluster_when_an_idle_group_reader_waits_then_s
             assert capabilities.filters.catalog, "the nodes reach the stand-in catalog"
             assert capabilities.filters.max_wait_ms > 0, "the cluster holds filtered waits"
             primaries = await asyncio.to_thread(
-                cluster.partition_primaries, stream, TOPIC, PARTITIONS
+                cluster.settled_primaries, stream, TOPIC, PARTITIONS
             )
             assert len(set(primaries)) > 1, (
                 f"the partitions are led by different nodes: {primaries}"
@@ -138,7 +141,7 @@ async def test_given_a_page_read_before_its_primary_crashes_on_a_cluster_when_ac
         laser = await cluster_laser(cluster, stream)
         try:
             primaries = await asyncio.to_thread(
-                cluster.partition_primaries, stream, TOPIC, PARTITIONS
+                cluster.settled_primaries, stream, TOPIC, PARTITIONS
             )
             leader, _ = await asyncio.to_thread(cluster.leader_and_follower)
             partition = next(
