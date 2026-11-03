@@ -132,7 +132,9 @@ wire/                   the laser-wire crate: the wire CONTRACT, data + pure fun
                         ADDRESSEE_FILTER_NAME ("agent-addressee"), pinned by
                         fixtures/dispatch_cases.json
     forward.rs          forwarded ForwardedQuery / ForwardedCommand frames + the server-stamped
-                        ForwardedScope { stream_id, stream, stream_created_at_micros }
+                        ForwardedScope { stream_id, stream, stream_created_at_micros } + the
+                        Caller { user_id, agent, on_behalf_of } that control stamps and mutation
+                        envelopes carry
     commands.rs         Command trait pairing each managed command code with request/reply types
     http.rs             /agdx/* route constants + path builders + typed query-param structs + JSON views + the ErrorBody reply contract
     http_client.rs      (feature http-client) typed /agdx/* client over an injected Transport, the crate's one (runtime-agnostic) async surface.
@@ -451,7 +453,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-This inventory describes the `0.9.0-dev.2` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.9.0-dev.3` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
 Capabilities identify managed support such as queries, key-value, forks, graphs, and an A2A gateway, plus native consumer filters served by the streaming server. Every capability flag maps to a hello feature bit or an op version. Memory combines query and graph operations and has no separate managed command group.
 

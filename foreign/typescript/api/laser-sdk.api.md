@@ -7927,10 +7927,10 @@ export interface WorkflowOutcome {
 // src/client/laser.ts:770:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point index.d.ts
-// src/wire/agent.ts:109:31 - (ae-forgotten-export) The symbol "TaskStateName" needs to be exported by the entry point index.d.ts
-// src/wire/agent.ts:855:31 - (ae-forgotten-export) The symbol "AgentErrorCodeName" needs to be exported by the entry point index.d.ts
-// src/wire/agent.ts:885:31 - (ae-forgotten-export) The symbol "DeadLetterReasonName" needs to be exported by the entry point index.d.ts
-// src/wire/agent.ts:912:31 - (ae-forgotten-export) The symbol "HealthName" needs to be exported by the entry point index.d.ts
+// src/wire/agent.ts:91:31 - (ae-forgotten-export) The symbol "TaskStateName" needs to be exported by the entry point index.d.ts
+// src/wire/agent.ts:837:31 - (ae-forgotten-export) The symbol "AgentErrorCodeName" needs to be exported by the entry point index.d.ts
+// src/wire/agent.ts:867:31 - (ae-forgotten-export) The symbol "DeadLetterReasonName" needs to be exported by the entry point index.d.ts
+// src/wire/agent.ts:894:31 - (ae-forgotten-export) The symbol "HealthName" needs to be exported by the entry point index.d.ts
 // src/wire/authz.ts:734:36 - (ae-forgotten-export) The symbol "Tenancy" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:398:7 - (ae-forgotten-export) The symbol "CheckpointRequestId" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:399:7 - (ae-forgotten-export) The symbol "DestinationId" needs to be exported by the entry point index.d.ts

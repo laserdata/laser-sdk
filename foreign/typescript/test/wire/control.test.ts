@@ -79,6 +79,15 @@ void test("given_a_stamped_control_fixture_when_decoded_then_should_preserve_the
   assert.equal(plain.stamp, undefined)
 })
 
+void test("given_a_control_stamp_with_a_caller_written_for_an_end_user_when_decoded_then_should_keep_both", async () => {
+  const stamped = await assertControlRoundTrips("control_stamped_caller.bin")
+  if (stamped.stamp === undefined) throw new Error("stamp missing")
+  assert.equal(stamped.stamp.actorUserId, 3)
+  assert.deepEqual(stamped.stamp.caller, { userId: 3, onBehalfOf: "1793690355287073" })
+  const unstamped = await assertControlRoundTrips("control_stamped_remove_binding.bin")
+  assert.equal(unstamped.stamp?.caller, undefined)
+})
+
 void test("given_each_schema_control_fixture_when_decoded_then_should_preserve_the_source", async () => {
   for (const name of [
     "control_register_schema_avro.bin",

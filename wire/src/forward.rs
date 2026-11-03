@@ -4,6 +4,24 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Who asked for a request the managed backend records, present only when a
+/// client asked. A record the backend or the streaming server issues on its own
+/// carries none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Caller {
+    /// The authenticated user. The root user is id zero.
+    pub user_id: u32,
+    /// The agent the caller's connection declared in its presence. A claim the
+    /// client makes, never verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<crate::agent::AgentId>,
+    /// The end user an intermediary wrote for, as it named that user in
+    /// [`ON_BEHALF_OF_HEADER`](crate::http::ON_BEHALF_OF_HEADER). A claim the
+    /// backend records, never verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
+}
+
 /// Trusted stream identity stamped by the server before forwarding a session request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardedScope {
@@ -19,7 +37,8 @@ pub struct ForwardedQuery {
     /// Authenticated identity. Audit today, per-user stream scoping later.
     /// Trusted: set by the server, not the client.
     pub user_id: u32,
-    /// Originating client id, for logging and audit only.
+    /// Originating client id, for logging and audit only. Never zero for a
+    /// client, zero on a request the server issues itself.
     pub client_id: u128,
     /// `gen_ai.conversation.id` echoed for the audit log, never used to route.
     pub correlation: Option<String>,
@@ -50,7 +69,8 @@ pub struct ForwardedCommand {
     /// Authenticated identity, set by the server. The key-value store scopes its
     /// rows by this `user_id`, and the SDK cannot set it.
     pub user_id: u32,
-    /// Originating client id, for logging and audit only.
+    /// The caller's consensus client id, for logging and audit only. Never zero
+    /// for a client, zero on a request the server issues itself.
     pub client_id: u128,
     /// `gen_ai.conversation.id` echoed for the audit log, never used to route.
     pub correlation: Option<String>,
@@ -101,6 +121,17 @@ pub struct ForwardedCommand {
     /// backend refuses a frame whose tenancy differs from its own.
     #[serde(default, skip_serializing_if = "crate::authz::Tenancy::is_deployment")]
     pub tenancy: crate::authz::Tenancy,
+    /// Set by the server on a mutation a client sent over the binary protocol:
+    /// the agent the calling connection declared in its presence. A claim the
+    /// client makes, never verified. Absent over HTTP and on the server's own
+    /// requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<crate::agent::AgentId>,
+    /// Set by the server from [`ON_BEHALF_OF_HEADER`](crate::http::ON_BEHALF_OF_HEADER)
+    /// on an HTTP write: the end user an intermediary wrote for. A claim, never
+    /// verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip predicate")]
@@ -159,6 +190,8 @@ mod tests {
             command_code: 1_000_000,
             payload: vec![0x90; 5],
             grants: Vec::new(),
+            agent: None,
+            on_behalf_of: None,
         })
         .expect("encodes");
         assert!(
@@ -201,9 +234,93 @@ mod tests {
             command_code: 42,
             payload: vec![0xde, 0xad, 0xbe, 0xef],
             grants: Vec::new(),
+            agent: None,
+            on_behalf_of: None,
         };
         let back: ForwardedCommand =
             decode_named(&encode_named(&command).expect("encodes")).expect("decodes");
         assert_eq!(back, command);
+    }
+
+    #[test]
+    fn given_a_root_caller_with_an_agent_when_round_tripped_then_should_keep_both() {
+        let caller = Caller {
+            user_id: 0,
+            agent: Some("orbit-planner".parse().expect("agent id")),
+            on_behalf_of: None,
+        };
+
+        let back: Caller = decode_named(&encode_named(&caller).expect("encodes")).expect("decodes");
+
+        assert_eq!(back, caller);
+    }
+
+    #[test]
+    fn given_a_caller_written_for_an_end_user_when_round_tripped_then_should_keep_who_it_was_for() {
+        let caller = Caller {
+            user_id: 3,
+            agent: None,
+            on_behalf_of: Some("1793690355287073".to_owned()),
+        };
+
+        let back: Caller = decode_named(&encode_named(&caller).expect("encodes")).expect("decodes");
+
+        assert_eq!(back, caller);
+    }
+
+    #[test]
+    fn given_a_caller_with_an_empty_agent_when_decoded_then_should_be_refused() {
+        #[derive(serde::Serialize)]
+        struct Unchecked<'a> {
+            user_id: u32,
+            agent: &'a str,
+        }
+        let frame = encode_named(&Unchecked {
+            user_id: 3,
+            agent: "",
+        })
+        .expect("encodes");
+
+        assert!(decode_named::<Caller>(&frame).is_err());
+    }
+
+    #[test]
+    fn given_a_forwarded_command_with_an_agent_when_read_without_the_field_then_should_ignore_it() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct BeforeAgent {
+            user_id: u32,
+            client_id: u128,
+            command_code: u32,
+        }
+        let command = ForwardedCommand {
+            read_barrier: false,
+            min_position: None,
+            positioned_reply: false,
+            min_sessions: Vec::new(),
+            tenancy: Default::default(),
+            user_id: 0,
+            client_id: 9,
+            correlation: None,
+            operation_id: Some(9),
+            read_all: false,
+            scope: None,
+            command_code: 42,
+            payload: vec![1],
+            grants: Vec::new(),
+            agent: Some("orbit-planner".parse().expect("agent id")),
+            on_behalf_of: None,
+        };
+
+        let before: BeforeAgent =
+            decode_named(&encode_named(&command).expect("encodes")).expect("decodes");
+
+        assert_eq!(
+            before,
+            BeforeAgent {
+                user_id: 0,
+                client_id: 9,
+                command_code: 42,
+            }
+        );
     }
 }

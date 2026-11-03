@@ -126,6 +126,8 @@ fn request(arm: UdsArm) -> Result<Vec<u8>, BenchError> {
                 command_code: AGDX_KV_GET_CODE,
                 payload,
                 grants: Vec::new(),
+                agent: None,
+                on_behalf_of: None,
             })
             .map_err(|error| {
                 BenchError::Invalid(format!("encode UDS forwarded command: {error}"))

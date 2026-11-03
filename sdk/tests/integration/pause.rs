@@ -2,6 +2,7 @@ use crate::harness;
 use crate::test_iggy::TestIggyCluster;
 use async_trait::async_trait;
 use iggy::prelude::{Identifier, StreamClient, TopicClient};
+use iggy_common::calculate_32;
 use laser_sdk::agent::{ParkedRecords, SessionControl};
 use laser_sdk::govern::{ActionDecision, ActionGovernor, ActionKind, GovernedAction, GovernorMode};
 use laser_sdk::prelude::full::*;
@@ -240,9 +241,7 @@ async fn pauses_across_nodes(cluster: &mut TestIggyCluster, stream: &str) {
 // and resume each one. Every acknowledgment arrives within `bound` of its
 // request. Returns the control partition of each pause.
 async fn pause_round(laser: &Laser, seen: &Seen, body: &str, bound: Duration) -> Vec<u32> {
-    let sessions: Vec<ConversationId> = (0..CLUSTER_SESSIONS)
-        .map(|_| ConversationId::new())
-        .collect();
+    let sessions = spread_sessions();
     for session in &sessions {
         send_work(laser, *session, body).await;
     }
@@ -259,6 +258,23 @@ async fn pause_round(laser: &Laser, seen: &Seen, body: &str, bound: Duration) ->
         partitions.push(pause.0);
     }
     partitions
+}
+
+// Sessions over every control partition, the same number on each, by the key
+// rule Iggy routes a conversation id with. Random ids can all land on one
+// partition, which would leave one primary to pause through.
+fn spread_sessions() -> Vec<ConversationId> {
+    let per_partition = CLUSTER_SESSIONS / CLUSTER_PARTITIONS as usize;
+    let mut buckets: Vec<Vec<ConversationId>> = vec![Vec::new(); CLUSTER_PARTITIONS as usize];
+    while buckets.iter().any(|bucket| bucket.len() < per_partition) {
+        let session = ConversationId::new();
+        let partition = calculate_32(session.to_string().as_bytes()) % CLUSTER_PARTITIONS;
+        let bucket = &mut buckets[partition as usize];
+        if bucket.len() < per_partition {
+            bucket.push(session);
+        }
+    }
+    buckets.into_iter().flatten().collect()
 }
 
 async fn wait_acknowledged_within(

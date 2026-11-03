@@ -8,6 +8,7 @@ import { CodecError, InvalidError } from "../client/errors.js"
 import { type CborMap, expectMap, expectString, field, singleVariantTag } from "./cbor.js"
 import { ContentType, type ContentType as ContentTypeValue } from "./content.js"
 import { type BackendBinding, decodeBackendBinding, encodeBackendBinding } from "./destination.js"
+import { type Caller, decodeCaller, encodeCaller } from "./mutation.js"
 import {
   MAX_GRAPH_LABEL_BYTES,
   MAX_INDEX_FIELD_BYTES,
@@ -502,6 +503,10 @@ export interface ControlStamp {
   readonly operationId: bigint
   readonly streamGeneration?: ControlStreamGeneration
   readonly keyId: bigint
+  /** The client that asked for the record. Absent on a record the backend or
+   * the streaming server issues on its own, so it tells the root user, id
+   * zero, apart from them. */
+  readonly caller?: Caller
 }
 
 export interface ControlStreamGeneration {
@@ -567,11 +572,13 @@ export function encodeControlStamp(stamp: ControlStamp): Map<string, unknown> {
     )
   }
   map.set("key_id", stamp.keyId)
+  if (stamp.caller !== undefined) map.set("caller", encodeCaller(stamp.caller))
   return map
 }
 
 export function decodeControlStamp(map: CborMap, context: string): ControlStamp {
   const generation = field.optionalMap(map, "stream_generation", context)
+  const callerMap = field.optionalMap(map, "caller", context)
   return {
     deploymentId: field.requiredU64(map, "deployment_id", context),
     actorUserId: field.requiredU32(map, "actor_user_id", context),
@@ -588,7 +595,8 @@ export function decodeControlStamp(map: CborMap, context: string): ControlStamp 
           }
         }
       : {}),
-    keyId: field.requiredU64(map, "key_id", context)
+    keyId: field.requiredU64(map, "key_id", context),
+    ...(callerMap !== undefined ? { caller: decodeCaller(callerMap, `${context}.caller`) } : {})
   }
 }
 

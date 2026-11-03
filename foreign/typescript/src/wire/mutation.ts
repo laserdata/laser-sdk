@@ -1,4 +1,5 @@
 import { CodecError } from "../client/errors.js"
+import { type AgentId, parseAgentId } from "./agent-id.js"
 import { type CborMap, expectMap, field } from "./cbor.js"
 import {
   AGDX_FORK_CREATE_CODE,
@@ -46,6 +47,37 @@ export function decodeForwardedScope(map: CborMap, context: string): ForwardedSc
     streamId: field.requiredU32(map, "stream_id", context),
     stream: field.requiredString(map, "stream", context),
     streamCreatedAtMicros: field.requiredU64(map, "stream_created_at_micros", context)
+  }
+}
+
+/** Who asked for a request the managed backend records, present only when a
+ * client asked. A record the backend or the streaming server issues on its own
+ * carries none. */
+export interface Caller {
+  /** The authenticated user. The root user is id zero. */
+  readonly userId: number
+  /** The agent the caller's connection declared in its presence. A claim the
+   * client makes, never verified. */
+  readonly agent?: AgentId
+  /** The end user an intermediary wrote for, as it named that user in the
+   * `agdx-on-behalf-of` header. A claim the backend records, never verified. */
+  readonly onBehalfOf?: string
+}
+
+export function encodeCaller(caller: Caller): Map<string, unknown> {
+  const map = new Map<string, unknown>([["user_id", BigInt(caller.userId)]])
+  if (caller.agent !== undefined) map.set("agent", caller.agent)
+  if (caller.onBehalfOf !== undefined) map.set("on_behalf_of", caller.onBehalfOf)
+  return map
+}
+
+export function decodeCaller(map: CborMap, context: string): Caller {
+  const agent = field.optionalString(map, "agent", context)
+  const onBehalfOf = field.optionalString(map, "on_behalf_of", context)
+  return {
+    userId: field.requiredU32(map, "user_id", context),
+    ...(agent !== undefined ? { agent: parseAgentId(agent) } : {}),
+    ...(onBehalfOf !== undefined ? { onBehalfOf } : {})
   }
 }
 
@@ -406,6 +438,9 @@ export interface MutationCommandEnvelope {
   readonly commandCode: number
   readonly scope?: ForwardedScope
   readonly payload: Uint8Array
+  /** The client that asked for the command. Absent on a command the backend
+   * issues on its own. */
+  readonly caller?: Caller
 }
 
 export function encodeMutationCommandEnvelope(
@@ -421,6 +456,7 @@ export function encodeMutationCommandEnvelope(
   ])
   if (envelope.scope !== undefined) map.set("scope", encodeForwardedScope(envelope.scope))
   map.set("payload", envelope.payload)
+  if (envelope.caller !== undefined) map.set("caller", encodeCaller(envelope.caller))
   return map
 }
 
@@ -434,6 +470,7 @@ export function decodeMutationCommandEnvelope(
   }
   const operationId = field.requiredU128(map, "operation_id", context)
   const scopeMap = field.optionalMap(map, "scope", context)
+  const callerMap = field.optionalMap(map, "caller", context)
   if (operationId === 0n) {
     throw new CodecError(
       "mutation command operation id must not be zero",
@@ -451,6 +488,7 @@ export function decodeMutationCommandEnvelope(
     ...(scopeMap !== undefined
       ? { scope: decodeForwardedScope(scopeMap, `${context}.scope`) }
       : {}),
-    payload: field.requiredBytes(map, "payload", context)
+    payload: field.requiredBytes(map, "payload", context),
+    ...(callerMap !== undefined ? { caller: decodeCaller(callerMap, `${context}.caller`) } : {})
   }
 }

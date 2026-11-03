@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { test } from "node:test"
+import { InvalidError } from "../../src/client/errors.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import {
   decodeManagedReadEnvelope,
@@ -48,6 +49,44 @@ void test("given_a_scoped_mutation_command_when_decoded_then_should_keep_the_tru
   assert.deepEqual(
     Buffer.from(encodeNamed(encodeMutationCommandEnvelope(envelope))),
     Buffer.from(bytes)
+  )
+})
+
+void test("given_a_mutation_command_with_a_caller_when_decoded_then_should_keep_the_caller_and_agent", async () => {
+  const bytes = await fixtureBytes("mutation_command_caller.bin")
+  const envelope = decodeMutationCommandEnvelope(
+    expectMap(decodeOne(bytes, "mutation_command_caller"), "mutation_command_caller"),
+    "mutation_command_caller"
+  )
+  assert.deepEqual(envelope.caller, { userId: 0, agent: "orbit-planner" })
+  assert.deepEqual(
+    Buffer.from(encodeNamed(encodeMutationCommandEnvelope(envelope))),
+    Buffer.from(bytes)
+  )
+})
+
+void test("given_a_mutation_command_with_an_empty_caller_agent_when_decoded_then_should_be_refused", () => {
+  const bytes = encodeNamed(
+    new Map<string, unknown>([
+      ["v", 1n],
+      ["operation_id", 7n],
+      ["actor_user_id", 0n],
+      ["deployment_id", 0n],
+      ["timestamp_micros", 1n],
+      ["command_code", 1n],
+      ["payload", new Uint8Array([1])],
+      [
+        "caller",
+        new Map<string, unknown>([
+          ["user_id", 0n],
+          ["agent", ""]
+        ])
+      ]
+    ])
+  )
+  assert.throws(
+    () => decodeMutationCommandEnvelope(expectMap(decodeOne(bytes, "caller"), "caller"), "caller"),
+    InvalidError
   )
 })
 

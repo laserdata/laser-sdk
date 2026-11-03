@@ -91,6 +91,39 @@ void test("given_a_positioned_forwarded_command_when_round_tripped_then_should_p
   assert.deepEqual(Buffer.from(encodeNamed(encodeForwardedCommand(command))), Buffer.from(bytes))
 })
 
+void test("given_a_forwarded_command_with_an_agent_when_round_tripped_then_should_keep_the_declared_agent", async () => {
+  const bytes = await readFixture("forwarded_command_agent.bin")
+  const command = decodeForwardedCommand(
+    expectMap(decodeOne(bytes, "forwarded_command_agent"), "forwarded_command_agent"),
+    "forwarded_command_agent"
+  )
+  assert.equal(command.userId, 0)
+  assert.equal(command.agent, "orbit-planner")
+  assert.deepEqual(Buffer.from(encodeNamed(encodeForwardedCommand(command))), Buffer.from(bytes))
+})
+
+void test("given_the_plain_forwarded_command_fixture_when_decoded_then_should_carry_no_agent", async () => {
+  const plain = decodeForwardedCommand(
+    expectMap(
+      decodeOne(await readFixture("forwarded_command.bin"), "forwarded_command"),
+      "forwarded_command"
+    ),
+    "forwarded_command"
+  )
+  assert.ok(!("agent" in plain))
+})
+
+void test("given_a_forwarded_http_write_for_an_end_user_when_round_tripped_then_should_keep_who_it_was_for", async () => {
+  const bytes = await readFixture("forwarded_command_on_behalf_of.bin")
+  const command = decodeForwardedCommand(
+    expectMap(decodeOne(bytes, "forwarded_command_on_behalf_of"), "forwarded_command_on_behalf_of"),
+    "forwarded_command_on_behalf_of"
+  )
+  assert.equal(command.onBehalfOf, "1793690355287073")
+  assert.equal(command.agent, undefined)
+  assert.deepEqual(Buffer.from(encodeNamed(encodeForwardedCommand(command))), Buffer.from(bytes))
+})
+
 void test("given_a_scoped_forwarded_command_when_decoded_then_should_keep_zero_stream_id", async () => {
   const bytes = await readFixture("forwarded_command_scoped.bin")
   const command = decodeForwardedCommand(

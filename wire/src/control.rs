@@ -981,6 +981,11 @@ pub struct ControlStamp {
     pub stream_generation: Option<ControlStreamGeneration>,
     /// Identifies the sealing key without revealing it.
     pub key_id: u64,
+    /// The client that asked for the record. Absent on a record the backend or
+    /// the streaming server issues on its own, so it tells the root user, id
+    /// zero, apart from them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<crate::forward::Caller>,
 }
 
 /// One incarnation of a stream: a deleted and recreated stream has a new
@@ -1532,6 +1537,7 @@ mod wire_tests {
                     created_at_micros: 1_700_000_000_000_000,
                 }),
                 key_id: u64::MAX,
+                caller: None,
             }),
         };
         let back: ControlEnvelope =

@@ -1318,6 +1318,11 @@ pub const PARAM_EXPECT_ABSENT: &str = "expect_absent";
 /// wire constant rather than an unscoped string. Absent means no expiry.
 pub const KV_EXPIRES_AT_MICROS_HEADER: &str = "agdx-expires-at-micros";
 
+/// Request header an intermediary sets on a managed HTTP write to name the end
+/// user it writes for. The streaming server forwards it to the backend, which
+/// records it beside the authenticated user and never trusts it.
+pub const ON_BEHALF_OF_HEADER: &str = "agdx-on-behalf-of";
+
 /// `GET /agdx/projections` filters. Every field is optional, and an absent field is
 /// omitted from the query string (no empty `topic=`). Field names are the
 /// `PARAM_*` consts verbatim, so the client serializer and the server parser

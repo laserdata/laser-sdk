@@ -1781,6 +1781,13 @@ export class BudgetExceededError extends LaserError {
 function bytes16ToBigInt(bytes: Uint8Array): bigint;
 
 // @public
+interface Caller {
+    readonly agent?: AgentId_2;
+    readonly onBehalfOf?: string;
+    readonly userId: number;
+}
+
+// @public
 export class CancelledError extends LaserError {
     constructor(message: string, options?: {
         cause?: unknown;
@@ -2880,6 +2887,7 @@ interface ControlEnvelope {
 interface ControlStamp {
     // (undocumented)
     readonly actorUserId: number;
+    readonly caller?: Caller;
     // (undocumented)
     readonly deploymentId: bigint;
     // (undocumented)
@@ -3163,6 +3171,9 @@ function decodeBrowseReply(value: unknown, context: string): BrowseReply;
 
 // @public (undocumented)
 function decodeBudget(map: CborMap, context: string): Budget;
+
+// @public (undocumented)
+function decodeCaller(map: CborMap, context: string): Caller;
 
 // @public (undocumented)
 function decodeCanonicalAgentEnvelope(record: CanonicalAgentRecord, context: string): AgentEnvelope;
@@ -4537,6 +4548,9 @@ function encodeBrowseReply(reply: BrowseReply): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeBudget(budget: Budget): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeCaller(caller: Caller): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeCanonicalAgentRecord(record: CanonicalAgentRecord): Map<string, unknown>;
@@ -6728,6 +6742,7 @@ export type ForkStatus = "open" | "promoted" | "squashed";
 
 // @public (undocumented)
 interface ForwardedCommand {
+    readonly agent?: AgentId_2;
     // (undocumented)
     readonly clientId: bigint;
     // (undocumented)
@@ -6740,6 +6755,7 @@ interface ForwardedCommand {
     readonly minPosition?: MutationPosition;
     // (undocumented)
     readonly minSessions: readonly SessionPosition[];
+    readonly onBehalfOf?: string;
     // (undocumented)
     readonly operationId?: bigint;
     // (undocumented)
@@ -10099,6 +10115,7 @@ export class Msgpack<T = unknown> implements Codec<T> {
 interface MutationCommandEnvelope {
     // (undocumented)
     readonly actorUserId: number;
+    readonly caller?: Caller;
     // (undocumented)
     readonly commandCode: number;
     // (undocumented)
@@ -14963,7 +14980,6 @@ declare namespace wire {
         CanonicalAgentRecord,
         parseAgentKind,
         parseIdempotencyKey,
-        parseAgentId,
         sessionStatusFromWire,
         encodeContextManifest,
         decodeContextManifest,
@@ -15057,9 +15073,10 @@ declare namespace wire {
         encodeAgentEnvelope,
         decodeAgentEnvelope,
         validateAgentEnvelope,
+        AgentId_2 as AgentId,
+        parseAgentId,
         AgentKind,
         IdempotencyKey,
-        AgentId_2 as AgentId,
         TaskState,
         SessionStatus,
         SdkInfo,
@@ -15885,8 +15902,11 @@ declare namespace wire {
         decodeForwardedQuery,
         encodeForwardedCommand,
         decodeForwardedCommand,
+        Caller,
         ForwardedScope,
+        decodeCaller,
         decodeForwardedScope,
+        encodeCaller,
         encodeForwardedScope,
         ForwardedQuery,
         ForwardedCommand,
