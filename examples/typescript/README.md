@@ -24,7 +24,7 @@ Start Apache Iggy, then run any example. The SDK uses Iggy's native VSR transpor
 npm run example:native-streaming
 ```
 
-With no environment set, the examples connect to `iggy:iggy@127.0.0.1:8090`. Each example uses its own `laser-<example>-typescript` stream so the agent topics, consumer offsets, and managed views of different examples never collide. A run deletes the previous run's stream first and keeps its own result on the server, so you can inspect it afterwards with the SDK, the Iggy CLI, or the LaserData Cloud Console. Managed index names carry a per-run token. A stream supplied through `LASER_STREAM` is never deleted. The `log` example keeps its readings on the `fleet` stream, so a rerun finds the earlier records.
+With no environment set, the examples connect to `iggy:iggy@127.0.0.1:8090`. Each example uses its own `laser-<example>-typescript` stream so the agent topics, consumer offsets, and managed views of different examples never collide. A run deletes the previous run's stream first and keeps its own result on the server, so you can inspect it afterwards with the SDK, the Iggy CLI, or the LaserData Cloud Console. Managed index names carry a per-run token. A stream supplied through `LASER_STREAM` is never deleted. Key-value entries, leases, forks, and memory views live under the stream's scoped names and belong to that stream, so a rerun of a managed example on a recreated stream starts from empty state.
 
 For the complete managed surface, start Laser Stack with `./scripts/up` from its checkout and use the `LASER_CONNECTION_STRING` it prints.
 
@@ -60,13 +60,13 @@ Set `LASER_STREAM` to the stream provisioned for the deployment. The helper uses
 | `LASER_BATCH` | Records per batch |
 | `LASER_APPLY_PLAN=1` | Promotes the incident-desk fork instead of leaving it open for inspection |
 | `LASER_NON_INTERACTIVE=1` | Runs orchestra without waiting for Enter between phases |
-| `LASER_GOVERNANCE_USER_ID` | User whose role bindings the governance example manages |
+| `LASER_GOVERNANCE_USER_ID` | User the governance example binds its roles to. By default the example creates a `governance-demo` user |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | Select a real LLM for incident-desk or interop instead of the deterministic mock |
 | `ANTHROPIC_MODEL`, `OPENAI_MODEL` | Override the default model of the selected provider |
 
 The firehose also accepts `LASER_FIREHOSE_MESSAGES`, `LASER_FIREHOSE_ORGS`, `LASER_FIREHOSE_CONCURRENCY`, `LASER_FIREHOSE_PAYLOAD_BYTES`, `LASER_FIREHOSE_BATCH`, `LASER_FIREHOSE_PARTITIONS`, `LASER_FIREHOSE_REGISTER`, and `LASER_FIREHOSE_QUERY`.
 
-## Primitives - start here
+## Primitives: start here
 
 One tiny, single-primitive example each, most under 100 lines including imports. `cdc` is longer because it walks every filter phase. Read one in a minute, then jump to the deep-dive scenario that uses the same primitive in anger.
 
@@ -94,7 +94,7 @@ One tiny, single-primitive example each, most under 100 lines including imports.
 | [`memory`](src/memory/README.md) | Agentic | Vector and durable memory, provenance records, incident blast radius, valid-time graph reads, and traced paths |
 | [`interop`](src/interop/README.md) | Agentic | One agent reached through A2A, MCP, AG-UI, and human approval while correlation remains on the durable log |
 | [`orchestra`](src/orchestra/README.md) | Agentic | Discovery, directed contracts, capability fan-out, journalled workflows, quarantine, recovery, and deadline rerouting |
-| [`governance`](src/governance/README.md) | Agentic | Deny-wins grants, delegated permission intersection, edge step-up, managed RBAC, role bindings, and budgeted run submission |
+| [`governance`](src/governance/README.md) | Agentic | Deny-wins grants, delegated permission intersection, edge step-up, managed RBAC, role bindings, and budgeted session submission |
 
 Examples with an open phase run it against Apache Iggy. Managed phases print one precise skip reason when the server does not advertise their capability. Point the same command at Laser Stack or LaserData Cloud to run the full scenario without changing code.
 
@@ -108,3 +108,7 @@ node --test dist/test/common.test.js
 ```
 
 `npm run smoke` additionally runs native streaming, interop, and the `log`, `recall`, `context`, and `agent` primitives against a live Apache Iggy instance. It also starts `cdc`, which skips on a server without the filter catalog.
+
+## Sessions
+
+The sessions example records an incident root, two child tasks, and an independent maintenance root in one stream. It prints the recorded event and managed resource link counts for each session. Child results are collected explicitly, and child state stays separate.

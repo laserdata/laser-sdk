@@ -2,7 +2,9 @@ use crate::common::test_iggy::fresh_connected_laser;
 use crate::common::world::LaserWorld;
 use cucumber::{given, then, when};
 use laser_bdd::filter_fixtures::{feed, filter, record};
-use laser_sdk::filters::{FaultPolicy, FilterHeader, FilteredStart, HeaderScalar, Verdict};
+use laser_sdk::filters::{
+    FaultPolicy, FilterErrorReason, FilterHeader, FilteredStart, HeaderScalar, Verdict,
+};
 use laser_sdk::iggy::prelude::{Consumer, ConsumerOffsetClient, Identifier};
 use laser_sdk::prelude::{CommitPolicy, ConsumerStart, ProducerMessage, Routing};
 use laser_sdk::types::MintUlid;
@@ -13,6 +15,11 @@ use std::time::Duration;
 
 const TOPIC: &str = "fleet_changes";
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+// A group policy is saved under a filter name, which allows no spaces.
+fn policy_name(fixture: &str) -> String {
+    fixture.replace(' ', "-")
+}
 
 fn evaluate(world: &mut LaserWorld, payload: &[u8], headers: &[FilterHeader]) {
     let compiled = CompiledFilter::compile(world.filter.as_ref().expect("a filter was chosen"))
@@ -79,6 +86,13 @@ async fn fault_policy_digest(world: &mut LaserWorld) {
 #[given("a fresh fleet change feed")]
 async fn fresh_feed(world: &mut LaserWorld) {
     let fresh = fresh_connected_laser().await;
+    // Producers no longer create streams, so the feed makes its own.
+    fresh
+        .laser
+        .topic(TOPIC)
+        .ensure(1, None)
+        .await
+        .expect("the feed topic is created");
     let producer = fresh
         .laser
         .topic(TOPIC)
@@ -106,7 +120,7 @@ async fn read_feed(world: &mut LaserWorld, name: String) {
     let group = laser.topic(TOPIC).consumer_group("anomaly-desk");
     group
         .create()
-        .filter(filter(&name))
+        .filter(policy_name(&name), filter(&name))
         .build()
         .await
         .expect("group policy configured");
@@ -169,14 +183,14 @@ async fn managed_group(world: &mut LaserWorld) {
     let operation_id = laser_sdk::wire::agent::RecordId::mint().as_u128();
     let first = named
         .create()
-        .filter(filter("safe mode"))
+        .filter(policy_name("safe mode"), filter("safe mode"))
         .operation_id(operation_id)
         .build()
         .await
         .expect("configure group");
     let retry = named
         .create()
-        .filter(filter("safe mode"))
+        .filter(policy_name("safe mode"), filter("safe mode"))
         .operation_id(operation_id)
         .build()
         .await
@@ -188,7 +202,10 @@ async fn managed_group(world: &mut LaserWorld) {
         .filter()
         .configure_as(
             Some(operation_id),
-            GroupFilterSpec::Definition(filter("safe mode")),
+            GroupFilterSpec::Definition {
+                name: policy_name("safe mode"),
+                filter: filter("safe mode"),
+            },
         )
         .await
         .expect("repeat saved operation");
@@ -260,15 +277,34 @@ async fn unbound_consumer(world: &mut LaserWorld) {
 async fn unbound_reader(world: &mut LaserWorld) {
     let group = world.laser().topic(TOPIC).consumer_group("unbound-desk");
     group.create().build().await.expect("plain group");
-    let mut reader = group
+    let reader = group
         .reader()
         .expect("group source")
         .start(FilteredStart::First)
         .count(100)
         .max_examined(100)
         .build()
+        .await;
+    if !world
+        .laser()
+        .capabilities()
         .await
-        .expect("unbound reader");
+        .filters
+        .group_policy_reads
+    {
+        let error = reader.err().expect("group-aware reads must be refused");
+        assert!(matches!(
+            error,
+            laser_sdk::LaserError::Unsupported {
+                surface: "filters",
+                feature: Some("group_policy_reads"),
+                ..
+            }
+        ));
+        world.last_result = Some(Err("unsupported".to_owned()));
+        return;
+    }
+    let mut reader = reader.expect("unbound reader");
     world.filtered_payloads.clear();
     while world.filtered_payloads.len() < feed().len() {
         let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
@@ -288,6 +324,27 @@ async fn unbound_reader(world: &mut LaserWorld) {
             .expect("acknowledge original records");
     }
     reader.close().await.expect("close");
+}
+
+#[then("the advanced reader follows the group-aware read capability")]
+async fn advanced_reader_capability(world: &mut LaserWorld) {
+    if world
+        .laser()
+        .capabilities()
+        .await
+        .filters
+        .group_policy_reads
+    {
+        assert_eq!(
+            world.filtered_payloads,
+            feed()
+                .iter()
+                .map(|name| record(name).to_vec())
+                .collect::<Vec<_>>()
+        );
+    } else {
+        assert_eq!(world.last_result, Some(Err("unsupported".to_owned())));
+    }
 }
 
 #[then("it receives every original feed record")]
@@ -315,7 +372,7 @@ async fn hundred_non_matches(world: &mut LaserWorld) {
     let group = topic.consumer_group("sparse-desk");
     group
         .create()
-        .filter(filter("safe mode"))
+        .filter(policy_name("safe mode"), filter("safe mode"))
         .build()
         .await
         .expect("configured group");
@@ -328,7 +385,17 @@ async fn hundred_non_matches(world: &mut LaserWorld) {
         .build()
         .await
         .expect("bounded reader");
-    let (empty, more) = reader.read_round().await.expect("first bounded scan");
+    let (empty, more) = tokio::time::timeout(READ_TIMEOUT, async {
+        loop {
+            let result = reader.read_round().await.expect("bounded scan");
+            if reader.examined_in_round() > 0 {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first assignment becomes readable");
     assert!(empty.is_none() && more);
     assert_eq!(reader.examined_in_round(), 100);
     let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
@@ -379,7 +446,7 @@ async fn hundred_non_matches_consumer(world: &mut LaserWorld) {
     let group = topic.consumer_group("normal-sparse-desk");
     group
         .create()
-        .filter(filter("safe mode"))
+        .filter(policy_name("safe mode"), filter("safe mode"))
         .build()
         .await
         .expect("configured group");
@@ -415,4 +482,42 @@ async fn hundred_non_matches_consumer(world: &mut LaserWorld) {
         .await
         .expect("acknowledge matching work");
     consumer.shutdown().await.expect("close");
+}
+
+#[when("the anomaly desk rejects a page after releasing its policy")]
+async fn reject_old_policy(world: &mut LaserWorld) {
+    let laser = world.laser().clone();
+    let group = laser.topic(TOPIC).consumer_group("policy-ack");
+    group
+        .create()
+        .filter(policy_name("safe mode"), filter("safe mode"))
+        .build()
+        .await
+        .expect("group");
+    let mut reader = group
+        .reader()
+        .expect("reader")
+        .start(FilteredStart::First)
+        .build()
+        .await
+        .expect("build");
+    let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("deadline")
+        .expect("page");
+    group.filter().release().await.expect("release");
+    let refused = reader.ack_page(&page).await.expect_err("old policy");
+    assert_eq!(refused.filter_reason(), Some(FilterErrorReason::Conflict));
+    let current = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("deadline")
+        .expect("current page");
+    assert_eq!(current.records[0].offset, 0);
+    world.filtered_payloads = current
+        .records
+        .iter()
+        .map(|record| record.message.payload.to_vec())
+        .collect();
+    reader.ack_page(&current).await.expect("current policy");
+    reader.close().await.expect("close");
 }

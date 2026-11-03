@@ -26,8 +26,8 @@ What it shows:
   - draft a stricter revision, run the variant in its own A/B group, pause
     and resume it, see a running policy refuse another one, release and delete both
 
-Consumer group filters need laser-plane, as Laser Stack or LaserData Cloud
-runs it, and skip elsewhere.
+Consumer group filters need the managed backend of Laser Stack or LaserData
+Cloud, and skip elsewhere.
 
 **The sample saves 98.5% of payload transfer: 424 of 27,953 bytes.**
 The desk receives 4 of 240 records, processes each typed change, then
@@ -291,7 +291,8 @@ async def route_alerts(laser: ls.Laser) -> None:
         await producer.send(frame, headers={"priority": ("uint8", priority)}, key=satellite_id)
     pager_group = alerts.consumer_group(f"{GROUP}-pager-{_common.run_token()}")
     await pager_group.create(
-        filter=ls.ConsumerFilter.headers_only(ls.FilterExpr.header("priority", "eq", CRITICAL))
+        filter=ls.ConsumerFilter.headers_only(ls.FilterExpr.header("priority", "eq", CRITICAL)),
+        filter_name="critical-alerts",
     )
     pager = await pager_group.reader(start="first")
     try:
@@ -324,7 +325,9 @@ async def manage_revisions(laser: ls.Laser, desk, binding: dict, expected: int) 
     _common.phase("A/B: the transitions-only variant runs in its own group")
     variant_name = f"{GROUP}-transitions-{_common.run_token()}"
     variant = laser.topic(TOPIC).consumer_group(variant_name)
-    created = await variant.create(filter=ls.ConsumerFilter.json(safe_mode_transition()))
+    created = await variant.create(
+        filter=ls.ConsumerFilter.json(safe_mode_transition()), filter_name="safe-mode-transitions"
+    )
     variant_binding = created.filter
     reader = await variant.reader(count=1, local_guard=True, start="first")
     try:
@@ -351,7 +354,9 @@ async def manage_revisions(laser: ls.Laser, desk, binding: dict, expected: int) 
 
     _common.phase("a group that runs a policy cannot be switched to another one")
     try:
-        await desk.filter().configure(ls.ConsumerFilter.json(safe_mode_transition()))
+        await desk.filter().configure(
+            "safe-mode-transitions", ls.ConsumerFilter.json(safe_mode_transition())
+        )
     except ls.FilterError as error:
         if error.reason != "conflict":
             raise
@@ -402,7 +407,7 @@ async def main() -> None:
 
         _common.phase("create the anomaly desk group with its filter")
         desk = topic.consumer_group(f"{GROUP}-{_common.run_token()}")
-        created = await desk.create(filter=safe_mode_filter())
+        created = await desk.create(filter=safe_mode_filter(), filter_name="safe-mode")
         binding = created.filter
         print(
             f"  group {created.name} ({created.id}) runs revision "
@@ -416,7 +421,7 @@ async def main() -> None:
         delivered_bytes = 0
         try:
             for _ in range(strict_matches):
-                message = await consumer.next_within(READ_TIMEOUT)
+                message = await consumer.next_within(READ_TIMEOUT * 1000)
                 change = fleet_change(message.json())
                 print(
                     f"  partition {message.partition_id} offset {message.position.offset}: "

@@ -1,5 +1,15 @@
 import { CodecError } from "../client/errors.js"
 import { encodeNamed, expectMap, field, singleVariantTag, type CborMap } from "./cbor.js"
+import {
+  decodeProducer,
+  decodeSourceRef,
+  encodeProducer,
+  encodeSourceRef,
+  type ProducerInfo,
+  type SourceRef
+} from "./graph.js"
+import { MAX_MEMORY_ID_BYTES } from "./limits.js"
+import { validateBoundedText } from "./validate.js"
 
 export type MemoryRecord =
   | {
@@ -7,35 +17,42 @@ export type MemoryRecord =
       readonly id: string
       readonly memoryKind: string
       readonly body: Uint8Array
+      readonly origin?: SourceRef
+      readonly producer?: ProducerInfo
     }
-  | { readonly kind: "forget"; readonly target: string }
-  | { readonly kind: "feedback"; readonly target: string; readonly weight: number }
+  | { readonly kind: "forget"; readonly target: string; readonly conversation?: string }
+  | {
+      readonly kind: "feedback"
+      readonly target: string
+      readonly weight: number
+      readonly conversation?: string
+    }
 
 export function encodeMemoryRecord(record: MemoryRecord): Map<string, unknown> {
   switch (record.kind) {
-    case "item":
-      return new Map([
-        [
-          "Item",
-          new Map<string, unknown>([
-            ["id", record.id],
-            ["kind", record.memoryKind],
-            ["body", Array.from(record.body, (byte) => BigInt(byte))]
-          ])
-        ]
+    case "item": {
+      const item = new Map<string, unknown>([
+        ["id", record.id],
+        ["kind", record.memoryKind],
+        ["body", Array.from(record.body, (byte) => BigInt(byte))]
       ])
-    case "forget":
-      return new Map([["Forget", new Map([["target", record.target]])]])
-    case "feedback":
-      return new Map([
-        [
-          "Feedback",
-          new Map<string, unknown>([
-            ["target", record.target],
-            ["weight", record.weight]
-          ])
-        ]
+      if (record.origin !== undefined) item.set("origin", encodeSourceRef(record.origin))
+      if (record.producer !== undefined) item.set("producer", encodeProducer(record.producer))
+      return new Map([["Item", item]])
+    }
+    case "forget": {
+      const forget = new Map<string, unknown>([["target", record.target]])
+      if (record.conversation !== undefined) forget.set("conversation", record.conversation)
+      return new Map([["Forget", forget]])
+    }
+    case "feedback": {
+      const feedback = new Map<string, unknown>([
+        ["target", record.target],
+        ["weight", record.weight]
       ])
+      if (record.conversation !== undefined) feedback.set("conversation", record.conversation)
+      return new Map([["Feedback", feedback]])
+    }
   }
 }
 
@@ -48,16 +65,39 @@ export function decodeMemoryRecord(value: unknown, context: string): MemoryRecor
         kind: "item",
         id: field.requiredString(map, "id", context),
         memoryKind: field.requiredString(map, "kind", context),
-        body: decodeByteArray(map, "body", context)
+        body: decodeByteArray(map, "body", context),
+        ...(map.has("origin")
+          ? { origin: decodeSourceRef(map.get("origin"), `${context}.origin`) }
+          : {}),
+        ...(map.has("producer")
+          ? {
+              producer: decodeProducer(
+                field.requiredMap(map, "producer", context),
+                `${context}.producer`
+              )
+            }
+          : {})
       }
-    case "Forget":
-      return { kind: "forget", target: field.requiredString(map, "target", context) }
+    case "Forget": {
+      const conversation = field.optionalString(map, "conversation", context)
+      return {
+        kind: "forget",
+        target: field.requiredString(map, "target", context),
+        ...(conversation !== undefined ? { conversation } : {})
+      }
+    }
     case "Feedback": {
       const weight = map.get("weight")
       if (typeof weight !== "number") {
         throw new CodecError(`field \`weight\` in ${context} must be a number`, context, "weight")
       }
-      return { kind: "feedback", target: field.requiredString(map, "target", context), weight }
+      const conversation = field.optionalString(map, "conversation", context)
+      return {
+        kind: "feedback",
+        target: field.requiredString(map, "target", context),
+        weight,
+        ...(conversation !== undefined ? { conversation } : {})
+      }
     }
     default:
       throw new CodecError(
@@ -68,7 +108,18 @@ export function decodeMemoryRecord(value: unknown, context: string): MemoryRecor
   }
 }
 
+/** Rust `MemoryRecord::validate`: ids, kind words and targets are bounded text. */
+export function validateMemoryRecord(record: MemoryRecord): void {
+  if (record.kind === "item") {
+    validateBoundedText("memory item id", record.id, MAX_MEMORY_ID_BYTES)
+    validateBoundedText("memory item kind", record.memoryKind, MAX_MEMORY_ID_BYTES)
+  } else {
+    validateBoundedText("memory target", record.target, MAX_MEMORY_ID_BYTES)
+  }
+}
+
 export function encodeMemoryRecordFrame(record: MemoryRecord): Uint8Array {
+  validateMemoryRecord(record)
   return encodeNamed(encodeMemoryRecord(record), { forceFloatNumbers: true })
 }
 

@@ -25,8 +25,7 @@ import _common
 import laser_sdk as ls
 
 EXAMPLE = "agent"
-COMMANDS = ls.AgentTopic.Commands
-RESPONSES = ls.AgentTopic.Responses
+SESSIONS = ls.AgentTopic.Sessions
 CAPABILITY = "resolve-ticket"
 DEADLINE_MS = 60_000
 
@@ -39,16 +38,18 @@ async def handle(ctx, message) -> None:
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
     try:
-        # The well-known agent topics (commands, responses, registry, ...) must
+        # The agent topics (the shared session topic and its satellites) must
         # exist before an agent's consumer group joins one.
-        await laser.bootstrap(_common.PARTITIONS)
+        await laser.bootstrap(
+            _common.PARTITIONS, retention=ls.TopicRetention.expire_after(86_400_000)
+        )
 
         _common.phase("spawn a handler, then hand it a deadline-bounded task")
         triage = laser.spawn_agent(
             "triage",
-            COMMANDS,
+            SESSIONS,
             handle,
-            respond_on=RESPONSES,
+            respond_on=SESSIONS,
             # The advertised capability is what makes this agent addressable by what
             # it can do rather than by the name it happens to run under.
             capabilities=[CAPABILITY],
@@ -65,7 +66,7 @@ async def main() -> None:
             CAPABILITY,
             b"ticket #42 is stuck",
             source="orchestrator",
-            fixed_inbox=COMMANDS,
+            fixed_inbox=SESSIONS,
             deadline_ms=DEADLINE_MS,
         )
         if isinstance(reply, ls.Contract.Completed):

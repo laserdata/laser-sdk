@@ -1,0 +1,65 @@
+{
+  "links": [
+    {
+      "surface": "kv",
+      "resource": "ops",
+      "item": "tasks",
+      "relation": "wrote",
+      "first": [
+        0,
+        0,
+        0,
+        5,
+        0,
+        0,
+        0,
+        3,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        40
+      ],
+      "last": [
+        0,
+        0,
+        0,
+        5,
+        0,
+        0,
+        0,
+        3,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        41
+      ]
+    }
+  ],
+  "frontier": [
+    {
+      "topic_id": 3,
+      "topic_generation": 1717171717000000,
+      "partition_id": 1,
+      "folded": 41,
+      "head": 42,
+      "retained_from": 7
+    }
+  ],
+  "truncated": false
+}

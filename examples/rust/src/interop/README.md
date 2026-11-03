@@ -1,33 +1,34 @@
-# interop - one agent reached as A2A, MCP, and AG-UI
+# interop: one agent through A2A, MCP, AG-UI, and human input
 
-This example exposes one agent through A2A, MCP, and AG-UI adapters. The agent receives AGDX records through the log and returns correlated replies.
+This example reaches an agent through A2A, MCP, and AG-UI adapters and pauses on a human decision. The agent only reads AGDX commands from the log and answers with correlated AGDX responses.
 
 ## What it does
 
-- A2A. `A2aBridge` exposes the worker to A2A JSON-RPC clients. `SendMessage` publishes a typed AGDX command on a fresh task conversation, and `GetTask` reads back the worker's answer mapped onto the A2A task.
-- MCP. `McpBridge` is an MCP tool server. `tools/list` advertises the configured tools, and `tools/call` reaches the same worker as an AGDX command and renders the correlated reply as a tool result.
-- AG-UI. A chat answer is streamed onto the log as an AGDX chunk stream, then `agui_events` renders that conversation as AG-UI `TEXT_MESSAGE_*` events.
-- Human-in-the-loop. An orchestrator pauses on a human with `Agdx::request_input`, and an approver agent resolves the interrupt with `AgentCtx::respond_input`, both riding AGDX command and response over the log (no new wire).
+- A2A. `A2aBridge::submit_to` publishes an A2A message as an AGDX command. The `assistant` worker answers, and `A2aBridge::task` reads the answer back as a completed task.
+- MCP. `McpBridge` lists its `ask` tool. `call_tool_to` sends the MCP `tools/call` params unchanged as an AGDX command, and the `tool-runner` worker's reply comes back as a tool result.
+- AG-UI. A chat answer is streamed onto the log as AGDX chunks, then `agui_events` renders the conversation as AG-UI `TEXT_MESSAGE_*` events.
+- Human input. An orchestrator pauses with `Agdx::request_input_from`, and an approver agent resolves it with `AgentCtx::respond_input`.
 
-The worker decodes an AGDX command, calls the configured model, and returns an AGDX response with the same correlation ID. `LlmClient` uses a deterministic mock by default. `--features llm-anthropic` uses `ANTHROPIC_API_KEY`, and `--features llm-openai` uses `OPENAI_API_KEY`. The bridges use the same flow with either model.
+The assistant, the tool runner, and the approver all read `agent.sessions` for the whole run. Each bridge call and the input request name the agent they are for, so only that agent takes them as work. The untargeted `submit`, `call_tool`, and `request_input` address every agent.
+
+`LlmClient` uses a deterministic mock by default. `--features llm-anthropic` uses `ANTHROPIC_API_KEY`, and `--features llm-openai` uses `OPENAI_API_KEY`. The bridges work the same with either model.
 
 ## Run it
 
 Run from `examples/rust`:
 
 ```sh
-just up                                                # start a local server
+just up
 cargo run --example interop                            # deterministic mock model
-cargo run --example interop --features llm-anthropic   # real Claude
-cargo run --example interop --features llm-openai      # real OpenAI
+cargo run --example interop --features llm-anthropic   # Anthropic
+cargo run --example interop --features llm-openai      # OpenAI
 ```
-
-The run sends an A2A task, makes an MCP tool call, renders a streamed answer as AG-UI events, and requests approval. The approver answers through the same AGDX reply path.
 
 ## Highlights
 
-- `A2aBridge` / `McpBridge`: the edge JSON-RPC surfaces, each a thin shell that publishes an AGDX command and replays the correlated reply off the log.
-- `agui_events`: a conversation rendered as AG-UI events, with offset replay instead of SSE, so a dropped stream resumes.
-- `Agdx::request_input` / `AgentCtx::respond_input`: human-in-the-loop pause and resume composed from the existing command and response verbs, adding nothing to the wire.
-- Map the core, tunnel the remainder: the edge protocols' shared fields map onto envelope fields, everything else rides byte-identical in the body. The mapping is documented in `docs/interop.md` and pinned normatively in the AGDX spec.
-cargo run --example interop                            # deterministic mock model
+- `A2aBridge` and `McpBridge` publish an AGDX command and read the correlated reply back from the log.
+- `agui_events` renders a conversation as AG-UI events by replaying offsets instead of holding an SSE connection.
+- `request_input_from` and `respond_input` build a human pause from the existing command and response records.
+- The edge protocols' shared fields map onto envelope fields, and everything else rides unchanged in the body. The AGDX specification defines the mapping.
+
+The Python and TypeScript `interop` examples send the same inputs and print the same lines.

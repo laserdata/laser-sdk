@@ -22,7 +22,7 @@ function evidence(
     mode: GovernorMode.Enforce,
     kind: "send",
     stream: "laser",
-    topic: "agent.commands",
+    topic: "agent.sessions",
     ...(source !== undefined ? { source } : {}),
     receiptDigest: "",
     outcome: decision === "block" ? "blocked" : "effected",
@@ -55,7 +55,10 @@ void test("given_untrusted_crash_fields_when_summarized_then_should_escape_and_t
       agent: AgentId.new("planner")
     },
     payload: new TextEncoder().encode(`${"x".repeat(201)}\nforged`),
-    topic: "agent.commands"
+    topic: "agent.sessions",
+    timestampMicros: 0n,
+    streamId: 1,
+    topicId: 1
   }
   const context = new CrashContext(
     [message],

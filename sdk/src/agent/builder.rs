@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// One logical agent defaults to one Iggy consumer group.
 ///
@@ -49,8 +49,9 @@ pub struct Agent<H> {
     /// inbox). Set [`InboxRoute::Fixed`] for a workflow topic the caller owns.
     #[builder(default)]
     pub inbox_route: InboxRoute,
-    /// Override the consumer poll interval (default: the runtime's reactive 10ms).
-    pub poll_interval: Option<Duration>,
+    /// How long the server holds a read that finds nothing new before it
+    /// answers. A record ends the wait at once. Default 5 s.
+    pub max_wait: Option<Duration>,
     /// How long [`AgentHandle::shutdown`] waits for the in-flight message to
     /// finish draining before the consumer is dropped. [`AgentHandle::abort`] is
     /// the unconditional hard stop. Defaults to the consumer's 30s grace.
@@ -73,6 +74,14 @@ pub struct Agent<H> {
     /// Notified on every dead-letter with the result of publishing it, so a lost
     /// poison message is an observable event rather than only a log line.
     pub on_dead_letter: Option<Arc<dyn DeadLetterSink>>,
+    /// The command operations the handler serves. Unset serves every
+    /// operation. A command for another operation is skipped.
+    pub operations: Option<Vec<String>>,
+    /// The session configuration the agent's runtime applies: the lens
+    /// [`AgentCtx::session`](crate::agent::AgentCtx::session) opens and
+    /// [`SessionConfig::fail_on_dead_letter`](crate::agent::SessionConfig::fail_on_dead_letter).
+    /// Defaults to [`SessionConfig::default`](crate::agent::SessionConfig::default).
+    pub sessions: Option<crate::agent::SessionConfig>,
     /// Override the dedup window size (recent idempotency keys kept in memory).
     /// Defaults to the [`ReliableConsumer`] default when unset.
     pub dedup_window: Option<usize>,
@@ -116,7 +125,8 @@ pub struct Agent<H> {
     /// own task, stopped with the agent). Both must be set for the tick to
     /// exist. Absent means no background consolidation, ever. Each pass runs
     /// over this agent's own memory: the scope carries the agent id and
-    /// nothing else.
+    /// nothing else. A zero period fails the agent with
+    /// [`LaserError::Config`] instead of starting.
     pub consolidate_every: Option<Duration>,
     /// The consolidation pass the periodic tick runs (see
     /// [`consolidate_every`](Self::consolidate_every)).
@@ -153,15 +163,23 @@ where
         let id = self.id.clone();
         let listen_on = self.listen_on.clone();
         let capabilities = self.capabilities;
-        let group = self
-            .consumer_group
-            .unwrap_or_else(|| ConsumerGroupName::for_agent(&id));
-        let topic = self.listen_on.topic_string();
+        let consumer_group = self.consumer_group;
+        // The agent's session configuration declares its stream's layout on
+        // this connection, so the agent reads and routes by it.
+        if let Some(config) = &self.sessions {
+            let _ = laser.sessions_with(config.clone());
+        }
+        // A declared agent of a per-agent topic layout reads its own topic in
+        // place of the lane.
+        let topic = Some(self.listen_on.topic_string())
+            .filter(|topic| topic != laser_wire::topics::AGENT_SESSIONS)
+            .or_else(|| laser.declared_topic(&id.wire_id()))
+            .unwrap_or_else(|| self.listen_on.topic_string());
         let handler = self.handler;
         let respond_on = self.respond_on;
         let inbox_route = self.inbox_route;
         let ack_on_pickup = self.ack_on_pickup;
-        let poll_interval = self.poll_interval;
+        let max_wait = self.max_wait;
         let warm_dedup = self.warm_dedup;
         let deduplicator = self.deduplicator;
         let shutdown_grace = self.shutdown_grace;
@@ -173,50 +191,74 @@ where
         let understood_features = self.understood_features;
         let middleware = self.middleware;
         let on_dead_letter = self.on_dead_letter;
+        let operations = self.operations;
+        let sessions = self.sessions;
         #[cfg(feature = "sign")]
         let verifier = self.verifier;
         #[cfg(feature = "sign")]
         let signing_key = self.signing_key;
         let (shutdown, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
+        // A zero period would panic inside the interval timer, so it fails the
+        // agent instead of starting the tick.
+        let zero_period = self.consolidate_every.is_some_and(|every| every.is_zero());
         // No background magic unless both knobs are set.
         let consolidation = match (self.consolidate_every, self.consolidator) {
-            (Some(every), Some(consolidator)) => {
+            (Some(every), Some(consolidator)) if !zero_period => {
                 Some(spawn_consolidation(&id, every, consolidator))
             }
             _ => None,
         };
         let task = tokio::spawn(async move {
-            if !capabilities.is_empty() {
-                advertise(&laser, &id, &listen_on, capabilities).await?;
+            let agent = id.clone();
+            let outcome = async move {
+                if zero_period {
+                    return Err(LaserError::Config(
+                        "consolidate_every must be greater than zero",
+                    ));
+                }
+                let group = match consumer_group {
+                    Some(group) => group,
+                    None => ConsumerGroupName::for_agent(&id)?,
+                };
+                if !capabilities.is_empty() {
+                    advertise(&laser, &id, &listen_on, capabilities).await?;
+                }
+                let consumer = ReliableConsumer::builder()
+                    .group(group)
+                    .agent(id)
+                    .topic(topic)
+                    .maybe_respond_on(respond_on)
+                    .inbox_route(inbox_route)
+                    .ack_on_pickup(ack_on_pickup)
+                    .maybe_max_wait(max_wait)
+                    .maybe_shutdown_grace(shutdown_grace)
+                    .maybe_concurrency(concurrency)
+                    .maybe_max_queued_records(max_queued_records)
+                    .maybe_max_queued_bytes(max_queued_bytes)
+                    .warm_dedup(warm_dedup)
+                    .maybe_deduplicator(deduplicator)
+                    .maybe_dedup_window(dedup_window)
+                    .maybe_retry(retry)
+                    .understood_features(understood_features)
+                    .middleware(middleware)
+                    .maybe_on_dead_letter(on_dead_letter)
+                    .maybe_operations(operations)
+                    .maybe_sessions(sessions);
+                #[cfg(feature = "sign")]
+                let consumer = consumer
+                    .maybe_verifier(verifier)
+                    .maybe_signing_key(signing_key);
+                consumer
+                    .build()
+                    .run(&laser, handler, ready_tx, shutdown_rx)
+                    .await
             }
-            let consumer = ReliableConsumer::builder()
-                .group(group)
-                .agent(id)
-                .topic(topic)
-                .maybe_respond_on(respond_on)
-                .inbox_route(inbox_route)
-                .ack_on_pickup(ack_on_pickup)
-                .maybe_poll_interval(poll_interval)
-                .maybe_shutdown_grace(shutdown_grace)
-                .maybe_concurrency(concurrency)
-                .maybe_max_queued_records(max_queued_records)
-                .maybe_max_queued_bytes(max_queued_bytes)
-                .warm_dedup(warm_dedup)
-                .maybe_deduplicator(deduplicator)
-                .maybe_dedup_window(dedup_window)
-                .maybe_retry(retry)
-                .understood_features(understood_features)
-                .middleware(middleware)
-                .maybe_on_dead_letter(on_dead_letter);
-            #[cfg(feature = "sign")]
-            let consumer = consumer
-                .maybe_verifier(verifier)
-                .maybe_signing_key(signing_key);
-            consumer
-                .build()
-                .run(&laser, handler, ready_tx, shutdown_rx)
-                .await
+            .await;
+            if let Err(error) = &outcome {
+                error!(%error, agent = %agent, "Agent {agent} stopped with an error: {error}");
+            }
+            outcome
         });
         AgentHandle {
             shutdown: Some(shutdown),
@@ -280,10 +322,20 @@ impl AgentHandle {
     /// Wait until the agent has joined its group and is polling, so a publish after
     /// this is delivered rather than racing the join. Idempotent.
     pub async fn ready(&mut self) -> Result<(), LaserError> {
-        if let Some(ready) = self.ready.take() {
-            ready.await.map_err(|_| {
-                LaserError::HandlerConfig("agent stopped before it became ready".to_owned())
-            })?;
+        if let Some(ready) = self.ready.take()
+            && ready.await.is_err()
+        {
+            // The runtime stopped before it was ready: surface why.
+            if let Some(task) = self.task.take() {
+                match task.await {
+                    Ok(Err(error)) => return Err(error),
+                    Err(error) => return Err(LaserError::HandlerConfig(error.to_string())),
+                    Ok(Ok(())) => {}
+                }
+            }
+            return Err(LaserError::HandlerConfig(
+                "agent stopped before it became ready".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -408,6 +460,36 @@ mod tests {
         assert!(scope.user.is_none());
         assert!(scope.app.is_none());
         assert!(scope.stream.is_none());
+    }
+
+    struct IgnoreHandler;
+
+    impl crate::agent::AgentHandler for IgnoreHandler {
+        async fn handle(
+            &self,
+            _message: &crate::agent::AgentMessage,
+            _ctx: &crate::agent::AgentCtx<'_>,
+        ) -> Result<(), LaserError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_zero_consolidation_period_when_spawned_then_should_fail_as_config() {
+        let (passes, _scopes) = tokio::sync::mpsc::unbounded_channel();
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default())
+            .with_default_stream("zero-tick");
+        let mut handle = Agent::builder()
+            .id("planner".parse().expect("valid agent id"))
+            .listen_on(AgentTopic::Sessions)
+            .handler(IgnoreHandler)
+            .consolidate_every(Duration::ZERO)
+            .consolidator(crate::memory::SharedConsolidator::new(
+                RecordingConsolidator(passes),
+            ))
+            .build()
+            .spawn(laser);
+        assert!(matches!(handle.ready().await, Err(LaserError::Config(_))));
     }
 
     #[tokio::test]

@@ -64,8 +64,8 @@ pub enum TextMatch {
     /// backreferences, and inline flags are refused. `\d`, `\w`, `\s`, and
     /// `\b` are Unicode-aware, and case-insensitive matching uses the
     /// engine's simple case folding, where the other kinds lowercase both
-    /// sides. The server's verdict is the contract, and TypeScript refuses to
-    /// build a local guard for a filter that holds a regex.
+    /// sides. The server's verdict is the contract, and the Rust, Python, and
+    /// TypeScript local evaluators follow the same rules.
     Regex,
 }
 

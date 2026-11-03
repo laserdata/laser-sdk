@@ -38,13 +38,193 @@ import {
   encodeTableFilePageJson,
   encodeTableMetricsJson,
   encodeTableSchemaJson,
-  encodeTableViewJson
+  encodeTableViewJson,
+  forkPath,
+  forkPromotePath,
+  forkRowsPath,
+  sessionsPath,
+  sessionPath,
+  sessionChangesPath,
+  sessionEventsPath,
+  sessionStatePath,
+  sessionLinksPath,
+  sessionSourcesPath,
+  pathSegment,
+  sessionsQueryParams,
+  decodeSessionsQuery,
+  decodeFilterListQuery,
+  filterListQueryOf,
+  filterListQueryOwner,
+  filterListQueryParams,
+  decodeSessionEventsQuery,
+  decodeSessionChangesQuery,
+  decodeSessionStateQuery,
+  decodeSessionLinksQuery,
+  sessionEventsQueryParams,
+  sessionChangesQueryParams,
+  sessionStateQueryParams,
+  sessionLinksQueryParams,
+  sessionErrorBody,
+  PARAM_FIXED_FRONTIER,
+  PARAM_HISTORY_LIMIT,
+  PARAM_TEXT
 } from "../../src/wire/http.js"
+import { ConversationId } from "../../src/wire/ids.js"
+import { STREAM_RESOURCE_PREFIX, streamResource } from "../../src/wire/authz.js"
+import { CodecError, InvalidError } from "../../src/client/errors.js"
+import { decodeOne } from "../../src/wire/cbor.js"
+import { parseCanonicalJson } from "../../src/wire/filter.js"
+import { decodeSessionReply, type SessionPage } from "../../src/wire/session.js"
 
 const FIXTURES_DIR = path.resolve(process.cwd(), "../../wire/fixtures")
 
+void test("given_a_stream_scoped_session_when_paths_are_built_then_should_encode_each_segment", () => {
+  const stream = "a/b?!"
+  const id = ConversationId.fromU128(3n)
+  const base = "/agdx/sessions/a%2Fb%3F%21/00000000000000000000000003"
+  assert.equal(pathSegment(stream), "a%2Fb%3F%21")
+  assert.equal(sessionsPath(stream), "/agdx/sessions/a%2Fb%3F%21")
+  assert.equal(sessionPath(stream, id), base)
+  assert.equal(sessionChangesPath(stream), "/agdx/sessions/a%2Fb%3F%21/changes")
+  assert.equal(sessionEventsPath(stream, id), `${base}/events`)
+  assert.equal(sessionStatePath(stream, id), `${base}/state`)
+  assert.equal(sessionLinksPath(stream, id), `${base}/links`)
+  assert.equal(sessionSourcesPath(stream, id), `${base}/sources`)
+})
+
+void test("given_a_stream_scoped_fork_id_when_paths_are_built_then_should_encode_it_as_one_segment", () => {
+  assert.equal(forkPath("stream:acme/try"), "/agdx/forks/stream%3Aacme%2Ftry")
+  assert.equal(forkPromotePath("stream:acme/try"), "/agdx/forks/stream%3Aacme%2Ftry/promote")
+  assert.equal(forkRowsPath("stream:acme/try"), "/agdx/forks/stream%3Aacme%2Ftry/rows")
+  assert.equal(forkPath("try-1"), "/agdx/forks/try-1")
+})
+
+void test("given_session_queries_when_decoded_then_should_take_the_stream_from_the_path", () => {
+  assert.equal(sessionsPath("agents"), "/agdx/sessions/agents")
+  const scoped = decodeSessionsQuery(new URLSearchParams("status=active&root=r1&label_prefix=t-"))
+  assert.equal(scoped.root, "r1")
+  assert.equal(scoped.labelPrefix, "t-")
+  assert.equal(sessionsQueryParams(scoped).toString(), "status=active&root=r1&label_prefix=t-")
+  const query = decodeSessionsQuery(new URLSearchParams("status=active&total=true"))
+  assert.equal(query.status, "active")
+  assert.equal(query.wantTotal, true)
+  assert.equal(sessionsQueryParams(query).toString(), "status=active&total=true")
+  assert.equal(
+    sessionsQueryParams({ agent: "planner", text: "check", cursor: "c1", limit: 0 }).toString(),
+    "agent=planner&text=check&cursor=c1&limit=0"
+  )
+  const events = decodeSessionEventsQuery(new URLSearchParams("fixed_frontier=true"))
+  assert.equal(events.fixedFrontier, true)
+  assert.equal(events.limit, undefined)
+  assert.equal(
+    sessionEventsQueryParams({ cursor: "c", limit: 5, fixedFrontier: true }).toString(),
+    "cursor=c&limit=5&fixed_frontier=true"
+  )
+  assert.deepEqual(decodeSessionEventsQuery(new URLSearchParams()), { fixedFrontier: false })
+  const changes = decodeSessionChangesQuery(new URLSearchParams())
+  assert.equal(changes.after, 0n)
+  assert.equal(sessionChangesQueryParams({ after: 42n, limit: 10 }).toString(), "after=42&limit=10")
+  assert.deepEqual(decodeSessionChangesQuery(new URLSearchParams("after=42&limit=10")), {
+    after: 42n,
+    limit: 10
+  })
+  const seriesQuery = { after: 42n, limit: 10, series: 0xffff_ffff_ffff_ffffn }
+  const seriesParams = sessionChangesQueryParams(seriesQuery)
+  assert.equal(seriesParams.toString(), "after=42&limit=10&series=18446744073709551615")
+  assert.deepEqual(decodeSessionChangesQuery(seriesParams), seriesQuery)
+  for (const series of ["-1", "x", "18446744073709551616"]) {
+    assert.throws(() => decodeSessionChangesQuery(new URLSearchParams({ series })), CodecError)
+  }
+  assert.deepEqual(decodeSessionStateQuery(new URLSearchParams("history_limit=7")), {
+    historyLimit: 7
+  })
+  assert.equal(sessionStateQueryParams({ historyLimit: 7 }).toString(), "history_limit=7")
+  assert.deepEqual(decodeSessionLinksQuery(new URLSearchParams("surface=memory")), {
+    surface: "memory"
+  })
+  assert.equal(sessionLinksQueryParams({ surface: "memory" }).toString(), "surface=memory")
+  assert.throws(() => decodeSessionsQuery(new URLSearchParams("limit=-1")), CodecError)
+  assert.throws(
+    () => decodeSessionEventsQuery(new URLSearchParams("fixed_frontier=yes")),
+    CodecError
+  )
+  assert.throws(() => decodeSessionChangesQuery(new URLSearchParams("after=x")), CodecError)
+  assert.equal(PARAM_FIXED_FRONTIER, "fixed_frontier")
+  assert.equal(PARAM_HISTORY_LIMIT, "history_limit")
+  assert.equal(PARAM_TEXT, "text")
+  assert.equal(streamResource("agents"), "stream:agents")
+  assert.equal(STREAM_RESOURCE_PREFIX, "stream:")
+})
+
+void test("given_a_session_error_when_rendered_as_an_error_body_then_should_carry_its_result_code", () => {
+  assert.deepEqual(sessionErrorBody({ kind: "notRegistered", message: "agents" }), {
+    code: { kind: "known", name: "NotFound" },
+    message: "stream is not registered for sessions: agents"
+  })
+  assert.deepEqual(sessionErrorBody({ kind: "stale", message: "topic 3" }).code, {
+    kind: "known",
+    name: "StaleGeneration"
+  })
+  assert.deepEqual(sessionErrorBody({ kind: "unauthorized", message: "x" }).code, {
+    kind: "known",
+    name: "Forbidden"
+  })
+  assert.deepEqual(sessionErrorBody({ kind: "unrecognized", tag: "Later", value: null }).code, {
+    kind: "known",
+    name: "Backend"
+  })
+})
+
+void test("given_the_session_http_error_fixture_when_decoded_then_should_match_the_session_error_mapping", async () => {
+  assert.deepEqual(
+    decodeErrorBodyJson(await fixture("session_http_error.json")),
+    sessionErrorBody({ kind: "notFound", message: "00000000000000000000000004" })
+  )
+})
+
+void test("given_the_session_http_json_fixtures_when_parsed_exactly_then_should_match_the_binary_replies", async () => {
+  for (const [json, binary] of [
+    ["session_http_page.json", "session_reply_page.bin"],
+    ["session_http_page_rebuilding.json", "session_reply_page_rebuilding.bin"]
+  ] as const) {
+    const parsed = parseCanonicalJson(await fixture(json))
+    assert.ok(parsed instanceof Map, json)
+    const page = await binaryPage(binary)
+    assert.equal(parsed.get("rebuilding") ?? false, page.rebuilding, json)
+    assert.equal(parsed.get("total"), page.total, json)
+    const items: unknown = parsed.get("items")
+    assert.ok(Array.isArray(items), json)
+    assert.deepEqual(
+      items.map((item: unknown) => (item instanceof Map ? (item.get("id") as unknown) : undefined)),
+      page.items.map((item) => item.id.toString()),
+      json
+    )
+  }
+  const series = 7_654_321_098_765_432_101n
+  const text = await fixture("session_http_changes_start_new.json")
+  const start = parseCanonicalJson(text)
+  assert.ok(start instanceof Map)
+  assert.equal(start.get("series"), series)
+  assert.equal(start.get("floor"), 0n)
+  assert.equal(start.get("resync"), true)
+  const { series: rounded } = JSON.parse(text) as { readonly series: number }
+  assert.notEqual(BigInt(rounded), series)
+  const legacy = parseCanonicalJson(await fixture("session_http_changes_legacy.json"))
+  assert.ok(legacy instanceof Map)
+  assert.equal(legacy.has("series"), false)
+})
+
 async function fixture(name: string): Promise<string> {
   return readFile(path.join(FIXTURES_DIR, name), "utf8")
+}
+
+async function binaryPage(name: string): Promise<SessionPage> {
+  const reply = decodeSessionReply(
+    decodeOne(await readFile(path.join(FIXTURES_DIR, name)), name),
+    name
+  )
+  assert.ok(reply.kind === "ok" && reply.outcome.kind === "page", name)
+  return reply.outcome.page
 }
 
 void test("given_the_http_json_fixtures_when_decoded_then_should_re_encode_byte_identically", async () => {
@@ -62,6 +242,7 @@ void test("given_the_http_json_fixtures_when_decoded_then_should_re_encode_byte_
     ["query_route_page.json", decodeQueryRoutePageJson, encodeQueryRoutePageJson],
     ["query_result.json", decodeQueryResultJson, encodeQueryResultJson],
     ["schema_def.json", decodeSchemaDefJson, encodeSchemaDefJson],
+    ["session_http_error.json", decodeErrorBodyJson, encodeErrorBodyJson],
     ["snapshot_page.json", decodeSnapshotPageJson, encodeSnapshotPageJson],
     ["table_file_page.json", decodeTableFilePageJson, encodeTableFilePageJson],
     ["table_metrics.json", decodeTableMetricsJson, encodeTableMetricsJson],
@@ -123,5 +304,31 @@ void test("given_a_legacy_json_id_array_when_decoded_then_should_reject_it", () 
         "submitted_at_micros": 1717171717000000
       }`),
     /operation_id.*Crockford base32 id/
+  )
+})
+
+void test("given_a_filter_list_query_when_the_owner_is_complete_or_partial_then_should_resolve_or_refuse", () => {
+  const identity = {
+    streamId: 1,
+    streamCreatedAtMicros: 10n,
+    topicId: 2,
+    topicCreatedAtMicros: 20n,
+    groupId: 3n
+  }
+  const query = filterListQueryOf(identity)
+  assert.deepEqual(filterListQueryOwner(query), identity)
+  assert.equal(filterListQueryOwner({}), undefined)
+  const params = filterListQueryParams(query)
+  assert.equal(
+    params.toString(),
+    "owner_stream_id=1&owner_stream_created_at_micros=10&owner_topic_id=2&owner_topic_created_at_micros=20&owner_group_id=3"
+  )
+  assert.deepEqual(decodeFilterListQuery(params), query)
+  const { ownerGroupId: _dropped, ...partial } = query
+  assert.throws(
+    () => filterListQueryOwner(partial),
+    new InvalidError(
+      "the owner filter needs owner_stream_id, owner_stream_created_at_micros, owner_topic_id, owner_topic_created_at_micros and owner_group_id together"
+    )
   )
 })

@@ -1,4 +1,24 @@
 import { InvalidError } from "../client/errors.js"
+import { type CborMap, field } from "./cbor.js"
+
+export interface SessionRef {
+  readonly stream: string
+  readonly session: ConversationId
+}
+
+export function encodeSessionRef(ref: SessionRef): Map<string, unknown> {
+  return new Map<string, unknown>([
+    ["stream", ref.stream],
+    ["session", ref.session.toBytes()]
+  ])
+}
+
+export function decodeSessionRef(map: CborMap, context: string): SessionRef {
+  return {
+    stream: field.requiredString(map, "stream", context),
+    session: ConversationId.fromBytes(field.requiredBytes(map, "session", context))
+  }
+}
 
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 const U128_MAX = (1n << 128n) - 1n
@@ -72,6 +92,28 @@ export interface LogPosition {
   readonly topicId: number
   readonly partitionId: number
   readonly offset: bigint
+}
+
+/** A locator at `(stream, topic, partition, offset)`, like Rust `LogPosition::new`. */
+export function newLogPosition(
+  streamId: number,
+  topicId: number,
+  partitionId: number,
+  offset: bigint
+): LogPosition {
+  for (const [name, value] of [
+    ["streamId", streamId],
+    ["topicId", topicId],
+    ["partitionId", partitionId]
+  ] as const) {
+    if (!Number.isInteger(value) || value < 0 || value > 0xffff_ffff) {
+      throw new InvalidError(`log position ${name} must be an unsigned 32-bit integer`)
+    }
+  }
+  if (offset < 0n || offset > 0xffff_ffff_ffff_ffffn) {
+    throw new InvalidError("log position offset must be an unsigned 64-bit integer")
+  }
+  return { streamId, topicId, partitionId, offset }
 }
 
 export function logPositionToBytes(position: LogPosition): Uint8Array {

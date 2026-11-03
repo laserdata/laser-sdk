@@ -141,7 +141,10 @@ mod tests {
                 .build(),
             payload: payload.to_vec(),
             envelope: None,
-            topic: "agent.commands".to_owned(),
+            topic: "agent.sessions".to_owned(),
+            timestamp_micros: 0,
+            stream_id: 1,
+            topic_id: 1,
         }
     }
 
@@ -167,7 +170,7 @@ mod tests {
             mode: "enforce".to_owned(),
             kind: "send".to_owned(),
             stream: "laser".to_owned(),
-            topic: "agent.commands".to_owned(),
+            topic: "agent.sessions".to_owned(),
             source: Some("planner".to_owned()),
             target: None,
             conversation: None,

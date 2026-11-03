@@ -3,6 +3,13 @@
 The Python peer of the Rust `governance` example. Live role and binding calls
 need server-side `authz`. The pure decision pieces run everywhere.
 
+Set LASER_GOVERNANCE_USER_ID to bind the example roles to a specific Iggy user.
+The Rust and TypeScript examples create a dedicated `governance-demo` user when
+it is unset. The Python SDK has no Iggy user management, so without the
+variable this example defines the roles and skips the binding. It never binds
+to the caller: the role set includes deny-wins grants, and binding those to the
+session user would poison every later run against the same server.
+
     python3 governance.py
 """
 
@@ -12,17 +19,21 @@ import _common
 import laser_sdk as ls
 
 EXAMPLE = "governance"
+TARGET_USER_ENV = "LASER_GOVERNANCE_USER_ID"
 
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
     try:
-        await laser.bootstrap(_common.PARTITIONS)
+        await laser.bootstrap(
+            _common.PARTITIONS, retention=ls.TopicRetention.expire_after(86_400_000)
+        )
 
         _common.phase("Capability RBAC: roles bound to a server-stamped user")
         caps = await laser.capabilities()
         if _common.managed_gate(caps.authz, "capability RBAC", "governance"):
-            await install_roles(laser, _common.env_int("LASER_GOVERNANCE_USER_ID", 1))
+            target_user = _common.env_int(TARGET_USER_ENV, -1)
+            await install_roles(laser, target_user if target_user >= 0 else None)
 
         _common.phase("Permission intersection: agent grants cannot exceed the user")
         demonstrate_intersection()
@@ -30,27 +41,25 @@ async def main() -> None:
         _common.phase("External edge: audience validation and step-up")
         demonstrate_edge_auth()
 
-        _common.phase("Run governor: submit a budgeted managed run when served")
-        if caps.agent_workflow:
-            await submit_budgeted_run(laser)
-        else:
-            print("agent_workflow is not advertised, so the live budgeted-run submit is skipped.")
+        _common.phase("Session governor: submit a budgeted session")
+        await submit_budgeted_session(laser)
 
         print(
             "\ngovernance: role grants, deny-wins matching, on-behalf-of intersection,\n"
-            "external-edge step-up, and budgeted run submission share one governance model."
+            "external-edge step-up, and budgeted session submission share one governance model."
         )
     finally:
         await laser.close()
 
 
-async def install_roles(laser, target_user: int) -> None:
+async def install_roles(laser, target_user: int | None) -> None:
     for name, grants in roles().items():
         await laser.define_role(name, grants)
         print(f"defined role: {name}")
 
     bound = ["support-reader", "projection-operator", "agent-runner", "safety-deny"]
-    await laser.bind_roles(target_user, bound)
+    if target_user is not None:
+        await laser.bind_roles(target_user, bound)
 
     who = await laser.whoami()
     print(f"caller roles: {who.roles}, effective grants: {len(who.grants)}")
@@ -58,6 +67,9 @@ async def install_roles(laser, target_user: int) -> None:
     print("roles with prefix `support`:", [role.name for role in support_roles])
     if await laser.get_role("support-reader") is None:
         print("support-reader role was not visible after define")
+    if target_user is None:
+        print(f"set {TARGET_USER_ENV} to bind the roles to a user")
+        return
     bindings = await laser.get_bindings(target_user)
     print(f"user {target_user} is bound to: {bindings}")
 
@@ -111,21 +123,15 @@ def demonstrate_edge_auth() -> None:
     print(f"foreign audience rejected: {denial.kind == 'wrong_audience'}")
 
 
-async def submit_budgeted_run(laser) -> None:
-    budget = ls.RunBudget(
-        max_events=8,
-        max_model_calls=1,
-        max_tool_calls=2,
-        max_wall_clock_micros=30_000_000,
+async def submit_budgeted_session(laser) -> None:
+    submitted = await (
+        laser.sessions()
+        .submit("governance-auditor", b"audit this incident")
+        .from_("governance")
+        .budget(ls.Budget(tokens=4_000))
+        .send()
     )
-    try:
-        run = await laser.runs().submit_budgeted(
-            "governance-auditor", input=b"audit this incident", budget=budget
-        )
-    except ls.UnsupportedError as exc:
-        print(f"budgeted run submit returned unsupported: {exc}")
-        return
-    print(f"submitted budgeted run: {run.run_id}")
+    print(f"submitted budgeted session: {submitted.session}")
 
 
 if __name__ == "__main__":

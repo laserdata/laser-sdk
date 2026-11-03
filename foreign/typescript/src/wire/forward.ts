@@ -1,6 +1,27 @@
 import { CodecError } from "../client/errors.js"
-import { decodeGrant, encodeGrant, type Grant } from "./authz.js"
+import { type AgentId, parseAgentId } from "./agent-id.js"
+import { decodeGrant, encodeGrant, type Grant, type Tenancy } from "./authz.js"
 import { type CborMap, expectMap, field } from "./cbor.js"
+import {
+  type ForwardedScope,
+  type MutationPosition,
+  type SessionPosition,
+  decodeForwardedScope,
+  decodeMutationPosition,
+  decodeSessionPosition,
+  encodeForwardedScope,
+  encodeMutationPosition,
+  encodeSessionPosition
+} from "./mutation.js"
+
+export {
+  type Caller,
+  type ForwardedScope,
+  decodeCaller,
+  decodeForwardedScope,
+  encodeCaller,
+  encodeForwardedScope
+} from "./mutation.js"
 
 export interface ForwardedQuery {
   readonly userId: number
@@ -8,6 +29,10 @@ export interface ForwardedQuery {
   readonly correlation?: string
   readonly queryEnvelope: Uint8Array
   readonly grants: readonly Grant[]
+  /** Absent for deployment tenancy, as Rust skips the default. */
+  readonly tenancy?: Tenancy
+  /** The stream of the queried index, stamped after a native read check. */
+  readonly scope?: ForwardedScope
 }
 
 export interface ForwardedCommand {
@@ -16,9 +41,22 @@ export interface ForwardedCommand {
   readonly correlation?: string
   readonly operationId?: bigint
   readonly readAll: boolean
+  readonly scope?: ForwardedScope
   readonly commandCode: number
   readonly payload: Uint8Array
   readonly grants: readonly Grant[]
+  readonly readBarrier: boolean
+  readonly minPosition?: MutationPosition
+  readonly positionedReply: boolean
+  readonly minSessions: readonly SessionPosition[]
+  /** Absent for deployment tenancy, as Rust skips the default. */
+  readonly tenancy?: Tenancy
+  /** The agent the calling connection declared in its presence, set by the
+   * server on a client's mutation. A claim, never verified. */
+  readonly agent?: AgentId
+  /** Set by the server from the `agdx-on-behalf-of` header on an HTTP write:
+   * the end user an intermediary wrote for. A claim, never verified. */
+  readonly onBehalfOf?: string
 }
 
 function requireU128(value: bigint, context: string): bigint {
@@ -49,17 +87,23 @@ export function encodeForwardedQuery(query: ForwardedQuery): Map<string, unknown
   ])
   map.set("query_envelope", query.queryEnvelope)
   if (query.grants.length > 0) map.set("grants", encodeGrants(query.grants))
+  if (query.tenancy === "stream") map.set("tenancy", query.tenancy)
+  if (query.scope !== undefined) map.set("scope", encodeForwardedScope(query.scope))
   return map
 }
 
 export function decodeForwardedQuery(map: CborMap, context: string): ForwardedQuery {
   const correlation = decodeCorrelation(map, context)
+  const tenancy = decodeTenancy(map, context)
+  const scopeMap = field.optionalMap(map, "scope", context)
   return {
     userId: field.requiredU32(map, "user_id", context),
     clientId: field.requiredU128(map, "client_id", context),
     ...(correlation !== undefined ? { correlation } : {}),
     queryEnvelope: field.requiredBytes(map, "query_envelope", context),
-    grants: decodeGrants(map, context)
+    grants: decodeGrants(map, context),
+    ...(tenancy !== undefined ? { tenancy } : {}),
+    ...(scopeMap !== undefined ? { scope: decodeForwardedScope(scopeMap, `${context}.scope`) } : {})
   }
 }
 
@@ -73,25 +117,64 @@ export function encodeForwardedCommand(command: ForwardedCommand): Map<string, u
     map.set("operation_id", requireU128(command.operationId, "ForwardedCommand.operationId"))
   }
   map.set("read_all", command.readAll)
+  if (command.scope !== undefined) map.set("scope", encodeForwardedScope(command.scope))
   map.set("command_code", BigInt(command.commandCode))
   map.set("payload", command.payload)
   if (command.grants.length > 0) map.set("grants", encodeGrants(command.grants))
+  if (command.readBarrier) map.set("read_barrier", true)
+  if (command.minPosition !== undefined) {
+    map.set("min_position", encodeMutationPosition(command.minPosition))
+  }
+  if (command.positionedReply) map.set("positioned_reply", true)
+  if (command.minSessions.length > 0) {
+    map.set("min_sessions", command.minSessions.map(encodeSessionPosition))
+  }
+  if (command.tenancy === "stream") map.set("tenancy", command.tenancy)
+  if (command.agent !== undefined) map.set("agent", command.agent)
+  if (command.onBehalfOf !== undefined) map.set("on_behalf_of", command.onBehalfOf)
   return map
 }
 
 export function decodeForwardedCommand(map: CborMap, context: string): ForwardedCommand {
   const correlation = decodeCorrelation(map, context)
   const operationId = field.optionalU128(map, "operation_id", context)
+  const scopeMap = field.optionalMap(map, "scope", context)
+  const tenancy = decodeTenancy(map, context)
+  const minPosition = field.optionalMap(map, "min_position", context)
+  const agent = field.optionalString(map, "agent", context)
+  const onBehalfOf = field.optionalString(map, "on_behalf_of", context)
   return {
     userId: field.requiredU32(map, "user_id", context),
     clientId: field.requiredU128(map, "client_id", context),
     ...(correlation !== undefined ? { correlation } : {}),
     ...(operationId !== undefined ? { operationId } : {}),
     readAll: field.optionalBoolean(map, "read_all", context) ?? false,
+    ...(scopeMap !== undefined
+      ? { scope: decodeForwardedScope(scopeMap, `${context}.scope`) }
+      : {}),
     commandCode: field.requiredU32(map, "command_code", context),
     payload: field.requiredBytes(map, "payload", context),
-    grants: decodeGrants(map, context)
+    grants: decodeGrants(map, context),
+    readBarrier: field.optionalBoolean(map, "read_barrier", context) ?? false,
+    ...(minPosition !== undefined
+      ? { minPosition: decodeMutationPosition(minPosition, `${context}.min_position`) }
+      : {}),
+    positionedReply: field.optionalBoolean(map, "positioned_reply", context) ?? false,
+    minSessions: field.optionalArray(map, "min_sessions", context, (item, index) => {
+      const itemContext = `${context}.min_sessions[${String(index)}]`
+      return decodeSessionPosition(expectMap(item, itemContext), itemContext)
+    }),
+    ...(tenancy !== undefined ? { tenancy } : {}),
+    ...(agent !== undefined ? { agent: parseAgentId(agent) } : {}),
+    ...(onBehalfOf !== undefined ? { onBehalfOf } : {})
   }
+}
+
+function decodeTenancy(map: CborMap, context: string): Tenancy | undefined {
+  const tenancy = field.optionalString(map, "tenancy", context)
+  if (tenancy === undefined || tenancy === "deployment") return undefined
+  if (tenancy === "stream") return tenancy
+  throw new CodecError(`unknown tenancy \`${tenancy}\``, context, "tenancy")
 }
 
 function decodeCorrelation(map: CborMap, context: string): string | undefined {

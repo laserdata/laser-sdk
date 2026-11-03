@@ -5,13 +5,15 @@ use crate::filter::expr::ConsumerFilter;
 use crate::limits::{
     MAX_FILTER_PREVIEW_EXAMINED, MAX_FILTER_PREVIEW_RECORDS, MAX_FILTER_SAMPLE_BYTES,
     MAX_FILTER_SAMPLE_HEADERS, MAX_FILTER_SOURCE_NAME_BYTES, MAX_FILTERED_PAGE_BYTES,
-    MAX_FILTERED_PAGE_EXAMINED, MAX_FILTERED_PAGE_RECORDS,
+    MAX_FILTERED_PAGE_EXAMINED, MAX_FILTERED_PAGE_RECORDS, MAX_FILTERED_WAIT_CANCEL_IDS,
+    MAX_FILTERED_WAIT_MS, MAX_FILTERED_WAIT_PARTITIONS,
 };
 use crate::result::ResultCode;
 use crate::schema::Digest32;
 use crate::validate::Validate;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeSet;
 use std::fmt;
 
 /// The stream and topic a filtered read or preview addresses, by name.
@@ -110,31 +112,10 @@ pub enum FilteredStart {
     First,
     Last,
     Offset(u64),
-    /// Records at or after this broker timestamp, in microseconds.
+    /// Records at or after this server append timestamp, in microseconds.
     Timestamp(u64),
     /// Continue exactly where the previous page stopped.
     Continue(Continuation),
-}
-
-/// Which replica serves the read.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum ReadMode {
-    /// The partition primary, through an attached consumer session. The owner
-    /// proves the page came from the generation the reply names. Required for
-    /// acknowledgments.
-    #[default]
-    Primary,
-    /// Whatever replica the connection reaches. It may lag without bound, so it
-    /// serves diagnostics and previews, never acknowledgments.
-    Local,
-}
-
-impl ReadMode {
-    pub const fn is_primary(&self) -> bool {
-        matches!(self, Self::Primary)
-    }
 }
 
 /// How the server selected the records of a page. `Unfiltered` is the explicit
@@ -174,9 +155,10 @@ fn validate_policy_identity(
     }
 }
 
-/// The exact source history a page was read from. A purge or a recreated
-/// stream, topic, or partition changes it, so a continuation or acknowledgment
-/// from an older history is rejected rather than applied to new records.
+/// The exact source history a page was read from. A recreated stream, topic,
+/// or partition changes it, so a continuation or acknowledgment from an older
+/// history is rejected rather than applied to new records. The partition is
+/// named by its incarnation, the value its route reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceGeneration {
     pub stream_id: u32,
@@ -184,8 +166,18 @@ pub struct SourceGeneration {
     pub topic_id: u32,
     pub topic_created_at_micros: u64,
     pub partition_id: u32,
-    pub partition_created_revision: u64,
-    pub purge_generation: u64,
+    pub partition_incarnation: u64,
+}
+
+/// The partition owner a page was read under. The reader stores the page's
+/// offset with it and the page's partition incarnation, so the store is refused
+/// once the partition was recreated or its consumer group assignment moved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckContext {
+    /// The consumer group owner generation, zero for an independent consumer.
+    pub owner_generation: u64,
+    /// The metadata operation the serving node had applied when it read the page.
+    pub metadata_op: u64,
 }
 
 /// The resume point a page hands to the next request.
@@ -198,16 +190,56 @@ pub struct Continuation {
     /// The digest of the filter the page ran, absent for an unfiltered page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<Digest32>,
-    /// The route the page was read on. A continuation from a local page never
-    /// resumes a primary read, because a local replica can lag a purge.
-    #[serde(default, skip_serializing_if = "ReadMode::is_primary")]
-    pub read_mode: ReadMode,
     #[serde(default)]
     pub mode: ExecutionMode,
     /// The group's policy generation the page ran under, zero for an
     /// independent consumer.
     #[serde(default)]
     pub policy_generation: u64,
+}
+
+/// Hold until one of `partitions` has a record at or after its offset, or
+/// `max_wait_ms` passes. The server lowers the wait to its announced limit and
+/// reads nothing: the reader then sends a filtered poll to the ready ones.
+/// `wait_id` names the wait on its connection so a [`FilteredWaitCancel`] can
+/// end it early.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteredWaitRequest {
+    pub v: u32,
+    pub source: FilterSource,
+    pub consumer: FilterConsumer,
+    pub partitions: Vec<FilteredWaitPartition>,
+    pub max_wait_ms: u32,
+    pub wait_id: u64,
+}
+
+/// End the filtered waits this connection holds under `wait_ids`. Each
+/// cancelled wait answers at once with no ready partition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteredWaitCancel {
+    pub v: u32,
+    pub wait_ids: Vec<u64>,
+}
+
+/// The waits a [`FilteredWaitCancel`] ended. A wait that had already answered
+/// or was never held is left out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteredWaitCancelled {
+    pub cancelled: Vec<u64>,
+}
+
+/// One partition of a filtered wait and the offset its next read starts at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteredWaitPartition {
+    pub partition_id: u32,
+    pub offset: u64,
+}
+
+/// The partitions that hold a record at or after their offset. Empty when the
+/// wait ended first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteredWaitResult {
+    pub ready: Vec<u32>,
 }
 
 /// Read one bounded page of matching records from one partition.
@@ -223,8 +255,6 @@ pub struct FilteredPollRequest {
     pub count: u32,
     /// Most record bytes to return. The server may lower it.
     pub max_reply_bytes: u32,
-    #[serde(default)]
-    pub read_mode: ReadMode,
     /// Most source records to examine. The server lowers it to its own
     /// budget. Absent means the server budget alone. A normal consumer sets
     /// it to `count`, so a batch of 100 examines at most 100 records.
@@ -370,25 +400,28 @@ impl Validate for AppliedPolicy {
 
 /// One page of a filtered read.
 ///
-/// `records` is a standard polled-messages body: the matching records keep
-/// their original offsets, ids, timestamps, headers, and payload bytes.
+/// `records` is a standard polled-messages body: its head names the partition,
+/// the head offset, the record count and the partition context the page was
+/// served under, and the matching records keep their original offsets, ids,
+/// timestamps, headers, and payload bytes.
 /// `next_scan_offset` is the first record the server has not examined, `None`
 /// when nothing was examined and the start selector must be sent again.
-/// `safe_ack_offset` is the last examined offset. The reader may acknowledge it
-/// only after every returned record at or below it is fully handled.
+/// `safe_ack_offset` is the last examined offset. The reader may store it, with
+/// `ack_context`, only after every returned record at or below it is fully
+/// handled.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FilteredPage {
     pub v: u32,
     pub partition_id: u32,
     pub policy: AppliedPolicy,
     pub generation: SourceGeneration,
-    pub read_mode: ReadMode,
+    pub ack_context: AckContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_scan_offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safe_ack_offset: Option<u64>,
-    /// The serving replica's partition head when the page was read. Reported,
-    /// never used as scan progress.
+    /// The primary's partition head when the page was read. Reported, never
+    /// used as scan progress.
     pub frontier: u64,
     pub examined: u32,
     pub matched: u32,
@@ -415,7 +448,6 @@ impl FilteredPage {
                 next_scan_offset,
                 generation: self.generation,
                 digest: self.policy.digest.clone(),
-                read_mode: self.read_mode,
                 mode: self.policy.mode,
                 policy_generation: self.policy.policy_generation,
             }),
@@ -436,6 +468,7 @@ pub struct FilteredAck {
     pub partition_id: u32,
     pub consumer: FilterConsumer,
     pub generation: SourceGeneration,
+    pub ack_context: AckContext,
     /// The digest of the filter the page ran, absent for an unfiltered page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<Digest32>,
@@ -505,7 +538,6 @@ pub struct FilterPreview {
     pub v: u32,
     pub partition_id: u32,
     pub policy: AppliedPolicy,
-    pub read_mode: ReadMode,
     pub examined: u32,
     pub matched: u32,
     pub faults: u32,
@@ -618,13 +650,11 @@ pub enum FilterErrorReason {
     /// A policy or mutation precondition does not hold (a different digest is
     /// bound, a name is taken, an expected revision moved).
     Conflict,
-    /// The source history changed (purge or recreation) since the page or
-    /// continuation was issued.
+    /// The source history changed (recreation) since the page or continuation
+    /// was issued.
     SourceChanged,
     /// The consumer no longer owns the partition, or its session ended.
     MembershipStale,
-    /// This node is not the partition primary. Resolve the route again.
-    NotPrimary,
     /// The catalog cannot confirm the policy right now.
     CatalogUnavailable,
     /// The saved revision is paused. Pending records may still be acknowledged.
@@ -654,7 +684,7 @@ impl FilterErrorReason {
             Self::NotFound => ResultCode::NotFound,
             Self::Conflict => ResultCode::Conflict,
             Self::SourceChanged => ResultCode::StaleGeneration,
-            Self::MembershipStale | Self::NotPrimary => ResultCode::Stale,
+            Self::MembershipStale => ResultCode::Stale,
             Self::CatalogUnavailable | Self::Unavailable | Self::RevisionDisabled => {
                 ResultCode::Unavailable
             }
@@ -710,6 +740,8 @@ pub enum FilterOutcome {
     Preview(FilterPreview),
     Tested(FilterTestResult),
     Validated(FilterValidation),
+    Ready(FilteredWaitResult),
+    Cancelled(FilteredWaitCancelled),
 }
 
 /// The reply to every server-native consumer-filter command.
@@ -766,6 +798,53 @@ impl Validate for FilterRef {
             Self::Inline(filter) => filter.validate(),
             Self::Revision { .. } | Self::Bound | Self::Group => Ok(()),
         }
+    }
+}
+
+impl Validate for FilteredWaitRequest {
+    fn validate(&self) -> Result<(), InvalidError> {
+        validate_version(self.v)?;
+        self.source.validate()?;
+        self.consumer.validate()?;
+        if self.partitions.is_empty() || self.partitions.len() > MAX_FILTERED_WAIT_PARTITIONS {
+            return Err(InvalidError::new(format!(
+                "a filtered wait names 1..={MAX_FILTERED_WAIT_PARTITIONS} partitions"
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        if !self
+            .partitions
+            .iter()
+            .all(|partition| seen.insert(partition.partition_id))
+        {
+            return Err(InvalidError::new(
+                "a filtered wait names each partition once",
+            ));
+        }
+        if self.max_wait_ms > MAX_FILTERED_WAIT_MS {
+            return Err(InvalidError::new(format!(
+                "max_wait_ms must be 0..={MAX_FILTERED_WAIT_MS}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for FilteredWaitCancel {
+    fn validate(&self) -> Result<(), InvalidError> {
+        validate_version(self.v)?;
+        if self.wait_ids.is_empty() || self.wait_ids.len() > MAX_FILTERED_WAIT_CANCEL_IDS {
+            return Err(InvalidError::new(format!(
+                "a filtered wait cancel names 1..={MAX_FILTERED_WAIT_CANCEL_IDS} waits"
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        if !self.wait_ids.iter().all(|wait_id| seen.insert(*wait_id)) {
+            return Err(InvalidError::new(
+                "a filtered wait cancel names each wait once",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -906,6 +985,124 @@ mod tests {
     use crate::filter::expr::FilterExpr;
     use crate::query::CmpOp;
 
+    fn wait_request() -> FilteredWaitRequest {
+        FilteredWaitRequest {
+            v: FILTER_OP_VERSION,
+            source: FilterSource {
+                stream: "orbit".to_owned(),
+                topic: "fleet".to_owned(),
+            },
+            consumer: FilterConsumer::Group("desk".to_owned()),
+            partitions: vec![
+                FilteredWaitPartition {
+                    partition_id: 0,
+                    offset: 12,
+                },
+                FilteredWaitPartition {
+                    partition_id: 1,
+                    offset: 0,
+                },
+            ],
+            max_wait_ms: 5_000,
+            wait_id: 9,
+        }
+    }
+
+    #[test]
+    fn given_a_wait_cancel_when_encoded_as_json_then_should_round_trip_with_its_reply() {
+        let cancel = FilteredWaitCancel {
+            v: FILTER_OP_VERSION,
+            wait_ids: vec![9, 11],
+        };
+        cancel.validate().expect("valid");
+        let json = serde_json::to_string(&cancel).expect("encodes");
+        assert_eq!(
+            serde_json::from_str::<FilteredWaitCancel>(&json).expect("decodes"),
+            cancel
+        );
+        let cancelled = FilterReply::Ok(FilterOutcome::Cancelled(FilteredWaitCancelled {
+            cancelled: vec![9],
+        }));
+        let json = serde_json::to_string(&cancelled).expect("encodes");
+        assert_eq!(
+            serde_json::from_str::<FilterReply>(&json).expect("decodes"),
+            cancelled
+        );
+    }
+
+    #[test]
+    fn given_wait_cancels_out_of_range_when_validated_then_should_be_rejected() {
+        let cancel = |wait_ids: Vec<u64>| FilteredWaitCancel {
+            v: FILTER_OP_VERSION,
+            wait_ids,
+        };
+        let too_many = cancel((0..=MAX_FILTERED_WAIT_CANCEL_IDS as u64).collect());
+        let old_version = FilteredWaitCancel {
+            v: FILTER_OP_VERSION + 1,
+            ..cancel(vec![1])
+        };
+        for request in [
+            cancel(Vec::new()),
+            cancel(vec![4, 4]),
+            too_many,
+            old_version,
+        ] {
+            assert!(request.validate().is_err(), "{request:?} must be rejected");
+        }
+        cancel((0..MAX_FILTERED_WAIT_CANCEL_IDS as u64).collect())
+            .validate()
+            .expect("the cap is accepted");
+    }
+
+    #[test]
+    fn given_a_wait_request_when_encoded_as_json_then_should_round_trip() {
+        let request = wait_request();
+        request.validate().expect("valid");
+        let json = serde_json::to_string(&request).expect("encodes");
+        assert_eq!(
+            serde_json::from_str::<FilteredWaitRequest>(&json).expect("decodes"),
+            request
+        );
+        let ready = FilterReply::Ok(FilterOutcome::Ready(FilteredWaitResult { ready: vec![1] }));
+        let json = serde_json::to_string(&ready).expect("encodes");
+        assert_eq!(
+            serde_json::from_str::<FilterReply>(&json).expect("decodes"),
+            ready
+        );
+    }
+
+    #[test]
+    fn given_wait_requests_out_of_range_when_validated_then_should_be_rejected() {
+        let no_partitions = FilteredWaitRequest {
+            partitions: Vec::new(),
+            ..wait_request()
+        };
+        let too_long = FilteredWaitRequest {
+            max_wait_ms: MAX_FILTERED_WAIT_MS + 1,
+            ..wait_request()
+        };
+        let mut repeated = wait_request();
+        repeated.partitions[1].partition_id = 0;
+        let too_many = FilteredWaitRequest {
+            partitions: (0..=MAX_FILTERED_WAIT_PARTITIONS as u32)
+                .map(|partition_id| FilteredWaitPartition {
+                    partition_id,
+                    offset: 0,
+                })
+                .collect(),
+            ..wait_request()
+        };
+        for request in [no_partitions, too_long, repeated, too_many] {
+            assert!(request.validate().is_err(), "{request:?} must be rejected");
+        }
+        FilteredWaitRequest {
+            max_wait_ms: 0,
+            ..wait_request()
+        }
+        .validate()
+        .expect("a zero wait answers at once");
+    }
+
     fn generation() -> SourceGeneration {
         SourceGeneration {
             stream_id: 1,
@@ -913,8 +1110,7 @@ mod tests {
             topic_id: 2,
             topic_created_at_micros: 20,
             partition_id: 0,
-            partition_created_revision: 30,
-            purge_generation: 0,
+            partition_incarnation: 30,
         }
     }
 
@@ -931,7 +1127,6 @@ mod tests {
             start: FilteredStart::Next,
             count: 100,
             max_reply_bytes: 1024 * 1024,
-            read_mode: ReadMode::Primary,
             max_examined: None,
             min_catalog_position: None,
         }
@@ -959,7 +1154,6 @@ mod tests {
                 ..generation()
             },
             digest: Some(Digest32::new([1; 32])),
-            read_mode: ReadMode::Primary,
             mode: ExecutionMode::Filtered,
             policy_generation: 0,
         });
@@ -976,7 +1170,6 @@ mod tests {
             next_scan_offset: 7,
             generation: generation(),
             digest: Some(Digest32::new([1; 32])),
-            read_mode: ReadMode::Primary,
             mode: ExecutionMode::Unfiltered,
             policy_generation: 1,
         });
@@ -1046,7 +1239,10 @@ mod tests {
                 policy_generation: 0,
             },
             generation: generation(),
-            read_mode: ReadMode::Primary,
+            ack_context: AckContext {
+                owner_generation: 4,
+                metadata_op: 40,
+            },
             next_scan_offset: Some(1397),
             safe_ack_offset: Some(1396),
             frontier: 2000,
@@ -1065,7 +1261,6 @@ mod tests {
                 next_scan_offset: 1397,
                 generation: generation(),
                 digest: Some(Digest32::new([9; 32])),
-                read_mode: ReadMode::Primary,
                 mode: ExecutionMode::Filtered,
                 policy_generation: 0,
             })
@@ -1081,10 +1276,10 @@ mod tests {
     #[test]
     fn given_error_reasons_when_classified_then_should_map_to_shared_codes() {
         assert_eq!(
-            FilterError::new(FilterErrorReason::SourceChanged, "purged").code,
+            FilterError::new(FilterErrorReason::SourceChanged, "recreated").code,
             ResultCode::StaleGeneration
         );
-        assert_eq!(FilterErrorReason::NotPrimary.code(), ResultCode::Stale);
+        assert_eq!(FilterErrorReason::MembershipStale.code(), ResultCode::Stale);
         assert_eq!(FilterErrorReason::Conflict.code(), ResultCode::Conflict);
         assert_eq!(
             FilterErrorReason::CatalogUnavailable.code(),

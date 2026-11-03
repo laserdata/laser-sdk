@@ -12,7 +12,7 @@ impl AgentHandler for Planner {
             .agent("planner".parse()?)
             .build();
         Router::to("executor".parse()?).apply(&mut handoff);
-        ctx.send(AgentTopic::ToolCalls, message.payload.clone(), &handoff)
+        ctx.send(AgentTopic::Sessions, message.payload.clone(), &handoff)
             .await
     }
 }
@@ -31,27 +31,31 @@ impl AgentHandler for Executor {
 
 #[tokio::test]
 #[serial_test::serial(integration)]
-async fn given_a_planner_and_executor_when_a_command_arrives_then_should_hand_off_across_topics() {
+async fn given_a_planner_and_executor_when_a_command_arrives_then_should_hand_off_on_the_shared_topic()
+ {
     let laser = harness::laser().await;
     let _agent_lifetime_1 = Agent::builder()
         .id("planner".parse().expect("planner is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Planner)
         .build()
         .spawn(laser.clone());
     let _agent_lifetime_2 = Agent::builder()
         .id("executor".parse().expect("executor is a valid agent id"))
-        .listen_on(AgentTopic::ToolCalls)
-        .respond_on(AgentTopic::Responses)
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
         .handler(Executor)
         .build()
         .spawn(laser.clone());
 
     let conversation = ConversationId::new();
-    let command = Provenance::builder().conversation_id(conversation).build();
+    // Both agents read the shared session topic, so the client addresses the
+    // planner. An untargeted command would be work for every role.
+    let mut command = Provenance::builder().conversation_id(conversation).build();
+    Router::to("planner".parse().expect("planner is a valid agent id")).apply(&mut command);
     laser
         .send_agent(
-            AgentTopic::Commands,
+            AgentTopic::Sessions,
             Bytes::from_static(b"ship it"),
             &command,
         )
@@ -61,13 +65,22 @@ async fn given_a_planner_and_executor_when_a_command_arrives_then_should_hand_of
     let responses = harness::eventually(|| {
         let laser = laser.clone();
         async move {
-            let responses = ContextAssembler::builder()
+            let responses: Vec<_> = ContextAssembler::builder()
                 .conversation_id(conversation)
-                .topics(vec![AgentTopic::Responses])
+                .topics(vec![AgentTopic::Sessions])
                 .build()
                 .assemble(&laser)
                 .await
-                .expect("assembling the responses should succeed");
+                .expect("assembling the responses should succeed")
+                .into_iter()
+                .filter(|message| {
+                    message
+                        .provenance
+                        .agent
+                        .as_ref()
+                        .is_some_and(|agent| agent.as_str() == "executor")
+                })
+                .collect();
             (!responses.is_empty()).then_some(responses)
         }
     })

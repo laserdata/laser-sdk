@@ -1,61 +1,112 @@
-import { CodecError } from "../client/errors.js"
-import { type CborMap, expectMap, field } from "./cbor.js"
+import { CodecError, InvalidError } from "../client/errors.js"
+import { type CborMap, expectU32, expectU64, field } from "./cbor.js"
 import { ConversationId } from "./ids.js"
 
+export interface SnapshotOffset {
+  readonly topicId: number
+  readonly topicCreatedAtMicros: bigint
+  readonly partitionId: number
+  readonly offset: bigint
+}
+
 export interface FoldSnapshot {
+  readonly stream: string
+  readonly streamId: number
+  readonly streamCreatedAtMicros: bigint
   readonly conversation: ConversationId
-  readonly asOf: ReadonlyMap<number, bigint>
+  readonly fold: string
+  readonly asOf: readonly SnapshotOffset[]
   readonly state: Uint8Array
 }
 
 export function encodeFoldSnapshot(snapshot: FoldSnapshot): Map<string, unknown> {
-  const asOf = new Map<bigint, bigint>()
-  for (const [partition, offset] of [...snapshot.asOf].sort(([left], [right]) => left - right)) {
-    asOf.set(BigInt(partition), offset)
-  }
+  validateFoldSnapshot(snapshot)
   return new Map<string, unknown>([
+    ["stream", snapshot.stream],
+    ["stream_id", BigInt(snapshot.streamId)],
+    ["stream_created_at_micros", snapshot.streamCreatedAtMicros],
     ["conversation", snapshot.conversation.toBytes()],
-    ["as_of", asOf],
+    ["fold", snapshot.fold],
+    [
+      "as_of",
+      snapshot.asOf.map((entry) => [
+        BigInt(entry.topicId),
+        entry.topicCreatedAtMicros,
+        BigInt(entry.partitionId),
+        entry.offset
+      ])
+    ],
     ["state", snapshot.state]
   ])
 }
 
 export function decodeFoldSnapshot(map: CborMap, context: string): FoldSnapshot {
-  const rawAsOf = expectMap(map.get("as_of"), `${context}.as_of`)
-  const asOf = new Map<number, bigint>()
-  for (const [rawPartition, rawOffset] of rawAsOf) {
-    const partition = coercePartition(rawPartition, context)
-    if (asOf.has(partition)) {
+  const asOf = field.requiredArray(map, "as_of", context, (raw, index) => {
+    if (!Array.isArray(raw) || raw.length !== 4)
       throw new CodecError(
-        `duplicate partition ${String(partition)} in ${context}.as_of`,
+        `source offset ${String(index)} must have four integers`,
         context,
         "as_of"
       )
+    return {
+      topicId: expectU32(raw[0], `${context}.as_of[${String(index)}].topic_id`),
+      topicCreatedAtMicros: expectU64(
+        raw[1],
+        `${context}.as_of[${String(index)}].topic_created_at_micros`
+      ),
+      partitionId: expectU32(raw[2], `${context}.as_of[${String(index)}].partition_id`),
+      offset: expectU64(raw[3], `${context}.as_of[${String(index)}].offset`)
     }
-    asOf.set(partition, coerceOffset(rawOffset, context))
-  }
-  return {
+  })
+  const snapshot: FoldSnapshot = {
+    stream: field.requiredString(map, "stream", context),
+    streamId: field.requiredU32(map, "stream_id", context),
+    streamCreatedAtMicros: field.requiredU64(map, "stream_created_at_micros", context),
     conversation: ConversationId.fromBytes(field.requiredBytes(map, "conversation", context)),
+    fold: field.requiredString(map, "fold", context),
     asOf,
     state: field.requiredBytes(map, "state", context)
   }
+  validateFoldSnapshot(snapshot)
+  return snapshot
 }
 
-export function foldSnapshotResumeOffset(snapshot: FoldSnapshot, partition: number): bigint {
-  const offset = snapshot.asOf.get(partition)
-  if (offset === undefined) return 0n
-  return offset === (1n << 64n) - 1n ? offset : offset + 1n
-}
-
-function coercePartition(value: unknown, context: string): number {
-  if (typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff) {
-    return value
+export function foldSnapshotResumeOffset(
+  snapshot: FoldSnapshot,
+  topicId: number,
+  topicCreatedAtMicros: bigint,
+  partitionId: number
+): bigint {
+  let low = 0
+  let high = snapshot.asOf.length
+  const wanted = { topicId, topicCreatedAtMicros, partitionId, offset: 0n }
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2)
+    const entry = snapshot.asOf[middle]
+    if (entry === undefined) break
+    const order = compareSource(entry, wanted)
+    if (order < 0) low = middle + 1
+    else high = middle
   }
-  throw new CodecError(`partition key in ${context}.as_of must fit u32`, context, "as_of")
+  const entry = snapshot.asOf[low]
+  if (entry === undefined || compareSource(entry, wanted) !== 0) return 0n
+  return entry.offset === (1n << 64n) - 1n ? entry.offset : entry.offset + 1n
 }
 
-function coerceOffset(value: unknown, context: string): bigint {
-  if (typeof value === "bigint" && value >= 0n && value <= 0xffff_ffff_ffff_ffffn) return value
-  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return BigInt(value)
-  throw new CodecError(`offset in ${context}.as_of must fit u64`, context, "as_of")
+export function validateFoldSnapshot(snapshot: FoldSnapshot): void {
+  if (snapshot.stream.length === 0 || snapshot.fold.length === 0)
+    throw new InvalidError("snapshot stream and fold must be non-empty")
+  for (let index = 1; index < snapshot.asOf.length; index += 1) {
+    const previous = snapshot.asOf[index - 1]
+    const current = snapshot.asOf[index]
+    if (previous !== undefined && current !== undefined && compareSource(previous, current) >= 0)
+      throw new InvalidError("snapshot offsets must be sorted with no duplicate source")
+  }
+}
+
+function compareSource(left: SnapshotOffset, right: SnapshotOffset): number {
+  if (left.topicId !== right.topicId) return left.topicId - right.topicId
+  if (left.topicCreatedAtMicros !== right.topicCreatedAtMicros)
+    return left.topicCreatedAtMicros < right.topicCreatedAtMicros ? -1 : 1
+  return left.partitionId - right.partitionId
 }

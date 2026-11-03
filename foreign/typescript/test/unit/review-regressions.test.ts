@@ -15,6 +15,7 @@ import type { IggyClient, LaserTransport } from "../../src/iggy/apache-iggy.js"
 import { Topic } from "../../src/stream/topic.js"
 import { QueryCommand, CheckpointCommand } from "../../src/wire/commands.js"
 import { QueryExecutionId } from "../../src/wire/ids.js"
+import { AGDX_QUERY_CODE, AGDX_QUERY_STATUS_CODE } from "../../src/wire/codes.js"
 import { encodeQueryReplyFrame, encodeQueryStatusReplyFrame } from "../../src/wire/query.js"
 
 void test("given_a_partial_transport_failure_when_sending_a_topic_batch_then_should_preserve_its_confirmed_prefix_and_exact_tail", async () => {
@@ -61,6 +62,26 @@ void test("given_unconfirmed_records_when_batched_again_then_should_resend_them_
   ])
 })
 
+// A client of one replica that answers every managed request with `reply`.
+function oneNodeClient(
+  reply: (code: number, replica: number) => Uint8Array,
+  replicas: readonly number[] = [0]
+): IggyClient {
+  return {
+    clientProvider: () => Promise.resolve({ protocol: "vsr" }),
+    cluster: {
+      getClusterMetadata: () =>
+        Promise.resolve({
+          name: "orbit",
+          nodes: replicas.map((replicaId) => ({ replicaId, name: `node-${String(replicaId)}` }))
+        })
+    },
+    sendBinaryRequestToReplica: (code: number, _payload: Buffer, replica: number) =>
+      Promise.resolve(Buffer.from(reply(code, replica))),
+    destroy: () => Promise.resolve()
+  } as unknown as IggyClient
+}
+
 void test("given_a_status_for_another_execution_when_reading_or_cancelling_then_should_reject_the_reply", async () => {
   const bytes = encodeQueryStatusReplyFrame({
     kind: "ok",
@@ -73,11 +94,7 @@ void test("given_a_status_for_another_execution_when_reading_or_cancelling_then_
       rowCount: 0n
     }
   })
-  const client = {
-    clientProvider: () => Promise.resolve({ protocol: "vsr" }),
-    sendBinaryRequest: () => Promise.resolve(bytes),
-    destroy: () => Promise.resolve()
-  } as unknown as IggyClient
+  const client = oneNodeClient(() => bytes)
   await using base = await Laser.fromClient(client)
   const laser = base.withCapabilities({
     ...OPEN_CAPABILITIES,
@@ -98,11 +115,7 @@ void test("given_an_unsupported_query_reply_when_fetching_then_should_raise_the_
     kind: "err",
     error: { kind: "unsupported", message: "vector search is not served" }
   })
-  const client = {
-    clientProvider: () => Promise.resolve({ protocol: "vsr" }),
-    sendBinaryRequest: () => Promise.resolve(bytes),
-    destroy: () => Promise.resolve()
-  } as unknown as IggyClient
+  const client = oneNodeClient(() => bytes)
   await using base = await Laser.fromClient(client)
   const laser = base.withCapabilities({
     ...OPEN_CAPABILITIES,
@@ -154,4 +167,44 @@ void test("given_advertised_version_skew_when_using_query_or_checkpoint_then_sho
       return true
     }
   )
+})
+
+void test("given_a_query_that_ran_on_one_node_when_its_status_is_read_then_should_ask_that_node", async () => {
+  const asked: (readonly [number, number])[] = []
+  const status = (executionId: QueryExecutionId) =>
+    encodeQueryStatusReplyFrame({
+      kind: "ok",
+      status: {
+        executionId,
+        state: "running",
+        startedAtMicros: 1n,
+        scannedBytes: 0n,
+        producedBytes: 0n,
+        rowCount: 0n
+      }
+    })
+  const refused = encodeQueryReplyFrame({
+    kind: "err",
+    error: { kind: "unsupported", message: "vector search is not served" }
+  })
+  let executionId = QueryExecutionId.fromU128(0n)
+  const client = oneNodeClient(
+    (code, replica) => {
+      asked.push([code, replica])
+      return code === AGDX_QUERY_CODE ? refused : status(executionId)
+    },
+    [0, 1, 2]
+  )
+  await using base = await Laser.fromClient(client)
+  const laser = base.withCapabilities({
+    ...OPEN_CAPABILITIES,
+    query: { ...OPEN_CAPABILITIES.query, available: true, executionStatus: true }
+  })
+  const request = laser.query("readings")
+  await assert.rejects(request.fetch(), QueryExecutionError)
+  const [code, node] = asked[0] ?? []
+  assert.equal(code, AGDX_QUERY_CODE)
+  executionId = request.executionId()
+  await laser.queryStatus(executionId)
+  assert.deepEqual(asked[1], [AGDX_QUERY_STATUS_CODE, node], "the status reaches the query's node")
 })

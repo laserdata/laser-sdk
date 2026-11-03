@@ -1,23 +1,46 @@
-# orchestra - one orchestrator over a pool of long-running capability agents
+# orchestra: one orchestrator over a pool of capability agents
 
-This example coordinates agents through capability discovery, contracts, fan-out, workflows, and operator control. Agents communicate through the log.
+This example coordinates six agents through capability discovery, contracts, fan-out, a workflow, and operator control. Every exchange goes through the log, never a direct call.
 
-Each agent opens its own connection and remains active during the run. The example pauses for Enter between phases. The Console Orchestration view can display the changes:
+Each agent opens its own connection and stays up for the whole run. The example pauses for Enter after each phase, so you can watch the change in the console's Orchestration view. Set `LASER_NON_INTERACTIVE=1` to run it straight through.
 
-1. Discovery - six agents connect and advertise a capability card and a live inbox. The orchestrator resolves them from the fused registry (cards folded from the registry topic), so it never hard-codes who can do what.
-2. Contract - a directed task to one capable agent with a deadline (`Laser::contract(Router::to_capable("classify", RoutePolicy::Any))`). The orchestrator learns the reply, or that it never came. Acknowledgment-on-pickup tells consumed from expired.
-3. Fan-out - a panel scattered to every capable agent (`Router::all_capable("diagnose", RoutePolicy::Any)`). One diagnose agent advertises itself `Unavailable`, so capability resolution leaves it out with no orchestrator change, and the panel reaches two of the three.
-4. Workflow - a journalled, dependency-ordered run (`Laser::workflow`): `triage`, then a `diagnose` panel under a `verify_with` check, then `remediate`. A `Budget` caps the dispatches and wall clock, and each step builds its task from the prior steps' outputs. The journal shows the completed steps in the console's Workflow panel.
-5. Quarantine - an operator quarantines a misbehaving agent (`Laser::quarantine`), a registry fact every fused registry folds, and the next panel routes around it.
-6. Recovery - the operator reinstates it (`Laser::unquarantine`), and the panel is whole again.
-7. Expiry + recovery - a tight-deadline task to the slow agent times out, and the orchestrator recovers by re-dispatching the task to a healthy agent.
+## What it does
 
-Routing uses a fixed inbox topic (`InboxRoute::Fixed`) so the example runs against Apache Iggy: each branch is target-filtered to its agent on the shared commands topic. A managed deployment advertises per-agent inboxes and uses the default `InboxRoute::Advertised`, with no example change.
+1. Discovery. Six agents connect and advertise a capability card. The orchestrator resolves them from the fused registry, so it never hard-codes who can do what. `diag-gamma` advertises `Unavailable` and `laggard` is deliberately slow.
+2. Contract. The orchestrator sends a task with a deadline to one agent that can `classify`, through `Laser::contract(Router::to_capable("classify", RoutePolicy::Any))`. Acknowledgment on pickup tells a consumed task from an expired one.
+3. Fan-out. `Laser::scatter` sends a panel to every agent that can `diagnose`. Capability resolution leaves the unavailable agent out, so two of the three answer.
+4. Workflow. `Laser::workflow` runs a journalled `triage`, then a `diagnose` panel under a `verify_with` check, then `remediate`. A `WorkflowBudget` caps the dispatches and the wall clock. Each step builds its task from the earlier steps' outputs. The run is a root session and each step is a child session of it.
+5. Quarantine. An operator quarantines `diag-alpha` with `Laser::quarantine`. Every fused registry folds that fact, so the next panel routes around the agent.
+6. Recovery. The operator reinstates the agent with `Laser::unquarantine`, and the panel is whole again.
+7. Expiry and recovery. A task with a one-second deadline goes to the slow agent and times out. The orchestrator sends it again to a healthy agent.
+
+Routing uses a fixed inbox (`InboxRoute::Fixed(AgentTopic::Sessions)`), so the example runs on Apache Iggy. Each task is addressed to its agent on `agent.sessions`. A managed deployment also records live presence. On Apache Iggy that step is skipped.
+
+## Run it
 
 Run from `examples/rust`:
 
-```
-cargo run --release --example orchestra
+```sh
+just up && cargo run --example orchestra
 ```
 
-In the LaserData Console, open the Orchestration view and select the example stream. Press Enter in the terminal to advance each phase. Registry, contract, and workflow operations run on Apache Iggy. Live presence requires the managed discovery capability. On an unsupported server, that advertisement is skipped.
+Run it without prompts:
+
+```sh
+LASER_NON_INTERACTIVE=1 cargo run --example orchestra
+```
+
+## Where to look (LaserData Cloud)
+
+- Orchestration: the contract, the diagnostic panels, quarantine, recovery, and the deadline reroute.
+- Sessions: the workflow run and one child session for each step.
+- Agent registry: capabilities, health, quarantine state, and presence.
+
+## Highlights
+
+- Capability routing skips unavailable and quarantined agents without a change to the orchestrator.
+- `scatter` returns one reply for each selected agent.
+- `workflow` journals dependency-ordered steps and enforces one shared budget.
+- A contract ends as completed, failed, not consumed, or timed out.
+
+The Python and TypeScript `orchestra` examples run the same phases with the same agents and print the same lines.

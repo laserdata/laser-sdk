@@ -1,4 +1,4 @@
-# incident-desk - an AI incident desk on the log
+# incident-desk: an incident desk run by agents on the log
 
 This example runs an incident desk for a host fleet whose agents coordinate through the log. It combines tickets, queries, memory, capacity grants, approval, and a proposed change in a fork.
 
@@ -10,10 +10,10 @@ This example runs an incident desk for a host fleet whose agents coordinate thro
 4. Starts four long-running agents: triage, specialist, resolver, and approver.
 5. Fans three deadline-bounded specialist questions from triage, then synthesizes the findings through the example-owned LLM seam.
 6. Applies capacity grants through a KV-backed deduplicator even though every grant command is sent twice.
-7. Routes grants of 100 units or more through a correlated human approval gate before the resolver changes state.
+7. Routes grants of 100 units or more through an approval request addressed to the approver before the resolver changes state.
 8. Remembers the diagnosis as a durable summary in the vector memory the specialist recalls from.
 9. Writes a speculative bulk-resolution row into the `bulk-resolve-plan` fork and optionally promotes it.
-10. Rebuilds the incident from agent command, response, tool, and result topics through `ConversationState`.
+10. Rebuilds the incident from the shared `agent.sessions` topic through `ConversationState`.
 
 The example requires query, KV compare-and-swap, and forks for the full desk. On Apache Iggy it reports the first missing managed surface and exits before starting the agents.
 
@@ -57,6 +57,6 @@ Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to replace the deterministic `MockLl
 - `publishBatch().inlinePayload()` preserves each ticket body for query payload selection without duplicating indexed values in headers.
 - `context.request()` carries causality into specialist sub-conversations and bounds every branch with a deadline.
 - The KV deduplicator uses `expectAbsent().commit()` so at-least-once delivery does not duplicate the grant effect.
-- `approvalGate()` composes human input from ordinary correlated AGDX commands and responses.
+- The resolver asks for approval with a `context.request()` addressed to the approver, so no other desk agent on the shared session topic takes the prompt as work.
 - `laser.fork(id)` isolates a what-if row until the caller promotes it.
 - `ConversationState.load()` proves the incident can be rebuilt from the durable log alone.

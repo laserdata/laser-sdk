@@ -42,11 +42,17 @@ export interface ListProjections {
 export interface GetSchema {
   readonly v: number
   readonly id: number
+  /** The stream whose schema registry the request addresses, the
+   * deployment-wide registry when absent. */
+  readonly stream?: string
 }
 
 export interface ListSchemas {
   readonly v: number
   readonly nameContains?: string
+  /** The stream whose schema registry the request addresses, the
+   * deployment-wide registry when absent. */
+  readonly stream?: string
 }
 
 export interface RegisterSchema {
@@ -54,12 +60,18 @@ export interface RegisterSchema {
   readonly source: SchemaSource
   readonly name?: string
   readonly version?: number
+  /** The stream whose schema registry the request addresses, the
+   * deployment-wide registry when absent. */
+  readonly stream?: string
 }
 
 export interface DecodeRecord {
   readonly v: number
   readonly id: number
   readonly payload: Uint8Array
+  /** The stream whose schema registry the request addresses, the
+   * deployment-wide registry when absent. */
+  readonly stream?: string
 }
 
 export type BrowseOutcome =
@@ -123,24 +135,29 @@ export function decodeListProjections(map: CborMap, context: string): ListProjec
 }
 
 export function encodeGetSchema(request: GetSchema): Map<string, unknown> {
-  return encodeVersioned(request.v, [["id", BigInt(request.id)]])
+  return withStream(encodeVersioned(request.v, [["id", BigInt(request.id)]]), request.stream)
 }
 
 export function decodeGetSchema(map: CborMap, context: string): GetSchema {
-  return { v: field.requiredU32(map, "v", context), id: field.requiredU32(map, "id", context) }
+  return {
+    v: field.requiredU32(map, "v", context),
+    id: field.requiredU32(map, "id", context),
+    ...streamOf(map, context)
+  }
 }
 
 export function encodeListSchemas(request: ListSchemas): Map<string, unknown> {
   const map = encodeVersioned(request.v, [])
   if (request.nameContains !== undefined) map.set("name_contains", request.nameContains)
-  return map
+  return withStream(map, request.stream)
 }
 
 export function decodeListSchemas(map: CborMap, context: string): ListSchemas {
   const nameContains = field.optionalString(map, "name_contains", context)
   return {
     v: field.requiredU32(map, "v", context),
-    ...(nameContains !== undefined ? { nameContains } : {})
+    ...(nameContains !== undefined ? { nameContains } : {}),
+    ...streamOf(map, context)
   }
 }
 
@@ -148,7 +165,7 @@ export function encodeRegisterSchema(request: RegisterSchema): Map<string, unkno
   const map = encodeVersioned(request.v, [["source", encodeSchemaSource(request.source)]])
   if (request.name !== undefined) map.set("name", request.name)
   if (request.version !== undefined) map.set("version", BigInt(request.version))
-  return map
+  return withStream(map, request.stream)
 }
 
 export function decodeRegisterSchema(map: CborMap, context: string): RegisterSchema {
@@ -158,23 +175,38 @@ export function decodeRegisterSchema(map: CborMap, context: string): RegisterSch
     v: field.requiredU32(map, "v", context),
     source: decodeSchemaSource(field.requiredMap(map, "source", context), `${context}.source`),
     ...(name !== undefined ? { name } : {}),
-    ...(version !== undefined ? { version } : {})
+    ...(version !== undefined ? { version } : {}),
+    ...streamOf(map, context)
   }
 }
 
 export function encodeDecodeRecord(request: DecodeRecord): Map<string, unknown> {
-  return encodeVersioned(request.v, [
-    ["id", BigInt(request.id)],
-    ["payload", request.payload]
-  ])
+  return withStream(
+    encodeVersioned(request.v, [
+      ["id", BigInt(request.id)],
+      ["payload", request.payload]
+    ]),
+    request.stream
+  )
 }
 
 export function decodeDecodeRecord(map: CborMap, context: string): DecodeRecord {
   return {
     v: field.requiredU32(map, "v", context),
     id: field.requiredU32(map, "id", context),
-    payload: field.requiredBytes(map, "payload", context)
+    payload: field.requiredBytes(map, "payload", context),
+    ...streamOf(map, context)
   }
+}
+
+function withStream(map: Map<string, unknown>, stream: string | undefined): Map<string, unknown> {
+  if (stream !== undefined) map.set("stream", stream)
+  return map
+}
+
+function streamOf(map: CborMap, context: string): { readonly stream?: string } {
+  const stream = field.optionalString(map, "stream", context)
+  return stream === undefined ? {} : { stream }
 }
 
 export function encodeProjectionInfo(info: ProjectionInfo): Map<string, unknown> {

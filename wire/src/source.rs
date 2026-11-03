@@ -17,7 +17,7 @@ pub struct SourceIncarnation {
     pub stream_id: u32,
     pub topic_id: u32,
     pub partition_id: u32,
-    pub partition_created_revision: u64,
+    pub partition_incarnation: u64,
 }
 
 impl Validate for SourceIncarnation {
@@ -27,10 +27,8 @@ impl Validate for SourceIncarnation {
                 "physical cluster incarnation must be nonzero",
             ));
         }
-        if self.partition_created_revision == 0 {
-            return Err(InvalidError::new(
-                "partition created revision must be nonzero",
-            ));
+        if self.partition_incarnation == 0 {
+            return Err(InvalidError::new("partition incarnation must be nonzero"));
         }
         Ok(())
     }
@@ -147,13 +145,13 @@ fn validate_source_name(label: &str, value: &str) -> Result<(), InvalidError> {
 mod tests {
     use super::*;
 
-    fn incarnation(partition_id: u32, created_revision: u64) -> SourceIncarnation {
+    fn incarnation(partition_id: u32, partition_incarnation: u64) -> SourceIncarnation {
         SourceIncarnation {
             cluster: PhysicalClusterIncarnation::from_u128(1),
             stream_id: 10,
             topic_id: 20,
             partition_id,
-            partition_created_revision: created_revision,
+            partition_incarnation,
         }
     }
 

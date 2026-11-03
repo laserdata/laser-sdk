@@ -103,6 +103,12 @@ export class TestIggy {
     await this.spawn()
   }
 
+  /** Stops the server and keeps its data, so a client sees it gone. */
+  async stop(): Promise<void> {
+    await stop(this.child)
+    this.child = undefined
+  }
+
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
@@ -116,7 +122,7 @@ export class TestIggy {
     this.child = spawn(this.binary, [], {
       env: {
         ...process.env,
-        IGGY_PATH: this.directory,
+        IGGY_PATH: join(this.directory, "data"),
         IGGY_TCP_ADDRESS: `127.0.0.1:${String(this.port)}`,
         IGGY_HTTP_ENABLED: "false",
         IGGY_QUIC_ENABLED: "false",
@@ -126,7 +132,8 @@ export class TestIggy {
         IGGY_SHARD_RUNTIME_CAPACITY: "256",
         IGGY_SHARDING_CPU_ALLOCATION: "2",
         IGGY_SHARDING_PIN_CORES: "false",
-        IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms"
+        IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms",
+        IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT: "1s"
       },
       stdio: ["ignore", this.log.fd, this.log.fd]
     })
@@ -156,7 +163,7 @@ export class TestIggy {
 
 export class TestIggyCluster {
   private readonly overrides = new Map<number, NodeJS.ProcessEnv>()
-  private readonly children: (ChildProcess | undefined)[] = [undefined, undefined, undefined]
+  private readonly children: (ChildProcess | undefined)[]
   private readonly directories: string[] = []
   private readonly logs: FileHandle[] = []
   private proxy: ReturnType<typeof createServer> | undefined
@@ -170,25 +177,39 @@ export class TestIggyCluster {
     private readonly proxyPort: number
   ) {
     this.proxyTarget = required(tcpPorts[0], "cluster TCP port 0")
+    this.children = tcpPorts.map(() => undefined)
+  }
+
+  /** How many nodes the cluster has. */
+  get size(): number {
+    return this.tcpPorts.length
   }
 
   get endpoint(): string {
     return `iggy:iggy@127.0.0.1:${String(this.proxyPort)}`
   }
 
-  static async start(): Promise<TestIggyCluster> {
+  /** Starts `nodes` nodes, each with the extra variables `environment` gives it. */
+  static async start(
+    nodes = 3,
+    environment?: (replicaId: number) => NodeJS.ProcessEnv
+  ): Promise<TestIggyCluster> {
     const binary = await resolveBinary()
-    const ports = await uniquePorts(10)
+    const ports = await uniquePorts(nodes * 3 + 1)
     const cluster = new TestIggyCluster(
       binary,
-      ports.slice(0, 3),
-      ports.slice(3, 6),
-      ports.slice(6, 9),
-      required(ports[9], "cluster proxy port")
+      ports.slice(0, nodes),
+      ports.slice(nodes, nodes * 2),
+      ports.slice(nodes * 2, nodes * 3),
+      required(ports[nodes * 3], "cluster proxy port")
     )
+    if (environment !== undefined) {
+      for (let replicaId = 0; replicaId < nodes; replicaId += 1)
+        cluster.overrides.set(replicaId, environment(replicaId))
+    }
     try {
       await cluster.startProxy()
-      for (let replicaId = 0; replicaId < 3; replicaId += 1) {
+      for (let replicaId = 0; replicaId < nodes; replicaId += 1) {
         const directory = await mkdtemp(join(tmpdir(), "laser-iggy-cluster-"))
         cluster.directories.push(directory)
         cluster.logs.push(await open(join(directory, "test-server.log"), "w"))
@@ -217,6 +238,21 @@ export class TestIggyCluster {
 
   async stopNode(replicaId: number): Promise<void> {
     await stop(this.children[replicaId])
+    this.children[replicaId] = undefined
+    await this.logs[replicaId]?.close()
+    this.logs[replicaId] = await open(
+      join(required(this.directories[replicaId], "cluster data directory"), "test-server.log"),
+      "w"
+    )
+  }
+
+  /** Kills the node with SIGKILL, a crash. */
+  async killNode(replicaId: number): Promise<void> {
+    const child = this.children[replicaId]
+    if (child?.exitCode === null) {
+      child.kill("SIGKILL")
+      await waitForExit(child)
+    }
     this.children[replicaId] = undefined
     await this.logs[replicaId]?.close()
     this.logs[replicaId] = await open(
@@ -260,10 +296,10 @@ export class TestIggyCluster {
         const leaderNode = metadata.nodes?.find((node) => node.role === "leader")
         if (leaderNode === undefined) throw new Error("metadata returned no leader")
         const leader = Number.parseInt(leaderNode.name.replace(/^node-/, ""), 10)
-        if (!Number.isInteger(leader) || leader < 0 || leader >= 3) {
+        if (!Number.isInteger(leader) || leader < 0 || leader >= this.size) {
           throw new Error(`invalid leader name ${leaderNode.name}`)
         }
-        const follower = [0, 1, 2].find((node) => node !== leader)
+        const follower = this.tcpPorts.map((_, node) => node).find((node) => node !== leader)
         return [leader, required(follower, "follower node")]
       } catch {
         await new Promise((resolveDelay) => setTimeout(resolveDelay, 100))
@@ -311,7 +347,7 @@ export class TestIggyCluster {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       ...this.overrides.get(replicaId),
-      IGGY_PATH: this.directories[replicaId],
+      IGGY_PATH: join(required(this.directories[replicaId], "cluster data directory"), "data"),
       IGGY_CLUSTER_ENABLED: "true",
       IGGY_CLUSTER_NAME: "laser-sdk-rolling-restart",
       IGGY_MESSAGE_BUS_RECONNECT_PERIOD: "100ms",
@@ -324,9 +360,10 @@ export class TestIggyCluster {
       IGGY_SHARD_RUNTIME_CAPACITY: "256",
       IGGY_SHARDING_CPU_ALLOCATION: "1",
       IGGY_SHARDING_PIN_CORES: "false",
-      IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms"
+      IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms",
+      IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT: "1s"
     }
-    for (let node = 0; node < 3; node += 1) {
+    for (let node = 0; node < this.size; node += 1) {
       const prefix = `IGGY_CLUSTER_NODES_${String(node)}`
       env[`${prefix}_NAME`] = `node-${String(node)}`
       env[`${prefix}_IP`] = "127.0.0.1"
@@ -345,7 +382,7 @@ export class TestIggyCluster {
   }
 
   private async waitForMesh(replicaId?: number): Promise<void> {
-    const nodes = replicaId === undefined ? [0, 1, 2] : [replicaId]
+    const nodes = replicaId === undefined ? this.tcpPorts.map((_, node) => node) : [replicaId]
     const deadline = Date.now() + 30_000
     while (Date.now() < deadline) {
       let ready = true
@@ -357,12 +394,72 @@ export class TestIggyCluster {
           throw new Error(`Iggy cluster node exited with ${String(child?.exitCode)}:\n${contents}`)
         }
         const contents = await readFile(join(directory, "test-server.log"), "utf8")
+        // The nodes inherit the environment, so a RUST_LOG that silences the
+        // server's info lines never shows the marker.
         ready = ready && contents.includes("replica mesh complete")
       }
       if (ready) return
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 100))
     }
     throw new Error("Iggy cluster did not form its replica mesh within 30s")
+  }
+}
+
+/**
+ * The stand-in filter catalog (`laser-test-catalog`, built from the
+ * workspace's `test-support` crate), one Unix socket per node. Its path comes
+ * from `LASER_TEST_CATALOG`.
+ */
+export class TestCatalog {
+  private constructor(
+    private readonly child: ChildProcess,
+    private readonly directory: string,
+    readonly sockets: readonly string[]
+  ) {}
+
+  /** The catalog binary, or `undefined` when no test asked for one. */
+  static binary(): string | undefined {
+    const configured = process.env["LASER_TEST_CATALOG"]
+    return configured === undefined || configured.length === 0 ? undefined : configured
+  }
+
+  static async start(nodes: number): Promise<TestCatalog> {
+    const binary = TestCatalog.binary()
+    if (binary === undefined) throw new Error("LASER_TEST_CATALOG names no catalog binary")
+    const directory = await mkdtemp(join(tmpdir(), "laser-catalog-"))
+    const sockets = Array.from({ length: nodes }, (_, node) =>
+      join(directory, `backend-${String(node)}.sock`)
+    )
+    const child = spawn(binary, sockets, { stdio: ["ignore", "pipe", "ignore"] })
+    const catalog = new TestCatalog(child, directory, sockets)
+    try {
+      await new Promise<void>((resolveReady, reject) => {
+        let output = ""
+        const timer = setTimeout(() => {
+          reject(new Error("the catalog printed no ready line within 30s"))
+        }, 30_000)
+        child.stdout.on("data", (chunk: Buffer) => {
+          output += chunk.toString("utf8")
+          if (output.split("\n").includes("ready")) {
+            clearTimeout(timer)
+            resolveReady()
+          }
+        })
+        child.once("exit", (code) => {
+          clearTimeout(timer)
+          reject(new Error(`the catalog exited with ${String(code)}`))
+        })
+      })
+      return catalog
+    } catch (error) {
+      await catalog.close()
+      throw error
+    }
+  }
+
+  async close(): Promise<void> {
+    await stop(this.child)
+    await rm(this.directory, { recursive: true, force: true })
   }
 }
 

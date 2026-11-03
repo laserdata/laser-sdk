@@ -9,6 +9,11 @@ import type { BrowseOutcome, BrowseReply } from "../../src/wire/browse.js"
 import { encodeBrowseReply } from "../../src/wire/browse.js"
 import { ContentType } from "../../src/wire/content.js"
 import type { ControlCommand, Projection } from "../../src/wire/control.js"
+import { decodeOne } from "../../src/wire/cbor.js"
+import { AGDX_CONTROL_PUBLISH_CODE } from "../../src/wire/codes.js"
+import { INTERNAL_TRANSPORT } from "../../src/client/internals.js"
+import { Laser } from "../../src/client/laser.js"
+import type { IggyClient } from "../../src/iggy/apache-iggy.js"
 
 const CAPS: Capabilities = managedCapabilitiesFrom({
   versions: { query: 1, control: 1, kv: 1, fork: 1, agent: 1, graph: 1, features: 0n },
@@ -70,6 +75,38 @@ const GRAPH_PROJECTION: Projection = {
   kind: { kind: "graph" },
   entitySchema: { nodes: [], edges: [] }
 }
+
+void test("given_a_scoped_projection_when_registered_then_should_use_authenticated_managed_control", async () => {
+  const laser = (
+    await Laser.fromClient({ clientProvider: () => Promise.resolve({}) } as unknown as IggyClient)
+  )
+    .withDefaultStream("orders")
+    .withCapabilities(CAPS)
+  const sent: { code: number; payload: Uint8Array }[] = []
+  laser[INTERNAL_TRANSPORT]().sendManaged = (code, payload) => {
+    sent.push({ code, payload })
+    return Promise.resolve(
+      encodeNamed(
+        new Map<string, unknown>([
+          ["code", "ok"],
+          ["message", "accepted"]
+        ])
+      )
+    )
+  }
+  await laser.projections().register(ROW_PROJECTION)
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0]?.code, AGDX_CONTROL_PUBLISH_CODE)
+  const sentRequest = sent[0]
+  assert.ok(sentRequest)
+  const request = decodeOne(sentRequest.payload, "control request") as Map<string, unknown>
+  assert.equal(request.get("v"), 1)
+  assert.equal(request.get("timestamp_micros"), 0)
+  assert.equal(request.get("stream"), "orders")
+  const command = request.get("command") as Map<string, unknown>
+  const projection = command.get("RegisterProjection") as Map<string, unknown>
+  assert.equal(projection.get("id"), "stream:orders/reading.v1")
+})
 
 void test("given_a_row_projection_when_register_is_called_then_should_publish_the_control_command", async () => {
   const control = fakePublishControl()
@@ -203,7 +240,8 @@ void test("given_a_binding_when_applied_and_removed_then_should_publish_the_righ
     source: { stream: "readings", topic: "events" },
     allowedProjections: [ROW_PROJECTION.id],
     index: "events",
-    notify: false
+    notify: false,
+    skipRejected: false
   }
   await bindings.apply(binding)
   await bindings.remove({ stream: "readings", topic: "events" }, "reading.v1")

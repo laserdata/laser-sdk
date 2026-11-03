@@ -4,7 +4,7 @@ use super::*;
 pub(crate) async fn execute_managed(
     laser: &laser_sdk::laser::Laser,
     server: &NativeIggy,
-    plane: &NativePlane,
+    backend: &NativeBackend,
     execution: DirectExecution<'_>,
 ) -> Result<(), BenchError> {
     let processes = [
@@ -16,10 +16,10 @@ pub(crate) async fn execute_managed(
                 .ok_or_else(|| BenchError::Invalid("Iggy PID unavailable".to_owned()))?,
         ),
         (
-            "plane".to_owned(),
-            plane
+            "backend".to_owned(),
+            backend
                 .pid()
-                .ok_or_else(|| BenchError::Invalid("plane PID unavailable".to_owned()))?,
+                .ok_or_else(|| BenchError::Invalid("backend PID unavailable".to_owned()))?,
         ),
     ];
     let case = ManagedCase {
@@ -45,7 +45,7 @@ pub(crate) async fn execute_managed(
     };
     let managed = ManagedExecution {
         laser,
-        plane,
+        backend,
         case: &case,
         scope,
         output: execution.output,
@@ -66,17 +66,17 @@ pub(crate) async fn execute_managed(
 async fn execute_managed_uds(execution: ManagedExecution<'_>) -> Result<(), BenchError> {
     let arm = execution.scope.scenario.arm.parse::<UdsArm>()?;
     let evidence = run_uds_evidence(
-        &execution.plane.socket_path,
+        &execution.backend.socket_path,
         execution.case,
         arm,
-        execution.plane.profile,
+        execution.backend.profile,
         execution.processes,
     )
     .await?;
     write_managed_evidence(
         execution.scope,
         execution.output,
-        execution.plane,
+        execution.backend,
         &evidence.summary,
         ManagedMeasurements {
             operation: &evidence.summary.operation,
@@ -93,7 +93,7 @@ async fn execute_managed_batch(execution: ManagedExecution<'_>) -> Result<(), Be
         execution.laser,
         execution.case,
         arm,
-        execution.plane.profile,
+        execution.backend.profile,
         &execution.scope.scenario.name,
         execution.scope.run.seed,
         execution.processes,
@@ -102,7 +102,7 @@ async fn execute_managed_batch(execution: ManagedExecution<'_>) -> Result<(), Be
     write_managed_evidence(
         execution.scope,
         execution.output,
-        execution.plane,
+        execution.backend,
         &evidence.summary,
         ManagedMeasurements {
             operation: &evidence.summary.operation,
@@ -119,7 +119,7 @@ async fn execute_managed_graph(execution: ManagedExecution<'_>) -> Result<(), Be
         execution.laser,
         execution.case,
         arm,
-        execution.plane.profile,
+        execution.backend.profile,
         &execution.scope.scenario.name,
         execution.scope.run.seed,
         execution.processes,
@@ -128,7 +128,7 @@ async fn execute_managed_graph(execution: ManagedExecution<'_>) -> Result<(), Be
     write_managed_evidence(
         execution.scope,
         execution.output,
-        execution.plane,
+        execution.backend,
         &evidence.summary,
         ManagedMeasurements {
             operation: &evidence.summary.operation,
@@ -145,7 +145,7 @@ async fn execute_managed_fork(execution: ManagedExecution<'_>) -> Result<(), Ben
         execution.laser,
         execution.case,
         arm,
-        execution.plane.profile,
+        execution.backend.profile,
         &execution.scope.scenario.name,
         execution.scope.run.seed,
         execution.processes,
@@ -154,7 +154,7 @@ async fn execute_managed_fork(execution: ManagedExecution<'_>) -> Result<(), Ben
     write_managed_evidence(
         execution.scope,
         execution.output,
-        execution.plane,
+        execution.backend,
         &evidence.summary,
         ManagedMeasurements {
             operation: &evidence.summary.operation,
@@ -171,7 +171,7 @@ async fn execute_managed_memory(execution: ManagedExecution<'_>) -> Result<(), B
         execution.laser,
         execution.case,
         arm,
-        execution.plane.profile,
+        execution.backend.profile,
         &execution.scope.scenario.name,
         execution.scope.run.seed,
         execution.processes,
@@ -180,7 +180,7 @@ async fn execute_managed_memory(execution: ManagedExecution<'_>) -> Result<(), B
     write_managed_evidence(
         execution.scope,
         execution.output,
-        execution.plane,
+        execution.backend,
         &evidence.summary,
         ManagedMeasurements {
             operation: &evidence.summary.operation,
@@ -197,7 +197,7 @@ async fn execute_managed_kv(execution: ManagedExecution<'_>) -> Result<(), Bench
         execution.laser,
         execution.case,
         arm,
-        execution.plane.profile,
+        execution.backend.profile,
         &execution.scope.scenario.name,
         execution.scope.run.seed,
         execution.processes,
@@ -206,7 +206,7 @@ async fn execute_managed_kv(execution: ManagedExecution<'_>) -> Result<(), Bench
     write_managed_evidence(
         execution.scope,
         execution.output,
-        execution.plane,
+        execution.backend,
         &evidence.summary,
         ManagedMeasurements {
             operation: &evidence.summary.operation,
@@ -223,7 +223,7 @@ async fn execute_managed_query(execution: ManagedExecution<'_>) -> Result<(), Be
         execution.laser,
         execution.case,
         arm,
-        execution.plane.profile,
+        execution.backend.profile,
         &execution.scope.scenario.name,
         execution.scope.run.seed,
         execution.processes,
@@ -232,7 +232,7 @@ async fn execute_managed_query(execution: ManagedExecution<'_>) -> Result<(), Be
     write_managed_evidence(
         execution.scope,
         execution.output,
-        execution.plane,
+        execution.backend,
         &evidence.summary,
         ManagedMeasurements {
             operation: &evidence.summary.operation,
@@ -249,7 +249,7 @@ async fn execute_managed_projection(execution: ManagedExecution<'_>) -> Result<(
         execution.laser,
         execution.case,
         arm,
-        execution.plane.profile,
+        execution.backend.profile,
         &execution.scope.scenario.name,
         execution.scope.run.seed,
         execution.processes,
@@ -258,7 +258,7 @@ async fn execute_managed_projection(execution: ManagedExecution<'_>) -> Result<(
     write_managed_evidence(
         execution.scope,
         execution.output,
-        execution.plane,
+        execution.backend,
         &evidence.summary,
         ManagedMeasurements {
             operation: &evidence.summary.operation,
@@ -272,7 +272,7 @@ async fn execute_managed_projection(execution: ManagedExecution<'_>) -> Result<(
 fn write_managed_evidence<T: serde::Serialize>(
     scope: ReportScope<'_>,
     output: &Path,
-    plane: &NativePlane,
+    backend: &NativeBackend,
     summary: &T,
     measurements: ManagedMeasurements<'_>,
     invalidation_reason: &str,
@@ -282,7 +282,7 @@ fn write_managed_evidence<T: serde::Serialize>(
     let histograms = write_managed_histograms(output, measurements.load)?;
     let report = managed_report(
         scope,
-        plane,
+        backend,
         measurements.operation,
         summary,
         measurements.processes,

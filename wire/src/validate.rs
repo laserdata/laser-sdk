@@ -1,4 +1,5 @@
 use crate::batch::BatchRequest;
+use crate::browse::RegisterSchema;
 use crate::clients::ClientMetadata;
 use crate::codes::AGDX_BATCH_CODE;
 use crate::codes::KV_LEASE_OP_VERSION;
@@ -6,10 +7,11 @@ use crate::error::InvalidError;
 use crate::graph::{GraphEdge, GraphNode, GraphQuery, GraphUpsert, SourceRef};
 use crate::kv::{KvCasFenced, KvLease, KvLeaseRenew, KvRelease, KvScan, KvSet};
 use crate::limits::{
-    MAX_BATCH_OPS, MAX_CLIENT_METADATA, MAX_FRAME_BYTES, MAX_GRAPH_NODE_LABELS,
-    MAX_GRAPH_RESULT_ELEMENTS, MAX_GRAPH_TRAVERSE_DEPTH, MAX_HOLDER_ID_BYTES, MAX_KEY_BYTES,
-    MAX_LEASE_TTL_MICROS, MAX_MEMORY_BODY_BYTES, MAX_METADATA_ENTRIES, MAX_METADATA_KEY_BYTES,
-    MAX_PAGE_SIZE, MAX_QUERY_NAME_BYTES, MAX_SCAN_LIMIT, MAX_SOURCE_REF_BYTES,
+    MAX_BATCH_OPS, MAX_CLIENT_METADATA, MAX_FRAME_BYTES, MAX_GRAPH_LABEL_BYTES,
+    MAX_GRAPH_NODE_LABELS, MAX_GRAPH_RESULT_ELEMENTS, MAX_GRAPH_TRAVERSE_DEPTH,
+    MAX_HOLDER_ID_BYTES, MAX_KEY_BYTES, MAX_LEASE_TTL_MICROS, MAX_MEMORY_BODY_BYTES,
+    MAX_MEMORY_ID_BYTES, MAX_METADATA_ENTRIES, MAX_METADATA_KEY_BYTES, MAX_PAGE_SIZE,
+    MAX_QUERY_NAME_BYTES, MAX_SCAN_LIMIT, MAX_SCHEMA_NAME_BYTES, MAX_SOURCE_REF_BYTES,
     MAX_TEXT_QUERY_BYTES, MAX_VALUE_BYTES, MAX_VECTOR_DIMENSIONS, MIN_LEASE_TTL_MICROS,
 };
 use crate::memory::MemoryRecord;
@@ -50,6 +52,30 @@ pub(crate) fn validate_safelisted_name(
     {
         return Err(InvalidError::new(format!(
             "{label} has a disallowed byte {bad:#04x}: allowed are ASCII letters, digits, '-', '_', '.'"
+        )));
+    }
+    Ok(())
+}
+
+/// The shared rule for caller-chosen text that names a resource without a
+/// safelist: non-empty, within `cap` bytes, and free of control characters.
+pub(crate) fn validate_bounded_text(
+    label: &str,
+    value: &str,
+    cap: usize,
+) -> Result<(), InvalidError> {
+    if value.is_empty() {
+        return Err(InvalidError::new(format!("{label} must not be empty")));
+    }
+    if value.len() > cap {
+        return Err(InvalidError::new(format!(
+            "{label} is {}B, exceeds cap {cap}B",
+            value.len()
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(InvalidError::new(format!(
+            "{label} contains a control character"
         )));
     }
     Ok(())
@@ -148,6 +174,11 @@ fn validate_lease_shape(
             "lease holder id is {}B, exceeds cap {MAX_HOLDER_ID_BYTES}B",
             holder_id.len()
         )));
+    }
+    if holder_id.chars().any(char::is_control) {
+        return Err(InvalidError::new(
+            "lease holder id contains a control character",
+        ));
     }
     Ok(())
 }
@@ -300,6 +331,9 @@ impl Validate for GraphNode {
                 self.labels.len()
             )));
         }
+        for label in &self.labels {
+            validate_bounded_text("graph node label", label, MAX_GRAPH_LABEL_BYTES)?;
+        }
         validate_attrs("graph node", &self.attrs)?;
         if let Some(source) = &self.source {
             source.validate()?;
@@ -310,6 +344,7 @@ impl Validate for GraphNode {
 
 impl Validate for GraphEdge {
     fn validate(&self) -> Result<(), InvalidError> {
+        validate_bounded_text("graph edge type", &self.edge_type, MAX_GRAPH_LABEL_BYTES)?;
         validate_attrs("graph edge", &self.attrs)?;
         if let Some(source) = &self.source {
             source.validate()?;
@@ -393,6 +428,15 @@ impl Validate for VectorQuery {
 
 impl Validate for MemoryRecord {
     fn validate(&self) -> Result<(), InvalidError> {
+        match self {
+            MemoryRecord::Item { id, kind, .. } => {
+                validate_bounded_text("memory item id", id, MAX_MEMORY_ID_BYTES)?;
+                validate_bounded_text("memory item kind", kind, MAX_MEMORY_ID_BYTES)?;
+            }
+            MemoryRecord::Forget { target, .. } | MemoryRecord::Feedback { target, .. } => {
+                validate_bounded_text("memory target", target, MAX_MEMORY_ID_BYTES)?;
+            }
+        }
         if let MemoryRecord::Item { body, .. } = self
             && body.len() > MAX_MEMORY_BODY_BYTES
         {
@@ -400,6 +444,28 @@ impl Validate for MemoryRecord {
                 "memory body is {}B, exceeds cap {MAX_MEMORY_BODY_BYTES}B",
                 body.len()
             )));
+        }
+        if let MemoryRecord::Forget {
+            conversation: Some(conversation),
+            ..
+        }
+        | MemoryRecord::Feedback {
+            conversation: Some(conversation),
+            ..
+        } = self
+        {
+            conversation
+                .parse::<crate::agent::ConversationId>()
+                .map_err(|_| InvalidError::new("memory record conversation is not a valid id"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Validate for RegisterSchema {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if let Some(name) = &self.name {
+            validate_bounded_text("schema name", name, MAX_SCHEMA_NAME_BYTES)?;
         }
         Ok(())
     }
@@ -421,7 +487,142 @@ impl Validate for ClientMetadata {
 mod tests {
     use super::*;
     use crate::batch::BatchItem;
-    use crate::codes::{AGDX_KV_GET_CODE, BATCH_OP_VERSION, KV_OP_VERSION};
+    use crate::codes::{
+        AGDX_KV_GET_CODE, BATCH_OP_VERSION, KV_LEASE_OP_VERSION, KV_OP_VERSION, QUERY_OP_VERSION,
+    };
+    use crate::control::SchemaSource;
+    use crate::limits::{MAX_GRAPH_LABEL_BYTES, MAX_MEMORY_ID_BYTES, MAX_SCHEMA_NAME_BYTES};
+
+    #[test]
+    fn given_an_invalid_graph_label_or_edge_type_when_upserted_then_should_refuse_it() {
+        let at_cap = "l".repeat(MAX_GRAPH_LABEL_BYTES);
+        let alice = node_with(vec![at_cap.clone()], Vec::new());
+        let acme = node_with(vec!["Company".to_owned()], Vec::new());
+        alice.validate().expect("a node label at the cap is valid");
+        GraphEdge::relate(&alice, at_cap, &acme)
+            .validate()
+            .expect("an edge type at the cap is valid");
+        let long = "l".repeat(MAX_GRAPH_LABEL_BYTES + 1);
+        for invalid in [String::new(), long, "Per\nson".to_owned()] {
+            let node = node_with(vec![invalid.clone()], Vec::new());
+            assert!(node.validate().is_err(), "{invalid:?}");
+            assert!(
+                GraphEdge::relate(&alice, invalid.clone(), &acme)
+                    .validate()
+                    .is_err()
+            );
+            let upsert = GraphUpsert {
+                v: 1,
+                graph: "knowledge".to_owned(),
+                session: None,
+                nodes: vec![node],
+                edges: Vec::new(),
+            };
+            assert!(upsert.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn given_an_invalid_memory_id_kind_or_target_when_validated_then_should_refuse_it() {
+        let item = |id: &str, kind: &str| MemoryRecord::Item {
+            origin: None,
+            producer: None,
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            body: b"auth is slow".to_vec(),
+        };
+        let at_cap = "m".repeat(MAX_MEMORY_ID_BYTES);
+        item(&at_cap, &at_cap)
+            .validate()
+            .expect("an id and a kind at the cap are valid");
+        for invalid in [
+            String::new(),
+            "m".repeat(MAX_MEMORY_ID_BYTES + 1),
+            "fa\u{0}ct".to_owned(),
+        ] {
+            assert!(item(&invalid, "fact").validate().is_err(), "{invalid:?}");
+            assert!(
+                item("01KWM3K3XEP3NP5TN850J17YBP", &invalid)
+                    .validate()
+                    .is_err()
+            );
+            assert!(
+                MemoryRecord::Forget {
+                    target: invalid.clone(),
+                    conversation: None,
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                MemoryRecord::Feedback {
+                    target: invalid,
+                    weight: 1.0,
+                    conversation: None,
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_lease_holder_with_a_control_character_when_validated_then_should_refuse_it() {
+        let holder = "node\n1".to_owned();
+        let lease = KvLease {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "connectors.coordination".to_owned(),
+            key: b"source-owner".to_vec(),
+            lease_ttl_micros: 30_000_000,
+            holder_id: holder.clone(),
+            subject_user_id: None,
+        };
+        assert!(lease.validate().is_err());
+        let renew = KvLeaseRenew {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "connectors.coordination".to_owned(),
+            key: b"source-owner".to_vec(),
+            holder_id: holder.clone(),
+            subject_user_id: None,
+            lease_token: 7,
+            lease_ttl_micros: 30_000_000,
+        };
+        assert!(renew.validate().is_err());
+        let release = KvRelease {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "connectors.coordination".to_owned(),
+            key: b"source-owner".to_vec(),
+            lease_token: 7,
+            holder_id: holder,
+        };
+        assert!(release.validate().is_err());
+    }
+
+    #[test]
+    fn given_an_invalid_schema_name_when_a_registration_is_validated_then_should_refuse_it() {
+        let register = |name: Option<String>| RegisterSchema {
+            v: QUERY_OP_VERSION,
+            source: SchemaSource::JsonSchema {
+                schema: "{}".to_owned(),
+            },
+            name,
+            version: None,
+            stream: Some("fleet".to_owned()),
+        };
+        register(None)
+            .validate()
+            .expect("a registration without a name is valid");
+        register(Some("reading".to_owned()))
+            .validate()
+            .expect("a short schema name is valid");
+        assert!(register(Some(String::new())).validate().is_err());
+        assert!(
+            register(Some("s".repeat(MAX_SCHEMA_NAME_BYTES + 1)))
+                .validate()
+                .is_err()
+        );
+        assert!(register(Some("read\ting".to_owned())).validate().is_err());
+    }
 
     #[test]
     fn given_a_batch_over_the_op_cap_when_validated_then_should_reject() {
@@ -481,7 +682,7 @@ mod tests {
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
             lease_ttl_micros: 30_000_000,
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: Some(42),
         };
         assert!(valid.validate().is_ok());
@@ -522,7 +723,7 @@ mod tests {
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
             lease_ttl_micros: MIN_LEASE_TTL_MICROS,
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: None,
         };
         assert!(acquire.validate().is_ok(), "the floor itself is grantable");
@@ -557,7 +758,7 @@ mod tests {
             v: KV_LEASE_OP_VERSION,
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: None,
             lease_token: 7,
             lease_ttl_micros: MAX_LEASE_TTL_MICROS + 1,
@@ -581,7 +782,7 @@ mod tests {
             v: KV_LEASE_OP_VERSION,
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: None,
             lease_token: 7,
             lease_ttl_micros: 30_000_000,
@@ -597,7 +798,7 @@ mod tests {
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
             lease_token: 7,
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
         };
         assert!(release.validate().is_ok());
         let zero = KvRelease {
@@ -648,6 +849,7 @@ mod tests {
         let over = KvSet {
             v: KV_OP_VERSION,
             namespace: "ns".to_owned(),
+            session: None,
             key: vec![b'x'; MAX_KEY_BYTES + 1],
             value: vec![1, 2, 3],
             expires_at_micros: None,
@@ -656,6 +858,7 @@ mod tests {
         let ok = KvSet {
             v: KV_OP_VERSION,
             namespace: "ns".to_owned(),
+            session: None,
             key: vec![b'x'; 8],
             value: vec![1, 2, 3],
             expires_at_micros: None,
@@ -665,6 +868,7 @@ mod tests {
 
     fn node_with(labels: Vec<String>, attrs: Vec<(String, Value)>) -> GraphNode {
         GraphNode {
+            producer: None,
             id: crate::graph::NodeId::from_u128(1),
             labels,
             attrs,
@@ -721,6 +925,7 @@ mod tests {
         let over = GraphUpsert {
             v: 1,
             graph: "knowledge".to_owned(),
+            session: None,
             nodes: (0..=MAX_GRAPH_RESULT_ELEMENTS)
                 .map(|_| node_with(Vec::new(), Vec::new()))
                 .collect(),
@@ -730,6 +935,7 @@ mod tests {
         let ok = GraphUpsert {
             v: 1,
             graph: "knowledge".to_owned(),
+            session: None,
             nodes: vec![node_with(vec!["Person".to_owned()], Vec::new())],
             edges: Vec::new(),
         };
@@ -741,6 +947,7 @@ mod tests {
         let upsert = GraphUpsert {
             v: 1,
             graph: "knowledge".to_owned(),
+            session: None,
             nodes: vec![node_with(
                 (0..=MAX_GRAPH_NODE_LABELS)
                     .map(|index| format!("label-{index}"))
@@ -788,12 +995,16 @@ mod tests {
     #[test]
     fn given_an_oversized_memory_body_when_validated_then_should_reject() {
         let over = MemoryRecord::Item {
+            origin: None,
+            producer: None,
             id: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
             kind: "fact".to_owned(),
             body: vec![0u8; MAX_MEMORY_BODY_BYTES + 1],
         };
         assert!(over.validate().is_err());
         let ok = MemoryRecord::Item {
+            origin: None,
+            producer: None,
             id: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
             kind: "fact".to_owned(),
             body: b"auth is slow".to_vec(),
@@ -801,10 +1012,19 @@ mod tests {
         assert!(ok.validate().is_ok());
         assert!(
             MemoryRecord::Forget {
-                target: "01KWM3K3XEP3NP5TN850J17YBP".to_owned()
+                target: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
+                conversation: None,
             }
             .validate()
             .is_ok()
+        );
+        assert!(
+            MemoryRecord::Forget {
+                target: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
+                conversation: Some("not an id".to_owned()),
+            }
+            .validate()
+            .is_err()
         );
     }
 

@@ -7,9 +7,9 @@ use futures::StreamExt as _;
 use laser_sdk::batching::BatchingProducer;
 use laser_sdk::cursor::Cursor;
 use laser_sdk::iggy::prelude::{
-    AutoCommit, BackgroundConfig, Consumer as IggyConsumerIdentity, DirectConfig, Identifier,
-    IggyByteSize, IggyConsumer, IggyDuration, IggyMessage, MessageClient, NonZeroIggyDuration,
-    Partitioning, PollingStrategy,
+    BackgroundConfig, Consumer as IggyConsumerIdentity, DirectConfig, Identifier, IggyByteSize,
+    IggyConsumer, IggyDuration, IggyMessage, MessageClient, Partitioning, PollOptions,
+    PollingStrategy,
 };
 use laser_sdk::laser::Laser;
 use laser_sdk::stream::{
@@ -28,6 +28,8 @@ use crate::metrics::{ProcessDelta, ProcessSnapshot};
 use crate::report::OutcomeCounts;
 
 const MEASUREMENT_RECORD_OFFSET: u64 = 1_u64 << 63;
+// The raw arm holds its reads as long as the Laser consumer's default.
+const RAW_MAX_WAIT: Duration = Duration::from_secs(5);
 const PAIRED_MEASUREMENT_EPOCHS: u32 = 10;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -458,11 +460,11 @@ pub async fn run_producer_pair_evidence(
     let raw_topic = laser.stream(&stream).topic("raw");
     let laser_topic = laser.stream(&stream).topic("sdk");
     raw_topic
-        .ensure(case.partitions)
+        .ensure(case.partitions, None)
         .await
         .map_err(|error| sdk_error(&error))?;
     laser_topic
-        .ensure(case.partitions)
+        .ensure(case.partitions, None)
         .await
         .map_err(|error| sdk_error(&error))?;
     let payload = seeded_payload(case.payload_bytes, seed);
@@ -542,6 +544,10 @@ pub async fn run_producer_pair_evidence(
 /// # Errors
 ///
 /// Returns an error for invalid dimensions, setup failure, process counter failure, consumer failure, shutdown failure, or correctness failure.
+#[allow(
+    clippy::large_futures,
+    reason = "a Laser publish awaits the upstream IggyProducer send future inline, 16 080 bytes in debug"
+)]
 pub async fn run_consumer_pair_evidence(
     laser: &Laser,
     connection_string: &str,
@@ -566,11 +572,11 @@ pub async fn run_consumer_pair_evidence(
     let raw_topic = laser.stream(&stream).topic("raw");
     let laser_topic = laser.stream(&stream).topic("sdk");
     raw_topic
-        .ensure(case.partitions)
+        .ensure(case.partitions, None)
         .await
         .map_err(|error| sdk_error(&error))?;
     laser_topic
-        .ensure(case.partitions)
+        .ensure(case.partitions, None)
         .await
         .map_err(|error| sdk_error(&error))?;
     let payload = seeded_payload(case.payload_bytes, seed);
@@ -611,6 +617,10 @@ pub async fn run_consumer_pair_evidence(
     })
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "a Laser publish awaits the upstream IggyProducer send future inline, 16 080 bytes in debug"
+)]
 async fn run_cursor_pair_evidence(
     laser: &Laser,
     connection_string: &str,
@@ -627,11 +637,11 @@ async fn run_cursor_pair_evidence(
     let raw_topic = laser.stream(&stream).topic("raw");
     let laser_topic = laser.stream(&stream).topic("sdk");
     raw_topic
-        .ensure(case.partitions)
+        .ensure(case.partitions, None)
         .await
         .map_err(|error| sdk_error(&error))?;
     laser_topic
-        .ensure(case.partitions)
+        .ensure(case.partitions, None)
         .await
         .map_err(|error| sdk_error(&error))?;
     let payload = seeded_payload(case.payload_bytes, seed);
@@ -718,11 +728,11 @@ pub async fn run_pipeline_pair_evidence(
     let raw_topic = laser.stream(&stream).topic("raw");
     let laser_topic = laser.stream(&stream).topic("sdk");
     raw_topic
-        .ensure(case.partitions)
+        .ensure(case.partitions, None)
         .await
         .map_err(|error| sdk_error(&error))?;
     laser_topic
-        .ensure(case.partitions)
+        .ensure(case.partitions, None)
         .await
         .map_err(|error| sdk_error(&error))?;
     let raw_tracker = LatencyTracker::default();
@@ -1053,18 +1063,22 @@ fn raw_cursor_operation(
                         .poll_messages(
                             &stream,
                             &topic,
-                            Some(partition),
+                            partition,
                             &consumer,
                             &PollingStrategy::offset(offsets[partition as usize]),
-                            batch,
-                            false,
+                            PollOptions {
+                                count: batch,
+                                ..PollOptions::default()
+                            },
                         )
                         .await
                         .map_err(|error| error.to_string())?;
-                    let count = polled.messages.len();
                     let Some(last) = polled.messages.last() else {
                         break;
                     };
+                    // A reply is cut by its byte limit too, so only the
+                    // partition's current offset proves the tail was read.
+                    let tail_read = last.header.offset >= polled.current_offset;
                     offsets[partition as usize] = last.header.offset.saturating_add(1);
                     let mut sink = observed.lock().await;
                     sink.extend(polled.messages.into_iter().map(|message| ObservedMessage {
@@ -1073,7 +1087,7 @@ fn raw_cursor_operation(
                         offset: message.header.offset,
                     }));
                     drop(sink);
-                    if count < batch as usize {
+                    if tail_read {
                         break;
                     }
                 }
@@ -1134,6 +1148,10 @@ async fn measured_cursor_arm(
     })
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "a Laser publish awaits the upstream IggyProducer send future inline, 16 080 bytes in debug"
+)]
 async fn preload_topic(
     topic: &Topic,
     case: &DirectStreamingCase,
@@ -1213,7 +1231,6 @@ async fn build_consumers(
             StreamingConsumerPath::StreamConsumerGroup => raw_topic
                 .iggy_consumer_group("laser-bench-raw-group")
                 .map_err(|error| sdk_error(&error))?
-                .auto_join_consumer_group()
                 .create_consumer_group_if_not_exists(),
             StreamingConsumerPath::StreamCursor => {
                 return Err(BenchError::Invalid(
@@ -1222,10 +1239,11 @@ async fn build_consumers(
             }
         };
         let mut raw_consumer = raw_builder
-            .batch_length(batch_length)
+            .poll_options(PollOptions {
+                count: batch_length,
+                ..PollOptions::wait(IggyDuration::from(RAW_MAX_WAIT))
+            })
             .polling_strategy(PollingStrategy::first())
-            .auto_commit(AutoCommit::Disabled)
-            .without_poll_interval()
             .allow_replay()
             .build();
         raw_consumer
@@ -1249,7 +1267,6 @@ async fn build_consumers(
         };
         let laser_consumer = laser_builder
             .batch_length(batch_length)
-            .without_poll_interval()
             .start_at(ConsumerStart::First)
             .commit_policy(CommitPolicy::Disabled)
             .allow_replay()
@@ -1279,10 +1296,11 @@ async fn build_partition_consumers(
         let mut raw_consumer = raw_topic
             .iggy_consumer(&format!("laser-bench-raw-e2e-{partition}"), partition)
             .map_err(|error| sdk_error(&error))?
-            .batch_length(batch_length)
+            .poll_options(PollOptions {
+                count: batch_length,
+                ..PollOptions::wait(IggyDuration::from(RAW_MAX_WAIT))
+            })
             .polling_strategy(PollingStrategy::offset(0))
-            .auto_commit(AutoCommit::Disabled)
-            .without_poll_interval()
             .allow_replay()
             .build();
         raw_consumer
@@ -1294,7 +1312,6 @@ async fn build_partition_consumers(
         let laser_consumer = laser_topic
             .consumer(format!("laser-bench-sdk-e2e-{partition}"), partition)
             .batch_length(batch_length)
-            .without_poll_interval()
             .start_at(ConsumerStart::Offset(0))
             .commit_policy(CommitPolicy::Disabled)
             .allow_replay()
@@ -1403,6 +1420,10 @@ fn raw_end_to_end_operation(
     })
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "a Laser publish awaits the upstream IggyProducer send future inline, 16 080 bytes in debug"
+)]
 fn laser_end_to_end_operation(
     producers: Arc<Vec<Producer>>,
     payload: Bytes,
@@ -1472,7 +1493,7 @@ fn spawn_raw_consumer_pump(
                         .next()
                         .await
                         .ok_or_else(|| BenchError::Invalid("raw end-to-end consumer ended".to_owned()))?
-                        .map_err(|error| iggy_error(&error))
+                        .map_err(|error| iggy_error(&error.error))
                 } => {
                     let message = result?;
                     let id = decode_record_id(&message.message.payload)?;
@@ -2298,13 +2319,6 @@ async fn raw_producer_with_partition(
                 .build(),
         )
         .partitioning(partitioning)
-        .send_retries(
-            Some(3),
-            Some(
-                NonZeroIggyDuration::try_from(Duration::from_secs(1))
-                    .expect("retry interval should be non-zero"),
-            ),
-        )
         .do_not_create_stream_if_not_exists()
         .do_not_create_topic_if_not_exists()
         .build();
@@ -2372,13 +2386,6 @@ async fn raw_background_producer(
         .map_err(|error| sdk_error(&error))?
         .background(background_config(case))
         .partitioning(Partitioning::balanced())
-        .send_retries(
-            Some(3),
-            Some(
-                NonZeroIggyDuration::try_from(Duration::from_secs(1))
-                    .expect("retry interval should be non-zero"),
-            ),
-        )
         .do_not_create_stream_if_not_exists()
         .do_not_create_topic_if_not_exists()
         .build();
@@ -2533,6 +2540,10 @@ fn raw_pool_operation(
     })
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "a Laser publish awaits the upstream IggyProducer send future inline, 16 080 bytes in debug"
+)]
 fn laser_operation(
     producer: Producer,
     payload: Bytes,
@@ -2558,6 +2569,10 @@ fn laser_operation(
     })
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "a Laser publish awaits the upstream IggyProducer send future inline, 16 080 bytes in debug"
+)]
 fn laser_pool_operation(
     producers: Arc<Vec<Producer>>,
     payload: Bytes,
@@ -2757,7 +2772,7 @@ fn summarize_consumer(
             },
             "latency_boundary": "poll_dispatch_to_record_delivery",
             "batch_length": case.batch_size,
-            "poll_interval": null,
+            "max_wait_ms": RAW_MAX_WAIT.as_millis(),
             "start": "first",
             "auto_commit": "disabled",
             "allow_replay": true,
@@ -2862,7 +2877,7 @@ fn summarize_end_to_end(
             "consumer_lanes": case.partitions,
             "batch_length": case.batch_size,
             "consumer_batch_length": case.batch_size,
-            "poll_interval": null,
+            "max_wait_ms": RAW_MAX_WAIT.as_millis(),
             "auto_commit": "none",
             "producer_connections": case.concurrency,
             "consumer_connections": case.partitions,

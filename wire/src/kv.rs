@@ -28,6 +28,10 @@ pub struct MemoryRowScope {
     /// while it is still on the log. Absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<crate::graph::SourceRef>,
+    /// The server append time of the source record in microseconds. With the
+    /// source address, it orders items remembered on different partitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_micros: Option<u64>,
 }
 
 /// One stored entry: an arbitrary-bytes key and value plus optional expiry. The
@@ -102,7 +106,7 @@ pub struct KvPage {
 /// reader cannot observe a fold that predates its own lease acquisition. The
 /// server waits a short bound and answers [`KvError::Stale`] when the fold does
 /// not catch up, never an absent value. Only a deployment advertising the
-/// `KV_FENCED_LEASES` capability honors the barrier: a pre-fencing plane
+/// `KV_FENCED_LEASES` capability honors the barrier: a pre-fencing backend
 /// ignores the field, so a client must not send it unless the bit is
 /// advertised. Absent keeps today's immediate local read, byte-identical.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,6 +126,8 @@ pub struct KvGet {
 pub struct KvSet {
     pub v: u32,
     pub namespace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::agent::SessionRef>,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     #[serde(with = "crate::encoding::bin_bytes")]
@@ -149,6 +155,8 @@ pub enum CasExpect {
 pub struct KvCas {
     pub v: u32,
     pub namespace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::agent::SessionRef>,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     #[serde(with = "crate::encoding::bin_bytes")]
@@ -196,6 +204,8 @@ pub struct KvCasFenced {
 pub struct KvDelete {
     pub v: u32,
     pub namespace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::agent::SessionRef>,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -234,6 +244,8 @@ pub struct KvExpire {
 pub struct KvPatch {
     pub v: u32,
     pub namespace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::agent::SessionRef>,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     #[serde(with = "crate::encoding::bin_bytes")]
@@ -405,6 +417,11 @@ pub struct KvScan {
     /// when unfiltered, so a pre-lens scan stays byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// The stream the lens conversation belongs to. Set alongside
+    /// `conversation` by a client that scopes its resources to a stream.
+    /// Absent on the wire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
     pub limit: usize,
     #[serde(
         default,
@@ -446,6 +463,9 @@ pub struct KvDeleteMany {
     /// conversation wrote. See [`KvScan::conversation`]. Absent when unfiltered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// The stream the lens conversation belongs to. See [`KvScan::stream`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// The result of a key-value operation: `Ok` with the operation's outcome, or
@@ -556,7 +576,7 @@ pub enum KvError {
     /// expired (the formal `NOT_FOUND`).
     #[error("kv key not found")]
     NotFound,
-    /// This plane does not own the mutation partition for the key. The caller
+    /// This managed backend does not own the mutation partition for the key. The caller
     /// may retry after the streaming client refreshes partition leadership.
     #[error("not the partition leader for this key")]
     NotLeader,
@@ -600,6 +620,7 @@ mod tests {
             end: None,
             key_contains: Some("stale".to_owned()),
             conversation: None,
+            stream: None,
         };
         let bytes = encode_named(&request).expect("serializes");
         let back: KvDeleteMany = decode_named(&bytes).expect("deserializes");
@@ -623,6 +644,7 @@ mod tests {
         let request = KvSet {
             v: KV_OP_VERSION,
             namespace: "sessions".to_owned(),
+            session: None,
             key: b"user:42".to_vec(),
             value: b"online".to_vec(),
             expires_at_micros: Some(1_700_000_000_000_000),
@@ -683,6 +705,7 @@ mod tests {
             let request = KvCas {
                 v: KV_OP_VERSION,
                 namespace: "counters".to_owned(),
+                session: None,
                 key: b"hits".to_vec(),
                 value: b"42".to_vec(),
                 expires_at_micros: None,
@@ -727,6 +750,7 @@ mod tests {
         let request = KvPatch {
             v: KV_OP_VERSION,
             namespace: "docs".to_owned(),
+            session: None,
             key: b"doc:1".to_vec(),
             patch: br#"{"status":"closed"}"#.to_vec(),
             if_match: Some(3),
@@ -787,12 +811,12 @@ mod tests {
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
             lease_ttl_micros: 30_000_000,
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: Some(42),
         };
         let bytes = encode_named(&request).expect("serializes");
         let back: KvLease = decode_named(&bytes).expect("deserializes");
-        assert_eq!(back.holder_id, "warden-node-1");
+        assert_eq!(back.holder_id, "node-1");
         assert_eq!(back.subject_user_id, Some(42));
         // A self-lease omits the subject on the wire.
         let own = KvLease {
@@ -809,7 +833,7 @@ mod tests {
             v: crate::codes::KV_LEASE_OP_VERSION,
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: None,
             lease_token: 7,
             lease_ttl_micros: 30_000_000,
@@ -817,7 +841,7 @@ mod tests {
         let bytes = encode_named(&request).expect("serializes");
         let back: KvLeaseRenew = decode_named(&bytes).expect("deserializes");
         assert_eq!(back.lease_token, 7);
-        assert_eq!(back.holder_id, "warden-node-1");
+        assert_eq!(back.holder_id, "node-1");
     }
 
     #[test]
@@ -1011,6 +1035,7 @@ mod tests {
             end: None,
             key_contains: Some("admin".to_owned()),
             conversation: None,
+            stream: None,
             limit: 50,
             cursor: Some(b"user:9".to_vec()),
         };
@@ -1019,5 +1044,49 @@ mod tests {
         assert_eq!(back.prefix.as_deref(), Some(b"user:".as_ref()));
         assert_eq!(back.key_contains.as_deref(), Some("admin"));
         assert_eq!(back.cursor.as_deref(), Some(b"user:9".as_ref()));
+        assert_eq!(back.stream, None);
+    }
+
+    #[test]
+    fn given_a_lens_with_a_stream_when_round_tripped_then_should_preserve_it_and_omit_it_when_unset()
+     {
+        let scan = KvScan {
+            v: KV_OP_VERSION,
+            namespace: "stream:acme/memory".to_owned(),
+            prefix: None,
+            start: None,
+            end: None,
+            key_contains: None,
+            conversation: Some("01KWM3K3XEP3NP5TN850J17YBP".to_owned()),
+            stream: Some("acme".to_owned()),
+            limit: 10,
+            cursor: None,
+        };
+        let back: KvScan =
+            decode_named(&encode_named(&scan).expect("serializes")).expect("deserializes");
+        assert_eq!(back.stream.as_deref(), Some("acme"));
+        let delete = KvDeleteMany {
+            v: KV_OP_VERSION,
+            namespace: "stream:acme/memory".to_owned(),
+            prefix: None,
+            start: None,
+            end: None,
+            key_contains: None,
+            conversation: Some("01KWM3K3XEP3NP5TN850J17YBP".to_owned()),
+            stream: Some("acme".to_owned()),
+        };
+        let back: KvDeleteMany =
+            decode_named(&encode_named(&delete).expect("serializes")).expect("deserializes");
+        assert_eq!(back.stream.as_deref(), Some("acme"));
+        let unset = KvDeleteMany {
+            stream: None,
+            ..delete
+        };
+        assert!(
+            !serde_json::to_string(&unset)
+                .expect("serializes")
+                .contains("\"stream\":"),
+            "an unset stream is omitted"
+        );
     }
 }

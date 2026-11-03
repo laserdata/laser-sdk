@@ -11,7 +11,12 @@ import {
   parseMessageId,
   messageIdToString
 } from "../../src/types/ids.js"
-import { RecordId } from "../../src/wire/ids.js"
+import {
+  RecordId,
+  logPositionFromBytes,
+  logPositionToBytes,
+  newLogPosition
+} from "../../src/wire/ids.js"
 
 void test("given_a_conversation_id_when_round_tripped_through_a_string_then_should_be_equal", () => {
   const id = ConversationId.new()
@@ -57,8 +62,9 @@ void test("given_valid_and_invalid_agent_id_strings_when_constructed_then_should
   assert.throws(() => AgentId.new("bad\tname"), {
     message: "identifier contains invalid character `\t`"
   })
-  const tooLong = "x".repeat(256)
-  assert.throws(() => AgentId.new(tooLong), { message: "identifier length 256B exceeds max 255B" })
+  assert.equal(AgentId.new("x".repeat(256)).asStr().length, 256, "the wire agent id cap")
+  const tooLong = "x".repeat(257)
+  assert.throws(() => AgentId.new(tooLong), { message: "identifier length 257B exceeds max 256B" })
 })
 
 void test("given_an_agent_id_when_used_for_a_consumer_group_then_should_share_its_spelling", () => {
@@ -111,4 +117,12 @@ void test("given_a_wire_id_type_when_minted_then_should_be_distinct_ulids_from_t
     }
   }
   assert.equal(MintUlid.mint(RecordId, fixed).asU128(), 1n << 80n)
+})
+
+void test("given_log_position_fields_when_built_then_should_round_trip_and_refuse_out_of_range_values", () => {
+  const position = newLogPosition(1, 2, 3, 4n)
+  assert.deepEqual(logPositionFromBytes(logPositionToBytes(position)), position)
+  assert.throws(() => newLogPosition(-1, 2, 3, 4n), InvalidError)
+  assert.throws(() => newLogPosition(1, 0x1_0000_0000, 3, 4n), InvalidError)
+  assert.throws(() => newLogPosition(1, 2, 3, -1n), InvalidError)
 })

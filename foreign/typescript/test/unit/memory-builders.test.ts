@@ -173,19 +173,20 @@ void test("given_a_stale_scope_when_consolidated_then_should_forget_everything_p
   assert.equal(backend.forgotten.length, 2)
 })
 
-void test("given_items_in_backend_order_when_consolidated_then_should_prune_by_id_age", async () => {
+void test("given_content_ids_in_recent_order_when_consolidated_then_should_prune_by_arrival", async () => {
   const backend = new RecordingMemory()
-  const oldest = { ...item("oldest"), id: MemoryId.fromU128(1n) }
+  const oldest = { ...item("oldest"), id: MemoryId.fromU128(3n) }
   const middle = { ...item("middle"), id: MemoryId.fromU128(2n) }
-  const newest = { ...item("newest"), id: MemoryId.fromU128(3n) }
-  backend.items = [oldest, newest, middle]
+  const newest = { ...item("newest"), id: MemoryId.fromU128(1n) }
+  backend.items = [newest, middle, oldest]
   const report = await MemoryHandle.custom(backend).consolidate({}, 1)
   assert.deepEqual(
     backend.forgotten.map(({ id }) => id.asU128()),
-    [1n, 2n]
+    [3n, 2n]
   )
   assert.deepEqual(report, { summarized: 0, reweighted: 0, pruned: 2, derived: 0 })
-  assert.deepEqual(backend.items, [oldest, newest, middle])
+  assert.deepEqual(backend.items, [newest, middle, oldest])
+  assert.equal(backend.recalled[0]?.query.strategy, RecallStrategy.Recent)
 })
 
 void test("given_a_reranker_when_attached_then_should_reorder_semantic_recall_only", async () => {

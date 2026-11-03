@@ -15,6 +15,7 @@ import {
   type ActionGovernor,
   type PolicyEvidence
 } from "../../src/index.js"
+import { TopicRetention } from "../../src/session.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
@@ -32,9 +33,11 @@ void test("given_a_blocking_governor_when_vector_memory_writes_then_should_recor
   }
   const laser = connected.withGovernor(governor, GovernorMode.Enforce)
   try {
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     const conversation = ConversationId.new()
-    const memory = laser.memoryWith("governed-vector", MemoryBackend.Vector)
+    const memory = laser.memoryWith("governed-vector", MemoryBackend.Vector, {
+      embed: () => Promise.resolve([1, 0])
+    })
     await assert.rejects(
       memory.remember(new TextEncoder().encode("must not persist")).scope(conversation).send(),
       PolicyBlockedError

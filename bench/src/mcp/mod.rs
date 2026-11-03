@@ -100,7 +100,7 @@ impl AgentHandler for EchoTool {
             .ok_or_else(|| LaserError::Handler("MCP tool call has no correlation".to_owned()))?;
         ctx.laser()
             .agdx(
-                AgentTopic::ToolResults,
+                AgentTopic::Sessions,
                 self.source.clone(),
                 command.conversation,
             )
@@ -161,10 +161,10 @@ pub async fn run_mcp_bridge_evidence(
 
 async fn prepare_stream(laser: &Laser, case: &AgdxCase, seed: u64) -> Result<Laser, BenchError> {
     let scoped = laser.with_default_stream(format!("bench-mcp-bridge-{seed:016x}"));
-    for topic in [AgentTopic::ToolCalls, AgentTopic::ToolResults] {
+    for topic in [AgentTopic::Sessions, AgentTopic::Sessions] {
         scoped
             .topic(topic.topic_string())
-            .ensure(case.partitions)
+            .ensure(case.partitions, None)
             .await
             .map_err(sdk_error)?;
     }
@@ -182,24 +182,23 @@ fn start_agent(laser: &Laser, partitions: u32) -> Result<AgentHandle, BenchError
         .map_err(|_| BenchError::Invalid("MCP partition count exceeds usize".to_owned()))?;
     Ok(Agent::builder()
         .id(worker)
-        .listen_on(AgentTopic::ToolCalls)
+        .listen_on(AgentTopic::Sessions)
         .handler(EchoTool { source })
-        .poll_interval(Duration::ZERO)
         .concurrency(ConcurrencyPolicy::SerialPerPartition { max_partitions })
         .build()
         .spawn(laser.clone()))
 }
 
 fn build_bridge(laser: Laser, case: &AgdxCase) -> Result<Arc<McpBridge>, BenchError> {
-    let source = "laser-bench-mcp-bridge"
+    let source: laser_sdk::types::AgentId = "laser-bench-mcp-bridge"
         .parse()
         .map_err(|error| BenchError::Invalid(format!("invalid MCP bridge id: {error}")))?;
     Ok(Arc::new(
         McpBridge::new(
             laser,
             source,
-            AgentTopic::ToolCalls,
-            AgentTopic::ToolResults,
+            AgentTopic::Sessions,
+            AgentTopic::Sessions,
             "laser-bench",
         )
         .with_tool(
@@ -207,6 +206,7 @@ fn build_bridge(laser: Laser, case: &AgdxCase) -> Result<Arc<McpBridge>, BenchEr
             Some("Echo a deterministic benchmark payload".to_owned()),
             json!({"type": "object"}),
         )
+        .map_err(|error| BenchError::Invalid(format!("invalid MCP tool: {error}")))?
         .with_timeout(Duration::from_millis(case.timeout_millis)),
     ))
 }

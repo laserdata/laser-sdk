@@ -18,9 +18,9 @@ impl AgentHandler for Echo {
         let reply = format!("echo: {}", String::from_utf8_lossy(&command.body)).into_bytes();
         ctx.laser()
             .agdx(
-                AgentTopic::Responses,
+                AgentTopic::Sessions,
                 "a2a-worker"
-                    .parse()
+                    .parse::<laser_sdk::types::AgentId>()
                     .expect("a2a-worker is a valid agent id"),
                 command.conversation,
             )
@@ -40,7 +40,7 @@ async fn given_a_message_send_when_the_agent_replies_then_tasks_get_should_compl
         .id("a2a-worker"
             .parse()
             .expect("a2a-worker is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Echo)
         .build()
         .spawn(laser.clone());
@@ -48,10 +48,10 @@ async fn given_a_message_send_when_the_agent_replies_then_tasks_get_should_compl
     let bridge = Arc::new(A2aBridge::new(
         laser.clone(),
         "a2a-bridge"
-            .parse()
+            .parse::<laser_sdk::types::AgentId>()
             .expect("a2a-bridge is a valid agent id"),
-        AgentTopic::Commands,
-        AgentTopic::Responses,
+        AgentTopic::Sessions,
+        AgentTopic::Sessions,
     ));
 
     // message/send creates a task in the Submitted state, tunneling the whole
@@ -85,10 +85,10 @@ async fn given_a_submitted_task_when_canceled_then_tasks_get_should_report_cance
     let bridge = Arc::new(A2aBridge::new(
         laser.clone(),
         "a2a-bridge"
-            .parse()
+            .parse::<laser_sdk::types::AgentId>()
             .expect("a2a-bridge is a valid agent id"),
-        AgentTopic::Commands,
-        AgentTopic::Responses,
+        AgentTopic::Sessions,
+        AgentTopic::Sessions,
     ));
 
     // The card advertises the bridge's identity and A2A capabilities.
@@ -138,7 +138,10 @@ async fn given_an_agent_and_bridge_on_a_custom_stream_when_used_then_should_run_
         .expect("the test laser has a default stream");
     let scoped = laser.with_default_stream(format!("{default_stream}-scoped"));
     scoped
-        .bootstrap(2)
+        .bootstrap(
+            2,
+            laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(86_400)),
+        )
         .await
         .expect("the scoped stream bootstraps");
 
@@ -146,7 +149,7 @@ async fn given_an_agent_and_bridge_on_a_custom_stream_when_used_then_should_run_
         .id("a2a-worker"
             .parse()
             .expect("a2a-worker is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Echo)
         .build()
         .spawn(scoped.clone());
@@ -154,10 +157,10 @@ async fn given_an_agent_and_bridge_on_a_custom_stream_when_used_then_should_run_
     let bridge = Arc::new(A2aBridge::new(
         scoped.clone(),
         "a2a-bridge"
-            .parse()
+            .parse::<laser_sdk::types::AgentId>()
             .expect("a2a-bridge is a valid agent id"),
-        AgentTopic::Commands,
-        AgentTopic::Responses,
+        AgentTopic::Sessions,
+        AgentTopic::Sessions,
     ));
     let params =
         br#"{"message":{"role":"user","parts":[{"kind":"text","text":"on the scoped stream"}]}}"#
@@ -174,4 +177,167 @@ async fn given_an_agent_and_bridge_on_a_custom_stream_when_used_then_should_run_
     })
     .await;
     assert!(completed.artifacts[0].text.contains("echo:"));
+}
+
+// A worker that records each task it handles and answers it in its own name.
+struct Named {
+    name: &'static str,
+    seen: Arc<std::sync::Mutex<Vec<(String, ConversationId)>>>,
+}
+
+impl AgentHandler for Named {
+    async fn handle(&self, message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
+        let Some(command) = message.envelope.as_ref() else {
+            return Ok(());
+        };
+        let Some(correlation) = command.correlation else {
+            return Ok(());
+        };
+        if command.kind != laser_sdk::wire::agent::AgentKind::Command {
+            return Ok(());
+        }
+        self.seen
+            .lock()
+            .expect("the seen list is not poisoned")
+            .push((self.name.to_owned(), command.conversation.into()));
+        ctx.laser()
+            .agdx(
+                AgentTopic::Sessions,
+                self.name
+                    .parse::<laser_sdk::types::AgentId>()
+                    .expect("the worker name is a valid agent id"),
+                command.conversation,
+            )
+            .respond(correlation, self.name.as_bytes().to_vec())
+            .send()
+            .await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_two_workers_when_submitting_to_one_then_only_that_worker_should_handle_the_task() {
+    let laser = harness::laser().await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _workers: Vec<_> = ["alpha", "beta"]
+        .into_iter()
+        .map(|name| {
+            Agent::builder()
+                .id(name.parse().expect("the worker name is a valid agent id"))
+                .listen_on(AgentTopic::Sessions)
+                .handler(Named {
+                    name,
+                    seen: seen.clone(),
+                })
+                .build()
+                .spawn(laser.clone())
+        })
+        .collect();
+    let bridge = Arc::new(A2aBridge::new(
+        laser.clone(),
+        "a2a-bridge"
+            .parse::<laser_sdk::types::AgentId>()
+            .expect("a2a-bridge is a valid agent id"),
+        AgentTopic::Sessions,
+        AgentTopic::Sessions,
+    ));
+    let parent = ConversationId::new();
+    let to_beta = bridge
+        .submit_to(
+            "beta"
+                .parse::<laser_sdk::types::AgentId>()
+                .expect("beta is a valid agent id"),
+            br#"{"message":{"role":"user","text":"for beta"}}"#.to_vec(),
+        )
+        .await
+        .expect("submit_to should succeed");
+    let to_alpha = bridge
+        .submit_in_to(
+            "alpha"
+                .parse::<laser_sdk::types::AgentId>()
+                .expect("alpha is a valid agent id"),
+            parent,
+            parent,
+            br#"{"message":{"role":"user","text":"for alpha"}}"#.to_vec(),
+        )
+        .await
+        .expect("submit_in_to should succeed");
+    for (task, worker) in [(&to_beta, "beta"), (&to_alpha, "alpha")] {
+        let completed = harness::eventually(|| {
+            let bridge = bridge.clone();
+            let id = task.id.clone();
+            async move {
+                let task = bridge.task(&id).await.expect("task lookup should succeed");
+                (task.status.state == TaskState::Completed).then_some(task)
+            }
+        })
+        .await;
+        assert_eq!(completed.artifacts[0].text, worker);
+    }
+    let seen = seen.lock().expect("the seen list is not poisoned").clone();
+    let handled = |task: &Task| {
+        seen.iter()
+            .filter(|(_, conversation)| conversation.to_string() == task.id)
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(handled(&to_beta), ["beta"]);
+    assert_eq!(handled(&to_alpha), ["alpha"]);
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_task_binding_when_another_caller_uses_the_task_id_then_should_refuse_it() {
+    let laser = harness::laser().await;
+    let bridge = A2aBridge::new(
+        laser.clone(),
+        "a2a-bound"
+            .parse::<laser_sdk::types::AgentId>()
+            .expect("a2a-bound is a valid agent id"),
+        AgentTopic::Sessions,
+        AgentTopic::Sessions,
+    )
+    .with_task_binding([3; 32], std::time::Duration::from_secs(60));
+    let params = br#"{"message":{"role":"user","parts":[{"kind":"text","text":"hi"}]}}"#.to_vec();
+
+    // A bound bridge refuses an anonymous submit before publishing anything.
+    assert!(matches!(
+        bridge.submit(params.clone()).await,
+        Err(LaserError::HandlerConfig(_))
+    ));
+    let task = bridge
+        .caller("alice")
+        .submit(params)
+        .await
+        .expect("the caller submit should succeed");
+    assert_eq!(task.id.split('.').count(), 3);
+
+    for refused in [
+        bridge.caller("bob").cancel(&task.id).await,
+        bridge.caller("bob").task(&task.id).await,
+        bridge.cancel(&task.id).await,
+    ] {
+        assert!(matches!(refused, Err(LaserError::HandlerConfig(_))));
+    }
+    let anonymous = bridge
+        .handle_rpc(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "CancelTask", "params": {"id": task.id}
+        }))
+        .await;
+    assert!(anonymous.error.is_some());
+
+    let canceled = bridge
+        .caller("alice")
+        .cancel(&task.id)
+        .await
+        .expect("the owner cancel should succeed");
+    assert_eq!(canceled.status.state, TaskState::Canceled);
+    let owned = bridge
+        .caller("alice")
+        .handle_rpc(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task.id}
+        }))
+        .await;
+    assert!(owned.error.is_none());
 }

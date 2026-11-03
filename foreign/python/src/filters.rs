@@ -6,7 +6,7 @@ use laser_sdk::LaserError;
 use laser_sdk::filters::{
     Coerce, ConsumerFilter, ExecutionMode, FaultPolicy, FilterError, FilterErrorReason, FilterExpr,
     FilterHeader, FilteredReader, FilteredStart, HeaderScalar, MatchedPage, MatchedRecord,
-    ReadMode, RecordPolicy, TextMatch, TimestampFormat,
+    RecordPolicy, TextMatch, TimestampFormat,
 };
 use laser_sdk::query::CmpOp;
 use laser_sdk::wire::filter::eval::{
@@ -19,10 +19,32 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::pin::pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex, OnceLock};
-use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard, Notify};
+
+#[gen_stub_pyclass]
+#[pyclass(name = "AckContext", frozen, from_py_object)]
+#[derive(Clone)]
+pub struct PyAckContext {
+    #[pyo3(get)]
+    owner_generation: u64,
+    #[pyo3(get)]
+    metadata_op: u64,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyAckContext {
+    #[new]
+    fn new(owner_generation: u64, metadata_op: u64) -> Self {
+        Self {
+            owner_generation,
+            metadata_op,
+        }
+    }
+}
 
 /// One predicate or a composition of predicates over a record. Build it with
 /// the static constructors: `FilterExpr.pred("after.mode", "eq", "safe")`.
@@ -317,6 +339,18 @@ impl PyConsumerFilter {
             .into())
     }
 
+    /// A copy whose `schema_refs` resolve in the schema registry of `stream`.
+    fn with_schema_stream(&self, stream: String) -> Self {
+        self.inner.clone().with_schema_stream(stream).into()
+    }
+
+    /// The stream whose schema registry resolves `schema_refs`, or None for
+    /// the deployment registry.
+    #[getter]
+    fn schema_stream(&self) -> Option<String> {
+        self.inner.schema_stream.clone()
+    }
+
     /// A copy with the malformed-payload policy: stop, pass, or drop.
     fn with_fault_policy(&self, fault_policy: &str) -> PyResult<Self> {
         Ok(self
@@ -578,6 +612,7 @@ impl PyCompiledFilter {
 pub struct PyFilteredReader {
     examined: Arc<AtomicU64>,
     state: Arc<Mutex<ReaderState>>,
+    interrupt: Arc<Interrupt>,
     // Records a cancelled call read but never handed over, yielded first.
     returned: Arc<SyncMutex<VecDeque<PyMatchedRecord>>>,
     returned_pages: Arc<SyncMutex<VecDeque<Arc<SharedPage>>>>,
@@ -587,8 +622,25 @@ struct ReaderState {
     examined: Arc<AtomicU64>,
     reader: Option<FilteredReader>,
     buffered: VecDeque<PyMatchedRecord>,
-    idle_interval: Duration,
     more: bool,
+}
+
+// Ends an idle wait that holds the reader, so another call takes it at once.
+// `wanted` counts the calls still queued for the reader, so a wait that would
+// start before they get it returns at once.
+#[derive(Default)]
+struct Interrupt {
+    wanted: AtomicUsize,
+    notify: Notify,
+}
+
+// One queued call, counted until it holds the reader or is cancelled.
+struct Queued<'a>(&'a AtomicUsize);
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl PyFilteredReader {
@@ -597,12 +649,12 @@ impl PyFilteredReader {
         Self {
             examined: examined.clone(),
             state: Arc::new(Mutex::new(ReaderState {
-                idle_interval: reader.idle_interval(),
                 more: false,
                 examined,
                 reader: Some(reader),
                 buffered: VecDeque::new(),
             })),
+            interrupt: Arc::default(),
             returned: Arc::new(SyncMutex::new(VecDeque::new())),
             returned_pages: Arc::new(SyncMutex::new(VecDeque::new())),
         }
@@ -619,31 +671,28 @@ struct SharedPage {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyFilteredReader {
-    /// The next page with at least one match. Waits while nothing is new,
-    /// without holding the reader, so `ack` and `close` run meanwhile.
+    /// The next page with at least one match. While nothing is new it waits
+    /// the way the Rust reader does, in a filtered wait the server holds or
+    /// one idle interval on a server that holds none. `ack` and `close` end
+    /// that wait, so they run meanwhile.
     fn next_page<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
+        let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let returned_pages = self.returned_pages.clone();
         future_into_py_returning(
             py,
             async move {
                 loop {
-                    let idle_interval = {
+                    {
                         let mut state = state.lock().await;
                         if let Some(page) = state.next_page(&returned_pages).await? {
                             return Ok(page);
                         }
-                        if state.more {
-                            Duration::ZERO
-                        } else {
-                            state.idle_interval
+                        if !state.more {
+                            state.wait_for_records(&interrupt).await?;
+                            continue;
                         }
-                    };
-                    if idle_interval.is_zero() {
-                        tokio::task::yield_now().await;
-                    } else {
-                        tokio::time::sleep(idle_interval).await;
                     }
+                    tokio::task::yield_now().await;
                 }
             },
             give_back_page(self.returned_pages.clone()),
@@ -652,14 +701,14 @@ impl PyFilteredReader {
 
     /// Read until a page matches or nothing is new. `None` when nothing is new.
     fn try_next_page<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
+        let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let returned_pages = self.returned_pages.clone();
         future_into_py_returning(
             py,
             async move {
                 loop {
                     {
-                        let mut state = state.lock().await;
+                        let mut state = take(&state, &interrupt).await;
                         let page = state.next_page(&returned_pages).await?;
                         if page.is_some() || !state.more {
                             return Ok(page);
@@ -675,13 +724,13 @@ impl PyFilteredReader {
     /// One bounded round without an idle wait. Returns (page, more).
     /// Read examined_in_round() for the count of source records examined.
     fn read_round<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
+        let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let returned_pages = self.returned_pages.clone();
         let recover = give_back_page(self.returned_pages.clone());
         future_into_py_returning(
             py,
             async move {
-                let mut state = state.lock().await;
+                let mut state = take(&state, &interrupt).await;
                 let page = state.next_page(&returned_pages).await?;
                 Ok((page, state.more))
             },
@@ -691,6 +740,19 @@ impl PyFilteredReader {
                 }
             }),
         )
+    }
+
+    /// Wait after a round that found nothing new, for a caller that drives
+    /// `try_next_page` or `read_round` itself. The server holds one filtered
+    /// wait until one of this reader's partitions has a new record, at most
+    /// `max_wait_ms` and what it announces, and the next round reads only the
+    /// ready partitions. On a server that holds no filtered wait it sleeps one
+    /// idle interval. Any other call on the reader ends the wait.
+    fn wait_for_records<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
+        future_into_py(py, async move {
+            state.lock().await.wait_for_records(&interrupt).await
+        })
     }
 
     /// Source records examined in the last bounded round, including empty pages.
@@ -704,7 +766,7 @@ impl PyFilteredReader {
         let returned_pages = self.returned_pages.clone();
         future_into_py_returning(
             py,
-            next_record(state, returned, returned_pages),
+            next_record(state, self.interrupt.clone(), returned, returned_pages),
             give_back(self.returned.clone()),
         )
     }
@@ -715,10 +777,10 @@ impl PyFilteredReader {
         py: Python<'py>,
         record: PyRef<'_, PyMatchedRecord>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
+        let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let (page, index) = (record.page.clone(), record.index);
         future_into_py(py, async move {
-            let mut state = state.lock().await;
+            let mut state = take(&state, &interrupt).await;
             state
                 .open()?
                 .ack(&page.page.records[index])
@@ -734,10 +796,10 @@ impl PyFilteredReader {
         py: Python<'py>,
         record: PyRef<'_, PyMatchedRecord>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
+        let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let (page, index) = (record.page.clone(), record.index);
         future_into_py(py, async move {
-            let mut state = state.lock().await;
+            let mut state = take(&state, &interrupt).await;
             state
                 .open()?
                 .ack_through(&page.page.records[index])
@@ -753,28 +815,33 @@ impl PyFilteredReader {
         py: Python<'py>,
         page: PyRef<'_, PyMatchedPage>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
+        let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let page = page.page.clone();
         future_into_py(py, async move {
-            let mut state = state.lock().await;
+            let mut state = take(&state, &interrupt).await;
             state.open()?.ack_page(&page.page).await.map_err(to_pyerr)
         })
     }
 
     /// The partitions this reader reads now.
     fn partitions<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
-        future_into_py(
-            py,
-            async move { Ok(state.lock().await.open()?.partitions()) },
-        )
+        let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
+        future_into_py(py, async move {
+            Ok(take(&state, &interrupt).await.open()?.partitions())
+        })
     }
 
-    /// How long this reader waits, in seconds, when nothing is new.
-    fn idle_interval<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
+    /// How long this reader waits, in milliseconds, when nothing is new on a
+    /// server that holds no filtered wait.
+    fn idle_interval_ms<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         future_into_py(py, async move {
-            Ok(state.lock().await.open()?.idle_interval().as_secs_f64())
+            Ok(take(&state, &interrupt)
+                .await
+                .open()?
+                .idle_interval()
+                .as_secs_f64()
+                * 1000.0)
         })
     }
 
@@ -786,30 +853,20 @@ impl PyFilteredReader {
         py: Python<'py>,
         page: PyRef<'_, PyMatchedPage>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
+        let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let page = Arc::clone(&page.page);
         future_into_py(py, async move {
-            Ok(state.lock().await.open()?.owns(&page.page))
+            Ok(take(&state, &interrupt).await.open()?.owns(&page.page))
         })
     }
 
-    /// Data connections this reader opened to partition primaries, including
-    /// routes later retired. A healthy reader opens one per node and keeps it.
-    fn data_connections_opened<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
-        future_into_py(py, async move {
-            Ok(state.lock().await.open()?.data_connections_opened())
-        })
-    }
-
-    /// Store completed progress, leave the group, and close the data
-    /// connections. Closing twice is a no-op.
+    /// Store completed progress and leave the group. Closing twice is a no-op.
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let (state, returned) = (self.state.clone(), self.returned.clone());
-        let returned_pages = self.returned_pages.clone();
+        let (returned_pages, interrupt) = (self.returned_pages.clone(), self.interrupt.clone());
         future_into_py(py, async move {
             let taken = {
-                let mut state = state.lock().await;
+                let mut state = take(&state, &interrupt).await;
                 if let Some(reader) = state.reader.as_mut() {
                     reader.flush_completed().await.map_err(to_pyerr)?;
                 }
@@ -837,14 +894,14 @@ impl PyFilteredReader {
 
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let (state, returned) = (self.state.clone(), self.returned.clone());
-        let returned_pages = self.returned_pages.clone();
+        let (returned_pages, interrupt) = (self.returned_pages.clone(), self.interrupt.clone());
         future_into_py_returning(
             py,
             async move {
                 if state.lock().await.reader.is_none() {
                     return Err(PyStopAsyncIteration::new_err(()));
                 }
-                next_record(state, returned, returned_pages).await
+                next_record(state, interrupt, returned, returned_pages).await
             },
             give_back(self.returned.clone()),
         )
@@ -884,6 +941,24 @@ impl ReaderState {
             .ok_or_else(|| ConfigError::new_err("the filtered reader is closed"))
     }
 
+    // The Rust reader's wait after a round that found nothing new. Its held
+    // waits outlive an interrupted call, so the next wait picks them up.
+    async fn wait_for_records(&mut self, interrupt: &Interrupt) -> PyResult<()> {
+        let reader = self.open()?;
+        // Registered before the count is read, so a call that queues after
+        // the read still ends this wait.
+        let mut interrupted = pin!(interrupt.notify.notified());
+        interrupted.as_mut().enable();
+        if interrupt.wanted.load(Ordering::SeqCst) > 0 {
+            return Ok(());
+        }
+        tokio::select! {
+            () = reader.wait_for_records() => {}
+            () = interrupted => {}
+        }
+        Ok(())
+    }
+
     // Records of a membership the reader has since rejoined can no longer be
     // acknowledged, so they are dropped before anything is yielded. Pages
     // enter the buffer in read order and a rejoin retires every earlier page,
@@ -905,14 +980,15 @@ impl SharedPage {
 }
 
 // The next record: one a cancelled call gave back, then the buffer, then a new
-// page. The reader is held only while it reads, never across the idle wait.
+// page. Any other call on the reader ends its idle wait.
 async fn next_record(
     state: Arc<Mutex<ReaderState>>,
+    interrupt: Arc<Interrupt>,
     returned: Arc<SyncMutex<VecDeque<PyMatchedRecord>>>,
     returned_pages: Arc<SyncMutex<VecDeque<Arc<SharedPage>>>>,
 ) -> PyResult<PyMatchedRecord> {
     loop {
-        let idle_interval = {
+        {
             let mut state = state.lock().await;
             let reader = state.open()?;
             let given_back = returned
@@ -937,21 +1013,26 @@ async fn next_record(
                         }));
                     continue;
                 }
+                None if state.more => {}
                 None => {
-                    if state.more {
-                        Duration::ZERO
-                    } else {
-                        state.idle_interval
-                    }
+                    state.wait_for_records(&interrupt).await?;
+                    continue;
                 }
             }
-        };
-        if idle_interval.is_zero() {
-            tokio::task::yield_now().await;
-        } else {
-            tokio::time::sleep(idle_interval).await;
         }
+        tokio::task::yield_now().await;
     }
+}
+
+// Take the reader for a call that must not wait out an idle wait.
+async fn take<'a>(
+    state: &'a Mutex<ReaderState>,
+    interrupt: &Interrupt,
+) -> MutexGuard<'a, ReaderState> {
+    interrupt.wanted.fetch_add(1, Ordering::SeqCst);
+    let _queued = Queued(&interrupt.wanted);
+    interrupt.notify.notify_waiters();
+    state.lock().await
 }
 
 // Put a record whose call was cancelled after the read back in front, so the
@@ -1134,13 +1215,6 @@ pub(crate) fn execution_mode_is_filtered(mode: &Bound<'_, PyAny>) -> PyResult<bo
 #[pyfunction]
 pub(crate) fn fault_reason_is_foreign(reason: &str) -> PyResult<bool> {
     Ok(fault_reason(reason)?.is_foreign())
-}
-
-/// Whether the read `mode` (`primary` or `local`) reads the partition primary.
-#[gen_stub_pyfunction]
-#[pyfunction]
-pub(crate) fn read_mode_is_primary(mode: &Bound<'_, PyAny>) -> PyResult<bool> {
-    Ok(py_to_de::<ReadMode>(mode)?.is_primary())
 }
 
 /// Whether the record `policy` (`reject` or `pass`) skips the record.

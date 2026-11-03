@@ -1,10 +1,6 @@
 import { CodecError, InvalidError } from "../client/errors.js"
 import { type CborMap, expectMap, expectString, field, singleVariantTag } from "./cbor.js"
 import {
-  AGDX_AGENT_CANCEL_CODE,
-  AGDX_AGENT_LIST_CODE,
-  AGDX_AGENT_STATUS_CODE,
-  AGDX_AGENT_SUBMIT_CODE,
   AGDX_DECODE_RECORD_CODE,
   AGDX_DESTINATION_GET_CODE,
   AGDX_DESTINATION_LIST_CODE,
@@ -44,10 +40,18 @@ import {
   AGDX_LIST_SCHEMAS_CODE,
   AGDX_QUERY_CODE,
   AGDX_QUERY_ROUTE_LIST_CODE,
+  AGDX_SESSION_GET_CODE,
+  AGDX_SESSION_LIST_CODE,
+  AGDX_SESSION_EVENTS_CODE,
+  AGDX_SESSION_STATE_CODE,
+  AGDX_SESSION_LINKS_CODE,
+  AGDX_SESSION_SOURCES_CODE,
+  AGDX_SESSION_CHANGES_CODE,
   AGDX_REGISTER_SCHEMA_CODE,
   AUTHZ_OP_VERSION
 } from "./codes.js"
 import { MAX_ROLE_NAME_BYTES } from "./limits.js"
+import type { ResultCode } from "./result.js"
 
 export type Effect = "allow" | "deny"
 
@@ -73,6 +77,7 @@ export type Feature =
   | "kv_lease"
   | "kv_fence"
   | "filter"
+  | "session"
   | "unrecognized"
 
 const KNOWN_FEATURES: ReadonlySet<string> = new Set([
@@ -89,7 +94,8 @@ const KNOWN_FEATURES: ReadonlySet<string> = new Set([
   "authz",
   "kv_lease",
   "kv_fence",
-  "filter"
+  "filter",
+  "session"
 ])
 
 function parseFeature(word: string): Feature {
@@ -111,6 +117,39 @@ function parseResourceKind(word: string, context: string): ResourceKind {
     throw new CodecError(`\`${word}\` is not a recognized resource pattern kind`, context, "kind")
   }
   return word
+}
+
+/** The prefix of a resource name scoped to one stream, `stream:<name>` or
+ * `stream:<name>/<local>`. */
+export const STREAM_RESOURCE_PREFIX = "stream:"
+
+/** The resource name of `stream` itself. */
+export function streamResource(stream: string): string {
+  return `${STREAM_RESOURCE_PREFIX}${stream}`
+}
+
+/** The name of the managed resource `local` inside `stream`,
+ * `stream:<stream>/<local>`. A `local` that already starts with `stream:` is
+ * returned unchanged, so scoping is idempotent and a caller-scoped name is
+ * never scoped twice. */
+export function scopedResource(stream: string, local: string): string {
+  return local.startsWith(STREAM_RESOURCE_PREFIX)
+    ? local
+    : `${STREAM_RESOURCE_PREFIX}${stream}/${local}`
+}
+
+/** The stream and local part of a scoped resource name. `undefined` for a
+ * bare name, for the stream resource itself, and for a name with an empty
+ * stream or local part. Stream names never contain `/`, so the first `/` ends
+ * the stream. */
+export function splitScopedResource(
+  name: string
+): readonly [stream: string, local: string] | undefined {
+  if (!name.startsWith(STREAM_RESOURCE_PREFIX)) return undefined
+  const rest = name.slice(STREAM_RESOURCE_PREFIX.length)
+  const slash = rest.indexOf("/")
+  if (slash <= 0 || slash === rest.length - 1) return undefined
+  return [rest.slice(0, slash), rest.slice(slash + 1)]
 }
 
 export interface ResourcePattern {
@@ -303,13 +342,14 @@ export function featureAction(code: number): readonly [Feature, Action] | undefi
       return ["graph", "read"]
     case AGDX_GRAPH_UPSERT_CODE:
       return ["graph", "write"]
-    case AGDX_AGENT_STATUS_CODE:
-    case AGDX_AGENT_LIST_CODE:
-      return ["agent", "read"]
-    case AGDX_AGENT_SUBMIT_CODE:
-      return ["agent", "write"]
-    case AGDX_AGENT_CANCEL_CODE:
-      return ["agent", "delete"]
+    case AGDX_SESSION_GET_CODE:
+    case AGDX_SESSION_LIST_CODE:
+    case AGDX_SESSION_EVENTS_CODE:
+    case AGDX_SESSION_STATE_CODE:
+    case AGDX_SESSION_LINKS_CODE:
+    case AGDX_SESSION_SOURCES_CODE:
+    case AGDX_SESSION_CHANGES_CODE:
+      return ["session", "read"]
     case AGDX_GET_FILTER_CODE:
     case AGDX_LIST_FILTERS_CODE:
     case AGDX_LIST_FILTER_REVISIONS_CODE:
@@ -337,7 +377,8 @@ const FEATURE_ORDINALS = {
   kv_lease: 11,
   kv_fence: 12,
   filter: 13,
-  unrecognized: 14
+  session: 14,
+  unrecognized: 15
 } as const satisfies Readonly<Record<Feature, number>>
 const ACTION_ORDINALS = {
   read: 0,
@@ -621,6 +662,8 @@ export type AuthzSubject =
   | { readonly kind: "role"; readonly name: string }
   | { readonly kind: "binding"; readonly userId: number }
   | { readonly kind: "all" }
+  /** Every change attributed to one stream, as Rust `AuthzSubject::Stream`. */
+  | { readonly kind: "stream"; readonly stream: string }
 
 export function encodeAuthzSubject(subject: AuthzSubject): unknown {
   switch (subject.kind) {
@@ -630,6 +673,8 @@ export function encodeAuthzSubject(subject: AuthzSubject): unknown {
       return new Map([["binding", new Map<string, unknown>([["user_id", subject.userId]])]])
     case "all":
       return "all"
+    case "stream":
+      return new Map([["stream", subject.stream]])
   }
 }
 
@@ -645,6 +690,9 @@ export function decodeAuthzSubject(value: unknown, context: string): AuthzSubjec
   if (map.has("binding")) {
     const bindingMap = expectMap(map.get("binding"), context)
     return { kind: "binding", userId: field.requiredU32(bindingMap, "user_id", context) }
+  }
+  if (map.has("stream")) {
+    return { kind: "stream", stream: expectString(map.get("stream"), context) }
   }
   throw new CodecError("authz subject has no recognized tag", context, "subject")
 }
@@ -676,10 +724,14 @@ export function decodeAuthzHistoryReq(map: CborMap, context: string): AuthzHisto
   }
 }
 
+/** How a deployment scopes its managed resources, as Rust `Tenancy`. */
+export type Tenancy = "deployment" | "stream"
+
 export type AuthzEventKind =
   | { readonly kind: "roleDefined"; readonly name: string }
   | { readonly kind: "roleDeleted"; readonly name: string }
   | { readonly kind: "rolesBound"; readonly userId: number; readonly roles: readonly string[] }
+  | { readonly kind: "tenancySet"; readonly tenancy: Tenancy }
 
 export function encodeAuthzEventKind(op: AuthzEventKind): unknown {
   switch (op.kind) {
@@ -697,6 +749,8 @@ export function encodeAuthzEventKind(op: AuthzEventKind): unknown {
           ])
         ]
       ])
+    case "tenancySet":
+      return new Map([["tenancy_set", op.tenancy]])
   }
 }
 
@@ -716,6 +770,13 @@ export function decodeAuthzEventKind(value: unknown, context: string): AuthzEven
       roles: field.requiredArray(boundMap, "roles", context, (item) => expectString(item, context))
     }
   }
+  if (map.has("tenancy_set")) {
+    const tenancy = expectString(map.get("tenancy_set"), context)
+    if (tenancy !== "deployment" && tenancy !== "stream") {
+      throw new CodecError(`unknown tenancy \`${tenancy}\``, context, "tenancy_set")
+    }
+    return { kind: "tenancySet", tenancy }
+  }
   throw new CodecError("authz event has no recognized tag", context, "op")
 }
 
@@ -724,23 +785,29 @@ export interface AuthzEvent {
   readonly actor: string
   readonly atMicros: bigint
   readonly op: AuthzEventKind
+  /** The one stream the change is attributed to, absent when none. */
+  readonly stream?: string
 }
 
 export function encodeAuthzEvent(event: AuthzEvent): Map<string, unknown> {
-  return new Map<string, unknown>([
+  const map = new Map<string, unknown>([
     ["revision", event.revision],
     ["actor", event.actor],
     ["at_micros", event.atMicros],
     ["op", encodeAuthzEventKind(event.op)]
   ])
+  if (event.stream !== undefined) map.set("stream", event.stream)
+  return map
 }
 
 export function decodeAuthzEvent(map: CborMap, context: string): AuthzEvent {
+  const stream = field.optionalString(map, "stream", context)
   return {
     revision: field.requiredU64(map, "revision", context),
     actor: field.requiredString(map, "actor", context),
     atMicros: field.requiredU64(map, "at_micros", context),
-    op: decodeAuthzEventKind(map.get("op"), context)
+    op: decodeAuthzEventKind(map.get("op"), context),
+    ...(stream !== undefined ? { stream } : {})
   }
 }
 
@@ -783,6 +850,9 @@ export type AuthzError =
   | { readonly kind: "invalidName"; readonly name: string }
   | { readonly kind: "conflict"; readonly currentRevision: bigint }
   | { readonly kind: "version"; readonly expected: number; readonly got: number }
+  /** A grant refused because it reaches past one stream while the server runs
+   * with stream tenancy, for example a wildcard or a prefix spanning streams. */
+  | { readonly kind: "tenancyViolation"; readonly message: string }
   | { readonly kind: "unrecognized"; readonly tag: string; readonly value: unknown }
 
 export function encodeAuthzError(error: AuthzError): unknown {
@@ -809,8 +879,31 @@ export function encodeAuthzError(error: AuthzError): unknown {
           ])
         ]
       ])
+    case "tenancyViolation":
+      return new Map([["TenancyViolation", error.message]])
     case "unrecognized":
       return new Map([[error.tag, error.value]])
+  }
+}
+
+/** The unified result code of an authorization failure. */
+export function authzErrorResultCode(error: AuthzError): ResultCode {
+  switch (error.kind) {
+    case "unsupported":
+      return { kind: "known", name: "Unsupported" }
+    case "unauthorized":
+      return { kind: "known", name: "Forbidden" }
+    case "unknownRole":
+      return { kind: "known", name: "NotFound" }
+    case "invalidName":
+    case "tenancyViolation":
+      return { kind: "known", name: "InvalidArgument" }
+    case "conflict":
+      return { kind: "known", name: "Conflict" }
+    case "version":
+      return { kind: "known", name: "VersionSkew" }
+    case "unrecognized":
+      return { kind: "known", name: "Backend" }
   }
 }
 
@@ -828,6 +921,8 @@ export function decodeAuthzError(value: unknown, context: string): AuthzError {
       return { kind: "unknownRole", name: expectString(inner, context) }
     case "InvalidName":
       return { kind: "invalidName", name: expectString(inner, context) }
+    case "TenancyViolation":
+      return { kind: "tenancyViolation", message: expectString(inner, context) }
     case "Conflict": {
       const conflictMap = expectMap(inner, context)
       return {

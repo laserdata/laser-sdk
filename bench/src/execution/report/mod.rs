@@ -604,7 +604,7 @@ pub(crate) fn stack_artifacts(
         stack.benchmark.as_ref(),
         stack.iggy_server.as_ref(),
         stack.iggy_bench.as_ref(),
-        stack.plane.as_ref(),
+        stack.backend.as_ref(),
     ]
     .into_iter()
     .flatten()

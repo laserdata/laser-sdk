@@ -1,7 +1,7 @@
 use crate::agent::PyProvenance;
 use crate::async_bridge::{HookLoop, PyHook, call_hook, future_into_py, hook_callable};
 use crate::client::PyLaser;
-use crate::convert::{duration_seconds, json_to_py, payload_bytes};
+use crate::convert::{duration_ms, json_to_py, payload_bytes};
 use crate::errors::to_pyerr;
 use laser_sdk::error::LaserError;
 use laser_sdk::memory::{
@@ -17,6 +17,11 @@ use std::sync::Arc;
 
 // An `Embedder` over a Python callable or an object with `embed(text)`,
 // returning `list[float]` directly or through an awaitable.
+
+// A message source as Python sees it: stream, topic, partition, offset, topic
+// generation, and conversation.
+type MessageSource = (u32, u32, u32, u64, Option<u64>, Option<String>);
+
 #[derive(Clone)]
 pub(crate) struct PyEmbedder {
     hook: PyHook,
@@ -160,6 +165,8 @@ fn memory_items(
                 score,
                 signals: Vec::new(),
                 source: None,
+                origin: None,
+                producer: None,
             })
         })
         .collect()
@@ -359,6 +366,23 @@ pub(crate) struct RememberOptions {
     pub(crate) kind: MemoryKind,
     pub(crate) durable: bool,
     pub(crate) dedup: bool,
+    pub(crate) origin: Option<laser_sdk::wire::graph::SourceRef>,
+    pub(crate) producer: Option<laser_sdk::wire::graph::ProducerInfo>,
+}
+
+// The lineage keywords of a remember call: `origin` as the `SourceRef` dict
+// and `producer` as a `{"name", "version"}` dict.
+pub(crate) fn lineage(
+    origin: Option<&Bound<'_, PyAny>>,
+    producer: Option<&Bound<'_, PyAny>>,
+) -> PyResult<(
+    Option<laser_sdk::wire::graph::SourceRef>,
+    Option<laser_sdk::wire::graph::ProducerInfo>,
+)> {
+    Ok((
+        origin.map(crate::convert::py_to_de).transpose()?,
+        producer.map(crate::convert::py_to_de).transpose()?,
+    ))
 }
 
 impl Backend {
@@ -420,6 +444,12 @@ impl Backend {
         }
         if options.dedup {
             builder = builder.dedup();
+        }
+        if let Some(origin) = options.origin {
+            builder = builder.origin(origin);
+        }
+        if let Some(producer) = options.producer {
+            builder = builder.producer(producer);
         }
         builder.send().await
     }
@@ -761,8 +791,9 @@ impl PyMemory {
     /// that value. Omit `conversation` on recall to read across conversations.
     /// `dedup=True` derives the id from the owner scope (stream, agent, user, and
     /// application), the kind, and the body, so remembering the same body twice
-    /// stores it once.
-    #[pyo3(signature = (payload, *, agent=None, conversation=None, stream=None, user=None, application=None, kind="fact", durable=false, dedup=false))]
+    /// stores it once. `origin` is the `SourceRef` dict of the session record
+    /// that motivated the item, and `producer` is a `{"name", "version"}` dict.
+    #[pyo3(signature = (payload, *, agent=None, conversation=None, stream=None, user=None, application=None, kind="fact", durable=false, dedup=false, origin=None, producer=None))]
     #[allow(clippy::too_many_arguments)]
     fn remember<'py>(
         &self,
@@ -776,9 +807,14 @@ impl PyMemory {
         kind: &str,
         durable: bool,
         dedup: bool,
+        origin: Option<&Bound<'_, PyAny>>,
+        producer: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let backend = self.inner.clone();
+        let (origin, producer) = lineage(origin, producer)?;
         let options = RememberOptions {
+            origin,
+            producer,
             agent: parse_agent(agent)?,
             conversation: parse_conversation(conversation)?,
             stream,
@@ -1073,19 +1109,47 @@ impl PyMemoryItem {
         self.inner.score
     }
 
+    /// The session record that motivated the item, as the `SourceRef` dict, or None.
+    #[getter]
+    fn origin(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.inner
+            .origin
+            .as_ref()
+            .map(|origin| crate::convert::ser_to_py(py, origin))
+            .transpose()
+    }
+
+    /// The component that produced the item, as `{"name", "version"}`, or None.
+    #[getter]
+    fn producer(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.inner
+            .producer
+            .as_ref()
+            .map(|producer| crate::convert::ser_to_py(py, producer))
+            .transpose()
+    }
+
     /// The origin log record this item was folded from, as
-    /// `(stream, topic, partition, offset, conversation)`, or `None`. Points back
+    /// `(stream, topic, partition, offset, generation, conversation)`, or `None`. Points back
     /// to the source message while it is still on the log.
     #[getter]
-    fn source(&self) -> Option<(u32, u32, u32, u64, Option<String>)> {
+    fn source(&self) -> Option<MessageSource> {
         match &self.inner.source {
             Some(laser_sdk::wire::graph::SourceRef::Message {
                 stream,
                 topic,
                 partition,
                 offset,
+                generation,
                 conversation,
-            }) => Some((*stream, *topic, *partition, *offset, conversation.clone())),
+            }) => Some((
+                *stream,
+                *topic,
+                *partition,
+                *offset,
+                *generation,
+                conversation.clone(),
+            )),
             _ => None,
         }
     }
@@ -1189,16 +1253,16 @@ impl PyLaser {
 
     /// Configure and ensure a memory topic, then return memory on it: the
     /// stream, the partition count (each scope keyed to one partition), and the
-    /// stream message-expiry. `ttl_secs` defaults to thirty days. Pass `0` to
+    /// stream message-expiry. `ttl_ms` (milliseconds) defaults to thirty days. Pass `0` to
     /// keep the history until topic retention rotates it out.
-    #[pyo3(signature = (topic, *, stream=None, partitions=1, ttl_secs=None))]
+    #[pyo3(signature = (topic, *, stream=None, partitions=1, ttl_ms=None))]
     fn memory_topic<'py>(
         &self,
         py: Python<'py>,
         topic: String,
         stream: Option<String>,
         partitions: u32,
-        ttl_secs: Option<f64>,
+        ttl_ms: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
         future_into_py(py, async move {
@@ -1206,10 +1270,10 @@ impl PyLaser {
             if let Some(stream) = &stream {
                 builder = builder.stream(stream);
             }
-            builder = match ttl_secs {
+            builder = match ttl_ms {
                 None => builder,
-                Some(seconds) if seconds <= 0.0 => builder.no_expiry(),
-                Some(seconds) => builder.ttl(duration_seconds(seconds, "ttl_secs")?),
+                Some(ms) if ms <= 0.0 => builder.no_expiry(),
+                Some(ms) => builder.ttl(duration_ms(ms, "ttl_ms")?),
             };
             builder.build().await.map_err(to_pyerr)?;
             let memory = LogMemory::on_stream_topic_named(laser.clone(), stream, &topic)

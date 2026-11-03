@@ -23,12 +23,13 @@ a2a-bridge = ["agent", "dep:serde_json"]
 a2a-http = ["a2a-bridge", "dep:axum", "dep:strum"]
 # AG-UI state sync: emit `state_snapshot`/`state_delta` events and reconstruct
 # shared state by replaying them (RFC 6902 JSON Patch), over the log not SSE.
-agui = ["agent", "dep:json-patch", "dep:serde_json"]
+agui = ["agent", "dep:serde_json"]
 agent = [
     "dep:async-trait",
     "dep:blake3",
     "dep:dashmap",
     "dep:futures",
+    "dep:iggy_common",
     "dep:serde_json",
     "dep:sha2",
     "dep:strum",
@@ -54,11 +55,11 @@ graph = ["streaming"]
 # `cargo test --workspace` stays unit-only and infrastructure-free.
 integration = []
 # Managed key-value store over the `AGDX_KV` managed commands, backed by
-# laser-plane's point-state backend in Laser Stack or LaserData Cloud.
+# the managed backend's point-state store in Laser Stack or LaserData Cloud.
 # trait-variant backs the injectable coordination transport seam, async-trait
 # its object-safe (`Arc<dyn ..>`) counterpart for a runtime-selected transport.
 kv = ["dep:async-trait", "dep:trait-variant", "streaming"]
-# The managed tier in one word: everything laser-plane serves over the
+# The managed tier in one word: everything the managed backend serves over the
 # command band. `--features managed` instead of remembering which per-surface
 # features compose it.
 managed = [
@@ -70,7 +71,6 @@ managed = [
     "projections",
     "query",
     "rbac",
-    "runs",
     "watch",
 ]
 # Materialization destinations, query routes, checkpoint lifecycle, and status.
@@ -88,13 +88,10 @@ provenance = []
 # Capability RBAC over the managed surfaces: roles, grants, bindings, and the
 # authorization change history over the `AGDX_AUTHZ` managed commands.
 rbac = ["streaming"]
-# The managed run registry: submit, cancel, status, and list agent or workflow
-# runs over the `AGDX_AGENT_*` managed commands.
-runs = ["streaming"]
 # Client-side schema-first codec helpers: compile a registered `SchemaDef`
 # (Avro / Protobuf) locally, encode Avro bodies from serde values, and validate
 # payloads against the registered definition before publishing - the same
-# decode semantics the laser-plane projector applies.
+# decode semantics the managed backend's projector applies.
 schema-codecs = ["dep:apache-avro", "dep:jsonschema", "dep:prost-reflect", "projections"]
 # Envelope signing and verification: activate the dormant `Signature` field with
 # Ed25519 keys and a per-agent key registry keyed by the enrolled principal. The
@@ -111,14 +108,14 @@ streaming = [
     "dep:futures",
     "dep:iggy_binary_protocol",
     "dep:iggy_common",
-    "dep:secrecy",
     "dep:serde_json",
     "dep:tokio",
     "dep:tracing",
+    "dep:trait-variant",
     "laser-wire/codecs",
 ]
 # The materialized-view change feed: `Laser::watch()` over the `ChangeRecord`s
-# laser-plane publishes per committed projector batch.
+# the managed backend publishes per committed projector batch.
 watch = ["streaming"]
 
 [dependencies]
@@ -134,11 +131,9 @@ futures = { workspace = true, optional = true }
 iggy = { workspace = true }
 iggy_binary_protocol = { workspace = true, optional = true }
 iggy_common = { workspace = true, optional = true }
-json-patch = { workspace = true, optional = true }
 jsonschema = { workspace = true, optional = true }
 laser-wire = { workspace = true, features = ["builders", "cbor"] }
 prost-reflect = { workspace = true, optional = true }
-secrecy = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
@@ -154,6 +149,7 @@ apache-avro = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 iggy = { workspace = true }
+laser-test-support = { workspace = true }
 laser-wire = { workspace = true, features = ["builders", "cbor", "fixtures"] }
 libc = "0.2"
 prost = { workspace = true }

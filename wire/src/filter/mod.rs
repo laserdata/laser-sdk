@@ -17,11 +17,11 @@ pub use catalog::{
     CatalogPosition, FilterBinding, FilterBindingPage, FilterCatalogCommand, FilterCatalogLimits,
     FilterCatalogOutcome, FilterCatalogReply, FilterCatalogVersion, FilterDetail,
     FilterGroupIdentity, FilterGroupRef, FilterMutation, FilterMutationOutcome,
-    FilterMutationRequest, FilterMutationResult, FilterMutationStatus, FilterPage, FilterPolicyRef,
-    FilterRevisionInfo, FilterRevisionPage, FilterRevisionRef, FilterState, FilterSummary,
-    GetFilter, GetFilterBinding, GetFilterOperation, GroupFilterSpec, GroupPolicyUnbound,
-    ListFilterBindings, ListFilterRevisions, ListFilters, ResolveFilterPolicy,
-    ResolvedFilterPolicy, WatchFilterCatalog,
+    FilterMutationRequest, FilterMutationResult, FilterMutationStatus, FilterOwner, FilterPage,
+    FilterPolicyRef, FilterRevisionInfo, FilterRevisionPage, FilterRevisionRef, FilterState,
+    FilterSummary, GetFilter, GetFilterBinding, GetFilterOperation, GroupFilterSpec,
+    GroupPolicyUnbound, ListFilterBindings, ListFilterRevisions, ListFilters, ResolveFilterPolicy,
+    ResolvedFilterPolicy, WatchFilterCatalog, validate_filter_name,
 };
 pub use coerce::{ExactDecimal, TimestampFormat};
 pub use expr::{
@@ -30,11 +30,12 @@ pub use expr::{
 };
 pub use path::{FieldPath, PathSegment};
 pub use read::{
-    AckReceipt, AppliedPolicy, Continuation, ExecutionMode, ExplainNode, FaultReason,
+    AckContext, AckReceipt, AppliedPolicy, Continuation, ExecutionMode, ExplainNode, FaultReason,
     FilterConsumer, FilterDecodeLimits, FilterError, FilterErrorReason, FilterExplanation,
     FilterHeader, FilterOutcome, FilterPreview, FilterPreviewRequest, FilterRef, FilterReply,
     FilterSource, FilterTestRequest, FilterTestResult, FilterValidation, FilteredAck, FilteredPage,
-    FilteredPollRequest, FilteredStart, HeaderScalar, PreviewRecord, ReadMode, RecordFault,
-    SourceGeneration, StopReason, Truth, Verdict,
+    FilteredPollRequest, FilteredStart, FilteredWaitCancel, FilteredWaitCancelled,
+    FilteredWaitPartition, FilteredWaitRequest, FilteredWaitResult, HeaderScalar, PreviewRecord,
+    RecordFault, SourceGeneration, StopReason, Truth, Verdict,
 };
 pub use text::{TextMatch, TextMatcher, TextPredicate};

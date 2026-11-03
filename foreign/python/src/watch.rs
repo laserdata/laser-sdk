@@ -156,6 +156,9 @@ pub struct PyChangeRecord {
     pub to_offset: u64,
     /// Rows the batch wrote.
     pub rows: u32,
+    /// The stream whose source the batch read, or None when the deployment
+    /// publishes one feed for every stream.
+    pub stream: Option<String>,
 }
 
 impl From<laser_sdk::wire::change::ChangeRecord> for PyChangeRecord {
@@ -167,6 +170,7 @@ impl From<laser_sdk::wire::change::ChangeRecord> for PyChangeRecord {
             from_offset: record.from_offset,
             to_offset: record.to_offset,
             rows: record.rows,
+            stream: record.stream,
         }
     }
 }

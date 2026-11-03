@@ -4,9 +4,10 @@ import { test } from "node:test"
 import { INTERNAL_TRANSPORT, Laser } from "../../src/client/laser.js"
 import { AgentTopic } from "../../src/provenance/agent-topic.js"
 import { decodeProvenanceHeaders } from "../../src/provenance/provenance.js"
-import { ConversationId } from "../../src/types/ids.js"
+import { AgentId, ConversationId } from "../../src/types/ids.js"
 import type { AgentDeadLetter } from "../../src/wire/agent.js"
 import { IDEMPOTENCY_KEY } from "../../src/wire/headers.js"
+import { TopicRetention } from "../../src/session.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
@@ -14,10 +15,10 @@ void test("given_a_committed_group_offset_when_consumption_is_probed_then_should
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
   try {
-    await laser.bootstrap(1)
-    const topic = laser.topic(AgentTopic.Commands)
+    await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
+    const topic = laser.topic(AgentTopic.Sessions)
     const cursor = await topic.replay()
-    await laser.sendAgent(AgentTopic.Commands, new TextEncoder().encode("work"), {
+    await laser.sendAgent(AgentTopic.Sessions, new TextEncoder().encode("work"), {
       conversationId: ConversationId.new()
     })
     const [published] = await cursor.poll()
@@ -32,7 +33,7 @@ void test("given_a_committed_group_offset_when_consumption_is_probed_then_should
       await consumer.commit(received)
       const ids = await laser[INTERNAL_TRANSPORT]().resolveStreamTopicIds?.(
         stream,
-        AgentTopic.Commands
+        AgentTopic.Sessions
       )
       assert.ok(ids !== undefined)
       const status = await laser.consumed(
@@ -55,15 +56,59 @@ void test("given_a_committed_group_offset_when_consumption_is_probed_then_should
   }
 })
 
+void test("given_a_record_for_another_agent_when_its_group_commits_past_it_then_should_report_skipped", async () => {
+  const stream = `laser-ts-test-${randomUUID()}`
+  const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  try {
+    await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
+    const topic = laser.topic(AgentTopic.Sessions)
+    const cursor = await topic.replay()
+    await laser.sendAgent(AgentTopic.Sessions, new TextEncoder().encode("not mine"), {
+      conversationId: ConversationId.new(),
+      targetAgentId: AgentId.new("someone-else")
+    })
+    const [published] = await cursor.poll()
+    assert.ok(published !== undefined)
+    const groupName = `skipper-${randomUUID().slice(0, 8)}`
+    const consumer = await topic.consumerGroup(groupName).consumer({
+      commitPolicy: { kind: "disabled" },
+      startAt: { kind: "first" }
+    })
+    try {
+      await consumer.commit(await consumer.nextWithin(2_000))
+      const ids = await laser[INTERNAL_TRANSPORT]().resolveStreamTopicIds?.(
+        stream,
+        AgentTopic.Sessions
+      )
+      assert.ok(ids !== undefined)
+      const status = await laser.consumed(
+        { kind: "group", name: groupName },
+        {
+          streamId: ids.streamId,
+          topicId: ids.topicId,
+          partitionId: published.id.partitionId,
+          offset: published.id.offset
+        }
+      )
+      assert.ok(status.kind === "skipped")
+      assert.equal(status.dispatch, "foreign")
+    } finally {
+      await consumer.shutdown()
+    }
+  } finally {
+    await laser.close()
+  }
+})
+
 void test("given_a_dead_letter_source_when_redriven_then_should_preserve_the_record_and_rekey_deduplication", async () => {
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
   try {
-    await laser.bootstrap(1)
-    const cursor = await laser.topic(AgentTopic.Commands).replay()
+    await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
+    const cursor = await laser.topic(AgentTopic.Sessions).replay()
     const conversationId = ConversationId.new()
     const payload = new TextEncoder().encode("retry-this")
-    await laser.sendAgent(AgentTopic.Commands, payload, {
+    await laser.sendAgent(AgentTopic.Sessions, payload, {
       conversationId,
       idempotencyKey: "original-key"
     })
@@ -71,7 +116,7 @@ void test("given_a_dead_letter_source_when_redriven_then_should_preserve_the_rec
     assert.ok(original !== undefined)
     const ids = await laser[INTERNAL_TRANSPORT]().resolveStreamTopicIds?.(
       stream,
-      AgentTopic.Commands
+      AgentTopic.Sessions
     )
     assert.ok(ids !== undefined)
     const capsule: AgentDeadLetter = {

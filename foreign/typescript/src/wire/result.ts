@@ -17,12 +17,19 @@ export const ResultCodeName = {
   DeadlineExceeded: 15,
   ExpiredSnapshot: 16,
   StaleGeneration: 17,
-  TargetUnavailable: 18
+  TargetUnavailable: 18,
+  Pending: 19,
+  BackendUnavailable: 20
 } as const
 
 export type ResultCode =
   | { readonly kind: "known"; readonly name: keyof typeof ResultCodeName }
   | { readonly kind: "unrecognized"; readonly code: number }
+
+export interface CommandError {
+  readonly code: ResultCode
+  readonly message: string
+}
 
 const NAME_BY_CODE: ReadonlyMap<number, keyof typeof ResultCodeName> = new Map(
   Object.entries(ResultCodeName).map(([name, code]) => [code, name as keyof typeof ResultCodeName])
@@ -67,6 +74,14 @@ export function resultCodeHttpStatus(value: ResultCode): number {
     case "Unavailable":
     case "TargetUnavailable":
       return 503
+    // The outcome is still being decided, so the same request comes back
+    // later. It is not generically retryable, see `resultCodeIsPending`.
+    case "Pending":
+      return 503
+    // The node's own managed backend did not answer. Another node may serve
+    // the request.
+    case "BackendUnavailable":
+      return 503
     case "ResourceLimit":
       return 429
     case "Cancelled":
@@ -89,8 +104,30 @@ export function resultCodeHttpStatus(value: ResultCode): number {
 export function resultCodeIsRetryable(value: ResultCode): boolean {
   return (
     value.kind === "known" &&
-    (value.name === "Unavailable" || value.name === "Stale" || value.name === "TargetUnavailable")
+    (value.name === "Unavailable" ||
+      value.name === "Stale" ||
+      value.name === "TargetUnavailable" ||
+      value.name === "BackendUnavailable")
   )
+}
+
+/**
+ * Whether the mutation was accepted and its outcome is still unknown. Only the
+ * exact request with the same operation identity may be repeated, as in Rust
+ * `is_pending`.
+ */
+export function resultCodeIsPending(value: ResultCode): boolean {
+  return value.kind === "known" && value.name === "Pending"
+}
+
+/**
+ * Whether the streaming server could not reach its own managed backend, or
+ * the backend did not answer in time. The request may still apply, so a
+ * mutation is repeated under the same operation identity, possibly on another
+ * node, as in Rust `is_backend_unavailable`.
+ */
+export function resultCodeIsBackendUnavailable(value: ResultCode): boolean {
+  return value.kind === "known" && value.name === "BackendUnavailable"
 }
 
 const RESULT_NAMES: ReadonlyMap<string, ResultCode> = new Map([
@@ -112,7 +149,9 @@ const RESULT_NAMES: ReadonlyMap<string, ResultCode> = new Map([
   ["deadline_exceeded", { kind: "known", name: "DeadlineExceeded" }],
   ["expired_snapshot", { kind: "known", name: "ExpiredSnapshot" }],
   ["stale_generation", { kind: "known", name: "StaleGeneration" }],
-  ["target_unavailable", { kind: "known", name: "TargetUnavailable" }]
+  ["target_unavailable", { kind: "known", name: "TargetUnavailable" }],
+  ["pending", { kind: "known", name: "Pending" }],
+  ["backend_unavailable", { kind: "known", name: "BackendUnavailable" }]
 ])
 
 const RESULT_WORDS: Readonly<Record<string, string>> = {
@@ -134,7 +173,9 @@ const RESULT_WORDS: Readonly<Record<string, string>> = {
   DeadlineExceeded: "deadline_exceeded",
   ExpiredSnapshot: "expired_snapshot",
   StaleGeneration: "stale_generation",
-  TargetUnavailable: "target_unavailable"
+  TargetUnavailable: "target_unavailable",
+  Pending: "pending",
+  BackendUnavailable: "backend_unavailable"
 }
 
 /** The code a snake_case wire word names, `undefined` for an unknown word. */

@@ -40,7 +40,7 @@ fn card(skill: &str) -> AgentCard {
 
 // Every AGDX command envelope currently on the commands topic.
 async fn commands_on_log(laser: &Laser) -> Vec<AgentEnvelope> {
-    let commands = laser.topic(AgentTopic::Commands.topic_string());
+    let commands = laser.topic(AgentTopic::Sessions.topic_string());
     let mut cursor = commands.replay().expect("commands topic replays");
     cursor
         .poll()
@@ -58,8 +58,8 @@ async fn given_a_contract_when_completed_then_should_decompose_to_one_command_on
     let laser = harness::laser().await;
     let mut worker = Agent::builder()
         .id("echo".parse().expect("echo id is valid"))
-        .listen_on(AgentTopic::Commands)
-        .respond_on(AgentTopic::Responses)
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
         .capabilities(card("echo").capabilities)
         .handler(Echo)
         .build()
@@ -70,7 +70,7 @@ async fn given_a_contract_when_completed_then_should_decompose_to_one_command_on
         .contract(Router::to("echo".parse().expect("echo id is valid")))
         .from("caller".parse().expect("caller id is valid"))
         .payload(Bytes::from("job-1"))
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .deadline(Duration::from_secs(10))
         .send()
         .await
@@ -106,8 +106,8 @@ async fn given_a_scatter_when_gathered_then_should_decompose_to_one_contract_per
     for id in ["scat-a", "scat-b"] {
         let mut worker = Agent::builder()
             .id(id.parse().expect("worker id is valid"))
-            .listen_on(AgentTopic::Commands)
-            .respond_on(AgentTopic::Responses)
+            .listen_on(AgentTopic::Sessions)
+            .respond_on(AgentTopic::Sessions)
             .capabilities(card("scatter_skill").capabilities)
             .handler(Echo)
             .build()
@@ -133,7 +133,7 @@ async fn given_a_scatter_when_gathered_then_should_decompose_to_one_contract_per
             "caller".parse().expect("caller id is valid"),
             &CapabilitySelector::new("scatter_skill", RoutePolicy::Any),
             b"fan-1",
-            &InboxRoute::Fixed(AgentTopic::Commands),
+            &InboxRoute::Fixed(AgentTopic::Sessions),
             Duration::from_secs(10),
         )
         .await
@@ -184,7 +184,7 @@ async fn given_a_context_append_when_replayed_then_should_be_an_ordinary_publish
     // context accessor is a reading, not a store.
     let history = laser
         .context(conversation)
-        .fetch(vec![AgentTopic::Audit], 10)
+        .fetch(vec![AgentTopic::Audit], 10, None)
         .await
         .expect("the context reads back");
     assert_eq!(history.len(), 1);

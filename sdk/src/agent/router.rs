@@ -541,12 +541,12 @@ mod tests {
     #[test]
     fn given_a_fixed_inbox_route_when_resolved_then_should_use_that_topic_ignoring_presence() {
         let agent: AgentId = "metrics".parse().expect("valid agent id");
-        let route = InboxRoute::Fixed(AgentTopic::Commands);
+        let route = InboxRoute::Fixed(AgentTopic::Sessions);
         // Fixed ignores the advertised inbox entirely.
         let id = route
             .resolve(&agent, Some("some.other.topic"))
             .expect("a fixed route resolves");
-        assert_eq!(id.to_string(), "agent.commands");
+        assert_eq!(id.to_string(), "agent.sessions");
     }
 
     #[test]

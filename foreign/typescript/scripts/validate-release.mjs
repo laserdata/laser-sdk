@@ -15,7 +15,7 @@ if (!tag.startsWith(prefix)) {
 }
 
 const version = tag.slice(prefix.length)
-const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(alpha|beta|rc)\.(0|[1-9]\d*))?$/
+const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(dev|alpha|beta|rc)\.(0|[1-9]\d*))?$/
 if (!semver.test(version)) {
   console.error(`release tag has an unsupported semantic version: ${version}`)
   process.exit(1)

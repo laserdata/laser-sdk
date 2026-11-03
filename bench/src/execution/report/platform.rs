@@ -66,7 +66,7 @@ pub(crate) fn rust_client_startup_report(
 
 pub(crate) fn managed_report(
     scope: ReportScope<'_>,
-    plane: &NativePlane,
+    backend: &NativeBackend,
     operation: &laser_bench::managed::ManagedArmSummary,
     summary: serde_json::Value,
     processes: &[laser_bench::managed::ManagedProcessMeasurement],
@@ -90,11 +90,11 @@ pub(crate) fn managed_report(
     extra.insert("managed_summary".to_owned(), summary);
     extra.insert("processes".to_owned(), serde_json::to_value(processes)?);
     extra.insert(
-        "plane".to_owned(),
+        "backend".to_owned(),
         serde_json::json!({
-            "profile": plane.profile,
-            "db_path": plane.db_path,
-            "socket_path": plane.socket_path,
+            "profile": backend.profile,
+            "db_path": backend.db_path,
+            "socket_path": backend.socket_path,
         }),
     );
     Ok(RunReport {
@@ -212,7 +212,7 @@ pub(crate) fn local_memory_report(
 
 pub(crate) fn recovery_report(
     scope: ReportScope<'_>,
-    plane: &NativePlane,
+    backend: &NativeBackend,
     summary: &RecoverySummary,
 ) -> Result<RunReport, BenchError> {
     let ReportScope {
@@ -234,11 +234,11 @@ pub(crate) fn recovery_report(
         serde_json::to_value(summary)?,
     );
     extra.insert(
-        "plane".to_owned(),
+        "backend".to_owned(),
         serde_json::json!({
-            "profile": plane.profile,
-            "db_path": plane.db_path,
-            "socket_path": plane.socket_path,
+            "profile": backend.profile,
+            "db_path": backend.db_path,
+            "socket_path": backend.socket_path,
         }),
     );
     extra.insert(

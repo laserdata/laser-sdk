@@ -3,7 +3,7 @@ use crate::context::{Checkpoint, ContextAssembler, ContextMessage, ContextPolicy
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::memory::{
-    ConsolidationReport, Feedback, MemoryBackend, MemoryHandle, MemoryId, MemoryItem, MemoryScope,
+    ConsolidationReport, Feedback, MemoryBackend, MemoryHandle, MemoryId, MemoryScope,
     RecallBuilder, RememberBuilder,
 };
 use crate::provenance::{AgentTopic, Provenance};
@@ -47,15 +47,19 @@ impl ContextScope {
     }
 
     /// Read this conversation's history from `topics`, bounded to the last
-    /// `n` messages. The bound is required: an unbounded read of a long-lived
-    /// conversation is a replay nobody asked for, so the full walk has its own
-    /// deliberate spelling ([`fetch_with`](Self::fetch_with)).
+    /// `n` messages. `token_budget` trims the selected messages to an
+    /// estimated token count after `n`, so the read is bounded by turns and by
+    /// prompt size at once. The bound is required: an unbounded read of a
+    /// long-lived conversation is a replay nobody asked for, so the full walk
+    /// has its own deliberate spelling ([`fetch_with`](Self::fetch_with)).
     pub async fn fetch(
         &self,
         topics: Vec<AgentTopic<'static>>,
         n: usize,
+        token_budget: Option<usize>,
     ) -> Result<Vec<ContextMessage>, LaserError> {
-        self.fetch_with(topics, Box::new(LastN(n))).await
+        self.fetch_with(topics, bounded_policy(n, token_budget))
+            .await
     }
 
     /// Read this conversation's history from `topics` under an explicit
@@ -75,13 +79,16 @@ impl ContextScope {
     }
 
     /// The last `n` messages rendered as one newline-joined text block, the
-    /// prompt-ready form (each payload as UTF-8, lossy).
+    /// prompt-ready form (each payload as UTF-8, lossy). `token_budget` trims
+    /// the selected messages to an estimated token count after `n`, so the
+    /// block is bounded by turns and by prompt size at once.
     pub async fn block(
         &self,
         topics: Vec<AgentTopic<'static>>,
         n: usize,
+        token_budget: Option<usize>,
     ) -> Result<String, LaserError> {
-        let messages = self.fetch(topics, n).await?;
+        let messages = self.fetch(topics, n, token_budget).await?;
         Ok(messages
             .iter()
             .map(|message| String::from_utf8_lossy(&message.payload))
@@ -143,6 +150,8 @@ impl ContextScope {
         ScopedMemory {
             handle: self.laser.memory_with(namespace, backend),
             conversation: self.conversation,
+            origin: None,
+            producer: None,
         }
     }
 
@@ -181,6 +190,17 @@ impl ContextScope {
     }
 }
 
+// The last `n` messages, trimmed to `token_budget` estimated tokens when set.
+fn bounded_policy(n: usize, token_budget: Option<usize>) -> Box<dyn ContextPolicy> {
+    match token_budget {
+        Some(max_tokens) => Box::new(crate::context::Chain(vec![
+            Box::new(LastN(n)),
+            Box::new(crate::context::TokenBudget::new(max_tokens)),
+        ])),
+        None => Box::new(LastN(n)),
+    }
+}
+
 /// One conversation's memory: a [`MemoryHandle`] with the conversation already
 /// applied, so [`recall`](Self::recall) and [`remember`](Self::remember) take
 /// no conversation argument. Build it with [`ContextScope::memory`]. The
@@ -189,6 +209,8 @@ impl ContextScope {
 pub struct ScopedMemory {
     handle: MemoryHandle,
     conversation: ConversationId,
+    origin: Option<laser_wire::graph::SourceRef>,
+    producer: Option<laser_wire::graph::ProducerInfo>,
 }
 
 impl ScopedMemory {
@@ -202,7 +224,26 @@ impl ScopedMemory {
     /// Remember `payload` in this conversation's session scope. Chain `.kind`
     /// /`.dedup` and finish with `.send().await`.
     pub fn remember(&self, payload: impl Into<Vec<u8>>) -> RememberBuilder<'_> {
-        self.handle.remember(payload).scope(self.conversation)
+        let mut builder = self.handle.remember(payload).scope(self.conversation);
+        if let Some(origin) = &self.origin {
+            builder = builder.origin(origin.clone());
+        }
+        if let Some(producer) = &self.producer {
+            builder = builder.producer(producer.clone());
+        }
+        builder
+    }
+
+    /// This scope with `origin` and `producer` stamped on every remembered item.
+    #[must_use]
+    pub fn with_lineage(
+        mut self,
+        origin: Option<laser_wire::graph::SourceRef>,
+        producer: Option<laser_wire::graph::ProducerInfo>,
+    ) -> Self {
+        self.origin = origin;
+        self.producer = producer;
+        self
     }
 
     /// The one-call context altitude: recall this conversation's most relevant
@@ -211,30 +252,42 @@ impl ScopedMemory {
         self.handle.context(self.conversation, token_budget).await
     }
 
-    /// Keyword recall for `query` within this conversation. It needs no
-    /// [`Embedder`](crate::memory::Embedder), so it works on the default
-    /// log-backed memory. Chain [`recall`](Self::recall) for semantic or
-    /// hybrid recall.
-    pub async fn search(&self, query: impl Into<String>) -> Result<Vec<MemoryItem>, LaserError> {
-        self.recall().keyword(query).fetch().await
+    /// Keyword recall for `query` within this conversation, up to 50 items.
+    /// It needs no [`Embedder`](crate::memory::Embedder), so it works on the
+    /// default log-backed memory. Await it directly, or chain `.limit(n)` and
+    /// `.folded()` first. Use [`recall`](Self::recall) for semantic or hybrid
+    /// recall.
+    pub fn search(&self, query: impl Into<String>) -> RecallBuilder<'_> {
+        self.recall().keyword(query)
     }
 
-    /// One consolidation pass over this conversation, keeping the most relevant
-    /// `max_items`.
+    /// One consolidation pass over this conversation, keeping the newest
+    /// `max_items` and pruning the rest.
     pub async fn consolidate(&self, max_items: usize) -> Result<ConsolidationReport, LaserError> {
         self.handle.consolidate(&self.scope(), max_items).await
     }
 
-    /// Forget the item `id`. The item is addressed by id alone, so an item
-    /// remembered in another conversation is forgotten too. The conversation
-    /// only stamps the tombstone's provenance.
+    /// [`consolidate`](Self::consolidate) with the summarize pass, see
+    /// [`MemoryHandle::consolidate_with`].
+    pub async fn consolidate_with(
+        &self,
+        max_items: usize,
+        summarizer: impl crate::memory::Summarizer + Sync,
+        prune_summarized: bool,
+    ) -> Result<ConsolidationReport, LaserError> {
+        self.handle
+            .consolidate_with(&self.scope(), max_items, summarizer, prune_summarized)
+            .await
+    }
+
+    /// Forget the item `id` if it was remembered in this conversation. A
+    /// tombstone for an item of another conversation changes nothing.
     pub async fn forget(&self, id: MemoryId) -> Result<(), LaserError> {
         self.handle.forget(&self.scope(), id).await
     }
 
-    /// Record `feedback` on the item it targets, addressed by id alone like
-    /// [`forget`](Self::forget). The conversation only stamps the feedback
-    /// record's provenance.
+    /// Record `feedback` on the item it targets. Like [`forget`](Self::forget),
+    /// it counts only when the item was remembered in this conversation.
     pub async fn improve(&self, feedback: Feedback) -> Result<MemoryId, LaserError> {
         self.handle.improve(&self.scope(), feedback).await
     }
@@ -248,6 +301,16 @@ impl ScopedMemory {
     /// This scoped memory's conversation id.
     pub fn conversation(&self) -> ConversationId {
         self.conversation
+    }
+
+    /// The origin stamped on every remembered item, if any.
+    pub fn origin(&self) -> Option<&laser_wire::graph::SourceRef> {
+        self.origin.as_ref()
+    }
+
+    /// The producer stamped on every remembered item, if any.
+    pub fn producer(&self) -> Option<&laser_wire::graph::ProducerInfo> {
+        self.producer.as_ref()
     }
 
     fn scope(&self) -> MemoryScope {
@@ -271,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_an_item_of_another_conversation_when_forgotten_through_a_scope_then_should_remove_it_by_id()
+    async fn given_an_item_of_another_conversation_when_forgotten_through_a_scope_then_should_keep_it()
      {
         let owner = ConversationId::new();
         let handle = MemoryHandle::vector(UnitEmbedder);
@@ -284,6 +347,8 @@ mod tests {
         let elsewhere = ScopedMemory {
             handle,
             conversation: ConversationId::new(),
+            origin: None,
+            producer: None,
         };
         elsewhere.forget(id).await.expect("forget by id");
         let left = elsewhere
@@ -292,6 +357,73 @@ mod tests {
             .fetch()
             .await
             .expect("recall");
-        assert!(left.is_empty(), "the scope does not guard ownership");
+        assert_eq!(left.len(), 1, "another conversation cannot forget the item");
+    }
+
+    struct JoinSummarizer;
+
+    impl crate::memory::Summarizer for JoinSummarizer {
+        async fn summarize(&self, bodies: Vec<Vec<u8>>) -> Result<Vec<u8>, LaserError> {
+            Ok(bodies.concat())
+        }
+    }
+
+    fn scoped(handle: MemoryHandle, conversation: ConversationId) -> ScopedMemory {
+        ScopedMemory {
+            handle,
+            conversation,
+            origin: None,
+            producer: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn given_two_conversations_when_recalled_without_one_then_should_return_both() {
+        let handle = MemoryHandle::vector(UnitEmbedder);
+        for conversation in [ConversationId::new(), ConversationId::new()] {
+            handle
+                .remember("a fact")
+                .scope(conversation)
+                .send()
+                .await
+                .expect("remember");
+        }
+        let everywhere = handle
+            .recall(None)
+            .await
+            .expect("recall every conversation");
+        assert_eq!(everywhere.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn given_a_search_when_limited_then_should_cap_the_items() {
+        let conversation = ConversationId::new();
+        let memory = scoped(MemoryHandle::vector(UnitEmbedder), conversation);
+        for body in ["deploy one", "deploy two", "deploy three"] {
+            memory.remember(body).send().await.expect("remember");
+        }
+        assert_eq!(memory.search("deploy").await.expect("search").len(), 3);
+        let capped = memory.search("deploy").limit(1).await.expect("search");
+        assert_eq!(capped.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn given_message_turns_when_consolidated_with_a_summarizer_then_should_replace_them() {
+        let conversation = ConversationId::new();
+        let memory = scoped(MemoryHandle::vector(UnitEmbedder), conversation);
+        for body in ["one ", "two"] {
+            memory
+                .remember(body)
+                .kind(crate::memory::MemoryKind::Message)
+                .send()
+                .await
+                .expect("remember");
+        }
+        let report = memory
+            .consolidate_with(10, JoinSummarizer, true)
+            .await
+            .expect("consolidate");
+        assert_eq!(report.summarized, 2);
+        assert_eq!(report.pruned, 2);
     }
 }

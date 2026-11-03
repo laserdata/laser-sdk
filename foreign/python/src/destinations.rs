@@ -3,7 +3,7 @@ use crate::client::PyLaser;
 use crate::convert::{py_to_de, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use laser_sdk::laser::Laser;
-use laser_sdk::wire::authz::SupervisorActorAssertion;
+use laser_sdk::wire::authz::OperatorActorAssertion;
 use laser_sdk::wire::checkpoint::{
     CheckpointOwnerId, CheckpointReadConsistency, CheckpointRequestEnvelope, CheckpointRequestId,
     CompletedAttempt, DestinationBlock, DestinationBlockCode, DestinationListFilter,
@@ -39,24 +39,24 @@ pub struct PyDestinations {
 #[pymethods]
 impl PyDestinations {
     /// Submit one bounded public checkpoint mutation dict.
-    #[pyo3(signature = (expected_global_state_revision, mutation, *, supervisor_assertion=None))]
+    #[pyo3(signature = (expected_global_state_revision, mutation, *, operator_assertion=None))]
     fn mutate<'py>(
         &self,
         py: Python<'py>,
         expected_global_state_revision: u64,
         mutation: &Bound<'_, PyAny>,
-        supervisor_assertion: Option<&Bound<'_, PyAny>>,
+        operator_assertion: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mutation: PublicCheckpointMutation = py_to_de(mutation)?;
-        let supervisor_assertion = supervisor_assertion
-            .map(py_to_de::<SupervisorActorAssertion>)
+        let operator_assertion = operator_assertion
+            .map(py_to_de::<OperatorActorAssertion>)
             .transpose()?;
         submit_mutation(
             py,
             self.laser.clone(),
             expected_global_state_revision,
             mutation,
-            supervisor_assertion,
+            operator_assertion,
         )
     }
 
@@ -390,7 +390,7 @@ impl PyDestinations {
         destination_generation: u64,
         expected_checkpoint_revision: u64,
         next_offset: u64,
-        supervisor_assertion: &Bound<'_, PyAny>,
+        operator_assertion: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         submit_mutation(
             py,
@@ -402,7 +402,7 @@ impl PyDestinations {
                 expected_checkpoint_revision,
                 next_offset,
             },
-            Some(py_to_de::<SupervisorActorAssertion>(supervisor_assertion)?),
+            Some(py_to_de::<OperatorActorAssertion>(operator_assertion)?),
         )
     }
 
@@ -412,7 +412,7 @@ impl PyDestinations {
         expected_global_state_revision: u64,
         expected_definition_revision: u64,
         replacement: &Bound<'_, PyAny>,
-        supervisor_assertion: &Bound<'_, PyAny>,
+        operator_assertion: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         submit_mutation(
             py,
@@ -422,7 +422,7 @@ impl PyDestinations {
                 expected_definition_revision,
                 replacement: py_to_de::<MaterializationDestination>(replacement)?,
             },
-            Some(py_to_de::<SupervisorActorAssertion>(supervisor_assertion)?),
+            Some(py_to_de::<OperatorActorAssertion>(operator_assertion)?),
         )
     }
 
@@ -435,7 +435,7 @@ impl PyDestinations {
         destination_generation: u64,
         expected_checkpoint_revision: u64,
         repair: &Bound<'_, PyAny>,
-        supervisor_assertion: &Bound<'_, PyAny>,
+        operator_assertion: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         submit_mutation(
             py,
@@ -447,7 +447,7 @@ impl PyDestinations {
                 expected_checkpoint_revision,
                 repair: py_to_de::<RepairRecord>(repair)?,
             },
-            Some(py_to_de::<SupervisorActorAssertion>(supervisor_assertion)?),
+            Some(py_to_de::<OperatorActorAssertion>(operator_assertion)?),
         )
     }
 
@@ -574,17 +574,17 @@ impl PyDestinations {
 }
 
 /// Build the checkpoint request envelope dict `Laser.execute_checkpoint` takes,
-/// stamped with the checkpoint op version. `supervisor_assertion` attaches the
-/// signed supervisor actor a privileged mutation requires.
+/// stamped with the checkpoint op version. `operator_assertion` attaches the
+/// signed operator actor a privileged mutation requires.
 #[gen_stub_pyfunction]
 #[pyfunction]
-#[pyo3(signature = (request_id, expected_global_state_revision, mutation, *, supervisor_assertion=None))]
+#[pyo3(signature = (request_id, expected_global_state_revision, mutation, *, operator_assertion=None))]
 pub fn new_checkpoint_request_envelope(
     py: Python<'_>,
     request_id: &str,
     expected_global_state_revision: u64,
     mutation: &Bound<'_, PyAny>,
-    supervisor_assertion: Option<&Bound<'_, PyAny>>,
+    operator_assertion: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let request_id = CheckpointRequestId::from_str(request_id)
         .map_err(|error| InvalidError::new_err(error.to_string()))?;
@@ -593,8 +593,8 @@ pub fn new_checkpoint_request_envelope(
         expected_global_state_revision,
         py_to_de(mutation)?,
     );
-    if let Some(assertion) = supervisor_assertion {
-        envelope = envelope.with_supervisor_assertion(py_to_de(assertion)?);
+    if let Some(assertion) = operator_assertion {
+        envelope = envelope.with_operator_assertion(py_to_de(assertion)?);
     }
     ser_to_py(py, &envelope)
 }
@@ -617,13 +617,13 @@ pub fn new_source_scope(py: Python<'_>, stream: String, topic: String) -> PyResu
     ser_to_py(py, &SourceScope::new(stream, topic))
 }
 
-/// Check a supervisor actor assertion dict before sending it: version,
+/// Check an operator actor assertion dict before sending it: version,
 /// nonzero identities, a validity window within the maximum lifetime, and
 /// the key id and signature lengths. Raises `InvalidError` on a violation.
 #[gen_stub_pyfunction]
 #[pyfunction]
-pub fn validate_supervisor_actor_assertion(assertion: &Bound<'_, PyAny>) -> PyResult<()> {
-    py_to_de::<SupervisorActorAssertion>(assertion)?
+pub fn validate_operator_actor_assertion(assertion: &Bound<'_, PyAny>) -> PyResult<()> {
+    py_to_de::<OperatorActorAssertion>(assertion)?
         .validate()
         .map_err(|error| InvalidError::new_err(error.to_string()))
 }
@@ -641,14 +641,14 @@ fn submit_mutation<'py>(
     laser: Laser,
     expected_global_state_revision: u64,
     mutation: PublicCheckpointMutation,
-    supervisor_assertion: Option<SupervisorActorAssertion>,
+    operator_assertion: Option<OperatorActorAssertion>,
 ) -> PyResult<Bound<'py, PyAny>> {
     future_into_py(py, async move {
         let destinations = laser.destinations();
-        let result = match supervisor_assertion {
+        let result = match operator_assertion {
             Some(assertion) => {
                 destinations
-                    .mutate_with_supervisor_assertion(
+                    .mutate_with_operator_assertion(
                         expected_global_state_revision,
                         mutation,
                         assertion,

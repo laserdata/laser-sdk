@@ -1,0 +1,17 @@
+{
+  "sources": [
+    {
+      "topic_id": 3,
+      "topic_generation": 1717171717000000,
+      "partition_id": 1,
+      "folded": 41,
+      "head": 42,
+      "retained_from": 7
+    }
+  ],
+  "lane": [
+    2,
+    100,
+    4
+  ]
+}

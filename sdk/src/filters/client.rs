@@ -1,5 +1,11 @@
 use crate::error::{LaserError, decode_managed_reply};
+use crate::iggy::prelude::Identifier;
 use crate::laser::Laser;
+use crate::nodes::{Target, is_route_stale, partition_primary};
+use crate::retry::{
+    FILTER_MUTATION_ATTEMPTS as MUTATION_ATTEMPTS,
+    FILTER_MUTATION_BACKOFF as MUTATION_RETRY_BACKOFF,
+};
 #[cfg(feature = "filters")]
 use laser_wire::codes::AGDX_LIST_FILTER_BINDINGS_CODE;
 use laser_wire::codes::{
@@ -9,11 +15,12 @@ use laser_wire::codes::{
 };
 use laser_wire::filter::{
     CatalogPosition, ConsumerFilter, FilterBinding, FilterCatalogOutcome, FilterCatalogReply,
-    FilterError, FilterErrorReason, FilterGroupRef, FilterHeader, FilterMutation,
-    FilterMutationOutcome, FilterMutationRequest, FilterMutationResult, FilterMutationStatus,
-    FilterOutcome, FilterPage, FilterPreview, FilterPreviewRequest, FilterRef, FilterReply,
-    FilterRevisionPage, FilterRevisionRef, FilterSource, FilterTestRequest, FilterTestResult,
-    GetFilterBinding, GetFilterOperation, GroupFilterSpec, ListFilterRevisions, ListFilters,
+    FilterError, FilterErrorReason, FilterGroupIdentity, FilterGroupRef, FilterHeader,
+    FilterMutation, FilterMutationOutcome, FilterMutationRequest, FilterMutationResult,
+    FilterMutationStatus, FilterOutcome, FilterPreview, FilterPreviewRequest, FilterRef,
+    FilterReply, FilterRevisionPage, FilterRevisionRef, FilterSource, FilterSummary,
+    FilterTestRequest, FilterTestResult, GetFilterBinding, GetFilterOperation, GroupFilterSpec,
+    ListFilterRevisions, ListFilters,
 };
 #[cfg(feature = "filters")]
 use laser_wire::filter::{FilterBindingPage, ListFilterBindings};
@@ -25,17 +32,15 @@ use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
 const DEFAULT_PREVIEW_RECORDS: u32 = 20;
-const MUTATION_ATTEMPTS: u32 = 3;
-const MUTATION_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 const OUTCOME_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the typed catalog verbs wait for a mutation's authoritative
 /// outcome before they report it as ambiguous.
-pub const DEFAULT_OUTCOME_WAIT: Duration = Duration::from_secs(30);
+pub const DEFAULT_OUTCOME_WAIT: Duration = crate::retry::FILTER_OUTCOME_WAIT;
 
 impl Laser {
     /// The catalog and native filter commands behind a consumer group's
     /// filter handle. Native commands need a server that advertises consumer
-    /// filters. The catalog also needs a managed plane. Either missing answers
+    /// filters. The catalog also needs a managed backend. Either missing answers
     /// `LaserError::Unsupported`.
     pub(crate) fn filters(&self) -> Filters<'_> {
         Filters { laser: self }
@@ -127,25 +132,31 @@ impl<'a> Filters<'a> {
         }
     }
 
-    /// One page of saved filters whose name contains `name_contains`, newest
-    /// first.
-    pub(crate) async fn list_before(
+    /// The own filter of one consumer group incarnation, bound or released,
+    /// `None` when it has none.
+    pub(crate) async fn owned(
         &self,
-        name_contains: &str,
-        before_id: Option<u32>,
-        page_size: u32,
-    ) -> Result<FilterPage, LaserError> {
+        owner: FilterGroupIdentity,
+    ) -> Result<Option<FilterSummary>, LaserError> {
         let request = ListFilters {
             v: FILTER_OP_VERSION,
-            name_contains: Some(name_contains.to_owned()),
+            name_contains: None,
             state: None,
-            before_id,
+            before_id: None,
+            owner: Some(owner),
             page: 0,
-            page_size,
+            page_size: 1,
         };
         request.validate()?;
         match self.catalog(AGDX_LIST_FILTERS_CODE, &request).await? {
-            FilterCatalogOutcome::Filters(filters) => Ok(filters),
+            FilterCatalogOutcome::Filters(filters) => {
+                Ok(filters.items.into_iter().find(|summary| {
+                    summary
+                        .owner
+                        .as_ref()
+                        .is_some_and(|own| own.identity == owner)
+                }))
+            }
             _ => Err(unexpected("filters")),
         }
     }
@@ -229,7 +240,7 @@ impl<'a> Filters<'a> {
         let mutation = FilterMutation::Revise {
             filter_id,
             expected_revision,
-            filter,
+            filter: self.scoped_filter(filter),
         };
         match self.apply(mutation).await?.result {
             FilterMutationResult::Revised(revision) => Ok(revision),
@@ -247,9 +258,16 @@ impl<'a> Filters<'a> {
         group: FilterGroupRef,
         policy: GroupFilterSpec,
         operation_id: Option<u128>,
-        expected_identity: laser_wire::filter::FilterGroupIdentity,
+        expected_identity: FilterGroupIdentity,
     ) -> Result<(FilterBinding, Option<CatalogPosition>), LaserError> {
         let operation_id = operation_id.unwrap_or_else(|| u128::from(ulid::Ulid::generate()));
+        let policy = match policy {
+            GroupFilterSpec::Definition { name, filter } => GroupFilterSpec::Definition {
+                name,
+                filter: self.scoped_filter(filter),
+            },
+            other => other,
+        };
         let applied = self
             .apply_positioned(
                 operation_id,
@@ -304,6 +322,15 @@ impl<'a> Filters<'a> {
             FilterMutationResult::Unbound(binding) => Ok((binding, applied.catalog_position)),
             _ => Err(unexpected("unbind")),
         }
+    }
+
+    // A filter with writer schemas resolves them in the registry this handle
+    // registers schemas in, unless the caller named one.
+    fn scoped_filter(&self, mut filter: ConsumerFilter) -> ConsumerFilter {
+        if !filter.schema_refs.is_empty() && filter.schema_stream.is_none() {
+            filter.schema_stream = self.laser.resource_stream().map(str::to_owned);
+        }
+        filter
     }
 
     // Apply `mutation` under a fresh operation id and wait for its outcome.
@@ -403,6 +430,17 @@ impl<'a> Filters<'a> {
         code: u32,
         request: &impl Serialize,
     ) -> Result<FilterOutcome, LaserError> {
+        self.native_to(code, request, Target::Caller).await
+    }
+
+    // A request a partition's primary no longer takes goes to the caller's
+    // node, which serves it from its own copy.
+    async fn native_to(
+        &self,
+        code: u32,
+        request: &impl Serialize,
+        target: Target,
+    ) -> Result<FilterOutcome, LaserError> {
         if !self.laser.capabilities().await.filters.native {
             return Err(LaserError::unsupported(
                 "filters",
@@ -411,7 +449,19 @@ impl<'a> Filters<'a> {
         }
         let payload = encode_named(request)
             .map_err(|error| LaserError::Codec(format!("encode filter request: {error}")))?;
-        let reply = self.laser.send_raw_with_response(code, payload).await?;
+        let reply = match self
+            .laser
+            .send_managed_to(code, payload.clone(), target)
+            .await
+        {
+            Err(LaserError::Iggy(error)) if target != Target::Caller && is_route_stale(&error) => {
+                self.laser
+                    .send_managed_to(code, payload, Target::Caller)
+                    .await?
+            }
+            sent => sent?,
+        }
+        .0;
         match decode_managed_reply::<FilterReply>(&reply)? {
             FilterReply::Ok(outcome) => Ok(outcome),
             FilterReply::Err(error) => Err(error.into()),
@@ -458,7 +508,8 @@ impl<'a> Filters<'a> {
     }
 }
 
-/// A preview request. Build it with [`Filters::preview`].
+/// A preview request. Build it with
+/// [`GroupFilter::preview`](crate::stream::GroupFilter::preview).
 pub struct FilterPreviewBuilder<'a> {
     filters: Filters<'a>,
     request: FilterPreviewRequest,
@@ -495,9 +546,20 @@ impl FilterPreviewBuilder<'_> {
 
     pub async fn send(self) -> Result<FilterPreview, LaserError> {
         self.request.validate()?;
+        let target = match partition_primary(
+            &self.filters.laser.client(),
+            &Identifier::named(&self.request.source.stream)?,
+            &Identifier::named(&self.request.source.topic)?,
+            self.request.partition_id,
+        )
+        .await
+        {
+            Ok(replica) => Target::Replica(replica),
+            Err(_) => Target::Caller,
+        };
         match self
             .filters
-            .native(AGDX_FILTER_PREVIEW_CODE, &self.request)
+            .native_to(AGDX_FILTER_PREVIEW_CODE, &self.request, target)
             .await?
         {
             FilterOutcome::Preview(preview) => Ok(preview),

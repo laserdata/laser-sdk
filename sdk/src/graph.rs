@@ -2,15 +2,18 @@ use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::types::ConversationId;
 
+pub use laser_wire::limits::MAX_GRAPH_LABEL_BYTES;
+
 impl Laser {
     /// A handle to the knowledge-graph surface `name`. Traversals require the
     /// `graph` capability (LaserData Cloud) and ride the managed binary
     /// transport. Against Apache Iggy a fetch returns
-    /// [`LaserError::Unsupported`].
+    /// [`LaserError::Unsupported`]. The name is sent as
+    /// [`resource_name`](Self::resource_name) names it.
     pub fn graph(&self, name: impl Into<String>) -> GraphHandle<'_> {
         GraphHandle {
             laser: self,
-            name: name.into(),
+            name: self.resource_name(&name.into()),
             start: None,
             hops: Vec::new(),
             node_filter: None,
@@ -19,6 +22,10 @@ impl Laser {
             limit: laser_wire::limits::DEFAULT_RECALL_LIMIT,
             as_of: None,
             conversation: None,
+            stream: None,
+            session: None,
+            producer: None,
+            source: None,
         }
     }
 }
@@ -38,9 +45,35 @@ pub struct GraphHandle<'a> {
     limit: usize,
     as_of: Option<u64>,
     conversation: Option<String>,
+    stream: Option<String>,
+    session: Option<laser_wire::agent::SessionRef>,
+    producer: Option<laser_wire::graph::ProducerInfo>,
+    source: Option<laser_wire::graph::SourceRef>,
 }
 
 impl GraphHandle<'_> {
+    /// Link every upsert to `session`, so the deployment records which session
+    /// wrote each element.
+    #[must_use]
+    pub fn in_session(mut self, session: laser_wire::agent::SessionRef) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Stamp `producer` on every upserted element that has none.
+    #[must_use]
+    pub fn produced_by(mut self, producer: laser_wire::graph::ProducerInfo) -> Self {
+        self.producer = Some(producer);
+        self
+    }
+
+    /// Stamp `source` on every upserted element that has none.
+    #[must_use]
+    pub fn sourced_from(mut self, source: laser_wire::graph::SourceRef) -> Self {
+        self.source = Some(source);
+        self
+    }
+
     /// Narrow the traversal to elements a single conversation asserted (the
     /// conversation lens): only nodes and edges whose source records that
     /// `conversation` are traversed and returned. Applies to both `fetch` and
@@ -48,6 +81,7 @@ impl GraphHandle<'_> {
     #[must_use]
     pub fn conversation(mut self, conversation: ConversationId) -> Self {
         self.conversation = Some(conversation.to_string());
+        self.stream = self.laser.resource_stream().map(str::to_owned);
         self
     }
     /// Start the traversal from explicit node ids.
@@ -160,6 +194,7 @@ impl GraphHandle<'_> {
             consistency: laser_wire::query::Consistency::Eventual,
             as_of: self.as_of,
             conversation: self.conversation,
+            stream: self.stream,
         };
         let payload = laser_wire::framing::encode_named(&query)
             .map_err(|error| LaserError::Codec(format!("encode graph query: {error}")))?;
@@ -193,6 +228,7 @@ impl GraphHandle<'_> {
             limit: self.limit,
             as_of: self.as_of,
             conversation: self.conversation,
+            stream: self.stream,
         };
         let payload = laser_wire::framing::encode_named(&request)
             .map_err(|error| LaserError::Codec(format!("encode graph neighbors: {error}")))?;
@@ -297,14 +333,32 @@ impl GraphHandle<'_> {
         use laser_wire::graph::GraphUpsert;
         use laser_wire::validate::Validate;
         self.require_graph()?;
+        let (mut nodes, mut edges) = (nodes, edges);
+        for node in &mut nodes {
+            if node.producer.is_none() {
+                node.producer.clone_from(&self.producer);
+            }
+            if node.source.is_none() {
+                node.source.clone_from(&self.source);
+            }
+        }
+        for edge in &mut edges {
+            if edge.producer.is_none() {
+                edge.producer.clone_from(&self.producer);
+            }
+            if edge.source.is_none() {
+                edge.source.clone_from(&self.source);
+            }
+        }
         let request = GraphUpsert {
             v: laser_wire::codes::GRAPH_OP_VERSION,
             graph: self.name,
+            session: self.session,
             nodes,
             edges,
         };
         // Spend the cap failure locally rather than amplifying an over-cap
-        // upsert against the managed plane, which rejects it with the same
+        // upsert against the managed backend, which rejects it with the same
         // reason.
         request.validate()?;
         let payload = laser_wire::framing::encode_named(&request)
@@ -357,4 +411,34 @@ fn now_micros() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::laser::{Laser, ResourceNaming};
+    use crate::types::ConversationId;
+
+    fn laser() -> Laser {
+        Laser::from_client(crate::iggy::prelude::IggyClient::default()).with_default_stream("acme")
+    }
+
+    #[test]
+    fn given_a_default_stream_when_opening_a_graph_then_should_scope_the_name_and_the_lens() {
+        let laser = laser();
+        let handle = laser
+            .graph("knowledge")
+            .conversation(ConversationId::derive("lens"));
+        assert_eq!(handle.name, "stream:acme/knowledge");
+        assert_eq!(handle.stream.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn given_bare_naming_when_opening_a_graph_then_should_send_the_name_and_lens_unchanged() {
+        let laser = laser().with_resource_naming(ResourceNaming::Bare);
+        let handle = laser
+            .graph("knowledge")
+            .conversation(ConversationId::derive("lens"));
+        assert_eq!(handle.name, "knowledge");
+        assert_eq!(handle.stream, None);
+    }
 }

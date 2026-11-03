@@ -211,8 +211,8 @@ void test("given_a_custom_scorer_when_selected_then_should_rank_over_the_same_ca
 
 void test("given_a_fixed_inbox_route_when_resolved_then_should_use_that_topic_ignoring_presence", () => {
   const agent = AgentId.new("metrics")
-  const route = { kind: "fixed", topic: AgentTopic.Commands } as const
-  assert.equal(resolveInboxRoute(route, agent, "some.other.topic"), "agent.commands")
+  const route = { kind: "fixed", topic: AgentTopic.Sessions } as const
+  assert.equal(resolveInboxRoute(route, agent, "some.other.topic"), "agent.sessions")
 })
 
 void test("given_an_advertised_route_when_an_inbox_is_present_then_should_resolve_to_it", () => {

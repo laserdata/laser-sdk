@@ -1,16 +1,15 @@
-# interop - one agent through A2A, MCP, AG-UI, and human input
+# interop: one agent through A2A, MCP, AG-UI, and human input
 
-This example exposes one agent through A2A, MCP, and AG-UI adapters. The agent receives AGDX records through the log and returns correlated replies.
+This example reaches an agent through A2A, MCP, and AG-UI adapters and pauses on a human decision. The agent only reads AGDX commands from the log and answers with correlated AGDX responses.
 
 ## What it does
 
-1. Starts an assistant, a tool runner, and an approver as long-lived agents.
-2. Exposes the assistant through `A2aBridge`, submits an A2A message, polls the task, and prints the completed artifact.
-3. Builds an `McpBridge` with a tool, resource, and prompt, then calls the tool through a correlated agent request.
-4. Writes a two-chunk AGDX chat stream and reconstructs its conversation as AG-UI events.
-5. Publishes a human input request and waits for the approver agent to send the correlated response.
+1. A2A. `A2aBridge.submit(..)` publishes an A2A message as an AGDX command. The `assistant` worker answers, and `A2aBridge.task(..)` reads the answer back as a completed task.
+2. MCP. `McpBridge` lists its `ask` tool. `callTool(..)` sends the MCP `tools/call` params unchanged as an AGDX command, and the `tool-runner` worker's reply comes back as a tool result.
+3. AG-UI. A chat answer is streamed onto the log as AGDX chunks, then `laser.aguiEvents(..)` renders the conversation as AG-UI events.
+4. Human input. An orchestrator pauses with `requestInput(..)`, and an approver agent resolves it with `context.respondInput(..)`.
 
-The bridge classes translate protocol-shaped input at the edge. The workers only decode AGDX commands and publish AGDX responses, so protocol adapters never leak into agent business logic.
+The assistant, the tool runner, and the approver all read `agent.sessions` for the whole run. Each call passes `{ target }` with the agent it is for, so only that agent takes it as work. Without a target, a bridge call or input request addresses every agent.
 
 ## Run it
 
@@ -20,14 +19,14 @@ Run `npm run setup` once, then run from `examples/typescript`:
 npm run example:interop
 ```
 
-The deterministic model is the default. Set one provider key to use native `fetch` behind the same example-owned `LlmClient` interface.
+The deterministic model is the default. Set one provider key to use a real model behind the same `LlmClient` interface:
 
 ```sh
 ANTHROPIC_API_KEY=... npm run example:interop
 OPENAI_API_KEY=... npm run example:interop
 ```
 
-No managed service is required. The same example also runs against LaserData Cloud.
+It runs on Apache Iggy without LaserData Cloud, and against LaserData Cloud with a bare target:
 
 ```sh
 LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host \
@@ -36,14 +35,13 @@ LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host \
 
 ## Where to look (LaserData Cloud)
 
-- Conversations: the A2A task, MCP call, chunked chat, and approval request.
-- Agent registry: assistant, tool runner, and approver presence while the example runs.
-- Messages: commands and responses with stable correlations across each protocol boundary.
+- Sessions: the A2A task, the MCP call, the chat stream, and the input request.
+- Messages: commands and responses with one correlation across each protocol boundary.
 
 ## Highlights
 
-- A2A task state is reconstructed from the durable reply log instead of held in bridge memory.
-- MCP tool execution reuses the same request and response path as other agents.
+- A2A task state comes from the durable reply log, not from bridge memory.
+- MCP tool calls use the same request and response path as other agents.
 - AG-UI events come from replayable AGDX chunks rather than a one-shot SSE connection.
-- Human input uses the existing command and response vocabulary with no TypeScript-only wire shape.
-- All agent handles implement `AsyncDisposable` and shut down in reverse startup order.
+- Human input uses the existing command and response records.
+- One `AsyncResourceGroup` owns the three agents and stops them in reverse order when the run ends.

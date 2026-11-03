@@ -393,3 +393,74 @@ void test("given_live_presence_when_refreshed_within_ttl_then_should_reuse_the_c
   assert.equal(await registry.refreshPresence(), 1)
   assert.equal(transport.managedQueries.length, 1)
 })
+
+void test("given_cards_in_any_insertion_order_when_listed_then_should_order_by_agent_id", async () => {
+  const transport = new RegistryTransport()
+  transport.pollPages.push([
+    polled(cardEnvelope("worker-b", ["diagnose"]), 0n),
+    polled(cardEnvelope("planner", ["plan"]), 1n),
+    polled(cardEnvelope("worker-a", ["diagnose"]), 2n)
+  ])
+  const registry = AgentRegistry.create(
+    Cursor.create(transport, "stream", "agent.registry", [0]),
+    newRegistryCache(),
+    () => ClientMetadataRequest.create(transport),
+    () => 100n
+  )
+  await registry.refresh()
+  assert.deepEqual(
+    registry.agents().map((card) => card.agent.asStr()),
+    ["planner", "worker-a", "worker-b"]
+  )
+  assert.deepEqual(
+    registry.resolve("diagnose").map((card) => card.agent.asStr()),
+    ["worker-a", "worker-b"]
+  )
+})
+
+void test("given_presence_on_two_nodes_when_listing_all_then_should_page_each_node_independently", async () => {
+  const requests: { replica: number; after?: number }[] = []
+  const transport: Pick<LaserTransport, "sendManaged" | "sendManagedTo" | "replicaIds"> = {
+    replicaIds: () => Promise.resolve([0, 1]),
+    sendManaged: () => Promise.reject(new Error("presence must name its replica")),
+    sendManagedTo: (_code, payload, target) => {
+      assert.equal(target.kind, "replica")
+      const query = decodeClientMetadataQuery(
+        expectMap(decodeOne(payload, "query"), "query"),
+        "query"
+      )
+      requests.push({
+        replica: target.replica,
+        ...(query.afterClientId === undefined ? {} : { after: query.afterClientId })
+      })
+      const clientId = query.afterClientId === undefined ? 5 : 9
+      return Promise.resolve({
+        reply: encodeNamed(
+          encodeClientMetadataList({
+            clients: [
+              {
+                clientId,
+                transport: 1,
+                address: `node-${String(target.replica)}`,
+                consumerGroupsCount: 0
+              }
+            ],
+            ...(clientId === 5 ? { nextCursor: 5 } : {})
+          })
+        ),
+        replica: target.replica
+      })
+    }
+  }
+  const clients = await ClientMetadataRequest.create(transport).all()
+  assert.deepEqual(
+    clients.map((client) => client.address),
+    ["node-0", "node-0", "node-1", "node-1"]
+  )
+  assert.deepEqual(requests, [
+    { replica: 0 },
+    { replica: 0, after: 5 },
+    { replica: 1 },
+    { replica: 1, after: 5 }
+  ])
+})

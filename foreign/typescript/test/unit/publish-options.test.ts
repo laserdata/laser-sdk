@@ -8,6 +8,7 @@ import {
   TransportError
 } from "../../src/client/errors.js"
 import { publishOptions } from "../../src/client/publish-options.js"
+import { LaneBlockedError, OperationUncertainError } from "apache-iggy"
 import { Laser } from "../../src/client/laser.js"
 import { ApacheIggyTransport, type IggyClient } from "../../src/iggy/apache-iggy.js"
 import { isPermissionDenied } from "../../src/client/error-classify.js"
@@ -111,7 +112,7 @@ void test("given_a_permanent_server_error_when_publishing_then_should_not_retry"
   let attempts = 0
   const client = await transport(() => {
     attempts += 1
-    return Promise.reject(Object.assign(new Error("unauthorized"), { errorCode: 20 }))
+    return Promise.reject(Object.assign(new Error("unauthorized"), { errorCode: 41 }))
   })
   await assert.rejects(
     client.sendMessages("stream", "topic", [new Uint8Array([1])], {
@@ -122,6 +123,34 @@ void test("given_a_permanent_server_error_when_publishing_then_should_not_retry"
       error instanceof PublishFailedError && error.publishCause() instanceof TransportError
   )
   assert.equal(attempts, 1)
+})
+
+void test("given_a_missing_topic_when_publishing_then_should_rebuild_the_routing_once", async () => {
+  let attempts = 0
+  const client = await transport(() => {
+    attempts += 1
+    return Promise.reject(Object.assign(new Error("topic not found"), { errorCode: 2011 }))
+  })
+  await assert.rejects(
+    client.sendMessages("stream", "topic", [new Uint8Array([1])], {
+      kind: "partition",
+      partition: 0
+    }),
+    PublishFailedError
+  )
+  assert.equal(attempts, 2)
+  let recreated = 0
+  const healed = await transport(() => {
+    recreated += 1
+    return recreated === 1
+      ? Promise.reject(Object.assign(new Error("stream not found"), { errorCode: 1010 }))
+      : Promise.resolve({ confirmations: [] })
+  })
+  await healed.sendMessages("stream", "topic", [new Uint8Array([1])], {
+    kind: "partition",
+    partition: 0
+  })
+  assert.equal(recreated, 2)
 })
 
 void test("given_a_stalled_publish_with_no_retries_when_timed_out_then_should_close_and_reject", async () => {
@@ -320,4 +349,137 @@ void test("given_a_refused_agent_send_when_published_then_should_report_a_publis
       return true
     }
   )
+})
+
+void test("given_background_retry_timing_when_a_server_refuses_then_should_resend_at_once_then_at_the_fixed_interval", async () => {
+  const at: number[] = []
+  const client = await transport(() => {
+    at.push(Date.now())
+    return Promise.reject(Object.assign(new Error("refused"), { errorCode: 41 }))
+  }, 3)
+  await assert.rejects(
+    client.sendMessagesWithHeaders(
+      "stream",
+      "topic",
+      [{ payload: new Uint8Array([1]), headers: new Map() }],
+      undefined,
+      0,
+      { maxRetries: 3, fixedRetryIntervalMs: 40 }
+    ),
+    PublishFailedError
+  )
+  assert.equal(at.length, 4)
+  const gaps = at.slice(1).map((time, index) => time - (at[index] ?? time))
+  assert.ok((gaps[0] ?? 0) < 20, `first resend waited ${String(gaps[0])} ms`)
+  for (const gap of gaps.slice(1)) assert.ok(gap >= 35 && gap < 90, `resend gap ${String(gap)} ms`)
+})
+
+void test("given_background_retry_timing_when_the_confirmation_is_lost_then_should_not_resend", async () => {
+  let attempts = 0
+  const client = await transport(() => {
+    attempts += 1
+    return Promise.reject(Object.assign(new Error("bad bytes"), { errorCode: 303 }))
+  }, 3)
+  await assert.rejects(
+    client.sendMessagesWithHeaders(
+      "stream",
+      "topic",
+      [{ payload: new Uint8Array([1]), headers: new Map() }],
+      undefined,
+      0,
+      { maxRetries: 3, fixedRetryIntervalMs: 1 }
+    ),
+    PublishFailedError
+  )
+  assert.equal(attempts, 1)
+})
+
+void test("given_an_uncertain_send_when_a_later_publish_is_blocked_by_it_then_should_resolve_it_first_and_never_resend_it", async () => {
+  const sent: number[] = []
+  const resolved: bigint[] = []
+  const client = {
+    clientProvider: () => Promise.resolve({}),
+    message: {
+      send: (request: Parameters<Send>[0]) => {
+        sent.push(request.messages.length)
+        if (sent.length === 1)
+          return Promise.reject(
+            new OperationUncertainError(7n, Object.assign(new Error("lost"), { errorCode: 58 }))
+          )
+        return resolved.length === 0
+          ? Promise.reject(new LaneBlockedError(7n))
+          : Promise.resolve({ confirmations: [] })
+      }
+    },
+    resolveOperation: (operationId: bigint) => {
+      resolved.push(operationId)
+      return Promise.resolve()
+    },
+    destroy: () => Promise.resolve()
+  } as unknown as IggyClient
+  const adapted = await ApacheIggyTransport.fromClient(client, "owned", {
+    timeoutMs: 1_000,
+    maxRetries: 3,
+    retryBackoffMs: 1
+  })
+  const send = () =>
+    adapted.sendMessages("stream", "topic", [new Uint8Array([1])], {
+      kind: "partition",
+      partition: 0
+    })
+  await assert.rejects(
+    send(),
+    (error: unknown) =>
+      error instanceof PublishFailedError &&
+      error.publishCause() instanceof TransportError &&
+      !(error.publishCause() as TransportError).retryable
+  )
+  assert.equal(sent.length, 1, "a send that may have committed is never resent")
+  await send()
+  assert.deepEqual(resolved, [7n])
+  assert.equal(sent.length, 3, "the blocked send goes out once more after the resolve")
+})
+
+void test("given_a_blocker_that_stays_uncertain_or_belongs_to_another_caller_when_publishing_then_should_report_the_blocked_lane", async () => {
+  for (const blocker of [7n, 9n]) {
+    let sends = 0
+    const resolved: bigint[] = []
+    const client = {
+      clientProvider: () => Promise.resolve({}),
+      message: {
+        send: () => {
+          sends += 1
+          return Promise.reject(
+            sends === 1
+              ? new OperationUncertainError(7n, new Error("lost"))
+              : new LaneBlockedError(blocker)
+          )
+        }
+      },
+      resolveOperation: (operationId: bigint) => {
+        resolved.push(operationId)
+        return Promise.reject(new OperationUncertainError(operationId, new Error("still lost")))
+      },
+      destroy: () => Promise.resolve()
+    } as unknown as IggyClient
+    const adapted = await ApacheIggyTransport.fromClient(client, "owned", {
+      timeoutMs: 1_000,
+      maxRetries: 3,
+      retryBackoffMs: 1
+    })
+    const send = () =>
+      adapted.sendMessages("stream", "topic", [new Uint8Array([1])], {
+        kind: "partition",
+        partition: 0
+      })
+    await assert.rejects(send(), PublishFailedError)
+    await assert.rejects(
+      send(),
+      (error: unknown) =>
+        error instanceof PublishFailedError &&
+        (error.publishCause() as TransportError).cause instanceof LaneBlockedError
+    )
+    assert.deepEqual(resolved, blocker === 7n ? [7n] : [], "only an own uncertain send is resolved")
+    assert.equal(sends, 2, "a lane that stays blocked sends nothing more")
+  }
 })

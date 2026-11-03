@@ -28,7 +28,7 @@ pub enum LaserError {
     #[error(transparent)]
     PublishFailed(Box<PublishFailure>),
     /// A transient handler-side failure a handler may return to request a retry
-    /// (the reliable consumer retries it under the [`RetryPolicy`](crate::agent::RetryPolicy)).
+    /// (the reliable consumer retries it under the `RetryPolicy`).
     /// Deterministic wiring, startup, and configuration failures use
     /// [`HandlerConfig`](Self::HandlerConfig) instead, which never retries.
     #[error("handler error: {0}")]
@@ -70,12 +70,12 @@ pub enum LaserError {
     /// LaserData Cloud answered a fork op with a typed failure.
     #[error("fork: {0}")]
     Fork(#[from] ForkError),
+    /// LaserData Cloud answered a session read with a typed failure.
+    #[error("session: {0}")]
+    Session(#[from] laser_wire::session::SessionError),
     /// LaserData Cloud answered a graph op with a typed failure.
     #[error("graph: {0}")]
     Graph(#[from] laser_wire::graph::GraphError),
-    /// LaserData Cloud answered an agent or workflow control op with a typed failure.
-    #[error("agent: {0}")]
-    Agent(#[from] laser_wire::agent_workflow::AgentError),
     /// The streaming server answered an authorization op with a typed failure.
     #[error("authz: {0}")]
     Authz(#[from] laser_wire::authz::AuthzError),
@@ -126,6 +126,9 @@ pub enum LaserError {
     /// (e.g. a scan outcome for a get). Indicates server/client skew.
     #[error("protocol: {0}")]
     Protocol(String),
+    /// A managed endpoint returned its original result code and message.
+    #[error("managed command: {}", .0.message)]
+    Command(CommandError),
     /// The connected infrastructure does not provide the requested feature
     /// (Apache Iggy without LaserData Cloud, or a deployment whose backend
     /// does not advertise the sub-capability). Permanent by definition: gate
@@ -157,18 +160,18 @@ pub enum LaserError {
         reference: String,
     },
     /// An envelope signature was absent where required, enrolled to no known key,
-    /// or failed verification. The authorship and control-plane authorization
-    /// gate, never retryable.
+    /// or failed verification. The authorship and authorization gate, never
+    /// retryable.
     #[error("signature: {0}")]
     Signature(String),
-    /// The enrolled [`ActionGovernor`](crate::govern::ActionGovernor) rejected
+    /// The enrolled `ActionGovernor` rejected
     /// the action before the effect ran. Never retryable: the policy, not the
     /// transport, said no.
     #[error("policy blocked: {0}")]
     PolicyBlocked(String),
     /// The enrolled governor paused the action on a stronger approval.
     /// `scope` names the scope the approval must grant, so a handler can run an
-    /// [`approval_gate`](crate::agent::AgentCtx::approval_gate) and re-send.
+    /// `approval_gate` and re-send.
     /// Never retryable as-is.
     #[error("step-up required: {scope}")]
     StepUpRequired { scope: String },
@@ -183,7 +186,7 @@ pub enum LaserError {
     /// An advertised inbox route resolved a capable agent but the agent advertises
     /// no inbox topic in its live presence, so there is nowhere to address it. The
     /// caller waits for the agent to advertise, supplies an explicit
-    /// [`InboxRoute::Fixed`](crate::agent::InboxRoute::Fixed), or routes elsewhere.
+    /// `InboxRoute::Fixed`, or routes elsewhere.
     /// Never falls back to a shared topic name.
     #[error("agent has no advertised inbox: {agent}")]
     NoInbox { agent: String },
@@ -322,10 +325,8 @@ impl From<CommandError> for LaserError {
                 feature: None,
                 message: error.message,
             },
-            ResultCode::InvalidArgument | ResultCode::VersionSkew => {
-                LaserError::Invalid(error.message)
-            }
-            other => LaserError::Protocol(format!("{other:?}: {}", error.message)),
+            ResultCode::InvalidArgument => LaserError::Invalid(error.message),
+            _ => LaserError::Command(error),
         }
     }
 }
@@ -420,9 +421,10 @@ impl LaserError {
             #[cfg(feature = "provenance")]
             Self::Provenance(_) => false,
             Self::Query(error) => ResultCode::from(error).is_retryable(),
+            Self::Command(error) => error.code.is_retryable(),
             Self::Kv(error) => ResultCode::from(error).is_retryable(),
             Self::Fork(error) => ResultCode::from(error).is_retryable(),
-            Self::Agent(error) => ResultCode::from(error).is_retryable(),
+            Self::Session(error) => ResultCode::from(error).is_retryable(),
             Self::Graph(error) => ResultCode::from(error).is_retryable(),
             Self::Checkpoint(error) => ResultCode::from(error.as_ref()).is_retryable(),
             Self::Filter(error) => error.code.is_retryable(),
@@ -443,17 +445,18 @@ impl LaserError {
     /// the flag a retry loop keys on when it wants only the recoverable class
     /// rather than everything [`is_retryable`](Self::is_retryable) admits.
     pub fn is_unavailable(&self) -> bool {
-        self.code() == ResultCode::Unavailable
+        matches!(
+            self.code(),
+            ResultCode::Unavailable | ResultCode::TargetUnavailable
+        )
     }
 
-    /// Whether the connected plane declined a conditional write because it
+    /// Whether the connected managed backend declined a conditional write because it
     /// does not own that operation's mutation partition.
     pub fn is_not_leader(&self) -> bool {
         matches!(
             self.publish_cause(),
-            Self::Kv(KvError::NotLeader)
-                | Self::Fork(ForkError::NotLeader)
-                | Self::Agent(laser_wire::agent_workflow::AgentError::NotLeader)
+            Self::Kv(KvError::NotLeader) | Self::Fork(ForkError::NotLeader)
         )
     }
 
@@ -461,6 +464,10 @@ impl LaserError {
     /// does not provide the feature at all. Permanent: do not retry, gate the
     /// code path instead.
     pub fn is_unsupported(&self) -> bool {
+        if matches!(self.publish_cause(), Self::Command(error) if error.code == ResultCode::Unsupported)
+        {
+            return true;
+        }
         matches!(
             self.publish_cause(),
             Self::Unsupported { .. }
@@ -474,6 +481,10 @@ impl LaserError {
     /// Whether the failure names a missing resource (index, fork). Distinct
     /// from a backend being down: the call worked, the thing is not there.
     pub fn is_not_found(&self) -> bool {
+        if matches!(self.publish_cause(), Self::Command(error) if error.code == ResultCode::NotFound)
+        {
+            return true;
+        }
         matches!(
             self.publish_cause(),
             Self::Query(QueryError::IndexNotFound(_) | QueryError::ForkNotFound(_))
@@ -492,6 +503,10 @@ impl LaserError {
     /// connected LaserData Cloud (the envelope's `v` was not accepted). Permanent for
     /// this client build: upgrade or downshift instead of retrying.
     pub fn is_version_skew(&self) -> bool {
+        if matches!(self.publish_cause(), Self::Command(error) if error.code == ResultCode::VersionSkew)
+        {
+            return true;
+        }
         matches!(
             self.publish_cause(),
             Self::Query(QueryError::Version { .. })
@@ -529,6 +544,9 @@ impl LaserError {
     /// or key-value fold has not yet applied the required source position.
     /// Retryable: the read model is catching up.
     pub fn is_stale(&self) -> bool {
+        if matches!(self.publish_cause(), Self::Command(error) if error.code == ResultCode::Stale) {
+            return true;
+        }
         matches!(
             self.publish_cause(),
             Self::Query(QueryError::Stale { .. }) | Self::Kv(KvError::Stale { .. })
@@ -542,6 +560,10 @@ impl LaserError {
     /// the stream or topic permission the failing verb needs (read, send,
     /// create), or point the client at a stream the principal can use.
     pub fn is_permission_denied(&self) -> bool {
+        if matches!(self.publish_cause(), Self::Command(error) if matches!(error.code, ResultCode::Forbidden | ResultCode::Unauthenticated))
+        {
+            return true;
+        }
         matches!(self.publish_cause(), Self::RoutePrincipalMismatch { .. })
             || matches!(
                 self.iggy_cause(),
@@ -650,14 +672,15 @@ impl LaserError {
             }
             Self::Iggy(error) if is_transient_iggy_io_error(error) => ResultCode::Unavailable,
             Self::Filter(error) => error.code,
+            Self::Command(error) => error.code,
             Self::FilterFault { .. } => ResultCode::InvalidArgument,
             Self::FilterOversizedRecord { .. } => ResultCode::TooLarge,
             Self::ConsumerGroupSetup { source, .. } => source.code(),
             Self::Query(error) => ResultCode::from(error),
             Self::Kv(error) => ResultCode::from(error),
             Self::Fork(error) => ResultCode::from(error),
+            Self::Session(error) => ResultCode::from(error),
             Self::Graph(error) => ResultCode::from(error),
-            Self::Agent(error) => ResultCode::from(error),
             Self::Checkpoint(error) => ResultCode::from(error.as_ref()),
             Self::Unsupported { .. } | Self::NoStream | Self::NoRespondTopic => {
                 ResultCode::Unsupported
@@ -728,6 +751,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn given_managed_command_errors_when_classified_then_should_preserve_the_original_codes() {
+        for (code, retryable, unavailable, denied, missing, skew) in [
+            (ResultCode::Conflict, false, false, false, false, false),
+            (
+                ResultCode::TargetUnavailable,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (ResultCode::Forbidden, false, false, true, false, false),
+            (ResultCode::NotFound, false, false, false, true, false),
+            (ResultCode::VersionSkew, false, false, false, false, true),
+            (
+                ResultCode::Unrecognized(42),
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+        ] {
+            let error = LaserError::from(CommandError::new(code, "refused"));
+            assert_eq!(error.code(), code);
+            assert_eq!(error.is_retryable(), retryable);
+            assert_eq!(error.is_unavailable(), unavailable);
+            assert_eq!(error.is_permission_denied(), denied);
+            assert_eq!(error.is_not_found(), missing);
+            assert_eq!(error.is_version_skew(), skew);
+        }
+    }
+
+    #[test]
     fn given_a_failed_producer_send_when_classified_then_should_use_its_cause() {
         for (cause, code, retryable, denied, missing) in [
             (
@@ -769,6 +826,7 @@ mod tests {
             let error = LaserError::Iggy(IggyError::ProducerSendFailed {
                 cause: Box::new(cause),
                 failed: std::sync::Arc::new(Vec::new()),
+                uncertain: 0,
                 committed: std::sync::Arc::new(Vec::new()),
                 stream_name: "s".into(),
                 topic_name: "t".into(),
@@ -786,6 +844,7 @@ mod tests {
         let send = LaserError::Iggy(IggyError::ProducerSendFailed {
             cause: Box::new(IggyError::Unauthorized),
             failed: std::sync::Arc::new(Vec::new()),
+            uncertain: 0,
             committed: std::sync::Arc::new(Vec::new()),
             stream_name: "s".into(),
             topic_name: "t".into(),

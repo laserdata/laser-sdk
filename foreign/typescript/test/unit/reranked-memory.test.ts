@@ -16,6 +16,12 @@ import {
 import { VectorMemory } from "../../src/memory/vector-memory.js"
 import { ConversationId } from "../../src/types/ids.js"
 
+// A fake client that sends every resource name as written.
+const BARE_NAMING = {
+  resourceNameIn: (_stream: string | undefined, name: string) => name,
+  resourceScope: () => undefined
+}
+
 const embedder = { embed: () => Promise.resolve([1]) }
 
 void test("given_rerankers_when_a_typed_deduplicated_memory_item_is_written_then_should_preserve_its_id_and_kind", async () => {
@@ -129,7 +135,9 @@ void test("given_an_embedder_when_registered_on_a_vector_handle_then_should_rebu
 })
 
 void test("given_an_embedder_when_registered_on_a_log_or_custom_handle_then_should_leave_the_handle_unchanged", () => {
-  const log = MemoryHandle.create(new LogMemory({ defaultStream: "records" } as unknown as Laser))
+  const log = MemoryHandle.create(
+    new LogMemory({ defaultStream: "records", ...BARE_NAMING } as unknown as Laser)
+  )
   assert.equal(log.embedder(embedder), log)
   const custom = MemoryHandle.custom(new ListMemory([]))
   assert.equal(custom.embedder(embedder), custom)

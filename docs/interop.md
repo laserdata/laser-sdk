@@ -15,22 +15,22 @@ let metrics = laser.with_default_stream("metrics-agents");
 // An A2A gateway on the ops stream.
 let gateway = A2aBridge::new(
     ops.clone(),
-    "ops-gateway".parse()?,
-    AgentTopic::Commands,
-    AgentTopic::Responses,
+    "ops-gateway".parse::<AgentId>()?,
+    AgentTopic::Sessions,
+    AgentTopic::Sessions,
 );
 
 // An agent on the metrics stream, sharing the one connection.
 // Keep the handle: dropping it signals a graceful shutdown.
 let collector = Agent::builder()
     .id("collector".parse()?)
-    .listen_on(AgentTopic::Commands)
+    .listen_on(AgentTopic::Sessions)
     .handler(handler)
     .build()
     .spawn(metrics.clone());
 ```
 
-`AgentTopic` variants name the standard `agent.*` topics. `AgentTopic::Custom(&id)` accepts another Iggy topic name. Deployments can use their own topic layout.
+`AgentTopic` variants name the standard `agent.*` topics. Requests and replies share `agent.sessions` by default, and every record there carries its addressee in `agdx.to`. `AgentTopic::Custom(&id)` accepts another Iggy topic name. Deployments can use their own topic layout.
 
 Credentials and the hosted HTTP endpoint control access:
 
@@ -49,7 +49,7 @@ A2A v1.0 uses PascalCase operation names. The stateless bridge does not serve `L
 | --- | --- |
 | `SendMessage` | Publish a typed AGDX `command` on a fresh task conversation, tunneling the whole params JSON in the body. The task id is the conversation. The A2A task identity rides `correlation` (derived from the conversation, so lookup stays stateless). Returns `Submitted`. |
 | `SendStreamingMessage` | Same publish as `SendMessage`. The stream is consumed log-natively (`Laser::reassemble_channel`), not re-emitted as SSE. |
-| `GetTask` | Read the reply topic, map the answering `response`/`error` envelope (matched by `correlation`) to the A2A task. `Working` until one lands. |
+| `GetTask` | Read the reply topic, map the answering `response`/`error` envelope (matched by `correlation`) to the A2A task. `Working` until one lands, and `Unknown` when the bounded scan could not reach the end of the reply topic, so the caller should look again. |
 | `CancelTask` | Publish an AGDX `error` terminal (`Cancelled`, `task_state = Canceled`). Returns `Canceled`. With `sign` and `with_signing_key`, the terminal is signed. |
 
 ```rust
@@ -58,15 +58,36 @@ use std::sync::Arc;
 
 let bridge = Arc::new(A2aBridge::new(
     laser.clone(),
-    "a2a-gateway".parse()?,        // the bridge's agent id
-    AgentTopic::Commands,           // request topic
-    AgentTopic::Responses,          // reply topic
+    "a2a-gateway".parse::<AgentId>()?,        // the bridge's agent id
+    AgentTopic::Sessions,           // request topic
+    AgentTopic::Sessions,           // reply topic
 ));
 // Mount the JSON-RPC endpoint + the Agent Card route on your HTTP server:
 let app = bridge.router();
 ```
 
-A worker behind the bridge consumes the decoded command envelope (`message.envelope`) and answers with an AGDX `response` echoing the correlation.
+A worker behind the bridge consumes the decoded command envelope (`message.envelope`) and answers with an AGDX `response` echoing the correlation. The reply must be addressed to the bridge's agent id, which `ctx.respond` does.
+
+`A2aBridge::submit_in(parent, root, params)` sends a task as a child session of `parent` in the tree rooted at `root`. It writes the child's submitted start on `agent.sessions` with that ancestry before the command, and the handling agent ends the child. Python takes `submit_in(parent, params, root=)`, and TypeScript names it `submitIn`.
+
+A task the bridge submits is addressed to every agent (`agdx.to = *`), so on a shared `agent.sessions` topic every listening agent receives it. To send it to one agent, use `A2aBridge::submit_to(target, params)` or `submit_in_to(target, parent, root, params)`. The command then carries `agdx.to = <target>`, and only that agent handles it. Python takes `submit(params, target=)` and `submit_in(parent, params, root=, target=)`. TypeScript takes `submit(params, { target })` and `submitIn(parent, root, params, { target })`. The JSON-RPC `router()` and `handle_rpc` paths submit unaddressed, so run one worker per request topic behind them.
+
+### Binding tasks to callers
+
+By default anyone who knows a task id can read or cancel the task. `A2aBridge::with_task_binding(key, ttl)` ties each task id to the caller that submitted it. The id then has three dot-separated parts: the conversation, an expiry in Unix microseconds, and a keyed BLAKE3 digest. The digest covers the caller, the stream creation time, the conversation and the expiry, under the 32-byte `key`. So an id works only for its own caller, only on the stream it was made on, and only until it expires. A recreated stream with the same name does not accept old ids.
+
+Once binding is on, every task operation needs a caller. Use `bridge.caller(principal)` and call `submit`, `submit_to`, `submit_in`, `submit_in_to`, `task`, `cancel` or `handle_rpc` on it. The bridge methods without a caller refuse with `HandlerConfig` before they publish anything. Another caller's id, an expired id and a changed id are refused the same way as a malformed id. So a caller cannot tell whether a task exists. The `router()` reads the caller from an `A2aCallerPrincipal` request extension. Your authentication layer must insert it, and a request without it is refused. Keep the key secret and the same on every bridge replica that serves the same stream. Rotating the key ends every open task id.
+
+Python passes `task_binding_key=` (32 bytes) and `task_binding_ttl_ms=` to the `A2aBridge` constructor, and `caller=` to `submit`, `submit_in`, `task`, `cancel` and `handle_rpc`. TypeScript uses `withTaskBinding(key, ttlMs)` and `caller(principal)`, which returns an `A2aCaller` with the same methods. All three SDKs make the same digest, so a task id made by one works in the others.
+
+```rust
+let bridge = Arc::new(
+    A2aBridge::new(laser.clone(), "a2a-gateway".parse::<AgentId>()?, AgentTopic::Sessions, AgentTopic::Sessions)
+        .with_task_binding(task_key, std::time::Duration::from_secs(3600)),
+);
+let task = bridge.caller("user-42").submit(params).await?;
+let current = bridge.caller("user-42").task(&task.id).await?;
+```
 
 ## MCP (`mcp-bridge`)
 
@@ -87,38 +108,41 @@ use std::sync::Arc;
 let mcp = Arc::new(
     McpBridge::new(
         laser.clone(),
-        "mcp-gateway".parse()?,
-        AgentTopic::ToolCalls,
-        AgentTopic::ToolResults,
+        "mcp-gateway".parse::<AgentId>()?,
+        AgentTopic::Sessions,
+        AgentTopic::Sessions,
         "my-server",
     )
     .with_tool(
         "ask",
         Some("ask the assistant".into()),
         serde_json::json!({ "type": "object" }),
-    ),
+    )?,
 );
 let app = mcp.router();
 ```
+
+`McpBridge::call_tool_in(parent, root, name, params)` runs one tool call as a child session of `parent`. It writes the child's submitted start before the command and ends the child by the result: completed on a tool result and failed on a tool error. Python takes `call_tool_in(parent, name, params, root=)`, and TypeScript names it `callToolIn`.
+
+A tool call is addressed to every agent unless you name one. `McpBridge::call_tool_to(target, name, params)` and `call_tool_in_to(target, parent, root, name, params)` send it to that agent only. Python takes `call_tool(name, params, target=)` and `call_tool_in(parent, name, params, root=, target=)`. TypeScript takes `callTool(name, params, { target })` and `callToolIn(parent, root, name, params, { target })`. The JSON-RPC paths call unaddressed.
 
 ## AG-UI (`agui`)
 
 AG-UI provides interfaces for frontends. The SDK supports state synchronization and event rendering through the log:
 
-- Use `publish_state_snapshot` and `publish_state_delta` for full state and RFC 6902 patches. They produce `state_snapshot` and `state_delta` events. `reconstruct_state` takes the latest snapshot and applies every later delta.
+- Use `publish_state_snapshot` and `publish_state_delta` for full state and RFC 6902 patches. They write the session state document on the session lane, the same revision-guarded `state_delta` and `state_snapshot` records `session.state()` writes, so every reader folds one state model. `reconstruct_state` returns the session state document. It folds the retained lane first and uses the managed state view only when the lane no longer holds the document's baseline and the view is not behind the lane.
 - Use `agui_events` to convert chat, reasoning, tool, task, state, and error records into AG-UI events. The mappings include `TEXT_MESSAGE_*`, `REASONING_MESSAGE_*`, `TOOL_CALL_START`, `ARGS`, `END`, `TOOL_CALL_RESULT`, `RUN_STARTED`, `RUN_FINISHED`, `STATE_*`, and `RUN_ERROR`.
 
 ```rust
 laser
     .publish_state_snapshot(
-        AgentTopic::Audit,
-        "ui".parse()?,
+        "ui".parse::<AgentId>()?,
         conversation,
         &serde_json::json!({ "count": 0 }),
     )
     .await?;
 
-let events = laser.agui_events(conversation, AgentTopic::LlmIo).await?;
+let events = laser.agui_events(conversation, AgentTopic::Sessions).await?;
 ```
 
 The niche AG-UI events with no AGDX source (`MESSAGES_SNAPSHOT`, `ACTIVITY_*`, `RAW`/`CUSTOM`/`META`) are not rendered: they are application extensions, not substrate primitives.
@@ -156,17 +180,19 @@ The mapping onto AGDX:
 - its checkpoint-fork onto the AGDX fork
 - its lifecycle `cause` (`toolCall` / `send` / `edge`) onto `cause` / `causal_parent`
 
-`Agdx::request_input(reply_topic, prompt, timeout)` publishes a prompt with a new correlation ID and waits for a response. `AgentCtx::respond_input(reply_topic, response)` answers it. An AGDX `error` becomes `LaserError::Rejected`. These calls use existing command and response records. The `interop` example demonstrates them on `AgentTopic::HumanInput`.
+`Agdx::request_input(reply_topic, prompt, timeout)` publishes a prompt with a new correlation ID and waits for a response. `AgentCtx::respond_input(reply_topic, response)` answers it. An AGDX `error` becomes `LaserError::Rejected`. These calls use existing command and response records. The `interop` example demonstrates them on `AgentTopic::Sessions`.
+
+The prompt is addressed to every agent, so on a shared session topic any listening agent can answer it. `Agdx::request_input_from(target, reply_topic, prompt, timeout)` addresses it to one agent. Python takes `request_input(reply_topic, prompt, timeout_ms=, target=)`, and TypeScript takes `requestInput(replyTopic, prompt, timeoutMs, { target })`.
 
 ```rust
 // Pause for a human decision, resume with their answer.
 let decision = laser
-    .agdx(AgentTopic::HumanInput, "orchestrator".parse()?, conversation.into())
-    .request_input(AgentTopic::Responses, b"approve draining node-7?".to_vec(), Duration::from_secs(300))
+    .agdx(AgentTopic::Sessions, "orchestrator".parse::<AgentId>()?, conversation.into())
+    .request_input_from("approver".parse::<AgentId>()?, AgentTopic::Sessions, b"approve draining node-7?".to_vec(), Duration::from_secs(300))
     .await?;
 
 // The approver agent's handler resolves the interrupt it is handling:
-ctx.respond_input(AgentTopic::Responses, b"approved".to_vec()).await?;
+ctx.respond_input(AgentTopic::Sessions, b"approved".to_vec()).await?;
 ```
 
 Two proposals remain unimplemented. One adds typed `text`, `reasoning`, `data`, and `tool_call` blocks with start, delta, and finish events. The other adds a reply position that identifies where a command took effect.

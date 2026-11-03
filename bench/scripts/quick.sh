@@ -45,15 +45,15 @@ if [[ ! "$parallelism_override" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 readonly DEFAULT_IGGY_BENCH_VERSION="0.6.0-edge.3"
-readonly DEFAULT_PLANE_VERSION="0.16.0"
+readonly DEFAULT_BACKEND_VERSION="0.16.0"
 
 server_version="${LASER_BENCH_IGGY_SERVER_VERSION:-$(./scripts/resolve-test-iggy-server.sh --version)}"
 bench_version="${LASER_BENCH_IGGY_BENCH_VERSION:-$DEFAULT_IGGY_BENCH_VERSION}"
-plane_version="${LASER_BENCH_PLANE_VERSION:-$DEFAULT_PLANE_VERSION}"
+backend_version="${LASER_BENCH_BACKEND_VERSION:-$DEFAULT_BACKEND_VERSION}"
 cpu_target="${LASER_BENCH_CPU_TARGET:-auto}"
 iggy_server_binary="${LASER_BENCH_IGGY_SERVER_BINARY:-}"
 iggy_bench_binary="${LASER_BENCH_IGGY_BENCH_BINARY:-}"
-plane_binary="${LASER_BENCH_PLANE_BINARY:-}"
+backend_binary="${LASER_BENCH_BACKEND_BINARY:-}"
 
 if [[ "$cpu_target" == "auto" ]]; then
   case "$(uname -m)" in
@@ -166,15 +166,15 @@ if [[ -n "$iggy_server_binary" && -n "$iggy_bench_binary" ]]; then
     printf 'caller-provided Iggy binaries must exist and be executable\n' >&2
     exit 2
   fi
-  if [[ -z "$plane_binary" || ! -x "$plane_binary" ]]; then
-    printf 'path mode requires an executable LASER_BENCH_PLANE_BINARY\n' >&2
+  if [[ -z "$backend_binary" || ! -x "$backend_binary" ]]; then
+    printf 'path mode requires an executable LASER_BENCH_BACKEND_BINARY\n' >&2
     exit 2
   fi
   provisioning_mode="path"
-  printf 'Stack: caller-provided native Iggy and plane binaries\n'
+  printf 'Stack: caller-provided native Iggy and backend binaries\n'
 else
-  if [[ -n "$plane_binary" ]]; then
-    printf 'a local plane requires local Iggy binaries in path mode\n' >&2
+  if [[ -n "$backend_binary" ]]; then
+    printf 'a local backend requires local Iggy binaries in path mode\n' >&2
     printf 'set LASER_BENCH_IGGY_SERVER_BINARY and LASER_BENCH_IGGY_BENCH_BINARY\n' >&2
     exit 2
   fi
@@ -183,15 +183,15 @@ else
     printf 'required command not found: curl\n' >&2
     exit 127
   fi
-  printf 'Stack: signed native Iggy and plane artifacts\n'
-  printf 'Artifacts: Iggy %s, iggy-bench %s, plane %s\n' "$server_version" "$bench_version" "$plane_version"
+  printf 'Stack: signed native Iggy and backend artifacts\n'
+  printf 'Artifacts: Iggy %s, iggy-bench %s, backend %s\n' "$server_version" "$bench_version" "$backend_version"
 fi
 printf 'Surfaces: streaming, AGDX, managed data, and MCP interoperability\n'
 printf 'Concurrency: %s logical CPUs online, %s producer and consumer lanes\n' "$online_cpu_count" "$parallelism"
 
 if [[ "$smoke" != "true" ]]; then
   if [[ "$managed" == "true" && "$full" == "true" ]]; then
-    printf 'Measures: 8 Iggy substrate, 4 streaming including raw-Iggy A/A calibration, 16 AGDX, 45 managed, 12 local memory, %s MCP scenarios, 1 Rust client startup, 4 recovery scenarios, and 1 direct-plane diagnostic scenario\n' "$mcp_scenarios"
+    printf 'Measures: 8 Iggy substrate, 4 streaming including raw-Iggy A/A calibration, 16 AGDX, 45 managed, 12 local memory, %s MCP scenarios, 1 Rust client startup, 4 recovery scenarios, and 1 direct backend diagnostic scenario\n' "$mcp_scenarios"
     printf 'Expected runtime: at least 4 hours plus release builds, warmup, and setup\n'
   else
     printf 'Measures: 1 Iggy substrate, 3 streaming, 16 AGDX, 8 managed, 2 local memory, %s MCP scenarios, 1 Rust client startup, and 4 recovery scenarios\n' "$mcp_scenarios"
@@ -218,13 +218,13 @@ if [[ "$provisioning_mode" == "path" ]]; then
   cat >>"$manifest" <<EOF
 iggy_server = "$iggy_server_binary"
 iggy_bench = "$iggy_bench_binary"
-plane = "$plane_binary"
+backend = "$backend_binary"
 EOF
 else
   cat >>"$manifest" <<EOF
 iggy_server_version = "$server_version"
 iggy_bench_version = "$bench_version"
-plane_version = "$plane_version"
+backend_version = "$backend_version"
 EOF
 fi
 
@@ -459,10 +459,10 @@ consumers = 1
 operations = 100
 
 [[scenarios]]
-name = "plane_restart_memory_recovery"
+name = "backend_restart_memory_recovery"
 layer = "L7"
 arm = "fold_convergence"
-driver = "plane_restart_memory"
+driver = "backend_restart_memory"
 transport = "tcp_vsr"
 repetitions = $repetitions
 warmup_seconds = 0
@@ -475,10 +475,10 @@ consumers = 1
 operations = 100
 
 [[scenarios]]
-name = "plane_restart_projection_recovery"
+name = "backend_restart_projection_recovery"
 layer = "L7"
 arm = "projection_convergence"
-driver = "plane_restart_projection"
+driver = "backend_restart_projection"
 transport = "tcp_vsr"
 repetitions = $repetitions
 warmup_seconds = 0

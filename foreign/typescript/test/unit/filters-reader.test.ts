@@ -2,18 +2,22 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import { OPEN_CAPABILITIES, type Capabilities } from "../../src/client/capabilities.js"
 import {
+  ConfigError,
   FilterExecutionError,
   InvalidError,
   ProtocolError,
   TransportError,
   UnsupportedError
 } from "../../src/client/errors.js"
-import type { CoordinatorConnection, NodeConnection } from "../../src/iggy/apache-iggy.js"
+import type {
+  CoordinatorConnection,
+  FencedPosition,
+  ManagedTarget
+} from "../../src/iggy/apache-iggy.js"
 import {
   FilteredReader,
   FilteredReaderBuilder,
   Filters,
-  sessionReuse,
   type FilterTransport
 } from "../../src/managed/filters.js"
 import { CompiledFilter } from "../../src/wire/filter-eval.js"
@@ -21,6 +25,8 @@ import { decodeOne, encodeNamed } from "../../src/wire/cbor.js"
 import {
   AGDX_FILTERED_ACK_CODE,
   AGDX_FILTERED_POLL_CODE,
+  AGDX_FILTERED_WAIT_CANCEL_CODE,
+  AGDX_FILTERED_WAIT_CODE,
   FILTER_OP_VERSION
 } from "../../src/wire/codes.js"
 import {
@@ -28,51 +34,68 @@ import {
   FilterExpr,
   consumerFilterDigest,
   decodeFilteredPollRequest,
+  decodeFilteredAck,
+  decodeFilteredWaitCancel,
+  decodeFilteredWaitRequest,
   encodeFilterReply,
   type FilteredPage,
   type FilteredPollRequest,
   type FilteredStart,
-  type ReadMode
+  type FilteredWaitCancel,
+  type FilteredWaitRequest
 } from "../../src/wire/filter.js"
 
-const ATTACH_CONSUMER_SESSION_CODE = 14
-const GET_POLL_ROUTING_CODE = 103
-const GET_CONSUMER_OFFSET_ROUTING_CODE = 123
 const SYNC_CONSUMER_GROUP_CODE = 606
+const INVALID_IDENTIFIER = 6
+const HISTORY_UNAVAILABLE = 87
+const NOT_PRIMARY = 89
+const CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009
 
 const filter = ConsumerFilter.json(FilterExpr.present("mode"))
 const generation = {
   streamId: 1,
   streamCreatedAtMicros: 1n,
-  topicId: 1,
+  topicId: 2,
   topicCreatedAtMicros: 1n,
   partitionId: 0,
-  partitionCreatedRevision: 1n,
-  purgeGeneration: 0n
+  partitionIncarnation: 17n
 }
+const ackContext = { ownerGeneration: 4n, metadataOp: 40n }
 const capabilities: Capabilities = {
   ...OPEN_CAPABILITIES,
-  filters: { native: true, catalog: false, groupPolicyReads: true }
+  filters: { native: true, catalog: false, groupPolicyReads: true, maxWaitMs: 0 }
 }
 
-// A standard polled-messages body with one batch holding `offsets`.
-function body(partitionId: number, frontier: bigint, offsets: readonly bigint[]): Uint8Array {
+// The polled head: partition, current offset, count, then the partition context.
+const HEAD = 40
+
+// A standard polled-messages body with one batch holding `offsets`, read
+// under the page's partition context.
+function body(
+  partitionId: number,
+  frontier: bigint,
+  offsets: readonly bigint[],
+  context = { incarnation: 17n, ownerGeneration: 4n, metadataOp: 40n }
+): Uint8Array {
   const payload = new TextEncoder().encode(`{"mode":"safe"}`)
   const frameBytes = 48 + payload.byteLength
   const batchBytes = offsets.length === 0 ? 0 : 256 + frameBytes * offsets.length
-  const out = new Uint8Array(16 + batchBytes)
+  const out = new Uint8Array(HEAD + batchBytes)
   const view = new DataView(out.buffer)
   view.setUint32(0, partitionId, true)
   view.setBigUint64(4, frontier, true)
   view.setUint32(12, offsets.length, true)
+  view.setBigUint64(16, context.incarnation, true)
+  view.setBigUint64(24, context.ownerGeneration, true)
+  view.setBigUint64(32, context.metadataOp, true)
   const base = offsets[0]
   if (base === undefined) return out
-  view.setBigUint64(16 + 8, base, true)
-  view.setBigUint64(16 + 16, 1_700_000_000_123_456n, true)
-  view.setBigUint64(16 + 32, BigInt(batchBytes), true)
-  view.setUint32(16 + 48, offsets.length, true)
+  view.setBigUint64(HEAD + 8, base, true)
+  view.setBigUint64(HEAD + 16, 1_700_000_000_123_456n, true)
+  view.setBigUint64(HEAD + 32, BigInt(batchBytes), true)
+  view.setUint32(HEAD + 48, offsets.length, true)
   offsets.forEach((offset, index) => {
-    const frame = 16 + 256 + index * frameBytes
+    const frame = HEAD + 256 + index * frameBytes
     view.setUint32(frame + 24, Number(offset - base), true)
     view.setUint32(frame + 36, payload.byteLength, true)
     out.set(payload, frame + 48)
@@ -81,7 +104,6 @@ function body(partitionId: number, frontier: bigint, offsets: readonly bigint[])
 }
 
 function page(
-  mode: ReadMode,
   overrides: Partial<FilteredPage> & { readonly offsets?: readonly bigint[] } = {}
 ): FilteredPage {
   const { offsets = [], ...fields } = overrides
@@ -92,9 +114,9 @@ function page(
     partitionId,
     policy: { digest: consumerFilterDigest(filter), mode: "filtered", policyGeneration: 0n },
     generation: { ...generation, partitionId },
-    readMode: mode,
+    ackContext,
     nextScanOffset,
-    ...(mode === "primary" ? { safeAckOffset: nextScanOffset - 1n } : {}),
+    safeAckOffset: nextScanOffset - 1n,
     frontier: 1000n,
     examined: Math.max(1, offsets.length),
     matched: offsets.length,
@@ -105,17 +127,35 @@ function page(
   }
 }
 
-function pageReply(value: FilteredPage): Uint8Array {
-  return encodeNamed(encodeFilterReply({ kind: "ok", outcome: { kind: "page", page: value } }))
+// A page that examined nothing, which offers no acknowledgment offset.
+function unscanned(partitionId: number): FilteredPage {
+  const { safeAckOffset: _safe, nextScanOffset: _next, ...rest } = page({ partitionId })
+  return {
+    ...rest,
+    policy: {
+      digest: consumerFilterDigest(filter),
+      groupId: 3n,
+      mode: "filtered",
+      policyGeneration: 0n
+    },
+    examined: 0
+  }
 }
 
-function ackReply(offset: bigint): Uint8Array {
-  return encodeNamed(
-    encodeFilterReply({
-      kind: "ok",
-      outcome: { kind: "acknowledged", receipt: { partitionId: 0, offset, generation } }
-    })
-  )
+function groupPage(overrides: Partial<FilteredPage> & { readonly offsets?: readonly bigint[] }) {
+  return page({
+    policy: {
+      digest: consumerFilterDigest(filter),
+      groupId: 3n,
+      mode: "filtered",
+      policyGeneration: 0n
+    },
+    ...overrides
+  })
+}
+
+function pageReply(value: FilteredPage): Uint8Array {
+  return encodeNamed(encodeFilterReply({ kind: "ok", outcome: { kind: "page", page: value } }))
 }
 
 function staleReply(message: string): Uint8Array {
@@ -127,15 +167,11 @@ function staleReply(message: string): Uint8Array {
   )
 }
 
-function route(): Uint8Array {
-  const reply = new Uint8Array(32 + 4 + 1 + 4 + 9 + 10)
-  const view = new DataView(reply.buffer)
-  view.setUint32(32, 1, true)
-  reply[36] = 110
-  view.setUint32(37, 9, true)
-  reply.set(new TextEncoder().encode("127.0.0.1"), 41)
-  view.setUint16(50, 8090, true)
-  return reply
+// A server refusal as the transport surfaces it.
+function refusal(errorCode: number, retryable = false): TransportError {
+  return new TransportError(`refused with ${String(errorCode)}`, retryable, {
+    cause: Object.assign(new Error("server refusal"), { errorCode })
+  })
 }
 
 function assignment(generationId: bigint, partitions: readonly number[]): Uint8Array {
@@ -162,26 +198,162 @@ function baseTransport(sendManaged: FilterTransport["sendManaged"]): FilterTrans
   }
 }
 
-function coordinatorOf(transport: FilterTransport): CoordinatorConnection {
-  return {
-    send: (code, payload) => transport.sendManaged(code, payload),
+interface Coordinator {
+  readonly connection: CoordinatorConnection
+  readonly polls: { readonly target: ManagedTarget; readonly request: FilteredPollRequest }[]
+  readonly waits: {
+    readonly target: ManagedTarget
+    readonly request: FilteredWaitRequest
+    readonly deadline?: number
+  }[]
+  readonly stored: FencedPosition[]
+  readonly lookups: number[]
+  readonly acks: { readonly target: ManagedTarget; readonly offset: bigint }[]
+  readonly cancels: { readonly target: ManagedTarget; readonly request: FilteredWaitCancel }[]
+}
+
+/**
+ * A coordinator whose polls `poll` answers. The route lookup names replica 1
+ * unless `primary` says otherwise. Stores succeed unless `store` says
+ * otherwise. Group syncs answer with `sync`. A wait cancel ends the named
+ * waits held on its node with an empty ready answer, as the server does,
+ * unless `cancel` answers it.
+ */
+function coordinatorOf(spec: {
+  readonly poll: (request: FilteredPollRequest, target: ManagedTarget) => Promise<Uint8Array>
+  readonly primary?: (partitionId: number) => Promise<number>
+  readonly store?: (position: FencedPosition) => Promise<void>
+  readonly sync?: () => Promise<Uint8Array>
+  readonly wait?: (request: FilteredWaitRequest, target: ManagedTarget) => Promise<Uint8Array>
+  // Answers an acknowledgment with its own reply, or stores it when undefined.
+  readonly ack?: (offset: bigint, target: ManagedTarget) => Promise<Uint8Array | undefined>
+  readonly cancel?: (request: FilteredWaitCancel, target: ManagedTarget) => Promise<Uint8Array>
+}): Coordinator {
+  const polls: Coordinator["polls"] = []
+  const waits: Coordinator["waits"] = []
+  const stored: FencedPosition[] = []
+  const lookups: number[] = []
+  const acks: Coordinator["acks"] = []
+  const cancels: Coordinator["cancels"] = []
+  const held = new Map<string, () => void>()
+  const connection: CoordinatorConnection = {
+    send: (code) => {
+      assert.equal(code, SYNC_CONSUMER_GROUP_CODE, "only the group sync rides the plain send")
+      return spec.sync === undefined ? Promise.resolve(assignment(1n, [0])) : spec.sync()
+    },
+    sendManagedTo: async (code, payload, target, options) => {
+      if (code === AGDX_FILTERED_WAIT_CODE) {
+        const request = decodeFilteredWaitRequest(decodeOne(payload, "wait"), "wait")
+        waits.push({
+          target,
+          request,
+          ...(options?.deadline === undefined ? {} : { deadline: options.deadline })
+        })
+        assert.ok(spec.wait !== undefined, "this server holds no filtered wait")
+        const key = heldKey(target, request.waitId)
+        const cancelled = new Promise<Uint8Array>((resolve) => {
+          held.set(key, () => {
+            resolve(readyReply([]))
+          })
+        })
+        try {
+          return { reply: await Promise.race([spec.wait(request, target), cancelled]) }
+        } finally {
+          held.delete(key)
+        }
+      }
+      if (code === AGDX_FILTERED_WAIT_CANCEL_CODE) {
+        const request = decodeFilteredWaitCancel(decodeOne(payload, "cancel"), "cancel")
+        cancels.push({ target, request })
+        if (spec.cancel !== undefined) return { reply: await spec.cancel(request, target) }
+        const ended = request.waitIds.filter((waitId) => held.has(heldKey(target, waitId)))
+        for (const waitId of ended) held.get(heldKey(target, waitId))?.()
+        return { reply: cancelledReply(ended) }
+      }
+      if (code === AGDX_FILTERED_ACK_CODE) {
+        const ack = decodeFilteredAck(decodeOne(payload, "acknowledgment"), "acknowledgment")
+        const position: FencedPosition = {
+          streamId: ack.generation.streamId,
+          topicId: ack.generation.topicId,
+          consumer:
+            ack.groupId === undefined
+              ? {
+                  kind: "consumer",
+                  name: ack.consumer.kind === "consumer" ? ack.consumer.name : "reader"
+                }
+              : { kind: "group", id: Number(ack.groupId) },
+          partitionId: ack.partitionId,
+          offset: ack.offset,
+          context: {
+            incarnation: ack.generation.partitionIncarnation,
+            ownerGeneration: ack.ackContext.ownerGeneration,
+            metadataOp: ack.ackContext.metadataOp
+          }
+        }
+        acks.push({ target, offset: ack.offset })
+        const answered = spec.ack === undefined ? undefined : await spec.ack(ack.offset, target)
+        if (answered !== undefined) return { reply: answered }
+        if (spec.store !== undefined) await spec.store(position)
+        stored.push(position)
+        return {
+          reply: encodeNamed(
+            encodeFilterReply({
+              kind: "ok",
+              outcome: {
+                kind: "acknowledged",
+                receipt: {
+                  partitionId: ack.partitionId,
+                  offset: ack.offset,
+                  generation: ack.generation
+                }
+              }
+            })
+          )
+        }
+      }
+      assert.equal(code, AGDX_FILTERED_POLL_CODE)
+      const request = pollOf(payload)
+      polls.push({ target, request })
+      return { reply: await spec.poll(request, target) }
+    },
+    partitionPrimary: (_stream, _topic, partitionId) => {
+      lookups.push(partitionId)
+      return spec.primary === undefined ? Promise.resolve(1) : spec.primary(partitionId)
+    },
+    storePosition: async (position) => {
+      if (spec.store !== undefined) await spec.store(position)
+      stored.push(position)
+    },
     joinConsumerGroup: () => Promise.resolve(),
     leaveConsumerGroup: () => Promise.resolve(),
     close: () => Promise.resolve()
   }
+  return { connection, polls, waits, stored, lookups, acks, cancels }
+}
+
+function heldKey(target: ManagedTarget, waitId: bigint): string {
+  return `${target.kind === "replica" ? String(target.replica) : target.kind}:${String(waitId)}`
 }
 
 function reader(
-  transport: FilterTransport,
-  mode: ReadMode,
-  guarded?: ConsumerFilter,
-  layout: { readonly partitionIds?: readonly number[]; readonly idleIntervalMs?: number } = {}
+  coordinator: Coordinator,
+  layout: {
+    readonly guarded?: ConsumerFilter
+    readonly partitionIds?: readonly number[]
+    readonly idleIntervalMs?: number
+    readonly maxUnackedPages?: number
+    readonly maxWaitMs?: number
+    readonly start?: FilteredStart
+  } = {}
 ): FilteredReader {
-  const start: FilteredStart = { kind: "first" }
+  const transport = baseTransport(() =>
+    Promise.reject(new Error("the shared transport is not used"))
+  )
+  const start: FilteredStart = layout.start ?? { kind: "first" }
   return FilteredReader.create({
     transport,
     filters: new Filters(transport, () => Promise.resolve(capabilities)),
-    coordinator: coordinatorOf(transport),
+    coordinator: coordinator.connection,
     request: {
       v: FILTER_OP_VERSION,
       source: { stream: "orbit", topic: "fleet_changes" },
@@ -190,27 +362,27 @@ function reader(
       filter: { kind: "inline", filter },
       start,
       count: 10,
-      maxReplyBytes: 1024 * 1024,
-      readMode: mode
+      maxReplyBytes: 1024 * 1024
     },
     start,
     idleIntervalMs: layout.idleIntervalMs ?? 1,
-    guard: guarded === undefined ? undefined : CompiledFilter.compile(guarded),
+    ...(layout.maxWaitMs === undefined ? {} : { maxWaitMs: layout.maxWaitMs }),
+    ...(layout.maxUnackedPages === undefined ? {} : { maxUnackedPages: layout.maxUnackedPages }),
+    guard: layout.guarded === undefined ? undefined : CompiledFilter.compile(layout.guarded),
     membership: undefined,
     partitionIds: layout.partitionIds ?? [0]
   })
 }
 
-function groupReader(coordinator: CoordinatorConnection, data: NodeConnection) {
+function groupReader(coordinator: Coordinator, served: Capabilities = capabilities) {
   const transport: FilterTransport = {
     ...baseTransport(() => Promise.reject(new Error("the shared transport is not used"))),
-    openCoordinator: () => Promise.resolve(coordinator),
-    openNodeConnection: () => Promise.resolve(data)
+    openCoordinator: () => Promise.resolve(coordinator.connection)
   }
   return FilteredReaderBuilder.create(
     transport,
-    () => Promise.resolve(capabilities),
-    new Filters(transport, () => Promise.resolve(capabilities)),
+    () => Promise.resolve(served),
+    new Filters(transport, () => Promise.resolve(served)),
     { stream: "orbit", topic: "fleet_changes" },
     { kind: "group", name: "anomaly-desk" },
     { kind: "bound" }
@@ -227,7 +399,7 @@ void test("given_a_server_without_group_reads_when_an_automatic_reader_is_built_
   const outdated = (): Promise<Capabilities> =>
     Promise.resolve({
       ...capabilities,
-      filters: { native: true, catalog: false, groupPolicyReads: false }
+      filters: { native: true, catalog: false, groupPolicyReads: false, maxWaitMs: 0 }
     })
   const automatic = FilteredReaderBuilder.create(
     transport,
@@ -237,23 +409,62 @@ void test("given_a_server_without_group_reads_when_an_automatic_reader_is_built_
     { kind: "group", name: "anomaly-desk" },
     { kind: "group" }
   )
-  await assert.rejects(automatic.build(), UnsupportedError)
+  await assert.rejects(automatic.build(), (error: unknown) => {
+    assert.ok(error instanceof UnsupportedError)
+    assert.equal(error.surface, "filters")
+    assert.equal(error.feature, "group_policy_reads")
+    return true
+  })
   assert.equal(joined, false)
+})
+
+void test("given_a_server_without_native_filters_when_a_bound_reader_is_built_then_should_reject_before_transport", async () => {
+  let transportCalls = 0
+  const unexpectedTransport = (): Promise<never> => {
+    transportCalls += 1
+    return Promise.reject(new Error("no transport is needed"))
+  }
+  const transport: FilterTransport = {
+    ...baseTransport(unexpectedTransport),
+    joinConsumerGroup: unexpectedTransport,
+    openCoordinator: unexpectedTransport
+  }
+  const withoutNative = (): Promise<Capabilities> =>
+    Promise.resolve({
+      ...capabilities,
+      filters: { native: false, catalog: false, groupPolicyReads: true, maxWaitMs: 0 }
+    })
+  const bound = FilteredReaderBuilder.create(
+    transport,
+    withoutNative,
+    new Filters(transport, withoutNative),
+    { stream: "orbit", topic: "fleet_changes" },
+    { kind: "group", name: "anomaly-desk" },
+    { kind: "bound" }
+  )
+  await assert.rejects(bound.build(), (error: unknown) => {
+    assert.ok(error instanceof UnsupportedError)
+    assert.equal(error.surface, "filters")
+    assert.equal(error.feature, undefined)
+    return true
+  })
+  assert.equal(transportCalls, 0)
 })
 
 void test("given_an_unfiltered_page_when_read_then_should_need_an_automatic_group_read_that_delivered_everything", async () => {
   const unfiltered = (overrides: Partial<FilteredPage> = {}) =>
-    page("local", {
+    page({
       offsets: [0n],
       policy: { groupId: 3n, mode: "unfiltered", policyGeneration: 2n },
       ...overrides
     })
   const read = async (kind: "bound" | "group", served: FilteredPage) => {
-    const transport = baseTransport(() => Promise.resolve(pageReply(served)))
+    const coordinator = coordinatorOf({ poll: () => Promise.resolve(pageReply(served)) })
+    const transport = baseTransport(() => Promise.reject(new Error("unused")))
     const filtered = FilteredReader.create({
       transport,
       filters: new Filters(transport, () => Promise.resolve(capabilities)),
-      coordinator: coordinatorOf(transport),
+      coordinator: coordinator.connection,
       request: {
         v: FILTER_OP_VERSION,
         source: { stream: "orbit", topic: "fleet_changes" },
@@ -262,8 +473,7 @@ void test("given_an_unfiltered_page_when_read_then_should_need_an_automatic_grou
         filter: { kind },
         start: { kind: "first" },
         count: 10,
-        maxReplyBytes: 1024 * 1024,
-        readMode: "local"
+        maxReplyBytes: 1024 * 1024
       },
       start: { kind: "first" },
       idleIntervalMs: 1,
@@ -295,27 +505,15 @@ void test("given_an_unfiltered_page_when_read_then_should_need_an_automatic_grou
 })
 
 void test("given_an_over_budget_page_when_a_bounded_group_read_returns_then_should_reject_the_progress", async () => {
-  const transport = baseTransport(() =>
-    Promise.resolve(
-      pageReply(
-        page("local", {
-          offsets: [],
-          examined: 3,
-          nextScanOffset: 3n,
-          policy: {
-            groupId: 3n,
-            digest: consumerFilterDigest(filter),
-            mode: "filtered",
-            policyGeneration: 0n
-          }
-        })
-      )
-    )
-  )
+  const coordinator = coordinatorOf({
+    poll: () =>
+      Promise.resolve(pageReply(groupPage({ offsets: [], examined: 3, nextScanOffset: 3n })))
+  })
+  const transport = baseTransport(() => Promise.reject(new Error("unused")))
   const filtered = FilteredReader.create({
     transport,
     filters: new Filters(transport, () => Promise.resolve(capabilities)),
-    coordinator: coordinatorOf(transport),
+    coordinator: coordinator.connection,
     request: {
       v: FILTER_OP_VERSION,
       source: { stream: "orbit", topic: "fleet_changes" },
@@ -325,8 +523,7 @@ void test("given_an_over_budget_page_when_a_bounded_group_read_returns_then_shou
       start: { kind: "first" },
       count: 2,
       maxExamined: 2,
-      maxReplyBytes: 1024,
-      readMode: "local"
+      maxReplyBytes: 1024
     },
     start: { kind: "first" },
     idleIntervalMs: 1,
@@ -346,7 +543,7 @@ void test("given_group_policy_reads_without_an_evaluator_when_an_automatic_reade
   const withoutEvaluator = (): Promise<Capabilities> =>
     Promise.resolve({
       ...capabilities,
-      filters: { native: false, catalog: false, groupPolicyReads: true }
+      filters: { native: false, catalog: false, groupPolicyReads: true, maxWaitMs: 0 }
     })
   const automatic = FilteredReaderBuilder.create(
     transport,
@@ -362,37 +559,45 @@ void test("given_group_policy_reads_without_an_evaluator_when_an_automatic_reade
 })
 
 void test("given_inconsistent_reply_metadata_when_reading_without_a_guard_then_should_reject", async () => {
-  const forgedCount = new Uint8Array(16)
+  const forgedCount = new Uint8Array(HEAD)
   new DataView(forgedCount.buffer).setUint32(12, 0xffffffff, true)
-  const variants: readonly Partial<FilteredPage>[] = [
-    { records: forgedCount },
-    { readMode: "primary" },
-    { safeAckOffset: 0n },
-    { partitionId: 1 },
-    { matched: 1 },
-    { policy: { mode: "filtered", policyGeneration: 0n } },
-    { examined: 0 }
+  const { safeAckOffset: _safe, ...withoutAckOffset } = page()
+  const variants: readonly FilteredPage[] = [
+    page({ records: forgedCount }),
+    page({ safeAckOffset: 5n }),
+    withoutAckOffset,
+    page({ partitionId: 1 }),
+    page({ matched: 1 }),
+    page({ policy: { mode: "filtered", policyGeneration: 0n } }),
+    page({ examined: 0 }),
+    page({
+      records: body(0, 1000n, [], { incarnation: 17n, ownerGeneration: 5n, metadataOp: 40n })
+    }),
+    page({
+      records: body(0, 1000n, [], { incarnation: 18n, ownerGeneration: 4n, metadataOp: 40n })
+    }),
+    page({
+      records: body(0, 1000n, [], { incarnation: 17n, ownerGeneration: 4n, metadataOp: 41n })
+    })
   ]
   for (const variant of variants) {
-    const transport = baseTransport(() => Promise.resolve(pageReply(page("local", variant))))
-    const filtered = reader(transport, "local")
+    const filtered = reader(coordinatorOf({ poll: () => Promise.resolve(pageReply(variant)) }))
     await assert.rejects(filtered.tryNextPage(), ProtocolError)
     await filtered.close()
   }
 })
 
 void test("given_stored_record_headers_when_matched_then_should_carry_them_to_the_record", async () => {
-  const served = page("local", { offsets: [0n] })
+  const served = page({ offsets: [0n] })
   const records = served.records.slice()
   const view = new DataView(records.buffer)
-  const frame = 16 + 256
-  view.setBigUint64(16 + 24, 1_000n, true)
+  const frame = HEAD + 256
+  view.setBigUint64(HEAD + 24, 1_000n, true)
   view.setBigUint64(frame, 42n, true)
   view.setBigUint64(frame + 8, 7n, true)
   view.setUint32(frame + 28, 5, true)
   const filtered = reader(
-    baseTransport(() => Promise.resolve(pageReply({ ...served, records }))),
-    "local"
+    coordinatorOf({ poll: () => Promise.resolve(pageReply({ ...served, records })) })
   )
   const record = (await filtered.tryNextPage())?.records[0]
   assert.equal(record?.message.checksum, 42n)
@@ -400,20 +605,18 @@ void test("given_stored_record_headers_when_matched_then_should_carry_them_to_th
   assert.equal(record.message.originTimestampMicros, 1_005n)
   assert.equal(record.message.userHeaders, undefined)
   assert.equal(record.message.currentOffset, record.frontier)
+  assert.equal(record.message.timestampMicros, 1_700_000_000_123_456n, "micros stay exact")
   await filtered.close()
 })
 
 void test("given_a_command_error_reply_when_reading_then_should_classify_its_result_code", async () => {
-  const refusal = encodeNamed(
+  const unsupported = encodeNamed(
     new Map<string, unknown>([
       ["code", "unsupported"],
       ["message", "filtered reads are not served"]
     ])
   )
-  const filtered = reader(
-    baseTransport(() => Promise.resolve(refusal)),
-    "local"
-  )
+  const filtered = reader(coordinatorOf({ poll: () => Promise.resolve(unsupported) }))
   await assert.rejects(
     filtered.tryNextPage(),
     (error: unknown) =>
@@ -422,50 +625,155 @@ void test("given_a_command_error_reply_when_reading_then_should_classify_its_res
   await filtered.close()
 })
 
-void test("given_local_pages_when_never_acknowledged_then_should_keep_reading_past_the_pending_cap", async () => {
+void test("given_unacknowledged_pages_when_the_cap_is_reached_then_should_refuse_to_read_more", async () => {
   let next = 0n
-  const transport = baseTransport(() => {
-    const offset = next
-    next += 1n
-    return Promise.resolve(
-      pageReply(page("local", { offsets: [offset], nextScanOffset: offset + 1n }))
-    )
+  const coordinator = coordinatorOf({
+    poll: () => {
+      const offset = next
+      next += 1n
+      return Promise.resolve(pageReply(page({ offsets: [offset], nextScanOffset: offset + 1n })))
+    }
   })
-  const filtered = reader(transport, "local")
-  for (let read = 0; read < 70; read += 1) {
+  const filtered = reader(coordinator, { maxUnackedPages: 2 })
+  for (let read = 0; read < 2; read += 1) {
     const found = await filtered.tryNextPage()
-    assert.equal(found?.records.length, 1, `page ${String(read)} is read`)
-    assert.equal(found.safeAckOffset, undefined, "a local page offers no acknowledgment")
-    assert.equal(
-      found.records[0]?.message.timestampMicros,
-      1_700_000_000_123_456n,
-      "micros stay exact"
-    )
+    assert.equal(found?.safeAckOffset, BigInt(read), "every page offers its acknowledgment")
   }
+  await assert.rejects(filtered.tryNextPage(), (error: unknown) => {
+    assert.ok(error instanceof InvalidError)
+    assert.match(error.message, /unacknowledged pages/)
+    return true
+  })
+  assert.equal(coordinator.polls.length, 2, "a saturated partition is not read")
   await filtered.close()
 })
 
-void test("given_a_checkpoint_inside_a_page_when_acknowledged_through_then_should_keep_the_later_record_pending", async () => {
-  const stored: bigint[] = []
-  const transport: FilterTransport = {
-    ...baseTransport(() => Promise.resolve(route())),
-    openNodeConnection: () =>
-      Promise.resolve({
-        close: () => Promise.resolve(),
-        send: (code, payload) => {
-          if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-          if (code === AGDX_FILTERED_POLL_CODE)
-            return Promise.resolve(
-              pageReply(page("primary", { offsets: [3n, 7n], nextScanOffset: 10n }))
-            )
-          const ack = decodeOne(payload, "ack") as Map<string, unknown>
-          const offset = BigInt(ack.get("offset") as number | bigint)
-          stored.push(offset)
-          return Promise.resolve(ackReply(offset))
+void test("given_a_known_route_when_reading_then_should_send_every_poll_to_the_partition_primary", async () => {
+  let next = 0n
+  const coordinator = coordinatorOf({
+    primary: () => Promise.resolve(2),
+    poll: () => {
+      const offset = next
+      next += 1n
+      return Promise.resolve(pageReply(page({ offsets: [offset], nextScanOffset: offset + 1n })))
+    }
+  })
+  const filtered = reader(coordinator)
+  for (let read = 0; read < 3; read += 1) await filtered.tryNextPage()
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.target),
+    [
+      { kind: "replica", replica: 2 },
+      { kind: "replica", replica: 2 },
+      { kind: "replica", replica: 2 }
+    ]
+  )
+  assert.deepEqual(coordinator.lookups, [0], "the route is looked up once and kept")
+  await filtered.close()
+})
+
+void test("given_a_route_the_lookup_cannot_give_when_reading_then_should_read_on_the_callers_node", async () => {
+  let next = 0n
+  const coordinator = coordinatorOf({
+    primary: () => Promise.reject(refusal(1002)),
+    poll: () => {
+      const offset = next
+      next += 1n
+      return Promise.resolve(pageReply(page({ offsets: [offset], nextScanOffset: offset + 1n })))
+    }
+  })
+  const filtered = reader(coordinator)
+  assert.equal((await filtered.tryNextPage())?.records[0]?.offset, 0n)
+  await filtered.tryNextPage()
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.target),
+    [{ kind: "caller" }, { kind: "caller" }]
+  )
+  assert.deepEqual(coordinator.lookups, [0, 0], "an unknown route is looked up again")
+  await filtered.close()
+})
+
+for (const [label, failure] of [
+  ["not_primary", refusal(NOT_PRIMARY)],
+  ["invalid_identifier", refusal(INVALID_IDENTIFIER)],
+  ["lost_link", new TransportError("the link to the replica was lost", true)]
+] as const) {
+  void test(`given_a_poll_failing_with_${label}_when_reading_then_should_look_the_route_up_again_and_resend_once`, async () => {
+    let refused = false
+    const leaders = [1, 2]
+    const coordinator = coordinatorOf({
+      primary: () => Promise.resolve(leaders.shift() ?? 2),
+      poll: (_request, target) => {
+        if (!refused) {
+          refused = true
+          return Promise.reject(failure)
         }
-      })
-  }
-  const filtered = reader(transport, "primary")
+        assert.deepEqual(target, { kind: "replica", replica: 2 })
+        return Promise.resolve(pageReply(page({ offsets: [0n] })))
+      }
+    })
+    const filtered = reader(coordinator)
+    assert.equal((await filtered.tryNextPage())?.records[0]?.offset, 0n)
+    assert.deepEqual(
+      coordinator.polls.map((poll) => poll.target),
+      [
+        { kind: "replica", replica: 1 },
+        { kind: "replica", replica: 2 }
+      ]
+    )
+    assert.deepEqual(coordinator.lookups, [0, 0])
+    await filtered.close()
+  })
+}
+
+void test("given_a_route_stale_twice_when_reading_then_should_surface_the_refusal_and_look_it_up_next_time", async () => {
+  const coordinator = coordinatorOf({
+    poll: () => Promise.reject(refusal(NOT_PRIMARY)),
+    primary: () => Promise.resolve(1)
+  })
+  const filtered = reader(coordinator, { idleIntervalMs: 0 })
+  await assert.rejects(filtered.tryNextPage(), TransportError)
+  assert.equal(coordinator.polls.length, 2, "one resend after a fresh lookup")
+  await assert.rejects(filtered.tryNextPage(), TransportError)
+  assert.deepEqual(coordinator.lookups, [0, 0, 0, 0], "a stale route is never kept")
+  await filtered.close()
+})
+
+void test("given_a_read_on_the_callers_node_when_its_link_fails_then_should_not_resend_it_here", async () => {
+  const coordinator = coordinatorOf({
+    primary: () => Promise.reject(refusal(1002)),
+    poll: () => Promise.reject(new TransportError("the link to the replica was lost", true))
+  })
+  const filtered = reader(coordinator)
+  await assert.rejects(filtered.tryNextPage(), TransportError)
+  assert.equal(coordinator.polls.length, 1, "the caller's node moves on inside the node choice")
+  await filtered.close()
+})
+
+void test("given_a_read_on_the_callers_node_refused_as_not_primary_when_reading_then_should_look_the_route_up_again_and_resend_once", async () => {
+  let lookups = 0
+  const coordinator = coordinatorOf({
+    primary: () => (lookups++ === 0 ? Promise.reject(refusal(1002)) : Promise.resolve(2)),
+    poll: (_request, target) =>
+      target.kind === "caller"
+        ? Promise.reject(refusal(NOT_PRIMARY))
+        : Promise.resolve(pageReply(page({ offsets: [0n] })))
+  })
+  const filtered = reader(coordinator)
+  assert.equal((await filtered.tryNextPage())?.records[0]?.offset, 0n)
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.target),
+    [{ kind: "caller" }, { kind: "replica", replica: 2 }],
+    "a node that does not store the partition sends the read to its primary"
+  )
+  await filtered.close()
+})
+
+void test("given_a_checkpoint_inside_a_page_when_acknowledged_through_then_should_store_a_fenced_position", async () => {
+  const coordinator = coordinatorOf({
+    poll: () => Promise.resolve(pageReply(page({ offsets: [3n, 7n], nextScanOffset: 10n })))
+  })
+  const filtered = reader(coordinator)
   const found = await filtered.tryNextPage()
   assert.ok(found)
   const checkpoint = found.records[0]
@@ -473,260 +781,141 @@ void test("given_a_checkpoint_inside_a_page_when_acknowledged_through_then_shoul
   assert.ok(checkpoint)
   assert.ok(later)
   await filtered.ackThrough(checkpoint)
-  assert.deepEqual(stored, [3n])
+  assert.deepEqual(coordinator.stored, [
+    {
+      streamId: 1,
+      topicId: 2,
+      consumer: { kind: "consumer", name: "reader" },
+      partitionId: 0,
+      offset: 3n,
+      context: { incarnation: 17n, ownerGeneration: 4n, metadataOp: 40n }
+    }
+  ])
   await filtered.ack(later)
-  assert.deepEqual(stored, [3n, 9n])
+  assert.deepEqual(
+    coordinator.stored.map((position) => position.offset),
+    [3n, 9n]
+  )
   await filtered.close()
 })
 
-void test("given_a_lost_ack_route_when_retrying_then_should_use_offset_routing", async () => {
-  const routed: number[] = []
-  let acknowledgments = 0
-  const transport: FilterTransport = {
-    ...baseTransport((code) => {
-      routed.push(code)
-      return Promise.resolve(route())
-    }),
-    openNodeConnection: () =>
-      Promise.resolve({
-        close: () => Promise.resolve(),
-        send: async (code) => {
-          await Promise.resolve()
-          if (code === ATTACH_CONSUMER_SESSION_CODE) return new Uint8Array()
-          if (code === AGDX_FILTERED_POLL_CODE) return pageReply(page("primary"))
-          assert.equal(code, AGDX_FILTERED_ACK_CODE)
-          if (acknowledgments++ === 0)
-            return encodeNamed(
-              encodeFilterReply({
-                kind: "err",
-                error: {
-                  code: { kind: "known", name: "Unavailable" },
-                  reason: "not_primary",
-                  message: "route changed"
-                }
-              })
-            )
-          return ackReply(0n)
-        }
-      })
-  }
-  const filtered = reader(transport, "primary")
-  assert.equal(await filtered.tryNextPage(), undefined)
-  assert.deepEqual(routed, [GET_POLL_ROUTING_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE])
-  assert.equal(acknowledgments, 2)
+void test("given_a_group_page_when_acknowledged_then_should_store_under_the_numeric_group_it_named", async () => {
+  const coordinator = coordinatorOf({
+    poll: () => Promise.resolve(pageReply(groupPage({ offsets: [0n] }))),
+    sync: () => Promise.resolve(assignment(1n, [0]))
+  })
+  const filtered = await groupReader(coordinator).build()
+  const record = (await filtered.tryNextPage())?.records[0]
+  assert(record !== undefined)
+  await filtered.ack(record)
+  assert.deepEqual(coordinator.stored[0]?.consumer, { kind: "group", id: 3 })
   await filtered.close()
 })
 
-void test("given_a_lost_ack_reply_when_the_next_ack_runs_then_should_store_the_same_target_again", async () => {
-  const stored: bigint[] = []
-  let failNext = true
-  const transport: FilterTransport = {
-    ...baseTransport(() => Promise.resolve(route())),
-    openNodeConnection: () =>
-      Promise.resolve({
-        close: () => Promise.resolve(),
-        send: (code, payload) => {
-          if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-          if (code === AGDX_FILTERED_POLL_CODE)
-            return Promise.resolve(
-              pageReply(page("primary", { offsets: [0n, 1n], nextScanOffset: 2n }))
-            )
-          const ack = decodeOne(payload, "ack") as Map<string, unknown>
-          const offset = BigInt(ack.get("offset") as number | bigint)
-          if (failNext) {
-            failNext = false
-            return Promise.reject(new Error("the reply was lost"))
-          }
-          stored.push(offset)
-          return Promise.resolve(ackReply(offset))
-        }
-      })
-  }
-  const filtered = reader(transport, "primary")
+void test("given_a_refused_store_when_the_next_ack_runs_then_should_store_the_same_target_again", async () => {
+  let failures = 1
+  const coordinator = coordinatorOf({
+    poll: () => Promise.resolve(pageReply(page({ offsets: [0n, 1n], nextScanOffset: 2n }))),
+    store: (position) => {
+      if (position.offset === 1n && failures > 0) {
+        failures -= 1
+        return Promise.reject(new TransportError("the reply was lost", false))
+      }
+      return Promise.resolve()
+    }
+  })
+  const filtered = reader(coordinator)
   const found = await filtered.tryNextPage()
   assert(found !== undefined)
   const [first, second] = found.records
   assert(first !== undefined && second !== undefined)
   await filtered.ack(first)
-  await assert.rejects(filtered.ack(second), /filtered command/)
+  await assert.rejects(filtered.ack(second), /the reply was lost/)
   await filtered.ack({ ...second })
   assert.deepEqual(
-    stored,
+    coordinator.stored.map((position) => position.offset),
     [1n],
     "the unstored target is sent again, and a spread copy still acknowledges"
   )
   await filtered.close()
 })
 
-void test("given_a_single_node_when_a_primary_is_routed_then_should_dial_the_endpoint_the_caller_dialed", async () => {
-  const dialed: (readonly [string, number])[] = []
-  const read = async (nodes: number) => {
-    const coordinator: CoordinatorConnection = {
-      send: (code) =>
-        Promise.resolve(code === SYNC_CONSUMER_GROUP_CODE ? assignment(1n, [0]) : route()),
-      joinConsumerGroup: () => Promise.resolve(),
-      leaveConsumerGroup: () => Promise.resolve(),
-      close: () => Promise.resolve()
-    }
-    const data: NodeConnection = {
-      close: () => Promise.resolve(),
-      send: (code, payload) => {
-        if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-        const request = pollOf(payload)
-        const {
-          safeAckOffset: _safe,
-          nextScanOffset: _next,
-          ...unscanned
-        } = page("primary", { partitionId: request.partitionId })
-        return Promise.resolve(
-          pageReply({
-            ...unscanned,
-            policy: {
-              digest: consumerFilterDigest(filter),
-              groupId: 3n,
-              mode: "filtered",
-              policyGeneration: 0n
-            },
-            examined: 0
-          })
-        )
-      }
-    }
-    const transport: FilterTransport = {
-      ...baseTransport(() => Promise.reject(new Error("the shared transport is not used"))),
-      openCoordinator: () => Promise.resolve(coordinator),
-      openNodeConnection: (ip, port) => {
-        dialed.push([ip, port])
-        return Promise.resolve(data)
-      },
-      clusterNodeCount: () => Promise.resolve(nodes)
-    }
-    const filtered = await FilteredReaderBuilder.create(
-      transport,
-      () => Promise.resolve(capabilities),
-      new Filters(transport, () => Promise.resolve(capabilities)),
-      { stream: "orbit", topic: "fleet_changes" },
-      { kind: "group", name: "anomaly-desk" },
-      { kind: "bound" }
-    )
-      .start({ kind: "first" })
-      .build()
-    // The dial is what this test is about, the page itself is not served.
-    await filtered.tryNextPage().catch(() => undefined)
-    await filtered.close().catch(() => undefined)
-  }
-  await read(1)
-  assert.deepEqual(dialed, [["", 0]], "one node: the caller's own endpoint, port zero")
-  dialed.length = 0
-  await read(3)
-  assert.equal(dialed.length, 1)
-  assert.notEqual(dialed[0]?.[1], 0, "a cluster: the primary's advertised endpoint")
+void test("given_a_changed_history_when_storing_then_should_restart_the_partition_from_its_stored_offset", async () => {
+  const coordinator = coordinatorOf({
+    poll: () => Promise.resolve(pageReply(page({ offsets: [0n] }))),
+    store: () => Promise.reject(refusal(HISTORY_UNAVAILABLE))
+  })
+  const filtered = reader(coordinator)
+  const record = (await filtered.tryNextPage())?.records[0]
+  assert(record !== undefined)
+  await assert.rejects(filtered.ack(record), TransportError)
+  await filtered.tryNextPage().catch(() => undefined)
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.request.start.kind),
+    ["first", "next"],
+    "the partition starts over after its stored offset"
+  )
+  assert.deepEqual(coordinator.lookups, [0, 0], "a recreated partition is routed again")
+  await filtered.close()
 })
 
-void test("given_a_failed_topology_probe_when_reading_again_then_should_recover_the_mapped_endpoint_and_cache_success", async () => {
-  const failure = new TransportError("cluster metadata is temporarily unavailable", true)
-  let probes = 0
-  let loseRoute = false
-  const dialed: (readonly [string, number])[] = []
-  const transport: FilterTransport = {
-    ...baseTransport(() => Promise.resolve(route())),
-    clusterNodeCount: () => {
-      probes += 1
-      return probes === 1 ? Promise.reject(failure) : Promise.resolve(1)
+void test("given_a_moved_assignment_when_storing_then_should_sync_the_group_before_the_next_read", async () => {
+  let syncs = 0
+  let next = 0n
+  const coordinator = coordinatorOf({
+    poll: () => {
+      const offset = next
+      next += 1n
+      return Promise.resolve(
+        pageReply(groupPage({ offsets: [offset], nextScanOffset: offset + 1n }))
+      )
     },
-    openNodeConnection: (ip, port) => {
-      dialed.push([ip, port])
-      if (ip !== "" || port !== 0) {
-        return Promise.reject(new TransportError("the advertised port is unreachable", true))
-      }
-      return Promise.resolve({
-        close: () => Promise.resolve(),
-        send: (code, payload) => {
-          if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-          if (loseRoute) {
-            loseRoute = false
-            return Promise.resolve(staleReply("the data connection lost its route"))
-          }
-          const request = pollOf(payload)
-          const offset =
-            request.start.kind === "continue" ? request.start.continuation.nextScanOffset : 0n
-          return Promise.resolve(
-            pageReply(page("primary", { offsets: [offset], nextScanOffset: offset + 1n }))
-          )
-        }
-      })
+    store: () => Promise.reject(refusal(CONSUMER_GROUP_PARTITION_NOT_OWNED)),
+    sync: () => {
+      syncs += 1
+      return Promise.resolve(assignment(1n, [0]))
     }
-  }
-  const filtered = reader(transport, "primary", undefined, { idleIntervalMs: 0 })
-  try {
-    await assert.rejects(filtered.tryNextPage(), failure)
-    assert.deepEqual(dialed, [], "failed discovery must not dial an unverified endpoint")
-    const recovered = await filtered.tryNextPage()
-    assert.equal(recovered?.records[0]?.offset, 0n)
-    assert.deepEqual(dialed, [["", 0]])
-    assert.equal(probes, 2)
+  })
+  const filtered = await groupReader(coordinator).build()
+  const record = (await filtered.tryNextPage())?.records[0]
+  assert(record !== undefined)
+  const before = syncs
+  await assert.rejects(filtered.ack(record), TransportError)
+  await filtered.tryNextPage()
+  assert.equal(syncs, before + 1, "a refused store expires the membership")
+  await filtered.close().catch(() => undefined)
+})
 
-    loseRoute = true
-    assert.equal(await filtered.tryNextPage(), undefined)
-    const rerouted = await filtered.tryNextPage()
-    assert.equal(rerouted?.records[0]?.offset, 1n)
-    assert.deepEqual(dialed, [
-      ["", 0],
-      ["", 0]
-    ])
-    assert.equal(probes, 2, "successful topology discovery stays cached after rerouting")
-  } finally {
-    await filtered.close()
-  }
+void test("given_a_delayed_first_assignment_when_reading_then_should_preserve_the_requested_start", async () => {
+  let assigned: readonly number[] = []
+  const coordinator = coordinatorOf({
+    sync: () => Promise.resolve(assignment(1n, assigned)),
+    poll: (request) =>
+      Promise.resolve(pageReply({ ...unscanned(request.partitionId), nextScanOffset: 0n }))
+  })
+  const filtered = await groupReader(coordinator).start({ kind: "first" }).build()
+  await filtered.tryNextPage()
+  assigned = [0]
+  await filtered.tryNextPage()
+  assert.deepEqual(coordinator.polls[0]?.request.start, { kind: "first" })
+  await filtered.close()
 })
 
 void test("given_a_rebalance_when_a_partition_is_gained_then_should_start_it_at_the_stored_offset", async () => {
   let assigned: readonly number[] = [0]
   let generationId = 1n
   let expireOnce = false
-  const starts = new Map<number, string[]>()
-  const coordinator: CoordinatorConnection = {
-    send: (code) =>
-      Promise.resolve(
-        code === SYNC_CONSUMER_GROUP_CODE ? assignment(generationId, assigned) : route()
-      ),
-    joinConsumerGroup: () => Promise.resolve(),
-    leaveConsumerGroup: () => Promise.resolve(),
-    close: () => Promise.resolve()
-  }
-  const data: NodeConnection = {
-    close: () => Promise.resolve(),
-    send: (code, payload) => {
-      if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-      const request = pollOf(payload)
-      starts.set(request.partitionId, [
-        ...(starts.get(request.partitionId) ?? []),
-        request.start.kind
-      ])
+  const coordinator = coordinatorOf({
+    sync: () => Promise.resolve(assignment(generationId, assigned)),
+    poll: (request) => {
       if (expireOnce && request.partitionId === 0) {
         expireOnce = false
         return Promise.resolve(staleReply("rebalanced"))
       }
-      const {
-        safeAckOffset: _safe,
-        nextScanOffset: _next,
-        ...unscanned
-      } = page("primary", { partitionId: request.partitionId })
-      return Promise.resolve(
-        pageReply({
-          ...unscanned,
-          policy: {
-            digest: consumerFilterDigest(filter),
-            groupId: 3n,
-            mode: "filtered",
-            policyGeneration: 0n
-          },
-          examined: 0
-        })
-      )
+      return Promise.resolve(pageReply(unscanned(request.partitionId)))
     }
-  }
-  const filtered = await groupReader(coordinator, data).start({ kind: "last" }).build()
+  })
+  const filtered = await groupReader(coordinator).start({ kind: "last" }).build()
   await filtered.tryNextPage()
   assigned = [0, 1]
   generationId = 2n
@@ -734,50 +923,36 @@ void test("given_a_rebalance_when_a_partition_is_gained_then_should_start_it_at_
   await filtered.tryNextPage()
   await filtered.tryNextPage()
   assert.deepEqual(filtered.partitions(), [0, 1])
-  assert.equal(starts.get(0)?.[0], "last", "the build start applies at the build")
-  assert.equal(starts.get(1)?.[0], "next", "a gained partition resumes after the stored offset")
+  const starts = (partitionId: number) =>
+    coordinator.polls
+      .filter((poll) => poll.request.partitionId === partitionId)
+      .map((poll) => poll.request.start.kind)
+  assert.equal(starts(0)[0], "last", "the build start applies at the build")
+  assert.equal(starts(1)[0], "next", "a gained partition resumes after the stored offset")
   await filtered.close()
 })
 
 void test("given_a_rejoin_when_an_old_record_is_acknowledged_then_should_name_the_rejoin", async () => {
   let rejoin = false
-  const coordinator: CoordinatorConnection = {
-    send: (code) => {
-      if (code !== SYNC_CONSUMER_GROUP_CODE) return Promise.resolve(route())
+  let reads = 0
+  const coordinator = coordinatorOf({
+    sync: () => {
       if (rejoin) {
         rejoin = false
         return Promise.resolve(new Uint8Array())
       }
       return Promise.resolve(assignment(1n, [0]))
     },
-    joinConsumerGroup: () => Promise.resolve(),
-    leaveConsumerGroup: () => Promise.resolve(),
-    close: () => Promise.resolve()
-  }
-  let reads = 0
-  const data: NodeConnection = {
-    close: () => Promise.resolve(),
-    send: (code) => {
-      if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
+    poll: () => {
       reads += 1
       if (reads === 2) {
         rejoin = true
         return Promise.resolve(staleReply("the member was removed"))
       }
-      return Promise.resolve(
-        pageReply({
-          ...page("primary", { offsets: [0n] }),
-          policy: {
-            digest: consumerFilterDigest(filter),
-            groupId: 3n,
-            mode: "filtered",
-            policyGeneration: 0n
-          }
-        })
-      )
+      return Promise.resolve(pageReply(groupPage({ offsets: [0n] })))
     }
-  }
-  const filtered = await groupReader(coordinator, data).build()
+  })
+  const filtered = await groupReader(coordinator).build()
   const before = await filtered.tryNextPage()
   const record = before?.records[0]
   assert(record !== undefined)
@@ -792,149 +967,48 @@ void test("given_a_rejoin_when_an_old_record_is_acknowledged_then_should_name_th
 })
 
 void test("given_one_failing_partition_when_reading_then_should_still_read_the_others", async () => {
-  const transport: FilterTransport = {
-    ...baseTransport(() => Promise.resolve(route())),
-    openNodeConnection: () =>
-      Promise.resolve({
-        close: () => Promise.resolve(),
-        send: (code, payload) => {
-          if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-          const request = pollOf(payload)
-          if (request.partitionId === 0) return Promise.reject(new Error("node unreachable"))
-          return Promise.resolve(pageReply(page("primary", { partitionId: 1, offsets: [0n] })))
-        }
-      })
-  }
-  const filtered = reader(transport, "primary", undefined, {
-    partitionIds: [0, 1],
-    idleIntervalMs: 60_000
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      request.partitionId === 0
+        ? Promise.reject(new Error("node unreachable"))
+        : Promise.resolve(pageReply(page({ partitionId: 1, offsets: [0n] })))
   })
+  const filtered = reader(coordinator, { partitionIds: [0, 1], idleIntervalMs: 60_000 })
   const found = await filtered.tryNextPage()
   assert.equal(found?.partitionId, 1, "the failing partition does not starve the healthy one")
-  await assert.rejects(filtered.tryNextPage(), /filtered command/)
+  await assert.rejects(filtered.tryNextPage(), /node unreachable/)
   await filtered.close()
 })
 
-for (const refusals of [1, 2]) {
-  void test(`given_${String(refusals)}_primary_refusals_when_reading_then_should_route_again_next_round_and_surface_a_repeat`, async () => {
+for (const losses of [1, 2]) {
+  void test(`given_${String(losses)}_lost_assignments_when_reading_then_should_sync_the_next_round_and_surface_a_repeat`, async () => {
     let polls = 0
-    const transport: FilterTransport = {
-      ...baseTransport(() => Promise.resolve(route())),
-      openNodeConnection: () =>
-        Promise.resolve({
-          close: () => Promise.resolve(),
-          send: (code) => {
-            if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-            assert.equal(code, AGDX_FILTERED_POLL_CODE)
-            polls += 1
-            return Promise.resolve(
-              polls <= refusals
-                ? encodeNamed(
-                    encodeFilterReply({
-                      kind: "err",
-                      error: {
-                        code: { kind: "known", name: "Unavailable" },
-                        reason: "not_primary",
-                        message: "owner settling"
-                      }
-                    })
-                  )
-                : pageReply(page("primary", { offsets: [0n] }))
-            )
-          }
-        })
-    }
-    const filtered = reader(transport, "primary")
+    const coordinator = coordinatorOf({
+      poll: () => {
+        polls += 1
+        return Promise.resolve(
+          polls <= losses ? staleReply("owner settling") : pageReply(page({ offsets: [0n] }))
+        )
+      }
+    })
+    const filtered = reader(coordinator)
     try {
-      // The lost route ends the round empty. The next round routes again.
+      // The lost assignment ends the round empty. The next round reads again.
       assert.equal(await filtered.tryNextPage(), undefined)
-      if (refusals === 1) assert.equal((await filtered.tryNextPage())?.records[0]?.offset, 0n)
+      if (losses === 1) assert.equal((await filtered.tryNextPage())?.records[0]?.offset, 0n)
       else
         await assert.rejects(
           filtered.tryNextPage(),
           (error: unknown) =>
-            error instanceof FilterExecutionError && error.detail.reason === "not_primary"
+            error instanceof FilterExecutionError && error.detail.reason === "membership_stale"
         )
       assert.equal(polls, 2)
+      assert.deepEqual(coordinator.lookups, [0, 0], "a lost assignment drops the route")
     } finally {
       await filtered.close()
     }
   })
 }
-
-// Session bytes: a u128 client id, a u64 session number, then the u64 metadata watermark.
-function session(clientId: bigint, number: bigint, watermark: bigint): Uint8Array {
-  const bytes = new Uint8Array(32)
-  const view = new DataView(bytes.buffer)
-  view.setBigUint64(0, clientId, true)
-  view.setBigUint64(16, number, true)
-  view.setBigUint64(24, watermark, true)
-  return bytes
-}
-
-void test("given_session_bytes_when_compared_then_should_replace_the_connection_only_for_another_session", () => {
-  assert.equal(sessionReuse(session(7n, 3n, 10n), session(7n, 3n, 12n)), "raise")
-  assert.equal(sessionReuse(session(7n, 3n, 10n), session(7n, 3n, 10n)), "keep")
-  assert.equal(sessionReuse(session(7n, 3n, 10n), session(7n, 3n, 9n)), "keep")
-  assert.equal(sessionReuse(session(7n, 3n, 10n), session(7n, 4n, 10n)), "replace")
-  assert.equal(sessionReuse(session(7n, 3n, 10n), session(8n, 3n, 10n)), "replace")
-})
-
-void test("given_two_partitions_on_one_node_and_a_rising_watermark_when_reading_then_should_keep_one_connection", async () => {
-  let watermark = 0n
-  let opened = 0
-  const attached: bigint[] = []
-  const transport: FilterTransport = {
-    ...baseTransport(() => {
-      watermark += 1n
-      const reply = route()
-      reply.set(session(7n, 3n, watermark), 0)
-      return Promise.resolve(reply)
-    }),
-    openNodeConnection: () => {
-      opened += 1
-      return Promise.resolve({
-        close: () => Promise.resolve(),
-        send: (code, payload) => {
-          if (code === ATTACH_CONSUMER_SESSION_CODE) {
-            attached.push(new DataView(payload.buffer, payload.byteOffset).getBigUint64(24, true))
-            return Promise.resolve(new Uint8Array())
-          }
-          if (code === AGDX_FILTERED_POLL_CODE) {
-            const partitionId = pollOf(payload).partitionId
-            return Promise.resolve(
-              pageReply(
-                page("primary", { partitionId, generation: { ...generation, partitionId } })
-              )
-            )
-          }
-          const ack = decodeOne(payload, "ack") as Map<string, unknown>
-          const partitionId = Number(ack.get("partition_id"))
-          const offset = BigInt(ack.get("offset") as number | bigint)
-          return Promise.resolve(
-            encodeNamed(
-              encodeFilterReply({
-                kind: "ok",
-                outcome: {
-                  kind: "acknowledged",
-                  receipt: { partitionId, offset, generation: { ...generation, partitionId } }
-                }
-              })
-            )
-          )
-        }
-      })
-    }
-  }
-  const built = reader(transport, "primary", undefined, { partitionIds: [0, 1] })
-  for (let read = 0; read < 8; read += 1) {
-    await built.tryNextPage()
-  }
-  assert.equal(opened, 1, "both partitions share the one data connection")
-  assert.equal(built.dataConnectionsOpened(), 1)
-  assert.deepEqual(attached, [1n, 2n], "the second route raised the floor on the open connection")
-  await built.close()
-})
 
 void test("given_unevaluated_records_when_guarded_then_should_require_a_reproducible_pass_fault", async () => {
   const passing = { ...filter, faultPolicy: "pass" as const }
@@ -943,69 +1017,44 @@ void test("given_unevaluated_records_when_guarded_then_should_require_a_reproduc
     [passing, 4, true],
     [passing, 1024, false]
   ] as const) {
-    const transport = baseTransport(() =>
-      Promise.resolve(
-        pageReply(
-          page("local", {
-            offsets: [0n],
-            policy: {
-              digest: consumerFilterDigest(definition),
-              mode: "filtered",
-              policyGeneration: 0n
-            },
-            unevaluated: [0n],
-            evaluationLimits: { maxPayloadBytes: limit, maxDepth: 64 }
-          })
+    const coordinator = coordinatorOf({
+      poll: () =>
+        Promise.resolve(
+          pageReply(
+            page({
+              offsets: [0n],
+              policy: {
+                digest: consumerFilterDigest(definition),
+                mode: "filtered",
+                policyGeneration: 0n
+              },
+              unevaluated: [0n],
+              evaluationLimits: { maxPayloadBytes: limit, maxDepth: 64 }
+            })
+          )
         )
-      )
-    )
-    const filtered = reader(transport, "local", definition)
+    })
+    const filtered = reader(coordinator, { guarded: definition })
     if (accepted) assert.equal((await filtered.tryNextPage())?.records.length, 1)
     else await assert.rejects(filtered.tryNextPage())
     await filtered.close()
   }
 })
 
-void test("given_a_revoked_partition_when_its_last_record_is_stored_then_should_release_the_reopened_route", async () => {
+void test("given_a_revoked_partition_when_its_last_record_is_stored_then_should_retire_it", async () => {
   let assigned: readonly number[] = [0]
   let generationId = 1n
   let polls = 0
-  let closed = 0
-  const coordinator: CoordinatorConnection = {
-    send: (code) =>
+  const coordinator = coordinatorOf({
+    sync: () => Promise.resolve(assignment(generationId, assigned)),
+    poll: () =>
       Promise.resolve(
-        code === SYNC_CONSUMER_GROUP_CODE ? assignment(generationId, assigned) : route()
-      ),
-    joinConsumerGroup: () => Promise.resolve(),
-    leaveConsumerGroup: () => Promise.resolve(),
-    close: () => Promise.resolve()
-  }
-  const data: NodeConnection = {
-    close: () => {
-      closed += 1
-      return Promise.resolve()
-    },
-    send: (code) => {
-      if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-      if (code === AGDX_FILTERED_ACK_CODE) return Promise.resolve(ackReply(0n))
-      if (polls++ > 0) return Promise.resolve(staleReply("partition revoked"))
-      return Promise.resolve(
-        pageReply(
-          page("primary", {
-            offsets: [0n],
-            stop: "filled",
-            policy: {
-              digest: consumerFilterDigest(filter),
-              groupId: 3n,
-              mode: "filtered",
-              policyGeneration: 0n
-            }
-          })
-        )
+        polls++ > 0
+          ? staleReply("partition revoked")
+          : pageReply(groupPage({ offsets: [0n], stop: "filled" }))
       )
-    }
-  }
-  const filtered = await groupReader(coordinator, data).build()
+  })
+  const filtered = await groupReader(coordinator).build()
   const record = (await filtered.tryNextPage())?.records[0]
   assert(record !== undefined)
   assigned = []
@@ -1013,8 +1062,758 @@ void test("given_a_revoked_partition_when_its_last_record_is_stored_then_should_
   await filtered.tryNextPage()
   await filtered.tryNextPage()
   assert.deepEqual(filtered.partitions(), [])
-  const before = closed
   await filtered.ack(record)
-  assert.equal(closed, before + 1, "the acknowledgment-only route is released")
+  assert.deepEqual(
+    coordinator.stored.map((position) => position.offset),
+    [0n],
+    "a revoked partition still stores what it handed out"
+  )
+  await assert.rejects(filtered.ack(record), FilterExecutionError, "and then it is retired")
   await filtered.close()
 })
+
+void test("given_an_injected_client_without_targeted_requests_when_reading_then_should_name_what_is_missing", async () => {
+  const transport = baseTransport(() => Promise.resolve(assignment(1n, [0])))
+  const built = await FilteredReaderBuilder.create(
+    transport,
+    () => Promise.resolve(capabilities),
+    new Filters(transport, () => Promise.resolve(capabilities)),
+    { stream: "orbit", topic: "fleet_changes" },
+    { kind: "group", name: "anomaly-desk" },
+    { kind: "bound" }
+  ).build()
+  await assert.rejects(built.tryNextPage(), ConfigError)
+  await built.close()
+})
+
+function readyReply(ready: readonly number[]): Uint8Array {
+  return encodeNamed(
+    encodeFilterReply({ kind: "ok", outcome: { kind: "ready", result: { ready } } })
+  )
+}
+
+function cancelledReply(cancelled: readonly bigint[]): Uint8Array {
+  return encodeNamed(
+    encodeFilterReply({ kind: "ok", outcome: { kind: "cancelled", result: { cancelled } } })
+  )
+}
+
+void test("given_an_idle_round_on_a_server_that_holds_waits_when_waiting_then_should_send_one_wait_per_node_and_read_only_the_ready_partitions", async () => {
+  let held: ((reply: Uint8Array) => void) | undefined
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    primary: (partitionId) => Promise.resolve(partitionId === 1 ? 2 : 1),
+    wait: (_request, target) =>
+      target.kind === "replica" && target.replica === 1
+        ? Promise.resolve(readyReply([2]))
+        : new Promise((resolve) => {
+            held = resolve
+          })
+  })
+  const filtered = reader(coordinator, { partitionIds: [0, 1, 2], maxWaitMs: 2_000 })
+  assert.deepEqual(await filtered.readRound(), [undefined, false])
+  const before = Date.now()
+  await filtered.waitForRecords()
+  assert.equal(coordinator.waits.length, 2, "one wait per serving node")
+  const byNode = new Map(
+    coordinator.waits.map((wait) => [
+      wait.target.kind === "replica" ? wait.target.replica : -1,
+      wait.request
+    ])
+  )
+  assert.deepEqual(byNode.get(1)?.partitions, [
+    { partitionId: 0, offset: 5n },
+    { partitionId: 2, offset: 5n }
+  ])
+  assert.deepEqual(byNode.get(2)?.partitions, [{ partitionId: 1, offset: 5n }])
+  assert.equal(byNode.get(1)?.maxWaitMs, 2_000)
+  assert.equal(byNode.get(1)?.consumer.kind, "consumer")
+  for (const wait of coordinator.waits) {
+    assert.ok((wait.deadline ?? 0) >= before + 2_000 + 5_000, "the call outlives the server wait")
+  }
+  const polled = coordinator.polls.length
+  await filtered.readRound()
+  assert.deepEqual(
+    coordinator.polls.slice(polled).map((poll) => poll.request.partitionId),
+    [2],
+    "only the ready partition is read"
+  )
+  held?.(readyReply([]))
+  await filtered.close()
+})
+
+void test("given_a_server_that_refuses_waits_as_unsupported_when_idle_then_should_stop_waiting", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: () =>
+      Promise.resolve(
+        encodeNamed(
+          encodeFilterReply({
+            kind: "err",
+            error: {
+              code: { kind: "known", name: "Unsupported" },
+              reason: "unsupported",
+              message: "no filtered wait"
+            }
+          })
+        )
+      )
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 2_000 })
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  assert.equal(coordinator.waits.length, 1, "an unsupported wait is not sent again")
+  await filtered.close()
+})
+
+void test("given_a_server_without_filtered_waits_when_idle_then_should_pace_with_the_idle_interval", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n })))
+  })
+  const filtered = reader(coordinator, { idleIntervalMs: 30 })
+  await filtered.readRound()
+  const started = performance.now()
+  await filtered.waitForRecords()
+  assert.ok(performance.now() - started >= 25, "an idle round sleeps the idle interval")
+  assert.equal(coordinator.waits.length, 0)
+  await filtered.close()
+})
+
+void test("given_an_empty_wait_answer_long_before_its_deadline_when_idle_then_should_also_sleep_the_idle_interval", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: () => Promise.resolve(readyReply([]))
+  })
+  const filtered = reader(coordinator, { idleIntervalMs: 30, maxWaitMs: 2_000 })
+  await filtered.readRound()
+  const started = performance.now()
+  await filtered.waitForRecords()
+  assert.equal(coordinator.waits.length, 1)
+  assert.ok(
+    performance.now() - started >= 25,
+    "an early empty answer falls back to the idle interval"
+  )
+  await filtered.close()
+})
+
+void test("given_a_builder_wait_longer_than_the_announced_one_when_built_then_should_wait_the_announced_cap", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(
+        pageReply(groupPage({ partitionId: request.partitionId, nextScanOffset: 5n }))
+      ),
+    wait: () => Promise.resolve(readyReply([0]))
+  })
+  assert.throws(() => groupReader(coordinator).maxWait(-1), InvalidError)
+  const filtered = await groupReader(coordinator, {
+    ...capabilities,
+    filters: { ...capabilities.filters, maxWaitMs: 3_000 }
+  }).build()
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  const [first] = coordinator.waits
+  assert.ok(first !== undefined)
+  assert.equal(first.request.maxWaitMs, 3_000)
+  assert.deepEqual(first.request.consumer, { kind: "group", name: "anomaly-desk" })
+  await filtered.close()
+})
+
+void test("given_pages_without_a_continuation_when_waiting_then_should_wait_past_the_head_or_from_zero_and_keep_one_wait_per_node", async () => {
+  let rounds = 0
+  const coordinator = coordinatorOf({
+    poll: (request) => {
+      rounds += 1
+      const frontier = request.partitionId === 0 ? 1_000n : 0n
+      const {
+        safeAckOffset: _safe,
+        nextScanOffset: _next,
+        ...rest
+      } = page({
+        partitionId: request.partitionId,
+        frontier
+      })
+      return Promise.resolve(pageReply({ ...rest, examined: 0 }))
+    },
+    primary: (partitionId) => Promise.resolve(partitionId === 0 ? 1 : 2),
+    wait: (_request, target) =>
+      target.kind === "replica" && target.replica === 2
+        ? Promise.resolve(readyReply([1]))
+        : new Promise(() => undefined)
+  })
+  const filtered = reader(coordinator, {
+    partitionIds: [0, 1],
+    maxWaitMs: 2_000,
+    idleIntervalMs: 30,
+    start: { kind: "next" }
+  })
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  assert.deepEqual(
+    coordinator.waits.map((wait) => wait.request.partitions),
+    [[{ partitionId: 0, offset: 1_001n }], [{ partitionId: 1, offset: 0n }]],
+    "past a head of 1000, from 0 at a head of 0"
+  )
+  assert.equal(rounds, 2)
+  await filtered.readRound()
+  const paced = performance.now()
+  await filtered.waitForRecords()
+  assert.ok(performance.now() - paced >= 25, "a ready answer the round could not confirm is paced")
+  assert.equal(coordinator.waits.length, 2, "a node that still holds a wait gets no other")
+  await filtered.close()
+})
+
+void test("given_a_backup_refusing_a_read_as_unavailable_when_reading_then_should_forget_the_route_and_resend_once", async () => {
+  const leaders = [1, 2]
+  const coordinator = coordinatorOf({
+    primary: () => Promise.resolve(leaders.shift() ?? 2),
+    poll: (_request, target) =>
+      Promise.resolve(
+        target.kind === "replica" && target.replica === 1
+          ? unavailableReply()
+          : pageReply(page({ offsets: [0n] }))
+      )
+  })
+  const filtered = reader(coordinator)
+  assert.equal((await filtered.tryNextPage())?.records[0]?.offset, 0n)
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.target),
+    [
+      { kind: "replica", replica: 1 },
+      { kind: "replica", replica: 2 }
+    ]
+  )
+  assert.deepEqual(coordinator.lookups, [0, 0], "the refused route is looked up again")
+  await filtered.close()
+})
+
+void test("given_every_node_refusing_a_read_as_unavailable_when_reading_then_should_resend_once_and_surface_the_refusal", async () => {
+  const coordinator = coordinatorOf({ poll: () => Promise.resolve(unavailableReply()) })
+  const filtered = reader(coordinator, { idleIntervalMs: 0 })
+  await assert.rejects(filtered.tryNextPage(), FilterExecutionError)
+  assert.equal(coordinator.polls.length, 2, "one resend after a fresh lookup")
+  await filtered.close()
+})
+
+void test("given_a_cached_primary_that_stops_answering_when_reading_then_should_follow_the_new_primary_after_a_route_recheck", async () => {
+  let stopped = false
+  const coordinator = coordinatorOf({
+    primary: () => Promise.resolve(stopped ? 2 : 1),
+    poll: (request, target) => {
+      if (stopped && target.kind === "replica" && target.replica === 1)
+        return new Promise(() => undefined)
+      return Promise.resolve(
+        pageReply(
+          stopped
+            ? page({ partitionId: request.partitionId, offsets: [0n] })
+            : idlePage(request.partitionId, 0n)
+        )
+      )
+    }
+  })
+  const filtered = reader(coordinator, { partitionIds: [0, 1] })
+  assert.equal(await filtered.tryNextPage(), undefined)
+  stopped = true
+  const started = performance.now()
+  const found = await within(filtered.tryNextPage(), 5_000)
+  const elapsed = performance.now() - started
+  assert.equal(found?.partitionId, 0)
+  assert.ok(elapsed >= 900 && elapsed < 2_500, `followed the move after ${String(elapsed)} ms`)
+  const lookups = coordinator.lookups.length
+  assert.equal((await filtered.tryNextPage())?.partitionId, 1)
+  assert.deepEqual(
+    coordinator.lookups.slice(lookups),
+    [1],
+    "every route through the old node is read again"
+  )
+  assert.deepEqual(
+    coordinator.polls.slice(-3).map((poll) => [poll.request.partitionId, poll.target]),
+    [
+      [0, { kind: "replica", replica: 1 }],
+      [0, { kind: "replica", replica: 2 }],
+      [1, { kind: "replica", replica: 2 }]
+    ]
+  )
+  await filtered.close()
+})
+
+void test("given_a_primary_that_fails_at_once_and_a_route_that_still_names_it_when_reading_then_should_recheck_the_route_while_the_resend_waits", async () => {
+  // The crashed primary drops the first read at once, the route still names
+  // it for two lookups, and the resend to it would wait out the call bound.
+  const primaries = [1, 1, 1, 2]
+  let attempts = 0
+  const coordinator = coordinatorOf({
+    primary: () => Promise.resolve(primaries.shift() ?? 2),
+    poll: (_request, target) => {
+      if (target.kind === "replica" && target.replica === 2)
+        return Promise.resolve(pageReply(page({ offsets: [0n] })))
+      attempts += 1
+      return attempts === 1
+        ? Promise.reject(new TransportError("the link to the replica was lost", true))
+        : new Promise(() => undefined)
+    }
+  })
+  const filtered = reader(coordinator)
+  const found = await within(filtered.tryNextPage(), 5_000)
+  assert.equal(found?.records[0]?.offset, 0n)
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.target),
+    [
+      { kind: "replica", replica: 1 },
+      { kind: "replica", replica: 1 },
+      { kind: "replica", replica: 2 }
+    ]
+  )
+  await filtered.close()
+})
+
+void test("given_a_slow_but_healthy_primary_when_reading_then_should_keep_waiting_for_its_answer", async () => {
+  const coordinator = coordinatorOf({
+    primary: () => Promise.resolve(1),
+    poll: () =>
+      new Promise((resolve) => {
+        setTimeout(() => {
+          resolve(pageReply(page({ offsets: [0n] })))
+        }, 2_300)
+      })
+  })
+  const filtered = reader(coordinator)
+  assert.equal((await within(filtered.tryNextPage(), 5_000))?.records[0]?.offset, 0n)
+  assert.equal(coordinator.polls.length, 1, "the read was never abandoned")
+  assert.ok(coordinator.lookups.length >= 3, "the route was checked while the read was slow")
+  await filtered.close()
+})
+
+for (const [label, refuse] of [
+  ["not_primary", () => Promise.reject(refusal(NOT_PRIMARY))],
+  ["unavailable", () => Promise.resolve(unavailableReply())]
+] as const) {
+  void test(`given_no_primary_answering_an_ack_with_${label}_when_acknowledging_then_should_send_the_same_target_until_it_is_stored`, async () => {
+    let refusals = 3
+    const coordinator = coordinatorOf({
+      poll: () => Promise.resolve(pageReply(page({ offsets: [0n, 1n], nextScanOffset: 2n }))),
+      ack: () => {
+        if (refusals === 0) return Promise.resolve(undefined)
+        refusals -= 1
+        return refuse()
+      }
+    })
+    const filtered = reader(coordinator)
+    const found = await filtered.tryNextPage()
+    assert.ok(found !== undefined)
+    await within(filtered.ackPage(found), 5_000)
+    assert.ok(coordinator.acks.length >= 4, "each refused store is sent again")
+    assert.deepEqual(
+      [...new Set(coordinator.acks.map((ack) => ack.offset))],
+      [1n],
+      "every repeat names the same delivered target"
+    )
+    assert.deepEqual(
+      coordinator.stored.map((position) => position.offset),
+      [1n]
+    )
+    await filtered.close()
+  })
+}
+
+void test("given_an_empty_page_when_its_store_finds_no_primary_then_should_send_it_once_and_end_the_round", async () => {
+  let refusing = true
+  const coordinator = coordinatorOf({
+    poll: () => Promise.resolve(pageReply(page({ nextScanOffset: 5n }))),
+    ack: () => (refusing ? Promise.reject(refusal(NOT_PRIMARY)) : Promise.resolve(undefined))
+  })
+  const filtered = reader(coordinator)
+  const started = performance.now()
+  assert.equal(await filtered.tryNextPage(), undefined)
+  assert.ok(performance.now() - started < 1_000, "the round never waits for a primary")
+  assert.equal(coordinator.acks.length, 2, "one store and its one resend after a fresh lookup")
+  refusing = false
+  await filtered.close()
+})
+
+void test("given_a_woken_page_that_examined_records_when_the_next_round_is_idle_then_should_hold_a_wait_instead_of_sleeping", async () => {
+  let pending = false
+  let next = 0n
+  const coordinator = coordinatorOf({
+    poll: () => {
+      if (!pending) return Promise.resolve(pageReply(idlePage(0, next)))
+      pending = false
+      const offset = next
+      next += 1n
+      return Promise.resolve(pageReply(page({ offsets: [offset], nextScanOffset: offset + 1n })))
+    },
+    wait: () =>
+      new Promise((resolve) => {
+        setTimeout(() => {
+          pending = true
+          resolve(readyReply([0]))
+        }, 50)
+      })
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 2_000, idleIntervalMs: 30_000 })
+  await filtered.ackPage(await within(filtered.nextPage(), 5_000))
+  const started = performance.now()
+  const second = await within(filtered.nextPage(), 5_000)
+  assert.equal(second.records[0]?.offset, 1n)
+  assert.ok(performance.now() - started < 2_000, "the idle round after a page held a wait")
+  assert.equal(coordinator.waits.length, 2)
+  await filtered.close()
+})
+
+void test("given_held_waits_when_the_assignment_changes_meanwhile_then_should_end_the_wait_and_read_the_gained_partition", async () => {
+  let syncs = 0
+  const coordinator = coordinatorOf({
+    sync: () => {
+      syncs += 1
+      return Promise.resolve(syncs === 1 ? assignment(1n, [0]) : assignment(2n, [0, 1]))
+    },
+    poll: (request) =>
+      Promise.resolve(
+        pageReply(
+          request.partitionId === 1
+            ? groupPage({ partitionId: 1, offsets: [0n] })
+            : unscanned(request.partitionId)
+        )
+      ),
+    wait: () => new Promise(() => undefined)
+  })
+  const filtered = await groupReader(coordinator, waitingCapabilities).build()
+  const started = performance.now()
+  const found = await within(filtered.nextPage(), 6_000)
+  const elapsed = performance.now() - started
+  assert.equal(found.partitionId, 1)
+  assert.ok(
+    elapsed >= 1_500 && elapsed < 4_000,
+    `read the gained partition after ${String(elapsed)} ms`
+  )
+  assert.equal(coordinator.waits.length, 1, "the wait was never answered")
+  await until(() => coordinator.cancels.length > 0, 1_000)
+  assert.deepEqual(
+    coordinator.cancels.map((cancel) => cancel.request.waitIds),
+    [[coordinator.waits[0]?.request.waitId]],
+    "the wait over the old assignment was cancelled"
+  )
+  await filtered.close()
+})
+
+void test("given_held_waits_when_the_assignment_stays_the_same_then_should_keep_awaiting_the_same_waits", async () => {
+  let syncs = 0
+  let syncsWhileHeld = 0
+  let pending = false
+  const coordinator = coordinatorOf({
+    sync: () => {
+      syncs += 1
+      return Promise.resolve(assignment(1n, [0]))
+    },
+    poll: () => Promise.resolve(pageReply(pending ? groupPage({ offsets: [0n] }) : unscanned(0))),
+    wait: () =>
+      new Promise((resolve) => {
+        setTimeout(() => {
+          syncsWhileHeld = syncs
+          pending = true
+          resolve(readyReply([0]))
+        }, 2_600)
+      })
+  })
+  const filtered = await groupReader(coordinator, waitingCapabilities).build()
+  const found = await within(filtered.nextPage(), 6_000)
+  assert.equal(found.records[0]?.offset, 0n)
+  assert.equal(syncsWhileHeld, 2, "the assignment was read again while the wait held")
+  assert.equal(coordinator.waits.length, 1, "the same wait kept holding")
+  assert.deepEqual(coordinator.cancels, [], "a kept wait is not cancelled")
+  await filtered.close()
+})
+
+void test("given_a_held_wait_on_a_node_when_a_round_finds_its_partition_left_the_assignment_then_should_cancel_it", async () => {
+  let syncs = 0
+  const coordinator = coordinatorOf({
+    sync: () => {
+      syncs += 1
+      return Promise.resolve(syncs === 1 ? assignment(1n, [0, 1]) : assignment(2n, [0]))
+    },
+    primary: (partitionId) => Promise.resolve(partitionId === 1 ? 2 : 1),
+    poll: (request) => Promise.resolve(pageReply(unscanned(request.partitionId))),
+    // Node 1 answers empty at once, so each round sleeps while node 2 keeps its wait.
+    wait: (_request, target) =>
+      target.kind === "replica" && target.replica === 1
+        ? Promise.resolve(readyReply([]))
+        : new Promise(() => undefined)
+  })
+  const filtered = await groupReader(coordinator, waitingCapabilities)
+    .idleInterval(100)
+    .maxWait(2_000)
+    .build()
+  await filtered.nextPage({ timeoutMs: 3_500 }).catch(() => undefined)
+  const held = coordinator.waits.find(
+    (wait) => wait.target.kind === "replica" && wait.target.replica === 2
+  )
+  assert.ok(held !== undefined, "node 2 held a wait")
+  assert.deepEqual(
+    coordinator.cancels,
+    [
+      { target: { kind: "replica", replica: 2 }, request: { v: 1, waitIds: [held.request.waitId] } }
+    ],
+    "the wait naming the lost partition was cancelled when the round read the assignment"
+  )
+  await filtered.close()
+  assert.equal(coordinator.cancels.length, 1, "close finds no wait left to cancel")
+})
+
+void test("given_a_wait_refused_as_not_primary_when_idle_then_should_forget_its_route_and_wait_on_the_new_primary_at_once", async () => {
+  const primaries = [1, 2]
+  const coordinator = coordinatorOf({
+    primary: () => Promise.resolve(primaries.shift() ?? 2),
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: (_request, target) =>
+      target.kind === "replica" && target.replica === 1
+        ? Promise.reject(refusal(NOT_PRIMARY))
+        : Promise.resolve(readyReply([0]))
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 2_000, idleIntervalMs: 30_000 })
+  await filtered.readRound()
+  await within(filtered.waitForRecords(), 2_000)
+  await filtered.readRound()
+  await within(filtered.waitForRecords(), 2_000)
+  assert.deepEqual(
+    coordinator.waits.map((wait) => wait.target),
+    [
+      { kind: "replica", replica: 1 },
+      { kind: "replica", replica: 2 }
+    ]
+  )
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.target),
+    [
+      { kind: "replica", replica: 1 },
+      { kind: "replica", replica: 2 }
+    ],
+    "the read after the refused wait looks the route up again"
+  )
+  await filtered.close()
+})
+
+void test("given_a_wait_refused_as_unavailable_when_idle_then_should_wait_again_at_once_and_pace_a_second_refusal", async () => {
+  let refusals = 2
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: () => {
+      if (refusals === 0) return Promise.resolve(readyReply([0]))
+      refusals -= 1
+      return Promise.resolve(unavailableReply())
+    }
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 2_000, idleIntervalMs: 400 })
+  await filtered.readRound()
+  const first = performance.now()
+  await filtered.waitForRecords()
+  assert.ok(performance.now() - first < 200, "the first refusal waits again at once")
+  await filtered.readRound()
+  assert.equal(coordinator.lookups.length, 2, "the refused wait's route is looked up again")
+  const second = performance.now()
+  await filtered.waitForRecords()
+  assert.ok(performance.now() - second >= 350, "a second refusal in a row is paced")
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  assert.equal(coordinator.waits.length, 3)
+  await filtered.close()
+})
+
+void test("given_a_node_holding_a_wait_when_another_partition_moves_to_it_then_should_replace_the_wait_with_one_naming_both", async () => {
+  // Partition 1 moves from node 2 to node 1, which already holds a wait for partition 0.
+  const routes = new Map([[1, [2, 1]]])
+  let node1Waits = 0
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    primary: (partitionId) => Promise.resolve(routes.get(partitionId)?.shift() ?? 1),
+    wait: (_request, target) => {
+      if (target.kind === "replica" && target.replica === 2)
+        return Promise.resolve(unavailableReply())
+      node1Waits += 1
+      return node1Waits === 1 ? new Promise(() => undefined) : Promise.resolve(readyReply([1]))
+    }
+  })
+  const filtered = reader(coordinator, { partitionIds: [0, 1], maxWaitMs: 2_000 })
+  await filtered.readRound()
+  await within(filtered.waitForRecords(), 2_000)
+  await filtered.readRound()
+  await within(filtered.waitForRecords(), 2_000)
+  const [kept, , replacing] = coordinator.waits
+  assert.ok(kept !== undefined && replacing !== undefined)
+  assert.deepEqual(replacing.target, { kind: "replica", replica: 1 })
+  assert.deepEqual(
+    replacing.request.partitions.map((partition) => partition.partitionId),
+    [0, 1],
+    "the new wait names every partition node 1 leads now"
+  )
+  await until(() => coordinator.cancels.length > 0, 1_000)
+  assert.deepEqual(coordinator.cancels[0], {
+    target: { kind: "replica", replica: 1 },
+    request: { v: 1, waitIds: [kept.request.waitId] }
+  })
+  await filtered.close()
+})
+
+void test("given_one_node_answering_ready_when_another_node_holds_a_wait_then_should_cancel_it_by_its_wait_id", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    primary: (partitionId) => Promise.resolve(partitionId === 1 ? 2 : 1),
+    wait: (_request, target) =>
+      target.kind === "replica" && target.replica === 1
+        ? Promise.resolve(readyReply([0]))
+        : new Promise(() => undefined)
+  })
+  const filtered = reader(coordinator, { partitionIds: [0, 1], maxWaitMs: 2_000 })
+  const onNode = (replica: number) =>
+    coordinator.waits.filter(
+      (wait) => wait.target.kind === "replica" && wait.target.replica === replica
+    )
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  const [first] = onNode(2)
+  assert.ok(first !== undefined, "node 2 held a wait")
+  await until(() => coordinator.cancels.length === 1, 1_000)
+  assert.deepEqual(coordinator.cancels, [
+    { target: { kind: "replica", replica: 2 }, request: { v: 1, waitIds: [first.request.waitId] } }
+  ])
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  const [, second] = onNode(2)
+  assert.ok(second !== undefined, "a cancelled wait is not reused, the node gets a new one")
+  await until(() => coordinator.cancels.length === 2, 1_000)
+  assert.deepEqual(coordinator.cancels[1]?.request.waitIds, [second.request.waitId])
+  const ids = coordinator.waits.map((wait) => wait.request.waitId)
+  assert.equal(new Set(ids).size, ids.length, "every wait has its own id")
+  await filtered.close()
+  assert.equal(coordinator.cancels.length, 2, "close finds no wait left to cancel")
+})
+
+void test("given_a_held_wait_when_the_reader_closes_then_should_cancel_it_and_end_the_idle_wait", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: () => new Promise(() => undefined)
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 20_000, idleIntervalMs: 30_000 })
+  await filtered.readRound()
+  const idle = filtered.waitForRecords()
+  await until(() => coordinator.waits.length === 1, 1_000)
+  await filtered.close()
+  assert.deepEqual(
+    coordinator.cancels.map((cancel) => cancel.request.waitIds),
+    [[coordinator.waits[0]?.request.waitId]]
+  )
+  await within(idle, 1_000)
+})
+
+void test("given_a_held_wait_when_the_reader_is_woken_then_should_cancel_it", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: () => new Promise(() => undefined)
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 20_000 })
+  await filtered.readRound()
+  const idle = filtered.waitForRecords()
+  await until(() => coordinator.waits.length === 1, 1_000)
+  filtered.wake()
+  await within(idle, 1_000)
+  await until(() => coordinator.cancels.length === 1, 1_000)
+  assert.deepEqual(coordinator.cancels[0]?.request.waitIds, [coordinator.waits[0]?.request.waitId])
+  await filtered.close()
+  assert.equal(coordinator.cancels.length, 1, "a cancelled wait is not cancelled again")
+})
+
+void test("given_a_cancel_that_fails_when_a_wait_ends_then_should_warn_and_keep_reading", async () => {
+  const warnings: string[] = []
+  const listener = (warning: Error): void => {
+    warnings.push(warning.message)
+  }
+  process.on("warning", listener)
+  try {
+    const coordinator = coordinatorOf({
+      poll: (request) =>
+        Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+      primary: (partitionId) => Promise.resolve(partitionId === 1 ? 2 : 1),
+      wait: (_request, target) =>
+        target.kind === "replica" && target.replica === 1
+          ? Promise.resolve(readyReply([0]))
+          : new Promise(() => undefined),
+      cancel: () => Promise.reject(new TransportError("the link to node 2 is down", true))
+    })
+    const filtered = reader(coordinator, { partitionIds: [0, 1], maxWaitMs: 2_000 })
+    await filtered.readRound()
+    await filtered.waitForRecords()
+    await until(() => warnings.length > 0, 1_000)
+    assert.match(warnings[0] ?? "", /cancelling a filtered wait on replica 2 failed/)
+    const polled = coordinator.polls.length
+    await filtered.readRound()
+    assert.deepEqual(
+      coordinator.polls.slice(polled).map((poll) => poll.request.partitionId),
+      [0],
+      "the reader reads on"
+    )
+    await filtered.close()
+  } finally {
+    process.off("warning", listener)
+  }
+})
+
+const waitingCapabilities: Capabilities = {
+  ...capabilities,
+  filters: { ...capabilities.filters, maxWaitMs: 20_000 }
+}
+
+// A backup's refusal of a partition it no longer leads.
+function unavailableReply(): Uint8Array {
+  return encodeNamed(
+    encodeFilterReply({
+      kind: "err",
+      error: {
+        code: { kind: "known", name: "Unavailable" },
+        reason: "unavailable",
+        message: "Request not accepted by a backup replica"
+      }
+    })
+  )
+}
+
+// A page that examined nothing past `at`, where the read started.
+function idlePage(partitionId: number, at: bigint): FilteredPage {
+  const { safeAckOffset: _safe, ...rest } = page({ partitionId })
+  return { ...rest, examined: 0, nextScanOffset: at }
+}
+
+async function until(condition: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = performance.now() + timeoutMs
+  while (!condition()) {
+    if (performance.now() >= deadline) throw new Error(`not true within ${String(timeoutMs)} ms`)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
+
+function within<Value>(pending: Promise<Value>, timeoutMs: number): Promise<Value> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`not settled within ${String(timeoutMs)} ms`))
+    }, timeoutMs)
+    pending.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error: unknown) => {
+        clearTimeout(timer)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
+    )
+  })
+}

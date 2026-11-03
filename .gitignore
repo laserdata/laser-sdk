@@ -34,3 +34,6 @@ bdd/typescript/coverage/
 bdd/typescript/reports/
 examples/typescript/node_modules/
 examples/typescript/dist/
+
+# Iggy server data left by a local BDD or test run
+local_data/

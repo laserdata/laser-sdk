@@ -1,17 +1,15 @@
-# governance - permissions at every boundary
+# governance: roles, delegation, and budgets
 
-This example applies managed access roles and agent policies. It shows which requests the deployment permits and how the SDK records policy decisions.
+This example defines access roles on a managed deployment and shows the policy decisions the SDK makes without a server. It ends by submitting a session with a token budget.
 
 ## What it does
 
-1. Proves that a matching deny overrides a broader allow.
-2. Proves that an agent acting on behalf of a user receives only the intersection of both grant sets.
-3. Proves default deny when the invoking user has no matching grant.
-4. Checks an MCP edge request and renders the step-up challenge for a missing scope.
-5. Defines the `support-reader` role when the deployment advertises authorization.
-6. Binds that role to `LASER_GOVERNANCE_USER_ID`.
-7. Reads back the server-stamped identity, role listing, and user bindings.
-8. Submits a run with event, model-call, and wall-clock budgets when the run registry is available.
+1. Capability RBAC. When the deployment advertises `authz`, the example defines four roles: `support-reader`, `projection-operator`, `agent-runner`, and `safety-deny`. It binds them to a dedicated `governance-demo` Iggy user that it creates on the first run through `laser.client.user`, or to `LASER_GOVERNANCE_USER_ID` when set. It never binds them to the caller, because `safety-deny` holds a deny-wins grant that would restrict every later run. It then reads back `whoami`, the roles that start with `support`, and the user's bindings.
+2. Permission intersection. An agent acting for a user may do only what both grant sets allow. The example checks a read, a write, and a delete with `delegatedAllow`, and a direct delete with `grantsAllow`.
+3. External edge. `authorizeEdge` accepts a token with the right audience and scope, asks for step-up when the scope is missing, and rejects a foreign audience.
+4. Session governor. `laser.sessions().submit(..).budget({ tokens: 4_000n })` submits a session to `governance-auditor` with a token ceiling.
+
+The decision checks and the session submission run on Apache Iggy. The RBAC phase prints the missing capability there and skips.
 
 ## Run it
 
@@ -21,25 +19,23 @@ Run `npm run setup` once, then run from `examples/typescript`:
 npm run example:governance
 ```
 
-The pure grant and edge checks run on Apache Iggy. Managed authorization and run submission are capability-gated.
+Run the RBAC phase against Laser Stack or LaserData Cloud:
 
 ```sh
 LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host \
-LASER_GOVERNANCE_USER_ID=42 \
   npm run example:governance
 ```
 
 ## Where to look (LaserData Cloud)
 
-- Roles: the `support-reader` role with its allow and explicit deny.
-- Bindings: the role assignment for `LASER_GOVERNANCE_USER_ID`.
-- Identity: the effective roles returned by `whoami`.
-- Runs: the `governed-agent` run and its multidimensional budget.
+- Roles: `support-reader`, `projection-operator`, `agent-runner`, and `safety-deny`.
+- Bindings: the four roles on `governance-demo`, or on `LASER_GOVERNANCE_USER_ID`.
+- Sessions: the submitted `governance-auditor` session with its token budget.
 
 ## Highlights
 
-- Grants use one `effect`, `feature`, `action`, and resource grammar across client checks and managed RBAC.
-- Deny wins whenever both an allow and deny match the same operation.
-- Delegation cannot exceed either the agent's grants or the invoking user's grants.
-- Edge authorization distinguishes a wrong audience from a missing scope that can be stepped up.
-- A run budget constrains execution volume and time. It does not grant permission.
+- Grants use one `effect`, `feature`, `action`, and resource grammar for client checks and managed RBAC.
+- Deny wins whenever an allow and a deny match the same operation.
+- Delegation never exceeds the agent's grants or the user's grants.
+- Edge authorization tells a wrong audience apart from a missing scope that can step up.
+- A session budget is a ceiling the runtime compares usage with. It does not grant permission.

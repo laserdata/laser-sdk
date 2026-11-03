@@ -32,11 +32,17 @@ import {
   MAX_FILTER_CATALOG_PAGE,
   MAX_FILTERED_PAGE_BYTES,
   MAX_FILTERED_PAGE_EXAMINED,
-  MAX_FILTERED_PAGE_RECORDS
+  MAX_FILTERED_PAGE_RECORDS,
+  MAX_FILTERED_WAIT_CANCEL_IDS,
+  MAX_FILTERED_WAIT_MS,
+  MAX_FILTERED_WAIT_PARTITIONS
 } from "./limits.js"
 import type { CmpOp, Predicate } from "./query.js"
+import { RustRegex } from "./regex.js"
 import { type ResultCode, resultCodeFromWord, resultCodeWord } from "./result.js"
 import { type TypedValue, decodeTypedValue } from "./schema.js"
+
+export { unportableRegexConstruct } from "./regex.js"
 
 /** The catalog byte limit a command logged before the field existed replays with. */
 const DEFAULT_MAX_CATALOG_BYTES = 64n * 1024n * 1024n
@@ -95,7 +101,6 @@ const FILTER_ERROR_REASONS: ReadonlySet<FilterErrorReason> = new Set<FilterError
   "conflict",
   "source_changed",
   "membership_stale",
-  "not_primary",
   "catalog_unavailable",
   "revision_disabled",
   "too_large",
@@ -380,6 +385,10 @@ export interface ConsumerFilter {
   /** Default `reject`. */
   readonly mismatchPolicy?: RecordPolicy
   readonly schemaRefs: readonly number[]
+  /** The stream whose writer-schema registry holds `schemaRefs`. Absent
+   * resolves them in the deployment-wide registry and leaves the encoding and
+   * the digest unchanged. */
+  readonly schemaStream?: string
 }
 
 /** Builders for the `ConsumerFilter` type. */
@@ -426,6 +435,11 @@ export const ConsumerFilter = {
   /** The same filter under another policy for a field of an unexpected type. */
   withMismatchPolicy(filter: ConsumerFilter, mismatchPolicy: RecordPolicy): ConsumerFilter {
     return { ...filter, mismatchPolicy }
+  },
+  /** The same filter resolving `schemaRefs` in the writer-schema registry of
+   * `stream`. */
+  withSchemaStream(filter: ConsumerFilter, stream: string): ConsumerFilter {
+    return { ...filter, schemaStream: stream }
   },
   /**
    * SHA-256 over a domain tag and the canonical JSON encoding of the filter.
@@ -556,6 +570,17 @@ export function validateConsumerFilter(filter: ConsumerFilter): void {
       throw new InvalidError("schema_refs must be sorted distinct uint32 values")
     }
   })
+  const stream = filter.schemaStream
+  if (stream !== undefined) {
+    if (filter.schemaRefs.length === 0) {
+      throw new InvalidError("schema_stream applies only to a filter with schema_refs")
+    }
+    if (stream.length === 0 || stream.includes("/") || hasControlCharacter(stream)) {
+      throw new InvalidError(
+        "schema_stream must be a non-empty stream name without '/' or control characters"
+      )
+    }
+  }
   const encodedBytes = UTF8.encode(consumerFilterJson(filter)).byteLength
   if (encodedBytes > MAX_FILTER_BYTES) {
     throw new InvalidError(
@@ -644,9 +669,8 @@ function validateHeaderKey(key: string): void {
   }
 }
 
-// The server compiles regexes with the Rust engine and is the authority on
-// their syntax. These checks refuse what no SDK accepts, so a filter fails here
-// before it travels.
+// Compiling the regex with the Rust syntax and bounds is the validation, as in
+// Rust, so a filter fails here before it travels.
 export function textPredicateValidate(predicate: TextPredicate): void {
   if (UTF8.encode(predicate.pattern).byteLength > MAX_FILTER_STRING_BYTES) {
     throw new InvalidError(`a text pattern exceeds ${String(MAX_FILTER_STRING_BYTES)}B`)
@@ -654,12 +678,8 @@ export function textPredicateValidate(predicate: TextPredicate): void {
   if (predicate.kind === "glob" && globTokens(predicate.pattern) === undefined) {
     throw new InvalidError("a glob pattern cannot end with an unescaped backslash")
   }
-  if (predicate.kind === "regex") {
-    const construct = unportableRegexConstruct(predicate.pattern)
-    if (construct !== undefined) {
-      throw new InvalidError(`regex ${construct} is not supported, write the pattern without it`)
-    }
-  }
+  if (predicate.kind === "regex")
+    RustRegex.compile(predicate.pattern, predicate.caseInsensitive === true)
 }
 
 /** One glob element after escapes are resolved: any run, any one, or a literal. */
@@ -683,26 +703,6 @@ export function globTokens(pattern: string): GlobToken[] | undefined {
     } else tokens.push({ kind: "literal", value: character ?? "" })
   }
   return tokens
-}
-
-export function unportableRegexConstruct(pattern: string): string | undefined {
-  const characters = Array.from(pattern)
-  let inClass = false
-  for (let index = 0; index < characters.length; index += 1) {
-    const character = characters[index]
-    if (character === "\\") {
-      const escaped = characters[index + 1] ?? ""
-      if (escaped >= "1" && escaped <= "9") return "backreferences"
-      if (escaped === "k") return "named backreferences"
-      index += 1
-    } else if (character === "[") inClass = true
-    else if (character === "]") inClass = false
-    else if (character === "(" && !inClass && characters[index + 1] === "?") {
-      if (characters[index + 2] !== ":") return "groups starting with (? other than (?:"
-      index += 1
-    }
-  }
-  return undefined
 }
 
 function countNodes(nodes: { count: number }, added: number): void {
@@ -1120,22 +1120,30 @@ export interface CatalogPosition {
   readonly operationId?: bigint
 }
 
-/** Which replica serves the read. */
-export type ReadMode = "primary" | "local"
-
-export function readModeIsPrimary(mode: ReadMode): boolean {
-  return mode === "primary"
-}
-
-/** The exact source history a page was read from. */
+/**
+ * The exact source history a page was read from. A recreated stream, topic, or
+ * partition changes it. The partition is named by its incarnation, the value
+ * its route reports.
+ */
 export interface SourceGeneration {
   readonly streamId: number
   readonly streamCreatedAtMicros: bigint
   readonly topicId: number
   readonly topicCreatedAtMicros: bigint
   readonly partitionId: number
-  readonly partitionCreatedRevision: bigint
-  readonly purgeGeneration: bigint
+  readonly partitionIncarnation: bigint
+}
+
+/**
+ * The partition owner a page was read under. The reader stores the page's
+ * offset with it and the page's partition incarnation, so the store is refused
+ * once the partition was recreated or its group assignment moved.
+ */
+export interface AckContext {
+  /** The consumer group owner generation, zero for an independent consumer. */
+  readonly ownerGeneration: bigint
+  /** The metadata operation the primary had applied when it served the read. */
+  readonly metadataOp: bigint
 }
 
 export interface Continuation {
@@ -1144,11 +1152,6 @@ export interface Continuation {
   readonly generation: SourceGeneration
   /** The digest of the filter the page ran, absent for an unfiltered page. */
   readonly digest?: Uint8Array
-  /**
-   * The route the page was read on. A continuation from a local page never
-   * resumes a primary read, because a local replica can lag a purge.
-   */
-  readonly readMode: ReadMode
   readonly mode: ExecutionMode
   readonly policyGeneration: bigint
 }
@@ -1162,6 +1165,63 @@ export type FilteredStart =
   | { readonly kind: "timestamp"; readonly micros: bigint }
   | { readonly kind: "continue"; readonly continuation: Continuation }
 
+export interface FilteredAck {
+  readonly v: number
+  readonly source: FilterSource
+  readonly partitionId: number
+  readonly consumer: FilterConsumer
+  readonly groupId?: bigint
+  readonly generation: SourceGeneration
+  readonly ackContext: AckContext
+  readonly digest?: Uint8Array
+  readonly offset: bigint
+  readonly mode: ExecutionMode
+  readonly policyGeneration: bigint
+}
+
+export interface AckReceipt {
+  readonly partitionId: number
+  readonly offset: bigint
+  readonly generation: SourceGeneration
+}
+
+/**
+ * Hold until one of `partitions` has a record at or after its offset, or
+ * `maxWaitMs` passes. The server lowers the wait to its announced limit and
+ * reads nothing: the reader then sends a filtered poll to the ready ones.
+ * `waitId` names the wait on its connection so a `FilteredWaitCancel` can end it early.
+ */
+export interface FilteredWaitRequest {
+  readonly v: number
+  readonly source: FilterSource
+  readonly consumer: FilterConsumer
+  readonly partitions: readonly FilteredWaitPartition[]
+  readonly maxWaitMs: number
+  readonly waitId: bigint
+}
+
+/** End the filtered waits this connection holds under `waitIds`. Each one answers at once with no ready partition. */
+export interface FilteredWaitCancel {
+  readonly v: number
+  readonly waitIds: readonly bigint[]
+}
+
+/** The waits a `FilteredWaitCancel` ended. A wait that had already answered or was never held is left out. */
+export interface FilteredWaitCancelled {
+  readonly cancelled: readonly bigint[]
+}
+
+/** One partition of a filtered wait and the offset its next read starts at. */
+export interface FilteredWaitPartition {
+  readonly partitionId: number
+  readonly offset: bigint
+}
+
+/** The partitions that hold a record at or after their offset. Empty when the wait ended first. */
+export interface FilteredWaitResult {
+  readonly ready: readonly number[]
+}
+
 export interface FilteredPollRequest {
   readonly v: number
   readonly source: FilterSource
@@ -1171,7 +1231,6 @@ export interface FilteredPollRequest {
   readonly start: FilteredStart
   readonly count: number
   readonly maxReplyBytes: number
-  readonly readMode: ReadMode
   /** Most source records to examine. A normal consumer sets it to `count`. */
   readonly maxExamined?: number
   /** Serve only once the catalog has been examined through this position. */
@@ -1241,7 +1300,7 @@ export interface FilteredPage {
   readonly partitionId: number
   readonly policy: AppliedPolicy
   readonly generation: SourceGeneration
-  readonly readMode: ReadMode
+  readonly ackContext: AckContext
   readonly nextScanOffset?: bigint
   readonly safeAckOffset?: bigint
   readonly frontier: bigint
@@ -1263,32 +1322,11 @@ export function filteredPageNextStart(page: FilteredPage, original: FilteredStar
       nextScanOffset: page.nextScanOffset,
       generation: page.generation,
       ...(page.policy.digest === undefined ? {} : { digest: page.policy.digest }),
-      readMode: page.readMode,
       mode: page.policy.mode,
       policyGeneration: page.policy.policyGeneration,
       ...(page.policy.groupId !== undefined ? { groupId: page.policy.groupId } : {})
     }
   }
-}
-
-export interface FilteredAck {
-  readonly groupId?: bigint
-  readonly v: number
-  readonly source: FilterSource
-  readonly partitionId: number
-  readonly consumer: FilterConsumer
-  readonly generation: SourceGeneration
-  /** The digest of the filter the page ran, absent for an unfiltered page. */
-  readonly digest?: Uint8Array
-  readonly offset: bigint
-  readonly mode: ExecutionMode
-  readonly policyGeneration: bigint
-}
-
-export interface AckReceipt {
-  readonly partitionId: number
-  readonly offset: bigint
-  readonly generation: SourceGeneration
 }
 
 export interface FilterPreviewRequest {
@@ -1331,7 +1369,6 @@ export interface FilterPreview {
   readonly v: number
   readonly partitionId: number
   readonly policy: AppliedPolicy
-  readonly readMode: ReadMode
   readonly examined: number
   readonly matched: number
   readonly faults: number
@@ -1383,7 +1420,6 @@ export type FilterErrorReason =
   | "conflict"
   | "source_changed"
   | "membership_stale"
-  | "not_primary"
   | "catalog_unavailable"
   | "revision_disabled"
   | "too_large"
@@ -1425,11 +1461,13 @@ export function filterErrorCheckVersion(v: number): FilterError | undefined {
 }
 
 export type FilterOutcome =
-  | { readonly kind: "page"; readonly page: FilteredPage }
   | { readonly kind: "acknowledged"; readonly receipt: AckReceipt }
+  | { readonly kind: "page"; readonly page: FilteredPage }
   | { readonly kind: "preview"; readonly preview: FilterPreview }
   | { readonly kind: "tested"; readonly result: FilterTestResult }
   | { readonly kind: "validated"; readonly validation: FilterValidation }
+  | { readonly kind: "ready"; readonly result: FilteredWaitResult }
+  | { readonly kind: "cancelled"; readonly result: FilteredWaitCancelled }
 
 export type FilterReply =
   | { readonly kind: "ok"; readonly outcome: FilterOutcome }
@@ -1451,6 +1489,17 @@ export interface FilterGroupRef {
   readonly group: string
 }
 
+/**
+ * The consumer group a group policy filter belongs to: the exact incarnation
+ * and its names when the policy was configured. The group name stays current,
+ * while stream and topic names can change, so a reader resolves them from the
+ * identity.
+ */
+export interface FilterOwner {
+  readonly identity: FilterGroupIdentity
+  readonly group: FilterGroupRef
+}
+
 export interface FilterRevisionInfo {
   readonly enabled: boolean
   readonly revision: number
@@ -1470,6 +1519,8 @@ export interface FilterSummary {
   readonly bindings: number
   readonly createdAtMicros: bigint
   readonly updatedAtMicros: bigint
+  /** The consumer group whose own policy this filter is. Absent for a registered filter. */
+  readonly owner?: FilterOwner
 }
 
 export interface FilterBinding {
@@ -1483,9 +1534,14 @@ export interface FilterBinding {
   readonly policyGeneration: bigint
 }
 
-/** The policy a group is configured with in one step. */
+/**
+ * The policy a group is configured with in one step: a definition saved for
+ * this group alone under the caller's name, or a revision that already
+ * exists. The name follows the registered filter name rule and need not be
+ * unique, since every read returns the owning group with it.
+ */
 export type GroupFilterSpec =
-  | { readonly kind: "definition"; readonly filter: ConsumerFilter }
+  | { readonly kind: "definition"; readonly name: string; readonly filter: ConsumerFilter }
   | { readonly kind: "revision"; readonly filterId: number; readonly revision: number }
 
 /** A verified consumer group without a filter policy: every record is delivered. */
@@ -1549,8 +1605,9 @@ export interface FilterMutationRequest {
 
 /**
  * The mutation the catalog appends to its control log, stamped by the
- * streaming server with the actor and group identity, then by the plane with
- * the caller's grants and, for a registration, the allocated filter id.
+ * streaming server with the actor and group identity, then by the managed
+ * backend with the caller's grants and, for a registration, the allocated
+ * filter id.
  */
 export interface FilterCatalogLimits {
   readonly maxDefinitions: number
@@ -1618,6 +1675,8 @@ export interface ListFilters {
   readonly state?: FilterState
   /** Only filters with a lower id, so paging stays stable while the catalog changes. */
   readonly beforeId?: number
+  /** Only the own filter of this consumer group incarnation, bound or not. */
+  readonly owner?: FilterGroupIdentity
   readonly page: number
   readonly pageSize: number
 }
@@ -1741,6 +1800,19 @@ function validateDigest(digest: Uint8Array): void {
   if (digest.byteLength !== 32) throw new InvalidError("a digest must be 32 bytes")
 }
 
+export function validateFilteredAck(request: FilteredAck): void {
+  validateVersion(request.v)
+  validateSource(request.source)
+  validateConsumer(request.consumer)
+  validatePolicyIdentity(request.mode, request.digest)
+  if (request.mode === "unfiltered" && request.consumer.kind === "consumer")
+    throw new InvalidError("only a consumer group runs unfiltered")
+  if ((request.consumer.kind !== "consumer") !== (request.groupId !== undefined))
+    throw new InvalidError("a group acknowledgment must retain its group identity")
+  if (request.generation.partitionId !== request.partitionId)
+    throw new InvalidError("an acknowledgment names another partition's generation")
+}
+
 export function validateFilteredPollRequest(request: FilteredPollRequest): void {
   validateVersion(request.v)
   validateSource(request.source)
@@ -1789,6 +1861,56 @@ export function validateFilteredPollRequest(request: FilteredPollRequest): void 
   }
 }
 
+export function validateFilteredWaitRequest(request: FilteredWaitRequest): void {
+  validateVersion(request.v)
+  validateSource(request.source)
+  validateConsumer(request.consumer)
+  if (request.partitions.length === 0 || request.partitions.length > MAX_FILTERED_WAIT_PARTITIONS) {
+    throw new InvalidError(
+      `a filtered wait names 1..=${String(MAX_FILTERED_WAIT_PARTITIONS)} partitions`
+    )
+  }
+  const seen = new Set<number>()
+  for (const partition of request.partitions) {
+    if (
+      !Number.isInteger(partition.partitionId) ||
+      partition.partitionId < 0 ||
+      partition.partitionId > 0xffff_ffff
+    )
+      throw new InvalidError("partition must be an unsigned 32-bit integer")
+    if (partition.offset < 0n || partition.offset > U64_MAX)
+      throw new InvalidError("offset must be an unsigned 64-bit integer")
+    if (seen.has(partition.partitionId))
+      throw new InvalidError("a filtered wait names each partition once")
+    seen.add(partition.partitionId)
+  }
+  if (
+    !Number.isInteger(request.maxWaitMs) ||
+    request.maxWaitMs < 0 ||
+    request.maxWaitMs > MAX_FILTERED_WAIT_MS
+  ) {
+    throw new InvalidError(`max_wait_ms must be 0..=${String(MAX_FILTERED_WAIT_MS)}`)
+  }
+  validateWaitId(request.waitId)
+}
+
+export function validateFilteredWaitCancel(request: FilteredWaitCancel): void {
+  validateVersion(request.v)
+  if (request.waitIds.length === 0 || request.waitIds.length > MAX_FILTERED_WAIT_CANCEL_IDS) {
+    throw new InvalidError(
+      `a filtered wait cancel names 1..=${String(MAX_FILTERED_WAIT_CANCEL_IDS)} waits`
+    )
+  }
+  for (const waitId of request.waitIds) validateWaitId(waitId)
+  if (new Set(request.waitIds).size !== request.waitIds.length)
+    throw new InvalidError("a filtered wait cancel names each wait once")
+}
+
+function validateWaitId(waitId: bigint): void {
+  if (waitId < 0n || waitId > U64_MAX)
+    throw new InvalidError("wait_id must be an unsigned 64-bit integer")
+}
+
 /** A filtered policy names its digest and an unfiltered one has none. */
 export function validatePolicyIdentity(mode: ExecutionMode, digest: Uint8Array | undefined): void {
   if (mode === "filtered") {
@@ -1796,20 +1918,6 @@ export function validatePolicyIdentity(mode: ExecutionMode, digest: Uint8Array |
     validateDigest(digest)
   } else if (digest !== undefined) {
     throw new InvalidError("an unfiltered policy carries no digest")
-  }
-}
-
-export function validateFilteredAck(ack: FilteredAck): void {
-  validateVersion(ack.v)
-  validateSource(ack.source)
-  validateConsumer(ack.consumer)
-  validatePolicyIdentity(ack.mode, ack.digest)
-  if (ack.mode === "unfiltered" && ack.consumer.kind === "consumer")
-    throw new InvalidError("only a consumer group runs unfiltered")
-  if ((ack.consumer.kind !== "consumer") !== (ack.groupId !== undefined))
-    throw new InvalidError("a group acknowledgment must retain its group identity")
-  if (ack.generation.partitionId !== ack.partitionId) {
-    throw new InvalidError("an acknowledgment names another partition's generation")
   }
 }
 
@@ -1894,19 +2002,54 @@ export function validateFilterMutation(mutation: FilterMutation): void {
       return
     case "configure_group":
       validateFilterGroupRef(mutation.group)
-      if (mutation.policy.kind === "definition") validateConsumerFilter(mutation.policy.filter)
+      if (
+        mutation.expectedIdentity !== undefined &&
+        mutation.expectedIdentity.groupId > 0xffff_ffffn
+      )
+        throw new InvalidError("consumer group id exceeds the native offset-key range")
+      if (mutation.policy.kind === "definition") {
+        validateFilterName(mutation.policy.name)
+        validateConsumerFilter(mutation.policy.filter)
+      } else if (mutation.policy.revision === 0) {
+        throw new InvalidError("revision must be positive")
+      }
   }
 }
 
-function validateFilterName(name: string): void {
-  const bytes = UTF8.encode(name).byteLength
-  if (bytes === 0 || bytes > MAX_FILTER_NAME_BYTES) {
-    throw new InvalidError(`a filter name must be 1..=${String(MAX_FILTER_NAME_BYTES)} bytes`)
-  }
-  if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+/**
+ * A saved filter's name, registered or a group policy's: 1 to
+ * `MAX_FILTER_NAME_BYTES` bytes of ASCII letters, digits, `-`, `_` and `.`.
+ */
+export function validateFilterName(name: string): void {
+  const bytes = UTF8.encode(name)
+  if (bytes.byteLength === 0) throw new InvalidError("filter name must not be empty")
+  if (bytes.byteLength > MAX_FILTER_NAME_BYTES) {
     throw new InvalidError(
-      "a filter name has a disallowed byte: allowed are ASCII letters, digits, '-', '_', '.'"
+      `filter name is ${String(bytes.byteLength)}B, exceeds cap ${String(MAX_FILTER_NAME_BYTES)}B`
     )
+  }
+  const bad = bytes.find((byte) => !SAFELISTED_NAME_BYTE.test(String.fromCharCode(byte)))
+  if (bad !== undefined) {
+    throw new InvalidError(
+      `filter name has a disallowed byte 0x${bad.toString(16).padStart(2, "0")}: allowed are ASCII letters, digits, '-', '_', '.'`
+    )
+  }
+}
+
+const SAFELISTED_NAME_BYTE = /^[A-Za-z0-9._-]$/
+
+/** Rust `ListFilters::validate`: the page size, the name fragment, and an owner's native group id. */
+export function validateListFilters(request: ListFilters): void {
+  validateVersion(request.v)
+  validateCatalogPage(request.page, request.pageSize)
+  if (
+    request.nameContains !== undefined &&
+    UTF8.encode(request.nameContains).byteLength > MAX_FILTER_NAME_BYTES
+  ) {
+    throw new InvalidError("name filter exceeds the name cap")
+  }
+  if (request.owner !== undefined && request.owner.groupId > 0xffff_ffffn) {
+    throw new InvalidError("consumer group id exceeds the native offset-key range")
   }
 }
 
@@ -2061,6 +2204,7 @@ function encodeConsumerFilterTree(filter: ConsumerFilter, mode: TreeMode): Map<s
   if (filter.foreignPolicy === "pass") map.set("foreign_policy", "pass")
   if (filter.mismatchPolicy === "pass") map.set("mismatch_policy", "pass")
   if (filter.schemaRefs.length > 0) map.set("schema_refs", [...filter.schemaRefs])
+  if (filter.schemaStream !== undefined) map.set("schema_stream", filter.schemaStream)
   return map
 }
 
@@ -2142,8 +2286,14 @@ export function encodeSourceGeneration(generation: SourceGeneration): Map<string
     ["topic_id", generation.topicId],
     ["topic_created_at_micros", generation.topicCreatedAtMicros],
     ["partition_id", generation.partitionId],
-    ["partition_created_revision", generation.partitionCreatedRevision],
-    ["purge_generation", generation.purgeGeneration]
+    ["partition_incarnation", generation.partitionIncarnation]
+  ])
+}
+
+export function encodeAckContext(context: AckContext): Map<string, unknown> {
+  return mapOf([
+    ["owner_generation", context.ownerGeneration],
+    ["metadata_op", context.metadataOp]
   ])
 }
 
@@ -2170,14 +2320,44 @@ export function encodeFilteredStart(start: FilteredStart): unknown {
             ...(start.continuation.digest === undefined
               ? []
               : [["digest", start.continuation.digest] as const]),
-            ...(start.continuation.readMode === "primary"
-              ? []
-              : [["read_mode", start.continuation.readMode] as const]),
             ["mode", start.continuation.mode],
             ["policy_generation", start.continuation.policyGeneration]
           ])
         ]
       ])
+  }
+}
+
+export function encodeFilteredAck(request: FilteredAck): Map<string, unknown> {
+  return mapOf([
+    ...(request.groupId === undefined ? [] : [["group_id", request.groupId] as const]),
+    ["v", request.v],
+    ["source", encodeFilterSource(request.source)],
+    ["partition_id", request.partitionId],
+    ["consumer", encodeFilterConsumer(request.consumer)],
+    ["generation", encodeSourceGeneration(request.generation)],
+    ["ack_context", encodeAckContext(request.ackContext)],
+    ...(request.digest === undefined ? [] : [["digest", request.digest] as const]),
+    ["offset", request.offset],
+    ["mode", request.mode],
+    ["policy_generation", request.policyGeneration]
+  ])
+}
+
+export function decodeFilteredAck(value: unknown, context: string): FilteredAck {
+  const map = expectMap(value, context)
+  return {
+    v: requiredU32(map, "v", context),
+    source: decodeFilterSource(map.get("source"), context),
+    partitionId: requiredU32(map, "partition_id", context),
+    consumer: decodeFilterConsumer(map.get("consumer"), context),
+    generation: decodeSourceGeneration(map.get("generation"), context),
+    ackContext: decodeAckContext(map.get("ack_context"), context),
+    offset: field.requiredU64(map, "offset", context),
+    mode: map.has("mode") ? decodeExecutionMode(map.get("mode"), context) : "filtered",
+    policyGeneration: field.optionalU64(map, "policy_generation", context) ?? 0n,
+    ...(map.has("group_id") ? { groupId: field.requiredU64(map, "group_id", context) } : {}),
+    ...(map.has("digest") ? { digest: requiredBytes(map, "digest", context) } : {})
   }
 }
 
@@ -2191,7 +2371,6 @@ export function encodeFilteredPollRequest(request: FilteredPollRequest): Map<str
     ["start", encodeFilteredStart(request.start)],
     ["count", request.count],
     ["max_reply_bytes", request.maxReplyBytes],
-    ["read_mode", request.readMode],
     ...(request.maxExamined === undefined ? [] : [["max_examined", request.maxExamined] as const]),
     ...(request.minCatalogPosition === undefined
       ? []
@@ -2199,18 +2378,29 @@ export function encodeFilteredPollRequest(request: FilteredPollRequest): Map<str
   ])
 }
 
-export function encodeFilteredAck(ack: FilteredAck): Map<string, unknown> {
+export function encodeFilteredWaitRequest(request: FilteredWaitRequest): Map<string, unknown> {
   return mapOf([
-    ...(ack.groupId === undefined ? [] : [["group_id", ack.groupId] as const]),
-    ["v", ack.v],
-    ["source", encodeFilterSource(ack.source)],
-    ["partition_id", ack.partitionId],
-    ["consumer", encodeFilterConsumer(ack.consumer)],
-    ["generation", encodeSourceGeneration(ack.generation)],
-    ...(ack.digest === undefined ? [] : [["digest", ack.digest] as const]),
-    ["offset", ack.offset],
-    ["mode", ack.mode],
-    ["policy_generation", ack.policyGeneration]
+    ["v", request.v],
+    ["source", encodeFilterSource(request.source)],
+    ["consumer", encodeFilterConsumer(request.consumer)],
+    [
+      "partitions",
+      request.partitions.map((partition) =>
+        mapOf([
+          ["partition_id", partition.partitionId],
+          ["offset", partition.offset]
+        ])
+      )
+    ],
+    ["max_wait_ms", request.maxWaitMs],
+    ["wait_id", request.waitId]
+  ])
+}
+
+export function encodeFilteredWaitCancel(request: FilteredWaitCancel): Map<string, unknown> {
+  return mapOf([
+    ["v", request.v],
+    ["wait_ids", [...request.waitIds]]
   ])
 }
 
@@ -2271,7 +2461,7 @@ export function encodeFilteredPage(page: FilteredPage): Map<string, unknown> {
     ["partition_id", page.partitionId],
     ["policy", encodeAppliedPolicy(page.policy)],
     ["generation", encodeSourceGeneration(page.generation)],
-    ["read_mode", page.readMode]
+    ["ack_context", encodeAckContext(page.ackContext)]
   ])
   setIf(map, "next_scan_offset", page.nextScanOffset)
   setIf(map, "safe_ack_offset", page.safeAckOffset)
@@ -2301,14 +2491,6 @@ export function encodeFilteredPage(page: FilteredPage): Map<string, unknown> {
   return map
 }
 
-function encodeAckReceipt(receipt: AckReceipt): Map<string, unknown> {
-  return mapOf([
-    ["partition_id", receipt.partitionId],
-    ["offset", receipt.offset],
-    ["generation", encodeSourceGeneration(receipt.generation)]
-  ])
-}
-
 export function encodeFilterError(error: FilterError): Map<string, unknown> {
   return mapOf([
     ["code", resultCodeWord(error.code) ?? "backend"],
@@ -2333,10 +2515,19 @@ function encodeExplanation(explanation: FilterExplanation): Map<string, unknown>
 
 function encodeFilterOutcome(outcome: FilterOutcome): Map<string, unknown> {
   switch (outcome.kind) {
+    case "acknowledged":
+      return mapOf([
+        [
+          "acknowledged",
+          mapOf([
+            ["partition_id", outcome.receipt.partitionId],
+            ["offset", outcome.receipt.offset],
+            ["generation", encodeSourceGeneration(outcome.receipt.generation)]
+          ])
+        ]
+      ])
     case "page":
       return mapOf([["page", encodeFilteredPage(outcome.page)]])
-    case "acknowledged":
-      return mapOf([["acknowledged", encodeAckReceipt(outcome.receipt)]])
     case "tested":
       return mapOf([
         [
@@ -2362,6 +2553,10 @@ function encodeFilterOutcome(outcome: FilterOutcome): Map<string, unknown> {
       ])
     case "preview":
       return mapOf([["preview", encodeFilterPreview(outcome.preview)]])
+    case "ready":
+      return mapOf([["ready", mapOf([["ready", [...outcome.result.ready]]])]])
+    case "cancelled":
+      return mapOf([["cancelled", mapOf([["cancelled", [...outcome.result.cancelled]]])]])
   }
 }
 
@@ -2370,7 +2565,6 @@ function encodeFilterPreview(preview: FilterPreview): Map<string, unknown> {
     ["v", preview.v],
     ["partition_id", preview.partitionId],
     ["policy", encodeAppliedPolicy(preview.policy)],
-    ["read_mode", preview.readMode],
     ["examined", preview.examined],
     ["matched", preview.matched],
     ["faults", preview.faults],
@@ -2523,7 +2717,15 @@ export function encodeFilterMutation(mutation: FilterMutation): Map<string, unkn
 function encodeGroupFilterSpec(spec: GroupFilterSpec): Map<string, unknown> {
   switch (spec.kind) {
     case "definition":
-      return mapOf([["definition", encodeConsumerFilter(spec.filter)]])
+      return mapOf([
+        [
+          "definition",
+          mapOf([
+            ["name", spec.name],
+            ["filter", encodeConsumerFilter(spec.filter)]
+          ])
+        ]
+      ])
     case "revision":
       return mapOf([
         [
@@ -2540,7 +2742,12 @@ function encodeGroupFilterSpec(spec: GroupFilterSpec): Map<string, unknown> {
 function decodeGroupFilterSpec(value: unknown, context: string): GroupFilterSpec {
   const [tag, inner] = singleVariantTag(value, context)
   if (tag === "definition") {
-    return { kind: "definition", filter: decodeConsumerFilter(inner, `${context}.definition`) }
+    const map = expectMap(inner, `${context}.definition`)
+    return {
+      kind: "definition",
+      name: field.requiredString(map, "name", `${context}.definition`),
+      filter: decodeConsumerFilter(map.get("filter"), `${context}.definition.filter`)
+    }
   }
   if (tag === "revision") {
     const map = expectMap(inner, `${context}.revision`)
@@ -2604,6 +2811,7 @@ export function encodeListFilters(request: ListFilters): Map<string, unknown> {
   setIf(map, "name_contains", request.nameContains)
   setIf(map, "state", request.state)
   setIf(map, "before_id", request.beforeId)
+  if (request.owner !== undefined) map.set("owner", encodeFilterGroupIdentity(request.owner))
   map.set("page", request.page)
   map.set("page_size", request.pageSize)
   return map
@@ -2719,8 +2927,15 @@ function encodeRevisionInfo(info: FilterRevisionInfo): Map<string, unknown> {
   ])
 }
 
-function encodeSummary(summary: FilterSummary): Map<string, unknown> {
+function encodeFilterOwner(owner: FilterOwner): Map<string, unknown> {
   return mapOf([
+    ["identity", encodeFilterGroupIdentity(owner.identity)],
+    ["group", encodeFilterGroupRef(owner.group)]
+  ])
+}
+
+function encodeSummary(summary: FilterSummary): Map<string, unknown> {
+  const map = mapOf([
     ["id", summary.id],
     ["name", summary.name],
     ["description", summary.description],
@@ -2732,6 +2947,8 @@ function encodeSummary(summary: FilterSummary): Map<string, unknown> {
     ["created_at_micros", summary.createdAtMicros],
     ["updated_at_micros", summary.updatedAtMicros]
   ])
+  if (summary.owner !== undefined) map.set("owner", encodeFilterOwner(summary.owner))
+  return map
 }
 
 function encodeCatalogOutcome(outcome: FilterCatalogOutcome): Map<string, unknown> {
@@ -3045,8 +3262,23 @@ export function decodeConsumerFilter(value: unknown, context: string): ConsumerF
     ...recordPolicyOf(map, "mismatch_policy", "mismatchPolicy", context),
     schemaRefs: field.optionalArray(map, "schema_refs", context, (item, index) =>
       u32(item, `${context}.schema_refs[${String(index)}]`)
-    )
+    ),
+    ...schemaStreamOf(map, context)
   }
+}
+
+// Rust `char::is_control`: the C0 and C1 control ranges.
+function hasControlCharacter(text: string): boolean {
+  for (const character of text) {
+    const point = character.codePointAt(0) ?? 0
+    if (point <= 0x1f || (point >= 0x7f && point <= 0x9f)) return true
+  }
+  return false
+}
+
+function schemaStreamOf(map: CborMap, context: string): { readonly schemaStream?: string } {
+  const schemaStream = field.optionalString(map, "schema_stream", context)
+  return schemaStream === undefined ? {} : { schemaStream }
 }
 
 export function decodeFilterSource(value: unknown, context: string): FilterSource {
@@ -3093,8 +3325,15 @@ export function decodeSourceGeneration(value: unknown, context: string): SourceG
     topicId: requiredU32(map, "topic_id", context),
     topicCreatedAtMicros: field.requiredU64(map, "topic_created_at_micros", context),
     partitionId: requiredU32(map, "partition_id", context),
-    partitionCreatedRevision: field.requiredU64(map, "partition_created_revision", context),
-    purgeGeneration: field.requiredU64(map, "purge_generation", context)
+    partitionIncarnation: field.requiredU64(map, "partition_incarnation", context)
+  }
+}
+
+export function decodeAckContext(value: unknown, context: string): AckContext {
+  const map = expectMap(value, context)
+  return {
+    ownerGeneration: field.requiredU64(map, "owner_generation", context),
+    metadataOp: field.requiredU64(map, "metadata_op", context)
   }
 }
 
@@ -3122,9 +3361,6 @@ export function decodeFilteredStart(value: unknown, context: string): FilteredSt
           nextScanOffset: field.requiredU64(map, "next_scan_offset", context),
           generation: decodeSourceGeneration(map.get("generation"), `${context}.generation`),
           ...(map.has("digest") ? { digest: requiredBytes(map, "digest", context) } : {}),
-          readMode: map.has("read_mode")
-            ? decodeReadMode(map.get("read_mode"), `${context}.read_mode`)
-            : "primary",
           mode: map.has("mode")
             ? decodeExecutionMode(map.get("mode"), `${context}.mode`)
             : "filtered",
@@ -3135,10 +3371,6 @@ export function decodeFilteredStart(value: unknown, context: string): FilteredSt
     default:
       throw new CodecError(`\`${tag}\` is not a recognized filtered start`, context, "start")
   }
-}
-
-function decodeReadMode(value: unknown, context: string): ReadMode {
-  return oneOf(value, new Set<ReadMode>(["primary", "local"]), context)
 }
 
 export function decodeFilteredPollRequest(value: unknown, context: string): FilteredPollRequest {
@@ -3152,9 +3384,6 @@ export function decodeFilteredPollRequest(value: unknown, context: string): Filt
     start: decodeFilteredStart(map.get("start"), `${context}.start`),
     count: requiredU32(map, "count", context),
     maxReplyBytes: requiredU32(map, "max_reply_bytes", context),
-    readMode: map.has("read_mode")
-      ? decodeReadMode(map.get("read_mode"), `${context}.read_mode`)
-      : "primary",
     ...(map.has("max_examined") ? { maxExamined: requiredU32(map, "max_examined", context) } : {}),
     ...(map.has("min_catalog_position")
       ? {
@@ -3167,20 +3396,32 @@ export function decodeFilteredPollRequest(value: unknown, context: string): Filt
   }
 }
 
-export function decodeFilteredAck(value: unknown, context: string): FilteredAck {
+export function decodeFilteredWaitRequest(value: unknown, context: string): FilteredWaitRequest {
   const map = expectMap(value, context)
-  const groupId = field.optionalU64(map, "group_id", context)
   return {
-    ...(groupId !== undefined ? { groupId } : {}),
     v: requiredU32(map, "v", context),
     source: decodeFilterSource(map.get("source"), `${context}.source`),
-    partitionId: requiredU32(map, "partition_id", context),
     consumer: decodeFilterConsumer(map.get("consumer"), `${context}.consumer`),
-    generation: decodeSourceGeneration(map.get("generation"), `${context}.generation`),
-    ...(map.has("digest") ? { digest: requiredBytes(map, "digest", context) } : {}),
-    offset: field.requiredU64(map, "offset", context),
-    mode: map.has("mode") ? decodeExecutionMode(map.get("mode"), `${context}.mode`) : "filtered",
-    policyGeneration: field.optionalU64(map, "policy_generation", context) ?? 0n
+    partitions: field.requiredArray(map, "partitions", context, (item, index) => {
+      const itemContext = `${context}.partitions[${String(index)}]`
+      const partition = expectMap(item, itemContext)
+      return {
+        partitionId: requiredU32(partition, "partition_id", itemContext),
+        offset: field.requiredU64(partition, "offset", itemContext)
+      }
+    }),
+    maxWaitMs: requiredU32(map, "max_wait_ms", context),
+    waitId: field.requiredU64(map, "wait_id", context)
+  }
+}
+
+export function decodeFilteredWaitCancel(value: unknown, context: string): FilteredWaitCancel {
+  const map = expectMap(value, context)
+  return {
+    v: requiredU32(map, "v", context),
+    waitIds: field.requiredArray(map, "wait_ids", context, (item, index) =>
+      expectU64(item, `${context}.wait_ids[${String(index)}]`)
+    )
   }
 }
 
@@ -3214,7 +3455,7 @@ export function decodeFilteredPage(value: unknown, context: string): FilteredPag
     partitionId: requiredU32(map, "partition_id", context),
     policy: decodeAppliedPolicy(map.get("policy"), `${context}.policy`),
     generation: decodeSourceGeneration(map.get("generation"), `${context}.generation`),
-    readMode: decodeReadMode(map.get("read_mode"), `${context}.read_mode`),
+    ackContext: decodeAckContext(map.get("ack_context"), `${context}.ack_context`),
     ...(nextScanOffset !== undefined ? { nextScanOffset } : {}),
     ...(safeAckOffset !== undefined ? { safeAckOffset } : {}),
     frontier: field.requiredU64(map, "frontier", context),
@@ -3241,15 +3482,6 @@ export function decodeFilteredPage(value: unknown, context: string): FilteredPag
       expectU64(item, `${context}.unevaluated[${String(index)}]`)
     ),
     records: requiredBytes(map, "records", context)
-  }
-}
-
-function decodeAckReceipt(value: unknown, context: string): AckReceipt {
-  const map = expectMap(value, context)
-  return {
-    partitionId: requiredU32(map, "partition_id", context),
-    offset: field.requiredU64(map, "offset", context),
-    generation: decodeSourceGeneration(map.get("generation"), `${context}.generation`)
   }
 }
 
@@ -3301,7 +3533,6 @@ function decodeFilterPreview(value: unknown, context: string): FilterPreview {
     v: requiredU32(map, "v", context),
     partitionId: requiredU32(map, "partition_id", context),
     policy: decodeAppliedPolicy(map.get("policy"), `${context}.policy`),
-    readMode: decodeReadMode(map.get("read_mode"), `${context}.read_mode`),
     examined: requiredU32(map, "examined", context),
     matched: requiredU32(map, "matched", context),
     faults: requiredU32(map, "faults", context),
@@ -3334,10 +3565,19 @@ function decodeFilterPreview(value: unknown, context: string): FilterPreview {
 function decodeFilterOutcome(value: unknown, context: string): FilterOutcome {
   const [tag, inner] = singleVariantTag(value, context)
   switch (tag) {
+    case "acknowledged": {
+      const map = expectMap(inner, context)
+      return {
+        kind: "acknowledged",
+        receipt: {
+          partitionId: requiredU32(map, "partition_id", context),
+          offset: field.requiredU64(map, "offset", context),
+          generation: decodeSourceGeneration(map.get("generation"), context)
+        }
+      }
+    }
     case "page":
       return { kind: "page", page: decodeFilteredPage(inner, `${context}.page`) }
-    case "acknowledged":
-      return { kind: "acknowledged", receipt: decodeAckReceipt(inner, `${context}.acknowledged`) }
     case "preview":
       return { kind: "preview", preview: decodeFilterPreview(inner, `${context}.preview`) }
     case "tested": {
@@ -3360,6 +3600,28 @@ function decodeFilterOutcome(value: unknown, context: string): FilterOutcome {
           digest: requiredBytes(map, "digest", context),
           readsPayload: field.requiredBoolean(map, "reads_payload", context),
           readsHeaders: field.requiredBoolean(map, "reads_headers", context)
+        }
+      }
+    }
+    case "ready": {
+      const map = expectMap(inner, `${context}.ready`)
+      return {
+        kind: "ready",
+        result: {
+          ready: field.requiredArray(map, "ready", `${context}.ready`, (item, index) =>
+            u32(item, `${context}.ready.ready[${String(index)}]`)
+          )
+        }
+      }
+    }
+    case "cancelled": {
+      const map = expectMap(inner, `${context}.cancelled`)
+      return {
+        kind: "cancelled",
+        result: {
+          cancelled: field.requiredArray(map, "cancelled", `${context}.cancelled`, (item, index) =>
+            expectU64(item, `${context}.cancelled.cancelled[${String(index)}]`)
+          )
         }
       }
     }
@@ -3652,7 +3914,18 @@ function decodeSummary(value: unknown, context: string): FilterSummary {
     codec: decodeFilterCodec(map.get("codec"), `${context}.codec`),
     bindings: requiredU32(map, "bindings", context),
     createdAtMicros: field.requiredU64(map, "created_at_micros", context),
-    updatedAtMicros: field.requiredU64(map, "updated_at_micros", context)
+    updatedAtMicros: field.requiredU64(map, "updated_at_micros", context),
+    ...(map.get("owner") === undefined
+      ? {}
+      : { owner: decodeFilterOwner(map.get("owner"), `${context}.owner`) })
+  }
+}
+
+function decodeFilterOwner(value: unknown, context: string): FilterOwner {
+  const map = expectMap(value, context)
+  return {
+    identity: decodeFilterGroupIdentity(map.get("identity"), `${context}.identity`),
+    group: decodeFilterGroupRef(map.get("group"), `${context}.group`)
   }
 }
 

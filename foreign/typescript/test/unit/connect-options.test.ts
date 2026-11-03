@@ -9,6 +9,12 @@ import type { IggyClient } from "../../src/iggy/apache-iggy.js"
 import { encodeBackendAnnounce, newOpVersions } from "../../src/wire/hello.js"
 import { defaultWireTopology } from "../../src/wire/topology.js"
 
+// A one-node roster: the capability probe reaches replica 0.
+const ONE_NODE = {
+  getClusterMetadata: () =>
+    Promise.resolve({ name: "single", nodes: [{ replicaId: 0, name: "node" }] })
+}
+
 // Accepts every connection and reads without replying, the shape of a server that
 // completed the TCP handshake but never answers the login request.
 async function silentServer(): Promise<{ readonly server: Server; readonly port: number }> {
@@ -137,7 +143,8 @@ void test(
     })
     const client = {
       clientProvider: () => Promise.resolve({}),
-      sendBinaryRequest: () => {
+      cluster: ONE_NODE,
+      sendBinaryRequestToReplica: () => {
         probes += 1
         return probes === 1 ? delayed : Promise.resolve(reply)
       }
@@ -156,3 +163,30 @@ void test(
     await laser.close()
   }
 )
+
+void test("given_an_unmanaged_set_polled_faster_than_a_second_when_a_second_passes_then_should_probe_again_once", async (t) => {
+  let probes = 0
+  const client = {
+    clientProvider: () => Promise.resolve({}),
+    cluster: ONE_NODE,
+    sendBinaryRequestToReplica: () => {
+      probes += 1
+      return Promise.resolve(new Uint8Array())
+    }
+  } as unknown as IggyClient
+  const laser = await Laser.builder().client(client).connect()
+  const perProbe = probes
+  assert.ok(perProbe > 0)
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() })
+  for (let call = 0; call < 4; call += 1) {
+    assert.equal((await laser.capabilities()).managed, false)
+    t.mock.timers.tick(300)
+  }
+  assert.equal(probes, perProbe)
+  await laser.capabilities()
+  assert.equal(probes, 2 * perProbe)
+  t.mock.timers.tick(1_000)
+  await Promise.all([laser.capabilities(), laser.capabilities(), laser.capabilities()])
+  assert.equal(probes, 3 * perProbe)
+  await laser.close()
+})

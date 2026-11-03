@@ -1,0 +1,9 @@
+{
+  "jitter": { "low": 0.5, "high": 1.0 },
+  "managed_mutation": { "base_ms": 100, "max_ms": 2000, "deadline_ms": 30000 },
+  "consumer": { "base_ms": 50, "max_ms": 1000, "failure_budget": 10 },
+  "control_discovery": { "max_ms": 30000 },
+  "filter_mutation": { "attempts": 3, "backoff_ms": 200, "outcome_wait_ms": 30000 },
+  "query": { "deadline_ms": 25000, "reply_grace_ms": 2000 },
+  "create_race": { "attempts": 10 }
+}

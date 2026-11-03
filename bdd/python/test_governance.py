@@ -31,7 +31,7 @@ def govern_the_laser(world, needle, mode):
 def send_governed(world, payload):
     provenance = ls.Provenance(conversation_id=world.conversation)
     world.capture(
-        lambda: world.governed.send_agent(ls.AgentTopic.Commands, payload.encode(), provenance)
+        lambda: world.governed.send_agent(ls.AgentTopic.Sessions, payload.encode(), provenance)
     )
 
 

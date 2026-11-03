@@ -1,4 +1,4 @@
-# recall - the Memory primitive
+# recall: the Memory primitive
 
 This example records, retrieves, improves, and forgets memory items. Log-based memory reads recent records, while vector memory can rank them by similarity.
 

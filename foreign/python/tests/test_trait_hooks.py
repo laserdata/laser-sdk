@@ -12,7 +12,7 @@ REQUEST = contextvars.ContextVar("request")
 async def test_given_custom_routes_when_called_then_should_preserve_candidates_and_errors(
     laser, iggy_endpoint
 ):
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, retention=ls.TopicRetention.expire_after(86_400_000))
     connections = []
     workers = []
     seen = []
@@ -38,9 +38,9 @@ async def test_given_custom_routes_when_called_then_should_preserve_candidates_a
             connections.append(connection)
             agent = connection.spawn_agent(
                 name,
-                "agent.commands",
+                "agent.sessions",
                 worker(name),
-                respond_on="agent.responses",
+                respond_on="agent.sessions",
                 capabilities=[{"skill_id": "diagnose", "cost_class": cost}],
             )
             workers.append(agent)
@@ -61,7 +61,7 @@ async def test_given_custom_routes_when_called_then_should_preserve_candidates_a
             "diagnose",
             b"work",
             source="caller",
-            fixed_inbox="agent.commands",
+            fixed_inbox="agent.sessions",
             deadline_ms=10_000,
             policy=Scorer(),
         )
@@ -77,7 +77,7 @@ async def test_given_custom_routes_when_called_then_should_preserve_candidates_a
             None,
             b"again",
             skill="diagnose",
-            fixed_inbox="agent.commands",
+            fixed_inbox="agent.sessions",
             deadline_ms=10_000,
             policy=lambda skill, candidates: next(
                 index
@@ -90,7 +90,11 @@ async def test_given_custom_routes_when_called_then_should_preserve_candidates_a
 
         with pytest.raises(ls.LaserError) as refused:
             await laser.contract(
-                "diagnose", b"refuse", source="caller", policy=lambda skill, candidates: None
+                "diagnose",
+                b"refuse",
+                source="caller",
+                fixed_inbox="agent.sessions",
+                policy=lambda skill, candidates: None,
             )
         assert refused.value.no_capable_agent
 
@@ -100,14 +104,22 @@ async def test_given_custom_routes_when_called_then_should_preserve_candidates_a
             raise rejection
 
         with pytest.raises(ls.InvalidError) as failure:
-            await laser.contract("diagnose", b"invalid", source="caller", policy=broken)
+            await laser.contract(
+                "diagnose", b"invalid", source="caller", fixed_inbox="agent.sessions", policy=broken
+            )
         assert failure.value is rejection
 
         async def asynchronous(skill, candidates):
             return 0
 
         with pytest.raises(ls.InvalidError, match="synchronously"):
-            await laser.contract("diagnose", b"invalid", source="caller", policy=asynchronous)
+            await laser.contract(
+                "diagnose",
+                b"invalid",
+                source="caller",
+                fixed_inbox="agent.sessions",
+                policy=asynchronous,
+            )
     finally:
         for agent in workers:
             await agent.shutdown()
@@ -118,7 +130,7 @@ async def test_given_custom_routes_when_called_then_should_preserve_candidates_a
 async def test_given_middleware_when_a_handler_retries_then_should_receive_typed_errors_and_success(
     laser,
 ):
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, retention=ls.TopicRetention.expire_after(86_400_000))
     outcomes = []
     finished = asyncio.Event()
     attempts = 0
@@ -140,7 +152,7 @@ async def test_given_middleware_when_a_handler_retries_then_should_receive_typed
 
     agent = laser.spawn_agent(
         "full-outcome",
-        "agent.commands",
+        "agent.sessions",
         handle,
         middleware=[Middleware()],
         retry_max_attempts=2,
@@ -148,7 +160,7 @@ async def test_given_middleware_when_a_handler_retries_then_should_receive_typed
     )
     try:
         await agent.ready()
-        await laser.send_agent("agent.commands", b"work", ls.Provenance())
+        await laser.send_agent("agent.sessions", b"work", ls.Provenance())
         await asyncio.wait_for(finished.wait(), 10)
         assert len(outcomes) == 2
         first, first_attempt = outcomes[0]
@@ -168,7 +180,7 @@ async def test_given_middleware_when_a_handler_retries_then_should_receive_typed
 async def test_given_handler_refusal_when_dead_lettered_then_should_receive_capsule_and_error(
     laser, publish_fails
 ):
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, retention=ls.TopicRetention.expire_after(86_400_000))
     published = asyncio.Event()
     dead_lettered = asyncio.Event()
     observed = {}
@@ -189,14 +201,14 @@ async def test_given_handler_refusal_when_dead_lettered_then_should_receive_caps
 
     agent = laser.spawn_agent(
         "full-dead-letter",
-        "agent.commands",
+        "agent.sessions",
         handle,
         middleware=[Middleware()],
         dead_letter=sink,
     )
     try:
         await agent.ready()
-        await laser.send_agent("agent.commands", b"poison", ls.Provenance())
+        await laser.send_agent("agent.sessions", b"poison", ls.Provenance())
         published.set()
         await asyncio.wait_for(dead_lettered.wait(), 10)
         assert observed["message"].payload == b"poison"
@@ -232,7 +244,7 @@ async def test_given_handler_refusal_when_dead_lettered_then_should_receive_caps
 async def test_given_bad_provenance_when_dead_lettered_then_should_keep_the_payload(
     laser,
 ):
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, retention=ls.TopicRetention.expire_after(86_400_000))
     dead_lettered = asyncio.Event()
     observed = {}
 
@@ -245,15 +257,25 @@ async def test_given_bad_provenance_when_dead_lettered_then_should_keep_the_payl
         observed.update(message=message, capsule=capsule, publish_error=publish_error)
         loop.call_soon_threadsafe(dead_lettered.set)
 
-    agent = laser.spawn_agent("malformed-dead-letter", "agent.commands", handle, dead_letter=sink)
+    agent = laser.spawn_agent("malformed-dead-letter", "agent.sessions", handle, dead_letter=sink)
     try:
         await agent.ready()
-        await laser.topic("agent.commands").send(b"malformed")
-        await asyncio.wait_for(dead_lettered.wait(), 10)
-        assert observed["message"] is None
-        assert bytes(observed["capsule"]["payload"]) == b"malformed"
-        assert observed["capsule"]["reason"] == 3
-        assert observed["publish_error"] is None
+        await laser.topic("agent.sessions").send(b"malformed")
+        filters = (await laser.capabilities()).filters
+        if filters.group_policy_reads and filters.native and filters.catalog:
+            # A record without `agdx.to` never passes the addressee filter the
+            # agent's group is bound to, so a server that binds the filter (group
+            # reads, filtered reads, and the catalog) keeps it on the log and the
+            # agent neither handles nor dead-letters it.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(dead_lettered.wait(), 2)
+            assert not observed
+        else:
+            await asyncio.wait_for(dead_lettered.wait(), 10)
+            assert observed["message"] is None
+            assert bytes(observed["capsule"]["payload"]) == b"malformed"
+            assert observed["capsule"]["reason"] == 3
+            assert observed["publish_error"] is None
     finally:
         await agent.shutdown()
 
@@ -261,7 +283,7 @@ async def test_given_bad_provenance_when_dead_lettered_then_should_keep_the_payl
 async def test_given_partition_lanes_when_hooks_run_then_should_use_the_spawning_loop_and_context(
     laser,
 ):
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, retention=ls.TopicRetention.expire_after(86_400_000))
     handled = asyncio.Event()
     seen = {}
 
@@ -278,14 +300,14 @@ async def test_given_partition_lanes_when_hooks_run_then_should_use_the_spawning
     REQUEST.set("spawner")
     agent = laser.spawn_agent(
         "lane-hooks",
-        "agent.commands",
+        "agent.sessions",
         Handler(),
         dedup=Deduplicator(),
         max_partitions=2,
     )
     try:
         await agent.ready()
-        await laser.send_agent("agent.commands", b"work", ls.Provenance(idempotency_key="lane-key"))
+        await laser.send_agent("agent.sessions", b"work", ls.Provenance(idempotency_key="lane-key"))
         await asyncio.wait_for(handled.wait(), 10)
         assert seen == {"handler": "spawner", "dedup": ("lane-key", "spawner")}
     finally:
@@ -293,7 +315,7 @@ async def test_given_partition_lanes_when_hooks_run_then_should_use_the_spawning
 
 
 async def test_given_a_plain_consolidator_when_ticking_then_should_pass_the_agent_scope(laser):
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, retention=ls.TopicRetention.expire_after(86_400_000))
     scopes = []
     ticked = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -307,7 +329,7 @@ async def test_given_a_plain_consolidator_when_ticking_then_should_pass_the_agen
 
     agent = laser.spawn_agent(
         "consolidating-agent",
-        "agent.commands",
+        "agent.sessions",
         handle,
         consolidate_every_ms=10,
         consolidator=consolidate,
@@ -332,13 +354,13 @@ async def test_given_hooks_without_their_method_when_spawning_then_should_refuse
         pass
 
     with pytest.raises(ls.InvalidError, match="handle"):
-        laser.spawn_agent("refused-handler", "agent.commands", object())
+        laser.spawn_agent("refused-handler", "agent.sessions", object())
     with pytest.raises(ls.InvalidError, match="observe"):
-        laser.spawn_agent("refused-dedup", "agent.commands", handle, dedup=object())
+        laser.spawn_agent("refused-dedup", "agent.sessions", handle, dedup=object())
     with pytest.raises(ls.InvalidError, match="consolidate"):
         laser.spawn_agent(
             "refused-consolidator",
-            "agent.commands",
+            "agent.sessions",
             handle,
             consolidate_every_ms=10,
             consolidator=object(),

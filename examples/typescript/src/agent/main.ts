@@ -6,27 +6,27 @@ import {
   routeToCapable,
   type Laser
 } from "@laserdata/laser-sdk"
-import { PARTITIONS, decodeUtf8, phase, runExample, utf8 } from "../common.js"
+import { decodeUtf8, PARTITIONS, phase, runExample, SESSION_RETENTION, utf8 } from "../common.js"
 
 export const EXAMPLE = "agent"
 const CAPABILITY = "resolve-ticket"
 const DEADLINE_MS = 60_000
-const fixedCommands = { kind: "fixed" as const, topic: AgentTopic.Commands }
+const fixedCommands = { kind: "fixed" as const, topic: AgentTopic.Sessions }
 
 /** How the contract ended and the reply text when it completed. */
 export async function run(
   laser: Laser,
   _signal: AbortSignal
 ): Promise<{ readonly kind: string; readonly reply?: string }> {
-  // The well-known agent topics (commands, responses, registry, ...) must exist
+  // The agent topics (the shared session topic and its satellites) must exist
   // before an agent's consumer group joins one.
-  await laser.bootstrap(PARTITIONS)
+  await laser.bootstrap(PARTITIONS, SESSION_RETENTION)
 
   phase("spawn a handler, then hand it a deadline-bounded task")
   await using triage = Agent.builder()
     .id(AgentId.new("triage"))
-    .listenOn(AgentTopic.Commands)
-    .respondOn(AgentTopic.Responses)
+    .listenOn(AgentTopic.Sessions)
+    .respondOn(AgentTopic.Sessions)
     // The advertised capability is what makes this agent addressable by what it
     // can do rather than by the name it happens to run under.
     .capabilities([{ skillId: CAPABILITY }])

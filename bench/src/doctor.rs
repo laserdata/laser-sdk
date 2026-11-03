@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::BenchError;
 use crate::host::HostSnapshot;
 use crate::manifest::{ProvisionMode, SuiteManifest, Transport};
-use crate::process::{ComposeServices, NativeIggy, NativePlane};
+use crate::process::{ComposeServices, NativeBackend, NativeIggy};
 use crate::provision::ResolvedStack;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -123,7 +123,7 @@ pub fn inspect(manifest: &SuiteManifest) -> Result<DoctorReport, BenchError> {
         ));
     }
     let uds_bind_available = uds_probe()?;
-    if manifest.requires_plane() && !uds_bind_available {
+    if manifest.requires_backend() && !uds_bind_available {
         return Err(BenchError::Invalid(
             "managed benchmark host cannot bind a Unix socket".to_owned(),
         ));
@@ -137,7 +137,7 @@ pub fn inspect(manifest: &SuiteManifest) -> Result<DoctorReport, BenchError> {
     }
     let host = HostSnapshot::capture(Path::new("."))?;
     if let Some(requirements) = manifest.environment.host.as_ref() {
-        requirements.validate(&host, manifest.requires_plane())?;
+        requirements.validate(&host, manifest.requires_backend())?;
     }
     Ok(DoctorReport {
         tcp_vsr_only,
@@ -240,17 +240,17 @@ pub async fn inspect_live(
             .compose_file
             .as_deref()
             .ok_or_else(|| BenchError::Invalid("Compose mode requires compose_file".to_owned()))?;
-        let (compose, server, plane) = ComposeServices::start(
+        let (compose, server, backend) = ComposeServices::start(
             compose_file,
             directory,
-            manifest.requires_plane(),
-            manifest.environment.plane_profile,
+            manifest.requires_backend(),
+            manifest.environment.backend_profile,
         )?;
         let probe = server.probe_vsr().await;
         report.live_vsr = Some(probe.is_ok());
         drop(probe);
-        if let Some(plane) = plane {
-            plane.shutdown().await?;
+        if let Some(backend) = backend {
+            backend.shutdown().await?;
         }
         server.shutdown().await?;
         compose.shutdown()?;
@@ -262,22 +262,25 @@ pub async fn inspect_live(
     let server_manifest = stack.iggy_server.as_ref().ok_or_else(|| {
         BenchError::Invalid("live VSR doctor requires a native Iggy server".to_owned())
     })?;
-    let plane_socket = stack.plane.as_ref().map(|_| directory.join("plane.sock"));
+    let backend_socket = stack
+        .backend
+        .as_ref()
+        .map(|_| directory.join("backend.sock"));
     let server = NativeIggy::start(
         server_manifest,
         directory,
-        plane_socket.as_deref(),
+        backend_socket.as_deref(),
         &manifest.environment,
     )
     .await?;
-    let mut plane = if let Some(plane_manifest) = &stack.plane {
+    let mut backend = if let Some(backend_manifest) = &stack.backend {
         Some(
-            NativePlane::start(
-                plane_manifest,
+            NativeBackend::start(
+                backend_manifest,
                 directory,
                 &server,
-                plane_socket.clone().ok_or_else(|| {
-                    BenchError::Invalid("managed doctor requires a plane socket".to_owned())
+                backend_socket.clone().ok_or_else(|| {
+                    BenchError::Invalid("managed doctor requires a backend socket".to_owned())
                 })?,
                 &manifest.environment,
             )
@@ -289,11 +292,11 @@ pub async fn inspect_live(
     let probe = server.probe_vsr().await;
     report.live_vsr = Some(probe.is_ok());
     drop(probe);
-    if let Some(plane) = plane.as_mut() {
-        plane.wait_ready(Duration::from_secs(30)).await?;
+    if let Some(backend) = backend.as_mut() {
+        backend.wait_ready(Duration::from_secs(30)).await?;
     }
-    if let Some(plane) = plane {
-        plane.shutdown().await?;
+    if let Some(backend) = backend {
+        backend.shutdown().await?;
     }
     server.shutdown().await?;
     if report.live_vsr != Some(true) {

@@ -11,7 +11,6 @@
 // is just a `Future`, with no executor dependency, so it still compiles for
 // `wasm32-unknown-unknown`.
 
-use crate::agent_workflow::{AgentRunInfo, AgentSubmit};
 use crate::authz::{Role, WhoamiReply};
 use crate::browse::{ProjectionInfo, SchemaInfo};
 use crate::checkpoint::CheckpointReadConsistency;
@@ -30,16 +29,18 @@ use crate::http::{
     DestinationListQuery, DestinationMutationBody, DestinationPageView, DestinationView, ErrorBody,
     FilterBindingListQuery, FilterListQuery, FilterRevisionListQuery, FilterTestBody,
     ForkCreateBody, ForkPutBody, GraphNeighborsQuery, GraphResultView, KvCasQuery, KvPageView,
-    KvPutQuery, KvScanQuery, ProjectionListQuery, PromotedView, QueryExecutionView, QueryPageBody,
-    QueryRouteListQuery, QueryRoutePageView, RemoveBindingBody, RunPageView, RunsQuery,
-    SchemaListQuery, SnapshotListQuery, SnapshotPageView, TableFileListQuery, TableFilePageView,
-    TableMetricsView, TableSchemaView, TableSnapshotView, TableView,
+    KvPutQuery, KvScanQuery, OperationQuery, ProjectionListQuery, PromotedView, QueryExecutionView,
+    QueryPageBody, QueryRouteListQuery, QueryRoutePageView, RemoveBindingBody, SchemaListQuery,
+    SessionChangesQuery, SessionEventsQuery, SessionLinksQuery, SessionStateQuery, SessionsQuery,
+    SnapshotListQuery, SnapshotPageView, TableFileListQuery, TableFilePageView, TableMetricsView,
+    TableSchemaView, TableSnapshotView, TableView,
 };
 use crate::kv::{CasExpect, KvNamespaceInfo};
 use crate::query::{Query, QueryResult};
 use crate::result::ResultCode;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::num::NonZeroU128;
 
 /// The HTTP verb a [`Transport`] must perform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
@@ -155,6 +156,9 @@ pub enum ClientError<E> {
     Decode(String),
     /// The server returned a non-2xx status with a classified [`ErrorBody`].
     Api(ErrorBody),
+    /// A non-2xx reply without an [`ErrorBody`], such as a gateway's plain-text 502 or 504.
+    /// `body` carries the code derived from the status and the reply text.
+    Status { status: u16, body: ErrorBody },
 }
 
 impl<E: core::fmt::Display> core::fmt::Display for ClientError<E> {
@@ -163,6 +167,13 @@ impl<E: core::fmt::Display> core::fmt::Display for ClientError<E> {
             ClientError::Transport(error) => write!(f, "transport error: {error}"),
             ClientError::Decode(detail) => write!(f, "decode error: {detail}"),
             ClientError::Api(body) => write!(f, "api error ({:?}): {}", body.code, body.message),
+            ClientError::Status { status, body } => {
+                write!(
+                    f,
+                    "http status {status} ({:?}): {}",
+                    body.code, body.message
+                )
+            }
         }
     }
 }
@@ -170,12 +181,12 @@ impl<E: core::fmt::Display> core::fmt::Display for ClientError<E> {
 impl<E: core::fmt::Display + core::fmt::Debug> std::error::Error for ClientError<E> {}
 
 impl<E> ClientError<E> {
-    /// The classified [`ResultCode`] for an [`ClientError::Api`], so a caller
-    /// branches on the kind (`NotFound`, `Conflict`, ...) without matching the
+    /// The classified [`ResultCode`] for an [`ClientError::Api`] or [`ClientError::Status`],
+    /// so a caller branches on the kind (`NotFound`, `Conflict`, ...) without matching the
     /// message text. `None` for a transport or decode failure.
     pub fn code(&self) -> Option<ResultCode> {
         match self {
-            ClientError::Api(body) => Some(body.code),
+            ClientError::Api(body) | ClientError::Status { body, .. } => Some(body.code),
             _ => None,
         }
     }
@@ -417,17 +428,21 @@ impl<T: Transport> HttpClient<T> {
         self.get(with_query(http::SCHEMAS_PATH, filter)?).await
     }
 
-    /// `POST /agdx/schemas`: register a schema, get its allocated id.
+    /// `POST /agdx/schemas`: register a schema, get its allocated id. `stream`
+    /// names the stream whose registry allocates it, `None` the
+    /// deployment-wide registry.
     pub async fn register_schema(
         &self,
         source: SchemaSource,
         name: Option<String>,
         version: Option<u32>,
+        stream: Option<String>,
     ) -> ClientResult<u32, T::Error> {
         let body = http::RegisterSchemaBody {
             source,
             name,
             version,
+            stream,
         };
         self.send_json(Method::Post, http::SCHEMAS_PATH.to_owned(), &body)
             .await
@@ -469,10 +484,38 @@ impl<T: Transport> HttpClient<T> {
         value: &[u8],
         expires_at_micros: Option<u64>,
     ) -> ClientResult<(), T::Error> {
+        self.kv_set_with(namespace, key, value, expires_at_micros, None)
+            .await
+    }
+
+    /// [`kv_set`](Self::kv_set) under the caller's `operation_id`. Re-send a
+    /// write whose outcome is unknown with the same id: the server answers the
+    /// recorded outcome instead of writing again.
+    pub async fn kv_set_as(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        expires_at_micros: Option<u64>,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        self.kv_set_with(namespace, key, value, expires_at_micros, Some(operation_id))
+            .await
+    }
+
+    async fn kv_set_with(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        expires_at_micros: Option<u64>,
+        operation_id: Option<NonZeroU128>,
+    ) -> ClientResult<(), T::Error> {
         let path = with_query(
             &http::kv_entry_path(namespace, &base64url_encode(key)),
             &KvPutQuery { expires_at_micros },
         )?;
+        let path = operation_route(path, operation_id)?;
         // The key is base64url in the path, but the value rides the raw request
         // body, so a large value carries no base64 inflation.
         self.expect_ok(Method::Put, path, Some(value.to_vec()))
@@ -494,6 +537,42 @@ impl<T: Transport> HttpClient<T> {
         expect: CasExpect,
         expires_at_micros: Option<u64>,
     ) -> ClientResult<u64, T::Error> {
+        self.kv_cas_with(namespace, key, value, expect, expires_at_micros, None)
+            .await
+    }
+
+    /// [`kv_cas`](Self::kv_cas) under the caller's `operation_id`. A re-send
+    /// with the same id answers the recorded commit instead of a conflict
+    /// against the version the first attempt wrote.
+    pub async fn kv_cas_as(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        expect: CasExpect,
+        expires_at_micros: Option<u64>,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<u64, T::Error> {
+        self.kv_cas_with(
+            namespace,
+            key,
+            value,
+            expect,
+            expires_at_micros,
+            Some(operation_id),
+        )
+        .await
+    }
+
+    async fn kv_cas_with(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        expect: CasExpect,
+        expires_at_micros: Option<u64>,
+        operation_id: Option<NonZeroU128>,
+    ) -> ClientResult<u64, T::Error> {
         let (expect_version, expect_absent) = match expect {
             CasExpect::Match(version) => (Some(version), None),
             CasExpect::Absent => (None, Some(true)),
@@ -506,6 +585,7 @@ impl<T: Transport> HttpClient<T> {
                 expires_at_micros,
             },
         )?;
+        let path = operation_route(path, operation_id)?;
         // The value rides the raw body like the plain PUT.
         let response = self
             .dispatch(Method::Put, path, Some(value.to_vec()))
@@ -518,6 +598,18 @@ impl<T: Transport> HttpClient<T> {
     pub async fn kv_delete(&self, namespace: &str, key: &[u8]) -> ClientResult<bool, T::Error> {
         let path = http::kv_entry_path(namespace, &base64url_encode(key));
         self.send_empty(Method::Delete, path).await
+    }
+
+    /// [`kv_delete`](Self::kv_delete) under the caller's `operation_id`.
+    pub async fn kv_delete_as(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        operation_id: NonZeroU128,
+    ) -> ClientResult<bool, T::Error> {
+        let path = http::kv_entry_path(namespace, &base64url_encode(key));
+        self.send_empty(Method::Delete, with_operation(&path, operation_id)?)
+            .await
     }
 
     /// `GET /agdx/kv/{namespace}`: scan a page of entries.
@@ -536,6 +628,20 @@ impl<T: Transport> HttpClient<T> {
             .await
     }
 
+    /// [`create_fork`](Self::create_fork) under the caller's `operation_id`.
+    pub async fn create_fork_as(
+        &self,
+        body: &ForkCreateBody,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<ForkInfo, T::Error> {
+        self.send_json(
+            Method::Post,
+            with_operation(http::FORKS_PATH, operation_id)?,
+            body,
+        )
+        .await
+    }
+
     /// `GET /agdx/forks`: list the caller's forks.
     pub async fn list_forks(&self) -> ClientResult<Vec<ForkInfo>, T::Error> {
         self.get(http::FORKS_PATH.to_owned()).await
@@ -551,28 +657,80 @@ impl<T: Transport> HttpClient<T> {
         self.get(with_query(http::CLIENTS_PATH, query)?).await
     }
 
-    /// `POST /agdx/runs`: submit a task to an agent or workflow, returning the
-    /// minted (or converged) run.
-    pub async fn submit_run(&self, body: &AgentSubmit) -> ClientResult<AgentRunInfo, T::Error> {
-        self.send_json(Method::Post, http::RUNS_PATH.to_owned(), body)
+    /// `GET /agdx/sessions/{stream}`: one page of the stream's sessions,
+    /// filtered and paged per `query`.
+    pub async fn list_sessions(
+        &self,
+        stream: &str,
+        query: &SessionsQuery,
+    ) -> ClientResult<crate::session::SessionPage, T::Error> {
+        self.get(with_query(&http::sessions_path(stream), query)?)
             .await
     }
 
-    /// `GET /agdx/runs/{id}`: read one run's status, or `None` on a 404.
-    pub async fn run_status(&self, id: &str) -> ClientResult<Option<AgentRunInfo>, T::Error> {
-        self.get_optional(http::run_path(id)).await
+    /// `GET /agdx/sessions/{stream}/{id}`: one session's summary, or `None` on
+    /// a 404.
+    pub async fn session(
+        &self,
+        stream: &str,
+        id: crate::agent::ConversationId,
+    ) -> ClientResult<Option<crate::session::SessionInfo>, T::Error> {
+        self.get_optional(http::session_path(stream, id)).await
     }
 
-    /// `GET /agdx/runs`: one page of runs, filtered and paged per `query`.
-    /// Follow `cursor` as the next request's cursor to page.
-    pub async fn list_runs(&self, query: &RunsQuery) -> ClientResult<RunPageView, T::Error> {
-        self.get(with_query(http::RUNS_PATH, query)?).await
+    /// `GET /agdx/sessions/{stream}/{id}/events`: one page of a session's
+    /// events.
+    pub async fn session_events(
+        &self,
+        stream: &str,
+        id: crate::agent::ConversationId,
+        query: &SessionEventsQuery,
+    ) -> ClientResult<crate::session::SessionEventsPage, T::Error> {
+        self.get(with_query(&http::session_events_path(stream, id), query)?)
+            .await
     }
 
-    /// `POST /agdx/runs/{id}/cancel`: record the cancel intent, returning the
-    /// run (the engine observes the intent at its next step boundary).
-    pub async fn cancel_run(&self, id: &str) -> ClientResult<AgentRunInfo, T::Error> {
-        self.send_empty(Method::Post, http::run_cancel_path(id))
+    /// `GET /agdx/sessions/{stream}/{id}/state`: a session's state document.
+    pub async fn session_state(
+        &self,
+        stream: &str,
+        id: crate::agent::ConversationId,
+        query: &SessionStateQuery,
+    ) -> ClientResult<crate::session::SessionStateView, T::Error> {
+        self.get(with_query(&http::session_state_path(stream, id), query)?)
+            .await
+    }
+
+    /// `GET /agdx/sessions/{stream}/{id}/links`: the resources a session
+    /// wrote, recalled, or touched.
+    pub async fn session_links(
+        &self,
+        stream: &str,
+        id: crate::agent::ConversationId,
+        query: &SessionLinksQuery,
+    ) -> ClientResult<crate::session::SessionLinksView, T::Error> {
+        self.get(with_query(&http::session_links_path(stream, id), query)?)
+            .await
+    }
+
+    /// `GET /agdx/sessions/{stream}/{id}/sources`: the source partitions that
+    /// hold a session's records.
+    pub async fn session_sources(
+        &self,
+        stream: &str,
+        id: crate::agent::ConversationId,
+    ) -> ClientResult<crate::session::SessionSources, T::Error> {
+        self.get(http::session_sources_path(stream, id)).await
+    }
+
+    /// `GET /agdx/sessions/{stream}/changes`: the stream's change rows after
+    /// `query.after`.
+    pub async fn session_changes(
+        &self,
+        stream: &str,
+        query: &SessionChangesQuery,
+    ) -> ClientResult<crate::session::SessionChanges, T::Error> {
+        self.get(with_query(&http::session_changes_path(stream), query)?)
             .await
     }
 
@@ -589,16 +747,50 @@ impl<T: Transport> HttpClient<T> {
             .await
     }
 
+    /// [`register_projection`](Self::register_projection) under the caller's
+    /// `operation_id`. A control write whose outcome is unknown (`Pending`) is
+    /// safe to re-send with the same id: the managed backend applies it once.
+    pub async fn register_projection_as(
+        &self,
+        projection: &Projection,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(http::PROJECTIONS_PATH, operation_id)?;
+        self.send_json_ok(Method::Post, path, projection).await
+    }
+
     /// `DELETE /agdx/projections/{id}`: drop a projection.
     pub async fn drop_projection(&self, id: &str) -> ClientResult<(), T::Error> {
         self.expect_ok(Method::Delete, http::projection_path(id), None)
             .await
     }
 
+    /// [`drop_projection`](Self::drop_projection) under the caller's
+    /// `operation_id`.
+    pub async fn drop_projection_as(
+        &self,
+        id: &str,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(&http::projection_path(id), operation_id)?;
+        self.expect_ok(Method::Delete, path, None).await
+    }
+
     /// `POST /agdx/bindings`: apply (add or update) a binding.
     pub async fn apply_binding(&self, binding: &ProjectionBinding) -> ClientResult<(), T::Error> {
         self.send_json_ok(Method::Post, http::BINDINGS_PATH.to_owned(), binding)
             .await
+    }
+
+    /// [`apply_binding`](Self::apply_binding) under the caller's
+    /// `operation_id`.
+    pub async fn apply_binding_as(
+        &self,
+        binding: &ProjectionBinding,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(http::BINDINGS_PATH, operation_id)?;
+        self.send_json_ok(Method::Post, path, binding).await
     }
 
     /// `DELETE /agdx/bindings`: remove a binding for a source, or one projection
@@ -617,29 +809,76 @@ impl<T: Transport> HttpClient<T> {
             .await
     }
 
-    /// `GET /agdx/schemas/{id}`: read one writer schema, or `None` on a 404.
-    pub async fn get_schema(&self, id: u32) -> ClientResult<Option<SchemaInfo>, T::Error> {
-        self.get_optional(http::schema_path(id)).await
+    /// [`remove_binding`](Self::remove_binding) under the caller's
+    /// `operation_id`.
+    pub async fn remove_binding_as(
+        &self,
+        source: &SourceSelector,
+        projection_ref: Option<String>,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let body = RemoveBindingBody {
+            stream: source.stream.clone(),
+            topic: source.topic.clone(),
+            projection_ref,
+        };
+        let path = with_operation(http::BINDINGS_PATH, operation_id)?;
+        self.send_json_ok(Method::Delete, path, &body).await
     }
 
-    /// `DELETE /agdx/schemas/{id}`: drop (tombstone) a schema.
-    pub async fn drop_schema(&self, id: u32) -> ClientResult<(), T::Error> {
-        self.expect_ok(Method::Delete, http::schema_path(id), None)
+    /// `GET /agdx/schemas/{id}`: read one writer schema, or `None` on a 404.
+    /// `stream` names the stream whose registry holds the id, `None` the
+    /// deployment-wide registry.
+    pub async fn get_schema(
+        &self,
+        id: u32,
+        stream: Option<&str>,
+    ) -> ClientResult<Option<SchemaInfo>, T::Error> {
+        self.get_optional(schema_route(http::schema_path(id), stream)?)
+            .await
+    }
+
+    /// `DELETE /agdx/schemas/{id}`: drop (tombstone) a schema. `stream` names
+    /// the stream whose registry holds the id.
+    pub async fn drop_schema(&self, id: u32, stream: Option<&str>) -> ClientResult<(), T::Error> {
+        self.expect_ok(
+            Method::Delete,
+            schema_route(http::schema_path(id), stream)?,
+            None,
+        )
+        .await
+    }
+
+    /// [`drop_schema`](Self::drop_schema) under the caller's `operation_id`.
+    pub async fn drop_schema_as(
+        &self,
+        id: u32,
+        stream: Option<&str>,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = schema_route(http::schema_path(id), stream)?;
+        self.expect_ok(Method::Delete, with_operation(&path, operation_id)?, None)
             .await
     }
 
     /// `POST /agdx/schemas/{id}/decode`: decode a record body under the schema,
     /// returning its JSON form, or `None` when the body does not decode under it.
+    /// `stream` names the stream whose registry holds the id.
     pub async fn decode_record(
         &self,
         id: u32,
         payload: &[u8],
+        stream: Option<&str>,
     ) -> ClientResult<Option<serde_json::Value>, T::Error> {
         let body = DecodeRecordBody {
             payload: base64url_encode(payload),
         };
-        self.send_json(Method::Post, http::schema_decode_path(id), &body)
-            .await
+        self.send_json(
+            Method::Post,
+            schema_route(http::schema_decode_path(id), stream)?,
+            &body,
+        )
+        .await
     }
 
     /// `GET /agdx/filters`: list saved consumer filters, newest first.
@@ -774,6 +1013,21 @@ impl<T: Transport> HttpClient<T> {
         Ok(view.deleted)
     }
 
+    /// [`kv_delete_many`](Self::kv_delete_many) under the caller's
+    /// `operation_id`.
+    pub async fn kv_delete_many_as(
+        &self,
+        namespace: &str,
+        filter: &KvScanQuery,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<usize, T::Error> {
+        let path = with_query(&http::kv_namespace_path(namespace), filter)?;
+        let view: DeletedManyView = self
+            .send_empty(Method::Delete, with_operation(&path, operation_id)?)
+            .await?;
+        Ok(view.deleted)
+    }
+
     /// `POST /agdx/forks/{id}/promote`: promote a fork's rows onto the trunk.
     /// Returns the number of rows applied.
     pub async fn promote_fork(&self, id: &str) -> ClientResult<usize, T::Error> {
@@ -783,16 +1037,48 @@ impl<T: Transport> HttpClient<T> {
         Ok(view.rows)
     }
 
+    /// [`promote_fork`](Self::promote_fork) under the caller's `operation_id`.
+    pub async fn promote_fork_as(
+        &self,
+        id: &str,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<usize, T::Error> {
+        let path = with_operation(&http::fork_promote_path(id), operation_id)?;
+        let view: PromotedView = self.send_empty(Method::Post, path).await?;
+        Ok(view.rows)
+    }
+
     /// `DELETE /agdx/forks/{id}`: squash (discard) a fork.
     pub async fn delete_fork(&self, id: &str) -> ClientResult<(), T::Error> {
         self.expect_ok(Method::Delete, http::fork_path(id), None)
             .await
     }
 
+    /// [`delete_fork`](Self::delete_fork) under the caller's `operation_id`.
+    pub async fn delete_fork_as(
+        &self,
+        id: &str,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(&http::fork_path(id), operation_id)?;
+        self.expect_ok(Method::Delete, path, None).await
+    }
+
     /// `PUT /agdx/forks/{id}/rows`: write one speculative row into a fork.
     pub async fn put_fork_row(&self, id: &str, body: &ForkPutBody) -> ClientResult<(), T::Error> {
         self.send_json_ok(Method::Put, http::fork_rows_path(id), body)
             .await
+    }
+
+    /// [`put_fork_row`](Self::put_fork_row) under the caller's `operation_id`.
+    pub async fn put_fork_row_as(
+        &self,
+        id: &str,
+        body: &ForkPutBody,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(&http::fork_rows_path(id), operation_id)?;
+        self.send_json_ok(Method::Put, path, body).await
     }
 
     /// `POST /agdx/graph/{name}/query`: run a traversal over a named graph, get
@@ -839,6 +1125,17 @@ impl<T: Transport> HttpClient<T> {
             .await
     }
 
+    /// [`register_graph`](Self::register_graph) under the caller's
+    /// `operation_id`.
+    pub async fn register_graph_as(
+        &self,
+        projection: &Projection,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(http::GRAPHS_PATH, operation_id)?;
+        self.send_json_ok(Method::Post, path, projection).await
+    }
+
     /// `GET /agdx/graphs/{id}`: read one graph projection by id, or `None` when no
     /// graph projection has it.
     pub async fn get_graph(&self, id: &str) -> ClientResult<Option<ProjectionInfo>, T::Error> {
@@ -850,6 +1147,16 @@ impl<T: Transport> HttpClient<T> {
     pub async fn drop_graph(&self, id: &str) -> ClientResult<(), T::Error> {
         self.expect_ok(Method::Delete, http::graph_path(id), None)
             .await
+    }
+
+    /// [`drop_graph`](Self::drop_graph) under the caller's `operation_id`.
+    pub async fn drop_graph_as(
+        &self,
+        id: &str,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(&http::graph_path(id), operation_id)?;
+        self.expect_ok(Method::Delete, path, None).await
     }
 
     /// `GET /agdx/authz/whoami`: the caller's own bound roles and effective
@@ -974,19 +1281,45 @@ impl<T: Transport> HttpClient<T> {
 
 /// Append `?<urlencoded>` to a path when `params` serializes to a non-empty
 /// query string, else return the path unchanged.
+fn schema_route<E>(path: String, stream: Option<&str>) -> Result<String, ClientError<E>> {
+    with_query(
+        &path,
+        &http::SchemaQuery {
+            stream: stream.map(str::to_owned),
+        },
+    )
+}
+
+/// Append `params` to `path`, which may already carry a query string.
 fn with_query<E, P: Serialize>(path: &str, params: &P) -> Result<String, ClientError<E>> {
     let query = serde_urlencoded::to_string(params)
         .map_err(|error| ClientError::Decode(format!("query params: {error}")))?;
     if query.is_empty() {
         Ok(path.to_owned())
+    } else if path.contains('?') {
+        Ok(format!("{path}&{query}"))
     } else {
         Ok(format!("{path}?{query}"))
     }
 }
 
+fn with_operation<E>(path: &str, operation_id: NonZeroU128) -> Result<String, ClientError<E>> {
+    with_query(path, &OperationQuery::from(operation_id))
+}
+
+fn operation_route<E>(
+    path: String,
+    operation_id: Option<NonZeroU128>,
+) -> Result<String, ClientError<E>> {
+    match operation_id {
+        Some(operation_id) => with_operation(&path, operation_id),
+        None => Ok(path),
+    }
+}
+
 /// On a 2xx, decode the bare `Ok` payload, otherwise turn the body into a typed
-/// [`ClientError::Api`] (falling back to a synthetic body if the error body
-/// itself does not decode, so a malformed 500 still classifies).
+/// [`ClientError::Api`], or a [`ClientError::Status`] classified from the status
+/// when the error body itself does not decode.
 fn decode_ok<E, R: DeserializeOwned>(response: &HttpResponse) -> Result<R, ClientError<E>> {
     if (200..300).contains(&response.status) {
         serde_json::from_slice(&response.body)
@@ -1006,13 +1339,16 @@ fn check_status<E>(response: &HttpResponse) -> Result<(), ClientError<E>> {
 }
 
 fn api_error<E>(response: &HttpResponse) -> ClientError<E> {
-    let body = serde_json::from_slice::<ErrorBody>(&response.body).unwrap_or_else(|_| {
-        ErrorBody::new(
-            code_for_status(response.status),
-            String::from_utf8_lossy(&response.body).into_owned(),
-        )
-    });
-    ClientError::Api(body)
+    match serde_json::from_slice::<ErrorBody>(&response.body) {
+        Ok(body) => ClientError::Api(body),
+        Err(_) => ClientError::Status {
+            status: response.status,
+            body: ErrorBody::new(
+                code_for_status(response.status),
+                String::from_utf8_lossy(&response.body).into_owned(),
+            ),
+        },
+    }
 }
 
 /// A best-effort classification for an `ErrorBody`-less failure response,
@@ -1106,6 +1442,7 @@ pub fn base64url_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ConversationId;
 
     #[test]
     fn given_bytes_when_base64url_round_tripped_then_should_preserve_them() {
@@ -1181,6 +1518,21 @@ mod tests {
         type Error = std::convert::Infallible;
         async fn send(&self, _request: HttpRequest) -> Result<HttpResponse, Self::Error> {
             Ok(self.response.clone())
+        }
+    }
+
+    // Answers `202` with an empty body and keeps every request it was asked to
+    // send, so a test can read the exact path a method built.
+    #[derive(Default)]
+    struct RecordingTransport {
+        requests: std::cell::RefCell<Vec<HttpRequest>>,
+    }
+
+    impl Transport for RecordingTransport {
+        type Error = std::convert::Infallible;
+        async fn send(&self, request: HttpRequest) -> Result<HttpResponse, Self::Error> {
+            self.requests.borrow_mut().push(request);
+            Ok(HttpResponse::new(202, Vec::new()))
         }
     }
 
@@ -1352,5 +1704,137 @@ mod tests {
         let error = block_on(client.kv_cas("locks", b"job", b"steal", CasExpect::Absent, None))
             .expect_err("a precondition miss is an error");
         assert_eq!(error.code(), Some(ResultCode::Conflict));
+    }
+
+    #[test]
+    fn given_a_caller_operation_id_when_writing_the_registry_then_should_ride_the_query_string() {
+        let operation_id = NonZeroU128::new(42).expect("non-zero");
+        let client = HttpClient::new(RecordingTransport::default());
+        let projection = Projection::builder("reading.v1").build();
+        let source = SourceSelector::new("telemetry", "events");
+
+        block_on(client.register_projection_as(&projection, operation_id)).expect("register");
+        block_on(client.drop_projection_as("reading.v1", operation_id)).expect("drop");
+        block_on(client.remove_binding_as(&source, None, operation_id)).expect("remove");
+        block_on(client.drop_schema_as(7, Some("telemetry"), operation_id)).expect("drop schema");
+        block_on(client.drop_schema_as(7, None, operation_id)).expect("drop shared schema");
+        block_on(client.register_graph_as(&projection, operation_id)).expect("register graph");
+        block_on(client.drop_graph_as("topology.v1", operation_id)).expect("drop graph");
+
+        let paths: Vec<String> = client
+            .transport()
+            .requests
+            .borrow()
+            .iter()
+            .map(|request| request.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/agdx/projections?operation_id=42",
+                "/agdx/projections/reading.v1?operation_id=42",
+                "/agdx/bindings?operation_id=42",
+                "/agdx/schemas/7?stream=telemetry&operation_id=42",
+                "/agdx/schemas/7?operation_id=42",
+                "/agdx/graphs?operation_id=42",
+                "/agdx/graphs/topology.v1?operation_id=42",
+            ]
+        );
+    }
+
+    #[test]
+    fn given_a_caller_operation_id_when_writing_key_values_then_should_follow_the_other_parameters()
+    {
+        let operation_id = NonZeroU128::new(7).expect("non-zero");
+        let client = HttpClient::new(RecordingTransport::default());
+
+        let _ = block_on(client.kv_set_as("notes", b"k", b"v", Some(10), operation_id));
+        let _ =
+            block_on(client.kv_cas_as("notes", b"k", b"v", CasExpect::Absent, None, operation_id));
+        let _ = block_on(client.kv_delete_as("notes", b"k", operation_id));
+        let _ = block_on(client.delete_fork_as("f1", operation_id));
+
+        let requests = client.transport().requests.borrow();
+        assert_eq!(
+            requests[0].path,
+            "/agdx/kv/notes/aw?expires_at_micros=10&operation_id=7"
+        );
+        assert_eq!(
+            requests[1].path,
+            "/agdx/kv/notes/aw/cas?expect_absent=true&operation_id=7"
+        );
+        assert_eq!(requests[2].path, "/agdx/kv/notes/aw?operation_id=7");
+        assert_eq!(requests[3].path, "/agdx/forks/f1?operation_id=7");
+    }
+
+    #[test]
+    fn given_no_operation_id_when_writing_then_should_send_the_bare_path() {
+        let client = HttpClient::new(RecordingTransport::default());
+        block_on(client.drop_projection("reading.v1")).expect("drop");
+        block_on(client.drop_schema(7, Some("telemetry"))).expect("drop schema");
+        let requests = client.transport().requests.borrow();
+        assert_eq!(requests[0].path, "/agdx/projections/reading.v1");
+        assert_eq!(requests[1].path, "/agdx/schemas/7?stream=telemetry");
+    }
+
+    #[test]
+    fn given_a_plain_text_gateway_reply_when_read_then_should_keep_its_status() {
+        for (status, text) in [
+            (502, "bad gateway: upstream unreachable"),
+            (504, "gateway timeout: the request may still complete"),
+        ] {
+            let client = HttpClient::new(CannedTransport {
+                response: HttpResponse::new(status, text.as_bytes().to_vec()),
+            });
+            let error = block_on(client.list_sessions("agents", &SessionsQuery::default()))
+                .expect_err("a gateway failure is an error");
+            assert_eq!(error.code(), Some(ResultCode::Backend));
+            assert_eq!(
+                error.to_string(),
+                format!("http status {status} (Backend): {text}")
+            );
+            let ClientError::Status { status: kept, body } = error else {
+                panic!("a body that is not an ErrorBody is a status error: {error:?}");
+            };
+            assert_eq!(
+                (kept, body),
+                (status, ErrorBody::new(ResultCode::Backend, text))
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_typed_backend_error_with_status_502_when_read_then_should_stay_an_api_error() {
+        let typed = ErrorBody::new(ResultCode::Backend, "session backend error: store closed");
+        let client = HttpClient::new(CannedTransport {
+            response: HttpResponse::new(
+                502,
+                serde_json::to_vec(&typed).expect("error body encodes"),
+            ),
+        });
+        let error = block_on(client.list_sessions("agents", &SessionsQuery::default()))
+            .expect_err("a typed backend error is an error");
+        assert_eq!(error.code(), Some(ResultCode::Backend));
+        let ClientError::Api(body) = error else {
+            panic!("a decodable ErrorBody is an api error: {error:?}");
+        };
+        assert_eq!(body, typed);
+    }
+
+    #[test]
+    fn given_a_missing_session_when_read_then_should_be_none_for_any_404_body() {
+        let typed = ErrorBody::new(ResultCode::NotFound, "session not found");
+        for body in [
+            serde_json::to_vec(&typed).expect("error body encodes"),
+            b"not found".to_vec(),
+            Vec::new(),
+        ] {
+            let client = HttpClient::new(CannedTransport {
+                response: HttpResponse::new(404, body),
+            });
+            let session = block_on(client.session("agents", ConversationId::from_u128(2)))
+                .expect("a 404 maps to None");
+            assert_eq!(session, None);
+        }
     }
 }

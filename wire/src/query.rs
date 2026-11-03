@@ -92,7 +92,8 @@ pub struct Query {
     #[cfg_attr(feature = "builders", builder(into))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_type: Option<String>,
-    // (start, end) in epoch microseconds.
+    // (start, end) in epoch microseconds, both bounds inclusive: the managed backend
+    // keeps rows with `start <= ts <= end`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_range: Option<(u64, u64)>,
     // Predicate tree. `None` plus empty sugar is an unfiltered scan. Build
@@ -285,7 +286,7 @@ impl Validate for Query {
             && start >= end
         {
             return Err(InvalidError::new(
-                "query time range must be a nonempty half-open interval",
+                "query time range start must be before its end, and both bounds are inclusive",
             ));
         }
         for sort in &self.order {
@@ -1122,6 +1123,27 @@ pub struct QueryContext {
     pub scanned_bytes: u64,
     pub produced_bytes: u64,
     pub row_count: u64,
+    /// How far the store that served the query had applied each source
+    /// partition of the index. A reply from another node can sit at another
+    /// point of the same log, so a caller compares positions, not wall time.
+    /// Empty when the store reports no positions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frontier: Vec<QueryFrontier>,
+}
+
+/// One source partition's applied position in the store that served a query.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryFrontier {
+    pub stream: String,
+    pub topic: String,
+    pub partition_id: u32,
+    /// Creation time of the topic incarnation the rows come from, when the
+    /// serving node knows it. Offsets of different incarnations do not
+    /// compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic_created_at_micros: Option<u64>,
+    /// The last offset the store applied.
+    pub applied_offset: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1778,6 +1800,7 @@ mod serde_tests {
                 scanned_bytes: 128,
                 produced_bytes: 32,
                 row_count: 1,
+                frontier: Vec::new(),
             },
         }));
         let bytes = encode_named(&reply).expect("the reply serializes");

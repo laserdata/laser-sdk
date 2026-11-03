@@ -91,7 +91,7 @@ pub(crate) async fn execute_suite(manifest_path: &Path, output: &Path) -> Result
     execute_deterministic_gates(output)?;
     let host_before = HostSnapshot::capture(output)?;
     if let Some(requirements) = manifest.environment.host.as_ref() {
-        requirements.validate(&host_before, manifest.requires_plane())?;
+        requirements.validate(&host_before, manifest.requires_backend())?;
         pin_process(std::process::id(), &requirements.client_cpus)?;
     }
     write_json(
@@ -110,7 +110,7 @@ pub(crate) async fn execute_suite(manifest_path: &Path, output: &Path) -> Result
         ),
     );
     let stack = resolve_stack(&manifest, benchmark_root)?;
-    stack.verify(manifest.requires_plane())?;
+    stack.verify(manifest.requires_backend())?;
     announce_stack(&stack);
     write_json(
         &output.join("resolved-stack.json"),

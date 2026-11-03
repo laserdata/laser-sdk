@@ -1,9 +1,10 @@
-import type { LaserTransport } from "../iggy/apache-iggy.js"
+import type { LaserTransport, ManagedSendOptions } from "../iggy/apache-iggy.js"
 import { decodeOne } from "../wire/cbor.js"
 import type { ManagedCommand } from "../wire/commands.js"
 import { ResultCodeName } from "../wire/result.js"
 import {
   CheckpointExecutionError,
+  CommandExecutionError,
   FilterExecutionError,
   ForkExecutionError,
   GraphExecutionError,
@@ -68,7 +69,7 @@ export async function executeManaged<Request, Reply>(
   capabilities: Capabilities,
   command: ManagedCommand<Request, Reply>,
   request: Request,
-  options?: { readonly retryAfterReconnect?: boolean }
+  options?: ManagedSendOptions
 ): Promise<Reply> {
   requireManagedCommand(capabilities, command)
   command.validate?.(request)
@@ -117,14 +118,15 @@ function commandErrorOf(reply: Uint8Array): LaserError | undefined {
     unrecognized >= 0 &&
     unrecognized <= 0xffff
   ) {
-    return new ProtocolError(`Unrecognized(${String(unrecognized)}): ${message}`, {
-      resultCode: unrecognized
+    return new CommandExecutionError(message, {
+      code: { kind: "unrecognized", code: unrecognized },
+      message
     })
   }
   if (typeof wireCode !== "string") return undefined
   const name = RESULT_CODE_BY_WIRE_NAME.get(wireCode)
   if (name === undefined) return undefined
   if (name === "Unsupported") return new UnsupportedError(message, { surface: "managed" })
-  if (name === "InvalidArgument" || name === "VersionSkew") return new InvalidError(message)
-  return new ProtocolError(`${name}: ${message}`, { resultCode: ResultCodeName[name] })
+  if (name === "InvalidArgument") return new InvalidError(message)
+  return new CommandExecutionError(message, { code: { kind: "known", name }, message })
 }

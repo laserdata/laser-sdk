@@ -3,7 +3,7 @@ use laser_sdk::swarm::{AgentActivity, SwarmActivity};
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
-/// One agent's folded activity, so a supervisor answers "what has this agent
+/// One agent's folded activity, so a coordinator answers "what has this agent
 /// been doing" from evidence already read off the audit topic, without
 /// re-deriving counts by hand every time.
 #[gen_stub_pyclass]

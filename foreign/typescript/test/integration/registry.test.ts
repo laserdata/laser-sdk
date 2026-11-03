@@ -20,7 +20,7 @@ void test("given_a_cached_stream_when_deleted_and_recreated_then_should_discard_
     const registry = await laser.agentRegistry()
     await registry.refresh(0n)
     assert.equal(registry.isQuarantined(agent), true)
-    const oldHub = await laser[INTERNAL_REPLY_HUB](AgentTopic.Responses)
+    const oldHub = await laser[INTERNAL_REPLY_HUB](AgentTopic.Sessions)
     if (externallyDeleted) await laser.client.stream.delete({ streamId: streamName })
     assert.equal(await stream.delete(), !externallyDeleted)
     await stream.ensure()
@@ -29,7 +29,7 @@ void test("given_a_cached_stream_when_deleted_and_recreated_then_should_discard_
     await laser.quarantine(AgentId.new("operator"), agent)
     await fresh.refresh(0n)
     assert.equal(fresh.isQuarantined(agent), true)
-    assert.notEqual(await laser[INTERNAL_REPLY_HUB](AgentTopic.Responses), oldHub)
+    assert.notEqual(await laser[INTERNAL_REPLY_HUB](AgentTopic.Sessions), oldHub)
     await stream.delete()
   }
 })

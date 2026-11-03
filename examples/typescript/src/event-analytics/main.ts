@@ -14,6 +14,7 @@ import {
 } from "@laserdata/laser-sdk"
 import {
   batchSize,
+  exampleStream,
   indexFor,
   managedGate,
   messages,
@@ -160,11 +161,12 @@ async function registerProjection(
     inlinePayloadDefault
   }
   const binding: ProjectionBinding = {
-    source: { stream: laser.defaultStream ?? "", topic },
+    source: { stream: exampleStream(laser), topic },
     allowedProjections: [id],
     defaultProjection: id,
     index,
-    notify: true
+    notify: true,
+    skipRejected: false
   }
   await laser.projections().register(projection)
   await laser.bindings().apply(binding)
@@ -346,8 +348,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   if (capabilities.query.available) await registerProjection(laser, TOPIC, INDEX)
 
   await using live = await laser.topic(TOPIC).consumerGroup(LIVE_GROUP).consumer({
-    batchLength: 100,
-    pollIntervalMs: 5
+    batchLength: 100
   })
   const publishing = publishClickstream(laser, events)
   phase("hot path: a live reader tails the stream while the producer runs")

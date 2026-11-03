@@ -3,7 +3,7 @@ use laser_examples::{
 };
 use laser_sdk::prelude::full::*;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::info;
 
 // Agentic memory, three facets. An agent gets better with use, and this
@@ -151,7 +151,9 @@ async fn main() -> Result<(), LaserError> {
                 .send()
                 .await?;
         }
-        let durable_hits = durable.recall(conversation).limit(3).fetch().await?;
+        // The managed read view folds the memory topic asynchronously, so wait
+        // until it holds the new facts instead of reading it once.
+        let durable_hits = wait_for_recall(&durable, conversation, 3).await?;
         info!(
             "stored {} durable facts, recalled {} most-recent",
             KNOWLEDGE.len(),
@@ -190,7 +192,7 @@ async fn main() -> Result<(), LaserError> {
             .limit(3)
             .fetch()
             .await?;
-        let trail = session.fetch(vec![AgentTopic::Audit], 8).await?;
+        let trail = session.fetch(vec![AgentTopic::Audit], 8, None).await?;
         info!(
             "one scope recalled {} durable facts and read back {} of the conversation's messages",
             scoped_hits.len(),
@@ -509,6 +511,23 @@ fn scope(conversation: ConversationId) -> MemoryScope {
 }
 
 // Recall the top `limit` facts closest to `question`, returning (id, text, score).
+// Poll the managed read view until it returns `expected` items or the
+// deadline passes, then return what it holds.
+async fn wait_for_recall(
+    memory: &MemoryHandle,
+    conversation: ConversationId,
+    expected: usize,
+) -> Result<Vec<MemoryItem>, LaserError> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let hits = memory.recall(conversation).limit(expected).fetch().await?;
+        if hits.len() >= expected || Instant::now() >= deadline {
+            return Ok(hits);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn recall(
     memory: &VectorMemory<BagOfWords>,
     conversation: ConversationId,

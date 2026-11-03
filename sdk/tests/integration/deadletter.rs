@@ -40,7 +40,7 @@ async fn given_a_message_without_provenance_when_consumed_then_should_dead_lette
     // undecodable and dead-lettered first) and a collector drains the DLQ.
     let _agent_lifetime_1 = Agent::builder()
         .id("worker".parse().expect("worker is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Noop)
         .build()
         .spawn(laser.clone());
@@ -61,7 +61,7 @@ async fn given_a_message_without_provenance_when_consumed_then_should_dead_lette
             laser
                 .default_stream()
                 .expect("test laser has a default stream"),
-            "agent.commands",
+            "agent.sessions",
         )
         .expect("the producer builder should be created")
         .build();

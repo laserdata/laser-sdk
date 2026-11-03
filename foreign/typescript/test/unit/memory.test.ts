@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { CodecError, ConfigError } from "../../src/client/errors.js"
+import { CodecError, ConfigError, InvalidError } from "../../src/client/errors.js"
 import { INTERNAL_GOVERN } from "../../src/client/internals.js"
 import {
   AgentId,
@@ -80,6 +80,34 @@ void test("given_a_memory_topic_ttl_when_built_then_should_configure_microsecond
     partitions: 4,
     messageExpiryMicros: 86_400_000_000n
   })
+})
+
+void test("given_a_fractional_memory_topic_ttl_when_built_then_should_keep_it_to_the_microsecond", async () => {
+  const expiries: (bigint | undefined)[] = []
+  const laser = {
+    defaultStream: "laser-memory",
+    stream() {
+      return {
+        ensure: () => Promise.resolve(),
+        topic() {
+          return {
+            ensureWithExpiry(_partitions: number, messageExpiryMicros?: bigint) {
+              expiries.push(messageExpiryMicros)
+              return Promise.resolve()
+            }
+          }
+        }
+      }
+    }
+  } as unknown as Laser
+
+  await MemoryTopicBuilder.create(laser, "incidents").ttl(1.5).build()
+  await MemoryTopicBuilder.create(laser, "incidents").ttl(1.1).build()
+
+  assert.deepEqual(expiries, [1_500n, 1_100n])
+  assert.throws(() => MemoryTopicBuilder.create(laser, "incidents").ttl(0), InvalidError)
+  assert.throws(() => MemoryTopicBuilder.create(laser, "incidents").ttl(-1), InvalidError)
+  assert.throws(() => MemoryTopicBuilder.create(laser, "incidents").ttl(Number.NaN), InvalidError)
 })
 
 void test("given_a_memory_topic_without_expiry_when_built_then_should_ensure_a_topic_that_never_expires", async () => {
@@ -419,4 +447,22 @@ void test("given_a_memory_item_when_read_as_text_or_json_then_should_decode_its_
   const broken = { ...item, payload: Uint8Array.of(0xff) }
   assert.equal(memoryItemText(broken), "\ufffd")
   assert.throws(() => memoryItemJson(broken), CodecError)
+})
+
+void test("given_vector_memory_when_another_conversation_forgets_or_improves_then_should_keep_the_item", async () => {
+  const memory = new VectorMemory(new TokenEmbedder())
+  const owner = ConversationId.derive("owner")
+  const other = ConversationId.derive("other")
+  const id = await memory.append(
+    { conversation: owner },
+    MemoryId.new(),
+    MemoryKind.Fact,
+    encoder.encode("kept")
+  )
+  await memory.improve({ conversation: other }, { target: id, weight: 3 })
+  await memory.forget({ conversation: other }, id)
+  const kept = await memory.recall({}, {})
+  assert.deepEqual(bodies(kept), ["kept"])
+  await memory.forget({ conversation: owner }, id)
+  assert.deepEqual(await memory.recall({}, {}), [])
 })

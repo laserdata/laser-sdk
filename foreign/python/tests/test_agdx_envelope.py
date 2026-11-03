@@ -110,3 +110,10 @@ def test_given_a_presence_when_built_then_should_carry_the_inbox_and_validate():
     ls.validate_agent_presence(presence)
     with pytest.raises(ls.ValidateError):
         ls.validate_agent_presence(presence | {"inbox": "x" * 10_000})
+
+
+def test_given_an_idempotency_key_with_a_control_character_when_built_then_should_refuse_it():
+    with pytest.raises(ls.InvalidError, match="control character"):
+        ls.event_envelope(RECORD, CONVERSATION, "planner", b"{}", idempotency_key="order\n42")
+    envelope = ls.event_envelope(RECORD, CONVERSATION, "planner", b"{}", idempotency_key="order-42")
+    assert envelope["idempotency_key"] == "order-42"

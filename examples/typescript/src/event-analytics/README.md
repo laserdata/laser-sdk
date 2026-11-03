@@ -1,4 +1,4 @@
-# event-analytics - one clickstream, every read model
+# event-analytics: one clickstream, several read models
 
 This example publishes clickstream events and reads them through a live consumer and a replay cursor. Managed deployments also project the events for analytics and schema checks.
 

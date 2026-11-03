@@ -1,6 +1,8 @@
 import type { MessageWithHeaders, SendMessagesConfirmation } from "../iggy/apache-iggy.js"
 import type { CheckpointError } from "../wire/checkpoint.js"
 import type { FaultReason, FilterError, FilterGroupIdentity } from "../wire/filter.js"
+import type { SessionError as WireSessionError } from "../wire/session.js"
+import type { CommandError as WireCommandError } from "../wire/result.js"
 
 export type LaserErrorKind =
   | "config"
@@ -15,14 +17,15 @@ export type LaserErrorKind =
   | "codec"
   | "typed-decode"
   | "protocol"
+  | "command"
   | "transport"
   | "query"
   | "kv"
   | "fork"
   | "graph"
+  | "session"
   | "authz"
   | "filter"
-  | "agent-workflow"
   | "routing"
   | "presence-conflict"
   | "signature"
@@ -75,8 +78,8 @@ export class AmbiguousMutationError extends LaserError {
   }
 }
 
-/** An aborted wait, or a registered run whose cancel intent was observed at
- * a step boundary. `run` names that run. Not retryable on the same run. */
+/** An aborted wait, or a workflow run whose cancel request was observed at a
+ * step boundary. `run` names that run. Not retryable on the same run. */
 export class CancelledError extends LaserError {
   readonly run: string | undefined
 
@@ -241,6 +244,15 @@ export class ProtocolError extends LaserError {
   }
 }
 
+export class CommandExecutionError extends LaserError {
+  readonly detail: WireCommandError
+
+  constructor(message: string, detail: WireCommandError, options?: { cause?: unknown }) {
+    super(message, "command", options)
+    this.detail = detail
+  }
+}
+
 export class TransportError extends LaserError {
   /** Read through `isRetryable`, like the Rust `is_retryable`.
    * @internal */
@@ -295,6 +307,17 @@ export class GraphExecutionError extends LaserError {
     options?: { cause?: unknown }
   ) {
     super(message, "graph", options)
+  }
+}
+
+/** The deployment answered a session read with a typed failure. */
+export class SessionError extends LaserError {
+  constructor(
+    message: string,
+    readonly detail: WireSessionError,
+    options?: { cause?: unknown }
+  ) {
+    super(message, "session", options)
   }
 }
 
@@ -367,16 +390,6 @@ export class ConsumerGroupSetupError extends LaserError {
       "filter",
       { cause }
     )
-  }
-}
-
-export class AgentWorkflowExecutionError extends LaserError {
-  constructor(
-    message: string,
-    readonly detail: unknown,
-    options?: { cause?: unknown }
-  ) {
-    super(message, "agent-workflow", options)
   }
 }
 

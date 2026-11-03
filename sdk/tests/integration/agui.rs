@@ -10,23 +10,20 @@ use serde_json::json;
 async fn given_a_snapshot_and_deltas_when_reconstructed_then_should_replay_the_state() {
     let laser = harness::laser().await;
     let conversation = ConversationId::new();
-    let source = "ui".parse().expect("ui is a valid agent id");
+    let source = "ui"
+        .parse::<laser_sdk::types::AgentId>()
+        .expect("ui is a valid agent id");
 
     // Snapshot the initial shared state, then mutate it with an RFC 6902 delta -
     // both ride the log as `event`s, no SSE.
     laser
-        .publish_state_snapshot(
-            AgentTopic::Audit,
-            source,
-            conversation,
-            &json!({"count": 0, "items": []}),
-        )
+        .publish_state_snapshot(source, conversation, &json!({"count": 0, "items": []}))
         .await
         .expect("the snapshot publishes");
     laser
         .publish_state_delta(
-            AgentTopic::Audit,
-            "ui".parse().expect("ui is a valid agent id"),
+            "ui".parse::<laser_sdk::types::AgentId>()
+                .expect("ui is a valid agent id"),
             conversation,
             &json!([
                 {"op": "replace", "path": "/count", "value": 1},
@@ -41,7 +38,7 @@ async fn given_a_snapshot_and_deltas_when_reconstructed_then_should_replay_the_s
         let laser = laser.clone();
         async move {
             let state = laser
-                .reconstruct_state(conversation, AgentTopic::Audit)
+                .reconstruct_state(conversation)
                 .await
                 .expect("reconstruct succeeds");
             state.filter(|state| state["count"] == 1)
@@ -61,8 +58,10 @@ async fn given_a_chat_stream_when_rendered_then_should_produce_agui_text_events(
 
     let mut stream = laser
         .agdx(
-            AgentTopic::LlmIo,
-            "model".parse().expect("model is a valid agent id"),
+            AgentTopic::Sessions,
+            "model"
+                .parse::<laser_sdk::types::AgentId>()
+                .expect("model is a valid agent id"),
             WireConversationId::from(conversation),
         )
         .stream(correlation, OPERATION_CHAT);
@@ -73,7 +72,7 @@ async fn given_a_chat_stream_when_rendered_then_should_produce_agui_text_events(
         let laser = laser.clone();
         async move {
             let events = laser
-                .agui_events(conversation, AgentTopic::LlmIo)
+                .agui_events(conversation, AgentTopic::Sessions)
                 .await
                 .ok()?;
             (events.len() >= 2).then_some(events)
@@ -105,8 +104,10 @@ async fn given_a_tool_args_stream_when_rendered_then_should_produce_agui_tool_ca
 
     let mut stream = laser
         .agdx(
-            AgentTopic::ToolCalls,
-            "model".parse().expect("model is a valid agent id"),
+            AgentTopic::Sessions,
+            "model"
+                .parse::<laser_sdk::types::AgentId>()
+                .expect("model is a valid agent id"),
             WireConversationId::from(conversation),
         )
         .stream(correlation, OPERATION_TOOL_ARGS);
@@ -120,7 +121,7 @@ async fn given_a_tool_args_stream_when_rendered_then_should_produce_agui_tool_ca
         let laser = laser.clone();
         async move {
             let events = laser
-                .agui_events(conversation, AgentTopic::ToolCalls)
+                .agui_events(conversation, AgentTopic::Sessions)
                 .await
                 .ok()?;
             (events.len() >= 2).then_some(events)

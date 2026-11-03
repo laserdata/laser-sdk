@@ -15,7 +15,9 @@ void test("given_ported_header_keys_and_caps_when_compared_to_wire_src_headers_r
   assert.ok(rustNumeric.size > 0, `expected to parse numeric constants from ${HEADERS_RS}`)
   assert.ok(rustStrings.size > 0, `expected to parse string constants from ${HEADERS_RS}`)
 
-  const ported = Object.entries(headers)
+  const ported = Object.entries(headers).filter(
+    ([, value]) => typeof value === "string" || typeof value === "number"
+  )
   assert.ok(ported.length > 0, "expected headers.ts to export at least one constant")
 
   for (const [name, value] of ported) {

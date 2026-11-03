@@ -11,6 +11,7 @@ export const feature = {
   READ_YOUR_WRITES: 1n << 1n,
   STRONG_CONSISTENCY: 1n << 2n,
   KV_CAS_FENCED: 1n << 3n,
+  // Retired with the run registry. No server sets it and the bit is never reused.
   AGENT_WORKFLOW: 1n << 4n,
   KEYWORD_SEARCH: 1n << 5n,
   WATCH: 1n << 6n,
@@ -18,7 +19,12 @@ export const feature = {
   DESTINATIONS: 1n << 8n,
   KV_FENCED_LEASES: 1n << 9n,
   CONSUMER_FILTERS: 1n << 10n,
-  GROUP_POLICY_READS: 1n << 11n
+  GROUP_POLICY_READS: 1n << 11n,
+  SESSIONS: 1n << 12n,
+  // The managed backend runs in stream tenancy: every managed name is scoped
+  // to one stream, and the change feed and dead letters of each stream ride
+  // their own ops topics.
+  STREAM_TENANCY: 1n << 13n
 } as const
 
 export interface OpVersions {
@@ -174,13 +180,19 @@ export interface BackendAnnounce {
 export interface FilterAnnounce {
   readonly evaluatorVersion: number
   readonly codecs: readonly FilterCodec[]
+  /**
+   * Longest filtered wait the server holds, in milliseconds. Zero means it
+   * serves no filtered wait, so a reader paces idle rounds itself.
+   */
+  readonly maxWaitMs: number
 }
 
 /** What this build of the evaluator serves. */
 export function filterAnnounceServed(): FilterAnnounce {
   return {
     evaluatorVersion: FILTER_EVALUATOR_VERSION,
-    codecs: ["json", "headers_only", "avro", "protobuf", "cbor"]
+    codecs: ["json", "headers_only", "avro", "protobuf", "cbor"],
+    maxWaitMs: 0
   }
 }
 
@@ -534,6 +546,7 @@ export function encodeBackendAnnounce(value: BackendAnnounce): Uint8Array {
       ["evaluator_version", value.filters.evaluatorVersion]
     ])
     if (value.filters.codecs.length > 0) filters.set("codecs", [...value.filters.codecs])
+    if (value.filters.maxWaitMs !== 0) filters.set("max_wait_ms", value.filters.maxWaitMs)
     map.set("filters", filters)
   }
   return encodeNamed(map)
@@ -559,7 +572,8 @@ export function decodeBackendAnnounce(bytes: Uint8Array): BackendAnnounce {
             evaluatorVersion: field.requiredU32(filters, "evaluator_version", `${context}.filters`),
             codecs: field.optionalArray(filters, "codecs", `${context}.filters`, (item, index) =>
               decodeFilterCodec(item, `${context}.filters.codecs[${String(index)}]`)
-            )
+            ),
+            maxWaitMs: field.optionalU32(filters, "max_wait_ms", `${context}.filters`) ?? 0
           }
         })
   }

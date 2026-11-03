@@ -1,7 +1,7 @@
 use laser_wire::filter::{
-    ExecutionMode, FaultReason, FilteredPage, FilteredStart, SourceGeneration, StopReason,
+    AckContext, AppliedPolicy, FaultReason, FilteredPage, FilteredStart, SourceGeneration,
+    StopReason,
 };
-use laser_wire::schema::Digest32;
 use std::collections::{BTreeSet, VecDeque};
 use tokio::time::Instant;
 
@@ -20,18 +20,19 @@ pub(crate) struct PartitionProgress {
     retry_at: Option<Instant>,
     first_sequence: Option<u64>,
     settled_sequence: u64,
+    // The first offset no page examined yet, as the last page reported it.
+    wait_from: Option<u64>,
 }
 
 /// The offset a completed prefix of pages makes safe to store, with the
-/// history and the policy it was read under.
+/// group, the history and the partition owner it was read under.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AckTarget {
     pub(crate) group_id: Option<u64>,
     pub(crate) offset: u64,
     pub(crate) generation: SourceGeneration,
-    pub(crate) digest: Option<Digest32>,
-    pub(crate) mode: ExecutionMode,
-    pub(crate) policy_generation: u64,
+    pub(crate) ack_context: AckContext,
+    pub(crate) policy: AppliedPolicy,
 }
 
 /// Why a partition cannot be read past its current position.
@@ -59,6 +60,7 @@ impl PartitionProgress {
             retry_at: None,
             first_sequence: None,
             settled_sequence: 0,
+            wait_from: None,
         }
     }
 
@@ -79,6 +81,16 @@ impl PartitionProgress {
 
     pub(crate) const fn blocked(&self) -> Option<Blocked> {
         self.blocked
+    }
+
+    /// The offset a filtered wait holds this partition from: the first record
+    /// no page examined, else the start offset of an unread partition.
+    pub(crate) const fn wait_offset(&self) -> u64 {
+        match (self.wait_from, &self.original) {
+            (Some(offset), _) => offset,
+            (None, FilteredStart::Offset(offset)) => *offset,
+            (None, _) => 0,
+        }
     }
 
     /// Pages read but not yet fully handled.
@@ -110,6 +122,14 @@ impl PartitionProgress {
         self.retry_at = None;
         self.first_sequence.get_or_insert(sequence);
         self.start = page.next_start(&self.original);
+        // A page that examined nothing saw the head as its frontier, so the
+        // next record lands after it. A head of 0 may also be an empty
+        // partition, whose next record is 0.
+        self.wait_from = Some(match page.next_scan_offset {
+            Some(next) => next,
+            None if page.frontier == 0 => 0,
+            None => page.frontier.saturating_add(1),
+        });
         self.blocked = match (page.stop, page.fault) {
             (StopReason::Fault, Some(fault)) => Some(Blocked::Fault {
                 offset: fault.offset,
@@ -124,9 +144,8 @@ impl PartitionProgress {
             group_id: page.policy.group_id,
             offset,
             generation: page.generation,
-            digest: page.policy.digest.clone(),
-            mode: page.policy.mode,
-            policy_generation: page.policy.policy_generation,
+            ack_context: page.ack_context,
+            policy: page.policy.clone(),
         });
         let outstanding: BTreeSet<u64> = offsets.into_iter().collect();
         match self.pages.back_mut() {
@@ -235,7 +254,8 @@ impl PartitionProgress {
 mod tests {
     use super::*;
     use laser_wire::codes::FILTER_OP_VERSION;
-    use laser_wire::filter::{AppliedPolicy, Continuation, ReadMode, RecordFault};
+    use laser_wire::filter::{AppliedPolicy, Continuation, ExecutionMode, RecordFault};
+    use laser_wire::schema::Digest32;
 
     fn generation() -> SourceGeneration {
         SourceGeneration {
@@ -244,8 +264,7 @@ mod tests {
             topic_id: 2,
             topic_created_at_micros: 20,
             partition_id: 0,
-            partition_created_revision: 30,
-            purge_generation: 0,
+            partition_incarnation: 30,
         }
     }
 
@@ -262,7 +281,7 @@ mod tests {
                 policy_generation: 0,
             },
             generation: generation(),
-            read_mode: ReadMode::Primary,
+            ack_context: AckContext::default(),
             next_scan_offset,
             safe_ack_offset: next_scan_offset.and_then(|next| next.checked_sub(1)),
             frontier: 100,
@@ -337,6 +356,42 @@ mod tests {
     }
 
     #[test]
+    fn given_an_unread_partition_when_waiting_then_should_hold_from_its_start_offset() {
+        assert_eq!(
+            PartitionProgress::new(FilteredStart::Offset(7)).wait_offset(),
+            7
+        );
+        assert_eq!(PartitionProgress::new(FilteredStart::Next).wait_offset(), 0);
+    }
+
+    #[test]
+    fn given_a_scanned_page_when_waiting_then_should_hold_from_the_first_unexamined_record() {
+        let mut progress = PartitionProgress::new(FilteredStart::Next);
+        progress.record(1, &page(Some(42), StopReason::EndOfVisible), []);
+
+        assert_eq!(progress.wait_offset(), 42);
+    }
+
+    #[test]
+    fn given_a_page_that_examined_nothing_when_waiting_then_should_hold_past_the_head_it_saw() {
+        let mut progress = PartitionProgress::new(FilteredStart::Next);
+        let mut caught_up = page(None, StopReason::EndOfVisible);
+        caught_up.safe_ack_offset = None;
+        progress.record(1, &caught_up, []);
+        assert_eq!(progress.wait_offset(), 101);
+
+        let mut empty = page(None, StopReason::EndOfVisible);
+        empty.safe_ack_offset = None;
+        empty.frontier = 0;
+        progress.record(2, &empty, []);
+        assert_eq!(
+            progress.wait_offset(),
+            0,
+            "an empty partition and one holding only offset 0 share a head of 0"
+        );
+    }
+
+    #[test]
     fn given_a_page_that_examined_nothing_when_recorded_then_should_repeat_the_original_start() {
         let mut progress = PartitionProgress::new(FilteredStart::Next);
         let mut empty = page(None, StopReason::EndOfVisible);
@@ -363,7 +418,6 @@ mod tests {
                 next_scan_offset: 42,
                 generation: generation(),
                 digest: Some(Digest32::new([7; 32])),
-                read_mode: ReadMode::Primary,
                 mode: ExecutionMode::Filtered,
                 policy_generation: 0,
             })

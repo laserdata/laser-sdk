@@ -2,17 +2,21 @@ import type { Laser } from "./client/laser.js"
 import type { GraphHandle } from "./managed/graph.js"
 import {
   type Checkpoint,
+  Chain,
   ContextAssembler,
   contextCheckpoint,
   LastN,
   type ContextMessage,
-  type ContextPolicy
+  type ContextPolicy,
+  TokenBudget
 } from "./context.js"
 import { ConversationState, type ReplayBound } from "./conversation-state.js"
 import type { SnapshotStore } from "./snapshot.js"
 import type { BytesLike } from "./client/bytes.js"
 import type { ConversationId } from "./types/ids.js"
-import type { MemoryHandle } from "./memory/handle.js"
+import type { ProducerInfo, SourceRef } from "./wire/graph.js"
+import type { MemoryBackend, MemoryHandle } from "./memory/handle.js"
+import type { Embedder } from "./memory/types.js"
 import type {
   ConsolidateOptions,
   ConsolidationReport,
@@ -20,6 +24,8 @@ import type {
   MemoryId,
   MemoryItem
 } from "./memory/types.js"
+
+const DEFAULT_SEARCH_LIMIT = 50
 
 export class ContextScope {
   /** `laser` is the client this scope reads and writes through. */
@@ -37,8 +43,20 @@ export class ContextScope {
     return this.laser.sendAgent(topic, payload, { conversationId: this.conversation })
   }
 
-  fetch(topics: readonly string[], count: number): Promise<readonly ContextMessage[]> {
-    return this.fetchWith(topics, new LastN(count))
+  /** The newest `count` messages of this conversation on `topics`, then
+   * trimmed to `tokenBudget` estimated tokens when given, like Rust
+   * `Chain(LastN, TokenBudget)`. */
+  fetch(
+    topics: readonly string[],
+    count: number,
+    tokenBudget?: number
+  ): Promise<readonly ContextMessage[]> {
+    return this.fetchWith(
+      topics,
+      tokenBudget === undefined
+        ? new LastN(count)
+        : new Chain([new LastN(count), new TokenBudget(tokenBudget)])
+    )
   }
 
   fetchWith(topics: readonly string[], policy: ContextPolicy): Promise<readonly ContextMessage[]> {
@@ -50,8 +68,9 @@ export class ContextScope {
       .assemble(this.laser)
   }
 
-  async block(topics: readonly string[], count: number): Promise<string> {
-    const messages = await this.fetch(topics, count)
+  /** `fetch` rendered as one newline-joined text block. */
+  async block(topics: readonly string[], count: number, tokenBudget?: number): Promise<string> {
+    const messages = await this.fetch(topics, count, tokenBudget)
     return messages.map((message) => new TextDecoder().decode(message.payload)).join("\n")
   }
 
@@ -68,6 +87,15 @@ export class ContextScope {
         ? this.laser.memory(namespaceOrHandle)
         : namespaceOrHandle
     return ScopedMemory.create(handle, this.conversation)
+  }
+
+  /** `memory` on an explicit backend, like Rust `memory_with`. The vector
+   * backend needs `embedder`, and any other backend refuses one. */
+  memoryWith(namespace: string, backend: MemoryBackend, embedder?: Embedder): ScopedMemory {
+    return ScopedMemory.create(
+      this.laser.memoryWith(namespace, backend, embedder),
+      this.conversation
+    )
   }
 
   /** The knowledge graph `name`, reached from this scope so one conversation's
@@ -116,7 +144,9 @@ export class ScopedMemory {
    * scoped face does not narrow. */
   private constructor(
     readonly handle: MemoryHandle,
-    readonly conversation: ConversationId
+    readonly conversation: ConversationId,
+    private readonly originValue?: SourceRef,
+    private readonly producerValue?: ProducerInfo
   ) {}
 
   /** @internal */
@@ -125,18 +155,43 @@ export class ScopedMemory {
   }
 
   remember(payload: Uint8Array) {
-    return this.handle.remember(payload).scope(this.conversation)
+    const builder = this.handle.remember(payload).scope(this.conversation)
+    if (this.originValue !== undefined) builder.origin(this.originValue)
+    if (this.producerValue !== undefined) builder.producer(this.producerValue)
+    return builder
+  }
+
+  /** The origin stamped on every remembered item, if any. */
+  origin(): SourceRef | undefined {
+    return this.originValue
+  }
+
+  /** The producer stamped on every remembered item, if any. */
+  producer(): ProducerInfo | undefined {
+    return this.producerValue
+  }
+
+  /** This scope with `origin` and `producer` stamped on every remembered item. */
+  withLineage(origin?: SourceRef, producer?: ProducerInfo): ScopedMemory {
+    return new ScopedMemory(this.handle, this.conversation, origin, producer)
   }
 
   recall() {
     return this.handle.recall(this.conversation)
   }
 
-  /** Keyword recall for `query` within this conversation. Needs no embedder,
-   * so it works on the default log-backed memory. */
-  search(query: string, limit?: number): Promise<readonly MemoryItem[]> {
-    const recall = this.recall().keyword(query)
-    return (limit === undefined ? recall : recall.limit(limit)).fetch()
+  /** Keyword recall for `query` within this conversation, up to `limit`
+   * items (default 50). Needs no embedder, so it works on the default
+   * log-backed memory. `folded` folds the memory topic in process instead of
+   * reading the managed view. */
+  search(
+    query: string,
+    options: { readonly limit?: number; readonly folded?: boolean } = {}
+  ): Promise<readonly MemoryItem[]> {
+    const recall = this.recall()
+      .keyword(query)
+      .limit(options.limit ?? DEFAULT_SEARCH_LIMIT)
+    return (options.folded === true ? recall.folded() : recall).fetch()
   }
 
   /** This conversation's recalled items as one prompt-ready block, trimmed to
@@ -154,15 +209,15 @@ export class ScopedMemory {
     return this.handle.consolidate({ conversation: this.conversation }, maxItems, options)
   }
 
-  /** Forgets the item `id`. The item is addressed by id alone, so an item
-   * remembered in another conversation is forgotten too. The conversation
-   * only stamps the tombstone's provenance. */
+  /** Forgets the item `id` when it was remembered in this conversation. The
+   * tombstone carries the conversation, and both the log fold and the managed
+   * view leave an item of another conversation untouched. */
   forget(id: MemoryId): Promise<void> {
     return this.handle.forget({ conversation: this.conversation }, id)
   }
 
-  /** Records `feedback` on the item it targets, addressed by id alone like
-   * `forget`. The conversation only stamps the feedback record's provenance. */
+  /** Records `feedback` on the item it targets when that item was remembered
+   * in this conversation, scoped like `forget`. */
   improve(feedback: Feedback): Promise<MemoryId> {
     return this.handle.improve({ conversation: this.conversation }, feedback)
   }

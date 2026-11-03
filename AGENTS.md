@@ -24,7 +24,7 @@ These changes require explicit user authorization unless the current session alr
 
 - Changes to encoded data in `wire/src/` require coordinated updates. This includes codes, versions, header keys in `wire/src/headers.rs`, topics, fields, serde attributes, dictionaries, and limits. During the current pre-1.0 stage, authorized breaking changes do not require backward compatibility, and operation versions stay at 1. Update `wire/fixtures/`, all clients, consumers, examples, and specifications together.
 - Changing `ConversationId::derive` in `sdk/src/types/ids.rs` changes derived `SessionPolicy::PerUser` identities. Keep its version policy explicit through `DERIVE_VERSION`. `AgentId::wire_id` uses the agent name directly.
-- Renaming `AgentTopic` names (`sdk/src/provenance/topic.rs`) - repoints live topics.
+- Renaming `AgentTopic` names (`sdk/src/provenance/topic.rs`, backed by the `wire/src/topics.rs` constants) - repoints live topics.
 - Changing `Provenance::partition_key` (currently `conversation_id`) - breaks the per-conversation ordering guarantee.
 - Changing the public signatures of `Laser`, `AgentHandler`, `Agent`, `AgentConsumer::run`, or `AgentHandle` - these are the public API.
 - Preserve attribution fields such as `agent` and `root_conversation_id` when rebuilding `Provenance` through `spawn_subconversation` or `AgentCtx::reply_provenance`. Losing them breaks causal and cost attribution.
@@ -38,7 +38,7 @@ These changes require explicit user authorization unless the current session alr
 
 A `rust-v*` tag publishes both crates after the full gate. A `wire-v*` tag publishes only `laser-wire` after tests that need no server. This lets a changed contract publish before the matching server.
 
-`[wire-break]` in a pull request or push description skips only tests that need the published server artifact. Server-free tests still run. Update the pin in `scripts/resolve-test-iggy-server.sh` afterward and run the full pipeline. Rust, Python, and TypeScript package release tags always run their full pipelines. The wire-only tag remains server-free.
+`[wire-break]` in a pull request or push description marks a breaking wire change. `[skip-server]` marks a compatible change whose pinned server in `scripts/resolve-test-iggy-server.sh` is not published yet. Either one skips only tests that need the published server artifact. Server-free tests still run. Run the full pipeline on the unchanged revision after the pinned server is published. Rust, Python, and TypeScript package release tags always run their full pipelines. The wire-only tag remains server-free.
 
 GitHub Actions use readable upstream version tags. Never replace Action tags with commit hashes or add a workflow that enforces hashed Action references.
 
@@ -76,16 +76,28 @@ The wire crate must compile for `wasm32-unknown-unknown` with `cbor,codecs,fixtu
 ```
 wire/                   the laser-wire crate: the wire CONTRACT, data + pure functions only
   src/
-    codes.rs            managed command codes + per-surface op versions (incl. AGENT_OP_VERSION)
-    headers.rs          agdx.* / gen_ai.* header dictionaries + header caps (incl. agdx.av)
-    topics.rs           _agdx ops stream + topic names
-    limits.rs           page / KV / frame / agent-envelope / consumer-filter caps (MAX_FILTER_*, MAX_FILTERED_PAGE_*)
+    codes.rs            managed command codes + per-surface op versions (incl. AGENT_OP_VERSION and the
+                        session read band AGDX_SESSION_*_CODE, 1_000_710..=1_000_716. 1_000_700..=703
+                        belonged to the retired run registry and are never reused)
+    headers.rs          agdx.* / gen_ai.* header dictionaries + header caps (incl. agdx.av), the one
+                        RecordHeaders encoder both record families share, BROADCAST (`*`)
+    topics.rs           _agdx ops stream + topic names, the agent topic names AGENT_SESSIONS /
+                        AGENT_STREAMS / AGENT_HEARTBEATS / AGENT_CONTROL / AGENT_MEMORY / AGENT_DLQ /
+                        AGENT_AUDIT / AGENT_JOURNAL / AGENT_REGISTRY
+    limits.rs           page / KV / frame / agent-envelope / session / consumer-filter caps (MAX_FILTER_*,
+                        MAX_FILTERED_PAGE_*, MAX_SESSION_LABEL_BYTES, MAX_SESSION_TEXT_QUERY_BYTES,
+                        MAX_SESSION_CURSOR_BYTES, MAX_HEARTBEAT_SESSIONS, MAX_STATE_PATCH_OPS,
+                        MAX_STATE_DOCUMENT_BYTES, MAX_MANIFEST_FRAGMENTS) and the caller-chosen
+                        name caps (MAX_PROJECTION_ID_BYTES, MAX_PROJECTION_NAME_BYTES,
+                        MAX_INDEX_FIELD_BYTES, MAX_SCHEMA_NAME_BYTES, MAX_GRAPH_LABEL_BYTES,
+                        MAX_MEMORY_ID_BYTES)
     content.rs          ContentType + the agdx.ct u8 dictionary
-    hello.rs            HelloReply / OpVersions (AGDX_HELLO probe body, additive `agent` field + `features` capability bitset: feature::{KV_CAS,READ_YOUR_WRITES,STRONG_CONSISTENCY,KV_CAS_FENCED,AGENT_WORKFLOW,KEYWORD_SEARCH,WATCH,AUTHZ,DESTINATIONS,KV_FENCED_LEASES,CONSUMER_FILTERS,GROUP_POLICY_READS}) + BackendAnnounce (backend->streaming-server capability announce, AGDX_BACKEND_HELLO_CODE)
+    hello.rs            HelloReply / OpVersions (AGDX_HELLO probe body, additive `agent` field + `features` capability bitset: feature::{KV_CAS,READ_YOUR_WRITES,STRONG_CONSISTENCY,KV_CAS_FENCED,KEYWORD_SEARCH,WATCH,AUTHZ,DESTINATIONS,KV_FENCED_LEASES,CONSUMER_FILTERS,GROUP_POLICY_READS,SESSIONS}, AGENT_WORKFLOW = 1 << 4 retired and never set) + BackendAnnounce (backend->streaming-server capability announce, AGDX_BACKEND_HELLO_CODE)
     query.rs            query IR (incl. Consistency level) + QueryEnvelope/QueryReply/Row/QueryError (incl. Stale)
     result.rs           unified ResultCode space + HTTP status, From projections off every surface error
     browse.rs           registry browse requests + BrowseReply (incl. DecodeRecord)
-    control.rs          Projection / ProjectionBinding / SchemaDef / ControlEnvelope + builders
+    control.rs          Projection / ProjectionBinding / SchemaDef / ControlEnvelope + builders,
+                        RegisterSessionSource { stream, topics: SessionTopics } / RemoveSessionSource
     kv.rs               KV requests (incl. KvCas/CasExpect and the fenced-lease family KvLease/KvLeaseRenew/KvRelease/KvCasFenced at KV_LEASE_OP_VERSION 1: holder identity, delegated subject, coordination namespace, barriered KvGet.min_position) + KvReply (incl. Committed/Leased/Renewed) / KvError (incl. VersionConflict/LeaseLost/Stale) + entry version
     fork.rs             fork requests + ForkReply/ForkError
     filter/             consumer filters: expr (ConsumerFilter + FilterExpr builders, record
@@ -100,13 +112,34 @@ wire/                   the laser-wire crate: the wire CONTRACT, data + pure fun
                         dictionaries, TokenUsage, AgentDeadLetter, dormant Signature,
                         BodyRef (the agdx.ct=ref claim-check capsule), the pinned
                         operation vocabularies (task/card/progress, chunk-stream
-                        chat/reasoning/tool_args, state_snapshot/state_delta) and
-                        metadata keys (role, bridge_hops), validate() (the per-kind
+                        chat/reasoning/tool_args, state_snapshot/state_delta, session) and
+                        metadata keys (role, bridge_hops, submitted, gen_ai.request.model,
+                        gen_ai.response.model, gen_ai.provider.name, duration_micros),
+                        envelope parent/root, the session bodies SessionStart /
+                        SessionTransition / SessionEnd, SessionStatus, SessionRef, Budget,
+                        SdkInfo, ContextManifest / Fragment / ContextCompaction /
+                        ContextRetrieval, StateDelta / StateSnapshot + apply_json_patch,
+                        estimate_tokens (bytes / 4 rounded up), validate() (the per-kind
                         validity matrix + caps)
-    forward.rs          forwarded ForwardedQuery / ForwardedCommand frames
+    session.rs          session read requests (stream first), SessionReply / SessionOutcome
+                        (SessionInfo, SessionPage, SessionEventsPage, SessionStateView,
+                        SessionLinksView, SessionSources, SessionChanges), SourceFrontier /
+                        SourceGap / PayloadRange / StateChange, SessionError, SessionHeartbeat
+    dispatch.rs         (feature cbor) display_type over SessionRecord -> DisplayType, the
+                        classify / classify_generic -> Dispatch {Work, Observational, Reply,
+                        Lifecycle, Control, Foreign} table, control operation names,
+                        addressee_filter(me) / broadcast_filter() and
+                        ADDRESSEE_FILTER_NAME ("agent-addressee"), pinned by
+                        fixtures/dispatch_cases.json
+    forward.rs          forwarded ForwardedQuery / ForwardedCommand frames + the server-stamped
+                        ForwardedScope { stream_id, stream, stream_created_at_micros } + the
+                        Caller { user_id, agent, on_behalf_of } that control stamps and mutation
+                        envelopes carry
     commands.rs         Command trait pairing each managed command code with request/reply types
     http.rs             /agdx/* route constants + path builders + typed query-param structs + JSON views + the ErrorBody reply contract
-    http_client.rs      (feature http-client) typed /agdx/* client over an injected Transport, the crate's one (runtime-agnostic) async surface
+    http_client.rs      (feature http-client) typed /agdx/* client over an injected Transport, the crate's one (runtime-agnostic) async surface.
+                        A non-2xx reply is ClientError::Api with a decoded ErrorBody, else ClientError::Status
+                        with the HTTP status, a status-derived code, and the reply text
     framing.rs          (feature cbor) encode_named/decode_named + u32-LE frame codec, sans-io
     codecs.rs           (feature codecs, bson adds Bson) Codec/Decoder + Json/Msgpack/Cbor/Bson
     encoding.rs         the one shared bin-bytes serde helper module (internal)
@@ -136,6 +169,8 @@ sdk/src/
   error.rs            LaserError (the one crate error, maps wire DecodeError/InvalidError)
   prelude.rs          the single glob downstreams import
   laser.rs            Laser + LaserBuilder: connect/connect_env/connect_with_stream/local,
+                      ResourceNaming { Stream (default), Bare } and resource_name: every
+                      managed name scoped to `stream:<default stream>/<name>` unless Bare,
                       producer cache, send_raw_with_response (the raw managed-command
                       transport, Vec<u8> in/out, converts to/from iggy's own `Bytes` only at
                       the client call, never in the SDK's own signatures). `resolve_tls`
@@ -152,13 +187,15 @@ sdk/src/
                       <-> wire id, AgentId::wire_id = the name verbatim)
   provenance/         keys.rs re-exports the wire header dictionary, runtime.rs
                       (Provenance <-> headers) + topic.rs (AgentTopic) behind `provenance`
-  poll.rs             shared partition drain helper (context + reply + cursor paths)
+  poll.rs             shared partition drain helper (context + cursor paths, reads until
+                      empty or past the current offset) and TopicFollower, the held-read
+                      follower over the upstream PartitionReader (reply hub, control follower)
   stream.rs           the Log accessors: Laser::stream(name) -> Stream (real Iggy stream,
                       ensure/topic) and Laser::topic(name) -> Topic (default-stream shortcut,
                       publish()/publish_batch() fluent, send/batch raw (impl Into<Vec<u8>>,
                       matching PublishRequest/BatchPublishRequest), all returning Iggy's
                       SendMessagesResponse commit positions, replay() -> Cursor,
-                      ensure(partitions), producer/consumer/consumer_group, plus the raw
+                      ensure(partitions, replication_factor), producer/consumer/consumer_group, plus the raw
                       iggy_producer/iggy_consumer/iggy_consumer_group escape hatch)
                       Iggy provides the VSR transport. Standard Iggy commands and managed reads use the
                       non-replicated extension path, and authorization writes use dedicated
@@ -168,7 +205,8 @@ sdk/src/
                       Laser-native direct Producer plus live futures::Stream Consumer/
                       ConsumerMessage path - ProducerMessage/ConsumerMessage keep `bytes::Bytes`
                       (zero-copy clone) on this hot path specifically, including routing,
-                      polling/replay, group lifecycle, retries, exact headers, automatic commits,
+                      server-held polls (max_wait/min_count/max_bytes), read-error recovery,
+                      replay, group lifecycle, retries, exact headers, automatic commits,
                       explicit commit-after-success, producer commit confirmations, consumer
                       offsets, and next_within(timeout) for
                       a bounded single-record wait
@@ -196,8 +234,6 @@ sdk/src/
                       Protobuf / JSON Schema), encode and validate a body before it is published,
                       the same decode semantics the managed projector applies (feature =
                       "schema-codecs")
-  runs.rs             Laser::runs() -> the managed run registry (submit / status / cancel /
-                      fluent paged list), agent_workflow-gated (feature = "runs")
   memory.rs           Memory trait + MemoryHandle facade (Laser::memory, default Auto/Log:
                       publish to a memory topic -> materialized KV read view). One durable
                       backend LogMemory + in-process VectorMemory for similarity recall.
@@ -217,7 +253,7 @@ sdk/src/
   intent.rs           Intent/Vote/Decision: SDK-level typed records for effects that need
                       asynchronous, replayable approval, not an AGDX wire extension (feature =
                       "agent")
-  swarm.rs            SwarmActivity: a replay-safe supervisor read model over governance
+  swarm.rs            SwarmActivity: a replay-safe coordinator read model over governance
                       evidence, deduplicated by decision id (feature = "agent")
   crash_context.rs    CrashContext::assemble: one-call bundle over an already-read journal tail,
                       optional dead-letter capsule, and latest policy evidence, control characters
@@ -241,7 +277,7 @@ sdk/src/
                       asserts and why one is refused (wrong audience vs a scope step-up)
   managed.rs          Laser::execute_batch: up to MAX_BATCH_OPS independent managed commands in
                       one round trip over the AGDX_BATCH command, never a transaction (feature =
-                      any of fork/graph/kv/projections/query/rbac/runs)
+                      any of fork/graph/kv/projections/query/rbac)
   query/              the managed materialized-view query surface: wire query/browse/control
                       type re-exports plus Laser::query and the bounded row walks
                       (feature = "query")
@@ -269,12 +305,18 @@ sdk/src/
                       publish_card/advertise (the client face, the handler runtime stays
                       Agent::builder)
     agdx.rs            typed AGDX producer verbs: Laser::agdx -> Agdx (command/respond/emit/
-                      status/fail/request_input), AgdxStream chunk writer, routing-header stamping
+                      status/fail/request_input/request_input_from), AgdxStream chunk writer,
+                      routing-header stamping
     assembler.rs      ChunkAssembler: pure per-channel reassembly state machine
     clock.rs          Clock seam: SystemClock (real time) + TestClock (deterministic, advance/set),
                       the SLA-timer and deadline-check seam a test drives without sleeping
-    laser.rs          Laser facade: bootstrap, send_agent, request/reply, producer cache,
-                      spawn_subconversation, capabilities
+    laser.rs          Laser facade: bootstrap(partitions, TopicRetention) creating agent.sessions,
+                      agent.heartbeats and the satellites (never agent.control), send_agent,
+                      request/reply, producer cache, spawn_subconversation, capabilities
+    partitioning.rs   send-boundary partition routing from the declared SessionLayout: a command
+                      by its addressee, a reply by its requester, everything else by session
+    lease.rs          SessionLease + the per-connection lease registry and heartbeat task: one
+                      status(progress) per stream per interval on agent.heartbeats
     consumer.rs       reliable consumer: Deduplicator seam, commit-after-handle, retry -> DLQ,
                       fence high-water gate, opt-in ack_on_pickup (Working status), AgentMessage::body(),
                       ConcurrencyPolicy (Serial | SerialPerPartition lanes), graceful drain,
@@ -282,7 +324,7 @@ sdk/src/
     memory_handler.rs MemoryHandler<H>: wraps an AgentHandler so a successfully handled message is
                       remembered under its conversation, auto_remember selects the MemoryKind
     builder.rs        Agent::builder + AgentHandle (ready/shutdown=graceful drain/join/abort), capabilities +
-                      ack_on_pickup + inbox_route + signing_key + retry/verifier/dedup_window/shutdown_grace/concurrency/
+                      ack_on_pickup + inbox_route + max_wait + signing_key + retry/verifier/dedup_window/shutdown_grace/concurrency/
                       middleware/on_dead_letter, self-advertises card + presence on spawn
     ctx.rs            AgentCtx handed to a handler: respond/reply_on/send/request/respond_input,
                       fan_out (per-agent Gather under GatherPolicy), approval_gate, spawn_subconversation
@@ -294,18 +336,43 @@ sdk/src/
     router.rs         Router (To / ToPrincipal / Broadcast / ToCapable / AllCapable),
                       principal-bound CapabilitySelector, RoutePolicy, InboxRoute
     contract.rs       Laser::contract -> Contract (Completed/Failed/NotConsumed/TimedOut), the
-                      directed-task state machine. Laser::scatter + scatter_report (per-agent ScatterReport)
+                      directed-task state machine, ContractBuilder::parent(parent, root) runs it as
+                      a child session. Laser::scatter + scatter_report (per-agent ScatterReport)
     workflow.rs       Laser::workflow -> the engine: topo-ordered steps, budgets, verifier panels,
-                      saga compensation, journal/replay/resume, all_capable scatter, fenced steps
-    session.rs        SessionPolicy (PerCall / PerUser), Laser::sessions / sessions_with(SessionConfig)
-                      -> Sessions (create / start / open) -> Session: typed turns (SessionTurnKind, one
-                      conversation-level AgentTopic each), context, scoped memory, Checkpoint,
-                      turns_at / turns_since, state_at / replay. A facade over ContextScope,
-                      never a second store
+                      saga compensation, journal/replay/resume, all_capable scatter, fenced steps.
+                      The run is a root session (id = run id), steps and compensations are child
+                      sessions, and a cancel on agent.control, then the run's over_budget, is
+                      checked at every step boundary
+    session.rs        SessionPolicy (PerCall / PerUser), TopicRetention, SessionLayout, SessionConfig,
+                      derive_session_id, Laser::sessions / sessions_with -> Sessions (create /
+                      start / open / bootstrap) -> SessionBuilder (agent, namespace, parent,
+                      with_id, idle_timeout, budget, tag, begin) -> (Session, SessionLease).
+                      Session: end / fail / cancel behind one shared terminal latch, run (catch
+                      unwind), append (typed envelopes), context, memory, Checkpoint, turns_at /
+                      turns_since, state_at / replay, SessionTurn with its DisplayType
+    session_ops.rs    Session::{assemble, model, tool, record_model_call, record_retrieval,
+                      record_compaction, state, kv, linked_graph, linked_memory, reference,
+                      redact, acting_on, cancel_requested}, ModelRequest / ModelResponse /
+                      ModelCall / ToolCall / AssembledContext / SessionState, default_redact,
+                      Sessions::submit -> SubmitBuilder -> Submitted, Sessions::control ->
+                      SessionControl (pause / resume / cancel / force_cancel on agent.control,
+                      signed_by), Session::pending_control
+    session_reads.rs  managed reads Sessions::{get, list, events, state, links, sources,
+                      changes, watch}, Session::status, Laser::read_at (feature agent)
+    budget.rs         Session::over_budget (the index flag, else a fold of the retained lane),
+                      the failure with SessionEnd.reason = "budget", and the runtime BudgetGate
+                      that checks indexed sessions before their work reaches the handler
+    control.rs        PendingControl + the runtime ControlBook folded from agent.control
+    pause.rs          pause and resume runtime: the all-partition agent.control follower,
+                      pause acknowledgments, parking before commit (session_parked /
+                      session_unparked), held work replay, bounded recovery,
+                      Session::parked -> ParkedRecords, SessionControl::participants
     state.rs          ConversationState::load (fold the log)
 sdk/tests/integration/  one shared Apache Iggy, one stream per test, BDD-named cases
 sdk/tests/support/      test_iggy.rs (native Iggy process harness, test-only, not shipped)
                         + owned_server.rs
+test-support/           laser-test-support (publish = false): the stand-in catalog (lib catalog.rs,
+                        bin laser-test-catalog) and bin laser-test-routes (partition primaries)
 foreign/python/         the Python SDK (outside the workspace): PyO3 bindings over the
                         laser-sdk crate (cdylib lib laser_sdk_py, import name laser_sdk),
                         src/ one module per area + bin/stub_gen.rs, tests/ pytest
@@ -345,9 +412,10 @@ examples/typescript/    nine non-benchmark mirrors, one entry point + README per
 docs/                   tutorial.md (progressive guide), building-agents.md (scenario
                         -> SDK recipe guide), agdx.md (the AGDX spec),
                         interop.md (A2A / MCP / AG-UI bridges), parity.md (the generated
-                        cross-SDK parity matrix), client-behavior.md (0.6.0 behavior and
-                        migration), connect-timeout.md, publish-recovery.md,
-                        producer-statistics.md
+                        cross-SDK parity matrix), client-behavior.md (shared client
+                        behavior), connect-timeout.md, publish-recovery.md,
+                        producer-statistics.md, session-sizing.md (measured session index
+                        costs on a local managed stack)
 ```
 
 ## Repo-wide principles
@@ -375,26 +443,29 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 - Unit tests live next to the code (`#[cfg(test)] mod tests`).
 - `wire_fixtures` compares encoded bytes with `wire/fixtures/`. Regenerate through `just fixtures-regen` only for an intentional wire change. Update every affected client and implementation together. `constants.rs` fixes codes, keys, topics, and limits. Negative cases define input that every client must reject.
-- Integration tests (`sdk/tests/integration/`) run against Apache Iggy via a native `TestIggy` process. One process is shared. Each test gets its own data stream and ops stream, so the suite stays isolated and parallel. Set `LASER_TEST_IGGY_SERVER` to test a local Iggy binary instead of the R2 artifact.
-- `streaming.rs` tests publication and consumption through Laser APIs. It covers batches, headers, routing, delivery, commits, group rejoin, uncommitted redelivery, and replay.
-- `harness::eventually` polls instead of fixed sleeps. Iggy visibility is eventual.
+- Integration tests (`sdk/tests/integration/`) run against Apache Iggy via a native `TestIggy` process. One process is shared. Each test gets its own data stream and ops stream, so the suite stays isolated and parallel. Set `LASER_TEST_IGGY_SERVER` to test a local Iggy binary instead of the R2 artifact. Set `LASER_TEST_IGGY_CLUSTER=1` to run the shared server, and the stand-in catalog server of `filters_group.rs`, as a three-node cluster reached through its metadata leader (`SharedIggy` in `sdk/tests/integration/harness.rs`). Tests with `cluster` in their name start a `TestIggyCluster` of their own, three nodes by default (`sdk/tests/support/test_iggy.rs`: `start_with` per-node settings, `start_sized` for another node count such as the five-node replication factor tests, `leader`, `stop_node`, `kill_node`, `start_node`, `restart_node`, `route_endpoint_to`) and run one at a time. `harness::http_settings` serves a node's HTTP API with a shared JWT key, and `harness::held_requests` reads the server's count of parked requests (`deferred_poll_pending`) to prove what a client holds. The stand-in catalog lives in `test-support/`: `filters_group.rs` runs `laser_test_support::catalog` in process, and Python cluster tests run the `laser-test-catalog <socket>...` binary (one socket per node, each node started with `IGGY_PLANE_ENABLED=true` and its `IGGY_PLANE_SOCKET_PATH`, ready once it prints `ready`, stopped with SIGTERM) and ask `laser-test-routes` for partition primaries.
+- `streaming.rs` tests publication and consumption through Laser APIs. It covers batches, headers, routing, delivery, commits, group rejoin, group start seeds and rebalance resume on both group paths, uncommitted redelivery, and replay.
+- `harness::eventually` polls instead of fixed sleeps. Iggy visibility is eventual. A cluster test never reads the raw partition routes right after creation: a fresh cluster can lead every new partition on its one ready node and moves them one at a time afterwards, so a test that assumes a spread must wait for it. `harness::spread_primaries` waits until more than one node leads the topic. `harness::settled_primaries` (Python: `IggyTestCluster.settled_primaries`) waits until no node leads two more partitions than another, and only the one topic of its cluster settles that way, because the cluster balances the partitions of every topic together.
 - The test runner pins `FORK_VERSION`. `LASER_TEST_IGGY_SERVER` overrides the downloaded R2 binary for local validation.
 - Full query, KV, and fork execution requires LaserData Cloud or Laser Stack. SDK tests use reference files for encoded data and managed deployments for execution. `laser_bdd::query_engine` tests query behavior locally through `query.feature`. Original Apache Iggy returns `Unsupported` for these managed commands. Do not add a query worker or request-topic fallback to the SDK.
-- TypeScript verification runs from `foreign/typescript`: `npm run verify`, then `npm run test:integration` against Apache Iggy. Run `scripts/run-bdd-tests.sh typescript` and the TypeScript example tests before release. The package gate installs the exact tarball into clean ESM and CommonJS-interoperating consumers and compiles its declarations. Node 22.14 and Node 24 are supported. Bun, Deno, and browsers are not supported.
+- `scripts/run-managed-bdd.sh` runs the BDD runners against a local managed stack, Laser Streams and the managed backend built from the checkouts named by `LASER_IGGY_REPO` and `LASER_MANAGED_BACKEND_REPO`, with `LASER_BDD_MANAGED=1`. `--postgres` keeps the backend's session store in Postgres. The `@managed` scenarios, including `managed_sessions.feature`, run only there.
+- TypeScript verification runs from `foreign/typescript`: `npm run verify`, then `npm run test:integration` against Apache Iggy. Run `scripts/run-bdd-tests.sh typescript` and the TypeScript example tests before release. The package gate installs the exact tarball into clean ESM and CommonJS-interoperating consumers and compiles its declarations. Node 22.14 and Node 24 are supported. Bun, Deno, and browsers are not supported. Dependency policy: a lockfile change may only introduce versions that have been on the npm registry for at least seven days (`scripts/release-age-check.mjs`, `MINIMUM_RELEASE_AGE_DAYS`), so a freshly published or compromised release cannot enter the lockfile before the ecosystem has had time to catch it. `apache-iggy` is exempt: it is the exact client build of the server release the SDK is developed against and is consumed the day it ships. The security workflow fails on any known vulnerability in the lockfile (osv-scanner) and on high advisories (`npm audit`), so a vulnerable transitive dependency that no parent's range reaches is raised to the fixed version through `overrides` in `package.json`, pinned exactly. A version that fixes a published advisory is exempt from the cooldown as well, one exact version per entry of `ADVISORY_FIX_COOLDOWN_EXEMPT` in the script, named with its advisory and dropped once it is older than the cooldown.
 
 ## What is shipped vs planned
 
-This inventory describes the `0.6.0` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.9.0-dev.3` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
 Capabilities identify managed support such as queries, key-value, forks, graphs, and an A2A gateway, plus native consumer filters served by the streaming server. Every capability flag maps to a hello feature bit or an op version. Memory combines query and graph operations and has no separate managed command group.
 
-Rust, Python, and TypeScript expose streaming, managed, and agent surfaces. The generated [cross-SDK parity matrix](docs/parity.md) lists each Rust symbol with its Python and TypeScript spelling and records every deliberate difference, and `python3 scripts/check-parity.py` reports unresolved mappings as failures. The matrix checks naming idioms and argument shapes: Python takes cards, presence, and graph results as dicts, and TypeScript uses microsecond `ttl(ttlMicros)` units and `Map` offsets. Names otherwise follow Rust, for example `Filter`, `agg_as` (TypeScript `aggAs`), `dlq_topic` (TypeScript `dlqTopic`), and `from_client` (TypeScript `fromClient`). Defaults agree across the three: a 30-second contract deadline, a typed timeout from `next_within`, `Polling` as the default commit policy, TTL semantics for `expire` (TypeScript adds `expireAt` for an absolute time), a structured publish failure with committed and unconfirmed records, the same error classifiers, and the same context read window. [Client behavior](docs/client-behavior.md) lists what 0.6.0 added and changed.
+Managed resource names are scoped to the default stream (`stream:<stream>/<name>`) for KV, memory, lease and fence namespaces, the key registry, graph names, projection and index ids, query indexes, fork ids, and the watch index filter, with listings stripped to local names and schema requests carrying the stream. `ResourceNaming::Bare` opts out. `Capabilities::stream_tenancy` reports a deployment that enforces stream scoping, where `watch` reads `stream:<stream>/_agdx/changes`. The pause and resume runtime (`sdk/src/agent/pause.rs`) holds work for a paused session, parks it on the lane, and replays it after the resume. No capability advertises it yet.
 
-The open SDK supports provenance, causality, context, memory, routing, sessions, and state. Reliable consumption supports graceful drain, `ConcurrencyPolicy::SerialPerPartition`, `AgentMiddleware`, `DeadLetterSink`, and `Agent::builder` retry, verifier, and duplicate-suppression controls. `laser_sdk::testing`, `respond_on`, and `AgentCtx` support handlers.
+Rust, Python, and TypeScript expose streaming, managed, and agent surfaces. The generated [cross-SDK parity matrix](docs/parity.md) lists each Rust symbol with its Python and TypeScript spelling and records every deliberate difference, and `python3 scripts/check-parity.py` reports unresolved mappings as failures. The matrix checks naming idioms and argument shapes: Python takes cards, presence, and graph results as dicts, and TypeScript takes relative durations as millisecond numbers (for example `ttl(ttlMs)`) and offsets as a `Map`. Names otherwise follow Rust, for example `Filter`, `agg_as` (TypeScript `aggAs`), `dlq_topic` (TypeScript `dlqTopic`), and `from_client` (TypeScript `fromClient`). Defaults agree across the three: a 30-second contract deadline, a typed timeout from `next_within`, `Polling` as the default commit policy, TTL semantics for `expire` (TypeScript adds `expireAt` for an absolute time), a structured publish failure with committed and unconfirmed records, the same error classifiers, and the same context read window. [Client behavior](docs/client-behavior.md) describes the behavior the three clients share.
+
+The open SDK supports provenance, causality, context, memory, routing, sessions, and state. Sessions ride `agent.sessions` with satellites `agent.streams`, `agent.heartbeats`, `agent.memory`, `agent.dlq`, `agent.audit`, `agent.workflow_journal`, `agent.registry`, and the operator-only `agent.control`. The reliable consumer classifies every record with the wire `classify` before dispatch, and only work for the handler's operations reaches the handler. Each agent id reads through its own consumer group. On `agent.sessions` and `agent.control` the runtime binds that group to the addressee filter `agdx.to In [<agent>, "*"]` when the server resolves group policies, serves native filters and the catalog, and the `Laser` was built from a connection string, and it classifies on the client otherwise. On a deployment that indexes sessions the runtime fails an over-budget session once with reason `budget` instead of calling the handler, and a workflow stops at a step boundary with `BudgetExceeded`. [Agents, groups, and layouts](docs/building-agents.md#agents-groups-and-layouts) is the user guide for choosing a layout. A reply completes a request only in the request's session, as a response or error, and addressed to the requester when the request named one. Managed session reads (`AGDX_SESSION_*`) are served when the server announces `sessions`, and all three SDKs read them through `Sessions::{get, list, events, state, links, sources, changes, watch}` and `Session::status`, failing with `LaserError::Session` (`SessionError` in Python and TypeScript). Reliable consumption supports graceful drain, `ConcurrencyPolicy::SerialPerPartition`, `AgentMiddleware`, `DeadLetterSink`, and `Agent::builder` retry, verifier, and duplicate-suppression controls. `laser_sdk::testing`, `respond_on`, and `AgentCtx` support handlers.
 
 Streaming provides producers and continuous partition or consumer-group readers with exact headers, routing, retries, commits, and server offsets. Apache Iggy controls stream and topic access. Its builders remain available for detailed configuration. Python exposes the same underlying streaming implementation.
 
-Consumer filters belong to consumer groups. `topic.consumer_group(name)` (`sdk/src/stream/consumer_group.rs`) is the handle: `create().filter(..).build()` creates the group with its policy, `filter()` configures, inspects, revises, pauses, releases, previews and sample-tests it, `consumer()` is the normal consumer that runs whatever the group holds on a server with `group_policy_reads`, and `reader()` is the match-oriented reader with independent `count` and `max_examined`. The reader (`sdk/src/filters/reader.rs`) delivers `MatchedRecord`s with their original offsets, stores progress only through fenced acknowledgments (`ack`, `ack_through`, `ack_page`), and bounds outstanding pages per partition (`max_unacked_pages`, default 1024). Filters are `ConsumerFilter` over JSON, CBOR, Avro, Protobuf, or headers only, with fault, foreign, and mismatch policies. An unbound group receives every record. The `filters` feature only adds the local guard evaluator, the group transport lives in `streaming`. TypeScript (`foreign/typescript/src/stream/consumer-group.ts`, `managed/filters.ts`) and Python (`foreign/python/src/consumer_group.rs`, `filters.rs`) carry the same surface, and `wire/tests/filter_eval_corpus.rs` pins identical verdicts across the three.
+Consumer filters belong to consumer groups. `topic.consumer_group(name)` (`sdk/src/stream/consumer_group.rs`) is the handle: `create().filter(name, filter).build()` creates the group with its policy saved under the caller's name, `filter()` configures (`configure(name, filter)`), inspects (`get`, `summary` with the caller's name and owning group), revises, pauses, releases, deletes, previews and sample-tests it, and finds the group's own filter by its owner identity, never by name, `consumer()` is the normal consumer that runs whatever the group holds on a server with `group_policy_reads`, and `reader()` is the match-oriented reader with independent `count` and `max_examined`. The reader (`sdk/src/filters/reader.rs`) delivers `MatchedRecord`s with their original offsets, stores progress only through fenced acknowledgments (`ack`, `ack_through`, `ack_page`), and bounds outstanding pages per partition (`max_unacked_pages`, default 1024). After a round that found nothing new it holds one `AGDX_FILTERED_WAIT` per serving node for up to `max_wait` (default 5 s, lowered to the announced `Capabilities.filters.max_wait_ms`), each with a process-unique `wait_id`, reads its assignment again every 2 s while the waits hold, cancels the waits still held on other nodes (`AGDX_FILTERED_WAIT_CANCEL`) when one answers ready, the assignment changes, or the reader closes or drops, and sleeps `idle_interval` only on a server that announces no wait. A node that does not store a partition refuses its filtered reads, acks and waits with `NotPrimary`, and the reader looks the route up again. Filters are `ConsumerFilter` over JSON, CBOR, Avro, Protobuf, or headers only, with fault, foreign, and mismatch policies. An unbound group receives every record. The `filters` feature only adds the local guard evaluator, the group transport lives in `streaming`. TypeScript (`foreign/typescript/src/stream/consumer-group.ts`, `managed/filters.ts`) and Python (`foreign/python/src/consumer_group.rs`, `filters.rs`) carry the same surface, and `wire/tests/filter_eval_corpus.rs` pins identical verdicts across the three.
 
 `sdk/src/govern.rs` defines `ActionGovernor` under `agent`. `Laser::with_governor` applies it before publication, AGDX operations, and memory writes. `Verdict` values are `Allow`, `Observe`, `Block`, `StepUp`, `Modify`, and `Defer`. `GovernorMode::Observe` records decisions without enforcing them and warns on evidence failure. `Enforce` applies the decision and rejects effects if required evidence cannot be stored.
 
@@ -412,7 +483,7 @@ Consumer filters belong to consumer groups. `topic.consumer_group(name)` (`sdk/s
 
 The `rbac` API requires `authz` and lives in `sdk/src/rbac/`. It exposes `Laser::whoami`, `list_roles`, `get_role`, `get_bindings`, `define_role`, `delete_role`, `bind_roles`, `bind_roles_expect_revision`, and `authz_history`. Grants use `effect feature:action [on resource-pattern]` for the authenticated server identity. Deny takes precedence, and missing grants deny access.
 
-`validate_role_name` in `wire/src/authz.rs` applies during definition and binding, not replay. Standard Iggy `Permissions` remain independent. The server checks feature, action, and resource before forwarding. The plane checks access to query and graph sources.
+`validate_role_name` in `wire/src/authz.rs` applies during definition and binding, not replay. Standard Iggy `Permissions` remain independent. The server checks feature, action, and resource before forwarding. The managed backend checks access to query and graph sources.
 
 `laser-wire` defines the envelope, IDs, dictionaries, validity matrix, operation names, card body, `BodyRef`, reference data, `agdx.av`, and `OpVersions.agent`. SDK methods expose these through `Laser::agdx` and `Agdx`. `AgdxStream` writes chunks. `Agdx::request_input` and `AgentCtx::respond_input` use existing request and reply records. `ChunkAssembler` handles order, duplicates, gaps, late records, terminal records, and abandonment.
 
@@ -422,15 +493,15 @@ The reliable consumer publishes `AgentDeadLetter` for decode failures, expired d
 
 `A2aBridge` maps `SendMessage` and `SendStreamingMessage` to AGDX commands. It also provides `GetTask`, `CancelTask`, the v1.0 card with `supportedInterfaces`, and optional JWS signing. `McpBridge` supports `initialize`, `tools/list`, `tools/call`, configured `resources/*`, and `prompts/*` under the 2025-11-25 schema. `Laser::reassemble_channel` reads chunk streams from the log.
 
-AG-UI supports `publish_state_snapshot`, `publish_state_delta`, `reconstruct_state`, and `agui_events`. Event families include `TEXT_MESSAGE_*`, `REASONING_MESSAGE_*`, `TOOL_CALL_*`, `RUN_STARTED`, `RUN_FINISHED`, `STATE_*`, and `RUN_ERROR`.
+AG-UI supports `publish_state_snapshot(source, conversation, state)`, `publish_state_delta(source, conversation, patch)`, `reconstruct_state(conversation)`, and `agui_events`. State takes no topic: it is the session state document on `agent.sessions`, written as revision-guarded state records and read from the folded lane, or from the managed state view when the lane no longer holds the document's baseline. A fresh `SessionState` handle seeds its revision from the folded lane before its first write, and `SessionState::replace(document)` replaces the whole document. Event families include `TEXT_MESSAGE_*`, `REASONING_MESSAGE_*`, `TOOL_CALL_*`, `RUN_STARTED`, `RUN_FINISHED`, `STATE_*`, and `RUN_ERROR`.
 
 Multi-agent orchestration, all conventions over the log (client-side state machines over offsets/deadlines/leases/replies, no orchestration server):
 
 - `Laser::publish_card` records capabilities, and `AgentPresence` uses `set_client_metadata` for live discovery. `AgentRegistry` combines both and excludes unhealthy or quarantined agents. `Laser::quarantine` and `unquarantine` record reversible changes. Their signed variants require valid signatures. `Laser::agent_registry` caches state per stream and resumes from saved offsets.
 - Routing: `Router::{To,Broadcast,ToCapable,AllCapable}` + `InboxRoute::{Advertised,Fixed}`, resolving to an advertised inbox, never a hard-coded shared topic.
 - `Laser::contract` reports `Contract::{Completed,Failed,NotConsumed,TimedOut}` and optional pickup `Working` status. `AgentCtx::fan_out` and `Laser::scatter` use `GatherPolicy::{RequireAll,Quorum,BestEffort}`. `AgentCtx::approval_gate` waits for a decision. A configured verifier checks reply signatures before accepting completion.
-- `Laser::workflow` runs dependency-ordered steps with `Budget`, `verify_with`, `compensate_with`, replay, and `all_capable` dispatch. `.exclusive()` uses `acquire_fence` and requires `KV_FENCED_LEASES`. Renewal stays bounded by lease expiry and workflow deadline. The lease covers verification and the completion journal write. `StepHandle::on_timeout(OnTimeout::Reassign)` can then reacquire under a new fence. The handler protects external state through its own `Kv::cas_fenced` commit.
-- Bound in Python and TypeScript (contracts with `expire_if_not_consumed`, `reply_on`, `conversation`, `fence`, `registered`, and named-agent routing, `scatter`, quarantine, the agent registry, `Laser.agent(id)`, `spawn_agent` capabilities/ack_on_pickup/health, `AgentCtx.fan_out`/`approval_gate`, and the `agent_message`/`agent_ctx` handler-test seam), matched by the `orchestra` example in all three languages.
+- `Laser::workflow` runs dependency-ordered steps with `WorkflowBudget`, `verify_with`, `compensate_with`, replay, and `all_capable` dispatch. `.exclusive()` uses `acquire_fence` and requires `KV_FENCED_LEASES`. Renewal stays bounded by lease expiry and workflow deadline. The lease covers verification and the completion journal write. `StepHandle::on_timeout(OnTimeout::Reassign)` can then reacquire under a new fence. The handler protects external state through its own `Kv::cas_fenced` commit.
+- Bound in Python and TypeScript (contracts with `expire_if_not_consumed`, `reply_on`, `conversation`, `fence`, `parent`/`root`, and named-agent routing, `scatter`, quarantine, the agent registry, `Laser.agent(id)`, `spawn_agent` capabilities/ack_on_pickup/health, `AgentCtx.fan_out`/`approval_gate`, and the `agent_message`/`agent_ctx` handler-test seam), matched by the `orchestra` example in all three languages.
 
 Still planned, not present:
 
@@ -447,7 +518,7 @@ Each client-facing default has one owning page. Link to it rather than restating
 
 - [Connect timeout and cleanup](docs/connect-timeout.md) covers the 30-second connect budget, `close`, and `Stream::delete`.
 - [Publish recovery](docs/publish-recovery.md) covers publish timeouts, retries, failure reports, and outage handling.
-- [Client behavior](docs/client-behavior.md) lists the 0.6.0 changes and the upgrade steps.
+- [Client behavior](docs/client-behavior.md) describes session, dispatch, memory, and coordination behavior shared by all three clients.
 - [Producer statistics](docs/producer-statistics.md) covers optional producer telemetry.
 
 ## Consumer-group ownership

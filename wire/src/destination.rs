@@ -18,7 +18,7 @@ wire_id!(
 );
 
 wire_id!(
-    /// Stable identity of one supervisor-owned backend resource.
+    /// Stable identity of one operator-owned backend resource.
     BackendResourceId
 );
 
@@ -40,9 +40,7 @@ pub struct ProjectionRef {
 
 impl Validate for ProjectionRef {
     fn validate(&self) -> Result<(), InvalidError> {
-        if self.id.as_str().is_empty() {
-            return Err(InvalidError::new("projection id must not be empty"));
-        }
+        self.id.validate()?;
         if self.version == 0 {
             return Err(InvalidError::new("projection version must be nonzero"));
         }
@@ -332,7 +330,7 @@ mod tests {
             stream_id: 10,
             topic_id: 20,
             partition_id,
-            partition_created_revision: 7,
+            partition_incarnation: 7,
         }
     }
 

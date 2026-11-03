@@ -5,10 +5,9 @@
 // wire break. Consumer repos assert against the same bytes through the
 // `fixtures` feature instead of copying files.
 
-use laser_wire::agent::ConversationId;
-use laser_wire::agent_workflow::{
-    AgentError, AgentList, AgentOutcome, AgentReply, AgentRunInfo, AgentRunState, AgentSubmit,
-    RunPage,
+use laser_wire::agent::{
+    Budget, ConversationId, CorrelationId, LogPosition, SdkInfo, SessionRef, SessionStatus,
+    TokenUsage,
 };
 use laser_wire::arrow::{
     ArrowIpcMessageMetadata, ArrowIpcPolicy, ArrowIpcRejectionCode, ArrowTimestampUnit,
@@ -34,15 +33,16 @@ use laser_wire::checkpoint::{
 };
 use laser_wire::clients::{ClientMetadata, ClientMetadataList, ClientMetadataQuery};
 use laser_wire::codes::{
-    AGDX_KV_SET_CODE, AGENT_OP_VERSION, AGENT_WORKFLOW_OP_VERSION, AUTHZ_OP_VERSION,
+    AGDX_CONTROL_PUBLISH_CODE, AGDX_KV_SET_CODE, AGENT_OP_VERSION, AUTHZ_OP_VERSION,
     BATCH_OP_VERSION, CHANGE_OP_VERSION, CHECKPOINT_OP_VERSION, CLIENT_METADATA_OP_VERSION,
     CONTROL_OP_VERSION, FORK_OP_VERSION, GRAPH_OP_VERSION, KV_LEASE_OP_VERSION, KV_OP_VERSION,
     QUERY_OP_VERSION,
 };
 use laser_wire::content::ContentType;
 use laser_wire::control::{
-    ControlCommand, ControlEnvelope, FieldType, IndexField, IndexSchema, Projection,
-    ProjectionBinding, ProjectionId, ProjectionKind, RetentionPolicy, SchemaDef, SchemaSource,
+    ControlCommand, ControlEnvelope, ControlStamp, ControlStreamGeneration, FieldType,
+    GapAcceptance, IndexField, IndexSchema, Projection, ProjectionBinding, ProjectionId,
+    ProjectionKind, RecordSkip, RetentionPolicy, SchemaDef, SchemaSource, SessionTopics,
     SourceSelector,
 };
 use laser_wire::destination::{
@@ -52,22 +52,23 @@ use laser_wire::destination::{
     QueryRouteTarget, RecreatedPartitionPolicy, StartPolicy, TableFormat,
 };
 use laser_wire::filter::{
-    AckReceipt, AppliedPolicy, CatalogPosition, ConsumerFilter, ExecutionMode, FilterBinding,
-    FilterCatalogCommand, FilterCatalogOutcome, FilterCatalogReply, FilterConsumer, FilterError,
-    FilterErrorReason, FilterExpr, FilterGroupIdentity, FilterGroupRef, FilterMutation,
-    FilterMutationOutcome, FilterMutationRequest, FilterMutationResult, FilterMutationStatus,
-    FilterOutcome, FilterRef, FilterReply, FilterRevisionRef, FilterSource, FilterValidation,
-    FilteredAck, FilteredPage, FilteredPollRequest, FilteredStart, GroupFilterSpec,
-    GroupPolicyUnbound, ReadMode, SourceGeneration, StopReason,
+    AckContext, AckReceipt, AppliedPolicy, CatalogPosition, ConsumerFilter, ExecutionMode,
+    FilterBinding, FilterCatalogCommand, FilterCatalogOutcome, FilterCatalogReply, FilterConsumer,
+    FilterError, FilterErrorReason, FilterExpr, FilterGroupIdentity, FilterGroupRef,
+    FilterMutation, FilterMutationOutcome, FilterMutationRequest, FilterMutationResult,
+    FilterMutationStatus, FilterOutcome, FilterRef, FilterReply, FilterRevisionRef, FilterSource,
+    FilterValidation, FilteredAck, FilteredPage, FilteredPollRequest, FilteredStart,
+    FilteredWaitCancel, FilteredWaitCancelled, FilteredWaitPartition, FilteredWaitRequest,
+    FilteredWaitResult, GroupFilterSpec, GroupPolicyUnbound, SourceGeneration, StopReason,
 };
 use laser_wire::fork::{
     ForkCreate, ForkInfo, ForkKind, ForkOutcome, ForkPut, ForkReply, ForkStatus,
 };
-use laser_wire::forward::{ForwardedCommand, ForwardedQuery};
+use laser_wire::forward::{Caller, ForwardedCommand, ForwardedQuery, ForwardedScope};
 use laser_wire::framing::{decode_named, encode_named};
 use laser_wire::graph::{
     EdgeDir, GraphEdge, GraphNeighbors, GraphNode, GraphQuery, GraphReply, GraphResult,
-    GraphReturn, GraphStart, GraphUpsert, Hop, Path, SourceRef,
+    GraphReturn, GraphStart, GraphUpsert, Hop, Path, ProducerInfo, SourceRef,
 };
 use laser_wire::hello::{
     BackendAnnounce, BackendDescriptor, BackendDesiredState, BackendImplementation, BackendLimits,
@@ -83,11 +84,14 @@ use laser_wire::http::{
 };
 use laser_wire::keys::{KEY_ID_BYTES, KeyKind, KeyRecord, VERIFYING_KEY_BYTES};
 use laser_wire::kv::{
-    CasExpect, KvCas, KvCasFenced, KvCopy, KvEntry, KvError, KvGet, KvLease, KvLeaseRenew, KvMove,
-    KvNamespaceInfo, KvNamespaces, KvOutcome, KvPage, KvRelease, KvReply, KvScan, KvSet,
+    CasExpect, KvCas, KvCasFenced, KvCopy, KvDelete, KvEntry, KvError, KvGet, KvLease,
+    KvLeaseRenew, KvMove, KvNamespaceInfo, KvNamespaces, KvOutcome, KvPage, KvPatch, KvRelease,
+    KvReply, KvScan, KvSet,
 };
+use laser_wire::memory::MemoryRecord;
 use laser_wire::mutation::{
-    MANAGED_REQUEST_VERSION, ManagedRequestEnvelope, MutationCommandEnvelope, MutationPosition,
+    AppliedFrontier, MANAGED_REQUEST_VERSION, ManagedReadEnvelope, ManagedReplyEnvelope,
+    ManagedRequestEnvelope, MutationCommandEnvelope, MutationPosition, SessionPosition,
 };
 use laser_wire::query::{
     AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, Filter, KeyMatch, Page, Query,
@@ -101,16 +105,112 @@ use laser_wire::schema::{
     BinaryValue, DecimalValue, Digest32, FieldValue, LogicalField, LogicalSchema, LogicalSchemaId,
     LogicalType, LogicalTypeKind, MapEntry, SchemaFingerprint, TypedValue, UuidValue,
 };
-use laser_wire::snapshot::FoldSnapshot;
+use laser_wire::session::{
+    GapReason, LinkRelation, LinkSurface, PayloadRange, SessionChangeOrigin, SessionChangeRow,
+    SessionChanges, SessionError, SessionEvent, SessionEventsPage, SessionFlags, SessionHeartbeat,
+    SessionInfo, SessionLink, SessionLinksView, SessionOutcome, SessionPage, SessionReply,
+    SessionSources, SessionStateView, SourceFrontier, SourceGap, StateChange, StateOutcome,
+    request as session_request,
+};
+use laser_wire::snapshot::{FoldSnapshot, SnapshotOffset};
 use laser_wire::source::{PhysicalClusterIncarnation, SourceIncarnation, SourceScope};
 use laser_wire::topology::WireTopology;
+use laser_wire::validate::Validate;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path as FilePath, PathBuf};
+
+#[test]
+fn given_session_read_requests_when_encoded_then_should_match_golden_fixtures() {
+    let id = ConversationId::from_u128(2);
+    assert_frame(
+        "session_get.bin",
+        &session_request::SessionGet {
+            stream: "agents".to_owned(),
+            id,
+        },
+    );
+    assert_frame(
+        "session_list.bin",
+        &session_request::SessionList {
+            stream: "agents".to_owned(),
+            status: Some(laser_wire::agent::SessionStatus::Active),
+            root: None,
+            label_prefix: None,
+            agent: Some("planner".parse().expect("agent")),
+            text: Some("search".to_owned()),
+            cursor: Some("next".to_owned()),
+            limit: 25,
+            want_total: true,
+        },
+    );
+    assert_frame(
+        "session_events.bin",
+        &session_request::SessionEvents {
+            stream: "agents".to_owned(),
+            id,
+            cursor: Some("page".to_owned()),
+            limit: 20,
+            fixed_frontier: true,
+        },
+    );
+    assert_frame(
+        "session_state.bin",
+        &session_request::SessionState {
+            stream: "agents".to_owned(),
+            id,
+            history_limit: 10,
+        },
+    );
+    assert_frame(
+        "session_links.bin",
+        &session_request::SessionLinks {
+            stream: "agents".to_owned(),
+            id,
+            surface: Some(LinkSurface::Memory),
+        },
+    );
+    assert_frame(
+        "session_sources.bin",
+        &session_request::SessionSources {
+            stream: "agents".to_owned(),
+            id,
+            lane_only: false,
+        },
+    );
+    assert_frame(
+        "session_sources_lane_only.bin",
+        &session_request::SessionSources {
+            stream: "agents".to_owned(),
+            id,
+            lane_only: true,
+        },
+    );
+    assert_frame(
+        "session_changes.bin",
+        &session_request::SessionChanges {
+            stream: "agents".to_owned(),
+            after: 42,
+            limit: 100,
+            series: None,
+        },
+    );
+    assert_frame("session_link_surface.bin", &LinkSurface::GraphNode);
+    assert_frame("session_link_relation.bin", &LinkRelation::Recalled);
+    let missing_stream =
+        laser_wire::framing::encode_named(&std::collections::BTreeMap::from([("id", id)]))
+            .expect("missing-stream frame");
+    assert!(
+        laser_wire::framing::decode_named::<session_request::SessionGet>(&missing_stream).is_err()
+    );
+}
 
 const REGEN_ENV: &str = "AGDX_WIRE_FIXTURES_REGEN";
 const TIMESTAMP_MICROS: u64 = 1_717_171_717_000_000;
+// Above 2^53, so a JSON reader that parses numbers as doubles would round it.
+const SESSION_CHANGE_SERIES: u64 = 7_654_321_098_765_432_101;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct DataStackStringDiscriminants {
@@ -347,6 +447,33 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn write_fixture(path: &FilePath, encoded: impl AsRef<[u8]>) {
+    let mut temporary = path.as_os_str().to_os_string();
+    temporary.push(format!(".{}.tmp", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    std::fs::write(&temporary, encoded).expect("write fixture");
+    std::fs::rename(&temporary, path).expect("replace fixture");
+}
+
+#[test]
+fn given_an_open_fixture_when_regenerated_then_should_keep_the_reader_on_a_complete_snapshot() {
+    let path = std::env::temp_dir().join(format!("laser-wire-fixture-{}.bin", std::process::id()));
+    std::fs::write(&path, b"original fixture").expect("initial fixture");
+    let mut reader = std::fs::File::open(&path).expect("open fixture");
+
+    write_fixture(&path, b"replacement fixture");
+
+    let mut snapshot = Vec::new();
+    reader
+        .read_to_end(&mut snapshot)
+        .expect("read open fixture");
+    let replacement = std::fs::read(&path).expect("read replacement");
+    drop(reader);
+    std::fs::remove_file(&path).expect("remove fixture");
+    assert_eq!(snapshot, b"original fixture");
+    assert_eq!(replacement, b"replacement fixture");
+}
+
 fn assert_frame<T>(name: &str, value: &T)
 where
     T: Serialize + DeserializeOwned,
@@ -354,7 +481,7 @@ where
     let encoded = encode_named(value).expect("fixture value serializes");
     let path = fixture_path(name);
     if std::env::var(REGEN_ENV).is_ok() {
-        std::fs::write(&path, &encoded).expect("write fixture");
+        write_fixture(&path, &encoded);
     }
     let golden = std::fs::read(&path)
         .unwrap_or_else(|error| panic!("read fixture {name}: {error} (regen with {REGEN_ENV}=1)"));
@@ -375,7 +502,7 @@ where
     let encoded = serde_json::to_string_pretty(value).expect("fixture value serializes");
     let path = fixture_path(name);
     if std::env::var(REGEN_ENV).is_ok() {
-        std::fs::write(&path, &encoded).expect("write fixture");
+        write_fixture(&path, &encoded);
     }
     let golden = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read fixture {name}: {error} (regen with {REGEN_ENV}=1)"));
@@ -451,6 +578,7 @@ fn canonical_binding() -> ProjectionBinding {
         retention: Some(RetentionPolicy::TimeToLive {
             ttl_micros: 3_600_000_000,
         }),
+        skip_rejected: false,
     }
 }
 
@@ -533,7 +661,7 @@ fn canonical_incarnation(partition_id: u32) -> SourceIncarnation {
         stream_id: 2,
         topic_id: 3,
         partition_id,
-        partition_created_revision: 4,
+        partition_incarnation: 4,
     }
 }
 
@@ -881,6 +1009,7 @@ fn canonical_query_result() -> QueryResult {
             scanned_bytes: 4_096,
             produced_bytes: 128,
             row_count: 1,
+            frontier: Vec::new(),
         },
     }
 }
@@ -1336,7 +1465,7 @@ fn given_checkpoint_frames_when_encoded_then_should_match_golden_fixtures() {
         stamp: CheckpointMutationStamp {
             committed_at_micros: TIMESTAMP_MICROS,
             iggy_actor_id: 0,
-            supervisor_actor: None,
+            operator_actor: None,
         },
         mutation: ReplicatedCheckpointMutationBody::RegisterDestination {
             destination: canonical_destination(),
@@ -1413,6 +1542,8 @@ fn given_control_frames_when_encoded_then_should_match_golden_fixtures() {
         v: CONTROL_OP_VERSION,
         timestamp_micros: TIMESTAMP_MICROS,
         command,
+        stream: None,
+        stamp: None,
     };
     assert_frame(
         "control_register_projection.bin",
@@ -1430,18 +1561,84 @@ fn given_control_frames_when_encoded_then_should_match_golden_fixtures() {
         }),
     );
     assert_frame(
-        "control_register_run_source.bin",
-        &envelope(ControlCommand::RegisterRunSource(SourceSelector::new(
-            "laser-orchestra",
-            "agents",
-        ))),
+        "control_accept_gap.bin",
+        &envelope(ControlCommand::AcceptGap(GapAcceptance {
+            source: SourceSelector::new("fleet", "readings"),
+            partition_id: 2,
+            topic_created_at_micros: 1_700_000_000_000_000,
+            from_offset: 41,
+            to_offset: 97,
+        })),
     );
     assert_frame(
-        "control_remove_run_source.bin",
-        &envelope(ControlCommand::RemoveRunSource(SourceSelector::new(
-            "laser-orchestra",
-            "agents",
-        ))),
+        "control_skip_record.bin",
+        &envelope(ControlCommand::SkipRecord(RecordSkip {
+            source: SourceSelector::new("fleet", "readings"),
+            partition_id: 2,
+            topic_created_at_micros: 1_700_000_000_000_000,
+            offset: 58,
+            target: "readings_rows".to_owned(),
+            reason: "value out of range".to_owned(),
+        })),
+    );
+    assert_frame("control_stamped_remove_binding.bin", &{
+        let mut stamped = envelope(ControlCommand::RemoveBinding {
+            source: SourceSelector::new("fleet", "readings"),
+            projection_ref: None,
+        });
+        stamped.stream = Some("fleet".to_owned());
+        stamped.stamp = Some(ControlStamp {
+            deployment_id: 7,
+            actor_user_id: 42,
+            operation_id: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
+            stream_generation: Some(ControlStreamGeneration {
+                stream_id: 3,
+                created_at_micros: 1_700_000_000_000_000,
+            }),
+            key_id: 11,
+            caller: None,
+        });
+        stamped
+    });
+    assert_frame("control_stamped_caller.bin", &{
+        let mut stamped = envelope(ControlCommand::DropSchema(4));
+        stamped.stream = Some("fleet".to_owned());
+        stamped.stamp = Some(ControlStamp {
+            deployment_id: 7,
+            actor_user_id: 3,
+            operation_id: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdf0,
+            stream_generation: Some(ControlStreamGeneration {
+                stream_id: 3,
+                created_at_micros: 1_700_000_000_000_000,
+            }),
+            key_id: 11,
+            caller: Some(Caller {
+                user_id: 3,
+                agent: None,
+                on_behalf_of: Some("1793690355287073".to_owned()),
+            }),
+        });
+        stamped
+    });
+    assert_frame(
+        "control_register_session_source_all.bin",
+        &envelope(ControlCommand::RegisterSessionSource {
+            stream: "agents".to_owned(),
+            topics: SessionTopics::All,
+        }),
+    );
+    assert_frame(
+        "control_register_session_source_named.bin",
+        &envelope(ControlCommand::RegisterSessionSource {
+            stream: "agents".to_owned(),
+            topics: SessionTopics::Named(vec!["agent.sessions".to_owned()]),
+        }),
+    );
+    assert_frame(
+        "control_remove_session_source.bin",
+        &envelope(ControlCommand::RemoveSessionSource {
+            stream: "agents".to_owned(),
+        }),
     );
     assert_frame(
         "control_register_schema_avro.bin",
@@ -1468,6 +1665,7 @@ fn given_control_frames_when_encoded_then_should_match_golden_fixtures() {
             },
             name: Some("fills".to_owned()),
             version: Some(1),
+            stream: None,
         },
     );
     assert_frame(
@@ -1508,6 +1706,7 @@ fn given_browse_frames_when_encoded_then_should_match_golden_fixtures() {
             v: QUERY_OP_VERSION,
             id: 7,
             payload: vec![0xff, 0x00, 0x10],
+            stream: None,
         },
     );
     assert_frame(
@@ -1592,9 +1791,72 @@ fn given_authz_frames_when_encoded_then_should_match_golden_fixtures() {
                     user_id: 7,
                     roles: vec!["kv-reader".to_owned()],
                 },
+                stream: None,
             }],
             next_after_revision: None,
         }),
+    );
+}
+
+#[test]
+fn given_session_linked_mutations_when_encoded_then_should_match_golden_fixtures() {
+    let session = SessionRef {
+        stream: "alpha".to_owned(),
+        session: ConversationId::from_u128(3),
+    };
+    assert_frame(
+        "kv_set_session.bin",
+        &KvSet {
+            v: KV_OP_VERSION,
+            namespace: "sessions".to_owned(),
+            session: Some(session.clone()),
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+            expires_at_micros: None,
+        },
+    );
+    assert_frame(
+        "kv_cas_session.bin",
+        &KvCas {
+            v: KV_OP_VERSION,
+            namespace: "sessions".to_owned(),
+            session: Some(session.clone()),
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+            expires_at_micros: None,
+            expect: CasExpect::Absent,
+        },
+    );
+    assert_frame(
+        "kv_delete_session.bin",
+        &KvDelete {
+            v: KV_OP_VERSION,
+            namespace: "sessions".to_owned(),
+            session: Some(session.clone()),
+            key: b"key".to_vec(),
+            if_match: None,
+        },
+    );
+    assert_frame(
+        "kv_patch_session.bin",
+        &KvPatch {
+            v: KV_OP_VERSION,
+            namespace: "sessions".to_owned(),
+            session: Some(session.clone()),
+            key: b"key".to_vec(),
+            patch: br#"{"ready":true}"#.to_vec(),
+            if_match: None,
+        },
+    );
+    assert_frame(
+        "graph_upsert_session.bin",
+        &GraphUpsert {
+            v: GRAPH_OP_VERSION,
+            graph: "knowledge".to_owned(),
+            session: Some(session),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        },
     );
 }
 
@@ -1605,6 +1867,7 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
         &KvSet {
             v: KV_OP_VERSION,
             namespace: "sessions".to_owned(),
+            session: None,
             key: vec![0xff, 0x00, b'k'],
             value: b"online".to_vec(),
             expires_at_micros: Some(1_700_000_000_000_000),
@@ -1615,6 +1878,7 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
         &KvCas {
             v: KV_OP_VERSION,
             namespace: "counters".to_owned(),
+            session: None,
             key: b"hits".to_vec(),
             value: b"42".to_vec(),
             expires_at_micros: None,
@@ -1768,6 +2032,7 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
             end: None,
             key_contains: Some("admin".to_owned()),
             conversation: None,
+            stream: None,
             limit: 50,
             cursor: Some(b"user:9".to_vec()),
         },
@@ -1839,6 +2104,7 @@ fn given_graph_frames_when_encoded_then_should_match_golden_fixtures() {
         &GraphUpsert {
             v: GRAPH_OP_VERSION,
             graph: "knowledge".to_owned(),
+            session: None,
             nodes: vec![alice.clone(), acme.clone()],
             edges: vec![edge.clone()],
         },
@@ -1863,6 +2129,7 @@ fn given_graph_frames_when_encoded_then_should_match_golden_fixtures() {
             consistency: Consistency::Eventual,
             as_of: Some(1_500),
             conversation: None,
+            stream: None,
         },
     );
 
@@ -1878,6 +2145,7 @@ fn given_graph_frames_when_encoded_then_should_match_golden_fixtures() {
             limit: 50,
             as_of: Some(1_500),
             conversation: None,
+            stream: None,
         },
     );
 
@@ -1897,6 +2165,7 @@ fn given_graph_frames_when_encoded_then_should_match_golden_fixtures() {
     // canonical source-less frames above stay byte-identical. An unset
     // conversation keeps these frames identical to the pre-conversation contract.
     let source = SourceRef::Message {
+        generation: None,
         stream: 7,
         topic: 2,
         partition: 3,
@@ -1915,6 +2184,7 @@ fn given_graph_frames_when_encoded_then_should_match_golden_fixtures() {
     // conversation that asserted the element, and the read filters that narrow a
     // traversal to one conversation.
     let conv_source = SourceRef::Message {
+        generation: None,
         stream: 7,
         topic: 2,
         partition: 3,
@@ -1943,6 +2213,7 @@ fn given_graph_frames_when_encoded_then_should_match_golden_fixtures() {
             consistency: Consistency::Eventual,
             as_of: None,
             conversation: Some("7ZZZZZZZZZZZZZZZZZZZZZZZZZ".to_owned()),
+            stream: None,
         },
     );
     assert_frame(
@@ -1957,64 +2228,8 @@ fn given_graph_frames_when_encoded_then_should_match_golden_fixtures() {
             limit: 50,
             as_of: None,
             conversation: Some("7ZZZZZZZZZZZZZZZZZZZZZZZZZ".to_owned()),
+            stream: None,
         },
-    );
-}
-
-#[test]
-fn given_agent_workflow_frames_when_encoded_then_should_match_golden_fixtures() {
-    assert_frame(
-        "agent_submit.bin",
-        &AgentSubmit {
-            v: AGENT_WORKFLOW_OP_VERSION,
-            agent_id: "diagnoser".to_owned(),
-            run_id: Some("run-7".to_owned()),
-            params: BTreeMap::from([("priority".to_owned(), "high".to_owned())]),
-            input: Some(br#"{"incident":"INC-7"}"#.to_vec()),
-            budget: None,
-        },
-    );
-    let run = AgentRunInfo {
-        run_id: "run-7".to_owned(),
-        agent_id: "diagnoser".to_owned(),
-        user_id: 42,
-        state: AgentRunState::Running,
-        created_at_micros: TIMESTAMP_MICROS,
-        updated_at_micros: TIMESTAMP_MICROS + 1_000_000,
-        detail: None,
-        cancel_requested: false,
-    };
-    assert_frame(
-        "agent_reply_status.bin",
-        &AgentReply::Ok(AgentOutcome::Status(run.clone())),
-    );
-    assert_frame(
-        "agent_list_page.bin",
-        &AgentList {
-            v: AGENT_WORKFLOW_OP_VERSION,
-            agent_id: Some("diagnoser".to_owned()),
-            state: Some(AgentRunState::Running),
-            limit: Some(25),
-            cursor: Some(vec![0x0a, 0x0b]),
-        },
-    );
-    assert_frame(
-        "agent_reply_list_page.bin",
-        &AgentReply::Ok(AgentOutcome::List(RunPage {
-            runs: vec![AgentRunInfo {
-                state: AgentRunState::Failed,
-                detail: Some("budget exhausted".to_owned()),
-                ..run
-            }],
-            cursor: Some(vec![0x0c, 0x0d]),
-        })),
-    );
-    assert_frame(
-        "agent_reply_error.bin",
-        &AgentReply::Err(AgentError::Version {
-            expected: AGENT_WORKFLOW_OP_VERSION,
-            got: 99,
-        }),
     );
 }
 
@@ -2055,6 +2270,7 @@ fn given_a_change_record_when_encoded_then_should_match_the_golden_fixture() {
             from_offset: 100,
             to_offset: 141,
             rows: 42,
+            stream: None,
         },
     );
 }
@@ -2102,8 +2318,15 @@ fn given_a_fold_snapshot_when_encoded_then_should_match_golden_fixture() {
     assert_frame(
         "fold_snapshot.bin",
         &FoldSnapshot {
+            stream: "agents".to_owned(),
+            stream_id: 0,
+            stream_created_at_micros: 100,
             conversation: ConversationId::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
-            as_of: BTreeMap::from([(0, 41), (1, 9)]),
+            fold: "planner".to_owned(),
+            as_of: vec![
+                SnapshotOffset::new(2, 20, 0, 41),
+                SnapshotOffset::new(2, 20, 1, 9),
+            ],
             state: br#"{"folded":true}"#.to_vec(),
         },
     );
@@ -2121,19 +2344,202 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             correlation: Some("conv-1".to_owned()),
             query_envelope: vec![1, 2, 3, 4],
             grants: Vec::new(),
+            tenancy: Default::default(),
+            scope: None,
         },
     );
     assert_frame(
         "forwarded_command.bin",
         &ForwardedCommand {
+            read_barrier: false,
+            min_position: None,
+            positioned_reply: false,
+            min_sessions: Vec::new(),
+            tenancy: Default::default(),
             user_id: 7,
             client_id: 42,
             correlation: None,
             operation_id: None,
             read_all: true,
+            scope: None,
             command_code: AGDX_KV_SET_CODE,
             payload: vec![9, 9, 9],
             grants: Vec::new(),
+            agent: None,
+            on_behalf_of: None,
+        },
+    );
+    assert_frame(
+        "forwarded_command_agent.bin",
+        &ForwardedCommand {
+            read_barrier: false,
+            min_position: None,
+            positioned_reply: true,
+            min_sessions: Vec::new(),
+            tenancy: Default::default(),
+            user_id: 0,
+            client_id: 42,
+            correlation: None,
+            operation_id: Some(17),
+            read_all: false,
+            scope: None,
+            command_code: laser_wire::codes::AGDX_FORK_CREATE_CODE,
+            payload: vec![9, 9, 9],
+            grants: Vec::new(),
+            agent: Some("orbit-planner".parse().expect("agent id")),
+            on_behalf_of: None,
+        },
+    );
+    assert_frame(
+        "forwarded_command_on_behalf_of.bin",
+        &ForwardedCommand {
+            read_barrier: false,
+            min_position: None,
+            positioned_reply: false,
+            min_sessions: Vec::new(),
+            tenancy: Default::default(),
+            user_id: 3,
+            client_id: 42,
+            correlation: None,
+            operation_id: Some(18),
+            read_all: false,
+            scope: None,
+            command_code: AGDX_CONTROL_PUBLISH_CODE,
+            payload: vec![9, 9, 9],
+            grants: Vec::new(),
+            agent: None,
+            on_behalf_of: Some("1793690355287073".to_owned()),
+        },
+    );
+    let scope = ForwardedScope {
+        stream_id: 0,
+        stream: "alpha".to_owned(),
+        stream_created_at_micros: 1_700_000_000_000_000,
+    };
+    assert_frame(
+        "forwarded_command_scoped.bin",
+        &ForwardedCommand {
+            read_barrier: false,
+            min_position: None,
+            positioned_reply: false,
+            min_sessions: Vec::new(),
+            tenancy: Default::default(),
+            user_id: 7,
+            client_id: 42,
+            correlation: None,
+            operation_id: None,
+            read_all: false,
+            scope: Some(scope.clone()),
+            command_code: AGDX_KV_SET_CODE,
+            payload: vec![9, 9, 9],
+            grants: Vec::new(),
+            agent: None,
+            on_behalf_of: None,
+        },
+    );
+    assert_frame(
+        "forwarded_command_positioned.bin",
+        &ForwardedCommand {
+            read_barrier: true,
+            min_position: Some(laser_wire::mutation::MutationPosition {
+                topic_generation: 9,
+                partition: 0,
+                offset: 42,
+            }),
+            positioned_reply: true,
+            min_sessions: vec![laser_wire::mutation::SessionPosition {
+                stream_id: 0,
+                stream_generation: 1_700_000_000_000_000,
+                topic: "agent.sessions".to_owned(),
+                topic_generation: 10,
+                partition_id: 0,
+                offset: 43,
+            }],
+            tenancy: laser_wire::authz::Tenancy::Stream,
+            user_id: 7,
+            client_id: 42,
+            correlation: None,
+            operation_id: None,
+            read_all: false,
+            scope: Some(scope.clone()),
+            command_code: laser_wire::codes::AGDX_KV_GET_CODE,
+            payload: vec![9, 9, 9],
+            grants: Vec::new(),
+            agent: None,
+            on_behalf_of: None,
+        },
+    );
+    assert_frame(
+        "forwarded_query_scoped.bin",
+        &ForwardedQuery {
+            user_id: 7,
+            client_id: 42,
+            correlation: None,
+            query_envelope: vec![1, 2, 3, 4],
+            grants: Vec::new(),
+            tenancy: laser_wire::authz::Tenancy::Stream,
+            scope: Some(scope.clone()),
+        },
+    );
+    assert_frame(
+        "session_ref.bin",
+        &SessionRef {
+            stream: "alpha".to_owned(),
+            session: ConversationId::from_u128(3),
+        },
+    );
+}
+
+#[test]
+fn given_origin_and_producer_frames_when_encoded_then_should_match_golden_fixtures() {
+    let origin = SourceRef::Message {
+        stream: 0,
+        topic: 2,
+        partition: 1,
+        offset: 9,
+        generation: Some(1_700_000_000_000_000),
+        conversation: Some(ConversationId::from_u128(3).to_string()),
+    };
+    let producer = ProducerInfo {
+        name: "extractor".to_owned(),
+        version: "0.8.0".to_owned(),
+    };
+    assert_frame("source_ref_generation.bin", &origin);
+    let mut node = GraphNode::entity("Component", "cache");
+    node.source = Some(origin.clone());
+    node.producer = Some(producer.clone());
+    assert_frame("graph_node_producer.bin", &node);
+    let mut edge = GraphEdge::relate(
+        &node,
+        "depends_on",
+        &GraphNode::entity("Component", "store"),
+    );
+    edge.source = Some(origin.clone());
+    edge.producer = Some(producer.clone());
+    assert_frame("graph_edge_producer.bin", &edge);
+    assert_frame(
+        "memory_item_origin.bin",
+        &MemoryRecord::Item {
+            id: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
+            kind: "fact".to_owned(),
+            body: b"cache depends on store".to_vec(),
+            origin: Some(origin),
+            producer: Some(producer),
+        },
+    );
+    assert_frame(
+        "memory_forget_scoped.bin",
+        &MemoryRecord::Forget {
+            target: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
+            conversation: Some("01KWM3K3XEP3NP5TN850J17YBQ".to_owned()),
+        },
+    );
+    assert_frame(
+        "memory_feedback_scoped.bin",
+        &MemoryRecord::Feedback {
+            target: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
+            weight: 1.5,
+            conversation: Some("01KWM3K3XEP3NP5TN850J17YBQ".to_owned()),
         },
     );
 }
@@ -2218,7 +2624,7 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
         .unavailable(),
     );
     // A topology-bearing announce: the deployment's resolved stream/topic
-    // names ride the same private-socket hello, so a custom-topology plane
+    // names ride the same private-socket hello, so a custom-topology backend
     // and every consumer decode the identical shape.
     assert_frame(
         "backend_announce_topology.bin",
@@ -2235,12 +2641,11 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
             changes_topic: "acme.changes".to_owned(),
             kv_mutations_topic: "acme.kv.mutations".to_owned(),
             fork_mutations_topic: "acme.fork.mutations".to_owned(),
-            run_mutations_topic: "acme.run.mutations".to_owned(),
             graph_mutations_topic: "acme.graph.mutations".to_owned(),
             checkpoint_mutations_topic: "acme.checkpoint.mutations".to_owned(),
         }),
     );
-    // The durable managed-mutation log record: the plane replays these on
+    // The durable managed-mutation log record: the managed backend replays these on
     // every fold catch-up, the one place a silent serde drift would be
     // unrecoverable, so the canonical bytes are pinned here.
     assert_frame(
@@ -2248,16 +2653,57 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
         &MutationCommandEnvelope {
             v: KV_OP_VERSION,
             operation_id: 42,
+            actor_user_id: 0,
+            deployment_id: 0,
             timestamp_micros: 1_700_000_000_000_000,
             command_code: AGDX_KV_SET_CODE,
+            scope: None,
             payload: encode_named(&KvSet {
                 v: KV_OP_VERSION,
                 namespace: "sessions".to_owned(),
+                session: None,
                 key: vec![0xff, 0x00, b'k'],
                 value: b"online".to_vec(),
                 expires_at_micros: Some(1_700_000_000_000_000),
             })
             .expect("kv set encodes"),
+            caller: None,
+        },
+    );
+    assert_frame(
+        "mutation_command_caller.bin",
+        &MutationCommandEnvelope {
+            v: FORK_OP_VERSION,
+            operation_id: 44,
+            actor_user_id: 0,
+            deployment_id: 7,
+            timestamp_micros: 1_700_000_000_000_000,
+            command_code: laser_wire::codes::AGDX_FORK_CREATE_CODE,
+            scope: None,
+            payload: vec![9, 9, 9],
+            caller: Some(Caller {
+                user_id: 0,
+                agent: Some("orbit-planner".parse().expect("agent id")),
+                on_behalf_of: None,
+            }),
+        },
+    );
+    assert_frame(
+        "mutation_command_scoped.bin",
+        &MutationCommandEnvelope {
+            v: KV_OP_VERSION,
+            operation_id: 43,
+            actor_user_id: 0,
+            deployment_id: 0,
+            timestamp_micros: 1_700_000_000_000_000,
+            command_code: AGDX_KV_SET_CODE,
+            scope: Some(ForwardedScope {
+                stream_id: 0,
+                stream: "alpha".to_owned(),
+                stream_created_at_micros: 1_700_000_000_000_000,
+            }),
+            payload: vec![9, 9, 9],
+            caller: None,
         },
     );
 }
@@ -2283,6 +2729,49 @@ fn given_managed_identity_frames_when_encoded_then_should_match_golden_fixtures(
             valid_from_micros: 100,
             valid_to_micros: Some(200),
             revoked: false,
+        },
+    );
+}
+
+fn session_position() -> SessionPosition {
+    SessionPosition {
+        stream_id: 2,
+        stream_generation: 1_700_000_000_000_001,
+        topic: "agent.sessions".to_owned(),
+        topic_generation: 1_700_000_000_000_002,
+        partition_id: 1,
+        offset: 9,
+    }
+}
+
+#[test]
+fn given_positioned_managed_frames_when_encoded_then_should_match_golden_fixtures() {
+    let position = |offset| MutationPosition {
+        topic_generation: 1_700_000_000_000_000,
+        partition: 0,
+        offset,
+    };
+    assert_frame(
+        "managed_read.bin",
+        &ManagedReadEnvelope {
+            v: MANAGED_REQUEST_VERSION,
+            read: vec![9, 8, 7],
+            min_position: Some(position(41)),
+            log_head: true,
+            min_sessions: vec![session_position()],
+        },
+    );
+    assert_frame(
+        "managed_reply.bin",
+        &ManagedReplyEnvelope {
+            v: MANAGED_REQUEST_VERSION,
+            frontier: AppliedFrontier {
+                kv: Some(position(41)),
+                fork: None,
+                graph: Some(position(3)),
+                sessions: vec![session_position()],
+            },
+            reply: vec![1, 2, 3],
         },
     );
 }
@@ -2536,13 +3025,156 @@ mod agent_fixtures {
     use laser_wire::agent::{
         AgentCard, AgentDeadLetter, AgentEnvelope, AgentErrorBody, AgentErrorCode, AgentId,
         AgentKind, AgentPresence, BodyRef, CapabilityDescriptor, ChannelId, ContentRef,
-        ConversationId, CorrelationId, DeadLetterReason, Health, LogPosition, METADATA_RUN,
-        OPERATION_CARD, OPERATION_CHAT, OPERATION_REASONING, OPERATION_TASK, RecordId,
-        SIGNATURE_SCHEME_ED25519, Signature, TaskState, TokenUsage, validate,
+        ContextCompaction, ContextManifest, ContextRetrieval, ConversationId, CorrelationId,
+        DeadLetterReason, Fragment, Health, LogPosition, OPERATION_CARD, OPERATION_CHAT,
+        OPERATION_REASONING, OPERATION_SESSION, OPERATION_TASK, RecordId, SIGNATURE_SCHEME_ED25519,
+        SdkInfo, SessionEnd, SessionStart, SessionStatus, SessionTransition, Signature, StateDelta,
+        StateSnapshot, TaskState, TokenUsage, validate,
     };
     use laser_wire::content::ContentType;
+    use laser_wire::graph::{ProducerInfo, SourceRef};
     use laser_wire::query::Value;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn given_context_and_state_records_when_encoded_then_should_match_golden_fixtures() {
+        let at = SourceRef::Message {
+            stream: 0,
+            topic: 2,
+            partition: 0,
+            offset: 9,
+            generation: Some(20),
+            conversation: Some(conversation().to_string()),
+        };
+        assert_frame(
+            "context_manifest.bin",
+            &ContextManifest {
+                policy: "recent".to_owned(),
+                policy_version: "1".to_owned(),
+                fragments: vec![
+                    Fragment::Message {
+                        at: at.clone(),
+                        tokens: 12,
+                        bytes: 48,
+                    },
+                    Fragment::Memory {
+                        id: "item-7".to_owned(),
+                        version: Some(3),
+                        digest: None,
+                        tokens: 4,
+                        bytes: 16,
+                    },
+                ],
+                tokens: 16,
+                bytes: 64,
+                frontier: vec![(2, 0, 10)],
+                correlation: Some(correlation()),
+            },
+        );
+        assert_frame(
+            "context_compaction.bin",
+            &ContextCompaction {
+                summary_at: at,
+                covered: vec![(2, 0, 1, 9)],
+                summarizer: ProducerInfo {
+                    name: "summarizer".to_owned(),
+                    version: "0.8.0".to_owned(),
+                },
+            },
+        );
+        assert_frame(
+            "context_retrieval.bin",
+            &ContextRetrieval {
+                query: Some("cache".to_owned()),
+                items: vec![("item-7".to_owned(), 0.5)],
+            },
+        );
+        let operation = serde_json::from_str::<json_patch::PatchOperation>(
+            r#"{"op":"add","path":"/ready","value":true}"#,
+        )
+        .expect("patch operation decodes");
+        assert_frame(
+            "state_delta.bin",
+            &StateDelta {
+                base_revision: 3,
+                patch: vec![operation],
+                op_id: "patch-4".to_owned(),
+            },
+        );
+        assert_frame(
+            "state_snapshot.bin",
+            &StateSnapshot {
+                base_revision: 4,
+                document: serde_json::json!({"ready": true}),
+            },
+        );
+    }
+
+    #[test]
+    fn given_session_frames_when_encoded_then_should_match_golden_fixtures() {
+        let parent = conversation();
+        let root = ConversationId::from_u128(1);
+        let child = ConversationId::from_u128(3);
+        let start = SessionStart {
+            label: Some("Research".to_owned()),
+            namespace: Some("agents".to_owned()),
+            agent: source(),
+            sdk: SdkInfo {
+                language: "rust".to_owned(),
+                version: "0.8.0".to_owned(),
+            },
+            parent: Some(parent),
+            root: Some(root),
+            idle_timeout_micros: Some(300_000_000),
+            budget: None,
+            tags: vec!["demo".to_owned()],
+        };
+        assert_frame("agent_session_start.bin", &start);
+        let transition = SessionTransition {
+            actor: Some(source()),
+            acknowledges: Some(LogPosition::new(1, 2, 0, 9)),
+        };
+        assert_frame("agent_session_transition.bin", &transition);
+        let end = SessionEnd {
+            reason: Some("done".to_owned()),
+            error: None,
+        };
+        assert_frame("agent_session_end.bin", &end);
+        assert_frame("agent_session_status.bin", &SessionStatus::Paused);
+        let parking = laser_wire::agent::SessionParking {
+            source: laser_wire::graph::SourceRef::Message {
+                stream: 1,
+                topic: 2,
+                partition: 0,
+                offset: 41,
+                generation: Some(1_700_000_000_000_000),
+                conversation: Some(child.to_string()),
+            },
+            role: source(),
+            request: LogPosition::new(1, 5, 0, 7),
+        };
+        laser_wire::validate::Validate::validate(&parking).expect("canonical parking validates");
+        assert_frame("agent_session_parking.bin", &parking);
+
+        let mut envelope = AgentEnvelope::status(record(), child, source(), OPERATION_SESSION);
+        envelope.parent = Some(parent);
+        envelope.root = Some(root);
+        envelope.task_state = Some(TaskState::Submitted);
+        envelope.body = encode_named(&start).expect("start body encodes");
+        validate(&envelope).expect("session status validates");
+        assert_frame("agent_status_session.bin", &envelope);
+        assert_frame(
+            "agent_usage_cost.bin",
+            &TokenUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                reasoning_output_tokens: None,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+                cost_micros: Some(12_500),
+            },
+        );
+    }
 
     // DRAFT-grade fixtures by design: a real multi-agent application gets
     // built on this envelope before the corpus hardens, so v1 pins a shape
@@ -2591,6 +3223,7 @@ mod agent_fixtures {
             reasoning_output_tokens: Some(64),
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            cost_micros: None,
         });
         validate(&response).expect("canonical response validates");
         assert_frame("agent_response.bin", &response);
@@ -2660,6 +3293,7 @@ mod agent_fixtures {
             reasoning_output_tokens: None,
             cache_read_input_tokens: Some(900),
             cache_creation_input_tokens: None,
+            cost_micros: None,
         });
         validate(&terminal).expect("canonical terminal chunk validates");
         assert_frame("agent_chunk_terminal.bin", &terminal);
@@ -2669,15 +3303,6 @@ mod agent_fixtures {
             .with_task_state(TaskState::Working);
         validate(&task).expect("canonical task update validates");
         assert_frame("agent_status_task.bin", &task);
-
-        // A registered run's status record: identical to the task update above
-        // plus the pinned `run` metadata key the run-registry fold selects on.
-        let registered = AgentEnvelope::status(record(), conversation(), source(), OPERATION_TASK)
-            .with_correlation(correlation())
-            .with_task_state(TaskState::Working)
-            .with_metadata(METADATA_RUN, "run-7");
-        validate(&registered).expect("canonical registered-run status validates");
-        assert_frame("agent_status_run_metadata.bin", &registered);
 
         let card = AgentEnvelope::status(record(), conversation(), source(), OPERATION_CARD);
         validate(&card).expect("canonical card validates");
@@ -2830,7 +3455,7 @@ mod agent_fixtures {
         status.operation = None;
         assert_invalid("agent_invalid_status_no_operation.bin", &status);
 
-        // The status discriminator is a closed vocabulary (task|card|progress).
+        // The status discriminator is a closed vocabulary that excludes telemetry.
         let off_vocabulary = AgentEnvelope::status(record(), conversation(), source(), "telemetry");
         assert_invalid("agent_invalid_status_bad_operation.bin", &off_vocabulary);
 
@@ -2919,6 +3544,22 @@ fn canonical_safe_mode_filter() -> ConsumerFilter {
     ]))
 }
 
+// A standard polled-messages head with no records: partition 0, the head
+// offset, a zero count and the partition context the page was served under.
+fn polled_head(
+    frontier: u64,
+    incarnation: u64,
+    owner_generation: u64,
+    metadata_op: u64,
+) -> Vec<u8> {
+    let mut body = vec![0; 40];
+    body[4..12].copy_from_slice(&frontier.to_le_bytes());
+    body[16..24].copy_from_slice(&incarnation.to_le_bytes());
+    body[24..32].copy_from_slice(&owner_generation.to_le_bytes());
+    body[32..40].copy_from_slice(&metadata_op.to_le_bytes());
+    body
+}
+
 fn canonical_generation() -> SourceGeneration {
     SourceGeneration {
         stream_id: 1,
@@ -2926,8 +3567,7 @@ fn canonical_generation() -> SourceGeneration {
         topic_id: 2,
         topic_created_at_micros: TIMESTAMP_MICROS + 1,
         partition_id: 0,
-        partition_created_revision: 17,
-        purge_generation: 0,
+        partition_incarnation: 17,
     }
 }
 
@@ -2963,6 +3603,42 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             reads_headers: false,
         },
     );
+    let acknowledgment = FilteredAck {
+        v: laser_wire::codes::FILTER_OP_VERSION,
+        source: FilterSource {
+            stream: "orbit".to_owned(),
+            topic: "fleet_changes".to_owned(),
+        },
+        partition_id: 0,
+        consumer: FilterConsumer::Group("anomaly-desk".to_owned()),
+        group_id: Some(3),
+        generation: canonical_generation(),
+        ack_context: AckContext {
+            owner_generation: 4,
+            metadata_op: 40,
+        },
+        digest: Some(filter.digest()),
+        offset: 6,
+        mode: ExecutionMode::Filtered,
+        policy_generation: 2,
+    };
+    assert_frame("filter_ack.bin", &acknowledgment);
+    assert_frame(
+        "filter_ack_unfiltered.bin",
+        &FilteredAck {
+            digest: None,
+            mode: ExecutionMode::Unfiltered,
+            ..acknowledgment
+        },
+    );
+    assert_frame(
+        "filter_reply_acknowledged.bin",
+        &FilterReply::Ok(FilterOutcome::Acknowledged(AckReceipt {
+            partition_id: 0,
+            offset: 6,
+            generation: canonical_generation(),
+        })),
+    );
     assert_frame(
         "filter_poll_request.bin",
         &FilteredPollRequest {
@@ -2980,10 +3656,49 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             start: FilteredStart::Next,
             count: 200,
             max_reply_bytes: 1024 * 1024,
-            read_mode: ReadMode::Primary,
             max_examined: None,
             min_catalog_position: None,
         },
+    );
+    assert_frame(
+        "filter_wait_request.bin",
+        &FilteredWaitRequest {
+            v: laser_wire::codes::FILTER_OP_VERSION,
+            source: FilterSource {
+                stream: "orbit".to_owned(),
+                topic: "fleet_changes".to_owned(),
+            },
+            consumer: FilterConsumer::Group("anomaly-desk".to_owned()),
+            partitions: vec![
+                FilteredWaitPartition {
+                    partition_id: 0,
+                    offset: 7,
+                },
+                FilteredWaitPartition {
+                    partition_id: 1,
+                    offset: 0,
+                },
+            ],
+            max_wait_ms: 5_000,
+            wait_id: 9,
+        },
+    );
+    assert_frame(
+        "filter_reply_ready.bin",
+        &FilterReply::Ok(FilterOutcome::Ready(FilteredWaitResult { ready: vec![1] })),
+    );
+    assert_frame(
+        "filter_wait_cancel.bin",
+        &FilteredWaitCancel {
+            v: laser_wire::codes::FILTER_OP_VERSION,
+            wait_ids: vec![9, 11],
+        },
+    );
+    assert_frame(
+        "filter_reply_cancelled.bin",
+        &FilterReply::Ok(FilterOutcome::Cancelled(FilteredWaitCancelled {
+            cancelled: vec![9],
+        })),
     );
     assert_frame(
         "filter_poll_request_group_id.bin",
@@ -2999,7 +3714,6 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             start: FilteredStart::Next,
             count: 200,
             max_reply_bytes: 1024 * 1024,
-            read_mode: ReadMode::Primary,
             max_examined: None,
             min_catalog_position: None,
         },
@@ -3018,7 +3732,6 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             start: FilteredStart::Next,
             count: 100,
             max_reply_bytes: 1024 * 1024,
-            read_mode: ReadMode::Primary,
             max_examined: Some(100),
             min_catalog_position: Some(CatalogPosition {
                 partition_id: 0,
@@ -3048,7 +3761,10 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
                 policy_generation: 1,
             },
             generation: canonical_generation(),
-            read_mode: ReadMode::Primary,
+            ack_context: AckContext {
+                owner_generation: 4,
+                metadata_op: 40,
+            },
             next_scan_offset: Some(1397),
             safe_ack_offset: Some(1396),
             frontier: 2000,
@@ -3058,11 +3774,7 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             fault: None,
             unevaluated: Vec::new(),
             evaluation_limits: None,
-            records: {
-                let mut body = vec![0; 16];
-                body[4..12].copy_from_slice(&2000_u64.to_le_bytes());
-                body
-            },
+            records: polled_head(2000, 17, 4, 40),
         })),
     );
     assert_frame(
@@ -3072,7 +3784,10 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             partition_id: 0,
             policy: AppliedPolicy::unfiltered(canonical_identity().group_id, 0),
             generation: canonical_generation(),
-            read_mode: ReadMode::Primary,
+            ack_context: AckContext {
+                owner_generation: 4,
+                metadata_op: 40,
+            },
             next_scan_offset: Some(100),
             safe_ack_offset: Some(99),
             frontier: 2000,
@@ -3082,62 +3797,14 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             fault: None,
             unevaluated: Vec::new(),
             evaluation_limits: None,
-            records: {
-                let mut body = vec![0; 16];
-                body[4..12].copy_from_slice(&2000_u64.to_le_bytes());
-                body
-            },
-        })),
-    );
-    assert_frame(
-        "filter_ack.bin",
-        &FilteredAck {
-            group_id: Some(canonical_identity().group_id),
-            v: laser_wire::codes::FILTER_OP_VERSION,
-            source: FilterSource {
-                stream: "orbit".to_owned(),
-                topic: "fleet_changes".to_owned(),
-            },
-            partition_id: 0,
-            consumer: FilterConsumer::Group("anomaly-desk".to_owned()),
-            generation: canonical_generation(),
-            digest: Some(filter.digest()),
-            offset: 1396,
-            mode: ExecutionMode::Filtered,
-            policy_generation: 1,
-        },
-    );
-    assert_frame(
-        "filter_ack_unfiltered.bin",
-        &FilteredAck {
-            group_id: Some(canonical_identity().group_id),
-            v: laser_wire::codes::FILTER_OP_VERSION,
-            source: FilterSource {
-                stream: "orbit".to_owned(),
-                topic: "fleet_changes".to_owned(),
-            },
-            partition_id: 0,
-            consumer: FilterConsumer::GroupId(canonical_identity().group_id),
-            generation: canonical_generation(),
-            digest: None,
-            offset: 99,
-            mode: ExecutionMode::Unfiltered,
-            policy_generation: 0,
-        },
-    );
-    assert_frame(
-        "filter_reply_acknowledged.bin",
-        &FilterReply::Ok(FilterOutcome::Acknowledged(AckReceipt {
-            partition_id: 0,
-            offset: 1396,
-            generation: canonical_generation(),
+            records: polled_head(2000, 17, 4, 40),
         })),
     );
     assert_frame(
         "filter_reply_error.bin",
         &FilterReply::Err(FilterError::new(
             FilterErrorReason::SourceChanged,
-            "partition 0 was purged",
+            "partition 0 was recreated",
         )),
     );
 }
@@ -3192,7 +3859,10 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
         operation_id: 11,
         mutation: FilterMutation::ConfigureGroup {
             group: canonical_group(),
-            policy: GroupFilterSpec::Definition(filter.clone()),
+            policy: GroupFilterSpec::Definition {
+                name: "safe-mode".to_owned(),
+                filter: filter.clone(),
+            },
             expected_identity: Some(canonical_identity()),
         },
     };
@@ -3292,7 +3962,7 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
         &ControlEnvelope {
             v: CONTROL_OP_VERSION,
             timestamp_micros: TIMESTAMP_MICROS,
-            command: ControlCommand::FilterCatalog(FilterCatalogCommand {
+            command: ControlCommand::FilterCatalog(Box::new(FilterCatalogCommand {
                 limits: Some(laser_wire::filter::FilterCatalogLimits::default()),
                 operation_id: 9,
                 actor_user_id: 1,
@@ -3304,7 +3974,514 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
                 identity: Some(canonical_identity()),
                 filter_id: None,
                 grants: Vec::new(),
-            }),
+            })),
+            stream: None,
+            stamp: None,
         },
     );
+}
+
+#[test]
+fn given_session_read_replies_when_encoded_then_should_match_golden_fixtures() {
+    assert_frame(
+        "session_reply_info.bin",
+        &SessionReply::Ok(SessionOutcome::Info(Box::new(canonical_session_info()))),
+    );
+    assert_frame(
+        "session_reply_page.bin",
+        &SessionReply::Ok(SessionOutcome::Page(canonical_session_page())),
+    );
+    assert_frame(
+        "session_reply_page_rebuilding.bin",
+        &SessionReply::Ok(SessionOutcome::Page(SessionPage {
+            rebuilding: true,
+            ..SessionPage::default()
+        })),
+    );
+    assert_frame(
+        "session_reply_events.bin",
+        &SessionReply::Ok(SessionOutcome::Events(canonical_session_events_page())),
+    );
+    assert_frame(
+        "session_reply_state.bin",
+        &SessionReply::Ok(SessionOutcome::State(canonical_session_state_view())),
+    );
+    assert_frame(
+        "session_reply_links.bin",
+        &SessionReply::Ok(SessionOutcome::Links(canonical_session_links_view())),
+    );
+    assert_frame(
+        "session_reply_sources.bin",
+        &SessionReply::Ok(SessionOutcome::Sources(canonical_session_sources())),
+    );
+    let id = ConversationId::from_u128(2);
+    let position = LogPosition::new(5, 3, 1, 40);
+    assert_frame(
+        "session_reply_changes.bin",
+        &SessionReply::Ok(SessionOutcome::Changes(SessionChanges {
+            rows: vec![
+                SessionChangeRow {
+                    seq: 43,
+                    sessions: vec![id],
+                    positions: vec![position],
+                    truncated: false,
+                    origin: SessionChangeOrigin::Records,
+                },
+                SessionChangeRow {
+                    seq: 44,
+                    sessions: vec![id],
+                    positions: vec![position],
+                    truncated: false,
+                    origin: SessionChangeOrigin::Links,
+                },
+            ],
+            floor: 10,
+            resync: false,
+            series: 0,
+        })),
+    );
+    assert_frame(
+        "session_heartbeat.bin",
+        &SessionHeartbeat {
+            process: "01KWM3K3XEP3NP5TN850J17YBR".to_owned(),
+            stream: "agents".to_owned(),
+            sessions: vec![id, ConversationId::from_u128(3)],
+        },
+    );
+    assert_frame(
+        "session_reply_error.bin",
+        &SessionReply::Err(SessionError::NotRegistered("agents".to_owned())),
+    );
+}
+
+#[test]
+fn given_session_list_pages_when_decoded_then_should_carry_rebuilding_only_when_set() {
+    let page = |name: &str| -> (SessionPage, bool) {
+        let bytes = laser_wire::fixtures::bytes(name).expect("registered fixture");
+        let reply: SessionReply = decode_named(bytes).expect("fixture frame decodes");
+        let SessionReply::Ok(SessionOutcome::Page(page)) = reply else {
+            panic!("{name} holds a page reply");
+        };
+        let names_field = bytes.windows(10).any(|window| window == b"rebuilding");
+        (page, names_field)
+    };
+    let (settled, settled_names_field) = page("session_reply_page.bin");
+    assert!(!settled.rebuilding);
+    assert!(!settled_names_field);
+    let (rebuilding, rebuilding_names_field) = page("session_reply_page_rebuilding.bin");
+    assert!(rebuilding.rebuilding);
+    assert!(rebuilding.items.is_empty());
+    assert!(rebuilding_names_field);
+}
+
+#[test]
+fn given_session_http_payloads_when_encoded_then_should_match_golden_fixtures() {
+    assert_json("session_http_info.json", &canonical_session_info());
+    assert_json("session_http_page.json", &canonical_session_page());
+    assert_json(
+        "session_http_page_rebuilding.json",
+        &SessionPage {
+            rebuilding: true,
+            ..SessionPage::default()
+        },
+    );
+    assert_json("session_http_events.json", &canonical_session_events_page());
+    assert_json("session_http_state.json", &canonical_session_state_view());
+    assert_json("session_http_links.json", &canonical_session_links_view());
+    assert_json("session_http_sources.json", &canonical_session_sources());
+    assert_json(
+        "session_http_error.json",
+        &ErrorBody::from(&SessionError::NotFound(
+            ConversationId::from_u128(4).to_string(),
+        )),
+    );
+    let first = ConversationId::from_u128(2);
+    let second = ConversationId::from_u128(3);
+    let position = LogPosition::new(5, 3, 1, 40);
+    let row =
+        |seq: u64, origin: SessionChangeOrigin, positions: Vec<LogPosition>| SessionChangeRow {
+            seq,
+            sessions: vec![first],
+            positions,
+            truncated: false,
+            origin,
+        };
+    // `series=0&after=0` on a stream with no change yet.
+    assert_json(
+        "session_http_changes_start_new.json",
+        &SessionChanges {
+            rows: Vec::new(),
+            floor: 0,
+            resync: true,
+            series: SESSION_CHANGE_SERIES,
+        },
+    );
+    // `series=0&after=0` on a stream whose newest change is 4405.
+    assert_json(
+        "session_http_changes_start.json",
+        &SessionChanges {
+            rows: Vec::new(),
+            floor: 4405,
+            resync: true,
+            series: SESSION_CHANGE_SERIES,
+        },
+    );
+    // Any request to an older registration without a change-sequence row.
+    assert_json(
+        "session_http_changes_legacy.json",
+        &SessionChanges {
+            rows: Vec::new(),
+            floor: 1,
+            resync: false,
+            series: 0,
+        },
+    );
+    // `after=4403` in the current series, oldest retained change 4401.
+    assert_json(
+        "session_http_changes_page.json",
+        &SessionChanges {
+            rows: vec![
+                row(4404, SessionChangeOrigin::Records, vec![position]),
+                SessionChangeRow {
+                    seq: 4405,
+                    sessions: vec![first, second],
+                    positions: vec![position, LogPosition::new(5, 3, 1, 41)],
+                    truncated: false,
+                    origin: SessionChangeOrigin::Records,
+                },
+            ],
+            floor: 4401,
+            resync: false,
+            series: SESSION_CHANGE_SERIES,
+        },
+    );
+    // `after=4405` in the current series when no change row is retained and the next sequence is 4406.
+    assert_json(
+        "session_http_changes_no_retained_rows.json",
+        &SessionChanges {
+            rows: Vec::new(),
+            floor: 4406,
+            resync: false,
+            series: SESSION_CHANGE_SERIES,
+        },
+    );
+    // `after=4399` in the current series: 4400 is below the oldest retained change 4401.
+    assert_json(
+        "session_http_changes_gap.json",
+        &SessionChanges {
+            rows: vec![
+                row(4401, SessionChangeOrigin::Records, vec![position]),
+                row(4402, SessionChangeOrigin::Records, vec![position]),
+            ],
+            floor: 4401,
+            resync: true,
+            series: SESSION_CHANGE_SERIES,
+        },
+    );
+    // `after=4405` in the current series with nothing newer.
+    assert_json(
+        "session_http_changes_empty.json",
+        &SessionChanges {
+            rows: Vec::new(),
+            floor: 4401,
+            resync: false,
+            series: SESSION_CHANGE_SERIES,
+        },
+    );
+    assert_json(
+        "session_http_changes_truncated.json",
+        &SessionChanges {
+            rows: vec![SessionChangeRow {
+                seq: 4406,
+                sessions: vec![first],
+                positions: vec![position],
+                truncated: true,
+                origin: SessionChangeOrigin::Records,
+            }],
+            floor: 4401,
+            resync: false,
+            series: SESSION_CHANGE_SERIES,
+        },
+    );
+    assert_json(
+        "session_http_changes_origins.json",
+        &SessionChanges {
+            rows: vec![
+                row(4406, SessionChangeOrigin::Links, vec![position]),
+                row(4407, SessionChangeOrigin::Maintenance, Vec::new()),
+                row(4408, SessionChangeOrigin::Expiry, Vec::new()),
+            ],
+            floor: 4401,
+            resync: false,
+            series: SESSION_CHANGE_SERIES,
+        },
+    );
+    let start = std::fs::read_to_string(fixture_path("session_http_changes_start_new.json"))
+        .expect("read the start fixture");
+    assert!(
+        start.contains(&format!("\"series\": {SESSION_CHANGE_SERIES}")),
+        "{start}"
+    );
+}
+
+fn canonical_session_frontier() -> SourceFrontier {
+    SourceFrontier {
+        topic_id: 3,
+        topic_generation: TIMESTAMP_MICROS,
+        partition_id: 1,
+        folded: Some(41),
+        head: Some(42),
+        retained_from: Some(7),
+    }
+}
+
+fn canonical_session_info() -> SessionInfo {
+    SessionInfo {
+        stream: "agents".to_owned(),
+        id: ConversationId::from_u128(2),
+        label: Some("incident".to_owned()),
+        namespace: Some("ops".to_owned()),
+        agent: Some("planner".parse().expect("agent")),
+        parent: Some(ConversationId::from_u128(1)),
+        root: Some(ConversationId::from_u128(1)),
+        status: SessionStatus::Active,
+        idle: false,
+        over_budget: false,
+        pause_requested: false,
+        cancel_requested: true,
+        started_at: Some(TIMESTAMP_MICROS),
+        ended_at: None,
+        first_event_at: Some(TIMESTAMP_MICROS),
+        last_event_at: Some(TIMESTAMP_MICROS + 5),
+        last_heartbeat_at: Some(TIMESTAMP_MICROS + 4),
+        events: 12,
+        model_calls: 2,
+        tool_calls: 3,
+        tokens_in: 100,
+        tokens_out: 50,
+        cost_micros: 1_250,
+        errors: 1,
+        budget: Some(Budget {
+            tokens: Some(10_000),
+            cost_micros: None,
+        }),
+        sdk: Some(SdkInfo {
+            language: "rust".to_owned(),
+            version: "0.8.0".to_owned(),
+        }),
+        flags: SessionFlags {
+            events_truncated: true,
+            ..SessionFlags::default()
+        },
+        held: 0,
+        frontier: vec![canonical_session_frontier()],
+    }
+}
+
+fn canonical_session_page() -> SessionPage {
+    SessionPage {
+        items: vec![canonical_session_info()],
+        cursor: Some("next".to_owned()),
+        total: Some(9),
+        searched: None,
+        truncated: false,
+        rebuilding: false,
+    }
+}
+
+fn canonical_session_events_page() -> SessionEventsPage {
+    SessionEventsPage {
+        items: vec![SessionEvent {
+            at: SourceRef::Message {
+                stream: 5,
+                topic: 3,
+                partition: 1,
+                offset: 41,
+                generation: Some(TIMESTAMP_MICROS),
+                conversation: None,
+            },
+            session: ConversationId::from_u128(2),
+            broker_ts: TIMESTAMP_MICROS + 5,
+            kind: "response".to_owned(),
+            operation: Some("chat".to_owned()),
+            display: "model_response".to_owned(),
+            agent: Some("planner".parse().expect("agent")),
+            addressee: Some("*".to_owned()),
+            correlation: Some(CorrelationId::from_u128(9)),
+            cause: Some(LogPosition::new(5, 3, 1, 40)),
+            tool: None,
+            usage: Some(TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cost_micros: Some(1_250),
+                ..TokenUsage::default()
+            }),
+            after_end: false,
+            verified_actor: None,
+            summary: BTreeMap::from([(
+                "finish_reason".to_owned(),
+                serde_json::Value::from("stop"),
+            )]),
+        }],
+        cursor: Some("page".to_owned()),
+        ranges: vec![PayloadRange {
+            topic_id: 3,
+            topic_generation: TIMESTAMP_MICROS,
+            partition_id: 1,
+            first: 40,
+            last: 41,
+        }],
+        frontier: vec![canonical_session_frontier()],
+        fixed_frontier: true,
+        gaps: vec![SourceGap {
+            topic_id: 3,
+            topic_generation: TIMESTAMP_MICROS,
+            partition_id: 1,
+            from: 0,
+            to: 6,
+            reason: GapReason::ExpiredBeforeFold,
+        }],
+    }
+}
+
+fn canonical_session_state_view() -> SessionStateView {
+    SessionStateView {
+        revision: 2,
+        document: serde_json::json!({ "tasks": ["triage"] }),
+        history: vec![StateChange {
+            revision: 2,
+            op_id: Some("op-2".to_owned()),
+            outcome: StateOutcome::Applied,
+            at: LogPosition::new(5, 3, 1, 40),
+            broker_ts: TIMESTAMP_MICROS + 5,
+            old_digest: Some(Digest32(vec![1; 32])),
+            new_digest: Some(Digest32(vec![2; 32])),
+            reason: None,
+        }],
+        frontier: Some(canonical_session_frontier()),
+        complete: true,
+    }
+}
+
+fn canonical_session_links_view() -> SessionLinksView {
+    SessionLinksView {
+        links: vec![SessionLink {
+            surface: LinkSurface::Kv,
+            resource: "ops".to_owned(),
+            item: "tasks".to_owned(),
+            relation: LinkRelation::Wrote,
+            first: LogPosition::new(5, 3, 1, 40),
+            last: LogPosition::new(5, 3, 1, 41),
+        }],
+        frontier: vec![canonical_session_frontier()],
+        truncated: false,
+    }
+}
+
+fn canonical_session_sources() -> SessionSources {
+    SessionSources {
+        sources: vec![canonical_session_frontier()],
+        lane: Some((2, 100, 4)),
+    }
+}
+
+#[test]
+fn given_a_memory_view_entry_when_encoded_then_should_match_golden_fixture() {
+    assert_frame(
+        "kv_entry_memory_scope.bin",
+        &KvEntry {
+            key: b"01KWM3K3XEP3NP5TN850J17YBP".to_vec(),
+            value: b"api latency increased".to_vec(),
+            expires_at_micros: None,
+            version: 2,
+            scope: Some(Box::new(laser_wire::kv::MemoryRowScope {
+                kind: Some("fact".to_owned()),
+                agent: Some("planner".to_owned()),
+                user: Some("reader".to_owned()),
+                app: Some("desk".to_owned()),
+                conversation: Some("01KWM3K3XEP3NP5TN850J17YBQ".to_owned()),
+                source: Some(SourceRef::Message {
+                    stream: 1,
+                    topic: 2,
+                    partition: 3,
+                    offset: 4,
+                    generation: Some(TIMESTAMP_MICROS),
+                    conversation: None,
+                }),
+                timestamp_micros: Some(TIMESTAMP_MICROS + 9),
+            })),
+            source: None,
+        },
+    );
+}
+
+#[test]
+fn given_the_corpus_records_the_name_limits_govern_when_validated_then_should_all_pass() {
+    fn decoded<T: DeserializeOwned>(name: &str) -> T {
+        let golden = std::fs::read(fixture_path(name)).expect("read fixture");
+        decode_named(&golden).expect("fixture frame decodes")
+    }
+    for (name, _) in laser_wire::fixtures::ALL
+        .iter()
+        .filter(|(name, _)| name.starts_with("control_"))
+    {
+        decoded::<ControlEnvelope>(name)
+            .command
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    for name in ["graph_upsert.bin", "graph_upsert_session.bin"] {
+        decoded::<GraphUpsert>(name)
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    for name in [
+        "graph_node.bin",
+        "graph_node_sourced.bin",
+        "graph_node_conversation.bin",
+        "graph_node_producer.bin",
+    ] {
+        decoded::<GraphNode>(name)
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    for name in [
+        "graph_edge.bin",
+        "graph_edge_sourced.bin",
+        "graph_edge_conversation.bin",
+        "graph_edge_producer.bin",
+    ] {
+        decoded::<GraphEdge>(name)
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    for name in [
+        "memory_item_origin.bin",
+        "memory_forget_scoped.bin",
+        "memory_feedback_scoped.bin",
+    ] {
+        decoded::<MemoryRecord>(name)
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    decoded::<session_request::SessionList>("session_list.bin")
+        .validate()
+        .expect("session_list.bin validates");
+    decoded::<KvLease>("kv_lease.bin")
+        .validate()
+        .expect("kv_lease.bin validates");
+    decoded::<KvLeaseRenew>("kv_lease_renew.bin")
+        .validate()
+        .expect("kv_lease_renew.bin validates");
+    decoded::<KvRelease>("kv_release.bin")
+        .validate()
+        .expect("kv_release.bin validates");
+    decoded::<RegisterSchema>("register_schema_managed.bin")
+        .validate()
+        .expect("register_schema_managed.bin validates");
+    let schema: SchemaDef = serde_json::from_slice(
+        &std::fs::read(fixture_path("schema_def.json")).expect("read fixture"),
+    )
+    .expect("schema_def.json decodes");
+    schema.validate().expect("schema_def.json validates");
 }

@@ -29,8 +29,8 @@ pub use laser_wire::query::{
     AggCall, AggFunc, Aggregate, BoundaryRelation, CmpOp, Consistency, Dir, Filter, KeyMatch,
     MaterializationBoundary, Page, Predicate, Query, QueryBuilder, QueryContext, QueryEngine,
     QueryError, QueryErrorCode, QueryExecutionId, QueryExecutionState, QueryExecutionStatus,
-    QueryPageRequest, QueryResult, QueryTarget, RawSql, ResolvedQueryTarget, Row, Select,
-    SnapshotSelector, Sort, SqlDialect, TextQuery, Value, VectorQuery, Window,
+    QueryFrontier, QueryPageRequest, QueryResult, QueryTarget, RawSql, ResolvedQueryTarget, Row,
+    Select, SnapshotSelector, Sort, SqlDialect, TextQuery, Value, VectorQuery, Window,
 };
 pub use laser_wire::result::ResultCode;
 pub use laser_wire::schema::TypedValue;

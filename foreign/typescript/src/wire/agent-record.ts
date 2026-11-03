@@ -3,7 +3,7 @@ import { type AgentEnvelope, decodeAgentEnvelope, encodeAgentEnvelope } from "./
 import { type CborMap, decodeOne, encodeNamed, expectMap, field } from "./cbor.js"
 import { AGENT_OP_VERSION } from "./codes.js"
 import { type ContentType, contentTypeCode } from "./content.js"
-import { AGENT_VERSION, CONTENT_TYPE, CONVERSATION_ID, TARGET_AGENT_ID } from "./headers.js"
+import { type RecordHeaders, encodeRecordHeaders } from "./headers.js"
 
 export const CanonicalHeaderKind = {
   U32: "u32",
@@ -33,39 +33,60 @@ function u32LittleEndian(value: number): Uint8Array {
   return bytes
 }
 
-function u128LittleEndian(value: bigint): Uint8Array {
-  const bytes = new Uint8Array(16)
-  let remaining = value
-  for (let index = 0; index < bytes.length; index += 1) {
-    bytes[index] = Number(remaining & 0xffn)
-    remaining >>= 8n
+/**
+ * The header block of an envelope record: version, content type, conversation,
+ * ancestry, author, and addressee. A record without a target is addressed to
+ * every agent when `broadcast` is set, as every record on a shared session
+ * topic must be.
+ */
+export function recordHeadersForEnvelope(
+  envelope: AgentEnvelope,
+  contentType: ContentType,
+  broadcast = false
+): RecordHeaders {
+  return {
+    envelope: { version: AGENT_OP_VERSION, contentType: contentTypeCode(contentType) },
+    conversation: envelope.conversation.toString(),
+    ...(envelope.parent !== undefined ? { parent: envelope.parent.toString() } : {}),
+    ...(envelope.root !== undefined ? { root: envelope.root.toString() } : {}),
+    agent: envelope.source,
+    ...(envelope.target !== undefined
+      ? { addressee: { kind: "agent" as const, agent: envelope.target } }
+      : broadcast
+        ? { addressee: { kind: "broadcast" as const } }
+        : {})
   }
-  return bytes
 }
 
+/** The canonical record of `envelope`. `broadcast` addresses an untargeted
+ * envelope to every agent, as on a shared session topic. */
 export function canonicalAgentRecord(
   envelope: AgentEnvelope,
-  contentType: ContentType
+  contentType: ContentType,
+  broadcast = false
 ): CanonicalAgentRecord {
   const headers = new Map<string, CanonicalHeader>()
-  headers.set(AGENT_VERSION, {
-    kind: CanonicalHeaderKind.U32,
-    bytes: u32LittleEndian(AGENT_OP_VERSION)
-  })
-  headers.set(CONTENT_TYPE, {
-    kind: CanonicalHeaderKind.U8,
-    bytes: Uint8Array.of(contentTypeCode(contentType))
-  })
-  if (envelope.target !== undefined) {
-    headers.set(TARGET_AGENT_ID, {
-      kind: CanonicalHeaderKind.String,
-      bytes: textEncoder.encode(envelope.target)
-    })
+  for (const [key, field] of encodeRecordHeaders(
+    recordHeadersForEnvelope(envelope, contentType, broadcast)
+  )) {
+    switch (field.kind) {
+      case "text":
+        headers.set(key, {
+          kind: CanonicalHeaderKind.String,
+          bytes: textEncoder.encode(field.value)
+        })
+        break
+      case "uint32":
+        headers.set(key, { kind: CanonicalHeaderKind.U32, bytes: u32LittleEndian(field.value) })
+        break
+      case "uint8":
+        headers.set(key, { kind: CanonicalHeaderKind.U8, bytes: Uint8Array.of(field.value) })
+        break
+      case "uint64":
+      case "float64":
+        throw new CodecError(`unexpected envelope header ${key}`, "agent record", key)
+    }
   }
-  headers.set(CONVERSATION_ID, {
-    kind: CanonicalHeaderKind.Uint128,
-    bytes: u128LittleEndian(envelope.conversation.asU128())
-  })
   return {
     partitionKey: envelope.conversation.toString(),
     headers,

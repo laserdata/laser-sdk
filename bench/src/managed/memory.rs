@@ -17,7 +17,7 @@ use super::{
 use crate::BenchError;
 use crate::agdx::{record_payload, seeded_payload};
 use crate::engine::{LoadResult, Operation};
-use crate::process::PlaneProfile;
+use crate::process::BackendProfile;
 
 const VISIBILITY_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -44,7 +44,7 @@ fn invalid_memory_arm(value: &str) -> BenchError {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct MemorySummary {
     pub operation: ManagedArmSummary,
-    pub backend_profile: PlaneProfile,
+    pub backend_profile: BackendProfile,
     pub stream: String,
     pub topic: String,
     pub conversation: String,
@@ -78,7 +78,7 @@ pub async fn run_memory_evidence(
     laser: &Laser,
     case: &ManagedCase,
     arm: MemoryArm,
-    profile: PlaneProfile,
+    profile: BackendProfile,
     scenario: &str,
     seed: u64,
     monitored_processes: &[(String, u32)],
@@ -151,7 +151,7 @@ pub async fn run_memory_evidence(
             observation_resolution_ns: validates_managed_visibility(arm)
                 .then_some(duration_ns(VISIBILITY_POLL_INTERVAL)),
             configuration: serde_json::json!({
-                "path": "laser_log_memory_through_iggy_and_plane",
+                "path": "laser_log_memory_through_iggy_and_backend",
                 "backend_profile": profile,
                 "setup_timed": false,
                 "folded_recall_cursor": (arm == MemoryArm::FoldedRecall).then_some("warmed_incremental"),
@@ -194,7 +194,7 @@ async fn wait_for_memory(laser: &Laser, timeout: Duration) -> Result<(), BenchEr
         }
         if Instant::now() >= deadline {
             return Err(BenchError::Invalid(format!(
-                "plane did not advertise managed KV memory within {timeout:?}"
+                "backend did not advertise managed KV memory within {timeout:?}"
             )));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

@@ -19,6 +19,7 @@ import {
   type Reranker
 } from "./types.js"
 import { VectorMemory, WITH_EMBEDDER } from "./vector-memory.js"
+import type { ProducerInfo, SourceRef } from "../wire/graph.js"
 
 // How many items one consolidation pass recalls and operates over.
 const CONSOLIDATION_WINDOW = 10_000
@@ -104,16 +105,16 @@ export class MemoryHandle implements Memory {
     return recallFoldedOn(this.store, scope, query)
   }
 
-  /** Records `feedback` on the item it targets. The built-in backends address
-   * the item by id alone, and `scope` only stamps the feedback record's
-   * provenance. */
+  /** Records `feedback` on the item it targets. With a conversation in
+   * `scope`, the built-in backends apply it only to an item remembered in that
+   * conversation, without one to the item in any conversation. */
   improve(scope: MemoryScope, feedback: Feedback): Promise<MemoryId> {
     return this.store.improve(scope, feedback)
   }
 
-  /** Forgets the item `id`. The built-in backends address the item by id
-   * alone, so an item remembered under another scope is forgotten too, and
-   * `scope` only stamps the tombstone's provenance. */
+  /** Forgets the item `id`. With a conversation in `scope`, the built-in
+   * backends forget it only when it was remembered in that conversation,
+   * without one in any conversation. */
   forget(scope: MemoryScope, id: MemoryId): Promise<void> {
     return this.store.forget(scope, id)
   }
@@ -133,7 +134,10 @@ export class MemoryHandle implements Memory {
   ): Promise<ConsolidationReport> {
     if (!Number.isSafeInteger(maxItems) || maxItems < 0)
       throw new InvalidError("consolidation maxItems must be a non-negative safe integer")
-    const items = await this.store.recall(scope, { limit: CONSOLIDATION_WINDOW })
+    const items = await this.store.recall(scope, {
+      limit: CONSOLIDATION_WINDOW,
+      strategy: RecallStrategy.Recent
+    })
     let remaining = items
     let summarized = 0
     let pruned = 0
@@ -168,9 +172,7 @@ export class MemoryHandle implements Memory {
         }
       }
     }
-    const oldestFirst = [...remaining].sort((left, right) =>
-      left.id.asU128() < right.id.asU128() ? -1 : left.id.asU128() > right.id.asU128() ? 1 : 0
-    )
+    const oldestFirst = [...remaining].reverse()
     for (const item of oldestFirst.slice(0, Math.max(0, oldestFirst.length - maxItems))) {
       try {
         await this.store.forget(scope, item.id)
@@ -264,6 +266,18 @@ export class RememberBuilder {
   /** @internal */
   static create(handle: MemoryHandle, payload: Uint8Array): RememberBuilder {
     return new RememberBuilder(handle, payload)
+  }
+
+  /** Records the session record that motivated this item. */
+  origin(origin: SourceRef): this {
+    this.memoryScope = { ...this.memoryScope, origin }
+    return this
+  }
+
+  /** Records the component that produced this item. */
+  producer(producer: ProducerInfo): this {
+    this.memoryScope = { ...this.memoryScope, producer }
+    return this
   }
 
   /** Scopes the item to a conversation. */

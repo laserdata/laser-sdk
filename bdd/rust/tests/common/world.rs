@@ -21,9 +21,20 @@ pub struct LaserWorld {
     pub laser: Option<Laser>,
     pub platform: Option<Arc<TestIggy>>,
     pub conversation: Option<ConversationId>,
-    /// The session and checkpoint of the session scenarios.
+    /// The session, its lease, and its checkpoint in the session scenarios.
     pub session: Option<Session>,
+    pub session_lease: Option<laser_sdk::agent::SessionLease>,
     pub checkpoint: Option<Checkpoint>,
+    /// The session another step reads back: a submitted or controlled one.
+    pub other_session: Option<ConversationId>,
+    /// The worker agent of the submit scenario.
+    pub worker: Option<laser_sdk::agent::AgentHandle>,
+    /// The partitions a routed command and its reply landed on.
+    pub routed: Option<(Option<u32>, Option<u32>)>,
+    /// The session a routed command and its reply rode.
+    pub routed_session: Option<ConversationId>,
+    /// The native session scenarios: their configuration, agents, leases, and outcomes.
+    pub native: crate::steps::session::Native,
     /// `Ok(())` or the stringified error of the last fallible action.
     pub last_result: Option<Result<(), String>>,
     /// Number of records accepted by the last streaming batch publish.
@@ -31,6 +42,7 @@ pub struct LaserWorld {
     /// The unified result code of the last failed managed call, for the
     /// result-space scenarios.
     pub last_code: Option<ResultCode>,
+    pub last_retryable: Option<bool>,
     /// Whether a must-understand marker left a requirement unmet for a receiver
     /// that lacks the demanded feature bits.
     pub must_understand_unmet: Option<bool>,
@@ -55,6 +67,9 @@ pub struct LaserWorld {
     pub query_engine: Option<QueryEngine>,
     pub last_query: Option<QueryResult>,
     pub data_stack: Option<DataStackModel>,
+    /// The binding the bindings scenarios build, and its wire form.
+    pub binding_builder: Option<laser_sdk::query::ProjectionBindingBuilder>,
+    pub binding_wire: Option<serde_json::Value>,
     pub data_stack_operation: Option<AcceptedOperation>,
     pub data_stack_error: Option<ModelError>,
     pub data_stack_page: Option<(Vec<String>, Option<usize>)>,
@@ -62,6 +77,11 @@ pub struct LaserWorld {
     /// compare-and-swap, for the CAS-semantics scenarios (no Iggy, no transport).
     pub kv_engine: Option<KvEngine>,
     pub last_cas: Option<Result<u64, KvError>>,
+    /// A managed position noted by the consistency scenarios.
+    pub noted_position: Option<laser_sdk::wire::mutation::MutationPosition>,
+    /// The connections the client-listing scenarios listed and the user they name.
+    pub clients: Vec<laser_sdk::wire::clients::ClientMetadata>,
+    pub client_user: Option<u32>,
     /// The in-memory reference memory engine and the ids of the items remembered
     /// so far (keyed by their text body), for the memory-semantics scenarios (no
     /// Iggy, no transport).
@@ -86,8 +106,19 @@ pub struct LaserWorld {
     pub bridge_hops: Vec<String>,
     pub bridge_loop_rejected: bool,
     pub bridge_task_state: Option<String>,
+    pub bound_task: Option<String>,
+    pub bound_outcomes: Vec<String>,
     pub reconstructed_state: Option<serde_json::Value>,
     pub agui_event_types: Vec<String>,
+    /// The answering agents of the addressed bridge scenario, what each
+    /// answered, and the replies the bridge calls received.
+    pub responders: Vec<laser_sdk::agent::AgentHandle>,
+    pub answered: HashMap<String, Arc<std::sync::Mutex<Vec<String>>>>,
+    pub bridge_task: Option<String>,
+    pub tool_result: Option<String>,
+    pub input_decision: Option<String>,
+    /// The managed-session scenarios: their streams, sessions, and reads.
+    pub managed: crate::steps::managed_sessions::Managed,
 }
 
 impl fmt::Debug for LaserWorld {

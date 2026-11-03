@@ -12,14 +12,6 @@ AVRO_BLOB = json.dumps(
         "fields": [{"name": "blob", "type": "bytes"}, {"name": "n", "type": "long"}],
     }
 )
-TURN_KINDS = [
-    "instruction",
-    "response",
-    "model.response",
-    "tool.call",
-    "tool.result",
-    "human.input",
-]
 
 
 @pytest.mark.parametrize(
@@ -32,14 +24,14 @@ TURN_KINDS = [
         ("DEFAULT_LINGER_MS", 5),
         ("MIN_LINGER_MS", 1),
         ("DEFAULT_KEY_NAMESPACE", "agent.keys"),
-        ("DEFAULT_ATTEMPT_TIMEOUT_SECS", 10.0),
+        ("DEFAULT_ATTEMPT_TIMEOUT_MS", 10_000),
         ("DEFAULT_SNAPSHOT_NAMESPACE", "agent.snapshots"),
         ("DEFAULT_SNAPSHOT_TOPIC", "agent.snapshots"),
-        ("DEFAULT_MEMORY_TOPIC_TTL_SECS", 30 * 24 * 60 * 60.0),
+        ("DEFAULT_MEMORY_TOPIC_TTL_MS", 30 * 24 * 60 * 60 * 1000),
         ("POLICY_DECISION_OPERATION", "policy_decision"),
         ("A2A_PROTOCOL_VERSION", "1.0"),
         ("A2A_JSONRPC_BINDING", "JSONRPC"),
-        ("DEFAULT_OUTCOME_WAIT_SECS", 30.0),
+        ("DEFAULT_OUTCOME_WAIT_MS", 30_000),
         ("FINISH_REASON_ABANDONED", "abandoned"),
         ("FINISH_REASON_GAP", "gap"),
         ("DEFAULT_SESSION_MEMORY_NAMESPACE", "agent.session"),
@@ -55,10 +47,13 @@ def test_given_a_rust_default_when_importing_the_module_then_should_export_it(na
     assert getattr(ls, name) == value
 
 
-def test_given_the_session_defaults_when_importing_then_should_list_every_turn_topic():
-    assert sorted(ls.DEFAULT_SESSION_TOPICS) == sorted(
-        ls.Sessions.turn_topic(kind) for kind in TURN_KINDS
+def test_given_the_session_defaults_when_importing_then_should_match_the_rust_values():
+    assert ls.DEFAULT_SESSION_IDLE_TIMEOUT_MS == 300_000
+    assert ls.DEFAULT_SESSION_HEARTBEAT_MS == 60_000
+    assert ls.derive_session_id("agents", "ops", "incident") == ls.derive_session_id(
+        "agents", "ops", "incident"
     )
+    assert ls.derive_session_id("a", "bc", "d") != ls.derive_session_id("ab", "c", "d")
 
 
 @pytest.mark.parametrize("name", ["cursor_paging", "cancellation", "execution_status"])

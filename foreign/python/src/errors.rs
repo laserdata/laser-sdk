@@ -201,9 +201,9 @@ create_exception!(
 );
 create_exception!(
     laser_sdk,
-    AgentError,
+    SessionError,
     LaserError,
-    "An agent or workflow control operation returned a typed failure. `detail` is the typed cause."
+    "A session read returned a typed failure. `detail` is the typed cause."
 );
 create_exception!(
     laser_sdk,
@@ -308,6 +308,12 @@ create_exception!(
     ProtocolError,
     LaserError,
     "The reply decoded but carried an unexpected shape (client/server skew)."
+);
+create_exception!(
+    laser_sdk,
+    CommandError,
+    LaserError,
+    "A managed endpoint returned its result code and message. `detail` holds both fields."
 );
 create_exception!(
     laser_sdk,
@@ -441,13 +447,35 @@ impl From<&IggyMessage> for PyUnconfirmedMessage {
     }
 }
 
+impl PyUnconfirmedMessage {
+    /// The same record with the message id the failed attempts used, so a
+    /// resend through `Topic.batch` stays deduplicated on the server.
+    pub(crate) fn to_iggy_message(&self) -> PyResult<IggyMessage> {
+        let headers = self
+            .headers
+            .iter()
+            .map(|(key, value)| {
+                let key = iggy::prelude::HeaderKey::try_from(key.as_str())
+                    .map_err(|error| to_pyerr(error.into()))?;
+                Ok((key, value.clone()))
+            })
+            .collect::<PyResult<std::collections::BTreeMap<_, _>>>()?;
+        IggyMessage::builder()
+            .id(self.message_id)
+            .payload(self.payload.clone())
+            .user_headers(headers)
+            .build()
+            .map_err(|error| to_pyerr(error.into()))
+    }
+}
+
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyUnconfirmedMessage {
-    /// The message id the publish attempts used.
+    /// The 128-bit message id the publish attempts used.
     #[getter]
-    fn message_id(&self) -> String {
-        self.message_id.to_string()
+    fn message_id(&self) -> u128 {
+        self.message_id
     }
 
     /// Raw payload bytes.
@@ -901,10 +929,11 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
         ),
         class(py.get_type::<StateStoreError>(), None, None, &[], &[]),
         class(py.get_type::<QueryError>(), None, None, &[], &[DETAIL]),
+        class(py.get_type::<CommandError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<KvError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<ForkError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<GraphError>(), None, None, &[], &[DETAIL]),
-        class(py.get_type::<AgentError>(), None, None, &[], &[DETAIL]),
+        class(py.get_type::<SessionError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<AuthzError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<CheckpointError>(), None, None, &[], &[DETAIL]),
         class(
@@ -975,7 +1004,7 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
             None,
             &[],
             &[
-                ("position", "builtins.str | None"),
+                ("position", "MessageId | None"),
                 ("source", "builtins.BaseException"),
             ],
         ),
@@ -1124,7 +1153,7 @@ fn class_of<'py>(py: Python<'py>, err: &SdkError) -> Bound<'py, PyType> {
         SdkError::Kv(_) => py.get_type::<KvError>(),
         SdkError::Fork(_) => py.get_type::<ForkError>(),
         SdkError::Graph(_) => py.get_type::<GraphError>(),
-        SdkError::Agent(_) => py.get_type::<AgentError>(),
+        SdkError::Session(_) => py.get_type::<SessionError>(),
         SdkError::Authz(_) => py.get_type::<AuthzError>(),
         SdkError::Filter(_) => py.get_type::<FilterError>(),
         SdkError::FilterFault { .. } => py.get_type::<FilterFaultError>(),
@@ -1134,6 +1163,7 @@ fn class_of<'py>(py: Python<'py>, err: &SdkError) -> Bound<'py, PyType> {
         SdkError::Codec(_) => py.get_type::<CodecError>(),
         SdkError::Invalid(_) => py.get_type::<InvalidError>(),
         SdkError::Protocol(_) => py.get_type::<ProtocolError>(),
+        SdkError::Command(_) => py.get_type::<CommandError>(),
         SdkError::Unsupported { .. } => py.get_type::<UnsupportedError>(),
         SdkError::Integrity { .. } => py.get_type::<IntegrityError>(),
         SdkError::Signature(_) => py.get_type::<SignatureError>(),
@@ -1187,6 +1217,7 @@ fn set_fields(py: Python<'_>, pyerr: &PyErr, err: &SdkError) -> PyResult<()> {
         SdkError::Iggy(IggyError::ProducerSendFailed {
             cause,
             failed,
+            uncertain: _,
             committed,
             stream_name,
             topic_name,
@@ -1195,10 +1226,11 @@ fn set_fields(py: Python<'_>, pyerr: &PyErr, err: &SdkError) -> PyResult<()> {
             pyerr.set_cause(py, Some(to_pyerr_ref(&SdkError::Iggy((**cause).clone()))));
         }
         SdkError::Query(error) => value.setattr("detail", ser_to_py(py, error)?)?,
+        SdkError::Command(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Kv(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Fork(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Graph(error) => value.setattr("detail", ser_to_py(py, error)?)?,
-        SdkError::Agent(error) => value.setattr("detail", ser_to_py(py, error)?)?,
+        SdkError::Session(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Authz(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Checkpoint(error) => value.setattr("detail", ser_to_py(py, error.as_ref())?)?,
         SdkError::Id(error) => value.setattr("kind", id_kind(error))?,
@@ -1352,7 +1384,9 @@ fn typed_detail(
         .ok()
         .filter(|detail| !detail.is_none())?;
     let is = |class: Bound<'_, PyType>| value.is_instance(&class).unwrap_or(false);
-    if is(py.get_type::<QueryError>()) {
+    if is(py.get_type::<CommandError>()) {
+        py_to_de(&detail).ok().map(SdkError::Command)
+    } else if is(py.get_type::<QueryError>()) {
         py_to_de(&detail).ok().map(SdkError::Query)
     } else if is(py.get_type::<KvError>()) {
         py_to_de(&detail).ok().map(SdkError::Kv)
@@ -1360,8 +1394,8 @@ fn typed_detail(
         py_to_de(&detail).ok().map(SdkError::Fork)
     } else if is(py.get_type::<GraphError>()) {
         py_to_de(&detail).ok().map(SdkError::Graph)
-    } else if is(py.get_type::<AgentError>()) {
-        py_to_de(&detail).ok().map(SdkError::Agent)
+    } else if is(py.get_type::<SessionError>()) {
+        py_to_de(&detail).ok().map(SdkError::Session)
     } else if is(py.get_type::<AuthzError>()) {
         py_to_de(&detail).ok().map(SdkError::Authz)
     } else if is(py.get_type::<CheckpointError>()) {
@@ -1506,5 +1540,44 @@ fn provenance_kind(error: &laser_sdk::provenance::ProvenanceError) -> &'static s
         Provenance::MalformedHeaders(_) => "malformed_headers",
         Provenance::Header(_) => "header",
         Provenance::Id(_) => "id",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TransportError, to_pyerr_ref};
+    use iggy::prelude::IggyError;
+    use laser_sdk::LaserError as SdkError;
+    use pyo3::prelude::*;
+
+    #[test]
+    fn given_a_read_error_that_stops_a_partition_when_raised_then_should_carry_the_rust_retry_verdict()
+     {
+        Python::initialize();
+        Python::attach(|py| {
+            for error in [
+                IggyError::PartitionLaneBlocked(3, 7),
+                IggyError::FetchProgressUncertain(7),
+                IggyError::Disconnected,
+            ] {
+                let code = error.as_code();
+                let error = SdkError::Iggy(error);
+                let raised = to_pyerr_ref(&error);
+                assert!(raised.is_instance_of::<TransportError>(py));
+                let value = raised.value(py);
+                let retryable = value
+                    .getattr("retryable")
+                    .and_then(|flag| flag.extract::<bool>())
+                    .expect("a retryable flag");
+                assert_eq!(retryable, error.is_retryable(), "{error}");
+                let iggy_code = value
+                    .getattr("iggy_error_code")
+                    .and_then(|code| code.extract::<Option<u32>>())
+                    .expect("an iggy error code");
+                assert_eq!(iggy_code, Some(code));
+            }
+            assert!(!SdkError::Iggy(IggyError::PartitionLaneBlocked(3, 7)).is_retryable());
+            assert!(!SdkError::Iggy(IggyError::FetchProgressUncertain(7)).is_retryable());
+        });
     }
 }

@@ -18,7 +18,7 @@ DEFAULT_PORT = 8090
 DEFAULT_STREAM = "laser"
 PARTITIONS = 4
 
-# How long to wait for the managed plane to materialize a freshly registered
+# How long to wait for the managed backend to materialize a freshly registered
 # index, and how often to poll while waiting. Mirrors the Rust example crate.
 PROJECTOR_TIMEOUT = 60.0
 PROJECTION_POLL = 0.15
@@ -133,18 +133,23 @@ def _resolve_connection_string() -> str:
     return _normalize_connection_string(f"iggy+tcp://{_resolve_credentials()}{server}")
 
 
-async def connect(example: str) -> ls.Laser:
-    """Connect over the resolved target, pinned to the example's stream. The
-    previous run's stream is deleted so the run starts clean, and the stream
-    the run creates is kept afterwards for inspection. A provisioned
+async def connect(example: str, *, reset: bool = True) -> ls.Laser:
+    """Connect over the resolved target, pinned to the example's stream. With
+    ``reset`` the previous run's stream is deleted and created again so the run
+    starts clean, and the stream is kept afterwards for inspection. A second
+    connection of the same run passes ``reset=False``. The stream must exist
+    before the first managed call, because a deployment refuses a
+    stream-scoped name whose stream it cannot resolve. A provisioned
     ``LASER_STREAM`` is never deleted."""
-    laser = await ls.Laser.connect(_resolve_connection_string(), stream=stream_for(example))
-    if not _env("LASER_STREAM"):
-        try:
-            await laser.stream(stream_for(example)).delete()
-        except BaseException:
-            await laser.close()
-            raise
+    stream = stream_for(example)
+    laser = await ls.Laser.connect(_resolve_connection_string(), stream=stream)
+    try:
+        if reset and not _env("LASER_STREAM"):
+            await laser.stream(stream).delete()
+        await laser.stream(stream).ensure()
+    except BaseException:
+        await laser.close()
+        raise
     return laser
 
 
@@ -188,7 +193,7 @@ class Rng:
 
 async def start_projector(laser, topic, fields, *, index=None, content_type="json") -> None:
     """Declare `index` (default `topic`'s own name) over `topic` on the managed
-    plane and wait until it answers queries, the Python analog of the Rust
+    backend and wait until it answers queries, the Python analog of the Rust
     example crate's projector. Naming the index apart from its source topic
     (`readings` produces `readings_v1`) is what lets a view be versioned without
     renaming the topic. Index-only so each record's own `inline_payload` decides
@@ -241,7 +246,7 @@ async def wait_for_projection(laser, index, expected) -> int:
 
     Await-then-query where the deployment publishes the change feed (LaserData
     Cloud with a notifying binding): each tick drains the feed and re-runs the
-    count only when the plane reported the view advanced. Elsewhere every tick
+    count only when the managed backend reported the view advanced. Elsewhere every tick
     queries, the plain bounded poll."""
     deadline = time.monotonic() + PROJECTOR_TIMEOUT
     feed = laser.watch(index=index) if (await laser.capabilities()).watch else None

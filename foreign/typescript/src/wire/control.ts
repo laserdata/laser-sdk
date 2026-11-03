@@ -1,12 +1,25 @@
 import {
   type FilterCatalogCommand,
   decodeFilterCatalogCommand,
-  encodeFilterCatalogCommand
+  encodeFilterCatalogCommand,
+  validateFilterMutation
 } from "./filter.js"
 import { CodecError, InvalidError } from "../client/errors.js"
 import { type CborMap, expectMap, expectString, field, singleVariantTag } from "./cbor.js"
 import { ContentType, type ContentType as ContentTypeValue } from "./content.js"
 import { type BackendBinding, decodeBackendBinding, encodeBackendBinding } from "./destination.js"
+import { type Caller, decodeCaller, encodeCaller } from "./mutation.js"
+import {
+  MAX_GRAPH_LABEL_BYTES,
+  MAX_INDEX_FIELD_BYTES,
+  MAX_PROJECTION_ID_BYTES,
+  MAX_PROJECTION_NAME_BYTES,
+  MAX_SCHEMA_NAME_BYTES
+} from "./limits.js"
+import { validateBoundedText } from "./validate.js"
+
+/** Prefix no projection id may start with: activity keys an index-only binding under it. */
+export const RESERVED_PROJECTION_ID_PREFIX = "index:"
 
 export type FieldType = "text" | "int" | "float" | "bool"
 
@@ -63,8 +76,75 @@ export class IndexSchemaBuilder {
 export type ProjectionId = string & { readonly __projectionId: unique symbol }
 
 export function parseProjectionId(value: string): ProjectionId {
-  if (value.length === 0) throw new InvalidError("projection id must not be empty")
+  validateProjectionId(value)
   return value as ProjectionId
+}
+
+/** 1 to `MAX_PROJECTION_ID_BYTES` bytes without a control character, never under `RESERVED_PROJECTION_ID_PREFIX`. */
+export function validateProjectionId(value: string): void {
+  validateBoundedText("projection id", value, MAX_PROJECTION_ID_BYTES)
+  if (value.startsWith(RESERVED_PROJECTION_ID_PREFIX))
+    throw new InvalidError(`projection id must not start with "${RESERVED_PROJECTION_ID_PREFIX}"`)
+}
+
+/** Rust `Projection::validate`: the id, an optional name, index fields, and entity labels. */
+export function validateProjection(projection: Projection): void {
+  validateProjectionId(projection.id)
+  if (projection.name.length > 0)
+    validateBoundedText("projection name", projection.name, MAX_PROJECTION_NAME_BYTES)
+  for (const indexField of projection.extraction.fields) {
+    validateBoundedText("index field name", indexField.name, MAX_INDEX_FIELD_BYTES)
+    validateBoundedText("index field pointer", indexField.pointer, MAX_INDEX_FIELD_BYTES)
+  }
+  if (projection.extraction.vectorField !== undefined)
+    validateBoundedText(
+      "index vector field",
+      projection.extraction.vectorField,
+      MAX_INDEX_FIELD_BYTES
+    )
+  for (const node of projection.entitySchema?.nodes ?? [])
+    validateBoundedText("graph node label", node.label, MAX_GRAPH_LABEL_BYTES)
+  for (const edge of projection.entitySchema?.edges ?? [])
+    validateBoundedText("graph edge type", edge.edgeType, MAX_GRAPH_LABEL_BYTES)
+}
+
+/** Rust `SchemaDef::validate`: a name, when present, is bounded text. */
+export function validateSchemaName(name: string | undefined): void {
+  if (name !== undefined) validateBoundedText("schema name", name, MAX_SCHEMA_NAME_BYTES)
+}
+
+/** Rust `ControlCommand::validate`, checked before a command is published. */
+export function validateControlCommand(command: ControlCommand): void {
+  switch (command.kind) {
+    case "registerProjection":
+    case "registerGraph":
+      validateProjection(command.projection)
+      return
+    case "dropProjection":
+    case "dropGraph":
+      validateProjectionId(command.id)
+      return
+    case "applyBinding":
+      for (const projection of command.binding.allowedProjections) validateProjectionId(projection)
+      if (command.binding.defaultProjection !== undefined)
+        validateProjectionId(command.binding.defaultProjection)
+      return
+    case "removeBinding":
+      if (command.projectionRef !== undefined) validateProjectionId(command.projectionRef)
+      return
+    case "registerSchema":
+      validateSchemaName(command.schema.name)
+      return
+    case "filterCatalog":
+      validateFilterMutation(command.command.mutation)
+      return
+    case "dropSchema":
+    case "registerSessionSource":
+    case "removeSessionSource":
+    case "acceptGap":
+    case "skipRecord":
+      return
+  }
 }
 
 function projectionIdFromWire(value: string): ProjectionId {
@@ -246,6 +326,10 @@ export interface ProjectionBinding {
   readonly index: string
   readonly notify: boolean
   readonly retention?: RetentionPolicy
+  /** Lets the managed backend skip a record it proved the destination or the
+   * extraction rejects, instead of holding the partition. The skipped record goes to the
+   * dead-letter topic. */
+  readonly skipRejected: boolean
 }
 
 export class ProjectionBindingBuilder {
@@ -256,6 +340,7 @@ export class ProjectionBindingBuilder {
   private indexName: string | undefined
   private notifyChanges = false
   private retentionPolicy: RetentionPolicy | undefined
+  private skipRejectedRecords = false
 
   /** Sets the source stream and topic. Both are required. */
   source(stream: string, topic: string): this {
@@ -304,6 +389,14 @@ export class ProjectionBindingBuilder {
     return this
   }
 
+  /** Lets the managed backend skip a record it proved the destination or the
+   * extraction rejects, instead of holding the partition. Every skip is an ordered
+   * control record, and the skipped record goes to the dead-letter topic. */
+  skipRejected(): this {
+    this.skipRejectedRecords = true
+    return this
+  }
+
   /** Throws `InvalidError` when no source was set. */
   build(): ProjectionBinding {
     const binding = this.tryBuild()
@@ -324,7 +417,8 @@ export class ProjectionBindingBuilder {
       ...(this.backendBinding !== undefined ? { backend: this.backendBinding } : {}),
       index: this.indexName ?? source.topic,
       notify: this.notifyChanges,
-      ...(this.retentionPolicy !== undefined ? { retention: this.retentionPolicy } : {})
+      ...(this.retentionPolicy !== undefined ? { retention: this.retentionPolicy } : {}),
+      skipRejected: this.skipRejectedRecords
     }
   }
 }
@@ -372,14 +466,169 @@ export type ControlCommand =
   | { readonly kind: "dropSchema"; readonly id: number }
   | { readonly kind: "registerGraph"; readonly projection: Projection }
   | { readonly kind: "dropGraph"; readonly id: string }
-  | { readonly kind: "registerRunSource"; readonly source: SourceSelector }
-  | { readonly kind: "removeRunSource"; readonly source: SourceSelector }
+  | {
+      readonly kind: "registerSessionSource"
+      readonly stream: string
+      readonly topics: SessionTopics
+    }
+  | { readonly kind: "removeSessionSource"; readonly stream: string }
   | { readonly kind: "filterCatalog"; readonly command: FilterCatalogCommand }
+  | { readonly kind: "acceptGap"; readonly acceptance: GapAcceptance }
+  | { readonly kind: "skipRecord"; readonly skip: RecordSkip }
+
+/** The exact missing range an operator accepted for one source partition. */
+export interface GapAcceptance {
+  readonly source: SourceSelector
+  readonly partitionId: number
+  readonly topicCreatedAtMicros: bigint
+  readonly fromOffset: bigint
+  readonly toOffset: bigint
+}
+
+/** One record a binding skips, on one topic incarnation. */
+export interface RecordSkip {
+  readonly source: SourceSelector
+  readonly partitionId: number
+  readonly topicCreatedAtMicros: bigint
+  readonly offset: bigint
+  readonly target: string
+  readonly reason: string
+}
+
+/** Who appended a control record and for which resource generation. The
+ * backend sets it, a client never does. */
+export interface ControlStamp {
+  readonly deploymentId: bigint
+  readonly actorUserId: number
+  readonly operationId: bigint
+  readonly streamGeneration?: ControlStreamGeneration
+  readonly keyId: bigint
+  /** The client that asked for the record. Absent on a record the backend or
+   * the streaming server issues on its own, so it tells the root user, id
+   * zero, apart from them. */
+  readonly caller?: Caller
+}
+
+export interface ControlStreamGeneration {
+  readonly streamId: number
+  readonly createdAtMicros: bigint
+}
+
+function encodeGapAcceptance(acceptance: GapAcceptance): Map<string, unknown> {
+  return new Map<string, unknown>([
+    ["source", encodeSourceSelector(acceptance.source)],
+    ["partition_id", BigInt(acceptance.partitionId)],
+    ["topic_created_at_micros", acceptance.topicCreatedAtMicros],
+    ["from_offset", acceptance.fromOffset],
+    ["to_offset", acceptance.toOffset]
+  ])
+}
+
+function decodeGapAcceptance(map: CborMap, context: string): GapAcceptance {
+  return {
+    source: decodeSourceSelector(field.requiredMap(map, "source", context), `${context}.source`),
+    partitionId: field.requiredU32(map, "partition_id", context),
+    topicCreatedAtMicros: field.requiredU64(map, "topic_created_at_micros", context),
+    fromOffset: field.requiredU64(map, "from_offset", context),
+    toOffset: field.requiredU64(map, "to_offset", context)
+  }
+}
+
+function encodeRecordSkip(skip: RecordSkip): Map<string, unknown> {
+  return new Map<string, unknown>([
+    ["source", encodeSourceSelector(skip.source)],
+    ["partition_id", BigInt(skip.partitionId)],
+    ["topic_created_at_micros", skip.topicCreatedAtMicros],
+    ["offset", skip.offset],
+    ["target", skip.target],
+    ["reason", skip.reason]
+  ])
+}
+
+function decodeRecordSkip(map: CborMap, context: string): RecordSkip {
+  return {
+    source: decodeSourceSelector(field.requiredMap(map, "source", context), `${context}.source`),
+    partitionId: field.requiredU32(map, "partition_id", context),
+    topicCreatedAtMicros: field.requiredU64(map, "topic_created_at_micros", context),
+    offset: field.requiredU64(map, "offset", context),
+    target: field.requiredString(map, "target", context),
+    reason: field.requiredString(map, "reason", context)
+  }
+}
+
+export function encodeControlStamp(stamp: ControlStamp): Map<string, unknown> {
+  const map = new Map<string, unknown>([
+    ["deployment_id", stamp.deploymentId],
+    ["actor_user_id", BigInt(stamp.actorUserId)],
+    ["operation_id", stamp.operationId]
+  ])
+  if (stamp.streamGeneration !== undefined) {
+    map.set(
+      "stream_generation",
+      new Map<string, unknown>([
+        ["stream_id", BigInt(stamp.streamGeneration.streamId)],
+        ["created_at_micros", stamp.streamGeneration.createdAtMicros]
+      ])
+    )
+  }
+  map.set("key_id", stamp.keyId)
+  if (stamp.caller !== undefined) map.set("caller", encodeCaller(stamp.caller))
+  return map
+}
+
+export function decodeControlStamp(map: CborMap, context: string): ControlStamp {
+  const generation = field.optionalMap(map, "stream_generation", context)
+  const callerMap = field.optionalMap(map, "caller", context)
+  return {
+    deploymentId: field.requiredU64(map, "deployment_id", context),
+    actorUserId: field.requiredU32(map, "actor_user_id", context),
+    operationId: field.requiredU128(map, "operation_id", context),
+    ...(generation !== undefined
+      ? {
+          streamGeneration: {
+            streamId: field.requiredU32(generation, "stream_id", `${context}.stream_generation`),
+            createdAtMicros: field.requiredU64(
+              generation,
+              "created_at_micros",
+              `${context}.stream_generation`
+            )
+          }
+        }
+      : {}),
+    keyId: field.requiredU64(map, "key_id", context),
+    ...(callerMap !== undefined ? { caller: decodeCaller(callerMap, `${context}.caller`) } : {})
+  }
+}
+
+export type SessionTopics =
+  { readonly kind: "all" } | { readonly kind: "named"; readonly names: readonly string[] }
+
+export function encodeSessionTopics(topics: SessionTopics): unknown {
+  return topics.kind === "all" ? "All" : new Map([["Named", [...topics.names]]])
+}
+
+export function decodeSessionTopics(value: unknown, context: string): SessionTopics {
+  if (value === "All") return { kind: "all" }
+  const [tag, names] = singleVariantTag(value, context)
+  if (tag !== "Named" || !Array.isArray(names))
+    throw new CodecError("invalid session topics", context, "topics")
+  return {
+    kind: "named",
+    names: names.map((name, index) => expectString(name, `${context}.topics[${String(index)}]`))
+  }
+}
 
 export interface ControlEnvelope {
   readonly v: number
   readonly timestampMicros: bigint
   readonly command: ControlCommand
+  /** Set by the backend when it appends the record. Absent on a client's own
+   * envelope. */
+  readonly stamp?: ControlStamp
+  /** The stream the command's resource names belong to, set by a client that
+   * scopes its resources to a stream. The writer-schema registry keys
+   * `registerSchema` and `dropSchema` by stream and id when it is set. */
+  readonly stream?: string
 }
 
 const FIELD_TYPES: ReadonlySet<string> = new Set(["text", "int", "float", "bool"])
@@ -628,6 +877,7 @@ export function encodeProjectionBinding(binding: ProjectionBinding): Map<string,
   if (binding.notify) map.set("notify", true)
   if (binding.retention !== undefined)
     map.set("retention", encodeRetentionPolicy(binding.retention))
+  if (binding.skipRejected) map.set("skip_rejected", true)
   return map
 }
 
@@ -650,7 +900,8 @@ export function decodeProjectionBinding(map: CborMap, context: string): Projecti
     notify: field.optionalBoolean(map, "notify", context) ?? false,
     ...(retention !== undefined
       ? { retention: decodeRetentionPolicy(retention, `${context}.retention`) }
-      : {})
+      : {}),
+    skipRejected: field.optionalBoolean(map, "skip_rejected", context) ?? false
   }
 }
 
@@ -742,12 +993,26 @@ export function encodeControlCommand(command: ControlCommand): Map<string, unkno
       return new Map([["RegisterGraph", encodeProjection(command.projection)]])
     case "dropGraph":
       return new Map([["DropGraph", command.id]])
-    case "registerRunSource":
-      return new Map([["RegisterRunSource", encodeSourceSelector(command.source)]])
-    case "removeRunSource":
-      return new Map([["RemoveRunSource", encodeSourceSelector(command.source)]])
+    case "registerSessionSource":
+      return new Map([
+        [
+          "RegisterSessionSource",
+          new Map<string, unknown>([
+            ["stream", command.stream],
+            ["topics", encodeSessionTopics(command.topics)]
+          ])
+        ]
+      ])
+    case "removeSessionSource":
+      return new Map([
+        ["RemoveSessionSource", new Map<string, unknown>([["stream", command.stream]])]
+      ])
     case "filterCatalog":
       return new Map([["FilterCatalog", encodeFilterCatalogCommand(command.command)]])
+    case "acceptGap":
+      return new Map([["AcceptGap", encodeGapAcceptance(command.acceptance)]])
+    case "skipRecord":
+      return new Map([["SkipRecord", encodeRecordSkip(command.skip)]])
   }
 }
 
@@ -789,37 +1054,62 @@ export function decodeControlCommand(value: unknown, context: string): ControlCo
       }
     case "DropGraph":
       return { kind: "dropGraph", id: expectString(inner, context) }
-    case "RegisterRunSource":
+    case "RegisterSessionSource": {
+      const fields = expectMap(inner, context)
       return {
-        kind: "registerRunSource",
-        source: decodeSourceSelector(expectMap(inner, context), context)
+        kind: "registerSessionSource",
+        stream: field.requiredString(fields, "stream", context),
+        topics: decodeSessionTopics(fields.get("topics"), context)
       }
-    case "RemoveRunSource":
+    }
+    case "RemoveSessionSource":
       return {
-        kind: "removeRunSource",
-        source: decodeSourceSelector(expectMap(inner, context), context)
+        kind: "removeSessionSource",
+        stream: field.requiredString(expectMap(inner, context), "stream", context)
       }
     case "FilterCatalog":
       return { kind: "filterCatalog", command: decodeFilterCatalogCommand(inner, context) }
+    case "AcceptGap":
+      return {
+        kind: "acceptGap",
+        acceptance: decodeGapAcceptance(expectMap(inner, context), context)
+      }
+    case "SkipRecord":
+      return { kind: "skipRecord", skip: decodeRecordSkip(expectMap(inner, context), context) }
     default:
       throw new CodecError(`\`${tag}\` is not a recognized control command`, context, "command")
   }
 }
 
 export function encodeControlEnvelope(envelope: ControlEnvelope): Map<string, unknown> {
-  return new Map<string, unknown>([
+  const map = new Map<string, unknown>([
     ["v", BigInt(envelope.v)],
     ["timestamp_micros", envelope.timestampMicros],
     ["command", encodeControlCommand(envelope.command)]
   ])
+  if (envelope.stream !== undefined) map.set("stream", envelope.stream)
+  if (envelope.stamp !== undefined) map.set("stamp", encodeControlStamp(envelope.stamp))
+  return map
 }
 
 export function decodeControlEnvelope(map: CborMap, context: string): ControlEnvelope {
   return {
     v: field.requiredU32(map, "v", context),
     timestampMicros: field.requiredU64(map, "timestamp_micros", context),
-    command: decodeControlCommand(map.get("command"), `${context}.command`)
+    command: decodeControlCommand(map.get("command"), `${context}.command`),
+    ...optionalStream(map, context),
+    ...optionalStamp(map, context)
   }
+}
+
+function optionalStamp(map: CborMap, context: string): { readonly stamp?: ControlStamp } {
+  const stamp = field.optionalMap(map, "stamp", context)
+  return stamp === undefined ? {} : { stamp: decodeControlStamp(stamp, `${context}.stamp`) }
+}
+
+function optionalStream(map: CborMap, context: string): { readonly stream?: string } {
+  const stream = field.optionalString(map, "stream", context)
+  return stream === undefined ? {} : { stream }
 }
 
 function decodeOptionalNullableString(

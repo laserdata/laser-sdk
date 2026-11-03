@@ -1,5 +1,6 @@
 use crate::error::LaserError;
 use crate::laser::Laser;
+use iggy::prelude::IggyExpiry;
 use std::collections::BTreeMap;
 
 pub use iggy::prelude::{HeaderKey, HeaderValue};
@@ -20,6 +21,9 @@ pub use laser_wire::headers::{
     CONTENT_TYPE, IDX_PREFIX, INLINE_PAYLOAD, LOGICAL_SCHEMA_FINGERPRINT, PROJECTION_REF, SCHEMA_ID,
 };
 pub use laser_wire::limits::MAX_INDEX_ENTRIES_PER_RECORD;
+
+/// The highest replication factor a topic takes, as Apache Iggy defines it.
+pub const MAX_REPLICATION_FACTOR: u32 = iggy_common::MAX_REPLICATION_FACTOR;
 
 mod consumer_group;
 pub(crate) mod producer_statistics;
@@ -184,11 +188,24 @@ impl Topic {
     }
 
     /// Idempotently create this topic with `partitions`, creating the stream
-    /// first if needed.
-    pub async fn ensure(&self, partitions: u32) -> Result<(), LaserError> {
+    /// first if needed. `replication_factor` is how many nodes store each
+    /// partition, 1..=[`MAX_REPLICATION_FACTOR`] and at most the cluster's
+    /// node count, the server's default when `None`. An existing topic is
+    /// left as it is.
+    pub async fn ensure(
+        &self,
+        partitions: u32,
+        replication_factor: Option<u32>,
+    ) -> Result<(), LaserError> {
         let stream = self.stream()?.to_owned();
         self.laser
-            .ensure_topic_on(&stream, &self.name, partitions)
+            .ensure_topic_on_with(
+                &stream,
+                &self.name,
+                partitions,
+                IggyExpiry::NeverExpire,
+                replication_factor,
+            )
             .await
     }
 

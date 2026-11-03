@@ -1,5 +1,5 @@
 import { type LaserTransport } from "../iggy/apache-iggy.js"
-import { InvalidError } from "../client/errors.js"
+import { InvalidError, ProtocolError } from "../client/errors.js"
 import type { Cursor } from "../stream/cursor.js"
 import { AgentId, PrincipalId } from "../types/ids.js"
 import {
@@ -26,6 +26,7 @@ import { AGDX_GET_CLIENTS_METADATA_CODE, CLIENT_METADATA_OP_VERSION } from "../w
 import { MAX_PAGE_SIZE } from "../wire/limits.js"
 import { KeyKind, type KeyRegistry } from "../signing.js"
 import { decodeAgentMessage } from "./reliable-consumer.js"
+import { compareCodePoints } from "../runtime/compare.js"
 
 const PRESENCE_TTL_MICROS = 2_000_000n
 const APPLIED_FACT_CAPACITY = 16_384
@@ -175,10 +176,14 @@ export class ClientMetadataRequest {
     limit: MAX_PAGE_SIZE
   }
 
-  private constructor(private readonly transport: Pick<LaserTransport, "sendManaged">) {}
+  private constructor(
+    private readonly transport: Pick<LaserTransport, "sendManaged" | "sendManagedTo" | "replicaIds">
+  ) {}
 
   /** @internal */
-  static create(transport: Pick<LaserTransport, "sendManaged">): ClientMetadataRequest {
+  static create(
+    transport: Pick<LaserTransport, "sendManaged" | "sendManagedTo" | "replicaIds">
+  ): ClientMetadataRequest {
     return new ClientMetadataRequest(transport)
   }
 
@@ -211,17 +216,34 @@ export class ClientMetadataRequest {
 
   async all(): Promise<readonly ClientMetadata[]> {
     const clients: ClientMetadata[] = []
-    let cursor = this.query.afterClientId
-    do {
-      const request = new ClientMetadataRequest(this.transport)
-      request.query = {
-        ...this.query,
-        ...(cursor !== undefined ? { afterClientId: cursor } : {})
-      }
-      const page = await request.page()
-      clients.push(...page.clients)
-      cursor = page.nextCursor
-    } while (cursor !== undefined)
+    const replicas =
+      this.transport.replicaIds === undefined ? [undefined] : await this.transport.replicaIds()
+    for (const replica of replicas) {
+      let cursor = this.query.afterClientId
+      do {
+        const query = { ...this.query, ...(cursor === undefined ? {} : { afterClientId: cursor }) }
+        const payload = encodeNamed(encodeClientMetadataQuery(query))
+        const reply =
+          replica === undefined || this.transport.sendManagedTo === undefined
+            ? await this.transport.sendManaged(AGDX_GET_CLIENTS_METADATA_CODE, payload)
+            : (
+                await this.transport.sendManagedTo(AGDX_GET_CLIENTS_METADATA_CODE, payload, {
+                  kind: "replica",
+                  replica
+                })
+              ).reply
+        const context = "client metadata reply"
+        const page = decodeClientMetadataList(
+          expectMap(decodeOne(reply, context), context),
+          context
+        )
+        clients.push(...page.clients)
+        if (page.nextCursor !== undefined && cursor !== undefined && page.nextCursor <= cursor) {
+          throw new ProtocolError("the client metadata page did not advance")
+        }
+        cursor = page.nextCursor
+      } while (cursor !== undefined)
+    }
     return clients
   }
 }
@@ -318,8 +340,10 @@ export class AgentRegistry {
     }
   }
 
+  /** Every registered card, ordered by agent id in byte order like Rust, so
+   * `RoutePolicy` `any` and ranking ties pick the same agent in every SDK. */
   agents(): readonly RegisteredCard[] {
-    return [...this.cards.values()]
+    return [...this.cards.values()].sort(byAgentId)
   }
 
   lookup(agent: AgentId): RegisteredCard | undefined {
@@ -327,7 +351,7 @@ export class AgentRegistry {
   }
 
   resolve(skillId: string, nowMicros: bigint = this.nowMicros()): readonly RegisteredCard[] {
-    return [...this.cards.values()].filter(
+    return this.agents().filter(
       (card) =>
         cardAvailableFor(card, skillId) &&
         cardIsFresh(card, nowMicros) &&
@@ -383,4 +407,8 @@ export class AgentRegistry {
       this.cache.presenceReadAtMicros = this.presenceReadAtMicros
     }
   }
+}
+
+function byAgentId(left: RegisteredCard, right: RegisteredCard): number {
+  return compareCodePoints(left.agent.asStr(), right.agent.asStr())
 }

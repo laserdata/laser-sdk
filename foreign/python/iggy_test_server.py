@@ -1,6 +1,8 @@
+import functools
 import json
 import os
 import select
+import shutil
 import socket
 import socketserver
 import subprocess
@@ -12,7 +14,27 @@ import urllib.request
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+TEST_SUPPORT_BINARIES = ("laser-test-catalog", "laser-test-routes")
+TEST_SUPPORT_BUILD = "cargo build -p laser-test-support --bins"
 RESOLVER = REPOSITORY_ROOT / "scripts" / "resolve-test-iggy-server.sh"
+
+
+def _data_root():
+    base = Path("/dev/shm") if Path("/dev/shm").is_dir() else Path(tempfile.gettempdir())
+    root = base / "laser-python-test-iggy"
+    root.mkdir(exist_ok=True)
+    for previous in root.iterdir():
+        if not previous.name.isdecimal():
+            continue
+        try:
+            os.kill(int(previous.name), 0)
+        except ProcessLookupError:
+            shutil.rmtree(previous, ignore_errors=True)
+        except PermissionError:
+            pass
+    current = root / str(os.getpid())
+    current.mkdir(exist_ok=True)
+    return current
 
 
 class IggyTestServer:
@@ -37,14 +59,14 @@ class IggyTestServer:
             timeout=310,
         )
         binary = resolved.stdout.strip()
-        self._temporary = tempfile.TemporaryDirectory(prefix="laser-iggy-")
+        self._temporary = tempfile.TemporaryDirectory(prefix="laser-iggy-", dir=_data_root())
         data_path = Path(self._temporary.name)
         self._port = _free_port()
         self._log = (data_path / "test-server.log").open("w")
         env = os.environ.copy()
         env.update(
             {
-                "IGGY_PATH": str(data_path),
+                "IGGY_PATH": str(data_path / "data"),
                 "IGGY_TCP_ADDRESS": f"127.0.0.1:{self._port}",
                 "IGGY_HTTP_ENABLED": "false",
                 "IGGY_QUIC_ENABLED": "false",
@@ -55,6 +77,7 @@ class IggyTestServer:
                 "IGGY_SHARDING_CPU_ALLOCATION": "2",
                 "IGGY_SHARDING_PIN_CORES": "false",
                 "IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL": "200 ms",
+                "IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT": "1s",
             }
         )
         self._process = subprocess.Popen(
@@ -124,6 +147,7 @@ class IggyTestCluster:
         self._proxy_target = None
         self._proxy = None
         self._proxy_thread = None
+        self._node_environments = {}
 
     @property
     def endpoint(self):
@@ -146,7 +170,7 @@ class IggyTestCluster:
         self._proxy_thread = threading.Thread(target=self._proxy.serve_forever, daemon=True)
         self._proxy_thread.start()
         for replica_id in range(3):
-            temporary = tempfile.TemporaryDirectory(prefix="laser-iggy-cluster-")
+            temporary = tempfile.TemporaryDirectory(prefix="laser-iggy-cluster-", dir=_data_root())
             self._temporaries.append(temporary)
             self._logs.append(None)
             self._processes.append(None)
@@ -172,27 +196,56 @@ class IggyTestCluster:
     def route_endpoint_to(self, replica_id):
         self._proxy_target = self._tcp_ports[replica_id]
 
+    def set_node_environment(self, replica_id, environment):
+        """Extra variables for one node, applied from its next start."""
+        self._node_environments[replica_id] = dict(environment)
+
+    def kill_node(self, replica_id):
+        """Stop a node with SIGKILL, a crash with no shutdown work."""
+        process = self._processes[replica_id]
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        self._stop_process(replica_id)
+
+    def partition_primaries(self, stream, topic, partitions):
+        """The node that leads each partition of `topic`, by partition id."""
+        resolved = subprocess.run(
+            [
+                _test_support_binary("laser-test-routes"),
+                f"iggy://{self.endpoint}",
+                stream,
+                topic,
+                str(partitions),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return json.loads(resolved.stdout)
+
+    def settled_primaries(self, stream, topic, partitions):
+        """Each partition's primary once no node leads more than one partition above another."""
+        # Right after creation every partition can be led by the metadata
+        # leader, the one node counted ready. The cluster then moves one
+        # primary at a time until no node leads two more partitions than
+        # another, so that spread is final.
+        deadline = time.monotonic() + 60
+        while True:
+            primaries = self.partition_primaries(stream, topic, partitions)
+            led = [primaries.count(node) for node in range(3)]
+            if max(led) - min(led) <= 1:
+                return primaries
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"the primaries never settled within 60s: {primaries}")
+            time.sleep(0.5)
+
     def leader_and_follower(self, via=0):
-        base_url = f"http://127.0.0.1:{self._http_ports[via]}"
-        login_body = json.dumps({"username": "iggy", "password": "iggy"}).encode()
         deadline = time.monotonic() + 30
         while True:
             try:
-                login = urllib.request.Request(
-                    f"{base_url}/users/login",
-                    data=login_body,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(login, timeout=2) as response:
-                    identity = json.load(response)
-                token = identity["access_token"]["token"]
-                metadata_request = urllib.request.Request(
-                    f"{base_url}/cluster/metadata",
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-                with urllib.request.urlopen(metadata_request, timeout=2) as response:
-                    metadata = json.load(response)
+                metadata = self._http_get(via, "/cluster/metadata")
                 leader = next(
                     int(node["name"].removeprefix("node-"))
                     for node in metadata["nodes"]
@@ -206,6 +259,31 @@ class IggyTestCluster:
                         "Iggy cluster leader was not discoverable within 30s"
                     ) from None
                 time.sleep(0.1)
+
+    def topic_details(self, stream, topic, via=0):
+        """The topic as node `via` reports it over HTTP, `None` when it does not exist."""
+        try:
+            return self._http_get(via, f"/streams/{stream}/topics/{topic}")
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return None
+            raise
+
+    def _http_get(self, via, path):
+        base_url = f"http://127.0.0.1:{self._http_ports[via]}"
+        login = urllib.request.Request(
+            f"{base_url}/users/login",
+            data=json.dumps({"username": "iggy", "password": "iggy"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(login, timeout=2) as response:
+            token = json.load(response)["access_token"]["token"]
+        request = urllib.request.Request(
+            f"{base_url}{path}", headers={"Authorization": f"Bearer {token}"}
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return json.load(response)
 
     def stop(self):
         for replica_id in range(len(self._processes)):
@@ -230,7 +308,7 @@ class IggyTestCluster:
         env = os.environ.copy()
         env.update(
             {
-                "IGGY_PATH": str(data_path),
+                "IGGY_PATH": str(data_path / "data"),
                 "IGGY_CLUSTER_ENABLED": "true",
                 "IGGY_CLUSTER_NAME": "laser-sdk-rolling-restart",
                 "IGGY_MESSAGE_BUS_RECONNECT_PERIOD": "100ms",
@@ -244,8 +322,10 @@ class IggyTestCluster:
                 "IGGY_SHARDING_CPU_ALLOCATION": "1",
                 "IGGY_SHARDING_PIN_CORES": "false",
                 "IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL": "200 ms",
+                "IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT": "1s",
             }
         )
+        env.update(self._node_environments.get(replica_id, {}))
         for node in range(3):
             prefix = f"IGGY_CLUSTER_NODES_{node}"
             env.update(
@@ -292,11 +372,130 @@ class IggyTestCluster:
                     raise RuntimeError(f"Iggy cluster node exited:\n{path.read_text()}")
                 self._logs[node].flush()
                 path = Path(self._temporaries[node].name) / "test-server.log"
+                # The nodes inherit the environment, so a RUST_LOG that silences
+                # the server's info lines never shows the marker.
                 ready = ready and "replica mesh complete" in path.read_text()
             if ready:
                 return
             time.sleep(0.1)
         raise TimeoutError("Iggy cluster did not form its replica mesh within 30s")
+
+
+class StandInCatalog:
+    """The laser-test-catalog binary: one socket per node over one shared catalog state."""
+
+    def __init__(self, nodes=3):
+        self._nodes = nodes
+        self._directory = None
+        self._log = None
+        self._process = None
+
+    def start(self):
+        binary = _test_support_binary("laser-test-catalog")
+        self._directory = tempfile.TemporaryDirectory(prefix="laser-catalog-", dir=_data_root())
+        directory = Path(self._directory.name)
+        self._log = (directory / "catalog.log").open("w")
+        self._process = subprocess.Popen(
+            [binary, *(str(self.socket(node)) for node in range(self._nodes))],
+            stdout=subprocess.PIPE,
+            stderr=self._log,
+            text=True,
+        )
+        try:
+            readable, _, _ = select.select([self._process.stdout], [], [], 30)
+            line = self._process.stdout.readline() if readable else ""
+            if line.strip() != "ready":
+                self._log.flush()
+                raise RuntimeError(
+                    f"stand-in catalog did not start:\n{(directory / 'catalog.log').read_text()}"
+                )
+        except Exception:
+            self.stop()
+            raise
+        return self
+
+    def socket(self, node):
+        return Path(self._directory.name) / f"backend-{node}.sock"
+
+    def node_environment(self, node, max_waiting_reads=None):
+        """What a node needs to reach the catalog over its own socket."""
+        environment = {
+            "IGGY_PLANE_ENABLED": "true",
+            "IGGY_PLANE_SOCKET_PATH": str(self.socket(node)),
+        }
+        if max_waiting_reads is not None:
+            environment["IGGY_PLANE_FILTERS_MAX_WAITING_READS"] = str(max_waiting_reads)
+        return environment
+
+    def stop(self):
+        if self._process is not None:
+            if self._process.poll() is None:
+                self._process.terminate()
+                try:
+                    self._process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                    self._process.wait(timeout=5)
+            self._process.stdout.close()
+            self._process = None
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+        if self._directory is not None:
+            self._directory.cleanup()
+            self._directory = None
+
+
+@functools.cache
+def _test_support_binaries():
+    """Build the test-support binaries, or use built ones when cargo is not installed."""
+    if shutil.which("cargo") is None:
+        target = Path(os.environ.get("CARGO_TARGET_DIR", REPOSITORY_ROOT / "target"))
+        built = (target if target.is_absolute() else REPOSITORY_ROOT / target) / "debug"
+        binaries = {
+            name: str(built / name) for name in TEST_SUPPORT_BINARIES if (built / name).is_file()
+        }
+        if len(binaries) == len(TEST_SUPPORT_BINARIES):
+            return binaries
+        raise RuntimeError(
+            f"The cluster tests need {', '.join(TEST_SUPPORT_BINARIES)}. cargo is not installed "
+            f"and {built} does not hold them. Run `{TEST_SUPPORT_BUILD}` in {REPOSITORY_ROOT} "
+            "with the same CARGO_TARGET_DIR first."
+        )
+    try:
+        built = subprocess.run(
+            [
+                "cargo",
+                "build",
+                "--quiet",
+                "-p",
+                "laser-test-support",
+                "--bins",
+                "--message-format=json-render-diagnostics",
+            ],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            f"`{TEST_SUPPORT_BUILD}` failed in {REPOSITORY_ROOT}:\n{error.stderr}"
+        ) from error
+    binaries = {}
+    for line in built.stdout.splitlines():
+        artifact = json.loads(line)
+        if artifact.get("reason") == "compiler-artifact" and artifact.get("executable"):
+            binaries[artifact["target"]["name"]] = artifact["executable"]
+    missing = [name for name in TEST_SUPPORT_BINARIES if name not in binaries]
+    if missing:
+        raise RuntimeError(f"`{TEST_SUPPORT_BUILD}` built no {', '.join(missing)}")
+    return binaries
+
+
+def _test_support_binary(name):
+    return _test_support_binaries()[name]
 
 
 def _free_ports(count):

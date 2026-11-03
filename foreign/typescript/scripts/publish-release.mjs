@@ -8,7 +8,7 @@ if (tarball === undefined || tag === undefined) {
 }
 
 const match =
-  /^ts-v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(alpha|beta|rc)\.(0|[1-9]\d*))?$/.exec(tag)
+  /^ts-v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(dev|alpha|beta|rc)\.(0|[1-9]\d*))?$/.exec(tag)
 if (match === null) {
   console.error(`unsupported release tag: ${tag}`)
   process.exit(1)

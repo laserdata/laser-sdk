@@ -86,14 +86,22 @@ impl PublishOptions {
         let mut needs_recovery = false;
         let mut attempt = 0;
         loop {
-            let result = tokio::time::timeout(self.timeout, async {
-                if needs_recovery {
-                    recover().await?;
-                }
-                send().await
-            })
-            .await
-            .unwrap_or(Err(LaserError::Timeout("Iggy publish response")));
+            // One deadline covers the recovery and the send. Two awaits instead
+            // of one async block keep each publish future one layer shallower.
+            let deadline = tokio::time::Instant::now() + self.timeout;
+            let recovered = if needs_recovery {
+                tokio::time::timeout_at(deadline, recover())
+                    .await
+                    .unwrap_or(Err(LaserError::Timeout("Iggy publish response")))
+            } else {
+                Ok(())
+            };
+            let result = match recovered {
+                Ok(()) => tokio::time::timeout_at(deadline, send())
+                    .await
+                    .unwrap_or(Err(LaserError::Timeout("Iggy publish response"))),
+                Err(error) => Err(error),
+            };
             match result {
                 Ok(value) => return Ok(value),
                 Err(error) => {
@@ -119,16 +127,21 @@ impl PublishOptions {
                             Ok(Ok(()))
                         );
                     }
-                    let delay = self
-                        .retry_backoff
-                        .saturating_mul(1u32 << attempt.min(16))
-                        .min(Duration::from_secs(30));
+                    let delay = self.retry_delay(attempt);
                     tracing::warn!(attempt = attempt + 1, max_retries = self.max_retries, %error, "publish failed, reconnecting before retry");
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
             }
         }
+    }
+
+    // The pause before retry `attempt`, counted from zero: the backoff doubled
+    // per attempt and capped at 30 seconds.
+    pub(crate) fn retry_delay(&self, attempt: u32) -> Duration {
+        self.retry_backoff
+            .saturating_mul(1u32 << attempt.min(16))
+            .min(Duration::from_secs(30))
     }
 }
 
@@ -200,9 +213,10 @@ mod tests {
                             return Err(LaserError::Iggy(IggyError::ProducerSendFailed {
                                 cause: Box::new(IggyError::Unauthenticated),
                                 failed: std::sync::Arc::new(Vec::new()),
+                                uncertain: 0,
                                 committed: std::sync::Arc::new(Vec::new()),
-                                stream_name: "s".to_owned(),
-                                topic_name: "t".to_owned(),
+                                stream_name: "s".into(),
+                                topic_name: "t".into(),
                             }));
                         }
                         Ok(7)

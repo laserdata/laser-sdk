@@ -1,7 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import {
-  AgentWorkflowExecutionError,
   AmbiguousMutationError,
   AuthzExecutionError,
   BudgetExceededError,
@@ -72,8 +71,7 @@ void test("given_a_surface_scoped_execution_error_when_constructed_then_should_k
     KvExecutionError,
     ForkExecutionError,
     GraphExecutionError,
-    AuthzExecutionError,
-    AgentWorkflowExecutionError
+    AuthzExecutionError
   ] as const
   for (const Kind of surfaces) {
     const error = new Kind("rejected by the engine", { code: 7 })

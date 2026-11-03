@@ -170,14 +170,15 @@ impl Display for CommitMode {
 
 pub(crate) struct ConsumerConfig<'a> {
     pub batch_length: u32,
-    pub poll_interval_ms: Option<u64>,
+    pub max_wait_ms: u64,
+    pub min_count: u32,
+    pub max_bytes: u32,
     pub polling: &'a str,
     pub offset: Option<u64>,
     pub timestamp_micros: Option<u64>,
     pub auto_commit: &'a str,
     pub commit_interval_ms: u64,
     pub commit_every: Option<u32>,
-    pub auto_join_group: bool,
     pub create_group: bool,
     pub polling_retry_interval_ms: u64,
     pub init_retries: Option<u32>,
@@ -258,17 +259,14 @@ pub(crate) fn configure_consumer(
     )?;
     builder = builder
         .batch_length(config.batch_length)
+        .max_wait(Duration::from_millis(config.max_wait_ms))
+        .min_count(config.min_count)
+        .max_bytes(config.max_bytes)
         .start_at(start)
         .commit_policy(commit)
         .polling_retry_interval(Duration::from_millis(config.polling_retry_interval_ms));
-    builder = match config.poll_interval_ms {
-        Some(interval) => builder.poll_interval(Duration::from_millis(interval)),
-        None => builder.without_poll_interval(),
-    };
     if group {
-        builder = builder
-            .auto_join_group(config.auto_join_group)
-            .create_group(config.create_group);
+        builder = builder.create_group(config.create_group);
     }
     if let Some(retries) = config.init_retries {
         positive_duration_ms(config.init_retry_interval_ms, "init_retry_interval_ms")?;
@@ -466,8 +464,9 @@ pub(crate) struct ProducerSettings {
     pub create_stream: bool,
     pub create_topic: bool,
     pub partitions: u32,
+    pub replication_factor: Option<u32>,
     pub expiry: IggyExpiry,
-    pub max_topic_size: u64,
+    pub max_topic_size: iggy::prelude::MaxTopicSize,
     pub background: Option<BackgroundSettings>,
 }
 
@@ -480,8 +479,17 @@ impl ProducerSettings {
             .routing(self.routing)
             .create_stream(self.create_stream)
             .create_topic(self.create_topic)
-            .partitions(self.partitions)
-            .max_topic_bytes(self.max_topic_size);
+            .partitions(self.partitions);
+        if let Some(factor) = self.replication_factor {
+            builder = builder.replication_factor(factor);
+        }
+        builder = match self.max_topic_size {
+            iggy::prelude::MaxTopicSize::Unlimited => builder.unlimited_topic_size(),
+            iggy::prelude::MaxTopicSize::Custom(bytes) => {
+                builder.max_topic_bytes(bytes.as_bytes_u64())
+            }
+            iggy::prelude::MaxTopicSize::ServerDefault => builder,
+        };
         if let Some(retries) = self.retries {
             builder = builder.retries(Some(retries), self.retry_interval);
         } else if let Some(interval) = self.retry_interval {
@@ -531,7 +539,7 @@ impl PyBackgroundConfig {
         sharding: &str,
         batch_length: Option<usize>,
         batch_size: Option<usize>,
-        linger_ms: Option<u64>,
+        linger_ms: Option<f64>,
         max_buffer_size: Option<u64>,
         max_in_flight: Option<usize>,
         failure_mode: &str,
@@ -583,7 +591,10 @@ impl PyBackgroundConfig {
                 batch_length: batch_length.unwrap_or(defaults.batch_length),
                 batch_size: batch_size.unwrap_or(defaults.batch_size),
                 linger: linger_ms
-                    .map(|linger| IggyDuration::from(Duration::from_millis(linger)))
+                    .map(|linger| {
+                        crate::convert::duration_ms(linger, "linger_ms").map(IggyDuration::from)
+                    })
+                    .transpose()?
                     .unwrap_or(defaults.linger),
                 max_buffer_size: max_buffer_size.unwrap_or(defaults.max_buffer_size),
                 max_in_flight: max_in_flight.unwrap_or(defaults.max_in_flight),
@@ -733,12 +744,15 @@ impl ErrorCallback for PyErrorCallback {
     fn call(&self, ctx: ErrorCtx) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         let hook = self.0.clone();
         Box::pin(async move {
+            // A background failure reports no uncertain head, and the
+            // exception lists every record of the failed tail as unconfirmed.
             let error = LaserError::Iggy(IggyError::ProducerSendFailed {
                 cause: ctx.cause,
                 failed: ctx.messages,
+                uncertain: 0,
                 committed: ctx.committed,
-                stream_name: ctx.stream_name,
-                topic_name: ctx.topic_name,
+                stream_name: ctx.stream_name.into(),
+                topic_name: ctx.topic_name.into(),
             });
             let Some(hook) = hook else {
                 log::error!("background send failed, its records are dropped: {error}");
@@ -1038,7 +1052,7 @@ fn header_field<'a>(bytes: &mut &'a [u8]) -> Option<(u8, &'a [u8])> {
 #[pyclass(name = "ConsumerMessage", frozen)]
 pub struct PyConsumerMessage {
     payload: bytes::Bytes,
-    message_id: String,
+    message_id: u128,
     headers: BTreeMap<String, PyHeader>,
     user_headers: Option<bytes::Bytes>,
     #[pyo3(get)]
@@ -1075,7 +1089,7 @@ impl PyConsumerMessage {
                 .unwrap_or_else(|| (BTreeMap::new(), true));
         Ok(Self {
             payload: message.payload.clone(),
-            message_id: message.header.id.to_string(),
+            message_id: message.header.id,
             headers,
             user_headers: message.user_headers.clone(),
             headers_malformed,
@@ -1096,7 +1110,7 @@ impl PyConsumerMessage {
                 .unwrap_or_else(|| (BTreeMap::new(), true));
         Self {
             payload: message.payload.clone(),
-            message_id: message.message_id.to_string(),
+            message_id: message.message_id,
             headers,
             user_headers: message.user_headers.clone(),
             headers_malformed,
@@ -1120,10 +1134,10 @@ impl PyConsumerMessage {
         PyBytes::new(py, &self.payload)
     }
 
-    /// Iggy's 128-bit message identifier as decimal text.
+    /// Iggy's 128-bit message identifier.
     #[getter]
-    fn message_id(&self) -> String {
-        self.message_id.clone()
+    fn message_id(&self) -> u128 {
+        self.message_id
     }
 
     /// The record's log position (partition and offset).
@@ -1190,9 +1204,7 @@ impl PyConsumerMessage {
 /// exposes manual offset storage for commit-after-handle delivery. A group
 /// consumer on a server that resolves group policies runs the group's
 /// filter, or none, without naming one, and commits through the group's
-/// fenced acknowledgments. A purge restarts the partition at offset 0
-/// without telling an open reader, which can keep its old position and skip
-/// the replacement records, so rebuild it after a purge.
+/// fenced acknowledgments.
 #[gen_stub_pyclass]
 #[pyclass(name = "Consumer")]
 pub struct PyConsumer {
@@ -1322,11 +1334,11 @@ impl PyConsumer {
         )
     }
 
-    /// Wait at most `wait_secs` for the next message. Raises `TimeoutError` when
-    /// none arrives in time and `InvalidError` when the consumer has shut down,
-    /// matching the Rust `next_within`.
-    fn next_within<'py>(&self, py: Python<'py>, wait_secs: f64) -> PyResult<Bound<'py, PyAny>> {
-        let wait = crate::convert::duration_seconds(wait_secs, "wait_secs")?;
+    /// Wait at most `wait_ms` milliseconds for the next message. Raises
+    /// `TimeoutError` when none arrives in time and `InvalidError` when the
+    /// consumer has shut down, matching the Rust `next_within`.
+    fn next_within<'py>(&self, py: Python<'py>, wait_ms: f64) -> PyResult<Bound<'py, PyAny>> {
+        let wait = crate::convert::duration_ms(wait_ms, "wait_ms")?;
         let receive = Self::receive(
             self.state.clone(),
             Arc::clone(&self.receiving),
@@ -1593,13 +1605,46 @@ async fn return_deliveries(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsumerState, ProducerState, PyConsumer, PyConsumerMessage, PyHeaderValue, close_producer,
-        positive_duration_ms,
+        ConsumerState, ProducerSettings, ProducerState, PyConsumer, PyConsumerMessage,
+        PyHeaderValue, close_producer, positive_duration_ms,
     };
-    use iggy::prelude::IggyMessage;
+    use iggy::prelude::{IggyClient, IggyExpiry, IggyMessage, MaxTopicSize};
+    use laser_sdk::error::LaserError;
+    use laser_sdk::laser::Laser;
+    use laser_sdk::stream::{MAX_REPLICATION_FACTOR, Routing};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{Mutex, RwLock, watch};
+
+    #[tokio::test]
+    async fn given_a_replication_factor_outside_one_to_thirty_two_when_the_producer_builds_then_should_refuse_it_before_sending()
+     {
+        let laser = Laser::from_client(IggyClient::default());
+        for factor in [0, MAX_REPLICATION_FACTOR + 1] {
+            let settings = ProducerSettings {
+                batch_length: 1000,
+                linger: Duration::ZERO,
+                retries: None,
+                retry_interval: None,
+                routing: Routing::Balanced,
+                create_stream: false,
+                create_topic: true,
+                partitions: 1,
+                replication_factor: Some(factor),
+                expiry: IggyExpiry::ServerDefault,
+                max_topic_size: MaxTopicSize::ServerDefault,
+                background: None,
+            };
+            let result = settings
+                .build(laser.stream("fleet").topic("readings"))
+                .await;
+            assert!(
+                matches!(&result, Err(LaserError::Invalid(message)) if message == "replication factor must be 1..=32"),
+                "factor {factor}: {:?}",
+                result.err()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn given_an_in_flight_send_when_shutting_down_then_should_wait_for_it_and_close_once() {

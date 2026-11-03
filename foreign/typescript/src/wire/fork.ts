@@ -1,3 +1,4 @@
+import { splitScopedResource } from "./authz.js"
 import { CodecError, InvalidError } from "../client/errors.js"
 import { type CborMap, expectMap, expectString, field, singleVariantTag } from "./cbor.js"
 import { FORK_OP_VERSION } from "./codes.js"
@@ -383,19 +384,37 @@ export function decodeForkReply(value: unknown, context: string): ForkReply {
   }
 }
 
+/** Validate a fork id: ASCII letters, digits, `-`, `_`, and `.`, or a
+ * stream-scoped `stream:<stream>/<local>` whose two parts both pass that rule. */
 export function validateForkId(forkId: string): void {
-  if (forkId.length === 0) {
-    throw new InvalidError("fork id must not be empty")
+  const scoped = splitScopedResource(forkId)
+  if (scoped === undefined) {
+    validateSafelistedName("fork id", forkId)
+    return
   }
-  const bytes = new TextEncoder().encode(forkId)
-  if (bytes.length > MAX_FORK_ID_BYTES) {
+  const bytes = new TextEncoder().encode(forkId).length
+  if (bytes > MAX_FORK_ID_BYTES) {
     throw new InvalidError(
-      `fork id is ${String(bytes.length)}B, exceeds cap ${String(MAX_FORK_ID_BYTES)}B`
+      `fork id is ${String(bytes)}B, exceeds cap ${String(MAX_FORK_ID_BYTES)}B`
     )
   }
-  if (!/^[A-Za-z0-9._-]+$/.test(forkId)) {
+  validateSafelistedName("fork id stream", scoped[0])
+  validateSafelistedName("fork id", scoped[1])
+}
+
+function validateSafelistedName(label: string, value: string): void {
+  if (value.length === 0) {
+    throw new InvalidError(`${label} must not be empty`)
+  }
+  const bytes = new TextEncoder().encode(value).length
+  if (bytes > MAX_FORK_ID_BYTES) {
     throw new InvalidError(
-      "fork id has a disallowed byte: allowed are ASCII letters, digits, '-', '_', '.'"
+      `${label} is ${String(bytes)}B, exceeds cap ${String(MAX_FORK_ID_BYTES)}B`
+    )
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(value)) {
+    throw new InvalidError(
+      `${label} has a disallowed byte: allowed are ASCII letters, digits, '-', '_', '.'`
     )
   }
 }

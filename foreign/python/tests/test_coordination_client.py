@@ -45,6 +45,13 @@ async def test_given_release_when_repeated_after_ambiguity_then_should_keep_the_
     assert transport.resets == 1
 
 
+def test_given_a_holder_id_with_a_control_character_when_preparing_a_lease_then_should_refuse_it():
+    client = ls.FencedLeaseClient(Transport())
+    with pytest.raises(ls.InvalidError, match="control character"):
+        client.prepare_acquire({**ACQUIRE, "holder_id": "work\ter"})
+    assert client.prepare_acquire(ACQUIRE).operation_id > 0
+
+
 async def test_given_prepared_mutations_when_mismatched_then_should_refuse_before_send():
     transport = Transport()
     first = ls.FencedLeaseClient(transport)
@@ -73,10 +80,10 @@ async def test_given_a_stalled_acquisition_when_timed_out_then_should_report_rec
             await asyncio.sleep(0)
 
     transport = Stalled()
-    client = ls.FencedLeaseClient(transport).with_attempt_timeout(0.005)
+    client = ls.FencedLeaseClient(transport).with_attempt_timeout(5)
     operation = client.prepare_acquire(ACQUIRE)
-    assert operation.ambiguous_recovery == ls.AmbiguousMutationRecovery.wait_for_lease_expiry(1.0)
-    assert operation.ambiguous_recovery != ls.AmbiguousMutationRecovery.wait_for_lease_expiry(2.0)
+    assert operation.ambiguous_recovery == ls.AmbiguousMutationRecovery.wait_for_lease_expiry(1_000)
+    assert operation.ambiguous_recovery != ls.AmbiguousMutationRecovery.wait_for_lease_expiry(2_000)
     assert operation.ambiguous_recovery.kind == "wait_for_lease_expiry"
     with pytest.raises(ls.LaserError) as failure:
         await client.acquire(operation)

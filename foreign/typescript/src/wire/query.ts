@@ -265,6 +265,133 @@ export function newQuery(
   }
 }
 
+/**
+ * Builds a `Query` field for field, like Rust `Query::builder()`. `executionId`,
+ * `target`, and `deadlineMicros` are required. Every other field starts at the
+ * `newQuery` default, and passing `undefined` to an optional field clears it.
+ */
+export class QueryBuilder {
+  private executionIdValue: QueryExecutionId | undefined
+  private targetValue: QueryTarget | undefined
+  private deadlineMicrosValue: bigint | undefined
+  private fields: QueryBuilderFields = {
+    byKey: [],
+    order: [],
+    page: { limit: 50, offset: 0n, wantTotal: false },
+    distinct: false,
+    select: { fields: [], payload: false },
+    consistency: "eventual"
+  }
+
+  executionId(executionId: QueryExecutionId): this {
+    this.executionIdValue = executionId
+    return this
+  }
+
+  target(target: QueryTarget): this {
+    this.targetValue = target
+    return this
+  }
+
+  /** The absolute Unix deadline in microseconds. */
+  deadlineMicros(deadlineMicros: bigint): this {
+    this.deadlineMicrosValue = deadlineMicros
+    return this
+  }
+
+  byKey(byKey: readonly KeyMatch[]): this {
+    return this.with({ byKey })
+  }
+
+  messageType(messageType: string | undefined): this {
+    return this.with({ messageType })
+  }
+
+  /** The `[start, end]` range in epoch microseconds, both bounds inclusive. */
+  timeRange(timeRange: readonly [bigint, bigint] | undefined): this {
+    return this.with({ timeRange })
+  }
+
+  filter(filter: Filter | undefined): this {
+    return this.with({ filter })
+  }
+
+  vector(vector: VectorQuery | undefined): this {
+    return this.with({ vector })
+  }
+
+  text(text: TextQuery | undefined): this {
+    return this.with({ text })
+  }
+
+  order(order: readonly Sort[]): this {
+    return this.with({ order })
+  }
+
+  page(page: QueryPageRequest): this {
+    return this.with({ page })
+  }
+
+  aggregate(aggregate: Aggregate | undefined): this {
+    return this.with({ aggregate })
+  }
+
+  having(having: Filter | undefined): this {
+    return this.with({ having })
+  }
+
+  distinct(distinct: boolean): this {
+    return this.with({ distinct })
+  }
+
+  select(select: Select): this {
+    return this.with({ select })
+  }
+
+  /** The fork whose view to read, or `undefined` for the trunk. */
+  fork(fork: string | undefined): this {
+    return this.with({ fork })
+  }
+
+  rawSql(rawSql: RawSql | undefined): this {
+    return this.with({ rawSql })
+  }
+
+  consistency(consistency: Consistency): this {
+    return this.with({ consistency })
+  }
+
+  /** The query. Throws `InvalidError` when a required field is unset. */
+  build(): Query {
+    if (this.executionIdValue === undefined) throw missingQueryField("executionId")
+    if (this.targetValue === undefined) throw missingQueryField("target")
+    if (this.deadlineMicrosValue === undefined) throw missingQueryField("deadlineMicros")
+    const query: Record<string, unknown> = {
+      executionId: this.executionIdValue,
+      target: this.targetValue,
+      deadlineMicros: this.deadlineMicrosValue
+    }
+    for (const [name, value] of Object.entries(this.fields)) {
+      if (value !== undefined) query[name] = value
+    }
+    return query as unknown as Query
+  }
+
+  private with(fields: QueryBuilderFields): this {
+    this.fields = { ...this.fields, ...fields }
+    return this
+  }
+}
+
+type QueryBuilderFields = {
+  readonly [K in Exclude<keyof Query, "executionId" | "target" | "deadlineMicros">]?:
+    Query[K] | undefined
+}
+
+function missingQueryField(name: string): InvalidError {
+  return new InvalidError(`query builder requires ${name}`)
+}
+
 export function operationalQuery(
   executionId: QueryExecutionId,
   index: string,
@@ -653,7 +780,9 @@ export function validateQuery(query: Query): void {
   }
   if (query.messageType !== undefined) validateName(query.messageType)
   if (query.timeRange !== undefined && query.timeRange[0] >= query.timeRange[1])
-    throw new InvalidError("query time range must be a nonempty half-open interval")
+    throw new InvalidError(
+      "query time range start must be before its end, and both bounds are inclusive"
+    )
   for (const sort of query.order) validateName(sort.field)
   for (const field of query.select.fields) validateName(field)
   if (query.text !== undefined) {
@@ -886,6 +1015,22 @@ export interface QueryContext {
   readonly scannedBytes: bigint
   readonly producedBytes: bigint
   readonly rowCount: bigint
+  /** How far the store that served the query had applied each source
+   * partition of the index. A reply from another node can sit at another
+   * point of the same log, so compare positions, not wall time. Empty when the
+   * store reports no positions. */
+  readonly frontier: readonly QueryFrontier[]
+}
+/** One source partition's applied position in the store that served a query. */
+export interface QueryFrontier {
+  readonly stream: string
+  readonly topic: string
+  readonly partitionId: number
+  /** Creation time of the topic incarnation the rows come from, when the
+   * serving node knows it. Offsets of different incarnations do not compare. */
+  readonly topicCreatedAtMicros?: bigint
+  /** The last offset the store applied. */
+  readonly appliedOffset: bigint
 }
 export interface QueryResult {
   readonly fields: readonly LogicalField[]
@@ -1017,6 +1162,20 @@ function encodeContext(value: QueryContext): Map<string, unknown> {
   map.set("scanned_bytes", value.scannedBytes)
   map.set("produced_bytes", value.producedBytes)
   map.set("row_count", value.rowCount)
+  if (value.frontier.length > 0)
+    map.set(
+      "frontier",
+      value.frontier.map((entry) => {
+        const item = mapOf([
+          ["stream", entry.stream],
+          ["topic", entry.topic],
+          ["partition_id", entry.partitionId]
+        ])
+        optional(item, "topic_created_at_micros", entry.topicCreatedAtMicros)
+        item.set("applied_offset", entry.appliedOffset)
+        return item
+      })
+    )
   return map
 }
 function decodeContext(map: CborMap, context: string): QueryContext {
@@ -1058,7 +1217,19 @@ function decodeContext(map: CborMap, context: string): QueryContext {
     elapsedMicros: field.requiredU64(map, "elapsed_micros", context),
     scannedBytes: field.requiredU64(map, "scanned_bytes", context),
     producedBytes: field.requiredU64(map, "produced_bytes", context),
-    rowCount: field.requiredU64(map, "row_count", context)
+    rowCount: field.requiredU64(map, "row_count", context),
+    frontier: field.optionalArray(map, "frontier", context, (item, index) => {
+      const entryContext = `${context}.frontier[${String(index)}]`
+      const entry = expectMap(item, entryContext)
+      const topicCreatedAtMicros = field.optionalU64(entry, "topic_created_at_micros", entryContext)
+      return {
+        stream: field.requiredString(entry, "stream", entryContext),
+        topic: field.requiredString(entry, "topic", entryContext),
+        partitionId: field.requiredU32(entry, "partition_id", entryContext),
+        ...(topicCreatedAtMicros === undefined ? {} : { topicCreatedAtMicros }),
+        appliedOffset: field.requiredU64(entry, "applied_offset", entryContext)
+      }
+    })
   }
 }
 export function encodeQueryResult(value: QueryResult): Map<string, unknown> {

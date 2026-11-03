@@ -6,6 +6,8 @@ import type { HeaderValue } from "../stream/header-value.js"
 import type { UlidSource } from "../runtime/ulid.js"
 import { type KeyRegistry, type SigningKey } from "../signing.js"
 import { decodeAgentMessage } from "./reliable-consumer.js"
+import { replyTopicFor, resolveAgentPartition, resolveAgentTopic } from "./partitioning.js"
+import type { SessionLayout } from "../session.js"
 import {
   type AgentId as SdkAgentId,
   type ConversationId as SdkConversationId,
@@ -50,6 +52,7 @@ import {
   type LogPosition,
   RecordId
 } from "../wire/ids.js"
+import { AGENT_CONTROL, AGENT_SESSIONS } from "../wire/topics.js"
 import type { Value } from "../wire/value.js"
 
 export const DEFAULT_CHUNK_FLUSH_BYTES = 512
@@ -108,9 +111,13 @@ function iggyHeader(header: CanonicalHeader): HeaderValue {
   }
 }
 
-function assemble(envelope: AgentEnvelope, contentType: ContentType): MessageWithHeaders {
+function assemble(
+  envelope: AgentEnvelope,
+  contentType: ContentType,
+  broadcast: boolean
+): MessageWithHeaders {
   validateAgentEnvelope(envelope)
-  const record = canonicalAgentRecord(envelope, contentType)
+  const record = canonicalAgentRecord(envelope, contentType, broadcast)
   return {
     payload: record.payload,
     headers: new Map(
@@ -218,6 +225,16 @@ class AgdxReplyReader {
   }
 }
 
+/** Where one published envelope was committed. */
+export interface AgdxReceipt {
+  /** The envelope's record id. Chunks have none. */
+  readonly record?: RecordId
+  /** The partition the record landed on, when the server confirmed it. */
+  readonly partitionId?: number
+  /** The record's offset, when the server confirmed it. */
+  readonly offset?: bigint
+}
+
 export interface Agdx {
   command(correlation: CorrelationId, body: BytesLike): AgdxSend
   respond(correlation: CorrelationId, body: BytesLike): AgdxSend
@@ -225,12 +242,28 @@ export interface Agdx {
   status(operation: string): AgdxSend
   fail(correlation: CorrelationId, error: AgentErrorBody): AgdxSend
   stream(correlation: CorrelationId, purpose: string): AgdxStream
+  /**
+   * Publishes a prompt command and waits for the correlated response on
+   * `replyTopic`. `target` addresses the prompt to one agent. Without it every
+   * agent on a shared session topic receives the prompt.
+   */
   requestInput(
     replyTopic: string,
     prompt: BytesLike,
     timeoutMs: number,
-    options?: { readonly signal?: AbortSignal }
+    options?: { readonly signal?: AbortSignal; readonly target?: SdkAgentId }
   ): Promise<Uint8Array>
+  /** Publishes an envelope built elsewhere, unchanged, on this producer's topic.
+   * @internal */
+  publishEnvelope(envelope: AgentEnvelope): Promise<AgdxReceipt>
+  /** @internal */
+  withLaneGuard(
+    check: () => Promise<{
+      readonly streamId: number
+      readonly topicId: number
+      readonly partitions: number
+    }>
+  ): Agdx
 }
 
 interface ClaimCheck {
@@ -250,9 +283,13 @@ interface AgdxPublisher {
     signingKey?: SigningKey,
     claimCheck?: ClaimCheck
   ): Promise<PreparedSend>
-  publish(envelope: AgentEnvelope, contentType: ContentType): Promise<RecordId | undefined>
+  publish(envelope: AgentEnvelope, contentType: ContentType): Promise<AgdxReceipt>
   assemble(envelope: AgentEnvelope, contentType: ContentType): MessageWithHeaders
-  publishBatch(messages: readonly MessageWithHeaders[]): Promise<void>
+  publishBatch(
+    messages: readonly MessageWithHeaders[],
+    kind: AgentKind,
+    target: WireAgentId | undefined
+  ): Promise<void>
 }
 
 class AgdxClient implements Agdx, AgdxPublisher {
@@ -264,8 +301,35 @@ class AgdxClient implements Agdx, AgdxPublisher {
     readonly conversationId: ConversationId,
     private readonly ulidSource?: UlidSource,
     private readonly govern?: (envelope: AgentEnvelope, willSign: boolean) => Promise<Uint8Array>,
-    private readonly verifier?: KeyRegistry
+    private readonly verifier?: KeyRegistry,
+    private readonly layout?: () => SessionLayout | undefined,
+    private readonly laneGuard?: () => Promise<{
+      readonly streamId: number
+      readonly topicId: number
+      readonly partitions: number
+    }>
   ) {}
+
+  withLaneGuard(
+    check: () => Promise<{
+      readonly streamId: number
+      readonly topicId: number
+      readonly partitions: number
+    }>
+  ): Agdx {
+    return new AgdxClient(
+      this.transport,
+      this.streamName,
+      this.topicName,
+      this.sourceId,
+      this.conversationId,
+      this.ulidSource,
+      this.govern,
+      this.verifier,
+      this.layout,
+      check
+    )
+  }
 
   command(correlation: CorrelationId, body: BytesLike): AgdxSend {
     return this.sendOf(
@@ -337,7 +401,7 @@ class AgdxClient implements Agdx, AgdxPublisher {
     replyTopic: string,
     prompt: BytesLike,
     timeoutMs: number,
-    options: { readonly signal?: AbortSignal } = {}
+    options: { readonly signal?: AbortSignal; readonly target?: SdkAgentId } = {}
   ): Promise<Uint8Array> {
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
       throw new InvalidError("requestInput() timeout must be a non-negative finite number")
@@ -346,10 +410,11 @@ class AgdxClient implements Agdx, AgdxPublisher {
     const reader = await AgdxReplyReader.atTail(
       this.transport,
       this.streamName,
-      replyTopic,
+      replyTopicFor(this.layout?.(), replyTopic, this.sourceId),
       this.verifier
     )
-    await this.command(interrupt, prompt).send()
+    const command = this.command(interrupt, prompt)
+    await (options.target === undefined ? command : command.withTarget(options.target)).send()
     const deadline = Date.now() + timeoutMs
     for (;;) {
       if (options.signal?.aborted === true) {
@@ -378,15 +443,41 @@ class AgdxClient implements Agdx, AgdxPublisher {
     throw new TimeoutError("the AGDX reply")
   }
 
-  async publish(envelope: AgentEnvelope, contentType: ContentType): Promise<RecordId | undefined> {
-    const message = assemble(envelope, contentType)
-    await this.transport.sendMessagesWithHeaders(
+  publishEnvelope(envelope: AgentEnvelope): Promise<AgdxReceipt> {
+    return this.publish(envelope, ContentType.Raw)
+  }
+
+  async publish(envelope: AgentEnvelope, contentType: ContentType): Promise<AgdxReceipt> {
+    const message = this.assemble(envelope, contentType)
+    // A declared per-agent topic layout moves addressed work off the lane, and
+    // the lane identity guard covers lane records only.
+    const destination = this.destinationOf(envelope.kind, envelope.target)
+    const guard = destination === undefined ? this.laneGuard : undefined
+    let firstSource = await guard?.()
+    const sent = await this.transport.sendMessagesWithHeaders(
       this.streamName,
-      this.topicName,
+      destination ?? this.topicName,
       [message],
-      this.conversationId.toString()
+      envelope.conversation.toString(),
+      this.partitionOf(envelope.kind, envelope.target),
+      guard === undefined
+        ? undefined
+        : {
+            beforeSend: async () => {
+              const source = firstSource
+              firstSource = undefined
+              if (source !== undefined) return source
+              return guard()
+            }
+          }
     )
-    return envelope.record
+    const confirmation = sent.confirmations[0]
+    return {
+      ...(envelope.record !== undefined ? { record: envelope.record } : {}),
+      ...(confirmation !== undefined
+        ? { partitionId: confirmation.partitionId, offset: confirmation.baseOffset }
+        : {})
+    }
   }
 
   async prepare(
@@ -421,17 +512,40 @@ class AgdxClient implements Agdx, AgdxPublisher {
     }
   }
 
+  // Every untargeted record on the shared session and control topics is
+  // addressed to every agent, so an addressee-filtered group still reads it.
   assemble(envelope: AgentEnvelope, contentType: ContentType): MessageWithHeaders {
-    return assemble(envelope, contentType)
+    return assemble(
+      envelope,
+      contentType,
+      this.topicName === AGENT_SESSIONS || this.topicName === AGENT_CONTROL
+    )
   }
 
-  async publishBatch(messages: readonly MessageWithHeaders[]): Promise<void> {
+  async publishBatch(
+    messages: readonly MessageWithHeaders[],
+    kind: AgentKind,
+    target: WireAgentId | undefined
+  ): Promise<void> {
     await this.transport.sendMessagesWithHeaders(
       this.streamName,
-      this.topicName,
+      this.destinationOf(kind, target) ?? this.topicName,
       messages,
-      this.conversationId.toString()
+      this.conversationId.toString(),
+      this.partitionOf(kind, target)
     )
+  }
+
+  // The partition a record of `kind` addressed to `target` lands on under the
+  // stream's declared layout, or the conversation's own partition.
+  private partitionOf(kind: AgentKind, target: WireAgentId | undefined): number | undefined {
+    return resolveAgentPartition(this.layout?.(), this.topicName, kind, target)
+  }
+
+  // The declared topic a record of `kind` addressed to `target` moves to under
+  // a per-agent topic layout, or `undefined` to stay on this topic.
+  private destinationOf(kind: AgentKind, target: WireAgentId | undefined): string | undefined {
+    return resolveAgentTopic(this.layout?.(), this.topicName, kind, target)
   }
 
   private sendOf(envelope: AgentEnvelope): AgdxSend {
@@ -447,7 +561,8 @@ export function createAgdx(
   conversation: SdkConversationId,
   ulidSource?: UlidSource,
   govern?: (envelope: AgentEnvelope, willSign: boolean) => Promise<Uint8Array>,
-  verifier?: KeyRegistry
+  verifier?: KeyRegistry,
+  layout?: () => SessionLayout | undefined
 ): Agdx {
   return new AgdxClient(
     transport,
@@ -457,11 +572,19 @@ export function createAgdx(
     ConversationId.parse(conversation.toString()),
     ulidSource,
     govern,
-    verifier
+    verifier,
+    layout
   )
 }
 
 export interface AgdxSend {
+  /** Uses `record` as the envelope's record id, so a retried send repeats the
+   * same record.
+   * @internal */
+  withRecord(record: RecordId): this
+  /** Marks the envelope as part of a child session whose parent is `parent`
+   * and whose tree is rooted at `root`. */
+  withAncestry(parent?: ConversationId, root?: ConversationId): this
   withTarget(target: SdkAgentId): this
   withCause(cause: RecordId, causeAt?: LogPosition): this
   withCorrelation(correlation: CorrelationId): this
@@ -470,6 +593,8 @@ export interface AgdxSend {
   withTaskState(state: TaskState): this
   withOperation(operation: string): this
   withTool(tool: string): this
+  /** Sets why the model stopped generating. */
+  withFinishReason(reason: string): this
   withUsage(usage: TokenUsage): this
   withMetadata(key: string, value: Value): this
   last(): this
@@ -483,6 +608,8 @@ export interface AgdxSend {
    */
   claimCheck(store: BlobStore, thresholdBytes: number): this
   send(): Promise<RecordId | undefined>
+  /** Like `send`, and also returns where the record was committed. */
+  sendReceipt(): Promise<AgdxReceipt>
 }
 
 class AgdxSendBuilder implements AgdxSend {
@@ -495,6 +622,21 @@ class AgdxSendBuilder implements AgdxSend {
     private readonly agdx: AgdxPublisher,
     private envelope: AgentEnvelope
   ) {}
+
+  withRecord(record: RecordId): this {
+    this.envelope = { ...this.envelope, record }
+    return this
+  }
+
+  withAncestry(parent?: ConversationId, root?: ConversationId): this {
+    const { parent: _parent, root: _root, ...rest } = this.envelope
+    this.envelope = {
+      ...rest,
+      ...(parent !== undefined ? { parent } : {}),
+      ...(root !== undefined ? { root } : {})
+    }
+    return this
+  }
 
   withTarget(target: SdkAgentId): this {
     this.envelope = withTarget(this.envelope, target.wireId())
@@ -528,6 +670,11 @@ class AgdxSendBuilder implements AgdxSend {
 
   withOperation(operation: string): this {
     this.envelope = withOperation(this.envelope, operation)
+    return this
+  }
+
+  withFinishReason(reason: string): this {
+    this.envelope = { ...this.envelope, finishReason: reason }
     return this
   }
 
@@ -575,7 +722,16 @@ class AgdxSendBuilder implements AgdxSend {
   }
 
   async send(): Promise<RecordId | undefined> {
+    return (await this.sendReceipt()).record
+  }
+
+  async sendReceipt(): Promise<AgdxReceipt> {
     if (this.sent) throw new InvalidError("an AGDX send can only be performed once")
+    if (this.envelope.kind === AgentKind.Error && this.contentTypeValue !== ContentType.Cbor) {
+      throw new InvalidError(
+        "an error envelope carries a CBOR AgentErrorBody, so its content type cannot change"
+      )
+    }
     this.sent = true
     const prepared = await this.agdx.prepare(
       this.envelope,
@@ -684,7 +840,7 @@ class AgdxStreamWriter implements AgdxStream {
     const messages = this.buffer.messages
     this.buffer.messages = []
     this.buffer.firstAt = undefined
-    await this.agdx.publishBatch(messages)
+    await this.agdx.publishBatch(messages, AgentKind.Chunk, this.target)
   }
 
   async finish(finishReason: string, usage?: TokenUsage): Promise<void> {
@@ -719,7 +875,7 @@ class AgdxStreamWriter implements AgdxStream {
     const messages = this.buffer.messages
     this.buffer.messages = []
     this.buffer.firstAt = undefined
-    await this.agdx.publishBatch(messages)
+    await this.agdx.publishBatch(messages, envelope.kind, envelope.target)
   }
 
   private chunk(body: Uint8Array, last: boolean, finishReason?: string): AgentEnvelope {

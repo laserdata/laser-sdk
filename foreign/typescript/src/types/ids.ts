@@ -2,8 +2,8 @@ import { IdError, InvalidError } from "../client/errors.js"
 import { mintUlidValue, type UlidSource } from "../runtime/ulid.js"
 import { type AgentId as WireAgentId, parseAgentId } from "../wire/agent.js"
 import { crockfordDecode, crockfordEncode } from "../wire/ids.js"
+import { MAX_AGENT_STRING_BYTES, MAX_FILTER_SOURCE_NAME_BYTES } from "../wire/limits.js"
 
-const MAX_ID_LEN = 255
 const MAX_PARTITION_ID = 0xffff_ffffn
 const MAX_OFFSET = 0xffff_ffff_ffff_ffffn
 
@@ -80,13 +80,13 @@ export class IntentId {
   }
 }
 
-function validateId(name: string): void {
+function validateId(name: string, cap: number): void {
   if (name.length === 0) {
     throw IdError.empty()
   }
   const bytes = new TextEncoder().encode(name)
-  if (bytes.length > MAX_ID_LEN) {
-    throw IdError.tooLong(bytes.length, MAX_ID_LEN)
+  if (bytes.length > cap) {
+    throw IdError.tooLong(bytes.length, cap)
   }
   for (const char of name) {
     const codePoint = char.codePointAt(0) ?? 0
@@ -100,7 +100,7 @@ export class AgentId {
   private constructor(private readonly value: string) {}
 
   static new(name: string): AgentId {
-    validateId(name)
+    validateId(name, MAX_AGENT_STRING_BYTES)
     return new AgentId(name)
   }
 
@@ -127,12 +127,14 @@ export class ConsumerGroupName {
   private constructor(private readonly value: string) {}
 
   static new(name: string): ConsumerGroupName {
-    validateId(name)
+    validateId(name, MAX_FILTER_SOURCE_NAME_BYTES)
     return new ConsumerGroupName(name)
   }
 
+  /** The agent's default group. Throws `IdError` for an agent id longer
+   * than the 255 bytes Apache Iggy allows a group name. */
   static forAgent(agent: AgentId): ConsumerGroupName {
-    return new ConsumerGroupName(agent.asStr())
+    return ConsumerGroupName.new(agent.asStr())
   }
 
   asStr(): string {

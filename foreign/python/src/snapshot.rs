@@ -6,7 +6,6 @@ use laser_sdk::snapshot::{FoldSnapshot, KvSnapshotStore, SnapshotStore, TopicSna
 use laser_sdk::wire::agent::ConversationId;
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
-use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -34,8 +33,8 @@ pub struct PyKvSnapshotStore;
 impl PyKvSnapshotStore {
     /// A store over the default `agent.snapshots` namespace.
     #[new]
-    fn new(laser: PyRef<'_, PyLaser>) -> PyClassInitializer<PyKvSnapshotStore> {
-        let store = KvSnapshotStore::new(laser.inner.clone());
+    fn new(laser: PyRef<'_, PyLaser>, fold: String) -> PyClassInitializer<PyKvSnapshotStore> {
+        let store = KvSnapshotStore::new(laser.inner.clone(), fold);
         PyClassInitializer::from(PySnapshotStore::native(Kind::Kv(Arc::new(store))))
             .add_subclass(PyKvSnapshotStore)
     }
@@ -46,8 +45,9 @@ impl PyKvSnapshotStore {
         py: Python<'_>,
         laser: PyRef<'_, PyLaser>,
         namespace: String,
+        fold: String,
     ) -> PyResult<Py<PyKvSnapshotStore>> {
-        let store = KvSnapshotStore::in_namespace(laser.inner.clone(), namespace);
+        let store = KvSnapshotStore::in_namespace(laser.inner.clone(), namespace, fold);
         Py::new(
             py,
             PyClassInitializer::from(PySnapshotStore::native(Kind::Kv(Arc::new(store))))
@@ -66,8 +66,8 @@ pub struct PyTopicSnapshotStore;
 impl PyTopicSnapshotStore {
     /// A store over the default `agent.snapshots` topic.
     #[new]
-    fn new(laser: PyRef<'_, PyLaser>) -> PyClassInitializer<PyTopicSnapshotStore> {
-        let store = TopicSnapshotStore::new(laser.inner.clone());
+    fn new(laser: PyRef<'_, PyLaser>, fold: String) -> PyClassInitializer<PyTopicSnapshotStore> {
+        let store = TopicSnapshotStore::new(laser.inner.clone(), fold);
         PyClassInitializer::from(PySnapshotStore::native(Kind::Topic(Arc::new(store))))
             .add_subclass(PyTopicSnapshotStore)
     }
@@ -78,8 +78,9 @@ impl PyTopicSnapshotStore {
         py: Python<'_>,
         laser: PyRef<'_, PyLaser>,
         topic: String,
+        fold: String,
     ) -> PyResult<Py<PyTopicSnapshotStore>> {
-        let store = TopicSnapshotStore::on_topic(laser.inner.clone(), topic);
+        let store = TopicSnapshotStore::on_topic(laser.inner.clone(), topic, fold);
         Py::new(
             py,
             PyClassInitializer::from(PySnapshotStore::native(Kind::Topic(Arc::new(store))))
@@ -92,8 +93,13 @@ impl PyTopicSnapshotStore {
 /// `snapshot` folded, or `0` for a partition it did not cover.
 #[gen_stub_pyfunction]
 #[pyfunction]
-pub fn fold_snapshot_resume_offset(snapshot: &Bound<'_, PyAny>, partition: u32) -> PyResult<u64> {
-    Ok(snapshot_from_py(snapshot)?.resume_offset(partition))
+pub fn fold_snapshot_resume_offset(
+    snapshot: &Bound<'_, PyAny>,
+    topic_id: u32,
+    topic_created_at_micros: u64,
+    partition_id: u32,
+) -> PyResult<u64> {
+    Ok(snapshot_from_py(snapshot)?.resume_offset(topic_id, topic_created_at_micros, partition_id))
 }
 
 #[derive(Clone)]
@@ -201,7 +207,7 @@ impl PySnapshotStore {
         })
     }
 
-    /// The newest snapshot as `{"conversation": str, "as_of": {partition: offset}, "state": bytes}`, or `None`. The offsets are inclusive.
+    /// The newest snapshot as the dict `decode_snapshot` returns (stream, stream id and creation time, conversation, fold, `as_of` entries of `(topic_id, topic_created_at_micros, partition_id, offset)`, and state), or `None`. The offsets are inclusive.
     fn latest<'py>(&self, py: Python<'py>, conversation: String) -> PyResult<Bound<'py, PyAny>> {
         let conversation = ConversationId::from_str(&conversation)
             .map_err(|error| crate::errors::InvalidError::new_err(error.to_string()))?;
@@ -215,27 +221,18 @@ impl PySnapshotStore {
         })
     }
 
-    /// Save opaque folded bytes for `conversation`. `as_of` maps each partition to the last folded offset, inclusive. Custom callbacks receive the complete snapshot dict.
+    /// Save a snapshot with a stream, fold, and source generation.
     fn save<'py>(
         &self,
         py: Python<'py>,
-        conversation: String,
-        as_of: BTreeMap<u32, u64>,
-        state: Vec<u8>,
+        snapshot: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let conversation = ConversationId::from_str(&conversation)
-            .map_err(|error| crate::errors::InvalidError::new_err(error.to_string()))?;
+        let snapshot = snapshot_from_py(snapshot)?;
         let store = self.handle();
-        future_into_py(py, async move {
-            store
-                .save(&FoldSnapshot {
-                    conversation,
-                    as_of,
-                    state,
-                })
-                .await
-                .map_err(to_pyerr)
-        })
+        future_into_py(
+            py,
+            async move { store.save(&snapshot).await.map_err(to_pyerr) },
+        )
     }
 }
 

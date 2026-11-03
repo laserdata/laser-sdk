@@ -22,14 +22,14 @@ void test("given_agdx_messages_when_sent_through_iggy_then_should_preserve_heade
   const laser = await Laser.connectWithStream(CONNECTION_STRING, streamName)
   try {
     await laser.stream(streamName).ensure()
-    const topic = laser.topic(AgentTopic.Commands)
+    const topic = laser.topic(AgentTopic.Sessions)
     await topic.ensure(3)
 
     const conversation = ConversationId.new()
     const source = AgentId.new("source-agent")
     const target = AgentId.new("target-agent")
     const correlation = CorrelationId.fromU128(5n)
-    const agdx = laser.agdx(AgentTopic.Commands, source, conversation)
+    const agdx = laser.agdx(AgentTopic.Sessions, source, conversation)
 
     await agdx
       .command(correlation, new TextEncoder().encode("request"))
@@ -46,7 +46,10 @@ void test("given_agdx_messages_when_sent_through_iggy_then_should_preserve_heade
     assert.equal(messages.length, 4)
     const envelopes = messages.map((message) => {
       assert.deepEqual(message.headers.get(AGENT_VERSION), { kind: "uint32", value: 1 })
-      assert.equal(message.headers.get(CONVERSATION_ID)?.kind, "uint128")
+      assert.deepEqual(message.headers.get(CONVERSATION_ID), {
+        kind: "string",
+        value: conversation.toString()
+      })
       assert.deepEqual(message.headers.get(TARGET_AGENT_ID), {
         kind: "string",
         value: "target-agent"
@@ -65,7 +68,7 @@ void test("given_agdx_messages_when_sent_through_iggy_then_should_preserve_heade
     assert.ok(
       envelopes.every((envelope) => envelope.conversation.toString() === conversation.toString())
     )
-    const events = await laser.reassembleChannel(conversation, AgentTopic.Commands, chunks.channel)
+    const events = await laser.reassembleChannel(conversation, AgentTopic.Sessions, chunks.channel)
     assert.deepEqual(
       events.map((event) => event.kind),
       ["body", "body", "finished"]

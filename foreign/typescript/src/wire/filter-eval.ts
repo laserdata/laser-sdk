@@ -28,6 +28,7 @@ import {
   validateConsumerFilter
 } from "./filter.js"
 import type { CmpOp } from "./query.js"
+import { RustRegex } from "./regex.js"
 import type { TypedValue } from "./schema.js"
 
 const UTF8_STRICT = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
@@ -265,43 +266,20 @@ export class CompiledFilter {
   }
 }
 
-export function usesRegex(expr: FilterExpr): boolean {
-  switch (expr.kind) {
-    case "all":
-    case "any":
-      return expr.children.some(usesRegex)
-    case "not":
-      return usesRegex(expr.child)
-    case "text":
-    case "header_text":
-      return expr.predicate.kind === "regex"
-    case "pred":
-    case "pred_as":
-    case "present":
-    case "absent":
-    case "header":
-      return false
-  }
-}
-
 /** A validated text predicate ready to run per record. */
 export class TextMatcher {
   private readonly pattern: string
   private readonly glob: GlobProgram | undefined
+  private readonly regex: RustRegex | undefined
 
-  // Regex predicates run with the server's Rust engine, whose syntax is the
-  // contract. JavaScript regexes differ, so a local evaluation refuses them
-  // instead of guessing.
+  // Regex runs the Rust syntax with the engine's own case folding, the other
+  // kinds lowercase both sides, as in Rust.
   constructor(
     readonly kind: TextMatch,
     readonly source: string,
     private readonly caseInsensitive: boolean
   ) {
-    if (kind === "regex") {
-      throw new InvalidError(
-        "regex predicates cannot be evaluated in TypeScript, the server runs them"
-      )
-    }
+    if (kind === "regex") this.regex = RustRegex.compile(source, caseInsensitive)
     this.pattern = caseInsensitive ? source.toLowerCase() : source
     if (kind === "glob") {
       const tokens = globTokens(source)
@@ -324,6 +302,7 @@ export class TextMatcher {
   }
 
   matches(text: string): boolean {
+    if (this.regex !== undefined) return this.regex.matches(text)
     const value = this.caseInsensitive ? text.toLowerCase() : text
     switch (this.kind) {
       case "equals":

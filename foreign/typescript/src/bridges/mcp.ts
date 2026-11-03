@@ -1,3 +1,4 @@
+import { startChild } from "../agent/contract.js"
 import { publicErrorMessage } from "../client/error-classify.js"
 import { CodecError, HandlerConfigError, InvalidError, TimeoutError } from "../client/errors.js"
 import { INTERNAL_REPLY_HUB } from "../client/internals.js"
@@ -9,14 +10,11 @@ import {
   commandEnvelope,
   withTool,
   type AgentId as WireAgentId,
-  type AgentEnvelope
+  type AgentEnvelope,
+  type AgentErrorBody
 } from "../wire/agent.js"
 import { ContentType } from "../wire/content.js"
-import {
-  type ConversationId as WireConversationId,
-  CorrelationId,
-  type RecordId
-} from "../wire/ids.js"
+import { ConversationId as WireConversationId, CorrelationId, type RecordId } from "../wire/ids.js"
 import { SDK_VERSION } from "./a2a.js"
 import { bridgeHopMetadata, enterBridge } from "./hops.js"
 
@@ -100,6 +98,15 @@ interface PromptEntry {
   readonly messages: readonly (readonly [string, string])[]
 }
 
+// MCP requires an object input schema, so anything else is refused when the
+// tool is registered, as in Rust and Python.
+function toolSchema(value: unknown): Readonly<Record<string, unknown>> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new InvalidError("MCP tool input schema must be a JSON object")
+  }
+  return value as Readonly<Record<string, unknown>>
+}
+
 function jsonObject(value: unknown, context: string): Readonly<Record<string, unknown>> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new HandlerConfigError(`${context} must be a JSON object`)
@@ -130,6 +137,20 @@ export function toolCallFromRequest(
     commandEnvelope(record, conversation, source, correlation, paramsJson.slice()),
     toolName
   )
+}
+
+// Raw JSON as bytes or a string rides byte-identical, like the A2A bridge and
+// Python. Any other value is encoded as JSON first.
+function paramsBytes(paramsJson: unknown): Uint8Array {
+  return paramsJson instanceof Uint8Array
+    ? paramsJson
+    : typeof paramsJson === "string"
+      ? new TextEncoder().encode(paramsJson)
+      : jsonBytes(paramsJson)
+}
+
+function toolFailure(message: string): AgentErrorBody {
+  return { code: { kind: "known", name: "Internal" }, message, retryable: false }
 }
 
 export function toolResultFromEnvelope(envelope: AgentEnvelope): McpToolResult {
@@ -179,7 +200,7 @@ export class McpBridge {
     this.tools.push({
       name,
       ...(description !== undefined ? { description } : {}),
-      inputSchema: jsonObject(inputSchema, "MCP tool input schema")
+      inputSchema: toolSchema(inputSchema)
     })
     return this
   }
@@ -260,26 +281,85 @@ export class McpBridge {
   }
 
   /** `tools/call`: route the call to the agent and await its tool result.
-   * `paramsJson` is the JSON the call carries, raw JSON bytes or a value to
-   * encode as JSON. */
-  callTool(name: string, paramsJson: unknown): Promise<McpToolResult> {
-    return this.sendToolCall(
-      name,
-      paramsJson instanceof Uint8Array ? paramsJson : jsonBytes(paramsJson)
+   * `paramsJson` is the JSON the call carries: raw JSON bytes or text, sent
+   * as is, or another value to encode as JSON. `target` addresses the call to one agent. Without it
+   * every agent on a shared session topic receives the call. */
+  async callTool(
+    name: string,
+    paramsJson: unknown,
+    options: { readonly target?: AgentId } = {}
+  ): Promise<McpToolResult> {
+    const conversation = ConversationId.new()
+    return toolResultFromEnvelope(
+      await this.sendToolCall(
+        conversation,
+        name,
+        paramsBytes(paramsJson),
+        undefined,
+        options.target
+      )
     )
   }
 
-  private async sendToolCall(name: string, paramsJson: Uint8Array): Promise<McpToolResult> {
+  /** `callTool` as a child session of `parent`, in the tree rooted at `root`:
+   * the call's submitted start lands on `agent.sessions` with the ancestry
+   * before the command, and the child ends by the result, completed on a tool
+   * result and failed on a tool error. A wait error surfaces before a
+   * lifecycle error. `target` addresses the call to one agent, as in
+   * `callTool`. */
+  async callToolIn(
+    parent: ConversationId,
+    root: ConversationId,
+    name: string,
+    paramsJson: unknown,
+    options: { readonly target?: AgentId } = {}
+  ): Promise<McpToolResult> {
     const conversation = ConversationId.new()
+    const child = await startChild(this.laser, this.source, this.source, conversation, parent, root)
+    let envelope: AgentEnvelope
+    try {
+      envelope = await this.sendToolCall(
+        conversation,
+        name,
+        paramsBytes(paramsJson),
+        {
+          parent: WireConversationId.parse(parent.toString()),
+          root: WireConversationId.parse(root.toString())
+        },
+        options.target
+      )
+    } catch (error) {
+      await child
+        .fail(toolFailure(error instanceof Error ? error.message : String(error)))
+        .catch(() => undefined)
+      throw error
+    }
+    if (envelope.kind === AgentKind.Error)
+      await child.fail(toolFailure("the tool returned an error"))
+    else await child.end()
+    return toolResultFromEnvelope(envelope)
+  }
+
+  private async sendToolCall(
+    conversation: ConversationId,
+    name: string,
+    paramsJson: Uint8Array,
+    ancestry:
+      { readonly parent: WireConversationId; readonly root: WireConversationId } | undefined,
+    target: AgentId | undefined
+  ): Promise<AgentEnvelope> {
     const correlation = CorrelationId.parse(conversation.toString())
-    const hub = await this.laser[INTERNAL_REPLY_HUB](this.replyTopic)
+    const hub = await this.laser[INTERNAL_REPLY_HUB](this.replyTopic, this.source)
     const ticket = hub.subscribeStream(correlation.toString())
     const started = performance.now()
     try {
-      await this.laser
+      let command = this.laser
         .agdx(this.toolTopic, this.source, conversation)
         .command(correlation, paramsJson)
         .withTool(name)
+      if (ancestry !== undefined) command = command.withAncestry(ancestry.parent, ancestry.root)
+      if (target !== undefined) command = command.withTarget(target)
+      await command
         .withMetadata(METADATA_BRIDGE_HOPS, bridgeHopMetadata(this.hops))
         .contentType(ContentType.Json)
         .send()
@@ -292,7 +372,7 @@ export class McpBridge {
           envelope !== undefined &&
           (envelope.kind === AgentKind.Response || envelope.kind === AgentKind.Error)
         ) {
-          return toolResultFromEnvelope(envelope)
+          return envelope
         }
       }
     } finally {
@@ -335,7 +415,7 @@ export class McpBridge {
           break
         case McpMethod.ToolsCall:
           result = toolResultJson(
-            await this.sendToolCall(this.requiredString(params, "name"), jsonBytes(params))
+            await this.callTool(this.requiredString(params, "name"), jsonBytes(params))
           )
           break
         default:

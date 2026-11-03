@@ -1,15 +1,15 @@
-# agent - agents that survive crashes and find each other
+# agent: the Fabric primitive
 
 This example runs an agent that handles tasks from the log. It demonstrates capability-based routing, pickup acknowledgments, deadlines, and contract results.
 
 ## What it shows
 
-- Runs a `triage` handler on the commands topic with replies on the responses topic. It advertises its capability and enables pickup acknowledgments.
+- Runs a `triage` handler on the shared `agent.sessions` topic, replying on the same topic. It advertises its capability and enables pickup acknowledgments.
 - Emits a `Working` status on pickup (`.ackOnPickup()`), so a contract caller can tell the command was consumed. Redelivery after a crash comes from commit-after-success.
 - Sends it a deadline-bounded contract by capability, not by name: `laser.contract(routeToCapable("resolve-ticket", { kind: "any" })).from(...).payload(...).inboxRoute(...).deadline(60_000).send()`.
-- Reads the outcome (`completed` / `failed` / `notConsumed` / `timedOut`) and prints the decoded reply.
+- Reads the outcome (`completed`, `failed`, `notConsumed`, or `timedOut`) and prints the decoded reply.
 
-Runs against Apache Iggy - no LaserData Cloud needed.
+It runs on Apache Iggy without LaserData Cloud.
 
 ## Run it
 
@@ -22,4 +22,4 @@ npm run example:agent
 ## Learn more
 
 - Docs: https://docs.laserdata.cloud/laser-sdk/fabric
-- Full system built on this primitive: [`orchestra`](../orchestra) - discovery, contracts, scatter/gather, workflows, and quarantine in one durable orchestration.
+- Full system built on this primitive: [`orchestra`](../orchestra): discovery, contracts, scatter/gather, workflows, and quarantine in one durable orchestration.

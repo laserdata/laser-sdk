@@ -29,7 +29,7 @@
   },
   "graph": false,
   "fork": true,
-  "agent_workflow": false,
+  "sessions": false,
   "watch": false,
   "authz": false,
   "filters": {

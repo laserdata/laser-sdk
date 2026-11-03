@@ -111,17 +111,20 @@ impl PyLaser {
         })
     }
 
-    /// List defined roles, optionally filtered by name prefix.
-    #[pyo3(signature = (name_prefix=None))]
+    /// List defined roles, optionally filtered by name prefix and by a
+    /// `search` substring, the same bounded registry browse as listing
+    /// projections.
+    #[pyo3(signature = (name_prefix=None, *, search=None))]
     fn list_roles<'py>(
         &self,
         py: Python<'py>,
         name_prefix: Option<String>,
+        search: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
         future_into_py(py, async move {
             let roles = laser
-                .list_roles(name_prefix.as_deref())
+                .list_roles(name_prefix.as_deref(), search.as_deref())
                 .await
                 .map_err(to_pyerr)?;
             Ok(roles.into_iter().map(PyRole::from).collect::<Vec<_>>())
@@ -203,8 +206,9 @@ impl PyLaser {
     }
 
     /// Read a page of the authorization change history. Requires
-    /// `authz:read`. `subject` is `"all"`, `{"role": name}`, or
-    /// `{"binding": {"user_id": id}}`.
+    /// `authz:read`. `subject` is `"all"`, `{"role": name}`,
+    /// `{"binding": {"user_id": id}}`, or `{"stream": name}` for every change
+    /// attributed to one stream.
     #[pyo3(signature = (subject, *, after_revision=None, limit=100))]
     fn authz_history<'py>(
         &self,
@@ -420,8 +424,9 @@ impl From<WhoamiReply> for PyWhoamiReply {
 }
 
 /// One recorded authorization change: its revision, who made it, when, and
-/// what. `op` is `{"role_defined": name}`, `{"role_deleted": name}`, or
-/// `{"roles_bound": {"user_id": id, "roles": [...]}}`.
+/// what. `op` is `{"role_defined": name}`, `{"role_deleted": name}`,
+/// `{"roles_bound": {"user_id": id, "roles": [...]}}`, or
+/// `{"tenancy_set": "deployment" | "stream"}`.
 #[gen_stub_pyclass]
 #[pyclass(name = "AuthzEvent", frozen, skip_from_py_object)]
 #[derive(Clone)]
@@ -433,6 +438,9 @@ pub struct PyAuthzEvent {
     #[pyo3(get)]
     pub at_micros: u64,
     op: AuthzEventKind,
+    /// The one stream the change is attributed to, `None` when none.
+    #[pyo3(get)]
+    pub stream: Option<String>,
 }
 
 #[gen_stub_pymethods]
@@ -452,6 +460,7 @@ impl From<AuthzEvent> for PyAuthzEvent {
             actor: event.actor,
             at_micros: event.at_micros,
             op: event.op,
+            stream: event.stream,
         }
     }
 }
@@ -531,6 +540,25 @@ impl PyEdgeDenial {
     #[getter]
     fn challenge(&self) -> Option<String> {
         self.inner.challenge()
+    }
+
+    /// The audience the token should have been minted for, set for
+    /// `wrong_audience`, else `None`.
+    #[getter]
+    fn expected(&self) -> Option<String> {
+        match &self.inner {
+            EdgeDenial::WrongAudience { expected } => Some(expected.clone()),
+            EdgeDenial::StepUp { .. } => None,
+        }
+    }
+
+    /// The scope the token lacks, set for `step_up`, else `None`.
+    #[getter]
+    fn required_scope(&self) -> Option<String> {
+        match &self.inner {
+            EdgeDenial::StepUp { required_scope } => Some(required_scope.clone()),
+            EdgeDenial::WrongAudience { .. } => None,
+        }
     }
 
     fn __repr__(&self) -> String {

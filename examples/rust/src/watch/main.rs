@@ -32,7 +32,7 @@ async fn main() -> Result<(), LaserError> {
         }
 
         phase("watch a view, then publish something that advances it");
-        laser.topic(TOPIC).ensure(PARTITIONS).await?;
+        laser.topic(TOPIC).ensure(PARTITIONS, None).await?;
         // The same view shape the Views example declares, under this run's own
         // name, so this binary runs on its own with no shared state.
         let index = index_for("readings_v1");

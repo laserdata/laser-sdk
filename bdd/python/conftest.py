@@ -13,18 +13,20 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "foreign" / "python"))
 from iggy_test_server import IggyTestServer  # noqa: E402
 
 
-# `LASER_BDD_PLANE=1` marks a stack with a managed plane, which skips the
-# `@no_plane` scenarios.
+# `LASER_BDD_MANAGED=1` marks a stack with a managed backend, which skips the
+# `@unmanaged` scenarios.
 def pytest_configure(config):
     config.addinivalue_line("markers", "bridges: edge bridge interoperability scenarios")
-    config.addinivalue_line("markers", "plane: requires a managed plane")
-    config.addinivalue_line("markers", "no_plane: requires a server without a managed plane")
+    config.addinivalue_line("markers", "managed: requires a managed backend")
+    config.addinivalue_line("markers", "unmanaged: requires a server without a managed backend")
 
 
 def pytest_collection_modifyitems(config, items):
-    plane = bool(os.environ.get("LASER_BDD_PLANE"))
+    managed = bool(os.environ.get("LASER_BDD_MANAGED"))
     for item in items:
-        if (plane and "no_plane" in item.keywords) or (not plane and "plane" in item.keywords):
+        if (managed and "unmanaged" in item.keywords) or (
+            not managed and "managed" in item.keywords
+        ):
             item.add_marker(
                 pytest.mark.skip(reason="scenario requires another deployment capability")
             )
@@ -65,6 +67,9 @@ class World:
         self.caps = None
         self.error = None
         self.filtered = []
+        self.noted_position = None
+        self.clients = []
+        self.client_user = None
 
     def run(self, factory):
         # `factory` is a zero-arg callable returning a coroutine. The binding's
@@ -100,7 +105,7 @@ class World:
             correlation_id=correlation_id,
         )
         self.run(
-            lambda: self.laser.send_agent(ls.AgentTopic.Commands, payload.encode(), provenance)
+            lambda: self.laser.send_agent(ls.AgentTopic.Sessions, payload.encode(), provenance)
         )
 
     def assemble(self):
@@ -114,6 +119,8 @@ class World:
             self.error = error
 
     def close(self):
+        for agent in getattr(self, "responders", []):
+            self.run(agent.shutdown)
         self.loop.close()
 
 
@@ -139,6 +146,8 @@ class Bench:
         self.data_stack = None
         self.filter = None
         self.verdict = None
+        self.binding_builder = None
+        self.binding = None
 
 
 @pytest.fixture
@@ -162,7 +171,11 @@ def fresh_stream(world):
 @given(parsers.parse("a fresh stream bootstrapped with {partitions:d} partitions"))
 def fresh_stream_bootstrapped(world, partitions):
     world.connect()
-    world.run(lambda: world.laser.bootstrap(partitions))
+    world.run(
+        lambda: world.laser.bootstrap(
+            partitions, retention=ls.TopicRetention.expire_after(86_400_000)
+        )
+    )
 
 
 @given("a new conversation")

@@ -536,7 +536,7 @@ void test("checkpoint request validation rejects invalid mutations and assertion
   }
   assert.throws(() => {
     validateCheckpointRequest(highRisk)
-  }, /requires a supervisor assertion/)
+  }, /requires an operator assertion/)
 })
 
 void test("every public checkpoint mutation discriminant matches the Rust fixture", async () => {

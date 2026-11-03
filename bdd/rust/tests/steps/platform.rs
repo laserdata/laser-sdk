@@ -21,7 +21,10 @@ async fn fresh_stream_bootstrapped(world: &mut LaserWorld, partitions: u32) {
     let fresh = fresh_laser().await;
     fresh
         .laser
-        .bootstrap(partitions)
+        .bootstrap(
+            partitions,
+            laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(86_400)),
+        )
         .await
         .expect("bootstrap the stream");
     world.platform = fresh.iggy;
@@ -40,7 +43,13 @@ async fn start_another_conversation(world: &mut LaserWorld) {
 
 #[when(regex = r"^I bootstrap the stream with (\d+) partitions$")]
 async fn bootstrap(world: &mut LaserWorld, partitions: u32) {
-    let result = world.laser().bootstrap(partitions).await;
+    let result = world
+        .laser()
+        .bootstrap(
+            partitions,
+            laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(86_400)),
+        )
+        .await;
     world.last_result = Some(result.map(|_| ()).map_err(|error| format!("{error:?}")));
 }
 

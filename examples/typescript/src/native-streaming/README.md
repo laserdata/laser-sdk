@@ -1,4 +1,4 @@
-# native-streaming - live producers and consumer groups
+# native-streaming: producers and consumer groups
 
 This example uses the Laser producer and consumer APIs for ordinary Apache Iggy streaming. It demonstrates batching, headers, routing, and automatic or explicit offset commits.
 

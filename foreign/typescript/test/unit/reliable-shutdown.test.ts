@@ -2,8 +2,19 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { ReliableConsumer, type ConcurrencyPolicy } from "../../src/agent/reliable-consumer.js"
-import { CancelledError, InvalidError, TimeoutError } from "../../src/client/errors.js"
-import { INTERNAL_NATIVE_CONSUMER, INTERNAL_TRANSPORT } from "../../src/client/internals.js"
+import {
+  CancelledError,
+  InvalidError,
+  TimeoutError,
+  TransportError
+} from "../../src/client/errors.js"
+import {
+  INTERNAL_COMMIT_HANDLED,
+  INTERNAL_NATIVE_CONSUMER,
+  INTERNAL_TRANSPORT
+} from "../../src/client/internals.js"
+import { OPEN_CAPABILITIES } from "../../src/client/capabilities.js"
+import { SessionConfig } from "../../src/session.js"
 import type { Laser } from "../../src/client/laser.js"
 import { encodeProvenanceHeaders } from "../../src/provenance/provenance.js"
 import type { Consumer, ConsumerMessage } from "../../src/stream/consumer.js"
@@ -19,40 +30,57 @@ function deferred() {
 
 const group = ConsumerGroupName.forAgent(AgentId.new("grace-worker"))
 
-function source(commit: () => Promise<void>) {
-  let delivered = false
+// Each opened consumer delivers one record, then holds every later read until
+// its caller cancels it, like a server-held read that finds nothing new.
+function source(commit: () => Promise<void>, onOpen = () => undefined, idempotencyKey?: string) {
   const message = {
     partitionId: 0,
     position: { partitionId: 0, offset: 0n },
     timestampMicros: 1n,
     payload: new TextEncoder().encode("work"),
-    headers: encodeProvenanceHeaders({ conversationId: ConversationId.derive("grace") })
+    headers: encodeProvenanceHeaders({
+      conversationId: ConversationId.derive("grace"),
+      ...(idempotencyKey !== undefined ? { idempotencyKey } : {})
+    })
   } as ConsumerMessage
-  const consumer = {
-    nextWithin: (_waitMs: number, options?: { signal?: AbortSignal }) => {
-      if (!delivered) {
-        delivered = true
-        return Promise.resolve(message)
-      }
-      return new Promise<ConsumerMessage>((_resolve, reject) => {
-        const abort = (): void => {
-          reject(new CancelledError("stopped"))
+  const open = (): Consumer => {
+    let delivered = false
+    return {
+      nextWithin: (_waitMs: number, options?: { signal?: AbortSignal }) => {
+        if (!delivered) {
+          delivered = true
+          return Promise.resolve(message)
         }
-        options?.signal?.addEventListener("abort", abort, { once: true })
-        if (options?.signal?.aborted === true) abort()
-      })
-    },
-    commit,
-    shutdown: () => Promise.resolve()
-  } as unknown as Consumer
+        return new Promise<ConsumerMessage>((_resolve, reject) => {
+          const abort = (): void => {
+            reject(new CancelledError("stopped"))
+          }
+          options?.signal?.addEventListener("abort", abort, { once: true })
+          if (options?.signal?.aborted === true) abort()
+        })
+      },
+      commit,
+      [INTERNAL_COMMIT_HANDLED]: commit,
+      shutdown: () => Promise.resolve()
+    } as unknown as Consumer
+  }
   return {
     defaultStream: "agents",
     topic: () => ({
       consumerGroup: () => ({
-        [INTERNAL_NATIVE_CONSUMER]: () => Promise.resolve(consumer)
+        [INTERNAL_NATIVE_CONSUMER]: () => {
+          onOpen()
+          return Promise.resolve(open())
+        }
       })
     }),
+    capabilities: () => Promise.resolve({ ...OPEN_CAPABILITIES, hello: "rejected" }),
+    sessions: (config?: SessionConfig) => ({
+      config: config ?? new SessionConfig(),
+      indexesSessions: () => Promise.resolve(false)
+    }),
     [INTERNAL_TRANSPORT]: () => ({
+      findTopicPartitionCount: () => Promise.resolve(undefined),
       resolveStreamTopicIds: () => Promise.resolve({ streamId: 1, topicId: 2 })
     })
   } as unknown as Laser
@@ -161,3 +189,51 @@ void test("given_invalid_shutdown_grace_when_a_consumer_is_built_then_should_ref
       InvalidError
     )
 })
+
+void test(
+  "given_a_lane_that_fails_while_the_next_read_is_held_when_running_per_partition_then_should_reopen_without_waiting_out_the_read",
+  { timeout: 2_000 },
+  async () => {
+    let opens = 0
+    let reopened: () => void = () => undefined
+    const reopen = new Promise<void>((resolve) => {
+      reopened = resolve
+    })
+    let observed = 0
+    const stop = new AbortController()
+    const laser = source(
+      () => Promise.resolve(),
+      () => {
+        opens += 1
+        if (opens === 2) reopened()
+      },
+      "lane-a"
+    )
+    const consumer = new ReliableConsumer({
+      group,
+      topic: "commands",
+      concurrency: { kind: "serial-per-partition", maxPartitions: 2 },
+      maxWaitMs: 60_000,
+      deduplicator: {
+        observe: () => {
+          observed += 1
+          return observed === 1
+            ? Promise.reject(new TransportError("dedup store unavailable", true))
+            : Promise.resolve(true)
+        }
+      }
+    })
+    const running = consumer.run(
+      laser,
+      { handle: () => Promise.resolve() },
+      { signal: stop.signal }
+    )
+    try {
+      await Promise.race([reopen, new Promise((resolve) => setTimeout(resolve, 1_000))])
+    } finally {
+      stop.abort()
+      await running.catch(() => undefined)
+    }
+    assert.equal(opens, 2, "the failed lane reopens the consumer while the read is still held")
+  }
+)

@@ -1,0 +1,84 @@
+{
+  "items": [
+    {
+      "at": {
+        "Message": {
+          "stream": 5,
+          "topic": 3,
+          "partition": 1,
+          "offset": 41,
+          "generation": 1717171717000000
+        }
+      },
+      "session": "00000000000000000000000002",
+      "broker_ts": 1717171717000005,
+      "kind": "response",
+      "operation": "chat",
+      "display": "model_response",
+      "agent": "planner",
+      "addressee": "*",
+      "correlation": "00000000000000000000000009",
+      "cause": [
+        0,
+        0,
+        0,
+        5,
+        0,
+        0,
+        0,
+        3,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        40
+      ],
+      "usage": {
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "cost_micros": 1250
+      },
+      "summary": {
+        "finish_reason": "stop"
+      }
+    }
+  ],
+  "cursor": "page",
+  "ranges": [
+    {
+      "topic_id": 3,
+      "topic_generation": 1717171717000000,
+      "partition_id": 1,
+      "first": 40,
+      "last": 41
+    }
+  ],
+  "frontier": [
+    {
+      "topic_id": 3,
+      "topic_generation": 1717171717000000,
+      "partition_id": 1,
+      "folded": 41,
+      "head": 42,
+      "retained_from": 7
+    }
+  ],
+  "fixed_frontier": true,
+  "gaps": [
+    {
+      "topic_id": 3,
+      "topic_generation": 1717171717000000,
+      "partition_id": 1,
+      "from": 0,
+      "to": 6,
+      "reason": "expired_before_fold"
+    }
+  ]
+}

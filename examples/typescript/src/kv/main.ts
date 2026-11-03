@@ -13,11 +13,11 @@ import {
 export const EXAMPLE = "kv"
 const NAMESPACE = "config"
 const KEY = "service:auth"
-const TTL_MICROS = 86_400_000_000n // 86,400s
+const TTL_MS = 86_400_000 // 86,400s
 const FORK = "experiment-1"
 const LEASE_KEY = "lease:service:auth"
 const HOLDER = "worker-a"
-const LEASE_TTL_MICROS = 30_000_000n // 30s
+const LEASE_TTL_MS = 30_000 // 30s
 
 function levelOf(value: Uint8Array | undefined): string {
   if (value === undefined) return "no level"
@@ -43,7 +43,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   const kv = laser.kv(NAMESPACE)
 
   phase("set and get keyed state")
-  await kv.set(utf8(KEY)).json({ log_level: "info" }).ttl(TTL_MICROS).send()
+  await kv.set(utf8(KEY)).json({ log_level: "info" }).ttl(TTL_MS).send()
   console.log(`  ${KEY} logs at ${levelOf(await kv.get(utf8(KEY)))}`)
 
   if (managedGate(capabilities, "kvCas", EXAMPLE)) {
@@ -59,7 +59,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
 
   if (managedGate(capabilities, "kvFencedLeases", EXAMPLE)) {
     phase("lease and fenced write: at most one effective writer")
-    const lease = await kv.lease(utf8(LEASE_KEY), HOLDER, LEASE_TTL_MICROS)
+    const lease = await kv.lease(utf8(LEASE_KEY), HOLDER, LEASE_TTL_MS)
     console.log(`  ${HOLDER} holds ${LEASE_KEY} at fence ${String(lease.token)}`)
     // Barriered read: the answering fold has applied at least the grant, so a
     // holder that just took over never plans against its predecessor's state.
@@ -68,13 +68,13 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
     const fenced = await kv
       .casFenced(utf8(KEY), NAMESPACE, utf8(LEASE_KEY), lease.token)
       .json({ log_level: "trace" })
-      .ttl(TTL_MICROS)
+      .ttl(TTL_MS)
       .expectVersion(held.version)
       .commit()
     console.log(
       `  barriered read saw ${levelOf(held.value)}, the fenced write landed as version ${String(fenced)}`
     )
-    const renewed = await kv.renewLease(utf8(LEASE_KEY), HOLDER, lease.token, LEASE_TTL_MICROS)
+    const renewed = await kv.renewLease(utf8(LEASE_KEY), HOLDER, lease.token, LEASE_TTL_MS)
     await kv.release(utf8(LEASE_KEY), HOLDER, renewed.token)
     console.log(`  lease renewed at the same fence ${String(renewed.token)}, then released`)
     // The gate holds without waiting for a successor: a released fence is

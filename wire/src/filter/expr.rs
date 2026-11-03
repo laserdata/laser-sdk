@@ -196,6 +196,11 @@ pub struct ConsumerFilter {
     /// A record selects one of these with its agdx.sid header.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schema_refs: Vec<u32>,
+    /// The stream whose writer-schema registry holds `schema_refs`. Absent
+    /// resolves them in the deployment-wide registry and leaves the encoding
+    /// and the digest unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_stream: Option<String>,
 }
 
 impl FilterExpr {
@@ -373,6 +378,7 @@ impl ConsumerFilter {
             foreign_policy: RecordPolicy::Reject,
             mismatch_policy: RecordPolicy::Reject,
             schema_refs: Vec::new(),
+            schema_stream: None,
         }
     }
 
@@ -391,6 +397,13 @@ impl ConsumerFilter {
     #[must_use]
     pub fn with_mismatch_policy(mut self, mismatch_policy: RecordPolicy) -> Self {
         self.mismatch_policy = mismatch_policy;
+        self
+    }
+
+    /// Resolve `schema_refs` in the writer-schema registry of `stream`.
+    #[must_use]
+    pub fn with_schema_stream(mut self, stream: impl Into<String>) -> Self {
+        self.schema_stream = Some(stream.into());
         self
     }
 
@@ -431,6 +444,18 @@ impl Validate for ConsumerFilter {
             return Err(InvalidError::new(
                 "schema_refs must be sorted and contain no duplicates",
             ));
+        }
+        if let Some(stream) = &self.schema_stream {
+            if self.schema_refs.is_empty() {
+                return Err(InvalidError::new(
+                    "schema_stream applies only to a filter with schema_refs",
+                ));
+            }
+            if stream.is_empty() || stream.contains('/') || stream.chars().any(char::is_control) {
+                return Err(InvalidError::new(
+                    "schema_stream must be a non-empty stream name without '/' or control characters",
+                ));
+            }
         }
         let encoded_bytes = serde_json::to_vec(self)
             .map_err(|error| InvalidError::new(format!("filter does not encode: {error}")))?
@@ -691,6 +716,34 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn given_a_schema_stream_when_encoded_then_should_change_only_a_filter_that_sets_it() {
+        let filter = ConsumerFilter::avro(FilterExpr::pred("mode", CmpOp::Eq, "safe"), [7]);
+        let json = serde_json::to_string(&filter).expect("filter encodes");
+        assert!(!json.contains("schema_stream"), "unset is omitted: {json}");
+        let scoped = filter.clone().with_schema_stream("acme");
+        scoped.validate().expect("a scoped schema filter is valid");
+        assert_ne!(scoped.digest(), filter.digest());
+        let back: ConsumerFilter =
+            serde_json::from_str(&serde_json::to_string(&scoped).expect("filter encodes"))
+                .expect("filter decodes");
+        assert_eq!(back.schema_stream.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn given_an_invalid_schema_stream_when_validated_then_should_reject() {
+        let avro = ConsumerFilter::avro(FilterExpr::pred("mode", CmpOp::Eq, "safe"), [7]);
+        assert!(avro.clone().with_schema_stream("").validate().is_err());
+        assert!(avro.with_schema_stream("a/b").validate().is_err());
+        assert!(
+            safe_mode_filter()
+                .with_schema_stream("acme")
+                .validate()
+                .is_err(),
+            "a filter without schema_refs names no registry"
+        );
     }
 
     #[test]

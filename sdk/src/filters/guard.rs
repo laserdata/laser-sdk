@@ -44,6 +44,10 @@ impl LocalGuard {
             let payload = encode_named(&GetSchema {
                 v: QUERY_OP_VERSION,
                 id: *id,
+                stream: filter
+                    .schema_stream
+                    .clone()
+                    .or_else(|| laser.resource_stream().map(str::to_owned)),
             })?;
             let reply = laser
                 .send_raw_with_response(AGDX_GET_SCHEMA_CODE, payload)
@@ -155,7 +159,7 @@ impl LocalGuard {
 mod tests {
     use super::*;
     use laser_wire::codes::FILTER_OP_VERSION;
-    use laser_wire::filter::{AppliedPolicy, FilterExpr, ReadMode, SourceGeneration, StopReason};
+    use laser_wire::filter::{AckContext, AppliedPolicy, FilterExpr, SourceGeneration, StopReason};
     use laser_wire::query::CmpOp;
 
     fn filter() -> ConsumerFilter {
@@ -180,10 +184,9 @@ mod tests {
                 topic_id: 1,
                 topic_created_at_micros: 1,
                 partition_id: 0,
-                partition_created_revision: 1,
-                purge_generation: 0,
+                partition_incarnation: 1,
             },
-            read_mode: ReadMode::Primary,
+            ack_context: AckContext::default(),
             next_scan_offset: Some(1),
             safe_ack_offset: Some(0),
             frontier: 1,

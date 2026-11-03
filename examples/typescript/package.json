@@ -28,7 +28,8 @@
     "example:graph": "npm run build && node dist/src/graph/main.js",
     "example:recall": "npm run build && node dist/src/recall/main.js",
     "example:context": "npm run build && node dist/src/context/main.js",
-    "example:agent": "npm run build && node dist/src/agent/main.js"
+    "example:agent": "npm run build && node dist/src/agent/main.js",
+    "example:sessions": "npm run build && node dist/src/sessions/main.js"
   },
   "dependencies": {
     "@laserdata/laser-sdk": "file:../../foreign/typescript"

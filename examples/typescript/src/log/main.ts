@@ -2,7 +2,6 @@ import { Json, type Laser, type TypedRecord, type TypedRecords } from "@laserdat
 import { phase, runExample } from "../common.js"
 
 export const EXAMPLE = "log"
-const STREAM = "fleet"
 const TOPIC = "readings"
 const PARTITIONS = 2
 const REPLAY_TIMEOUT_MS = 10_000
@@ -30,7 +29,7 @@ const READING_CODEC = new Json<Reading>((value) => {
 
 export async function run(laser: Laser, _signal: AbortSignal): Promise<readonly Reading[]> {
   phase("write two messages, then read them back")
-  const topic = laser.stream(STREAM).topic(TOPIC)
+  const topic = laser.topic(TOPIC)
   await topic.ensure(PARTITIONS)
 
   for (const reading of READINGS) {

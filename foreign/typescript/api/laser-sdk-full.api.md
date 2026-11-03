@@ -4,6 +4,8 @@
 
 ```ts
 
+/// <reference types="node" />
+
 import type { SendMessagesConfirmation } from 'apache-iggy';
 import type { SendMessagesResponse } from 'apache-iggy';
 import { SimpleClient } from 'apache-iggy';
@@ -17,7 +19,7 @@ export const A2A_PROTOCOL_VERSION = "1.0";
 // @public (undocumented)
 export class A2aBridge {
     constructor(laser: Laser, source: AgentId, requestTopic: string, replyTopic: string);
-    // (undocumented)
+    caller(principal: string): A2aCaller;
     cancel(id: string): Promise<Task>;
     // (undocumented)
     card(): AgentCard;
@@ -25,8 +27,12 @@ export class A2aBridge {
     handleRpc(input: unknown): Promise<JsonRpcResponse>;
     // (undocumented)
     signedCard(key: SigningKey): AgentCard;
-    submit(paramsJson: unknown): Promise<Task>;
-    // (undocumented)
+    submit(paramsJson: unknown, options?: {
+        readonly target?: AgentId;
+    }): Promise<Task>;
+    submitIn(parent: ConversationId, root: ConversationId, paramsJson: unknown, options?: {
+        readonly target?: AgentId;
+    }): Promise<Task>;
     task(id: string): Promise<Task>;
     // (undocumented)
     withBridgeHops(previous: readonly string[]): this;
@@ -34,6 +40,20 @@ export class A2aBridge {
     withCapabilities(capabilities: readonly CapabilityDescriptor[]): this;
     // (undocumented)
     withSigningKey(key: SigningKey): this;
+    withTaskBinding(key: Uint8Array, ttlMs: number): this;
+}
+
+// @public
+export class A2aCaller {
+    cancel(id: string): Promise<Task>;
+    handleRpc(input: unknown): Promise<JsonRpcResponse>;
+    submit(paramsJson: unknown, options?: {
+        readonly target?: AgentId;
+    }): Promise<Task>;
+    submitIn(parent: ConversationId, root: ConversationId, paramsJson: unknown, options?: {
+        readonly target?: AgentId;
+    }): Promise<Task>;
+    task(id: string): Promise<Task>;
 }
 
 // @public (undocumented)
@@ -63,6 +83,12 @@ interface AcceptedOperationView {
     readonly state: OperationState;
     // (undocumented)
     readonly submittedAtMicros: bigint;
+}
+
+// @public
+export interface AckContext {
+    readonly metadataOp: bigint;
+    readonly ownerGeneration: bigint;
 }
 
 // @public (undocumented)
@@ -146,6 +172,23 @@ export const ActionKind: {
 // @public (undocumented)
 export type ActionKind = (typeof ActionKind)[keyof typeof ActionKind];
 
+// @public
+type Addressee = {
+    readonly kind: "agent";
+    readonly agent: string;
+} | {
+    readonly kind: "broadcast";
+};
+
+// @public
+const ADDRESSEE_FILTER_NAME = "agent-addressee";
+
+// @public
+function addresseeFilter(me: AgentId_2): ConsumerFilter;
+
+// @public
+function addresseeText(addressee: Addressee): string;
+
 // @public (undocumented)
 export interface Agdx {
     // Warning: (ae-forgotten-export) The symbol "BytesLike" needs to be exported by the entry point full.d.ts
@@ -156,9 +199,9 @@ export interface Agdx {
     emit(body: BytesLike): AgdxSend;
     // (undocumented)
     fail(correlation: CorrelationId, error: AgentErrorBody): AgdxSend;
-    // (undocumented)
     requestInput(replyTopic: string, prompt: BytesLike, timeoutMs: number, options?: {
         readonly signal?: AbortSignal;
+        readonly target?: AgentId;
     }): Promise<Uint8Array>;
     // (undocumented)
     respond(correlation: CorrelationId, body: BytesLike): AgdxSend;
@@ -170,18 +213,6 @@ export interface Agdx {
 
 // @public (undocumented)
 const AGDX_AGENT_BASE: number;
-
-// @public (undocumented)
-const AGDX_AGENT_CANCEL_CODE: number;
-
-// @public (undocumented)
-const AGDX_AGENT_LIST_CODE: number;
-
-// @public (undocumented)
-const AGDX_AGENT_STATUS_CODE: number;
-
-// @public (undocumented)
-const AGDX_AGENT_SUBMIT_CODE: number;
 
 // @public (undocumented)
 const AGDX_AUTHZ_BASE: number;
@@ -260,6 +291,12 @@ const AGDX_FILTERED_ACK_CODE: number;
 
 // @public (undocumented)
 const AGDX_FILTERED_POLL_CODE: number;
+
+// @public
+const AGDX_FILTERED_WAIT_CANCEL_CODE: number;
+
+// @public
+const AGDX_FILTERED_WAIT_CODE: number;
 
 // @public (undocumented)
 const AGDX_FORK_BASE: number;
@@ -400,10 +437,38 @@ const AGDX_REGISTER_SCHEMA_CODE: number;
 const AGDX_RESOLVE_FILTER_POLICY_CODE: number;
 
 // @public (undocumented)
+const AGDX_SESSION_CHANGES_CODE: number;
+
+// @public (undocumented)
+const AGDX_SESSION_EVENTS_CODE: number;
+
+// @public (undocumented)
+const AGDX_SESSION_GET_CODE: number;
+
+// @public (undocumented)
+const AGDX_SESSION_LINKS_CODE: number;
+
+// @public (undocumented)
+const AGDX_SESSION_LIST_CODE: number;
+
+// @public (undocumented)
+const AGDX_SESSION_SOURCES_CODE: number;
+
+// @public (undocumented)
+const AGDX_SESSION_STATE_CODE: number;
+
+// @public (undocumented)
 const AGDX_SET_CLIENT_METADATA_CODE: number;
 
 // @public
 const AGDX_WATCH_FILTER_CATALOG_CODE: number;
+
+// @public
+export interface AgdxReceipt {
+    readonly offset?: bigint;
+    readonly partitionId?: number;
+    readonly record?: RecordId;
+}
 
 // @public (undocumented)
 export interface AgdxSend {
@@ -416,14 +481,17 @@ export interface AgdxSend {
     last(): this;
     // (undocumented)
     send(): Promise<RecordId | undefined>;
+    sendReceipt(): Promise<AgdxReceipt>;
     // (undocumented)
     signedBy(key: SigningKey): this;
+    withAncestry(parent?: ConversationId_2, root?: ConversationId_2): this;
     // (undocumented)
     withCause(cause: RecordId, causeAt?: LogPosition): this;
     // (undocumented)
     withCorrelation(correlation: CorrelationId): this;
     // (undocumented)
     withDeadlineMicros(deadlineMicros: bigint): this;
+    withFinishReason(reason: string): this;
     // (undocumented)
     withIdempotencyKey(key: IdempotencyKey): this;
     // (undocumented)
@@ -472,16 +540,40 @@ export class Agent {
 }
 
 // @public (undocumented)
+const AGENT_AUDIT = "agent.audit";
+
+// @public (undocumented)
+const AGENT_CONTROL = "agent.control";
+
+// @public (undocumented)
+const AGENT_DLQ = "agent.dlq";
+
+// @public (undocumented)
+const AGENT_HEARTBEATS = "agent.heartbeats";
+
+// @public (undocumented)
 const AGENT_ID = "gen_ai.agent.id";
+
+// @public (undocumented)
+const AGENT_JOURNAL = "agent.workflow_journal";
+
+// @public (undocumented)
+const AGENT_MEMORY = "agent.memory";
 
 // @public (undocumented)
 const AGENT_OP_VERSION = 1;
 
 // @public (undocumented)
-const AGENT_VERSION = "agdx.av";
+const AGENT_REGISTRY = "agent.registry";
 
 // @public (undocumented)
-const AGENT_WORKFLOW_OP_VERSION = 1;
+const AGENT_SESSIONS = "agent.sessions";
+
+// @public (undocumented)
+const AGENT_STREAMS = "agent.streams";
+
+// @public (undocumented)
+const AGENT_VERSION = "agdx.av";
 
 // @public (undocumented)
 export class AgentActivity {
@@ -503,7 +595,7 @@ export class AgentBuilder {
     // (undocumented)
     concurrency(policy: ConcurrencyPolicy): this;
     // (undocumented)
-    consolidateEvery(milliseconds: number): this;
+    consolidateEvery(intervalMs: number): this;
     // (undocumented)
     consolidator(consolidator: Consolidator): this;
     // (undocumented)
@@ -526,18 +618,19 @@ export class AgentBuilder {
     maxQueuedBytes(value: number): this;
     // (undocumented)
     maxQueuedRecords(value: number): this;
+    maxWait(waitMs: number): this;
     // (undocumented)
     middleware(middleware: AgentMiddleware): this;
     // (undocumented)
     onDeadLetter(sink: DeadLetterSink): this;
-    // (undocumented)
-    pollInterval(ms: number): this;
+    operations(operations: readonly string[]): this;
     // (undocumented)
     respondOn(topic: string): this;
     // (undocumented)
     retry(retry: RetryPolicy): this;
+    sessions(config: SessionConfig): this;
     // (undocumented)
-    shutdownGrace(ms: number): this;
+    shutdownGrace(graceMs: number): this;
     // (undocumented)
     signingKey(signingKey: SigningKey): this;
     // (undocumented)
@@ -547,15 +640,6 @@ export class AgentBuilder {
     // (undocumented)
     warmDedup(value?: boolean): this;
 }
-
-// @public (undocumented)
-interface AgentCancel {
-    // (undocumented)
-    readonly runId: string;
-}
-
-// @public (undocumented)
-const AgentCancelCommand: ManagedCommand<AgentCancel, AgentReply>;
 
 // @public (undocumented)
 export interface AgentCard {
@@ -623,16 +707,16 @@ export class AgentCtx {
     readonly laser: Laser;
     // (undocumented)
     readonly message: AgentMessage;
-    // (undocumented)
     replyOn(topic: string, payload: BytesLike): Promise<void>;
     // (undocumented)
     request(requestTopic: string, replyTopic: string, payload: BytesLike, provenance: Provenance, timeoutMs: number, signal?: AbortSignal): Promise<AgentMessage>;
-    // (undocumented)
+    requestAt(): LogPosition | undefined;
     respond(payload: BytesLike): Promise<void>;
     // (undocumented)
     respondInput(replyTopic: string, response: BytesLike): Promise<void>;
     // (undocumented)
     send(topic: string, payload: BytesLike, provenance: Provenance): Promise<void>;
+    session(): Session;
     // (undocumented)
     spawnSubconversation(): Provenance;
 }
@@ -689,7 +773,11 @@ export interface AgentEnvelope {
     // (undocumented)
     readonly operation?: string;
     // (undocumented)
+    readonly parent?: ConversationId_2;
+    // (undocumented)
     readonly record?: RecordId;
+    // (undocumented)
+    readonly root?: ConversationId_2;
     // (undocumented)
     readonly sequence?: bigint;
     // (undocumented)
@@ -804,21 +892,6 @@ const AgentKind: {
 type AgentKind = (typeof AgentKind)[keyof typeof AgentKind];
 
 // @public (undocumented)
-interface AgentList {
-    // (undocumented)
-    readonly agentId?: string;
-    // (undocumented)
-    readonly cursor?: Uint8Array;
-    // (undocumented)
-    readonly limit?: number;
-    // (undocumented)
-    readonly state?: AgentRunState;
-}
-
-// @public (undocumented)
-const AgentListCommand: ManagedCommand<AgentList, AgentReply>;
-
-// @public (undocumented)
 export interface AgentMessage {
     // (undocumented)
     readonly contentType?: ContentType;
@@ -840,6 +913,9 @@ export function agentMessage(payload: BytesLike, provenance: Provenance): AgentM
 // @public (undocumented)
 export function agentMessageBody(message: AgentMessage): Uint8Array;
 
+// @public
+export function agentMessageResolveBody(message: AgentMessage, store: BlobStore): Promise<Uint8Array>;
+
 // @public (undocumented)
 export interface AgentMiddleware {
     // (undocumented)
@@ -854,25 +930,6 @@ export interface AgentMiddleware {
 }
 
 // @public (undocumented)
-type AgentOutcome = {
-    readonly kind: "submitted";
-    readonly run: AgentRunInfo;
-} | {
-    readonly kind: "cancelled";
-    readonly run: AgentRunInfo;
-} | {
-    readonly kind: "status";
-    readonly run: AgentRunInfo;
-} | {
-    readonly kind: "list";
-    readonly page: RunPage;
-} | {
-    readonly kind: "unrecognized";
-    readonly tag: string;
-    readonly value: unknown;
-};
-
-// @public (undocumented)
 export interface AgentPresence {
     // (undocumented)
     readonly agent: AgentId_2;
@@ -884,7 +941,6 @@ export interface AgentPresence {
 
 // @public (undocumented)
 export class AgentRegistry {
-    // (undocumented)
     agents(): readonly RegisteredCard[];
     // (undocumented)
     inboxFor(agent: AgentId): string | undefined;
@@ -903,48 +959,6 @@ export class AgentRegistry {
     // (undocumented)
     resolve(skillId: string, nowMicros?: bigint): readonly RegisteredCard[];
 }
-
-// @public (undocumented)
-type AgentReply = {
-    readonly kind: "ok";
-    readonly outcome: AgentOutcome;
-} | {
-    readonly kind: "err";
-    readonly error: AgentWorkflowError;
-} | {
-    readonly kind: "unrecognized";
-    readonly tag: string;
-    readonly value: unknown;
-};
-
-// @public (undocumented)
-export interface AgentRunInfo {
-    // (undocumented)
-    readonly agentId: string;
-    // (undocumented)
-    readonly cancelRequested: boolean;
-    // (undocumented)
-    readonly createdAtMicros: bigint;
-    // (undocumented)
-    readonly detail?: string;
-    // (undocumented)
-    readonly runId: string;
-    // (undocumented)
-    readonly state: AgentRunState;
-    // (undocumented)
-    readonly updatedAtMicros: bigint;
-    // (undocumented)
-    readonly userId: number;
-}
-
-// @public (undocumented)
-export type AgentRunState = "submitted" | "running" | "completed" | "cancelled" | "failed";
-
-// @public (undocumented)
-function agentRunStateFromWord(word: string, context: string): AgentRunState;
-
-// @public (undocumented)
-export function agentRunStateIsTerminal(state: AgentRunState): boolean;
 
 // @public (undocumented)
 export class AgentScope {
@@ -978,39 +992,12 @@ export interface AgentSkill {
 }
 
 // @public (undocumented)
-const AgentStatusCommand: ManagedCommand<AgentStatusReq, AgentReply>;
-
-// @public (undocumented)
-interface AgentStatusReq {
-    // (undocumented)
-    readonly runId: string;
-}
-
-// @public (undocumented)
-interface AgentSubmit {
-    // (undocumented)
-    readonly agentId: string;
-    // (undocumented)
-    readonly budget?: RunBudget;
-    // (undocumented)
-    readonly input?: Uint8Array;
-    // (undocumented)
-    readonly params: ReadonlyMap<string, string>;
-    // (undocumented)
-    readonly runId?: string;
-}
-
-// @public (undocumented)
-const AgentSubmitCommand: ManagedCommand<AgentSubmit, AgentReply>;
-
-// @public (undocumented)
 export const AgentTopic: {
-    readonly Commands: "agent.commands";
-    readonly Responses: "agent.responses";
-    readonly ToolCalls: "agent.tool_calls";
-    readonly ToolResults: "agent.tool_results";
-    readonly LlmIo: "agent.llm_io";
-    readonly HumanInput: "agent.human_input";
+    readonly Sessions: "agent.sessions";
+    readonly Streams: "agent.streams";
+    readonly Heartbeats: "agent.heartbeats";
+    readonly Control: "agent.control";
+    readonly Memory: "agent.memory";
     readonly Audit: "agent.audit";
     readonly Registry: "agent.registry";
     readonly WorkflowJournal: "agent.workflow_journal";
@@ -1020,43 +1007,6 @@ export const AgentTopic: {
 
 // @public (undocumented)
 export type AgentTopic = Exclude<(typeof AgentTopic)[keyof typeof AgentTopic], typeof AgentTopic.Custom>;
-
-// @public (undocumented)
-type AgentWorkflowError = {
-    readonly kind: "unsupported";
-    readonly message: string;
-} | {
-    readonly kind: "notFound";
-    readonly message: string;
-} | {
-    readonly kind: "invalid";
-    readonly message: string;
-} | {
-    readonly kind: "backend";
-    readonly message: string;
-} | {
-    readonly kind: "unavailable";
-    readonly message: string;
-} | {
-    readonly kind: "version";
-    readonly expected: number;
-    readonly got: number;
-} | {
-    readonly kind: "notLeader";
-} | {
-    readonly kind: "unrecognized";
-    readonly tag: string;
-    readonly value: unknown;
-};
-
-// @public (undocumented)
-export class AgentWorkflowExecutionError extends LaserError {
-    constructor(message: string, detail: unknown, options?: {
-        cause?: unknown;
-    });
-    // (undocumented)
-    readonly detail: unknown;
-}
 
 // @public (undocumented)
 interface AggCall {
@@ -1074,7 +1024,7 @@ interface AggCall {
 export type AggFunc = "count" | "count_distinct" | "sum" | "avg" | "min" | "max" | "percentile" | "std_dev";
 
 // @public (undocumented)
-interface Aggregate {
+export interface Aggregate {
     // (undocumented)
     readonly funcs: readonly AggCall[];
     // (undocumented)
@@ -1150,12 +1100,24 @@ export class AmbiguousMutationError extends LaserError {
 // @public (undocumented)
 export type AmbiguousMutationRecovery = {
     readonly kind: "waitForLeaseExpiry";
-    readonly ttlMicros: bigint;
+    readonly ttlMs: number;
 } | {
     readonly kind: "repeatPrepared";
 } | {
     readonly kind: "reconcileTargetPrecondition";
 };
+
+// @public
+export interface AppliedFrontier {
+    // (undocumented)
+    readonly fork?: MutationPosition;
+    // (undocumented)
+    readonly graph?: MutationPosition;
+    // (undocumented)
+    readonly kv?: MutationPosition;
+    // (undocumented)
+    readonly sessions?: readonly SessionPosition[];
+}
 
 // @public (undocumented)
 export interface AppliedPolicy {
@@ -1239,6 +1201,15 @@ export interface Artifact {
     readonly text: string;
 }
 
+// @public
+export class AssembledContext {
+    // (undocumented)
+    readonly fragments: readonly ContextMessage[];
+    // (undocumented)
+    readonly manifest: ContextManifest;
+    text(): string;
+}
+
 // @public (undocumented)
 interface AttemptColumnMetrics {
     // (undocumented)
@@ -1300,11 +1271,20 @@ export type AuthzError = {
     readonly kind: "version";
     readonly expected: number;
     readonly got: number;
+}
+/** A grant refused because it reaches past one stream while the server runs
+* with stream tenancy, for example a wildcard or a prefix spanning streams. */
+| {
+    readonly kind: "tenancyViolation";
+    readonly message: string;
 } | {
     readonly kind: "unrecognized";
     readonly tag: string;
     readonly value: unknown;
 };
+
+// @public
+function authzErrorResultCode(error: AuthzError): ResultCode;
 
 // @public (undocumented)
 export interface AuthzEvent {
@@ -1316,6 +1296,7 @@ export interface AuthzEvent {
     readonly op: AuthzEventKind;
     // (undocumented)
     readonly revision: bigint;
+    readonly stream?: string;
 }
 
 // @public (undocumented)
@@ -1329,6 +1310,9 @@ export type AuthzEventKind = {
     readonly kind: "rolesBound";
     readonly userId: number;
     readonly roles: readonly string[];
+} | {
+    readonly kind: "tenancySet";
+    readonly tenancy: Tenancy;
 };
 
 // @public (undocumented)
@@ -1402,6 +1386,11 @@ export type AuthzSubject = {
     readonly userId: number;
 } | {
     readonly kind: "all";
+}
+/** Every change attributed to one stream, as Rust `AuthzSubject::Stream`. */
+| {
+    readonly kind: "stream";
+    readonly stream: string;
 };
 
 // @public (undocumented)
@@ -1557,7 +1546,7 @@ export class BatchingProducer implements AsyncDisposable {
 // @public
 export class BatchingProducerBuilder {
     build(): BatchingProducer;
-    linger(milliseconds: number): this;
+    linger(lingerMs: number): this;
     maxBytes(bytes: number): this;
     maxRecords(count: number): this;
     partitionKey(key: string | BytesLike): this;
@@ -1716,6 +1705,12 @@ interface BodyRef {
 // @public (undocumented)
 type BoundaryRelation = "current" | "historical" | "ahead_of_observed_checkpoint";
 
+// @public
+const BROADCAST = "*";
+
+// @public
+function broadcastFilter(): ConsumerFilter;
+
 // @public (undocumented)
 type BrowseOutcome = {
     readonly kind: "projections";
@@ -1766,15 +1761,11 @@ export class Bson<T = unknown> implements Codec<T> {
 }
 
 // @public (undocumented)
-export class Budget {
+export interface Budget {
     // (undocumented)
-    invocations(invocations: number): Budget;
+    readonly costMicros?: bigint;
     // (undocumented)
-    static tokens(tokens: bigint): Budget;
-    // (undocumented)
-    static unlimited(): Budget;
-    // (undocumented)
-    wallClock(milliseconds: number): Budget;
+    readonly tokens?: bigint;
 }
 
 // @public (undocumented)
@@ -1788,6 +1779,13 @@ export class BudgetExceededError extends LaserError {
 
 // @public (undocumented)
 function bytes16ToBigInt(bytes: Uint8Array): bigint;
+
+// @public
+interface Caller {
+    readonly agent?: AgentId_2;
+    readonly onBehalfOf?: string;
+    readonly userId: number;
+}
 
 // @public
 export class CancelledError extends LaserError {
@@ -1809,8 +1807,8 @@ interface CanonicalAgentRecord {
     readonly payload: Uint8Array;
 }
 
-// @public (undocumented)
-function canonicalAgentRecord(envelope: AgentEnvelope, contentType: ContentType): CanonicalAgentRecord;
+// @public
+function canonicalAgentRecord(envelope: AgentEnvelope, contentType: ContentType, broadcast?: boolean): CanonicalAgentRecord;
 
 // @public (undocumented)
 interface CanonicalHeader {
@@ -1836,8 +1834,6 @@ export interface Capabilities {
     // (undocumented)
     readonly a2aGateway: boolean;
     // (undocumented)
-    readonly agentWorkflow: boolean;
-    // (undocumented)
     readonly authz: boolean;
     // (undocumented)
     readonly backends: readonly BackendDescriptor[];
@@ -1857,6 +1853,9 @@ export interface Capabilities {
     readonly managed: boolean;
     // (undocumented)
     readonly query: QueryCaps;
+    // (undocumented)
+    readonly sessions: boolean;
+    readonly streamTenancy: boolean;
     // (undocumented)
     readonly versions?: OpVersions;
     // (undocumented)
@@ -1943,12 +1942,21 @@ export class Cbor<T = unknown> implements Codec<T> {
 type CborMap = ReadonlyMap<unknown, unknown>;
 
 // @public (undocumented)
+function cborToJson(value: unknown, context: string): unknown;
+
+// @public
 export class Chain implements ContextPolicy {
     constructor(policies: readonly ContextPolicy[]);
+    // (undocumented)
+    name(): string;
     // (undocumented)
     readonly policies: readonly ContextPolicy[];
     // (undocumented)
     select(history: readonly ContextMessage[]): readonly ContextMessage[];
+    // (undocumented)
+    selection(history: readonly ContextMessage[]): Selection;
+    // (undocumented)
+    version(): string;
 }
 
 // @public (undocumented)
@@ -1964,6 +1972,7 @@ export interface ChangeRecord {
     readonly partitionId: number;
     // (undocumented)
     readonly rows: number;
+    readonly stream?: string;
     // (undocumented)
     readonly toOffset: bigint;
     // (undocumented)
@@ -2000,6 +2009,7 @@ export class Checkpoint {
         readonly per_topic: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
     };
     topicOffsets(topic: string): ReadonlyMap<number, bigint> | undefined;
+    topics(): IterableIterator<[string, ReadonlyMap<number, bigint>]>;
 }
 
 // @public (undocumented)
@@ -2038,6 +2048,9 @@ export class CheckpointExecutionError extends LaserError {
     // (undocumented)
     readonly detail: CheckpointError;
 }
+
+// @public (undocumented)
+export function checkpointFromSnapshot(laser: Laser, snapshot: FoldSnapshot, topics: readonly string[]): Promise<Checkpoint>;
 
 // @public (undocumented)
 export type CheckpointMutationResult = {
@@ -2114,9 +2127,9 @@ export interface CheckpointRequestEnvelope {
     // (undocumented)
     readonly mutation: PublicCheckpointMutation;
     // (undocumented)
-    readonly requestId: CheckpointRequestId;
+    readonly operatorAssertion?: OperatorActorAssertion;
     // (undocumented)
-    readonly supervisorAssertion?: SupervisorActorAssertion;
+    readonly requestId: CheckpointRequestId;
     // (undocumented)
     readonly v: number;
 }
@@ -2147,6 +2160,12 @@ export class ChunkAssembler {
 
 // @public (undocumented)
 export function chunkEnvelope(conversation: ConversationId_2, source: AgentId_2, correlation: CorrelationId, channel: ChannelId, sequence: bigint, body: Uint8Array): AgentEnvelope;
+
+// @public
+function classify(envelope: AgentEnvelope, topic: string, me: AgentId_2, handled: HandledOperations): Dispatch;
+
+// @public
+function classifyGeneric(addressee: string | undefined, hasCause: boolean, hasCorrelation: boolean, topic: string, me: AgentId_2): Dispatch;
 
 // @public (undocumented)
 const CLIENT_METADATA_OP_VERSION = 1;
@@ -2223,7 +2242,7 @@ export interface Clock {
 }
 
 // @public (undocumented)
-type CmpOp = "eq" | "ne" | "lt" | "lte" | "gt" | "gte" | "in" | "contains" | "prefix";
+export type CmpOp = "eq" | "ne" | "lt" | "lte" | "gt" | "gte" | "in" | "contains" | "prefix";
 
 // @public
 export function code(error: unknown): ResultCode;
@@ -2261,6 +2280,23 @@ export interface CoercedPredicate {
 
 // @public (undocumented)
 export function commandEnvelope(record: RecordId, conversation: ConversationId_2, source: AgentId_2, correlation: CorrelationId, body: Uint8Array): AgentEnvelope;
+
+// @public (undocumented)
+interface CommandError {
+    // (undocumented)
+    readonly code: ResultCode;
+    // (undocumented)
+    readonly message: string;
+}
+
+// @public (undocumented)
+export class CommandExecutionError extends LaserError {
+    constructor(message: string, detail: CommandError, options?: {
+        cause?: unknown;
+    });
+    // (undocumented)
+    readonly detail: CommandError;
+}
 
 // @public
 export function commandFromMessageSend(record: RecordId, conversation: ConversationId_2, source: AgentId_2, correlation: CorrelationId, paramsJson: Uint8Array): AgentEnvelope;
@@ -2440,6 +2476,7 @@ export interface ConsumerFilter {
     readonly mismatchPolicy?: RecordPolicy;
     // (undocumented)
     readonly schemaRefs: readonly number[];
+    readonly schemaStream?: string;
     // (undocumented)
     readonly v: number;
 }
@@ -2454,6 +2491,7 @@ export const ConsumerFilter: {
     readonly withFaultPolicy: (filter: ConsumerFilter, faultPolicy: FaultPolicy) => ConsumerFilter;
     readonly withForeignPolicy: (filter: ConsumerFilter, foreignPolicy: RecordPolicy) => ConsumerFilter;
     readonly withMismatchPolicy: (filter: ConsumerFilter, mismatchPolicy: RecordPolicy) => ConsumerFilter;
+    readonly withSchemaStream: (filter: ConsumerFilter, stream: string) => ConsumerFilter;
     readonly digest: (filter: ConsumerFilter) => Uint8Array;
 };
 
@@ -2488,7 +2526,6 @@ export interface ConsumerGroupInfo {
 export class ConsumerGroupName {
     // (undocumented)
     asStr(): string;
-    // (undocumented)
     static forAgent(agent: AgentId): ConsumerGroupName;
     // (undocumented)
     static new(name: string): ConsumerGroupName;
@@ -2525,7 +2562,6 @@ export interface ConsumerMessage extends Message {
 // @public (undocumented)
 export interface ConsumerOptions {
     readonly allowReplay?: boolean;
-    readonly autoJoinGroup?: boolean;
     readonly batchLength?: number;
     readonly commitPolicy?: CommitPolicy;
     readonly createGroup?: boolean;
@@ -2533,9 +2569,10 @@ export interface ConsumerOptions {
         readonly retries: number;
         readonly intervalMs: number;
     };
+    readonly maxBytes?: number;
+    readonly maxWaitMs?: number;
+    readonly minCount?: number;
     readonly pollingRetryIntervalMs?: number;
-    readonly pollIntervalMs?: number;
-    // (undocumented)
     readonly startAt?: ConsumerStart;
 }
 
@@ -2571,6 +2608,13 @@ export type ConsumptionStatus = {
     readonly kind: "consumed";
     readonly committed: bigint;
     readonly head: bigint;
+}
+/** The agent's group committed past the record without handling it. */
+| {
+    readonly kind: "skipped";
+    readonly committed: bigint;
+    readonly head: bigint;
+    readonly dispatch: Dispatch;
 };
 
 // @public (undocumented)
@@ -2642,6 +2686,34 @@ export class ContextAssemblerBuilder {
 export function contextCheckpoint(laser: Laser, topics: readonly string[]): Promise<Checkpoint>;
 
 // @public (undocumented)
+interface ContextCompaction {
+    // (undocumented)
+    readonly covered: readonly (readonly [number, number, bigint, bigint])[];
+    // (undocumented)
+    readonly summarizer: ProducerInfo;
+    // (undocumented)
+    readonly summaryAt: SourceRef;
+}
+
+// @public (undocumented)
+interface ContextManifest {
+    // (undocumented)
+    readonly bytes: bigint;
+    // (undocumented)
+    readonly correlation?: CorrelationId;
+    // (undocumented)
+    readonly fragments: readonly Fragment[];
+    // (undocumented)
+    readonly frontier: readonly (readonly [number, number, bigint])[];
+    // (undocumented)
+    readonly policy: string;
+    // (undocumented)
+    readonly policyVersion: string;
+    // (undocumented)
+    readonly tokens: bigint;
+}
+
+// @public (undocumented)
 export interface ContextMessage {
     // (undocumented)
     readonly envelope?: AgentEnvelope;
@@ -2651,32 +2723,45 @@ export interface ContextMessage {
     readonly payload: Uint8Array;
     // (undocumented)
     readonly provenance: Provenance;
+    readonly streamId: number;
+    readonly timestampMicros: bigint;
     readonly topic: string;
+    readonly topicId: number;
+}
+
+// @public
+export interface ContextPolicy {
+    name?(): string;
+    // (undocumented)
+    select(history: readonly ContextMessage[]): readonly ContextMessage[];
+    selection?(history: readonly ContextMessage[]): Selection;
+    version?(): string;
 }
 
 // @public (undocumented)
-export interface ContextPolicy {
+interface ContextRetrieval {
     // (undocumented)
-    select(history: readonly ContextMessage[]): readonly ContextMessage[];
+    readonly items: readonly (readonly [string, number])[];
+    // (undocumented)
+    readonly query?: string;
 }
 
 // @public (undocumented)
 export class ContextScope {
     // (undocumented)
     append(topic: string, payload: BytesLike): Promise<void>;
-    // (undocumented)
-    block(topics: readonly string[], count: number): Promise<string>;
+    block(topics: readonly string[], count: number, tokenBudget?: number): Promise<string>;
     checkpoint(topics: readonly string[]): Promise<Checkpoint>;
     // (undocumented)
     readonly conversation: ConversationId;
-    // (undocumented)
-    fetch(topics: readonly string[], count: number): Promise<readonly ContextMessage[]>;
+    fetch(topics: readonly string[], count: number, tokenBudget?: number): Promise<readonly ContextMessage[]>;
     // (undocumented)
     fetchWith(topics: readonly string[], policy: ContextPolicy): Promise<readonly ContextMessage[]>;
     graph(name: string): GraphHandle;
     // (undocumented)
     readonly laser: Laser;
     memory(namespaceOrHandle: string | MemoryHandle): ScopedMemory;
+    memoryWith(namespace: string, backend: MemoryBackend, embedder?: Embedder): ScopedMemory;
     // (undocumented)
     state<State>(topics: readonly string[], bound: ReplayBound, initial: State, fold: (state: State, message: ContextMessage) => State): Promise<State>;
     stateWith<State>(store: SnapshotStore, topics: readonly string[], init: State, fold: (state: State, message: ContextMessage) => State, decodeState?: (bytes: Uint8Array) => State): Promise<State>;
@@ -2695,7 +2780,6 @@ export interface Continuation {
     readonly nextScanOffset: bigint;
     // (undocumented)
     readonly policyGeneration: bigint;
-    readonly readMode: ReadMode;
 }
 
 // @public (undocumented)
@@ -2725,10 +2809,9 @@ export class ContractBuilder {
     from(source: AgentId): this;
     // (undocumented)
     inboxRoute(route: InboxRoute): this;
+    parent(parent: ConversationId, root: ConversationId): this;
     // (undocumented)
     payload(payload: BytesLike): this;
-    // (undocumented)
-    registered(): this;
     // (undocumented)
     replyOn(topic: string): this;
     // (undocumented)
@@ -2737,6 +2820,9 @@ export class ContractBuilder {
 
 // @public (undocumented)
 const CONTROL_OP_VERSION = 1;
+
+// @public
+const CONTROL_OPERATIONS: readonly string[];
 
 // @public (undocumented)
 const CONTROL_TOPIC = "control.commands";
@@ -2768,24 +2854,56 @@ type ControlCommand = {
     readonly kind: "dropGraph";
     readonly id: string;
 } | {
-    readonly kind: "registerRunSource";
-    readonly source: SourceSelector;
+    readonly kind: "registerSessionSource";
+    readonly stream: string;
+    readonly topics: SessionTopics;
 } | {
-    readonly kind: "removeRunSource";
-    readonly source: SourceSelector;
+    readonly kind: "removeSessionSource";
+    readonly stream: string;
 } | {
     readonly kind: "filterCatalog";
     readonly command: FilterCatalogCommand;
+} | {
+    readonly kind: "acceptGap";
+    readonly acceptance: GapAcceptance;
+} | {
+    readonly kind: "skipRecord";
+    readonly skip: RecordSkip;
 };
 
 // @public (undocumented)
 interface ControlEnvelope {
     // (undocumented)
     readonly command: ControlCommand;
+    readonly stamp?: ControlStamp;
+    readonly stream?: string;
     // (undocumented)
     readonly timestampMicros: bigint;
     // (undocumented)
     readonly v: number;
+}
+
+// @public
+interface ControlStamp {
+    // (undocumented)
+    readonly actorUserId: number;
+    readonly caller?: Caller;
+    // (undocumented)
+    readonly deploymentId: bigint;
+    // (undocumented)
+    readonly keyId: bigint;
+    // (undocumented)
+    readonly operationId: bigint;
+    // (undocumented)
+    readonly streamGeneration?: ControlStreamGeneration;
+}
+
+// @public (undocumented)
+interface ControlStreamGeneration {
+    // (undocumented)
+    readonly createdAtMicros: bigint;
+    // (undocumented)
+    readonly streamId: number;
 }
 
 // @public (undocumented)
@@ -2866,6 +2984,7 @@ export class CrashContext {
 // @public (undocumented)
 export interface CreateConsumerGroupOptions {
     readonly filter?: ConsumerFilter;
+    readonly filterName?: string;
     readonly operationId?: bigint;
     readonly policy?: GroupFilterSpec;
 }
@@ -2889,20 +3008,14 @@ function crockfordEncode(value: bigint): string;
 
 // @public (undocumented)
 export class Cursor {
-    // (undocumented)
     batch(size: number): this;
-    // (undocumented)
     fromOffsets(offsets: ReadonlyMap<number, bigint>): this;
-    // (undocumented)
     get offsets(): ReadonlyMap<number, bigint>;
-    // (undocumented)
     poll(options?: {
         readonly signal?: AbortSignal;
     }): Promise<readonly Message[]>;
-    // (undocumented)
     stream(options?: {
         readonly signal?: AbortSignal;
-        readonly pollIntervalMs?: number;
     }): AsyncIterable<Message>;
 }
 
@@ -2979,7 +3092,7 @@ export class Decision {
 function decodeAcceptedOperationJson(text: string): AcceptedOperationView;
 
 // @public (undocumented)
-function decodeAgentCancel(map: CborMap, context: string): AgentCancel;
+function decodeAckContext(value: unknown, context: string): AckContext;
 
 // @public (undocumented)
 function decodeAgentCard(map: CborMap, context: string): AgentCard_2;
@@ -2994,28 +3107,10 @@ function decodeAgentEnvelope(map: CborMap, context: string): AgentEnvelope;
 function decodeAgentErrorBody(map: CborMap, context: string): AgentErrorBody;
 
 // @public (undocumented)
-function decodeAgentList(map: CborMap, context: string): AgentList;
-
-// @public (undocumented)
-function decodeAgentOutcome(value: unknown, context: string): AgentOutcome;
-
-// @public (undocumented)
 function decodeAgentPresence(map: CborMap, context: string): AgentPresence;
 
 // @public (undocumented)
-function decodeAgentReply(value: unknown, context: string): AgentReply;
-
-// @public (undocumented)
-function decodeAgentRunInfo(map: CborMap, context: string): AgentRunInfo;
-
-// @public (undocumented)
-function decodeAgentStatusReq(map: CborMap, context: string): AgentStatusReq;
-
-// @public (undocumented)
-function decodeAgentSubmit(map: CborMap, context: string): AgentSubmit;
-
-// @public (undocumented)
-function decodeAgentWorkflowError(value: unknown, context: string): AgentWorkflowError;
+function decodeAppliedFrontier(map: CborMap, context: string): AppliedFrontier;
 
 // @public (undocumented)
 function decodeArrowIpcMessageMetadata(map: CborMap, context: string): ArrowIpcMessageMetadata;
@@ -3075,6 +3170,12 @@ function decodeBrowseOutcome(value: unknown, context: string): BrowseOutcome;
 function decodeBrowseReply(value: unknown, context: string): BrowseReply;
 
 // @public (undocumented)
+function decodeBudget(map: CborMap, context: string): Budget;
+
+// @public (undocumented)
+function decodeCaller(map: CborMap, context: string): Caller;
+
+// @public (undocumented)
 function decodeCanonicalAgentEnvelope(record: CanonicalAgentRecord, context: string): AgentEnvelope;
 
 // @public (undocumented)
@@ -3129,10 +3230,22 @@ function decodeConsumerFilterJson(text: string): ConsumerFilter;
 function decodeContentRef(value: unknown, context: string): ContentRef;
 
 // @public (undocumented)
+function decodeContextCompaction(map: CborMap, context: string): ContextCompaction;
+
+// @public (undocumented)
+function decodeContextManifest(map: CborMap, context: string): ContextManifest;
+
+// @public (undocumented)
+function decodeContextRetrieval(map: CborMap, context: string): ContextRetrieval;
+
+// @public (undocumented)
 function decodeControlCommand(value: unknown, context: string): ControlCommand;
 
 // @public (undocumented)
 function decodeControlEnvelope(map: CborMap, context: string): ControlEnvelope;
+
+// @public (undocumented)
+function decodeControlStamp(map: CborMap, context: string): ControlStamp;
 
 // @public (undocumented)
 function decodeDecodeRecord(map: CborMap, context: string): DecodeRecord;
@@ -3195,6 +3308,12 @@ function decodeFilteredPollRequest(value: unknown, context: string): FilteredPol
 function decodeFilteredStart(value: unknown, context: string): FilteredStart;
 
 // @public (undocumented)
+function decodeFilteredWaitCancel(value: unknown, context: string): FilteredWaitCancel;
+
+// @public (undocumented)
+function decodeFilteredWaitRequest(value: unknown, context: string): FilteredWaitRequest;
+
+// @public (undocumented)
 function decodeFilterError(value: unknown, context: string): FilterError;
 
 // @public (undocumented)
@@ -3205,6 +3324,9 @@ function decodeFilterGroupIdentity(value: unknown, context: string): FilterGroup
 
 // @public (undocumented)
 function decodeFilterGroupRef(value: unknown, context: string): FilterGroupRef;
+
+// @public (undocumented)
+function decodeFilterListQuery(params: URLSearchParams): FilterListQuery;
 
 // @public (undocumented)
 function decodeFilterMutation(value: unknown, context: string): FilterMutation;
@@ -3262,6 +3384,9 @@ function decodeForwardedCommand(map: CborMap, context: string): ForwardedCommand
 
 // @public (undocumented)
 function decodeForwardedQuery(map: CborMap, context: string): ForwardedQuery;
+
+// @public (undocumented)
+function decodeForwardedScope(map: CborMap, context: string): ForwardedScope;
 
 // @public (undocumented)
 function decodeGetBindingsReq(map: CborMap, context: string): GetBindingsReq;
@@ -3428,6 +3553,12 @@ function decodeLogicalSchemaRef(map: CborMap, context: string): LogicalSchemaRef
 function decodeLogicalType(map: CborMap, context: string): LogicalType;
 
 // @public (undocumented)
+function decodeManagedReadEnvelope(map: CborMap, context: string): ManagedReadEnvelope;
+
+// @public
+function decodeManagedReplyEnvelope(map: CborMap, context: string): ManagedReplyEnvelope;
+
+// @public (undocumented)
 function decodeManagedRequestEnvelope(map: CborMap, context: string): ManagedRequestEnvelope;
 
 // @public (undocumented)
@@ -3462,6 +3593,9 @@ export function decodePolicyEvidence(payload: Uint8Array): PolicyEvidence;
 
 // @public (undocumented)
 function decodePreparedAttemptSummary(map: CborMap, context: string): PreparedAttemptSummary;
+
+// @public (undocumented)
+function decodeProducer(map: CborMap, context: string): ProducerInfo;
 
 // @public (undocumented)
 function decodeProjection(map: CborMap, context: string): Projection;
@@ -3556,6 +3690,7 @@ interface DecodeRecord {
     readonly id: number;
     // (undocumented)
     readonly payload: Uint8Array;
+    readonly stream?: string;
     // (undocumented)
     readonly v: number;
 }
@@ -3582,12 +3717,6 @@ function decodeRole(map: CborMap, context: string): Role;
 function decodeRoleBinding(map: CborMap, context: string): RoleBinding;
 
 // @public (undocumented)
-function decodeRunBudget(map: CborMap, context: string): RunBudget;
-
-// @public (undocumented)
-function decodeRunPage(map: CborMap, context: string): RunPage;
-
-// @public (undocumented)
 function decodeSchemaDef(map: CborMap, context: string): SchemaDef;
 
 // @public (undocumented)
@@ -3603,6 +3732,87 @@ const decodeSchemaListJson: (text: string) => SchemaInfo[];
 function decodeSchemaSource(map: CborMap, context: string): SchemaSource;
 
 // @public (undocumented)
+function decodeSdkInfo(map: CborMap, context: string): SdkInfo;
+
+// @public (undocumented)
+function decodeSessionChanges(map: CborMap, context: string): SessionChanges;
+
+// @public (undocumented)
+function decodeSessionChangesQuery(params: URLSearchParams): SessionChangesQuery;
+
+// @public (undocumented)
+function decodeSessionEnd(map: CborMap, context: string): SessionEnd;
+
+// @public (undocumented)
+function decodeSessionError(value: unknown, context: string): SessionError_2;
+
+// @public (undocumented)
+function decodeSessionEvent(map: CborMap, context: string): SessionEvent;
+
+// @public (undocumented)
+function decodeSessionEvents(map: CborMap, context: string): SessionEvents;
+
+// @public (undocumented)
+function decodeSessionEventsQuery(params: URLSearchParams): SessionEventsQuery;
+
+// @public (undocumented)
+const decodeSessionGet: (map: CborMap, context: string) => SessionGet;
+
+// @public (undocumented)
+function decodeSessionHeartbeat(map: CborMap, context: string): SessionHeartbeat;
+
+// @public (undocumented)
+function decodeSessionInfo(map: CborMap, context: string): SessionInfo;
+
+// @public (undocumented)
+function decodeSessionLinks(map: CborMap, context: string): SessionLinks;
+
+// @public (undocumented)
+function decodeSessionLinksQuery(params: URLSearchParams): SessionLinksQuery;
+
+// @public (undocumented)
+function decodeSessionList(map: CborMap, context: string): SessionList;
+
+// @public (undocumented)
+function decodeSessionOutcome(value: unknown, context: string): SessionOutcome;
+
+// @public (undocumented)
+function decodeSessionParking(map: CborMap, context: string): SessionParking;
+
+// @public
+function decodeSessionPauseRequestJson(body: Uint8Array): SessionPauseRequest;
+
+// @public (undocumented)
+function decodeSessionPosition(map: CborMap, context: string): SessionPosition;
+
+// @public (undocumented)
+function decodeSessionRef(map: CborMap, context: string): SessionRef;
+
+// @public (undocumented)
+function decodeSessionReply(value: unknown, context: string): SessionReply;
+
+// @public (undocumented)
+function decodeSessionSources(map: CborMap, context: string): SessionSources;
+
+// @public (undocumented)
+function decodeSessionsQuery(params: URLSearchParams): SessionsQuery;
+
+// @public (undocumented)
+function decodeSessionStart(map: CborMap, context: string): SessionStart;
+
+// @public (undocumented)
+function decodeSessionState(map: CborMap, context: string): SessionState_2;
+
+// @public (undocumented)
+function decodeSessionStateQuery(params: URLSearchParams): SessionStateQuery;
+
+// @public (undocumented)
+function decodeSessionTopics(value: unknown, context: string): SessionTopics;
+
+// @public (undocumented)
+function decodeSessionTransition(map: CborMap, context: string): SessionTransition;
+
+// @public (undocumented)
 function decodeSignature(map: CborMap, context: string): Signature;
 
 // @public (undocumented)
@@ -3616,6 +3826,9 @@ function decodeSnapshotPageJson(text: string): SnapshotPageView;
 
 // @public (undocumented)
 function decodeSourceCut(map: CborMap, context: string): SourceCut;
+
+// @public (undocumented)
+function decodeSourceFrontier(map: CborMap, context: string): SourceFrontier;
 
 // @public (undocumented)
 function decodeSourceGeneration(value: unknown, context: string): SourceGeneration;
@@ -3637,6 +3850,12 @@ function decodeSourceSelector(map: CborMap, context: string): SourceSelector;
 
 // @public (undocumented)
 function decodeStartPolicy(map: CborMap, context: string): StartPolicy;
+
+// @public (undocumented)
+function decodeStateDelta(map: CborMap, context: string): StateDelta;
+
+// @public (undocumented)
+function decodeStateSnapshot(map: CborMap, context: string): StateSnapshot;
 
 // @public (undocumented)
 function decodeStoredKeyRecord(map: CborMap, context: string): StoredKeyRecord;
@@ -3747,9 +3966,6 @@ export const DEFAULT_OUTCOME_WAIT_MS = 30000;
 const DEFAULT_RECALL_LIMIT = 100;
 
 // @public (undocumented)
-const DEFAULT_RUN_MUTATIONS_TOPIC = "run.mutations";
-
-// @public (undocumented)
 const DEFAULT_SCAN_LIMIT = 100;
 
 // @public (undocumented)
@@ -3759,10 +3975,13 @@ export const DEFAULT_SESSION_CONTEXT_TOKENS = 4000;
 export const DEFAULT_SESSION_CONTEXT_TURNS = 50;
 
 // @public
-export const DEFAULT_SESSION_MEMORY_NAMESPACE = "agent.session";
+export const DEFAULT_SESSION_HEARTBEAT_MS = 60000;
 
 // @public
-export const DEFAULT_SESSION_TOPICS: readonly string[];
+export const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 300000;
+
+// @public
+export const DEFAULT_SESSION_MEMORY_NAMESPACE = "agent.session";
 
 // @public (undocumented)
 export const DEFAULT_SNAPSHOT_NAMESPACE = "agent.snapshots";
@@ -3772,6 +3991,9 @@ export const DEFAULT_SNAPSHOT_TOPIC = "agent.snapshots";
 
 // @public (undocumented)
 const DEFAULT_STREAM_PAGE_SIZE = 100;
+
+// @public
+export function defaultRedact(value: unknown): unknown;
 
 // @public (undocumented)
 function defaultWireTopology(): WireTopology;
@@ -3805,6 +4027,9 @@ interface DeleteRoleReq {
     readonly name: string;
     readonly v?: number;
 }
+
+// @public
+export function deriveSessionId(stream: string, namespace: string, label: string): ConversationId;
 
 // @public (undocumented)
 const DESTINATION_HTTP_OP_VERSION = 1;
@@ -4076,7 +4301,7 @@ const destinationRetentionGapPath: (id: DestinationId) => string;
 // @public (undocumented)
 export class Destinations {
     // (undocumented)
-    acceptRetentionGap(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, nextOffset: bigint, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    acceptRetentionGap(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, nextOffset: bigint, operatorAssertion: OperatorActorAssertion): Promise<CheckpointMutationResult>;
     // (undocumented)
     acquireLease(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, owner: CheckpointOwnerId, expectedLeaseSequence: bigint, leaseDurationMicros: bigint): Promise<CheckpointMutationResult>;
     // (undocumented)
@@ -4092,8 +4317,8 @@ export class Destinations {
     // (undocumented)
     list(consistency: CheckpointReadConsistency, filter?: DestinationListFilter, after?: DestinationId, limit?: number): Promise<DestinationCheckpointPage>;
     // (undocumented)
-    mutate(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, supervisorAssertion?: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
-    mutateWithSupervisorAssertion(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    mutate(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, operatorAssertion?: OperatorActorAssertion): Promise<CheckpointMutationResult>;
+    mutateWithOperatorAssertion(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, operatorAssertion: OperatorActorAssertion): Promise<CheckpointMutationResult>;
     // (undocumented)
     observePartitionLifecycle(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, partitionId: number): Promise<CheckpointMutationResult>;
     // (undocumented)
@@ -4103,7 +4328,7 @@ export class Destinations {
     // (undocumented)
     recordBlock(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, block: DestinationBlock): Promise<CheckpointMutationResult>;
     // (undocumented)
-    recordRepair(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, repair: RepairRecord, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    recordRepair(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, repair: RepairRecord, operatorAssertion: OperatorActorAssertion): Promise<CheckpointMutationResult>;
     // (undocumented)
     recordRetentionGap(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, gap: RetentionGap): Promise<CheckpointMutationResult>;
     // (undocumented)
@@ -4117,7 +4342,7 @@ export class Destinations {
     // (undocumented)
     setDesiredState(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedDefinitionRevision: bigint, desiredState: DestinationDesiredState): Promise<CheckpointMutationResult>;
     // (undocumented)
-    supersedeGeneration(expectedGlobalStateRevision: bigint, expectedDefinitionRevision: bigint, replacement: MaterializationDestination, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    supersedeGeneration(expectedGlobalStateRevision: bigint, expectedDefinitionRevision: bigint, replacement: MaterializationDestination, operatorAssertion: OperatorActorAssertion): Promise<CheckpointMutationResult>;
     // (undocumented)
     takeOverLease(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, owner: CheckpointOwnerId, expectedLeaseSequence: bigint, leaseDurationMicros: bigint): Promise<CheckpointMutationResult>;
 }
@@ -4157,7 +4382,18 @@ export const Digest32: {
 export type Digest32 = Uint8Array;
 
 // @public (undocumented)
-type Dir = "asc" | "desc";
+export type Dir = "asc" | "desc";
+
+// @public
+type Dispatch = "work" | "observational" | "reply" | "lifecycle" | "control" | "foreign";
+
+// @public
+export type DisplayType = "session.submitted" | "session.started" | "session.paused" | "session.resumed" | "session.completed" | "session.failed" | "session.canceled" | "session.heartbeat" | "session.control" | "session.parked" | "session.unparked" | "user.message" | "model.request" | "model.response" | "model.stream" | "tool.call" | "tool.result" | "agent.handoff" | "agent.message" | "state.updated" | "context.assembled" | "context.compacted" | "context.retrieved" | "memory.created" | "memory.forgotten" | "memory.feedback" | "task.status" | "workflow.step" | "policy.decision" | "error" | "dead_letter" | "undecodable"
+/** A record whose header and body name different identities. */
+| "invalid" | "kv.set" | "graph.upsert" | "unauthorized_control";
+
+// @public
+function displayType(record: SessionRecord, topic: string): DisplayType;
 
 // @public (undocumented)
 const DLQ_TOPIC = "dlq";
@@ -4233,7 +4469,7 @@ export function enabledBackends(capabilities: Capabilities): readonly BackendDes
 function encodeAcceptedOperationJson(value: AcceptedOperationView): string;
 
 // @public (undocumented)
-function encodeAgentCancel(cancel: AgentCancel): Map<string, unknown>;
+function encodeAckContext(context: AckContext): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeAgentCard(card: AgentCard_2): Map<string, unknown>;
@@ -4248,28 +4484,10 @@ function encodeAgentEnvelope(envelope: AgentEnvelope): Map<string, unknown>;
 function encodeAgentErrorBody(body: AgentErrorBody): Map<string, unknown>;
 
 // @public (undocumented)
-function encodeAgentList(list: AgentList): Map<string, unknown>;
-
-// @public (undocumented)
-function encodeAgentOutcome(outcome: AgentOutcome): Map<string, unknown>;
-
-// @public (undocumented)
 function encodeAgentPresence(presence: AgentPresence): Map<string, unknown>;
 
 // @public (undocumented)
-function encodeAgentReply(reply: AgentReply): Map<string, unknown>;
-
-// @public (undocumented)
-function encodeAgentRunInfo(info: AgentRunInfo): Map<string, unknown>;
-
-// @public (undocumented)
-function encodeAgentStatusReq(req: AgentStatusReq): Map<string, unknown>;
-
-// @public (undocumented)
-function encodeAgentSubmit(submit: AgentSubmit): Map<string, unknown>;
-
-// @public (undocumented)
-function encodeAgentWorkflowError(error: AgentWorkflowError): unknown;
+function encodeAppliedFrontier(frontier: AppliedFrontier): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeArrowIpcMessageMetadata(metadata: ArrowIpcMessageMetadata): Map<string, unknown>;
@@ -4329,6 +4547,12 @@ function encodeBrowseOutcome(outcome: BrowseOutcome): Map<string, unknown>;
 function encodeBrowseReply(reply: BrowseReply): Map<string, unknown>;
 
 // @public (undocumented)
+function encodeBudget(budget: Budget): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeCaller(caller: Caller): Map<string, unknown>;
+
+// @public (undocumented)
 function encodeCanonicalAgentRecord(record: CanonicalAgentRecord): Map<string, unknown>;
 
 // @public (undocumented)
@@ -4374,10 +4598,22 @@ function encodeConsumerFilter(filter: ConsumerFilter): Map<string, unknown>;
 function encodeContentRef(ref: ContentRef): Map<string, unknown>;
 
 // @public (undocumented)
+function encodeContextCompaction(compaction: ContextCompaction): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeContextManifest(manifest: ContextManifest): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeContextRetrieval(retrieval: ContextRetrieval): Map<string, unknown>;
+
+// @public (undocumented)
 function encodeControlCommand(command: ControlCommand): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeControlEnvelope(envelope: ControlEnvelope): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeControlStamp(stamp: ControlStamp): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeDecodeRecord(request: DecodeRecord): Map<string, unknown>;
@@ -4431,7 +4667,7 @@ function encodeFilterCatalogReply(reply: FilterCatalogReply): Map<string, unknow
 function encodeFilterConsumer(consumer: FilterConsumer): Map<string, unknown>;
 
 // @public (undocumented)
-function encodeFilteredAck(ack: FilteredAck): Map<string, unknown>;
+function encodeFilteredAck(request: FilteredAck): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeFilteredPage(page: FilteredPage): Map<string, unknown>;
@@ -4441,6 +4677,12 @@ function encodeFilteredPollRequest(request: FilteredPollRequest): Map<string, un
 
 // @public (undocumented)
 function encodeFilteredStart(start: FilteredStart): unknown;
+
+// @public (undocumented)
+function encodeFilteredWaitCancel(request: FilteredWaitCancel): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeFilteredWaitRequest(request: FilteredWaitRequest): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeFilterError(error: FilterError): Map<string, unknown>;
@@ -4513,6 +4755,9 @@ function encodeForwardedCommand(command: ForwardedCommand): Map<string, unknown>
 
 // @public (undocumented)
 function encodeForwardedQuery(query: ForwardedQuery): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeForwardedScope(scope: ForwardedScope): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeGetBindingsReq(req: GetBindingsReq): Map<string, unknown>;
@@ -4701,6 +4946,12 @@ function encodeLogicalSchemaRef(value: LogicalSchemaRef): Map<string, unknown>;
 function encodeLogicalType(value: LogicalType): Map<string, unknown>;
 
 // @public (undocumented)
+function encodeManagedReadEnvelope(envelope: ManagedReadEnvelope): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeManagedReplyEnvelope(envelope: ManagedReplyEnvelope): Map<string, unknown>;
+
+// @public (undocumented)
 function encodeManagedRequestEnvelope(envelope: ManagedRequestEnvelope): Map<string, unknown>;
 
 // @public (undocumented)
@@ -4745,6 +4996,9 @@ export function encodePolicyEvidence(evidence: PolicyEvidence): Uint8Array;
 
 // @public (undocumented)
 function encodePreparedAttemptSummary(value: PreparedAttemptSummary): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeProducer(producer: ProducerInfo): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeProjection(projection: Projection): Map<string, unknown>;
@@ -4824,6 +5078,9 @@ function encodeQueryStatusReplyFrame(reply: QueryStatusReply): Uint8Array;
 // @public (undocumented)
 function encodeQueryTarget(target: QueryTarget): Map<string, unknown>;
 
+// @public
+function encodeRecordHeaders(headers: RecordHeaders): readonly (readonly [string, HeaderField])[];
+
 // @public (undocumented)
 function encodeRegisterSchema(request: RegisterSchema): Map<string, unknown>;
 
@@ -4843,12 +5100,6 @@ function encodeRole(role: Role): Map<string, unknown>;
 function encodeRoleBinding(binding: RoleBinding): Map<string, unknown>;
 
 // @public (undocumented)
-function encodeRunBudget(budget: RunBudget): Map<string, unknown>;
-
-// @public (undocumented)
-function encodeRunPage(page: RunPage): Map<string, unknown>;
-
-// @public (undocumented)
 function encodeSchemaDef(schema: SchemaDef): Map<string, unknown>;
 
 // @public (undocumented)
@@ -4864,6 +5115,72 @@ const encodeSchemaListJson: (items: readonly SchemaInfo[]) => string;
 function encodeSchemaSource(source: SchemaSource): Map<string, unknown>;
 
 // @public (undocumented)
+function encodeSdkInfo(sdk: SdkInfo): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionChanges(request: SessionChanges): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionEnd(end: SessionEnd): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionError(error: SessionError_2): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionEvent(event: SessionEvent): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionEvents(request: SessionEvents): Map<string, unknown>;
+
+// @public (undocumented)
+const encodeSessionGet: (request: SessionGet) => Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionHeartbeat(heartbeat: SessionHeartbeat): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionInfo(info: SessionInfo): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionLinks(request: SessionLinks): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionList(request: SessionList): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionOutcome(outcome: SessionOutcome): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionParking(parking: SessionParking): Map<string, unknown>;
+
+// @public
+function encodeSessionPauseRequestJson(request: SessionPauseRequest): string;
+
+// @public (undocumented)
+function encodeSessionPosition(position: SessionPosition): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionRef(ref: SessionRef): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionReply(reply: SessionReply): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionSources(request: SessionSources): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionStart(start: SessionStart): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionState(request: SessionState_2): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSessionTopics(topics: SessionTopics): unknown;
+
+// @public (undocumented)
+function encodeSessionTransition(transition: SessionTransition): Map<string, unknown>;
+
+// @public (undocumented)
 function encodeSignature(signature: Signature): Map<string, unknown>;
 
 // @public (undocumented)
@@ -4877,6 +5194,9 @@ function encodeSnapshotPageJson(value: SnapshotPageView): string;
 
 // @public (undocumented)
 function encodeSourceCut(value: SourceCut): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSourceFrontier(frontier: SourceFrontier): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeSourceGeneration(generation: SourceGeneration): Map<string, unknown>;
@@ -4898,6 +5218,12 @@ function encodeSourceSelector(source: SourceSelector): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeStartPolicy(value: StartPolicy): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeStateDelta(delta: StateDelta): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeStateSnapshot(snapshot: StateSnapshot): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeStoredKeyRecord(record: StoredKeyRecord): Map<string, unknown>;
@@ -4958,6 +5284,9 @@ interface ErrorBody {
 
 // @public (undocumented)
 export function errorEnvelope(record: RecordId, conversation: ConversationId_2, source: AgentId_2, correlation: CorrelationId, body: Uint8Array): AgentEnvelope;
+
+// @public
+function estimateTokens(bytes: number): bigint;
 
 // @public (undocumented)
 export function eventEnvelope(record: RecordId, conversation: ConversationId_2, source: AgentId_2, body: Uint8Array): AgentEnvelope;
@@ -5026,7 +5355,7 @@ export type FaultReason = "malformed" | "too_large" | "too_deep" | "missing_sche
 export function faultReasonIsForeign(reason: FaultReason): boolean;
 
 // @public (undocumented)
-type Feature = "kv" | "memory" | "projection" | "fork" | "graph" | "query" | "agent" | "workflow" | "destination" | "checkpoint" | "authz" | "kv_lease" | "kv_fence" | "filter" | "unrecognized";
+export type Feature = "kv" | "memory" | "projection" | "fork" | "graph" | "query" | "agent" | "workflow" | "destination" | "checkpoint" | "authz" | "kv_lease" | "kv_fence" | "filter" | "session" | "unrecognized";
 
 // @public (undocumented)
 const feature: {
@@ -5042,6 +5371,8 @@ const feature: {
     readonly KV_FENCED_LEASES: bigint;
     readonly CONSUMER_FILTERS: bigint;
     readonly GROUP_POLICY_READS: bigint;
+    readonly SESSIONS: bigint;
+    readonly STREAM_TENANCY: bigint;
 };
 
 // @public (undocumented)
@@ -5093,7 +5424,7 @@ export class FencedLeaseClient implements AsyncDisposable {
     // (undocumented)
     renew(operation: PreparedMutation): Promise<Lease>;
     // (undocumented)
-    withAttemptTimeout(milliseconds: number): this;
+    withAttemptTimeout(timeoutMs: number): this;
 }
 
 // @public
@@ -5224,6 +5555,7 @@ export interface FilterAnnounce {
     readonly codecs: readonly FilterCodec[];
     // (undocumented)
     readonly evaluatorVersion: number;
+    readonly maxWaitMs: number;
 }
 
 // @public
@@ -5272,6 +5604,7 @@ export interface FilterCaps {
     readonly catalog: boolean;
     readonly evaluation?: FilterAnnounce;
     readonly groupPolicyReads: boolean;
+    readonly maxWaitMs: number;
     readonly native: boolean;
 }
 
@@ -5394,7 +5727,10 @@ interface FilterDetail {
 // @public (undocumented)
 interface FilteredAck {
     // (undocumented)
+    readonly ackContext: AckContext;
+    // (undocumented)
     readonly consumer: FilterConsumer;
+    // (undocumented)
     readonly digest?: Uint8Array;
     // (undocumented)
     readonly generation: SourceGeneration;
@@ -5417,6 +5753,8 @@ interface FilteredAck {
 // @public
 interface FilteredPage {
     // (undocumented)
+    readonly ackContext: AckContext;
+    // (undocumented)
     readonly evaluationLimits?: {
         readonly maxPayloadBytes: number;
         readonly maxDepth: number;
@@ -5437,8 +5775,6 @@ interface FilteredPage {
     readonly partitionId: number;
     // (undocumented)
     readonly policy: AppliedPolicy;
-    // (undocumented)
-    readonly readMode: ReadMode;
     // (undocumented)
     readonly records: Uint8Array;
     // (undocumented)
@@ -5469,8 +5805,6 @@ interface FilteredPollRequest {
     // (undocumented)
     readonly partitionId: number;
     // (undocumented)
-    readonly readMode: ReadMode;
-    // (undocumented)
     readonly source: FilterSource;
     // (undocumented)
     readonly start: FilteredStart;
@@ -5488,7 +5822,6 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     ackPage(page: MatchedPage): Promise<void>;
     ackThrough(record: MatchedRecord): Promise<void>;
     close(): Promise<void>;
-    dataConnectionsOpened(): number;
     examinedInRound(): number;
     idleIntervalMs(): number;
     nextPage(options?: {
@@ -5501,6 +5834,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     partitions(): readonly number[];
     readRound(): Promise<readonly [MatchedPage | undefined, boolean]>;
     tryNextPage(): Promise<MatchedPage | undefined>;
+    waitForRecords(): Promise<void>;
 }
 
 // @public
@@ -5508,13 +5842,13 @@ export class FilteredReaderBuilder {
     // (undocumented)
     build(): Promise<FilteredReader>;
     count(count: number): this;
-    idleInterval(milliseconds: number): this;
+    idleInterval(intervalMs: number): this;
     localGuard(enabled: boolean): this;
     maxExamined(records: number): this;
     maxReplyBytes(bytes: number): this;
     maxUnackedPages(pages: number): this;
+    maxWait(waitMs: number): this;
     partition(partitionId: number): this;
-    readMode(mode: ReadMode): this;
     start(start: FilteredStart): this;
 }
 
@@ -5537,6 +5871,50 @@ export type FilteredStart = {
 };
 
 // @public
+interface FilteredWaitCancel {
+    // (undocumented)
+    readonly v: number;
+    // (undocumented)
+    readonly waitIds: readonly bigint[];
+}
+
+// @public
+interface FilteredWaitCancelled {
+    // (undocumented)
+    readonly cancelled: readonly bigint[];
+}
+
+// @public
+interface FilteredWaitPartition {
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+}
+
+// @public
+interface FilteredWaitRequest {
+    // (undocumented)
+    readonly consumer: FilterConsumer;
+    // (undocumented)
+    readonly maxWaitMs: number;
+    // (undocumented)
+    readonly partitions: readonly FilteredWaitPartition[];
+    // (undocumented)
+    readonly source: FilterSource;
+    // (undocumented)
+    readonly v: number;
+    // (undocumented)
+    readonly waitId: bigint;
+}
+
+// @public
+interface FilteredWaitResult {
+    // (undocumented)
+    readonly ready: readonly number[];
+}
+
+// @public
 export interface FilterError {
     // (undocumented)
     readonly code: ResultCode;
@@ -5553,7 +5931,7 @@ export function filterErrorCheckVersion(v: number): FilterError | undefined;
 export function filterErrorInvalid(error: InvalidError): FilterError;
 
 // @public (undocumented)
-export type FilterErrorReason = "invalid_request" | "unsupported" | "version_skew" | "not_found" | "conflict" | "source_changed" | "membership_stale" | "not_primary" | "catalog_unavailable" | "revision_disabled" | "too_large" | "unauthenticated" | "forbidden" | "unavailable" | "capacity_exhausted" | "backend"
+export type FilterErrorReason = "invalid_request" | "unsupported" | "version_skew" | "not_found" | "conflict" | "source_changed" | "membership_stale" | "catalog_unavailable" | "revision_disabled" | "too_large" | "unauthenticated" | "forbidden" | "unavailable" | "capacity_exhausted" | "backend"
 /** A reason this build does not know. The error's `code` still classifies it. */
 | "unknown";
 
@@ -5678,6 +6056,38 @@ export interface FilterHeader {
 }
 
 // @public
+interface FilterListQuery {
+    readonly beforeId?: number;
+    // (undocumented)
+    readonly nameContains?: string;
+    // (undocumented)
+    readonly ownerGroupId?: bigint;
+    // (undocumented)
+    readonly ownerStreamCreatedAtMicros?: bigint;
+    // (undocumented)
+    readonly ownerStreamId?: number;
+    // (undocumented)
+    readonly ownerTopicCreatedAtMicros?: bigint;
+    // (undocumented)
+    readonly ownerTopicId?: number;
+    // (undocumented)
+    readonly page?: number;
+    // (undocumented)
+    readonly pageSize?: number;
+    // (undocumented)
+    readonly state?: FilterState;
+}
+
+// @public
+function filterListQueryOf(identity: FilterGroupIdentity): FilterListQuery;
+
+// @public
+function filterListQueryOwner(query: FilterListQuery): FilterGroupIdentity | undefined;
+
+// @public (undocumented)
+function filterListQueryParams(query: FilterListQuery): URLSearchParams;
+
+// @public
 type FilterLiteral = string | number | bigint | boolean | null | TypedValue | readonly FilterLiteral[];
 
 // @public (undocumented)
@@ -5798,11 +6208,11 @@ function filterOperationPath(operationId: bigint): string;
 
 // @public (undocumented)
 type FilterOutcome = {
-    readonly kind: "page";
-    readonly page: FilteredPage;
-} | {
     readonly kind: "acknowledged";
     readonly receipt: AckReceipt;
+} | {
+    readonly kind: "page";
+    readonly page: FilteredPage;
 } | {
     readonly kind: "preview";
     readonly preview: FilterPreview;
@@ -5812,6 +6222,12 @@ type FilterOutcome = {
 } | {
     readonly kind: "validated";
     readonly validation: FilterValidation;
+} | {
+    readonly kind: "ready";
+    readonly result: FilteredWaitResult;
+} | {
+    readonly kind: "cancelled";
+    readonly result: FilteredWaitCancelled;
 };
 
 // @public
@@ -5821,6 +6237,14 @@ export class FilterOversizedRecordError extends LaserError {
     readonly offset: bigint;
     // (undocumented)
     readonly partitionId: number;
+}
+
+// @public
+interface FilterOwner {
+    // (undocumented)
+    readonly group: FilterGroupRef;
+    // (undocumented)
+    readonly identity: FilterGroupIdentity;
 }
 
 // @public (undocumented)
@@ -5867,8 +6291,6 @@ export interface FilterPreview {
     readonly partitionId: number;
     // (undocumented)
     readonly policy: AppliedPolicy;
-    // (undocumented)
-    readonly readMode: ReadMode;
     // (undocumented)
     readonly records: readonly PreviewRecord[];
     // (undocumented)
@@ -6024,6 +6446,7 @@ interface FilterSummary {
     readonly latestRevision: number;
     // (undocumented)
     readonly name: string;
+    readonly owner?: FilterOwner;
     // (undocumented)
     readonly state: FilterState;
     // (undocumented)
@@ -6082,15 +6505,23 @@ export const FINISH_REASON_GAP = "gap";
 // @public (undocumented)
 export interface FoldSnapshot {
     // (undocumented)
-    readonly asOf: ReadonlyMap<number, bigint>;
+    readonly asOf: readonly SnapshotOffset[];
     // (undocumented)
     readonly conversation: ConversationId_2;
     // (undocumented)
+    readonly fold: string;
+    // (undocumented)
     readonly state: Uint8Array;
+    // (undocumented)
+    readonly stream: string;
+    // (undocumented)
+    readonly streamCreatedAtMicros: bigint;
+    // (undocumented)
+    readonly streamId: number;
 }
 
 // @public (undocumented)
-export function foldSnapshotResumeOffset(snapshot: FoldSnapshot, partition: number): bigint;
+export function foldSnapshotResumeOffset(snapshot: FoldSnapshot, topicId: number, topicCreatedAtMicros: bigint, partitionId: number): bigint;
 
 // @public (undocumented)
 const FORK_OP_VERSION = 1;
@@ -6173,10 +6604,10 @@ export class ForkExecutionError extends LaserError {
 // @public
 export class ForkHandle {
     create(): ForkCreateRequest;
-    // (undocumented)
-    readonly id: string;
+    get id(): string;
     promote(): Promise<number>;
     putRow(table: string, partitionId: number, offset: bigint): ForkPutRequest;
+    readonly resourceId: string;
     squash(): Promise<boolean>;
 }
 
@@ -6311,6 +6742,7 @@ export type ForkStatus = "open" | "promoted" | "squashed";
 
 // @public (undocumented)
 interface ForwardedCommand {
+    readonly agent?: AgentId_2;
     // (undocumented)
     readonly clientId: bigint;
     // (undocumented)
@@ -6320,11 +6752,23 @@ interface ForwardedCommand {
     // (undocumented)
     readonly grants: readonly Grant[];
     // (undocumented)
+    readonly minPosition?: MutationPosition;
+    // (undocumented)
+    readonly minSessions: readonly SessionPosition[];
+    readonly onBehalfOf?: string;
+    // (undocumented)
     readonly operationId?: bigint;
     // (undocumented)
     readonly payload: Uint8Array;
     // (undocumented)
+    readonly positionedReply: boolean;
+    // (undocumented)
     readonly readAll: boolean;
+    // (undocumented)
+    readonly readBarrier: boolean;
+    // (undocumented)
+    readonly scope?: ForwardedScope;
+    readonly tenancy?: Tenancy;
     // (undocumented)
     readonly userId: number;
 }
@@ -6339,12 +6783,75 @@ interface ForwardedQuery {
     readonly grants: readonly Grant[];
     // (undocumented)
     readonly queryEnvelope: Uint8Array;
+    readonly scope?: ForwardedScope;
+    readonly tenancy?: Tenancy;
     // (undocumented)
     readonly userId: number;
 }
 
+// @public (undocumented)
+interface ForwardedScope {
+    // (undocumented)
+    readonly stream: string;
+    // (undocumented)
+    readonly streamCreatedAtMicros: bigint;
+    // (undocumented)
+    readonly streamId: number;
+}
+
+// @public (undocumented)
+type Fragment = {
+    readonly kind: "message";
+    readonly at: SourceRef;
+    readonly tokens: number;
+    readonly bytes: number;
+} | {
+    readonly kind: "memory";
+    readonly id: string;
+    readonly version?: bigint;
+    readonly digest?: Uint8Array;
+    readonly tokens: number;
+    readonly bytes: number;
+} | {
+    readonly kind: "kv";
+    readonly namespace: string;
+    readonly key: string;
+    readonly version?: bigint;
+    readonly digest?: Uint8Array;
+    readonly tokens: number;
+    readonly bytes: number;
+} | {
+    readonly kind: "state";
+    readonly key: string;
+    readonly revision: bigint;
+    readonly tokens: number;
+    readonly bytes: number;
+} | {
+    readonly kind: "summary";
+    readonly at: SourceRef;
+    readonly tokens: number;
+    readonly bytes: number;
+};
+
 // @public
 export function fuseReciprocalRank(signals: readonly (readonly MemoryItem[])[], limit: number): readonly MemoryItem[];
+
+// @public
+interface GapAcceptance {
+    // (undocumented)
+    readonly fromOffset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly source: SourceSelector;
+    // (undocumented)
+    readonly toOffset: bigint;
+    // (undocumented)
+    readonly topicCreatedAtMicros: bigint;
+}
+
+// @public (undocumented)
+type GapReason = "expired_before_fold" | "pruned" | "truncated" | "rebuilding" | "unrecognized";
 
 // @public
 export interface Gather {
@@ -6438,6 +6945,7 @@ interface GetRoleReq {
 interface GetSchema {
     // (undocumented)
     readonly id: number;
+    readonly stream?: string;
     // (undocumented)
     readonly v: number;
 }
@@ -6541,6 +7049,8 @@ export interface GraphEdge {
     // (undocumented)
     readonly id: EdgeId;
     // (undocumented)
+    readonly producer?: ProducerInfo;
+    // (undocumented)
     readonly source?: SourceRef;
     // (undocumented)
     readonly to: NodeId;
@@ -6560,6 +7070,9 @@ export function graphEdgeValid(edge: GraphEdge, from?: bigint, to?: bigint): Gra
 
 // @public (undocumented)
 export function graphEdgeValidAt(edge: GraphEdge, at: bigint): boolean;
+
+// @public
+export function graphEdgeWithSource(edge: GraphEdge, source: SourceRef): GraphEdge;
 
 // @public (undocumented)
 type GraphError = {
@@ -6611,14 +7124,17 @@ export class GraphHandle {
     conversation(conversationId: string): this;
     fetch(): Promise<GraphResult>;
     incoming(edgeType: string): this;
+    inSession(session: SessionRef): this;
     limit(limit: number): this;
     link(from: string, relation: string, to: string): Promise<void>;
     neighbors(node: NodeId, dir: EdgeDir, edgeType: string | undefined, depth: number): Promise<GraphResult>;
     out(edgeType: string): this;
+    producedBy(producer: ProducerInfo): this;
     relink(from: string, relation: string, to: string): Promise<number>;
     returnEdges(): this;
     returnPaths(): this;
     returnTriplets(): this;
+    sourcedFrom(source: SourceRef): this;
     startIds(ids: readonly NodeId[]): this;
     startMatch(filter: Filter): this;
     startNearest(embedding: readonly number[], k: number): this;
@@ -6644,6 +7160,7 @@ interface GraphNeighbors {
     readonly limit: number;
     // (undocumented)
     readonly node: NodeId;
+    readonly stream?: string;
 }
 
 // @public (undocumented)
@@ -6662,6 +7179,8 @@ export interface GraphNode {
     readonly id: NodeId;
     // (undocumented)
     readonly labels: readonly string[];
+    // (undocumented)
+    readonly producer?: ProducerInfo;
     // (undocumented)
     readonly source?: SourceRef;
 }
@@ -6694,6 +7213,7 @@ interface GraphQuery {
     readonly return: GraphReturn;
     // (undocumented)
     readonly start: GraphStart;
+    readonly stream?: string;
     // (undocumented)
     readonly traverse: readonly Hop[];
 }
@@ -6757,6 +7277,8 @@ interface GraphUpsert {
     readonly graph: string;
     // (undocumented)
     readonly nodes: readonly GraphNode[];
+    // (undocumented)
+    readonly session?: SessionRef;
 }
 
 // @public (undocumented)
@@ -6764,7 +7286,7 @@ const GraphUpsertCommand: ManagedCommand<GraphUpsert, GraphReply>;
 
 // @public
 export class GroupFilter {
-    configure(filter: ConsumerFilter): Promise<FilterBinding>;
+    configure(name: string, filter: ConsumerFilter): Promise<FilterBinding>;
     configureAs(operationId: bigint | undefined, policy: GroupFilterSpec): Promise<FilterBinding>;
     configureWith(policy: GroupFilterSpec): Promise<FilterBinding>;
     delete(): Promise<boolean>;
@@ -6774,12 +7296,14 @@ export class GroupFilter {
     revise(expectedRevision: number, filter: ConsumerFilter): Promise<FilterRevisionRef>;
     revisions(page?: number, pageSize?: number): Promise<FilterRevisionPage>;
     setRevisionEnabled(revision: number, enabled: boolean): Promise<void>;
+    summary(): Promise<FilterSummary | undefined>;
     test(payload: Uint8Array | string, headers?: readonly FilterHeader[]): Promise<FilterTestResult>;
 }
 
 // @public
 export type GroupFilterSpec = {
     readonly kind: "definition";
+    readonly name: string;
     readonly filter: ConsumerFilter;
 } | {
     readonly kind: "revision";
@@ -6794,6 +7318,9 @@ interface GroupPolicyUnbound {
     // (undocumented)
     readonly policyGeneration: bigint;
 }
+
+// @public
+type HandledOperations = "any" | readonly string[];
 
 // @public (undocumented)
 export class HandlerConfigError extends LaserError {
@@ -6817,6 +7344,24 @@ const HEADER_SOFT_CAP = 1024;
 
 // @public (undocumented)
 const HEADER_VALUE_MAX = 255;
+
+// @public
+type HeaderField = {
+    readonly kind: "text";
+    readonly value: string;
+} | {
+    readonly kind: "uint8";
+    readonly value: number;
+} | {
+    readonly kind: "uint32";
+    readonly value: number;
+} | {
+    readonly kind: "uint64";
+    readonly value: bigint;
+} | {
+    readonly kind: "float64";
+    readonly value: number;
+};
 
 // @public
 export type HeaderNeed =
@@ -6999,8 +7544,6 @@ interface Hop {
 // @public (undocumented)
 interface HttpCapabilities {
     // (undocumented)
-    readonly agentWorkflow: boolean;
-    // (undocumented)
     readonly authz: boolean;
     // (undocumented)
     readonly backends: readonly BackendDescriptor[];
@@ -7018,6 +7561,8 @@ interface HttpCapabilities {
     readonly managed: boolean;
     // (undocumented)
     readonly query: QueryCapsView;
+    // (undocumented)
+    readonly sessions: boolean;
     // (undocumented)
     readonly topology?: WireTopology;
     // (undocumented)
@@ -7132,11 +7677,7 @@ export class IntegrityError extends LaserError {
 
 // @public (undocumented)
 export class Intent {
-    constructor(options: IntentOptions & {
-        readonly intentId?: IntentId;
-        readonly digest?: string;
-        readonly atMicros?: bigint;
-    });
+    constructor(options: IntentOptions);
     // (undocumented)
     readonly atMicros: bigint;
     // (undocumented)
@@ -7246,7 +7787,13 @@ export class InvalidError extends LaserError {
 }
 
 // @public
+function isAfter(position: MutationPosition, other: MutationPosition): boolean;
+
+// @public
 export function isAmbiguousMutation(error: unknown): boolean;
+
+// @public
+function isBarrierRead(code: number): boolean;
 
 // @public
 export function isBudgetExceeded(error: unknown): boolean;
@@ -7346,6 +7893,9 @@ export interface JsonRpcResponse {
     readonly result?: unknown;
 }
 
+// @public (undocumented)
+function jsonToCbor(value: unknown): unknown;
+
 // @public
 type JsonValue = null | boolean | bigint | number | string | readonly JsonValue[] | ReadonlyMap<string, JsonValue>;
 
@@ -7365,7 +7915,7 @@ export const KeyKind: {
 export type KeyKind = (typeof KeyKind)[keyof typeof KeyKind];
 
 // @public (undocumented)
-interface KeyMatch {
+export interface KeyMatch {
     // (undocumented)
     readonly field: string;
     // (undocumented)
@@ -7424,7 +7974,7 @@ export class Kv {
     deleteMany(): KvDeleteManyRequest;
     // (undocumented)
     exists(key: Uint8Array): Promise<KvMetadata | undefined>;
-    expire(key: Uint8Array, ttlMicros?: bigint, nowMicros?: bigint): Promise<bigint>;
+    expire(key: Uint8Array, ttlMs?: number, nowMicros?: bigint): Promise<bigint>;
     expireAt(key: Uint8Array, expiresAtMicros?: bigint): Promise<bigint>;
     // (undocumented)
     get(key: Uint8Array): Promise<Uint8Array | undefined>;
@@ -7435,16 +7985,18 @@ export class Kv {
     getMany(keys: readonly Uint8Array[]): Promise<readonly (Uint8Array | undefined)[]>;
     // (undocumented)
     getTyped<T>(key: Uint8Array, decodeValue: (value: unknown) => T): Promise<T | undefined>;
-    lease(key: Uint8Array, holderId: string, leaseTtlMicros: bigint): Promise<Lease>;
+    inSession(session: SessionRef): Kv;
+    lease(key: Uint8Array, holderId: string, ttlMs: number): Promise<Lease>;
     // (undocumented)
     moveTo(key: Uint8Array, toKey: Uint8Array): KvCopyRequest;
-    // (undocumented)
-    readonly namespace: string;
+    get namespace(): string;
     patch(key: Uint8Array, patch: Uint8Array): Promise<bigint>;
     release(key: Uint8Array, holderId: string, token: bigint): Promise<boolean>;
-    renewLease(key: Uint8Array, holderId: string, token: bigint, leaseTtlMicros: bigint): Promise<Lease>;
+    renewLease(key: Uint8Array, holderId: string, token: bigint, ttlMs: number): Promise<Lease>;
+    readonly resourceNamespace: string;
     // (undocumented)
     scan(): KvScanRequest;
+    session(): SessionRef | undefined;
     set(key: Uint8Array): KvSetRequest;
 }
 
@@ -7490,6 +8042,8 @@ interface KvCas {
     readonly key: Uint8Array;
     // (undocumented)
     readonly namespace: string;
+    // (undocumented)
+    readonly session?: SessionRef;
     readonly v?: number;
     // (undocumented)
     readonly value: Uint8Array;
@@ -7538,7 +8092,7 @@ export class KvCasFencedRequest {
     json(value: unknown): this;
     // (undocumented)
     msgpack(value: unknown): this;
-    ttl(ttlMicros: bigint, nowMicros?: bigint): this;
+    ttl(ttlMs: number, nowMicros?: bigint): this;
 }
 
 // @public (undocumented)
@@ -7576,6 +8130,8 @@ interface KvDelete {
     readonly key: Uint8Array;
     // (undocumented)
     readonly namespace: string;
+    // (undocumented)
+    readonly session?: SessionRef;
     readonly v?: number;
 }
 
@@ -7596,6 +8152,7 @@ interface KvDeleteMany {
     readonly prefix?: Uint8Array;
     // (undocumented)
     readonly start?: Uint8Array;
+    readonly stream?: string;
     readonly v?: number;
 }
 
@@ -7917,6 +8474,8 @@ interface KvPatch {
     readonly namespace: string;
     // (undocumented)
     readonly patch: Uint8Array;
+    // (undocumented)
+    readonly session?: SessionRef;
     readonly v?: number;
 }
 
@@ -7969,6 +8528,7 @@ interface KvScan {
     readonly prefix?: Uint8Array;
     // (undocumented)
     readonly start?: Uint8Array;
+    readonly stream?: string;
     readonly v?: number;
 }
 
@@ -8000,6 +8560,8 @@ interface KvSet {
     readonly key: Uint8Array;
     // (undocumented)
     readonly namespace: string;
+    // (undocumented)
+    readonly session?: SessionRef;
     readonly v?: number;
     // (undocumented)
     readonly value: Uint8Array;
@@ -8026,16 +8588,27 @@ export class KvSetRequest {
     // (undocumented)
     msgpack(value: unknown): this;
     send(): Promise<void>;
-    ttl(ttlMicros: bigint, nowMicros?: bigint): this;
+    ttl(ttlMs: number, nowMicros?: bigint): this;
 }
 
 // @public (undocumented)
 export class KvSnapshotStore implements SnapshotStore {
-    constructor(laser: Laser, namespace?: string);
+    constructor(laser: Laser, fold: string, namespace?: string);
     // (undocumented)
     latest(conversation: ConversationId): Promise<FoldSnapshot | undefined>;
     // (undocumented)
     save(snapshot: FoldSnapshot): Promise<void>;
+}
+
+// @public
+export class KvStore implements StateStore {
+    constructor(kv: Kv);
+    // (undocumented)
+    delete(key: string): Promise<void>;
+    // (undocumented)
+    get(key: string): Promise<Uint8Array | undefined>;
+    // (undocumented)
+    set(key: string, value: Uint8Array): Promise<void>;
 }
 
 // @public (undocumented)
@@ -8060,8 +8633,7 @@ export class Laser implements AsyncDisposable {
     bindings(): Bindings;
     // (undocumented)
     bindRoles(userId: number, roles: readonly string[], expectRevision?: bigint): Promise<void>;
-    // (undocumented)
-    bootstrap(partitions: number): Promise<void>;
+    bootstrap(partitions: number, retention: TopicRetention): Promise<void>;
     // (undocumented)
     static builder(): LaserBuilder;
     cancelQuery(executionId: QueryExecutionId): Promise<QueryExecutionStatus>;
@@ -8103,9 +8675,7 @@ export class Laser implements AsyncDisposable {
     executeBatch(ops: readonly BatchItem[]): Promise<readonly Uint8Array[]>;
     executeCheckpoint(request: CheckpointRequestEnvelope): Promise<CheckpointMutationResult>;
     executeQuery(query: Query): Promise<QueryResult>;
-    // (undocumented)
     fork(forkId: string): ForkHandle;
-    // (undocumented)
     forks(): Promise<readonly ForkInfo[]>;
     // Warning: (ae-forgotten-export) The symbol "IggyClient" needs to be exported by the entry point full.d.ts
     static fromClient(client: IggyClient, options?: {
@@ -8117,9 +8687,7 @@ export class Laser implements AsyncDisposable {
     getRole(name: string): Promise<Role | undefined>;
     // (undocumented)
     graph(name: string): GraphHandle;
-    // (undocumented)
     kv(namespace: string): Kv;
-    // (undocumented)
     kvNamespaces(): Promise<readonly KvNamespaceInfo[]>;
     // (undocumented)
     listRoles(options?: {
@@ -8134,7 +8702,6 @@ export class Laser implements AsyncDisposable {
     memoryCustom(memory: Memory): MemoryHandle;
     memoryOnTopic(topic: string, stream?: string): MemoryHandle;
     memoryTopic(topic: string): MemoryTopicBuilder;
-    // (undocumented)
     memoryWith(namespace: string, backend: MemoryBackend, embedder?: Embedder): MemoryHandle;
     // (undocumented)
     get opsStream(): string;
@@ -8142,47 +8709,44 @@ export class Laser implements AsyncDisposable {
     projections(): Projections;
     // (undocumented)
     publishCard(source: AgentId, card: AgentCard_2): Promise<void>;
-    // (undocumented)
-    publishStateDelta(topic: string, source: AgentId, conversation: ConversationId, patch: unknown): Promise<void>;
-    // (undocumented)
-    publishStateSnapshot(topic: string, source: AgentId, conversation: ConversationId, state: unknown): Promise<void>;
+    publishStateDelta(source: AgentId, conversation: ConversationId, patch: readonly PatchOp[]): Promise<void>;
+    publishStateSnapshot(source: AgentId, conversation: ConversationId, state: Readonly<Record<string, unknown>>): Promise<void>;
     // (undocumented)
     quarantine(operator: AgentId, agent: AgentId): Promise<void>;
     // (undocumented)
     quarantineSigned(operator: AgentId, agent: AgentId, key: SigningKey): Promise<void>;
-    // (undocumented)
     query(index: string): QueryRequest;
     // (undocumented)
     queryLakehouse(destinationId: DestinationId, destinationGeneration: bigint): QueryRequest;
     queryPage(executionId: QueryExecutionId, cursor: string, deadlineMicros: bigint): Promise<QueryResult>;
     queryStatus(executionId: QueryExecutionId): Promise<QueryExecutionStatus>;
-    // (undocumented)
     queryTarget(target: QueryTarget): QueryRequest;
+    readAt(at: SourceRef): Promise<ContextMessage | undefined>;
     // (undocumented)
     reassembleChannel(conversation: ConversationId, topic: string, channel: ChannelId): Promise<readonly StreamEvent[]>;
-    // (undocumented)
-    reconstructState(conversation: ConversationId, topic: string): Promise<unknown>;
+    reconstructState(conversation: ConversationId): Promise<unknown>;
     // (undocumented)
     redriveDeadLetter(capsule: AgentDeadLetter): Promise<void>;
     // (undocumented)
     refreshCapabilities(): Promise<Capabilities>;
     // (undocumented)
     request(requestTopic: string, replyTopic: string, payload: BytesLike, provenance: Provenance, timeoutMs: number, signal?: AbortSignal): Promise<AgentMessage>;
-    // (undocumented)
-    runs(): Runs;
+    resourceName(name: string): string;
+    resourceNaming(): ResourceNaming;
     // (undocumented)
     scatter(source: AgentId, selector: CapabilitySelector, payload: BytesLike, inboxRoute: InboxRoute, deadlineMs: number): Promise<readonly Uint8Array[]>;
     // (undocumented)
     scatterReport(source: AgentId, selector: CapabilitySelector, payload: BytesLike, inboxRoute: InboxRoute, deadlineMs: number): Promise<ScatterReport>;
     // (undocumented)
     schemas(): Schemas;
+    seenPositions(): AppliedFrontier;
     // (undocumented)
     sendAgent(topic: string, payload: BytesLike, provenance: Provenance, options?: {
         readonly contentType?: ContentType;
     }): Promise<void>;
     sessions(config?: SessionConfig): Sessions;
     // (undocumented)
-    spawnSubconversation(parent: Provenance): Provenance;
+    spawnSubconversation(parent: Provenance, author: AgentId): Provenance;
     // (undocumented)
     stream(name: string): Stream;
     // (undocumented)
@@ -8201,7 +8765,6 @@ export class Laser implements AsyncDisposable {
     withCapabilities(capabilities: Capabilities): Laser;
     withChangesTopic(changesTopic: string): Laser;
     withControlTopic(controlTopic: string): Laser;
-    // (undocumented)
     withDefaultStream(stream: string): Laser;
     withDlqTopic(dlqTopic: string): Laser;
     // (undocumented)
@@ -8209,6 +8772,7 @@ export class Laser implements AsyncDisposable {
     // (undocumented)
     withObserver(observer: LaserObserver): Laser;
     withOpsStream(opsStream: string): Laser;
+    withResourceNaming(naming: ResourceNaming): Laser;
     // (undocumented)
     workflow(name: string): Workflow;
 }
@@ -8228,7 +8792,7 @@ export class LaserBuilder {
     connect(): Promise<Laser>;
     // (undocumented)
     connectionString(value: string): this;
-    connectTimeout(milliseconds: number): this;
+    connectTimeout(timeoutMs: number): this;
     // (undocumented)
     controlTopic(value: string): this;
     // (undocumented)
@@ -8244,9 +8808,10 @@ export class LaserBuilder {
     // (undocumented)
     publishMaxRetries(value: number): this;
     // (undocumented)
-    publishRetryBackoff(milliseconds: number): this;
+    publishRetryBackoff(backoffMs: number): this;
     // (undocumented)
-    publishTimeout(milliseconds: number): this;
+    publishTimeout(timeoutMs: number): this;
+    resourceNaming(value: ResourceNaming): this;
     // (undocumented)
     stream(value: string): this;
     // (undocumented)
@@ -8272,19 +8837,25 @@ export interface LaserObserver {
     start(operation: string, attributes: Readonly<Record<string, unknown>>): SpanScope;
 }
 
-// @public (undocumented)
+// @public
 export class LastN implements ContextPolicy {
     constructor(count: number);
     // (undocumented)
     readonly count: number;
     // (undocumented)
+    name(): string;
+    // (undocumented)
     select(history: readonly ContextMessage[]): readonly ContextMessage[];
+    // (undocumented)
+    selection(history: readonly ContextMessage[]): Selection;
+    // (undocumented)
+    version(): string;
 }
 
 // @public
 export interface Lease {
     // (undocumented)
-    readonly grantedTtlMicros: bigint;
+    readonly grantedTtlMs: number;
     // (undocumented)
     readonly position: MutationPosition;
     // (undocumented)
@@ -8299,6 +8870,12 @@ export const Lifetime: {
 
 // @public (undocumented)
 export type Lifetime = (typeof Lifetime)[keyof typeof Lifetime];
+
+// @public (undocumented)
+type LinkRelation = "wrote" | "recalled" | "touched";
+
+// @public (undocumented)
+export type LinkSurface = "memory" | "kv" | "graph_node" | "graph_edge" | "projection" | "child";
 
 // @public (undocumented)
 interface ListFilterBindings {
@@ -8339,6 +8916,7 @@ interface ListFilters {
     readonly beforeId?: number;
     // (undocumented)
     readonly nameContains?: string;
+    readonly owner?: FilterGroupIdentity;
     // (undocumented)
     readonly page: number;
     // (undocumented)
@@ -8392,6 +8970,7 @@ interface ListRolesReq {
 interface ListSchemas {
     // (undocumented)
     readonly nameContains?: string;
+    readonly stream?: string;
     // (undocumented)
     readonly v: number;
 }
@@ -8545,7 +9124,7 @@ interface MaintenanceCapabilities {
 }
 
 // @public (undocumented)
-const MANAGED_COMMANDS: readonly [ManagedCommand<undefined, AuthzReply>, ManagedCommand<ListRolesReq, AuthzReply>, ManagedCommand<GetRoleReq, AuthzReply>, ManagedCommand<GetBindingsReq, AuthzReply>, ManagedCommand<DefineRoleReq, AuthzReply>, ManagedCommand<DeleteRoleReq, AuthzReply>, ManagedCommand<BindRolesReq, AuthzReply>, ManagedCommand<QueryEnvelope, QueryReply>, ManagedCommand<QueryPageEnvelope, QueryReply>, ManagedCommand<QueryCancelEnvelope, QueryStatusReply>, ManagedCommand<QueryStatusEnvelope, QueryStatusReply>, ManagedCommand<CheckpointRequestEnvelope, CheckpointReply>, ManagedCommand<DestinationGetRequest, CheckpointReadReply>, ManagedCommand<DestinationListRequest, CheckpointReadReply>, ManagedCommand<QueryRouteListRequest, CheckpointReadReply>, ManagedCommand<DestinationHttpRequest, DestinationHttpReply>, ManagedCommand<GetProjection, BrowseReply>, ManagedCommand<ListProjections, BrowseReply>, ManagedCommand<GetSchema, BrowseReply>, ManagedCommand<ListSchemas, BrowseReply>, ManagedCommand<RegisterSchema, BrowseReply>, ManagedCommand<DecodeRecord, BrowseReply>, ManagedCommand<KvGet, KvReply>, ManagedCommand<KvSet, KvReply>, ManagedCommand<KvScan, KvReply>, ManagedCommand<KvDelete, KvReply>, ManagedCommand<KvDeleteMany, KvReply>, ManagedCommand<undefined, KvReply>, ManagedCommand<ForkCreate, ForkReply>, ManagedCommand<ForkDelete, ForkReply>, ManagedCommand<ForkPromote, ForkReply>, ManagedCommand<undefined, ForkReply>, ManagedCommand<ForkPut, ForkReply>, ManagedCommand<AgentSubmit, AgentReply>, ManagedCommand<AgentCancel, AgentReply>, ManagedCommand<AgentStatusReq, AgentReply>, ManagedCommand<AgentList, AgentReply>];
+const MANAGED_COMMANDS: readonly [ManagedCommand<undefined, AuthzReply>, ManagedCommand<ListRolesReq, AuthzReply>, ManagedCommand<GetRoleReq, AuthzReply>, ManagedCommand<GetBindingsReq, AuthzReply>, ManagedCommand<DefineRoleReq, AuthzReply>, ManagedCommand<DeleteRoleReq, AuthzReply>, ManagedCommand<BindRolesReq, AuthzReply>, ManagedCommand<QueryEnvelope, QueryReply>, ManagedCommand<QueryPageEnvelope, QueryReply>, ManagedCommand<QueryCancelEnvelope, QueryStatusReply>, ManagedCommand<QueryStatusEnvelope, QueryStatusReply>, ManagedCommand<CheckpointRequestEnvelope, CheckpointReply>, ManagedCommand<DestinationGetRequest, CheckpointReadReply>, ManagedCommand<DestinationListRequest, CheckpointReadReply>, ManagedCommand<QueryRouteListRequest, CheckpointReadReply>, ManagedCommand<DestinationHttpRequest, DestinationHttpReply>, ManagedCommand<GetProjection, BrowseReply>, ManagedCommand<ListProjections, BrowseReply>, ManagedCommand<GetSchema, BrowseReply>, ManagedCommand<ListSchemas, BrowseReply>, ManagedCommand<RegisterSchema, BrowseReply>, ManagedCommand<DecodeRecord, BrowseReply>, ManagedCommand<KvGet, KvReply>, ManagedCommand<KvSet, KvReply>, ManagedCommand<KvScan, KvReply>, ManagedCommand<KvDelete, KvReply>, ManagedCommand<KvDeleteMany, KvReply>, ManagedCommand<undefined, KvReply>, ManagedCommand<ForkCreate, ForkReply>, ManagedCommand<ForkDelete, ForkReply>, ManagedCommand<ForkPromote, ForkReply>, ManagedCommand<undefined, ForkReply>, ManagedCommand<ForkPut, ForkReply>, ManagedCommand<SessionGet, SessionReply>, ManagedCommand<SessionList, SessionReply>, ManagedCommand<SessionEvents, SessionReply>, ManagedCommand<SessionState_2, SessionReply>, ManagedCommand<SessionLinks, SessionReply>, ManagedCommand<SessionSources, SessionReply>, ManagedCommand<SessionChanges, SessionReply>];
 
 // @public (undocumented)
 const MANAGED_REQUEST_VERSION = 1;
@@ -8581,6 +9160,29 @@ export interface ManagedKvTransport {
     reset(): Promise<void>;
     // (undocumented)
     send(code: number, frame: Uint8Array): Promise<Uint8Array>;
+}
+
+// @public
+interface ManagedReadEnvelope {
+    // (undocumented)
+    readonly logHead?: boolean;
+    // (undocumented)
+    readonly minPosition?: MutationPosition;
+    readonly minSessions?: readonly SessionPosition[];
+    // (undocumented)
+    readonly read: Uint8Array;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public
+interface ManagedReplyEnvelope {
+    // (undocumented)
+    readonly frontier: AppliedFrontier;
+    // (undocumented)
+    readonly reply: Uint8Array;
+    // (undocumented)
+    readonly v: number;
 }
 
 // @public (undocumented)
@@ -8825,6 +9427,15 @@ const MAX_FILTERED_PAGE_EXAMINED = 100000;
 // @public (undocumented)
 const MAX_FILTERED_PAGE_RECORDS = 1000;
 
+// @public
+const MAX_FILTERED_WAIT_CANCEL_IDS = 64;
+
+// @public
+const MAX_FILTERED_WAIT_MS = 20000;
+
+// @public
+const MAX_FILTERED_WAIT_PARTITIONS = 1024;
+
 // @public (undocumented)
 const MAX_FIXED_BYTES = 1048576;
 
@@ -8833,6 +9444,9 @@ const MAX_FORK_ID_BYTES = 128;
 
 // @public (undocumented)
 const MAX_FRAME_BYTES: number;
+
+// @public
+const MAX_GRAPH_LABEL_BYTES = 128;
 
 // @public (undocumented)
 const MAX_GRAPH_NAME_BYTES = 128;
@@ -8846,6 +9460,9 @@ const MAX_GRAPH_RESULT_ELEMENTS = 10000;
 // @public (undocumented)
 const MAX_GRAPH_TRAVERSE_DEPTH = 8;
 
+// @public
+const MAX_HEARTBEAT_SESSIONS = 2048;
+
 // @public (undocumented)
 const MAX_HOLDER_ID_BYTES = 128;
 
@@ -8854,6 +9471,9 @@ const MAX_IDEMPOTENCY_KEY_BYTES = 64;
 
 // @public (undocumented)
 const MAX_INDEX_ENTRIES_PER_RECORD = 32;
+
+// @public
+const MAX_INDEX_FIELD_BYTES = 255;
 
 // @public (undocumented)
 const MAX_KEY_BYTES = 512;
@@ -8871,10 +9491,16 @@ const MAX_LOGICAL_SCHEMA_DEPTH = 16;
 const MAX_LOGICAL_SCHEMA_FIELDS = 4096;
 
 // @public (undocumented)
+const MAX_MANIFEST_FRAGMENTS = 1024;
+
+// @public (undocumented)
 const MAX_MANIFEST_IDENTITY_BYTES = 4096;
 
 // @public (undocumented)
 const MAX_MEMORY_BODY_BYTES: number;
+
+// @public
+const MAX_MEMORY_ID_BYTES = 255;
 
 // @public (undocumented)
 const MAX_MEMORY_TAG_BYTES = 64;
@@ -8901,7 +9527,16 @@ const MAX_NAMESPACE_BYTES = 128;
 const MAX_NAMESPACE_PARTS = 16;
 
 // @public (undocumented)
+const MAX_OPERATOR_ASSERTION_TTL_MICROS = 300000000n;
+
+// @public (undocumented)
 const MAX_PAGE_SIZE = 1000;
+
+// @public (undocumented)
+const MAX_PROJECTION_ID_BYTES = 255;
+
+// @public (undocumented)
+const MAX_PROJECTION_NAME_BYTES = 255;
 
 // @public (undocumented)
 const MAX_PROJECTOR_PAYLOAD_BYTES: number;
@@ -8936,11 +9571,26 @@ const MAX_REGEX_PREDICATES = 4;
 // @public (undocumented)
 const MAX_REPAIR_DETAIL_BYTES = 4096;
 
+// @public
+export const MAX_REPLICATION_FACTOR = 32;
+
 // @public (undocumented)
 const MAX_ROLE_NAME_BYTES = 64;
 
 // @public (undocumented)
 const MAX_SCAN_LIMIT = 1000;
+
+// @public (undocumented)
+const MAX_SCHEMA_NAME_BYTES = 255;
+
+// @public
+const MAX_SESSION_CURSOR_BYTES = 512;
+
+// @public (undocumented)
+const MAX_SESSION_LABEL_BYTES = 256;
+
+// @public
+const MAX_SESSION_TEXT_QUERY_BYTES = 1024;
 
 // @public (undocumented)
 const MAX_SOURCE_PARTITIONS = 65536;
@@ -8949,7 +9599,10 @@ const MAX_SOURCE_PARTITIONS = 65536;
 const MAX_SOURCE_REF_BYTES: number;
 
 // @public (undocumented)
-const MAX_SUPERVISOR_ASSERTION_TTL_MICROS = 300000000n;
+const MAX_STATE_DOCUMENT_BYTES: number;
+
+// @public (undocumented)
+const MAX_STATE_PATCH_OPS = 256;
 
 // @public (undocumented)
 const MAX_TABLE_NAME_BYTES = 255;
@@ -8966,7 +9619,12 @@ const MAX_VECTOR_DIMENSIONS = 65536;
 // @public (undocumented)
 export class McpBridge {
     constructor(laser: Laser, source: AgentId, toolTopic: string, replyTopic: string, serverName: string);
-    callTool(name: string, paramsJson: unknown): Promise<McpToolResult>;
+    callTool(name: string, paramsJson: unknown, options?: {
+        readonly target?: AgentId;
+    }): Promise<McpToolResult>;
+    callToolIn(parent: ConversationId, root: ConversationId, name: string, paramsJson: unknown, options?: {
+        readonly target?: AgentId;
+    }): Promise<McpToolResult>;
     // (undocumented)
     getPrompt(name: string): unknown;
     // (undocumented)
@@ -9212,8 +9870,10 @@ export interface MemoryItem {
     readonly id: MemoryId;
     // (undocumented)
     readonly kind: MemoryKind;
+    readonly origin?: SourceRef;
     // (undocumented)
     readonly payload: Uint8Array;
+    readonly producer?: ProducerInfo;
     // (undocumented)
     readonly provenance: {
         readonly conversationId: ConversationId;
@@ -9270,13 +9930,17 @@ type MemoryRecord = {
     readonly id: string;
     readonly memoryKind: string;
     readonly body: Uint8Array;
+    readonly origin?: SourceRef;
+    readonly producer?: ProducerInfo;
 } | {
     readonly kind: "forget";
     readonly target: string;
+    readonly conversation?: string;
 } | {
     readonly kind: "feedback";
     readonly target: string;
     readonly weight: number;
+    readonly conversation?: string;
 };
 
 // @public (undocumented)
@@ -9292,6 +9956,8 @@ interface MemoryRowScope {
     // (undocumented)
     readonly source?: SourceRef;
     // (undocumented)
+    readonly timestampMicros?: bigint;
+    // (undocumented)
     readonly user?: string;
 }
 
@@ -9305,6 +9971,8 @@ export interface MemoryScope {
     readonly conversation?: ConversationId;
     // (undocumented)
     readonly lifetime?: Lifetime;
+    readonly origin?: SourceRef;
+    readonly producer?: ProducerInfo;
     // (undocumented)
     readonly stream?: string;
     // (undocumented)
@@ -9317,8 +9985,11 @@ export class MemoryTopicBuilder {
     noExpiry(): this;
     partitions(count: number): this;
     stream(name: string): this;
-    ttl(milliseconds: number): this;
+    ttl(ttlMs: number): this;
 }
+
+// @public
+function mergeFrontier(seen: AppliedFrontier, other: AppliedFrontier): AppliedFrontier;
 
 // @public
 export interface Message {
@@ -9350,17 +10021,29 @@ const METADATA_DATA_CLASSIFICATION = "data_classification";
 // @public (undocumented)
 const METADATA_DELEGATED_BY = "on_behalf_of";
 
+// @public
+const METADATA_DURATION_MICROS = "duration_micros";
+
+// @public
+const METADATA_PROVIDER_NAME = "gen_ai.provider.name";
+
 // @public (undocumented)
 const METADATA_PURPOSE = "purpose";
+
+// @public
+const METADATA_REQUEST_MODEL = "gen_ai.request.model";
+
+// @public
+const METADATA_RESPONSE_MODEL = "gen_ai.response.model";
 
 // @public (undocumented)
 const METADATA_ROLE = "role";
 
 // @public (undocumented)
-const METADATA_RUN = "run";
-
-// @public (undocumented)
 const METADATA_SESSION_INTENT = "session_intent";
+
+// @public
+const METADATA_SUBMITTED = "submitted";
 
 // @public (undocumented)
 const METADATA_TASK_CONTEXT = "task_context";
@@ -9386,6 +10069,38 @@ export const MintUlid: {
 };
 
 // @public
+export class ModelCall {
+    complete(response: ModelResponse): Promise<AgdxReceipt>;
+    correlation(): CorrelationId;
+    fail(error: AgentErrorBody): Promise<AgdxReceipt>;
+}
+
+// @public
+export class ModelRequest {
+    constructor(model: string, body: Uint8Array, provider?: string | undefined, operation?: string);
+    // (undocumented)
+    readonly body: Uint8Array;
+    // (undocumented)
+    readonly model: string;
+    // (undocumented)
+    readonly operation: string;
+    // (undocumented)
+    readonly provider?: string | undefined;
+}
+
+// @public
+export interface ModelResponse {
+    // (undocumented)
+    readonly body: Uint8Array;
+    readonly durationMs?: number;
+    // (undocumented)
+    readonly finishReason?: string;
+    readonly model?: string;
+    // (undocumented)
+    readonly usage?: TokenUsage;
+}
+
+// @public
 export class Msgpack<T = unknown> implements Codec<T> {
     constructor(decodeValue?: (value: unknown) => T);
     // (undocumented)
@@ -9399,11 +10114,18 @@ export class Msgpack<T = unknown> implements Codec<T> {
 // @public (undocumented)
 interface MutationCommandEnvelope {
     // (undocumented)
+    readonly actorUserId: number;
+    readonly caller?: Caller;
+    // (undocumented)
     readonly commandCode: number;
+    // (undocumented)
+    readonly deploymentId: bigint;
     // (undocumented)
     readonly operationId: bigint;
     // (undocumented)
     readonly payload: Uint8Array;
+    // (undocumented)
+    readonly scope?: ForwardedScope;
     // (undocumented)
     readonly timestampMicros: bigint;
     // (undocumented)
@@ -9432,6 +10154,9 @@ function newBackendDescriptor(resourceId: BackendResourceId, mode: BackendMode, 
 // @public (undocumented)
 function newBodyRef(reference: string, sizeBytes: bigint, sha256: Uint8Array): BodyRef;
 
+// @public
+export function newLogPosition(streamId: number, topicId: number, partitionId: number, offset: bigint): LogPosition;
+
 // @public (undocumented)
 function newOpVersions(query: number, control: number, kv: number, fork: number): OpVersions;
 
@@ -9459,7 +10184,7 @@ export interface NodeExtract {
 }
 
 // @public (undocumented)
-class NodeId extends WireId<"NodeId"> {
+export class NodeId extends WireId<"NodeId"> {
     // (undocumented)
     static content(label: string, value: Uint8Array): NodeId;
     // (undocumented)
@@ -9511,6 +10236,30 @@ const OPERATION_CARD = "card";
 const OPERATION_CHAT = "chat";
 
 // @public (undocumented)
+const OPERATION_CONTEXT_ASSEMBLED = "context_assembled";
+
+// @public (undocumented)
+const OPERATION_CONTEXT_COMPACTED = "context_compacted";
+
+// @public (undocumented)
+const OPERATION_CONTEXT_RETRIEVED = "context_retrieved";
+
+// @public (undocumented)
+const OPERATION_EXECUTE_TOOL = "execute_tool";
+
+// @public (undocumented)
+const OPERATION_FORCE_CANCEL = "force_cancel";
+
+// @public (undocumented)
+const OPERATION_GENERATE_CONTENT = "generate_content";
+
+// @public (undocumented)
+const OPERATION_INVOKE_AGENT = "invoke_agent";
+
+// @public (undocumented)
+const OPERATION_POLICY_DECISION = "policy_decision";
+
+// @public (undocumented)
 const OPERATION_PROGRESS = "progress";
 
 // @public (undocumented)
@@ -9520,6 +10269,24 @@ const OPERATION_QUARANTINE = "quarantine";
 const OPERATION_REASONING = "reasoning";
 
 // @public (undocumented)
+const OPERATION_SESSION = "session";
+
+// @public (undocumented)
+const OPERATION_SESSION_CANCEL = "session_cancel";
+
+// @public
+const OPERATION_SESSION_PARKED = "session_parked";
+
+// @public (undocumented)
+const OPERATION_SESSION_PAUSE = "session_pause";
+
+// @public (undocumented)
+const OPERATION_SESSION_RESUME = "session_resume";
+
+// @public
+const OPERATION_SESSION_UNPARKED = "session_unparked";
+
+// @public (undocumented)
 const OPERATION_STATE_DELTA = "state_delta";
 
 // @public (undocumented)
@@ -9527,6 +10294,9 @@ const OPERATION_STATE_SNAPSHOT = "state_snapshot";
 
 // @public (undocumented)
 const OPERATION_TASK = "task";
+
+// @public (undocumented)
+const OPERATION_TEXT_COMPLETION = "text_completion";
 
 // @public (undocumented)
 const OPERATION_TOOL_ARGS = "tool_args";
@@ -9550,6 +10320,52 @@ interface OperationErrorView {
 
 // @public (undocumented)
 type OperationState = "accepted" | "running" | "succeeded" | "failed" | "cancelled";
+
+// @public (undocumented)
+const OPERATOR_ASSERTION_KEY_ID_BYTES = 8;
+
+// @public (undocumented)
+const OPERATOR_ASSERTION_SIGNATURE_BYTES = 64;
+
+// @public (undocumented)
+const OPERATOR_ASSERTION_VERSION = 1;
+
+// @public (undocumented)
+interface OperatorActorAssertion {
+    // (undocumented)
+    readonly claims: OperatorActorClaims;
+    // (undocumented)
+    readonly keyId: Uint8Array;
+    // (undocumented)
+    readonly signature: Uint8Array;
+}
+
+// @public (undocumented)
+interface OperatorActorClaims {
+    // (undocumented)
+    readonly action: OperatorAssertionAction;
+    // (undocumented)
+    readonly cloudUserId: number;
+    // (undocumented)
+    readonly deploymentId: number;
+    // (undocumented)
+    readonly destinationGeneration: bigint;
+    // (undocumented)
+    readonly destinationId: DestinationId;
+    // (undocumented)
+    readonly expectedRevision?: bigint;
+    // (undocumented)
+    readonly expiresAtMicros: bigint;
+    // (undocumented)
+    readonly issuedAtMicros: bigint;
+    // (undocumented)
+    readonly requestId: CheckpointRequestId;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public (undocumented)
+type OperatorAssertionAction = "accept_retention_gap" | "supersede_generation" | "record_repair";
 
 // @public (undocumented)
 export const OPS_STREAM_DEFAULT = "_agdx";
@@ -9599,8 +10415,56 @@ export function pageAtLeast(page: Page, rowsOnPage: number): bigint | undefined;
 // @public (undocumented)
 export function pageTotalPages(page: Page): bigint | undefined;
 
+// @public
+const PARAM_AFTER = "after";
+
+// @public
+const PARAM_AGENT = "agent";
+
+// @public
+const PARAM_CURSOR = "cursor";
+
+// @public
+const PARAM_FIXED_FRONTIER = "fixed_frontier";
+
+// @public
+const PARAM_HISTORY_LIMIT = "history_limit";
+
+// @public
+const PARAM_LABEL_PREFIX = "label_prefix";
+
+// @public
+const PARAM_LIMIT = "limit";
+
+// @public
+const PARAM_NAME_CONTAINS = "name_contains";
+
+// @public
+const PARAM_ROOT = "root";
+
+// @public
+const PARAM_STATUS = "status";
+
+// @public
+const PARAM_STREAM = "stream";
+
+// @public
+const PARAM_SURFACE = "surface";
+
+// @public
+const PARAM_TEXT = "text";
+
+// @public
+const PARAM_TOTAL = "total";
+
 // @public (undocumented)
 const PARENT_CONVERSATION_ID = "agdx.parent_conv";
+
+// @public
+export interface ParkedRecords {
+    readonly complete: boolean;
+    readonly records: readonly SessionParking[];
+}
 
 // @public (undocumented)
 function parseAgentId(value: string): AgentId_2;
@@ -9650,6 +10514,20 @@ interface PartitionStart {
 }
 
 // @public (undocumented)
+type PatchOp = {
+    readonly op: "add" | "replace" | "test";
+    readonly path: string;
+    readonly value: unknown;
+} | {
+    readonly op: "remove";
+    readonly path: string;
+} | {
+    readonly op: "move" | "copy";
+    readonly from: string;
+    readonly path: string;
+};
+
+// @public (undocumented)
 interface Path {
     // (undocumented)
     readonly edges: readonly EdgeId[];
@@ -9666,6 +10544,9 @@ export type PathSegment = {
     readonly index: number;
 };
 
+// @public (undocumented)
+function pathSegment(value: string): string;
+
 // @public
 class PayloadDecoders {
     constructor(filter: ConsumerFilter, schemas: readonly SchemaDef[]);
@@ -9678,6 +10559,27 @@ class PayloadFault extends Error {
     constructor(reason: FaultReason);
     // (undocumented)
     readonly reason: FaultReason;
+}
+
+// @public (undocumented)
+interface PayloadRange {
+    // (undocumented)
+    readonly first: bigint;
+    // (undocumented)
+    readonly last: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly topicGeneration: bigint;
+    // (undocumented)
+    readonly topicId: number;
+}
+
+// @public
+export interface PendingControl {
+    readonly cancelRequested: boolean;
+    readonly controlConflict: boolean;
+    readonly pauseRequested: boolean;
 }
 
 // @public (undocumented)
@@ -9768,6 +10670,12 @@ export interface PolicyRef {
     // (undocumented)
     readonly ruleIds: readonly string[];
 }
+
+// @public
+type PositionSurface = "kv" | "fork" | "graph";
+
+// @public
+function positionSurfaceOf(code: number): PositionSurface | undefined;
 
 // @public (undocumented)
 export interface Predicate {
@@ -9961,6 +10869,14 @@ export interface ProducerBackgroundOptions {
     readonly shards?: number;
 }
 
+// @public (undocumented)
+export interface ProducerInfo {
+    // (undocumented)
+    readonly name: string;
+    // (undocumented)
+    readonly version: string;
+}
+
 // @public
 export class ProducerMessage {
     constructor(payload: BytesLike);
@@ -9978,11 +10894,12 @@ export interface ProducerOptions {
     readonly batchLength?: number;
     readonly createStream?: boolean;
     readonly createTopic?: boolean;
-    readonly expireAfterMicros?: bigint;
+    readonly expireAfterMs?: number;
     readonly lingerMs?: number;
     readonly maxTopicBytes?: bigint;
     readonly neverExpire?: boolean;
     readonly partitions?: number;
+    readonly replicationFactor?: number;
     readonly retries?: number;
     readonly retryBackoffMs?: number;
     // (undocumented)
@@ -10027,6 +10944,7 @@ export interface ProjectionBinding {
     readonly notify: boolean;
     // (undocumented)
     readonly retention?: RetentionPolicy;
+    readonly skipRejected: boolean;
     // (undocumented)
     readonly source: SourceSelector;
 }
@@ -10042,6 +10960,7 @@ export class ProjectionBindingBuilder {
     retention(retention: RetentionPolicy): this;
     // (undocumented)
     selector(source: SourceSelector): this;
+    skipRejected(): this;
     source(stream: string, topic: string): this;
     tryBuild(): ProjectionBinding | undefined;
 }
@@ -10133,7 +11052,6 @@ const PROJECTIONS_PATH = "/agdx/projections";
 
 // @public (undocumented)
 export class ProjectionsRequest {
-    // (undocumented)
     fetch(): Promise<readonly ProjectionInfo[]>;
     // (undocumented)
     forTopic(topic: string): this;
@@ -10213,6 +11131,9 @@ export class ProvenanceError extends LaserError {
 
 // @public (undocumented)
 export function provenancePartitionKey(provenance: Provenance): string;
+
+// @public (undocumented)
+const PROVIDER_NAME = "gen_ai.provider.name";
 
 // @public (undocumented)
 export type PublicCheckpointMutation = {
@@ -10437,6 +11358,44 @@ const QUERY_PATH = "/agdx/query";
 // @public (undocumented)
 const QUERY_ROUTES_PATH = "/agdx/query-routes";
 
+// @public
+export class QueryBuilder {
+    // (undocumented)
+    aggregate(aggregate: Aggregate | undefined): this;
+    build(): Query;
+    // (undocumented)
+    byKey(byKey: readonly KeyMatch[]): this;
+    // (undocumented)
+    consistency(consistency: Consistency): this;
+    deadlineMicros(deadlineMicros: bigint): this;
+    // (undocumented)
+    distinct(distinct: boolean): this;
+    // (undocumented)
+    executionId(executionId: QueryExecutionId): this;
+    // (undocumented)
+    filter(filter: Filter | undefined): this;
+    fork(fork: string | undefined): this;
+    // (undocumented)
+    having(having: Filter | undefined): this;
+    // (undocumented)
+    messageType(messageType: string | undefined): this;
+    // (undocumented)
+    order(order: readonly Sort[]): this;
+    // (undocumented)
+    page(page: QueryPageRequest): this;
+    // (undocumented)
+    rawSql(rawSql: RawSql | undefined): this;
+    // (undocumented)
+    select(select: Select): this;
+    // (undocumented)
+    target(target: QueryTarget): this;
+    // (undocumented)
+    text(text: TextQuery | undefined): this;
+    timeRange(timeRange: readonly [bigint, bigint] | undefined): this;
+    // (undocumented)
+    vector(vector: VectorQuery | undefined): this;
+}
+
 // @public (undocumented)
 const QueryCancelCommand: ManagedCommand<QueryCancelEnvelope, QueryCancelReply>;
 
@@ -10527,6 +11486,7 @@ export interface QueryContext {
     readonly engine: QueryEngine;
     // (undocumented)
     readonly executionId: QueryExecutionId;
+    readonly frontier: readonly QueryFrontier[];
     // (undocumented)
     readonly globalStateRevision?: bigint;
     // (undocumented)
@@ -10613,7 +11573,7 @@ export class QueryExecutionError extends LaserError {
 }
 
 // @public (undocumented)
-class QueryExecutionId extends WireId<"QueryExecutionId"> {
+export class QueryExecutionId extends WireId<"QueryExecutionId"> {
     // (undocumented)
     static fromBytes(bytes: Uint8Array): QueryExecutionId;
     // (undocumented)
@@ -10656,6 +11616,18 @@ interface QueryExecutionView {
     readonly status: QueryExecutionStatus;
 }
 
+// @public
+export interface QueryFrontier {
+    readonly appliedOffset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly stream: string;
+    // (undocumented)
+    readonly topic: string;
+    readonly topicCreatedAtMicros?: bigint;
+}
+
 // @public (undocumented)
 const QueryPageCommand: ManagedCommand<QueryPageEnvelope, QueryReply>;
 
@@ -10675,7 +11647,7 @@ interface QueryPageEnvelope {
 const queryPagePath: (id: QueryExecutionId) => string;
 
 // @public (undocumented)
-interface QueryPageRequest {
+export interface QueryPageRequest {
     // (undocumented)
     readonly cursor?: string;
     // (undocumented)
@@ -10721,7 +11693,7 @@ export class QueryRequest {
     countDistinct(field: string, alias?: string): this;
     // (undocumented)
     cursor(value: string): this;
-    deadline(milliseconds: number): this;
+    deadline(timeoutMs: number): this;
     deadlineMicros(value: bigint): this;
     // (undocumented)
     distinct(): this;
@@ -10756,7 +11728,6 @@ export class QueryRequest {
     filterNe(field: string, value: TypedValue): this;
     // (undocumented)
     filterPrefix(field: string, value: string): this;
-    // (undocumented)
     fork(forkId: string): this;
     // (undocumented)
     groupBy(fields: readonly string[]): this;
@@ -10805,7 +11776,6 @@ export class QueryRequest {
     text(query: string): this;
     // (undocumented)
     textIn(field: string, query: string): this;
-    // (undocumented)
     timeRange(startMicros: bigint, endMicros: bigint): this;
     // (undocumented)
     whereEq(field: string, value: string | TypedValue): this;
@@ -10960,7 +11930,7 @@ export class QuorumGovernor implements ActionGovernor {
     // (undocumented)
     decide(action: GovernedAction): Promise<ActionDecision>;
     // (undocumented)
-    voter(name: string, governor: ActionGovernor, mandatory?: boolean): this;
+    voter(name: string, governor: ActionGovernor, mandatory: boolean): this;
 }
 
 // @public
@@ -10974,7 +11944,7 @@ export type QuorumPolicy = {
 };
 
 // @public (undocumented)
-interface RawSql {
+export interface RawSql {
     // (undocumented)
     readonly dialect: SqlDialect;
     // (undocumented)
@@ -10985,12 +11955,6 @@ interface RawSql {
 
 // @public (undocumented)
 export function readinessReasons(capabilities: Capabilities, resourceId: BackendResourceId): readonly BackendReadinessReason[] | undefined;
-
-// @public
-export type ReadMode = "primary" | "local";
-
-// @public (undocumented)
-export function readModeIsPrimary(mode: ReadMode): boolean;
 
 // @public (undocumented)
 export class RecallBuilder {
@@ -11071,6 +12035,44 @@ interface RecordFault {
     readonly reason: FaultReason;
 }
 
+// @public
+interface RecordHeaders {
+    // (undocumented)
+    readonly addressee?: Addressee;
+    // (undocumented)
+    readonly agent?: string;
+    // (undocumented)
+    readonly causalParent?: string;
+    // (undocumented)
+    readonly conversation: string;
+    // (undocumented)
+    readonly correlation?: string;
+    // (undocumented)
+    readonly costUsd?: number;
+    // (undocumented)
+    readonly deadlineMicros?: bigint;
+    // (undocumented)
+    readonly envelope?: {
+        readonly version: number;
+        readonly contentType: number;
+    };
+    // (undocumented)
+    readonly fence?: bigint;
+    // (undocumented)
+    readonly idempotencyKey?: string;
+    // (undocumented)
+    readonly inputTokens?: bigint;
+    // (undocumented)
+    readonly outputTokens?: bigint;
+    // (undocumented)
+    readonly parent?: string;
+    // (undocumented)
+    readonly root?: string;
+}
+
+// @public
+function recordHeadersForEnvelope(envelope: AgentEnvelope, contentType: ContentType, broadcast?: boolean): RecordHeaders;
+
 // @public (undocumented)
 export class RecordId extends WireId<"RecordId"> {
     // (undocumented)
@@ -11088,6 +12090,22 @@ export type RecordPolicy = "reject" | "pass";
 
 // @public (undocumented)
 export function recordPolicyIsReject(policy: RecordPolicy): boolean;
+
+// @public
+interface RecordSkip {
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly reason: string;
+    // (undocumented)
+    readonly source: SourceSelector;
+    // (undocumented)
+    readonly target: string;
+    // (undocumented)
+    readonly topicCreatedAtMicros: bigint;
+}
 
 // @public (undocumented)
 type RecreatedPartitionPolicy = "reject";
@@ -11108,6 +12126,7 @@ interface RegisterSchema {
     readonly name?: string;
     // (undocumented)
     readonly source: SchemaSource;
+    readonly stream?: string;
     // (undocumented)
     readonly v: number;
     // (undocumented)
@@ -11138,8 +12157,6 @@ export class RejectedError extends LaserError {
 export class ReliableConsumer {
     constructor(options: ReliableConsumerOptions);
     // Warning: (ae-forgotten-export) The symbol "ReliableConsumerControl" needs to be exported by the entry point full.d.ts
-    //
-    // (undocumented)
     run(laser: Laser, handler: AgentHandler, control?: ReliableConsumerControl): Promise<void>;
 }
 
@@ -11163,16 +12180,17 @@ export interface ReliableConsumerOptions {
     readonly maxQueuedBytes?: number;
     // (undocumented)
     readonly maxQueuedRecords?: number;
+    readonly maxWaitMs?: number;
     // (undocumented)
     readonly middleware?: readonly AgentMiddleware[];
     // (undocumented)
     readonly onDeadLetter?: DeadLetterSink;
-    // (undocumented)
-    readonly pollIntervalMs?: number;
+    readonly operations?: readonly string[];
     // (undocumented)
     readonly respondOn?: string;
     // (undocumented)
     readonly retry?: RetryPolicy;
+    readonly sessions?: SessionConfig;
     readonly shutdownGraceMs?: number;
     // (undocumented)
     readonly signingKey?: SigningKey;
@@ -11198,6 +12216,8 @@ export class RememberBuilder {
     durable(): this;
     // (undocumented)
     kind(kind: MemoryKind): this;
+    origin(origin: SourceRef): this;
+    producer(producer: ProducerInfo): this;
     scope(conversation: ConversationId): this;
     // (undocumented)
     send(): Promise<MemoryId>;
@@ -11221,7 +12241,7 @@ interface RepairRecord {
 // @public (undocumented)
 export type ReplayBound = {
     readonly kind: "from-offsets";
-    readonly offsets: ReadonlyMap<number, bigint>;
+    readonly offsets: ReadonlyMap<string, ReadonlyMap<number, bigint>>;
 } | {
     readonly kind: "from-checkpoint";
     readonly checkpoint: Checkpoint;
@@ -11234,6 +12254,9 @@ export type ReplayBound = {
 } | {
     readonly kind: "full";
 };
+
+// @public (undocumented)
+const REQUEST_MODEL = "gen_ai.request.model";
 
 // @public (undocumented)
 export function requiring(envelope: AgentEnvelope, bits: bigint): AgentEnvelope;
@@ -11264,7 +12287,10 @@ export interface Reranker {
     rerank(query: string, items: readonly MemoryItem[]): Promise<readonly MemoryItem[]>;
 }
 
-// @public (undocumented)
+// @public
+const RESERVED_PROJECTION_ID_PREFIX = "index:";
+
+// @public
 export function resolveBody(store: BlobStore, payload: Uint8Array): Promise<Uint8Array>;
 
 // @public (undocumented)
@@ -11326,6 +12352,9 @@ export function resolveTargets(router: Router, registry: RegistryView, nowMicros
 // @public (undocumented)
 export type ResourceKind = "all" | "literal" | "prefix";
 
+// @public
+export type ResourceNaming = "stream" | "bare";
+
 // @public (undocumented)
 export interface ResourcePattern {
     // (undocumented)
@@ -11347,6 +12376,9 @@ export function resourcePatternMatches(pattern: ResourcePattern, resource?: stri
 export function resourcePatternPrefix(value: string): ResourcePattern;
 
 // @public (undocumented)
+const RESPONSE_MODEL = "gen_ai.response.model";
+
+// @public (undocumented)
 export function responseEnvelope(record: RecordId, conversation: ConversationId_2, source: AgentId_2, correlation: CorrelationId, body: Uint8Array): AgentEnvelope;
 
 // @public (undocumented)
@@ -11366,6 +12398,12 @@ function resultCodeFromWord(word: string): ResultCode | undefined;
 
 // @public (undocumented)
 export function resultCodeHttpStatus(value: ResultCode): number;
+
+// @public
+export function resultCodeIsBackendUnavailable(value: ResultCode): boolean;
+
+// @public
+export function resultCodeIsPending(value: ResultCode): boolean;
 
 // @public
 function resultCodeIsRetryable(value: ResultCode): boolean;
@@ -11391,6 +12429,8 @@ const ResultCodeName: {
     readonly ExpiredSnapshot: 16;
     readonly StaleGeneration: 17;
     readonly TargetUnavailable: 18;
+    readonly Pending: 19;
+    readonly BackendUnavailable: 20;
 };
 
 // @public (undocumented)
@@ -11400,7 +12440,7 @@ function resultCodeToCode(value: ResultCode): number;
 function resultCodeWord(value: ResultCode): string | undefined;
 
 // @public (undocumented)
-export function resumeOffsets(snapshot: FoldSnapshot): ReadonlyMap<number, bigint>;
+export function resumeOffsets(snapshot: FoldSnapshot): readonly SnapshotOffset[];
 
 // @public (undocumented)
 interface RetentionGap {
@@ -11456,11 +12496,17 @@ interface RoleBinding {
     readonly userId: number;
 }
 
-// @public (undocumented)
+// @public
 export class RoleFilter implements ContextPolicy {
     constructor(agents: Iterable<AgentId>);
     // (undocumented)
+    name(): string;
+    // (undocumented)
     select(history: readonly ContextMessage[]): readonly ContextMessage[];
+    // (undocumented)
+    selection(history: readonly ContextMessage[]): Selection;
+    // (undocumented)
+    version(): string;
 }
 
 // @public (undocumented)
@@ -11570,77 +12616,6 @@ export interface Row {
 }
 
 // @public (undocumented)
-interface RunBudget {
-    // (undocumented)
-    readonly maxCostUsd?: number;
-    // (undocumented)
-    readonly maxDepth?: number;
-    // (undocumented)
-    readonly maxEvents?: bigint;
-    // (undocumented)
-    readonly maxModelCalls?: bigint;
-    // (undocumented)
-    readonly maxPatches?: bigint;
-    // (undocumented)
-    readonly maxToolCalls?: bigint;
-    // (undocumented)
-    readonly maxWallClockMicros?: bigint;
-}
-
-// @public (undocumented)
-const runCancelPath: (id: string) => string;
-
-// @public (undocumented)
-export class RunListRequest {
-    // (undocumented)
-    agent(agentId: string): this;
-    // (undocumented)
-    cursor(cursor: Uint8Array): this;
-    // (undocumented)
-    fetch(): Promise<RunPage>;
-    // (undocumented)
-    limit(limit: number): this;
-    // (undocumented)
-    state(state: AgentRunState): this;
-}
-
-// @public (undocumented)
-export interface RunPage {
-    // (undocumented)
-    readonly cursor?: Uint8Array;
-    // (undocumented)
-    readonly runs: readonly AgentRunInfo[];
-}
-
-// @public (undocumented)
-const runPath: (id: string) => string;
-
-// @public (undocumented)
-export class Runs {
-    // (undocumented)
-    cancel(runId: string): Promise<AgentRunInfo>;
-    // (undocumented)
-    list(): RunListRequest;
-    // (undocumented)
-    registerSource(stream: string, topic: string): Promise<void>;
-    // (undocumented)
-    removeSource(stream: string, topic: string): Promise<void>;
-    // (undocumented)
-    status(runId: string): Promise<AgentRunInfo>;
-    // (undocumented)
-    submit(agentId: string, input?: Uint8Array): Promise<AgentRunInfo>;
-    // (undocumented)
-    submitBudgeted(agentId: string, budget: RunBudget, input?: Uint8Array): Promise<AgentRunInfo>;
-    // Warning: (ae-forgotten-export) The symbol "SubmitOptions" needs to be exported by the entry point full.d.ts
-    //
-    // (undocumented)
-    submitWith(agentId: string, options?: SubmitOptions): Promise<AgentRunInfo>;
-}
-
-// @public (undocumented)
-const RUNS_PATH = "/agdx/runs";
-
-// @public (undocumented)
 function rustDouble(value: number): string;
 
 // @public (undocumented)
@@ -11721,8 +12696,28 @@ export interface SchemaInfo {
     readonly schema: SchemaDef;
 }
 
+// @public
+interface SchemaListQuery {
+    // (undocumented)
+    readonly nameContains?: string;
+    // (undocumented)
+    readonly stream?: string;
+}
+
+// @public (undocumented)
+function schemaListQueryParams(query: SchemaListQuery): URLSearchParams;
+
 // @public (undocumented)
 const schemaPath: (id: number) => string;
+
+// @public
+interface SchemaQuery {
+    // (undocumented)
+    readonly stream?: string;
+}
+
+// @public (undocumented)
+function schemaQueryParams(query: SchemaQuery): URLSearchParams;
 
 // @public (undocumented)
 export class Schemas {
@@ -11764,19 +12759,46 @@ export class ScopedMemory {
     // (undocumented)
     readonly handle: MemoryHandle;
     improve(feedback: Feedback): Promise<MemoryId>;
+    origin(): SourceRef | undefined;
+    producer(): ProducerInfo | undefined;
     // (undocumented)
     recall(): RecallBuilder;
     // (undocumented)
     remember(payload: Uint8Array): RememberBuilder;
-    search(query: string, limit?: number): Promise<readonly MemoryItem[]>;
+    search(query: string, options?: {
+        readonly limit?: number;
+        readonly folded?: boolean;
+    }): Promise<readonly MemoryItem[]>;
+    withLineage(origin?: SourceRef, producer?: ProducerInfo): ScopedMemory;
+}
+
+// @public
+function scopedResource(stream: string, local: string): string;
+
+// @public (undocumented)
+interface SdkInfo {
+    // (undocumented)
+    readonly language: string;
+    // (undocumented)
+    readonly version: string;
 }
 
 // @public (undocumented)
-interface Select {
+export interface Select {
     // (undocumented)
     readonly fields: readonly string[];
     // (undocumented)
     readonly payload: boolean;
+}
+
+// @public
+export interface Selection {
+    // (undocumented)
+    readonly dropped: readonly ContextMessage[];
+    // (undocumented)
+    readonly kept: readonly ContextMessage[];
+    // (undocumented)
+    readonly reason: string;
 }
 
 export { SendMessagesConfirmation }
@@ -11788,24 +12810,132 @@ export function servesConsistency(capabilities: Capabilities, level: Consistency
 
 // @public
 export class Session {
-    // (undocumented)
-    append(kind: SessionTurnKind, data: BytesLike): Promise<void>;
+    actingOn(source: SourceRef): Session;
+    get agent(): AgentId | undefined;
+    append(envelope: AgentEnvelope): Promise<AgdxReceipt>;
+    asAgent(agent: AgentId): Session;
+    assemble(policy: ContextPolicy): Promise<AssembledContext>;
+    cancel(): Promise<void>;
+    cancelRequested(): Promise<boolean>;
     checkpoint(): Promise<Checkpoint>;
     // (undocumented)
     readonly config: SessionConfig;
     context(): Promise<readonly SessionTurn[]>;
-    // (undocumented)
     contextWith(policy: ContextPolicy): Promise<readonly SessionTurn[]>;
-    // (undocumented)
     get conversation(): ConversationId;
+    end(): Promise<void>;
+    fail(error: AgentErrorBody): Promise<void>;
     graph(name: string): GraphHandle;
+    kv(namespace: string): Kv;
+    linkedGraph(name: string): GraphHandle;
+    linkedMemory(): ScopedMemory;
     memory(namespace?: string): ScopedMemory;
+    model(request: ModelRequest, assembled?: AssembledContext): Promise<ModelCall>;
+    overBudget(): Promise<boolean>;
+    get parent(): ConversationId | undefined;
+    parked(): Promise<ParkedRecords>;
+    pendingControl(): Promise<PendingControl>;
+    recordCompaction(compaction: ContextCompaction): Promise<AgdxReceipt>;
+    recordModelCall(request: ModelRequest, response: ModelResponse, assembled?: AssembledContext): Promise<AgdxReceipt>;
+    recordRetrieval(query: string | undefined, items: readonly MemoryItem[]): Promise<AgdxReceipt>;
+    redact(redactor: (value: unknown) => unknown): Session;
+    reference(): SessionRef;
     replay<State>(checkpoint: Checkpoint, initial: State, fold: (state: State, turn: SessionTurn) => State): Promise<State>;
-    // (undocumented)
+    get root(): ConversationId | undefined;
+    run<T>(lease: SessionLease, work: (session: Session) => T | Promise<T>): Promise<T>;
     readonly scope: ContextScope;
+    signedBy(key: SigningKey): Session;
+    state(): SessionState;
     stateAt<State>(checkpoint: Checkpoint, initial: State, fold: (state: State, turn: SessionTurn) => State): Promise<State>;
+    status(): Promise<SessionInfo>;
+    stream(): string;
+    tool(name: string, args: unknown): Promise<ToolCall>;
     turnsAt(checkpoint: Checkpoint): Promise<readonly SessionTurn[]>;
     turnsSince(checkpoint: Checkpoint): Promise<readonly SessionTurn[]>;
+}
+
+// @public
+export interface SessionBootstrap {
+    readonly registered: boolean;
+}
+
+// @public
+export class SessionBuilder {
+    agent(agent: AgentId): this;
+    begin(): Promise<{
+        readonly session: Session;
+        readonly lease: SessionLease;
+    }>;
+    budget(budget: Budget): this;
+    id(): ConversationId;
+    idleTimeout(timeoutMs: number): this;
+    namespace(namespace: string): this;
+    parent(parent: ConversationId, root: ConversationId): this;
+    tag(tag: string): this;
+    withId(id: ConversationId): this;
+}
+
+// @public
+export type SessionChange = {
+    readonly kind: "changed";
+    readonly sessions: readonly ConversationId_2[];
+} | {
+    readonly kind: "resync";
+};
+
+// @public
+type SessionChangeOrigin = "records" | "links" | "maintenance" | "expiry";
+
+// @public (undocumented)
+interface SessionChangeRow {
+    readonly origin?: SessionChangeOrigin;
+    readonly positions: readonly LogPosition[];
+    // (undocumented)
+    readonly seq: bigint;
+    // (undocumented)
+    readonly sessions: readonly ConversationId_2[];
+    // (undocumented)
+    readonly truncated: boolean;
+}
+
+// @public (undocumented)
+interface SessionChanges {
+    // (undocumented)
+    readonly after: bigint;
+    readonly limit: number;
+    readonly series?: bigint;
+    // (undocumented)
+    readonly stream: string;
+}
+
+// @public (undocumented)
+const SessionChangesCommand: ManagedCommand<SessionChanges, SessionReply>;
+
+// @public (undocumented)
+const sessionChangesPath: (stream: string) => string;
+
+// @public
+interface SessionChangesQuery {
+    // (undocumented)
+    readonly after?: bigint;
+    // (undocumented)
+    readonly limit?: number;
+    // (undocumented)
+    readonly series?: bigint;
+}
+
+// @public (undocumented)
+function sessionChangesQueryParams(query: SessionChangesQuery): URLSearchParams;
+
+// @public
+interface SessionChangesView {
+    // (undocumented)
+    readonly floor: bigint;
+    // (undocumented)
+    readonly resync: boolean;
+    // (undocumented)
+    readonly rows: readonly SessionChangeRow[];
+    readonly series: bigint;
 }
 
 // @public
@@ -11814,47 +12944,684 @@ export class SessionConfig {
     contextTokens(tokens: number): SessionConfig;
     get contextTurnBound(): number;
     contextTurns(turns: number): SessionConfig;
-    kindFor(topic: string): SessionTurnKind | undefined;
+    failOnDeadLetter(fail: boolean): SessionConfig;
+    get failsOnDeadLetter(): boolean;
+    heartbeat(intervalMs: number): SessionConfig;
+    get heartbeatValue(): number;
+    idleTimeout(timeoutMs: number): SessionConfig;
+    get idleTimeoutValue(): number;
+    layout(layout: SessionLayout): SessionConfig;
+    get layoutKind(): SessionLayout;
     memoryNamespace(namespace: string): SessionConfig;
     get memoryNamespaceName(): string;
+    registerSource(register: boolean): SessionConfig;
+    get registersSource(): boolean;
+    sdk(language: string, version: string): SessionConfig;
+    get sdkInfo(): SdkInfo;
     stream(stream: string): SessionConfig;
     get streamName(): string | undefined;
-    topic(kind: SessionTurnKind, topic: string): SessionConfig;
-    topicFor(kind: SessionTurnKind): string;
-    topics(): readonly string[];
+}
+
+// @public
+export class SessionControl {
+    asOperator(operator: AgentId): SessionControl;
+    cancel(): Promise<AgdxReceipt>;
+    forceCancel(): Promise<AgdxReceipt>;
+    participants(participants: Iterable<AgentId>): SessionControl;
+    pause(): Promise<AgdxReceipt>;
+    resume(): Promise<AgdxReceipt>;
+    signedBy(key: SigningKey): SessionControl;
+}
+
+// @public (undocumented)
+interface SessionEnd {
+    // (undocumented)
+    readonly error?: AgentErrorBody;
+    // (undocumented)
+    readonly reason?: string;
+}
+
+// @public
+export class SessionError extends LaserError {
+    constructor(message: string, detail: SessionError_2, options?: {
+        cause?: unknown;
+    });
+    // (undocumented)
+    readonly detail: SessionError_2;
+}
+
+// @public (undocumented)
+type SessionError_2 = {
+    readonly kind: SessionErrorKind;
+    readonly message: string;
+} | {
+    readonly kind: "unrecognized";
+    readonly tag: string;
+    readonly value: unknown;
+};
+
+// @public
+function sessionErrorBody(error: SessionError_2): ErrorBody;
+
+// @public (undocumented)
+type SessionErrorKind = "unsupported" | "notFound" | "notRegistered" | "invalid" | "unauthorized" | "stale" | "backend" | "unavailable";
+
+// @public
+function sessionErrorMessage(error: SessionError_2): string;
+
+// @public
+function sessionErrorResultCode(error: SessionError_2): ResultCode;
+
+// @public (undocumented)
+interface SessionEvent {
+    // (undocumented)
+    readonly addressee?: string;
+    // (undocumented)
+    readonly afterEnd: boolean;
+    // (undocumented)
+    readonly agent?: AgentId_2;
+    // (undocumented)
+    readonly at: SourceRef;
+    // (undocumented)
+    readonly brokerTs: bigint;
+    // (undocumented)
+    readonly cause?: LogPosition;
+    // (undocumented)
+    readonly correlation?: CorrelationId;
+    // (undocumented)
+    readonly display: string;
+    // (undocumented)
+    readonly kind: string;
+    // (undocumented)
+    readonly operation?: string;
+    // (undocumented)
+    readonly session: ConversationId_2;
+    // (undocumented)
+    readonly summary: ReadonlyMap<string, unknown>;
+    // (undocumented)
+    readonly tool?: string;
+    // (undocumented)
+    readonly usage?: TokenUsage;
+    readonly verifiedActor?: string;
+}
+
+// @public (undocumented)
+interface SessionEvents {
+    // (undocumented)
+    readonly cursor?: string;
+    // (undocumented)
+    readonly fixedFrontier: boolean;
+    // (undocumented)
+    readonly id: ConversationId_2;
+    readonly limit: number;
+    // (undocumented)
+    readonly stream: string;
+}
+
+// @public (undocumented)
+const SessionEventsCommand: ManagedCommand<SessionEvents, SessionReply>;
+
+// @public (undocumented)
+export interface SessionEventsPage {
+    // (undocumented)
+    readonly cursor?: string;
+    // (undocumented)
+    readonly fixedFrontier: boolean;
+    // (undocumented)
+    readonly frontier: readonly SourceFrontier[];
+    // (undocumented)
+    readonly gaps: readonly SourceGap[];
+    // (undocumented)
+    readonly items: readonly SessionEvent[];
+    // (undocumented)
+    readonly ranges: readonly PayloadRange[];
+}
+
+// @public (undocumented)
+const sessionEventsPath: (stream: string, id: ConversationId_2) => string;
+
+// @public
+interface SessionEventsQuery {
+    // (undocumented)
+    readonly cursor?: string;
+    // (undocumented)
+    readonly fixedFrontier?: boolean;
+    // (undocumented)
+    readonly limit?: number;
+}
+
+// @public (undocumented)
+function sessionEventsQueryParams(query: SessionEventsQuery): URLSearchParams;
+
+// @public
+export class SessionEventsRequest {
+    cursor(cursor: string): this;
+    fetch(): Promise<SessionEventsPage>;
+    fixedFrontier(): this;
+    limit(limit: number): this;
+}
+
+// @public (undocumented)
+interface SessionFlags {
+    readonly controlConflict: boolean;
+    // (undocumented)
+    readonly eventsTruncated: boolean;
+    // (undocumented)
+    readonly labelTruncated: boolean;
+    // (undocumented)
+    readonly laneConflict: boolean;
+    readonly livenessUnknown: boolean;
+    // (undocumented)
+    readonly overflow: boolean;
+    // (undocumented)
+    readonly rebuilding: boolean;
+}
+
+// @public (undocumented)
+interface SessionGet {
+    // (undocumented)
+    readonly id: ConversationId_2;
+    // (undocumented)
+    readonly stream: string;
+}
+
+// @public (undocumented)
+const SessionGetCommand: ManagedCommand<SessionGet, SessionReply>;
+
+// @public
+interface SessionHeartbeat {
+    // (undocumented)
+    readonly process: string;
+    // (undocumented)
+    readonly sessions: readonly ConversationId_2[];
+    // (undocumented)
+    readonly stream: string;
+}
+
+// @public (undocumented)
+export interface SessionInfo {
+    // (undocumented)
+    readonly agent?: AgentId_2;
+    // (undocumented)
+    readonly budget?: Budget;
+    // (undocumented)
+    readonly cancelRequested: boolean;
+    // (undocumented)
+    readonly costMicros: bigint;
+    // (undocumented)
+    readonly endedAt?: bigint;
+    // (undocumented)
+    readonly errors: bigint;
+    // (undocumented)
+    readonly events: bigint;
+    // (undocumented)
+    readonly firstEventAt?: bigint;
+    // (undocumented)
+    readonly flags: SessionFlags;
+    // (undocumented)
+    readonly frontier: readonly SourceFrontier[];
+    readonly held: bigint;
+    // (undocumented)
+    readonly id: ConversationId_2;
+    // (undocumented)
+    readonly idle: boolean;
+    // (undocumented)
+    readonly label?: string;
+    // (undocumented)
+    readonly lastEventAt?: bigint;
+    // (undocumented)
+    readonly lastHeartbeatAt?: bigint;
+    // (undocumented)
+    readonly modelCalls: bigint;
+    // (undocumented)
+    readonly namespace?: string;
+    // (undocumented)
+    readonly overBudget: boolean;
+    // (undocumented)
+    readonly parent?: ConversationId_2;
+    // (undocumented)
+    readonly pauseRequested: boolean;
+    // (undocumented)
+    readonly root?: ConversationId_2;
+    // (undocumented)
+    readonly sdk?: SdkInfo;
+    // (undocumented)
+    readonly startedAt?: bigint;
+    // (undocumented)
+    readonly status: SessionStatus;
+    // (undocumented)
+    readonly stream: string;
+    // (undocumented)
+    readonly tokensIn: bigint;
+    // (undocumented)
+    readonly tokensOut: bigint;
+    // (undocumented)
+    readonly toolCalls: bigint;
+}
+
+// @public
+export type SessionLayout =
+/** One `agent.sessions` topic keyed by session. The default. */
+    {
+    readonly kind: "shared";
+}
+/** Each declared agent reads its own topic, keyed by session. Commands,
+* replies, and chunks addressed to a declared agent on `agent.sessions`
+* land on its topic, everything else stays on the lane. */
+| {
+    readonly kind: "perAgentTopic";
+    readonly topics: ReadonlyMap<string, string>;
+}
+/** Work rides `agent.sessions` on a declared partition per agent. */
+| {
+    readonly kind: "perAgentPartition";
+    readonly partitions: ReadonlyMap<string, number>;
+}
+/** Everything on one partition. */
+| {
+    readonly kind: "singlePartition";
+};
+
+// @public
+export class SessionLease {
+    // (undocumented)
+    [Symbol.dispose](): void;
+    release(): void;
+    get session(): ConversationId;
+    get stream(): string;
+}
+
+// @public (undocumented)
+interface SessionLink {
+    // (undocumented)
+    readonly first: LogPosition;
+    // (undocumented)
+    readonly item: string;
+    // (undocumented)
+    readonly last: LogPosition;
+    // (undocumented)
+    readonly relation: LinkRelation;
+    // (undocumented)
+    readonly resource: string;
+    // (undocumented)
+    readonly surface: LinkSurface;
+}
+
+// @public (undocumented)
+interface SessionLinks {
+    // (undocumented)
+    readonly id: ConversationId_2;
+    // (undocumented)
+    readonly stream: string;
+    // (undocumented)
+    readonly surface?: LinkSurface;
+}
+
+// @public (undocumented)
+const SessionLinksCommand: ManagedCommand<SessionLinks, SessionReply>;
+
+// @public (undocumented)
+const sessionLinksPath: (stream: string, id: ConversationId_2) => string;
+
+// @public
+interface SessionLinksQuery {
+    // (undocumented)
+    readonly surface?: string;
+}
+
+// @public (undocumented)
+function sessionLinksQueryParams(query: SessionLinksQuery): URLSearchParams;
+
+// @public (undocumented)
+export interface SessionLinksView {
+    // (undocumented)
+    readonly frontier: readonly SourceFrontier[];
+    // (undocumented)
+    readonly links: readonly SessionLink[];
+    // (undocumented)
+    readonly truncated: boolean;
+}
+
+// @public (undocumented)
+interface SessionList {
+    // (undocumented)
+    readonly agent?: AgentId_2;
+    // (undocumented)
+    readonly cursor?: string;
+    readonly labelPrefix?: string;
+    readonly limit: number;
+    readonly root?: ConversationId_2;
+    // (undocumented)
+    readonly status?: SessionStatus;
+    // (undocumented)
+    readonly stream: string;
+    // (undocumented)
+    readonly text?: string;
+    // (undocumented)
+    readonly wantTotal: boolean;
+}
+
+// @public (undocumented)
+const SessionListCommand: ManagedCommand<SessionList, SessionReply>;
+
+// @public
+export class SessionListRequest {
+    agent(agent: AgentId_2): this;
+    cursor(cursor: string): this;
+    fetch(): Promise<SessionPage>;
+    labelPrefix(prefix: string): this;
+    limit(limit: number): this;
+    root(root: ConversationId): this;
+    status(status: SessionStatus): this;
+    text(text: string): this;
+    total(): this;
+}
+
+// @public (undocumented)
+type SessionOutcome = {
+    readonly kind: "info";
+    readonly info: SessionInfo;
+} | {
+    readonly kind: "page";
+    readonly page: SessionPage;
+} | {
+    readonly kind: "events";
+    readonly page: SessionEventsPage;
+} | {
+    readonly kind: "state";
+    readonly state: SessionStateView;
+} | {
+    readonly kind: "links";
+    readonly links: SessionLinksView;
+} | {
+    readonly kind: "sources";
+    readonly sources: SessionSourcesView;
+} | {
+    readonly kind: "changes";
+    readonly changes: SessionChangesView;
+} | {
+    readonly kind: "unrecognized";
+    readonly tag: string;
+    readonly value: unknown;
+};
+
+// @public (undocumented)
+export interface SessionPage {
+    // (undocumented)
+    readonly cursor?: string;
+    // (undocumented)
+    readonly items: readonly SessionInfo[];
+    readonly rebuilding: boolean;
+    // (undocumented)
+    readonly searched?: bigint;
+    // (undocumented)
+    readonly total?: bigint;
+    // (undocumented)
+    readonly truncated: boolean;
+}
+
+// @public
+interface SessionParking {
+    // (undocumented)
+    readonly request: LogPosition;
+    // (undocumented)
+    readonly role: AgentId_2;
+    // (undocumented)
+    readonly source: SourceRef;
+}
+
+// @public (undocumented)
+const sessionPath: (stream: string, id: ConversationId_2) => string;
+
+// @public
+interface SessionPauseRequest {
+    // (undocumented)
+    readonly participants: readonly AgentId_2[];
 }
 
 // @public (undocumented)
 export type SessionPolicy = "perCall" | "perUser";
 
 // @public
+export interface SessionPosition {
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly streamGeneration: bigint;
+    // (undocumented)
+    readonly streamId: number;
+    // (undocumented)
+    readonly topic: string;
+    // (undocumented)
+    readonly topicGeneration: bigint;
+}
+
+// @public
+type SessionRecord = {
+    readonly kind: "envelope";
+    readonly envelope: AgentEnvelope;
+} | {
+    readonly kind: "memory";
+    readonly record: MemoryRecord;
+} | {
+    readonly kind: "dead_letter";
+} | {
+    readonly kind: "journal";
+} | {
+    readonly kind: "kv_mutation";
+} | {
+    readonly kind: "graph_mutation";
+} | {
+    readonly kind: "undecodable";
+    readonly recordKind?: AgentKind;
+};
+
+// @public (undocumented)
+export interface SessionRef {
+    // (undocumented)
+    readonly session: ConversationId_2;
+    // (undocumented)
+    readonly stream: string;
+}
+
+// @public (undocumented)
+type SessionReply = {
+    readonly kind: "ok";
+    readonly outcome: SessionOutcome;
+} | {
+    readonly kind: "err";
+    readonly error: SessionError_2;
+} | {
+    readonly kind: "unrecognized";
+    readonly tag: string;
+    readonly value: unknown;
+};
+
+// @public
 export class Sessions {
+    bootstrap(partitions: number, retention: TopicRetention): Promise<SessionBootstrap>;
+    changes(after: bigint, limit: number): Promise<SessionChangesView>;
     // (undocumented)
     readonly config: SessionConfig;
-    create(id: string): Session;
+    control(stream: string, id: ConversationId): SessionControl;
+    create(label: string): SessionBuilder;
+    events(id: ConversationId): SessionEventsRequest;
+    get(id: ConversationId): Promise<SessionInfo>;
+    links(id: ConversationId, surface?: LinkSurface): Promise<SessionLinksView>;
+    list(): SessionListRequest;
     open(conversation: ConversationId): Session;
-    start(): Session;
+    sources(id: ConversationId): Promise<SessionSourcesView>;
+    start(): SessionBuilder;
+    state(id: ConversationId, historyLimit: number): Promise<SessionStateView>;
+    stream(): string;
+    submit(agent: AgentId, input: BytesLike): SubmitBuilder;
+    unregister(): Promise<void>;
+    watch(pollEveryMs: number): Promise<SessionWatch>;
+}
+
+// @public (undocumented)
+const SESSIONS_PATH = "/agdx/sessions";
+
+// @public (undocumented)
+interface SessionSources {
+    // (undocumented)
+    readonly id: ConversationId_2;
+    // (undocumented)
+    readonly laneOnly?: boolean;
+    // (undocumented)
+    readonly stream: string;
+}
+
+// @public (undocumented)
+const SessionSourcesCommand: ManagedCommand<SessionSources, SessionReply>;
+
+// @public (undocumented)
+const sessionSourcesPath: (stream: string, id: ConversationId_2) => string;
+
+// @public (undocumented)
+interface SessionSourcesView {
+    // (undocumented)
+    readonly lane?: readonly [number, bigint, number];
+    // (undocumented)
+    readonly sources: readonly SourceFrontier[];
+}
+
+// @public (undocumented)
+const sessionsPath: (stream: string) => string;
+
+// @public
+interface SessionsQuery {
+    // (undocumented)
+    readonly agent?: string;
+    // (undocumented)
+    readonly cursor?: string;
+    // (undocumented)
+    readonly labelPrefix?: string;
+    // (undocumented)
+    readonly limit?: number;
+    // (undocumented)
+    readonly root?: string;
+    // (undocumented)
+    readonly status?: string;
+    // (undocumented)
+    readonly text?: string;
+    // (undocumented)
+    readonly wantTotal?: boolean;
+}
+
+// @public (undocumented)
+function sessionsQueryParams(query: SessionsQuery): URLSearchParams;
+
+// @public (undocumented)
+interface SessionStart {
+    // (undocumented)
+    readonly agent: AgentId_2;
+    // (undocumented)
+    readonly budget?: Budget;
+    // (undocumented)
+    readonly idleTimeoutMicros?: bigint;
+    // (undocumented)
+    readonly label?: string;
+    // (undocumented)
+    readonly namespace?: string;
+    // (undocumented)
+    readonly parent?: ConversationId_2;
+    // (undocumented)
+    readonly root?: ConversationId_2;
+    // (undocumented)
+    readonly sdk: SdkInfo;
+    // (undocumented)
+    readonly tags: readonly string[];
+}
+
+// @public
+export class SessionState {
+    get(): Promise<SessionStateView>;
+    patch(patch: readonly PatchOp[]): Promise<AgdxReceipt>;
+    replace(document: Readonly<Record<string, unknown>>): Promise<AgdxReceipt>;
+    set(key: string, value: unknown): Promise<AgdxReceipt>;
+    snapshot(): Promise<AgdxReceipt>;
+}
+
+// @public (undocumented)
+interface SessionState_2 {
+    readonly historyLimit: number;
+    // (undocumented)
+    readonly id: ConversationId_2;
+    // (undocumented)
+    readonly stream: string;
+}
+
+// @public (undocumented)
+const SessionStateCommand: ManagedCommand<SessionState_2, SessionReply>;
+
+// @public (undocumented)
+const sessionStatePath: (stream: string, id: ConversationId_2) => string;
+
+// @public
+interface SessionStateQuery {
+    // (undocumented)
+    readonly historyLimit?: number;
+}
+
+// @public (undocumented)
+function sessionStateQueryParams(query: SessionStateQuery): URLSearchParams;
+
+// @public (undocumented)
+export interface SessionStateView {
+    // (undocumented)
+    readonly complete: boolean;
+    // (undocumented)
+    readonly document: unknown;
+    // (undocumented)
+    readonly frontier?: SourceFrontier;
+    // (undocumented)
+    readonly history: readonly StateChange[];
+    // (undocumented)
+    readonly revision: bigint;
+}
+
+// @public (undocumented)
+export type SessionStatus = "submitted" | "active" | "paused" | "completed" | "failed" | "canceled" | "unrecognized";
+
+// @public (undocumented)
+function sessionStatusFromWire(value: string): SessionStatus;
+
+// @public (undocumented)
+type SessionTopics = {
+    readonly kind: "all";
+} | {
+    readonly kind: "named";
+    readonly names: readonly string[];
+};
+
+// @public (undocumented)
+interface SessionTransition {
+    // (undocumented)
+    readonly acknowledges?: LogPosition;
+    // (undocumented)
+    readonly actor?: AgentId_2;
 }
 
 // @public
 export interface SessionTurn {
     // (undocumented)
-    readonly kind: SessionTurnKind;
+    readonly display: DisplayType;
     // (undocumented)
     readonly message: ContextMessage;
 }
 
 // @public
-export type SessionTurnKind = "instruction" | "response" | "model.response" | "tool.call" | "tool.result" | "human.input";
-
-// @public
-export function sessionTurnKind(topic: string): SessionTurnKind | undefined;
-
-// @public
 export function sessionTurnText(turn: SessionTurn): string;
 
 // @public
-export function sessionTurnTopic(kind: SessionTurnKind): string;
+export class SessionWatch {
+    next(options?: {
+        readonly signal?: AbortSignal;
+    }): Promise<SessionChange>;
+}
 
 // @public (undocumented)
 export interface Signature {
@@ -11916,6 +13683,21 @@ export class SlidingWindow implements Deduplicator {
     observe(key: string): Promise<boolean>;
 }
 
+// @public
+export function snapshotFromCheckpoint(laser: Laser, conversation: ConversationId, fold: string, checkpoint: Checkpoint, state: Uint8Array): Promise<FoldSnapshot>;
+
+// @public (undocumented)
+interface SnapshotOffset {
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly topicCreatedAtMicros: bigint;
+    // (undocumented)
+    readonly topicId: number;
+}
+
 // @public (undocumented)
 interface SnapshotPageView {
     // (undocumented)
@@ -11942,7 +13724,7 @@ export interface SnapshotStore {
 }
 
 // @public (undocumented)
-interface Sort {
+export interface Sort {
     // (undocumented)
     readonly dir: Dir;
     // (undocumented)
@@ -11955,14 +13737,44 @@ interface SourceCut {
     readonly partitions: readonly SourcePartitionCut[];
 }
 
-// @public
-export interface SourceGeneration {
+// @public (undocumented)
+interface SourceFrontier {
     // (undocumented)
-    readonly partitionCreatedRevision: bigint;
+    readonly folded?: bigint;
+    // (undocumented)
+    readonly head?: bigint;
     // (undocumented)
     readonly partitionId: number;
     // (undocumented)
-    readonly purgeGeneration: bigint;
+    readonly retainedFrom?: bigint;
+    // (undocumented)
+    readonly topicGeneration: bigint;
+    // (undocumented)
+    readonly topicId: number;
+}
+
+// @public (undocumented)
+interface SourceGap {
+    // (undocumented)
+    readonly from: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly reason: GapReason;
+    // (undocumented)
+    readonly to: bigint;
+    // (undocumented)
+    readonly topicGeneration: bigint;
+    // (undocumented)
+    readonly topicId: number;
+}
+
+// @public
+export interface SourceGeneration {
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly partitionIncarnation: bigint;
     // (undocumented)
     readonly streamCreatedAtMicros: bigint;
     // (undocumented)
@@ -11978,9 +13790,9 @@ interface SourceIncarnation {
     // (undocumented)
     readonly cluster: PhysicalClusterIncarnation;
     // (undocumented)
-    readonly partitionCreatedRevision: bigint;
-    // (undocumented)
     readonly partitionId: number;
+    // (undocumented)
+    readonly partitionIncarnation: bigint;
     // (undocumented)
     readonly streamId: number;
     // (undocumented)
@@ -12014,6 +13826,7 @@ export type SourceRef = {
     readonly topic: number;
     readonly partition: number;
     readonly offset: bigint;
+    readonly generation?: bigint;
     readonly conversation?: string;
 } | {
     readonly kind: "kv";
@@ -12046,6 +13859,9 @@ export interface SpanScope {
     end(error?: unknown): void;
 }
 
+// @public
+function splitScopedResource(name: string): readonly [stream: string, local: string] | undefined;
+
 // @public (undocumented)
 export type SqlDialect = "data_fusion" | "postgres" | "my_sql" | "sqlite";
 
@@ -12056,6 +13872,47 @@ type StartPolicy = {
     readonly kind: "explicit";
     readonly partitions: readonly PartitionStart[];
 };
+
+// @public (undocumented)
+interface StateChange {
+    // (undocumented)
+    readonly at: LogPosition;
+    // (undocumented)
+    readonly brokerTs: bigint;
+    // (undocumented)
+    readonly newDigest?: Uint8Array;
+    // (undocumented)
+    readonly oldDigest?: Uint8Array;
+    // (undocumented)
+    readonly opId?: string;
+    // (undocumented)
+    readonly outcome: StateOutcome;
+    // (undocumented)
+    readonly reason?: string;
+    // (undocumented)
+    readonly revision: bigint;
+}
+
+// @public (undocumented)
+interface StateDelta {
+    // (undocumented)
+    readonly baseRevision: bigint;
+    // (undocumented)
+    readonly opId: string;
+    // (undocumented)
+    readonly patch: readonly PatchOp[];
+}
+
+// @public (undocumented)
+type StateOutcome = "applied" | "rejected" | "stale" | "duplicate" | "unrecognized";
+
+// @public (undocumented)
+interface StateSnapshot {
+    // (undocumented)
+    readonly baseRevision: bigint;
+    // (undocumented)
+    readonly document: unknown;
+}
 
 // @public (undocumented)
 export interface StateStore {
@@ -12091,7 +13948,7 @@ export class StepHandle {
     // (undocumented)
     after(label: string): this;
     // (undocumented)
-    budget(budget: Budget): this;
+    budget(budget: WorkflowBudget): this;
     // (undocumented)
     compensateWith(compensation: StepFn): this;
     // (undocumented)
@@ -12102,8 +13959,6 @@ export class StepHandle {
     inboxRoute(route: InboxRoute): this;
     // (undocumented)
     onTimeout(onTimeout: OnTimeout): this;
-    // (undocumented)
-    registered(): this;
     // (undocumented)
     run(options?: {
         readonly signal?: AbortSignal;
@@ -12165,6 +14020,9 @@ export class Stream {
     topic(name: string): Topic;
 }
 
+// @public
+const STREAM_RESOURCE_PREFIX = "stream:";
+
 // @public (undocumented)
 export type StreamEvent = {
     readonly kind: "body";
@@ -12181,56 +14039,35 @@ export type StreamEvent = {
 };
 
 // @public
+function streamOpsTopic(stream: string, surface: string): string;
+
+// @public
+function streamResource(stream: string): string;
+
+// @public
+export class SubmitBuilder {
+    budget(budget: Budget): this;
+    from(submitter: AgentId): this;
+    label(label: string): this;
+    namespace(namespace: string): this;
+    operation(operation: string): this;
+    send(): Promise<Submitted>;
+    tag(tag: string): this;
+}
+
+// @public
+export interface Submitted {
+    // (undocumented)
+    readonly correlation: CorrelationId;
+    // (undocumented)
+    readonly session: ConversationId;
+}
+
+// @public
 export interface Summarizer {
     // (undocumented)
     summarize(bodies: readonly Uint8Array[]): Promise<Uint8Array>;
 }
-
-// @public (undocumented)
-const SUPERVISOR_ASSERTION_KEY_ID_BYTES = 8;
-
-// @public (undocumented)
-const SUPERVISOR_ASSERTION_SIGNATURE_BYTES = 64;
-
-// @public (undocumented)
-const SUPERVISOR_ASSERTION_VERSION = 1;
-
-// @public (undocumented)
-interface SupervisorActorAssertion {
-    // (undocumented)
-    readonly claims: SupervisorActorClaims;
-    // (undocumented)
-    readonly keyId: Uint8Array;
-    // (undocumented)
-    readonly signature: Uint8Array;
-}
-
-// @public (undocumented)
-interface SupervisorActorClaims {
-    // (undocumented)
-    readonly action: SupervisorAssertionAction;
-    // (undocumented)
-    readonly cloudUserId: number;
-    // (undocumented)
-    readonly deploymentId: number;
-    // (undocumented)
-    readonly destinationGeneration: bigint;
-    // (undocumented)
-    readonly destinationId: DestinationId;
-    // (undocumented)
-    readonly expectedRevision?: bigint;
-    // (undocumented)
-    readonly expiresAtMicros: bigint;
-    // (undocumented)
-    readonly issuedAtMicros: bigint;
-    // (undocumented)
-    readonly requestId: CheckpointRequestId;
-    // (undocumented)
-    readonly v: number;
-}
-
-// @public (undocumented)
-type SupervisorAssertionAction = "accept_retention_gap" | "supersede_generation" | "record_repair";
 
 // @public (undocumented)
 export class SwappableGovernor implements ActionGovernor {
@@ -12406,6 +14243,7 @@ const TaskStateName: {
     readonly Rejected: 7;
     readonly AuthRequired: 8;
     readonly Unknown: 9;
+    readonly Paused: 10;
 };
 
 // @public (undocumented)
@@ -12413,6 +14251,9 @@ export interface TaskStatus {
     // (undocumented)
     readonly state: TaskState;
 }
+
+// @public
+type Tenancy = "deployment" | "stream";
 
 // @public (undocumented)
 export function terminal(envelope: AgentEnvelope, finishReason: string): AgentEnvelope;
@@ -12462,7 +14303,7 @@ export interface TextPredicate {
 export function textPredicateValidate(predicate: TextPredicate): void;
 
 // @public (undocumented)
-interface TextQuery {
+export interface TextQuery {
     // (undocumented)
     readonly field?: string;
     // (undocumented)
@@ -12491,11 +14332,17 @@ type TimeTravelCapability = "snapshot_id" | "timestamp_micros";
 // @public (undocumented)
 export function toContextBlock(items: readonly MemoryItem[], tokenBudget?: number): string;
 
-// @public (undocumented)
+// @public
 export class TokenBudget implements ContextPolicy {
     constructor(maxTokens: number, estimate?: (message: ContextMessage) => number);
     // (undocumented)
+    name(): string;
+    // (undocumented)
     select(history: readonly ContextMessage[]): readonly ContextMessage[];
+    // (undocumented)
+    selection(history: readonly ContextMessage[]): Selection;
+    // (undocumented)
+    version(): string;
 }
 
 // @public (undocumented)
@@ -12505,11 +14352,20 @@ interface TokenUsage {
     // (undocumented)
     readonly cacheReadInputTokens?: bigint;
     // (undocumented)
+    readonly costMicros?: bigint;
+    // (undocumented)
     readonly inputTokens: bigint;
     // (undocumented)
     readonly outputTokens: bigint;
     // (undocumented)
     readonly reasoningOutputTokens?: bigint;
+}
+
+// @public
+export class ToolCall {
+    complete(result: BytesLike): Promise<AgdxReceipt>;
+    correlation(): CorrelationId;
+    fail(error: AgentErrorBody): Promise<AgdxReceipt>;
 }
 
 // @public
@@ -12530,7 +14386,7 @@ export class Topic {
     consumer(name: string, partitionId: number, options?: ConsumerOptions): Consumer;
     consumerGroup(name: string): ConsumerGroup;
     consumerGroupId(id: bigint | number): ConsumerGroup;
-    ensure(partitions?: number): Promise<void>;
+    ensure(partitions?: number, replicationFactor?: number): Promise<void>;
     ensureConsumerGroup(name: string): Promise<void>;
     // (undocumented)
     json<T>(codec: Codec<T>): TypedTopic<T>;
@@ -12552,9 +14408,17 @@ export class Topic {
     send(payload: BytesLike, options?: RawSendOptions): Promise<SendMessagesResponse>;
 }
 
+// @public
+export class TopicRetention {
+    static expireAfter(ageMs: number): TopicRetention;
+    expiry(): number | undefined;
+    maxSize(): bigint | undefined;
+    static new(expiryMs?: number, maxSizeBytes?: bigint): TopicRetention;
+}
+
 // @public (undocumented)
 export class TopicSnapshotStore implements SnapshotStore {
-    constructor(laser: Laser, topic?: string);
+    constructor(laser: Laser, fold: string, topic?: string);
     latest(conversation: ConversationId): Promise<FoldSnapshot | undefined>;
     // (undocumented)
     save(snapshot: FoldSnapshot): Promise<void>;
@@ -12596,22 +14460,18 @@ export interface TypedRecord<T> {
 
 // @public (undocumented)
 export class TypedRecords<T> {
-    // (undocumented)
     batch(size: number): this;
-    // (undocumented)
     fromOffsets(offsets: ReadonlyMap<number, bigint>): this;
-    // (undocumented)
-    get offsets(): ReadonlyMap<number, bigint>;
     // Warning: (ae-forgotten-export) The symbol "TypedPollResult" needs to be exported by the entry point full.d.ts
-    //
-    // (undocumented)
+    next(options?: {
+        readonly signal?: AbortSignal;
+    }): Promise<TypedPollResult<T> | undefined>;
+    get offsets(): ReadonlyMap<number, bigint>;
     poll(options?: {
         readonly signal?: AbortSignal;
     }): Promise<readonly TypedPollResult<T>[]>;
-    // (undocumented)
     stream(options?: {
         readonly signal?: AbortSignal;
-        readonly pollIntervalMs?: number;
     }): AsyncIterable<TypedPollResult<T>>;
 }
 
@@ -12688,7 +14548,7 @@ export function typedValueValidateCanonical(value: TypedValue): void;
 // @public (undocumented)
 export function unmetRequirements(envelope: AgentEnvelope, understood: bigint): bigint;
 
-// @public (undocumented)
+// @public
 function unportableRegexConstruct(pattern: string): string | undefined;
 
 // @public (undocumented)
@@ -12712,9 +14572,6 @@ const USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens";
 
 // @public (undocumented)
 const USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens";
-
-// @public (undocumented)
-function usesRegex(expr: FilterExpr): boolean;
 
 // @public (undocumented)
 export const UuidValue: {
@@ -12760,6 +14617,9 @@ function validateCheckpointRequest(value: CheckpointRequestEnvelope): void;
 // @public (undocumented)
 function validateConsumerFilter(filter: ConsumerFilter): void;
 
+// @public
+function validateControlCommand(command: ControlCommand): void;
+
 // @public (undocumented)
 function validateDestinationCheckpointStatus(value: DestinationCheckpointStatus): void;
 
@@ -12793,10 +14653,16 @@ type ValidateError = {
 };
 
 // @public (undocumented)
-function validateFilteredAck(ack: FilteredAck): void;
+function validateFilteredAck(request: FilteredAck): void;
 
 // @public (undocumented)
 function validateFilteredPollRequest(request: FilteredPollRequest): void;
+
+// @public (undocumented)
+function validateFilteredWaitCancel(request: FilteredWaitCancel): void;
+
+// @public (undocumented)
+function validateFilteredWaitRequest(request: FilteredWaitRequest): void;
 
 // @public (undocumented)
 function validateFilterGroupRef(group: FilterGroupRef): void;
@@ -12807,6 +14673,9 @@ function validateFilterMutation(mutation: FilterMutation): void;
 // @public (undocumented)
 function validateFilterMutationRequest(request: FilterMutationRequest): void;
 
+// @public
+function validateFilterName(name: string): void;
+
 // @public (undocumented)
 function validateFilterPreviewRequest(request: FilterPreviewRequest): void;
 
@@ -12814,10 +14683,19 @@ function validateFilterPreviewRequest(request: FilterPreviewRequest): void;
 function validateFilterTestRequest(request: FilterTestRequest): void;
 
 // @public (undocumented)
+function validateFoldSnapshot(snapshot: FoldSnapshot): void;
+
+// @public
 function validateForkId(forkId: string): void;
 
 // @public (undocumented)
 function validateGraphName(name: string): void;
+
+// @public
+function validateGraphUpsert(upsert: GraphUpsert): void;
+
+// @public
+function validateListFilters(request: ListFilters): void;
 
 // @public (undocumented)
 function validateLogicalSchema(schema: LogicalSchema): void;
@@ -12825,11 +14703,23 @@ function validateLogicalSchema(schema: LogicalSchema): void;
 // @public (undocumented)
 function validateMaterializationDestination(value: MaterializationDestination): void;
 
+// @public
+function validateMemoryRecord(record: MemoryRecord): void;
+
 // @public (undocumented)
 function validateNamespace(namespace: string): void;
 
+// @public (undocumented)
+export function validateOperatorAssertion(value: OperatorActorAssertion): void;
+
 // @public
 function validatePolicyIdentity(mode: ExecutionMode, digest: Uint8Array | undefined): void;
+
+// @public
+function validateProjection(projection: Projection): void;
+
+// @public
+function validateProjectionId(value: string): void;
 
 // @public (undocumented)
 function validatePublicCheckpointMutation(value: PublicCheckpointMutation): void;
@@ -12867,6 +14757,18 @@ function validateResultFields(fields: readonly LogicalField[]): void;
 // @public (undocumented)
 export function validateRoleName(name: string): void;
 
+// @public
+function validateSchemaName(name: string | undefined): void;
+
+// @public
+function validateSessionList(request: SessionList): void;
+
+// @public
+function validateSessionParking(parking: SessionParking): void;
+
+// @public (undocumented)
+function validateSessionStart(start: SessionStart): void;
+
 // @public (undocumented)
 export function validateSignature(signature: Signature): void;
 
@@ -12880,7 +14782,10 @@ function validateSourceIncarnation(value: SourceIncarnation): void;
 function validateSourceScope(value: SourceScope): void;
 
 // @public (undocumented)
-export function validateSupervisorAssertion(value: SupervisorActorAssertion): void;
+function validateStateDelta(delta: StateDelta): void;
+
+// @public (undocumented)
+function validateStateSnapshot(snapshot: StateSnapshot): void;
 
 // @public (undocumented)
 export type Value = {
@@ -12933,7 +14838,7 @@ export class VectorMemory implements Memory {
 }
 
 // @public (undocumented)
-interface VectorQuery {
+export interface VectorQuery {
     // (undocumented)
     readonly embedding: readonly number[];
     // (undocumented)
@@ -12993,8 +14898,7 @@ export class Vote {
     constructor(intentId: IntentId, intentDigest: string, policyVersion: bigint, voter: AgentId, choice: VoteChoice, atMicros?: bigint);
     // (undocumented)
     readonly atMicros: bigint;
-    // (undocumented)
-    static cast(intent: Intent, voter: AgentId, choice: VoteChoice, atMicros?: bigint): Vote;
+    static cast(intent: Intent, voter: AgentId, choice: VoteChoice): Vote;
     // (undocumented)
     readonly choice: VoteChoice;
     // (undocumented)
@@ -13019,7 +14923,6 @@ export type VoteChoice = (typeof VoteChoice)[keyof typeof VoteChoice];
 
 // @public (undocumented)
 export class Watch {
-    // (undocumented)
     index(index: string): this;
     // (undocumented)
     records(): Promise<WatchReader>;
@@ -13067,6 +14970,7 @@ const WINDOW_START = "window_start";
 
 declare namespace wire {
     export {
+        recordHeadersForEnvelope,
         canonicalAgentRecord,
         encodeCanonicalAgentRecord,
         decodeCanonicalAgentRecord,
@@ -13074,42 +14978,39 @@ declare namespace wire {
         CanonicalHeaderKind,
         CanonicalHeader,
         CanonicalAgentRecord,
-        encodeRunBudget,
-        decodeRunBudget,
-        encodeAgentSubmit,
-        decodeAgentSubmit,
-        encodeAgentCancel,
-        decodeAgentCancel,
-        encodeAgentStatusReq,
-        decodeAgentStatusReq,
-        agentRunStateFromWord,
-        agentRunStateIsTerminal,
-        encodeAgentRunInfo,
-        decodeAgentRunInfo,
-        encodeAgentList,
-        decodeAgentList,
-        encodeRunPage,
-        decodeRunPage,
-        encodeAgentOutcome,
-        decodeAgentOutcome,
-        encodeAgentWorkflowError,
-        decodeAgentWorkflowError,
-        encodeAgentReply,
-        decodeAgentReply,
-        RunBudget,
-        AgentSubmit,
-        AgentCancel,
-        AgentStatusReq,
-        AgentRunState,
-        AgentRunInfo,
-        AgentList,
-        RunPage,
-        AgentOutcome,
-        AgentWorkflowError,
-        AgentReply,
         parseAgentKind,
         parseIdempotencyKey,
-        parseAgentId,
+        sessionStatusFromWire,
+        encodeContextManifest,
+        decodeContextManifest,
+        encodeContextCompaction,
+        decodeContextCompaction,
+        encodeContextRetrieval,
+        decodeContextRetrieval,
+        validateStateDelta,
+        validateStateSnapshot,
+        jsonToCbor,
+        cborToJson,
+        encodeStateDelta,
+        decodeStateDelta,
+        encodeStateSnapshot,
+        decodeStateSnapshot,
+        validateSessionStart,
+        encodeSdkInfo,
+        decodeSdkInfo,
+        encodeBudget,
+        decodeBudget,
+        encodeSessionStart,
+        decodeSessionStart,
+        encodeSessionTransition,
+        decodeSessionTransition,
+        encodeSessionPauseRequestJson,
+        decodeSessionPauseRequestJson,
+        encodeSessionParking,
+        decodeSessionParking,
+        validateSessionParking,
+        encodeSessionEnd,
+        decodeSessionEnd,
         taskStateFromCode,
         taskStateCode,
         taskStateDisplay,
@@ -13148,6 +15049,7 @@ declare namespace wire {
         validateSignature,
         encodeSignature,
         decodeSignature,
+        estimateTokens,
         commandEnvelope,
         responseEnvelope,
         eventEnvelope,
@@ -13171,10 +15073,26 @@ declare namespace wire {
         encodeAgentEnvelope,
         decodeAgentEnvelope,
         validateAgentEnvelope,
+        AgentId_2 as AgentId,
+        parseAgentId,
         AgentKind,
         IdempotencyKey,
-        AgentId_2 as AgentId,
         TaskState,
+        SessionStatus,
+        SdkInfo,
+        Budget,
+        SessionStart,
+        SessionTransition,
+        SessionEnd,
+        SessionPauseRequest,
+        SessionParking,
+        Fragment,
+        ContextManifest,
+        ContextCompaction,
+        ContextRetrieval,
+        PatchOp,
+        StateDelta,
+        StateSnapshot,
         TaskStateName,
         AgentErrorCode,
         AgentErrorCodeName,
@@ -13197,6 +15115,9 @@ declare namespace wire {
         Signature,
         features,
         OPERATION_TASK,
+        OPERATION_SESSION,
+        OPERATION_SESSION_PARKED,
+        OPERATION_SESSION_UNPARKED,
         OPERATION_CARD,
         OPERATION_PROGRESS,
         OPERATION_QUARANTINE,
@@ -13208,12 +15129,16 @@ declare namespace wire {
         OPERATION_STATE_DELTA,
         METADATA_ROLE,
         METADATA_BRIDGE_HOPS,
-        METADATA_RUN,
         METADATA_DELEGATED_BY,
         METADATA_PURPOSE,
         METADATA_DATA_CLASSIFICATION,
         METADATA_TASK_CONTEXT,
         METADATA_SESSION_INTENT,
+        METADATA_REQUEST_MODEL,
+        METADATA_RESPONSE_MODEL,
+        METADATA_PROVIDER_NAME,
+        METADATA_SUBMITTED,
+        METADATA_DURATION_MICROS,
         AgentEnvelope,
         encodeArrowIpcMessageMetadata,
         decodeArrowIpcMessageMetadata,
@@ -13234,6 +15159,9 @@ declare namespace wire {
         ArrowTimestampUnit,
         ArrowIpcRejectionCode,
         DEFAULT_ARROW_IPC_POLICY,
+        streamResource,
+        scopedResource,
+        splitScopedResource,
         resourcePatternAll,
         resourcePatternLiteral,
         resourcePatternPrefix,
@@ -13282,6 +15210,7 @@ declare namespace wire {
         encodeAuthzHistoryReply,
         decodeAuthzHistoryReply,
         encodeAuthzError,
+        authzErrorResultCode,
         decodeAuthzError,
         encodeAuthzReply,
         decodeAuthzReply,
@@ -13289,6 +15218,7 @@ declare namespace wire {
         Feature,
         Action,
         ResourceKind,
+        STREAM_RESOURCE_PREFIX,
         ResourcePattern,
         Grant,
         Role,
@@ -13306,6 +15236,7 @@ declare namespace wire {
         BindRolesReq,
         AuthzSubject,
         AuthzHistoryReq,
+        Tenancy,
         AuthzEventKind,
         AuthzEvent,
         AuthzHistoryReply,
@@ -13377,7 +15308,7 @@ declare namespace wire {
         encodeCheckpointRequestFrame,
         validateCheckpointRequest,
         validatePublicCheckpointMutation,
-        validateSupervisorAssertion,
+        validateOperatorAssertion,
         decodeCheckpointMutationResult,
         encodeCheckpointMutationResult,
         encodeCheckpointReplyFrame,
@@ -13405,10 +15336,10 @@ declare namespace wire {
         MAX_CHECKPOINT_ERROR_BYTES,
         MAX_REPAIR_DETAIL_BYTES,
         MAX_CHECKPOINT_LEASE_DURATION_MICROS,
-        SUPERVISOR_ASSERTION_VERSION,
-        MAX_SUPERVISOR_ASSERTION_TTL_MICROS,
-        SUPERVISOR_ASSERTION_KEY_ID_BYTES,
-        SUPERVISOR_ASSERTION_SIGNATURE_BYTES,
+        OPERATOR_ASSERTION_VERSION,
+        MAX_OPERATOR_ASSERTION_TTL_MICROS,
+        OPERATOR_ASSERTION_KEY_ID_BYTES,
+        OPERATOR_ASSERTION_SIGNATURE_BYTES,
         CheckpointReadConsistency,
         DestinationEffectiveState,
         PartitionLifecycleState,
@@ -13430,9 +15361,9 @@ declare namespace wire {
         DestinationBlock,
         RepairRecord,
         DestinationCheckpointStatus,
-        SupervisorAssertionAction,
-        SupervisorActorClaims,
-        SupervisorActorAssertion,
+        OperatorAssertionAction,
+        OperatorActorClaims,
+        OperatorActorAssertion,
         PublicCheckpointMutation,
         CheckpointRequestEnvelope,
         CheckpointMutationResult,
@@ -13456,6 +15387,7 @@ declare namespace wire {
         ClientMetadata,
         ClientMetadataList,
         isIdempotentManagedRequest,
+        isBarrierRead,
         AGDX_COMMAND_BASE,
         AGDX_HELLO_CODE,
         AGDX_BACKEND_HELLO_CODE,
@@ -13516,16 +15448,21 @@ declare namespace wire {
         AGDX_GRAPH_UPSERT_CODE,
         AGDX_GRAPH_NEIGHBORS_CODE,
         AGDX_AGENT_BASE,
-        AGDX_AGENT_SUBMIT_CODE,
-        AGDX_AGENT_CANCEL_CODE,
-        AGDX_AGENT_STATUS_CODE,
-        AGDX_AGENT_LIST_CODE,
+        AGDX_SESSION_GET_CODE,
+        AGDX_SESSION_LIST_CODE,
+        AGDX_SESSION_EVENTS_CODE,
+        AGDX_SESSION_STATE_CODE,
+        AGDX_SESSION_LINKS_CODE,
+        AGDX_SESSION_SOURCES_CODE,
+        AGDX_SESSION_CHANGES_CODE,
         AGDX_DELIVERY_BASE,
         AGDX_FILTERED_POLL_CODE,
         AGDX_FILTERED_ACK_CODE,
         AGDX_FILTER_PREVIEW_CODE,
         AGDX_FILTER_TEST_CODE,
         AGDX_FILTER_VALIDATE_CODE,
+        AGDX_FILTERED_WAIT_CODE,
+        AGDX_FILTERED_WAIT_CANCEL_CODE,
         AGDX_FILTER_MUTATE_CODE,
         AGDX_GET_FILTER_CODE,
         AGDX_LIST_FILTERS_CODE,
@@ -13545,7 +15482,6 @@ declare namespace wire {
         FORK_OP_VERSION,
         GRAPH_OP_VERSION,
         FILTER_OP_VERSION,
-        AGENT_WORKFLOW_OP_VERSION,
         BATCH_OP_VERSION,
         CHANGE_OP_VERSION,
         CLIENT_METADATA_OP_VERSION,
@@ -13607,10 +15543,13 @@ declare namespace wire {
         ForkPromoteCommand,
         ForkListCommand,
         ForkPutCommand,
-        AgentSubmitCommand,
-        AgentCancelCommand,
-        AgentStatusCommand,
-        AgentListCommand,
+        SessionGetCommand,
+        SessionListCommand,
+        SessionEventsCommand,
+        SessionStateCommand,
+        SessionLinksCommand,
+        SessionSourcesCommand,
+        SessionChangesCommand,
         BatchCommand,
         GraphQueryCommand,
         GraphNeighborsCommand,
@@ -13653,9 +15592,41 @@ declare namespace wire {
         MaterializationDestination,
         QueryRouteTarget,
         QueryRoute,
+        displayType,
+        classify,
+        addresseeFilter,
+        broadcastFilter,
+        classifyGeneric,
+        BROADCAST,
+        OPERATION_SESSION_PAUSE,
+        OPERATION_SESSION_RESUME,
+        OPERATION_SESSION_CANCEL,
+        OPERATION_FORCE_CANCEL,
+        OPERATION_TEXT_COMPLETION,
+        OPERATION_GENERATE_CONTENT,
+        OPERATION_EXECUTE_TOOL,
+        OPERATION_INVOKE_AGENT,
+        OPERATION_CONTEXT_ASSEMBLED,
+        OPERATION_CONTEXT_COMPACTED,
+        OPERATION_CONTEXT_RETRIEVED,
+        OPERATION_POLICY_DECISION,
+        CONTROL_OPERATIONS,
+        SessionRecord,
+        DisplayType,
+        Dispatch,
+        HandledOperations,
+        ADDRESSEE_FILTER_NAME,
         parseProjectionId,
+        validateProjectionId,
+        validateProjection,
+        validateSchemaName,
+        validateControlCommand,
         projectionKindIsRow,
         schemaDefContentType,
+        encodeControlStamp,
+        decodeControlStamp,
+        encodeSessionTopics,
+        decodeSessionTopics,
         encodeIndexField,
         decodeIndexField,
         encodeIndexSchema,
@@ -13680,6 +15651,7 @@ declare namespace wire {
         decodeControlCommand,
         encodeControlEnvelope,
         decodeControlEnvelope,
+        RESERVED_PROJECTION_ID_PREFIX,
         FieldType,
         IndexField,
         IndexSchema,
@@ -13698,6 +15670,11 @@ declare namespace wire {
         SchemaSource,
         SchemaDef,
         ControlCommand,
+        GapAcceptance,
+        RecordSkip,
+        ControlStamp,
+        ControlStreamGeneration,
+        SessionTopics,
         ControlEnvelope,
         recordPolicyIsReject,
         filterExprCaseInsensitive,
@@ -13709,25 +15686,27 @@ declare namespace wire {
         validateConsumerFilter,
         textPredicateValidate,
         globTokens,
-        unportableRegexConstruct,
         timestampFormatMicrosFromText,
         timestampFormatMicrosFromInteger,
         filterConsumerIsGroup,
         executionModeIsFiltered,
-        readModeIsPrimary,
         faultReasonIsForeign,
         appliedPolicyFiltered,
         appliedPolicyUnfiltered,
         filteredPageNextStart,
         filterErrorInvalid,
         filterErrorCheckVersion,
-        validateFilteredPollRequest,
-        validatePolicyIdentity,
         validateFilteredAck,
+        validateFilteredPollRequest,
+        validateFilteredWaitRequest,
+        validateFilteredWaitCancel,
+        validatePolicyIdentity,
         validateFilterPreviewRequest,
         validateFilterTestRequest,
         validateFilterGroupRef,
         validateFilterMutation,
+        validateFilterName,
+        validateListFilters,
         validateFilterMutationRequest,
         validateCatalogPage,
         encodeFilterExpr,
@@ -13738,9 +15717,13 @@ declare namespace wire {
         encodeCatalogPosition,
         decodeCatalogPosition,
         encodeSourceGeneration,
+        encodeAckContext,
         encodeFilteredStart,
-        encodeFilteredPollRequest,
         encodeFilteredAck,
+        decodeFilteredAck,
+        encodeFilteredPollRequest,
+        encodeFilteredWaitRequest,
+        encodeFilteredWaitCancel,
         encodeFilterPreviewRequest,
         encodeHeaderScalar,
         encodeFilterTestRequest,
@@ -13766,9 +15749,11 @@ declare namespace wire {
         decodeFilterConsumer,
         decodeFilterRef,
         decodeSourceGeneration,
+        decodeAckContext,
         decodeFilteredStart,
         decodeFilteredPollRequest,
-        decodeFilteredAck,
+        decodeFilteredWaitRequest,
+        decodeFilteredWaitCancel,
         decodeFilteredPage,
         decodeFilterError,
         decodeFilterReply,
@@ -13782,6 +15767,7 @@ declare namespace wire {
         decodeFilterCatalogReply,
         rustDouble,
         parseCanonicalJson,
+        unportableRegexConstruct,
         FILTER_EVALUATOR_VERSION,
         MAX_REGEX_PREDICATES,
         PathSegment,
@@ -13805,18 +15791,23 @@ declare namespace wire {
         FilterRef,
         ExecutionMode,
         CatalogPosition,
-        ReadMode,
         SourceGeneration,
+        AckContext,
         Continuation,
         FilteredStart,
+        FilteredAck,
+        AckReceipt,
+        FilteredWaitRequest,
+        FilteredWaitCancel,
+        FilteredWaitCancelled,
+        FilteredWaitPartition,
+        FilteredWaitResult,
         FilteredPollRequest,
         StopReason,
         FaultReason,
         RecordFault,
         AppliedPolicy,
         FilteredPage,
-        FilteredAck,
-        AckReceipt,
         FilterPreviewRequest,
         FilterVerdict as Verdict,
         Truth,
@@ -13836,6 +15827,7 @@ declare namespace wire {
         FilterState,
         FilterGroupIdentity,
         FilterGroupRef,
+        FilterOwner,
         FilterRevisionInfo,
         FilterSummary,
         FilterBinding,
@@ -13866,7 +15858,6 @@ declare namespace wire {
         FilterCatalogReply,
         PayloadFault,
         PayloadDecoders,
-        usesRegex,
         decodeJsonPayload,
         DecodeLimits,
         DEFAULT_DECODE_LIMITS,
@@ -13911,6 +15902,12 @@ declare namespace wire {
         decodeForwardedQuery,
         encodeForwardedCommand,
         decodeForwardedCommand,
+        Caller,
+        ForwardedScope,
+        decodeCaller,
+        decodeForwardedScope,
+        encodeCaller,
+        encodeForwardedScope,
         ForwardedQuery,
         ForwardedCommand,
         edgeDirIsOut,
@@ -13926,12 +15923,15 @@ declare namespace wire {
         decodeGraphNeighbors,
         encodeSourceRef,
         decodeSourceRef,
+        encodeProducer,
+        decodeProducer,
         graphNodeEntity,
         encodeGraphNode,
         decodeGraphNode,
         encodeGraphNodeFrame,
         graphEdgeRelate,
         graphEdgeValid,
+        graphEdgeWithSource,
         graphEdgeValidAt,
         encodeGraphEdge,
         decodeGraphEdge,
@@ -13940,6 +15940,7 @@ declare namespace wire {
         decodePath,
         encodeGraphResult,
         decodeGraphResult,
+        validateGraphUpsert,
         encodeGraphUpsert,
         decodeGraphUpsert,
         encodeGraphUpsertFrame,
@@ -13958,6 +15959,7 @@ declare namespace wire {
         GraphQuery,
         GraphNeighbors,
         SourceRef,
+        ProducerInfo,
         GraphAttr,
         GraphNode,
         GraphEdge,
@@ -13967,6 +15969,8 @@ declare namespace wire {
         GraphError,
         GraphReply,
         contentId,
+        addresseeText,
+        encodeRecordHeaders,
         CONTENT_TYPE,
         SCHEMA_ID,
         LOGICAL_SCHEMA_FINGERPRINT,
@@ -13984,6 +15988,9 @@ declare namespace wire {
         CONVERSATION_ID,
         CONVERSATION_FIELD,
         AGENT_ID,
+        REQUEST_MODEL,
+        RESPONSE_MODEL,
+        PROVIDER_NAME,
         USAGE_INPUT_TOKENS,
         USAGE_OUTPUT_TOKENS,
         CAUSAL_PARENT,
@@ -13999,6 +16006,9 @@ declare namespace wire {
         MEMORY_NAMESPACE,
         MEMORY_USER,
         MEMORY_APP,
+        HeaderField,
+        Addressee,
+        RecordHeaders,
         newOpVersions,
         opVersionsHasFeature,
         encodeOpVersions,
@@ -14037,10 +16047,28 @@ declare namespace wire {
         BackendDescriptor,
         BackendAnnounce,
         FilterAnnounce,
+        schemaListQueryParams,
+        schemaQueryParams,
+        filterListQueryOf,
+        filterListQueryOwner,
+        filterListQueryParams,
+        decodeFilterListQuery,
+        sessionsQueryParams,
+        decodeSessionsQuery,
+        sessionEventsQueryParams,
+        decodeSessionEventsQuery,
+        sessionStateQueryParams,
+        decodeSessionStateQuery,
+        sessionLinksQueryParams,
+        decodeSessionLinksQuery,
+        sessionChangesQueryParams,
+        decodeSessionChangesQuery,
+        sessionErrorBody,
         filterPath,
         filterRevisionsPath,
         filterOperationPath,
         filterBindingPath,
+        pathSegment,
         encodeDestinationHttpRequest,
         decodeDestinationHttpRequest,
         encodeDestinationHttpReply,
@@ -14085,7 +16113,29 @@ declare namespace wire {
         FORKS_PATH,
         GRAPHS_PATH,
         CLIENTS_PATH,
-        RUNS_PATH,
+        SESSIONS_PATH,
+        PARAM_LIMIT,
+        PARAM_CURSOR,
+        PARAM_STATUS,
+        PARAM_AGENT,
+        PARAM_TEXT,
+        PARAM_ROOT,
+        PARAM_LABEL_PREFIX,
+        PARAM_SURFACE,
+        PARAM_AFTER,
+        PARAM_TOTAL,
+        PARAM_FIXED_FRONTIER,
+        PARAM_HISTORY_LIMIT,
+        PARAM_STREAM,
+        PARAM_NAME_CONTAINS,
+        SchemaListQuery,
+        SchemaQuery,
+        FilterListQuery,
+        SessionsQuery,
+        SessionEventsQuery,
+        SessionStateQuery,
+        SessionLinksQuery,
+        SessionChangesQuery,
         AUTHZ_WHOAMI_PATH,
         AUTHZ_ROLES_PATH,
         FILTERS_PATH,
@@ -14108,8 +16158,13 @@ declare namespace wire {
         forkPath,
         forkPromotePath,
         forkRowsPath,
-        runPath,
-        runCancelPath,
+        sessionsPath,
+        sessionChangesPath,
+        sessionPath,
+        sessionEventsPath,
+        sessionStatePath,
+        sessionLinksPath,
+        sessionSourcesPath,
         destinationPath,
         destinationEnablePath,
         destinationDisablePath,
@@ -14162,12 +16217,16 @@ declare namespace wire {
         encodeForkInfoJson,
         encodeQueryResultJson,
         FILTER_METRICS_PATH,
+        encodeSessionRef,
+        decodeSessionRef,
         crockfordEncode,
         crockfordDecode,
         bigIntToBytes16,
         bytes16ToBigInt,
+        newLogPosition,
         logPositionToBytes,
         logPositionFromBytes,
+        SessionRef,
         LogPosition,
         WireId,
         RecordId,
@@ -14278,6 +16337,13 @@ declare namespace wire {
         DEFAULT_SCAN_LIMIT,
         DEFAULT_NAMESPACE,
         MAX_NAMESPACE_BYTES,
+        MAX_SESSION_LABEL_BYTES,
+        MAX_SESSION_TEXT_QUERY_BYTES,
+        MAX_SESSION_CURSOR_BYTES,
+        MAX_HEARTBEAT_SESSIONS,
+        MAX_STATE_PATCH_OPS,
+        MAX_STATE_DOCUMENT_BYTES,
+        MAX_MANIFEST_FRAGMENTS,
         MAX_HOLDER_ID_BYTES,
         MIN_LEASE_TTL_MICROS,
         MAX_LEASE_TTL_MICROS,
@@ -14286,6 +16352,10 @@ declare namespace wire {
         MAX_FRAME_BYTES,
         MAX_QUERY_REPLY_BYTES,
         MAX_QUERY_NAME_BYTES,
+        MAX_PROJECTION_ID_BYTES,
+        MAX_PROJECTION_NAME_BYTES,
+        MAX_INDEX_FIELD_BYTES,
+        MAX_SCHEMA_NAME_BYTES,
         MAX_RAW_SQL_BYTES,
         MAX_QUERY_PARAMETERS,
         MAX_QUERY_CURSOR_BYTES,
@@ -14308,10 +16378,12 @@ declare namespace wire {
         DEFAULT_RECALL_LIMIT,
         MAX_MEMORY_TAGS,
         MAX_MEMORY_TAG_BYTES,
+        MAX_MEMORY_ID_BYTES,
         MAX_GRAPH_NAME_BYTES,
         MAX_GRAPH_TRAVERSE_DEPTH,
         MAX_GRAPH_RESULT_ELEMENTS,
         MAX_GRAPH_NODE_LABELS,
+        MAX_GRAPH_LABEL_BYTES,
         MAX_SOURCE_REF_BYTES,
         MAX_FILTER_BYTES,
         MAX_FILTER_NODES,
@@ -14326,6 +16398,9 @@ declare namespace wire {
         MAX_FILTERED_PAGE_RECORDS,
         MAX_FILTERED_PAGE_BYTES,
         MAX_FILTERED_PAGE_EXAMINED,
+        MAX_FILTERED_WAIT_MS,
+        MAX_FILTERED_WAIT_PARTITIONS,
+        MAX_FILTERED_WAIT_CANCEL_IDS,
         MAX_FILTER_PREVIEW_EXAMINED,
         MAX_FILTER_PREVIEW_RECORDS,
         MAX_FILTER_PREVIEW_PAYLOAD_BYTES,
@@ -14337,16 +16412,33 @@ declare namespace wire {
         MAX_FILTER_SCHEMA_DEPTH,
         encodeMemoryRecord,
         decodeMemoryRecord,
+        validateMemoryRecord,
         encodeMemoryRecordFrame,
         MemoryRecord,
         encodeManagedRequestEnvelope,
         decodeManagedRequestEnvelope,
+        encodeSessionPosition,
+        decodeSessionPosition,
+        encodeManagedReadEnvelope,
+        decodeManagedReadEnvelope,
+        positionSurfaceOf,
+        isAfter,
+        mergeFrontier,
+        encodeAppliedFrontier,
+        decodeAppliedFrontier,
+        encodeManagedReplyEnvelope,
+        decodeManagedReplyEnvelope,
         encodeMutationPosition,
         decodeMutationPosition,
         encodeMutationCommandEnvelope,
         decodeMutationCommandEnvelope,
         MANAGED_REQUEST_VERSION,
         ManagedRequestEnvelope,
+        ManagedReadEnvelope,
+        SessionPosition,
+        PositionSurface,
+        AppliedFrontier,
+        ManagedReplyEnvelope,
         MutationPosition,
         MutationCommandEnvelope,
         consistencyIsEventual,
@@ -14433,6 +16525,7 @@ declare namespace wire {
         QueryPageEnvelope,
         QueryCancelEnvelope,
         QueryStatusEnvelope,
+        QueryBuilder,
         Row,
         Page,
         QueryEngine,
@@ -14440,6 +16533,7 @@ declare namespace wire {
         BoundaryRelation,
         MaterializationBoundary,
         QueryContext,
+        QueryFrontier,
         QueryResult,
         QueryError,
         QueryErrorCode,
@@ -14452,10 +16546,13 @@ declare namespace wire {
         resultCodeToCode,
         resultCodeHttpStatus,
         resultCodeIsRetryable,
+        resultCodeIsPending,
+        resultCodeIsBackendUnavailable,
         resultCodeFromWord,
         resultCodeWord,
         ResultCodeName,
         ResultCode,
+        CommandError,
         logicalTypeKind,
         logicalTypeAcceptsMapKey,
         encodeLogicalSchema,
@@ -14503,6 +16600,69 @@ declare namespace wire {
         TypedValue,
         FieldValue,
         MapEntry,
+        validateSessionList,
+        encodeSessionList,
+        decodeSessionList,
+        encodeSessionEvents,
+        decodeSessionEvents,
+        encodeSessionState,
+        decodeSessionState,
+        encodeSessionLinks,
+        decodeSessionLinks,
+        encodeSessionSources,
+        decodeSessionSources,
+        encodeSessionChanges,
+        decodeSessionChanges,
+        encodeSessionHeartbeat,
+        decodeSessionHeartbeat,
+        sessionErrorResultCode,
+        sessionErrorMessage,
+        encodeSourceFrontier,
+        decodeSourceFrontier,
+        encodeSessionInfo,
+        decodeSessionInfo,
+        encodeSessionEvent,
+        decodeSessionEvent,
+        encodeSessionOutcome,
+        decodeSessionOutcome,
+        encodeSessionError,
+        decodeSessionError,
+        encodeSessionReply,
+        decodeSessionReply,
+        LinkSurface,
+        LinkRelation,
+        SessionGet,
+        encodeSessionGet,
+        decodeSessionGet,
+        SessionList,
+        SessionEvents,
+        SessionState_2 as SessionState,
+        SessionLinks,
+        SessionSources,
+        SessionChanges,
+        SessionHeartbeat,
+        SourceFrontier,
+        GapReason,
+        SourceGap,
+        PayloadRange,
+        StateOutcome,
+        StateChange,
+        SessionFlags,
+        SessionInfo,
+        SessionPage,
+        SessionEvent,
+        SessionEventsPage,
+        SessionStateView,
+        SessionLink,
+        SessionLinksView,
+        SessionSourcesView,
+        SessionChangeOrigin,
+        SessionChangeRow,
+        SessionChangesView,
+        SessionOutcome,
+        SessionErrorKind,
+        SessionError_2 as SessionError,
+        SessionReply,
         encodeSourceIncarnation,
         decodeSourceIncarnation,
         encodeSourceScope,
@@ -14522,18 +16682,29 @@ declare namespace wire {
         encodeFoldSnapshot,
         decodeFoldSnapshot,
         foldSnapshotResumeOffset,
+        validateFoldSnapshot,
+        SnapshotOffset,
         FoldSnapshot,
+        streamOpsTopic,
         OPS_STREAM_DEFAULT as OPS_STREAM,
         CONTROL_TOPIC,
         DLQ_TOPIC,
         CHANGES_TOPIC,
+        AGENT_SESSIONS,
+        AGENT_STREAMS,
+        AGENT_HEARTBEATS,
+        AGENT_CONTROL,
+        AGENT_MEMORY,
+        AGENT_DLQ,
+        AGENT_AUDIT,
+        AGENT_JOURNAL,
+        AGENT_REGISTRY,
         defaultWireTopology,
         wireTopologyFromPartial,
         encodeWireTopology,
         decodeWireTopology,
         DEFAULT_KV_MUTATIONS_TOPIC,
         DEFAULT_FORK_MUTATIONS_TOPIC,
-        DEFAULT_RUN_MUTATIONS_TOPIC,
         DEFAULT_GRAPH_MUTATIONS_TOPIC,
         DEFAULT_CHECKPOINT_MUTATIONS_TOPIC,
         WireTopology,
@@ -14577,8 +16748,6 @@ interface WireTopology {
     readonly kvMutationsTopic: string;
     // (undocumented)
     readonly opsStream: string;
-    // (undocumented)
-    readonly runMutationsTopic: string;
 }
 
 // Warning: (ae-forgotten-export) The symbol "PartialWireTopology" needs to be exported by the entry point full.d.ts
@@ -14622,11 +16791,9 @@ function withUsage(envelope: AgentEnvelope, usage: TokenUsage): AgentEnvelope;
 // @public (undocumented)
 export class Workflow {
     // (undocumented)
-    budget(budget: Budget): this;
+    budget(budget: WorkflowBudget): this;
     // (undocumented)
     inboxRoute(route: InboxRoute): this;
-    // (undocumented)
-    registered(): this;
     run(options?: {
         readonly signal?: AbortSignal;
     }): Promise<WorkflowOutcome>;
@@ -14640,6 +16807,18 @@ export class Workflow {
 export const WORKFLOW_FENCE_NAMESPACE = "agdx.workflow.fence";
 
 // @public (undocumented)
+export class WorkflowBudget {
+    // (undocumented)
+    invocations(invocations: number): WorkflowBudget;
+    // (undocumented)
+    static tokens(tokens: bigint): WorkflowBudget;
+    // (undocumented)
+    static unlimited(): WorkflowBudget;
+    // (undocumented)
+    wallClock(wallClockMs: number): WorkflowBudget;
+}
+
+// @public (undocumented)
 export interface WorkflowOutcome {
     // (undocumented)
     readonly outputs: ReadonlyMap<string, Uint8Array>;
@@ -14649,9 +16828,9 @@ export interface WorkflowOutcome {
 
 // Warnings were encountered during analysis:
 //
-// src/client/laser.ts:588:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point full.d.ts
-// src/conversation-state.ts:101:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point full.d.ts
-// src/conversation-state.ts:101:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point full.d.ts
+// src/client/laser.ts:770:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point full.d.ts
+// src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point full.d.ts
+// src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point full.d.ts
 
 // (No @packageDocumentation comment for this package)
 

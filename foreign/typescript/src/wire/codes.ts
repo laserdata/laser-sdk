@@ -64,11 +64,16 @@ export const AGDX_GRAPH_QUERY_CODE = AGDX_GRAPH_BASE
 export const AGDX_GRAPH_UPSERT_CODE = AGDX_GRAPH_BASE + 1
 export const AGDX_GRAPH_NEIGHBORS_CODE = AGDX_GRAPH_BASE + 2
 
+// Codes 1_000_700 to 1_000_703 belonged to the retired run registry and are
+// never reused. The session reads start at 1_000_710.
 export const AGDX_AGENT_BASE = AGDX_COMMAND_BASE + 700
-export const AGDX_AGENT_SUBMIT_CODE = AGDX_AGENT_BASE
-export const AGDX_AGENT_CANCEL_CODE = AGDX_AGENT_BASE + 1
-export const AGDX_AGENT_STATUS_CODE = AGDX_AGENT_BASE + 2
-export const AGDX_AGENT_LIST_CODE = AGDX_AGENT_BASE + 3
+export const AGDX_SESSION_GET_CODE = AGDX_AGENT_BASE + 10
+export const AGDX_SESSION_LIST_CODE = AGDX_AGENT_BASE + 11
+export const AGDX_SESSION_EVENTS_CODE = AGDX_AGENT_BASE + 12
+export const AGDX_SESSION_STATE_CODE = AGDX_AGENT_BASE + 13
+export const AGDX_SESSION_LINKS_CODE = AGDX_AGENT_BASE + 14
+export const AGDX_SESSION_SOURCES_CODE = AGDX_AGENT_BASE + 15
+export const AGDX_SESSION_CHANGES_CODE = AGDX_AGENT_BASE + 16
 
 export const AGDX_DELIVERY_BASE = AGDX_COMMAND_BASE + 800
 export const AGDX_FILTERED_POLL_CODE = AGDX_DELIVERY_BASE
@@ -76,6 +81,14 @@ export const AGDX_FILTERED_ACK_CODE = AGDX_DELIVERY_BASE + 1
 export const AGDX_FILTER_PREVIEW_CODE = AGDX_DELIVERY_BASE + 2
 export const AGDX_FILTER_TEST_CODE = AGDX_DELIVERY_BASE + 3
 export const AGDX_FILTER_VALIDATE_CODE = AGDX_DELIVERY_BASE + 4
+/**
+ * Hold until one of a reader's partitions has a record at or after its
+ * offset, or the wait ends. Served when the filter announcement names a
+ * non-zero `max_wait_ms`.
+ */
+export const AGDX_FILTERED_WAIT_CODE = AGDX_DELIVERY_BASE + 5
+/** End filtered waits this connection holds, named by their `wait_id`. */
+export const AGDX_FILTERED_WAIT_CANCEL_CODE = AGDX_DELIVERY_BASE + 6
 export const AGDX_FILTER_MUTATE_CODE = AGDX_DELIVERY_BASE + 10
 export const AGDX_GET_FILTER_CODE = AGDX_DELIVERY_BASE + 11
 export const AGDX_LIST_FILTERS_CODE = AGDX_DELIVERY_BASE + 12
@@ -98,7 +111,6 @@ export const KV_LEASE_OP_VERSION = 1
 export const FORK_OP_VERSION = 1
 export const GRAPH_OP_VERSION = 1
 export const FILTER_OP_VERSION = 1
-export const AGENT_WORKFLOW_OP_VERSION = 1
 export const BATCH_OP_VERSION = 1
 export const CHANGE_OP_VERSION = 1
 export const CLIENT_METADATA_OP_VERSION = 1
@@ -108,6 +120,7 @@ export const AGENT_OP_VERSION = 1
 const IDEMPOTENT_MANAGED_REQUESTS = new Set([
   AGDX_BATCH_CODE,
   AGDX_CHECKPOINT_CODE,
+  AGDX_CONTROL_PUBLISH_CODE,
   AGDX_KV_SET_CODE,
   AGDX_KV_DELETE_CODE,
   AGDX_KV_DELETE_MANY_CODE,
@@ -124,11 +137,35 @@ const IDEMPOTENT_MANAGED_REQUESTS = new Set([
   AGDX_FORK_DELETE_CODE,
   AGDX_FORK_PROMOTE_CODE,
   AGDX_FORK_PUT_CODE,
-  AGDX_GRAPH_UPSERT_CODE,
-  AGDX_AGENT_SUBMIT_CODE,
-  AGDX_AGENT_CANCEL_CODE
+  AGDX_GRAPH_UPSERT_CODE
 ])
 
 export function isIdempotentManagedRequest(code: number): boolean {
   return IDEMPOTENT_MANAGED_REQUESTS.has(code)
+}
+
+const BARRIER_READS: ReadonlySet<number> = new Set([
+  AGDX_KV_GET_CODE,
+  AGDX_KV_SCAN_CODE,
+  AGDX_KV_NAMESPACES_CODE,
+  AGDX_KV_EXISTS_CODE,
+  AGDX_FORK_LIST_CODE,
+  AGDX_GRAPH_QUERY_CODE,
+  AGDX_GRAPH_NEIGHBORS_CODE,
+  AGDX_SESSION_GET_CODE,
+  AGDX_SESSION_LIST_CODE,
+  AGDX_SESSION_EVENTS_CODE,
+  AGDX_SESSION_STATE_CODE,
+  AGDX_SESSION_LINKS_CODE,
+  AGDX_SESSION_SOURCES_CODE,
+  AGDX_SESSION_CHANGES_CODE
+])
+
+/**
+ * Whether a managed read may carry a `ManagedReadEnvelope` barrier: the reads
+ * of the key-value, fork, graph and session surfaces, as Rust
+ * `is_barrier_read`.
+ */
+export function isBarrierRead(code: number): boolean {
+  return BARRIER_READS.has(code)
 }

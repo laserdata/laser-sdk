@@ -355,7 +355,7 @@ impl AgentHandler for EchoHandler {
         self.tracker.handler_entry(id).await;
         ctx.laser()
             .agdx(
-                AgentTopic::Responses,
+                AgentTopic::Sessions,
                 self.source.clone(),
                 envelope.conversation,
             )
@@ -550,7 +550,7 @@ pub async fn run_publish_evidence(
     let typed_topic = laser.stream(&stream).topic("typed");
     for topic in [&bare_topic, &provenance_topic, &typed_topic] {
         topic
-            .ensure(case.partitions)
+            .ensure(case.partitions, None)
             .await
             .map_err(|error| sdk_error(&error))?;
     }
@@ -637,13 +637,13 @@ pub async fn run_request_reply_evidence(
     let stream = format!("bench-request-reply-{seed:016x}");
     let command_topic = laser
         .stream(&stream)
-        .topic(AgentTopic::Commands.topic_string());
+        .topic(AgentTopic::Sessions.topic_string());
     let response_topic = laser
         .stream(&stream)
-        .topic(AgentTopic::Responses.topic_string());
+        .topic(AgentTopic::Sessions.topic_string());
     for topic in [&command_topic, &response_topic] {
         topic
-            .ensure(case.partitions)
+            .ensure(case.partitions, None)
             .await
             .map_err(|error| sdk_error(&error))?;
     }
@@ -662,12 +662,11 @@ pub async fn run_request_reply_evidence(
         .with_default_stream(&stream);
     let mut agent = Agent::builder()
         .id(worker.clone())
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(EchoHandler {
             tracker: tracker.clone(),
             source: worker.wire_id(),
         })
-        .poll_interval(Duration::ZERO)
         .concurrency(ConcurrencyPolicy::SerialPerPartition { max_partitions })
         .build()
         .spawn(worker_laser);
@@ -743,9 +742,9 @@ pub async fn run_stream_evidence(
     let stream_name = format!("bench-agdx-stream-{seed:016x}");
     let topic = laser
         .stream(&stream_name)
-        .topic(AgentTopic::LlmIo.topic_string());
+        .topic(AgentTopic::Sessions.topic_string());
     topic
-        .ensure(case.partitions)
+        .ensure(case.partitions, None)
         .await
         .map_err(|error| sdk_error(&error))?;
     let scoped = laser.with_default_stream(&stream_name);
@@ -839,7 +838,7 @@ fn stream_operation(
                 .checked_add(sequence)
                 .ok_or_else(|| "AGDX stream ID exceeds u64".to_owned())?;
             let mut stream = laser
-                .agdx(AgentTopic::LlmIo, source, conversation(seed, id))
+                .agdx(AgentTopic::Sessions, source, conversation(seed, id))
                 .stream(correlation(seed, id), OPERATION_CHAT);
             let channel = stream.channel();
             let completion = tracker.register(channel, id).await;
@@ -870,7 +869,6 @@ async fn start_stream_pumps(
         let consumer = topic
             .consumer(format!("laser-bench-stream-{partition}"), partition)
             .batch_length(128)
-            .without_poll_interval()
             .start_at(ConsumerStart::Offset(0))
             .commit_policy(CommitPolicy::Disabled)
             .allow_replay()
@@ -1010,7 +1008,7 @@ fn request_reply_operation(
                 .ok_or_else(|| "AGDX request ID exceeds u64".to_owned())?;
             let receiver = tracker.register(id).await;
             let publish_result = laser
-                .agdx(AgentTopic::Commands, source, conversation(seed, id))
+                .agdx(AgentTopic::Sessions, source, conversation(seed, id))
                 .command(correlation(seed, id), record_payload(&payload, id)?)
                 .send()
                 .await;
@@ -1036,7 +1034,6 @@ async fn start_response_pumps(
         let consumer = topic
             .consumer(format!("laser-bench-response-{partition}"), partition)
             .batch_length(128)
-            .without_poll_interval()
             .start_at(ConsumerStart::Offset(0))
             .commit_policy(CommitPolicy::Disabled)
             .allow_replay()

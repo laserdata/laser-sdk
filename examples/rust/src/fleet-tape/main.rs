@@ -234,8 +234,8 @@ async fn main() -> Result<(), LaserError> {
     let data_stream = stream_for("fleet-tape");
     let laser = laser(&data_stream, Capabilities::OPEN).await?;
     fresh_run(&laser, &data_stream, async {
-        laser.topic(FEED_TOPIC).ensure(PARTITIONS).await?;
-        laser.topic(TAPE_TOPIC).ensure(PARTITIONS).await?;
+        laser.topic(FEED_TOPIC).ensure(PARTITIONS, None).await?;
+        laser.topic(TAPE_TOPIC).ensure(PARTITIONS, None).await?;
         let query_available = laser.capabilities().await.query.available;
 
         // Start the projector before the feed opens so no reading is missed, then warm
@@ -330,7 +330,6 @@ async fn build_fleet_consumer(laser: &Laser, data_stream: &str) -> Result<Consum
         .consumer()
         .commit_policy(CommitPolicy::Polling)
         .start_at(ConsumerStart::Next)
-        .poll_interval(Duration::from_millis(1))
         .batch_length(256)
         .build()
         .await
@@ -591,7 +590,10 @@ async fn avro_tape(laser: &Laser, readings: &[Reading]) -> Result<(), LaserError
         .await?;
     info!("LaserData Cloud allocated writer-schema id {schema_id} for the HostReading schema");
 
-    laser.topic(AVRO_TAPE_TOPIC).ensure(PARTITIONS).await?;
+    laser
+        .topic(AVRO_TAPE_TOPIC)
+        .ensure(PARTITIONS, None)
+        .await?;
     let index = index_for(AVRO_TAPE_TOPIC);
     let projection = format!("{index}.v1");
     laser

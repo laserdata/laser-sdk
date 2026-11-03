@@ -12,7 +12,7 @@ use crate::binary::{BinaryManifest, BuildIdentity, SourceSnapshot, command_outpu
 pub enum LocalBinary {
     IggyServer,
     IggyBench,
-    Plane,
+    Backend,
 }
 
 impl LocalBinary {
@@ -20,7 +20,8 @@ impl LocalBinary {
         match self {
             Self::IggyServer => "server",
             Self::IggyBench => "iggy-bench",
-            Self::Plane => "plane",
+            // the artifact host and the backend repository use this name
+            Self::Backend => "plane",
         }
     }
 
@@ -28,7 +29,7 @@ impl LocalBinary {
         match self {
             Self::IggyServer => "iggy-server",
             Self::IggyBench => "iggy-bench",
-            Self::Plane => "plane",
+            Self::Backend => "plane",
         }
     }
 
@@ -36,7 +37,7 @@ impl LocalBinary {
         match self {
             Self::IggyServer => "core/server/Cargo.toml",
             Self::IggyBench => "core/bench/Cargo.toml",
-            Self::Plane => "plane/Cargo.toml",
+            Self::Backend => "plane/Cargo.toml",
         }
     }
 }
@@ -286,7 +287,7 @@ fn verify_vsr_graph(root: &Path, binary: LocalBinary) -> Result<(), BenchError> 
     let dependency = match binary {
         LocalBinary::IggyServer => "iggy_common",
         LocalBinary::IggyBench => "iggy",
-        LocalBinary::Plane => return Ok(()),
+        LocalBinary::Backend => return Ok(()),
     };
     let output = command_output(
         root,
@@ -340,7 +341,7 @@ mod tests {
         let supported = [
             LocalBinary::IggyServer.binary(),
             LocalBinary::IggyBench.binary(),
-            LocalBinary::Plane.binary(),
+            LocalBinary::Backend.binary(),
         ];
         assert!(!supported.contains(&"iggy-server-ng"));
     }

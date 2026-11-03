@@ -18,7 +18,7 @@ async fn given_consumer_group_committed_offsets_when_rebuilding_state_then_shoul
             .build();
         laser
             .send_agent(
-                AgentTopic::Commands,
+                AgentTopic::Sessions,
                 Bytes::from(format!("{i}")),
                 &provenance,
             )
@@ -32,7 +32,7 @@ async fn given_consumer_group_committed_offsets_when_rebuilding_state_then_shoul
     let handled = Arc::new(AtomicUsize::new(0));
     let _agent_lifetime_1 = Agent::builder()
         .id("counter".parse().expect("counter is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Counter {
             handled: handled.clone(),
         })
@@ -50,7 +50,7 @@ async fn given_consumer_group_committed_offsets_when_rebuilding_state_then_shoul
     let sum = ConversationState::load(
         &laser,
         conversation,
-        vec![AgentTopic::Commands],
+        vec![AgentTopic::Sessions],
         ReplayBound::Full,
         0,
         sum_events,
@@ -65,7 +65,7 @@ async fn given_consumer_group_committed_offsets_when_rebuilding_state_then_shoul
     let replayed = ConversationState::load(
         &laser,
         conversation,
-        vec![AgentTopic::Commands],
+        vec![AgentTopic::Sessions],
         ReplayBound::Full,
         0,
         sum_events,
@@ -88,7 +88,7 @@ async fn given_context_assembler_when_topic_actively_consumed_then_should_still_
             .build();
         laser
             .send_agent(
-                AgentTopic::Commands,
+                AgentTopic::Sessions,
                 Bytes::from(format!("{i}")),
                 &provenance,
             )
@@ -103,7 +103,7 @@ async fn given_context_assembler_when_topic_actively_consumed_then_should_still_
         async move {
             let history = ContextAssembler::builder()
                 .conversation_id(conversation)
-                .topics(vec![AgentTopic::Commands])
+                .topics(vec![AgentTopic::Sessions])
                 .build()
                 .assemble(&laser)
                 .await
@@ -131,7 +131,7 @@ async fn given_consumer_group_committed_offsets_when_reading_with_a_cursor_then_
     let handled = Arc::new(AtomicUsize::new(0));
     let agent = Agent::builder()
         .id("counter".parse().expect("counter is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Counter {
             handled: handled.clone(),
         })
@@ -147,7 +147,7 @@ async fn given_consumer_group_committed_offsets_when_reading_with_a_cursor_then_
     // A fresh cursor owns its own offsets (start at 0) and polls by explicit
     // offset, so it drains the whole topic regardless of the group's commit.
     let commands = laser.topic(
-        AgentTopic::Commands
+        AgentTopic::Sessions
             .name()
             .expect("commands has a topic name"),
     );
@@ -222,7 +222,7 @@ async fn given_consumer_group_committed_when_a_new_member_resumes_then_should_no
         .id("replay-guard"
             .parse()
             .expect("replay-guard is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Counter {
             handled: first.clone(),
         })
@@ -246,7 +246,7 @@ async fn given_consumer_group_committed_when_a_new_member_resumes_then_should_no
         .id("replay-guard"
             .parse()
             .expect("replay-guard is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Counter {
             handled: second.clone(),
         })
@@ -290,7 +290,7 @@ async fn given_appended_messages_when_streamed_then_should_drain_each_once_and_e
     // shape as `async for` in the Python binding. A fresh cursor starts at offset
     // zero, so it drains the whole topic.
     let commands = laser.topic(
-        AgentTopic::Commands
+        AgentTopic::Sessions
             .name()
             .expect("commands has a topic name"),
     );
@@ -341,7 +341,7 @@ async fn send_events(
             .build();
         laser
             .send_agent(
-                AgentTopic::Commands,
+                AgentTopic::Sessions,
                 Bytes::from(format!("{i}")),
                 &provenance,
             )

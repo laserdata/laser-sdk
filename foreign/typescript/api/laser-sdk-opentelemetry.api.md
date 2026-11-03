@@ -4,6 +4,8 @@
 
 ```ts
 
+/// <reference types="node" />
+
 // Warning: (ae-forgotten-export) The symbol "LaserObserver" needs to be exported by the entry point opentelemetry.d.ts
 //
 // @public (undocumented)

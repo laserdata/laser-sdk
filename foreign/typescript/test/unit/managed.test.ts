@@ -5,12 +5,19 @@ import { test } from "node:test"
 import { OPEN_CAPABILITIES, managedCapabilitiesFrom } from "../../src/client/capabilities.js"
 import {
   CodecError,
+  CommandExecutionError,
   InvalidError,
   KvExecutionError,
-  ProtocolError,
   UnsupportedError
 } from "../../src/client/errors.js"
-import { isVersionSkew } from "../../src/client/error-classify.js"
+import {
+  code,
+  isNotFound,
+  isPermissionDenied,
+  isUnavailable,
+  isVersionSkew
+} from "../../src/client/error-classify.js"
+import { isRetryable } from "../../src/agent/reliable-consumer.js"
 import { executeManaged } from "../../src/client/managed.js"
 import { encodeNamed } from "../../src/wire/cbor.js"
 import { Destinations } from "../../src/managed/destinations.js"
@@ -97,7 +104,7 @@ void test("given_an_advertised_version_skew_when_executing_then_should_reject_be
   assert.equal(sent, false)
 })
 
-void test("given_a_supervisor_assertion_when_mutating_then_should_reuse_its_signed_request_id", async () => {
+void test("given_an_operator_assertion_when_mutating_then_should_reuse_its_signed_request_id", async () => {
   const replyBytes = await readFixture("checkpoint_reply_destination.bin")
   const requestId = CheckpointRequestId.fromU128(41n)
   const destinationId = DestinationId.fromU128(42n)
@@ -172,7 +179,7 @@ void test("given_a_command_error_reply_when_executing_then_should_classify_its_r
       error.message === "not served" &&
       error.surface === "managed"
   )
-  for (const code of ["invalid_argument", "version_skew"]) {
+  for (const code of ["invalid_argument"]) {
     await assert.rejects(
       executeManaged(answering(commandError(code, "bad")), managed, KvSetCommand, SET_REQUEST),
       InvalidError
@@ -186,7 +193,10 @@ void test("given_a_command_error_reply_when_executing_then_should_classify_its_r
       SET_REQUEST
     ),
     (error: unknown) =>
-      error instanceof ProtocolError && error.message === "NotFound: gone" && error.resultCode === 2
+      error instanceof CommandExecutionError &&
+      error.message === "gone" &&
+      error.detail.code.kind === "known" &&
+      error.detail.code.name === "NotFound"
   )
 })
 
@@ -216,8 +226,35 @@ void test("given_a_command_error_with_a_newer_code_when_executing_then_should_re
   await assert.rejects(
     executeManaged(answering(reply), managed, KvSetCommand, SET_REQUEST),
     (error: unknown) =>
-      error instanceof ProtocolError &&
-      error.message === "Unrecognized(42): later" &&
-      error.resultCode === 42
+      error instanceof CommandExecutionError &&
+      error.message === "later" &&
+      error.detail.code.kind === "unrecognized" &&
+      error.detail.code.code === 42
   )
+})
+
+void test("given_managed_command_errors_when_decoded_then_should_preserve_codes_and_classifiers", async () => {
+  for (const [wireCode, name, retryable, classify] of [
+    ["conflict", "Conflict", false, () => true],
+    ["target_unavailable", "TargetUnavailable", true, isUnavailable],
+    ["forbidden", "Forbidden", false, isPermissionDenied],
+    ["not_found", "NotFound", false, isNotFound],
+    ["version_skew", "VersionSkew", false, isVersionSkew]
+  ] as const) {
+    await assert.rejects(
+      executeManaged(
+        answering(commandError(wireCode, "refused")),
+        managed,
+        KvSetCommand,
+        SET_REQUEST
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof CommandExecutionError)
+        assert.deepEqual(code(error), { kind: "known", name })
+        assert.equal(isRetryable(error), retryable)
+        assert.ok(classify(error))
+        return true
+      }
+    )
+  }
 })

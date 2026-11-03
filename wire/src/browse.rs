@@ -55,6 +55,10 @@ pub struct ListProjections {
 pub struct GetSchema {
     pub v: u32,
     pub id: u32,
+    /// The stream whose registry holds `id`. Absent for the deployment-wide
+    /// registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// Request to list registered writer schemas, optionally filtered.
@@ -67,6 +71,10 @@ pub struct ListSchemas {
     pub v: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_contains: Option<String>,
+    /// The stream whose registry is listed. Absent for the deployment-wide
+    /// registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// The synchronous register request: no id, LaserData Cloud validates the
@@ -82,6 +90,10 @@ pub struct RegisterSchema {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
+    /// The stream whose registry allocates the id. Absent for the
+    /// deployment-wide registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// Request to decode one record body under the schema registered for `id`,
@@ -94,6 +106,10 @@ pub struct DecodeRecord {
     pub id: u32,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub payload: Vec<u8>,
+    /// The stream whose registry holds `id`. Absent for the deployment-wide
+    /// registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// Reply to a registry browse: `Ok` with the result, or `Err`.
@@ -170,10 +186,76 @@ mod tests {
             v: QUERY_OP_VERSION,
             id: 7,
             payload: vec![0xff, 0x00, 0x10],
+            stream: None,
         };
         let bytes = encode_named(&request).expect("serializes");
         let back: DecodeRecord = decode_named(&bytes).expect("deserializes");
         assert_eq!(back.id, 7);
         assert_eq!(back.payload, vec![0xff, 0x00, 0x10]);
+        assert_eq!(back.stream, None);
+    }
+
+    #[test]
+    fn given_schema_requests_with_a_stream_when_round_tripped_then_should_preserve_it() {
+        let get = GetSchema {
+            v: QUERY_OP_VERSION,
+            id: 7,
+            stream: Some("acme".to_owned()),
+        };
+        let back: GetSchema =
+            decode_named(&encode_named(&get).expect("serializes")).expect("deserializes");
+        assert_eq!((back.id, back.stream.as_deref()), (7, Some("acme")));
+        let list = ListSchemas {
+            v: QUERY_OP_VERSION,
+            name_contains: None,
+            stream: Some("acme".to_owned()),
+        };
+        let back: ListSchemas =
+            decode_named(&encode_named(&list).expect("serializes")).expect("deserializes");
+        assert_eq!(back.stream.as_deref(), Some("acme"));
+        let register = RegisterSchema {
+            v: QUERY_OP_VERSION,
+            source: SchemaSource::JsonSchema {
+                schema: "{}".to_owned(),
+            },
+            name: None,
+            version: None,
+            stream: Some("acme".to_owned()),
+        };
+        let back: RegisterSchema =
+            decode_named(&encode_named(&register).expect("serializes")).expect("deserializes");
+        assert_eq!(back.stream.as_deref(), Some("acme"));
+        let decode = DecodeRecord {
+            v: QUERY_OP_VERSION,
+            id: 7,
+            payload: vec![1],
+            stream: Some("acme".to_owned()),
+        };
+        let back: DecodeRecord =
+            decode_named(&encode_named(&decode).expect("serializes")).expect("deserializes");
+        assert_eq!(back.stream.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn given_schema_requests_without_a_stream_when_encoded_then_should_omit_it() {
+        let get = GetSchema {
+            v: QUERY_OP_VERSION,
+            id: 7,
+            stream: None,
+        };
+        let list = ListSchemas {
+            v: QUERY_OP_VERSION,
+            name_contains: None,
+            stream: None,
+        };
+        for json in [
+            serde_json::to_string(&get).expect("serializes"),
+            serde_json::to_string(&list).expect("serializes"),
+        ] {
+            assert!(
+                !json.contains("stream"),
+                "an unset stream is omitted: {json}"
+            );
+        }
     }
 }

@@ -8,15 +8,15 @@ What it shows:
   - publish two `Reading` records as JSON
   - replay them back through a typed handle (`json(Reading)` decodes each record)
 
-Run it twice and the second run replays four readings: the log keeps every record,
-and a fresh reader starts at offset 0. That is the primitive, not a bug.
+Each run starts on a fresh `laser-log-python` stream. Inside a run, a fresh
+reader starts at offset 0 and replays every retained record.
 
 Run it:
     just up
     python3 log.py
 
 Docs: https://docs.laserdata.cloud/laser-sdk/log
-Full scenario: native_streaming.py (a tuned producer/consumer over this same topic)
+Full scenario: native_streaming.py (a tuned producer and consumer group over the log)
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ from dataclasses import dataclass
 import _common
 
 EXAMPLE = "log"
-STREAM = "fleet"
 TOPIC = "readings"
 
 
@@ -41,7 +40,7 @@ async def main() -> None:
     laser = await _common.connect(EXAMPLE)
     try:
         _common.phase("write two messages, then read them back")
-        topic = laser.stream(STREAM).topic(TOPIC)
+        topic = laser.topic(TOPIC)
         await topic.ensure(2)
 
         for reading in (Reading(host="node-1", cpu=42), Reading(host="node-2", cpu=91)):

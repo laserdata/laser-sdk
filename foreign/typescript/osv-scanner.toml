@@ -1,0 +1,5 @@
+# Keep ignored advisories aligned with the root osv-scanner.toml and deny.toml.
+
+[[IgnoredVulns]]
+id = "GHSA-hp3w-g68c-fv3c"
+reason = "sprintf-js 1.0.3 is a dev-only transitive dependency of @microsoft/api-extractor through @rushstack/ts-command-line and argparse 1.x. It formats the API Extractor command line help from fixed strings, never from input. No sprintf-js release fixes CVE-2026-97058, and argparse 2.x has a different API that ts-command-line does not support. Remove this exception when api-extractor drops argparse 1.x or sprintf-js ships a fix."

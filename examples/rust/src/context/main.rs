@@ -12,18 +12,25 @@ async fn main() -> Result<(), LaserError> {
     init_tracing();
     let laser = laser(&stream_for("context"), Capabilities::OPEN).await?;
     fresh_run(&laser, &stream_for("context"), async {
-        // Conversation turns ride the well-known agent topics, created once here.
-        laser.bootstrap(PARTITIONS).await?;
+        // Conversation turns ride the shared session topic, created once here.
+        laser
+            .bootstrap(
+                PARTITIONS,
+                laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(
+                    86_400,
+                )),
+            )
+            .await?;
         let conversation = ConversationId::new();
 
         phase("append a conversation, then assemble it under a budget");
         let scope = laser.context(conversation);
         scope
-            .append(AgentTopic::Commands, "drain node-7".as_bytes())
+            .append(AgentTopic::Sessions, "drain node-7".as_bytes())
             .await?;
         scope
             .append(
-                AgentTopic::Responses,
+                AgentTopic::Sessions,
                 "drained, 0 connections left".as_bytes(),
             )
             .await?;
@@ -32,7 +39,7 @@ async fn main() -> Result<(), LaserError> {
         // spread through the application: cap the turns, then fit the budget.
         let turns = scope
             .fetch_with(
-                vec![AgentTopic::Commands, AgentTopic::Responses],
+                vec![AgentTopic::Sessions],
                 Box::new(Chain(vec![
                     Box::new(LastN(LAST_N)),
                     Box::new(TokenBudget::new(TOKEN_BUDGET)),

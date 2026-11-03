@@ -11,7 +11,7 @@ pub struct HostRequirements {
     pub client_cpus: Vec<u32>,
     pub iggy_cpus: Vec<u32>,
     #[serde(default)]
-    pub plane_cpus: Vec<u32>,
+    pub backend_cpus: Vec<u32>,
     pub numa_node: u32,
     pub clocksource: String,
     pub governor: String,
@@ -95,9 +95,9 @@ impl HostRequirements {
     pub fn validate(
         &self,
         snapshot: &HostSnapshot,
-        plane_required: bool,
+        backend_required: bool,
     ) -> Result<(), BenchError> {
-        validate_core_sets(self, snapshot, plane_required)?;
+        validate_core_sets(self, snapshot, backend_required)?;
         require_equal("clocksource", &self.clocksource, &snapshot.clocksource)?;
         require_equal("filesystem", &self.filesystem, &snapshot.filesystem)?;
         require_equal("disk model", &self.disk_model, &snapshot.disk_model)?;
@@ -144,7 +144,7 @@ impl HostRequirements {
         self.client_cpus
             .iter()
             .chain(&self.iggy_cpus)
-            .chain(&self.plane_cpus)
+            .chain(&self.backend_cpus)
             .copied()
             .collect()
     }
@@ -257,14 +257,14 @@ pub fn pin_process(_pid: u32, cpus: &[u32]) -> Result<(), BenchError> {
 fn validate_core_sets(
     requirements: &HostRequirements,
     snapshot: &HostSnapshot,
-    plane_required: bool,
+    backend_required: bool,
 ) -> Result<(), BenchError> {
     if requirements.client_cpus.is_empty()
         || requirements.iggy_cpus.is_empty()
-        || (plane_required && requirements.plane_cpus.is_empty())
+        || (backend_required && requirements.backend_cpus.is_empty())
     {
         return Err(BenchError::Invalid(
-            "authoritative client, Iggy, and required plane CPU sets cannot be empty".to_owned(),
+            "authoritative client, Iggy, and required backend CPU sets cannot be empty".to_owned(),
         ));
     }
     let selected = requirements.selected_cpus();
@@ -528,7 +528,7 @@ mod tests {
         HostRequirements {
             client_cpus: vec![0],
             iggy_cpus: vec![1],
-            plane_cpus: vec![2],
+            backend_cpus: vec![2],
             numa_node: 0,
             clocksource: "tsc".to_owned(),
             governor: "performance".to_owned(),

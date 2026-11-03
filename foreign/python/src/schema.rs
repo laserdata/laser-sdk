@@ -103,7 +103,7 @@ impl PyCompiledSchema {
     }
 
     /// Decode `payload` under this schema into a Python value, the model the
-    /// managed plane extracts indexed fields from. Raises `CodecError` when the
+    /// managed backend extracts indexed fields from. Raises `CodecError` when the
     /// payload does not decode.
     fn decode(&self, py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let value = self

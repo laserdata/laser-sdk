@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// One materialized-view advancement on the change feed: after committing a
 /// projector batch for a binding that opted in (`ProjectionBinding.notify`),
-/// the plane publishes one record naming the index, the partition, the offset
+/// the managed backend publishes one record naming the index, the partition, the offset
 /// window the batch covered, and how many rows landed. A consumer awaits the
 /// record then queries, instead of sleeping and retrying: change notification
 /// as records on a topic, consumed by offset, never a server-push watch (the
@@ -22,6 +22,10 @@ pub struct ChangeRecord {
     pub to_offset: u64,
     /// Rows the batch landed in the view.
     pub rows: u32,
+    /// The stream whose source the batch read, when the deployment publishes
+    /// change records per stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 #[cfg(all(test, feature = "cbor"))]
@@ -39,6 +43,7 @@ mod tests {
             from_offset: 100,
             to_offset: 141,
             rows: 42,
+            stream: None,
         };
         let bytes = encode_named(&record).expect("encodes");
         let back: ChangeRecord = decode_named(&bytes).expect("decodes");

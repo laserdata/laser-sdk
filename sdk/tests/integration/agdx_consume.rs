@@ -84,7 +84,7 @@ async fn publish_fixture(laser: &Laser, bytes: &[u8]) {
         HeaderValue::from(ContentType::Cbor.code()),
     );
     laser
-        .topic(AgentTopic::Commands.topic_string())
+        .topic(AgentTopic::Sessions.topic_string())
         .send(bytes.to_vec(), headers, None)
         .await
         .expect("the fixture should publish");
@@ -98,7 +98,7 @@ async fn given_an_agdx_command_when_consumed_then_the_handler_should_see_the_dec
 
     let _agent_lifetime_1 = Agent::builder()
         .id("worker".parse().expect("worker is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Capture { seen: seen.clone() })
         .build()
         .spawn(laser.clone());
@@ -110,8 +110,10 @@ async fn given_an_agdx_command_when_consumed_then_the_handler_should_see_the_dec
     let params = br#"{"ask":"plan the rollout"}"#.to_vec();
     laser
         .agdx(
-            AgentTopic::Commands,
-            "client".parse().expect("client is a valid agent id"),
+            AgentTopic::Sessions,
+            "client"
+                .parse::<laser_sdk::types::AgentId>()
+                .expect("client is a valid agent id"),
             conversation,
         )
         .command(correlation, params.clone())
@@ -165,7 +167,7 @@ async fn given_invalid_and_unmet_agdx_records_when_consumed_then_should_reject_b
     let middleware_calls = Arc::new(AtomicUsize::new(0));
     let mut rejecting = Agent::builder()
         .id("strict-worker".parse().expect("the agent id is valid"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Capture { seen: seen.clone() })
         .middleware(vec![Arc::new(CountingMiddleware {
             before: middleware_calls.clone(),
@@ -212,7 +214,7 @@ async fn given_invalid_and_unmet_agdx_records_when_consumed_then_should_reject_b
 
     let mut understanding = Agent::builder()
         .id("strict-worker".parse().expect("the agent id is valid"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Capture { seen: seen.clone() })
         .understood_features(required.must_understand)
         .build()
@@ -221,7 +223,21 @@ async fn given_invalid_and_unmet_agdx_records_when_consumed_then_should_reject_b
         .ready()
         .await
         .expect("the understanding agent should be ready");
-    publish_fixture(&laser, fixture("agent_must_understand.bin")).await;
+    // An event is observational and never reaches a handler, so the accepted
+    // case is a command that demands the same features.
+    let mut command = laser_sdk::wire::agent::AgentEnvelope::command(
+        laser_sdk::wire::agent::RecordId::from_u128(7),
+        required.conversation,
+        required.source.clone(),
+        laser_sdk::wire::agent::CorrelationId::from_u128(8),
+        b"{}".to_vec(),
+    );
+    command.must_understand = required.must_understand;
+    publish_fixture(
+        &laser,
+        &laser_sdk::wire::framing::encode_named(&command).expect("the command encodes"),
+    )
+    .await;
 
     harness::eventually(|| {
         let seen = seen.clone();

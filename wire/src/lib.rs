@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
-pub mod agent_workflow;
 pub mod arrow;
 pub mod authz;
 pub mod batch;
@@ -14,6 +13,8 @@ pub mod commands;
 pub mod content;
 pub mod control;
 pub mod destination;
+#[cfg(feature = "cbor")]
+pub mod dispatch;
 pub(crate) mod encoding;
 pub mod error;
 pub mod filter;
@@ -32,6 +33,7 @@ pub mod mutation;
 pub mod query;
 pub mod result;
 pub mod schema;
+pub mod session;
 pub mod snapshot;
 pub mod source;
 pub mod topics;
@@ -57,9 +59,9 @@ pub mod prelude {
         ArrowIpcMessageMetadata, ArrowIpcPolicy, ArrowIpcRejectionCode, ArrowTimestampUnit,
     };
     pub use crate::authz::{
-        Action, AuthzError, AuthzReply, Effect, Feature, Grant, ResourceKind, ResourcePattern,
-        Role, RoleBinding, SupervisorActorAssertion, SupervisorActorClaims,
-        SupervisorAssertionAction,
+        Action, AuthzError, AuthzReply, Effect, Feature, Grant, OperatorActorAssertion,
+        OperatorActorClaims, OperatorAssertionAction, ResourceKind, ResourcePattern, Role,
+        RoleBinding,
     };
     pub use crate::browse::{BrowseOutcome, BrowseReply, ProjectionInfo, SchemaInfo};
     pub use crate::checkpoint::{
@@ -93,7 +95,7 @@ pub mod prelude {
         Coerce, ConsumerFilter, FaultPolicy, FieldPath, FilterBinding, FilterCodec, FilterConsumer,
         FilterError, FilterErrorReason, FilterExpr, FilterGroupRef, FilterMutation,
         FilterMutationOutcome, FilterMutationStatus, FilterRef, FilterSource, FilteredPage,
-        FilteredStart, ReadMode, StopReason, TimestampFormat,
+        FilteredStart, StopReason, TimestampFormat,
     };
     pub use crate::fork::{ForkError, ForkInfo, ForkKind, ForkOutcome, ForkReply, ForkStatus};
     pub use crate::graph::{

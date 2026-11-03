@@ -23,7 +23,8 @@ pub mod feature {
     pub const STRONG_CONSISTENCY: u64 = 1 << 2;
     /// The key-value store serves fenced compare-and-swap (`AGDX_KV_CAS_FENCED`).
     pub const KV_CAS_FENCED: u64 = 1 << 3;
-    /// The plane serves the agent and workflow control band (`AGDX_AGENT_*`).
+    /// Retired with the run registry. No server sets it and the bit is never
+    /// reused.
     pub const AGENT_WORKFLOW: u64 = 1 << 4;
     /// The query surface serves lexical relevance search (`Query.text`).
     pub const KEYWORD_SEARCH: u64 = 1 << 5;
@@ -56,6 +57,12 @@ pub mod feature {
     /// examined records and wait for a catalog position. A client must not send
     /// the automatic selector to a server without this bit.
     pub const GROUP_POLICY_READS: u64 = 1 << 11;
+    /// The managed backend serves session reads for one named stream.
+    pub const SESSIONS: u64 = 1 << 12;
+    /// The managed backend runs in stream tenancy: every managed name is
+    /// scoped to one stream, and the change feed and dead letters of each
+    /// stream ride their own ops topics.
+    pub const STREAM_TENANCY: u64 = 1 << 13;
 }
 
 /// The wire op versions a server accepts, one per surface, plus the capability
@@ -624,6 +631,10 @@ pub struct FilterAnnounce {
     pub evaluator_version: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub codecs: Vec<FilterCodec>,
+    /// Longest filtered wait the server holds. Zero means it serves no
+    /// filtered wait, so a reader paces idle rounds itself.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_wait_ms: u32,
 }
 
 impl FilterAnnounce {
@@ -638,6 +649,7 @@ impl FilterAnnounce {
                 FilterCodec::Protobuf,
                 FilterCodec::Cbor,
             ],
+            max_wait_ms: 0,
         }
     }
 
@@ -892,4 +904,7 @@ mod tests {
         let older: BackendAnnounce = decode_named(&plain).expect("deserializes");
         assert_eq!(older.filters, None);
     }
+}
+const fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }

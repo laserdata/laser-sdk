@@ -8,6 +8,7 @@ import { ActionDecision, GovernorMode, type ActionGovernor } from "../../src/gov
 import { Json } from "../../src/stream/codecs.js"
 import { Record } from "../../src/stream/record.js"
 import { ContentType } from "../../src/wire/content.js"
+import { TopicRetention } from "../../src/session.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
@@ -196,7 +197,7 @@ void test("given_a_blocking_governor_when_a_publish_batch_is_sent_then_should_wr
   }
   const laser = connected.withGovernor(governor, GovernorMode.Enforce)
   try {
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     const topic = laser.topic("business.audit")
     await topic.ensure(1)
 

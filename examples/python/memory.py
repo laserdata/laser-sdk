@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 
 import _common
 import laser_sdk as ls
@@ -119,16 +120,18 @@ async def run_durable(laser, conversation) -> None:
     topic, so facts persist and replay. `memory_topic` configures that topic up
     front: a partition count and a stream message-expiry window."""
     _common.phase("Remember durable facts")
-    durable = await laser.memory_topic("incidents", partitions=4, ttl_secs=86_400)
+    durable = await laser.memory_topic("incidents", partitions=4, ttl_ms=86_400_000)
     for fact in KNOWLEDGE:
         await durable.remember(fact, conversation=conversation)
-    hits = await durable.recall(limit=3, conversation=conversation)
-    print(f"stored {len(KNOWLEDGE)} durable facts, recalled {len(hits)}")
+    # The managed read view folds the memory topic asynchronously, so wait until
+    # it holds the new facts instead of reading it once.
+    hits = await wait_for_recall(durable, conversation, 3)
+    print(f"stored {len(KNOWLEDGE)} durable facts, recalled {len(hits)} most-recent")
     # Each recalled item points back to its origin log record, so a reader (or
     # the console) can fold from the read view to the source message.
     for hit in hits:
         if hit.source:
-            stream, topic, partition, offset, _conversation = hit.source
+            stream, topic, partition, offset, _generation, _conversation = hit.source
             print(f"  recalled from source {stream}/{topic} partition {partition} offset {offset}")
 
     # ONE SCOPE. The incident is one conversation. `laser.context(..)` binds it
@@ -145,6 +148,17 @@ async def run_durable(laser, conversation) -> None:
         f"one scope recalled {len(scoped_hits)} durable facts and read back "
         f"{len(trail)} of the conversation's messages"
     )
+
+
+async def wait_for_recall(memory, conversation: str, expected: int):
+    """Poll the managed read view until it returns `expected` items or the
+    deadline passes, then return what it holds."""
+    deadline = time.monotonic() + _common.PROJECTOR_TIMEOUT
+    while True:
+        hits = await memory.recall(limit=expected, conversation=conversation)
+        if len(hits) >= expected or time.monotonic() >= deadline:
+            return hits
+        await asyncio.sleep(_common.PROJECTION_POLL)
 
 
 async def run_graph(laser) -> None:

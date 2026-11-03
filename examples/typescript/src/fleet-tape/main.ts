@@ -12,6 +12,7 @@ import {
 
 import {
   batchSize,
+  exampleStream,
   indexFor,
   managedGate,
   messages,
@@ -142,11 +143,12 @@ async function registerTape(
     inlinePayloadDefault
   }
   const binding: ProjectionBinding = {
-    source: { stream: laser.defaultStream ?? "", topic },
+    source: { stream: exampleStream(laser), topic },
     allowedProjections: [id],
     defaultProjection: id,
     index,
-    notify: true
+    notify: true,
+    skipRejected: false
   }
   await laser.projections().register(projection)
   await laser.bindings().apply(binding)

@@ -20,7 +20,7 @@ use crate::managed::{
     ManagedCase, ProjectionNames, prepare_projection, query_payload, wait_for_row_count,
 };
 use crate::manifest::Environment;
-use crate::process::{NativeIggy, NativePlane, PlaneProfile, StoppedPlane};
+use crate::process::{BackendProfile, NativeBackend, NativeIggy, StoppedBackend};
 use crate::report::OutcomeCounts;
 use crate::telemetry::{TelemetrySampler, TelemetrySeries};
 
@@ -39,16 +39,16 @@ const TELEMETRY_INTERVAL: Duration = Duration::from_secs(1);
 pub enum RecoveryDriver {
     ConsumerRestart,
     IggyRestart,
-    PlaneRestartMemory,
-    PlaneRestartProjection,
+    BackendRestartMemory,
+    BackendRestartProjection,
 }
 
 impl RecoveryDriver {
     #[must_use]
-    pub fn requires_plane(self) -> bool {
+    pub fn requires_backend(self) -> bool {
         matches!(
             self,
-            Self::PlaneRestartMemory | Self::PlaneRestartProjection
+            Self::BackendRestartMemory | Self::BackendRestartProjection
         )
     }
 }
@@ -68,19 +68,19 @@ pub struct RecoveryCase {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct RecoveryTimeline {
     pub fault_injected_ns: u64,
-    pub plane_stopped_ns: u64,
+    pub backend_stopped_ns: u64,
     pub managed_unavailable_ns: u64,
     pub backlog_published_ns: u64,
     pub restart_started_ns: u64,
-    pub plane_available_ns: u64,
-    pub plane_ready_ns: u64,
+    pub backend_available_ns: u64,
+    pub backend_ready_ns: u64,
     pub converged_ns: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct RecoverySummary {
     pub driver: RecoveryDriver,
-    pub backend_profile: PlaneProfile,
+    pub backend_profile: BackendProfile,
     pub baseline_records: usize,
     pub backlog_records: usize,
     pub recovered_records: usize,
@@ -151,7 +151,7 @@ pub struct IggyRecoveryEvidence {
 
 pub struct RecoveryEvidence {
     pub summary: RecoverySummary,
-    pub plane: NativePlane,
+    pub backend: NativeBackend,
     pub telemetry_before: TelemetrySeries,
     pub telemetry_after: TelemetrySeries,
 }
@@ -159,8 +159,8 @@ pub struct RecoveryEvidence {
 pub struct RecoveryRun<'a> {
     pub laser: &'a Laser,
     pub server: &'a NativeIggy,
-    pub plane: NativePlane,
-    pub plane_manifest: &'a BinaryManifest,
+    pub backend: NativeBackend,
+    pub backend_manifest: &'a BinaryManifest,
     pub environment: &'a Environment,
     pub case: &'a RecoveryCase,
     pub driver: RecoveryDriver,
@@ -172,18 +172,18 @@ pub struct RecoveryRun<'a> {
 struct RecoveryContext<'a> {
     laser: &'a Laser,
     server: &'a NativeIggy,
-    plane_manifest: &'a BinaryManifest,
+    backend_manifest: &'a BinaryManifest,
     environment: &'a Environment,
     case: &'a RecoveryCase,
     scenario: &'a str,
     seed: u64,
 }
 
-struct RestartedPlane {
-    plane: NativePlane,
+struct RestartedBackend {
+    backend: NativeBackend,
     telemetry: TelemetrySampler,
-    plane_available_ns: u64,
-    plane_ready_ns: u64,
+    backend_available_ns: u64,
+    backend_ready_ns: u64,
 }
 
 struct RecoveryMetrics {
@@ -194,7 +194,7 @@ struct RecoveryMetrics {
     timeline: RecoveryTimeline,
 }
 
-/// Stop plane while Iggy remains live, append a deterministic backlog, restart plane, and verify convergence.
+/// Stop the backend while Iggy remains live, append a deterministic backlog, restart the backend, and verify convergence.
 ///
 /// # Errors
 ///
@@ -204,7 +204,7 @@ pub async fn run_recovery_evidence(run: RecoveryRun<'_>) -> Result<RecoveryEvide
     let context = RecoveryContext {
         laser: run.laser,
         server: run.server,
-        plane_manifest: run.plane_manifest,
+        backend_manifest: run.backend_manifest,
         environment: run.environment,
         case: run.case,
         scenario: run.scenario,
@@ -217,8 +217,10 @@ pub async fn run_recovery_evidence(run: RecoveryRun<'_>) -> Result<RecoveryEvide
         RecoveryDriver::IggyRestart => Err(BenchError::Invalid(
             "Iggy restart uses run_iggy_recovery".to_owned(),
         )),
-        RecoveryDriver::PlaneRestartMemory => run_memory_recovery(context, run.plane).await,
-        RecoveryDriver::PlaneRestartProjection => run_projection_recovery(context, run.plane).await,
+        RecoveryDriver::BackendRestartMemory => run_memory_recovery(context, run.backend).await,
+        RecoveryDriver::BackendRestartProjection => {
+            run_projection_recovery(context, run.backend).await
+        }
     }
 }
 
@@ -227,6 +229,10 @@ pub async fn run_recovery_evidence(run: RecoveryRun<'_>) -> Result<RecoveryEvide
 /// # Errors
 ///
 /// Returns an error when setup, shutdown, unavailability probing, restart, telemetry, replay, or append validation fails.
+#[allow(
+    clippy::large_futures,
+    reason = "a Laser publish awaits the upstream IggyProducer send future inline, 16 080 bytes in debug"
+)]
 pub async fn run_iggy_recovery(
     laser: Laser,
     server: NativeIggy,
@@ -245,7 +251,7 @@ pub async fn run_iggy_recovery(
     let stream = format!("bench-iggy-recovery-{seed:016x}");
     let topic = laser.stream(&stream).topic(scenario);
     topic
-        .ensure(1)
+        .ensure(1, None)
         .await
         .map_err(|error| recovery_error("create Iggy recovery topic", &error))?;
     let payload = seeded_payload(case.payload_bytes, seed);
@@ -381,6 +387,10 @@ fn iggy_recovery_summary(
 /// # Errors
 ///
 /// Returns an error when topology setup, baseline delivery, publishing, consumer shutdown, or resumed-consumer construction fails.
+#[allow(
+    clippy::large_futures,
+    reason = "a Laser publish awaits the upstream IggyProducer send future inline, 16 080 bytes in debug"
+)]
 pub async fn run_consumer_recovery(
     laser: &Laser,
     case: &RecoveryCase,
@@ -396,7 +406,7 @@ pub async fn run_consumer_recovery(
     let stream = format!("bench-recovery-{seed:016x}");
     let topic = laser.stream(&stream).topic(scenario);
     topic
-        .ensure(1)
+        .ensure(1, None)
         .await
         .map_err(|error| recovery_error("create recovery topic", &error))?;
     let producer = recovery_producer(&topic).await?;
@@ -530,7 +540,6 @@ async fn build_recovery_consumer(
     topic
         .consumer(consumer_id, 0)
         .batch_length(100)
-        .without_poll_interval()
         .start_at(start)
         .commit_policy(CommitPolicy::Disabled)
         .allow_replay()
@@ -551,6 +560,10 @@ async fn recovery_producer(topic: &Topic) -> Result<Producer, BenchError> {
         .map_err(|error| recovery_error("build recovery producer", &error))
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "a Laser publish awaits the upstream IggyProducer send future inline, 16 080 bytes in debug"
+)]
 async fn publish_recovery_records(
     producer: &Producer,
     payload: &Bytes,
@@ -655,12 +668,12 @@ fn decode_recovery_id(payload: &[u8]) -> Result<u64, BenchError> {
 
 async fn run_projection_recovery(
     context: RecoveryContext<'_>,
-    plane: NativePlane,
+    backend: NativeBackend,
 ) -> Result<RecoveryEvidence, BenchError> {
     let names = ProjectionNames::new(context.scenario, context.seed);
     let managed_case = managed_case(context.case);
     let (laser, topic) =
-        prepare_projection(context.laser, &managed_case, &names, plane.profile).await?;
+        prepare_projection(context.laser, &managed_case, &names, backend.profile).await?;
     publish_projection(
         &topic,
         &names,
@@ -676,12 +689,12 @@ async fn run_projection_recovery(
         context.case.timeout,
     )
     .await?;
-    let telemetry_before = start_telemetry(context.server, &plane, context.environment).await?;
+    let telemetry_before = start_telemetry(context.server, &backend, context.environment).await?;
     let telemetry_before = telemetry_before.stop().await?;
     let started = Instant::now();
     let fault_injected_ns = elapsed_ns(started);
-    let stopped = plane.stop_for_restart().await?;
-    let plane_stopped_ns = elapsed_ns(started);
+    let stopped = backend.stop_for_restart().await?;
+    let backend_stopped_ns = elapsed_ns(started);
     require_query_unavailable(&laser, &names.index).await?;
     let managed_unavailable_ns = elapsed_ns(started);
     publish_projection(
@@ -694,7 +707,7 @@ async fn run_projection_recovery(
     .await?;
     let backlog_published_ns = elapsed_ns(started);
     let restart_started_ns = elapsed_ns(started);
-    let restarted = restart_plane(context, stopped, started).await?;
+    let restarted = restart_backend(context, stopped, started).await?;
     let expected = context.case.backlog_records.saturating_mul(2);
     if let Err(error) =
         wait_for_row_count(&laser, &names.index, expected as u64, context.case.timeout).await
@@ -706,9 +719,9 @@ async fn run_projection_recovery(
         Err(error) => return restarted.fail(error).await,
     };
     let converged_ns = elapsed_ns(started);
-    let plane_available_ns = restarted.plane_available_ns;
-    let plane_ready_ns = restarted.plane_ready_ns;
-    let (plane, telemetry_after) = restarted.finish().await?;
+    let backend_available_ns = restarted.backend_available_ns;
+    let backend_ready_ns = restarted.backend_ready_ns;
+    let (backend, telemetry_after) = restarted.finish().await?;
     let metrics = RecoveryMetrics {
         telemetry_before,
         telemetry_after,
@@ -716,26 +729,26 @@ async fn run_projection_recovery(
         duplicates,
         timeline: RecoveryTimeline {
             fault_injected_ns,
-            plane_stopped_ns,
+            backend_stopped_ns,
             managed_unavailable_ns,
             backlog_published_ns,
             restart_started_ns,
-            plane_available_ns,
-            plane_ready_ns,
+            backend_available_ns,
+            backend_ready_ns,
             converged_ns,
         },
     };
     Ok(evidence(
         &context,
-        RecoveryDriver::PlaneRestartProjection,
-        plane,
+        RecoveryDriver::BackendRestartProjection,
+        backend,
         metrics,
     ))
 }
 
 async fn run_memory_recovery(
     context: RecoveryContext<'_>,
-    plane: NativePlane,
+    backend: NativeBackend,
 ) -> Result<RecoveryEvidence, BenchError> {
     let names = RecoveryNames::new(context.scenario, context.seed);
     let stream = context.laser.stream(&names.stream);
@@ -771,12 +784,12 @@ async fn run_memory_recovery(
         context.case.timeout,
     )
     .await?;
-    let telemetry_before = start_telemetry(context.server, &plane, context.environment).await?;
+    let telemetry_before = start_telemetry(context.server, &backend, context.environment).await?;
     let telemetry_before = telemetry_before.stop().await?;
     let started = Instant::now();
     let fault_injected_ns = elapsed_ns(started);
-    let stopped = plane.stop_for_restart().await?;
-    let plane_stopped_ns = elapsed_ns(started);
+    let stopped = backend.stop_for_restart().await?;
+    let backend_stopped_ns = elapsed_ns(started);
     require_memory_unavailable(&memory, conversation).await?;
     let managed_unavailable_ns = elapsed_ns(started);
     publish_memory(
@@ -789,7 +802,7 @@ async fn run_memory_recovery(
     .await?;
     let backlog_published_ns = elapsed_ns(started);
     let restart_started_ns = elapsed_ns(started);
-    let restarted = restart_plane(context, stopped, started).await?;
+    let restarted = restart_backend(context, stopped, started).await?;
     let expected = context.case.backlog_records.saturating_mul(2);
     let items = match wait_for_memory(
         &memory,
@@ -805,13 +818,13 @@ async fn run_memory_recovery(
     };
     let duplicates = duplicate_payloads(&items);
     let converged_ns = elapsed_ns(started);
-    let plane_available_ns = restarted.plane_available_ns;
-    let plane_ready_ns = restarted.plane_ready_ns;
-    let (plane, telemetry_after) = restarted.finish().await?;
+    let backend_available_ns = restarted.backend_available_ns;
+    let backend_ready_ns = restarted.backend_ready_ns;
+    let (backend, telemetry_after) = restarted.finish().await?;
     Ok(evidence(
         &context,
-        RecoveryDriver::PlaneRestartMemory,
-        plane,
+        RecoveryDriver::BackendRestartMemory,
+        backend,
         RecoveryMetrics {
             telemetry_before,
             telemetry_after,
@@ -819,12 +832,12 @@ async fn run_memory_recovery(
             duplicates,
             timeline: RecoveryTimeline {
                 fault_injected_ns,
-                plane_stopped_ns,
+                backend_stopped_ns,
                 managed_unavailable_ns,
                 backlog_published_ns,
                 restart_started_ns,
-                plane_available_ns,
-                plane_ready_ns,
+                backend_available_ns,
+                backend_ready_ns,
                 converged_ns,
             },
         },
@@ -834,7 +847,7 @@ async fn run_memory_recovery(
 fn evidence(
     context: &RecoveryContext<'_>,
     driver: RecoveryDriver,
-    plane: NativePlane,
+    backend: NativeBackend,
     metrics: RecoveryMetrics,
 ) -> RecoveryEvidence {
     let expected = context.case.backlog_records.saturating_mul(2);
@@ -842,7 +855,7 @@ fn evidence(
     RecoveryEvidence {
         summary: RecoverySummary {
             driver,
-            backend_profile: plane.profile,
+            backend_profile: backend.profile,
             baseline_records: context.case.backlog_records,
             backlog_records: context.case.backlog_records,
             recovered_records: metrics.recovered_records,
@@ -861,68 +874,68 @@ fn evidence(
                 ..OutcomeCounts::default()
             },
             configuration: serde_json::json!({
-                "fault": "plane_process_stop",
+                "fault": "backend_process_stop",
                 "iggy_remained_available": true,
                 "database_reused": true,
-                "backlog_published_while_plane_stopped": true,
+                "backlog_published_while_backend_stopped": true,
                 "latency_boundary": "fault_injection_to_full_result_convergence",
                 "observation_resolution_ns": 1_000_000,
             }),
         },
-        plane,
+        backend,
         telemetry_before: metrics.telemetry_before,
         telemetry_after: metrics.telemetry_after,
     }
 }
 
-impl RestartedPlane {
+impl RestartedBackend {
     async fn fail(self, error: BenchError) -> Result<RecoveryEvidence, BenchError> {
-        let _ = self.plane.shutdown().await;
+        let _ = self.backend.shutdown().await;
         Err(error)
     }
 
-    async fn finish(self) -> Result<(NativePlane, TelemetrySeries), BenchError> {
-        let RestartedPlane {
-            plane,
+    async fn finish(self) -> Result<(NativeBackend, TelemetrySeries), BenchError> {
+        let RestartedBackend {
+            backend,
             telemetry,
-            plane_available_ns: _,
-            plane_ready_ns: _,
+            backend_available_ns: _,
+            backend_ready_ns: _,
         } = self;
         let telemetry_after = telemetry.stop().await?;
-        Ok((plane, telemetry_after))
+        Ok((backend, telemetry_after))
     }
 }
 
-async fn restart_plane(
+async fn restart_backend(
     context: RecoveryContext<'_>,
-    stopped: StoppedPlane,
+    stopped: StoppedBackend,
     started: Instant,
-) -> Result<RestartedPlane, BenchError> {
-    let mut plane = stopped
+) -> Result<RestartedBackend, BenchError> {
+    let mut backend = stopped
         .start(
-            context.plane_manifest,
+            context.backend_manifest,
             context.server,
             context.environment,
             RESTART_INDEX,
         )
         .await?;
-    let plane_available_ns = elapsed_ns(started);
-    let telemetry = match start_telemetry(context.server, &plane, context.environment).await {
+    let backend_available_ns = elapsed_ns(started);
+    let telemetry = match start_telemetry(context.server, &backend, context.environment).await {
         Ok(telemetry) => telemetry,
         Err(error) => {
-            let _ = plane.shutdown().await;
+            let _ = backend.shutdown().await;
             return Err(error);
         }
     };
-    if let Err(error) = plane.wait_ready(context.case.timeout).await {
-        let _ = plane.shutdown().await;
+    if let Err(error) = backend.wait_ready(context.case.timeout).await {
+        let _ = backend.shutdown().await;
         return Err(error);
     }
-    Ok(RestartedPlane {
-        plane,
+    Ok(RestartedBackend {
+        backend,
         telemetry,
-        plane_available_ns,
-        plane_ready_ns: elapsed_ns(started),
+        backend_available_ns,
+        backend_ready_ns: elapsed_ns(started),
     })
 }
 
@@ -980,7 +993,7 @@ async fn validate_projection(
 async fn require_query_unavailable(laser: &Laser, index: &str) -> Result<(), BenchError> {
     if laser.query(index).limit(1).fetch().await.is_ok() {
         return Err(BenchError::Invalid(
-            "managed query remained available after plane stopped".to_owned(),
+            "managed query remained available after the backend stopped".to_owned(),
         ));
     }
     Ok(())
@@ -1010,7 +1023,7 @@ async fn require_memory_unavailable(
 ) -> Result<(), BenchError> {
     if memory.recall(conversation).limit(1).fetch().await.is_ok() {
         return Err(BenchError::Invalid(
-            "managed memory remained available after plane stopped".to_owned(),
+            "managed memory remained available after the backend stopped".to_owned(),
         ));
     }
     Ok(())
@@ -1056,7 +1069,7 @@ fn duplicate_payloads(items: &[MemoryItem]) -> u64 {
 
 async fn start_telemetry(
     server: &NativeIggy,
-    plane: &NativePlane,
+    backend: &NativeBackend,
     environment: &Environment,
 ) -> Result<TelemetrySampler, BenchError> {
     TelemetrySampler::start(
@@ -1070,13 +1083,13 @@ async fn start_telemetry(
                     .ok_or_else(|| BenchError::Invalid("Iggy PID unavailable".to_owned()))?,
             ),
             (
-                "plane".to_owned(),
-                plane
+                "backend".to_owned(),
+                backend
                     .pid()
-                    .ok_or_else(|| BenchError::Invalid("plane PID unavailable".to_owned()))?,
+                    .ok_or_else(|| BenchError::Invalid("backend PID unavailable".to_owned()))?,
             ),
         ],
-        plane.health_address,
+        backend.health_address,
         TELEMETRY_INTERVAL,
         environment
             .host
@@ -1186,8 +1199,8 @@ mod tests {
     fn given_recovery_driver_names_when_parsed_then_should_use_snake_case() {
         for name in [
             "consumer_restart",
-            "plane_restart_memory",
-            "plane_restart_projection",
+            "backend_restart_memory",
+            "backend_restart_projection",
         ] {
             let driver = name
                 .parse::<RecoveryDriver>()
@@ -1195,7 +1208,7 @@ mod tests {
             let rendered: &'static str = driver.into();
             assert_eq!(rendered, name);
         }
-        assert!("plane-restart-memory".parse::<RecoveryDriver>().is_err());
+        assert!("backend-restart-memory".parse::<RecoveryDriver>().is_err());
     }
 
     #[test]

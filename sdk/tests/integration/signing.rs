@@ -74,7 +74,7 @@ fn now_micros() -> u64 {
 }
 
 // A signed command encoded exactly as the AGDX producer would publish it, so a
-// test can vary the broker headers independently of the signed context.
+// test can vary the transport headers independently of the signed context.
 fn signed_command(key: &SigningKey, conversation: u128, correlation: u128) -> Vec<u8> {
     let mut envelope = AgentEnvelope::command(
         WireRecordId::from_u128(correlation | 0x1000),
@@ -116,7 +116,7 @@ async fn publish_with_headers(
         );
     }
     laser
-        .topic(AgentTopic::Commands.topic_string())
+        .topic(AgentTopic::Sessions.topic_string())
         .send(bytes, headers, None)
         .await
         .expect("the record should publish");
@@ -124,7 +124,7 @@ async fn publish_with_headers(
 
 #[tokio::test]
 #[serial_test::serial(integration)]
-async fn given_a_verified_consumer_when_broker_headers_are_mutated_then_should_dead_letter_before_dispatch()
+async fn given_a_verified_consumer_when_transport_headers_are_mutated_then_should_dead_letter_before_dispatch()
  {
     let laser = harness::laser().await;
     let caller_key = SigningKey::from_bytes(&[21u8; 32]);
@@ -136,7 +136,7 @@ async fn given_a_verified_consumer_when_broker_headers_are_mutated_then_should_d
     let middleware_calls = Arc::new(AtomicUsize::new(0));
     let mut worker = Agent::builder()
         .id("header-strict".parse().expect("the agent id is valid"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .verifier(Arc::new(registry))
         .handler(Capture {
             principals: principals.clone(),
@@ -239,7 +239,7 @@ async fn given_a_verified_consumer_when_broker_headers_are_mutated_then_should_d
 
 #[tokio::test]
 #[serial_test::serial(integration)]
-async fn given_lifecycle_bound_keys_when_verified_at_the_broker_timestamp_then_should_gate_by_validity()
+async fn given_lifecycle_bound_keys_when_verified_at_the_server_timestamp_then_should_gate_by_validity()
  {
     let laser = harness::laser().await;
     let now = now_micros();
@@ -263,7 +263,7 @@ async fn given_lifecycle_bound_keys_when_verified_at_the_broker_timestamp_then_s
     let capsules = Arc::new(Mutex::new(Vec::new()));
     let mut worker = Agent::builder()
         .id("window-strict".parse().expect("the agent id is valid"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .verifier(Arc::new(registry))
         .handler(Capture {
             principals: principals.clone(),
@@ -275,7 +275,7 @@ async fn given_lifecycle_bound_keys_when_verified_at_the_broker_timestamp_then_s
         .spawn(laser.clone());
     worker.ready().await.expect("the worker should be ready");
 
-    // Each key signs an otherwise identical command. The broker stamps the
+    // Each key signs an otherwise identical command. The streaming server stamps the
     // record timestamp on ingest, so only the key whose window covers that
     // stamp may pass; the future, expired, and revoked keys must dead-letter.
     let conversation = WireConversationId::from_u128(0x0190_3c1f_aa00_0000_0000_0000_0000_0102u128);
@@ -290,7 +290,7 @@ async fn given_lifecycle_bound_keys_when_verified_at_the_broker_timestamp_then_s
     {
         laser
             .agdx(
-                AgentTopic::Commands,
+                AgentTopic::Sessions,
                 source.parse::<WireAgentId>().expect("the id is valid"),
                 conversation,
             )
@@ -361,8 +361,8 @@ async fn given_a_verifier_when_reply_hub_replies_are_forged_then_should_accept_o
     let pending = tokio::spawn(async move {
         requester
             .request(
-                AgentTopic::ToolCalls,
-                AgentTopic::ToolResults,
+                AgentTopic::Sessions,
+                AgentTopic::Sessions,
                 b"work".to_vec(),
                 &provenance,
                 Duration::from_secs(10),
@@ -381,12 +381,12 @@ async fn given_a_verifier_when_reply_hub_replies_are_forged_then_should_accept_o
         .build();
     Router::to("orchestrator".parse().expect("the id is valid")).apply(&mut forged);
     laser
-        .send_agent(AgentTopic::ToolResults, b"forged-plain".to_vec(), &forged)
+        .send_agent(AgentTopic::Sessions, b"forged-plain".to_vec(), &forged)
         .await
         .expect("the plain forgery should publish");
     laser
         .agdx(
-            AgentTopic::ToolResults,
+            AgentTopic::Sessions,
             "attacker".parse::<WireAgentId>().expect("the id is valid"),
             conversation.into(),
         )
@@ -396,7 +396,7 @@ async fn given_a_verifier_when_reply_hub_replies_are_forged_then_should_accept_o
         .expect("the unsigned forgery should publish");
     laser
         .agdx(
-            AgentTopic::ToolResults,
+            AgentTopic::Sessions,
             "other".parse::<WireAgentId>().expect("the id is valid"),
             conversation.into(),
         )
@@ -413,7 +413,7 @@ async fn given_a_verifier_when_reply_hub_replies_are_forged_then_should_accept_o
 
     laser
         .agdx(
-            AgentTopic::ToolResults,
+            AgentTopic::Sessions,
             "tool".parse::<WireAgentId>().expect("the id is valid"),
             conversation.into(),
         )
@@ -450,7 +450,7 @@ async fn given_a_verifier_when_input_replies_are_forged_then_should_resume_only_
             _message: &AgentMessage,
             ctx: &AgentCtx<'_>,
         ) -> Result<(), LaserError> {
-            ctx.respond_input(AgentTopic::Responses, self.answer.to_vec())
+            ctx.respond_input(AgentTopic::Sessions, self.answer.to_vec())
                 .await
         }
     }
@@ -459,14 +459,14 @@ async fn given_a_verifier_when_input_replies_are_forged_then_should_resume_only_
     // verify, so the paused caller must keep waiting and time out.
     let mut faker = Agent::builder()
         .id("faker".parse().expect("faker is a valid agent id"))
-        .listen_on(AgentTopic::HumanInput)
+        .listen_on(AgentTopic::Sessions)
         .handler(Approve { answer: b"forged" })
         .build()
         .spawn(laser.clone());
     faker.ready().await.expect("the faker should be ready");
 
     let orchestrator = caller.agdx(
-        AgentTopic::HumanInput,
+        AgentTopic::Sessions,
         "orchestrator"
             .parse::<WireAgentId>()
             .expect("orchestrator is a valid agent id"),
@@ -474,7 +474,7 @@ async fn given_a_verifier_when_input_replies_are_forged_then_should_resume_only_
     );
     let result = orchestrator
         .request_input(
-            AgentTopic::Responses,
+            AgentTopic::Sessions,
             b"approve?".to_vec(),
             Duration::from_secs(2),
         )
@@ -488,7 +488,7 @@ async fn given_a_verifier_when_input_replies_are_forged_then_should_resume_only_
     // agent's key, so the verified reader accepts exactly this decision.
     let mut approver = Agent::builder()
         .id("approver".parse().expect("approver is a valid agent id"))
-        .listen_on(AgentTopic::HumanInput)
+        .listen_on(AgentTopic::Sessions)
         .signing_key(Arc::new(approver_key))
         .handler(Approve {
             answer: b"approved-signed",
@@ -502,7 +502,7 @@ async fn given_a_verifier_when_input_replies_are_forged_then_should_resume_only_
 
     let decision = orchestrator
         .request_input(
-            AgentTopic::Responses,
+            AgentTopic::Sessions,
             b"approve?".to_vec(),
             Duration::from_secs(10),
         )
@@ -523,18 +523,13 @@ async fn given_an_expired_key_when_replaying_a_record_signed_in_its_window_then_
     let laser = harness::laser().await;
     let now = now_micros();
     let key = SigningKey::from_bytes(&[61u8; 32]);
-    let mut registry = KeyRegistry::new();
-    registry.enroll_record(
-        KeyRecord::agent("historic", key.verifying_key())
-            .valid_window(now.saturating_sub(3_600_000_000), Some(now + 2_000_000)),
-    );
 
     // The record lands on the log while the key is valid. By the time the
     // consumer replays it the key has expired, so acceptance proves the
-    // lifecycle check reads the broker-stamped record time, not the wall clock.
+    // lifecycle check reads the server-stamped record time, not the wall clock.
     laser
         .agdx(
-            AgentTopic::Commands,
+            AgentTopic::Sessions,
             "historic".parse::<WireAgentId>().expect("the id is valid"),
             WireConversationId::from_u128(0x0190_3c1f_aa00_0000_0000_0000_0000_0103u128),
         )
@@ -543,12 +538,18 @@ async fn given_an_expired_key_when_replaying_a_record_signed_in_its_window_then_
         .send()
         .await
         .expect("the signed command should publish");
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let expires_at = now_micros();
+    let mut registry = KeyRegistry::new();
+    registry.enroll_record(
+        KeyRecord::agent("historic", key.verifying_key())
+            .valid_window(now.saturating_sub(3_600_000_000), Some(expires_at)),
+    );
+    harness::eventually(|| async { (now_micros() > expires_at).then_some(()) }).await;
 
     let principals = Arc::new(Mutex::new(Vec::new()));
     let mut worker = Agent::builder()
         .id("replayer".parse().expect("the agent id is valid"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .verifier(Arc::new(registry))
         .handler(Capture {
             principals: principals.clone(),

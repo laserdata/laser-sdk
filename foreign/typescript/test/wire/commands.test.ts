@@ -1,10 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import {
-  AgentCancelCommand,
-  AgentListCommand,
-  AgentStatusCommand,
-  AgentSubmitCommand,
   BindRolesCommand,
   DecodeRecordCommand,
   DefineRoleCommand,
@@ -34,12 +30,6 @@ import {
   type ManagedCommand
 } from "../../src/wire/commands.js"
 import { decodeOne, encodeNamed } from "../../src/wire/cbor.js"
-import {
-  encodeAgentCancel,
-  encodeAgentList,
-  encodeAgentStatusReq,
-  encodeAgentSubmit
-} from "../../src/wire/agent-workflow.js"
 import {
   encodeBindRolesReq,
   encodeDefineRoleReq,
@@ -94,10 +84,10 @@ void test("given_the_command_registry_when_checked_then_should_pin_every_rust_co
       1_000_201, 1_000_202, 1_000_203, 1_000_021, 1_000_022, 1_000_023, 1_000_024, 1_000_025,
       1_000_210, 1_000_211, 1_000_220, 1_000_221, 1_000_222, 1_000_223, 1_000_300, 1_000_301,
       1_000_302, 1_000_303, 1_000_304, 1_000_305, 1_000_400, 1_000_401, 1_000_402, 1_000_403,
-      1_000_404, 1_000_700, 1_000_701, 1_000_702, 1_000_703
+      1_000_404, 1_000_710, 1_000_711, 1_000_712, 1_000_713, 1_000_714, 1_000_715, 1_000_716
     ]
   )
-  assert.equal(new Set(MANAGED_COMMANDS.map((command) => command.code)).size, 37)
+  assert.equal(new Set(MANAGED_COMMANDS.map((command) => command.code)).size, 40)
 })
 
 void test("given_typed_command_requests_when_encoded_then_should_delegate_to_the_exact_wire_codec", () => {
@@ -160,9 +150,4 @@ void test("given_typed_command_requests_when_encoded_then_should_delegate_to_the
     },
     encodeForkPut
   )
-
-  assertFramed(AgentSubmitCommand, { agentId: "planner", params: new Map() }, encodeAgentSubmit)
-  assertFramed(AgentCancelCommand, { runId: "run-1" }, encodeAgentCancel)
-  assertFramed(AgentStatusCommand, { runId: "run-1" }, encodeAgentStatusReq)
-  assertFramed(AgentListCommand, {}, encodeAgentList)
 })

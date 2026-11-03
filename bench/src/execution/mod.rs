@@ -40,7 +40,7 @@ use laser_bench::observer::ObserverCost;
 use laser_bench::orchestration::{
     OrchestrationEvidence, OrchestrationKind, OrchestrationSummary, run_orchestration_evidence,
 };
-use laser_bench::process::{ComposeServices, NativeIggy, NativePlane};
+use laser_bench::process::{ComposeServices, NativeBackend, NativeIggy};
 use laser_bench::provision;
 use laser_bench::recovery::{
     ConsumerRecoverySummary, IggyRecoverySummary, RecoveryCase, RecoveryDriver, RecoveryRun,
@@ -119,7 +119,7 @@ pub(crate) struct ManagedMeasurements<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct ManagedExecution<'a> {
     laser: &'a laser_sdk::laser::Laser,
-    plane: &'a NativePlane,
+    backend: &'a NativeBackend,
     case: &'a ManagedCase,
     scope: ReportScope<'a>,
     output: &'a Path,

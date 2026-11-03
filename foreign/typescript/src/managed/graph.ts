@@ -1,3 +1,4 @@
+import { BARE_SCOPE, type ResourceScope } from "../client/resource-scope.js"
 import type { Capabilities } from "../client/capabilities.js"
 import { GraphExecutionError, ProtocolError } from "../client/errors.js"
 import { executeManaged, type ManagedTransport } from "../client/managed.js"
@@ -17,10 +18,13 @@ import {
   type GraphStart,
   type Hop,
   type NodeId,
+  type ProducerInfo,
+  type SourceRef,
   graphEdgeRelate,
   graphNodeEntity,
   validateGraphName
 } from "../wire/graph.js"
+import type { SessionRef } from "../wire/ids.js"
 import type { Filter } from "../wire/query.js"
 import { DEFAULT_RECALL_LIMIT } from "../wire/limits.js"
 
@@ -57,12 +61,17 @@ export class GraphHandle {
   private limitValue = DEFAULT_RECALL_LIMIT
   private asOfValue: bigint | undefined
   private conversationValue: string | undefined
+  private streamValue: string | undefined
+  private sessionValue: SessionRef | undefined
+  private producerValue: ProducerInfo | undefined
+  private sourceValue: SourceRef | undefined
 
   private constructor(
     private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly name: string,
-    private readonly nowMicros: () => bigint = () => BigInt(Date.now()) * 1000n
+    private readonly nowMicros: () => bigint = () => BigInt(Date.now()) * 1000n,
+    private readonly scope: ResourceScope = BARE_SCOPE
   ) {}
 
   /** @internal */
@@ -70,14 +79,35 @@ export class GraphHandle {
     backend: ManagedTransport,
     getCapabilities: () => Promise<Capabilities>,
     name: string,
-    nowMicros: () => bigint = () => BigInt(Date.now()) * 1000n
+    nowMicros: () => bigint = () => BigInt(Date.now()) * 1000n,
+    scope: ResourceScope = BARE_SCOPE
   ): GraphHandle {
-    return new GraphHandle(backend, getCapabilities, name, nowMicros)
+    return new GraphHandle(backend, getCapabilities, scope.name(name), nowMicros, scope)
+  }
+
+  /** Links every upsert to `session`, so the deployment records which session
+   * wrote each element. */
+  inSession(session: SessionRef): this {
+    this.sessionValue = session
+    return this
+  }
+
+  /** Stamps `producer` on every upserted element that has none. */
+  producedBy(producer: ProducerInfo): this {
+    this.producerValue = producer
+    return this
+  }
+
+  /** Stamps `source` on every upserted element that has none. */
+  sourcedFrom(source: SourceRef): this {
+    this.sourceValue = source
+    return this
   }
 
   /** Restricts traversal to elements asserted by one conversation. */
   conversation(conversationId: string): this {
     this.conversationValue = conversationId
+    this.streamValue = this.scope.stream
     return this
   }
 
@@ -161,7 +191,8 @@ export class GraphHandle {
       ...(this.nodeFilterValue !== undefined ? { nodeFilter: this.nodeFilterValue } : {}),
       ...(this.edgeFilterValue !== undefined ? { edgeFilter: this.edgeFilterValue } : {}),
       ...(this.asOfValue !== undefined ? { asOf: this.asOfValue } : {}),
-      ...(this.conversationValue !== undefined ? { conversation: this.conversationValue } : {})
+      ...(this.conversationValue !== undefined ? { conversation: this.conversationValue } : {}),
+      ...(this.streamValue !== undefined ? { stream: this.streamValue } : {})
     })
   }
 
@@ -182,7 +213,8 @@ export class GraphHandle {
       limit: this.limitValue,
       ...(edgeType !== undefined ? { edgeType } : {}),
       ...(this.asOfValue !== undefined ? { asOf: this.asOfValue } : {}),
-      ...(this.conversationValue !== undefined ? { conversation: this.conversationValue } : {})
+      ...(this.conversationValue !== undefined ? { conversation: this.conversationValue } : {}),
+      ...(this.streamValue !== undefined ? { stream: this.streamValue } : {})
     })
   }
 
@@ -222,8 +254,21 @@ export class GraphHandle {
     const capabilities = await this.getCapabilities()
     await executeGraph(this.backend, capabilities, GraphUpsertCommand, {
       graph: this.name,
-      nodes,
-      edges
+      ...(this.sessionValue !== undefined ? { session: this.sessionValue } : {}),
+      nodes: nodes.map((node) => this.stamped(node)),
+      edges: edges.map((edge) => this.stamped(edge))
     })
+  }
+
+  private stamped<Element extends GraphNode | GraphEdge>(element: Element): Element {
+    return {
+      ...element,
+      ...(element.producer === undefined && this.producerValue !== undefined
+        ? { producer: this.producerValue }
+        : {}),
+      ...(element.source === undefined && this.sourceValue !== undefined
+        ? { source: this.sourceValue }
+        : {})
+    }
   }
 }

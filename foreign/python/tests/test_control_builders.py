@@ -96,6 +96,13 @@ def test_given_a_binding_builder_when_built_then_should_default_the_index_to_the
     assert binding["default_projection"] == "readings"
     assert binding["retention"] == {"kind": "time_to_live", "ttl_micros": 60_000_000}
     assert binding["notify"] is True
+    assert "skip_rejected" not in binding
+
+
+def test_given_a_binding_that_skips_rejected_records_when_built_then_should_carry_the_opt_in():
+    binding = ls.ProjectionBindingBuilder().source("telemetry", "readings").skip_rejected().build()
+
+    assert binding["skip_rejected"] is True
 
 
 def test_given_a_binding_without_source_when_built_then_should_raise_invalid():

@@ -163,7 +163,7 @@ function newAgdx(transport: FakeTransport): Agdx {
   return createAgdx(
     transport,
     "agents",
-    "agent.commands",
+    "agent.sessions",
     AgentId.new("source-agent"),
     SdkConversationId.parse(conversation.toString()),
     new FixedUlids()
@@ -194,13 +194,16 @@ void test("given_a_refined_command_when_sent_then_should_stamp_typed_headers_and
   const batch = transport.batches[0]
   assert.ok(batch !== undefined)
   assert.equal(batch.stream, "agents")
-  assert.equal(batch.topic, "agent.commands")
+  assert.equal(batch.topic, "agent.sessions")
   assert.equal(batch.partitionKey, "01J0Y1ZAG00000000000000002")
   const sent = batch.messages[0]
   assert.ok(sent !== undefined)
   assert.deepEqual(sent.headers.get(AGENT_VERSION), { kind: "uint32", value: 1 })
   assert.deepEqual(sent.headers.get(CONTENT_TYPE), { kind: "uint8", value: 1 })
-  assert.equal(sent.headers.get(CONVERSATION_ID)?.kind, "uint128")
+  assert.deepEqual(sent.headers.get(CONVERSATION_ID), {
+    kind: "string",
+    value: "01J0Y1ZAG00000000000000002"
+  })
   assert.deepEqual(sent.headers.get(TARGET_AGENT_ID), {
     kind: "string",
     value: "target-agent"
@@ -266,7 +269,7 @@ void test("given_a_governed_signed_command_when_sent_then_should_sign_the_modifi
   const agdx = createAgdx(
     transport,
     "agents",
-    "agent.commands",
+    "agent.sessions",
     AgentId.new("source-agent"),
     SdkConversationId.parse(conversation.toString()),
     new FixedUlids(),
@@ -315,7 +318,7 @@ void test("given_a_correlated_input_response_when_requested_then_should_return_t
   }
 
   const body = await newAgdx(transport).requestInput(
-    "agent.human_input",
+    "agent.sessions",
     new TextEncoder().encode("approve?"),
     1_000
   )
@@ -350,11 +353,54 @@ void test("given_a_correlated_input_error_when_requested_then_should_surface_the
   }
 
   await assert.rejects(
-    newAgdx(transport).requestInput(
-      "agent.human_input",
-      new TextEncoder().encode("approve?"),
-      1_000
-    ),
+    newAgdx(transport).requestInput("agent.sessions", new TextEncoder().encode("approve?"), 1_000),
     (error: unknown) => error instanceof RejectedError && error.message === "not approved"
   )
+})
+
+void test("given_a_target_when_requesting_input_then_should_address_the_prompt_to_that_agent", async () => {
+  const transport = new FakeTransport()
+  const targets: (string | undefined)[] = []
+  transport.onSend = (messages) => {
+    const command = messages[0]
+    assert.ok(command !== undefined)
+    const envelope = envelopeOf(command)
+    targets.push(envelope.target)
+    assert.ok(envelope.correlation !== undefined)
+    const reply = responseEnvelope(
+      RecordId.fromU128(102n),
+      WireConversationId.fromU128(2n),
+      parseAgentId("approver"),
+      envelope.correlation,
+      new TextEncoder().encode("approved")
+    )
+    transport.replies.push({
+      payload: encodeNamed(encodeAgentEnvelope(reply)),
+      partitionId: 0,
+      offset: 0n,
+      headers: new Map([[AGENT_VERSION, { kind: "uint32", value: 1 }]])
+    })
+  }
+  const agdx = newAgdx(transport)
+  const prompt = new TextEncoder().encode("approve?")
+  await agdx.requestInput("agent.sessions", prompt, 1_000, { target: AgentId.new("approver") })
+  await agdx.requestInput("agent.sessions", prompt, 1_000)
+  assert.deepEqual(targets, ["approver", undefined])
+})
+
+void test("given_a_failure_with_a_changed_content_type_when_sent_then_should_refuse_it", async () => {
+  const transport = new FakeTransport()
+  const agdx = newAgdx(transport)
+  const failure = { code: { kind: "known", name: "Internal" }, retryable: false } as const
+  await assert.rejects(
+    agdx.fail(CorrelationId.fromU128(6n), failure).contentType(ContentType.Json).send(),
+    InvalidError
+  )
+  assert.equal(transport.batches.length, 0)
+  await agdx
+    .fail(CorrelationId.fromU128(7n), failure)
+    .withOperation("chat")
+    .withTaskState({ kind: "known", name: "Failed" })
+    .send()
+  assert.equal(transport.batches.length, 1)
 })

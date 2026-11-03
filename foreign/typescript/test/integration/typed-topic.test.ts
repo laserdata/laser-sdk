@@ -114,3 +114,28 @@ void test("given_a_poison_record_among_good_ones_when_polled_then_should_report_
     await laser.close()
   }
 })
+
+void test("given_a_typed_reader_when_calling_next_then_should_yield_each_record_and_undefined_when_caught_up", async () => {
+  const laser = await Laser.connect(CONNECTION_STRING)
+  try {
+    const topic = await freshTopic(laser)
+    const readings = topic.json(new Json(decodeReading))
+    await readings.publishBatch([
+      { host: "node-1", cpu: 1 },
+      { host: "node-2", cpu: 2 }
+    ])
+
+    const records = await readings.records("readings-next")
+    assert.deepEqual(records.offsets, new Map())
+    const first = await records.next()
+    assert.ok(first?.kind === "record")
+    assert.equal(first.record.value.host, "node-1")
+    const second = await records.next()
+    assert.ok(second?.kind === "record")
+    assert.equal(second.record.value.host, "node-2")
+    assert.equal(await records.next(), undefined)
+    assert.deepEqual(records.offsets, new Map([[0, 2n]]))
+  } finally {
+    await laser.close()
+  }
+})

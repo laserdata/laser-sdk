@@ -12,10 +12,10 @@ async fn given_interleaved_turns_when_assembling_context_then_should_order_chron
     let laser = harness::laser().await;
     let conversation = ConversationId::new();
     let turns = [
-        (AgentTopic::Commands, "planner", "draft"),
-        (AgentTopic::Responses, "writer", "first draft"),
-        (AgentTopic::Commands, "planner", "tighten"),
-        (AgentTopic::Responses, "writer", "tightened"),
+        (AgentTopic::Sessions, "planner", "draft"),
+        (AgentTopic::Sessions, "writer", "first draft"),
+        (AgentTopic::Sessions, "planner", "tighten"),
+        (AgentTopic::Sessions, "writer", "tightened"),
     ];
     for (topic, agent, text) in turns {
         let provenance = Provenance::builder()
@@ -86,7 +86,7 @@ async fn given_a_context_scope_when_appending_and_recalling_then_should_bind_one
         let session = session.clone();
         async move {
             let trail = session
-                .fetch(vec![AgentTopic::Audit], 8)
+                .fetch(vec![AgentTopic::Audit], 8, None)
                 .await
                 .expect("fetch the scope");
             (!trail.is_empty()).then_some(trail)

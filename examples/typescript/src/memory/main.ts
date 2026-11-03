@@ -12,7 +12,8 @@ import {
   type GraphEdge,
   type GraphNode,
   type Laser,
-  type MemoryId
+  type MemoryId,
+  type MemoryItem
 } from "@laserdata/laser-sdk"
 
 import {
@@ -24,6 +25,9 @@ import {
   printHits,
   printNodes,
   printNodesOf,
+  PROJECTION_POLL_MS,
+  PROJECTOR_TIMEOUT_MS,
+  SESSION_RETENTION,
   utf8
 } from "../common.js"
 
@@ -181,9 +185,11 @@ async function durablePhase(laser: Laser, conversation: ConversationId): Promise
     .ttl(86_400_000)
     .build()
   for (const fact of KNOWLEDGE) {
-    await durable.remember(utf8(fact)).scope(conversation).durable().send()
+    await durable.remember(utf8(fact)).scope(conversation).send()
   }
-  const durableHits = await durable.recall(conversation).limit(3).fetch()
+  // The managed read view folds the memory topic asynchronously, so wait until
+  // it holds the new facts instead of reading it once.
+  const durableHits = await waitForRecall(durable, conversation, 3)
   console.log(
     `stored ${String(KNOWLEDGE.length)} durable facts, recalled ` +
       `${String(durableHits.length)} most-recent`
@@ -206,6 +212,21 @@ async function durablePhase(laser: Laser, conversation: ConversationId): Promise
     `one scope recalled ${String(scopedHits.length)} durable facts and read back ` +
       `${String(trail.length)} of the conversation's messages`
   )
+}
+
+/** Polls the managed read view until it returns `expected` items or the
+ * deadline passes, then returns what it holds. */
+async function waitForRecall(
+  memory: MemoryHandle,
+  conversation: ConversationId,
+  expected: number
+): Promise<readonly MemoryItem[]> {
+  const deadline = Date.now() + PROJECTOR_TIMEOUT_MS
+  for (;;) {
+    const hits = await memory.recall(conversation).limit(expected).fetch()
+    if (hits.length >= expected || Date.now() >= deadline) return hits
+    await new Promise((resolve) => setTimeout(resolve, PROJECTION_POLL_MS))
+  }
 }
 
 function requiredNode(nodes: ReadonlyMap<string, GraphNode>, value: string): GraphNode {
@@ -338,7 +359,7 @@ async function graphPhase(laser: Laser): Promise<void> {
 async function managedPhase(laser: Laser, conversation: ConversationId): Promise<void> {
   const capabilities = await laser.capabilities()
   if (managedGate(capabilities, "graph", EXAMPLE) && managedGate(capabilities, "kv", EXAMPLE)) {
-    await laser.bootstrap(PARTITIONS)
+    await laser.bootstrap(PARTITIONS, SESSION_RETENTION)
     await durablePhase(laser, conversation)
     await graphPhase(laser)
   }

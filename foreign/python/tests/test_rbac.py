@@ -92,7 +92,11 @@ def test_given_edge_claims_when_authorized_then_should_return_the_denial():
     assert step_up.kind == "step_up"
     assert step_up.code == "StepUpRequired"
     assert step_up.challenge == 'Bearer scope="tool:write"'
+    assert step_up.required_scope == "tool:write"
+    assert step_up.expected is None
     foreign = ls.authorize_edge(["other.server"], ["tool:write"], "mcp.laserdata", "tool:write")
     assert foreign == ls.EdgeDenial.wrong_audience("mcp.laserdata")
     assert foreign.code == "Unauthenticated"
     assert foreign.challenge is None
+    assert foreign.expected == "mcp.laserdata"
+    assert foreign.required_scope is None

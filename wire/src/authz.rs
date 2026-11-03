@@ -74,6 +74,8 @@ pub enum Feature {
     /// describe (`write`), archive and drop (`delete`), and group bindings or
     /// revision pause/resume (`admin`). Filtered reads themselves need only native source permission.
     Filter,
+    /// Managed reads of one stream's agent sessions.
+    Session,
     /// A feature name a newer peer used that this build does not know. An unknown
     /// `feature` string decodes here instead of failing the whole grant set, and
     /// it matches no request (requests only ever carry a known feature), so an
@@ -85,20 +87,115 @@ pub enum Feature {
     Unrecognized,
 }
 
-pub const SUPERVISOR_ASSERTION_VERSION: u32 = 1;
-pub const SUPERVISOR_ASSERTION_DOMAIN: &[u8] = b"agdx.supervisor-actor.v1";
-pub const MAX_SUPERVISOR_ASSERTION_TTL_MICROS: u64 = 5 * 60 * 1_000_000;
-pub const SUPERVISOR_ASSERTION_KEY_ID_BYTES: usize = 8;
-pub const SUPERVISOR_ASSERTION_SIGNATURE_BYTES: usize = 64;
+/// The prefix of a resource name scoped to one stream, `stream:<name>` or
+/// `stream:<name>/<local>`.
+pub const STREAM_RESOURCE_PREFIX: &str = "stream:";
 
-/// Canonical claims signed by supervisor for one high-risk Iggy mutation.
+/// The resource name of `stream` itself.
+pub fn stream_resource(stream: &str) -> String {
+    format!("{STREAM_RESOURCE_PREFIX}{stream}")
+}
+
+/// The name of the managed resource `local` inside `stream`,
+/// `stream:<stream>/<local>`. A `local` that already starts with `stream:` is
+/// returned unchanged, so scoping is idempotent and a caller-scoped name is
+/// never scoped twice.
+pub fn scoped_resource(stream: &str, local: &str) -> String {
+    if local.starts_with(STREAM_RESOURCE_PREFIX) {
+        local.to_owned()
+    } else {
+        format!("{STREAM_RESOURCE_PREFIX}{stream}/{local}")
+    }
+}
+
+/// The stream and local part of a scoped resource name. `None` for a bare name,
+/// for the stream resource itself, and for a name with an empty stream or local
+/// part. Stream names never contain `/`, so the first `/` ends the stream.
+pub fn split_scoped_resource(name: &str) -> Option<(&str, &str)> {
+    let (stream, local) = name.strip_prefix(STREAM_RESOURCE_PREFIX)?.split_once('/')?;
+    (!stream.is_empty() && !local.is_empty()).then_some((stream, local))
+}
+
+/// How a deployment scopes its managed resources, as its replicated
+/// authorization state records it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tenancy {
+    /// One deployment-wide namespace. Every grant pattern is accepted.
+    #[default]
+    Deployment,
+    /// Each stream is an account. A role may allow access inside one stream
+    /// only, and the root role is bound to root alone.
+    Stream,
+}
+
+impl Tenancy {
+    pub fn is_deployment(&self) -> bool {
+        *self == Self::Deployment
+    }
+}
+
+/// Whether an allow grant reaches resources in more than one stream: a
+/// whole-feature grant, or a prefix that is not inside one `stream:<name>/`.
+/// A deny grant only narrows access, so it never spans.
+pub fn grant_spans_streams(grant: &Grant) -> bool {
+    if grant.effect == Effect::Deny {
+        return false;
+    }
+    match grant.resource.kind {
+        ResourceKind::Literal => false,
+        ResourceKind::Prefix => prefix_stream(&grant.resource.value).is_none(),
+        // A whole-feature grant, and any pattern kind this build does not know.
+        _ => true,
+    }
+}
+
+/// The one stream every allow grant of a role stays inside, which its audit
+/// events are attributed to. `None` when a grant reaches more than one stream
+/// or none, or when the role allows nothing.
+pub fn grants_stream(grants: &[Grant]) -> Option<String> {
+    let mut streams = grants
+        .iter()
+        .filter(|grant| grant.effect == Effect::Allow)
+        .map(|grant| match grant.resource.kind {
+            ResourceKind::Literal => split_scoped_resource(&grant.resource.value)
+                .map(|(stream, _)| stream)
+                .or_else(|| grant.resource.value.strip_prefix(STREAM_RESOURCE_PREFIX))
+                .filter(|stream| !stream.is_empty() && !stream.contains('/')),
+            ResourceKind::Prefix => prefix_stream(&grant.resource.value),
+            _ => None,
+        });
+    let first = streams.next()??;
+    streams
+        .all(|stream| stream == Some(first))
+        .then(|| first.to_owned())
+}
+
+/// The one stream a prefix stays inside, if any.
+fn prefix_stream(prefix: &str) -> Option<&str> {
+    if let Some((stream, _local)) = split_scoped_resource(prefix) {
+        return Some(stream);
+    }
+    prefix
+        .strip_prefix(STREAM_RESOURCE_PREFIX)?
+        .strip_suffix('/')
+        .filter(|stream| !stream.is_empty() && !stream.contains('/'))
+}
+
+pub const OPERATOR_ASSERTION_VERSION: u32 = 1;
+pub const OPERATOR_ASSERTION_DOMAIN: &[u8] = b"agdx.operator-actor.v1";
+pub const MAX_OPERATOR_ASSERTION_TTL_MICROS: u64 = 5 * 60 * 1_000_000;
+pub const OPERATOR_ASSERTION_KEY_ID_BYTES: usize = 8;
+pub const OPERATOR_ASSERTION_SIGNATURE_BYTES: usize = 64;
+
+/// Canonical claims signed by the service operator for one high-risk Iggy mutation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SupervisorActorClaims {
+pub struct OperatorActorClaims {
     pub v: u32,
     pub request_id: CheckpointRequestId,
     pub deployment_id: u32,
     pub cloud_user_id: u32,
-    pub action: SupervisorAssertionAction,
+    pub action: OperatorAssertionAction,
     pub destination_id: DestinationId,
     pub destination_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,8 +206,8 @@ pub struct SupervisorActorClaims {
 
 /// Signed cloud-user evidence accepted only for the exact action and destination.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SupervisorActorAssertion {
-    pub claims: SupervisorActorClaims,
+pub struct OperatorActorAssertion {
+    pub claims: OperatorActorClaims,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key_id: Vec<u8>,
     #[serde(with = "crate::encoding::bin_bytes")]
@@ -120,18 +217,18 @@ pub struct SupervisorActorAssertion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
-pub enum SupervisorAssertionAction {
+pub enum OperatorAssertionAction {
     AcceptRetentionGap,
     SupersedeGeneration,
     RecordRepair,
 }
 
-impl SupervisorActorAssertion {
+impl OperatorActorAssertion {
     pub fn validate(&self) -> Result<(), InvalidError> {
         let claims = &self.claims;
-        if claims.v != SUPERVISOR_ASSERTION_VERSION {
+        if claims.v != OPERATOR_ASSERTION_VERSION {
             return Err(InvalidError::new(format!(
-                "supervisor assertion version must be {SUPERVISOR_ASSERTION_VERSION}"
+                "operator assertion version must be {OPERATOR_ASSERTION_VERSION}"
             )));
         }
         if claims.request_id.as_u128() == 0
@@ -141,23 +238,23 @@ impl SupervisorActorAssertion {
             || claims.destination_generation == 0
         {
             return Err(InvalidError::new(
-                "supervisor assertion identities must be nonzero",
+                "operator assertion identities must be nonzero",
             ));
         }
         if claims.issued_at_micros == 0
             || claims.expires_at_micros <= claims.issued_at_micros
             || claims.expires_at_micros - claims.issued_at_micros
-                > MAX_SUPERVISOR_ASSERTION_TTL_MICROS
+                > MAX_OPERATOR_ASSERTION_TTL_MICROS
         {
             return Err(InvalidError::new(
-                "supervisor assertion validity window is invalid",
+                "operator assertion validity window is invalid",
             ));
         }
-        if self.key_id.len() != SUPERVISOR_ASSERTION_KEY_ID_BYTES
-            || self.signature.len() != SUPERVISOR_ASSERTION_SIGNATURE_BYTES
+        if self.key_id.len() != OPERATOR_ASSERTION_KEY_ID_BYTES
+            || self.signature.len() != OPERATOR_ASSERTION_SIGNATURE_BYTES
         {
             return Err(InvalidError::new(
-                "supervisor assertion key id or signature length is invalid",
+                "operator assertion key id or signature length is invalid",
             ));
         }
         Ok(())
@@ -347,9 +444,13 @@ pub fn feature_action(code: u32) -> Option<(Feature, Action)> {
         AGDX_FORK_DELETE_CODE => (Feature::Fork, Action::Delete),
         AGDX_GRAPH_QUERY_CODE | AGDX_GRAPH_NEIGHBORS_CODE => (Feature::Graph, Action::Read),
         AGDX_GRAPH_UPSERT_CODE => (Feature::Graph, Action::Write),
-        AGDX_AGENT_STATUS_CODE | AGDX_AGENT_LIST_CODE => (Feature::Agent, Action::Read),
-        AGDX_AGENT_SUBMIT_CODE => (Feature::Agent, Action::Write),
-        AGDX_AGENT_CANCEL_CODE => (Feature::Agent, Action::Delete),
+        AGDX_SESSION_GET_CODE
+        | AGDX_SESSION_LIST_CODE
+        | AGDX_SESSION_EVENTS_CODE
+        | AGDX_SESSION_STATE_CODE
+        | AGDX_SESSION_LINKS_CODE
+        | AGDX_SESSION_SOURCES_CODE
+        | AGDX_SESSION_CHANGES_CODE => (Feature::Session, Action::Read),
         AGDX_GET_FILTER_CODE
         | AGDX_LIST_FILTERS_CODE
         | AGDX_LIST_FILTER_REVISIONS_CODE
@@ -370,7 +471,7 @@ pub fn feature_action(code: u32) -> Option<(Feature, Action)> {
 pub const ACTION_COUNT: usize = 5;
 
 /// The bit index of a `(feature, action)` in the coarse-capability bitmask, a
-/// pure function shared by every enforcer so the fork and the plane cannot drift.
+/// pure function shared by every enforcer so the streaming server and the managed backend cannot drift.
 /// `Feature`/`Action` are `VariantArray` enums, so the ordinal is stable per wire
 /// revision.
 pub fn action_index(feature: Feature, action: Action) -> usize {
@@ -527,6 +628,9 @@ pub enum AuthzSubject {
     Binding { user_id: u32 },
     /// Every authorization change.
     All,
+    /// Every change attributed to one stream: roles whose grants stay inside
+    /// it and bindings of such roles. What a stream's owner may audit.
+    Stream(String),
 }
 
 /// Read the authorization change history for a subject, paged by revision. The
@@ -550,6 +654,8 @@ pub enum AuthzEventKind {
     RoleDeleted(String),
     /// A user's role set was rebound.
     RolesBound { user_id: u32, roles: Vec<String> },
+    /// The deployment's tenancy was set.
+    TenancySet(Tenancy),
 }
 
 /// One recorded authorization change: its revision, who made it, when, and what.
@@ -559,6 +665,10 @@ pub struct AuthzEvent {
     pub actor: String,
     pub at_micros: u64,
     pub op: AuthzEventKind,
+    /// The stream the change is attributed to, see [`grants_stream`]. Absent
+    /// for a change that concerns no single stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// A page of authorization change history.
@@ -609,12 +719,131 @@ pub enum AuthzError {
     Conflict { current_revision: u64 },
     #[error("unsupported authz op version (expected {expected}, got {got})")]
     Version { expected: u32, got: u32 },
+    /// A grant refused because it reaches past one stream while the server
+    /// runs with stream tenancy, for example a wildcard or a prefix spanning
+    /// streams.
+    #[error("refused by stream tenancy: {0}")]
+    TenancyViolation(String),
 }
 
 #[cfg(all(test, feature = "cbor"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_role_grants_when_attributed_then_should_name_one_stream_or_none() {
+        let allow = |kind: ResourceKind, value: &str| Grant {
+            effect: Effect::Allow,
+            feature: Feature::Kv,
+            action: Action::Read,
+            resource: ResourcePattern {
+                kind,
+                value: value.to_owned(),
+            },
+        };
+        assert_eq!(
+            grants_stream(&[
+                allow(ResourceKind::Prefix, "stream:acme/"),
+                allow(ResourceKind::Literal, "stream:acme/cart"),
+            ]),
+            Some("acme".to_owned())
+        );
+        assert_eq!(
+            grants_stream(&[
+                allow(ResourceKind::Prefix, "stream:acme/"),
+                allow(ResourceKind::Literal, "stream:other/cart"),
+            ]),
+            None
+        );
+        assert_eq!(grants_stream(&[allow(ResourceKind::All, "")]), None);
+        assert_eq!(
+            grants_stream(&[allow(ResourceKind::Prefix, "stream:acme")]),
+            None
+        );
+        assert_eq!(grants_stream(&[]), None);
+    }
+
+    #[test]
+    fn given_a_tenancy_event_when_round_tripped_then_should_keep_it_and_spanning_should_follow_the_pattern()
+     {
+        let event = AuthzEventKind::TenancySet(Tenancy::Stream);
+        let bytes = crate::framing::encode_named(&event).expect("encodes");
+        assert_eq!(
+            crate::framing::decode_named::<AuthzEventKind>(&bytes).expect("decodes"),
+            event
+        );
+        let allow = |resource| Grant {
+            effect: Effect::Allow,
+            feature: Feature::Kv,
+            action: Action::Read,
+            resource,
+        };
+        assert!(grant_spans_streams(&allow(ResourcePattern::all())));
+        assert!(grant_spans_streams(&allow(ResourcePattern::prefix(
+            "orders"
+        ))));
+        assert!(!grant_spans_streams(&allow(ResourcePattern::prefix(
+            "stream:a/"
+        ))));
+        assert!(!grant_spans_streams(&allow(ResourcePattern::literal("x"))));
+        assert!(Tenancy::default().is_deployment());
+    }
     use crate::framing::{decode_named, encode_named};
+
+    #[test]
+    fn given_a_tenancy_violation_when_round_tripped_then_should_keep_the_reason() {
+        let reply = AuthzReply::Err(AuthzError::TenancyViolation("prefix acme".to_owned()));
+        let back: AuthzReply =
+            decode_named(&encode_named(&reply).expect("reply serializes")).expect("deserializes");
+        assert!(matches!(
+            back,
+            AuthzReply::Err(AuthzError::TenancyViolation(reason)) if reason == "prefix acme"
+        ));
+    }
+
+    #[test]
+    fn given_a_local_name_when_scoped_then_should_prefix_the_stream() {
+        assert_eq!(
+            scoped_resource("acme", "agent.keys"),
+            "stream:acme/agent.keys"
+        );
+        assert_eq!(scoped_resource("acme", "a/b"), "stream:acme/a/b");
+    }
+
+    #[test]
+    fn given_a_scoped_name_when_scoped_again_then_should_return_it_unchanged() {
+        let scoped = scoped_resource("acme", "sessions");
+        assert_eq!(scoped_resource("acme", &scoped), scoped);
+        assert_eq!(
+            scoped_resource("other", "stream:acme/sessions"),
+            "stream:acme/sessions"
+        );
+    }
+
+    #[test]
+    fn given_scoped_names_when_split_then_should_return_stream_and_local_part() {
+        assert_eq!(
+            split_scoped_resource("stream:acme/agent.keys"),
+            Some(("acme", "agent.keys"))
+        );
+        assert_eq!(
+            split_scoped_resource("stream:acme/a/b"),
+            Some(("acme", "a/b"))
+        );
+        assert_eq!(
+            split_scoped_resource(&scoped_resource("acme", "graph")),
+            Some(("acme", "graph"))
+        );
+    }
+
+    #[test]
+    fn given_unscoped_names_when_split_then_should_return_none() {
+        assert_eq!(split_scoped_resource("agent.keys"), None);
+        assert_eq!(split_scoped_resource("stream:acme"), None);
+        assert_eq!(split_scoped_resource("stream:/local"), None);
+        assert_eq!(split_scoped_resource("stream:acme/"), None);
+        assert_eq!(split_scoped_resource("streams:acme/local"), None);
+    }
 
     #[test]
     fn given_a_role_when_round_tripped_then_should_preserve_grants() {
@@ -781,6 +1010,7 @@ mod tests {
         }
         assert_eq!(action_index(Feature::Destination, Action::Read), 40);
         assert_eq!(action_index(Feature::Checkpoint, Action::Admin), 48);
+        assert_eq!(action_index(Feature::Session, Action::Read), 70);
     }
 
     #[test]

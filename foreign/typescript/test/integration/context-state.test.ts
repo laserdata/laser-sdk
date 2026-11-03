@@ -6,6 +6,7 @@ import { FULL_REPLAY } from "../../src/conversation-state.js"
 import { Laser } from "../../src/client/laser.js"
 import { AgentTopic } from "../../src/provenance/agent-topic.js"
 import { AgentId, ConversationId } from "../../src/types/ids.js"
+import { TopicRetention } from "../../src/session.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
@@ -24,13 +25,13 @@ void test("given_interleaved_turns_when_fetching_context_then_should_order_and_f
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
   try {
-    await laser.bootstrap(2)
+    await laser.bootstrap(2, TopicRetention.expireAfter(86_400_000))
     const conversation = ConversationId.new()
     const turns = [
-      [AgentTopic.Commands, "planner", "draft"],
-      [AgentTopic.Responses, "writer", "first draft"],
-      [AgentTopic.Commands, "planner", "tighten"],
-      [AgentTopic.Responses, "writer", "tightened"]
+      [AgentTopic.Sessions, "planner", "draft"],
+      [AgentTopic.Sessions, "writer", "first draft"],
+      [AgentTopic.Sessions, "planner", "tighten"],
+      [AgentTopic.Sessions, "writer", "tightened"]
     ] as const
     for (const [topic, agent, payload] of turns) {
       await laser.sendAgent(topic, new TextEncoder().encode(payload), {
@@ -41,10 +42,7 @@ void test("given_interleaved_turns_when_fetching_context_then_should_order_and_f
     }
     const scope = laser.context(conversation)
     const history = await eventually(async () => {
-      const messages = await scope.fetchWith(
-        [AgentTopic.Commands, AgentTopic.Responses],
-        new LastN(10)
-      )
+      const messages = await scope.fetchWith([AgentTopic.Sessions], new LastN(10))
       return messages.length === 4 ? messages : undefined
     })
     assert.deepEqual(
@@ -52,7 +50,7 @@ void test("given_interleaved_turns_when_fetching_context_then_should_order_and_f
       ["draft", "first draft", "tighten", "tightened"]
     )
     const writers = await scope.fetchWith(
-      [AgentTopic.Commands, AgentTopic.Responses],
+      [AgentTopic.Sessions],
       new RoleFilter([AgentId.new("writer")])
     )
     assert.equal(writers.length, 2)
@@ -65,14 +63,14 @@ void test("given_scoped_events_when_folding_state_then_should_replay_determinist
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
   try {
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     const scope = laser.context(ConversationId.new())
     for (let value = 1; value <= 5; value += 1) {
-      await scope.append(AgentTopic.Commands, new TextEncoder().encode(String(value)))
+      await scope.append(AgentTopic.Sessions, new TextEncoder().encode(String(value)))
     }
     const sum = await eventually(async () => {
       const folded = await scope.state(
-        [AgentTopic.Commands],
+        [AgentTopic.Sessions],
         FULL_REPLAY,
         0,
         (total, message) => total + Number(new TextDecoder().decode(message.payload))
@@ -80,7 +78,7 @@ void test("given_scoped_events_when_folding_state_then_should_replay_determinist
       return folded === 15 ? folded : undefined
     })
     assert.equal(sum, 15)
-    assert.equal(await scope.block([AgentTopic.Commands], 2), "4\n5")
+    assert.equal(await scope.block([AgentTopic.Sessions], 2), "4\n5")
   } finally {
     await laser.close()
   }

@@ -1,10 +1,11 @@
 import type { ResultCode, ResultCodeName } from "../wire/result.js"
 import type { FilterErrorReason } from "../wire/filter.js"
 import {
-  AgentWorkflowExecutionError,
   AmbiguousMutationError,
+  AuthzExecutionError,
   BudgetExceededError,
   CheckpointExecutionError,
+  CommandExecutionError,
   ConsumerGroupSetupError,
   FenceViolationError,
   FilterExecutionError,
@@ -12,6 +13,7 @@ import {
   FilterOversizedRecordError,
   ForkExecutionError,
   GraphExecutionError,
+  SessionError,
   KvExecutionError,
   LaserError,
   NoCapableAgentError,
@@ -24,6 +26,8 @@ import {
   UnsupportedError,
   publishCause
 } from "./errors.js"
+import { sessionErrorResultCode } from "../wire/session.js"
+import { type AuthzError, authzErrorResultCode } from "../wire/authz.js"
 
 // Apache Iggy server error codes the classifiers read.
 const IGGY_RESOURCE_NOT_FOUND = 20
@@ -40,8 +44,7 @@ function detailKind(error: unknown): string | undefined {
     error instanceof QueryExecutionError ||
     error instanceof KvExecutionError ||
     error instanceof ForkExecutionError ||
-    error instanceof GraphExecutionError ||
-    error instanceof AgentWorkflowExecutionError
+    error instanceof GraphExecutionError
   ) {
     const detail = error.detail as { readonly kind?: unknown } | undefined
     return typeof detail?.kind === "string" ? detail.kind : undefined
@@ -90,6 +93,12 @@ export function isStreamOrTopicNotFound(error: unknown): boolean {
  * is a grant, not a retry. */
 export function isPermissionDenied(error: unknown): boolean {
   const cause = publishCause(error)
+  if (
+    cause instanceof CommandExecutionError &&
+    cause.detail.code.kind === "known" &&
+    ["Forbidden", "Unauthenticated"].includes(cause.detail.code.name)
+  )
+    return true
   if (cause instanceof RoutePrincipalMismatchError) return true
   const code = iggyErrorCode(error)
   if (code === IGGY_UNAUTHORIZED || code === IGGY_UNAUTHENTICATED) return true
@@ -102,6 +111,12 @@ export function isPermissionDenied(error: unknown): boolean {
  * Permanent: gate the code path instead of retrying. */
 export function isUnsupported(error: unknown): boolean {
   const cause = publishCause(error)
+  if (
+    cause instanceof CommandExecutionError &&
+    cause.detail.code.kind === "known" &&
+    cause.detail.code.name === "Unsupported"
+  )
+    return true
   if (cause instanceof UnsupportedError) return true
   if (
     (cause instanceof QueryExecutionError ||
@@ -118,6 +133,12 @@ export function isUnsupported(error: unknown): boolean {
 /** Whether the failure names a missing resource. */
 export function isNotFound(error: unknown): boolean {
   const cause = publishCause(error)
+  if (
+    cause instanceof CommandExecutionError &&
+    cause.detail.code.kind === "known" &&
+    cause.detail.code.name === "NotFound"
+  )
+    return true
   const kind = detailKind(cause)
   if (
     cause instanceof QueryExecutionError &&
@@ -138,6 +159,12 @@ export function isNotFound(error: unknown): boolean {
  * connected deployment. Permanent for this client build. */
 export function isVersionSkew(error: unknown): boolean {
   const cause = publishCause(error)
+  if (
+    cause instanceof CommandExecutionError &&
+    cause.detail.code.kind === "known" &&
+    cause.detail.code.name === "VersionSkew"
+  )
+    return true
   if (
     (cause instanceof QueryExecutionError ||
       cause instanceof KvExecutionError ||
@@ -166,20 +193,24 @@ export function isAmbiguousMutation(error: unknown): boolean {
 /** Whether a read-consistency barrier was not met yet. Retryable. */
 export function isStale(error: unknown): boolean {
   const cause = publishCause(error)
+  if (
+    cause instanceof CommandExecutionError &&
+    cause.detail.code.kind === "known" &&
+    cause.detail.code.name === "Stale"
+  )
+    return true
   return (
     (cause instanceof QueryExecutionError || cause instanceof KvExecutionError) &&
     detailKind(cause) === "stale"
   )
 }
 
-/** Whether the plane declined a conditional write because it does not own
- * the mutation partition. */
+/** Whether the managed backend declined a conditional write because it does
+ * not own the mutation partition. */
 export function isNotLeader(error: unknown): boolean {
   const cause = publishCause(error)
   return (
-    (cause instanceof KvExecutionError ||
-      cause instanceof ForkExecutionError ||
-      cause instanceof AgentWorkflowExecutionError) &&
+    (cause instanceof KvExecutionError || cause instanceof ForkExecutionError) &&
     detailKind(cause) === "notLeader"
   )
 }
@@ -215,7 +246,9 @@ export function isQuarantined(error: unknown): boolean {
  * later attempt. */
 export function isUnavailable(error: unknown): boolean {
   const value = code(error)
-  return value.kind === "known" && value.name === "Unavailable"
+  return (
+    value.kind === "known" && (value.name === "Unavailable" || value.name === "TargetUnavailable")
+  )
 }
 
 const QUERY_CODES: Readonly<Record<string, keyof typeof ResultCodeName>> = {
@@ -273,16 +306,6 @@ const GRAPH_CODES: Readonly<Record<string, keyof typeof ResultCodeName>> = {
   version: "VersionSkew"
 }
 
-const AGENT_CODES: Readonly<Record<string, keyof typeof ResultCodeName>> = {
-  unsupported: "Unsupported",
-  notFound: "NotFound",
-  invalid: "InvalidArgument",
-  backend: "Backend",
-  unavailable: "Unavailable",
-  version: "VersionSkew",
-  notLeader: "Unavailable"
-}
-
 const CHECKPOINT_CODES: Readonly<Record<string, keyof typeof ResultCodeName>> = {
   invalid: "InvalidArgument",
   not_found: "NotFound",
@@ -308,6 +331,7 @@ function surfaceCode(
  */
 export function code(error: unknown): ResultCode {
   const cause = publishCause(error)
+  if (cause instanceof CommandExecutionError) return cause.detail.code
   const iggy = iggyErrorCode(error)
   if (iggy === IGGY_RESOURCE_NOT_FOUND || isStreamOrTopicNotFound(error)) return known("NotFound")
   if (iggy === IGGY_UNAUTHORIZED) return known("Forbidden")
@@ -320,8 +344,9 @@ export function code(error: unknown): ResultCode {
   if (cause instanceof KvExecutionError) return surfaceCode(KV_CODES, detailKind(cause))
   if (cause instanceof ForkExecutionError) return surfaceCode(FORK_CODES, detailKind(cause))
   if (cause instanceof GraphExecutionError) return surfaceCode(GRAPH_CODES, detailKind(cause))
-  if (cause instanceof AgentWorkflowExecutionError) {
-    return surfaceCode(AGENT_CODES, detailKind(cause))
+  if (cause instanceof SessionError) return sessionErrorResultCode(cause.detail)
+  if (cause instanceof AuthzExecutionError && isAuthzError(cause.detail)) {
+    return authzErrorResultCode(cause.detail)
   }
   if (cause instanceof CheckpointExecutionError) {
     return surfaceCode(CHECKPOINT_CODES, detailKind(cause))
@@ -332,6 +357,8 @@ export function code(error: unknown): ResultCode {
     return known("NotFound")
   if (!(cause instanceof LaserError)) return known("Backend")
   switch (cause.kind) {
+    case "command":
+      return known("Backend")
     case "unsupported":
     case "no-stream":
     case "no-respond-topic":
@@ -362,9 +389,9 @@ export function code(error: unknown): ResultCode {
     case "kv":
     case "fork":
     case "graph":
+    case "session":
     case "authz":
     case "filter":
-    case "agent-workflow":
     case "routing":
     case "handler":
     case "state-store":
@@ -392,4 +419,8 @@ export function publicErrorMessage(error: unknown): string {
     NotFound: "not found"
   }
   return messages[result.name] ?? "internal error"
+}
+
+function isAuthzError(detail: unknown): detail is AuthzError {
+  return typeof detail === "object" && detail !== null && "kind" in detail
 }

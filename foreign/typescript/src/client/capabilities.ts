@@ -44,7 +44,7 @@ export interface FilterCaps {
    * validation, served by the streaming server itself. */
   readonly native: boolean
   /** Saved filters, revisions, group bindings, and mutation outcomes, served
-   * with a ready managed plane. */
+   * with a ready managed backend. */
   readonly catalog: boolean
   /** Group-aware reads: the server resolves a consumer group's own policy,
    * delivers an unbound group unfiltered, and fences acknowledgments by policy
@@ -53,6 +53,9 @@ export interface FilterCaps {
   /** The evaluator version and codecs the server announced. Absent from a
    * server that predates the announcement, which evaluates as this build does. */
   readonly evaluation?: FilterAnnounce
+  /** The longest filtered wait the server holds, in milliseconds. Zero when it
+   * serves none, so a group reader paces idle rounds itself. */
+  readonly maxWaitMs: number
 }
 
 /**
@@ -71,7 +74,10 @@ export interface Capabilities {
   readonly graph: boolean
   readonly forks: boolean
   readonly a2aGateway: boolean
-  readonly agentWorkflow: boolean
+  readonly sessions: boolean
+  /** The deployment scopes every managed name to one stream, and each
+   * stream's change feed rides its own ops topic. */
+  readonly streamTenancy: boolean
   readonly watch: boolean
   readonly authz: boolean
   readonly filters: FilterCaps
@@ -90,7 +96,7 @@ export type CapabilitySurface =
   | "kvFencedLeases"
   | "graph"
   | "forks"
-  | "agentWorkflow"
+  | "sessions"
   | "watch"
   | "authz"
   | "filters"
@@ -111,10 +117,11 @@ export const OPEN_CAPABILITIES: Capabilities = Object.freeze({
   graph: false,
   forks: false,
   a2aGateway: false,
-  agentWorkflow: false,
+  sessions: false,
+  streamTenancy: false,
   watch: false,
   authz: false,
-  filters: Object.freeze({ native: false, catalog: false, groupPolicyReads: false }),
+  filters: Object.freeze({ native: false, catalog: false, groupPolicyReads: false, maxWaitMs: 0 }),
   backends: Object.freeze([]),
   hello: "unknown"
 })
@@ -175,13 +182,13 @@ export function isOpenOnly(capabilities: Capabilities): boolean {
     capabilities.graph === open.graph &&
     capabilities.forks === open.forks &&
     capabilities.a2aGateway === open.a2aGateway &&
-    capabilities.agentWorkflow === open.agentWorkflow &&
     capabilities.watch === open.watch &&
     capabilities.authz === open.authz &&
     filters.native === open.filters.native &&
     filters.catalog === open.filters.catalog &&
     filters.groupPolicyReads === open.filters.groupPolicyReads &&
     filters.evaluation === undefined &&
+    filters.maxWaitMs === open.filters.maxWaitMs &&
     capabilities.versions === undefined &&
     capabilities.backends.length === 0
   )
@@ -258,8 +265,8 @@ export function requireCapability(capabilities: Capabilities, surface: Capabilit
                     ? capabilities.graph
                     : surface === "forks"
                       ? capabilities.forks
-                      : surface === "agentWorkflow"
-                        ? capabilities.agentWorkflow
+                      : surface === "sessions"
+                        ? capabilities.sessions
                         : surface === "watch"
                           ? capabilities.watch
                           : surface === "filters"
@@ -280,7 +287,7 @@ function strongerConsistency(left: Consistency, right: Consistency): Consistency
 
 // Folds one hello announcement into `capabilities`, step for step like Rust
 // `merge_announcement` and `merge_features`. Only a ready announcement lights
-// up plane-served surfaces, and the query surface needs a ready backend that
+// up backend-served surfaces, and the query surface needs a ready backend that
 // announces query capabilities. Additive, so a surface the seed set survives.
 function mergeAnnouncement(capabilities: Capabilities, announce: BackendAnnounce): Capabilities {
   const merged = foldAnnouncement(capabilities, announce)
@@ -303,7 +310,8 @@ function foldAnnouncement(capabilities: Capabilities, announce: BackendAnnounce)
       native,
       catalog: capabilities.filters.catalog,
       groupPolicyReads,
-      ...(evaluation !== undefined ? { evaluation } : {})
+      ...(evaluation !== undefined ? { evaluation } : {}),
+      maxWaitMs: evaluation?.maxWaitMs ?? capabilities.filters.maxWaitMs
     },
     hello: "answered"
   }
@@ -350,7 +358,8 @@ function foldAnnouncement(capabilities: Capabilities, announce: BackendAnnounce)
     },
     graph: capabilities.graph || versions.graph > 0,
     forks: capabilities.forks || versions.fork > 0,
-    agentWorkflow: capabilities.agentWorkflow || has(feature.AGENT_WORKFLOW),
+    sessions: capabilities.sessions || has(feature.SESSIONS),
+    streamTenancy: capabilities.streamTenancy || has(feature.STREAM_TENANCY),
     watch: capabilities.watch || has(feature.WATCH),
     filters: {
       ...answered.filters,

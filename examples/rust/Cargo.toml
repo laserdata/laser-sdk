@@ -97,3 +97,7 @@ path = "src/orchestra/main.rs"
 [[example]]
 name = "governance"
 path = "src/governance/main.rs"
+
+[[example]]
+name = "sessions"
+path = "src/sessions/main.rs"

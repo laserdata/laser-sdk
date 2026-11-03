@@ -14,3 +14,18 @@ Feature: The read-consistency pre-gate under injected capabilities
     When I run a read-your-writes query against topic "events"
     Then the call fails as unsupported
     And the unified result code is unsupported
+
+  Scenario Outline: A prepared mutation preserves a managed command error
+    When a prepared release receives managed result code <code>
+    Then the command error keeps code <code> and retryability <retryable>
+
+    Examples:
+      | code | retryable |
+      | 5    | false     |
+      | 18   | true      |
+      | 10   | false     |
+      | 2    | false     |
+      | 7    | false     |
+      | 19   | false     |
+      | 20   | true      |
+      | 42   | false     |

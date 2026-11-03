@@ -90,7 +90,7 @@ void test("given_a_stalled_acquisition_when_timed_out_then_should_reset_and_requ
   const operation = client.prepareAcquire(acquire)
   assert.deepEqual(operation.ambiguousRecovery, {
     kind: "waitForLeaseExpiry",
-    ttlMicros: 1_000_000n
+    ttlMs: 1_000
   })
   await assert.rejects(client.acquire(operation), (error: unknown) => {
     assert.ok(error instanceof AmbiguousMutationError)

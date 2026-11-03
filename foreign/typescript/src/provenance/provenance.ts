@@ -9,6 +9,7 @@ import {
 } from "../types/ids.js"
 import {
   AGENT_ID,
+  BROADCAST,
   CAUSAL_PARENT,
   CONVERSATION_ID,
   CORRELATION_ID,
@@ -23,7 +24,9 @@ import {
   ROOT_CONVERSATION_ID,
   TARGET_AGENT_ID,
   USAGE_INPUT_TOKENS,
-  USAGE_OUTPUT_TOKENS
+  USAGE_OUTPUT_TOKENS,
+  encodeRecordHeaders,
+  type HeaderField
 } from "../wire/headers.js"
 
 export interface LlmUsage {
@@ -66,59 +69,74 @@ function putHeader(map: Map<string, HeaderValue>, key: string, value: string): v
   map.set(key, { kind: "string", value })
 }
 
-function putFinite(map: Map<string, HeaderValue>, key: string, value: number): void {
-  if (!Number.isFinite(value)) {
-    throw ProvenanceError.nonFinite(key)
-  }
-  putHeader(map, key, String(value))
+export function encodeProvenanceHeaders(provenance: Provenance): ReadonlyMap<string, HeaderValue> {
+  const block = encodeRecordHeaders({
+    conversation: provenance.conversationId.toString(),
+    ...(provenance.parentConversationId !== undefined
+      ? { parent: provenance.parentConversationId.toString() }
+      : {}),
+    ...(provenance.rootConversationId !== undefined
+      ? { root: provenance.rootConversationId.toString() }
+      : {}),
+    ...(provenance.causalParent !== undefined
+      ? { causalParent: messageIdToString(provenance.causalParent) }
+      : {}),
+    ...(provenance.agent !== undefined ? { agent: provenance.agent.asStr() } : {}),
+    ...(provenance.targetAgentId !== undefined
+      ? { addressee: { kind: "agent" as const, agent: provenance.targetAgentId.asStr() } }
+      : {}),
+    ...(provenance.idempotencyKey !== undefined
+      ? { idempotencyKey: provenance.idempotencyKey }
+      : {}),
+    ...(provenance.correlationId !== undefined ? { correlation: provenance.correlationId } : {}),
+    ...(provenance.fenceToken !== undefined ? { fence: provenance.fenceToken } : {}),
+    ...(provenance.deadlineMicros !== undefined
+      ? { deadlineMicros: provenance.deadlineMicros }
+      : {}),
+    ...(provenance.usage?.inputTokens !== undefined
+      ? { inputTokens: provenance.usage.inputTokens }
+      : {}),
+    ...(provenance.usage?.outputTokens !== undefined
+      ? { outputTokens: provenance.usage.outputTokens }
+      : {}),
+    ...(provenance.usage?.costUsd !== undefined ? { costUsd: provenance.usage.costUsd } : {})
+  })
+  return headerMap(block)
 }
 
-export function encodeProvenanceHeaders(provenance: Provenance): ReadonlyMap<string, HeaderValue> {
+/** The Iggy header map of one record's header block, checked against the
+ * value and soft size caps. */
+export function headerMap(
+  block: readonly (readonly [string, HeaderField])[]
+): ReadonlyMap<string, HeaderValue> {
   const map = new Map<string, HeaderValue>()
-  putHeader(map, CONVERSATION_ID, provenance.conversationId.toString())
-  if (provenance.parentConversationId !== undefined) {
-    putHeader(map, PARENT_CONVERSATION_ID, provenance.parentConversationId.toString())
-  }
-  if (provenance.rootConversationId !== undefined) {
-    putHeader(map, ROOT_CONVERSATION_ID, provenance.rootConversationId.toString())
-  }
-  if (provenance.causalParent !== undefined) {
-    putHeader(map, CAUSAL_PARENT, messageIdToString(provenance.causalParent))
-  }
-  if (provenance.agent !== undefined) {
-    putHeader(map, AGENT_ID, provenance.agent.asStr())
-  }
-  if (provenance.targetAgentId !== undefined) {
-    putHeader(map, TARGET_AGENT_ID, provenance.targetAgentId.asStr())
-  }
-  if (provenance.idempotencyKey !== undefined) {
-    putHeader(map, IDEMPOTENCY_KEY, provenance.idempotencyKey)
-  }
-  if (provenance.correlationId !== undefined) {
-    putHeader(map, CORRELATION_ID, provenance.correlationId)
-  }
-  if (provenance.fenceToken !== undefined) {
-    putHeader(map, FENCE, provenance.fenceToken.toString())
-  }
-  if (provenance.deadlineMicros !== undefined) {
-    putHeader(map, DEADLINE, provenance.deadlineMicros.toString())
-  }
-  if (provenance.usage !== undefined) {
-    if (provenance.usage.inputTokens !== undefined) {
-      putHeader(map, USAGE_INPUT_TOKENS, provenance.usage.inputTokens.toString())
-    }
-    if (provenance.usage.outputTokens !== undefined) {
-      putHeader(map, USAGE_OUTPUT_TOKENS, provenance.usage.outputTokens.toString())
-    }
-    if (provenance.usage.costUsd !== undefined) {
-      putFinite(map, COST_USD, provenance.usage.costUsd)
-    }
-  }
-
   let size = 0
-  for (const [key, value] of map) {
-    const valueBytes = value.kind === "string" ? new TextEncoder().encode(value.value).length : 0
-    size += new TextEncoder().encode(key).length + valueBytes + HEADER_FRAMING_BYTES
+  for (const [key, field] of block) {
+    let bytes = 0
+    switch (field.kind) {
+      case "text":
+        putHeader(map, key, field.value)
+        bytes = new TextEncoder().encode(field.value).length
+        break
+      case "uint8":
+        map.set(key, { kind: "uint8", value: field.value })
+        bytes = 1
+        break
+      case "uint32":
+        map.set(key, { kind: "uint32", value: field.value })
+        bytes = 4
+        break
+      case "uint64":
+        map.set(key, { kind: "uint64", value: field.value })
+        bytes = 8
+        break
+      case "float64":
+        if (!Number.isFinite(field.value)) throw ProvenanceError.nonFinite(key)
+        map.set(key, { kind: "double", value: field.value })
+        bytes = 8
+        break
+    }
+    size += new TextEncoder().encode(key).length + bytes + HEADER_FRAMING_BYTES
   }
   if (size > HEADER_SOFT_CAP) {
     throw ProvenanceError.tooLarge(size, HEADER_SOFT_CAP)
@@ -144,22 +162,11 @@ function strValue(value: HeaderValue, key: string): string {
   return value.value
 }
 
-function parseUnsignedBigInt(text: string, key: string): bigint {
-  // Bounded before parsing: decimal-to-BigInt conversion is superlinear, so a
-  // megabyte of digits on a peer-supplied header would burn CPU per message.
-  // Encode enforces the same cap, so anything longer was never produced here.
-  if (text.length > HEADER_VALUE_MAX || !/^[0-9]+$/.test(text)) {
-    throw ProvenanceError.invalidValue(key)
-  }
-  return BigInt(text)
-}
-
-function parseFloatValue(text: string, key: string): number {
-  const parsed = Number(text)
-  if (Number.isNaN(parsed) && text.trim().toLowerCase() !== "nan") {
-    throw ProvenanceError.invalidValue(key)
-  }
-  return parsed
+// A malformed number is a decode error, never dropped: a silently missing fence
+// would skip the gate and let a tampered record through as unfenced.
+function uint64Value(value: HeaderValue, key: string): bigint {
+  if (value.kind !== "uint64") throw ProvenanceError.invalidValue(key)
+  return value.value
 }
 
 export function decodeProvenanceHeaders(headers: ReadonlyMap<string, HeaderValue>): Provenance {
@@ -195,9 +202,12 @@ export function decodeProvenanceHeaders(headers: ReadonlyMap<string, HeaderValue
       case AGENT_ID:
         agent = parseId(() => AgentId.new(strValue(value, key)))
         break
-      case TARGET_AGENT_ID:
-        targetAgentId = parseId(() => AgentId.new(strValue(value, key)))
+      case TARGET_AGENT_ID: {
+        // Broadcast `*` addresses every agent and is never an agent id.
+        const target = strValue(value, key)
+        if (target !== BROADCAST) targetAgentId = parseId(() => AgentId.new(target))
         break
+      }
       case IDEMPOTENCY_KEY:
         idempotencyKey = strValue(value, key)
         break
@@ -205,21 +215,23 @@ export function decodeProvenanceHeaders(headers: ReadonlyMap<string, HeaderValue
         correlationId = strValue(value, key)
         break
       case FENCE:
-        fenceToken = parseUnsignedBigInt(strValue(value, key), key)
+        fenceToken = uint64Value(value, key)
         break
       case DEADLINE:
-        deadlineMicros = parseUnsignedBigInt(strValue(value, key), key)
+        deadlineMicros = uint64Value(value, key)
         break
       case USAGE_INPUT_TOKENS:
-        inputTokens = parseUnsignedBigInt(strValue(value, key), key)
+        inputTokens = uint64Value(value, key)
         hasUsage = true
         break
       case USAGE_OUTPUT_TOKENS:
-        outputTokens = parseUnsignedBigInt(strValue(value, key), key)
+        outputTokens = uint64Value(value, key)
         hasUsage = true
         break
       case COST_USD:
-        costUsd = parseFloatValue(strValue(value, key), key)
+        if (value.kind !== "double") throw ProvenanceError.invalidValue(key)
+        if (!Number.isFinite(value.value)) throw ProvenanceError.nonFinite(key)
+        costUsd = value.value
         hasUsage = true
         break
       default:

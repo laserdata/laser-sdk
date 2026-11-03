@@ -103,14 +103,13 @@ pub(crate) async fn execute_iggy_recovery(
 pub(crate) async fn execute_recovery(
     laser: &laser_sdk::laser::Laser,
     server: &NativeIggy,
-    plane: NativePlane,
+    backend: NativeBackend,
     execution: DirectExecution<'_>,
-) -> Result<(NativePlane, serde_json::Value, RunReport), BenchError> {
-    let plane_manifest = execution
-        .stack
-        .plane
-        .as_ref()
-        .ok_or_else(|| BenchError::Invalid("L7 scenario requires a plane binary".to_owned()))?;
+) -> Result<(NativeBackend, serde_json::Value, RunReport), BenchError> {
+    let backend_manifest =
+        execution.stack.backend.as_ref().ok_or_else(|| {
+            BenchError::Invalid("L7 scenario requires a backend binary".to_owned())
+        })?;
     let case = RecoveryCase {
         payload_bytes: execution.scenario.payload_bytes,
         backlog_records: usize::try_from(execution.scenario.operations)
@@ -122,8 +121,8 @@ pub(crate) async fn execute_recovery(
     let evidence = run_recovery_evidence(RecoveryRun {
         laser,
         server,
-        plane,
-        plane_manifest,
+        backend,
+        backend_manifest,
         environment: &execution.manifest.environment,
         case: &case,
         driver,
@@ -154,8 +153,8 @@ pub(crate) async fn execute_recovery(
             scenario: execution.scenario,
             run: execution.run,
         },
-        &evidence.plane,
+        &evidence.backend,
         &evidence.summary,
     )?;
-    Ok((evidence.plane, telemetry, report))
+    Ok((evidence.backend, telemetry, report))
 }

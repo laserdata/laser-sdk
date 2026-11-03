@@ -213,11 +213,15 @@ impl PyTopic {
     }
 
     /// Many raw payloads in one Iggy send, all sharing `partition_key` (or
-    /// balanced when `None`). An empty list is a cheap no-op.
+    /// balanced when `None`). An empty list is a cheap no-op. An item can also
+    /// be an `IggyMessage` from `PublishFailedError.unconfirmed`, which is
+    /// resent with its original message id and headers so the server
+    /// deduplicates it.
     #[pyo3(signature = (messages, *, partition_key=None))]
     fn batch<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "typing.Sequence[typing.Union[builtins.bytes, builtins.bytearray, builtins.str, IggyMessage]]", imports = ("typing", "builtins")))]
         messages: Vec<Bound<'_, PyAny>>,
         partition_key: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -225,6 +229,9 @@ impl PyTopic {
         let messages = messages
             .iter()
             .map(|payload| {
+                if let Ok(message) = payload.cast::<crate::errors::PyUnconfirmedMessage>() {
+                    return message.get().to_iggy_message();
+                }
                 let bytes = crate::convert::payload_bytes(payload)?;
                 iggy::prelude::IggyMessage::builder()
                     .payload(bytes.into())
@@ -249,7 +256,7 @@ impl PyTopic {
         &self,
         max_records: Option<usize>,
         max_bytes: Option<usize>,
-        linger_ms: Option<u64>,
+        linger_ms: Option<f64>,
         partition_key: Option<String>,
     ) -> PyResult<crate::batching::PyBatchingProducer> {
         let mut builder = self.handle().batching().map_err(to_pyerr)?;
@@ -260,7 +267,7 @@ impl PyTopic {
             builder = builder.max_bytes(n);
         }
         if let Some(ms) = linger_ms {
-            builder = builder.linger(Duration::from_millis(ms));
+            builder = builder.linger(crate::convert::duration_ms(ms, "linger_ms")?);
         }
         if let Some(key) = partition_key {
             builder = builder.partition_key(key);
@@ -281,13 +288,19 @@ impl PyTopic {
     /// (shards, sharding, flush limits, byte budget, in-flight writes,
     /// backpressure, error callback). `batch_length` and `linger_ms` apply to
     /// direct mode only. A send then returns once the record is queued, so call
-    /// `await producer.shutdown()` before exit.
-    #[pyo3(signature = (*, batch_length=1000, linger_ms=0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=true, create_topic=true, partitions=1, message_expiry="server_default", max_topic_size=0, background=None))]
+    /// `await producer.shutdown()` before exit. A topic this producer creates
+    /// takes `expire_after_ms` (milliseconds) or `never_expire=True`, else the
+    /// server default, and `max_topic_bytes` or `unlimited_topic_size=True`,
+    /// else the server default. Setting both of a pair raises `InvalidError`.
+    /// `replication_factor` stores each partition of a topic this producer
+    /// creates on that many nodes, 1 to `MAX_REPLICATION_FACTOR` and at most
+    /// the cluster's node count, else the server default.
+    #[pyo3(signature = (*, batch_length=1000, linger_ms=0.0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=false, create_topic=true, partitions=1, replication_factor=None, expire_after_ms=None, never_expire=false, max_topic_bytes=None, unlimited_topic_size=false, background=None))]
     #[allow(clippy::too_many_arguments)]
     fn producer(
         &self,
         batch_length: u32,
-        linger_ms: u64,
+        linger_ms: f64,
         retries: Option<u32>,
         retry_interval_ms: Option<u64>,
         key: Option<&Bound<'_, PyAny>>,
@@ -295,10 +308,28 @@ impl PyTopic {
         create_stream: bool,
         create_topic: bool,
         partitions: u32,
-        message_expiry: &str,
-        max_topic_size: u64,
+        replication_factor: Option<u32>,
+        expire_after_ms: Option<f64>,
+        never_expire: bool,
+        max_topic_bytes: Option<u64>,
+        unlimited_topic_size: bool,
         background: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyProducer> {
+        let max_topic_size = match (max_topic_bytes, unlimited_topic_size) {
+            (Some(_), true) => {
+                return Err(InvalidError::new_err(
+                    "set max_topic_bytes or unlimited_topic_size, not both",
+                ));
+            }
+            (Some(0), false) => {
+                return Err(InvalidError::new_err(
+                    "max_topic_bytes must be greater than zero",
+                ));
+            }
+            (Some(bytes), false) => iggy::prelude::MaxTopicSize::from(bytes),
+            (None, true) => iggy::prelude::MaxTopicSize::Unlimited,
+            (None, false) => iggy::prelude::MaxTopicSize::ServerDefault,
+        };
         if batch_length == 0 {
             return Err(InvalidError::new_err(
                 "producer batch_length must be greater than zero",
@@ -319,16 +350,32 @@ impl PyTopic {
             .ok_or_else(|| to_pyerr(LaserError::NoStream))?;
         let settings = ProducerSettings {
             batch_length,
-            linger: Duration::from_millis(linger_ms),
+            linger: crate::convert::duration_ms(linger_ms, "linger_ms")?,
             retries,
             retry_interval: retry_interval_ms.map(Duration::from_millis),
             routing: routing(key, partition)?,
             create_stream,
             create_topic,
             partitions,
-            expiry: message_expiry
-                .parse::<IggyExpiry>()
-                .map_err(InvalidError::new_err)?,
+            replication_factor,
+            expiry: match (expire_after_ms, never_expire) {
+                (Some(_), true) => {
+                    return Err(InvalidError::new_err(
+                        "set expire_after_ms or never_expire, not both",
+                    ));
+                }
+                (Some(ms), false) => {
+                    let age = crate::convert::duration_ms(ms, "expire_after_ms")?;
+                    if age.is_zero() {
+                        return Err(InvalidError::new_err(
+                            "expire_after_ms must be greater than zero",
+                        ));
+                    }
+                    IggyExpiry::ExpireDuration(age.into())
+                }
+                (None, true) => IggyExpiry::NeverExpire,
+                (None, false) => IggyExpiry::ServerDefault,
+            },
             max_topic_size,
             background: match background.filter(|value| !value.is_none()) {
                 None => None,
@@ -353,15 +400,20 @@ impl PyTopic {
     /// Build a Laser reader for one partition. It is an async iterator
     /// and supports the same polling, batching, replay, retry, and commit modes
     /// as the Rust builder. Use `auto_commit="disabled"` plus
-    /// `commit(message)` for commit-after-handle delivery.
-    #[pyo3(signature = (name, *, partition=0, batch_length=1000, poll_interval_ms=None, polling="next", offset=None, timestamp_micros=None, auto_commit="polling", commit_interval_ms=0, commit_every=None, polling_retry_interval_ms=1000, init_retries=None, init_retry_interval_ms=1000, allow_replay=false))]
+    /// `commit(message)` for commit-after-handle delivery. The server holds a
+    /// poll that finds fewer than `min_count` new records for up to
+    /// `max_wait_ms` (0 to 600000, 0 answers at once), and `max_bytes` caps
+    /// the record bytes of one reply.
+    #[pyo3(signature = (name, *, partition=0, batch_length=1000, max_wait_ms=5000, min_count=1, max_bytes=1048576, polling="next", offset=None, timestamp_micros=None, auto_commit="polling", commit_interval_ms=0, commit_every=None, polling_retry_interval_ms=1000, init_retries=None, init_retry_interval_ms=1000, allow_replay=false))]
     #[allow(clippy::too_many_arguments)]
     fn consumer(
         &self,
         name: &str,
         partition: u32,
         batch_length: u32,
-        poll_interval_ms: Option<u64>,
+        max_wait_ms: u64,
+        min_count: u32,
+        max_bytes: u32,
         polling: &str,
         offset: Option<u64>,
         timestamp_micros: Option<u64>,
@@ -382,14 +434,15 @@ impl PyTopic {
             name.to_owned(),
             ConsumerConfig {
                 batch_length,
-                poll_interval_ms,
+                max_wait_ms,
+                min_count,
+                max_bytes,
                 polling,
                 offset,
                 timestamp_micros,
                 auto_commit,
                 commit_interval_ms,
                 commit_every,
-                auto_join_group: false,
                 create_group: false,
                 polling_retry_interval_ms,
                 init_retries,
@@ -437,8 +490,16 @@ impl PyTopic {
     }
 
     /// Idempotently create this topic with `partitions`, creating the stream
-    /// first when needed.
-    fn ensure<'py>(&self, py: Python<'py>, partitions: u32) -> PyResult<Bound<'py, PyAny>> {
+    /// first when needed. `replication_factor` is how many nodes store each
+    /// partition, 1 to `MAX_REPLICATION_FACTOR` and at most the cluster's node
+    /// count, the server default when `None`. An existing topic is left as it is.
+    #[pyo3(signature = (partitions, replication_factor=None))]
+    fn ensure<'py>(
+        &self,
+        py: Python<'py>,
+        partitions: u32,
+        replication_factor: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let stream = self.stream.clone();
         let name = self.name.clone();
@@ -447,7 +508,10 @@ impl PyTopic {
                 Some(stream) => laser.stream(stream.clone()).topic(&*name),
                 None => laser.topic(&*name),
             };
-            handle.ensure(partitions).await.map_err(to_pyerr)
+            handle
+                .ensure(partitions, replication_factor)
+                .await
+                .map_err(to_pyerr)
         })
     }
 

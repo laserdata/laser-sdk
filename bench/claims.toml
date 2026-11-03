@@ -34,7 +34,7 @@ evidence = ["L3"]
 
 [[claim]]
 id = "C7"
-statement = "Managed operation cost is quantified for every declared plane backend profile."
+statement = "Managed operation cost is quantified for every declared backend profile."
 evidence = ["L4"]
 
 [[claim]]

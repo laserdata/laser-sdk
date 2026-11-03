@@ -74,15 +74,17 @@ pub async fn resolve_body(store: &dyn BlobStore, payload: &[u8]) -> Result<Vec<u
 }
 
 impl crate::agent::AgentMessage {
-    /// The real body of a claim-checked message: when the content type is
-    /// `ref`, decode the capsule, fetch, and digest-verify through
-    /// [`resolve_body`]. Any other content type returns the payload as-is.
-    /// The consume-side pairing of the publish builder's `claim_check`.
+    /// The real body of a claim-checked message. It starts from
+    /// [`body`](Self::body): the AGDX envelope's body for an AGDX record, the
+    /// payload otherwise. When the content type is `ref`, that body is the
+    /// capsule, which is decoded, fetched, and digest-verified through
+    /// [`resolve_body`]. Any other content type returns the body as-is. The
+    /// consume-side pairing of the publish builder's `claim_check`.
     pub async fn resolve_body(&self, store: &dyn BlobStore) -> Result<Vec<u8>, LaserError> {
         if self.content_type == Some(ContentType::Ref) {
-            return resolve_body(store, &self.payload).await;
+            return resolve_body(store, self.body()).await;
         }
-        Ok(self.payload.clone())
+        Ok(self.body().to_vec())
     }
 }
 
@@ -138,6 +140,40 @@ mod tests {
         assert_eq!(content_type, Some(ContentType::Ref));
         let resolved = resolve_body(&store, &capsule).await.expect("resolves");
         assert_eq!(resolved, payload);
+    }
+
+    #[tokio::test]
+    async fn given_a_claim_checked_agdx_record_when_resolved_then_should_resolve_the_envelope_body()
+    {
+        use crate::types::MintUlid;
+        use laser_wire::agent::{AgentEnvelope, ConversationId, RecordId};
+        use std::str::FromStr;
+        let store = MemoryStore::default();
+        let body = vec![9u8; 4096];
+        let (capsule, content_type) = check_in(&store, 1024, body.clone())
+            .await
+            .expect("externalizes");
+        let envelope = AgentEnvelope::event(
+            RecordId::mint(),
+            ConversationId::mint(),
+            laser_wire::agent::AgentId::from_str("worker").expect("a valid agent id"),
+            capsule,
+        );
+        let mut message = crate::testing::agent_message(
+            encode_named(&envelope).expect("the envelope encodes"),
+            crate::provenance::Provenance::builder()
+                .conversation_id(crate::types::ConversationId::new())
+                .build(),
+        );
+        message.envelope = Some(envelope);
+        message.content_type = content_type;
+        assert_eq!(message.resolve_body(&store).await.expect("resolves"), body);
+        message.content_type = None;
+        assert_eq!(
+            message.resolve_body(&store).await.expect("passes through"),
+            message.body(),
+            "a body that was not claim-checked comes back as the envelope body"
+        );
     }
 
     #[tokio::test]

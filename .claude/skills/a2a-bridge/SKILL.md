@@ -5,7 +5,7 @@ description: The A2A JSON-RPC bridge - `sdk/src/a2a.rs`. The adapter (submit / t
 
 # A2A bridge
 
-The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescript/src/bridges` and share the cross-language bridge scenarios. Python binds the same bridges as classes: `A2aBridge(laser, source, request_topic, reply_topic, capabilities=, signing_key=)` with `signed_card(key)`, and `McpBridge(laser, source, tool_topic, reply_topic, server_name, memory_tools=False, timeout_secs=None)`, matching Rust `with_capabilities`, `with_signing_key`, `signed_card`, `with_memory_tools`, and `with_timeout` (default 30 seconds).
+The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescript/src/bridges` and share the cross-language bridge scenarios. Python binds the same bridges as classes: `A2aBridge(laser, source, request_topic, reply_topic, capabilities=, signing_key=)` with `signed_card(key)`, and `McpBridge(laser, source, tool_topic, reply_topic, server_name, memory_tools=False, timeout_ms=None)`, matching Rust `with_capabilities`, `with_signing_key`, `signed_card`, `with_memory_tools`, and `with_timeout` (default 30 seconds).
 
 `a2a.rs` maps A2A requests to durable AGDX records. `a2a-bridge` enables the transport-independent `submit`, `task`, `cancel`, and `card` adapter. `handle_rpc` dispatches JSON-RPC requests without HTTP. `a2a-http` adds the axum `router()`. Neither feature is enabled by default. Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first and follow [AGENTS.md](../../../AGENTS.md).
 
@@ -21,12 +21,13 @@ The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescri
 - `JsonRpcRequest` / `JsonRpcResponse` / `JsonRpcError` - the 2.0 envelope. `JSONRPC_VERSION` and `APP_ERROR_CODE` are named consts, not literals.
 - `AgentCard` / `AgentCardCapabilities` - the bridge's discovery doc (name = `source`, version, methods, `streaming`).
 - `A2aBridge::new(laser, source, request_topic, reply_topic)` - rides the typed AGDX verbs (`Laser::agdx`), not raw `send_agent`:
-  - `submit(params_json) -> Task` (`SendMessage`): publish a typed AGDX `command` tunneling the whole params JSON byte-identical (`agdx.ct = json`) on a fresh task conversation. The task identity rides `correlation`, derived from the conversation via `correlation_of` so lookup stays stateless. Returns `Submitted`.
+  - `submit(params_json) -> Task` (`SendMessage`): publish a typed AGDX `command` tunneling the whole params JSON byte-identical (`agdx.ct = json`) on a fresh task conversation. The task identity rides `correlation`, derived from the conversation via `correlation_of` so lookup stays stateless. Returns `Submitted`. The command is addressed to every agent (`agdx.to = *`). `submit_to(target, params_json)` addresses it to one agent, so only that agent handles it on a shared session topic.
   - `task(id) -> Task` (`GetTask`): read the reply topic (envelope-aware `ContextAssembler`), map the answering `response`/`error` envelope with the matching `correlation` via `task_from_envelope`, else `Working`.
   - `cancel(id) -> Task` (`CancelTask`): publish an AGDX `error` terminal (`Cancelled`, `task_state = Canceled`), returns `Canceled`.
+  - `submit_in(parent, root, params_json) -> Task`: `submit` as a child session of `parent` in the tree rooted at `root`. It writes the child's submitted start on `agent.sessions` with the ancestry before the command and stamps the ancestry on the command. The handling agent ends the child. Python takes `submit_in(parent, params_json, *, root=)`, TypeScript `submitIn`. `McpBridge::call_tool_in(parent, root, name, params_json)` is the MCP peer, and it ends the child by the tool result. `submit_in_to(target, parent, root, params_json)`, `McpBridge::call_tool_to(target, name, params_json)`, and `call_tool_in_to(target, ..)` are the addressed forms. Python takes `target=` on `submit`, `submit_in`, `call_tool`, and `call_tool_in`, and TypeScript a `{ target }` option. `handle_rpc` and `router()` stay unaddressed.
   - `card() -> AgentCard`: served at `GET /.well-known/agent-card.json`.
   - `router() -> axum::Router` (requires `a2a-http`): the JSON-RPC endpoint at `POST /` plus the card route. The adapter above is usable without it (serve it over any transport, or call `submit` / `task` / `cancel` directly).
-  - A worker behind the bridge reads `message.envelope` (the decoded command) and answers via `ctx.laser().agdx(reply_topic, source, conversation).respond(correlation, body)`.
+  - A worker behind the bridge reads `message.envelope` (the decoded command) and answers via `ctx.respond(..)`, or `ctx.laser().agdx(reply_topic, source, conversation).respond(correlation, body)` addressed to the bridge with `with_target`. Address every reply to its requester, as `ctx.respond` does, because shared-topic readers classify records by `agdx.to`.
 
 ## Rules specific to this area
 

@@ -1,3 +1,4 @@
+import { millis, millisToMicros } from "../client/duration.js"
 import { InvalidError, NoStreamError } from "../client/errors.js"
 import type { Laser } from "../client/laser.js"
 import { MemoryHandle } from "./handle.js"
@@ -35,12 +36,12 @@ export class MemoryTopicBuilder {
     return this
   }
 
-  /** Sets message expiry in milliseconds. */
-  ttl(milliseconds: number): this {
-    if (!Number.isSafeInteger(milliseconds) || milliseconds < 1) {
-      throw new InvalidError("memory topic TTL must be a positive whole number of milliseconds")
+  /** Sets message expiry in milliseconds. Fractions are kept to the microsecond. */
+  ttl(ttlMs: number): this {
+    if (millis(ttlMs, "memory topic ttlMs") === 0) {
+      throw new InvalidError("memory topic ttlMs must be positive, use noExpiry() to keep records")
     }
-    this.ttlMs = milliseconds
+    this.ttlMs = ttlMs
     return this
   }
 
@@ -60,8 +61,12 @@ export class MemoryTopicBuilder {
       .topic(this.topic)
       .ensureWithExpiry(
         this.partitionsValue,
-        this.ttlMs === undefined ? undefined : BigInt(this.ttlMs) * 1_000n
+        this.ttlMs === undefined ? undefined : maxBigint(1n, millisToMicros(this.ttlMs))
       )
     return MemoryHandle.logTopic(this.laser, this.topic, stream)
   }
+}
+
+function maxBigint(left: bigint, right: bigint): bigint {
+  return left > right ? left : right
 }

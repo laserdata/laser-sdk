@@ -78,15 +78,19 @@ export class Topic {
   }
 
   /** Idempotently creates this topic with `partitions`, creating its stream
-   * first if needed, so one call is enough to address a fresh server. */
-  async ensure(partitions: number = DEFAULT_PARTITIONS): Promise<void> {
-    await this.ensureWithExpiry(partitions)
+   * first if needed, so one call is enough to address a fresh server.
+   * `replicationFactor` is how many nodes store each partition,
+   * 1..=`MAX_REPLICATION_FACTOR` and at most the cluster's node count, the
+   * server's default when left out. An existing topic is left as it is. */
+  async ensure(partitions: number = DEFAULT_PARTITIONS, replicationFactor?: number): Promise<void> {
+    await this.ensureWithExpiry(partitions, undefined, replicationFactor)
   }
 
   /** @internal `ensure` that also sets the message expiry of the topic. */
   async ensureWithExpiry(
     partitions: number = DEFAULT_PARTITIONS,
-    messageExpiryMicros?: bigint
+    messageExpiryMicros?: bigint,
+    replicationFactor?: number
   ): Promise<void> {
     await this.observed("ensure", { partitions }, async () => {
       await this.transport.ensureStream(this.streamName)
@@ -95,11 +99,12 @@ export class Topic {
           this.streamName,
           this.name,
           partitions,
-          messageExpiryMicros
+          messageExpiryMicros,
+          replicationFactor
         )
         return
       }
-      await this.transport.ensureTopic(this.streamName, this.name, partitions)
+      await this.transport.ensureTopic(this.streamName, this.name, partitions, replicationFactor)
     })
   }
 
@@ -388,7 +393,7 @@ export class Topic {
    * Empty when the topic does not exist yet. */
   async tailOffsets(): Promise<ReadonlyMap<number, bigint>> {
     const partitionCount = (await this.partitionCount()) ?? 0
-    const tails = await Promise.all(
+    const settled = await Promise.allSettled(
       Array.from({ length: partitionCount }, async (_, partitionId) => {
         const polled = await this.transport.pollMessages(
           this.streamName,
@@ -402,6 +407,9 @@ export class Topic {
         return [partitionId, last === undefined ? 0n : last.offset + 1n] as const
       })
     )
+    const failure = settled.find((result) => result.status === "rejected")
+    if (failure?.status === "rejected") throw failure.reason
+    const tails = settled.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))
     return new Map(tails)
   }
 

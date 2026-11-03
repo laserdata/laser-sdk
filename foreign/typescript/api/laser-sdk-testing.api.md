@@ -4,6 +4,8 @@
 
 ```ts
 
+/// <reference types="node" />
+
 import type { SendMessagesConfirmation } from 'apache-iggy';
 import type { SendMessagesResponse } from 'apache-iggy';
 import { SimpleClient } from 'apache-iggy';
@@ -52,8 +54,8 @@ export class TestClock implements Clock {
 
 // Warnings were encountered during analysis:
 //
-// src/testing.ts:25:5 - (ae-forgotten-export) The symbol "AgentId" needs to be exported by the entry point testing.d.ts
-// src/testing.ts:27:5 - (ae-forgotten-export) The symbol "InboxRoute" needs to be exported by the entry point testing.d.ts
+// src/testing.ts:27:5 - (ae-forgotten-export) The symbol "AgentId" needs to be exported by the entry point testing.d.ts
+// src/testing.ts:29:5 - (ae-forgotten-export) The symbol "InboxRoute" needs to be exported by the entry point testing.d.ts
 
 // (No @packageDocumentation comment for this package)
 

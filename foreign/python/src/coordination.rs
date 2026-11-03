@@ -1,5 +1,5 @@
 use crate::async_bridge::{HookLoop, call_hook, future_into_py};
-use crate::convert::{duration_seconds, payload_bytes, py_to_de, ser_to_py};
+use crate::convert::{duration_ms, payload_bytes, py_to_de, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::kv::PyLease;
 use async_trait::async_trait;
@@ -210,13 +210,12 @@ pub struct PyAmbiguousMutationRecovery {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyAmbiguousMutationRecovery {
-    /// Wait `ttl_secs`, the requested lease TTL, before acquiring again.
+    /// Wait `ttl_ms`, the requested lease TTL in milliseconds, before
+    /// acquiring again.
     #[staticmethod]
-    fn wait_for_lease_expiry(ttl_secs: f64) -> PyResult<Self> {
+    fn wait_for_lease_expiry(ttl_ms: f64) -> PyResult<Self> {
         Ok(Self {
-            inner: AmbiguousMutationRecovery::WaitForLeaseExpiry(duration_seconds(
-                ttl_secs, "ttl_secs",
-            )?),
+            inner: AmbiguousMutationRecovery::WaitForLeaseExpiry(duration_ms(ttl_ms, "ttl_ms")?),
         })
     }
 
@@ -244,6 +243,15 @@ impl PyAmbiguousMutationRecovery {
             AmbiguousMutationRecovery::ReconcileTargetPrecondition => {
                 "reconcile_target_precondition"
             }
+        }
+    }
+
+    /// The time to wait in milliseconds for `wait_for_lease_expiry`, else `None`.
+    #[getter]
+    fn ttl_ms(&self) -> Option<f64> {
+        match self.inner {
+            AmbiguousMutationRecovery::WaitForLeaseExpiry(ttl) => Some(ttl.as_secs_f64() * 1_000.0),
+            _ => None,
         }
     }
 
@@ -303,9 +311,9 @@ impl PyFencedLeaseClient {
 
     fn with_attempt_timeout(
         mut slf: PyRefMut<'_, Self>,
-        seconds: f64,
+        timeout_ms: f64,
     ) -> PyResult<PyRefMut<'_, Self>> {
-        let timeout = duration_seconds(seconds, "coordination attempt timeout")?;
+        let timeout = duration_ms(timeout_ms, "timeout_ms")?;
         let client = slf
             .inner
             .take()

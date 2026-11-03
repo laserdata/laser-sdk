@@ -1,3 +1,12 @@
+import {
+  FILTER_MUTATION_ATTEMPTS,
+  FILTER_MUTATION_BACKOFF_MS,
+  FILTER_OUTCOME_WAIT_MS,
+  MANAGED_MUTATION,
+  MANAGED_MUTATION_DEADLINE_MS,
+  backoffDelay
+} from "../retry.js"
+import { BARE_SCOPE, type ResourceScope } from "../client/resource-scope.js"
 import { resultCodeIsRetryable } from "../wire/result.js"
 import { Json } from "../stream/codecs.js"
 import { decodeBrowseReply, encodeGetSchema } from "../wire/browse.js"
@@ -23,19 +32,26 @@ import {
   type CoordinatorConnection,
   type HeaderFault,
   type LaserTransport,
-  type NodeConnection,
+  type ManagedTarget,
+  POLLED_HEAD_BYTES,
   type PolledMessage,
   decodePolledBody,
+  decodePolledHead,
+  isRouteStale,
   serverErrorCode
 } from "../iggy/apache-iggy.js"
 import type { HeaderValue } from "../stream/header-value.js"
 import type { ConsumerMessage } from "../stream/consumer.js"
+import { storeSeeds } from "../stream/consumer-start.js"
 import { withMessageJson } from "../stream/message.js"
 import { mintUlidValue } from "../runtime/ulid.js"
+import { warn } from "../runtime/warn.js"
 import { decodeOne, encodeNamed } from "../wire/cbor.js"
 import {
   AGDX_FILTERED_ACK_CODE,
   AGDX_FILTERED_POLL_CODE,
+  AGDX_FILTERED_WAIT_CANCEL_CODE,
+  AGDX_FILTERED_WAIT_CODE,
   FILTER_OP_VERSION
 } from "../wire/codes.js"
 import {
@@ -48,12 +64,13 @@ import {
   ListFilterRevisionsCommand,
   ListFiltersCommand
 } from "../wire/commands.js"
-import { CompiledFilter, usesRegex, type DecodeLimits } from "../wire/filter-eval.js"
+import { CompiledFilter, type DecodeLimits } from "../wire/filter-eval.js"
 import {
+  encodeFilteredAck,
+  type AckContext,
   type AppliedPolicy,
   type CatalogPosition,
   type ConsumerFilter,
-  type ExecutionMode,
   type FaultReason,
   type FilterBinding,
   type FilterBindingPage,
@@ -75,17 +92,17 @@ import {
   type FilterRevisionRef,
   type FilterSource,
   type FilterTestResult,
-  type FilteredAck,
   type FilteredPage,
   type FilteredPollRequest,
   type FilteredStart,
+  type FilteredWaitPartition,
   type GroupFilterSpec,
-  type ReadMode,
   type SourceGeneration,
   type StopReason,
   decodeFilterReply,
-  encodeFilteredAck,
   encodeFilteredPollRequest,
+  encodeFilteredWaitCancel,
+  encodeFilteredWaitRequest,
   filteredPageNextStart,
   validateCatalogPage,
   validateFilterGroupRef,
@@ -93,42 +110,51 @@ import {
   validateFilterPreviewRequest,
   validateFilterTestRequest,
   validateFilteredPollRequest,
-  type FilterPage,
+  validateFilteredWaitCancel,
+  validateFilteredWaitRequest,
+  validateListFilters,
+  type FilterSummary,
   type ListFilters
 } from "../wire/filter.js"
 import {
   MAX_FILTER_CATALOG_PAGE,
   MAX_FILTER_PARSE_DEPTH,
   MAX_FILTER_PREVIEW_EXAMINED,
-  MAX_FILTERED_PAGE_BYTES
+  MAX_FILTERED_PAGE_BYTES,
+  MAX_FILTERED_WAIT_PARTITIONS
 } from "../wire/limits.js"
 
 const DEFAULT_COUNT = 100
 const DEFAULT_MAX_REPLY_BYTES = 1024 * 1024
 const DEFAULT_IDLE_INTERVAL_MS = 250
+const DEFAULT_MAX_WAIT_MS = 5_000
+// A filtered wait gets this long past its server wait for the reply.
+const WAIT_REPLY_MARGIN_MS = 5_000
+const WAIT_CANCEL_DEADLINE_MS = 5_000
 const DEFAULT_PAGE_SIZE = 50
 const DEFAULT_PREVIEW_RECORDS = 20
 const DEFAULT_MAX_UNACKED_PAGES = 1024
-const MAX_NODE_CONNECTIONS = 16
 const ASSIGNMENT_REFRESH_MS = 2_000
-const MUTATION_ATTEMPTS = 3
-const MUTATION_RETRY_BACKOFF_MS = 200
+// How often a read still unanswered by its cached primary looks the route up.
+const ROUTE_RECHECK_MS = 1_000
+const MUTATION_ATTEMPTS = FILTER_MUTATION_ATTEMPTS
+const MUTATION_RETRY_BACKOFF_MS = FILTER_MUTATION_BACKOFF_MS
 const OUTCOME_POLL_INTERVAL_MS = 100
 /** How long the typed catalog verbs wait for a mutation's authoritative outcome. */
-export const DEFAULT_OUTCOME_WAIT_MS = 30_000
+export const DEFAULT_OUTCOME_WAIT_MS = FILTER_OUTCOME_WAIT_MS
 
 const GET_STREAM_CODE = 200
 const GET_TOPIC_CODE = 300
 const GET_CONSUMER_GROUP_CODE = 600
-const ATTACH_CONSUMER_SESSION_CODE = 14
 const SYNC_CONSUMER_GROUP_CODE = 606
-const GET_CONSUMER_OFFSET_ROUTING_CODE = 123
-const GET_POLL_ROUTING_CODE = 103
-const CONSUMER_SESSION_BYTES = 32
-// A consumer session is a u128 client id and a u64 session number, then the u64 metadata watermark.
-const SESSION_IDENTITY_BYTES = 24
-const POLLING_NEXT = 5
+const HISTORY_UNAVAILABLE = 87
+const NOT_PRIMARY = 89
 const CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009
+
+// Wait ids count up across every reader of the process, so no two waits on
+// one connection share an id.
+let lastWaitId = 0n
+
 // Wider than any server bound, so a record the server could decode always
 // decodes here too and a mismatch is a real disagreement.
 const GUARD_LIMITS: DecodeLimits = {
@@ -153,14 +179,16 @@ export interface ReaderTag {
 export type FilterTransport = Pick<
   LaserTransport,
   | "sendManaged"
+  | "sendManagedTo"
+  | "partitionPrimary"
+  | "storePosition"
   | "joinConsumerGroup"
   | "leaveConsumerGroup"
   | "joinExistingConsumerGroup"
-  | "openNodeConnection"
-  | "clusterNodeCount"
   | "openCoordinator"
   | "connectsNodes"
->
+> &
+  Partial<Pick<LaserTransport, "storeOffset" | "getConsumerOffset">>
 
 /** One page of matching records from one partition. */
 export interface MatchedPage {
@@ -176,7 +204,7 @@ export interface MatchedPage {
   readonly frontier: bigint
   /**
    * The offset acknowledging this page stores, once every earlier page is
-   * handled too. Absent on a local page, which cannot be acknowledged.
+   * handled too. Absent when the page examined nothing.
    */
   readonly safeAckOffset?: bigint
   readonly [READER_TAG]?: ReaderTag
@@ -221,13 +249,30 @@ export interface ConfiguredGroup {
  * The catalog and native filter commands behind a consumer group's filter
  * handle, reached through `ConsumerGroup.filter()`. Native commands need a
  * server that serves consumer filters. The catalog also needs a managed
- * plane. Either missing throws `UnsupportedError`.
+ * backend. Either missing throws `UnsupportedError`.
  */
 export class Filters {
+  /** @internal */
   constructor(
     private readonly transport: FilterTransport,
-    private readonly capabilities: () => Promise<Capabilities>
+    private readonly capabilities: () => Promise<Capabilities>,
+    private readonly scope: ResourceScope = BARE_SCOPE
   ) {}
+
+  /** The stream whose schema registry this handle resolves writer schemas in.
+   * @internal */
+  schemaStream(): string | undefined {
+    return this.scope.stream
+  }
+
+  // A filter with writer schemas resolves them in the registry this handle
+  // registers schemas in, unless the caller named one.
+  private scopedFilter(filter: ConsumerFilter): ConsumerFilter {
+    const stream = this.scope.stream
+    return filter.schemaRefs.length > 0 && filter.schemaStream === undefined && stream !== undefined
+      ? { ...filter, schemaStream: stream }
+      : filter
+  }
 
   /** Throws `UnsupportedError` unless the group filter catalog is served. */
   async requireCatalog(): Promise<void> {
@@ -272,7 +317,16 @@ export class Filters {
       explain: options.explain ?? false
     }
     validateFilterPreviewRequest(request)
-    const outcome = await this.native(FilterPreviewCommand, request)
+    const target = await this.partitionTarget(stream, topic, partitionId)
+    let outcome: FilterOutcome
+    try {
+      outcome = await this.native(FilterPreviewCommand, request, target)
+    } catch (error) {
+      // A preview the partition's primary no longer takes goes to the
+      // caller's node, which serves it from its own copy.
+      if (target.kind === "caller" || !isRouteStale(error)) throw error
+      outcome = await this.native(FilterPreviewCommand, request, { kind: "caller" })
+    }
     if (outcome.kind === "preview") return outcome.preview
     throw unexpected("preview")
   }
@@ -292,26 +346,19 @@ export class Filters {
   }
 
   /**
-   * One page of saved filters whose name contains `nameContains`, newest first.
+   * The own filter of one consumer group incarnation, bound or released,
+   * `undefined` when it has none.
    *
    * @internal
    */
-  async list(
-    nameContains: string,
-    options: CatalogPageOptions = {},
-    beforeId?: number
-  ): Promise<FilterPage> {
-    const request: ListFilters = {
-      v: FILTER_OP_VERSION,
-      nameContains,
-      ...(beforeId !== undefined ? { beforeId } : {}),
-      page: options.page ?? 0,
-      pageSize: options.pageSize ?? DEFAULT_PAGE_SIZE
-    }
-    validateCatalogPage(request.page, request.pageSize)
+  async owned(owner: FilterGroupIdentity): Promise<FilterSummary | undefined> {
+    const request: ListFilters = { v: FILTER_OP_VERSION, owner, page: 0, pageSize: 1 }
+    validateListFilters(request)
     const outcome = await this.catalog(ListFiltersCommand, request)
-    if (outcome.kind === "filters") return outcome.page
-    throw unexpected("filters")
+    if (outcome.kind !== "filters") throw unexpected("filters")
+    return outcome.page.items.find(
+      (summary) => summary.owner !== undefined && sameGroupIdentity(summary.owner.identity, owner)
+    )
   }
 
   /**
@@ -371,7 +418,12 @@ export class Filters {
     expectedRevision: number,
     filter: ConsumerFilter
   ): Promise<FilterRevisionRef> {
-    const applied = await this.apply({ kind: "revise", filterId, expectedRevision, filter })
+    const applied = await this.apply({
+      kind: "revise",
+      filterId,
+      expectedRevision,
+      filter: this.scopedFilter(filter)
+    })
     if (applied.result.kind === "revised") return applied.result.revision
     throw unexpected("revise")
   }
@@ -396,8 +448,12 @@ export class Filters {
   ): Promise<ConfiguredGroup> {
     const identity =
       expectedIdentity ?? (await nativeGroup(this.transport, group, group.group)).identity
+    const scoped: GroupFilterSpec =
+      policy.kind === "definition"
+        ? { kind: "definition", name: policy.name, filter: this.scopedFilter(policy.filter) }
+        : policy
     const applied = await this.apply(
-      { kind: "configure_group", group, policy, expectedIdentity: identity },
+      { kind: "configure_group", group, policy: scoped, expectedIdentity: identity },
       operationId
     )
     if (applied.result.kind === "bound") return bound(applied.result.binding, applied)
@@ -491,11 +547,37 @@ export class Filters {
 
   private async native<Request>(
     command: Parameters<typeof executeManaged<Request, FilterReply>>[2],
-    request: Request
+    request: Request,
+    target?: ManagedTarget
   ): Promise<FilterOutcome> {
-    const reply = await executeManaged(this.transport, await this.capabilities(), command, request)
+    const reply = await executeManaged(
+      this.transport,
+      await this.capabilities(),
+      command,
+      request,
+      target === undefined ? undefined : { target }
+    )
     if (reply.kind === "ok") return reply.outcome
     throw filterError(reply.error)
+  }
+
+  // The partition's primary, or the caller's node when the route cannot be
+  // read. Every node holds every partition, so either one answers.
+  private async partitionTarget(
+    stream: string,
+    topic: string,
+    partitionId: number
+  ): Promise<ManagedTarget> {
+    const lookup = this.transport.partitionPrimary
+    if (lookup === undefined) return { kind: "caller" }
+    try {
+      return {
+        kind: "replica",
+        replica: await lookup.call(this.transport, stream, topic, partitionId)
+      }
+    } catch {
+      return { kind: "caller" }
+    }
   }
 
   private async catalog<Request>(
@@ -541,10 +623,11 @@ export class FilteredReaderBuilder {
   private pageCount = DEFAULT_COUNT
   private examinedBudget?: number
   private replyBytes = DEFAULT_MAX_REPLY_BYTES
-  private mode: ReadMode = "primary"
   private guarded = false
   private idleMs = DEFAULT_IDLE_INTERVAL_MS
+  private waitMs = DEFAULT_MAX_WAIT_MS
   private maxUnacked = DEFAULT_MAX_UNACKED_PAGES
+  private seed?: GroupSeed
   private readonly selectedPartitions = new Set<number>()
 
   private constructor(
@@ -589,6 +672,17 @@ export class FilteredReaderBuilder {
     return this
   }
 
+  /**
+   * Store `offsets` taken at a group consumer's join, each before this member
+   * first reads its partition, where `group` still stored nothing.
+   *
+   * @internal
+   */
+  seedStart(group: string, offsets: ReadonlyMap<number, bigint>): this {
+    if (offsets.size > 0) this.seed = { group, offsets }
+    return this
+  }
+
   /** Read this partition only while the group assigns it to this member. Repeat for several. */
   partition(partitionId: number): this {
     if (!Number.isSafeInteger(partitionId) || partitionId < 0 || partitionId > 0xffff_ffff) {
@@ -621,16 +715,6 @@ export class FilteredReaderBuilder {
     return this
   }
 
-  /**
-   * `primary` (the default) reads from each partition primary and can
-   * acknowledge, and needs a Laser connected from a connection string.
-   * `local` reads any replica, cannot acknowledge, and keeps no pending pages.
-   */
-  readMode(mode: ReadMode): this {
-    this.mode = mode
-    return this
-  }
-
   /** Re-evaluate returned records and fail on disagreement. Regex predicates cannot use this guard. */
   localGuard(enabled: boolean): this {
     this.guarded = enabled
@@ -638,13 +722,27 @@ export class FilteredReaderBuilder {
   }
 
   /**
-   * How long `nextPage` waits after a round that found nothing new, and how
-   * long a failing or blocked partition waits before it is read again.
+   * How long the server holds a round that found nothing new until one of the
+   * reader's partitions has a record, within the server's announced filtered
+   * wait. Defaults to 5 seconds. A server that announces none paces idle
+   * rounds with `idleInterval`.
    */
-  idleInterval(milliseconds: number): this {
-    if (!Number.isFinite(milliseconds) || milliseconds < 0)
+  maxWait(waitMs: number): this {
+    if (!Number.isSafeInteger(waitMs) || waitMs < 0)
+      throw new InvalidError("the maximum wait must be a non-negative whole number of milliseconds")
+    this.waitMs = waitMs
+    return this
+  }
+
+  /**
+   * How long `nextPage` waits after a round that found nothing new on a server
+   * that holds no filtered wait, and how long a failing or blocked partition
+   * waits before it is read again.
+   */
+  idleInterval(intervalMs: number): this {
+    if (!Number.isFinite(intervalMs) || intervalMs < 0)
       throw new InvalidError("the idle interval must be finite and non-negative")
-    this.idleMs = milliseconds
+    this.idleMs = intervalMs
     return this
   }
 
@@ -660,16 +758,14 @@ export class FilteredReaderBuilder {
     const capabilities = await this.capabilities()
     if (this.filter.kind === "group" && !capabilities.filters.groupPolicyReads) {
       throw new UnsupportedError(
-        "this server serves consumer filters but not group-aware reads, upgrade it before reading groups through the Laser SDK"
+        "this server serves consumer filters but not group-aware reads, upgrade it before reading groups through the Laser SDK",
+        { surface: "filters", feature: "group_policy_reads" }
       )
     }
     if (this.filter.kind !== "group" && !capabilities.filters.native) {
-      throw new UnsupportedError("consumer filters are not served by this server")
-    }
-    if (this.mode === "primary" && this.transport.connectsNodes !== true) {
-      throw new ConfigError(
-        "primary group reads open data connections, so they need a Laser connected from a connection string. Read in local mode for an injected client"
-      )
+      throw new UnsupportedError("consumer filters are not served by this server", {
+        surface: "filters"
+      })
     }
     const consumer = this.consumer
     const request: FilteredPollRequest = {
@@ -681,7 +777,6 @@ export class FilteredReaderBuilder {
       start: this.startAt,
       count: this.pageCount,
       maxReplyBytes: this.replyBytes,
-      readMode: this.mode,
       ...(this.examinedBudget !== undefined ? { maxExamined: this.examinedBudget } : {}),
       ...(this.minCatalogPosition !== undefined
         ? { minCatalogPosition: this.minCatalogPosition }
@@ -719,7 +814,9 @@ export class FilteredReaderBuilder {
       request,
       start: this.startAt,
       idleIntervalMs: this.idleMs,
+      maxWaitMs: Math.min(this.waitMs, capabilities.filters.maxWaitMs),
       maxUnackedPages: this.maxUnacked,
+      ...(this.seed === undefined ? {} : { seed: this.seed }),
       guard: undefined,
       guardEnabled: this.guarded,
       membership,
@@ -745,12 +842,21 @@ interface ReaderSettings {
   readonly request: FilteredPollRequest
   readonly start: FilteredStart
   readonly idleIntervalMs: number
+  /** The server wait of an idle round, zero for none. */
+  readonly maxWaitMs?: number
   readonly maxUnackedPages?: number
   readonly guard: CompiledFilter | undefined
   readonly guardEnabled?: boolean
   readonly membership: Membership | undefined
   readonly partitionIds: readonly number[]
   readonly selectedPartitions?: ReadonlySet<number>
+  readonly seed?: GroupSeed
+}
+
+/** A group consumer's start, taken at its join for the partitions its group never stored. */
+interface GroupSeed {
+  readonly group: string
+  readonly offsets: ReadonlyMap<number, bigint>
 }
 
 type Read =
@@ -765,14 +871,21 @@ type Read =
  * and every earlier page of the partition are fully handled. Pages that
  * matched nothing are stored by the reader itself. A partition that fails,
  * faults, or blocks waits one idle interval before it is read again, while
- * the others keep reading. A purge or a new group binding restarts the
- * partition from its stored offset once, and the error that reports it
- * reaches the caller. Drive one reader from one task at a time.
+ * the others keep reading. A recreated partition or a new group binding
+ * restarts the partition from its stored offset once, and the error that
+ * reports it reaches the caller. Every read goes to the partition's primary
+ * when its route is known, any other node serves it from its own copy
+ * otherwise, and every acknowledgment is a consumer offset store fenced to the
+ * partition incarnation and the group owner the page was read under. Drive one
+ * reader from one task at a time.
  */
 export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRecord> {
+  private initialAssignment: boolean
   private readonly progress = new Map<number, PartitionProgress>()
   private readonly revoked = new Set<number>()
-  private readonly routes: Routes
+  // The replica id of each partition's primary, looked up before the first
+  // read and again after a read that found it moved or gone.
+  private readonly leaders = new Map<number, number>()
   private readonly buffered: MatchedRecord[] = []
   private guard: CompiledFilter | undefined
   private cursor = 0
@@ -783,22 +896,54 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   private closed = false
   private deferredError: unknown
   private pinnedSource: SourceIncarnation | undefined
+  // A server that refused a filtered wait as unsupported paces idle rounds
+  // with the idle interval from then on.
+  private waitsServed = true
+  // The partitions the last filtered wait found ready. The next round reads
+  // only these.
+  private readyOnly: ReadonlySet<number> | undefined
+  // A ready answer the next round could not confirm would repeat at once, so
+  // the wait after that round is paced instead.
+  private readyUnconfirmed = false
+  // The filtered waits still held, by the node that holds them. A node holds
+  // at most one, kept across rounds until it answers or is cancelled.
+  private readonly heldWaits = new Map<string, HeldWait>()
+  // Ends the idle wait in progress early.
+  private idling: AbortController | undefined
+  // The last wait was refused and sent again at once, so another refusal in
+  // a row is paced instead.
+  private waitRefused = false
 
-  // Partitions whose last read lost its route, for an independent reader.
-  private readonly lostRoutes = new Set<number>()
+  // Partitions whose last read found the group assignment gone. The next such
+  // read reaches the caller instead of syncing the group again.
+  private readonly lostAssignments = new Set<number>()
+  // Seeds still to store, each before the first read of its partition.
+  private readonly seeds: Map<number, bigint>
 
   private constructor(private readonly settings: ReaderSettings) {
-    this.routes = new Routes(settings.transport, settings.coordinator)
+    this.initialAssignment =
+      (settings.membership?.partitions.length ?? settings.partitionIds.length) === 0
     this.guard = settings.guard
     this.pinnedSource = settings.pinnedSource
     for (const partitionId of settings.partitionIds) {
       this.progress.set(partitionId, new PartitionProgress(settings.start))
     }
+    this.seeds = new Map(settings.seed?.offsets)
   }
 
   /** @internal */
   static create(settings: ReaderSettings): FilteredReader {
     return new FilteredReader(settings)
+  }
+
+  /**
+   * Store the start's seeds of the partitions this member owns now, so a
+   * refused seed fails the group consumer's start.
+   *
+   * @internal
+   */
+  async storeOwnedSeeds(): Promise<void> {
+    await this.storeSeeds([...this.progress.keys()])
   }
 
   /** The next page with at least one match. Waits while nothing is new, up to `timeoutMs` when given. */
@@ -810,7 +955,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       if (deadline !== undefined && Date.now() >= deadline) {
         throw new TimeoutError("a filtered page with a match")
       }
-      if (round.kind === "idle") await sleep(this.settings.idleIntervalMs)
+      if (round.kind === "idle") await this.waitForRecords()
     }
   }
 
@@ -851,28 +996,28 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
 
   /** Mark one record handled, and store the progress this completes. */
   async ack(record: MatchedRecord): Promise<void> {
-    this.requireAcknowledgments()
+    this.requireOpen()
     const sequence = this.requireSequence(record)
     this.partitionProgress(record.partitionId).completeRecord(sequence, record.offset)
-    await this.flush(record.partitionId)
+    await this.store(record.partitionId)
   }
 
   /** Mark this partition's preceding records through `record` handled. Later records stay pending. */
   async ackThrough(record: MatchedRecord): Promise<void> {
-    this.requireAcknowledgments()
+    this.requireOpen()
     const sequence = this.requireSequence(record)
     if (!this.partitionProgress(record.partitionId).completeThrough(sequence, record.offset)) {
       throw new InvalidError("the record is past the page acknowledgment boundary")
     }
-    await this.flush(record.partitionId)
+    await this.store(record.partitionId)
   }
 
   /** Mark every record of `page` handled, and store the progress this completes. */
   async ackPage(page: MatchedPage): Promise<void> {
-    this.requireAcknowledgments()
+    this.requireOpen()
     const sequence = this.requireSequence(page)
     this.partitionProgress(page.partitionId).completePage(sequence)
-    await this.flush(page.partitionId)
+    await this.store(page.partitionId)
   }
 
   /**
@@ -895,11 +1040,10 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
    * @internal
    */
   async flushCompleted(): Promise<void> {
-    if (this.settings.request.readMode !== "primary") return
     let failure: unknown
     for (const partitionId of [...this.progress.keys()]) {
       try {
-        await this.flush(partitionId)
+        await this.store(partitionId)
       } catch (error) {
         failure ??= error
       }
@@ -922,6 +1066,71 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   }
 
   /**
+   * Wait after a round that found nothing new, for a caller that drives its
+   * own loop with `readRound` or `tryNextPage`. The server holds one filtered
+   * wait per node that serves this reader's partitions until one of them has a
+   * record past what was examined, at most `maxWait` and what the server
+   * announces, and the next round reads only the ready partitions. On a server
+   * without filtered waits, or after a wait that failed or answered empty long
+   * before its time, it sleeps one idle interval instead.
+   */
+  waitForRecords(): Promise<void> {
+    return this.waitForRecordsWithin(undefined)
+  }
+
+  /**
+   * `waitForRecords` bounded by `limitMs`, for a caller with work due sooner.
+   *
+   * @internal
+   */
+  async waitForRecordsWithin(limitMs: number | undefined): Promise<void> {
+    const idling = new AbortController()
+    this.idling = idling
+    const signal = idling.signal
+    const pacing = Math.min(limitMs ?? Infinity, this.settings.idleIntervalMs)
+    try {
+      const waitMs = this.waitsServed
+        ? Math.min(this.settings.maxWaitMs ?? 0, limitMs ?? Infinity)
+        : 0
+      const unconfirmed = this.readyUnconfirmed && this.examined === 0
+      this.readyUnconfirmed = false
+      if (waitMs <= 0 || unconfirmed) {
+        await sleep(pacing, signal)
+        return
+      }
+      const answer = await this.heldWait(Math.floor(waitMs), signal)
+      switch (answer.kind) {
+        case "ready":
+          this.readyOnly = new Set(
+            answer.ready.filter((partitionId) => this.progress.has(partitionId))
+          )
+          this.readyUnconfirmed = true
+          return
+        case "elapsed":
+          return
+        case "unsupported":
+          this.waitsServed = false
+          await sleep(pacing, signal)
+          return
+        case "sleep":
+          await sleep(pacing, signal)
+      }
+    } finally {
+      if (this.idling === idling) this.idling = undefined
+    }
+  }
+
+  /**
+   * End the idle wait in progress, so a consumer that shuts down does not sit
+   * out a held wait.
+   *
+   * @internal
+   */
+  wake(): void {
+    this.idling?.abort()
+  }
+
+  /**
    * Whether `value` was read by this reader in its current membership, so it
    * can still be acknowledged. A rejoin retires every earlier page.
    */
@@ -932,39 +1141,29 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   }
 
   /**
-   * Data connections this reader opened to partition primaries. A healthy
-   * reader opens one per node and keeps it: the count grows only when a node
-   * stops being primary, a connection fails, or the group session ends.
-   */
-  dataConnectionsOpened(): number {
-    return this.routes.opened
-  }
-
-  /**
-   * Store completed progress, leave the group, and close the data
-   * connections. A round still running stops at its next step and opens
-   * nothing new.
+   * Store completed progress, leave the group, and close the coordinator
+   * connection. A round still running stops at its next step.
    */
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
     this.buffered.length = 0
+    this.idling?.abort()
+    const cancelled = this.cancelHeldWaits()
     let failure: unknown
-    if (this.settings.request.readMode === "primary") {
-      for (const partitionId of [...this.progress.keys()]) {
-        try {
-          await this.flush(partitionId)
-        } catch (error) {
-          failure ??= error
-        }
+    for (const partitionId of [...this.progress.keys()]) {
+      try {
+        await this.store(partitionId)
+      } catch (error) {
+        failure ??= error
       }
     }
+    await cancelled
     try {
       await this.settings.membership?.leave()
     } catch (error) {
       failure ??= error
     }
-    await this.routes.close()
     await this.settings.coordinator.close()
     if (failure !== undefined) {
       throw failure instanceof Error
@@ -998,6 +1197,8 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
         : new TransportError("a filtered partition failed", true, { cause: error })
     }
     if (this.settings.membership?.isDue() === true) await this.refreshMembership()
+    const only = this.readyOnly
+    this.readyOnly = undefined
     const readable = this.partitions()
     if (readable.length === 0) return { kind: "idle" }
     const now = performance.now()
@@ -1008,6 +1209,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       this.requireOpen()
       const index = (this.cursor + step) % readable.length
       const partitionId = readable[index] ?? 0
+      if (only !== undefined && !only.has(partitionId)) continue
       if (this.progress.get(partitionId)?.waiting(now) === true) continue
       try {
         const read = await this.read(partitionId)
@@ -1041,6 +1243,12 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     const progress = this.partitionProgress(partitionId)
     if (progress.inFlight >= (this.settings.maxUnackedPages ?? DEFAULT_MAX_UNACKED_PAGES))
       return { kind: "saturated" }
+    // A partition not yet installed for this member keeps its seed and is
+    // read once the next sync installed it.
+    if (this.seeds.has(partitionId) && !(await this.storeSeeds([partitionId]))) {
+      this.settings.membership?.expire()
+      return { kind: "empty", more: false }
+    }
     const request: FilteredPollRequest = {
       ...this.settings.request,
       partitionId,
@@ -1048,19 +1256,16 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     }
     let outcome: FilterOutcome
     try {
-      outcome = await this.exchange(
-        partitionId,
-        AGDX_FILTERED_POLL_CODE,
-        encodeFilteredPollRequest(request)
-      )
-      this.lostRoutes.delete(partitionId)
+      outcome = await this.exchange(partitionId, encodeFilteredPollRequest(request))
+      this.lostAssignments.delete(partitionId)
     } catch (error) {
-      if (isRouteLost(error)) {
-        // The round ends empty and the next one routes again, so the other
-        // partitions of this round never wait. A group follows its refreshed
-        // assignment. A reader whose route is lost twice in a row surfaces the refusal.
-        if (this.lostRoutes.has(partitionId)) throw error
-        this.lostRoutes.add(partitionId)
+      if (isAssignmentLost(error)) {
+        // The round ends empty and the next one follows the synced assignment,
+        // so the other partitions of this round never wait. A second lost
+        // assignment in a row reaches the caller.
+        this.leaders.delete(partitionId)
+        if (this.lostAssignments.has(partitionId)) throw error
+        this.lostAssignments.add(partitionId)
         this.settings.membership?.expire()
         return { kind: "empty", more: false }
       }
@@ -1078,15 +1283,12 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     if (outcome.kind !== "page") throw unexpected("filtered poll")
     const page = outcome.page
     this.examined += page.examined
-    if (page.records.byteLength > request.maxReplyBytes + 16)
+    if (page.examined > 0) this.readyUnconfirmed = false
+    if (page.records.byteLength > request.maxReplyBytes + POLLED_HEAD_BYTES)
       throw new ProtocolError("filtered page exceeds the requested record byte limit")
-    if (page.records.byteLength < 16) throw new ProtocolError("filtered record body is truncated")
-    const recordHead = new DataView(
-      page.records.buffer,
-      page.records.byteOffset,
-      page.records.byteLength
-    )
-    if (recordHead.getUint32(12, true) !== page.matched || page.matched > request.count)
+    if (page.records.byteLength < POLLED_HEAD_BYTES)
+      throw new ProtocolError("filtered record body is truncated")
+    if (decodePolledHead(page.records).count !== page.matched || page.matched > request.count)
       throw new ProtocolError("filtered record body has invalid counts")
     const messages = decodePolledBody(page.records)
     validatePage(request, page, messages)
@@ -1114,7 +1316,8 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       if (this.settings.guardEnabled && this.guard === undefined) {
         this.guard = await compileGuard(
           this.settings.transport,
-          await boundDefinition(this.settings.filters, request.source, page)
+          await boundDefinition(this.settings.filters, request.source, page),
+          this.settings.filters.schemaStream()
         )
       }
       if (this.guard !== undefined) {
@@ -1128,19 +1331,18 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     }
     this.sequence += 1
     const sequence = this.sequence
-    const primary = request.readMode === "primary"
-    // A local page cannot be acknowledged, so its records are not pending
-    // work and never saturate the partition.
-    progress.record(sequence, page, primary ? messages.map((message) => message.offset) : [])
+    progress.record(
+      sequence,
+      page,
+      messages.map((message) => message.offset)
+    )
     const blocked = progress.blocked
     if (blocked !== undefined) progress.defer(performance.now() + this.settings.idleIntervalMs)
     if (messages.length === 0) {
-      if (primary) {
-        try {
-          await this.flush(partitionId)
-        } catch {
-          // Kept unstored: the next acknowledgment of this partition sends it again.
-        }
+      try {
+        await this.flush(partitionId)
+      } catch {
+        // Kept unstored: the next acknowledgment of this partition sends it again.
       }
       if (blocked !== undefined) {
         throw blocked.stop === "fault"
@@ -1174,113 +1376,405 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     return { kind: "page", page: matched }
   }
 
-  // A purge, a recreated group, or a new group binding ends the history or
-  // the policy the partition's continuation was issued for. The partition
+  // A recreated partition or group, or a new group binding, ends the history
+  // or the policy the partition's continuation was issued for. The partition
   // starts over from its stored offset, the guard reloads a rebound filter,
   // and the error reaches the caller once.
   private restartAfter(partitionId: number, error: unknown): void {
-    if (
-      !(error instanceof FilterExecutionError) ||
-      (error.detail.reason !== "source_changed" && error.detail.reason !== "conflict")
-    ) {
-      return
-    }
+    const reason =
+      serverErrorCode(error) === HISTORY_UNAVAILABLE
+        ? "source_changed"
+        : error instanceof FilterExecutionError
+          ? error.detail.reason
+          : undefined
+    if (reason !== "source_changed" && reason !== "conflict") return
+    this.leaders.delete(partitionId)
     this.progress.get(partitionId)?.restart({ kind: "next" })
     for (let index = this.buffered.length - 1; index >= 0; index -= 1) {
       if (this.buffered[index]?.partitionId === partitionId) this.buffered.splice(index, 1)
     }
-    if (error.detail.reason === "source_changed") this.settings.membership?.expire()
+    if (reason === "source_changed") this.settings.membership?.expire()
     if (this.settings.guardEnabled) this.guard = undefined
   }
 
+  // Store the completed prefix like `flush`, again on the managed mutation
+  // backoff while a failover leaves the partition without a primary that takes
+  // it. Each repeat sends the same target, never past what was delivered.
+  private async store(partitionId: number): Promise<void> {
+    const deadline = performance.now() + MANAGED_MUTATION_DEADLINE_MS
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await this.flush(partitionId)
+        return
+      } catch (error) {
+        if (!isRouteMoved(error) || performance.now() >= deadline) throw error
+        await sleep(backoffDelay(MANAGED_MUTATION, attempt))
+      }
+    }
+  }
+
   // Store the completed prefix of one partition. A lost reply keeps the target
-  // unstored and the next store sends it again. Stores are monotone.
+  // unstored and the next store sends it again. Stores are monotone, so a
+  // repeat never moves progress back.
   private async flush(partitionId: number): Promise<void> {
     const target = this.partitionProgress(partitionId).unstored
     if (target === undefined) {
       this.retire(partitionId)
       return
     }
-    const request = this.settings.request
-    const ack: FilteredAck = {
-      ...(target.groupId !== undefined ? { groupId: target.groupId } : {}),
-      v: FILTER_OP_VERSION,
-      source: request.source,
-      partitionId,
-      consumer: request.consumer,
-      generation: target.generation,
-      ...(target.digest === undefined ? {} : { digest: target.digest }),
-      offset: target.offset,
-      mode: target.mode,
-      policyGeneration: target.policyGeneration
-    }
-    const encoded = encodeFilteredAck(ack)
-    for (let rerouted = false; ; rerouted = true) {
-      try {
-        const outcome = await this.exchange(partitionId, AGDX_FILTERED_ACK_CODE, encoded)
-        if (outcome.kind !== "acknowledged") throw unexpected("filtered acknowledgment")
-        if (
-          outcome.receipt.partitionId !== partitionId ||
-          outcome.receipt.offset !== target.offset ||
-          !sameGeneration(outcome.receipt.generation, target.generation)
-        ) {
-          throw new ProtocolError("filtered acknowledgment does not match its request")
-        }
-        this.progress.get(partitionId)?.stored(target)
-        const revoked = this.revoked.has(partitionId)
-        this.retire(partitionId)
-        if (revoked) await this.routes.release(partitionId)
-        return
-      } catch (error) {
-        this.restartAfter(partitionId, error)
-        if (rerouted || !isRouteLost(error)) throw error
+    try {
+      const outcome = await this.exchange(
+        partitionId,
+        encodeFilteredAck({
+          v: FILTER_OP_VERSION,
+          source: this.settings.request.source,
+          consumer: this.settings.request.consumer,
+          partitionId,
+          offset: target.offset,
+          generation: target.generation,
+          ackContext: target.ackContext,
+          mode: target.policy.mode,
+          policyGeneration: target.policy.policyGeneration,
+          ...(target.groupId === undefined ? {} : { groupId: target.groupId }),
+          ...(target.policy.digest === undefined ? {} : { digest: target.policy.digest })
+        }),
+        AGDX_FILTERED_ACK_CODE
+      )
+      if (
+        outcome.kind !== "acknowledged" ||
+        outcome.receipt.partitionId !== partitionId ||
+        outcome.receipt.offset !== target.offset ||
+        !sameGeneration(outcome.receipt.generation, target.generation)
+      ) {
+        throw new ProtocolError("the acknowledgment receipt does not match its page")
       }
+    } catch (error) {
+      if (isAssignmentLost(error)) this.settings.membership?.expire()
+      this.restartAfter(partitionId, error)
+      throw error
     }
+    this.progress.get(partitionId)?.stored(target)
+    this.retire(partitionId)
   }
 
+  // One read on the partition's primary. A read the primary no longer takes,
+  // or a backup refuses as unavailable, looks the route up again and goes to
+  // the node it names, once.
   private async exchange(
     partitionId: number,
-    code: number,
-    request: ReadonlyMap<string, unknown>
+    request: ReadonlyMap<string, unknown>,
+    code = AGDX_FILTERED_POLL_CODE
   ): Promise<FilterOutcome> {
     const payload = encodeNamed(request)
-    let reply: Uint8Array
-    const read = this.settings.request
-    if (read.readMode === "local") {
-      reply = await this.settings.coordinator.send(code, payload)
-    } else {
-      const connection = await this.routes.connection(
-        read.source,
-        read.consumer,
-        partitionId,
-        code === AGDX_FILTERED_ACK_CODE
-      )
+    let rerouted = false
+    for (;;) {
+      const target = await this.readTarget(partitionId)
+      let reply: Uint8Array
       try {
-        reply = await connection.send(code, payload)
-      } catch (cause) {
-        await this.routes.invalidate(partitionId)
-        throw new TransportError(`filtered command ${String(code)} failed`, true, { cause })
+        // A resend rechecks the route too: right after a crash the lookup can
+        // still name the dead primary, whose link would hold the resend until
+        // the call deadline.
+        const sent = await this.sendUnlessMoved(partitionId, code, payload, target)
+        if (sent === undefined) {
+          rerouted = true
+          continue
+        }
+        reply = sent
+      } catch (error) {
+        const moved = isRouteStale(error)
+        if (moved) this.leaders.delete(partitionId)
+        // The caller's node moves on by itself after a lost link, but a node
+        // that does not store the partition refuses it as not the primary.
+        const elsewhere = target.kind !== "caller" || serverErrorCode(error) === NOT_PRIMARY
+        if (!moved || rerouted || !elsewhere) throw error
+        rerouted = true
+        continue
       }
+      const decoded = decodeManagedReply(
+        (bytes) => decodeFilterReply(decodeOne(bytes, "filter reply"), "filter reply"),
+        reply
+      )
+      if (decoded.kind === "ok") return decoded.outcome
+      if (decoded.error.reason !== "unavailable") throw filterError(decoded.error)
+      // A backup refuses a read of a partition it no longer leads as
+      // unavailable, not as a transport error.
+      this.leaders.delete(partitionId)
+      if (rerouted || target.kind === "caller") throw filterError(decoded.error)
+      rerouted = true
     }
-    const decoded = decodeManagedReply(
-      (bytes) => decodeFilterReply(decodeOne(bytes, "filter reply"), "filter reply"),
-      reply
-    )
-    if (decoded.kind === "ok") return decoded.outcome
-    if (decoded.error.reason === "not_primary" || decoded.error.reason === "membership_stale") {
-      await this.routes.invalidate(partitionId)
-    }
-    throw filterError(decoded.error)
   }
 
-  // Follow the group's current assignment. The whole change is applied to the
-  // reader before anything awaits. A partition that left the assignment stops
-  // being read but keeps its in-flight pages, so records already handed out
-  // can still be acknowledged while the server's offset fence allows it.
-  private async refreshMembership(): Promise<void> {
+  // Send to the partition's known primary. A stopped primary holds the request
+  // until the client's call deadline while the cluster names its successor
+  // within moments, so a slow reply looks the route up again each
+  // `ROUTE_RECHECK_MS` until it answers. `undefined` when another node leads
+  // the partition now: the request is abandoned and every route through the
+  // old node is read again.
+  private async sendUnlessMoved(
+    partitionId: number,
+    code: number,
+    payload: Uint8Array,
+    target: ManagedTarget
+  ): Promise<Uint8Array | undefined> {
+    const answer = this.settings.coordinator
+      .sendManagedTo(code, payload, target)
+      .then((answered) => answered.reply)
+    if (target.kind !== "replica") return answer
+    // An abandoned request settles unobserved.
+    answer.catch(() => undefined)
+    const source = this.settings.request.source
+    for (;;) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const recheck = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => {
+          resolve(undefined)
+        }, ROUTE_RECHECK_MS)
+      })
+      let reply: Uint8Array | undefined
+      try {
+        reply = await Promise.race([answer, recheck])
+      } finally {
+        clearTimeout(timer)
+      }
+      if (reply !== undefined) return reply
+      const primary = await this.settings.coordinator
+        .partitionPrimary(source.stream, source.topic, partitionId)
+        .catch(() => undefined)
+      if (primary !== undefined && primary !== target.replica) {
+        for (const [partition, leader] of this.leaders) {
+          if (leader === target.replica) this.leaders.delete(partition)
+        }
+        this.leaders.set(partitionId, primary)
+        return undefined
+      }
+    }
+  }
+
+  // Store the seeds of `partitions` the group still stored nothing on. The
+  // store goes through the member's own connection, the only one the server
+  // lets store a partition this member owns.
+  private async storeSeeds(partitions: Iterable<number>): Promise<boolean> {
+    const group = this.settings.seed?.group
+    if (group === undefined || this.seeds.size === 0) return true
+    const read = this.settings.transport.getConsumerOffset?.bind(this.settings.transport)
+    const store = this.settings.coordinator.storeOffset?.bind(this.settings.coordinator)
+    if (read === undefined || store === undefined)
+      throw new ConfigError(
+        "this transport cannot seed a group's start, which a group consumer needs"
+      )
+    const { stream, topic } = this.settings.request.source
+    const target = { kind: "group" as const, name: group }
+    return storeSeeds(
+      this.seeds,
+      partitions,
+      (partitionId) => read(stream, topic, target, partitionId),
+      (partitionId, offset) => store(stream, topic, target, partitionId, offset)
+    )
+  }
+
+  // Send one filtered wait to each node that serves a readable partition and
+  // holds no wait naming all of them, and take the first answer of any held wait.
+  private async heldWait(waitMs: number, signal: AbortSignal): Promise<WaitAnswer> {
+    const now = performance.now()
+    const groups = new Map<string, { target: ManagedTarget; partitions: FilteredWaitPartition[] }>()
+    for (const partitionId of this.partitions()) {
+      const progress = this.progress.get(partitionId)
+      if (progress === undefined || progress.waiting(now)) continue
+      const target = await this.readTarget(partitionId)
+      const node = target.kind === "replica" ? `replica:${String(target.replica)}` : target.kind
+      const group = groups.get(node) ?? { target, partitions: [] }
+      group.partitions.push({ partitionId, offset: progress.waitOffset() })
+      groups.set(node, group)
+    }
+    const replaced: HeldWait[] = []
+    for (const [node, group] of groups) {
+      // A node holds one wait, so a reader of more partitions than one wait
+      // names waits on the first ones.
+      const partitions = group.partitions.slice(0, MAX_FILTERED_WAIT_PARTITIONS)
+      // A held wait stays while it names every partition the node leads now.
+      // One that misses a partition moved to the node is replaced.
+      const held = this.heldWaits.get(node)
+      if (held !== undefined) {
+        if (partitions.every((partition) => held.partitions.has(partition.partitionId))) continue
+        this.heldWaits.delete(node)
+        replaced.push(held)
+      }
+      const sent = performance.now()
+      lastWaitId += 1n
+      const waitId = lastWaitId
+      this.heldWaits.set(node, {
+        target: group.target,
+        waitId,
+        partitions: new Set(partitions.map((partition) => partition.partitionId)),
+        answer: this.waitOn({ target: group.target, partitions }, waitMs, waitId).then(
+          (ready): HeldAnswer => ({ node, sent, ready }),
+          (error: unknown): HeldAnswer => ({ node, sent, error, target: group.target, partitions })
+        )
+      })
+    }
+    if (replaced.length > 0) void this.cancelWaits(replaced)
+    if (this.heldWaits.size === 0) return { kind: "sleep" }
+    // The assignment is read again when it is due while every wait holds, so
+    // partitions gained or lost meanwhile are read at once.
+    let first: HeldAnswer | undefined
+    for (;;) {
+      const answered = Promise.race([...this.heldWaits.values()].map((held) => held.answer))
+      const membership = this.settings.membership
+      if (membership === undefined) {
+        first = await untilAborted(answered, signal, undefined)
+        break
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const due = new Promise<"due">((resolve) => {
+        timer = setTimeout(() => {
+          resolve("due")
+        }, membership.refreshIn())
+      })
+      const outcome = await untilAborted(Promise.race([answered, due]), signal, undefined)
+      clearTimeout(timer)
+      if (outcome !== "due") {
+        first = outcome
+        break
+      }
+      try {
+        if (await this.refreshMembership()) return { kind: "elapsed" }
+      } catch {
+        return { kind: "elapsed" }
+      }
+    }
+    if (first === undefined) {
+      void this.cancelHeldWaits()
+      return { kind: "elapsed" }
+    }
+    this.heldWaits.delete(first.node)
+    if (first.ready !== undefined) {
+      this.waitRefused = false
+      if (first.ready.length > 0) {
+        void this.cancelHeldWaits()
+        return { kind: "ready", ready: first.ready }
+      }
+      return performance.now() - first.sent >= waitMs / 2 ? { kind: "elapsed" } : { kind: "sleep" }
+    }
+    if (first.error instanceof UnsupportedError) return { kind: "unsupported" }
+    // A node that no longer serves these partitions, or refuses for now as a
+    // backup does, refused the whole wait: the next round looks their routes
+    // up and waits again at once, as a read is resent once.
+    const refused =
+      (first.target?.kind === "replica" && isRouteStale(first.error)) ||
+      (first.error instanceof FilterExecutionError && first.error.detail.reason === "unavailable")
+    if (refused && !this.waitRefused) {
+      this.waitRefused = true
+      for (const partition of first.partitions ?? []) this.leaders.delete(partition.partitionId)
+      return { kind: "elapsed" }
+    }
+    return { kind: "sleep" }
+  }
+
+  // End every held wait on its node, so a node that lost the race does not
+  // hold its wait to the deadline. An ended wait answers at once and nobody
+  // reads that answer. A failed cancel only warns: the wait still ends at its
+  // deadline.
+  private async cancelHeldWaits(): Promise<void> {
+    const held = [...this.heldWaits.values()]
+    this.heldWaits.clear()
+    await this.cancelWaits(held)
+  }
+
+  private async cancelWaits(waits: readonly HeldWait[]): Promise<void> {
+    await Promise.all(
+      waits.map(async (wait) => {
+        try {
+          await this.cancelOn(wait)
+        } catch (error) {
+          const node =
+            wait.target.kind === "replica"
+              ? `replica ${String(wait.target.replica)}`
+              : `the ${wait.target.kind} node`
+          warn(`cancelling a filtered wait on ${node} failed: ${String(error)}`)
+        }
+      })
+    )
+  }
+
+  private async cancelOn(wait: HeldWait): Promise<void> {
+    const request = { v: FILTER_OP_VERSION, waitIds: [wait.waitId] }
+    validateFilteredWaitCancel(request)
+    const answer = await this.settings.coordinator.sendManagedTo(
+      AGDX_FILTERED_WAIT_CANCEL_CODE,
+      encodeNamed(encodeFilteredWaitCancel(request)),
+      wait.target,
+      { deadline: Date.now() + WAIT_CANCEL_DEADLINE_MS }
+    )
+    const decoded = decodeManagedReply(
+      (bytes) => decodeFilterReply(decodeOne(bytes, "filter reply"), "filter reply"),
+      answer.reply
+    )
+    if (decoded.kind === "err") throw filterError(decoded.error)
+    if (decoded.outcome.kind !== "cancelled") throw unexpected("filtered wait cancel")
+  }
+
+  // One filtered wait on one node. The call outlives the server's wait, which
+  // never holds longer than the server announced.
+  private async waitOn(
+    group: WaitGroup,
+    waitMs: number,
+    waitId: bigint
+  ): Promise<readonly number[]> {
+    const request = {
+      v: FILTER_OP_VERSION,
+      source: this.settings.request.source,
+      consumer: this.settings.request.consumer,
+      partitions: group.partitions,
+      maxWaitMs: waitMs,
+      waitId
+    }
+    validateFilteredWaitRequest(request)
+    const answer = await this.settings.coordinator.sendManagedTo(
+      AGDX_FILTERED_WAIT_CODE,
+      encodeNamed(encodeFilteredWaitRequest(request)),
+      group.target,
+      { deadline: Date.now() + waitMs + WAIT_REPLY_MARGIN_MS }
+    )
+    const decoded = decodeManagedReply(
+      (bytes) => decodeFilterReply(decodeOne(bytes, "filter reply"), "filter reply"),
+      answer.reply
+    )
+    if (decoded.kind === "err") throw filterError(decoded.error)
+    if (decoded.outcome.kind !== "ready") throw unexpected("filtered wait")
+    const asked = new Set(group.partitions.map((partition) => partition.partitionId))
+    return decoded.outcome.result.ready.filter((partitionId) => asked.has(partitionId))
+  }
+
+  // The partition's primary, or the caller's node when the route cannot be
+  // read. Every node holds every partition, so either one answers.
+  private async readTarget(partitionId: number): Promise<ManagedTarget> {
+    const known = this.leaders.get(partitionId)
+    if (known !== undefined) return { kind: "replica", replica: known }
+    const source = this.settings.request.source
+    try {
+      const replica = await this.settings.coordinator.partitionPrimary(
+        source.stream,
+        source.topic,
+        partitionId
+      )
+      this.leaders.set(partitionId, replica)
+      return { kind: "replica", replica }
+    } catch {
+      return { kind: "caller" }
+    }
+  }
+
+  // Follow the group's current assignment, `true` when it changed. The whole
+  // change is applied to the reader before anything awaits. A partition that
+  // left the assignment stops being read but keeps its in-flight pages, so
+  // records already handed out can still be acknowledged while the server's
+  // offset fence allows it.
+  private async refreshMembership(): Promise<boolean> {
     const membership = this.settings.membership
-    if (membership === undefined || !(await membership.sync())) return
+    if (membership === undefined || !(await membership.sync())) return false
     this.requireOpen()
+    // Held waits name the old assignment's partitions.
+    void this.cancelHeldWaits()
     const selection = this.settings.selectedPartitions
     const assigned = new Set(
       membership.partitions.filter(
@@ -1288,8 +1782,8 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       )
     )
     const rejoined = membership.takeRejoined()
-    const stale = rejoined ? this.routes.detach() : []
     if (rejoined) {
+      this.initialAssignment = false
       // A rejoin can land in a recreated group with another binding.
       if (this.settings.guardEnabled) this.guard = undefined
       this.retiredOwners.add(this.owner)
@@ -1307,16 +1801,20 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     // offset, which holds what the previous owner acknowledged. One that
     // comes back before its revoked entry retired starts over the same way,
     // so it never replays another member's work from an old continuation.
+    const initialAssignment = this.initialAssignment
+    if (assigned.size > 0) this.initialAssignment = false
     for (const partitionId of assigned) {
       if (this.revoked.delete(partitionId) || !this.progress.has(partitionId)) {
         for (let index = this.buffered.length - 1; index >= 0; index--) {
           if (this.buffered[index]?.partitionId === partitionId) this.buffered.splice(index, 1)
         }
-        this.progress.set(partitionId, new PartitionProgress({ kind: "next" }))
+        this.progress.set(
+          partitionId,
+          new PartitionProgress(initialAssignment ? this.settings.start : { kind: "next" })
+        )
       }
     }
-    await Promise.all(stale.map((connection) => connection.close()))
-    for (const partitionId of left) await this.routes.release(partitionId)
+    return true
   }
 
   // Forget a revoked partition once nothing of it is in flight.
@@ -1371,24 +1869,44 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   private requireOpen(): void {
     if (this.closed) throw new ConfigError("the filtered reader is closed")
   }
-
-  private requireAcknowledgments(): void {
-    this.requireOpen()
-    if (this.settings.request.readMode === "local") {
-      throw new InvalidError(
-        "a local read mode reader cannot acknowledge: only the partition primary proves the history a page came from"
-      )
-    }
-  }
 }
+
+interface WaitGroup {
+  readonly target: ManagedTarget
+  readonly partitions: readonly FilteredWaitPartition[]
+}
+
+// One filtered wait a node holds, named by its id on the connection.
+interface HeldWait {
+  readonly target: ManagedTarget
+  readonly waitId: bigint
+  readonly partitions: ReadonlySet<number>
+  readonly answer: Promise<HeldAnswer>
+}
+
+// What one held filtered wait answered: the ready partitions, or its failure
+// with where it went.
+interface HeldAnswer {
+  readonly node: string
+  readonly sent: number
+  readonly ready?: readonly number[]
+  readonly error?: unknown
+  readonly target?: ManagedTarget
+  readonly partitions?: readonly FilteredWaitPartition[]
+}
+
+type WaitAnswer =
+  | { readonly kind: "ready"; readonly ready: readonly number[] }
+  | { readonly kind: "elapsed" }
+  | { readonly kind: "sleep" }
+  | { readonly kind: "unsupported" }
 
 interface AckTarget {
   readonly groupId?: bigint
   readonly offset: bigint
   readonly generation: SourceGeneration
-  readonly digest?: Uint8Array
-  readonly mode: ExecutionMode
-  readonly policyGeneration: bigint
+  readonly ackContext: AckContext
+  readonly policy: AppliedPolicy
 }
 
 interface PendingPage {
@@ -1412,6 +1930,8 @@ class PartitionProgress {
   private retryAt: number | undefined
   private firstSequence: number | undefined
   private settledSequence = 0
+  // The first offset no page examined yet, as the last page reported it.
+  private waitFrom: bigint | undefined
 
   constructor(private original: FilteredStart) {
     this.current = original
@@ -1433,6 +1953,12 @@ class PartitionProgress {
     return this.pendingStore
   }
 
+  /** Where a filtered wait of this partition starts, as Rust `wait_offset`. */
+  waitOffset(): bigint {
+    if (this.waitFrom !== undefined) return this.waitFrom
+    return this.original.kind === "offset" ? this.original.offset : 0n
+  }
+
   /**
    * Start over at `start` after the source history or the executed filter
    * changed. Every page in flight is dropped, so its records are delivered
@@ -1447,6 +1973,7 @@ class PartitionProgress {
     this.retryAt = undefined
     this.firstSequence = undefined
     this.settledSequence = 0
+    this.waitFrom = undefined
   }
 
   knows(sequence: number): boolean {
@@ -1474,6 +2001,10 @@ class PartitionProgress {
    */
   record(sequence: number, page: FilteredPage, offsets: readonly bigint[]): void {
     this.retryAt = undefined
+    // The frontier is the partition's last offset, so the next record lands
+    // after it. A head of 0 may also be an empty partition, whose next record
+    // is 0.
+    this.waitFrom = page.nextScanOffset ?? (page.frontier === 0n ? 0n : page.frontier + 1n)
     this.firstSequence ??= sequence
     this.current = filteredPageNextStart(page, this.original)
     this.stoppedAt =
@@ -1490,9 +2021,8 @@ class PartitionProgress {
         : {
             offset: page.safeAckOffset,
             generation: page.generation,
-            ...(page.policy.digest === undefined ? {} : { digest: page.policy.digest }),
-            mode: page.policy.mode,
-            policyGeneration: page.policy.policyGeneration,
+            ackContext: page.ackContext,
+            policy: page.policy,
             ...(page.policy.groupId !== undefined ? { groupId: page.policy.groupId } : {})
           }
     const newest = this.pages.at(-1)
@@ -1547,189 +2077,35 @@ class PartitionProgress {
   }
 }
 
-/**
- * Data connections to partition primaries, one per node endpoint, each
- * attached to the coordinator's consumer session. The coordinator keeps the
- * session, the user, and any group membership.
- */
-class Routes {
-  private readonly connections = new Map<
-    string,
-    { readonly connection: NodeConnection; session: Uint8Array }
-  >()
-  // One open per endpoint at a time, so two routes to one node share it.
-  private readonly opening = new Map<string, Promise<NodeConnection>>()
-  private readonly partitions = new Map<number, string>()
-  private closed = false
-  // Whether the deployment is one node, learned on the first route. A single
-  // node is every partition's primary, and the address it advertises can be
-  // one the caller cannot reach (a port mapped by a container runtime, a slot
-  // behind a proxy), so its data connection dials what the caller dialed.
-  private singleNode: boolean | undefined
-  /** Data connections these routes opened. */
-  opened = 0
-
-  constructor(
-    private readonly transport: FilterTransport,
-    private readonly coordinator: CoordinatorConnection
-  ) {}
-
-  async connection(
-    source: FilterSource,
-    consumer: FilterConsumer,
-    partitionId: number,
-    acknowledgment: boolean
-  ): Promise<NodeConnection> {
-    const routed = this.partitions.get(partitionId)
-    const known = routed === undefined ? undefined : this.connections.get(routed)
-    if (known !== undefined) return known.connection
-    const open = this.transport.openNodeConnection
-    if (open === undefined) {
-      throw new ConfigError(
-        "primary filtered reads need a transport that can open node connections"
-      )
-    }
-    const route = decodePollRouting(
-      await this.coordinator.send(
-        acknowledgment ? GET_CONSUMER_OFFSET_ROUTING_CODE : GET_POLL_ROUTING_CODE,
-        acknowledgment
-          ? encodeOffsetRouting(source, consumer, partitionId)
-          : encodePollRouting(source, consumer, partitionId)
-      )
-    )
-    this.requireOpen()
-    if (this.singleNode === undefined) {
-      const count = this.transport.clusterNodeCount
-      this.singleNode = count === undefined ? false : (await count.call(this.transport)) <= 1
-    }
-    const dial: PollRoute = this.singleNode ? { ...route, ip: "", tcpPort: 0 } : route
-    const endpoint = this.singleNode ? "caller" : `${route.ip}:${String(route.tcpPort)}`
-    const existing = this.connections.get(endpoint)
-    const reuse = existing === undefined ? undefined : sessionReuse(existing.session, route.session)
-    if (existing !== undefined && reuse === "raise") {
-      try {
-        await existing.connection.send(ATTACH_CONSUMER_SESSION_CODE, route.session)
-        existing.session = route.session
-      } catch {
-        await this.dropEndpoint(endpoint)
-      }
-    } else if (reuse === "replace") {
-      await this.dropEndpoint(endpoint)
-    }
-    if (!this.connections.has(endpoint)) {
-      if (!this.singleNode && route.tcpPort === 0) {
-        throw new UnsupportedError(`partition primary ${route.name} serves no TCP endpoint`)
-      }
-      let pending = this.opening.get(endpoint)
-      if (pending === undefined) {
-        if (this.connections.size >= MAX_NODE_CONNECTIONS) {
-          const idle = [...this.connections.keys()].find(
-            (candidate) => ![...this.partitions.values()].includes(candidate)
-          )
-          const oldest = idle ?? this.connections.keys().next().value
-          if (oldest !== undefined) await this.dropEndpoint(oldest)
-        }
-        pending = this.opening.get(endpoint)
-        if (pending === undefined && !this.connections.has(endpoint)) {
-          pending = attach(open.bind(this.transport), dial).then((connection) => {
-            this.opened += 1
-            return connection
-          })
-          this.opening.set(endpoint, pending)
-        }
-      }
-      if (pending !== undefined) {
-        let connection: NodeConnection
-        try {
-          connection = await pending
-        } finally {
-          if (this.opening.get(endpoint) === pending) this.opening.delete(endpoint)
-        }
-        if (this.closed) {
-          await connection.close()
-          this.requireOpen()
-        }
-        if (!this.connections.has(endpoint))
-          this.connections.set(endpoint, { connection, session: route.session })
-      }
-    }
-    this.partitions.set(partitionId, endpoint)
-    const attached = this.connections.get(endpoint)
-    if (attached === undefined) throw new ProtocolError("the partition route vanished")
-    return attached.connection
-  }
-
-  /**
-   * Stop routing `partitionId`, for a partition this reader no longer reads.
-   * The node connection stays open for the other partitions it serves and
-   * closes only when none is left.
-   */
-  async release(partitionId: number): Promise<void> {
-    const endpoint = this.partitions.get(partitionId)
-    if (endpoint === undefined) return
-    this.partitions.delete(partitionId)
-    if (![...this.partitions.values()].includes(endpoint)) await this.dropEndpoint(endpoint)
-  }
-
-  /**
-   * Route `partitionId` again on its next use and drop the connection it
-   * used, because that node no longer serves it as primary or the session
-   * behind the attachment has ended.
-   */
-  async invalidate(partitionId: number): Promise<void> {
-    const endpoint = this.partitions.get(partitionId)
-    this.partitions.delete(partitionId)
-    if (endpoint !== undefined) await this.dropEndpoint(endpoint)
-  }
-
-  /** Forget every route and hand back the connections, which the caller closes. */
-  detach(): NodeConnection[] {
-    this.partitions.clear()
-    const connections = [...this.connections.values()].map((entry) => entry.connection)
-    this.connections.clear()
-    return connections
-  }
-
-  /** Close every connection. No connection opens after this. */
-  async close(): Promise<void> {
-    this.closed = true
-    await Promise.all(this.detach().map((connection) => connection.close()))
-  }
-
-  // The routing table forgets the endpoint before the close awaits.
-  private async dropEndpoint(endpoint: string): Promise<void> {
-    for (const [partitionId, routed] of this.partitions) {
-      if (routed === endpoint) this.partitions.delete(partitionId)
-    }
-    const entry = this.connections.get(endpoint)
-    this.connections.delete(endpoint)
-    await entry?.connection.close()
-  }
-
-  private requireOpen(): void {
-    if (this.closed) throw new ConfigError("the filtered reader is closed")
-  }
-}
-
-async function attach(
-  open: (ip: string, port: number) => Promise<NodeConnection>,
-  route: PollRoute
-): Promise<NodeConnection> {
-  const connection = await open(route.ip, route.tcpPort)
-  try {
-    await connection.send(ATTACH_CONSUMER_SESSION_CODE, route.session)
-  } catch (cause) {
-    await connection.close()
-    throw new TransportError("attaching the consumer session failed", true, { cause })
-  }
-  return connection
-}
-
 // The shared transport as a coordinator, for a reader that has no connection
 // of its own: an injected client.
 function sharedCoordinator(transport: FilterTransport): CoordinatorConnection {
+  const missing = (verb: string): never => {
+    throw new ConfigError(`this transport cannot ${verb}, which a group reader needs`)
+  }
   return {
     send: (code, payload) => transport.sendManaged(code, payload),
+    sendManagedTo: (code, payload, target, options) =>
+      transport.sendManagedTo === undefined
+        ? missing("send a managed request to a chosen node")
+        : transport.sendManagedTo(
+            code,
+            payload,
+            target,
+            options?.deadline === undefined ? undefined : { deadline: options.deadline }
+          ),
+    partitionPrimary: (streamId, topicId, partitionId) =>
+      transport.partitionPrimary === undefined
+        ? missing("look a partition route up")
+        : transport.partitionPrimary(streamId, topicId, partitionId),
+    storePosition: (position) =>
+      transport.storePosition === undefined
+        ? missing("store a fenced consumer position")
+        : transport.storePosition(position),
+    storeOffset: (streamId, topicId, target, partitionId, offset) =>
+      transport.storeOffset === undefined
+        ? missing("store a group offset")
+        : transport.storeOffset(streamId, topicId, target, partitionId, offset),
     joinConsumerGroup: (streamId, topicId, name) =>
       transport.joinExistingConsumerGroup !== undefined
         ? transport.joinExistingConsumerGroup(streamId, topicId, name)
@@ -1781,7 +2157,18 @@ class Membership {
   }
 
   isDue(): boolean {
-    return this.syncedAt === undefined || performance.now() - this.syncedAt >= ASSIGNMENT_REFRESH_MS
+    return (
+      this.partitions.length === 0 ||
+      this.syncedAt === undefined ||
+      performance.now() - this.syncedAt >= ASSIGNMENT_REFRESH_MS
+    )
+  }
+
+  /** How long until the assignment is read again, zero once it is due. */
+  refreshIn(): number {
+    return this.syncedAt === undefined
+      ? 0
+      : Math.max(0, ASSIGNMENT_REFRESH_MS - (performance.now() - this.syncedAt))
   }
 
   expire(): void {
@@ -1851,13 +2238,6 @@ class Membership {
     if (this.sourceReplaced) return
     await this.coordinator.leaveConsumerGroup(this.source.stream, this.source.topic, this.group)
   }
-}
-
-interface PollRoute {
-  readonly session: Uint8Array
-  readonly name: string
-  readonly ip: string
-  readonly tcpPort: number
 }
 
 async function sourceIncarnation(
@@ -1945,78 +2325,6 @@ function identifier(name: string | number): Uint8Array {
   return concat([Uint8Array.of(2, bytes.byteLength), bytes])
 }
 
-// The stored-offset lookup shape, which routes an acknowledgment to the
-// partition primary that stores the offset.
-function encodeOffsetRouting(
-  source: FilterSource,
-  consumer: FilterConsumer,
-  partitionId: number
-): Uint8Array {
-  const partition = new Uint8Array(5)
-  const view = new DataView(partition.buffer)
-  view.setUint8(0, 1)
-  view.setUint32(1, partitionId, true)
-  return concat([
-    Uint8Array.of(consumer.kind !== "consumer" ? 2 : 1),
-    identifier(consumer.kind === "group_id" ? Number(consumer.id) : consumer.name),
-    identifier(source.stream),
-    identifier(source.topic),
-    partition
-  ])
-}
-
-// A committing poll shape, which the coordinator requires before it answers
-// with a route. It routes and reads nothing.
-function encodePollRouting(
-  source: FilterSource,
-  consumer: FilterConsumer,
-  partitionId: number
-): Uint8Array {
-  const tail = new Uint8Array(1 + 4 + 1 + 8 + 4 + 1)
-  const view = new DataView(tail.buffer)
-  view.setUint8(0, 1)
-  view.setUint32(1, partitionId, true)
-  view.setUint8(5, POLLING_NEXT)
-  view.setBigUint64(6, 0n, true)
-  view.setUint32(14, 1, true)
-  view.setUint8(18, 1)
-  return concat([
-    Uint8Array.of(consumer.kind !== "consumer" ? 2 : 1),
-    identifier(consumer.kind === "group_id" ? Number(consumer.id) : consumer.name),
-    identifier(source.stream),
-    identifier(source.topic),
-    tail
-  ])
-}
-
-function decodePollRouting(reply: Uint8Array): PollRoute {
-  const truncated = (): never => {
-    throw new ProtocolError("the partition route is truncated")
-  }
-  const view = new DataView(reply.buffer, reply.byteOffset, reply.byteLength)
-  const decoder = new TextDecoder()
-  let position = CONSUMER_SESSION_BYTES
-  const text = (): string => {
-    if (position + 4 > reply.byteLength) truncated()
-    const length = view.getUint32(position, true)
-    position += 4
-    if (position + length > reply.byteLength) truncated()
-    const value = decoder.decode(reply.subarray(position, position + length))
-    position += length
-    return value
-  }
-  if (reply.byteLength < CONSUMER_SESSION_BYTES) truncated()
-  const name = text()
-  const ip = text()
-  if (reply.byteLength < position + 10) truncated()
-  return {
-    session: reply.slice(0, CONSUMER_SESSION_BYTES),
-    name,
-    ip,
-    tcpPort: view.getUint16(position, true)
-  }
-}
-
 function concat(parts: readonly Uint8Array[]): Uint8Array {
   const total = parts.reduce((sum, part) => sum + part.byteLength, 0)
   const out = new Uint8Array(total)
@@ -2026,26 +2334,6 @@ function concat(parts: readonly Uint8Array[]): Uint8Array {
     offset += part.byteLength
   }
   return out
-}
-
-/**
- * What a fresh route means for the data connection already open to its node.
- *
- * A connection stays open for the life of its session. The first 24 bytes
- * name the session, its client id and number. The metadata watermark after
- * them grows with every write the coordinator commits, and that alone never
- * justifies a new connection: the attachment is sent again on the open one,
- * which only raises its read-your-writes floor.
- */
-export function sessionReuse(open: Uint8Array, routed: Uint8Array): "keep" | "raise" | "replace" {
-  const identity = (bytes: Uint8Array) => bytes.subarray(0, SESSION_IDENTITY_BYTES)
-  if (!sameBytes(identity(open), identity(routed))) return "replace"
-  const watermark = (bytes: Uint8Array) =>
-    new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(
-      SESSION_IDENTITY_BYTES,
-      true
-    )
-  return watermark(routed) > watermark(open) ? "raise" : "keep"
 }
 
 function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
@@ -2176,18 +2464,21 @@ function filterHeaders(headers: ReadonlyMap<string, HeaderValue>): FilterHeader[
 
 async function compileGuard(
   transport: FilterTransport,
-  filter: ConsumerFilter
+  filter: ConsumerFilter,
+  defaultSchemaStream: string | undefined
 ): Promise<CompiledFilter> {
-  if (usesRegex(filter.expr)) {
-    throw new ConfigError(
-      "the TypeScript local guard cannot verify regex predicates, disable localGuard or use Rust or Python"
-    )
-  }
+  const schemaStream = filter.schemaStream ?? defaultSchemaStream
   const schemas: SchemaDef[] = []
   for (const id of filter.schemaRefs) {
     const bytes = await transport.sendManaged(
       AGDX_GET_SCHEMA_CODE,
-      encodeNamed(encodeGetSchema({ v: QUERY_OP_VERSION, id }))
+      encodeNamed(
+        encodeGetSchema({
+          v: QUERY_OP_VERSION,
+          id,
+          ...(schemaStream !== undefined ? { stream: schemaStream } : {})
+        })
+      )
     )
     const reply = decodeBrowseReply(decodeOne(bytes, "writer schema"), "writer schema")
     if (reply.kind === "err")
@@ -2279,16 +2570,24 @@ function filterError(error: {
   return new FilterExecutionError(`${error.reason}: ${error.message}`, error)
 }
 
-// The data connection no longer reaches the partition primary for this
-// consumer: the primary moved, the attached session ended, or the group
-// assignment changed, which the coordinator reports as a partition this member
-// no longer owns. Reads are side-effect free, so the next one routes again.
-function isRouteLost(error: unknown): boolean {
-  if (error instanceof FilterExecutionError) {
-    return error.detail.reason === "not_primary" || error.detail.reason === "membership_stale"
-  }
+// The group no longer assigns the partition to this member, or its session
+// ended. Reads are side-effect free, so the next one follows the synced
+// assignment.
+// No primary takes the request: the route moved, or a backup refused it.
+function isRouteMoved(error: unknown): boolean {
+  return (
+    isRouteStale(error) ||
+    (error instanceof FilterExecutionError && error.detail.reason === "unavailable")
+  )
+}
+
+function isAssignmentLost(error: unknown): boolean {
+  if (error instanceof FilterExecutionError) return error.detail.reason === "membership_stale"
   return serverErrorCode(error) === CONSUMER_GROUP_PARTITION_NOT_OWNED
 }
+
+// The consumer a target's offset belongs to. A group stores under the numeric
+// id its page named, so a recreated group with the same name never receives it.
 
 function isNotYetApplied(error: unknown): boolean {
   return (
@@ -2311,8 +2610,50 @@ function unexpected(verb: string): ProtocolError {
   return new ProtocolError(`filters ${verb}: unexpected reply variant`)
 }
 
-function sleep(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds))
+function sleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  return untilAborted(
+    new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    signal,
+    undefined
+  )
+}
+
+// `pending`, or `fallback` once `signal` aborts first.
+function untilAborted<Value>(
+  pending: Promise<Value>,
+  signal: AbortSignal | undefined,
+  fallback: Value
+): Promise<Value> {
+  if (signal === undefined) return pending
+  if (signal.aborted) return Promise.resolve(fallback)
+  return new Promise((resolve, reject) => {
+    const abort = (): void => {
+      resolve(fallback)
+    }
+    signal.addEventListener("abort", abort, { once: true })
+    pending.then(
+      (value) => {
+        signal.removeEventListener("abort", abort)
+        resolve(value)
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", abort)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
+    )
+  })
+}
+
+/** Whether two group identities name the same group incarnation.
+ * @internal */
+export function sameGroupIdentity(left: FilterGroupIdentity, right: FilterGroupIdentity): boolean {
+  return (
+    left.streamId === right.streamId &&
+    left.streamCreatedAtMicros === right.streamCreatedAtMicros &&
+    left.topicId === right.topicId &&
+    left.topicCreatedAtMicros === right.topicCreatedAtMicros &&
+    left.groupId === right.groupId
+  )
 }
 
 function sameGeneration(left: SourceGeneration, right: SourceGeneration): boolean {
@@ -2322,8 +2663,7 @@ function sameGeneration(left: SourceGeneration, right: SourceGeneration): boolea
     left.topicId === right.topicId &&
     left.topicCreatedAtMicros === right.topicCreatedAtMicros &&
     left.partitionId === right.partitionId &&
-    left.partitionCreatedRevision === right.partitionCreatedRevision &&
-    left.purgeGeneration === right.purgeGeneration
+    left.partitionIncarnation === right.partitionIncarnation
   )
 }
 
@@ -2340,7 +2680,6 @@ function validatePage(
     page.v !== FILTER_OP_VERSION ||
     page.partitionId !== request.partitionId ||
     page.generation.partitionId !== request.partitionId ||
-    page.readMode !== request.readMode ||
     page.matched !== messages.length ||
     page.matched > request.count ||
     page.matched > page.examined ||
@@ -2356,8 +2695,15 @@ function validatePage(
     (request.consumer.kind !== "consumer") !== (page.policy.groupId !== undefined)
   )
     invalid()
-  const body = new DataView(page.records.buffer, page.records.byteOffset, page.records.byteLength)
-  if (body.getUint32(0, true) !== page.partitionId || body.getBigUint64(4, true) !== page.frontier)
+  // The record body was read under the context the page names.
+  const head = decodePolledHead(page.records)
+  if (
+    head.partitionId !== page.partitionId ||
+    head.currentOffset !== page.frontier ||
+    head.context.incarnation !== page.generation.partitionIncarnation ||
+    head.context.ownerGeneration !== page.ackContext.ownerGeneration ||
+    head.context.metadataOp !== page.ackContext.metadataOp
+  )
     invalid()
   if (
     request.filter.kind === "revision" &&
@@ -2376,28 +2722,21 @@ function validatePage(
       (cursor.digest === undefined) !== (page.policy.digest === undefined) ||
       (cursor.digest !== undefined &&
         page.policy.digest !== undefined &&
-        !sameBytes(cursor.digest, page.policy.digest)) ||
-      cursor.readMode !== request.readMode
+        !sameBytes(cursor.digest, page.policy.digest))
     )
       invalid()
     start = cursor.nextScanOffset
   } else if (request.start.kind === "offset") start = request.start.offset
   else if (request.start.kind === "first") start = 0n
-  // The last offset the page examined. A primary page offers it as its safe
-  // acknowledgment offset, a local page offers none.
+  // The last offset the page examined, which the page offers as its safe
+  // acknowledgment offset.
   const scannedTo =
     page.nextScanOffset === undefined || page.nextScanOffset === 0n
       ? undefined
       : page.nextScanOffset - 1n
   if (page.examined === 0) {
     if (page.safeAckOffset !== undefined || page.nextScanOffset !== start) invalid()
-  } else if (
-    scannedTo === undefined ||
-    (request.readMode === "primary"
-      ? page.safeAckOffset !== scannedTo
-      : page.safeAckOffset !== undefined)
-  )
-    invalid()
+  } else if (scannedTo === undefined || page.safeAckOffset !== scannedTo) invalid()
   if (scannedTo !== undefined && scannedTo > page.frontier) invalid()
   if (start !== undefined && page.nextScanOffset !== undefined && page.nextScanOffset < start)
     invalid()

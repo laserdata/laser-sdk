@@ -4,13 +4,19 @@ import path from "node:path"
 import { test } from "node:test"
 import {
   actionIndex,
+  decodeAuthzEvent,
+  decodeAuthzEventKind,
   decodeAuthzHistoryReq,
   decodeAuthzReply,
+  decodeAuthzSubject,
   decodeBindRolesReq,
   decodeRole,
   delegatedAllow,
+  encodeAuthzEvent,
+  encodeAuthzEventKind,
   encodeAuthzHistoryReq,
   encodeAuthzReply,
+  encodeAuthzSubject,
   encodeBindRolesReq,
   encodeRole,
   featureAction,
@@ -23,12 +29,12 @@ import {
 } from "../../src/wire/authz.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import {
-  type SupervisorActorAssertion,
-  validateSupervisorAssertion
+  type OperatorActorAssertion,
+  validateOperatorAssertion
 } from "../../src/wire/checkpoint.js"
 import { CheckpointRequestId, DestinationId } from "../../src/wire/ids.js"
 import {
-  AGDX_AGENT_SUBMIT_CODE,
+  AGDX_AGENT_BASE,
   AGDX_BATCH_CODE,
   AGDX_CHECKPOINT_CODE,
   AGDX_CONTROL_PUBLISH_CODE,
@@ -39,7 +45,14 @@ import {
   AGDX_KV_GET_CODE,
   AGDX_KV_LEASE_CODE,
   AGDX_KV_LEASE_RENEW_CODE,
-  AGDX_KV_RELEASE_CODE
+  AGDX_KV_RELEASE_CODE,
+  AGDX_SESSION_GET_CODE,
+  AGDX_SESSION_LIST_CODE,
+  AGDX_SESSION_EVENTS_CODE,
+  AGDX_SESSION_STATE_CODE,
+  AGDX_SESSION_LINKS_CODE,
+  AGDX_SESSION_SOURCES_CODE,
+  AGDX_SESSION_CHANGES_CODE
 } from "../../src/wire/codes.js"
 
 const FIXTURES_DIR = path.resolve(process.cwd(), "../../wire/fixtures")
@@ -175,7 +188,21 @@ void test("given_a_command_code_when_classified_then_should_map_to_feature_and_a
   assert.deepEqual(featureAction(AGDX_KV_CAS_FENCED_CODE), ["kv", "write"])
   assert.equal(featureAction(AGDX_HELLO_CODE), undefined)
   assert.equal(featureAction(AGDX_BATCH_CODE), undefined)
-  assert.deepEqual(featureAction(AGDX_AGENT_SUBMIT_CODE), ["agent", "write"])
+  // The retired run codes map to no feature.
+  for (let code = AGDX_AGENT_BASE; code <= AGDX_AGENT_BASE + 3; code += 1) {
+    assert.equal(featureAction(code), undefined)
+  }
+  for (const code of [
+    AGDX_SESSION_GET_CODE,
+    AGDX_SESSION_LIST_CODE,
+    AGDX_SESSION_EVENTS_CODE,
+    AGDX_SESSION_STATE_CODE,
+    AGDX_SESSION_LINKS_CODE,
+    AGDX_SESSION_SOURCES_CODE,
+    AGDX_SESSION_CHANGES_CODE
+  ]) {
+    assert.deepEqual(featureAction(code), ["session", "read"])
+  }
   assert.deepEqual(featureAction(AGDX_DESTINATION_GET_CODE), ["destination", "read"])
   assert.equal(featureAction(AGDX_CHECKPOINT_CODE), undefined)
   assert.equal(featureAction(AGDX_DESTINATION_HTTP_CODE), undefined)
@@ -199,6 +226,8 @@ void test("given_feature_action_pairs_when_indexed_then_should_match_rust_and_fi
     "authz",
     "kv_lease",
     "kv_fence",
+    "filter",
+    "session",
     "unrecognized"
   ] as const
   const actions = ["read", "write", "delete", "admin", "unrecognized"] as const
@@ -215,10 +244,11 @@ void test("given_feature_action_pairs_when_indexed_then_should_match_rust_and_fi
   assert.equal(actionIndex("authz", "admin"), 53)
   assert.equal(actionIndex("kv_lease", "admin"), 58)
   assert.equal(actionIndex("kv_fence", "read"), 60)
+  assert.equal(actionIndex("session", "read"), 70)
 })
 
-void test("given_a_supervisor_assertion_when_validated_then_should_check_version_ids_window_and_lengths", () => {
-  const valid: SupervisorActorAssertion = {
+void test("given_an_operator_assertion_when_validated_then_should_check_version_ids_window_and_lengths", () => {
+  const valid: OperatorActorAssertion = {
     claims: {
       v: 1,
       requestId: CheckpointRequestId.fromU128(1n),
@@ -233,8 +263,8 @@ void test("given_a_supervisor_assertion_when_validated_then_should_check_version
     keyId: new Uint8Array(8),
     signature: new Uint8Array(64)
   }
-  validateSupervisorAssertion(valid)
-  const broken: readonly [SupervisorActorAssertion, RegExp][] = [
+  validateOperatorAssertion(valid)
+  const broken: readonly [OperatorActorAssertion, RegExp][] = [
     [{ ...valid, claims: { ...valid.claims, v: 2 } }, /version/],
     [{ ...valid, claims: { ...valid.claims, cloudUserId: 0 } }, /nonzero/],
     [{ ...valid, claims: { ...valid.claims, expiresAtMicros: 1_000n + 300_000_001n } }, /window/],
@@ -242,7 +272,43 @@ void test("given_a_supervisor_assertion_when_validated_then_should_check_version
   ]
   for (const [assertion, message] of broken) {
     assert.throws(() => {
-      validateSupervisorAssertion(assertion)
+      validateOperatorAssertion(assertion)
     }, message)
   }
+})
+
+void test("given_a_tenancy_event_when_round_tripped_then_should_keep_it", () => {
+  const event = { kind: "tenancySet", tenancy: "stream" } as const
+  assert.deepEqual(
+    decodeAuthzEventKind(
+      decodeOne(encodeNamed(encodeAuthzEventKind(event) as Map<string, unknown>), "event"),
+      "event"
+    ),
+    event
+  )
+})
+
+void test("given_a_stream_subject_and_an_attributed_event_when_round_tripped_then_should_keep_them", () => {
+  const subject = { kind: "stream", stream: "acme" } as const
+  assert.deepEqual(
+    decodeAuthzSubject(
+      decodeOne(encodeNamed(encodeAuthzSubject(subject) as Map<string, unknown>), "subject"),
+      "subject"
+    ),
+    subject
+  )
+  const event = {
+    revision: 3n,
+    actor: "0",
+    atMicros: 1n,
+    op: { kind: "roleDefined", name: "acme-reader" },
+    stream: "acme"
+  } as const
+  assert.deepEqual(
+    decodeAuthzEvent(
+      expectMap(decodeOne(encodeNamed(encodeAuthzEvent(event)), "event"), "event"),
+      "event"
+    ),
+    event
+  )
 })

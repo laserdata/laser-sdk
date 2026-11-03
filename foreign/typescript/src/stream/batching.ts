@@ -53,11 +53,11 @@ export class BatchingProducerBuilder {
 
   /** Flush a non-empty queue after at most this long, so a trickle of records
    * never waits for a full batch. */
-  linger(milliseconds: number): this {
-    if (!Number.isFinite(milliseconds) || milliseconds < 0) {
+  linger(lingerMs: number): this {
+    if (!Number.isFinite(lingerMs) || lingerMs < 0) {
       throw new InvalidError("linger must be a non-negative finite number")
     }
-    this.lingerValue = milliseconds
+    this.lingerValue = lingerMs
     return this
   }
 

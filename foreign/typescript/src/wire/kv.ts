@@ -12,6 +12,7 @@ import {
 } from "./cbor.js"
 import { KV_LEASE_OP_VERSION, KV_OP_VERSION } from "./codes.js"
 import { decodeSourceRef, encodeSourceRef, type SourceRef } from "./graph.js"
+import { decodeSessionRef, encodeSessionRef, type SessionRef } from "./ids.js"
 import {
   MAX_HOLDER_ID_BYTES,
   MAX_KEY_BYTES,
@@ -20,6 +21,7 @@ import {
   MAX_VALUE_BYTES,
   MIN_LEASE_TTL_MICROS
 } from "./limits.js"
+import { hasControlCharacter } from "./validate.js"
 import {
   decodeMutationPosition,
   encodeMutationPosition,
@@ -33,6 +35,7 @@ export interface MemoryRowScope {
   readonly app?: string
   readonly conversation?: string
   readonly source?: SourceRef
+  readonly timestampMicros?: bigint
 }
 
 export function encodeMemoryRowScope(scope: MemoryRowScope): Map<string, unknown> {
@@ -43,6 +46,7 @@ export function encodeMemoryRowScope(scope: MemoryRowScope): Map<string, unknown
   if (scope.app !== undefined) map.set("app", scope.app)
   if (scope.conversation !== undefined) map.set("conversation", scope.conversation)
   if (scope.source !== undefined) map.set("source", encodeSourceRef(scope.source))
+  if (scope.timestampMicros !== undefined) map.set("timestamp_micros", scope.timestampMicros)
   return map
 }
 
@@ -52,6 +56,7 @@ export function decodeMemoryRowScope(map: CborMap, context: string): MemoryRowSc
   const user = field.optionalString(map, "user", context)
   const app = field.optionalString(map, "app", context)
   const conversation = field.optionalString(map, "conversation", context)
+  const timestampMicros = field.optionalU64(map, "timestamp_micros", context)
   return {
     ...(kind !== undefined ? { kind } : {}),
     ...(agent !== undefined ? { agent } : {}),
@@ -60,7 +65,8 @@ export function decodeMemoryRowScope(map: CborMap, context: string): MemoryRowSc
     ...(conversation !== undefined ? { conversation } : {}),
     ...(map.has("source")
       ? { source: decodeSourceRef(map.get("source"), `${context}.source`) }
-      : {})
+      : {}),
+    ...(timestampMicros !== undefined ? { timestampMicros } : {})
   }
 }
 
@@ -179,6 +185,7 @@ export interface KvSet {
   /** The operation version, the current one when absent. */
   readonly v?: number
   readonly namespace: string
+  readonly session?: SessionRef
   readonly key: Uint8Array
   readonly value: Uint8Array
   readonly expiresAtMicros?: bigint
@@ -188,6 +195,7 @@ export function encodeKvSet(set: KvSet): Map<string, unknown> {
   const map = new Map<string, unknown>()
   map.set("v", set.v ?? KV_OP_VERSION)
   map.set("namespace", set.namespace)
+  if (set.session !== undefined) map.set("session", encodeSessionRef(set.session))
   map.set("key", set.key)
   map.set("value", set.value)
   if (set.expiresAtMicros !== undefined) map.set("expires_at_micros", set.expiresAtMicros)
@@ -196,9 +204,11 @@ export function encodeKvSet(set: KvSet): Map<string, unknown> {
 
 export function decodeKvSet(map: CborMap, context: string): KvSet {
   const expiresAtMicros = field.optionalU64(map, "expires_at_micros", context)
+  const session = field.optionalMap(map, "session", context)
   return {
     v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
+    ...(session !== undefined ? { session: decodeSessionRef(session, `${context}.session`) } : {}),
     key: field.requiredBytes(map, "key", context),
     value: field.requiredBytes(map, "value", context),
     ...(expiresAtMicros !== undefined ? { expiresAtMicros } : {})
@@ -228,6 +238,7 @@ export interface KvCas {
   /** The operation version, the current one when absent. */
   readonly v?: number
   readonly namespace: string
+  readonly session?: SessionRef
   readonly key: Uint8Array
   readonly value: Uint8Array
   readonly expiresAtMicros?: bigint
@@ -238,6 +249,7 @@ export function encodeKvCas(cas: KvCas): Map<string, unknown> {
   const map = new Map<string, unknown>()
   map.set("v", cas.v ?? KV_OP_VERSION)
   map.set("namespace", cas.namespace)
+  if (cas.session !== undefined) map.set("session", encodeSessionRef(cas.session))
   map.set("key", cas.key)
   map.set("value", cas.value)
   if (cas.expiresAtMicros !== undefined) map.set("expires_at_micros", cas.expiresAtMicros)
@@ -247,9 +259,11 @@ export function encodeKvCas(cas: KvCas): Map<string, unknown> {
 
 export function decodeKvCas(map: CborMap, context: string): KvCas {
   const expiresAtMicros = field.optionalU64(map, "expires_at_micros", context)
+  const session = field.optionalMap(map, "session", context)
   return {
     v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
+    ...(session !== undefined ? { session: decodeSessionRef(session, `${context}.session`) } : {}),
     key: field.requiredBytes(map, "key", context),
     value: field.requiredBytes(map, "value", context),
     ...(expiresAtMicros !== undefined ? { expiresAtMicros } : {}),
@@ -289,6 +303,8 @@ function validateHolderId(holderId: string): void {
       `lease holder id is ${String(bytes.byteLength)}B, exceeds cap ${String(MAX_HOLDER_ID_BYTES)}B`
     )
   }
+  if (hasControlCharacter(holderId))
+    throw new InvalidError("lease holder id contains a control character")
 }
 
 function validateKvCasFenced(cas: KvCasFenced): void {
@@ -366,6 +382,7 @@ export interface KvDelete {
   /** The operation version, the current one when absent. */
   readonly v?: number
   readonly namespace: string
+  readonly session?: SessionRef
   readonly key: Uint8Array
   readonly ifMatch?: bigint
 }
@@ -374,6 +391,7 @@ export function encodeKvDelete(del: KvDelete): Map<string, unknown> {
   const map = new Map<string, unknown>()
   map.set("v", del.v ?? KV_OP_VERSION)
   map.set("namespace", del.namespace)
+  if (del.session !== undefined) map.set("session", encodeSessionRef(del.session))
   map.set("key", del.key)
   if (del.ifMatch !== undefined) map.set("if_match", del.ifMatch)
   return map
@@ -381,9 +399,11 @@ export function encodeKvDelete(del: KvDelete): Map<string, unknown> {
 
 export function decodeKvDelete(map: CborMap, context: string): KvDelete {
   const ifMatch = field.optionalU64(map, "if_match", context)
+  const session = field.optionalMap(map, "session", context)
   return {
     v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
+    ...(session !== undefined ? { session: decodeSessionRef(session, `${context}.session`) } : {}),
     key: field.requiredBytes(map, "key", context),
     ...(ifMatch !== undefined ? { ifMatch } : {})
   }
@@ -443,6 +463,7 @@ export interface KvPatch {
   /** The operation version, the current one when absent. */
   readonly v?: number
   readonly namespace: string
+  readonly session?: SessionRef
   readonly key: Uint8Array
   readonly patch: Uint8Array
   readonly ifMatch?: bigint
@@ -452,6 +473,7 @@ export function encodeKvPatch(patch: KvPatch): Map<string, unknown> {
   const map = new Map<string, unknown>()
   map.set("v", patch.v ?? KV_OP_VERSION)
   map.set("namespace", patch.namespace)
+  if (patch.session !== undefined) map.set("session", encodeSessionRef(patch.session))
   map.set("key", patch.key)
   map.set("patch", patch.patch)
   if (patch.ifMatch !== undefined) map.set("if_match", patch.ifMatch)
@@ -460,9 +482,11 @@ export function encodeKvPatch(patch: KvPatch): Map<string, unknown> {
 
 export function decodeKvPatch(map: CborMap, context: string): KvPatch {
   const ifMatch = field.optionalU64(map, "if_match", context)
+  const session = field.optionalMap(map, "session", context)
   return {
     v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
+    ...(session !== undefined ? { session: decodeSessionRef(session, `${context}.session`) } : {}),
     key: field.requiredBytes(map, "key", context),
     patch: field.requiredBytes(map, "patch", context),
     ...(ifMatch !== undefined ? { ifMatch } : {})
@@ -754,6 +778,9 @@ export interface KvScan {
   readonly end?: Uint8Array
   readonly keyContains?: string
   readonly conversation?: string
+  /** The stream the lens conversation belongs to, set alongside
+   * `conversation` by a client that scopes its resources to a stream. */
+  readonly stream?: string
   readonly limit: number
   readonly cursor?: Uint8Array
 }
@@ -767,6 +794,7 @@ export function encodeKvScan(scan: KvScan): Map<string, unknown> {
   if (scan.end !== undefined) map.set("end", scan.end)
   if (scan.keyContains !== undefined) map.set("key_contains", scan.keyContains)
   if (scan.conversation !== undefined) map.set("conversation", scan.conversation)
+  if (scan.stream !== undefined) map.set("stream", scan.stream)
   map.set("limit", scan.limit)
   if (scan.cursor !== undefined) map.set("cursor", scan.cursor)
   return map
@@ -778,6 +806,7 @@ export function decodeKvScan(map: CborMap, context: string): KvScan {
   const end = field.optionalBytes(map, "end", context)
   const keyContains = field.optionalString(map, "key_contains", context)
   const conversation = field.optionalString(map, "conversation", context)
+  const stream = field.optionalString(map, "stream", context)
   const cursor = field.optionalBytes(map, "cursor", context)
   return {
     v: field.requiredU32(map, "v", context),
@@ -787,6 +816,7 @@ export function decodeKvScan(map: CborMap, context: string): KvScan {
     ...(end !== undefined ? { end } : {}),
     ...(keyContains !== undefined ? { keyContains } : {}),
     ...(conversation !== undefined ? { conversation } : {}),
+    ...(stream !== undefined ? { stream } : {}),
     limit: field.requiredU32(map, "limit", context),
     ...(cursor !== undefined ? { cursor } : {})
   }
@@ -801,6 +831,9 @@ export interface KvDeleteMany {
   readonly end?: Uint8Array
   readonly keyContains?: string
   readonly conversation?: string
+  /** The stream the lens conversation belongs to, set alongside
+   * `conversation` by a client that scopes its resources to a stream. */
+  readonly stream?: string
 }
 
 export function encodeKvDeleteMany(deleteMany: KvDeleteMany): Map<string, unknown> {
@@ -812,6 +845,7 @@ export function encodeKvDeleteMany(deleteMany: KvDeleteMany): Map<string, unknow
   if (deleteMany.end !== undefined) map.set("end", deleteMany.end)
   if (deleteMany.keyContains !== undefined) map.set("key_contains", deleteMany.keyContains)
   if (deleteMany.conversation !== undefined) map.set("conversation", deleteMany.conversation)
+  if (deleteMany.stream !== undefined) map.set("stream", deleteMany.stream)
   return map
 }
 
@@ -821,6 +855,7 @@ export function decodeKvDeleteMany(map: CborMap, context: string): KvDeleteMany 
   const end = field.optionalBytes(map, "end", context)
   const keyContains = field.optionalString(map, "key_contains", context)
   const conversation = field.optionalString(map, "conversation", context)
+  const stream = field.optionalString(map, "stream", context)
   return {
     v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
@@ -828,7 +863,8 @@ export function decodeKvDeleteMany(map: CborMap, context: string): KvDeleteMany 
     ...(start !== undefined ? { start } : {}),
     ...(end !== undefined ? { end } : {}),
     ...(keyContains !== undefined ? { keyContains } : {}),
-    ...(conversation !== undefined ? { conversation } : {})
+    ...(conversation !== undefined ? { conversation } : {}),
+    ...(stream !== undefined ? { stream } : {})
   }
 }
 

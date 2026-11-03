@@ -40,7 +40,13 @@ async def paused_transport(iggy_endpoint):
             await forwarding.wait()
             writer.write(data)
             await writer.drain()
-            if reply and pause_after_reply[0] is not None:
+            if (
+                reply
+                and header[208] == 160
+                and int.from_bytes(header[216:220], "little") == 0
+                and header[220] == 1
+                and pause_after_reply[0] is not None
+            ):
                 pause_after_reply[0] -= 1
                 if pause_after_reply[0] == 0:
                     forwarding.clear()
@@ -98,6 +104,7 @@ async def test_given_a_stalled_connection_when_a_producer_sends_then_should_hono
         publish_retry_backoff_ms=10,
     )
     try:
+        await laser.stream(laser.default_stream).ensure()
         producer = laser.topic("pulse").producer(**options)
         if initialized:
             await producer.init()
@@ -128,6 +135,7 @@ async def test_given_a_confirmed_chunk_when_the_next_times_out_then_should_prese
         publish_max_retries=0,
     )
     try:
+        await laser.stream(laser.default_stream).ensure()
         producer = laser.topic("pulse").producer(batch_length=1, partition=0)
         await producer.init()
         pause_after_reply[0] = 1
@@ -156,6 +164,7 @@ async def test_given_a_temporary_outage_when_retries_are_overridden_then_should_
     )
     resume = None
     try:
+        await laser.stream(laser.default_stream).ensure()
         producer = laser.topic("pulse").producer(retries=2, retry_interval_ms=10, partition=0)
         await producer.init()
         forwarding.clear()
@@ -181,6 +190,7 @@ async def test_given_a_stopped_server_when_a_producer_sends_then_should_time_out
             publish_max_retries=1,
             publish_retry_backoff_ms=100,
         )
+        await laser.stream(laser.default_stream).ensure()
         producer = laser.topic("pulse").producer(retries=1, retry_interval_ms=100)
         await producer.send(b"warm")
         await asyncio.to_thread(server.stop)
@@ -199,6 +209,7 @@ async def test_given_a_deleted_stream_when_a_producer_sends_then_should_name_cau
     laser,
 ):
     stream = laser.default_stream
+    await laser.stream(laser.default_stream).ensure()
     producer = laser.topic("pulse").producer(retries=1, retry_interval_ms=100)
     await producer.send(b"first")
     await laser.stream(stream).delete()
@@ -212,3 +223,44 @@ async def test_given_a_deleted_stream_when_a_producer_sends_then_should_name_cau
     assert failure.value.not_found
     assert failure.value.code == "NotFound"
     assert not failure.value.retryable
+
+
+async def test_given_unconfirmed_records_when_resent_through_batch_then_should_keep_their_ids(
+    paused_transport,
+):
+    endpoint, forwarding, pause_after_reply = paused_transport
+    stream = f"resend-{uuid.uuid4().hex[:12]}"
+    laser = await ls.Laser.connect(
+        endpoint, stream=stream, publish_timeout_ms=200, publish_max_retries=0
+    )
+    resender = None
+    try:
+        topic = laser.topic("pulse")
+        await laser.stream(laser.default_stream).ensure()
+        producer = topic.producer(batch_length=1, partition=0)
+        await producer.init()
+        pause_after_reply[0] = 1
+        with pytest.raises(ls.PublishFailedError) as failure:
+            await asyncio.wait_for(
+                producer.send_batch([b"first", (b"second", {"kind": "retry"})]), 2
+            )
+        unconfirmed = failure.value.unconfirmed
+        assert all(isinstance(message.message_id, int) for message in unconfirmed)
+        forwarding.set()
+        # The timed-out connection is retired, so the resend dials afresh.
+        resender = await ls.Laser.connect(endpoint, stream=stream)
+        topic = resender.topic("pulse")
+        await topic.batch(unconfirmed, partition_key=None)
+        consumer = topic.consumer(
+            "resend-reader", partition=0, polling="first", auto_commit="disabled"
+        )
+        records = [await asyncio.wait_for(consumer.next(), 10) for _ in range(2)]
+        resent = records[-1]
+        assert resent.payload == b"second"
+        assert resent.message_id == unconfirmed[0].message_id
+        assert resent.headers == {"kind": "retry"}
+    finally:
+        forwarding.set()
+        await laser.close()
+        if resender is not None:
+            await resender.close()

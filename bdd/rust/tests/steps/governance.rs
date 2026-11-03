@@ -47,7 +47,7 @@ async fn send_governed(world: &mut LaserWorld, payload: String) {
         .governed
         .as_ref()
         .expect("a governed laser")
-        .send_agent(AgentTopic::Commands, payload.into_bytes(), &provenance)
+        .send_agent(AgentTopic::Sessions, payload.into_bytes(), &provenance)
         .await;
     world.last_result = Some(result.map(|_| ()).map_err(|error| format!("{error:?}")));
 }
@@ -57,7 +57,7 @@ async fn publish_governed(world: &mut LaserWorld, payload: String) {
     let governed = world.governed.as_ref().expect("a governed laser");
     governed
         .topic("business.audit")
-        .ensure(1)
+        .ensure(1, None)
         .await
         .expect("business topic ready");
     let provenance = Provenance::builder()

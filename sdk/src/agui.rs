@@ -7,7 +7,6 @@ use laser_wire::agent::{
     AgentEnvelope, AgentId, AgentKind, OPERATION_REASONING, OPERATION_STATE_DELTA,
     OPERATION_STATE_SNAPSHOT, OPERATION_TASK, OPERATION_TOOL_ARGS, TaskState,
 };
-use laser_wire::content::ContentType;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
@@ -101,90 +100,58 @@ pub enum AgUiEvent {
 }
 
 impl Laser {
-    /// Publish an AG-UI state snapshot: the full shared state as a
-    /// `state_snapshot` event (`agdx.ct = json`). Replaying a snapshot plus the
-    /// later deltas reconstructs the state at any historical offset, the
-    /// log-native form of AG-UI's STATE_SNAPSHOT/STATE_DELTA, over Iggy's own
-    /// transport rather than SSE.
+    /// Publish an AG-UI state snapshot: replace the session state document of
+    /// `conversation` with `state`, a JSON object, then snapshot it. The state
+    /// rides the session lane as one revision-guarded patch, the same records
+    /// `Session::state` writes, so every reader folds one state model.
     pub async fn publish_state_snapshot(
         &self,
-        topic: AgentTopic<'static>,
-        source: AgentId,
+        source: impl Into<AgentId>,
         conversation: ConversationId,
         state: &JsonValue,
     ) -> Result<(), LaserError> {
-        let body =
-            serde_json::to_vec(state).map_err(|error| LaserError::Codec(error.to_string()))?;
-        self.agdx(topic, source, conversation.into())
-            .emit(body)
-            .with_operation(OPERATION_STATE_SNAPSHOT)
-            .content_type(ContentType::Json)
-            .send()
-            .await?;
+        let source = source.into();
+        let session = self.sessions().open(conversation).as_agent(source);
+        let document = session.state();
+        document.replace(state.clone()).await?;
+        document.snapshot().await?;
         Ok(())
     }
 
-    /// Publish an AG-UI state delta: an RFC 6902 JSON Patch document as a
-    /// `state_delta` event (`agdx.ct = json`).
+    /// Publish an AG-UI state delta: apply `patch`, an RFC 6902 JSON Patch
+    /// array, to the session state document of `conversation`.
     pub async fn publish_state_delta(
         &self,
-        topic: AgentTopic<'static>,
-        source: AgentId,
+        source: impl Into<AgentId>,
         conversation: ConversationId,
         patch: &JsonValue,
     ) -> Result<(), LaserError> {
-        let body =
-            serde_json::to_vec(patch).map_err(|error| LaserError::Codec(error.to_string()))?;
-        self.agdx(topic, source, conversation.into())
-            .emit(body)
-            .with_operation(OPERATION_STATE_DELTA)
-            .content_type(ContentType::Json)
-            .send()
+        let source = source.into();
+        let operations = serde_json::from_value(patch.clone())
+            .map_err(|error| LaserError::Invalid(format!("state patch: {error}")))?;
+        self.sessions()
+            .open(conversation)
+            .as_agent(source)
+            .state()
+            .patch(operations)
             .await?;
         Ok(())
     }
 
-    /// Reconstruct shared state by replaying `conversation`'s `state_snapshot` /
-    /// `state_delta` events on `topic`: take the latest snapshot, then apply
-    /// every delta after it (RFC 6902). `None` until a snapshot exists.
+    /// The session state document of `conversation`: the fold of the retained
+    /// session lane, or the managed state view when the lane no longer holds
+    /// the document's baseline. `None` until a state record exists.
     pub async fn reconstruct_state(
         &self,
         conversation: ConversationId,
-        topic: AgentTopic<'static>,
     ) -> Result<Option<JsonValue>, LaserError> {
-        let messages = ContextAssembler::builder()
-            .conversation_id(conversation)
-            .topics(vec![topic])
-            .build()
-            .assemble(self)
+        let view = self
+            .sessions()
+            .open(conversation)
+            .state()
+            .current_view()
             .await?;
-        let mut state: Option<JsonValue> = None;
-        for message in &messages {
-            let Some(envelope) = &message.envelope else {
-                continue;
-            };
-            if envelope.kind != AgentKind::Event {
-                continue;
-            }
-            match envelope.operation.as_deref() {
-                Some(OPERATION_STATE_SNAPSHOT) => {
-                    state = Some(
-                        serde_json::from_slice(&envelope.body)
-                            .map_err(|error| LaserError::Codec(error.to_string()))?,
-                    );
-                }
-                Some(OPERATION_STATE_DELTA) => {
-                    if let Some(document) = state.as_mut() {
-                        let patch: json_patch::Patch = serde_json::from_slice(&envelope.body)
-                            .map_err(|error| LaserError::Codec(error.to_string()))?;
-                        json_patch::patch(document, &patch)
-                            .map_err(|error| LaserError::Invalid(error.to_string()))?;
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(state)
+        Ok((view.revision > 0 || view.complete).then_some(view.document))
     }
 
     /// Render `conversation` on `topic` as AG-UI events by reading the log:
@@ -266,6 +233,18 @@ fn envelope_to_agui(envelope: &AgentEnvelope) -> Vec<AgUiEvent> {
                 .unwrap_or_default();
             match envelope.task_state {
                 Some(TaskState::Submitted) => vec![AgUiEvent::RunStarted { thread_id, run_id }],
+                Some(TaskState::Failed | TaskState::Rejected) => {
+                    let detail = envelope
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("detail"))
+                        .and_then(|value| match value {
+                            laser_wire::query::Value::Str(detail) => Some(detail.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "task failed".to_owned());
+                    vec![AgUiEvent::RunError { message: detail }]
+                }
                 Some(state) if state.is_terminal() => {
                     vec![AgUiEvent::RunFinished { thread_id, run_id }]
                 }
@@ -287,12 +266,22 @@ fn envelope_to_agui(envelope: &AgentEnvelope) -> Vec<AgUiEvent> {
             message: String::from_utf8_lossy(&envelope.body).into_owned(),
         }],
         AgentKind::Event => match envelope.operation.as_deref() {
-            Some(OPERATION_STATE_SNAPSHOT) => serde_json::from_slice(&envelope.body)
-                .map(|snapshot| vec![AgUiEvent::StateSnapshot { snapshot }])
-                .unwrap_or_default(),
-            Some(OPERATION_STATE_DELTA) => serde_json::from_slice(&envelope.body)
-                .map(|delta| vec![AgUiEvent::StateDelta { delta }])
-                .unwrap_or_default(),
+            Some(OPERATION_STATE_SNAPSHOT) => laser_wire::framing::decode_named::<
+                laser_wire::agent::StateSnapshot,
+            >(&envelope.body)
+            .map(|snapshot| {
+                vec![AgUiEvent::StateSnapshot {
+                    snapshot: snapshot.document,
+                }]
+            })
+            .unwrap_or_default(),
+            Some(OPERATION_STATE_DELTA) => {
+                laser_wire::framing::decode_named::<laser_wire::agent::StateDelta>(&envelope.body)
+                    .ok()
+                    .and_then(|delta| serde_json::to_value(delta.patch).ok())
+                    .map(|delta| vec![AgUiEvent::StateDelta { delta }])
+                    .unwrap_or_default()
+            }
             _ => Vec::new(),
         },
         _ => Vec::new(),
@@ -366,4 +355,31 @@ fn chunk_to_agui(envelope: &AgentEnvelope, kind: ChunkKind) -> Vec<AgUiEvent> {
         }
     }
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use laser_wire::agent::{ConversationId as WireConversationId, RecordId, TaskState};
+    use laser_wire::query::Value;
+
+    #[test]
+    fn given_failed_task_status_when_rendered_then_should_emit_run_error() {
+        let mut envelope = AgentEnvelope::status(
+            RecordId::from_u128(1),
+            WireConversationId::from_u128(2),
+            "worker".parse().expect("valid agent id"),
+            OPERATION_TASK,
+        )
+        .with_task_state(TaskState::Failed);
+        envelope.metadata = Some(std::collections::BTreeMap::from([(
+            "detail".to_owned(),
+            Value::Str("worker failed".to_owned()),
+        )]));
+
+        assert!(matches!(
+            envelope_to_agui(&envelope).as_slice(),
+            [AgUiEvent::RunError { message }] if message == "worker failed"
+        ));
+    }
 }

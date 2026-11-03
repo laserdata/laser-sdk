@@ -18,7 +18,7 @@ import {
   type QueryRoutePage,
   type RepairRecord,
   type RetentionGap,
-  type SupervisorActorAssertion
+  type OperatorActorAssertion
 } from "../wire/checkpoint.js"
 import {
   CheckpointCommand,
@@ -74,26 +74,26 @@ export class Destinations {
   async mutate(
     expectedGlobalStateRevision: bigint,
     mutation: PublicCheckpointMutation,
-    supervisorAssertion?: SupervisorActorAssertion
+    operatorAssertion?: OperatorActorAssertion
   ): Promise<CheckpointMutationResult> {
     return this.executeCheckpoint({
       v: CHECKPOINT_OP_VERSION,
       requestId:
-        supervisorAssertion?.claims.requestId ?? CheckpointRequestId.fromU128(mintUlidValue()),
+        operatorAssertion?.claims.requestId ?? CheckpointRequestId.fromU128(mintUlidValue()),
       expectedGlobalStateRevision,
       mutation,
-      ...(supervisorAssertion === undefined ? {} : { supervisorAssertion })
+      ...(operatorAssertion === undefined ? {} : { operatorAssertion })
     })
   }
 
-  /** A mutation carried under a supervisor actor assertion. The request id is
+  /** A mutation carried under an operator actor assertion. The request id is
    * the one the assertion's claims name. */
-  mutateWithSupervisorAssertion(
+  mutateWithOperatorAssertion(
     expectedGlobalStateRevision: bigint,
     mutation: PublicCheckpointMutation,
-    supervisorAssertion: SupervisorActorAssertion
+    operatorAssertion: OperatorActorAssertion
   ): Promise<CheckpointMutationResult> {
-    return this.mutate(expectedGlobalStateRevision, mutation, supervisorAssertion)
+    return this.mutate(expectedGlobalStateRevision, mutation, operatorAssertion)
   }
 
   register(
@@ -309,7 +309,7 @@ export class Destinations {
     destinationGeneration: bigint,
     expectedCheckpointRevision: bigint,
     nextOffset: bigint,
-    supervisorAssertion: SupervisorActorAssertion
+    operatorAssertion: OperatorActorAssertion
   ): Promise<CheckpointMutationResult> {
     return this.mutate(
       expectedGlobalStateRevision,
@@ -320,7 +320,7 @@ export class Destinations {
         expectedCheckpointRevision,
         nextOffset
       },
-      supervisorAssertion
+      operatorAssertion
     )
   }
 
@@ -328,12 +328,12 @@ export class Destinations {
     expectedGlobalStateRevision: bigint,
     expectedDefinitionRevision: bigint,
     replacement: MaterializationDestination,
-    supervisorAssertion: SupervisorActorAssertion
+    operatorAssertion: OperatorActorAssertion
   ): Promise<CheckpointMutationResult> {
     return this.mutate(
       expectedGlobalStateRevision,
       { kind: "supersede_generation", expectedDefinitionRevision, replacement },
-      supervisorAssertion
+      operatorAssertion
     )
   }
 
@@ -343,7 +343,7 @@ export class Destinations {
     destinationGeneration: bigint,
     expectedCheckpointRevision: bigint,
     repair: RepairRecord,
-    supervisorAssertion: SupervisorActorAssertion
+    operatorAssertion: OperatorActorAssertion
   ): Promise<CheckpointMutationResult> {
     return this.mutate(
       expectedGlobalStateRevision,
@@ -354,7 +354,7 @@ export class Destinations {
         expectedCheckpointRevision,
         repair
       },
-      supervisorAssertion
+      operatorAssertion
     )
   }
 

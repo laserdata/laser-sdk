@@ -30,7 +30,7 @@ def start_another_conversation(world):
 def publish_agdx_command(world, body):
     correlation = ls.mint_ulid()
     world.run(
-        lambda: world.laser.agdx(ls.AgentTopic.Commands, "producer", world.conversation).command(
+        lambda: world.laser.agdx(ls.AgentTopic.Sessions, "producer", world.conversation).command(
             correlation, body.encode()
         )
     )

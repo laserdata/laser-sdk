@@ -1,13 +1,18 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { TimeoutError } from "../../src/client/errors.js"
-import type { ConsumerTarget, LaserTransport, PolledMessage } from "../../src/iggy/apache-iggy.js"
+import type {
+  ConsumerTarget,
+  LaserTransport,
+  PollWait,
+  PolledMessage
+} from "../../src/iggy/apache-iggy.js"
 import type { HeaderValue } from "../../src/stream/header-value.js"
 import { agentMessageBody } from "../../src/agent/reliable-consumer.js"
 import { ReplyHub, findAgdxReply } from "../../src/agent/replies.js"
 import { encodeProvenanceHeaders } from "../../src/provenance/provenance.js"
 import { KeyRegistry, SigningKey } from "../../src/signing.js"
-import { ConversationId } from "../../src/types/ids.js"
+import { AgentId, ConversationId } from "../../src/types/ids.js"
 import type { ConsumerStart } from "../../src/stream/consumer-start.js"
 import { encodeAgentEnvelope, parseAgentId, responseEnvelope } from "../../src/wire/agent.js"
 import { encodeNamed } from "../../src/wire/cbor.js"
@@ -89,6 +94,43 @@ void test("given_a_matching_reply_when_dispatched_then_should_resolve_the_waitin
   }
 })
 
+void test("given_one_topic_for_request_and_reply_when_armed_then_should_skip_the_request_address", async () => {
+  const transport = fakeTransport([
+    { strategy: "last", result: [] },
+    {
+      strategy: "offset",
+      result: [replyMessage("corr-self", 5n), replyMessage("corr-self", 6n)]
+    }
+  ])
+  const hub = await ReplyHub.create(transport, "stream", "one-topic")
+  try {
+    const ticket = hub.subscribe("corr-self", undefined, true)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    ticket.arm({ partitionId: 0, offset: 5n })
+    const reply = await ticket.wait(2_000)
+    assert.equal(reply.id.offset, 6n)
+  } finally {
+    hub.stop()
+  }
+})
+
+void test("given_different_reply_topic_when_offsets_match_then_should_accept_the_reply", async () => {
+  const transport = fakeTransport([
+    { strategy: "last", result: [] },
+    { strategy: "offset", result: [replyMessage("corr-other-topic", 5n)] }
+  ])
+  const hub = await ReplyHub.create(transport, "stream", "reply-topic")
+  try {
+    const ticket = hub.subscribe("corr-other-topic", undefined, true)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    ticket.arm()
+    const reply = await ticket.wait(2_000)
+    assert.equal(reply.id.offset, 5n)
+  } finally {
+    hub.stop()
+  }
+})
+
 void test("given_no_matching_reply_when_waiting_then_should_time_out", async () => {
   const transport = fakeTransport([{ strategy: "last", result: [] }])
   const hub = await ReplyHub.create(transport, "stream", "replies")
@@ -153,7 +195,7 @@ void test("given_a_stream_waiter_when_two_replies_arrive_then_should_deliver_bot
 })
 
 // An AGDX response echoing `correlation`, optionally signed, carried exactly as
-// the broker would deliver it: named-CBOR payload, AGDX headers, a record
+// the streaming server would deliver it: named-CBOR payload, AGDX headers, a record
 // timestamp for the key-lifecycle check.
 function agdxReply(
   correlation: CorrelationId,
@@ -281,18 +323,23 @@ void test("given_two_verified_replies_when_looked_up_then_should_return_the_firs
     agdxReply(correlation, "second", 1n, toolKey)
   ])
   const found = await findAgdxReply(transport, "stream", "replies", correlation, enrolled())
-  assert.equal(new TextDecoder().decode(found?.body), "first")
+  assert.equal(
+    new TextDecoder().decode(found.kind === "found" ? found.envelope.body : undefined),
+    "first"
+  )
 })
 
 void test("given_a_verifier_when_only_an_unsigned_reply_exists_then_should_find_nothing", async () => {
   const correlation = CorrelationId.fromU128(0x0405n)
   const transport = scannedTopic([agdxReply(correlation, "forged-unsigned", 0n)])
-  assert.equal(
-    await findAgdxReply(transport, "stream", "replies", correlation, enrolled()),
-    undefined
-  )
+  assert.deepEqual(await findAgdxReply(transport, "stream", "replies", correlation, enrolled()), {
+    kind: "notFound"
+  })
   const unverified = await findAgdxReply(transport, "stream", "replies", correlation)
-  assert.equal(new TextDecoder().decode(unverified?.body), "forged-unsigned")
+  assert.equal(
+    new TextDecoder().decode(unverified.kind === "found" ? unverified.envelope.body : undefined),
+    "forged-unsigned"
+  )
 })
 
 void test("given_a_forged_reply_before_a_verified_one_when_looked_up_then_should_skip_the_forgery", async () => {
@@ -302,5 +349,284 @@ void test("given_a_forged_reply_before_a_verified_one_when_looked_up_then_should
     agdxReply(correlation, "honest", 1n, toolKey)
   ])
   const found = await findAgdxReply(transport, "stream", "replies", correlation, enrolled())
-  assert.equal(new TextDecoder().decode(found?.body), "honest")
+  assert.equal(
+    new TextDecoder().decode(found.kind === "found" ? found.envelope.body : undefined),
+    "honest"
+  )
 })
+
+void test("given_an_expected_reply_when_dispatched_then_should_take_only_the_requesters_reply_in_its_session", async () => {
+  const session = ConversationId.new()
+  const generic = (offset: bigint, conversationId: ConversationId, target?: string) => ({
+    payload: new TextEncoder().encode(String(offset)),
+    partitionId: 0,
+    offset,
+    headers: encodeProvenanceHeaders({
+      conversationId,
+      correlationId: "corr-expected",
+      ...(target !== undefined ? { targetAgentId: AgentId.new(target) } : {})
+    })
+  })
+  const transport = fakeTransport([
+    { strategy: "last", result: [] },
+    {
+      strategy: "offset",
+      result: [
+        generic(1n, ConversationId.new(), "planner"),
+        generic(2n, session, "bystander"),
+        generic(3n, session),
+        generic(4n, session, "planner")
+      ]
+    }
+  ])
+  const hub = await ReplyHub.create(transport, "stream", "replies")
+  try {
+    const ticket = hub.subscribe("corr-expected", undefined, false, {
+      session,
+      requester: "planner"
+    })
+    const reply = await ticket.wait(2_000)
+    assert.equal(reply.id.offset, 4n)
+  } finally {
+    hub.stop()
+  }
+})
+
+void test("given_a_reply_deeper_than_a_thousand_records_per_pass_when_looked_up_then_should_scan_ten_thousand_per_pass", async () => {
+  const correlation = CorrelationId.fromU128(0x0407n)
+  const depth = 40_000n
+  const reply = agdxReply(correlation, "deep", depth)
+  const filler = (offset: bigint): PolledMessage => ({
+    payload: new Uint8Array(),
+    partitionId: 0,
+    offset,
+    headers: new Map()
+  })
+  const transport: Pick<LaserTransport, "findTopicPartitionCount" | "pollMessages"> = {
+    findTopicPartitionCount: () => Promise.resolve(1),
+    pollMessages(_streamId, _topicId, _target, strategy, count) {
+      const from = strategy.kind === "offset" ? strategy.value : 0n
+      const page: PolledMessage[] = []
+      for (let offset = from; offset <= depth && page.length < count; offset += 1n) {
+        page.push(offset === depth ? reply : filler(offset))
+      }
+      return Promise.resolve(page)
+    }
+  }
+  const found = await findAgdxReply(transport as LaserTransport, "stream", "replies", correlation)
+  assert.equal(
+    new TextDecoder().decode(found.kind === "found" ? found.envelope.body : undefined),
+    "deep"
+  )
+})
+
+void test("given_a_reply_topic_longer_than_the_scan_bound_when_looked_up_then_should_report_incomplete", async () => {
+  const correlation = CorrelationId.fromU128(0x0499n)
+  const other = CorrelationId.fromU128(0x0500n)
+  // Every poll returns another unrelated reply, so the scan never ends.
+  const endless: Pick<LaserTransport, "findTopicPartitionCount" | "pollMessages"> = {
+    findTopicPartitionCount: () => Promise.resolve(1),
+    pollMessages(
+      _streamId: string,
+      _topicId: string,
+      _target: ConsumerTarget,
+      strategy: ConsumerStart
+    ): Promise<readonly PolledMessage[]> {
+      const from = strategy.kind === "offset" ? strategy.value : 0n
+      return Promise.resolve([agdxReply(other, "unrelated", from)])
+    }
+  }
+  assert.deepEqual(
+    await findAgdxReply(endless as LaserTransport, "stream", "replies", correlation),
+    { kind: "incomplete" }
+  )
+})
+
+void test("given_no_waiter_when_the_hub_is_idle_then_should_not_poll_until_a_subscribe", async () => {
+  const polls = { offset: 0 }
+  const transport = fakeTransport([{ strategy: "last", result: [] }])
+  const scripted = transport.pollMessages.bind(transport)
+  // Assigned onto the fake, so its throwing getters are never read.
+  Object.assign(transport, {
+    pollMessages(
+      streamId: string,
+      topicId: string,
+      target: ConsumerTarget,
+      strategy: ConsumerStart
+    ): Promise<readonly PolledMessage[]> {
+      if (strategy.kind === "offset") polls.offset += 1
+      return scripted(streamId, topicId, target, strategy, 1, false)
+    }
+  })
+  const hub = await ReplyHub.create(transport, "stream", "idle")
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.equal(polls.offset, 0, "an idle hub parks")
+    hub.subscribe("corr-idle")
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.notEqual(polls.offset, 0, "a subscribe wakes the dispatcher")
+  } finally {
+    hub.stop()
+  }
+})
+
+void test("given_an_idle_pass_over_two_reply_partitions_when_a_reply_lands_on_one_then_should_deliver_it_while_the_other_read_is_held", async () => {
+  const waits: number[] = []
+  let cancelled = 0
+  let held = 0
+  const transport = fakeTransport([])
+  Object.assign(transport, {
+    findTopicPartitionCount: () => Promise.resolve(2),
+    pollMessages(
+      _streamId: string,
+      _topicId: string,
+      target: ConsumerTarget,
+      strategy: ConsumerStart,
+      _count: number,
+      _commit: boolean,
+      wait?: PollWait,
+      signal?: AbortSignal
+    ): Promise<readonly PolledMessage[]> {
+      if (strategy.kind !== "offset") return Promise.resolve([])
+      waits.push(wait?.maxWaitMs ?? 0)
+      if ((wait?.maxWaitMs ?? 0) === 0)
+        return new Promise((resolve) =>
+          setTimeout(() => {
+            resolve([])
+          }, 1)
+        )
+      held += 1
+      if (target.partitionId === 1 && held <= 2) {
+        return new Promise((resolve) =>
+          setTimeout(() => {
+            resolve([{ ...replyMessage("corr-held", 0n), partitionId: 1 }])
+          }, 10)
+        )
+      }
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          cancelled += 1
+          reject(new Error("cancelled"))
+        })
+      })
+    }
+  })
+  const hub = await ReplyHub.create(transport, "stream", "held")
+  try {
+    const started = performance.now()
+    const reply = await hub.subscribe("corr-held").wait(2_000)
+    assert.equal(reply.provenance.correlationId, "corr-held")
+    assert.ok(
+      performance.now() - started < 1_000,
+      "the reply arrives without waiting out the other read"
+    )
+  } finally {
+    hub.stop()
+  }
+  assert.deepEqual(
+    waits.slice(0, 4),
+    [0, 0, 5_000, 5_000],
+    "an idle pass holds one read per partition"
+  )
+  assert.ok(cancelled >= 1, "the read still held is cancelled")
+})
+
+void test("given_a_hub_holding_reads_for_a_waiter_when_stopped_then_should_cancel_every_read_end_the_wait_and_keep_no_timer", async () => {
+  let holding = 0
+  let cancelled = 0
+  let allHeld: () => void = () => undefined
+  const held = new Promise<void>((resolve) => {
+    allHeld = resolve
+  })
+  const transport = fakeTransport([])
+  Object.assign(transport, {
+    findTopicPartitionCount: () => Promise.resolve(2),
+    pollMessages(
+      _streamId: string,
+      _topicId: string,
+      _target: ConsumerTarget,
+      strategy: ConsumerStart,
+      _count: number,
+      _commit: boolean,
+      wait?: PollWait,
+      signal?: AbortSignal
+    ): Promise<readonly PolledMessage[]> {
+      if (strategy.kind !== "offset" || (wait?.maxWaitMs ?? 0) === 0) return Promise.resolve([])
+      holding += 1
+      if (holding === 2) allHeld()
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          cancelled += 1
+          reject(new Error("cancelled"))
+        })
+      })
+    }
+  })
+  const timers = (): number =>
+    process.getActiveResourcesInfo().filter((resource) => resource === "Timeout").length
+  const before = timers()
+  const hub = await ReplyHub.create(transport, "stream", "closing")
+  const reply = hub.subscribe("corr-closing").wait(60_000)
+  await held
+  const started = performance.now()
+  hub.stop()
+  await assert.rejects(reply, TimeoutError)
+  assert.ok(performance.now() - started < 1_000, "the wait ends with the hub, not at its timeout")
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(cancelled, 2, "every held read is cancelled")
+  assert.equal(timers(), before, "a stopped hub keeps no timer")
+})
+
+void test("given_held_reads_for_reply_waiters_when_the_last_waiter_leaves_then_should_cancel_them_and_hold_nothing_while_idle", async () => {
+  let holding = 0
+  let cancelled = 0
+  const transport = fakeTransport([])
+  Object.assign(transport, {
+    findTopicPartitionCount: () => Promise.resolve(2),
+    pollMessages(
+      _streamId: string,
+      _topicId: string,
+      _target: ConsumerTarget,
+      strategy: ConsumerStart,
+      _count: number,
+      _commit: boolean,
+      wait?: PollWait,
+      signal?: AbortSignal
+    ): Promise<readonly PolledMessage[]> {
+      if (strategy.kind !== "offset" || (wait?.maxWaitMs ?? 0) === 0) return Promise.resolve([])
+      holding += 1
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          cancelled += 1
+          reject(new Error("cancelled"))
+        })
+      })
+    }
+  })
+  const open = (): number => holding - cancelled
+  const hub = await ReplyHub.create(transport, "stream", "released")
+  try {
+    const first = hub.subscribe("corr-first")
+    const second = hub.subscribe("corr-second")
+    await until(() => open() === 2, 1_000)
+    await assert.rejects(first.wait(20), TimeoutError)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(open(), 2, "a remaining waiter keeps the reads held")
+    second.cancel()
+    await until(() => open() === 0, 1_000)
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.equal(holding, 2, "an idle hub holds nothing")
+    hub.subscribe("corr-third")
+    await until(() => open() === 2, 1_000)
+  } finally {
+    hub.stop()
+  }
+})
+
+async function until(condition: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = performance.now() + timeoutMs
+  while (!condition()) {
+    if (performance.now() >= deadline) throw new Error(`not true within ${String(timeoutMs)} ms`)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}

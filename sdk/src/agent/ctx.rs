@@ -16,6 +16,11 @@ pub struct AgentCtx<'a> {
     agent: Option<AgentId>,
     respond_on: Option<AgentTopic<'static>>,
     inbox_route: InboxRoute,
+    request_at: Option<laser_wire::agent::LogPosition>,
+    // The runtime's session factory and control state, when a reliable
+    // consumer handed this context to its handler.
+    sessions: Option<crate::agent::Sessions>,
+    control: Option<std::sync::Arc<crate::agent::control::ControlBook>>,
     #[cfg(feature = "sign")]
     signing_key: Option<std::sync::Arc<crate::sign::SigningKey>>,
 }
@@ -35,9 +40,36 @@ impl<'a> AgentCtx<'a> {
             agent,
             respond_on,
             inbox_route,
+            request_at: None,
+            sessions: None,
+            control: None,
             #[cfg(feature = "sign")]
             signing_key,
         }
+    }
+
+    // The session factory and control state of the runtime handling the
+    // record, so `session` follows its configuration and control requests.
+    pub(crate) fn with_sessions(
+        mut self,
+        sessions: crate::agent::Sessions,
+        control: std::sync::Arc<crate::agent::control::ControlBook>,
+    ) -> Self {
+        self.sessions = Some(sessions);
+        self.control = Some(control);
+        self
+    }
+
+    /// Where the handled record sits on the log, when the runtime knows it.
+    pub fn request_at(&self) -> Option<laser_wire::agent::LogPosition> {
+        self.request_at
+    }
+
+    // Where the handled record sits on the log, stamped on typed replies as
+    // their causal position.
+    pub(crate) fn with_request_at(mut self, at: laser_wire::agent::LogPosition) -> Self {
+        self.request_at = Some(at);
+        self
     }
 
     /// The `Laser` handle, for operations the ctx helpers do not cover (`kv`, `query`, ...).
@@ -50,6 +82,34 @@ impl<'a> AgentCtx<'a> {
         self.message
     }
 
+    /// The session of the handled record, written as this agent and acting on
+    /// the handled record: graph writes take it as source and remembered
+    /// items as origin. A lens only: it holds no lease and starts no
+    /// heartbeat. Its [`pending_control`](crate::agent::Session::pending_control)
+    /// reports the pause and cancel requests the runtime observed.
+    pub fn session(&self) -> crate::agent::Session {
+        let conversation = self.message.provenance.conversation_id;
+        let mut session = match &self.sessions {
+            Some(sessions) => sessions.open(conversation),
+            None => self.laser.sessions().open(conversation),
+        };
+        session.control.clone_from(&self.control);
+        if let Some(agent) = &self.agent {
+            session = session.as_agent(agent.wire_id());
+        }
+        if let Some(at) = self.request_at {
+            session = session.acting_on(laser_wire::graph::SourceRef::Message {
+                stream: at.stream_id,
+                topic: at.topic_id,
+                partition: at.partition_id,
+                offset: at.offset,
+                generation: None,
+                conversation: Some(self.message.provenance.conversation_id.to_string()),
+            });
+        }
+        session
+    }
+
     /// Reply on the agent's configured `respond_on` topic, chaining causality
     /// (causal_parent = this message) and routing back to its sender. Errors with
     /// `NoRespondTopic` if the agent was built without `respond_on`.
@@ -60,29 +120,28 @@ impl<'a> AgentCtx<'a> {
     pub async fn respond(&self, payload: impl Into<Vec<u8>>) -> Result<(), LaserError> {
         let topic = self.respond_on.clone().ok_or(LaserError::NoRespondTopic)?;
         let payload = payload.into();
-        // Sign only when answering an AGDX command (a directed contract or
-        // workflow step): the caller awaits the envelope correlation and, under a
-        // verifier, refuses an unsigned terminal. A plain request (fan-out branch,
-        // `Laser::request`) carries no envelope and is matched by the string
-        // correlation on the reply hub, so it keeps the plain reply.
-        #[cfg(feature = "sign")]
-        if let Some(key) = &self.signing_key
-            && let Some(envelope) = &self.message.envelope
+        // A typed request gets a typed response: correlated, addressed to the
+        // requester, and caused by the request's log position. A plain request
+        // gets a plain reply matched by its string correlation.
+        if let Some(envelope) = &self.message.envelope
             && let Some(correlation) = envelope.correlation
         {
             let source = self.agent.as_ref().ok_or_else(|| {
-                LaserError::HandlerConfig("a signing agent must have an id".to_owned())
+                LaserError::HandlerConfig("a responding agent must have an id".to_owned())
             })?;
-            let producer = self.laser.agdx(
-                topic,
-                source.wire_id(),
-                self.message.provenance.conversation_id.into(),
-            );
+            let producer = self
+                .laser
+                .agdx(topic, source.wire_id(), envelope.conversation);
             let mut send = producer
-                .respond(correlation, payload.to_vec())
-                .signed_by(key);
-            if let Some(target) = &self.message.provenance.agent {
-                send = send.with_target(target.wire_id());
+                .respond(correlation, payload)
+                .with_target(envelope.source.clone())
+                .with_ancestry(envelope.parent, envelope.root);
+            if let Some(record) = envelope.record {
+                send = send.with_cause(record, self.request_at);
+            }
+            #[cfg(feature = "sign")]
+            if let Some(key) = &self.signing_key {
+                send = send.signed_by(key);
             }
             return send.send().await.map(|_| ());
         }
@@ -100,7 +159,10 @@ impl<'a> AgentCtx<'a> {
         topic: AgentTopic<'_>,
         payload: impl Into<Vec<u8>>,
     ) -> Result<(), LaserError> {
-        let provenance = self.reply_provenance();
+        let mut provenance = self.reply_provenance();
+        if let Some(source) = &self.message.provenance.agent {
+            Router::to(source.clone()).apply(&mut provenance);
+        }
         self.laser.send_agent(topic, payload, &provenance).await
     }
 
@@ -160,7 +222,13 @@ impl<'a> AgentCtx<'a> {
             })?
             .wire_id();
         let producer = self.laser.agdx(reply_topic, source, envelope.conversation);
-        let send = producer.respond(correlation, response.into());
+        let mut send = producer
+            .respond(correlation, response.into())
+            .with_target(envelope.source.clone())
+            .with_ancestry(envelope.parent, envelope.root);
+        if let Some(record) = envelope.record {
+            send = send.with_cause(record, self.request_at);
+        }
         #[cfg(feature = "sign")]
         let send = match &self.signing_key {
             Some(key) => send.signed_by(key),
@@ -192,7 +260,7 @@ impl<'a> AgentCtx<'a> {
             .wire_id();
         self.laser
             .agdx(
-                AgentTopic::HumanInput,
+                AgentTopic::Sessions,
                 source,
                 self.message.provenance.conversation_id.into(),
             )
@@ -201,8 +269,13 @@ impl<'a> AgentCtx<'a> {
     }
 
     /// A child conversation of the handled message, linked by parent/root ids.
-    pub fn spawn_subconversation(&self) -> Provenance {
-        self.laser.spawn_subconversation(&self.message.provenance)
+    pub fn spawn_subconversation(&self) -> Result<Provenance, LaserError> {
+        let author = self.agent.as_ref().ok_or_else(|| {
+            LaserError::HandlerConfig("spawn_subconversation: the agent has no id".to_owned())
+        })?;
+        Ok(self
+            .laser
+            .spawn_subconversation(&self.message.provenance, author))
     }
 
     /// Fan out to every agent advertising `selector`'s skill, gathering replies
@@ -243,6 +316,10 @@ impl<'a> AgentCtx<'a> {
             registry.refresh_presence().await?;
         }
         let targets = Router::AllCapable(selector).resolve_targets(&registry, now)?;
+        let author = self
+            .agent
+            .clone()
+            .ok_or_else(|| LaserError::HandlerConfig("fan_out: the agent has no id".to_owned()))?;
 
         let mut gather = Gather::default();
 
@@ -262,9 +339,10 @@ impl<'a> AgentCtx<'a> {
             let laser = self.laser.clone();
             let body = payload.clone();
             let parent = self.message.provenance.clone();
+            let author = author.clone();
             let reply_topic = reply_topic.clone();
             branches.spawn(async move {
-                let mut provenance = laser.spawn_subconversation(&parent);
+                let mut provenance = laser.spawn_subconversation(&parent, &author);
                 provenance.target_agent_id = Some(agent.clone());
                 // A distinct correlation per branch so replies never cross.
                 provenance.correlation_id = Some(ulid::Ulid::generate().to_string());
@@ -290,13 +368,23 @@ impl<'a> AgentCtx<'a> {
             .causal_parent(self.message.id)
             .build();
         provenance.agent = self.agent.clone();
+        provenance.parent_conversation_id = self.message.provenance.parent_conversation_id;
         provenance.root_conversation_id = self.message.provenance.root_conversation_id;
         // Echo the request's correlation back so the caller's request/reply
         // correlator can identify this reply unambiguously. Without this a reply
         // with only conversation_id matching would be hijackable when multiple
         // agents share a reply topic. The request's business idempotency_key is
-        // deliberately NOT echoed: the reply is its own operation.
-        provenance.correlation_id = self.message.provenance.correlation_id.clone();
+        // deliberately NOT echoed: the reply is its own operation. A request
+        // without a correlation gets its own position as one, so the reply
+        // names both its cause and a correlation and every reader classifies
+        // it as a reply, never as new work.
+        provenance.correlation_id = Some(
+            self.message
+                .provenance
+                .correlation_id
+                .clone()
+                .unwrap_or_else(|| self.message.id.to_string()),
+        );
         provenance
     }
 }
@@ -386,6 +474,33 @@ fn quorum_satisfied(policy: GatherPolicy, successes: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_a_child_conversation_when_replying_then_should_keep_parent_and_root() {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        let root = crate::types::ConversationId::new();
+        let parent = crate::types::ConversationId::new();
+        let child = crate::types::ConversationId::new();
+        let provenance = Provenance::builder()
+            .conversation_id(child)
+            .parent_conversation_id(parent)
+            .root_conversation_id(root)
+            .build();
+        let message = crate::testing::agent_message(b"request".to_vec(), provenance);
+        let ctx = AgentCtx::new(
+            &laser,
+            &message,
+            Some("worker".parse().expect("agent id parses")),
+            None,
+            InboxRoute::default(),
+            #[cfg(feature = "sign")]
+            None,
+        );
+
+        let reply = ctx.reply_provenance();
+        assert_eq!(reply.parent_conversation_id, Some(parent));
+        assert_eq!(reply.root_conversation_id, Some(root));
+    }
 
     #[test]
     fn given_require_all_when_checking_quorum_then_should_never_short_circuit() {

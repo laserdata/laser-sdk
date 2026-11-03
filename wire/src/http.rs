@@ -5,6 +5,8 @@ use crate::checkpoint::{
 use crate::destination::{
     DestinationId, DestinationOperationId, MaterializationDestination, QueryRoute,
 };
+use crate::error::InvalidError;
+use crate::filter::FilterGroupIdentity;
 use crate::fork::{ForkError, ForkKind};
 use crate::graph::SourceRef;
 use crate::hello::{BackendDescriptor, FilterAnnounce, OpVersions};
@@ -15,6 +17,7 @@ use crate::schema::{Digest32, LogicalSchema, TypedValue, UuidValue};
 use crate::topology::WireTopology;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::num::NonZeroU128;
 
 /// `GET /agdx/capabilities`: the feature-detection probe.
 pub const CAPABILITIES_PATH: &str = "/agdx/capabilities";
@@ -36,14 +39,12 @@ pub const KV_PATH: &str = "/agdx/kv";
 pub const FORKS_PATH: &str = "/agdx/forks";
 /// `GET /agdx/graphs` to list graph projections, `POST` to register.
 pub const GRAPHS_PATH: &str = "/agdx/graphs";
+/// Prefix of the graph traversal and neighbor routes, `/agdx/graph/{name}/...`.
+pub const GRAPH_PATH: &str = "/agdx/graph";
 /// `GET /agdx/clients` to list live connections with their advertised metadata,
 /// filtered and paginated by query parameters. The HTTP face of the
 /// `AGDX_GET_CLIENTS_METADATA` discovery read.
 pub const CLIENTS_PATH: &str = "/agdx/clients";
-/// `GET /agdx/runs` to list runs (filtered and paged, [`RunsQuery`]), `POST`
-/// to submit one (a JSON `AgentSubmit` body). The HTTP face of the
-/// `AGDX_AGENT_*` run-registry band.
-pub const RUNS_PATH: &str = "/agdx/runs";
 /// `GET /agdx/authz/whoami`: the caller's effective governance roles and grants.
 pub const AUTHZ_WHOAMI_PATH: &str = "/agdx/authz/whoami";
 /// `GET /agdx/authz/roles`: list governance roles.
@@ -63,6 +64,40 @@ pub const FILTER_PREVIEW_PATH: &str = "/agdx/filters/preview";
 pub const FILTER_BINDINGS_PATH: &str = "/agdx/filter-bindings";
 /// `GET /agdx/group-policies/{stream}/{topic}/{group}`: confirmed group policy.
 pub const GROUP_POLICIES_PATH: &str = "/agdx/group-policies";
+/// Base path for reads of sessions in one named stream.
+pub const SESSIONS_PATH: &str = "/agdx/sessions";
+
+pub fn sessions_path(stream: &str) -> String {
+    format!("{SESSIONS_PATH}/{}", path_segment(stream))
+}
+
+pub fn session_changes_path(stream: &str) -> String {
+    format!("{}/changes", sessions_path(stream))
+}
+
+pub fn session_path(stream: &str, id: crate::agent::ConversationId) -> String {
+    format!(
+        "{}/{}",
+        sessions_path(stream),
+        path_segment(&id.to_string())
+    )
+}
+
+pub fn session_events_path(stream: &str, id: crate::agent::ConversationId) -> String {
+    format!("{}/events", session_path(stream, id))
+}
+
+pub fn session_state_path(stream: &str, id: crate::agent::ConversationId) -> String {
+    format!("{}/state", session_path(stream, id))
+}
+
+pub fn session_links_path(stream: &str, id: crate::agent::ConversationId) -> String {
+    format!("{}/links", session_path(stream, id))
+}
+
+pub fn session_sources_path(stream: &str, id: crate::agent::ConversationId) -> String {
+    format!("{}/sources", session_path(stream, id))
+}
 
 /// `GET /agdx/filters/{id}`.
 pub fn filter_path(id: u32) -> String {
@@ -423,7 +458,7 @@ pub enum DestinationHttpOperation {
     GetMetrics,
 }
 
-/// One closed destination HTTP operation forwarded from Iggy to Plane.
+/// One closed destination HTTP operation forwarded from the streaming server to the managed backend.
 ///
 /// The operation enum prevents arbitrary paths or methods from crossing the
 /// sidecar boundary. Path parameters stay textual, while query and body carry
@@ -437,7 +472,7 @@ pub struct DestinationHttpRequest {
     pub body: Vec<u8>,
 }
 
-/// Plane's HTTP-shaped response for one [`DestinationHttpRequest`].
+/// The managed backend's HTTP-shaped response for one [`DestinationHttpRequest`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DestinationHttpReply {
     pub status: u16,
@@ -454,24 +489,30 @@ pub fn authz_user_roles_path(user_id: u32) -> String {
     format!("/agdx/authz/users/{user_id}/roles")
 }
 
-/// `DELETE`/`GET /agdx/graphs/{id}`: drop or read a graph projection.
+/// `DELETE`/`GET /agdx/graphs/{id}`: drop or read a graph projection. The id
+/// is percent-encoded as one path segment, like every name below, because a
+/// stream-scoped name holds `/`.
 pub fn graph_path(id: &str) -> String {
-    format!("{GRAPHS_PATH}/{id}")
+    format!("{GRAPHS_PATH}/{}", path_segment(id))
 }
 
 /// `POST /agdx/graph/{name}/query`: run a traversal (a `GraphQuery` body).
 pub fn graph_query_path(name: &str) -> String {
-    format!("/agdx/graph/{name}/query")
+    format!("{GRAPH_PATH}/{}/query", path_segment(name))
 }
 
 /// `GET /agdx/graph/{name}/neighbors/{node}`: one-hop neighbor read.
 pub fn graph_neighbors_path(name: &str, node: &str) -> String {
-    format!("/agdx/graph/{name}/neighbors/{node}")
+    format!(
+        "{GRAPH_PATH}/{}/neighbors/{}",
+        path_segment(name),
+        path_segment(node)
+    )
 }
 
 /// `GET`/`DELETE /agdx/projections/{id}`.
 pub fn projection_path(id: &str) -> String {
-    format!("{PROJECTIONS_PATH}/{id}")
+    format!("{PROJECTIONS_PATH}/{}", path_segment(id))
 }
 
 /// `GET`/`DELETE /agdx/schemas/{id}`.
@@ -486,14 +527,14 @@ pub fn schema_decode_path(id: u32) -> String {
 
 /// `GET /agdx/kv/{namespace}` to scan, `DELETE` to bulk-delete.
 pub fn kv_namespace_path(namespace: &str) -> String {
-    format!("{KV_PATH}/{namespace}")
+    format!("{KV_PATH}/{}", path_segment(namespace))
 }
 
 /// `GET`/`PUT`/`DELETE /agdx/kv/{namespace}/{key}`. `key` is the URL-safe
 /// unpadded base64 form of the key bytes, the encoding this surface uses for
 /// every binary body.
 pub fn kv_entry_path(namespace: &str, key_b64: &str) -> String {
-    format!("{KV_PATH}/{namespace}/{key_b64}")
+    format!("{}/{}", kv_namespace_path(namespace), path_segment(key_b64))
 }
 
 /// `PUT /agdx/kv/{namespace}/{key}/cas`: a conditional write (compare-and-swap).
@@ -503,32 +544,22 @@ pub fn kv_entry_path(namespace: &str, key_b64: &str) -> String {
 /// with an `ErrorBody` of code `conflict` whose `detail` carries the current
 /// version.
 pub fn kv_cas_path(namespace: &str, key_b64: &str) -> String {
-    format!("{KV_PATH}/{namespace}/{key_b64}/cas")
+    format!("{}/cas", kv_entry_path(namespace, key_b64))
 }
 
 /// `DELETE /agdx/forks/{id}`.
 pub fn fork_path(id: &str) -> String {
-    format!("{FORKS_PATH}/{id}")
+    format!("{FORKS_PATH}/{}", path_segment(id))
 }
 
 /// `POST /agdx/forks/{id}/promote`.
 pub fn fork_promote_path(id: &str) -> String {
-    format!("{FORKS_PATH}/{id}/promote")
+    format!("{}/promote", fork_path(id))
 }
 
 /// `PUT /agdx/forks/{id}/rows`.
 pub fn fork_rows_path(id: &str) -> String {
-    format!("{FORKS_PATH}/{id}/rows")
-}
-
-/// `GET /agdx/runs/{id}`: read one run's status.
-pub fn run_path(id: &str) -> String {
-    format!("{RUNS_PATH}/{id}")
-}
-
-/// `POST /agdx/runs/{id}/cancel`: record the cancel intent on a run.
-pub fn run_cancel_path(id: &str) -> String {
-    format!("{RUNS_PATH}/{id}/cancel")
+    format!("{}/rows", fork_path(id))
 }
 
 /// `GET /agdx/capabilities` reply: what the `/agdx/*` surface offers on this
@@ -540,7 +571,7 @@ pub fn run_cancel_path(id: &str) -> String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Capabilities {
-    /// Connected to a managed plane at all (the root: with no plane every managed
+    /// Connected to a managed backend at all (the root: with no backend every managed
     /// surface below is off, and the reply still answers `200` with `managed:
     /// false`).
     pub managed: bool,
@@ -558,10 +589,9 @@ pub struct Capabilities {
     pub graph: bool,
     /// Whether copy-on-write forks are served.
     pub fork: bool,
-    /// Whether the agent and workflow control band is served. Off until the plane
-    /// serves it (the engine is a later phase).
+    /// Whether managed session reads are served.
     #[serde(default)]
-    pub agent_workflow: bool,
+    pub sessions: bool,
     /// Whether the change feed is published (one change record per committed
     /// notifying projector batch on the changes topic). Off by default: a
     /// client that waits on an unpublished feed would wait forever.
@@ -773,7 +803,7 @@ impl Capabilities {
             },
             graph: false,
             fork: enabled,
-            agent_workflow: false,
+            sessions: false,
             watch: false,
             authz: false,
             filters: FilterCapsView::default(),
@@ -798,14 +828,6 @@ impl Capabilities {
         self
     }
 
-    /// Advertise that the agent and workflow control band is served. Off by
-    /// default: a server sets it only when it serves the band.
-    #[must_use]
-    pub fn with_agent_workflow(mut self, value: bool) -> Self {
-        self.agent_workflow = value;
-        self
-    }
-
     /// Set whether lexical keyword search is served on the query surface.
     #[must_use]
     pub fn with_query_keyword(mut self, value: bool) -> Self {
@@ -824,6 +846,13 @@ impl Capabilities {
     #[must_use]
     pub fn with_destinations(mut self, destinations: DestinationCapsView) -> Self {
         self.destinations = destinations;
+        self
+    }
+
+    /// Advertise that managed session reads are served.
+    #[must_use]
+    pub fn with_sessions(mut self, value: bool) -> Self {
+        self.sessions = value;
         self
     }
 
@@ -910,9 +939,9 @@ impl Capabilities {
             .with_kv_cas(versions.has_feature(feature::KV_CAS))
             .with_kv_cas_fenced(versions.has_feature(feature::KV_CAS_FENCED))
             .with_kv_fenced_leases(versions.has_feature(feature::KV_FENCED_LEASES))
-            .with_agent_workflow(versions.has_feature(feature::AGENT_WORKFLOW))
             .with_query_keyword(versions.has_feature(feature::KEYWORD_SEARCH))
             .with_watch(versions.has_feature(feature::WATCH))
+            .with_sessions(enabled && versions.has_feature(feature::SESSIONS))
             .with_authz(versions.has_feature(feature::AUTHZ))
             .with_query_consistency(consistency)
             .with_destinations(DestinationCapsView {
@@ -966,16 +995,6 @@ pub struct KvEntryView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvPageView {
     pub entries: Vec<KvEntryView>,
-    pub cursor: Option<String>,
-}
-
-/// One page of runs on the HTTP surface: the rows (the binary `AgentRunInfo`
-/// is already JSON-safe) plus the next-page cursor as URL-safe unpadded
-/// base64, like every binary value on this surface. Absent cursor means the
-/// last page.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunPageView {
-    pub runs: Vec<crate::agent_workflow::AgentRunInfo>,
     pub cursor: Option<String>,
 }
 
@@ -1099,6 +1118,10 @@ pub struct RegisterSchemaBody {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
+    /// The stream whose registry allocates the id. Absent for the
+    /// deployment-wide registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// `POST /agdx/schemas/{id}/decode` body: the record payload as URL-safe
@@ -1220,8 +1243,14 @@ impl From<&ForkError> for ErrorBody {
     }
 }
 
-impl From<&crate::agent_workflow::AgentError> for ErrorBody {
-    fn from(error: &crate::agent_workflow::AgentError) -> Self {
+impl From<&crate::authz::AuthzError> for ErrorBody {
+    fn from(error: &crate::authz::AuthzError) -> Self {
+        Self::new(ResultCode::from(error), error.to_string())
+    }
+}
+
+impl From<&crate::session::SessionError> for ErrorBody {
+    fn from(error: &crate::session::SessionError) -> Self {
         Self::new(ResultCode::from(error), error.to_string())
     }
 }
@@ -1232,6 +1261,9 @@ pub const PARAM_TOPIC: &str = "topic";
 pub const PARAM_NAME_CONTAINS: &str = "name_contains";
 /// `?id_prefix=` on `GET /agdx/projections`: keep ids starting with the prefix.
 pub const PARAM_ID_PREFIX: &str = "id_prefix";
+/// `?stream=` on the schema routes: the stream whose writer-schema registry
+/// the request addresses. Absent addresses the deployment-wide registry.
+pub const PARAM_STREAM: &str = "stream";
 /// `?search=` on `GET /agdx/projections`: one substring matched against the
 /// projection name OR id. A console with a single filter box maps to it. A
 /// server matches it as `name_contains(name) OR id contains search`. Composes
@@ -1249,6 +1281,27 @@ pub const PARAM_KEY_CONTAINS: &str = "key_contains";
 pub const PARAM_LIMIT: &str = "limit";
 /// `?cursor=`: opaque continuation token from the prior page.
 pub const PARAM_CURSOR: &str = "cursor";
+/// `?status=` on a session list: one session status.
+pub const PARAM_STATUS: &str = "status";
+/// `?agent=` on a session list: sessions this agent took part in.
+pub const PARAM_AGENT: &str = "agent";
+/// `?text=` on a session list: a substring of the label or id.
+pub const PARAM_TEXT: &str = "text";
+/// `?root=` on a session list: the root of the session tree.
+pub const PARAM_ROOT: &str = "root";
+/// `?label_prefix=` on a session list: the start of the label.
+pub const PARAM_LABEL_PREFIX: &str = "label_prefix";
+/// `?surface=` on session links: one link surface.
+pub const PARAM_SURFACE: &str = "surface";
+/// `?after=` on session changes: the last change sequence already seen.
+pub const PARAM_AFTER: &str = "after";
+/// `?total=` on a session list: also count every match.
+pub const PARAM_TOTAL: &str = "total";
+/// `?fixed_frontier=` on session events: pin the fold frontier of the first
+/// page for a historical walk.
+pub const PARAM_FIXED_FRONTIER: &str = "fixed_frontier";
+/// `?history_limit=` on session state: the most history rows to return.
+pub const PARAM_HISTORY_LIMIT: &str = "history_limit";
 /// `?expires_at_micros=` on a KV `PUT`: absolute expiry, epoch microseconds.
 pub const PARAM_EXPIRES_AT_MICROS: &str = "expires_at_micros";
 /// `?expect_version=` on a KV compare-and-swap: apply only if the key holds
@@ -1264,6 +1317,11 @@ pub const PARAM_EXPECT_ABSENT: &str = "expect_absent";
 /// out-of-band metadata a single-key read needs. Owned here so the name is a
 /// wire constant rather than an unscoped string. Absent means no expiry.
 pub const KV_EXPIRES_AT_MICROS_HEADER: &str = "agdx-expires-at-micros";
+
+/// Request header an intermediary sets on a managed HTTP write to name the end
+/// user it writes for. The streaming server forwards it to the backend, which
+/// records it beside the authenticated user and never trusts it.
+pub const ON_BEHALF_OF_HEADER: &str = "agdx-on-behalf-of";
 
 /// `GET /agdx/projections` filters. Every field is optional, and an absent field is
 /// omitted from the query string (no empty `topic=`). Field names are the
@@ -1290,7 +1348,60 @@ pub struct ProjectionListQuery {
 pub struct SchemaListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_contains: Option<String>,
+    /// The stream whose registry is listed. Absent lists the deployment-wide
+    /// registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
+
+/// `?stream=` on `GET`/`DELETE /agdx/schemas/{id}` and
+/// `POST /agdx/schemas/{id}/decode`: the stream whose registry holds the id.
+/// Absent addresses the deployment-wide registry.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
+}
+
+/// `?operation_id=` on the HTTP managed writes: the projection, binding, graph,
+/// and schema-drop control writes, the key-value writes, and the fork writes.
+/// It names one logical write, so a re-sent request with the same id applies
+/// once. The value is the decimal text of a non-zero `u128`, the same text the
+/// filter routes use. A write without it gets a fresh id per request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+}
+
+impl OperationQuery {
+    /// The caller's operation id, or `None` when the request carries none.
+    pub fn operation_id(&self) -> Result<Option<NonZeroU128>, InvalidOperationId> {
+        self.operation_id
+            .as_deref()
+            .map(|text| {
+                // `u128::from_str` accepts a leading `+`, which no client sends.
+                if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(InvalidOperationId);
+                }
+                text.parse::<NonZeroU128>().map_err(|_| InvalidOperationId)
+            })
+            .transpose()
+    }
+}
+
+impl From<NonZeroU128> for OperationQuery {
+    fn from(operation_id: NonZeroU128) -> Self {
+        Self {
+            operation_id: Some(operation_id.to_string()),
+        }
+    }
+}
+
+/// An `?operation_id=` that is not the decimal text of a non-zero `u128`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("operation_id must be a non-zero decimal u128")]
+pub struct InvalidOperationId;
 
 /// `GET /agdx/filters` query parameters.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1302,10 +1413,65 @@ pub struct FilterListQuery {
     /// Only filters with a lower id, for stable paging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_id: Option<u32>,
+    /// The owner filter is the five fields of a group identity, all or none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_stream_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_stream_created_at_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_topic_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_topic_created_at_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_group_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<u32>,
+}
+
+impl FilterListQuery {
+    /// The owner filter, refused unless all five identity fields are set or none.
+    pub fn owner(&self) -> Result<Option<FilterGroupIdentity>, InvalidError> {
+        match (
+            self.owner_stream_id,
+            self.owner_stream_created_at_micros,
+            self.owner_topic_id,
+            self.owner_topic_created_at_micros,
+            self.owner_group_id,
+        ) {
+            (None, None, None, None, None) => Ok(None),
+            (
+                Some(stream_id),
+                Some(stream_created_at_micros),
+                Some(topic_id),
+                Some(topic_created_at_micros),
+                Some(group_id),
+            ) => Ok(Some(FilterGroupIdentity {
+                stream_id,
+                stream_created_at_micros,
+                topic_id,
+                topic_created_at_micros,
+                group_id,
+            })),
+            _ => Err(InvalidError::new(
+                "the owner filter needs owner_stream_id, owner_stream_created_at_micros, owner_topic_id, owner_topic_created_at_micros and owner_group_id together",
+            )),
+        }
+    }
+}
+
+impl From<FilterGroupIdentity> for FilterListQuery {
+    fn from(identity: FilterGroupIdentity) -> Self {
+        Self {
+            owner_stream_id: Some(identity.stream_id),
+            owner_stream_created_at_micros: Some(identity.stream_created_at_micros),
+            owner_topic_id: Some(identity.topic_id),
+            owner_topic_created_at_micros: Some(identity.topic_created_at_micros),
+            owner_group_id: Some(identity.group_id),
+            ..Self::default()
+        }
+    }
 }
 
 /// `GET /agdx/filters/{id}/revisions` query parameters.
@@ -1402,22 +1568,65 @@ pub struct GraphNeighborsQuery {
     pub conversation: Option<String>,
 }
 
-/// `GET /agdx/runs` filters: the binary `AgentList` rendered as query
-/// parameters. `state` is the snake-case
-/// [`AgentRunState`](crate::agent_workflow::AgentRunState) word, `cursor` is
-/// the base64url form of the opaque page cursor, like every binary value on
-/// this surface. One struct shared by the typed client and the server route,
-/// so the two cannot drift.
+/// Filters for `GET /agdx/sessions/{stream}`. The stream is the path
+/// segment. A `limit` of zero or none leaves the page size to the server.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunsQuery {
+pub struct SessionsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<String>,
+    pub status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<String>,
+    pub root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, rename = "total")]
+    pub want_total: bool,
+}
+
+/// Query of `GET /agdx/sessions/{stream}/{id}/events`. A `limit` of zero or
+/// none leaves the page size to the server.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEventsQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub fixed_frontier: bool,
+}
+
+/// Query of `GET /agdx/sessions/{stream}/{id}/state`. A `history_limit` of
+/// zero or none leaves the history size to the server.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStateQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_limit: Option<u32>,
+}
+
+/// Query of `GET /agdx/sessions/{stream}/{id}/links`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLinksQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
+}
+
+/// Query of `GET /agdx/sessions/{stream}/changes`. A `limit` of zero or none
+/// leaves the page size to the server.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionChangesQuery {
+    #[serde(default)]
+    pub after: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
+    pub series: Option<u64>,
 }
 
 /// `PUT /agdx/kv/{namespace}/{key}/cas` query: the compare-and-swap precondition
@@ -1446,6 +1655,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn given_a_filter_list_query_when_the_owner_is_complete_or_partial_then_should_resolve_or_refuse()
+     {
+        let identity = FilterGroupIdentity {
+            stream_id: 1,
+            stream_created_at_micros: 10,
+            topic_id: 2,
+            topic_created_at_micros: 20,
+            group_id: 3,
+        };
+        let query = FilterListQuery::from(identity);
+        assert_eq!(query.owner().expect("complete owner"), Some(identity));
+        assert_eq!(FilterListQuery::default().owner().expect("no owner"), None);
+        let partial = FilterListQuery {
+            owner_group_id: None,
+            ..query
+        };
+        assert!(partial.owner().is_err());
+    }
+
+    #[test]
     fn given_path_builders_when_rendered_then_should_match_the_router() {
         assert_eq!(CAPABILITIES_PATH, "/agdx/capabilities");
         assert_eq!(
@@ -1466,6 +1695,74 @@ mod tests {
         assert_eq!(fork_path("f1"), "/agdx/forks/f1");
         assert_eq!(fork_promote_path("f1"), "/agdx/forks/f1/promote");
         assert_eq!(fork_rows_path("f1"), "/agdx/forks/f1/rows");
+    }
+
+    #[test]
+    fn given_an_operation_id_when_rendered_and_parsed_then_should_round_trip() {
+        let operation_id = NonZeroU128::new(u128::MAX).expect("non-zero");
+        let query = OperationQuery::from(operation_id);
+        assert_eq!(
+            query.operation_id.as_deref(),
+            Some("340282366920938463463374607431768211455")
+        );
+        assert_eq!(query.operation_id(), Ok(Some(operation_id)));
+        assert_eq!(OperationQuery::default().operation_id(), Ok(None));
+    }
+
+    #[test]
+    fn given_a_malformed_operation_id_when_parsed_then_should_refuse_it() {
+        for text in [
+            "",
+            "0",
+            "+7",
+            "-7",
+            " 7",
+            "0x7",
+            "7.0",
+            "340282366920938463463374607431768211456",
+        ] {
+            let query = OperationQuery {
+                operation_id: Some(text.to_owned()),
+            };
+            assert_eq!(query.operation_id(), Err(InvalidOperationId), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn given_stream_scoped_names_when_rendered_then_should_encode_each_as_one_segment() {
+        assert_eq!(
+            kv_namespace_path("stream:acme/support"),
+            "/agdx/kv/stream%3Aacme%2Fsupport"
+        );
+        assert_eq!(
+            kv_cas_path("stream:acme/support", "dXNlcjo0Mg"),
+            "/agdx/kv/stream%3Aacme%2Fsupport/dXNlcjo0Mg/cas"
+        );
+        assert_eq!(
+            graph_neighbors_path("stream:acme/kg", "a/b"),
+            "/agdx/graph/stream%3Aacme%2Fkg/neighbors/a%2Fb"
+        );
+        assert_eq!(
+            graph_query_path("stream:acme/kg"),
+            "/agdx/graph/stream%3Aacme%2Fkg/query"
+        );
+        assert_eq!(
+            graph_path("stream:acme/kg"),
+            "/agdx/graphs/stream%3Aacme%2Fkg"
+        );
+        assert_eq!(
+            projection_path("stream:acme/readings"),
+            "/agdx/projections/stream%3Aacme%2Freadings"
+        );
+    }
+
+    #[test]
+    fn given_the_sessions_feature_when_built_from_versions_then_should_advertise_sessions() {
+        let mut versions = OpVersions::new(1, 1, 1, 1);
+        assert!(!Capabilities::from_versions(true, versions).sessions);
+        versions.features |= crate::hello::feature::SESSIONS;
+        assert!(Capabilities::from_versions(true, versions).sessions);
+        assert!(!Capabilities::from_versions(false, versions).sessions);
     }
 
     #[test]
@@ -1651,10 +1948,52 @@ mod tests {
 
         let schemas = SchemaListQuery {
             name_contains: Some("Reading".to_owned()),
+            stream: None,
         };
         assert_eq!(
             serde_urlencoded::to_string(&schemas).expect("encodes"),
             "name_contains=Reading"
         );
+        let scoped = SchemaListQuery {
+            name_contains: None,
+            stream: Some("acme".to_owned()),
+        };
+        assert_eq!(
+            serde_urlencoded::to_string(&scoped).expect("encodes"),
+            format!("{PARAM_STREAM}=acme")
+        );
+        assert_eq!(
+            serde_urlencoded::to_string(SchemaQuery::default()).expect("encodes"),
+            ""
+        );
+        assert_eq!(
+            serde_urlencoded::to_string(SchemaQuery {
+                stream: Some("acme".to_owned()),
+            })
+            .expect("encodes"),
+            format!("{PARAM_STREAM}=acme")
+        );
+    }
+
+    #[test]
+    fn given_a_register_schema_body_without_a_stream_when_encoded_then_should_omit_it() {
+        let body = RegisterSchemaBody {
+            source: crate::control::SchemaSource::JsonSchema {
+                schema: "{}".to_owned(),
+            },
+            name: None,
+            version: None,
+            stream: None,
+        };
+        let json = serde_json::to_string(&body).expect("encodes");
+        assert!(
+            !json.contains("stream"),
+            "an unset stream is omitted: {json}"
+        );
+        let scoped: RegisterSchemaBody = serde_json::from_str(
+            r#"{"source":{"kind":"json_schema","schema":"{}"},"stream":"acme"}"#,
+        )
+        .expect("decodes");
+        assert_eq!(scoped.stream.as_deref(), Some("acme"));
     }
 }

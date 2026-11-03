@@ -1,4 +1,4 @@
-# fleet-tape - live fleet view + reading-tape analytics
+# fleet-tape: live fleet view and reading-tape analytics
 
 This example sends host CPU readings to a live fleet-view reader and a reading-history topic. Managed deployments also support analytics and schema-based publication.
 
@@ -29,7 +29,7 @@ LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host cargo run --example f
 
 ## Highlights
 
-- `topic.producer()` tuned for a feed (balanced routing, bounded retries) and `topic.consumer_group(group)` with a tight `poll_interval` for low reading-to-view latency.
+- `topic.producer()` tuned for a feed (balanced routing, bounded retries) and `topic.consumer_group(group)`, whose held reads answer as soon as a reading lands, for low reading-to-view latency.
 - The feed runs concurrently with the view reader, so the view updates in real time as readings arrive rather than after a batch lands.
 - `laser.topic(topic).publish_batch()` feeds the tape in batches of indexed records with inline bodies, each batch one `send_messages` call, spread across partitions by the balanced partitioner.
 - `query(topic).sum(field).group_by([..])`, with the mean CPU derived from two grouped sums (weighted CPU total over samples).

@@ -34,6 +34,11 @@ export function publishOptions(
   return resolved
 }
 
+/** The pause before retry `attempt`, counted from zero: the backoff doubled per attempt and capped at 30 seconds. */
+export function retryDelayMs(options: PublishOptions, attempt: number): number {
+  return Math.min(options.retryBackoffMs * 2 ** Math.min(attempt, 16), 30_000)
+}
+
 export async function publishWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {

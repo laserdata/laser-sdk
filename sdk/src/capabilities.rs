@@ -19,16 +19,16 @@ pub use laser_wire::hello::{
 ///
 /// Capabilities are grouped by where they live and what they depend on, rather
 /// than a flat list of unrelated flags. [`managed`](Self::managed) is the root
-/// (connected to a managed plane at all). The managed surfaces ([`query`](Self::query),
+/// (connected to a managed backend at all). The managed surfaces ([`query`](Self::query),
 /// [`kv`](Self::kv), [`graph`](Self::graph), [`forks`](Self::forks),
-/// [`a2a_gateway`](Self::a2a_gateway)) are served by that plane. A surface's
+/// [`a2a_gateway`](Self::a2a_gateway)) are served by that backend. A surface's
 /// sub-features nest under it ([`QueryCaps::consistency`], [`KvCaps::cas`]) so a
 /// dependent feature cannot be advertised apart from the surface it refines.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Capabilities {
-    /// Connected to a managed plane (LaserData Cloud). The root managed switch:
-    /// with no plane, every managed surface below is unavailable.
+    /// Connected to a managed backend (LaserData Cloud). The root managed switch:
+    /// with no backend, every managed surface below is unavailable.
     pub managed: bool,
     /// The managed query surface (`Laser::query`) and the read-consistency it
     /// serves.
@@ -45,9 +45,11 @@ pub struct Capabilities {
     pub forks: bool,
     /// A managed A2A gateway (auth, streaming, persisted task store).
     pub a2a_gateway: bool,
-    /// The managed run registry (`Laser::runs` submit / cancel / status /
-    /// list). Off when the plane does not serve the band.
-    pub agent_workflow: bool,
+    /// Managed reads of agent sessions in one stream.
+    pub sessions: bool,
+    /// The deployment scopes every managed name to one stream, and each
+    /// stream's change feed rides its own ops topic.
+    pub stream_tenancy: bool,
     /// The change feed (`Laser::watch`): `ChangeRecord`s published after each
     /// committed projector batch for a binding that opted into `notify`. Off
     /// when the deployment does not publish the feed.
@@ -56,7 +58,7 @@ pub struct Capabilities {
     /// verbs). Fork-native, advertised by the `AUTHZ` feature bit.
     pub authz: bool,
     /// Server-side consumer filters, administered through a consumer group's
-    /// `filter()` handle: native filtered reads and, with a managed plane,
+    /// `filter()` handle: native filtered reads and, with a managed backend,
     /// the group policy catalog.
     pub filters: FilterCaps,
     /// The wire op versions the server advertised in its `AGDX_HELLO` reply, or
@@ -120,10 +122,10 @@ pub struct DestinationCaps {
 pub struct FilterCaps {
     /// Filtered reads, fenced acknowledgments, previews, sample tests, and
     /// validation. Served by the streaming server itself, advertised by the
-    /// `CONSUMER_FILTERS` feature bit, so it needs no managed plane.
+    /// `CONSUMER_FILTERS` feature bit, so it needs no managed backend.
     pub native: bool,
     /// Saved filters, revisions, group bindings, and mutation outcomes. Needs a
-    /// ready managed plane that advertises the `filter` op version.
+    /// ready managed backend that advertises the `filter` op version.
     pub catalog: bool,
     /// Group-aware reads: the server resolves a consumer group's own policy,
     /// delivers an unbound group unfiltered, and fences acknowledgments by
@@ -134,6 +136,9 @@ pub struct FilterCaps {
     /// server that predates the announcement, which then evaluates as this
     /// build does.
     pub evaluation: Option<FilterAnnounce>,
+    /// The longest filtered wait the server holds, in milliseconds. Zero when
+    /// it serves none, so a filtered reader paces idle rounds itself.
+    pub max_wait_ms: u32,
 }
 
 impl FilterCaps {
@@ -195,7 +200,8 @@ impl Capabilities {
         graph: false,
         forks: false,
         a2a_gateway: false,
-        agent_workflow: false,
+        sessions: false,
+        stream_tenancy: false,
         watch: false,
         authz: false,
         filters: FilterCaps {
@@ -203,6 +209,7 @@ impl Capabilities {
             catalog: false,
             group_policy_reads: false,
             evaluation: None,
+            max_wait_ms: 0,
         },
         versions: None,
         backends: Vec::new(),
@@ -260,7 +267,7 @@ impl Capabilities {
     // The struct is `#[non_exhaustive]`, so these chainable setters are the
     // supported way to build a custom set: `Capabilities::OPEN.with_query(true)`.
 
-    /// Returns a copy connected to a managed plane (the root switch).
+    /// Returns a copy connected to a managed backend (the root switch).
     #[must_use]
     pub fn with_managed(mut self, value: bool) -> Self {
         self.managed = value;
@@ -358,10 +365,17 @@ impl Capabilities {
         self
     }
 
-    /// Returns a copy advertising the managed agent and workflow control band.
+    /// Returns a copy advertising managed session reads.
     #[must_use]
-    pub fn with_agent_workflow(mut self, value: bool) -> Self {
-        self.agent_workflow = value;
+    pub fn with_sessions(mut self, value: bool) -> Self {
+        self.sessions = value;
+        self
+    }
+
+    /// Returns a copy advertising stream tenancy.
+    #[must_use]
+    pub fn with_stream_tenancy(mut self, value: bool) -> Self {
+        self.stream_tenancy = value;
         self
     }
 
@@ -374,6 +388,7 @@ impl Capabilities {
             catalog,
             group_policy_reads: native,
             evaluation: None,
+            max_wait_ms: 0,
         };
         self
     }
@@ -404,7 +419,8 @@ impl Capabilities {
         self.kv.cas_fenced |= versions.has_feature(feature::KV_CAS_FENCED);
         self.kv.fenced_leases |= versions.has_feature(feature::KV_FENCED_LEASES);
         self.kv.cas_fenced |= self.kv.fenced_leases;
-        self.agent_workflow |= versions.has_feature(feature::AGENT_WORKFLOW);
+        self.sessions |= versions.has_feature(feature::SESSIONS);
+        self.stream_tenancy |= versions.has_feature(feature::STREAM_TENANCY);
         self.query.keyword |= versions.has_feature(feature::KEYWORD_SEARCH);
         self.watch |= versions.has_feature(feature::WATCH);
         self.authz |= versions.has_feature(feature::AUTHZ);
@@ -463,9 +479,11 @@ mod tests {
             feature::KV_CAS
                 | feature::READ_YOUR_WRITES
                 | feature::KV_CAS_FENCED
-                | feature::KV_FENCED_LEASES,
+                | feature::KV_FENCED_LEASES
+                | feature::SESSIONS,
         );
         caps.merge_features(&versions);
+        assert!(caps.sessions);
         assert!(caps.kv.cas, "KV_CAS bit should set kv.cas");
         assert!(
             caps.kv.cas_fenced,
@@ -489,7 +507,7 @@ mod tests {
         assert!(caps.filters.native);
         assert!(
             !caps.filters.catalog,
-            "the catalog needs a ready plane with the filter op version"
+            "the catalog needs a ready backend with the filter op version"
         );
     }
 

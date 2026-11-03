@@ -19,9 +19,19 @@ function build(policy: ConstructorParameters<typeof Intent>[0]["policy"]): Inten
     eligibleVoters: [AgentId.new("a"), AgentId.new("b")],
     policy,
     policyVersion: 1n,
-    atMicros: 10n,
-    deadlineMicros: 1_000n
+    deadlineMicros: nowMicros() + MINUTE_MICROS
   })
+}
+
+const MINUTE_MICROS = 60_000_000n
+
+function nowMicros(): bigint {
+  return BigInt(Date.now()) * 1_000n
+}
+
+// A moment after every vote cast so far and before any deadline.
+function soon(): bigint {
+  return nowMicros() + 1_000_000n
 }
 
 void test("given_invalid_voters_and_thresholds_when_constructed_then_should_fail_closed", () => {
@@ -34,8 +44,7 @@ void test("given_invalid_voters_and_thresholds_when_constructed_then_should_fail
         eligibleVoters: [],
         policy: { kind: "any" },
         policyVersion: 1n,
-        atMicros: 1n,
-        deadlineMicros: 2n
+        deadlineMicros: nowMicros() + MINUTE_MICROS
       }),
     IntentError
   )
@@ -43,26 +52,23 @@ void test("given_invalid_voters_and_thresholds_when_constructed_then_should_fail
 })
 
 void test("given_quorum_and_mandatory_votes_when_folded_then_should_commit_deterministically", () => {
-  const base = build({ kind: "at-least", required: 1 })
   const intent = new Intent({
-    intentId: base.intentId,
-    conversation: base.conversation,
-    proposer: base.proposer,
-    body: base.body,
-    eligibleVoters: base.eligibleVoters,
+    conversation: ConversationId.new(),
+    proposer: AgentId.new("proposer"),
+    body: new TextEncoder().encode("transfer $100"),
+    eligibleVoters: [AgentId.new("a"), AgentId.new("b")],
     mandatoryVoters: [AgentId.new("b")],
-    policy: base.policy,
-    policyVersion: base.policyVersion,
-    atMicros: base.atMicros,
-    deadlineMicros: base.deadlineMicros,
-    digest: base.digest
+    policy: { kind: "at-least", required: 1 },
+    policyVersion: 1n,
+    deadlineMicros: nowMicros() + MINUTE_MICROS
   })
   const votes = [
-    Vote.cast(intent, AgentId.new("b"), VoteChoice.Allow, 20n),
-    Vote.cast(intent, AgentId.new("a"), VoteChoice.Allow, 30n)
+    Vote.cast(intent, AgentId.new("b"), VoteChoice.Allow),
+    Vote.cast(intent, AgentId.new("a"), VoteChoice.Allow)
   ]
-  const forward = decide(intent, votes, 40n)
-  const reverse = decide(intent, votes.toReversed(), 40n)
+  const at = soon()
+  const forward = decide(intent, votes, at)
+  const reverse = decide(intent, votes.toReversed(), at)
   assert.deepEqual(reverse, forward)
   assert.ok(forward !== undefined)
   assert.equal(forward.outcome, IntentOutcome.Committed)
@@ -72,19 +78,19 @@ void test("given_quorum_and_mandatory_votes_when_folded_then_should_commit_deter
 void test("given_conflicting_or_expired_votes_when_folded_then_should_abort", () => {
   const intent = build({ kind: "any" })
   const conflicting = [
-    Vote.cast(intent, AgentId.new("a"), VoteChoice.Allow, 20n),
-    Vote.cast(intent, AgentId.new("a"), VoteChoice.Block, 30n)
+    Vote.cast(intent, AgentId.new("a"), VoteChoice.Allow),
+    Vote.cast(intent, AgentId.new("a"), VoteChoice.Block)
   ]
-  assert.equal(decide(intent, conflicting, 40n)?.outcome, IntentOutcome.Aborted)
-  assert.equal(decide(intent, [], 1_000n)?.reason, "quorum not reached by deadline")
+  assert.equal(decide(intent, conflicting, soon())?.outcome, IntentOutcome.Aborted)
+  assert.equal(decide(intent, [], intent.deadlineMicros)?.reason, "quorum not reached by deadline")
 })
 
 void test("given_a_mutated_body_or_foreign_voter_when_used_then_should_reject", () => {
   const intent = build({ kind: "any" })
   intent.body[0] = 0
-  assert.throws(() => decide(intent, [], 20n), IntentError)
+  assert.throws(() => decide(intent, [], soon()), IntentError)
   const valid = build({ kind: "any" })
-  assert.throws(() => Vote.cast(valid, AgentId.new("outsider"), VoteChoice.Allow, 20n), IntentError)
+  assert.throws(() => Vote.cast(valid, AgentId.new("outsider"), VoteChoice.Allow), IntentError)
 })
 
 void test("given_each_invalid_configuration_when_constructed_then_should_raise_its_rust_variant", () => {
@@ -96,8 +102,7 @@ void test("given_each_invalid_configuration_when_constructed_then_should_raise_i
     eligibleVoters: [a],
     policy: { kind: "any" } as const,
     policyVersion: 1n,
-    atMicros: 10n,
-    deadlineMicros: 20n
+    deadlineMicros: nowMicros() + MINUTE_MICROS
   }
   const cases: readonly [() => unknown, IntentError][] = [
     [() => new Intent({ ...options, eligibleVoters: [] }), IntentError.noEligibleVoters()],
@@ -117,14 +122,17 @@ void test("given_each_invalid_configuration_when_constructed_then_should_raise_i
       () => new Intent({ ...options, policy: { kind: "at-least", required: 2 } }),
       IntentError.invalidThreshold(2, 1)
     ],
-    [() => new Intent({ ...options, deadlineMicros: 10n }), IntentError.invalidDeadline(10n, 10n)],
-    [() => new Intent({ ...options, digest: "00" }), IntentError.digestMismatch()]
+    [() => new Intent({ ...options, deadlineMicros: 10n }), IntentError.invalidDeadline(0n, 10n)]
   ]
   for (const [construct, expected] of cases) {
     assert.throws(construct, (error: unknown) => {
       assert.ok(error instanceof IntentError)
-      assert.equal(error.message, expected.message)
-      assert.deepEqual(error.context, expected.context)
+      if (expected.message.startsWith("deadline")) {
+        assert.match(error.message, /^deadline 10 must be after proposal time \d+$/u)
+      } else {
+        assert.equal(error.message, expected.message)
+        assert.deepEqual(error.context, expected.context)
+      }
       return true
     })
   }
@@ -135,16 +143,25 @@ void test("given_each_invalid_configuration_when_constructed_then_should_raise_i
   assert.deepEqual(IntentError.invalidDeadline(10n, 5n).context, { proposed: 10n, deadline: 5n })
   const intent = new Intent(options)
   assert.throws(
-    () => Vote.cast(intent, AgentId.new("outsider"), VoteChoice.Allow, 15n),
+    () => Vote.cast(intent, AgentId.new("outsider"), VoteChoice.Allow),
     (error: unknown) =>
       error instanceof IntentError &&
       error.message === IntentError.ineligibleVoter("outsider").message
   )
   const other = new Intent(options)
-  const decision = decide(other, [Vote.cast(other, a, VoteChoice.Allow, 15n)], 15n)
+  const decision = decide(other, [Vote.cast(other, a, VoteChoice.Allow)], soon())
   assert.throws(
     () => decision?.authorizes(intent),
     (error: unknown) =>
       error instanceof IntentError && error.message === IntentError.decisionIntentMismatch().message
   )
+})
+
+void test("given_a_new_intent_and_vote_when_created_then_should_stamp_the_current_time", () => {
+  const before = nowMicros()
+  const intent = build({ kind: "any" })
+  const vote = Vote.cast(intent, AgentId.new("a"), VoteChoice.Allow)
+  const after = nowMicros()
+  assert.ok(intent.atMicros >= before && intent.atMicros <= after)
+  assert.ok(vote.atMicros >= intent.atMicros && vote.atMicros <= after)
 })

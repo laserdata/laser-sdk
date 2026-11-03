@@ -16,7 +16,14 @@ import {
 } from "../../src/client/errors.js"
 import { filterReason } from "../../src/client/error-classify.js"
 import { Laser } from "../../src/client/laser.js"
-import type { ConsumerMessage } from "../../src/stream/consumer.js"
+import { Agent } from "../../src/agent/builder.js"
+import { agentMessageBody } from "../../src/agent/reliable-consumer.js"
+import { AgentTopic } from "../../src/provenance/agent-topic.js"
+import { AgentId, ConversationId } from "../../src/types/ids.js"
+import { parseAgentId } from "../../src/wire/agent.js"
+import { addresseeFilter, broadcastFilter } from "../../src/wire/dispatch.js"
+import { CorrelationId } from "../../src/wire/ids.js"
+import { AGENT_SESSIONS } from "../../src/wire/topics.js"
 import type { ConsumerGroup } from "../../src/stream/consumer-group.js"
 import { HeaderValue } from "../../src/stream/header-value.js"
 import type { FilteredReader, FilteredReaderBuilder } from "../../src/managed/filters.js"
@@ -78,7 +85,7 @@ function safeModeFilter(): ConsumerFilter {
   )
 }
 
-// A consumer group filter needs the catalog, which only a managed plane serves.
+// A consumer group filter needs the catalog, which only a managed backend serves.
 class NeedsCatalog extends Error {}
 
 async function withSource(
@@ -93,7 +100,7 @@ async function withSource(
     await run(laser, stream)
   } catch (error) {
     if (!(error instanceof NeedsCatalog)) throw error
-    context.skip("a consumer group filter needs a managed plane")
+    context.skip("a consumer group filter needs a managed backend")
   } finally {
     await laser
       .stream(stream)
@@ -117,7 +124,7 @@ async function boundGroup(
 ): Promise<ConsumerGroup> {
   if (!(await laser.capabilities()).filters.catalog) throw new NeedsCatalog()
   const group = laser.stream(stream).topic(TOPIC).consumerGroup(name)
-  await group.create({ filter: definition })
+  await group.create({ filter: definition, filterName: "safe-mode" })
   return group
 }
 
@@ -260,19 +267,6 @@ void test("given_a_local_guard_when_reading_then_should_agree_with_the_server", 
   })
 })
 
-void test("given_a_local_reader_when_acknowledging_then_should_refuse", async (context) => {
-  await withSource(context, async (laser, stream) => {
-    await publish(laser, stream, [DECOMMISSION])
-    const filtered = await reader(laser, stream, "safe-mode-local", (builder) =>
-      builder.start({ kind: "first" }).readMode("local")
-    )
-    const page = await filtered.nextPage({ timeoutMs: READ_TIMEOUT_MS })
-
-    await assert.rejects(filtered.ackPage(page), InvalidError)
-    await filtered.close()
-  })
-})
-
 void test("given_stored_records_when_previewed_then_should_judge_them_without_progress", async (context) => {
   await withSource(context, async (laser, stream) => {
     const group = await boundGroup(laser, stream, "preview-desk")
@@ -310,13 +304,15 @@ void test("given_no_catalog_when_a_group_is_created_with_a_filter_then_should_re
       context.skip("this deployment serves the group filter catalog")
       return
     }
-    assert.equal(capabilities.filters.groupPolicyReads, true)
     const topic = laser.stream(stream).topic(TOPIC)
     const group = topic.consumerGroup("anomaly-desk")
-    await assert.rejects(group.create({ filter: safeModeFilter() }), UnsupportedError)
+    await assert.rejects(
+      group.create({ filter: safeModeFilter(), filterName: "safe-mode" }),
+      UnsupportedError
+    )
 
     const plain = await group.create()
-    await assert.rejects(group.filter().configure(safeModeFilter()), UnsupportedError)
+    await assert.rejects(group.filter().configure("safe-mode", safeModeFilter()), UnsupportedError)
     assert.equal(plain.name, "anomaly-desk")
     assert.equal(plain.filter, undefined)
     assert.equal(plain.identity.groupId, BigInt(plain.id))
@@ -329,37 +325,44 @@ void test("given_no_catalog_when_a_group_is_created_with_a_filter_then_should_re
 void test("given_an_unbound_group_when_consumed_then_should_deliver_every_record", async (context) => {
   await withSource(context, async (laser, stream) => {
     await publish(laser, stream, [SAFE_MODE, GROUND_STATION, DECOMMISSION])
-    const group = laser.stream(stream).topic(TOPIC).consumerGroup("plain-desk")
-    const consumer = await group.consumer({
-      startAt: { kind: "first" },
-      commitPolicy: { kind: "disabled" },
-      pollIntervalMs: 5
-    })
-    try {
-      const delivered: bigint[] = []
-      for (let index = 0; index < 3; index += 1) {
-        const message = await consumer.nextWithin(READ_TIMEOUT_MS)
-        delivered.push(message.position.offset)
-        await consumer.commit(message)
+    for (const allowReplay of [false, true]) {
+      const group = laser
+        .stream(stream)
+        .topic(TOPIC)
+        .consumerGroup(`plain-desk-${String(allowReplay)}`)
+      const consumer = await group.consumer({
+        startAt: { kind: "first" },
+        commitPolicy: { kind: "disabled" },
+        allowReplay
+      })
+      try {
+        const delivered: bigint[] = []
+        for (let index = 0; index < 3; index += 1) {
+          const message = await consumer.nextWithin(READ_TIMEOUT_MS)
+          delivered.push(message.position.offset)
+          await consumer.commit(message)
+        }
+        assert.deepEqual(delivered, [0n, 1n, 2n], "a group without a filter receives everything")
+        assert.equal(consumer.lastConsumedOffset(0), 2n)
+        assert.equal(consumer.lastStoredOffset(0), 2n)
+        if ((await laser.capabilities()).filters.groupPolicyReads) {
+          await assert.rejects(consumer.storeOffset(1n, 0), InvalidError)
+        } else {
+          await consumer.storeOffset(1n, 0)
+          assert.equal((await consumer.storedOffset(0))?.storedOffset, allowReplay ? 1n : 2n)
+          await consumer.deleteOffset(0)
+          assert.equal(await consumer.storedOffset(0), undefined)
+          assert.equal(consumer.lastStoredOffset(0), undefined)
+          await consumer.storeOffset(1n, 0)
+          assert.equal((await consumer.storedOffset(0))?.storedOffset, 1n)
+          await consumer.storeOffset(0n, 0)
+          assert.equal((await consumer.storedOffset(0))?.storedOffset, allowReplay ? 0n : 1n)
+        }
+      } finally {
+        await consumer.shutdown()
       }
-      assert.deepEqual(delivered, [0n, 1n, 2n], "a group without a filter receives everything")
-      assert.equal(consumer.lastConsumedOffset(0), 2n)
-      assert.equal((await consumer.storedOffset(0))?.storedOffset, 2n)
-      await assert.rejects(
-        consumer.commit({
-          payload: new Uint8Array(),
-          id: { partitionId: 0, offset: 1n },
-          partitionId: 0,
-          offset: 1n,
-          headers: new Map()
-        } as unknown as ConsumerMessage),
-        InvalidError,
-        "only a delivered message commits"
-      )
-    } finally {
-      await consumer.shutdown()
+      assert.equal((await group.info()).filter, undefined)
     }
-    assert.equal((await group.info()).filter, undefined)
   })
 })
 
@@ -369,8 +372,7 @@ void test("given_a_group_with_a_filter_when_consumed_then_should_deliver_only_ma
     await publish(laser, stream, [SAFE_MODE, GROUND_STATION, DECOMMISSION])
     const consumer = await group.consumer({
       startAt: { kind: "first" },
-      commitPolicy: { kind: "disabled" },
-      pollIntervalMs: 5
+      commitPolicy: { kind: "disabled" }
     })
     try {
       const delivered: bigint[] = []
@@ -388,7 +390,7 @@ void test("given_a_group_with_a_filter_when_consumed_then_should_deliver_only_ma
     assert.deepEqual(binding.digest, consumerFilterDigest(safeModeFilter()))
     assert.equal(binding.policyGeneration, 1n)
     await assert.rejects(
-      group.filter().configure(ConsumerFilter.json(FilterExpr.present("kind"))),
+      group.filter().configure("kind-present", ConsumerFilter.json(FilterExpr.present("kind"))),
       (error: unknown) =>
         error instanceof FilterExecutionError && error.detail.reason === "conflict"
     )
@@ -524,8 +526,7 @@ void test(
       const consumer = await topic.consumerGroup("cluster-desk").consumer({
         startAt: { kind: "first" },
         commitPolicy: { kind: "disabled" },
-        batchLength: 1,
-        pollIntervalMs: 5
+        batchLength: 1
       })
       try {
         const seen = new Set<number>()
@@ -554,35 +555,32 @@ void test(
 )
 
 void test(
-  "given_a_partition_data_connection_to_a_follower_when_authenticating_then_should_stay_on_that_node",
+  "given_a_request_to_a_follower_when_its_filters_are_off_then_should_answer_from_that_node",
   { timeout: 120_000 },
-  async () => {
+  async (context) => {
+    await using laser = await Laser.connect(CONNECTION_STRING)
+    if (!(await laser.capabilities()).filters.native) {
+      context.skip("this deployment does not serve native consumer filters")
+      return
+    }
     const cluster = await TestIggyCluster.start()
     let transport: ApacheIggyTransport | undefined
     try {
       const [leader, follower] = await cluster.leaderAndFollower()
+      // the streaming server reads this configuration name
       cluster.setNodeEnvironment(follower, { IGGY_PLANE_FILTERS_ENABLED: "false" })
       await cluster.restartNode(follower)
       cluster.routeEndpointTo(leader)
       transport = await ApacheIggyTransport.connect(cluster.endpoint)
-      const endpoint = cluster.nodeEndpoint(follower)
-      const data = await transport.openNodeConnection(endpoint.host, endpoint.port)
-      try {
-        const reply = decodeFilterReply(
-          decodeOne(
-            await data.send(
-              AGDX_FILTER_VALIDATE_CODE,
-              encodeNamed(encodeConsumerFilter(safeModeFilter()))
-            ),
-            "node validation"
-          ),
-          "node validation"
-        )
-        assert.equal(reply.kind, "err")
-        assert.equal(reply.error.reason, "unsupported")
-      } finally {
-        await data.close()
-      }
+      const answer = await transport.sendManagedTo(
+        AGDX_FILTER_VALIDATE_CODE,
+        encodeNamed(encodeConsumerFilter(safeModeFilter())),
+        { kind: "replica", replica: follower }
+      )
+      assert.equal(answer.replica, follower)
+      const reply = decodeFilterReply(decodeOne(answer.reply, "node validation"), "node validation")
+      assert.equal(reply.kind, "err")
+      assert.equal(reply.error.reason, "unsupported")
     } finally {
       await transport?.close()
       await cluster.close()
@@ -624,8 +622,11 @@ void test("given_a_group_with_a_filter_when_deleted_then_should_release_it_and_r
     assert.equal(await group.filter().delete(), true)
     assert.equal(await group.filter().get(), undefined)
     assert.equal(await group.filter().delete(), false, "a second delete finds no filter")
-    const again = await group.filter().configure(safeModeFilter())
+    const again = await group.filter().configure("safe-mode", safeModeFilter())
     assert.notEqual(again.filterId, before?.filterId, "the id is not reused")
+    const summary = await group.filter().summary()
+    assert.equal(summary?.name, "safe-mode")
+    assert.deepEqual(summary.owner?.identity, (await group.info()).identity)
     assert.deepEqual(again.digest, before?.digest)
     assert.equal(await group.filter().delete(), true)
   })
@@ -643,9 +644,12 @@ void test("given_group_9_and_groups_90_to_97_when_deleted_then_should_find_the_e
       const info = await group.create()
       if (info.id === 9) {
         target = group
-        before = await group.filter().configure(safeModeFilter())
+        before = await group.filter().configure("safe-mode", safeModeFilter())
       } else if (info.id >= 90 && info.id <= 97) {
-        collisions.push({ group, binding: await group.filter().configure(safeModeFilter()) })
+        collisions.push({
+          group,
+          binding: await group.filter().configure("safe-mode", safeModeFilter())
+        })
       }
       if (info.id === 97) break
     }
@@ -655,7 +659,7 @@ void test("given_group_9_and_groups_90_to_97_when_deleted_then_should_find_the_e
     assert.equal(await target.filter().delete(), true)
     assert.equal(await target.filter().get(), undefined)
     assert.equal(await target.filter().delete(), false)
-    const again = await target.filter().configure(safeModeFilter())
+    const again = await target.filter().configure("safe-mode", safeModeFilter())
     assert.notEqual(again.filterId, before.filterId)
     assert.deepEqual(again.digest, before.digest)
     assert.equal(await target.filter().delete(), true)
@@ -701,7 +705,10 @@ void test("given_a_group_filter_when_members_rejoin_then_should_resume_and_refus
         await resumed.close()
       }
       await assert.rejects(
-        group.create({ filter: ConsumerFilter.json(FilterExpr.present("other")) }),
+        group.create({
+          filter: ConsumerFilter.json(FilterExpr.present("other")),
+          filterName: "other-present"
+        }),
         (error: unknown) =>
           error instanceof ConsumerGroupSetupError && filterReason(error.cause) === "conflict"
       )
@@ -730,7 +737,7 @@ void test("given_a_recreated_topic_when_a_numeric_member_rejoins_then_should_lea
     try {
       await native.topic.delete({ streamId: stream, topicId: TOPIC, partitionsCount: 1 })
       await laser.stream(stream).topic(TOPIC).ensure(1)
-      const current = await group.create({ filter: safeModeFilter() })
+      const current = await group.create({ filter: safeModeFilter(), filterName: "safe-mode" })
       recreated = true
       assert.equal(current.id, old.id)
       assert.notDeepEqual(
@@ -762,6 +769,144 @@ void test("given_a_recreated_topic_when_a_numeric_member_rejoins_then_should_lea
       await stale.close()
       await native.destroy()
       if (recreated) await group.filter().release()
+    }
+  })
+})
+
+// An agent on its own stream, so its role group starts unbound.
+async function withAgentStream(
+  context: TestContext,
+  run: (laser: Laser) => Promise<void>
+): Promise<void> {
+  const stream = `laser-ts-agents-${randomUUID()}`
+  const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  try {
+    if (!(await laser.capabilities()).filters.catalog) throw new NeedsCatalog()
+    await laser.stream(stream).ensure()
+    await laser.topic(AGENT_SESSIONS).ensure(1)
+    await run(laser)
+  } catch (error) {
+    if (!(error instanceof NeedsCatalog)) throw error
+    context.skip("binding a role group needs a managed backend")
+  } finally {
+    await laser
+      .stream(stream)
+      .delete()
+      .catch(() => false)
+    await laser.close()
+  }
+}
+
+void test("given_a_filtering_server_when_an_agent_spawns_on_the_session_topic_then_should_bind_its_group_to_the_addressee_filter", async (context) => {
+  await withAgentStream(context, async (laser) => {
+    const seen: string[] = []
+    const agent = Agent.builder()
+      .id(AgentId.new("triage"))
+      .listenOn(AgentTopic.Sessions)
+      .handler({
+        handle(message): Promise<void> {
+          seen.push(new TextDecoder().decode(agentMessageBody(message)))
+          return Promise.resolve()
+        }
+      })
+      .build()
+      .spawn(laser)
+    try {
+      await agent.ready()
+      const info = await laser.topic(AGENT_SESSIONS).consumerGroup("triage").info()
+      assert.deepEqual(
+        info.filter?.digest,
+        consumerFilterDigest(addresseeFilter(parseAgentId("triage"))),
+        "the role group runs the addressee filter"
+      )
+      const conversation = ConversationId.new()
+      let correlation = 0n
+      for (const [target, body] of [
+        ["triage", "mine"],
+        ["critic", "theirs"],
+        [undefined, "everyone"]
+      ] as const) {
+        correlation += 1n
+        const command = laser
+          .agdx(AgentTopic.Sessions, AgentId.new("client"), conversation)
+          .command(CorrelationId.fromU128(correlation), new TextEncoder().encode(body))
+        await (target === undefined ? command : command.withTarget(AgentId.new(target))).send()
+      }
+      const deadline = Date.now() + READ_TIMEOUT_MS
+      while (seen.length < 2 && Date.now() < deadline) await delay(20)
+      await delay(300)
+      assert.deepEqual([...seen].sort(), ["everyone", "mine"])
+    } finally {
+      await agent.shutdown()
+    }
+  })
+})
+
+void test("given_a_role_group_bound_to_another_filter_when_an_agent_spawns_then_should_refuse_to_run", async (context) => {
+  await withAgentStream(context, async (laser) => {
+    await laser
+      .topic(AGENT_SESSIONS)
+      .consumerGroup("auditor")
+      .create({ filter: broadcastFilter(), filterName: "broadcast" })
+    const agent = Agent.builder()
+      .id(AgentId.new("auditor"))
+      .listenOn(AgentTopic.Sessions)
+      .handler({ handle: () => Promise.resolve() })
+      .build()
+      .spawn(laser)
+    await assert.rejects(agent.join(), ConsumerGroupSetupError)
+  })
+})
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+void test("given_a_released_policy_when_acknowledging_its_page_then_should_refuse_without_storing", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    const group = await boundGroup(laser, stream, "policy-ack")
+    await publish(laser, stream, [SAFE_MODE, GROUND_STATION, DECOMMISSION])
+    const filtered = await group.reader().start({ kind: "first" }).build()
+    try {
+      const page = await filtered.nextPage({ timeoutMs: READ_TIMEOUT_MS })
+      await group.filter().release()
+      await assert.rejects(
+        filtered.ackPage(page),
+        (error: unknown) => filterReason(error) === "conflict"
+      )
+      const current = await filtered.nextPage({ timeoutMs: READ_TIMEOUT_MS })
+      assert.equal(current.records[0]?.offset, 0n)
+      await filtered.ackPage(current)
+    } finally {
+      await filtered.close()
+    }
+  })
+})
+
+void test("given_an_idle_group_reader_on_a_server_that_holds_waits_when_a_match_lands_then_should_wake_before_the_wait_ends", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    if ((await laser.capabilities()).filters.maxWaitMs === 0) {
+      context.skip("the server holds no filtered wait")
+      return
+    }
+    const filtered = await reader(laser, stream, "safe-mode-held", (builder) =>
+      builder.start({ kind: "first" }).maxWait(10_000)
+    )
+    try {
+      assert.deepEqual(await filtered.readRound(), [undefined, false])
+      const started = performance.now()
+      const waiting = filtered.waitForRecords()
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      await publish(laser, stream, [SAFE_MODE])
+      await waiting
+      assert.ok(performance.now() - started < 8_000, "a landed record ends the held wait")
+      const [page] = await filtered.readRound()
+      assert.deepEqual(
+        page?.records.map((record) => record.offset),
+        [0n]
+      )
+    } finally {
+      await filtered.close()
     }
   })
 })

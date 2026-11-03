@@ -3,19 +3,18 @@ use iggy::prelude::Identifier;
 /// A well-known agent topic, or a `Custom` one. Each maps to an Iggy topic name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTopic<'a> {
-    /// Inbound commands to an agent.
-    Commands,
-    /// Replies from an agent.
-    Responses,
-    /// Tool-call requests.
-    ToolCalls,
-    /// Tool-call results.
-    ToolResults,
-    /// LLM input/output traces.
-    LlmIo,
-    /// Human-in-the-loop prompts and decisions.
-    HumanInput,
-    /// Audit / memory records.
+    /// The session lane: commands, replies, tool and model records, user
+    /// turns, lifecycle, and state, keyed by session.
+    Sessions,
+    /// High-volume chunk streams, collapsed into their response on a timeline.
+    Streams,
+    /// Process heartbeats listing the sessions a process holds leases on.
+    Heartbeats,
+    /// Session control requests, sent by operators only.
+    Control,
+    /// Memory records.
+    Memory,
+    /// Policy evidence and other audit records.
     Audit,
     /// The agent card registry: agents republish their cards here, and the
     /// registry read model folds it to the latest card per agent.
@@ -33,16 +32,15 @@ impl AgentTopic<'_> {
     /// The static topic name, or `None` for `Custom`.
     pub const fn name(&self) -> Option<&'static str> {
         match self {
-            Self::Commands => Some("agent.commands"),
-            Self::Responses => Some("agent.responses"),
-            Self::ToolCalls => Some("agent.tool_calls"),
-            Self::ToolResults => Some("agent.tool_results"),
-            Self::LlmIo => Some("agent.llm_io"),
-            Self::HumanInput => Some("agent.human_input"),
-            Self::Audit => Some("agent.audit"),
-            Self::Registry => Some("agent.registry"),
-            Self::WorkflowJournal => Some("agent.workflow_journal"),
-            Self::Dlq => Some("agent.dlq"),
+            Self::Sessions => Some(laser_wire::topics::AGENT_SESSIONS),
+            Self::Streams => Some(laser_wire::topics::AGENT_STREAMS),
+            Self::Heartbeats => Some(laser_wire::topics::AGENT_HEARTBEATS),
+            Self::Control => Some(laser_wire::topics::AGENT_CONTROL),
+            Self::Memory => Some(laser_wire::topics::AGENT_MEMORY),
+            Self::Audit => Some(laser_wire::topics::AGENT_AUDIT),
+            Self::Registry => Some(laser_wire::topics::AGENT_REGISTRY),
+            Self::WorkflowJournal => Some(laser_wire::topics::AGENT_JOURNAL),
+            Self::Dlq => Some(laser_wire::topics::AGENT_DLQ),
             Self::Custom(_) => None,
         }
     }
@@ -74,10 +72,10 @@ mod tests {
 
     #[test]
     fn given_a_well_known_topic_when_converted_then_should_map_to_its_identifier() {
-        assert_eq!(AgentTopic::Commands.name(), Some("agent.commands"));
+        assert_eq!(AgentTopic::Sessions.name(), Some("agent.sessions"));
         assert_eq!(
-            AgentTopic::Commands.as_identifier(),
-            Identifier::named("agent.commands").expect("the topic name is a valid identifier")
+            AgentTopic::Sessions.as_identifier(),
+            Identifier::named("agent.sessions").expect("the topic name is a valid identifier")
         );
     }
 
