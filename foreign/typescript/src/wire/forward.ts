@@ -1,4 +1,5 @@
 import { CodecError } from "../client/errors.js"
+import { type AgentId, parseAgentId } from "./agent-id.js"
 import { decodeGrant, encodeGrant, type Grant, type Tenancy } from "./authz.js"
 import { type CborMap, expectMap, field } from "./cbor.js"
 import {
@@ -13,7 +14,14 @@ import {
   encodeSessionPosition
 } from "./mutation.js"
 
-export { type ForwardedScope, decodeForwardedScope, encodeForwardedScope } from "./mutation.js"
+export {
+  type Caller,
+  type ForwardedScope,
+  decodeCaller,
+  decodeForwardedScope,
+  encodeCaller,
+  encodeForwardedScope
+} from "./mutation.js"
 
 export interface ForwardedQuery {
   readonly userId: number
@@ -43,6 +51,12 @@ export interface ForwardedCommand {
   readonly minSessions: readonly SessionPosition[]
   /** Absent for deployment tenancy, as Rust skips the default. */
   readonly tenancy?: Tenancy
+  /** The agent the calling connection declared in its presence, set by the
+   * server on a client's mutation. A claim, never verified. */
+  readonly agent?: AgentId
+  /** Set by the server from the `agdx-on-behalf-of` header on an HTTP write:
+   * the end user an intermediary wrote for. A claim, never verified. */
+  readonly onBehalfOf?: string
 }
 
 function requireU128(value: bigint, context: string): bigint {
@@ -116,6 +130,8 @@ export function encodeForwardedCommand(command: ForwardedCommand): Map<string, u
     map.set("min_sessions", command.minSessions.map(encodeSessionPosition))
   }
   if (command.tenancy === "stream") map.set("tenancy", command.tenancy)
+  if (command.agent !== undefined) map.set("agent", command.agent)
+  if (command.onBehalfOf !== undefined) map.set("on_behalf_of", command.onBehalfOf)
   return map
 }
 
@@ -125,6 +141,8 @@ export function decodeForwardedCommand(map: CborMap, context: string): Forwarded
   const scopeMap = field.optionalMap(map, "scope", context)
   const tenancy = decodeTenancy(map, context)
   const minPosition = field.optionalMap(map, "min_position", context)
+  const agent = field.optionalString(map, "agent", context)
+  const onBehalfOf = field.optionalString(map, "on_behalf_of", context)
   return {
     userId: field.requiredU32(map, "user_id", context),
     clientId: field.requiredU128(map, "client_id", context),
@@ -146,7 +164,9 @@ export function decodeForwardedCommand(map: CborMap, context: string): Forwarded
       const itemContext = `${context}.min_sessions[${String(index)}]`
       return decodeSessionPosition(expectMap(item, itemContext), itemContext)
     }),
-    ...(tenancy !== undefined ? { tenancy } : {})
+    ...(tenancy !== undefined ? { tenancy } : {}),
+    ...(agent !== undefined ? { agent: parseAgentId(agent) } : {}),
+    ...(onBehalfOf !== undefined ? { onBehalfOf } : {})
   }
 }
 

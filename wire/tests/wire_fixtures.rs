@@ -33,9 +33,10 @@ use laser_wire::checkpoint::{
 };
 use laser_wire::clients::{ClientMetadata, ClientMetadataList, ClientMetadataQuery};
 use laser_wire::codes::{
-    AGDX_KV_SET_CODE, AGENT_OP_VERSION, AUTHZ_OP_VERSION, BATCH_OP_VERSION, CHANGE_OP_VERSION,
-    CHECKPOINT_OP_VERSION, CLIENT_METADATA_OP_VERSION, CONTROL_OP_VERSION, FORK_OP_VERSION,
-    GRAPH_OP_VERSION, KV_LEASE_OP_VERSION, KV_OP_VERSION, QUERY_OP_VERSION,
+    AGDX_CONTROL_PUBLISH_CODE, AGDX_KV_SET_CODE, AGENT_OP_VERSION, AUTHZ_OP_VERSION,
+    BATCH_OP_VERSION, CHANGE_OP_VERSION, CHECKPOINT_OP_VERSION, CLIENT_METADATA_OP_VERSION,
+    CONTROL_OP_VERSION, FORK_OP_VERSION, GRAPH_OP_VERSION, KV_LEASE_OP_VERSION, KV_OP_VERSION,
+    QUERY_OP_VERSION,
 };
 use laser_wire::content::ContentType;
 use laser_wire::control::{
@@ -63,7 +64,7 @@ use laser_wire::filter::{
 use laser_wire::fork::{
     ForkCreate, ForkInfo, ForkKind, ForkOutcome, ForkPut, ForkReply, ForkStatus,
 };
-use laser_wire::forward::{ForwardedCommand, ForwardedQuery, ForwardedScope};
+use laser_wire::forward::{Caller, ForwardedCommand, ForwardedQuery, ForwardedScope};
 use laser_wire::framing::{decode_named, encode_named};
 use laser_wire::graph::{
     EdgeDir, GraphEdge, GraphNeighbors, GraphNode, GraphQuery, GraphReply, GraphResult,
@@ -117,6 +118,9 @@ use laser_wire::topology::WireTopology;
 use laser_wire::validate::Validate;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::{Path as FilePath, PathBuf};
 
 #[test]
 fn given_session_read_requests_when_encoded_then_should_match_golden_fixtures() {
@@ -202,8 +206,6 @@ fn given_session_read_requests_when_encoded_then_should_match_golden_fixtures() 
         laser_wire::framing::decode_named::<session_request::SessionGet>(&missing_stream).is_err()
     );
 }
-use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 const REGEN_ENV: &str = "AGDX_WIRE_FIXTURES_REGEN";
 const TIMESTAMP_MICROS: u64 = 1_717_171_717_000_000;
@@ -445,6 +447,33 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn write_fixture(path: &FilePath, encoded: impl AsRef<[u8]>) {
+    let mut temporary = path.as_os_str().to_os_string();
+    temporary.push(format!(".{}.tmp", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    std::fs::write(&temporary, encoded).expect("write fixture");
+    std::fs::rename(&temporary, path).expect("replace fixture");
+}
+
+#[test]
+fn given_an_open_fixture_when_regenerated_then_should_keep_the_reader_on_a_complete_snapshot() {
+    let path = std::env::temp_dir().join(format!("laser-wire-fixture-{}.bin", std::process::id()));
+    std::fs::write(&path, b"original fixture").expect("initial fixture");
+    let mut reader = std::fs::File::open(&path).expect("open fixture");
+
+    write_fixture(&path, b"replacement fixture");
+
+    let mut snapshot = Vec::new();
+    reader
+        .read_to_end(&mut snapshot)
+        .expect("read open fixture");
+    let replacement = std::fs::read(&path).expect("read replacement");
+    drop(reader);
+    std::fs::remove_file(&path).expect("remove fixture");
+    assert_eq!(snapshot, b"original fixture");
+    assert_eq!(replacement, b"replacement fixture");
+}
+
 fn assert_frame<T>(name: &str, value: &T)
 where
     T: Serialize + DeserializeOwned,
@@ -452,7 +481,7 @@ where
     let encoded = encode_named(value).expect("fixture value serializes");
     let path = fixture_path(name);
     if std::env::var(REGEN_ENV).is_ok() {
-        std::fs::write(&path, &encoded).expect("write fixture");
+        write_fixture(&path, &encoded);
     }
     let golden = std::fs::read(&path)
         .unwrap_or_else(|error| panic!("read fixture {name}: {error} (regen with {REGEN_ENV}=1)"));
@@ -473,7 +502,7 @@ where
     let encoded = serde_json::to_string_pretty(value).expect("fixture value serializes");
     let path = fixture_path(name);
     if std::env::var(REGEN_ENV).is_ok() {
-        std::fs::write(&path, &encoded).expect("write fixture");
+        write_fixture(&path, &encoded);
     }
     let golden = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read fixture {name}: {error} (regen with {REGEN_ENV}=1)"));
@@ -1567,6 +1596,27 @@ fn given_control_frames_when_encoded_then_should_match_golden_fixtures() {
                 created_at_micros: 1_700_000_000_000_000,
             }),
             key_id: 11,
+            caller: None,
+        });
+        stamped
+    });
+    assert_frame("control_stamped_caller.bin", &{
+        let mut stamped = envelope(ControlCommand::DropSchema(4));
+        stamped.stream = Some("fleet".to_owned());
+        stamped.stamp = Some(ControlStamp {
+            deployment_id: 7,
+            actor_user_id: 3,
+            operation_id: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdf0,
+            stream_generation: Some(ControlStreamGeneration {
+                stream_id: 3,
+                created_at_micros: 1_700_000_000_000_000,
+            }),
+            key_id: 11,
+            caller: Some(Caller {
+                user_id: 3,
+                agent: None,
+                on_behalf_of: Some("1793690355287073".to_owned()),
+            }),
         });
         stamped
     });
@@ -2315,6 +2365,50 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             command_code: AGDX_KV_SET_CODE,
             payload: vec![9, 9, 9],
             grants: Vec::new(),
+            agent: None,
+            on_behalf_of: None,
+        },
+    );
+    assert_frame(
+        "forwarded_command_agent.bin",
+        &ForwardedCommand {
+            read_barrier: false,
+            min_position: None,
+            positioned_reply: true,
+            min_sessions: Vec::new(),
+            tenancy: Default::default(),
+            user_id: 0,
+            client_id: 42,
+            correlation: None,
+            operation_id: Some(17),
+            read_all: false,
+            scope: None,
+            command_code: laser_wire::codes::AGDX_FORK_CREATE_CODE,
+            payload: vec![9, 9, 9],
+            grants: Vec::new(),
+            agent: Some("orbit-planner".parse().expect("agent id")),
+            on_behalf_of: None,
+        },
+    );
+    assert_frame(
+        "forwarded_command_on_behalf_of.bin",
+        &ForwardedCommand {
+            read_barrier: false,
+            min_position: None,
+            positioned_reply: false,
+            min_sessions: Vec::new(),
+            tenancy: Default::default(),
+            user_id: 3,
+            client_id: 42,
+            correlation: None,
+            operation_id: Some(18),
+            read_all: false,
+            scope: None,
+            command_code: AGDX_CONTROL_PUBLISH_CODE,
+            payload: vec![9, 9, 9],
+            grants: Vec::new(),
+            agent: None,
+            on_behalf_of: Some("1793690355287073".to_owned()),
         },
     );
     let scope = ForwardedScope {
@@ -2339,6 +2433,8 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             command_code: AGDX_KV_SET_CODE,
             payload: vec![9, 9, 9],
             grants: Vec::new(),
+            agent: None,
+            on_behalf_of: None,
         },
     );
     assert_frame(
@@ -2369,6 +2465,8 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             command_code: laser_wire::codes::AGDX_KV_GET_CODE,
             payload: vec![9, 9, 9],
             grants: Vec::new(),
+            agent: None,
+            on_behalf_of: None,
         },
     );
     assert_frame(
@@ -2569,6 +2667,25 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
                 expires_at_micros: Some(1_700_000_000_000_000),
             })
             .expect("kv set encodes"),
+            caller: None,
+        },
+    );
+    assert_frame(
+        "mutation_command_caller.bin",
+        &MutationCommandEnvelope {
+            v: FORK_OP_VERSION,
+            operation_id: 44,
+            actor_user_id: 0,
+            deployment_id: 7,
+            timestamp_micros: 1_700_000_000_000_000,
+            command_code: laser_wire::codes::AGDX_FORK_CREATE_CODE,
+            scope: None,
+            payload: vec![9, 9, 9],
+            caller: Some(Caller {
+                user_id: 0,
+                agent: Some("orbit-planner".parse().expect("agent id")),
+                on_behalf_of: None,
+            }),
         },
     );
     assert_frame(
@@ -2586,6 +2703,7 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
                 stream_created_at_micros: 1_700_000_000_000_000,
             }),
             payload: vec![9, 9, 9],
+            caller: None,
         },
     );
 }

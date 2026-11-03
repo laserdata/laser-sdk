@@ -191,6 +191,10 @@ pub struct MutationCommandEnvelope {
     pub scope: Option<crate::forward::ForwardedScope>,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub payload: Vec<u8>,
+    /// The client that asked for the command. Absent on a command the backend
+    /// issues on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<crate::forward::Caller>,
 }
 
 impl MutationCommandEnvelope {
@@ -318,6 +322,7 @@ mod tests {
             command_code: AGDX_KV_SET_CODE,
             scope: None,
             payload: vec![0, 1, 2, 255],
+            caller: None,
         };
         let bytes = encode_named(&envelope).expect("encodes");
         let back: MutationCommandEnvelope = decode_named(&bytes).expect("decodes");
@@ -362,6 +367,7 @@ mod tests {
             command_code: AGDX_KV_SET_CODE,
             scope: None,
             payload: Vec::new(),
+            caller: None,
         };
 
         assert!(request.validate().is_err());
