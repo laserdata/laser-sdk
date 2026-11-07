@@ -221,6 +221,84 @@ void test("given_a_cursor_stream_when_the_reader_catches_up_then_should_end", as
   assert.deepEqual(read, [0n, 1n])
 })
 
+void test("given_a_cursor_stream_when_each_record_is_yielded_then_should_expose_offsets_past_it", async () => {
+  let served = false
+  const transport = {
+    pollMessages(_stream, _topic, target) {
+      assert.equal(target.kind, "single")
+      if (served || target.partitionId !== 0) return Promise.resolve([])
+      served = true
+      return Promise.resolve([message(0, 0n, 2n), message(0, 1n, 2n), message(0, 2n, 2n)])
+    }
+  } satisfies Pick<LaserTransport, "pollMessages">
+  const cursor = Cursor.create(transport as unknown as LaserTransport, "test", "events", [0, 1])
+
+  const seen: (readonly [bigint, ReadonlyMap<number, bigint>])[] = []
+  for await (const record of cursor.stream()) seen.push([record.id.offset, cursor.offsets])
+  assert.deepEqual(seen, [
+    [0n, new Map([[0, 1n]])],
+    [1n, new Map([[0, 2n]])],
+    [
+      2n,
+      new Map([
+        [0, 3n],
+        [1, 0n]
+      ])
+    ]
+  ])
+})
+
+void test("given_a_typed_reader_when_calling_next_then_should_expose_offsets_past_each_yielded_record", async () => {
+  let served = false
+  const transport = {
+    pollMessages() {
+      if (served) return Promise.resolve([])
+      served = true
+      return Promise.resolve([json(0n, { cpu: 1 }), json(1n, { cpu: 2 }), json(2n, { cpu: 3 })])
+    }
+  } satisfies Pick<LaserTransport, "pollMessages">
+  const records = TypedRecords.create(
+    Cursor.create(transport as unknown as LaserTransport, "test", "events", [0]),
+    new Json<{ readonly cpu: number }>()
+  )
+
+  const seen: bigint[] = []
+  for (let read = 0; read < 3; read += 1) {
+    assert.ok((await records.next())?.kind === "record")
+    seen.push(records.offsets.get(0) ?? -1n)
+  }
+  assert.deepEqual(seen, [1n, 2n, 3n], "a crash after handling a record resumes right after it")
+})
+
+void test("given_a_replay_cursor_when_partitions_are_added_then_should_read_them_on_the_next_poll", async () => {
+  let partitions = 1
+  const read: number[] = []
+  const transport = {
+    pollMessages(_stream, _topic, target, strategy) {
+      assert.equal(target.kind, "single")
+      assert.equal(strategy.kind, "offset")
+      if (strategy.value > 0n) return Promise.resolve([])
+      read.push(target.partitionId)
+      return Promise.resolve([message(target.partitionId, 0n)])
+    }
+  } satisfies Pick<LaserTransport, "pollMessages">
+  const cursor = Cursor.create(transport as unknown as LaserTransport, "test", "events", [0], () =>
+    Promise.resolve(partitions)
+  )
+
+  assert.equal((await cursor.poll()).length, 1)
+  partitions = 2
+  assert.equal((await cursor.poll()).length, 1)
+  assert.deepEqual(read, [0, 1], "the added partition is read from its start")
+  assert.deepEqual(
+    cursor.offsets,
+    new Map([
+      [0, 1n],
+      [1, 1n]
+    ])
+  )
+})
+
 void test("given_a_typed_reader_when_calling_next_then_should_yield_one_record_at_a_time_and_undefined_when_caught_up", async () => {
   let served = false
   const transport = {

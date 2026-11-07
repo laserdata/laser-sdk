@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { test } from "node:test"
+import { InvalidError } from "../../src/client/errors.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import {
   IndexSchemaBuilder,
@@ -9,15 +10,22 @@ import {
   ProjectionBuilder,
   decodeControlEnvelope,
   decodeProjectionBinding,
+  decodeProjectionHistory,
   decodeRetentionPolicy,
   decodeSchemaSource,
   encodeControlEnvelope,
   encodeProjectionBinding,
+  encodeProjectionHistory,
   parseProjectionId,
   projectionKindFromCode,
   projectionKindIsRow,
-  schemaDefContentType
+  schemaDefContentType,
+  validateControlCommand,
+  validateProjection,
+  validateSchemaSource,
+  type RetentionPolicy
 } from "../../src/wire/control.js"
+import { AGDX_REGISTER_SCHEMA_CODE, isIdempotentManagedRequest } from "../../src/wire/codes.js"
 import { BackendResourceId } from "../../src/wire/ids.js"
 
 const FIXTURES_DIR = path.resolve(process.cwd(), "../../wire/fixtures")
@@ -50,7 +58,17 @@ void test("given_the_binding_control_fixtures_when_decoded_then_should_preserve_
   assert.equal(applied.command.binding.retention?.kind, "timeToLive")
 
   const removed = await assertControlRoundTrips("control_remove_binding.bin")
-  assert.equal(removed.command.kind, "removeBinding")
+  if (removed.command.kind !== "removeBinding") throw new Error("wrong command")
+  assert.equal(removed.command.generation, undefined)
+
+  const retired = await assertControlRoundTrips("control_generation_remove_binding.bin")
+  if (retired.command.kind !== "removeBinding") throw new Error("wrong command")
+  assert.deepEqual(retired.command.generation, {
+    streamId: 3,
+    createdAtMicros: 1_700_000_000_000_000n
+  })
+  assert.equal(retired.stream, undefined)
+  assert.equal(retired.stamp?.caller, undefined)
 })
 
 void test("given_the_operator_control_fixtures_when_decoded_then_should_preserve_the_decision", async () => {
@@ -64,6 +82,11 @@ void test("given_the_operator_control_fixtures_when_decoded_then_should_preserve
   if (skipped.command.kind !== "skipRecord") throw new Error("wrong command")
   assert.equal(skipped.command.skip.offset, 58n)
   assert.equal(skipped.command.skip.target, "readings_rows")
+
+  const retained = await assertControlRoundTrips("control_source_retained.bin")
+  if (retained.command.kind !== "sourceRetained") throw new Error("wrong command")
+  assert.equal(retained.command.retention.partitionId, 2)
+  assert.equal(retained.command.retention.firstOffset, 59n)
 })
 
 void test("given_a_stamped_control_fixture_when_decoded_then_should_preserve_the_stamp", async () => {
@@ -71,7 +94,7 @@ void test("given_a_stamped_control_fixture_when_decoded_then_should_preserve_the
   assert.equal(stamped.stream, "fleet")
   if (stamped.stamp === undefined) throw new Error("stamp missing")
   assert.equal(stamped.stamp.deploymentId, 7n)
-  assert.equal(stamped.stamp.actorUserId, 42)
+  assert.equal(stamped.stamp.caller, undefined)
   assert.equal(stamped.stamp.operationId, 0x0123456789abcdef0123456789abcdefn)
   assert.equal(stamped.stamp.streamGeneration?.streamId, 3)
   assert.equal(stamped.stamp.keyId, 11n)
@@ -82,7 +105,6 @@ void test("given_a_stamped_control_fixture_when_decoded_then_should_preserve_the
 void test("given_a_control_stamp_with_a_caller_written_for_an_end_user_when_decoded_then_should_keep_both", async () => {
   const stamped = await assertControlRoundTrips("control_stamped_caller.bin")
   if (stamped.stamp === undefined) throw new Error("stamp missing")
-  assert.equal(stamped.stamp.actorUserId, 3)
   assert.deepEqual(stamped.stamp.caller, { userId: 3, onBehalfOf: "1793690355287073" })
   const unstamped = await assertControlRoundTrips("control_stamped_remove_binding.bin")
   assert.equal(unstamped.stamp?.caller, undefined)
@@ -213,18 +235,52 @@ void test("given_a_binding_without_a_source_when_built_then_should_refuse", () =
   assert.equal(binding.notify, true)
 })
 
+void test("given_an_index_field_name_that_is_not_an_identifier_when_validated_then_should_refuse_it", () => {
+  for (const name of ["user-id", "order.total", "9lives", "café"]) {
+    assert.throws(() => {
+      validateProjection(new ProjectionBuilder("orders").fieldAt(name, "/value").build())
+    }, /must start with an ASCII letter/)
+  }
+  for (const name of ["user_id", "_private", "total2"])
+    validateProjection(new ProjectionBuilder("orders").fieldAt(name, "/value").build())
+})
+
+void test("given_a_retention_that_never_or_always_prunes_when_validated_then_should_refuse_the_binding", () => {
+  const applying = (retention: RetentionPolicy) => ({
+    kind: "applyBinding" as const,
+    binding: new ProjectionBindingBuilder().source("s", "t").retention(retention).build()
+  })
+  for (const retention of [
+    { kind: "unknown" },
+    { kind: "timeToLive", ttlMicros: 0n },
+    { kind: "maxRows", rows: 0n }
+  ] as const) {
+    assert.throws(() => {
+      validateControlCommand(applying(retention))
+    }, /policy this build does not know|above zero/)
+  }
+  validateControlCommand(applying({ kind: "maxRows", rows: 1n }))
+})
+
 void test("given_a_binding_that_skips_rejected_records_when_encoded_then_should_round_trip_the_opt_in", () => {
   const plain = new ProjectionBindingBuilder().source("s", "t").build()
-  assert.equal(plain.skipRejected, false)
-  assert.equal(encodeProjectionBinding(plain).has("skip_rejected"), false)
-  const opted = new ProjectionBindingBuilder().source("s", "t").skipRejected().build()
+  assert.equal(plain.invalidRecords, "block")
+  assert.equal(plain.oversize, "block")
+  assert.equal(encodeProjectionBinding(plain).has("oversize"), false)
+  assert.equal(encodeProjectionBinding(plain).has("invalid_records"), false)
+  const opted = new ProjectionBindingBuilder()
+    .source("s", "t")
+    .invalidRecords("dead_letter")
+    .oversize("reference")
+    .build()
   const encoded = encodeProjectionBinding(opted)
-  assert.equal(encoded.get("skip_rejected"), true)
+  assert.equal(encoded.get("invalid_records"), "dead_letter")
   const decoded = decodeProjectionBinding(
     expectMap(decodeOne(encodeNamed(encoded), "binding"), "binding"),
     "binding"
   )
-  assert.equal(decoded.skipRejected, true)
+  assert.equal(decoded.invalidRecords, "dead_letter")
+  assert.equal(decoded.oversize, "reference")
 })
 
 void test("given_an_index_schema_builder_when_built_then_should_expand_root_fields", () => {
@@ -258,4 +314,76 @@ void test("given_each_schema_source_when_asked_for_the_content_type_then_should_
   )
   assert.equal(schemaDefContentType(def({ kind: "jsonSchema", schema: "{}" })), "json")
   assert.equal(schemaDefContentType(def({ kind: "unknown" })), "any")
+})
+
+void test("given_the_allocate_schema_control_fixture_when_decoded_then_should_round_trip_without_an_id", async () => {
+  const envelope = await assertControlRoundTrips("control_allocate_schema.bin")
+  if (envelope.command.kind !== "allocateSchema") throw new Error("wrong command")
+  assert.equal(envelope.command.allocation.name, "reading")
+  assert.equal(envelope.command.allocation.version, 2)
+  assert.equal(envelope.command.allocation.source.kind, "jsonSchema")
+  assert.equal(envelope.stream, "fleet")
+  assert.equal(isIdempotentManagedRequest(AGDX_REGISTER_SCHEMA_CODE), true)
+})
+
+void test("given_record_and_policy_fixtures_when_decoded_then_should_round_trip_the_materialization_contract", async () => {
+  const projection = await assertControlRoundTrips("control_register_projection_record.bin")
+  assert.equal(projection.command.kind, "registerProjection")
+  assert.equal(projection.command.projection.kind.kind, "record")
+  const binding = await assertControlRoundTrips("control_apply_binding_policies.bin")
+  assert.equal(binding.command.kind, "applyBinding")
+  assert.equal(binding.command.binding.invalidRecords, "dead_letter")
+  assert.equal(binding.command.binding.oversize, "reference")
+})
+
+void test("given_a_keyed_projection_fixture_when_decoded_then_should_preserve_key_and_deletion_header", async () => {
+  const envelope = await assertControlRoundTrips("control_register_projection_keyed.bin")
+  if (envelope.command.kind !== "registerProjection") throw new Error("projection command")
+  assert.deepEqual(envelope.command.projection.history, {
+    kind: "keyed",
+    key: { kind: "header", name: "reading_id" },
+    deleteHeader: "deleted"
+  })
+})
+
+void test("given_a_keyed_projection_fixture_without_a_delete_header_when_decoded_then_should_round_trip_without_it", async () => {
+  const envelope = await assertControlRoundTrips(
+    "control_register_projection_keyed_without_delete.bin"
+  )
+  if (envelope.command.kind !== "registerProjection") throw new Error("projection command")
+  assert.deepEqual(envelope.command.projection.history, {
+    kind: "keyed",
+    key: { kind: "header", name: "reading_id" }
+  })
+})
+
+void test("given_a_keyed_projection_without_a_delete_header_when_encoded_then_should_omit_it_and_validate", () => {
+  const key = { kind: "header", name: "reading_id" } as const
+  const projection = new ProjectionBuilder("latest_readings").record().keyed(key).build()
+  validateProjection(projection)
+  const history = encodeProjectionHistory(projection.history)
+  assert.equal(history.has("delete_header"), false)
+  assert.deepEqual(decodeProjectionHistory(history, "history"), { kind: "keyed", key })
+  assert.throws(() => {
+    validateProjection(new ProjectionBuilder("latest_readings").record().keyed(key, "").build())
+  }, InvalidError)
+})
+
+void test("given_a_json_schema_dialect_with_trailing_hashes_when_validated_then_should_accept_it_and_refuse_other_dialects", () => {
+  const dialect = "https://json-schema.org/draft/2020-12/schema"
+  const hashes = "#".repeat(50_000)
+  const accepts = (value: string): void => {
+    validateSchemaSource({ kind: "jsonSchema", schema: JSON.stringify({ $schema: value }) })
+  }
+  accepts(dialect)
+  accepts(`${dialect}#`)
+  accepts(dialect + hashes)
+  const started = performance.now()
+  assert.throws(() => {
+    accepts(`${dialect}${hashes}x`)
+  }, InvalidError)
+  assert.throws(() => {
+    accepts("https://json-schema.org/draft-07/schema#")
+  }, InvalidError)
+  assert.ok(performance.now() - started < 1_000, "the dialect check stays linear in the hash run")
 })

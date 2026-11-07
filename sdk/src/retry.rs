@@ -49,6 +49,12 @@ const JITTER_HIGH: f64 = 1.0;
 pub(crate) const MANAGED_MUTATION: Backoff = Backoff::from_millis(100, 2_000);
 pub(crate) const MANAGED_MUTATION_DEADLINE: Duration = Duration::from_secs(30);
 
+/// The first attempt of a managed mutation gets this long before it counts as
+/// lost, the scale the route recheck uses, and each later one twice as long,
+/// never past the operation deadline. A dead node then costs one bound, not the
+/// whole deadline.
+pub(crate) const MANAGED_ATTEMPT_FIRST: Duration = Duration::from_secs(1);
+
 /// A reliable consumer or pause runtime reopens on this backoff, and gives up
 /// after this many consecutive failures.
 pub(crate) const CONSUMER: Backoff = Backoff::from_millis(50, 1_000);
@@ -74,6 +80,11 @@ pub(crate) const QUERY_REPLY_GRACE: Duration = Duration::from_secs(2);
 
 /// Producers racing to create the same stream or topic retry this often.
 pub(crate) const CREATE_RACE_ATTEMPTS: usize = 10;
+
+/// How long a presence advertise or clear waits for the replica that holds
+/// the presence before it reports the replica unavailable and keeps the pin.
+#[cfg_attr(not(all(feature = "agent", feature = "query")), allow(dead_code))]
+pub(crate) const PRESENCE_ATTEMPT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {
@@ -106,6 +117,10 @@ mod tests {
             MANAGED_MUTATION_DEADLINE,
             millis(&table, "managed_mutation", "deadline_ms")
         );
+        assert_eq!(
+            MANAGED_ATTEMPT_FIRST,
+            millis(&table, "managed_mutation", "attempt_first_ms")
+        );
         assert_eq!(CONSUMER.base, millis(&table, "consumer", "base_ms"));
         assert_eq!(CONSUMER.max, millis(&table, "consumer", "max_ms"));
         assert_eq!(
@@ -134,6 +149,7 @@ mod tests {
             CREATE_RACE_ATTEMPTS as u64,
             count(&table, "create_race", "attempts")
         );
+        assert_eq!(PRESENCE_ATTEMPT, millis(&table, "presence", "attempt_ms"));
     }
 
     #[test]

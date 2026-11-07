@@ -66,7 +66,7 @@ pub struct Provenance {
     /// LLM token / cost usage for this step.
     pub usage: Option<LlmUsage>,
     /// Drop-dead time. A consumer past it dead-letters the message.
-    pub deadline: Option<IggyTimestamp>,
+    pub deadline_at: Option<IggyTimestamp>,
     /// Business dedup key: a producer-supplied key that suppresses a duplicate of
     /// the same logical operation. Distinct from [`correlation_id`](Self::correlation_id):
     /// setting a real dedup key and retrying no longer cross-matches replies.
@@ -106,7 +106,7 @@ impl TryFrom<&Provenance> for BTreeMap<HeaderKey, HeaderValue> {
         headers.idempotency_key = p.idempotency_key.clone();
         headers.correlation = p.correlation_id.clone();
         headers.fence = p.fence_token;
-        headers.deadline_micros = p.deadline.map(|deadline| deadline.as_micros());
+        headers.deadline_micros = p.deadline_at.map(|deadline_at| deadline_at.as_micros());
         if let Some(usage) = &p.usage {
             headers.input_tokens = usage.input_tokens;
             headers.output_tokens = usage.output_tokens;
@@ -180,7 +180,7 @@ pub(crate) fn provenance_from_headers(
     let mut idempotency_key: Option<String> = None;
     let mut correlation_id: Option<String> = None;
     let mut fence_token: Option<u64> = None;
-    let mut deadline: Option<IggyTimestamp> = None;
+    let mut deadline_at: Option<IggyTimestamp> = None;
     let mut usage = LlmUsage::default();
     let mut has_usage = false;
 
@@ -234,7 +234,7 @@ pub(crate) fn provenance_from_headers(
             // through as unfenced.
             keys::FENCE => fence_token = Some(u64_value(value, keys::FENCE)?),
             keys::DEADLINE => {
-                deadline = Some(IggyTimestamp::from(u64_value(value, keys::DEADLINE)?));
+                deadline_at = Some(IggyTimestamp::from(u64_value(value, keys::DEADLINE)?));
             }
             keys::USAGE_INPUT_TOKENS => {
                 usage.input_tokens = Some(u64_value(value, keys::USAGE_INPUT_TOKENS)?);
@@ -267,7 +267,7 @@ pub(crate) fn provenance_from_headers(
         agent,
         target_agent_id,
         usage: has_usage.then_some(usage),
-        deadline,
+        deadline_at,
         idempotency_key,
         correlation_id,
         fence_token,
@@ -326,6 +326,7 @@ mod tests {
             .idempotency_key("key-1".to_owned())
             .correlation_id("corr-1".to_owned())
             .fence_token(7)
+            .deadline_at(IggyTimestamp::from(1_717_171_777_000_000))
             .usage(
                 LlmUsage::builder()
                     .input_tokens(10)
@@ -357,6 +358,10 @@ mod tests {
         assert_eq!(back.idempotency_key.as_deref(), Some("key-1"));
         assert_eq!(back.correlation_id.as_deref(), Some("corr-1"));
         assert_eq!(back.fence_token, Some(7));
+        assert_eq!(
+            back.deadline_at,
+            Some(IggyTimestamp::from(1_717_171_777_000_000))
+        );
         let usage = back.usage.expect("usage should be set");
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(20));

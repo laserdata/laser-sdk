@@ -12,7 +12,7 @@ Given(
 
 When("the binding lets the backend skip rejected records", function (this: LaserWorld) {
   assert.ok(this.bindingBuilder, "a binding builder");
-  this.bindingBuilder = this.bindingBuilder.skipRejected();
+  this.bindingBuilder = this.bindingBuilder.invalidRecords("dead_letter");
 });
 
 When("I build the binding", function (this: LaserWorld) {
@@ -20,10 +20,19 @@ When("I build the binding", function (this: LaserWorld) {
   this.bindingWire = wire.encodeProjectionBinding(this.bindingBuilder.build());
 });
 
-Then("the binding's wire form omits skip_rejected", function (this: LaserWorld) {
-  assert.equal(this.bindingWire?.has("skip_rejected"), false);
+Then("the binding's wire form omits invalid_records", function (this: LaserWorld) {
+  assert.equal(this.bindingWire?.has("invalid_records"), false);
 });
 
-Then("the binding's wire form carries skip_rejected true", function (this: LaserWorld) {
-  assert.equal(this.bindingWire?.get("skip_rejected"), true);
+Then("the binding's wire form carries invalid_records dead_letter", function (this: LaserWorld) {
+  assert.equal(this.bindingWire?.get("invalid_records"), "dead_letter");
+});
+
+When("the binding keeps references for oversized records", function (this: LaserWorld) {
+  assert.ok(this.bindingBuilder, "a binding builder");
+  this.bindingBuilder = this.bindingBuilder.oversize("reference");
+});
+
+Then("the binding's wire form carries oversize reference", function (this: LaserWorld) {
+  assert.equal(this.bindingWire?.get("oversize"), "reference");
 });

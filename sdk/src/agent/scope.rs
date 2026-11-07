@@ -65,7 +65,7 @@ impl AgentScope {
 
     /// Open a directed [`contract`](Laser::contract) from this agent to
     /// `router`'s target, with `.from(..)` already set.
-    pub fn contract(&self, router: Router) -> crate::agent::contract::ContractBuilder<'_> {
+    pub fn contract(&self, router: Router) -> crate::agent::contract::ContractBuilder {
         self.laser.contract(router).from(self.id.clone())
     }
 
@@ -75,16 +75,19 @@ impl AgentScope {
         self.laser.publish_card(self.id.clone(), card).await
     }
 
-    /// Advertise `capabilities` the way a spawning agent does: a durable card
-    /// on the registry plus, where the server serves presence, this agent's
-    /// live inbox at `listen_on`. Fails when this connection already belongs to
+    /// Advertise `capabilities`: a durable card on the registry naming
+    /// `listen_on` as this agent's inbox, with no ttl, plus, where the server
+    /// serves presence, the same inbox as live presence. A spawned agent
+    /// refreshes a card with a ttl instead. Fails when this connection already belongs to
     /// another advertised agent, so presence cannot be overwritten silently.
     pub async fn advertise(
         &self,
         listen_on: AgentTopic<'static>,
         capabilities: Vec<CapabilityDescriptor>,
     ) -> Result<(), LaserError> {
-        crate::agent::builder::advertise(&self.laser, &self.id, &listen_on, capabilities).await
+        crate::agent::builder::advertise(&self.laser, &self.id, &listen_on, capabilities, None)
+            .await
+            .map(|_| ())
     }
 
     /// This agent's id.

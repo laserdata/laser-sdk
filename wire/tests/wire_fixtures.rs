@@ -18,48 +18,35 @@ use laser_wire::authz::{
 };
 use laser_wire::batch::{BatchItem, BatchReply, BatchRequest};
 use laser_wire::browse::{
-    BrowseOutcome, BrowseReply, DecodeRecord, ProjectionInfo, RegisterSchema, SchemaInfo,
+    BindingStatus, BrowseOutcome, BrowseReply, DecodeRecord, FailureClass, GetProjection, Hold,
+    HoldCause, ListProjections, PartitionProgress, ProjectionInfo, ProjectionPage,
+    RealizationState, RegisterSchema, SchemaInfo, SchemaPage, StallReason,
 };
 use laser_wire::change::ChangeRecord;
-use laser_wire::checkpoint::{
-    AttemptColumnMetrics, AttemptObject, CheckpointMutationResult, CheckpointMutationStamp,
-    CheckpointOwnerId, CheckpointReadConsistency, CheckpointReply, CheckpointRequestEnvelope,
-    CheckpointRequestId, CompletedAttempt, CredentialGeneration, DestinationBlock,
-    DestinationBlockCode, DestinationCheckpointStatus, DestinationEffectiveState,
-    IcebergCommitRequirement, PartitionCheckpoint, PartitionLifecycleChange,
-    PartitionLifecycleState, PreparedAttempt, PreparedAttemptId, PreparedTableRequirements,
-    PublicCheckpointMutation, RepairAction, RepairRecord, ReplicatedCheckpointMutation,
-    ReplicatedCheckpointMutationBody, RetentionGap, SourceOffsetRange,
-};
 use laser_wire::clients::{ClientMetadata, ClientMetadataList, ClientMetadataQuery};
 use laser_wire::codes::{
     AGDX_CONTROL_PUBLISH_CODE, AGDX_KV_SET_CODE, AGENT_OP_VERSION, AUTHZ_OP_VERSION,
-    BATCH_OP_VERSION, CHANGE_OP_VERSION, CHECKPOINT_OP_VERSION, CLIENT_METADATA_OP_VERSION,
-    CONTROL_OP_VERSION, FORK_OP_VERSION, GRAPH_OP_VERSION, KV_LEASE_OP_VERSION, KV_OP_VERSION,
-    QUERY_OP_VERSION,
+    BATCH_OP_VERSION, CHANGE_OP_VERSION, CLIENT_METADATA_OP_VERSION, CONTROL_OP_VERSION,
+    FORK_OP_VERSION, GRAPH_OP_VERSION, KV_LEASE_OP_VERSION, KV_OP_VERSION, QUERY_OP_VERSION,
 };
 use laser_wire::content::ContentType;
 use laser_wire::control::{
     ControlCommand, ControlEnvelope, ControlStamp, ControlStreamGeneration, FieldType,
-    GapAcceptance, IndexField, IndexSchema, Projection, ProjectionBinding, ProjectionId,
-    ProjectionKind, RecordSkip, RetentionPolicy, SchemaDef, SchemaSource, SessionTopics,
-    SourceSelector,
+    GapAcceptance, IndexField, IndexSchema, InvalidRecordPolicy, OversizePolicy, Projection,
+    ProjectionBinding, ProjectionId, ProjectionKey, ProjectionKind, RecordSkip, RetentionPolicy,
+    SchemaAllocation, SchemaDef, SchemaSource, SessionTopics, SourceRetention, SourceSelector,
 };
-use laser_wire::destination::{
-    BackendBinding, BackendResourceId, DestinationDesiredState, DestinationErrorPolicy,
-    DestinationId, DestinationOperationId, FileFormat, MaterializationDestination,
-    NewPartitionPolicy, PartitionStart, PhysicalTable, ProjectionRef, QueryRoute, QueryRouteId,
-    QueryRouteTarget, RecreatedPartitionPolicy, StartPolicy, TableFormat,
-};
+use laser_wire::destination::{BackendBinding, BackendResourceId};
 use laser_wire::filter::{
     AckContext, AckReceipt, AppliedPolicy, CatalogPosition, ConsumerFilter, ExecutionMode,
-    FilterBinding, FilterCatalogCommand, FilterCatalogOutcome, FilterCatalogReply, FilterConsumer,
-    FilterError, FilterErrorReason, FilterExpr, FilterGroupIdentity, FilterGroupRef,
-    FilterMutation, FilterMutationOutcome, FilterMutationRequest, FilterMutationResult,
-    FilterMutationStatus, FilterOutcome, FilterRef, FilterReply, FilterRevisionRef, FilterSource,
-    FilterValidation, FilteredAck, FilteredPage, FilteredPollRequest, FilteredStart,
-    FilteredWaitCancel, FilteredWaitCancelled, FilteredWaitPartition, FilteredWaitRequest,
-    FilteredWaitResult, GroupFilterSpec, GroupPolicyUnbound, SourceGeneration, StopReason,
+    FaultPolicy, FaultReason, FilterBinding, FilterCatalogCommand, FilterCatalogOutcome,
+    FilterCatalogReply, FilterConsumer, FilterDecodeLimits, FilterError, FilterErrorReason,
+    FilterExpr, FilterGroupIdentity, FilterGroupRef, FilterMutation, FilterMutationOutcome,
+    FilterMutationRequest, FilterMutationResult, FilterMutationStatus, FilterOutcome, FilterRef,
+    FilterReply, FilterRevisionRef, FilterSource, FilterValidation, FilteredAck, FilteredPage,
+    FilteredPollRequest, FilteredStart, FilteredWaitCancel, FilteredWaitCancelled,
+    FilteredWaitPartition, FilteredWaitRequest, FilteredWaitResult, GroupFilterSpec,
+    GroupPolicyUnbound, RecordFault, RecordPolicy, SourceGeneration, StopReason,
 };
 use laser_wire::fork::{
     ForkCreate, ForkInfo, ForkKind, ForkOutcome, ForkPut, ForkReply, ForkStatus,
@@ -73,15 +60,9 @@ use laser_wire::graph::{
 use laser_wire::hello::{
     BackendAnnounce, BackendDescriptor, BackendDesiredState, BackendImplementation, BackendLimits,
     BackendMode, BackendObservedState, BackendReadiness, BackendReadinessCode, HelloReply,
-    MaterializationCapability, OpVersions, QueryCapabilities, QueryPagingCapability,
-    SchemaCapabilities, TimeTravelCapability, feature,
+    OpVersions, QueryCapabilities, SchemaCapabilities, feature,
 };
-use laser_wire::http::{
-    AcceptedOperationView, Capabilities, DestinationCapsView, DestinationIssueView,
-    DestinationPageView, DestinationView, ErrorBody, KvEntryView, KvPageView, OperationState,
-    QueryExecutionView, QueryRoutePageView, SnapshotPageView, TableFilePageView, TableFileView,
-    TableMetricsView, TableSchemaView, TableSnapshotView, TableView,
-};
+use laser_wire::http::{Capabilities, ErrorBody, KvEntryView, KvPageView};
 use laser_wire::keys::{KEY_ID_BYTES, KeyKind, KeyRecord, VERIFYING_KEY_BYTES};
 use laser_wire::kv::{
     CasExpect, KvCas, KvCasFenced, KvCopy, KvDelete, KvEntry, KvError, KvGet, KvLease,
@@ -95,15 +76,14 @@ use laser_wire::mutation::{
 };
 use laser_wire::query::{
     AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, Filter, KeyMatch, Page, Query,
-    QueryCancelEnvelope, QueryContext, QueryEngine, QueryEnvelope, QueryError, QueryErrorCode,
-    QueryExecutionId, QueryExecutionState, QueryExecutionStatus, QueryPageEnvelope,
-    QueryPageRequest, QueryReply, QueryResult, QueryStatusEnvelope, QueryStatusReply, QueryTarget,
-    RawSql, ResolvedQueryTarget, Row, Select, Sort, SqlDialect, TextQuery, VectorQuery, Window,
+    QueryContext, QueryEngine, QueryEnvelope, QueryError, QueryErrorCode, QueryExecutionId,
+    QueryPageRequest, QueryReply, QueryResult, QueryTarget, RawSql, ResolvedQueryTarget, Row,
+    Select, Sort, SqlDialect, TextQuery, VectorQuery, Window,
 };
 use laser_wire::result::ResultCode;
 use laser_wire::schema::{
     BinaryValue, DecimalValue, Digest32, FieldValue, LogicalField, LogicalSchema, LogicalSchemaId,
-    LogicalType, LogicalTypeKind, MapEntry, SchemaFingerprint, TypedValue, UuidValue,
+    LogicalType, LogicalTypeKind, MapEntry, TypedValue, UuidValue,
 };
 use laser_wire::session::{
     GapReason, LinkRelation, LinkSurface, PayloadRange, SessionChangeOrigin, SessionChangeRow,
@@ -113,7 +93,6 @@ use laser_wire::session::{
     request as session_request,
 };
 use laser_wire::snapshot::{FoldSnapshot, SnapshotOffset};
-use laser_wire::source::{PhysicalClusterIncarnation, SourceIncarnation, SourceScope};
 use laser_wire::topology::WireTopology;
 use laser_wire::validate::Validate;
 use serde::de::DeserializeOwned;
@@ -141,9 +120,10 @@ fn given_session_read_requests_when_encoded_then_should_match_golden_fixtures() 
             label_prefix: None,
             agent: Some("planner".parse().expect("agent")),
             text: Some("search".to_owned()),
-            cursor: Some("next".to_owned()),
-            limit: 25,
-            want_total: true,
+            page: 2,
+            results: 25,
+            as_of: Some(4405),
+            series: Some(SESSION_CHANGE_SERIES),
         },
     );
     assert_frame(
@@ -151,9 +131,10 @@ fn given_session_read_requests_when_encoded_then_should_match_golden_fixtures() 
         &session_request::SessionEvents {
             stream: "agents".to_owned(),
             id,
-            cursor: Some("page".to_owned()),
-            limit: 20,
-            fixed_frontier: true,
+            page: 3,
+            results: 20,
+            as_of: Some(4405),
+            series: Some(SESSION_CHANGE_SERIES),
         },
     );
     assert_frame(
@@ -192,9 +173,8 @@ fn given_session_read_requests_when_encoded_then_should_match_golden_fixtures() 
         "session_changes.bin",
         &session_request::SessionChanges {
             stream: "agents".to_owned(),
-            after: 42,
-            limit: 100,
-            series: None,
+            page: 45,
+            results: 100,
         },
     );
     assert_frame("session_link_surface.bin", &LinkSurface::GraphNode);
@@ -216,34 +196,17 @@ const SESSION_CHANGE_SERIES: u64 = 7_654_321_098_765_432_101;
 struct DataStackStringDiscriminants {
     arrow_timestamp_units: Vec<ArrowTimestampUnit>,
     arrow_rejections: Vec<ArrowIpcRejectionCode>,
-    file_formats: Vec<FileFormat>,
-    table_formats: Vec<TableFormat>,
-    new_partition_policies: Vec<NewPartitionPolicy>,
-    recreated_partition_policies: Vec<RecreatedPartitionPolicy>,
-    destination_error_policies: Vec<DestinationErrorPolicy>,
-    destination_desired_states: Vec<DestinationDesiredState>,
-    partition_lifecycle_states: Vec<PartitionLifecycleState>,
-    destination_block_codes: Vec<DestinationBlockCode>,
-    checkpoint_read_consistency: Vec<CheckpointReadConsistency>,
-    destination_effective_states: Vec<DestinationEffectiveState>,
-    partition_lifecycle_changes: Vec<PartitionLifecycleChange>,
-    repair_actions: Vec<RepairAction>,
     sql_dialects: Vec<SqlDialect>,
     query_consistency: Vec<Consistency>,
     comparison_operators: Vec<CmpOp>,
     sort_directions: Vec<Dir>,
     aggregate_functions: Vec<AggFunc>,
-    boundary_relations: Vec<laser_wire::query::BoundaryRelation>,
-    query_execution_states: Vec<QueryExecutionState>,
     query_error_codes: Vec<QueryErrorCode>,
     logical_type_kinds: Vec<LogicalTypeKind>,
     backend_modes: Vec<BackendMode>,
     backend_desired_states: Vec<BackendDesiredState>,
     backend_observed_states: Vec<BackendObservedState>,
     backend_readiness_codes: Vec<BackendReadinessCode>,
-    time_travel_capabilities: Vec<TimeTravelCapability>,
-    query_paging_capabilities: Vec<QueryPagingCapability>,
-    operation_states: Vec<OperationState>,
 }
 
 fn data_stack_string_discriminants() -> DataStackStringDiscriminants {
@@ -266,71 +229,8 @@ fn data_stack_string_discriminants() -> DataStackStringDiscriminants {
             ArrowIpcRejectionCode::ByteLimit,
             ArrowIpcRejectionCode::MalformedStream,
         ],
-        file_formats: vec![FileFormat::Parquet],
-        table_formats: vec![TableFormat::IcebergV2],
-        new_partition_policies: vec![
-            NewPartitionPolicy::Beginning,
-            NewPartitionPolicy::CapturedLatest,
-            NewPartitionPolicy::Reject,
-        ],
-        recreated_partition_policies: vec![RecreatedPartitionPolicy::Reject],
-        destination_error_policies: vec![DestinationErrorPolicy::Block],
-        destination_desired_states: vec![
-            DestinationDesiredState::Disabled,
-            DestinationDesiredState::Enabled,
-        ],
-        partition_lifecycle_states: vec![
-            PartitionLifecycleState::Active,
-            PartitionLifecycleState::Removed,
-            PartitionLifecycleState::Recreated,
-        ],
-        destination_block_codes: vec![
-            DestinationBlockCode::Decode,
-            DestinationBlockCode::Schema,
-            DestinationBlockCode::Projection,
-            DestinationBlockCode::Value,
-            DestinationBlockCode::Size,
-            DestinationBlockCode::RetentionGap,
-            DestinationBlockCode::PreparedAttempt,
-            DestinationBlockCode::BackendGeneration,
-            DestinationBlockCode::BackendUnavailable,
-            DestinationBlockCode::TableIdentity,
-            DestinationBlockCode::CatalogOutcomeUnknown,
-            DestinationBlockCode::SourceIncarnation,
-            DestinationBlockCode::Authorization,
-        ],
-        checkpoint_read_consistency: vec![
-            CheckpointReadConsistency::Linearizable,
-            CheckpointReadConsistency::PotentiallyStale,
-        ],
-        destination_effective_states: vec![
-            DestinationEffectiveState::Disabled,
-            DestinationEffectiveState::WaitingForBackend,
-            DestinationEffectiveState::Ready,
-            DestinationEffectiveState::Running,
-            DestinationEffectiveState::Blocked,
-        ],
-        partition_lifecycle_changes: vec![
-            PartitionLifecycleChange::Removed,
-            PartitionLifecycleChange::Recreated,
-        ],
-        repair_actions: vec![
-            RepairAction::ReconciledPreparedAttempt,
-            RepairAction::AcceptedRetentionGap,
-            RepairAction::ClearedRetryableBlock,
-            RepairAction::SupersededGeneration,
-        ],
-        sql_dialects: vec![
-            SqlDialect::DataFusion,
-            SqlDialect::Postgres,
-            SqlDialect::MySql,
-            SqlDialect::Sqlite,
-        ],
-        query_consistency: vec![
-            Consistency::Eventual,
-            Consistency::ReadYourWrites,
-            Consistency::Strong,
-        ],
+        sql_dialects: vec![SqlDialect::Postgres, SqlDialect::MySql, SqlDialect::Sqlite],
+        query_consistency: vec![Consistency::Eventual, Consistency::ReadYourWrites],
         comparison_operators: vec![
             CmpOp::Eq,
             CmpOp::Ne,
@@ -353,22 +253,9 @@ fn data_stack_string_discriminants() -> DataStackStringDiscriminants {
             AggFunc::Percentile,
             AggFunc::StdDev,
         ],
-        boundary_relations: vec![
-            laser_wire::query::BoundaryRelation::Current,
-            laser_wire::query::BoundaryRelation::Historical,
-            laser_wire::query::BoundaryRelation::AheadOfObservedCheckpoint,
-        ],
-        query_execution_states: vec![
-            QueryExecutionState::Queued,
-            QueryExecutionState::Planning,
-            QueryExecutionState::Running,
-            QueryExecutionState::Completed,
-            QueryExecutionState::Cancelled,
-            QueryExecutionState::Failed,
-            QueryExecutionState::Expired,
-        ],
         query_error_codes: vec![
             QueryErrorCode::Unsupported,
+            QueryErrorCode::Invalid,
             QueryErrorCode::Unauthorized,
             QueryErrorCode::IndexNotFound,
             QueryErrorCode::ForkNotFound,
@@ -377,12 +264,8 @@ fn data_stack_string_discriminants() -> DataStackStringDiscriminants {
             QueryErrorCode::TooLarge,
             QueryErrorCode::Version,
             QueryErrorCode::Stale,
-            QueryErrorCode::Cancelled,
             QueryErrorCode::DeadlineExceeded,
-            QueryErrorCode::ExpiredSnapshot,
             QueryErrorCode::StaleGeneration,
-            QueryErrorCode::TargetUnavailable,
-            QueryErrorCode::ResourceLimit,
         ],
         logical_type_kinds: vec![
             LogicalTypeKind::Boolean,
@@ -403,7 +286,7 @@ fn data_stack_string_discriminants() -> DataStackStringDiscriminants {
             LogicalTypeKind::List,
             LogicalTypeKind::Map,
         ],
-        backend_modes: vec![BackendMode::Operational, BackendMode::Lakehouse],
+        backend_modes: vec![BackendMode::Operational],
         backend_desired_states: vec![BackendDesiredState::Disabled, BackendDesiredState::Enabled],
         backend_observed_states: vec![
             BackendObservedState::Disabled,
@@ -422,21 +305,7 @@ fn data_stack_string_discriminants() -> DataStackStringDiscriminants {
             BackendReadinessCode::QueryRuntimeUnavailable,
             BackendReadinessCode::GenerationMismatch,
             BackendReadinessCode::ProbeFailed,
-        ],
-        time_travel_capabilities: vec![
-            TimeTravelCapability::SnapshotId,
-            TimeTravelCapability::TimestampMicros,
-        ],
-        query_paging_capabilities: vec![
-            QueryPagingCapability::Offset,
-            QueryPagingCapability::Cursor,
-        ],
-        operation_states: vec![
-            OperationState::Accepted,
-            OperationState::Running,
-            OperationState::Succeeded,
-            OperationState::Failed,
-            OperationState::Cancelled,
+            BackendReadinessCode::QueryIdentityRejected,
         ],
     }
 }
@@ -472,6 +341,44 @@ fn given_an_open_fixture_when_regenerated_then_should_keep_the_reader_on_a_compl
     std::fs::remove_file(&path).expect("remove fixture");
     assert_eq!(snapshot, b"original fixture");
     assert_eq!(replacement, b"replacement fixture");
+}
+
+#[test]
+fn given_listings_naming_a_stream_when_encoded_then_should_round_trip_the_stream() {
+    let namespaces: KvNamespaces = decode_named(
+        &encode_named(&KvNamespaces {
+            v: KV_OP_VERSION,
+            stream: Some("acme".to_owned()),
+        })
+        .expect("encode"),
+    )
+    .expect("decode");
+    assert_eq!(namespaces.stream.as_deref(), Some("acme"));
+    let forks: laser_wire::fork::ForkList = decode_named(
+        &encode_named(&laser_wire::fork::ForkList {
+            v: laser_wire::codes::FORK_OP_VERSION,
+            stream: Some("acme".to_owned()),
+        })
+        .expect("encode"),
+    )
+    .expect("decode");
+    assert_eq!(forks.stream.as_deref(), Some("acme"));
+    let projections: laser_wire::browse::ListProjections = decode_named(
+        &encode_named(&laser_wire::browse::ListProjections {
+            v: laser_wire::codes::QUERY_OP_VERSION,
+            topics: Vec::new(),
+            name_contains: None,
+            id_prefix: None,
+            search: None,
+            kinds: Vec::new(),
+            stream: Some("acme".to_owned()),
+            page: 0,
+            results: 0,
+        })
+        .expect("encode"),
+    )
+    .expect("decode");
+    assert_eq!(projections.stream.as_deref(), Some("acme"));
 }
 
 fn assert_frame<T>(name: &str, value: &T)
@@ -549,6 +456,7 @@ fn canonical_projection() -> Projection {
         name: "reading".to_owned(),
         version: 1,
         kind: ProjectionKind::Row,
+        history: Default::default(),
         content_type: ContentType::Json,
         extraction: IndexSchema {
             fields: vec![
@@ -578,7 +486,57 @@ fn canonical_binding() -> ProjectionBinding {
         retention: Some(RetentionPolicy::TimeToLive {
             ttl_micros: 3_600_000_000,
         }),
-        skip_rejected: false,
+        invalid_records: InvalidRecordPolicy::Block,
+        oversize: OversizePolicy::Block,
+    }
+}
+
+fn canonical_record_binding() -> ProjectionBinding {
+    ProjectionBinding {
+        source: SourceSelector::new("fleet", "readings"),
+        allowed_projections: vec![ProjectionId::new("readings_mirror")],
+        default_projection: Some(ProjectionId::new("readings_mirror")),
+        backend: None,
+        index: "readings_mirror".to_owned(),
+        notify: false,
+        retention: Some(RetentionPolicy::MirrorLog),
+        invalid_records: InvalidRecordPolicy::DeadLetter,
+        oversize: OversizePolicy::Reference,
+    }
+}
+
+fn canonical_binding_status() -> BindingStatus {
+    BindingStatus {
+        history: Default::default(),
+        source: SourceSelector::new("fleet", "readings"),
+        index: "readings_mirror".to_owned(),
+        realization: RealizationState::Realized,
+        realization_reason: None,
+        failure: None,
+        stall: None,
+        source_incarnation: Some(1_700_000_000_000_000),
+        partitions: vec![
+            PartitionProgress {
+                partition_id: 0,
+                head_offset: Some(41),
+                applied_offset: Some(40),
+                first_offset: Some(0),
+            },
+            PartitionProgress {
+                partition_id: 1,
+                head_offset: None,
+                applied_offset: None,
+                first_offset: None,
+            },
+        ],
+        holds: vec![Hold {
+            partition_id: 0,
+            offset: 41,
+            cause: HoldCause::Oversize,
+            reason: "payload of 9000000 bytes exceeds the 8388608 byte body limit".to_owned(),
+        }],
+        accepted_gaps: Vec::new(),
+        skipped_records: 2,
     }
 }
 
@@ -655,184 +613,6 @@ fn canonical_logical_schema() -> LogicalSchema {
     .expect("canonical logical schema is valid")
 }
 
-fn canonical_incarnation(partition_id: u32) -> SourceIncarnation {
-    SourceIncarnation {
-        cluster: PhysicalClusterIncarnation::from_u128(200),
-        stream_id: 2,
-        topic_id: 3,
-        partition_id,
-        partition_incarnation: 4,
-    }
-}
-
-fn canonical_destination() -> MaterializationDestination {
-    MaterializationDestination {
-        id: DestinationId::from_u128(300),
-        generation: 2,
-        definition_revision: 7,
-        name: "readings-lakehouse".to_owned(),
-        source: SourceScope::new("fleet", "readings"),
-        recreated_partition_policy: RecreatedPartitionPolicy::Reject,
-        projection: ProjectionRef {
-            id: ProjectionId::new("reading.v1"),
-            version: 3,
-        },
-        schema: canonical_logical_schema().schema,
-        backend: BackendBinding {
-            resource_id: BackendResourceId::from_u128(301),
-            generation: 5,
-        },
-        table: PhysicalTable {
-            namespace: vec!["fleet".to_owned(), "analytics".to_owned()],
-            table: "readings".to_owned(),
-            expected_table_uuid: Some(UuidValue::new([9; 16])),
-        },
-        file_format: FileFormat::Parquet,
-        table_format: TableFormat::IcebergV2,
-        start_policy: StartPolicy::CapturedLatest,
-        new_partition_policy: NewPartitionPolicy::CapturedLatest,
-        error_policy: DestinationErrorPolicy::Block,
-        desired_state: DestinationDesiredState::Enabled,
-    }
-}
-
-fn canonical_checkpoint_status() -> DestinationCheckpointStatus {
-    DestinationCheckpointStatus {
-        destination_id: DestinationId::from_u128(300),
-        destination_generation: 2,
-        backend: canonical_destination().backend,
-        schema: canonical_logical_schema().schema,
-        projection: canonical_destination().projection,
-        global_state_revision: 11,
-        definition_revision: 7,
-        checkpoint_revision: 3,
-        desired_state: DestinationDesiredState::Enabled,
-        effective_state: DestinationEffectiveState::Running,
-        table_uuid: Some(UuidValue::new([9; 16])),
-        owner: Some(laser_wire::checkpoint::CheckpointOwnerLease {
-            owner: CheckpointOwnerId::from_u128(401),
-            epoch: 2,
-            sequence: 4,
-            deadline_micros: TIMESTAMP_MICROS + 30_000_000,
-        }),
-        partitions: vec![PartitionCheckpoint {
-            incarnation: canonical_incarnation(0),
-            started_at_offset: 100,
-            next_offset: 150,
-            lifecycle: PartitionLifecycleState::Active,
-        }],
-        prepared_attempt: None,
-        last_completion: None,
-        retention_gap: None,
-        block: None,
-        last_repair: None,
-        consistency: CheckpointReadConsistency::Linearizable,
-    }
-}
-
-fn canonical_table_requirements() -> PreparedTableRequirements {
-    let table_uuid = UuidValue::new([9; 16]);
-    let base_metadata_identity = "metadata/00001.json".to_owned();
-    PreparedTableRequirements {
-        table_uuid: table_uuid.clone(),
-        base_metadata_identity: base_metadata_identity.clone(),
-        base_snapshot_id: Some(40),
-        schema_id: 3,
-        partition_spec_id: 1,
-        commit_requirements: vec![
-            IcebergCommitRequirement::AssertTableUuid { table_uuid },
-            IcebergCommitRequirement::AssertMetadataIdentity {
-                identity: base_metadata_identity,
-            },
-            IcebergCommitRequirement::AssertCurrentSnapshot {
-                snapshot_id: Some(40),
-            },
-            IcebergCommitRequirement::AssertCurrentSchema { schema_id: 3 },
-            IcebergCommitRequirement::AssertDefaultPartitionSpec {
-                partition_spec_id: 1,
-            },
-        ],
-    }
-}
-
-fn canonical_source_range() -> SourceOffsetRange {
-    SourceOffsetRange {
-        incarnation: canonical_incarnation(0),
-        start: 100,
-        end_exclusive: 150,
-    }
-}
-
-fn canonical_prepared_attempt() -> PreparedAttempt {
-    let range = canonical_source_range();
-    PreparedAttempt {
-        id: PreparedAttemptId::from_u128(402),
-        destination_id: DestinationId::from_u128(300),
-        destination_generation: 2,
-        backend: canonical_destination().backend,
-        owner: CheckpointOwnerId::from_u128(401),
-        epoch: 2,
-        created_at_checkpoint_revision: 3,
-        table: canonical_table_requirements(),
-        schema_fingerprint: SchemaFingerprint::new([6; 32]),
-        projection: canonical_destination().projection,
-        ranges: vec![range.clone()],
-        resulting_boundary: vec![PartitionCheckpoint {
-            incarnation: range.incarnation,
-            started_at_offset: 100,
-            next_offset: 150,
-            lifecycle: PartitionLifecycleState::Active,
-        }],
-        resulting_boundary_digest: Digest32::new([7; 32]),
-        manifest_identity: "manifests/attempt-402.avro".to_owned(),
-        manifest_digest: Digest32::new([8; 32]),
-        objects: vec![AttemptObject {
-            identity: "data/attempt-402-0.parquet".to_owned(),
-            size_bytes: 4_096,
-            row_count: 50,
-            sha256: Digest32::new([10; 32]),
-            columns: vec![AttemptColumnMetrics {
-                field_id: 1,
-                value_count: 50,
-                null_count: 0,
-                nan_count: 0,
-                lower_bound: Some(TypedValue::Long(1)),
-                upper_bound: Some(TypedValue::Long(50)),
-            }],
-        }],
-        credential_generations: vec![CredentialGeneration {
-            role: "writer".to_owned(),
-            generation: 4,
-        }],
-    }
-}
-
-fn canonical_completion() -> CompletedAttempt {
-    CompletedAttempt {
-        id: PreparedAttemptId::from_u128(402),
-        table_uuid: UuidValue::new([9; 16]),
-        snapshot_id: 41,
-        manifest_digest: Digest32::new([8; 32]),
-        resulting_boundary_digest: Digest32::new([7; 32]),
-        ranges: vec![canonical_source_range()],
-        completion_revision: 4,
-    }
-}
-
-fn canonical_query_route() -> QueryRoute {
-    QueryRoute {
-        id: QueryRouteId::from_u128(302),
-        generation: 2,
-        definition_revision: 8,
-        name: "readings-history".to_owned(),
-        target: QueryRouteTarget::Lakehouse {
-            destination_id: DestinationId::from_u128(300),
-            destination_generation: 2,
-        },
-        desired_state: DestinationDesiredState::Enabled,
-    }
-}
-
 fn base_query(index: &str, execution_id: u128) -> Query {
     Query {
         execution_id: QueryExecutionId::from_u128(execution_id),
@@ -881,7 +661,6 @@ fn canonical_query() -> Query {
         page: QueryPageRequest {
             limit: 20,
             offset: Some(40),
-            cursor: None,
             want_total: false,
         },
         aggregate: None,
@@ -922,7 +701,6 @@ fn canonical_aggregate_query() -> Query {
             }),
         }),
         having: Some(Filter::pred("n", CmpOp::Gt, 10i64)),
-        distinct: true,
         page: QueryPageRequest {
             limit: 100,
             ..QueryPageRequest::default()
@@ -938,8 +716,8 @@ fn canonical_raw_sql_query() -> Query {
             ..QueryPageRequest::default()
         },
         raw_sql: Some(RawSql {
-            dialect: SqlDialect::DataFusion,
-            sql: "SELECT host, cpu FROM readings_rows WHERE cpu > ? LIMIT ?".to_owned(),
+            dialect: SqlDialect::Postgres,
+            sql: "SELECT host, cpu FROM readings_rows WHERE cpu > $1 LIMIT $2".to_owned(),
             params: vec![
                 TypedValue::Long(100),
                 TypedValue::Long(i64::MAX),
@@ -984,14 +762,13 @@ fn canonical_query_result() -> QueryResult {
             limit: 50,
             total: Some(1),
             has_more: false,
-            next_cursor: None,
         },
         context: QueryContext {
             execution_id: QueryExecutionId::from_u128(1),
             engine: QueryEngine {
-                name: "datafusion".to_owned(),
-                version: "50.0.0".to_owned(),
-                dialect: Some(SqlDialect::DataFusion),
+                name: "postgres".to_owned(),
+                version: "17.0".to_owned(),
+                dialect: Some(SqlDialect::Postgres),
             },
             resolved_target: ResolvedQueryTarget::Operational {
                 index: "readings".to_owned(),
@@ -1001,9 +778,6 @@ fn canonical_query_result() -> QueryResult {
             },
             requested_consistency: Consistency::Eventual,
             delivered_consistency: Consistency::Eventual,
-            boundary: None,
-            checkpoint_revision: None,
-            global_state_revision: None,
             truncated: false,
             elapsed_micros: 12_000,
             scanned_bytes: 4_096,
@@ -1020,16 +794,6 @@ fn canonical_backend(
     label: &str,
     kind: &str,
 ) -> BackendDescriptor {
-    let materialization = if mode == BackendMode::Lakehouse {
-        vec![MaterializationCapability {
-            file_format: FileFormat::Parquet,
-            table_format: TableFormat::IcebergV2,
-            create_table: true,
-            append: true,
-        }]
-    } else {
-        Vec::new()
-    };
     BackendDescriptor::new(
         BackendResourceId::from_u128(resource_id),
         mode,
@@ -1046,19 +810,14 @@ fn canonical_backend(
         BackendObservedState::Ready,
         BackendReadiness::ready(TIMESTAMP_MICROS),
     )
-    .with_materialization(materialization)
     .with_query(QueryCapabilities {
-        dialects: vec![SqlDialect::DataFusion],
-        time_travel: vec![
-            TimeTravelCapability::SnapshotId,
-            TimeTravelCapability::TimestampMicros,
-        ],
+        dialects: vec![SqlDialect::Postgres],
         consistency: vec![Consistency::Eventual, Consistency::ReadYourWrites],
         logical_types: vec![LogicalTypeKind::Long, LogicalTypeKind::String],
-        paging: vec![QueryPagingCapability::Offset, QueryPagingCapability::Cursor],
-        cancellation: true,
-        execution_status: true,
         raw_sql: true,
+        aggregates: vec![AggFunc::Count, AggFunc::Percentile],
+        vector_search: false,
+        text_search: true,
     })
     .with_schema(SchemaCapabilities {
         logical_schema: true,
@@ -1072,7 +831,7 @@ fn canonical_backend(
         max_query_micros: 30_000_000,
         max_concurrent_queries: 16,
         max_schema_fields: 4_096,
-        max_materialization_file_bytes: 536_870_912,
+        max_payload_bytes: 8_388_608,
     })
 }
 
@@ -1090,35 +849,16 @@ fn canonical_fork_info() -> ForkInfo {
 
 #[test]
 fn given_query_frames_when_encoded_then_should_match_golden_fixtures() {
-    let destination_id = DestinationId::from_u128(300);
     assert_frame(
         "query_target_discriminants.bin",
-        &vec![
-            QueryTarget::operational("readings"),
-            QueryTarget::Lakehouse {
-                destination_id,
-                destination_generation: 2,
-                snapshot: None,
-            },
-            QueryTarget::Lakehouse {
-                destination_id,
-                destination_generation: 2,
-                snapshot: Some(laser_wire::query::SnapshotSelector::SnapshotId(41)),
-            },
-            QueryTarget::Lakehouse {
-                destination_id,
-                destination_generation: 2,
-                snapshot: Some(laser_wire::query::SnapshotSelector::TimestampMicros(
-                    TIMESTAMP_MICROS as i64,
-                )),
-            },
-        ],
+        &vec![QueryTarget::operational("readings")],
     );
     let execution_id = QueryExecutionId::from_u128(500);
     assert_frame(
         "query_error_discriminants.bin",
         &vec![
             QueryError::Unsupported("feature".to_owned()),
+            QueryError::Invalid("query limit 0 is outside 1..=1000".to_owned()),
             QueryError::Unauthorized("query".to_owned()),
             QueryError::IndexNotFound("readings".to_owned()),
             QueryError::ForkNotFound("run-7".to_owned()),
@@ -1138,21 +878,11 @@ fn given_query_frames_when_encoded_then_should_match_golden_fixtures() {
                 applied: 40,
                 required: 41,
             },
-            QueryError::Cancelled { execution_id },
             QueryError::DeadlineExceeded { execution_id },
-            QueryError::ExpiredSnapshot { snapshot_id: 41 },
             QueryError::StaleGeneration {
-                what: "destination".to_owned(),
+                what: "backend".to_owned(),
                 requested: 2,
                 observed: 3,
-            },
-            QueryError::TargetUnavailable {
-                reason: "backend not ready".to_owned(),
-            },
-            QueryError::ResourceLimit {
-                resource: "scan_bytes".to_owned(),
-                observed: 101,
-                limit: 100,
             },
         ],
     );
@@ -1210,19 +940,6 @@ fn given_data_contract_frames_when_encoded_then_should_match_golden_fixtures() {
         "data_stack_string_discriminants.bin",
         &data_stack_string_discriminants(),
     );
-    assert_frame(
-        "start_policy_discriminants.bin",
-        &vec![
-            StartPolicy::Beginning,
-            StartPolicy::CapturedLatest,
-            StartPolicy::Explicit {
-                partitions: vec![PartitionStart {
-                    incarnation: canonical_incarnation(0),
-                    next_offset: 100,
-                }],
-            },
-        ],
-    );
     assert_frame("logical_schema.bin", &canonical_logical_schema());
     assert_frame(
         "logical_type_discriminants.bin",
@@ -1265,6 +982,7 @@ fn given_data_contract_frames_when_encoded_then_should_match_golden_fixtures() {
                 value_required: false,
                 value: Box::new(LogicalType::Long),
             },
+            LogicalType::Variant,
         ],
     );
     assert_frame(
@@ -1300,8 +1018,6 @@ fn given_data_contract_frames_when_encoded_then_should_match_golden_fixtures() {
             }]),
         ],
     );
-    assert_frame("materialization_destination.bin", &canonical_destination());
-    assert_frame("query_route.bin", &canonical_query_route());
     assert_frame(
         "arrow_ipc_metadata.bin",
         &ArrowIpcMessageMetadata {
@@ -1315,225 +1031,6 @@ fn given_data_contract_frames_when_encoded_then_should_match_golden_fixtures() {
         },
     );
     assert_frame("arrow_ipc_policy.bin", &ArrowIpcPolicy::default());
-}
-
-#[test]
-fn given_checkpoint_frames_when_encoded_then_should_match_golden_fixtures() {
-    let public = CheckpointRequestEnvelope::new(
-        CheckpointRequestId::from_u128(400),
-        10,
-        PublicCheckpointMutation::RegisterDestination {
-            destination: canonical_destination(),
-        },
-    );
-    assert_frame("checkpoint_request_public.bin", &public);
-    let destination_id = DestinationId::from_u128(300);
-    let destination_generation = 2;
-    let owner = CheckpointOwnerId::from_u128(401);
-    let block = DestinationBlock {
-        code: DestinationBlockCode::PreparedAttempt,
-        message: "catalog outcome requires reconciliation".to_owned(),
-        incarnation: Some(canonical_incarnation(0)),
-        offset: Some(149),
-        row_ordinal: Some(49),
-    };
-    let gap = RetentionGap {
-        incarnation: canonical_incarnation(0),
-        required_next_offset: 50,
-        retained_start: 100,
-    };
-    let repair = RepairRecord {
-        action: RepairAction::ReconciledPreparedAttempt,
-        detail: "catalog snapshot 41 contains attempt 402".to_owned(),
-    };
-    assert_frame(
-        "checkpoint_public_mutation_discriminants.bin",
-        &vec![
-            PublicCheckpointMutation::RegisterDestination {
-                destination: canonical_destination(),
-            },
-            PublicCheckpointMutation::RegisterQueryRoute {
-                route: canonical_query_route(),
-            },
-            PublicCheckpointMutation::RemoveQueryRoute {
-                route_id: QueryRouteId::from_u128(302),
-                route_generation: 2,
-                expected_definition_revision: 8,
-            },
-            PublicCheckpointMutation::BindTable {
-                destination_id,
-                destination_generation,
-                expected_definition_revision: 7,
-                table_uuid: UuidValue::new([9; 16]),
-            },
-            PublicCheckpointMutation::SetDesiredState {
-                destination_id,
-                destination_generation,
-                expected_definition_revision: 7,
-                desired_state: DestinationDesiredState::Disabled,
-            },
-            PublicCheckpointMutation::AddPartition {
-                destination_id,
-                destination_generation,
-                expected_checkpoint_revision: 3,
-                partition_id: 1,
-            },
-            PublicCheckpointMutation::ObservePartitionLifecycle {
-                destination_id,
-                destination_generation,
-                expected_checkpoint_revision: 3,
-                partition_id: 1,
-            },
-            PublicCheckpointMutation::AcquireLease {
-                destination_id,
-                destination_generation,
-                owner,
-                expected_lease_sequence: 0,
-                lease_duration_micros: 30_000_000,
-            },
-            PublicCheckpointMutation::RenewLease {
-                destination_id,
-                destination_generation,
-                owner,
-                epoch: 2,
-                expected_lease_sequence: 4,
-                lease_duration_micros: 30_000_000,
-            },
-            PublicCheckpointMutation::TakeoverLease {
-                destination_id,
-                destination_generation,
-                owner,
-                expected_lease_sequence: 4,
-                lease_duration_micros: 30_000_000,
-            },
-            PublicCheckpointMutation::Prepare {
-                expected_checkpoint_revision: 3,
-                attempt: canonical_prepared_attempt(),
-            },
-            PublicCheckpointMutation::Complete {
-                destination_id,
-                destination_generation,
-                owner,
-                epoch: 2,
-                expected_checkpoint_revision: 3,
-                completion: canonical_completion(),
-            },
-            PublicCheckpointMutation::RecordBlock {
-                destination_id,
-                destination_generation,
-                expected_checkpoint_revision: 3,
-                block: block.clone(),
-            },
-            PublicCheckpointMutation::ClearBlock {
-                destination_id,
-                destination_generation,
-                expected_checkpoint_revision: 3,
-                expected_code: DestinationBlockCode::PreparedAttempt,
-            },
-            PublicCheckpointMutation::RecordRetentionGap {
-                destination_id,
-                destination_generation,
-                expected_checkpoint_revision: 3,
-                gap,
-            },
-            PublicCheckpointMutation::AcceptRetentionGap {
-                destination_id,
-                destination_generation,
-                expected_checkpoint_revision: 3,
-                next_offset: 100,
-            },
-            PublicCheckpointMutation::SupersedeGeneration {
-                expected_definition_revision: 7,
-                replacement: MaterializationDestination {
-                    generation: 3,
-                    definition_revision: 8,
-                    desired_state: DestinationDesiredState::Disabled,
-                    ..canonical_destination()
-                },
-            },
-            PublicCheckpointMutation::RecordRepair {
-                destination_id,
-                destination_generation,
-                expected_checkpoint_revision: 3,
-                repair,
-            },
-        ],
-    );
-    let replicated = ReplicatedCheckpointMutation {
-        request_id: CheckpointRequestId::from_u128(400),
-        expected_global_state_revision: 10,
-        stamp: CheckpointMutationStamp {
-            committed_at_micros: TIMESTAMP_MICROS,
-            iggy_actor_id: 0,
-            operator_actor: None,
-        },
-        mutation: ReplicatedCheckpointMutationBody::RegisterDestination {
-            destination: canonical_destination(),
-        },
-    };
-    assert_frame("checkpoint_mutation_replicated.bin", &replicated);
-    assert_frame(
-        "checkpoint_reply_destination.bin",
-        &CheckpointReply::Ok(CheckpointMutationResult::Destination {
-            request_id: CheckpointRequestId::from_u128(400),
-            destination_id,
-            destination_generation,
-            global_state_revision: 11,
-            definition_revision: 7,
-            checkpoint_revision: 3,
-            lease: None,
-        }),
-    );
-    assert_frame(
-        "checkpoint_reply_query_route.bin",
-        &CheckpointReply::Ok(CheckpointMutationResult::QueryRoute {
-            request_id: CheckpointRequestId::from_u128(403),
-            route_id: QueryRouteId::from_u128(302),
-            route_generation: 2,
-            global_state_revision: 12,
-            definition_revision: 8,
-        }),
-    );
-    assert!(
-        decode_named::<ReplicatedCheckpointMutation>(
-            &encode_named(&public).expect("public request encodes")
-        )
-        .is_err()
-    );
-    assert!(
-        decode_named::<CheckpointRequestEnvelope>(
-            &encode_named(&replicated).expect("replicated mutation encodes")
-        )
-        .is_err()
-    );
-    assert_frame(
-        "destination_checkpoint_status.bin",
-        &canonical_checkpoint_status(),
-    );
-}
-
-#[test]
-fn given_query_control_frames_when_encoded_then_should_match_golden_fixtures() {
-    let execution_id = QueryExecutionId::from_u128(500);
-    assert_frame(
-        "query_page.bin",
-        &QueryPageEnvelope::new(execution_id, "cursor-2", TIMESTAMP_MICROS + 30_000_000),
-    );
-    assert_frame("query_cancel.bin", &QueryCancelEnvelope::new(execution_id));
-    assert_frame("query_status.bin", &QueryStatusEnvelope::new(execution_id));
-    assert_frame(
-        "query_status_reply.bin",
-        &QueryStatusReply::Ok(QueryExecutionStatus {
-            execution_id,
-            state: QueryExecutionState::Completed,
-            started_at_micros: TIMESTAMP_MICROS,
-            finished_at_micros: Some(TIMESTAMP_MICROS + 1_000),
-            scanned_bytes: 4_096,
-            produced_bytes: 256,
-            row_count: 2,
-            error: None,
-        }),
-    );
 }
 
 #[test]
@@ -1554,12 +1051,72 @@ fn given_control_frames_when_encoded_then_should_match_golden_fixtures() {
         &envelope(ControlCommand::ApplyBinding(canonical_binding())),
     );
     assert_frame(
+        "control_register_projection_record.bin",
+        &envelope(ControlCommand::RegisterProjection(
+            Projection::builder("readings_mirror")
+                .name("readings")
+                .record()
+                .build(),
+        )),
+    );
+    assert_frame(
+        "control_register_projection_keyed.bin",
+        &envelope(ControlCommand::RegisterProjection(
+            Projection::builder("latest_readings")
+                .record()
+                .keyed(
+                    ProjectionKey::Header {
+                        name: "reading_id".to_owned(),
+                    },
+                    Some("deleted"),
+                )
+                .build(),
+        )),
+    );
+    assert_frame(
+        "control_register_projection_keyed_without_delete.bin",
+        &envelope(ControlCommand::RegisterProjection(
+            Projection::builder("latest_readings")
+                .record()
+                .keyed(
+                    ProjectionKey::Header {
+                        name: "reading_id".to_owned(),
+                    },
+                    None,
+                )
+                .build(),
+        )),
+    );
+    assert_frame(
+        "control_apply_binding_policies.bin",
+        &envelope(ControlCommand::ApplyBinding(canonical_record_binding())),
+    );
+    assert_frame(
         "control_remove_binding.bin",
         &envelope(ControlCommand::RemoveBinding {
             source: SourceSelector::new("fleet", "readings"),
             projection_ref: Some("reading.v1".to_owned()),
+            generation: None,
         }),
     );
+    assert_frame("control_generation_remove_binding.bin", &{
+        let mut retired = envelope(ControlCommand::RemoveBinding {
+            source: SourceSelector::new("fleet", "readings"),
+            projection_ref: None,
+            generation: Some(ControlStreamGeneration {
+                stream_id: 3,
+                created_at_micros: 1_700_000_000_000_000,
+            }),
+        });
+        retired.stamp = Some(ControlStamp {
+            deployment_id: 0,
+            operation_id: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
+            stream_generation: None,
+            key_id: 11,
+            caller: None,
+        });
+        retired
+    });
     assert_frame(
         "control_accept_gap.bin",
         &envelope(ControlCommand::AcceptGap(GapAcceptance {
@@ -1570,6 +1127,27 @@ fn given_control_frames_when_encoded_then_should_match_golden_fixtures() {
             to_offset: 97,
         })),
     );
+    assert_frame("control_allocate_schema.bin", &{
+        let mut allocation = envelope(ControlCommand::AllocateSchema(SchemaAllocation {
+            source: SchemaSource::JsonSchema {
+                schema: r#"{"type":"object"}"#.to_owned(),
+            },
+            name: Some("reading".to_owned()),
+            version: Some(2),
+        }));
+        allocation.stream = Some("fleet".to_owned());
+        allocation.stamp = Some(ControlStamp {
+            deployment_id: 7,
+            operation_id: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
+            stream_generation: Some(ControlStreamGeneration {
+                stream_id: 3,
+                created_at_micros: 1_700_000_000_000_000,
+            }),
+            key_id: 11,
+            caller: None,
+        });
+        allocation
+    });
     assert_frame(
         "control_skip_record.bin",
         &envelope(ControlCommand::SkipRecord(RecordSkip {
@@ -1581,15 +1159,24 @@ fn given_control_frames_when_encoded_then_should_match_golden_fixtures() {
             reason: "value out of range".to_owned(),
         })),
     );
+    assert_frame(
+        "control_source_retained.bin",
+        &envelope(ControlCommand::SourceRetained(SourceRetention {
+            source: SourceSelector::new("fleet", "readings"),
+            partition_id: 2,
+            topic_created_at_micros: 1_700_000_000_000_000,
+            first_offset: 59,
+        })),
+    );
     assert_frame("control_stamped_remove_binding.bin", &{
         let mut stamped = envelope(ControlCommand::RemoveBinding {
             source: SourceSelector::new("fleet", "readings"),
             projection_ref: None,
+            generation: None,
         });
         stamped.stream = Some("fleet".to_owned());
         stamped.stamp = Some(ControlStamp {
             deployment_id: 7,
-            actor_user_id: 42,
             operation_id: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
             stream_generation: Some(ControlStreamGeneration {
                 stream_id: 3,
@@ -1605,7 +1192,6 @@ fn given_control_frames_when_encoded_then_should_match_golden_fixtures() {
         stamped.stream = Some("fleet".to_owned());
         stamped.stamp = Some(ControlStamp {
             deployment_id: 7,
-            actor_user_id: 3,
             operation_id: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdf0,
             stream_generation: Some(ControlStreamGeneration {
                 stream_id: 3,
@@ -1678,27 +1264,83 @@ fn given_control_frames_when_encoded_then_should_match_golden_fixtures() {
 fn given_browse_frames_when_encoded_then_should_match_golden_fixtures() {
     assert_frame(
         "browse_reply_projections.bin",
-        &BrowseReply::Ok(BrowseOutcome::Projections(vec![ProjectionInfo {
-            projection: canonical_projection(),
-            bindings: vec![canonical_binding()],
-        }])),
+        &BrowseReply::Ok(BrowseOutcome::Projections(ProjectionPage {
+            items: vec![ProjectionInfo {
+                projection: canonical_projection(),
+                bindings: vec![canonical_binding()],
+                status: Vec::new(),
+            }],
+            page: 2,
+            total_pages: 3,
+            total_results: 21,
+        })),
+    );
+    assert_frame(
+        "browse_get_projection_status.bin",
+        &GetProjection {
+            v: QUERY_OP_VERSION,
+            id: "readings_mirror".to_owned(),
+            status: true,
+        },
+    );
+    assert_frame(
+        "browse_reply_projection_status.bin",
+        &BrowseReply::Ok(BrowseOutcome::Projection(Some(Box::new(ProjectionInfo {
+            projection: Projection::builder("readings_mirror")
+                .name("readings")
+                .record()
+                .build(),
+            bindings: vec![canonical_record_binding()],
+            status: vec![canonical_binding_status()],
+        })))),
+    );
+    assert_frame(
+        "browse_binding_status_stalled.bin",
+        &BindingStatus {
+            realization: RealizationState::Pending,
+            realization_reason: Some("the destination refused the table".to_owned()),
+            failure: Some(FailureClass::Schema),
+            stall: Some(StallReason::Backpressure),
+            holds: vec![Hold {
+                partition_id: 1,
+                offset: 0,
+                cause: HoldCause::RetiredIncarnation,
+                reason: "the binding was applied for an earlier incarnation of `fleet`".to_owned(),
+            }],
+            ..canonical_binding_status()
+        },
+    );
+    assert_frame(
+        "browse_list_projections_page.bin",
+        &ListProjections {
+            v: QUERY_OP_VERSION,
+            kinds: vec![laser_wire::control::ProjectionKind::Graph],
+            page: 2,
+            results: 25,
+            ..ListProjections::default()
+        },
     );
     assert_frame(
         "browse_reply_schemas.bin",
-        &BrowseReply::Ok(BrowseOutcome::Schemas(vec![
-            SchemaInfo {
-                schema: canonical_avro_schema(),
-                dropped: false,
-            },
-            SchemaInfo {
-                schema: canonical_protobuf_schema(),
-                dropped: true,
-            },
-            SchemaInfo {
-                schema: canonical_json_schema(),
-                dropped: false,
-            },
-        ])),
+        &BrowseReply::Ok(BrowseOutcome::Schemas(SchemaPage {
+            items: vec![
+                SchemaInfo {
+                    schema: canonical_avro_schema(),
+                    dropped: false,
+                },
+                SchemaInfo {
+                    schema: canonical_protobuf_schema(),
+                    dropped: true,
+                },
+                SchemaInfo {
+                    schema: canonical_json_schema(),
+                    dropped: false,
+                },
+            ],
+            page: 1,
+            total_pages: 1,
+            total_results: 3,
+        })),
     );
     assert_frame(
         "decode_record.bin",
@@ -1758,6 +1400,7 @@ fn given_authz_frames_when_encoded_then_should_match_golden_fixtures() {
         "authz_get_role_reply.bin",
         &AuthzReply::Role(Some(canonical_role())),
     );
+
     assert_frame(
         "authz_bind_roles.bin",
         &BindRolesReq {
@@ -1813,6 +1456,7 @@ fn given_session_linked_mutations_when_encoded_then_should_match_golden_fixtures
             key: b"key".to_vec(),
             value: b"value".to_vec(),
             expires_at_micros: None,
+            ttl_micros: None,
         },
     );
     assert_frame(
@@ -1824,6 +1468,7 @@ fn given_session_linked_mutations_when_encoded_then_should_match_golden_fixtures
             key: b"key".to_vec(),
             value: b"value".to_vec(),
             expires_at_micros: None,
+            ttl_micros: None,
             expect: CasExpect::Absent,
         },
     );
@@ -1871,6 +1516,19 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
             key: vec![0xff, 0x00, b'k'],
             value: b"online".to_vec(),
             expires_at_micros: Some(1_700_000_000_000_000),
+            ttl_micros: None,
+        },
+    );
+    assert_frame(
+        "kv_set_ttl.bin",
+        &KvSet {
+            v: KV_OP_VERSION,
+            namespace: "sessions".to_owned(),
+            session: None,
+            key: b"user:42".to_vec(),
+            value: b"online".to_vec(),
+            expires_at_micros: None,
+            ttl_micros: Some(300_000_000),
         },
     );
     assert_frame(
@@ -1882,6 +1540,7 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
             key: b"hits".to_vec(),
             value: b"42".to_vec(),
             expires_at_micros: None,
+            ttl_micros: None,
             expect: CasExpect::Match(7),
         },
     );
@@ -1890,9 +1549,30 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
         &KvCasFenced {
             v: KV_LEASE_OP_VERSION,
             namespace: "effects".to_owned(),
+            session: None,
             key: b"apply-grant:job-7".to_vec(),
             value: b"done".to_vec(),
             expires_at_micros: None,
+            ttl_micros: None,
+            expect: CasExpect::Absent,
+            fence_namespace: "coordination".to_owned(),
+            fence_key: b"task:job-7".to_vec(),
+            fence_token: 3,
+        },
+    );
+    assert_frame(
+        "kv_cas_fenced_session.bin",
+        &KvCasFenced {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "effects".to_owned(),
+            session: Some(laser_wire::agent::SessionRef {
+                stream: "orders".to_owned(),
+                session: laser_wire::agent::ConversationId::from_u128(7),
+            }),
+            key: b"apply-grant:job-7".to_vec(),
+            value: b"done".to_vec(),
+            expires_at_micros: None,
+            ttl_micros: Some(60_000_000),
             expect: CasExpect::Absent,
             fence_namespace: "coordination".to_owned(),
             fence_key: b"task:job-7".to_vec(),
@@ -1981,6 +1661,22 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
         }),
     );
     assert_frame(
+        "kv_reply_barrier_unreachable.bin",
+        &KvReply::Err(KvError::BarrierUnreachable {
+            required: MutationPosition {
+                topic_generation: 1,
+                partition: 0,
+                offset: 512,
+            },
+        }),
+    );
+    assert_frame(
+        "kv_reply_lease_held.bin",
+        &KvReply::Err(KvError::LeaseHeld {
+            expires_at_micros: Some(1_700_000_030_000_000),
+        }),
+    );
+    assert_frame(
         "kv_copy.bin",
         &KvCopy {
             v: KV_OP_VERSION,
@@ -2008,7 +1704,13 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
         "kv_reply_version_conflict.bin",
         &KvReply::Err(KvError::VersionConflict { current: Some(7) }),
     );
-    assert_frame("kv_namespaces.bin", &KvNamespaces { v: KV_OP_VERSION });
+    assert_frame(
+        "kv_namespaces.bin",
+        &KvNamespaces {
+            v: KV_OP_VERSION,
+            stream: None,
+        },
+    );
     assert_frame(
         "kv_reply_namespaces.bin",
         &KvReply::Ok(KvOutcome::Namespaces(vec![
@@ -2033,14 +1735,17 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
             key_contains: Some("admin".to_owned()),
             conversation: None,
             stream: None,
-            limit: 50,
-            cursor: Some(b"user:9".to_vec()),
+            user: None,
+            agent: None,
+            app: None,
+            page: 3,
+            results: 50,
         },
     );
     assert_frame(
         "kv_reply_page.bin",
         &KvReply::Ok(KvOutcome::Page(KvPage {
-            entries: vec![KvEntry {
+            items: vec![KvEntry {
                 key: b"user:1".to_vec(),
                 value: vec![0, 1, 2],
                 expires_at_micros: None,
@@ -2048,7 +1753,9 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
                 scope: None,
                 source: None,
             }],
-            cursor: Some(b"user:1".to_vec()),
+            page: 3,
+            total_pages: 3,
+            total_results: 101,
         })),
     );
 }
@@ -2125,8 +1832,6 @@ fn given_graph_frames_when_encoded_then_should_match_golden_fixtures() {
             edge_filter: None,
             return_: GraphReturn::Paths,
             limit: 100,
-            fork: None,
-            consistency: Consistency::Eventual,
             as_of: Some(1_500),
             conversation: None,
             stream: None,
@@ -2158,6 +1863,7 @@ fn given_graph_frames_when_encoded_then_should_match_golden_fixtures() {
                 nodes: vec![alice.id, acme.id],
                 edges: vec![edge.id],
             }],
+            truncated: false,
         }),
     );
 
@@ -2209,8 +1915,6 @@ fn given_graph_frames_when_encoded_then_should_match_golden_fixtures() {
             edge_filter: None,
             return_: GraphReturn::Nodes,
             limit: 100,
-            fork: None,
-            consistency: Consistency::Eventual,
             as_of: None,
             conversation: Some("7ZZZZZZZZZZZZZZZZZZZZZZZZZ".to_owned()),
             stream: None,
@@ -2356,7 +2060,11 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             positioned_reply: false,
             min_sessions: Vec::new(),
             tenancy: Default::default(),
-            user_id: 7,
+            caller: Some(Caller {
+                user_id: 7,
+                agent: None,
+                on_behalf_of: None,
+            }),
             client_id: 42,
             correlation: None,
             operation_id: None,
@@ -2365,8 +2073,6 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             command_code: AGDX_KV_SET_CODE,
             payload: vec![9, 9, 9],
             grants: Vec::new(),
-            agent: None,
-            on_behalf_of: None,
         },
     );
     assert_frame(
@@ -2377,7 +2083,11 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             positioned_reply: true,
             min_sessions: Vec::new(),
             tenancy: Default::default(),
-            user_id: 0,
+            caller: Some(Caller {
+                user_id: 0,
+                agent: Some("orbit-planner".parse().expect("agent id")),
+                on_behalf_of: None,
+            }),
             client_id: 42,
             correlation: None,
             operation_id: Some(17),
@@ -2386,8 +2096,6 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             command_code: laser_wire::codes::AGDX_FORK_CREATE_CODE,
             payload: vec![9, 9, 9],
             grants: Vec::new(),
-            agent: Some("orbit-planner".parse().expect("agent id")),
-            on_behalf_of: None,
         },
     );
     assert_frame(
@@ -2398,7 +2106,11 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             positioned_reply: false,
             min_sessions: Vec::new(),
             tenancy: Default::default(),
-            user_id: 3,
+            caller: Some(Caller {
+                user_id: 3,
+                agent: None,
+                on_behalf_of: Some("1793690355287073".to_owned()),
+            }),
             client_id: 42,
             correlation: None,
             operation_id: Some(18),
@@ -2407,8 +2119,25 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             command_code: AGDX_CONTROL_PUBLISH_CODE,
             payload: vec![9, 9, 9],
             grants: Vec::new(),
-            agent: None,
-            on_behalf_of: Some("1793690355287073".to_owned()),
+        },
+    );
+    assert_frame(
+        "forwarded_command_internal.bin",
+        &ForwardedCommand {
+            read_barrier: false,
+            min_position: None,
+            positioned_reply: false,
+            min_sessions: Vec::new(),
+            tenancy: Default::default(),
+            caller: None,
+            client_id: 0,
+            correlation: None,
+            operation_id: Some(19),
+            read_all: false,
+            scope: None,
+            command_code: AGDX_CONTROL_PUBLISH_CODE,
+            payload: vec![9, 9, 9],
+            grants: Vec::new(),
         },
     );
     let scope = ForwardedScope {
@@ -2424,7 +2153,11 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             positioned_reply: false,
             min_sessions: Vec::new(),
             tenancy: Default::default(),
-            user_id: 7,
+            caller: Some(Caller {
+                user_id: 7,
+                agent: None,
+                on_behalf_of: None,
+            }),
             client_id: 42,
             correlation: None,
             operation_id: None,
@@ -2433,8 +2166,6 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             command_code: AGDX_KV_SET_CODE,
             payload: vec![9, 9, 9],
             grants: Vec::new(),
-            agent: None,
-            on_behalf_of: None,
         },
     );
     assert_frame(
@@ -2456,7 +2187,11 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
                 offset: 43,
             }],
             tenancy: laser_wire::authz::Tenancy::Stream,
-            user_id: 7,
+            caller: Some(Caller {
+                user_id: 7,
+                agent: None,
+                on_behalf_of: None,
+            }),
             client_id: 42,
             correlation: None,
             operation_id: None,
@@ -2465,8 +2200,6 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             command_code: laser_wire::codes::AGDX_KV_GET_CODE,
             payload: vec![9, 9, 9],
             grants: Vec::new(),
-            agent: None,
-            on_behalf_of: None,
         },
     );
     assert_frame(
@@ -2581,15 +2314,13 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
                 KV_OP_VERSION,
                 FORK_OP_VERSION,
             )
-            .with_checkpoint(CHECKPOINT_OP_VERSION)
-            .with_features(feature::KV_CAS | feature::READ_YOUR_WRITES | feature::DESTINATIONS),
+            .with_features(feature::KV_CAS | feature::READ_YOUR_WRITES),
         ),
     );
     // The managed backend announces its served capabilities to the streaming server over
     // their private socket, so the streaming server relays them instead of hardcoding bits.
     // The announce also lists secret-free structured backend descriptors with
-    // stable identity, revisions, readiness, query, schema, and maintenance
-    // capabilities. The embedded engine serves everything. A second backend
+    // stable identity, revisions, readiness, query, and schema capabilities. The embedded engine serves everything. A second backend
     // advertises a narrower capability set, so a consumer can gate precisely.
     assert_frame(
         "backend_announce.bin",
@@ -2600,14 +2331,13 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
                 KV_OP_VERSION,
                 FORK_OP_VERSION,
             )
-            .with_checkpoint(CHECKPOINT_OP_VERSION)
-            .with_features(feature::KV_CAS | feature::DESTINATIONS),
+            .with_features(feature::KV_CAS),
         )
         .with_backends(vec![
             canonical_backend(10, BackendMode::Operational, "Embedded", "embedded"),
             canonical_backend(
                 11,
-                BackendMode::Lakehouse,
+                BackendMode::Operational,
                 "Analytics warehouse",
                 "columnar",
             ),
@@ -2642,7 +2372,6 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
             kv_mutations_topic: "acme.kv.mutations".to_owned(),
             fork_mutations_topic: "acme.fork.mutations".to_owned(),
             graph_mutations_topic: "acme.graph.mutations".to_owned(),
-            checkpoint_mutations_topic: "acme.checkpoint.mutations".to_owned(),
         }),
     );
     // The durable managed-mutation log record: the managed backend replays these on
@@ -2653,7 +2382,6 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
         &MutationCommandEnvelope {
             v: KV_OP_VERSION,
             operation_id: 42,
-            actor_user_id: 0,
             deployment_id: 0,
             timestamp_micros: 1_700_000_000_000_000,
             command_code: AGDX_KV_SET_CODE,
@@ -2665,6 +2393,7 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
                 key: vec![0xff, 0x00, b'k'],
                 value: b"online".to_vec(),
                 expires_at_micros: Some(1_700_000_000_000_000),
+                ttl_micros: None,
             })
             .expect("kv set encodes"),
             caller: None,
@@ -2675,7 +2404,6 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
         &MutationCommandEnvelope {
             v: FORK_OP_VERSION,
             operation_id: 44,
-            actor_user_id: 0,
             deployment_id: 7,
             timestamp_micros: 1_700_000_000_000_000,
             command_code: laser_wire::codes::AGDX_FORK_CREATE_CODE,
@@ -2693,7 +2421,6 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
         &MutationCommandEnvelope {
             v: KV_OP_VERSION,
             operation_id: 43,
-            actor_user_id: 0,
             deployment_id: 0,
             timestamp_micros: 1_700_000_000_000_000,
             command_code: AGDX_KV_SET_CODE,
@@ -2804,18 +2531,23 @@ fn given_http_json_shapes_when_encoded_then_should_match_golden_fixtures() {
     );
     assert_json(
         "browse_projections.json",
-        &vec![ProjectionInfo {
-            projection: canonical_projection(),
-            bindings: vec![canonical_binding()],
-        }],
+        &ProjectionPage {
+            items: vec![ProjectionInfo {
+                projection: canonical_projection(),
+                bindings: vec![canonical_binding()],
+                status: Vec::new(),
+            }],
+            page: 1,
+            total_pages: 1,
+            total_results: 1,
+        },
     );
     assert_json("query_result.json", &canonical_query_result());
     assert_json("fork_info.json", &canonical_fork_info());
     assert_json(
         "capabilities.json",
         // The embedded transactional backend serves CAS and read-your-writes,
-        // so it opts both on. Strong consistency stays off (per deployment).
-        // The reply also lists the materialization backends the server exposes,
+        // so it opts both on. The reply also lists the materialization backends the server exposes,
         // mirroring the binary announce, so the HTTP client sees the same set.
         &Capabilities::from_versions(
             true,
@@ -2825,26 +2557,13 @@ fn given_http_json_shapes_when_encoded_then_should_match_golden_fixtures() {
                 KV_OP_VERSION,
                 FORK_OP_VERSION,
             )
-            .with_checkpoint(CHECKPOINT_OP_VERSION)
-            .with_features(feature::KV_CAS | feature::READ_YOUR_WRITES | feature::DESTINATIONS),
+            .with_features(feature::KV_CAS | feature::READ_YOUR_WRITES),
         )
-        .with_query_execution(true, true, true)
-        .with_destinations(DestinationCapsView {
-            available: true,
-            lifecycle: true,
-            checkpoint_status: true,
-            query_routes: true,
-            table_schema: true,
-            snapshots: true,
-            files: true,
-            metrics: true,
-            strongest_consistency: CheckpointReadConsistency::Linearizable,
-        })
         .with_backends(vec![
             canonical_backend(10, BackendMode::Operational, "Embedded", "embedded"),
             canonical_backend(
                 11,
-                BackendMode::Lakehouse,
+                BackendMode::Operational,
                 "Analytics warehouse",
                 "columnar",
             ),
@@ -2853,14 +2572,17 @@ fn given_http_json_shapes_when_encoded_then_should_match_golden_fixtures() {
     assert_json(
         "kv_page_view.json",
         &KvPageView {
-            entries: vec![KvEntryView {
+            items: vec![KvEntryView {
                 key: "dXNlcjox".to_owned(),
                 value: "AAEC".to_owned(),
                 expires_at_micros: Some(1_700_000_000_000_000),
+                version: 3,
                 scope: None,
                 source: None,
             }],
-            cursor: Some("dXNlcjox".to_owned()),
+            page: 1,
+            total_pages: 1,
+            total_results: 1,
         },
     );
     assert_json(
@@ -2873,151 +2595,6 @@ fn given_http_json_shapes_when_encoded_then_should_match_golden_fixtures() {
         )
         .with_detail(serde_json::json!({ "current": 3 })),
     );
-    assert_json(
-        "destination_page.json",
-        &DestinationPageView {
-            destinations: vec![DestinationView {
-                destination: canonical_destination(),
-                status: canonical_checkpoint_status(),
-            }],
-            next_cursor: Some("cursor-2".to_owned()),
-            global_state_revision: 11,
-            consistency: CheckpointReadConsistency::Linearizable,
-        },
-    );
-    assert_json(
-        "query_route_page.json",
-        &QueryRoutePageView {
-            routes: vec![canonical_query_route()],
-            next_cursor: Some("route-2".to_owned()),
-            definition_revision: 8,
-            global_state_revision: 11,
-            consistency: CheckpointReadConsistency::Linearizable,
-        },
-    );
-    assert_json(
-        "table_view.json",
-        &TableView {
-            table_uuid: UuidValue::new([9; 16]),
-            destination_id: DestinationId::from_u128(300),
-            destination_generation: 2,
-            namespace: vec!["fleet".to_owned(), "analytics".to_owned()],
-            table: "readings".to_owned(),
-            current_snapshot_id: 42,
-            current_schema_id: 3,
-            current_partition_spec_id: 1,
-            metadata_identity: "metadata/v2.json".to_owned(),
-            properties: BTreeMap::from([
-                ("format-version".to_owned(), "2".to_owned()),
-                ("write.format.default".to_owned(), "parquet".to_owned()),
-            ]),
-        },
-    );
-    assert_json(
-        "table_schema_view.json",
-        &TableSchemaView {
-            table_uuid: UuidValue::new([9; 16]),
-            iceberg_schema_id: 3,
-            logical_schema: canonical_logical_schema(),
-        },
-    );
-    assert_json(
-        "snapshot_page.json",
-        &SnapshotPageView {
-            snapshots: vec![TableSnapshotView {
-                snapshot_id: 42,
-                parent_snapshot_id: Some(41),
-                sequence_number: 5,
-                committed_at_micros: TIMESTAMP_MICROS,
-                schema_id: 3,
-                partition_spec_id: 1,
-                materialization_boundary_digest: laser_wire::schema::Digest32::new([7; 32]),
-                checkpoint_revision: 3,
-                summary: BTreeMap::from([
-                    ("added-data-files".to_owned(), "1".to_owned()),
-                    ("added-records".to_owned(), "100".to_owned()),
-                ]),
-            }],
-            next_before_snapshot_id: Some(41),
-        },
-    );
-    assert_json(
-        "table_file_page.json",
-        &TableFilePageView {
-            files: vec![TableFileView {
-                object_identity: "data/0001.parquet".to_owned(),
-                file_size_bytes: 4_096,
-                row_count: 100,
-                partition: BTreeMap::from([("day".to_owned(), TypedValue::Date(20_000))]),
-                lower_bounds: BTreeMap::from([(1, TypedValue::Long(1))]),
-                upper_bounds: BTreeMap::from([(1, TypedValue::Long(100))]),
-                null_value_counts: BTreeMap::from([(1, 0)]),
-            }],
-            next_cursor: Some("file-2".to_owned()),
-        },
-    );
-    assert_json(
-        "table_metrics.json",
-        &TableMetricsView {
-            snapshot_id: 42,
-            data_file_count: 1,
-            delete_file_count: 0,
-            total_rows: 100,
-            total_bytes: 4_096,
-            partition_count: 1,
-        },
-    );
-    assert_json(
-        "accepted_operation.json",
-        &AcceptedOperationView {
-            operation_id: DestinationOperationId::from_u128(600),
-            request_id: CheckpointRequestId::from_u128(400),
-            state: OperationState::Succeeded,
-            submitted_at_micros: TIMESTAMP_MICROS,
-            completed_at_micros: Some(TIMESTAMP_MICROS + 1_000),
-            error: None,
-            result: Some(CheckpointMutationResult::Destination {
-                request_id: CheckpointRequestId::from_u128(400),
-                destination_id: DestinationId::from_u128(300),
-                destination_generation: 2,
-                global_state_revision: 11,
-                definition_revision: 7,
-                checkpoint_revision: 3,
-                lease: None,
-            }),
-        },
-    );
-    assert_json(
-        "query_execution.json",
-        &QueryExecutionView {
-            status: QueryExecutionStatus {
-                execution_id: QueryExecutionId::from_u128(500),
-                state: QueryExecutionState::Completed,
-                started_at_micros: TIMESTAMP_MICROS,
-                finished_at_micros: Some(TIMESTAMP_MICROS + 1_000),
-                scanned_bytes: 4_096,
-                produced_bytes: 256,
-                row_count: 2,
-                error: None,
-            },
-            result: Some(canonical_query_result()),
-        },
-    );
-    assert_json(
-        "destination_issue.json",
-        &DestinationIssueView {
-            retention_gap: Some(RetentionGap {
-                incarnation: canonical_incarnation(0),
-                required_next_offset: 10,
-                retained_start: 20,
-            }),
-            prepared_attempt: None,
-            block: None,
-            global_state_revision: 11,
-            checkpoint_revision: 4,
-            consistency: CheckpointReadConsistency::Linearizable,
-        },
-    );
 }
 
 mod agent_fixtures {
@@ -3027,9 +2604,9 @@ mod agent_fixtures {
         AgentKind, AgentPresence, BodyRef, CapabilityDescriptor, ChannelId, ContentRef,
         ContextCompaction, ContextManifest, ContextRetrieval, ConversationId, CorrelationId,
         DeadLetterReason, Fragment, Health, LogPosition, OPERATION_CARD, OPERATION_CHAT,
-        OPERATION_REASONING, OPERATION_SESSION, OPERATION_TASK, RecordId, SIGNATURE_SCHEME_ED25519,
-        SdkInfo, SessionEnd, SessionStart, SessionStatus, SessionTransition, Signature, StateDelta,
-        StateSnapshot, TaskState, TokenUsage, validate,
+        OPERATION_QUARANTINE, OPERATION_REASONING, OPERATION_SESSION, OPERATION_TASK, RecordId,
+        SIGNATURE_SCHEME_ED25519, SdkInfo, SessionEnd, SessionStart, SessionStatus,
+        SessionTransition, Signature, StateDelta, StateSnapshot, TaskState, TokenUsage, validate,
     };
     use laser_wire::content::ContentType;
     use laser_wire::graph::{ProducerInfo, SourceRef};
@@ -3375,6 +2952,7 @@ mod agent_fixtures {
                 },
             ],
             ttl_micros: Some(30_000_000),
+            inbox: Some("rollout-planner.work".to_owned()),
         };
         agent_card.validate().expect("canonical card validates");
         assert_frame("agent_card.bin", &agent_card);
@@ -3458,6 +3036,12 @@ mod agent_fixtures {
         // The status discriminator is a closed vocabulary that excludes telemetry.
         let off_vocabulary = AgentEnvelope::status(record(), conversation(), source(), "telemetry");
         assert_invalid("agent_invalid_status_bad_operation.bin", &off_vocabulary);
+
+        // A registry fact carries the signed deadline that bounds its replay.
+        let mut undated_fact =
+            AgentEnvelope::status(record(), conversation(), source(), OPERATION_QUARANTINE);
+        undated_fact.body = b"target-agent".to_vec();
+        assert_invalid("agent_invalid_status_fact_no_deadline.bin", &undated_fact);
 
         // The opening chunk must declare its purpose (chat|reasoning|tool_args).
         let undeclared_opening = AgentEnvelope::chunk(
@@ -3587,6 +3171,62 @@ fn canonical_identity() -> FilterGroupIdentity {
         topic_created_at_micros: TIMESTAMP_MICROS + 1,
         group_id: 3,
     }
+}
+
+// A page whose pass policies delivered a broken payload and a mistyped field
+// without evaluating them, each named with its reason.
+fn unevaluated_page_reply() -> FilterReply {
+    let filter = canonical_safe_mode_filter()
+        .with_fault_policy(FaultPolicy::Pass)
+        .with_mismatch_policy(RecordPolicy::Pass);
+    FilterReply::Ok(FilterOutcome::Page(FilteredPage {
+        v: laser_wire::codes::FILTER_OP_VERSION,
+        partition_id: 0,
+        policy: AppliedPolicy {
+            group_id: Some(canonical_identity().group_id),
+            digest: Some(filter.digest()),
+            filter_id: Some(1),
+            revision: Some(1),
+            mode: ExecutionMode::Filtered,
+            policy_generation: 1,
+        },
+        generation: canonical_generation(),
+        ack_context: AckContext {
+            owner_generation: 4,
+            metadata_op: 40,
+        },
+        next_scan_offset: Some(1402),
+        safe_ack_offset: Some(1401),
+        frontier: 2000,
+        examined: 5,
+        matched: 3,
+        stop: StopReason::Filled,
+        fault: None,
+        unevaluated: vec![
+            RecordFault {
+                offset: 1398,
+                reason: FaultReason::Malformed,
+            },
+            RecordFault {
+                offset: 1401,
+                reason: FaultReason::TypeMismatch,
+            },
+        ],
+        evaluation_limits: Some(Box::new(FilterDecodeLimits {
+            max_payload_bytes: 1024 * 1024,
+            max_depth: 64,
+        })),
+        records: polled_head(2000, 17, 4, 40),
+    }))
+}
+
+#[test]
+fn given_an_unevaluated_page_fixture_when_decoded_then_should_name_why_each_record_was_not_evaluated()
+ {
+    let golden = std::fs::read(fixture_path("filter_reply_page_unevaluated.bin"))
+        .expect("read the unevaluated page fixture");
+    let decoded: FilterReply = decode_named(&golden).expect("the fixture frame decodes");
+    assert_eq!(decoded, unevaluated_page_reply());
 }
 
 #[test]
@@ -3737,6 +3377,7 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
                 partition_id: 0,
                 offset: 41,
                 operation_id: Some(11),
+                revision: None,
             }),
         },
     );
@@ -3799,6 +3440,10 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             evaluation_limits: None,
             records: polled_head(2000, 17, 4, 40),
         })),
+    );
+    assert_frame(
+        "filter_reply_page_unevaluated.bin",
+        &unevaluated_page_reply(),
     );
     assert_frame(
         "filter_reply_error.bin",
@@ -3879,6 +3524,7 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
                     partition_id: 0,
                     offset: 41,
                     operation_id: Some(11),
+                    revision: None,
                 }),
             },
         ))),
@@ -3940,9 +3586,9 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
         &FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Revisions(
             laser_wire::filter::FilterRevisionPage {
                 filter_id: 1,
-                total: 2,
-                page: 0,
-                page_size: 50,
+                page: 1,
+                total_pages: 1,
+                total_results: 2,
                 items: [true, false]
                     .into_iter()
                     .enumerate()
@@ -3965,7 +3611,6 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
             command: ControlCommand::FilterCatalog(Box::new(FilterCatalogCommand {
                 limits: Some(laser_wire::filter::FilterCatalogLimits::default()),
                 operation_id: 9,
-                actor_user_id: 1,
                 mutation: FilterMutation::Bind {
                     group: canonical_group(),
                     filter_id: 1,
@@ -4019,7 +3664,7 @@ fn given_session_read_replies_when_encoded_then_should_match_golden_fixtures() {
     assert_frame(
         "session_reply_changes.bin",
         &SessionReply::Ok(SessionOutcome::Changes(SessionChanges {
-            rows: vec![
+            items: vec![
                 SessionChangeRow {
                     seq: 43,
                     sessions: vec![id],
@@ -4035,9 +3680,12 @@ fn given_session_read_replies_when_encoded_then_should_match_golden_fixtures() {
                     origin: SessionChangeOrigin::Links,
                 },
             ],
+            page: 1,
+            total_pages: 1,
+            total_results: 44,
+            results: 100,
             floor: 10,
-            resync: false,
-            series: 0,
+            series: SESSION_CHANGE_SERIES,
         })),
     );
     assert_frame(
@@ -4075,6 +3723,13 @@ fn given_session_list_pages_when_decoded_then_should_carry_rebuilding_only_when_
 }
 
 #[test]
+fn given_a_session_changes_reply_without_its_series_when_decoded_then_should_reject() {
+    let payload = laser_wire::fixtures::bytes("session_http_changes_legacy.json")
+        .expect("registered negative fixture");
+    assert!(serde_json::from_slice::<SessionChanges>(payload).is_err());
+}
+
+#[test]
 fn given_session_http_payloads_when_encoded_then_should_match_golden_fixtures() {
     assert_json("session_http_info.json", &canonical_session_info());
     assert_json("session_http_page.json", &canonical_session_page());
@@ -4106,41 +3761,33 @@ fn given_session_http_payloads_when_encoded_then_should_match_golden_fixtures() 
             truncated: false,
             origin,
         };
-    // `series=0&after=0` on a stream with no change yet.
+    let page =
+        |page: u32, items: Vec<SessionChangeRow>, total_results: u64, floor: u64| SessionChanges {
+            items,
+            page,
+            total_pages: u32::try_from(total_results.div_ceil(100)).expect("pages fit"),
+            total_results,
+            results: 100,
+            floor,
+            series: SESSION_CHANGE_SERIES,
+        };
+    // Page 1 of a stream with no change yet: the next sequence is 1.
     assert_json(
         "session_http_changes_start_new.json",
-        &SessionChanges {
-            rows: Vec::new(),
-            floor: 0,
-            resync: true,
-            series: SESSION_CHANGE_SERIES,
-        },
+        &page(1, Vec::new(), 0, 1),
     );
-    // `series=0&after=0` on a stream whose newest change is 4405.
+    // A follower's start reads page 1 of a stream whose newest change is 4405
+    // and starts after it, the old changes of that page long pruned.
     assert_json(
         "session_http_changes_start.json",
-        &SessionChanges {
-            rows: Vec::new(),
-            floor: 4405,
-            resync: true,
-            series: SESSION_CHANGE_SERIES,
-        },
+        &page(1, Vec::new(), 4405, 4401),
     );
-    // Any request to an older registration without a change-sequence row.
-    assert_json(
-        "session_http_changes_legacy.json",
-        &SessionChanges {
-            rows: Vec::new(),
-            floor: 1,
-            resync: false,
-            series: 0,
-        },
-    );
-    // `after=4403` in the current series, oldest retained change 4401.
+    // Page 45 holds sequences 4401 to 4500, of which 4404 and 4405 are retained.
     assert_json(
         "session_http_changes_page.json",
-        &SessionChanges {
-            rows: vec![
+        &page(
+            45,
+            vec![
                 row(4404, SessionChangeOrigin::Records, vec![position]),
                 SessionChangeRow {
                     seq: 4405,
@@ -4150,71 +3797,60 @@ fn given_session_http_payloads_when_encoded_then_should_match_golden_fixtures() 
                     origin: SessionChangeOrigin::Records,
                 },
             ],
-            floor: 4401,
-            resync: false,
-            series: SESSION_CHANGE_SERIES,
-        },
+            4405,
+            4404,
+        ),
     );
-    // `after=4405` in the current series when no change row is retained and the next sequence is 4406.
+    // Page 45 when no change row is retained and the next sequence is 4406.
     assert_json(
         "session_http_changes_no_retained_rows.json",
-        &SessionChanges {
-            rows: Vec::new(),
-            floor: 4406,
-            resync: false,
-            series: SESSION_CHANGE_SERIES,
-        },
+        &page(45, Vec::new(), 4405, 4406),
     );
-    // `after=4399` in the current series: 4400 is below the oldest retained change 4401.
+    // A follower that still needs 4402 finds the floor at 4403 and lists again.
     assert_json(
         "session_http_changes_gap.json",
-        &SessionChanges {
-            rows: vec![
-                row(4401, SessionChangeOrigin::Records, vec![position]),
-                row(4402, SessionChangeOrigin::Records, vec![position]),
+        &page(
+            45,
+            vec![
+                row(4403, SessionChangeOrigin::Records, vec![position]),
+                row(4404, SessionChangeOrigin::Records, vec![position]),
             ],
-            floor: 4401,
-            resync: true,
-            series: SESSION_CHANGE_SERIES,
-        },
+            4404,
+            4403,
+        ),
     );
-    // `after=4405` in the current series with nothing newer.
+    // A page past the last holds nothing and still names the totals.
     assert_json(
         "session_http_changes_empty.json",
-        &SessionChanges {
-            rows: Vec::new(),
-            floor: 4401,
-            resync: false,
-            series: SESSION_CHANGE_SERIES,
-        },
+        &page(46, Vec::new(), 4405, 4401),
     );
     assert_json(
         "session_http_changes_truncated.json",
-        &SessionChanges {
-            rows: vec![SessionChangeRow {
+        &page(
+            45,
+            vec![SessionChangeRow {
                 seq: 4406,
                 sessions: vec![first],
                 positions: vec![position],
                 truncated: true,
                 origin: SessionChangeOrigin::Records,
             }],
-            floor: 4401,
-            resync: false,
-            series: SESSION_CHANGE_SERIES,
-        },
+            4406,
+            4401,
+        ),
     );
     assert_json(
         "session_http_changes_origins.json",
-        &SessionChanges {
-            rows: vec![
+        &page(
+            45,
+            vec![
                 row(4406, SessionChangeOrigin::Links, vec![position]),
                 row(4407, SessionChangeOrigin::Maintenance, Vec::new()),
                 row(4408, SessionChangeOrigin::Expiry, Vec::new()),
             ],
-            floor: 4401,
-            resync: false,
-            series: SESSION_CHANGE_SERIES,
-        },
+            4408,
+            4401,
+        ),
     );
     let start = std::fs::read_to_string(fixture_path("session_http_changes_start_new.json"))
         .expect("read the start fixture");
@@ -4247,7 +3883,8 @@ fn canonical_session_info() -> SessionInfo {
         status: SessionStatus::Active,
         idle: false,
         over_budget: false,
-        pause_requested: false,
+        pause_requested: true,
+        awaiting: vec!["writer".parse().expect("agent")],
         cancel_requested: true,
         started_at: Some(TIMESTAMP_MICROS),
         ended_at: None,
@@ -4281,8 +3918,11 @@ fn canonical_session_info() -> SessionInfo {
 fn canonical_session_page() -> SessionPage {
     SessionPage {
         items: vec![canonical_session_info()],
-        cursor: Some("next".to_owned()),
-        total: Some(9),
+        page: 2,
+        total_pages: 9,
+        total_results: 9,
+        as_of: 4405,
+        series: SESSION_CHANGE_SERIES,
         searched: None,
         truncated: false,
         rebuilding: false,
@@ -4291,6 +3931,11 @@ fn canonical_session_page() -> SessionPage {
 
 fn canonical_session_events_page() -> SessionEventsPage {
     SessionEventsPage {
+        page: 3,
+        total_pages: 3,
+        total_results: 41,
+        as_of: 4405,
+        series: SESSION_CHANGE_SERIES,
         items: vec![SessionEvent {
             at: SourceRef::Message {
                 stream: 5,
@@ -4323,7 +3968,6 @@ fn canonical_session_events_page() -> SessionEventsPage {
                 serde_json::Value::from("stop"),
             )]),
         }],
-        cursor: Some("page".to_owned()),
         ranges: vec![PayloadRange {
             topic_id: 3,
             topic_generation: TIMESTAMP_MICROS,
@@ -4332,7 +3976,6 @@ fn canonical_session_events_page() -> SessionEventsPage {
             last: 41,
         }],
         frontier: vec![canonical_session_frontier()],
-        fixed_frontier: true,
         gaps: vec![SourceGap {
             topic_id: 3,
             topic_generation: TIMESTAMP_MICROS,
@@ -4409,6 +4052,7 @@ fn given_a_memory_view_entry_when_encoded_then_should_match_golden_fixture() {
                     conversation: None,
                 }),
                 timestamp_micros: Some(TIMESTAMP_MICROS + 9),
+                weight: Some(2.5),
             })),
             source: None,
         },

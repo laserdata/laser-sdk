@@ -473,6 +473,7 @@ fn operation(
                             &CapabilitySelector::new(SKILL, RoutePolicy::Any),
                             &body,
                             &InboxRoute::Fixed(AgentTopic::Sessions),
+                            GatherPolicy::RequireAll,
                             timeout,
                         )
                         .await

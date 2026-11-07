@@ -1,7 +1,8 @@
-use crate::agent::ReplayBound;
 use crate::agent::agdx::AgdxReceipt;
 use crate::agent::lease::{LeaseKey, SessionLease};
-use crate::context::{Chain, Checkpoint, ContextMessage, ContextPolicy, LastN, TokenBudget};
+use crate::context::{
+    Chain, Checkpoint, ContextAssembler, ContextMessage, ContextPolicy, LastN, TokenBudget,
+};
 use crate::context_scope::{ContextScope, ScopedMemory};
 use crate::error::LaserError;
 use crate::laser::Laser;
@@ -9,9 +10,10 @@ use crate::provenance::AgentTopic;
 use crate::types::{ConversationId, MintUlid};
 use futures::FutureExt;
 use iggy::prelude::{Identifier, IggyExpiry, MaxTopicSize, StreamClient};
+use iggy_common::with_binary_deadline;
 use laser_wire::agent::{
-    AgentEnvelope, AgentErrorBody, AgentErrorCode, AgentId, Budget, OPERATION_SESSION, RecordId,
-    SdkInfo, SessionEnd, SessionStart, TaskState,
+    AgentEnvelope, AgentErrorBody, AgentErrorCode, AgentId, AgentKind, Budget, METADATA_RECORDED,
+    OPERATION_SESSION, RecordId, SdkInfo, SessionEnd, SessionStart, SessionStatus, TaskState,
 };
 use laser_wire::content::ContentType;
 use laser_wire::control::{ControlCommand, SessionTopics};
@@ -503,30 +505,51 @@ impl Sessions {
     // folds, so reads and linked writes right after bootstrap would otherwise
     // race it.
     async fn registration_visible(&self, stream: &str) -> bool {
-        let deadline = tokio::time::Instant::now() + self.laser.publish_options().timeout;
-        let mut last_unavailable = None;
-        loop {
-            match self.changes(0, 1).await {
-                Err(LaserError::Session(
-                    laser_wire::session::SessionError::NotRegistered(_)
-                    | laser_wire::session::SessionError::Stale(_),
-                )) => {}
-                Ok(_) => return true,
-                Err(error) if error.is_unavailable() => {
-                    last_unavailable = Some(error.to_string());
-                }
-                Err(error) => {
-                    tracing::warn!(stream = %stream, %error, "session source registration not confirmed");
-                    return false;
-                }
+        wait_for_registration(stream, self.laser.publish_options().timeout, || async {
+            self.changes(0, 1).await.map(|_| ())
+        })
+        .await
+    }
+}
+
+async fn wait_for_registration<Read, Pending>(
+    stream: &str,
+    timeout: Duration,
+    mut read: Read,
+) -> bool
+where
+    Read: FnMut() -> Pending,
+    Pending: Future<Output = Result<(), LaserError>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_unavailable = None;
+    while tokio::time::Instant::now() < deadline {
+        let Ok(reply) =
+            tokio::time::timeout_at(deadline, with_binary_deadline(deadline, read())).await
+        else {
+            break;
+        };
+        match reply {
+            Err(LaserError::Session(
+                laser_wire::session::SessionError::NotRegistered(_)
+                | laser_wire::session::SessionError::Stale(_),
+            )) => {}
+            Ok(_) => return true,
+            Err(error) if error.is_unavailable() || error.is_stale() => {
+                last_unavailable = Some(error.to_string());
             }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(stream = %stream, last_unavailable = ?last_unavailable, "session source registration not visible before the publish timeout");
+            Err(error) => {
+                tracing::warn!(stream = %stream, %error, "session source registration not confirmed");
                 return false;
             }
-            tokio::time::sleep(REGISTRATION_POLL_INTERVAL).await;
         }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + REGISTRATION_POLL_INTERVAL).min(deadline),
+        )
+        .await;
     }
+    tracing::warn!(stream = %stream, last_unavailable = ?last_unavailable, "session source registration not visible before the publish timeout");
+    false
 }
 
 // The distinct topics a per-agent topic layout declares, each a valid topic
@@ -649,15 +672,37 @@ impl SessionBuilder {
     }
 
     /// Write the session start on the lane and take a lease that keeps the
-    /// session listed in this process's heartbeat.
+    /// session listed in this process's heartbeat. A labeled session or one
+    /// with an explicit id that already ended is refused with
+    /// [`LaserError::SessionEnded`] before anything is written. Reopen a
+    /// completed or failed one with [`resume`](Self::resume).
     pub async fn begin(self) -> Result<(Session, SessionLease), LaserError> {
+        self.open(false).await
+    }
+
+    /// [`begin`](Self::begin) that also reopens a session that ended
+    /// completed or failed: its new start record follows the earlier
+    /// terminal, and the next `end`, `fail`, or `cancel` ends it again. A
+    /// session an agent or an operator canceled stays ended and is refused
+    /// with [`LaserError::SessionEnded`].
+    pub async fn resume(self) -> Result<(Session, SessionLease), LaserError> {
+        self.open(true).await
+    }
+
+    async fn open(self, resume: bool) -> Result<(Session, SessionLease), LaserError> {
         let agent = self
             .agent
             .clone()
             .ok_or_else(|| LaserError::Invalid("a session needs an agent".to_owned()))?;
+        let named = self.id.is_some() || self.label.is_some();
         let id = self.id()?;
         let config = Arc::clone(&self.sessions.config);
         let idle_timeout = self.idle_timeout.unwrap_or(config.idle_timeout);
+        if idle_timeout.is_zero() || config.heartbeat.is_zero() {
+            return Err(LaserError::Invalid(
+                "a session idle timeout and heartbeat must be positive".to_owned(),
+            ));
+        }
         let start = SessionStart {
             label: self.label,
             namespace: self.namespace,
@@ -674,6 +719,15 @@ impl SessionBuilder {
             .with_lane_guard(Arc::clone(&self.sessions.lane_guard))
             .as_agent(agent)
             .with_ancestry(self.parent, self.root);
+        if named && let Some(status) = session.ended_as().await? {
+            let reopens = resume && status != SessionStatus::Canceled;
+            if !reopens {
+                return Err(LaserError::SessionEnded {
+                    session: id.to_string(),
+                    status: status_name(status).to_owned(),
+                });
+            }
+        }
         let generation = session.stream_generation().await?;
         let lane = session.lane()?;
         let status = lane
@@ -689,6 +743,18 @@ impl SessionBuilder {
 
 fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn status_name(status: SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Submitted => "submitted",
+        SessionStatus::Active => "active",
+        SessionStatus::Paused => "paused",
+        SessionStatus::Completed => "completed",
+        SessionStatus::Failed => "failed",
+        SessionStatus::Canceled => "canceled",
+        SessionStatus::Unrecognized => "unrecognized",
+    }
 }
 
 // The first terminal a session handle wrote or tried to write. Every clone
@@ -803,7 +869,8 @@ pub struct Session {
     terminal: Arc<Mutex<Option<TerminalIntent>>>,
     lane_guard: Arc<LaneGuard>,
     pub(crate) redactor: Arc<dyn Fn(&mut serde_json::Value) + Send + Sync>,
-    pub(crate) state: Arc<Mutex<crate::agent::session_ops::StateCursor>>,
+    // An async lock, held across each state write's publish.
+    pub(crate) state: Arc<tokio::sync::Mutex<crate::agent::session_ops::StateCursor>>,
     pub(crate) current: Option<laser_wire::graph::SourceRef>,
     // The control state of the runtime that handed this lens to a handler.
     pub(crate) control: Option<Arc<crate::agent::control::ControlBook>>,
@@ -1082,10 +1149,13 @@ impl Session {
         )
     }
 
-    /// The model-ready context: the configured last records on the session
-    /// lane, trimmed to the configured estimated token bound.
+    /// The configured last records of the session, every kind, trimmed to
+    /// the configured estimated token bound of their bodies. A model prompt
+    /// reads [`assemble`](Self::assemble), which keeps the conversation
+    /// records only.
     pub async fn context(&self) -> Result<Vec<SessionTurn>, LaserError> {
-        self.context_with(self.config.policy()).await
+        let messages = self.lane_context(self.config.policy()).await?;
+        Ok(turns_of(messages))
     }
 
     /// [`context`](Self::context) under an explicit policy.
@@ -1093,8 +1163,95 @@ impl Session {
         &self,
         policy: Box<dyn ContextPolicy>,
     ) -> Result<Vec<SessionTurn>, LaserError> {
-        let messages = self.scope.fetch_with(lane_topics(), policy).await?;
-        Ok(turns_of(messages))
+        Ok(turns_of(self.lane_context(policy).await?))
+    }
+
+    // The topics this session's records ride: `agent.sessions` and the
+    // declared topics of the stream's per-agent topic layout.
+    fn lane_topic_names(&self) -> Vec<String> {
+        let mut names = vec![laser_wire::topics::AGENT_SESSIONS.to_owned()];
+        if let Some(SessionLayout::PerAgentTopic(declared)) = self
+            .laser
+            .default_stream()
+            .and_then(|stream| self.laser.layout(stream))
+        {
+            for topic in declared.into_values() {
+                if !names.contains(&topic) {
+                    names.push(topic);
+                }
+            }
+        }
+        names
+    }
+
+    // The newest records of this session under `policy`, within the context
+    // window of each partition its records land on.
+    pub(crate) async fn lane_context(
+        &self,
+        policy: Box<dyn ContextPolicy>,
+    ) -> Result<Vec<ContextMessage>, LaserError> {
+        ContextAssembler::builder()
+            .conversation_id(self.conversation())
+            .topics(Vec::new())
+            .policy(policy)
+            .build()
+            .with_topic_names(self.lane_topic_names())
+            .conversation_partitions()
+            .assemble(&self.laser)
+            .await
+    }
+
+    // Every retained record of this session, read whole from the partitions
+    // its records land on, for a fold that must see every record.
+    pub(crate) async fn lane_records(&self) -> Result<Vec<ContextMessage>, LaserError> {
+        ContextAssembler::builder()
+            .conversation_id(self.conversation())
+            .topics(Vec::new())
+            .policy(Box::new(LastN(usize::MAX)))
+            .build()
+            .with_topic_names(self.lane_topic_names())
+            .conversation_partitions()
+            .replay(&self.laser)
+            .await
+    }
+
+    // How this session ended, `None` while it is open or never started. The
+    // retained lane and control route decide, as the session index folds
+    // them, since they are never behind a terminal already written.
+    pub(crate) async fn ended_as(&self) -> Result<Option<SessionStatus>, LaserError> {
+        let mut lifecycle = LaneLifecycle::default();
+        for record in self.lane_records().await? {
+            if record.topic == laser_wire::topics::AGENT_SESSIONS
+                && let Some(envelope) = &record.envelope
+            {
+                lifecycle.add(envelope);
+            }
+        }
+        let forced = self.control_records().await?.iter().any(|record| {
+            record.envelope.as_ref().is_some_and(|envelope| {
+                envelope.kind == AgentKind::Status
+                    && envelope.task_state == Some(TaskState::Canceled)
+            })
+        });
+        Ok(if forced {
+            Some(SessionStatus::Canceled)
+        } else {
+            lifecycle.ended
+        })
+    }
+
+    // Every retained control record of this session, read whole from its
+    // control route, the one partition of `agent.control` its requests apply
+    // on.
+    pub(crate) async fn control_records(&self) -> Result<Vec<ContextMessage>, LaserError> {
+        ContextAssembler::builder()
+            .conversation_id(self.conversation())
+            .topics(vec![AgentTopic::Control])
+            .policy(Box::new(LastN(usize::MAX)))
+            .build()
+            .conversation_partitions()
+            .replay(&self.laser)
+            .await
     }
 
     /// This session's memory in the configured namespace, scoped to the
@@ -1111,19 +1268,20 @@ impl Session {
     /// The knowledge graph `name`, the same graph [`Laser::graph`] returns.
     /// Feature `graph`.
     #[cfg(feature = "graph")]
-    pub fn graph(&self, name: impl Into<String>) -> crate::graph::GraphHandle<'_> {
+    pub fn graph(&self, name: impl Into<String>) -> crate::graph::GraphHandle {
         self.scope.graph(name)
     }
 
-    /// Where the session lane ends right now. Persist it (it serializes) and
-    /// hand it to [`state_at`](Self::state_at) or [`replay`](Self::replay).
+    /// Where the session lane and the declared agent topics end right now.
+    /// Persist it (it serializes) and hand it to
+    /// [`state_at`](Self::state_at) or [`replay`](Self::replay).
     pub async fn checkpoint(&self) -> Result<Checkpoint, LaserError> {
-        self.scope.checkpoint(&lane_topics()).await
+        crate::context::checkpoint_of(&self.laser, &self.lane_topic_names()).await
     }
 
     /// The records up to `checkpoint`.
     pub async fn turns_at(&self, checkpoint: Checkpoint) -> Result<Vec<SessionTurn>, LaserError> {
-        self.turns(ReplayBound::At(checkpoint)).await
+        self.turns(None, Some(checkpoint)).await
     }
 
     /// The records appended after `checkpoint`.
@@ -1131,7 +1289,7 @@ impl Session {
         &self,
         checkpoint: Checkpoint,
     ) -> Result<Vec<SessionTurn>, LaserError> {
-        self.turns(ReplayBound::FromCheckpoint(checkpoint)).await
+        self.turns(Some(checkpoint), None).await
     }
 
     /// Fold the records up to `checkpoint` into `S`: state as it stood then.
@@ -1161,25 +1319,24 @@ impl Session {
         Ok(self.turns_since(checkpoint).await?.iter().fold(init, fold))
     }
 
-    async fn turns(&self, bound: ReplayBound) -> Result<Vec<SessionTurn>, LaserError> {
-        let messages = self
-            .scope
-            .state(
-                lane_topics(),
-                bound,
-                Vec::new(),
-                |mut acc: Vec<ContextMessage>, message| {
-                    acc.push(message.clone());
-                    acc
-                },
-            )
+    async fn turns(
+        &self,
+        from: Option<Checkpoint>,
+        to: Option<Checkpoint>,
+    ) -> Result<Vec<SessionTurn>, LaserError> {
+        let messages = ContextAssembler::builder()
+            .conversation_id(self.conversation())
+            .topics(Vec::new())
+            .policy(Box::new(LastN(usize::MAX)))
+            .maybe_from_checkpoint(from)
+            .maybe_to_checkpoint(to)
+            .build()
+            .with_topic_names(self.lane_topic_names())
+            .conversation_partitions()
+            .replay(&self.laser)
             .await?;
         Ok(turns_of(messages))
     }
-}
-
-fn lane_topics() -> Vec<AgentTopic<'static>> {
-    vec![AgentTopic::Sessions]
 }
 
 fn turns_of(messages: Vec<ContextMessage>) -> Vec<SessionTurn> {
@@ -1198,6 +1355,33 @@ fn turns_of(messages: Vec<ContextMessage>) -> Vec<SessionTurn> {
         .collect()
 }
 
+fn is_conversation(message: &ContextMessage) -> bool {
+    let Some(envelope) = &message.envelope else {
+        return true;
+    };
+    if matches!(envelope.kind, AgentKind::Status | AgentKind::Chunk) {
+        return false;
+    }
+    match display_type(
+        SessionRecord::Envelope(envelope),
+        laser_wire::topics::AGENT_SESSIONS,
+    ) {
+        DisplayType::UserMessage
+        | DisplayType::AgentHandoff
+        | DisplayType::AgentMessage
+        | DisplayType::ToolCall
+        | DisplayType::ToolResult
+        | DisplayType::ModelResponse
+        | DisplayType::Error => true,
+        DisplayType::ModelRequest => !envelope
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(METADATA_RECORDED))
+            .is_some_and(|recorded| matches!(recorded, laser_wire::query::Value::Bool(true))),
+        _ => false,
+    }
+}
+
 fn error_body(message: String) -> AgentErrorBody {
     AgentErrorBody {
         code: AgentErrorCode::Internal,
@@ -1213,6 +1397,89 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
         .map(|message| (*message).to_owned())
         .or_else(|| panic.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "the session work panicked".to_owned())
+}
+
+// The lifecycle of one session as the session index folds its lane: the
+// first terminal ends it, and a start after a completed or failed end
+// resumes it with that start's budget.
+#[derive(Debug, Default)]
+pub(crate) struct LaneLifecycle {
+    pub(crate) started: bool,
+    pub(crate) ended: Option<SessionStatus>,
+    pub(crate) budget: Option<Budget>,
+}
+
+impl LaneLifecycle {
+    pub(crate) fn add(&mut self, envelope: &AgentEnvelope) {
+        if envelope.kind != AgentKind::Status
+            || envelope.operation.as_deref() != Some(OPERATION_SESSION)
+        {
+            return;
+        }
+        match envelope.task_state {
+            Some(
+                state @ (TaskState::Completed
+                | TaskState::Failed
+                | TaskState::Rejected
+                | TaskState::Canceled),
+            ) => {
+                if self.ended.is_none() {
+                    self.ended = Some(match state {
+                        TaskState::Completed => SessionStatus::Completed,
+                        TaskState::Canceled => SessionStatus::Canceled,
+                        _ => SessionStatus::Failed,
+                    });
+                }
+            }
+            Some(
+                TaskState::Submitted
+                | TaskState::Working
+                | TaskState::InputRequired
+                | TaskState::AuthRequired,
+            ) => {
+                let Ok(start) = laser_wire::framing::decode_named::<SessionStart>(&envelope.body)
+                else {
+                    return;
+                };
+                if !self.started {
+                    self.started = true;
+                    self.budget = start.budget;
+                } else if matches!(
+                    self.ended,
+                    Some(SessionStatus::Completed | SessionStatus::Failed)
+                ) {
+                    self.ended = None;
+                    self.budget = start.budget;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// Narrows a history to the conversation records of a session before the
+// inner policy selects from them: no lifecycle, state, or context
+// bookkeeping, and no model request the session recorded, whose body repeats
+// an earlier context.
+pub(crate) struct ConversationRecords(pub(crate) Box<dyn ContextPolicy>);
+
+impl ContextPolicy for ConversationRecords {
+    fn name(&self) -> String {
+        self.0.name()
+    }
+
+    fn version(&self) -> String {
+        self.0.version()
+    }
+
+    fn select(&self, history: &[ContextMessage]) -> Vec<ContextMessage> {
+        let conversation: Vec<ContextMessage> = history
+            .iter()
+            .filter(|message| is_conversation(message))
+            .cloned()
+            .collect();
+        self.0.select(&conversation)
+    }
 }
 
 /// One record read back from a [`Session`]: the message off the log plus how
@@ -1238,6 +1505,93 @@ impl SessionTurn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use laser_wire::agent::{ChannelId, CorrelationId, OPERATION_CHAT, OPERATION_STATE_DELTA};
+    use laser_wire::dispatch::{OPERATION_CONTEXT_ASSEMBLED, OPERATION_EXECUTE_TOOL};
+    use laser_wire::result::{CommandError, ResultCode};
+    use std::future::pending;
+
+    #[tokio::test]
+    async fn given_a_zero_idle_timeout_or_heartbeat_when_a_session_begins_then_should_refuse_it_before_any_write()
+     {
+        let laser =
+            Laser::from_client(iggy::prelude::IggyClient::default()).with_default_stream("acme");
+        let agent: laser_wire::agent::AgentId = "worker".parse().expect("valid agent id");
+        let idle = laser
+            .sessions()
+            .start()
+            .agent(agent.clone())
+            .idle_timeout(Duration::ZERO)
+            .begin()
+            .await
+            .map(|_| ());
+        assert!(matches!(idle, Err(LaserError::Invalid(_))), "{idle:?}");
+        let heartbeat = laser
+            .sessions_with(SessionConfig::new().heartbeat(Duration::ZERO))
+            .start()
+            .agent(agent.clone())
+            .begin()
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(heartbeat, Err(LaserError::Invalid(_))),
+            "{heartbeat:?}"
+        );
+        let submitted = laser
+            .sessions_with(SessionConfig::new().idle_timeout(Duration::ZERO))
+            .submit(agent.clone(), b"task".to_vec())
+            .from(agent)
+            .send()
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(submitted, Err(LaserError::Invalid(_))),
+            "{submitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_registration_read_that_never_finishes_when_its_deadline_expires_then_should_stop_waiting()
+     {
+        let mut reads = 0;
+        let result = tokio::time::timeout(
+            Duration::from_millis(300),
+            wait_for_registration("agents", Duration::from_millis(20), || {
+                reads += 1;
+                pending::<Result<(), LaserError>>()
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(false)),
+            "the registration deadline must bound its read: {result:?}"
+        );
+        assert_eq!(reads, 1);
+    }
+
+    #[tokio::test]
+    async fn given_a_stale_registration_read_when_waiting_then_should_retry_until_visible() {
+        let mut reads = 0;
+        let registered = wait_for_registration("agents", Duration::from_secs(1), || {
+            reads += 1;
+            let stale = reads == 1;
+            async move {
+                if stale {
+                    Err(
+                        CommandError::new(ResultCode::Stale, "the session fold is catching up")
+                            .into(),
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(
+            registered,
+            "a transient frontier refusal must not end registration discovery"
+        );
+        assert_eq!(reads, 2);
+    }
 
     #[test]
     fn given_per_user_policy_when_deriving_for_a_key_then_should_be_stable_and_distinct() {
@@ -1306,6 +1660,211 @@ mod tests {
                 MaxTopicSize::Unlimited
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn given_session_records_when_selecting_the_conversation_then_should_drop_lifecycle_state_and_recorded_requests()
+     {
+        let conversation = laser_wire::agent::ConversationId::from_u128(7);
+        let agent: AgentId = "planner".parse().expect("agent id is valid");
+        let record = |n: u128| RecordId::from_u128(n);
+        let correlation = CorrelationId::from_u128(9);
+        let recorded = laser_wire::query::Value::Bool(true);
+        let envelopes = [
+            (
+                "start",
+                AgentEnvelope::status(record(1), conversation, agent.clone(), OPERATION_SESSION)
+                    .with_task_state(TaskState::Working),
+            ),
+            (
+                "input",
+                AgentEnvelope::command(
+                    record(2),
+                    conversation,
+                    agent.clone(),
+                    correlation,
+                    b"hi".to_vec(),
+                )
+                .with_operation(OPERATION_CHAT),
+            ),
+            (
+                "recorded request",
+                AgentEnvelope::command(
+                    record(3),
+                    conversation,
+                    agent.clone(),
+                    correlation,
+                    b"prompt".to_vec(),
+                )
+                .with_operation(OPERATION_CHAT)
+                .with_metadata(METADATA_RECORDED, recorded.clone()),
+            ),
+            (
+                "manifest",
+                AgentEnvelope::event(record(4), conversation, agent.clone(), Vec::new())
+                    .with_operation(OPERATION_CONTEXT_ASSEMBLED),
+            ),
+            (
+                "answer",
+                AgentEnvelope::response(
+                    record(5),
+                    conversation,
+                    agent.clone(),
+                    correlation,
+                    b"hello".to_vec(),
+                )
+                .with_operation(OPERATION_CHAT),
+            ),
+            (
+                "tool call",
+                AgentEnvelope::command(
+                    record(6),
+                    conversation,
+                    agent.clone(),
+                    correlation,
+                    b"{}".to_vec(),
+                )
+                .with_operation(OPERATION_EXECUTE_TOOL)
+                .with_metadata(METADATA_RECORDED, recorded),
+            ),
+            (
+                "tool result",
+                AgentEnvelope::response(
+                    record(7),
+                    conversation,
+                    agent.clone(),
+                    correlation,
+                    b"found".to_vec(),
+                )
+                .with_operation(OPERATION_EXECUTE_TOOL),
+            ),
+            (
+                "state",
+                AgentEnvelope::event(record(8), conversation, agent.clone(), Vec::new())
+                    .with_operation(OPERATION_STATE_DELTA),
+            ),
+            (
+                "chunk",
+                AgentEnvelope::chunk(
+                    conversation,
+                    agent,
+                    correlation,
+                    ChannelId::from_u128(1),
+                    0,
+                    b"he".to_vec(),
+                )
+                .with_operation(OPERATION_CHAT),
+            ),
+        ];
+        let history: Vec<ContextMessage> = envelopes
+            .iter()
+            .enumerate()
+            .map(|(offset, (_, envelope))| ContextMessage {
+                id: crate::types::MessageId::new(0, offset as u64),
+                provenance: crate::provenance::Provenance::builder()
+                    .conversation_id(conversation.into())
+                    .build(),
+                payload: encode_named(envelope).expect("the envelope encodes"),
+                envelope: Some(envelope.clone()),
+                topic: laser_wire::topics::AGENT_SESSIONS.to_owned(),
+                timestamp_micros: offset as u64,
+                stream_id: 1,
+                topic_id: 1,
+            })
+            .collect();
+        let kept: Vec<&str> = ConversationRecords(Box::new(LastN(usize::MAX)))
+            .select(&history)
+            .iter()
+            .map(|message| envelopes[message.id.offset as usize].0)
+            .collect();
+        assert_eq!(kept, ["input", "answer", "tool call", "tool result"]);
+        assert_eq!(
+            ConversationRecords(Box::new(LastN(2)))
+                .select(&history)
+                .len(),
+            2,
+            "the inner policy selects from the conversation records"
+        );
+    }
+
+    #[test]
+    fn given_a_lane_that_ended_and_started_again_when_folded_then_should_follow_the_index_rule() {
+        let conversation = laser_wire::agent::ConversationId::from_u128(1);
+        let agent: AgentId = "desk".parse().expect("agent id is valid");
+        let status = |state: TaskState, body: Vec<u8>| {
+            let mut envelope = AgentEnvelope::status(
+                RecordId::from_u128(1),
+                conversation,
+                agent.clone(),
+                OPERATION_SESSION,
+            )
+            .with_task_state(state);
+            envelope.body = body;
+            envelope
+        };
+        let start = |tokens: u64| {
+            status(
+                TaskState::Working,
+                encode_named(&SessionStart {
+                    label: None,
+                    namespace: None,
+                    agent: agent.clone(),
+                    sdk: SessionConfig::default().sdk_info().clone(),
+                    parent: None,
+                    root: None,
+                    idle_timeout_micros: None,
+                    budget: Some(Budget {
+                        tokens: Some(tokens),
+                        cost_micros: None,
+                    }),
+                    tags: Vec::new(),
+                })
+                .expect("a start encodes"),
+            )
+        };
+        let end = |state: TaskState| {
+            status(
+                state,
+                encode_named(&SessionEnd::default()).expect("an end encodes"),
+            )
+        };
+        let fold = |envelopes: &[AgentEnvelope]| {
+            let mut lifecycle = LaneLifecycle::default();
+            for envelope in envelopes {
+                lifecycle.add(envelope);
+            }
+            lifecycle
+        };
+        let tokens = |lifecycle: &LaneLifecycle| lifecycle.budget.and_then(|budget| budget.tokens);
+        assert_eq!(
+            fold(&[start(1), end(TaskState::Completed)]).ended,
+            Some(SessionStatus::Completed)
+        );
+        let resumed = fold(&[start(1), end(TaskState::Completed), start(9)]);
+        assert_eq!(resumed.ended, None);
+        assert_eq!(tokens(&resumed), Some(9), "a resume carries its own budget");
+        assert_eq!(
+            fold(&[
+                start(1),
+                end(TaskState::Failed),
+                start(9),
+                end(TaskState::Completed)
+            ])
+            .ended,
+            Some(SessionStatus::Completed)
+        );
+        let canceled = fold(&[start(1), end(TaskState::Canceled), start(9)]);
+        assert_eq!(
+            canceled.ended,
+            Some(SessionStatus::Canceled),
+            "a canceled session stays ended"
+        );
+        assert_eq!(tokens(&canceled), Some(1));
+        assert_eq!(
+            tokens(&fold(&[start(1), start(5)])),
+            Some(1),
+            "an open session keeps its start"
         );
     }
 

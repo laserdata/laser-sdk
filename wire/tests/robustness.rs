@@ -15,18 +15,9 @@ use laser_wire::prelude::{
 };
 use laser_wire::{
     arrow::{ArrowIpcMessageMetadata, ArrowIpcPolicy},
-    checkpoint::{
-        CheckpointReadReply, CheckpointReply, CheckpointRequestEnvelope,
-        DestinationCheckpointStatus, ReplicatedCheckpointMutation,
-    },
-    destination::{MaterializationDestination, QueryRoute},
     hello::{BackendAnnounce, HelloReply},
-    query::{
-        QueryCancelEnvelope, QueryEnvelope, QueryPageEnvelope, QueryStatusEnvelope,
-        QueryStatusReply,
-    },
+    query::QueryEnvelope,
     schema::{LogicalSchema, LogicalType, TypedValue},
-    source::SourceCut,
 };
 
 struct XorShift(u64);
@@ -65,21 +56,9 @@ fn decode_every_shape(payload: &[u8]) {
     let _ = decode_named::<LogicalSchema>(payload);
     let _ = decode_named::<LogicalType>(payload);
     let _ = decode_named::<TypedValue>(payload);
-    let _ = decode_named::<SourceCut>(payload);
-    let _ = decode_named::<MaterializationDestination>(payload);
-    let _ = decode_named::<QueryRoute>(payload);
     let _ = decode_named::<ArrowIpcMessageMetadata>(payload);
     let _ = decode_named::<ArrowIpcPolicy>(payload);
-    let _ = decode_named::<CheckpointRequestEnvelope>(payload);
-    let _ = decode_named::<ReplicatedCheckpointMutation>(payload);
-    let _ = decode_named::<CheckpointReply>(payload);
-    let _ = decode_named::<CheckpointReadReply>(payload);
-    let _ = decode_named::<DestinationCheckpointStatus>(payload);
     let _ = decode_named::<QueryEnvelope>(payload);
-    let _ = decode_named::<QueryPageEnvelope>(payload);
-    let _ = decode_named::<QueryCancelEnvelope>(payload);
-    let _ = decode_named::<QueryStatusEnvelope>(payload);
-    let _ = decode_named::<QueryStatusReply>(payload);
 }
 
 #[test]

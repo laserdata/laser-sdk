@@ -90,6 +90,41 @@ async fn given_typed_publishes_when_read_back_then_should_yield_values_and_skip_
 
 #[tokio::test]
 #[serial_test::serial(integration)]
+async fn given_a_typed_reader_when_records_are_yielded_one_at_a_time_then_should_expose_offsets_past_each_yielded_record()
+ {
+    let laser = harness::laser().await;
+    laser
+        .topic("progress")
+        .ensure(1, None)
+        .await
+        .expect("topic exists");
+    let samples = laser.topic("progress").json::<Sample>();
+    for cpu_millis in [1, 2, 3] {
+        samples
+            .publish(&Sample {
+                host: "node-1".to_owned(),
+                cpu_millis,
+            })
+            .expect("body encodes")
+            .send()
+            .await
+            .expect("publish succeeds");
+    }
+    let mut records = samples.records("progress-it").expect("reader opens");
+    let mut seen = Vec::new();
+    while let Some(next) = records.next().await {
+        let record = next.expect("the record decodes");
+        seen.push((record.value.cpu_millis, records.offsets().to_vec()));
+    }
+    assert_eq!(
+        seen,
+        vec![(1, vec![1]), (2, vec![2]), (3, vec![3])],
+        "a crash after handling a record resumes right after it"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
 async fn given_the_cbor_form_when_round_tripped_then_should_decode_with_positions() {
     let laser = harness::laser().await;
     laser

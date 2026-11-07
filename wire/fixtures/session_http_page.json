@@ -11,7 +11,10 @@
       "status": "active",
       "idle": false,
       "over_budget": false,
-      "pause_requested": false,
+      "pause_requested": true,
+      "awaiting": [
+        "writer"
+      ],
       "cancel_requested": true,
       "started_at": 1717171717000000,
       "first_event_at": 1717171717000000,
@@ -46,7 +49,10 @@
       ]
     }
   ],
-  "cursor": "next",
-  "total": 9,
+  "page": 2,
+  "total_pages": 9,
+  "total_results": 9,
+  "as_of": 4405,
+  "series": 7654321098765432101,
   "truncated": false
 }

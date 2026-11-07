@@ -3,20 +3,17 @@ use crate::laser::Laser;
 use crate::nodes::Target;
 use crate::query::{
     AGDX_QUERY_CODE, AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, Filter, KeyMatch,
-    QUERY_OP_VERSION, Query, QueryError, QueryExecutionId, QueryExecutionStatus, QueryResult,
-    QueryTarget, RawSql, Row, SnapshotSelector, Sort, SqlDialect, TextQuery, TypedValue,
-    VECTOR_FIELD, VectorQuery, Window,
+    QUERY_OP_VERSION, Query, QueryError, QueryExecutionId, QueryFrontier, QueryResult, QueryTarget,
+    RawSql, Row, Sort, SqlDialect, TextQuery, TypedValue, VECTOR_FIELD, VectorQuery, Window,
 };
 use crate::stream::Decoder;
 use crate::types::{ConversationId, MintUlid};
 use laser_wire::framing::encode_named;
-use laser_wire::query::{
-    QueryCancelEnvelope, QueryCancelReply, QueryEnvelope, QueryPageEnvelope, QueryReply,
-    QueryStatusEnvelope, QueryStatusReply,
-};
-use laser_wire::schema::ORIGINAL_PAYLOAD_FIELD_NAME;
+use laser_wire::query::{QueryEnvelope, QueryReply};
+use laser_wire::schema::{LogicalField, ORIGINAL_PAYLOAD_FIELD_NAME};
 use laser_wire::validate::Validate;
 use serde::de::DeserializeOwned;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::retry::{QUERY_DEADLINE as DEFAULT_QUERY_DEADLINE, QUERY_REPLY_GRACE};
@@ -40,34 +37,23 @@ impl Laser {
     ///     .fetch_typed().await?;
     /// # Ok(()) }
     /// ```
-    pub fn query<'a>(&'a self, index: &'a str) -> QueryRequest<'a> {
-        QueryRequest::new(self, QueryTarget::operational(self.resource_name(index)))
+    pub fn query(&self, index: &str) -> QueryRequest {
+        QueryRequest::new(
+            self.clone(),
+            QueryTarget::operational(self.resource_name(index)),
+        )
     }
 
-    /// Start a query against an explicit operational or lakehouse target. An
-    /// operational index is sent as [`resource_name`](Self::resource_name)
-    /// names it.
-    pub fn query_target(&self, target: QueryTarget) -> QueryRequest<'_> {
+    /// Start a query against an explicit target. An operational index is sent
+    /// as [`resource_name`](Self::resource_name) names it.
+    pub fn query_target(&self, target: QueryTarget) -> QueryRequest {
         let target = match target {
             QueryTarget::Operational { index } => {
                 QueryTarget::operational(self.resource_name(&index))
             }
             other => other,
         };
-        QueryRequest::new(self, target)
-    }
-
-    /// Start a query against one destination generation.
-    pub fn query_lakehouse(
-        &self,
-        destination_id: laser_wire::destination::DestinationId,
-        destination_generation: u64,
-    ) -> QueryRequest<'_> {
-        self.query_target(QueryTarget::Lakehouse {
-            destination_id,
-            destination_generation,
-            snapshot: None,
-        })
+        QueryRequest::new(self.clone(), target)
     }
 
     /// Lower-level: execute a pre-built `Query` and return the raw paged result.
@@ -84,6 +70,19 @@ impl Laser {
             return Err(LaserError::unsupported(
                 "query",
                 "the query surface is not served by this deployment",
+            ));
+        }
+        if let Some(raw) = &query.raw_sql
+            && !capabilities.enabled_backends().any(|backend| {
+                backend
+                    .query
+                    .as_ref()
+                    .is_some_and(|query| query.raw_sql && query.dialects.contains(&raw.dialect))
+            })
+        {
+            return Err(LaserError::unsupported(
+                "query",
+                "raw SQL dialect is not served by an enabled backend",
             ));
         }
         // Fail fast on a consistency level the server has not advertised.
@@ -133,12 +132,9 @@ impl Laser {
         // The encoded query envelope rides the `AGDX_QUERY` managed command: the
         // server forwards it to LaserData Cloud over its local socket and returns
         // the `QueryReply` bytes, off the log, no reply topic, no correlation poll.
-        let (payload, replica) = self
+        let (payload, _) = self
             .send_query_until(AGDX_QUERY_CODE, payload, deadline_micros, Target::Caller)
             .await?;
-        if let Some(replica) = replica {
-            self.nodes().pin_query(execution_id, replica);
-        }
         match crate::error::decode_managed_reply::<QueryReply>(&payload)? {
             QueryReply::Ok(result) => validate_query_result(*result, execution_id),
             QueryReply::Err(error) => Err(error.into()),
@@ -167,106 +163,6 @@ impl Laser {
         .await
         .map_err(|_| LaserError::Timeout("no query reply by the query deadline"))?
     }
-
-    /// Retrieve the next cursor page for an executing query.
-    pub async fn query_page(
-        &self,
-        execution_id: QueryExecutionId,
-        cursor: impl Into<String>,
-        deadline_micros: u64,
-    ) -> Result<QueryResult, LaserError> {
-        let capabilities = self.capabilities().await;
-        if !capabilities.query.cursor_paging {
-            return Err(LaserError::unsupported_feature(
-                "query",
-                "cursor_paging",
-                "query cursor paging is not advertised by this deployment",
-            ));
-        }
-        let request = QueryPageEnvelope::new(execution_id, cursor, deadline_micros);
-        request.validate()?;
-        let payload = encode_named(&request)
-            .map_err(|error| LaserError::Codec(format!("encode request: {error}")))?;
-        let (payload, _) = self
-            .send_query_until(
-                crate::query::AGDX_QUERY_PAGE_CODE,
-                payload,
-                deadline_micros,
-                self.nodes().query_target(execution_id),
-            )
-            .await?;
-        match crate::error::decode_managed_reply::<QueryReply>(&payload)? {
-            QueryReply::Ok(result) => validate_query_result(*result, execution_id),
-            QueryReply::Err(error) => Err(error.into()),
-            _ => Err(LaserError::Protocol(
-                "query page: unknown reply variant".to_owned(),
-            )),
-        }
-    }
-
-    /// Cancel an executing query by its unguessable identity.
-    pub async fn cancel_query(
-        &self,
-        execution_id: QueryExecutionId,
-    ) -> Result<QueryExecutionStatus, LaserError> {
-        if !self.capabilities().await.query.cancellation {
-            return Err(LaserError::unsupported_feature(
-                "query",
-                "cancellation",
-                "query cancellation is not advertised by this deployment",
-            ));
-        }
-        let request = QueryCancelEnvelope::new(execution_id);
-        request.validate()?;
-        let payload = encode_named(&request)
-            .map_err(|error| LaserError::Codec(format!("encode request: {error}")))?;
-        let (payload, _) = self
-            .send_managed_to(
-                crate::query::AGDX_QUERY_CANCEL_CODE,
-                payload,
-                self.nodes().query_target(execution_id),
-            )
-            .await?;
-        match crate::error::decode_managed_reply::<QueryCancelReply>(&payload)? {
-            QueryCancelReply::Ok(status) => validate_query_status(status, execution_id),
-            QueryCancelReply::Err(error) => Err(error.into()),
-            _ => Err(LaserError::Protocol(
-                "query cancellation: unknown reply variant".to_owned(),
-            )),
-        }
-    }
-
-    /// Read the current state of an executing or recently completed query.
-    pub async fn query_status(
-        &self,
-        execution_id: QueryExecutionId,
-    ) -> Result<QueryExecutionStatus, LaserError> {
-        if !self.capabilities().await.query.execution_status {
-            return Err(LaserError::unsupported_feature(
-                "query",
-                "execution_status",
-                "query execution status is not advertised by this deployment",
-            ));
-        }
-        let request = QueryStatusEnvelope::new(execution_id);
-        request.validate()?;
-        let payload = encode_named(&request)
-            .map_err(|error| LaserError::Codec(format!("encode request: {error}")))?;
-        let (payload, _) = self
-            .send_managed_to(
-                crate::query::AGDX_QUERY_STATUS_CODE,
-                payload,
-                self.nodes().query_target(execution_id),
-            )
-            .await?;
-        match crate::error::decode_managed_reply::<QueryStatusReply>(&payload)? {
-            QueryStatusReply::Ok(status) => validate_query_status(status, execution_id),
-            QueryStatusReply::Err(error) => Err(error.into()),
-            _ => Err(LaserError::Protocol(
-                "query status: unknown reply variant".to_owned(),
-            )),
-        }
-    }
 }
 
 fn validate_query_result(
@@ -282,93 +178,52 @@ fn validate_query_result(
     Ok(result)
 }
 
-fn validate_query_status(
-    status: QueryExecutionStatus,
-    execution_id: QueryExecutionId,
-) -> Result<QueryExecutionStatus, LaserError> {
-    status.validate()?;
-    if status.execution_id != execution_id {
-        return Err(LaserError::Protocol(
-            "query status execution id does not match the request".to_owned(),
-        ));
-    }
-    Ok(status)
-}
-
 /// Fluent builder for `Laser::query`. Accumulates a `Query`, then `.fetch()`
 /// returns the paged result, `.fetch_typed::<T>()` deserializes every row's
 /// payload into `T`, `.fetch_one::<T>()` is the same but for at most one row.
 #[must_use = "call .fetch().await (or a fetch_* variant) to run the query"]
-pub struct QueryRequest<'a> {
-    laser: &'a Laser,
+pub struct QueryRequest {
+    laser: Laser,
     query: Query,
     max_rows: Option<usize>,
+    timeout: Option<Duration>,
 }
 
-impl<'a> QueryRequest<'a> {
-    fn new(laser: &'a Laser, target: QueryTarget) -> Self {
+impl QueryRequest {
+    fn new(laser: Laser, target: QueryTarget) -> Self {
         Self {
             laser,
             query: Query::builder()
-                .execution_id(crate::query::QueryExecutionId::mint())
+                .execution_id(QueryExecutionId::mint())
                 .target(target)
                 .deadline_micros(query_deadline(DEFAULT_QUERY_DEADLINE))
                 .build(),
             max_rows: None,
+            timeout: Some(DEFAULT_QUERY_DEADLINE),
         }
     }
 
-    /// Set the absolute execution budget from now. The deadline applies to all
-    /// pages under this query identity and is never extended by the server.
-    /// The longest budget is 25 seconds. A longer one fails the fetch.
-    pub fn deadline(mut self, timeout: Duration) -> Self {
-        self.query.deadline_micros = query_deadline(timeout);
+    /// Set the budget of the call and of each page of a walk, counted from
+    /// when it starts. The default and longest budget is 25 seconds. A longer
+    /// one fails the fetch.
+    pub fn deadline(mut self, deadline: Duration) -> Self {
+        self.timeout = Some(deadline);
         self
     }
 
-    /// Replace the absolute execution deadline, in Unix epoch microseconds.
-    /// A caller that already holds a deadline passes it through unchanged
-    /// instead of converting it back into a relative budget.
-    pub fn deadline_micros(mut self, deadline_micros: u64) -> Self {
-        self.query.deadline_micros = deadline_micros;
+    /// Set one absolute deadline, in Unix epoch microseconds, for the call and
+    /// every page of a walk. A caller that already holds a deadline passes it
+    /// through unchanged instead of converting it back into a relative budget.
+    pub fn deadline_at_micros(mut self, deadline_at_micros: u64) -> Self {
+        self.query.deadline_micros = deadline_at_micros;
+        self.timeout = None;
         self
     }
 
-    /// The identity shared by execution, cursor pages, status, and cancellation.
+    /// The identity the first request sends and its reply echoes back. Each
+    /// later page of a walk takes a fresh one.
     pub const fn execution_id(&self) -> QueryExecutionId {
         self.query.execution_id
-    }
-
-    /// Read the current execution state for this query identity.
-    pub async fn status(&self) -> Result<QueryExecutionStatus, LaserError> {
-        self.laser.query_status(self.query.execution_id).await
-    }
-
-    /// Request cancellation for this query identity and return its observed state.
-    pub async fn cancel(&self) -> Result<QueryExecutionStatus, LaserError> {
-        self.laser.cancel_query(self.query.execution_id).await
-    }
-
-    /// Select one exact Iceberg snapshot for a lakehouse query.
-    pub fn at_snapshot(mut self, snapshot_id: i64) -> Result<Self, LaserError> {
-        let QueryTarget::Lakehouse { snapshot, .. } = &mut self.query.target else {
-            return Err(LaserError::Invalid(
-                "snapshot selection requires a lakehouse query target".to_owned(),
-            ));
-        };
-        *snapshot = Some(SnapshotSelector::SnapshotId(snapshot_id));
-        Ok(self)
-    }
-
-    /// Select the retained Iceberg snapshot current at a timestamp.
-    pub fn at_timestamp_micros(mut self, timestamp_micros: i64) -> Result<Self, LaserError> {
-        let QueryTarget::Lakehouse { snapshot, .. } = &mut self.query.target else {
-            return Err(LaserError::Invalid(
-                "timestamp selection requires a lakehouse query target".to_owned(),
-            ));
-        };
-        *snapshot = Some(SnapshotSelector::TimestampMicros(timestamp_micros));
-        Ok(self)
     }
 
     /// Exact-match on an indexed field (point lookup).
@@ -486,18 +341,10 @@ impl<'a> QueryRequest<'a> {
         self
     }
 
-    /// Resume from an opaque cursor that the server returned in a previous
-    /// page. Replaces any [`offset`](Self::offset).
-    pub fn cursor(mut self, cursor: impl Into<String>) -> Self {
-        self.query.page.cursor = Some(cursor.into());
-        self.query.page.offset = None;
-        self
-    }
-
-    /// Skip the first `n` matching rows.
+    /// Skip the first `n` matching rows. An offset above `MAX_QUERY_OFFSET` is
+    /// rejected as [`LaserError::Invalid`] before the request is sent.
     pub fn offset(mut self, n: usize) -> Self {
         self.query.page.offset = Some(n as u64);
-        self.query.page.cursor = None;
         self
     }
 
@@ -528,7 +375,7 @@ impl<'a> QueryRequest<'a> {
     }
 
     /// Set the read-consistency level explicitly (`Eventual` is the default,
-    /// `ReadYourWrites`, or `Strong`). `Strong` is gated by `strong_consistency`.
+    /// or `ReadYourWrites`).
     pub fn consistency(mut self, level: Consistency) -> Self {
         self.query.consistency = level;
         self
@@ -537,7 +384,9 @@ impl<'a> QueryRequest<'a> {
     /// Lexical relevance search over every text-hinted indexed field. Relevance
     /// lands in each row's `score` exactly as vector distance does. Gated by
     /// the `keyword` capability: refused locally when unadvertised, so an
-    /// unaware backend can never silently drop the filter.
+    /// unaware backend can never silently drop the filter. Rows come in
+    /// relevance order and page by offset, so the query takes no `order` and
+    /// no total.
     pub fn text(mut self, query: impl Into<String>) -> Self {
         self.query.text = Some(TextQuery {
             field: None,
@@ -653,13 +502,13 @@ impl<'a> QueryRequest<'a> {
         self
     }
 
-    /// Bucket the aggregate into tumbling windows of `every_micros` over the
+    /// Bucket the aggregate into tumbling windows `every` wide over the
     /// timestamp `field`. Each result row carries a `window_start` header (the
     /// bucket's lower edge in epoch micros).
-    pub fn window(mut self, field: impl Into<String>, every_micros: u64) -> Self {
+    pub fn window(mut self, field: impl Into<String>, every: Duration) -> Self {
         let window = Some(Window {
             field: field.into(),
-            every_micros,
+            every_micros: u64::try_from(every.as_micros()).unwrap_or(u64::MAX),
         });
         match self.query.aggregate.as_mut() {
             Some(aggregate) => aggregate.window = window,
@@ -717,7 +566,8 @@ impl<'a> QueryRequest<'a> {
 
     /// Approximate nearest-neighbour search against the default vector field
     /// (`VECTOR_FIELD` = `"embedding"`). Use [`nearest_in`](Self::nearest_in) to
-    /// point at a different field name.
+    /// point at a different field name. The `top_k` nearest rows are the whole
+    /// answer, one page with no `order`, offset or total.
     pub fn nearest(self, embedding: Vec<f32>, top_k: usize) -> Self {
         self.nearest_in(VECTOR_FIELD, embedding, top_k)
     }
@@ -740,15 +590,17 @@ impl<'a> QueryRequest<'a> {
 
     /// Run the query and return the paged result + metadata.
     pub async fn fetch(self) -> Result<QueryResult, LaserError> {
-        self.laser.execute_query(self.query).await
+        let (laser, query) = self.stamped();
+        laser.execute_query(query).await
     }
 
     /// Run the query, then deserialize every row's payload into `T` (JSON).
     /// `with_payload()` is implied. Single-page only: use `.stream_typed()` or
     /// `.fetch_all_typed()` if there may be more than `MAX_PAGE_SIZE` matches.
-    pub async fn fetch_typed<T: DeserializeOwned>(mut self) -> Result<Vec<T>, LaserError> {
-        self.query.select.payload = true;
-        let result = self.laser.execute_query(self.query).await?;
+    pub async fn fetch_typed<T: DeserializeOwned>(self) -> Result<Vec<T>, LaserError> {
+        let (laser, mut query) = self.stamped();
+        query.select.payload = true;
+        let result = laser.execute_query(query).await?;
         result
             .rows
             .iter()
@@ -757,10 +609,11 @@ impl<'a> QueryRequest<'a> {
     }
 
     /// Like `fetch_typed` but caps the result at one row.
-    pub async fn fetch_one<T: DeserializeOwned>(mut self) -> Result<Option<T>, LaserError> {
-        self.query.select.payload = true;
-        self.query.page.limit = 1;
-        let result = self.laser.execute_query(self.query).await?;
+    pub async fn fetch_one<T: DeserializeOwned>(self) -> Result<Option<T>, LaserError> {
+        let (laser, mut query) = self.stamped();
+        query.select.payload = true;
+        query.page.limit = 1;
+        let result = laser.execute_query(query).await?;
         match result.rows.first() {
             Some(row) => decode_row::<crate::stream::Json, T>(&result.fields, row).map(Some),
             None => Ok(None),
@@ -780,12 +633,13 @@ impl<'a> QueryRequest<'a> {
     /// let readings: Vec<Reading> = laser.query("readings").fetch_typed_with::<Msgpack, _>().await?;
     /// # Ok(()) }
     /// ```
-    pub async fn fetch_typed_with<C, T>(mut self) -> Result<Vec<T>, LaserError>
+    pub async fn fetch_typed_with<C, T>(self) -> Result<Vec<T>, LaserError>
     where
         C: Decoder<T>,
     {
-        self.query.select.payload = true;
-        let result = self.laser.execute_query(self.query).await?;
+        let (laser, mut query) = self.stamped();
+        query.select.payload = true;
+        let result = laser.execute_query(query).await?;
         result
             .rows
             .iter()
@@ -795,13 +649,14 @@ impl<'a> QueryRequest<'a> {
 
     /// Like [`fetch_one`](Self::fetch_one) but decode the row with any
     /// [`Decoder`] instead of JSON.
-    pub async fn fetch_one_with<C, T>(mut self) -> Result<Option<T>, LaserError>
+    pub async fn fetch_one_with<C, T>(self) -> Result<Option<T>, LaserError>
     where
         C: Decoder<T>,
     {
-        self.query.select.payload = true;
-        self.query.page.limit = 1;
-        let result = self.laser.execute_query(self.query).await?;
+        let (laser, mut query) = self.stamped();
+        query.select.payload = true;
+        query.page.limit = 1;
+        let result = laser.execute_query(query).await?;
         match result.rows.first() {
             Some(row) => decode_row::<C, T>(&result.fields, row).map(Some),
             None => Ok(None),
@@ -811,28 +666,21 @@ impl<'a> QueryRequest<'a> {
     // The auto-paginating page walk behind `rows()` and `fetch_all()`. Private:
     // an unbounded walk is never handed out directly (the bounded-reads law),
     // and the public `stream` verb belongs to Iggy topology root alone.
-    // Auto-paginates with `limit` (or 100 if unset) and stops when the worker
-    // reports `has_more = false`, an empty page, or no new cursor.
-    // Aggregate and vector queries are single-page by construction: `offset`
-    // is not a meaningful cursor for either shape.
-    fn page_stream(mut self) -> QueryStream<'a> {
-        if self.query.page.limit == 0 {
-            self.query.page.limit = crate::query::DEFAULT_STREAM_PAGE_SIZE as u32;
-        }
+    // Pages by offset with the query's `limit` and stops when the worker
+    // reports `has_more = false` or an empty page. Aggregate and vector
+    // queries are single-page by construction.
+    fn page_stream(self) -> QueryStream {
         let single_page = self.query.aggregate.is_some() || self.query.vector.is_some();
-        QueryStream::new(self.laser, self.query, single_page)
+        QueryStream::new(self.laser, self.query, self.timeout, single_page)
     }
 
     // Like `page_stream` but each yield is `T` decoded from the row's payload.
     // `with_payload()` is implied, and the publisher must have chained
     // `.inline_payload()` for the bytes to be there.
-    fn typed_page_stream<T: DeserializeOwned>(mut self) -> TypedQueryStream<'a, T> {
+    fn typed_page_stream<T: DeserializeOwned>(mut self) -> TypedQueryStream<T> {
         self.query.select.payload = true;
-        if self.query.page.limit == 0 {
-            self.query.page.limit = crate::query::DEFAULT_STREAM_PAGE_SIZE as u32;
-        }
         let single_page = self.query.aggregate.is_some() || self.query.vector.is_some();
-        TypedQueryStream::new(self.laser, self.query, single_page)
+        TypedQueryStream::new(self.laser, self.query, self.timeout, single_page)
     }
 
     /// Cap the total rows a [`rows`](Self::rows) walk may yield. Explicit by
@@ -858,7 +706,7 @@ impl<'a> QueryRequest<'a> {
     /// }
     /// # Ok(()) }
     /// ```
-    pub fn rows(self) -> Result<QueryRows<'a>, LaserError> {
+    pub fn rows(self) -> Result<QueryRows, LaserError> {
         let Some(max_rows) = self.max_rows else {
             return Err(LaserError::Invalid(
                 "rows() needs an explicit ceiling: chain .max_rows(n) first".to_owned(),
@@ -874,7 +722,7 @@ impl<'a> QueryRequest<'a> {
     /// payload, under the same explicit [`max_rows`](Self::max_rows) ceiling.
     /// `with_payload()` is implied, and the publisher must have chained
     /// `.inline_payload()` for the bytes to be there.
-    pub fn rows_typed<T: DeserializeOwned>(self) -> Result<TypedQueryRows<'a, T>, LaserError> {
+    pub fn rows_typed<T: DeserializeOwned>(self) -> Result<TypedQueryRows<T>, LaserError> {
         let Some(max_rows) = self.max_rows else {
             return Err(LaserError::Invalid(
                 "rows_typed() needs an explicit ceiling: chain .max_rows(n) first".to_owned(),
@@ -889,14 +737,18 @@ impl<'a> QueryRequest<'a> {
     /// Materialize EVERY matching row by walking pages internally: the
     /// explicit full-result opt-in. Convenient when you need them all and the
     /// working set fits comfortably in memory. Prefer the bounded
-    /// [`rows`](Self::rows) walk when it might not.
-    pub async fn fetch_all(self) -> Result<Vec<Row>, LaserError> {
+    /// [`rows`](Self::rows) walk when it might not. Each row is bound to its
+    /// fields, and the set reports whether the frontier moved between pages.
+    pub async fn fetch_all(self) -> Result<QueryRowSet, LaserError> {
         let mut stream = self.page_stream();
         let mut rows = Vec::new();
         while let Some(row) = stream.next().await? {
             rows.push(row);
         }
-        Ok(rows)
+        Ok(QueryRowSet {
+            rows,
+            frontier_moved: stream.frontier_moved,
+        })
     }
 
     /// Materialize EVERY matching row, decoded into `T`: the explicit
@@ -910,9 +762,19 @@ impl<'a> QueryRequest<'a> {
         Ok(rows)
     }
 
-    /// Inspect the raw `Query` the builder produced (debugging).
+    /// Inspect the raw `Query` the builder produced, with its deadline
+    /// counted from now (debugging).
     pub fn into_query(self) -> Query {
-        self.query
+        self.stamped().1
+    }
+
+    // The query a call sends now: a relative budget becomes a deadline counted
+    // from this instant.
+    fn stamped(mut self) -> (Laser, Query) {
+        if let Some(timeout) = self.timeout {
+            self.query.deadline_micros = query_deadline(timeout);
+        }
+        (self.laser, self.query)
     }
 
     fn predicate(self, field: impl Into<String>, op: CmpOp, value: impl Into<TypedValue>) -> Self {
@@ -964,9 +826,9 @@ fn agg_call(func: AggFunc, field: Option<String>, arg: Option<f64>, alias: &str)
     }
 }
 
-impl<'a> From<QueryRequest<'a>> for Query {
-    fn from(request: QueryRequest<'a>) -> Self {
-        request.query
+impl From<QueryRequest> for Query {
+    fn from(request: QueryRequest) -> Self {
+        request.into_query()
     }
 }
 
@@ -1024,81 +886,120 @@ where
 
 /// The auto-paginating row walk behind [`QueryRequest::rows`] and
 /// [`QueryRequest::fetch_all`]. Holds the `Query` and refills its buffer by
-/// continuing it with the server-issued opaque cursor when a local page drains,
-/// until the worker reports `has_more = false`, returns an empty page, or
-/// returns no new cursor, whichever comes first. The empty-page and cursor
-/// guards rule out an infinite loop if the worker skews on `has_more`.
-struct QueryStream<'a> {
-    laser: &'a Laser,
+/// moving its offset past the rows already read when a local page drains,
+/// until the worker reports `has_more = false` or returns an empty page. The
+/// empty-page guard rules out an infinite loop if the worker skews on
+/// `has_more`.
+struct QueryStream {
+    laser: Laser,
     query: Query,
+    timeout: Option<Duration>,
+    pages_sent: usize,
     finished: bool,
-    // Aggregate / vector queries do not support cursor continuation, so the
-    // stream fetches once and stops regardless of `has_more`.
+    // Aggregate and vector queries do not page, so the stream fetches once and
+    // stops regardless of `has_more`.
     single_page: bool,
-    fields: Vec<laser_wire::schema::LogicalField>,
-    buffer: std::vec::IntoIter<Row>,
+    buffer: std::vec::IntoIter<QueryRow>,
+    // The first page's frontier, which every later page is compared with.
+    frontier: Option<Vec<QueryFrontier>>,
+    frontier_moved: bool,
 }
 
-impl<'a> QueryStream<'a> {
-    fn new(laser: &'a Laser, query: Query, single_page: bool) -> Self {
+impl QueryStream {
+    fn new(laser: Laser, query: Query, timeout: Option<Duration>, single_page: bool) -> Self {
         Self {
             laser,
             query,
+            timeout,
+            pages_sent: 0,
             finished: false,
             single_page,
-            fields: Vec::new(),
             buffer: Vec::new().into_iter(),
+            frontier: None,
+            frontier_moved: false,
         }
     }
 
     // Yield the next row, fetching the next page if the local buffer is empty.
     // Returns `Ok(None)` after the final row of the last page.
-    async fn next(&mut self) -> Result<Option<Row>, LaserError> {
-        if let Some(row) = self.buffer.next() {
+    async fn next(&mut self) -> Result<Option<QueryRow>, LaserError> {
+        if let Some(row) = self.buffered() {
             return Ok(Some(row));
         }
         if self.finished {
             return Ok(None);
         }
-        let page = self.laser.execute_query(self.query.clone()).await?;
-        self.finished = self.single_page
-            || page_ends_walk(
-                page.rows.len(),
-                &page.page,
-                self.query.page.cursor.as_deref(),
-            );
-        self.query.page.cursor = page.page.next_cursor.clone();
-        self.query.page.offset = None;
-        self.fields = page.fields;
-        self.buffer = page.rows.into_iter();
-        Ok(self.buffer.next())
+        let query = self.page_query();
+        let page = self.laser.execute_query(query).await?;
+        self.absorb(page);
+        Ok(self.buffered())
+    }
+
+    fn buffered(&mut self) -> Option<QueryRow> {
+        self.buffer.next()
+    }
+
+    // Take a fetched page: move the offset past its rows, compare its frontier
+    // with the first page's, and buffer its rows.
+    fn absorb(&mut self, page: QueryResult) {
+        self.finished = self.single_page || page_ends_walk(page.rows.len(), &page.page);
+        self.query.page.offset = Some(next_offset(self.query.page.offset, page.rows.len()));
+        match &self.frontier {
+            None => self.frontier = Some(page.context.frontier),
+            Some(first) if frontier_differs(first, &page.context.frontier) => {
+                self.frontier_moved = true;
+            }
+            Some(_) => {}
+        }
+        self.buffer = QueryRow::from_page(page.fields, page.rows).into_iter();
+    }
+
+    // The request for the next page: its own deadline counted from now under a
+    // relative budget, and a fresh execution id after the first page.
+    fn page_query(&mut self) -> Query {
+        let mut query = self.query.clone();
+        if let Some(timeout) = self.timeout {
+            query.deadline_micros = query_deadline(timeout);
+        }
+        if self.pages_sent > 0 {
+            query.execution_id = QueryExecutionId::mint();
+        }
+        self.pages_sent += 1;
+        query
     }
 }
 
-// Whether a fetched page is the last one the walk reads. An empty page, a
-// page without more rows, and a page that reports more rows but gives no new
-// cursor all end it. Continuing without a cursor would restart at page one and
-// continuing with the same cursor would repeat the page, both forever.
-fn page_ends_walk(fetched: usize, page: &laser_wire::query::Page, sent: Option<&str>) -> bool {
-    fetched == 0
-        || !page.has_more
-        || page
-            .next_cursor
-            .as_deref()
-            .is_none_or(|next| Some(next) == sent)
+// Whether a fetched page is the last one the walk reads. An empty page and a
+// page without more rows both end it, so a worker that skews on `has_more`
+// cannot make the walk repeat forever.
+fn page_ends_walk(fetched: usize, page: &laser_wire::query::Page) -> bool {
+    fetched == 0 || !page.has_more
+}
+
+// The offset of the page after one that started at `sent` and held `fetched`
+// rows.
+fn next_offset(sent: Option<u64>, fetched: usize) -> u64 {
+    sent.unwrap_or(0)
+        .saturating_add(u64::try_from(fetched).unwrap_or(u64::MAX))
+}
+
+// Whether two pages were served at different frontiers. The plane names each
+// partition once, so equal length and containment is set equality.
+fn frontier_differs(first: &[QueryFrontier], later: &[QueryFrontier]) -> bool {
+    first.len() != later.len() || later.iter().any(|position| !first.contains(position))
 }
 
 /// The bounded row walk returned by [`QueryRequest::rows`]: the auto-paginating
 /// stream under the explicit `max_rows` ceiling. Yields `Ok(None)` at the cap
 /// or after the last page, whichever comes first.
-pub struct QueryRows<'a> {
-    stream: QueryStream<'a>,
+pub struct QueryRows {
+    stream: QueryStream,
     remaining: usize,
 }
 
-impl QueryRows<'_> {
+impl QueryRows {
     /// Yield the next row, or `Ok(None)` at the ceiling or after the last page.
-    pub async fn next(&mut self) -> Result<Option<Row>, LaserError> {
+    pub async fn next(&mut self) -> Result<Option<QueryRow>, LaserError> {
         if self.remaining == 0 {
             return Ok(None);
         }
@@ -1108,20 +1009,110 @@ impl QueryRows<'_> {
         }
         Ok(row)
     }
+
+    /// Whether a page after the first was served at another frontier, so rows
+    /// may repeat or be missing.
+    pub fn frontier_moved(&self) -> bool {
+        self.stream.frontier_moved
+    }
+}
+
+/// One query row bound to the fields of the page it came on, read by field name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryRow {
+    fields: Arc<[LogicalField]>,
+    row: Row,
+}
+
+impl QueryRow {
+    /// Every row of one page, each bound to the page's fields.
+    pub fn from_page(fields: Vec<LogicalField>, rows: Vec<Row>) -> Vec<Self> {
+        let fields: Arc<[LogicalField]> = Arc::from(fields);
+        rows.into_iter()
+            .map(|row| Self {
+                fields: fields.clone(),
+                row,
+            })
+            .collect()
+    }
+
+    /// The fields of the page this row came on, in value order.
+    pub fn fields(&self) -> &[LogicalField] {
+        &self.fields
+    }
+
+    /// The tagged values, in field order.
+    pub fn values(&self) -> &[TypedValue] {
+        &self.row.values
+    }
+
+    /// Backend-native vector distance or lexical rank.
+    pub fn score(&self) -> Option<f32> {
+        self.row.score
+    }
+
+    pub fn field_index(&self, name: &str) -> Option<usize> {
+        self.fields.iter().position(|field| field.name == name)
+    }
+
+    pub fn value(&self, field: &str) -> Option<&TypedValue> {
+        self.field_index(field)
+            .and_then(|index| self.row.values.get(index))
+    }
+
+    pub fn value_text(&self, field: &str) -> Option<String> {
+        self.value(field).map(TypedValue::diagnostic_text)
+    }
+
+    pub fn value_u64(&self, field: &str) -> Option<u64> {
+        self.value(field).and_then(TypedValue::as_u64)
+    }
+
+    pub fn value_i64(&self, field: &str) -> Option<i64> {
+        self.value(field).and_then(TypedValue::as_i64)
+    }
+
+    /// The positional wire row.
+    pub fn row(&self) -> &Row {
+        &self.row
+    }
+}
+
+impl From<QueryRow> for Row {
+    fn from(row: QueryRow) -> Self {
+        row.row
+    }
+}
+
+/// Every row [`QueryRequest::fetch_all`] read, and whether a page after the
+/// first was served at another frontier, so rows may repeat or be missing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryRowSet {
+    pub rows: Vec<QueryRow>,
+    pub frontier_moved: bool,
+}
+
+impl IntoIterator for QueryRowSet {
+    type Item = QueryRow;
+    type IntoIter = std::vec::IntoIter<QueryRow>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.rows.into_iter()
+    }
 }
 
 /// The typed sibling of [`QueryStream`], behind [`QueryRequest::rows_typed`]
 /// and [`QueryRequest::fetch_all_typed`]. Each `.next().await` decodes the
 /// next row's payload into `T`.
-struct TypedQueryStream<'a, T> {
-    inner: QueryStream<'a>,
+struct TypedQueryStream<T> {
+    inner: QueryStream,
     _marker: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<'a, T: DeserializeOwned> TypedQueryStream<'a, T> {
-    fn new(laser: &'a Laser, query: Query, single_page: bool) -> Self {
+impl<T: DeserializeOwned> TypedQueryStream<T> {
+    fn new(laser: Laser, query: Query, timeout: Option<Duration>, single_page: bool) -> Self {
         Self {
-            inner: QueryStream::new(laser, query, single_page),
+            inner: QueryStream::new(laser, query, timeout, single_page),
             _marker: std::marker::PhantomData,
         }
     }
@@ -1129,7 +1120,7 @@ impl<'a, T: DeserializeOwned> TypedQueryStream<'a, T> {
     // Yield the next decoded value, or `Ok(None)` after the last page.
     async fn next(&mut self) -> Result<Option<T>, LaserError> {
         match self.inner.next().await? {
-            Some(row) => decode_row::<crate::stream::Json, T>(&self.inner.fields, &row).map(Some),
+            Some(row) => decode_row::<crate::stream::Json, T>(row.fields(), row.row()).map(Some),
             None => Ok(None),
         }
     }
@@ -1139,12 +1130,12 @@ impl<'a, T: DeserializeOwned> TypedQueryStream<'a, T> {
 /// auto-paginating stream under the explicit `max_rows` ceiling, decoding each
 /// row's payload into `T`. Yields `Ok(None)` at the cap or after the last
 /// page, whichever comes first.
-pub struct TypedQueryRows<'a, T> {
-    stream: TypedQueryStream<'a, T>,
+pub struct TypedQueryRows<T> {
+    stream: TypedQueryStream<T>,
     remaining: usize,
 }
 
-impl<T: DeserializeOwned> TypedQueryRows<'_, T> {
+impl<T: DeserializeOwned> TypedQueryRows<T> {
     /// Yield the next decoded value, or `Ok(None)` at the ceiling or after the
     /// last page.
     pub async fn next(&mut self) -> Result<Option<T>, LaserError> {
@@ -1157,11 +1148,44 @@ impl<T: DeserializeOwned> TypedQueryRows<'_, T> {
         }
         Ok(row)
     }
+
+    /// Whether a page after the first was served at another frontier, so rows
+    /// may repeat or be missing.
+    pub fn frontier_moved(&self) -> bool {
+        self.stream.inner.frontier_moved
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "graph", feature = "fork"))]
+    #[tokio::test]
+    async fn given_owned_managed_handles_when_spawned_then_should_run_on_their_own_tasks() {
+        let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default())
+            .with_capabilities(crate::capabilities::Capabilities::OPEN);
+        let query = tokio::spawn(laser.query("readings").fetch());
+        let graph = tokio::spawn(laser.graph("knowledge").fetch());
+        let fork = tokio::spawn(laser.fork("experiment").create().send());
+        assert!(
+            query
+                .await
+                .expect("the query task joins")
+                .is_err_and(|error| error.is_unsupported())
+        );
+        assert!(
+            graph
+                .await
+                .expect("the graph task joins")
+                .is_err_and(|error| error.is_unsupported())
+        );
+        assert!(
+            fork.await
+                .expect("the fork task joins")
+                .is_err_and(|error| error.is_unsupported())
+        );
+    }
 
     #[test]
     fn given_query_deadlines_when_waiting_then_should_cap_them_and_add_the_grace() {
@@ -1217,35 +1241,71 @@ mod tests {
     }
 
     #[test]
-    fn given_more_rows_without_a_new_cursor_when_paging_then_should_end_the_walk() {
-        let page = |has_more: bool, next_cursor: Option<&str>| laser_wire::query::Page {
-            offset: None,
+    fn given_a_page_when_paging_then_should_end_only_on_an_empty_or_last_page() {
+        let page = |has_more: bool| laser_wire::query::Page {
+            offset: Some(0),
             limit: 2,
             total: None,
             has_more,
-            next_cursor: next_cursor.map(str::to_owned),
         };
-        assert!(!page_ends_walk(2, &page(true, Some("b")), Some("a")));
-        assert!(page_ends_walk(2, &page(true, None), Some("a")));
-        assert!(page_ends_walk(2, &page(true, None), None));
-        assert!(page_ends_walk(2, &page(true, Some("a")), Some("a")));
-        assert!(page_ends_walk(0, &page(true, Some("b")), Some("a")));
-        assert!(page_ends_walk(2, &page(false, Some("b")), Some("a")));
+        assert!(!page_ends_walk(2, &page(true)));
+        assert!(page_ends_walk(0, &page(true)));
+        assert!(page_ends_walk(2, &page(false)));
     }
 
     #[test]
-    fn given_a_cursor_when_set_then_should_replace_the_offset() {
+    fn given_a_read_page_when_paging_then_should_move_the_offset_past_its_rows() {
+        assert_eq!(next_offset(None, 2), 2);
+        assert_eq!(next_offset(Some(40), 20), 60);
+        assert_eq!(next_offset(Some(u64::MAX), 1), u64::MAX);
+    }
+
+    #[test]
+    fn given_a_walk_when_paging_then_should_give_every_page_its_own_deadline_and_execution_id() {
         let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default());
-        let query = laser
-            .query("readings")
-            .offset(20)
-            .cursor("c-2")
-            .into_query();
-        assert_eq!(query.page.cursor.as_deref(), Some("c-2"));
-        assert_eq!(query.page.offset, None);
-        let query = laser.query("readings").cursor("c-2").offset(5).into_query();
-        assert_eq!(query.page.cursor, None);
-        assert_eq!(query.page.offset, Some(5));
+        let request = laser.query("readings").deadline(Duration::from_secs(5));
+        let first_id = request.execution_id();
+        let mut stream = request.page_stream();
+        std::thread::sleep(Duration::from_millis(2));
+        let started = now_micros();
+        let first = stream.page_query();
+        let second = stream.page_query();
+        assert_eq!(first.execution_id, first_id);
+        assert_ne!(second.execution_id, first.execution_id);
+        assert!(first.deadline_micros >= started + 5_000_000);
+        assert!(second.deadline_micros >= first.deadline_micros);
+    }
+
+    #[test]
+    fn given_walked_pages_when_read_then_should_bind_each_row_to_its_fields_and_report_a_moved_frontier()
+     {
+        let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default());
+        let mut stream = laser.query("readings").page_stream();
+        stream.absorb(walked_page(1, 5, true));
+        let first = stream.buffered().expect("the first page holds a row");
+        assert_eq!(first.value_text("id").as_deref(), Some("o-1"));
+        assert_eq!(first.field_index("id"), Some(0));
+        assert_eq!(first.value("absent"), None);
+        assert_eq!(first.fields()[0].name, "id");
+        assert!(!stream.frontier_moved);
+        stream.absorb(walked_page(2, 5, true));
+        assert_eq!(
+            stream.buffered().and_then(|row| row.value_text("id")),
+            Some("o-2".to_owned())
+        );
+        assert!(!stream.frontier_moved, "the same frontier has not moved");
+        stream.absorb(walked_page(3, 6, false));
+        assert!(stream.frontier_moved, "a later applied offset moved it");
+        assert!(stream.finished);
+    }
+
+    #[test]
+    fn given_a_relative_deadline_when_the_query_is_taken_later_then_should_count_from_then() {
+        let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default());
+        let request = laser.query("readings").deadline(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(2));
+        let started = now_micros();
+        assert!(request.into_query().deadline_micros >= started + 5_000_000);
     }
 
     #[test]
@@ -1253,8 +1313,75 @@ mod tests {
         let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default());
         let query = laser
             .query("readings")
-            .deadline_micros(1_700_000_000_000_000)
+            .deadline_at_micros(1_700_000_000_000_000)
             .into_query();
         assert_eq!(query.deadline_micros, 1_700_000_000_000_000);
+    }
+
+    #[test]
+    fn given_a_window_duration_when_bucketing_then_should_send_its_width_in_micros() {
+        let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default());
+        let query = laser
+            .query("readings")
+            .count()
+            .window("ts", Duration::from_millis(1_500))
+            .into_query();
+        let window = query
+            .aggregate
+            .and_then(|aggregate| aggregate.window)
+            .expect("the aggregate carries the window");
+        assert_eq!(window.every_micros, 1_500_000);
+    }
+
+    // One page holding the row `o-<row>` with `has_more`, served at the applied
+    // offset `applied` of `shop/orders` partition 0.
+    fn walked_page(row: u32, applied: u64, has_more: bool) -> QueryResult {
+        QueryResult {
+            fields: vec![LogicalField {
+                id: 1,
+                name: "id".to_owned(),
+                required: false,
+                field_type: laser_wire::schema::LogicalType::String,
+                doc: None,
+            }],
+            rows: vec![Row {
+                values: vec![TypedValue::String(format!("o-{row}"))],
+                score: None,
+            }],
+            page: laser_wire::query::Page {
+                offset: Some(u64::from(row) - 1),
+                limit: 1,
+                total: None,
+                has_more,
+            },
+            context: crate::query::QueryContext {
+                execution_id: QueryExecutionId::from_u128(1),
+                engine: crate::query::QueryEngine {
+                    name: "embedded".to_owned(),
+                    version: "1".to_owned(),
+                    dialect: None,
+                },
+                resolved_target: crate::query::ResolvedQueryTarget::Operational {
+                    index: "readings".to_owned(),
+                    backend_resource_id: laser_wire::destination::BackendResourceId::from_u128(1),
+                    backend_generation: 1,
+                    runtime_configuration_revision: 1,
+                },
+                requested_consistency: Consistency::Eventual,
+                delivered_consistency: Consistency::Eventual,
+                truncated: false,
+                elapsed_micros: 1,
+                scanned_bytes: 0,
+                produced_bytes: 0,
+                row_count: 1,
+                frontier: vec![QueryFrontier {
+                    stream: "shop".to_owned(),
+                    topic: "orders".to_owned(),
+                    partition_id: 0,
+                    topic_created_at_micros: None,
+                    applied_offset: applied,
+                }],
+            },
+        }
     }
 }

@@ -43,8 +43,8 @@ void test(
     let signal: AbortSignal | undefined
     const handle = builder()
       .consolidator({
-        consolidate: (_scope, cancellation) => {
-          signal = cancellation
+        consolidate: (_scope, options) => {
+          signal = options?.signal
           return new Promise<ConsolidationReport>(() => undefined)
         }
       })
@@ -74,8 +74,8 @@ void test(
     let signal: AbortSignal | undefined
     const handle = builder()
       .consolidator({
-        consolidate: (_scope, cancellation) => {
-          signal = cancellation
+        consolidate: (_scope, options) => {
+          signal = options?.signal
           return new Promise<ConsolidationReport>(() => undefined)
         }
       })
@@ -98,8 +98,8 @@ void test(
     let signal: AbortSignal | undefined
     const handle = builder()
       .consolidator({
-        consolidate: (_scope, cancellation) => {
-          signal = cancellation
+        consolidate: (_scope, options) => {
+          signal = options?.signal
           return new Promise<ConsolidationReport>(() => undefined)
         }
       })

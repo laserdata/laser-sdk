@@ -1,3 +1,4 @@
+import { type CallOptions, cancellable } from "./client/call-options.js"
 import { CodecError, InvalidError, UnsupportedError } from "./client/errors.js"
 import { INTERNAL_TRANSPORT } from "./client/internals.js"
 import type { Laser } from "./client/laser.js"
@@ -41,7 +42,20 @@ export function resumeOffsets(snapshot: FoldSnapshot): readonly SnapshotOffset[]
  * fold named `fold`. It records the stream and every checkpointed topic by id
  * and creation time, so a resume refuses a recreated source. Empty partitions
  * are left out. */
-export async function snapshotFromCheckpoint(
+export function snapshotFromCheckpoint(
+  laser: Laser,
+  conversation: ConversationId,
+  fold: string,
+  checkpoint: Checkpoint,
+  state: Uint8Array,
+  options: CallOptions = {}
+): Promise<FoldSnapshot> {
+  return cancellable(options.signal, "snapshot", () =>
+    snapshotAt(laser, conversation, fold, checkpoint, state)
+  )
+}
+
+async function snapshotAt(
   laser: Laser,
   conversation: ConversationId,
   fold: string,
@@ -93,7 +107,16 @@ export async function snapshotFromCheckpoint(
   return snapshot
 }
 
-export async function checkpointFromSnapshot(
+export function checkpointFromSnapshot(
+  laser: Laser,
+  snapshot: FoldSnapshot,
+  topics: readonly string[],
+  options: CallOptions = {}
+): Promise<Checkpoint> {
+  return cancellable(options.signal, "snapshot resume", () => checkpointAt(laser, snapshot, topics))
+}
+
+async function checkpointAt(
   laser: Laser,
   snapshot: FoldSnapshot,
   topics: readonly string[]
@@ -209,4 +232,27 @@ function decodeJsonState(bytes: Uint8Array): unknown {
   }
 }
 
-export const ConversationState = { load, loadWith } as const
+/** Folds a conversation's records from the log into application state. */
+export interface ConversationStateLoader {
+  /** Fold the records `bound` selects over `initial`. */
+  load<State>(
+    laser: Laser,
+    conversation: ConversationId,
+    topics: readonly string[],
+    bound: ReplayBound,
+    initial: State,
+    fold: (state: State, message: ContextMessage) => State
+  ): Promise<State>
+  /** Start from the newest snapshot in `store` and fold only the records past it. */
+  loadWith<State>(
+    laser: Laser,
+    store: SnapshotStore,
+    conversation: ConversationId,
+    topics: readonly string[],
+    initial: State,
+    fold: (state: State, message: ContextMessage) => State,
+    decodeState?: (bytes: Uint8Array) => State
+  ): Promise<State>
+}
+
+export const ConversationState: ConversationStateLoader = { load, loadWith }

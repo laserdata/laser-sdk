@@ -1,16 +1,6 @@
 import laser_sdk as ls
 import pytest
 
-DESTINATION_ID = "00000000000000000000000001"
-REQUEST_ID = "00000000000000000000000002"
-SET_DESIRED_STATE = {
-    "kind": "set_desired_state",
-    "destination_id": DESTINATION_ID,
-    "destination_generation": 1,
-    "expected_definition_revision": 1,
-    "desired_state": "enabled",
-}
-
 
 @pytest.mark.parametrize("store", ["InMemoryStore", "FileStore"])
 def test_given_a_native_state_store_when_checking_its_type_then_should_be_a_state_store(store):
@@ -44,34 +34,6 @@ def test_given_a_fold_snapshot_when_resuming_then_should_start_past_the_folded_o
     }
     assert ls.fold_snapshot_resume_offset(snapshot, 2, 20, 0) == 8
     assert ls.fold_snapshot_resume_offset(snapshot, 2, 21, 0) == 0
-
-
-def test_given_a_mutation_when_building_a_checkpoint_envelope_then_should_stamp_the_op_version():
-    envelope = ls.new_checkpoint_request_envelope(REQUEST_ID, 4, SET_DESIRED_STATE)
-    assert envelope["v"] == 1
-    assert envelope["request_id"] == REQUEST_ID
-    assert envelope["expected_global_state_revision"] == 4
-    assert envelope["mutation"] == SET_DESIRED_STATE
-    assert "operator_assertion" not in envelope
-
-
-def test_given_a_malformed_request_id_when_building_a_checkpoint_envelope_then_should_raise():
-    with pytest.raises(ls.InvalidError):
-        ls.new_checkpoint_request_envelope("not-an-id", 0, SET_DESIRED_STATE)
-
-
-def test_given_a_destination_mutation_when_asking_its_grant_then_should_need_destination_write():
-    assert ls.public_checkpoint_mutation_required_capability(SET_DESIRED_STATE) == (
-        "destination",
-        "write",
-    )
-
-
-def test_given_a_stream_and_topic_when_building_a_source_scope_then_should_name_both():
-    assert ls.new_source_scope("telemetry", "readings") == {
-        "stream": "telemetry",
-        "topic": "readings",
-    }
 
 
 def test_given_an_edge_when_windowed_then_should_contain_only_its_valid_range():
@@ -108,38 +70,6 @@ def test_given_an_edge_direction_when_checking_the_default_then_should_be_out(di
 )
 def test_given_a_graph_return_when_checking_the_default_then_should_be_nodes(returns, nodes):
     assert ls.graph_return_is_nodes(returns) is nodes
-
-
-def operator_assertion(**claims):
-    return {
-        "claims": {
-            "v": 1,
-            "request_id": REQUEST_ID,
-            "deployment_id": 1,
-            "cloud_user_id": 1,
-            "action": "record_repair",
-            "destination_id": DESTINATION_ID,
-            "destination_generation": 1,
-            "issued_at_micros": 1_000_000,
-            "expires_at_micros": 2_000_000,
-            **claims,
-        },
-        "key_id": bytes(8),
-        "signature": bytes(64),
-    }
-
-
-def test_given_a_well_formed_operator_assertion_when_validated_then_should_pass():
-    assert ls.validate_operator_actor_assertion(operator_assertion()) is None
-
-
-@pytest.mark.parametrize(
-    "claims",
-    [{"v": 2}, {"deployment_id": 0}, {"expires_at_micros": 1_000_000}],
-)
-def test_given_a_broken_operator_assertion_when_validated_then_should_raise_invalid(claims):
-    with pytest.raises(ls.InvalidError):
-        ls.validate_operator_actor_assertion(operator_assertion(**claims))
 
 
 def test_given_an_entity_when_minting_its_content_id_then_should_match_the_node_dict_id():

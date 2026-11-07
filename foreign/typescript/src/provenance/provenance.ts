@@ -43,7 +43,7 @@ export interface Provenance {
   readonly agent?: AgentId
   readonly targetAgentId?: AgentId
   readonly usage?: LlmUsage
-  readonly deadlineMicros?: bigint
+  readonly deadlineAtMicros?: bigint
   readonly idempotencyKey?: string
   readonly correlationId?: string
   readonly fenceToken?: bigint
@@ -90,8 +90,8 @@ export function encodeProvenanceHeaders(provenance: Provenance): ReadonlyMap<str
       : {}),
     ...(provenance.correlationId !== undefined ? { correlation: provenance.correlationId } : {}),
     ...(provenance.fenceToken !== undefined ? { fence: provenance.fenceToken } : {}),
-    ...(provenance.deadlineMicros !== undefined
-      ? { deadlineMicros: provenance.deadlineMicros }
+    ...(provenance.deadlineAtMicros !== undefined
+      ? { deadlineMicros: provenance.deadlineAtMicros }
       : {}),
     ...(provenance.usage?.inputTokens !== undefined
       ? { inputTokens: provenance.usage.inputTokens }
@@ -179,7 +179,7 @@ export function decodeProvenanceHeaders(headers: ReadonlyMap<string, HeaderValue
   let idempotencyKey: string | undefined
   let correlationId: string | undefined
   let fenceToken: bigint | undefined
-  let deadlineMicros: bigint | undefined
+  let deadlineAtMicros: bigint | undefined
   let inputTokens: bigint | undefined
   let outputTokens: bigint | undefined
   let costUsd: number | undefined
@@ -218,7 +218,7 @@ export function decodeProvenanceHeaders(headers: ReadonlyMap<string, HeaderValue
         fenceToken = uint64Value(value, key)
         break
       case DEADLINE:
-        deadlineMicros = uint64Value(value, key)
+        deadlineAtMicros = uint64Value(value, key)
         break
       case USAGE_INPUT_TOKENS:
         inputTokens = uint64Value(value, key)
@@ -259,7 +259,7 @@ export function decodeProvenanceHeaders(headers: ReadonlyMap<string, HeaderValue
           }
         }
       : {}),
-    ...(deadlineMicros !== undefined ? { deadlineMicros } : {}),
+    ...(deadlineAtMicros !== undefined ? { deadlineAtMicros } : {}),
     ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
     ...(correlationId !== undefined ? { correlationId } : {}),
     ...(fenceToken !== undefined ? { fenceToken } : {})

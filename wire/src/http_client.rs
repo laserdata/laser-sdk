@@ -12,10 +12,8 @@
 // `wasm32-unknown-unknown`.
 
 use crate::authz::{Role, WhoamiReply};
-use crate::browse::{ProjectionInfo, SchemaInfo};
-use crate::checkpoint::CheckpointReadConsistency;
+use crate::browse::{ProjectionInfo, ProjectionPage, SchemaInfo, SchemaPage};
 use crate::control::{Projection, ProjectionBinding, SchemaSource, SourceSelector};
-use crate::destination::{DestinationId, DestinationOperationId};
 use crate::filter::{
     ConsumerFilter, FilterBinding, FilterBindingPage, FilterDetail, FilterMutationOutcome,
     FilterMutationRequest, FilterPage, FilterPreview, FilterPreviewRequest, FilterRevisionPage,
@@ -24,16 +22,12 @@ use crate::filter::{
 use crate::fork::ForkInfo;
 use crate::graph::GraphQuery;
 use crate::http::{
-    self, AcceptedOperationView, Capabilities, CasCommittedView, CheckpointReadQuery,
-    ClientMetadataListView, ClientsQuery, DecodeRecordBody, DeletedManyView, DestinationIssueView,
-    DestinationListQuery, DestinationMutationBody, DestinationPageView, DestinationView, ErrorBody,
-    FilterBindingListQuery, FilterListQuery, FilterRevisionListQuery, FilterTestBody,
-    ForkCreateBody, ForkPutBody, GraphNeighborsQuery, GraphResultView, KvCasQuery, KvPageView,
-    KvPutQuery, KvScanQuery, OperationQuery, ProjectionListQuery, PromotedView, QueryExecutionView,
-    QueryPageBody, QueryRouteListQuery, QueryRoutePageView, RemoveBindingBody, SchemaListQuery,
-    SessionChangesQuery, SessionEventsQuery, SessionLinksQuery, SessionStateQuery, SessionsQuery,
-    SnapshotListQuery, SnapshotPageView, TableFileListQuery, TableFilePageView, TableMetricsView,
-    TableSchemaView, TableSnapshotView, TableView,
+    self, Capabilities, CasCommittedView, ClientMetadataListView, ClientsQuery, DecodeRecordBody,
+    DeletedManyView, ErrorBody, FilterBindingListQuery, FilterListQuery, FilterRevisionListQuery,
+    FilterTestBody, ForkCreateBody, ForkPutBody, GraphNeighborsQuery, GraphResultView, KvCasQuery,
+    KvPageView, KvPutQuery, KvScanQuery, OperationQuery, ProjectionListQuery, PromotedView,
+    RemoveBindingBody, SchemaListQuery, SessionChangesQuery, SessionEventsQuery, SessionLinksQuery,
+    SessionStateQuery, SessionsQuery,
 };
 use crate::kv::{CasExpect, KvNamespaceInfo};
 use crate::query::{Query, QueryResult};
@@ -118,6 +112,8 @@ impl HttpResponse {
 pub struct KvValue {
     pub value: Vec<u8>,
     pub expires_at_micros: Option<u64>,
+    /// The entry's version, the value a compare-and-swap expects.
+    pub version: u64,
 }
 
 /// The IO seam. A wasm consumer implements it over `gloo-net`, a native one over
@@ -222,209 +218,26 @@ impl<T: Transport> HttpClient<T> {
         self.get(http::CAPABILITIES_PATH.to_owned()).await
     }
 
-    /// `POST /agdx/query`: submit a query and return its current execution view.
-    pub async fn query(&self, query: &Query) -> ClientResult<QueryExecutionView, T::Error> {
+    /// `POST /agdx/query`: run a query and return its first page.
+    pub async fn query(&self, query: &Query) -> ClientResult<QueryResult, T::Error> {
         self.send_json(Method::Post, http::QUERY_PATH.to_owned(), query)
             .await
     }
 
-    pub async fn query_page(
-        &self,
-        execution_id: crate::query::QueryExecutionId,
-        body: &QueryPageBody,
-    ) -> ClientResult<QueryResult, T::Error> {
-        self.send_json(Method::Post, http::query_page_path(execution_id), body)
-            .await
-    }
-
-    pub async fn query_status(
-        &self,
-        execution_id: crate::query::QueryExecutionId,
-    ) -> ClientResult<QueryExecutionView, T::Error> {
-        self.get(http::query_execution_path(execution_id)).await
-    }
-
-    pub async fn cancel_query(
-        &self,
-        execution_id: crate::query::QueryExecutionId,
-    ) -> ClientResult<crate::query::QueryExecutionStatus, T::Error> {
-        self.send_empty(Method::Post, http::query_cancel_path(execution_id))
-            .await
-    }
-
-    pub async fn list_destinations(
-        &self,
-        query: &DestinationListQuery,
-    ) -> ClientResult<DestinationPageView, T::Error> {
-        self.get(with_query(http::DESTINATIONS_PATH, query)?).await
-    }
-
-    pub async fn destination(
-        &self,
-        id: DestinationId,
-        consistency: CheckpointReadConsistency,
-    ) -> ClientResult<Option<DestinationView>, T::Error> {
-        self.get_optional(with_query(
-            &http::destination_path(id),
-            &CheckpointReadQuery::new(consistency),
-        )?)
-        .await
-    }
-
-    pub async fn create_destination(
-        &self,
-        body: &DestinationMutationBody,
-    ) -> ClientResult<AcceptedOperationView, T::Error> {
-        self.send_json(Method::Post, http::DESTINATIONS_PATH.to_owned(), body)
-            .await
-    }
-
-    pub async fn enable_destination(
-        &self,
-        id: DestinationId,
-        body: &DestinationMutationBody,
-    ) -> ClientResult<AcceptedOperationView, T::Error> {
-        self.send_json(Method::Post, http::destination_enable_path(id), body)
-            .await
-    }
-
-    pub async fn disable_destination(
-        &self,
-        id: DestinationId,
-        body: &DestinationMutationBody,
-    ) -> ClientResult<AcceptedOperationView, T::Error> {
-        self.send_json(Method::Post, http::destination_disable_path(id), body)
-            .await
-    }
-
-    pub async fn destination_operation(
-        &self,
-        id: DestinationOperationId,
-    ) -> ClientResult<AcceptedOperationView, T::Error> {
-        self.get(http::destination_operation_path(id)).await
-    }
-
-    pub async fn destination_status(
-        &self,
-        id: DestinationId,
-        consistency: CheckpointReadConsistency,
-    ) -> ClientResult<crate::checkpoint::DestinationCheckpointStatus, T::Error> {
-        self.get(with_query(
-            &http::destination_status_path(id),
-            &CheckpointReadQuery::new(consistency),
-        )?)
-        .await
-    }
-
-    pub async fn destination_checkpoint(
-        &self,
-        id: DestinationId,
-        consistency: CheckpointReadConsistency,
-    ) -> ClientResult<crate::checkpoint::DestinationCheckpointStatus, T::Error> {
-        self.get(with_query(
-            &http::destination_checkpoint_path(id),
-            &CheckpointReadQuery::new(consistency),
-        )?)
-        .await
-    }
-
-    pub async fn destination_retention_gap(
-        &self,
-        id: DestinationId,
-        consistency: CheckpointReadConsistency,
-    ) -> ClientResult<DestinationIssueView, T::Error> {
-        self.get(with_query(
-            &http::destination_retention_gap_path(id),
-            &CheckpointReadQuery::new(consistency),
-        )?)
-        .await
-    }
-
-    pub async fn destination_prepared_attempt(
-        &self,
-        id: DestinationId,
-        consistency: CheckpointReadConsistency,
-    ) -> ClientResult<DestinationIssueView, T::Error> {
-        self.get(with_query(
-            &http::destination_prepared_attempt_path(id),
-            &CheckpointReadQuery::new(consistency),
-        )?)
-        .await
-    }
-
-    pub async fn query_routes(
-        &self,
-        query: &QueryRouteListQuery,
-    ) -> ClientResult<QueryRoutePageView, T::Error> {
-        self.get(with_query(http::QUERY_ROUTES_PATH, query)?).await
-    }
-
-    pub async fn destination_table(&self, id: DestinationId) -> ClientResult<TableView, T::Error> {
-        self.get(http::destination_table_path(id)).await
-    }
-
-    pub async fn destination_table_schema(
-        &self,
-        id: DestinationId,
-    ) -> ClientResult<TableSchemaView, T::Error> {
-        self.get(http::destination_table_schema_path(id)).await
-    }
-
-    pub async fn destination_current_snapshot(
-        &self,
-        id: DestinationId,
-    ) -> ClientResult<TableSnapshotView, T::Error> {
-        self.get(http::destination_current_snapshot_path(id)).await
-    }
-
-    pub async fn destination_snapshots(
-        &self,
-        id: DestinationId,
-        query: &SnapshotListQuery,
-    ) -> ClientResult<SnapshotPageView, T::Error> {
-        self.get(with_query(&http::destination_snapshots_path(id), query)?)
-            .await
-    }
-
-    pub async fn destination_snapshot(
-        &self,
-        id: DestinationId,
-        snapshot_id: i64,
-    ) -> ClientResult<TableSnapshotView, T::Error> {
-        self.get(http::destination_snapshot_path(id, snapshot_id))
-            .await
-    }
-
-    pub async fn destination_files(
-        &self,
-        id: DestinationId,
-        query: &TableFileListQuery,
-    ) -> ClientResult<TableFilePageView, T::Error> {
-        self.get(with_query(&http::destination_files_path(id), query)?)
-            .await
-    }
-
-    pub async fn destination_metrics(
-        &self,
-        id: DestinationId,
-    ) -> ClientResult<TableMetricsView, T::Error> {
-        self.get(http::destination_metrics_path(id)).await
-    }
-
-    /// `GET /agdx/projections`: list projections and their bindings, optionally
-    /// filtered.
+    /// `GET /agdx/projections`: one page of the projections and their
+    /// bindings, optionally filtered.
     pub async fn list_projections(
         &self,
         filter: &ProjectionListQuery,
-    ) -> ClientResult<Vec<ProjectionInfo>, T::Error> {
+    ) -> ClientResult<ProjectionPage, T::Error> {
         self.get(with_query(http::PROJECTIONS_PATH, filter)?).await
     }
 
-    /// `GET /agdx/schemas`: list registered schemas, optionally filtered.
+    /// `GET /agdx/schemas`: one page of registered schemas, optionally filtered.
     pub async fn list_schemas(
         &self,
         filter: &SchemaListQuery,
-    ) -> ClientResult<Vec<SchemaInfo>, T::Error> {
+    ) -> ClientResult<SchemaPage, T::Error> {
         self.get(with_query(http::SCHEMAS_PATH, filter)?).await
     }
 
@@ -448,6 +261,31 @@ impl<T: Transport> HttpClient<T> {
             .await
     }
 
+    /// [`register_schema`](Self::register_schema) under the caller's
+    /// `operation_id`, so a retry after a lost reply returns the id the first
+    /// attempt was given.
+    pub async fn register_schema_as(
+        &self,
+        source: SchemaSource,
+        name: Option<String>,
+        version: Option<u32>,
+        stream: Option<String>,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<u32, T::Error> {
+        let body = http::RegisterSchemaBody {
+            source,
+            name,
+            version,
+            stream,
+        };
+        self.send_json(
+            Method::Post,
+            with_operation(http::SCHEMAS_PATH, operation_id)?,
+            &body,
+        )
+        .await
+    }
+
     /// `GET /agdx/kv/{namespace}/{key}`: fetch one entry, or `None` on a 404.
     /// The value rides the raw response body (no base64 inflation, symmetric with
     /// `kv_set`), and the optional expiry rides the
@@ -469,9 +307,19 @@ impl<T: Transport> HttpClient<T> {
         let expires_at_micros = response
             .header(http::KV_EXPIRES_AT_MICROS_HEADER)
             .and_then(|value| value.parse::<u64>().ok());
+        let version = response
+            .header(http::KV_VERSION_HEADER)
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                ClientError::Decode(format!(
+                    "the entry answer carries no `{}` header",
+                    http::KV_VERSION_HEADER
+                ))
+            })?;
         Ok(Some(KvValue {
             value: response.body,
             expires_at_micros,
+            version,
         }))
     }
 
@@ -1107,13 +955,14 @@ impl<T: Transport> HttpClient<T> {
             .await
     }
 
-    /// `GET /agdx/graphs`: list the registered graph projections, the discovery
-    /// surface a graph explorer reads to offer the available graphs. Reuses the
-    /// projection-list filter, narrowed to graph-kind projections server-side.
+    /// `GET /agdx/graphs`: one page of the registered graph projections, the
+    /// discovery surface a graph explorer reads to offer the available graphs.
+    /// Reuses the projection-list filter, narrowed to graph-kind projections
+    /// server-side.
     pub async fn list_graphs(
         &self,
         filter: &ProjectionListQuery,
-    ) -> ClientResult<Vec<ProjectionInfo>, T::Error> {
+    ) -> ClientResult<ProjectionPage, T::Error> {
         self.get(with_query(http::GRAPHS_PATH, filter)?).await
     }
 
@@ -1183,10 +1032,40 @@ impl<T: Transport> HttpClient<T> {
             .await
     }
 
+    /// [`define_role`](Self::define_role) under the caller's `operation_id`. A
+    /// retry with the same id answers the recorded outcome and changes nothing
+    /// again.
+    pub async fn define_role_as(
+        &self,
+        role: &Role,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        self.send_json_ok(
+            Method::Put,
+            with_operation(&http::authz_role_path(&role.name), operation_id)?,
+            role,
+        )
+        .await
+    }
+
     /// `DELETE /agdx/authz/roles/{name}`: delete a role.
     pub async fn delete_role(&self, name: &str) -> ClientResult<(), T::Error> {
         self.expect_ok(Method::Delete, http::authz_role_path(name), None)
             .await
+    }
+
+    /// [`delete_role`](Self::delete_role) under the caller's `operation_id`.
+    pub async fn delete_role_as(
+        &self,
+        name: &str,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        self.expect_ok(
+            Method::Delete,
+            with_operation(&http::authz_role_path(name), operation_id)?,
+            None,
+        )
+        .await
     }
 
     /// `GET /agdx/authz/users/{id}/roles`: one user's bound role names.
@@ -1202,6 +1081,21 @@ impl<T: Transport> HttpClient<T> {
     ) -> ClientResult<(), T::Error> {
         self.send_json_ok(Method::Put, http::authz_user_roles_path(user_id), &roles)
             .await
+    }
+
+    /// [`bind_user_roles`](Self::bind_user_roles) under the caller's `operation_id`.
+    pub async fn bind_user_roles_as(
+        &self,
+        user_id: u32,
+        roles: &[String],
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        self.send_json_ok(
+            Method::Put,
+            with_operation(&http::authz_user_roles_path(user_id), operation_id)?,
+            &roles,
+        )
+        .await
     }
 
     async fn get<R: DeserializeOwned>(&self, path: String) -> ClientResult<R, T::Error> {
@@ -1472,30 +1366,6 @@ mod tests {
     }
 
     #[test]
-    fn given_checkpoint_reads_when_paths_are_built_then_should_require_the_selected_consistency() {
-        let single = with_query::<(), _>(
-            &http::destination_status_path(DestinationId::from_u128(1)),
-            &CheckpointReadQuery::new(CheckpointReadConsistency::Linearizable),
-        )
-        .expect("single checkpoint read query encodes");
-        assert!(single.ends_with("?consistency=linearizable"));
-
-        let list = with_query::<(), _>(
-            http::DESTINATIONS_PATH,
-            &DestinationListQuery {
-                source_stream: None,
-                source_topic: None,
-                name_contains: None,
-                after: None,
-                limit: None,
-                consistency: CheckpointReadConsistency::PotentiallyStale,
-            },
-        )
-        .expect("checkpoint list query encodes");
-        assert!(list.ends_with("?consistency=potentially_stale"));
-    }
-
-    #[test]
     fn given_a_bad_base64_string_when_decoded_then_should_reject() {
         assert!(
             base64url_decode("====").is_none(),
@@ -1609,15 +1479,31 @@ mod tests {
     }
 
     #[test]
-    fn given_a_present_kv_entry_when_fetched_then_should_read_raw_body_and_expiry_header() {
+    fn given_a_present_kv_entry_when_fetched_then_should_read_raw_body_expiry_and_version_headers()
+    {
         let response = HttpResponse::new(200, b"world".to_vec())
-            .with_header(http::KV_EXPIRES_AT_MICROS_HEADER, "1700000000000000");
+            .with_header(http::KV_EXPIRES_AT_MICROS_HEADER, "1700000000000000")
+            .with_header(http::KV_VERSION_HEADER, "7");
         let client = HttpClient::new(CannedTransport { response });
         let entry = block_on(client.kv_get("sessions", b"user:1"))
             .expect("decodes")
             .expect("present");
         assert_eq!(entry.value, b"world");
         assert_eq!(entry.expires_at_micros, Some(1_700_000_000_000_000));
+        assert_eq!(
+            entry.version, 7,
+            "the version a CAS expects survives the helper"
+        );
+    }
+
+    #[test]
+    fn given_a_kv_entry_answer_without_its_version_when_fetched_then_should_refuse_it() {
+        let response = HttpResponse::new(200, b"world".to_vec());
+        let client = HttpClient::new(CannedTransport { response });
+        assert!(matches!(
+            block_on(client.kv_get("sessions", b"user:1")),
+            Err(ClientError::Decode(_))
+        ));
     }
 
     #[test]

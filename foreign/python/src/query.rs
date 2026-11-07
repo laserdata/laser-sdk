@@ -1,4 +1,4 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::convert::{codec_decode, json_to_py, py_to_de, py_to_typed_value, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
@@ -6,27 +6,31 @@ use laser_sdk::LaserError;
 use laser_sdk::laser::Laser;
 use laser_sdk::query::{
     AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, Filter, KeyMatch, Query,
-    QueryExecutionId, QueryPageRequest, QueryResult, QueryTarget, RawSql, ResultCode, Row, Select,
-    SnapshotSelector, Sort, SqlDialect, TextQuery, TypedValue, VectorQuery, Window,
+    QueryExecutionId, QueryFrontier, QueryPageRequest, QueryResult, QueryRow, QueryTarget, RawSql,
+    ResultCode, Row, Select, Sort, SqlDialect, TextQuery, TypedValue, VectorQuery, Window,
 };
 use laser_sdk::stream::{Decoder, Json};
 use laser_sdk::types::MintUlid;
 use laser_sdk::wire::error::DecodeError;
-use pyo3::exceptions::PyStopAsyncIteration;
+use pyo3::exceptions::{PyIndexError, PyKeyError, PyStopAsyncIteration, PyTypeError};
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
+
+/// The default and longest query budget in the shared retry table.
+const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(25);
 
 fn parse_consistency(level: &str) -> PyResult<Consistency> {
     match level {
         "eventual" => Ok(Consistency::Eventual),
         "read_your_writes" => Ok(Consistency::ReadYourWrites),
-        "strong" => Ok(Consistency::Strong),
         other => Err(InvalidError::new_err(format!(
-            "consistency must be 'eventual', 'read_your_writes', or 'strong', got '{other}'"
+            "consistency must be 'eventual' or 'read_your_writes', got '{other}'"
         ))),
     }
 }
@@ -43,8 +47,8 @@ impl PyLaser {
         PyQuery::new(self.inner.clone(), QueryTarget::operational(index))
     }
 
-    /// Start a query against an explicit operational or lakehouse target dict.
-    /// An operational index is scoped like `query(index)`.
+    /// Start a query against an explicit target dict. An operational index is
+    /// scoped like `query(index)`.
     fn query_target(&self, target: &Bound<'_, PyAny>) -> PyResult<PyQuery> {
         let target = match py_to_de(target)? {
             QueryTarget::Operational { index } => {
@@ -53,24 +57,6 @@ impl PyLaser {
             other => other,
         };
         Ok(PyQuery::new(self.inner.clone(), target))
-    }
-
-    /// Start a query against one materialization destination generation.
-    fn query_lakehouse(
-        &self,
-        destination_id: String,
-        destination_generation: u64,
-    ) -> PyResult<PyQuery> {
-        let destination_id = laser_sdk::wire::destination::DestinationId::from_str(&destination_id)
-            .map_err(|error| InvalidError::new_err(error.to_string()))?;
-        Ok(PyQuery::new(
-            self.inner.clone(),
-            QueryTarget::Lakehouse {
-                destination_id,
-                destination_generation,
-                snapshot: None,
-            },
-        ))
     }
 }
 
@@ -112,6 +98,187 @@ impl PyRow {
     }
 }
 
+/// One query row bound to the fields of the page it came on. Read a tagged
+/// value by field name or position with `row["name"]` or `row[0]`, like
+/// `sqlite3.Row`.
+#[gen_stub_pyclass]
+#[pyclass(name = "QueryRow", frozen, skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyQueryRow {
+    inner: QueryRow,
+}
+
+impl From<QueryRow> for PyQueryRow {
+    fn from(inner: QueryRow) -> Self {
+        Self { inner }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyQueryRow {
+    /// Every row of one page, each bound to the page's fields. Takes the
+    /// fields and rows as `QueryResult.fields` and the wire rows read them.
+    #[staticmethod]
+    fn from_page(fields: &Bound<'_, PyAny>, rows: &Bound<'_, PyAny>) -> PyResult<Vec<Self>> {
+        Ok(QueryRow::from_page(py_to_de(fields)?, py_to_de(rows)?)
+            .into_iter()
+            .map(Self::from)
+            .collect())
+    }
+
+    /// Ordered logical field metadata of the page this row came on.
+    #[getter]
+    fn fields(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        ser_to_py(py, &self.inner.fields())
+    }
+
+    /// Tagged values in field order.
+    #[getter]
+    fn values(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        ser_to_py(py, &self.inner.values())
+    }
+
+    /// Backend-native vector distance or lexical rank.
+    #[getter]
+    fn score(&self) -> Option<f32> {
+        self.inner.score()
+    }
+
+    /// The positional row, for `QueryResult`-style access.
+    #[getter]
+    fn row(&self) -> PyRow {
+        PyRow::from(self.inner.row().clone())
+    }
+
+    /// The field names, in value order.
+    fn keys(&self) -> Vec<String> {
+        self.inner
+            .fields()
+            .iter()
+            .map(|field| field.name.clone())
+            .collect()
+    }
+
+    /// The position of the field `name`, or `None`.
+    fn field_index(&self, name: &str) -> Option<usize> {
+        self.inner.field_index(name)
+    }
+
+    /// One tagged value by field name, or `None`.
+    fn value(&self, py: Python<'_>, field: &str) -> PyResult<Py<PyAny>> {
+        match self.inner.value(field) {
+            Some(value) => ser_to_py(py, value),
+            None => Ok(py.None()),
+        }
+    }
+
+    /// One value by field name in its stable diagnostic form.
+    fn value_text(&self, field: &str) -> Option<String> {
+        self.inner.value_text(field)
+    }
+
+    /// One integer value by field name as an unsigned integer, or `None`.
+    fn value_u64(&self, field: &str) -> Option<u64> {
+        self.inner.value_u64(field)
+    }
+
+    /// One integer value by field name as a signed integer, or `None`.
+    fn value_i64(&self, field: &str) -> Option<i64> {
+        self.inner.value_i64(field)
+    }
+
+    fn __getitem__(
+        &self,
+        py: Python<'_>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.int", imports = ("builtins",)))]
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let values = self.inner.values();
+        let value = if let Ok(name) = key.extract::<String>() {
+            self.inner
+                .value(&name)
+                .ok_or_else(|| PyKeyError::new_err(name))?
+        } else if let Ok(position) = key.extract::<isize>() {
+            let index = if position < 0 {
+                values.len().checked_sub(position.unsigned_abs())
+            } else {
+                Some(position.unsigned_abs())
+            };
+            index
+                .and_then(|index| values.get(index))
+                .ok_or_else(|| PyIndexError::new_err("query row index out of range"))?
+        } else {
+            return Err(PyTypeError::new_err(
+                "a query row is read by field name or position",
+            ));
+        };
+        ser_to_py(py, value)
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.values().len()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "QueryRow(fields={:?}, score={:?})",
+            self.keys(),
+            self.inner.score()
+        )
+    }
+}
+
+/// Every row `fetch_all()` read, each bound to its fields, and whether a page
+/// after the first was served at another frontier, so rows may repeat or be
+/// missing. Iterates, indexes and measures like a list of `QueryRow`.
+#[gen_stub_pyclass]
+#[pyclass(name = "QueryRowSet", frozen)]
+pub struct PyQueryRowSet {
+    rows: Vec<PyQueryRow>,
+    frontier_moved: bool,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyQueryRowSet {
+    /// The rows, in walk order.
+    #[getter]
+    fn rows(&self) -> Vec<PyQueryRow> {
+        self.rows.clone()
+    }
+
+    /// Whether a page after the first was served at another frontier.
+    #[getter]
+    fn frontier_moved(&self) -> bool {
+        self.frontier_moved
+    }
+
+    fn __len__(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn __getitem__(&self, index: isize) -> PyResult<PyQueryRow> {
+        let position = if index < 0 {
+            self.rows.len().checked_sub(index.unsigned_abs())
+        } else {
+            Some(index.unsigned_abs())
+        };
+        position
+            .and_then(|position| self.rows.get(position))
+            .cloned()
+            .ok_or_else(|| PyIndexError::new_err("query row set index out of range"))
+    }
+
+    #[gen_stub(override_return_type(type_repr = "typing.Iterator[QueryRow]", imports = ("typing",)))]
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        Ok(PyList::new(py, self.rows.clone())?
+            .try_iter()?
+            .unbind()
+            .into_any())
+    }
+}
+
 /// A page of query rows with its logical schema, page metadata, and result
 /// evidence.
 #[gen_stub_pyclass]
@@ -141,8 +308,8 @@ impl PyQueryResult {
         self.inner.rows.iter().cloned().map(PyRow::from).collect()
     }
 
-    /// Paging metadata: offset, limit, optional exact total, and the cursor
-    /// for the next page.
+    /// Paging metadata: offset, limit, optional exact total, and whether more
+    /// rows follow.
     #[getter]
     fn page(&self) -> PyPage {
         PyPage {
@@ -150,7 +317,7 @@ impl PyQueryResult {
         }
     }
 
-    /// Engine, resolved target, consistency, checkpoint, and resource evidence.
+    /// Engine, resolved target, consistency, resource, and frontier evidence.
     #[getter]
     fn context(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         ser_to_py(py, &self.inner.context)
@@ -203,7 +370,7 @@ pub struct PyPage {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyPage {
-    /// The offset this page started at, absent for a cursor page.
+    /// The offset this page started at.
     #[getter]
     fn offset(&self) -> Option<u64> {
         self.inner.offset
@@ -227,14 +394,7 @@ impl PyPage {
         self.inner.has_more
     }
 
-    /// The opaque cursor for the next page, present exactly when `has_more`.
-    #[getter]
-    fn next_cursor(&self) -> Option<String> {
-        self.inner.next_cursor.clone()
-    }
-
-    /// Rows known to exist so far, one past this page's last row, or `None`
-    /// for a cursor page.
+    /// Rows known to exist so far, one past this page's last row.
     fn at_least(&self, rows_on_page: usize) -> Option<u64> {
         self.inner.at_least(rows_on_page)
     }
@@ -260,28 +420,38 @@ pub struct PyQuery {
     laser: Laser,
     query: Query,
     max_rows: Option<usize>,
+    timeout: Option<Duration>,
 }
 
 impl PyQuery {
     fn new(laser: Laser, target: QueryTarget) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros();
-        // The default and longest query deadline in the shared retry table.
-        let deadline_micros = u64::try_from(now)
-            .unwrap_or(u64::MAX)
-            .saturating_add(25_000_000);
         let query = Query::builder()
-            .execution_id(laser_sdk::query::QueryExecutionId::mint())
+            .execution_id(QueryExecutionId::mint())
             .target(target)
-            .deadline_micros(deadline_micros)
+            .deadline_micros(deadline_from_now(DEFAULT_QUERY_TIMEOUT))
             .build();
         Self {
             laser,
             query,
             max_rows: None,
+            timeout: Some(DEFAULT_QUERY_TIMEOUT),
         }
+    }
+
+    // The query the next call sends, with a deadline counted from now under a
+    // relative budget. The request then moves to a fresh execution id.
+    fn next_call(&mut self) -> Query {
+        let query = self.stamped();
+        self.query.execution_id = QueryExecutionId::mint();
+        query
+    }
+
+    fn stamped(&self) -> Query {
+        let mut query = self.query.clone();
+        if let Some(timeout) = self.timeout {
+            query.deadline_micros = deadline_from_now(timeout);
+        }
+        query
     }
 
     fn and_filter(&mut self, filter: Filter) {
@@ -397,55 +567,30 @@ impl PyQuery {
         slf
     }
 
-    /// This query's execution id, the identity `status` and `cancel` use.
+    /// The execution id the next call sends and its reply echoes back. Every
+    /// call and every page of a walk takes a fresh one.
     #[getter]
     fn execution_id(&self) -> String {
         self.query.execution_id.to_string()
     }
 
-    /// Set the execution deadline `timeout_ms` milliseconds from now
-    /// (default and longest 25,000). A longer one fails the fetch.
-    fn deadline(mut slf: PyRefMut<'_, Self>, timeout_ms: f64) -> PyResult<PyRefMut<'_, Self>> {
-        let wait = crate::convert::duration_ms(timeout_ms, "timeout_ms")?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros();
-        slf.query.deadline_micros = u64::try_from(now)
-            .unwrap_or(u64::MAX)
-            .saturating_add(u64::try_from(wait.as_micros()).unwrap_or(u64::MAX));
+    /// Set the budget of each call and each page of a walk, `deadline_ms`
+    /// milliseconds from when it starts (default and longest 25,000). A
+    /// longer one fails the fetch.
+    fn deadline(mut slf: PyRefMut<'_, Self>, deadline_ms: f64) -> PyResult<PyRefMut<'_, Self>> {
+        slf.timeout = Some(crate::convert::duration_ms(deadline_ms, "deadline_ms")?);
         Ok(slf)
     }
 
-    /// Replace the absolute execution deadline in epoch microseconds.
-    fn deadline_micros(mut slf: PyRefMut<'_, Self>, deadline_micros: u64) -> PyRefMut<'_, Self> {
-        slf.query.deadline_micros = deadline_micros;
-        slf
-    }
-
-    /// Select one exact Iceberg snapshot for a lakehouse target.
-    fn at_snapshot(mut slf: PyRefMut<'_, Self>, snapshot_id: i64) -> PyResult<PyRefMut<'_, Self>> {
-        let QueryTarget::Lakehouse { snapshot, .. } = &mut slf.query.target else {
-            return Err(InvalidError::new_err(
-                "snapshot selection requires a lakehouse query target",
-            ));
-        };
-        *snapshot = Some(SnapshotSelector::SnapshotId(snapshot_id));
-        Ok(slf)
-    }
-
-    /// Select the retained Iceberg snapshot current at an epoch timestamp.
-    fn at_timestamp_micros(
+    /// Set one absolute deadline in epoch microseconds for every later call
+    /// and every page of a walk.
+    fn deadline_at_micros(
         mut slf: PyRefMut<'_, Self>,
-        timestamp_micros: i64,
-    ) -> PyResult<PyRefMut<'_, Self>> {
-        let QueryTarget::Lakehouse { snapshot, .. } = &mut slf.query.target else {
-            return Err(InvalidError::new_err(
-                "timestamp selection requires a lakehouse query target",
-            ));
-        };
-        *snapshot = Some(SnapshotSelector::TimestampMicros(timestamp_micros));
-        Ok(slf)
+        deadline_at_micros: u64,
+    ) -> PyRefMut<'_, Self> {
+        slf.query.deadline_micros = deadline_at_micros;
+        slf.timeout = None;
+        slf
     }
 
     fn filter_eq<'py>(
@@ -572,14 +717,6 @@ impl PyQuery {
 
     fn offset(mut slf: PyRefMut<'_, Self>, n: u64) -> PyRefMut<'_, Self> {
         slf.query.page.offset = Some(n);
-        slf.query.page.cursor = None;
-        slf
-    }
-
-    /// Resume from an opaque cursor returned by the server. Replaces any offset.
-    fn cursor<'py>(mut slf: PyRefMut<'py, Self>, cursor: String) -> PyRefMut<'py, Self> {
-        slf.query.page.cursor = Some(cursor);
-        slf.query.page.offset = None;
         slf
     }
 
@@ -615,7 +752,8 @@ impl PyQuery {
 
     /// Lexical relevance search over every text-hinted indexed field. Relevance
     /// lands in each row's `score` like vector distance. Gated on the `keyword`
-    /// capability and refused locally when unadvertised.
+    /// capability and refused locally when unadvertised. Rows come in relevance
+    /// order and page by offset, so the query takes no `order` and no total.
     fn text<'py>(mut slf: PyRefMut<'py, Self>, query: String) -> PyRefMut<'py, Self> {
         slf.query.text = Some(TextQuery { field: None, query });
         slf
@@ -634,7 +772,7 @@ impl PyQuery {
         slf
     }
 
-    /// Set the read-consistency level: 'eventual', 'read_your_writes', or 'strong'.
+    /// Set the read-consistency level: 'eventual' or 'read_your_writes'.
     fn consistency<'py>(
         mut slf: PyRefMut<'py, Self>,
         level: &str,
@@ -718,15 +856,17 @@ impl PyQuery {
         slf
     }
 
-    /// Bucket the aggregate into tumbling windows of `every_micros` over `field`.
+    /// Bucket the aggregate into tumbling windows `every_ms` milliseconds wide
+    /// over `field`.
     fn window<'py>(
         mut slf: PyRefMut<'py, Self>,
         field: String,
-        every_micros: u64,
-    ) -> PyRefMut<'py, Self> {
+        every_ms: f64,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let every = crate::convert::duration_ms(every_ms, "every_ms")?;
         let window = Some(Window {
             field,
-            every_micros,
+            every_micros: u64::try_from(every.as_micros()).unwrap_or(u64::MAX),
         });
         match slf.query.aggregate.as_mut() {
             Some(aggregate) => aggregate.window = window,
@@ -738,19 +878,18 @@ impl PyQuery {
                 });
             }
         }
-        slf
+        Ok(slf)
     }
 
     /// Raw-SQL escape hatch with an explicit backend dialect and typed parameters.
-    #[pyo3(signature = (sql, params=None, *, dialect="data_fusion"))]
+    #[pyo3(signature = (dialect, sql, params=None))]
     fn raw_sql<'py>(
         mut slf: PyRefMut<'py, Self>,
+        dialect: &str,
         sql: String,
         params: Option<&Bound<'_, PyAny>>,
-        dialect: &str,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let dialect = match dialect {
-            "data_fusion" => SqlDialect::DataFusion,
             "postgres" => SqlDialect::Postgres,
             "my_sql" => SqlDialect::MySql,
             "sqlite" => SqlDialect::Sqlite,
@@ -780,6 +919,8 @@ impl PyQuery {
     }
 
     /// Approximate nearest-neighbour search on `field` (default "embedding").
+    /// The `top_k` nearest rows are the whole answer, one page with no `order`,
+    /// offset or total.
     #[pyo3(signature = (embedding, top_k, *, field=None))]
     fn nearest<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -797,35 +938,49 @@ impl PyQuery {
     }
 
     /// Run the query and return one page plus pagination metadata.
-    fn fetch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        let query = self.query.clone();
-        future_into_py(py, async move {
+    fn fetch<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Awaitable<'py, PyQueryResult>> {
+        let laser = slf.laser.clone();
+        let query = slf.next_call();
+        awaitable(py, async move {
             let result = laser.execute_query(query).await.map_err(to_pyerr)?;
             Ok(PyQueryResult::from(result))
         })
     }
 
-    /// Run the query and return every matching row, auto-paginating internally.
-    fn fetch_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        let mut walk = RowWalk::new(self.query.clone(), usize::MAX);
-        future_into_py(py, async move {
+    /// Run the query and return every matching row, auto-paginating
+    /// internally, each bound to its fields, with whether the frontier moved
+    /// between pages.
+    fn fetch_all<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Awaitable<'py, PyQueryRowSet>> {
+        let laser = slf.laser.clone();
+        let mut walk = RowWalk::new(slf.next_call(), slf.timeout, usize::MAX);
+        awaitable(py, async move {
             let mut rows = Vec::new();
             while let Some(row) = walk.next(&laser).await.map_err(to_pyerr)? {
-                rows.push(PyRow::from(row));
+                rows.push(PyQueryRow::from(row));
             }
-            Ok(rows)
+            Ok(PyQueryRowSet {
+                rows,
+                frontier_moved: walk.frontier_moved.load(Ordering::Relaxed),
+            })
         })
     }
 
     /// Run the query, decoding every row's JSON payload into a Python value.
     /// A row without its original payload raises `ConfigError`.
-    fn fetch_typed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        let mut query = self.query.clone();
+    fn fetch_typed<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
+        let laser = slf.laser.clone();
+        let mut query = slf.next_call();
         query.select.payload = true;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let result = laser.execute_query(query).await.map_err(to_pyerr)?;
             Python::attach(|py| {
                 let mut decoded = Vec::with_capacity(result.rows.len());
@@ -840,15 +995,20 @@ impl PyQuery {
     /// Run the query and decode every matching row's JSON payload into a
     /// Python value, walking pages internally. A row without its original
     /// payload raises `ConfigError`.
-    fn fetch_all_typed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        let mut query = self.query.clone();
+    fn fetch_all_typed<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Awaitable<'py, Vec<Py<PyAny>>>> {
+        let laser = slf.laser.clone();
+        let mut query = slf.next_call();
         query.select.payload = true;
-        let mut walk = RowWalk::new(query, usize::MAX);
-        future_into_py(py, async move {
+        let mut walk = RowWalk::new(query, slf.timeout, usize::MAX);
+        awaitable(py, async move {
             let mut decoded = Vec::new();
             while let Some(row) = walk.next(&laser).await.map_err(to_pyerr)? {
-                decoded.push(Python::attach(|py| decode_row(py, &walk.fields, &row))?);
+                decoded.push(Python::attach(|py| {
+                    decode_row(py, row.fields(), row.row())
+                })?);
             }
             Ok(decoded)
         })
@@ -856,12 +1016,15 @@ impl PyQuery {
 
     /// Run the query capped at one row, decoding its JSON payload, or `None`
     /// when nothing matches.
-    fn fetch_one<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        let mut query = self.query.clone();
+    fn fetch_one<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
+        let laser = slf.laser.clone();
+        let mut query = slf.next_call();
         query.select.payload = true;
         query.page.limit = 1;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let result = laser.execute_query(query).await.map_err(to_pyerr)?;
             Python::attach(|py| match result.rows.first() {
                 Some(row) => decode_row(py, &result.fields, row),
@@ -874,14 +1037,14 @@ impl PyQuery {
     /// (any object with `decode(data) -> value`) instead of JSON. A codec
     /// failure raises `CodecError` with the codec's exception as its cause.
     fn fetch_typed_with<'py>(
-        &self,
+        mut slf: PyRefMut<'py, Self>,
         py: Python<'py>,
         codec: Py<PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        let mut query = self.query.clone();
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
+        let laser = slf.laser.clone();
+        let mut query = slf.next_call();
         query.select.payload = true;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let result = laser.execute_query(query).await.map_err(to_pyerr)?;
             Python::attach(|py| {
                 let codec = codec.bind(py);
@@ -898,15 +1061,15 @@ impl PyQuery {
 
     /// Like `fetch_one` but the payload is decoded by a user `codec`.
     fn fetch_one_with<'py>(
-        &self,
+        mut slf: PyRefMut<'py, Self>,
         py: Python<'py>,
         codec: Py<PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        let mut query = self.query.clone();
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
+        let laser = slf.laser.clone();
+        let mut query = slf.next_call();
         query.select.payload = true;
         query.page.limit = 1;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let result = laser.execute_query(query).await.map_err(to_pyerr)?;
             Python::attach(|py| match result.rows.first() {
                 Some(row) => decode_row_with(&result.fields, row, |payload| {
@@ -922,11 +1085,13 @@ impl PyQuery {
     /// stops at the cap or after the last page, whichever comes first. Pages
     /// are fetched only as the walk reaches them. Raises `InvalidError` at once
     /// without a `max_rows` ceiling.
-    fn rows(&self) -> PyResult<PyQueryRows> {
-        let cap = self.row_ceiling("rows")?;
+    fn rows(mut slf: PyRefMut<'_, Self>) -> PyResult<PyQueryRows> {
+        let cap = slf.row_ceiling("rows")?;
+        let walk = RowWalk::new(slf.next_call(), slf.timeout, cap);
         Ok(PyQueryRows {
-            laser: self.laser.clone(),
-            walk: Arc::new(AsyncMutex::new(RowWalk::new(self.query.clone(), cap))),
+            laser: slf.laser.clone(),
+            frontier_moved: walk.frontier_moved.clone(),
+            walk: Arc::new(AsyncMutex::new(walk)),
         })
     }
 
@@ -934,33 +1099,15 @@ impl PyQuery {
     /// Python value, under the same explicit `max_rows` ceiling. The payload
     /// is requested automatically, and the publisher must have inlined it: a
     /// row without it raises `ConfigError`.
-    fn rows_typed(&self) -> PyResult<PyTypedQueryRows> {
-        let cap = self.row_ceiling("rows_typed")?;
-        let mut query = self.query.clone();
+    fn rows_typed(mut slf: PyRefMut<'_, Self>) -> PyResult<PyTypedQueryRows> {
+        let cap = slf.row_ceiling("rows_typed")?;
+        let mut query = slf.next_call();
         query.select.payload = true;
+        let walk = RowWalk::new(query, slf.timeout, cap);
         Ok(PyTypedQueryRows {
-            laser: self.laser.clone(),
-            walk: Arc::new(AsyncMutex::new(RowWalk::new(query, cap))),
-        })
-    }
-
-    /// Read the current execution state for this query identity.
-    fn status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        let execution_id = self.query.execution_id;
-        future_into_py(py, async move {
-            let status = laser.query_status(execution_id).await.map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &status))
-        })
-    }
-
-    /// Request cancellation for this query identity and return its observed state.
-    fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        let execution_id = self.query.execution_id;
-        future_into_py(py, async move {
-            let status = laser.cancel_query(execution_id).await.map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &status))
+            laser: slf.laser.clone(),
+            frontier_moved: walk.frontier_moved.clone(),
+            walk: Arc::new(AsyncMutex::new(walk)),
         })
     }
 
@@ -969,7 +1116,7 @@ impl PyQuery {
     // name and borrows.
     #[allow(clippy::wrong_self_convention)]
     fn into_query(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        ser_to_py(py, &self.query)
+        ser_to_py(py, &self.stamped())
     }
 }
 
@@ -1204,7 +1351,7 @@ impl PyQueryBuilder {
         Ok(slf)
     }
 
-    /// The page request dict: `limit`, `offset`, `cursor`, `want_total`.
+    /// The page request dict: `limit`, `offset`, `want_total`.
     fn page<'py>(
         mut slf: PyRefMut<'py, Self>,
         page: &Bound<'_, PyAny>,
@@ -1265,7 +1412,7 @@ impl PyQueryBuilder {
         Ok(slf)
     }
 
-    /// The read-consistency level: 'eventual', 'read_your_writes', or 'strong'.
+    /// The read-consistency level: 'eventual' or 'read_your_writes'.
     fn consistency<'py>(
         mut slf: PyRefMut<'py, Self>,
         consistency: &str,
@@ -1400,6 +1547,22 @@ pub fn result_code_is_backend_unavailable(code: &str) -> PyResult<bool> {
     Ok(parse_result_code(code)?.is_backend_unavailable())
 }
 
+/// Whether a failure with this result code name could not be served right
+/// now: the retryable codes other than a lagging read model.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn result_code_is_unavailable(code: &str) -> PyResult<bool> {
+    Ok(parse_result_code(code)?.is_unavailable())
+}
+
+/// Whether a failure with this result code name refused the caller's
+/// credential or grant.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn result_code_is_permission_denied(code: &str) -> PyResult<bool> {
+    Ok(parse_result_code(code)?.is_permission_denied())
+}
+
 fn parse_execution_id(value: &str) -> PyResult<QueryExecutionId> {
     QueryExecutionId::from_str(value).map_err(|error| InvalidError::new_err(error.to_string()))
 }
@@ -1440,31 +1603,40 @@ fn agg_call(func: AggFunc, field: Option<String>, arg: Option<f64>, alias: &str)
 pub struct PyQueryRows {
     laser: Laser,
     walk: Arc<AsyncMutex<RowWalk>>,
+    frontier_moved: Arc<AtomicBool>,
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyQueryRows {
-    /// The next row, or `None` at the ceiling or after the last page.
-    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// The next row bound to its fields, or `None` at the ceiling or after the
+    /// last page.
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Option<PyQueryRow>>> {
         let laser = self.laser.clone();
         let walk = self.walk.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let row = walk.lock().await.next(&laser).await.map_err(to_pyerr)?;
-            Ok(row.map(PyRow::from))
+            Ok(row.map(PyQueryRow::from))
         })
+    }
+
+    /// Whether a page after the first was served at another frontier, so rows
+    /// may repeat or be missing.
+    #[getter]
+    fn frontier_moved(&self) -> bool {
+        self.frontier_moved.load(Ordering::Relaxed)
     }
 
     fn __aiter__(slf: Py<Self>) -> Py<Self> {
         slf
     }
 
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyQueryRow>> {
         let laser = self.laser.clone();
         let walk = self.walk.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             match walk.lock().await.next(&laser).await.map_err(to_pyerr)? {
-                Some(row) => Ok(PyRow::from(row)),
+                Some(row) => Ok(PyQueryRow::from(row)),
                 None => Err(PyStopAsyncIteration::new_err(())),
             }
         })
@@ -1480,6 +1652,7 @@ impl PyQueryRows {
 pub struct PyTypedQueryRows {
     laser: Laser,
     walk: Arc<AsyncMutex<RowWalk>>,
+    frontier_moved: Arc<AtomicBool>,
 }
 
 #[gen_stub_pymethods]
@@ -1488,29 +1661,34 @@ impl PyTypedQueryRows {
     /// The next decoded payload, or `None` at the ceiling or after the last
     /// page. A payload that is JSON `null` also reads as `None`, and
     /// `async for` tells the two apart.
-    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.laser.clone();
         let walk = self.walk.clone();
-        future_into_py(py, async move {
-            let mut walk = walk.lock().await;
-            match walk.next(&laser).await.map_err(to_pyerr)? {
-                Some(row) => Python::attach(|py| decode_row(py, &walk.fields, &row)),
+        awaitable(py, async move {
+            match walk.lock().await.next(&laser).await.map_err(to_pyerr)? {
+                Some(row) => Python::attach(|py| decode_row(py, row.fields(), row.row())),
                 None => Ok(Python::attach(|py| py.None())),
             }
         })
+    }
+
+    /// Whether a page after the first was served at another frontier, so rows
+    /// may repeat or be missing.
+    #[getter]
+    fn frontier_moved(&self) -> bool {
+        self.frontier_moved.load(Ordering::Relaxed)
     }
 
     fn __aiter__(slf: Py<Self>) -> Py<Self> {
         slf
     }
 
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.laser.clone();
         let walk = self.walk.clone();
-        future_into_py(py, async move {
-            let mut walk = walk.lock().await;
-            match walk.next(&laser).await.map_err(to_pyerr)? {
-                Some(row) => Python::attach(|py| decode_row(py, &walk.fields, &row)),
+        awaitable(py, async move {
+            match walk.lock().await.next(&laser).await.map_err(to_pyerr)? {
+                Some(row) => Python::attach(|py| decode_row(py, row.fields(), row.row())),
                 None => Err(PyStopAsyncIteration::new_err(())),
             }
         })
@@ -1519,53 +1697,47 @@ impl PyTypedQueryRows {
 
 // The SDK's bounded page walk behind `rows()`: pages fetch on demand, an empty
 // page or `has_more = false` ends it, aggregate and vector queries are single
-// page, and the walk continues with the server cursor. A continuation with no
-// cursor would restart the result, so it ends the walk too.
+// page, and the walk moves its offset past the rows it read.
 struct RowWalk {
     query: Query,
+    timeout: Option<Duration>,
+    pages_sent: usize,
     remaining: usize,
     finished: bool,
     single_page: bool,
-    fields: Vec<laser_sdk::wire::schema::LogicalField>,
-    buffer: std::vec::IntoIter<Row>,
+    buffer: std::vec::IntoIter<QueryRow>,
+    // The first page's frontier, which every later page is compared with.
+    frontier: Option<Vec<QueryFrontier>>,
+    frontier_moved: Arc<AtomicBool>,
 }
 
 impl RowWalk {
-    fn new(mut query: Query, max_rows: usize) -> Self {
-        if query.page.limit == 0 {
-            query.page.limit = laser_sdk::query::DEFAULT_STREAM_PAGE_SIZE as u32;
-        }
+    fn new(query: Query, timeout: Option<Duration>, max_rows: usize) -> Self {
         let single_page = query.aggregate.is_some() || query.vector.is_some();
         Self {
             query,
+            timeout,
+            pages_sent: 0,
             remaining: max_rows,
             finished: false,
             single_page,
-            fields: Vec::new(),
             buffer: Vec::new().into_iter(),
+            frontier: None,
+            frontier_moved: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    async fn next(&mut self, laser: &Laser) -> Result<Option<Row>, LaserError> {
+    async fn next(&mut self, laser: &Laser) -> Result<Option<QueryRow>, LaserError> {
         if self.remaining == 0 {
             return Ok(None);
         }
-        let row = match self.buffer.next() {
+        let row = match self.buffered() {
             Some(row) => Some(row),
             None if self.finished => None,
             None => {
-                let page = laser.execute_query(self.query.clone()).await?;
-                let fetched = page.rows.len();
-                self.finished = self.single_page
-                    || fetched == 0
-                    || !page.page.has_more
-                    || page.page.next_cursor.is_none()
-                    || page.page.next_cursor == self.query.page.cursor;
-                self.query.page.cursor = page.page.next_cursor;
-                self.query.page.offset = None;
-                self.fields = page.fields;
-                self.buffer = page.rows.into_iter();
-                self.buffer.next()
+                let page = laser.execute_query(self.page_query()).await?;
+                self.absorb(page);
+                self.buffered()
             }
         };
         if row.is_some() {
@@ -1573,6 +1745,61 @@ impl RowWalk {
         }
         Ok(row)
     }
+
+    fn buffered(&mut self) -> Option<QueryRow> {
+        self.buffer.next()
+    }
+
+    // Take a fetched page: move the offset past its rows, compare its frontier
+    // with the first page's, and buffer its rows bound to its fields.
+    fn absorb(&mut self, page: QueryResult) {
+        let fetched = page.rows.len();
+        self.finished = self.single_page || fetched == 0 || !page.page.has_more;
+        self.query.page.offset = Some(
+            self.query
+                .page
+                .offset
+                .unwrap_or(0)
+                .saturating_add(u64::try_from(fetched).unwrap_or(u64::MAX)),
+        );
+        match &self.frontier {
+            None => self.frontier = Some(page.context.frontier),
+            Some(first)
+                if first.len() != page.context.frontier.len()
+                    || page
+                        .context
+                        .frontier
+                        .iter()
+                        .any(|position| !first.contains(position)) =>
+            {
+                self.frontier_moved.store(true, Ordering::Relaxed);
+            }
+            Some(_) => {}
+        }
+        self.buffer = QueryRow::from_page(page.fields, page.rows).into_iter();
+    }
+
+    // The request for the next page: its own deadline counted from now under
+    // a relative budget, and a fresh execution id after the first page.
+    fn page_query(&mut self) -> Query {
+        let mut query = self.query.clone();
+        if let Some(timeout) = self.timeout {
+            query.deadline_micros = deadline_from_now(timeout);
+        }
+        if self.pages_sent > 0 {
+            query.execution_id = QueryExecutionId::mint();
+        }
+        self.pages_sent += 1;
+        query
+    }
+}
+
+fn deadline_from_now(timeout: Duration) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .saturating_add(timeout);
+    u64::try_from(now.as_micros()).unwrap_or(u64::MAX)
 }
 
 // Decode one row's original payload as JSON exactly as the SDK's typed reads
@@ -1634,7 +1861,7 @@ mod tests {
             .target(QueryTarget::operational("readings"))
             .deadline_micros(u64::MAX)
             .build();
-        (laser, RowWalk::new(query, max_rows))
+        (laser, RowWalk::new(query, None, max_rows))
     }
 
     fn payload_field() -> LogicalField {
@@ -1672,16 +1899,45 @@ mod tests {
     }
 
     #[test]
-    fn given_a_zero_page_limit_when_walked_then_should_page_by_the_stream_default() {
-        let (_, template) = walk(5);
-        let mut query = template.query;
-        query.page.limit = 0;
-        let walk = RowWalk::new(query, 5);
-        assert_eq!(
-            walk.query.page.limit,
-            laser_sdk::query::DEFAULT_STREAM_PAGE_SIZE as u32
-        );
-        assert!(!walk.single_page);
+    fn given_walked_pages_when_read_then_should_bind_each_row_to_its_fields_and_report_a_moved_frontier()
+     {
+        let (_, mut walk) = walk(10);
+        walk.absorb(walked_page(1, 5, true));
+        let first = walk.buffered().expect("the first page holds a row");
+        assert_eq!(first.value_text("id").as_deref(), Some("o-1"));
+        assert!(!walk.frontier_moved.load(Ordering::Relaxed));
+        walk.absorb(walked_page(2, 5, true));
+        assert!(!walk.frontier_moved.load(Ordering::Relaxed));
+        walk.absorb(walked_page(3, 6, false));
+        assert!(walk.frontier_moved.load(Ordering::Relaxed));
+        assert!(walk.finished);
+        Python::initialize();
+        Python::attach(|py| {
+            let row = Bound::new(py, PyQueryRow::from(first)).expect("the row binds");
+            let text = |key: Bound<'_, PyAny>| {
+                row.get_item(key)
+                    .and_then(|value| value.get_item("value"))
+                    .and_then(|value| value.extract::<String>())
+            };
+            assert_eq!(
+                text("id".into_pyobject(py).expect("key").into_any()).expect("by name"),
+                "o-1"
+            );
+            assert_eq!(
+                text(0_i64.into_pyobject(py).expect("index").into_any()).expect("by position"),
+                "o-1"
+            );
+            assert!(
+                row.get_item("absent")
+                    .is_err_and(|error| error.is_instance_of::<pyo3::exceptions::PyKeyError>(py))
+            );
+            assert_eq!(row.len().expect("length"), 1);
+            let keys: Vec<String> = row
+                .call_method0("keys")
+                .and_then(|keys| keys.extract())
+                .expect("keys");
+            assert_eq!(keys, vec!["id".to_owned()]);
+        });
     }
 
     #[test]
@@ -1722,5 +1978,56 @@ mod tests {
                 .expect("cpu field");
             assert_eq!(cpu, 82);
         });
+    }
+
+    // One page holding the row `o-<row>` with `has_more`, served at the applied
+    // offset `applied` of `shop/orders` partition 0.
+    fn walked_page(row: u32, applied: u64, has_more: bool) -> QueryResult {
+        QueryResult {
+            fields: vec![LogicalField {
+                id: 1,
+                name: "id".to_owned(),
+                required: false,
+                field_type: LogicalType::String,
+                doc: None,
+            }],
+            rows: vec![self::row(vec![TypedValue::String(format!("o-{row}"))])],
+            page: laser_sdk::query::Page {
+                offset: Some(u64::from(row) - 1),
+                limit: 1,
+                total: None,
+                has_more,
+            },
+            context: laser_sdk::query::QueryContext {
+                execution_id: QueryExecutionId::from_u128(1),
+                engine: laser_sdk::query::QueryEngine {
+                    name: "embedded".to_owned(),
+                    version: "1".to_owned(),
+                    dialect: None,
+                },
+                resolved_target: laser_sdk::query::ResolvedQueryTarget::Operational {
+                    index: "readings".to_owned(),
+                    backend_resource_id: laser_sdk::wire::destination::BackendResourceId::from_u128(
+                        1,
+                    ),
+                    backend_generation: 1,
+                    runtime_configuration_revision: 1,
+                },
+                requested_consistency: Consistency::Eventual,
+                delivered_consistency: Consistency::Eventual,
+                truncated: false,
+                elapsed_micros: 1,
+                scanned_bytes: 0,
+                produced_bytes: 0,
+                row_count: 1,
+                frontier: vec![QueryFrontier {
+                    stream: "shop".to_owned(),
+                    topic: "orders".to_owned(),
+                    partition_id: 0,
+                    topic_created_at_micros: None,
+                    applied_offset: applied,
+                }],
+            },
+        }
     }
 }

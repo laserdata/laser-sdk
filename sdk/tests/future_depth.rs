@@ -63,6 +63,7 @@ fn given_a_scatter_when_built_under_a_recursion_limit_of_110_then_should_lay_out
             &selector,
             b"task".as_slice(),
             &route,
+            GatherPolicy::RequireAll,
             Duration::from_secs(1),
         )
     });

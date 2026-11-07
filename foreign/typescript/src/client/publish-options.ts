@@ -1,3 +1,4 @@
+import { jittered } from "../retry.js"
 import { ConfigError, TimeoutError } from "./errors.js"
 
 export interface PublishOptions {
@@ -34,9 +35,9 @@ export function publishOptions(
   return resolved
 }
 
-/** The pause before retry `attempt`, counted from zero: the backoff doubled per attempt and capped at 30 seconds. */
+/** The pause before retry `attempt`, counted from zero: the backoff doubled per attempt, capped at 30 seconds and spread over its upper half. */
 export function retryDelayMs(options: PublishOptions, attempt: number): number {
-  return Math.min(options.retryBackoffMs * 2 ** Math.min(attempt, 16), 30_000)
+  return jittered(Math.min(options.retryBackoffMs * 2 ** Math.min(attempt, 16), 30_000))
 }
 
 export async function publishWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {

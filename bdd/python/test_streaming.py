@@ -23,17 +23,6 @@ def stream_ready(world):
     assert world.laser is not None
 
 
-@when(parsers.parse('I publish a JSON event to topic "{topic}"'))
-def publish_json(world, topic):
-    world.run(lambda: world.laser.topic(topic).publish().json({"hello": "world"}).send())
-    world.published = True
-
-
-@then("the publish succeeds")
-def publish_succeeds(world):
-    assert world.published is True
-
-
 @when(parsers.parse('I publish a batch of {count:d} JSON events to topic "{topic}"'))
 def publish_batch(world, count, topic):
     items = [{"i": index} for index in range(count)]

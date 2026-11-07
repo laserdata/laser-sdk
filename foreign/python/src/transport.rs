@@ -1,7 +1,7 @@
 use crate::async_bridge::{
-    PyHook, Undelivered, future_into_py, future_into_py_returning, hook_callable,
+    Awaitable, PyHook, Undelivered, awaitable, awaitable_returning, hook_callable,
 };
-use crate::convert::payload_bytes;
+use crate::convert::{duration_ms, payload_bytes};
 use crate::errors::{InvalidError, to_pyerr};
 use iggy::clients::producer_config::BackpressureMode;
 use iggy::clients::producer_error_callback::{ErrorCallback, ErrorCtx};
@@ -12,7 +12,7 @@ use iggy::prelude::{
 };
 use laser_sdk::error::LaserError;
 use laser_sdk::stream::{
-    CommitPolicy, Consumer, ConsumerBuilder, ConsumerMessage, ConsumerStart, Producer,
+    CommitPolicy, Consumer, ConsumerBuilder, ConsumerMessage, ConsumerStart, Headers, Producer,
     ProducerMessage, Routing, StoredOffset, Topic,
 };
 use pyo3::prelude::*;
@@ -32,11 +32,10 @@ pub(crate) fn transport_error(error: impl Into<LaserError>) -> PyErr {
     to_pyerr(error.into())
 }
 
-pub(crate) fn positive_duration_ms(
-    value: u64,
-    field: &'static str,
-) -> PyResult<NonZeroIggyDuration> {
-    NonZeroIggyDuration::try_from(Duration::from_millis(value))
+pub(crate) fn positive_duration_ms(value: f64, field: &'static str) -> PyResult<Duration> {
+    let duration = duration_ms(value, field)?;
+    NonZeroIggyDuration::try_from(duration)
+        .map(|_| duration)
         .map_err(|_| InvalidError::new_err(format!("{field} must be greater than zero")))
 }
 
@@ -170,19 +169,19 @@ impl Display for CommitMode {
 
 pub(crate) struct ConsumerConfig<'a> {
     pub batch_length: u32,
-    pub max_wait_ms: u64,
+    pub max_wait_ms: f64,
     pub min_count: u32,
     pub max_bytes: u32,
     pub polling: &'a str,
     pub offset: Option<u64>,
     pub timestamp_micros: Option<u64>,
     pub auto_commit: &'a str,
-    pub commit_interval_ms: u64,
+    pub commit_interval_ms: f64,
     pub commit_every: Option<u32>,
     pub create_group: bool,
-    pub polling_retry_interval_ms: u64,
+    pub polling_retry_interval_ms: f64,
     pub init_retries: Option<u32>,
-    pub init_retry_interval_ms: u64,
+    pub init_retry_interval_ms: f64,
     pub allow_replay: bool,
 }
 
@@ -199,29 +198,8 @@ pub(crate) fn configure_consumer(
             "consumer batch_length must be greater than zero",
         ));
     }
-    let start = match (config.offset, config.timestamp_micros) {
-        (Some(_), Some(_)) => {
-            return Err(InvalidError::new_err(
-                "offset and timestamp_micros are mutually exclusive",
-            ));
-        }
-        (Some(offset), None) => ConsumerStart::Offset(offset),
-        (None, Some(timestamp)) => ConsumerStart::TimestampMicros(timestamp),
-        (None, None) => match config.polling.parse::<PollingMode>()? {
-            PollingMode::First => ConsumerStart::First,
-            PollingMode::Last => ConsumerStart::Last,
-            PollingMode::Next => ConsumerStart::Next,
-            PollingMode::Offset => {
-                return Err(InvalidError::new_err("polling='offset' requires offset"));
-            }
-            PollingMode::Timestamp => {
-                return Err(InvalidError::new_err(
-                    "polling='timestamp' requires timestamp_micros",
-                ));
-            }
-        },
-    };
-    let interval = Duration::from_millis(config.commit_interval_ms);
+    let start = consumer_start(config.polling, config.offset, config.timestamp_micros)?;
+    let interval = duration_ms(config.commit_interval_ms, "commit_interval_ms")?;
     let commit = match (
         config.auto_commit.parse::<CommitMode>()?,
         interval.is_zero(),
@@ -253,32 +231,60 @@ pub(crate) fn configure_consumer(
             }
         }
     };
-    positive_duration_ms(
+    let polling_retry_interval = positive_duration_ms(
         config.polling_retry_interval_ms,
         "polling_retry_interval_ms",
     )?;
     builder = builder
         .batch_length(config.batch_length)
-        .max_wait(Duration::from_millis(config.max_wait_ms))
+        .max_wait(duration_ms(config.max_wait_ms, "max_wait_ms")?)
         .min_count(config.min_count)
         .max_bytes(config.max_bytes)
         .start_at(start)
         .commit_policy(commit)
-        .polling_retry_interval(Duration::from_millis(config.polling_retry_interval_ms));
+        .polling_retry_interval(polling_retry_interval);
     if group {
         builder = builder.create_group(config.create_group);
     }
     if let Some(retries) = config.init_retries {
-        positive_duration_ms(config.init_retry_interval_ms, "init_retry_interval_ms")?;
-        builder = builder.init_retries(
-            retries,
-            Duration::from_millis(config.init_retry_interval_ms),
-        );
+        let init_retry_interval =
+            positive_duration_ms(config.init_retry_interval_ms, "init_retry_interval_ms")?;
+        builder = builder.init_retries(retries, init_retry_interval);
     }
     if config.allow_replay {
         builder = builder.allow_replay();
     }
     Ok(PyConsumer::new(name, builder))
+}
+
+// A read position named by `polling`, or by an explicit offset or timestamp.
+fn consumer_start(
+    polling: &str,
+    offset: Option<u64>,
+    timestamp_micros: Option<u64>,
+) -> PyResult<ConsumerStart> {
+    Ok(match (offset, timestamp_micros) {
+        (Some(_), Some(_)) => {
+            return Err(InvalidError::new_err(
+                "offset and timestamp_micros are mutually exclusive",
+            ));
+        }
+        (Some(offset), None) => ConsumerStart::Offset(offset),
+        (None, Some(timestamp)) => ConsumerStart::TimestampMicros(timestamp),
+        (None, None) => match polling.parse::<PollingMode>()? {
+            PollingMode::First => ConsumerStart::First,
+            PollingMode::Last => ConsumerStart::Last,
+            PollingMode::Next => ConsumerStart::Next,
+            PollingMode::Offset => {
+                return Err(InvalidError::new_err("polling='offset' requires offset"));
+            }
+            PollingMode::Timestamp => {
+                return Err(InvalidError::new_err(
+                    "polling='timestamp' requires timestamp_micros",
+                ));
+            }
+        },
+    })
 }
 
 pub(crate) fn routing(key: Option<&Bound<'_, PyAny>>, partition: Option<u32>) -> PyResult<Routing> {
@@ -520,8 +526,8 @@ impl ProducerSettings {
 /// object with `call(error)`, sync or async, receives each write that failed
 /// after its retries as a `PublishFailedError` with `stream`, `topic`,
 /// `committed`, `unconfirmed`, and the cause as `__cause__`. Without one, the
-/// failure is logged on the `laser_sdk`
-/// logger and its records are dropped.
+/// producer keeps the failures, and the next `flush` or `shutdown` raises them
+/// as one `PublishFailedError` that lists the records of every failed write.
 #[gen_stub_pyclass]
 #[pyclass(name = "BackgroundConfig", frozen)]
 pub struct PyBackgroundConfig {
@@ -536,14 +542,22 @@ impl PyBackgroundConfig {
     #[allow(clippy::too_many_arguments)]
     fn new(
         num_shards: Option<usize>,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['ordered', 'balanced']",
+            imports = ("typing",)
+        ))]
         sharding: &str,
         batch_length: Option<usize>,
         batch_size: Option<usize>,
         linger_ms: Option<f64>,
         max_buffer_size: Option<u64>,
         max_in_flight: Option<usize>,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['block', 'block_with_timeout', 'fail_immediately']",
+            imports = ("typing",)
+        ))]
         failure_mode: &str,
-        block_timeout_ms: Option<u64>,
+        block_timeout_ms: Option<f64>,
         error_callback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let defaults = BackgroundSettings::default();
@@ -559,7 +573,7 @@ impl PyBackgroundConfig {
         let failure_mode = match (failure_mode, block_timeout_ms) {
             ("block", None) => BackpressureMode::Block,
             ("block_with_timeout", Some(timeout)) => BackpressureMode::BlockWithTimeout(
-                IggyDuration::from(Duration::from_millis(timeout)),
+                IggyDuration::from(duration_ms(timeout, "block_timeout_ms")?),
             ),
             ("fail_immediately", None) => BackpressureMode::FailImmediately,
             ("block_with_timeout", None) => {
@@ -656,9 +670,11 @@ impl PyBackgroundConfig {
     }
 
     #[getter]
-    fn block_timeout_ms(&self) -> Option<u128> {
+    fn block_timeout_ms(&self) -> Option<f64> {
         match &self.settings.failure_mode {
-            BackpressureMode::BlockWithTimeout(timeout) => Some(timeout.get_duration().as_millis()),
+            BackpressureMode::BlockWithTimeout(timeout) => {
+                Some(timeout.get_duration().as_secs_f64() * 1000.0)
+            }
             _ => None,
         }
     }
@@ -716,7 +732,9 @@ impl BackgroundSettings {
                 .inspect_err(|error| log::warn!("background error callback unusable: {error}"))
                 .ok()
         });
-        BackgroundConfig::builder()
+        // Without a callback the producer keeps the failure for `flush` and
+        // `shutdown`, so Apache Iggy's default stays in place.
+        let mut config = BackgroundConfig::builder()
             .num_shards(self.num_shards)
             .sharding(sharding)
             .batch_length(self.batch_length)
@@ -725,14 +743,17 @@ impl BackgroundSettings {
             .max_buffer_size(IggyByteSize::from(self.max_buffer_size))
             .max_in_flight(self.max_in_flight)
             .failure_mode(self.failure_mode)
-            .error_callback(Arc::new(Box::new(PyErrorCallback(callback))))
-            .build()
+            .build();
+        if let Some(callback) = callback {
+            config.error_callback = Arc::new(Box::new(PyErrorCallback(callback)));
+        }
+        config
     }
 }
 
 // Hands a failed background write to the Python callback as the same typed
-// exception a direct send raises, or logs it when there is no callback.
-struct PyErrorCallback(Option<PyHook>);
+// exception a direct send raises.
+struct PyErrorCallback(PyHook);
 
 impl std::fmt::Debug for PyErrorCallback {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
@@ -746,7 +767,7 @@ impl ErrorCallback for PyErrorCallback {
         Box::pin(async move {
             // A background failure reports no uncertain head, and the
             // exception lists every record of the failed tail as unconfirmed.
-            let error = LaserError::Iggy(IggyError::ProducerSendFailed {
+            let error = LaserError::from(IggyError::ProducerSendFailed {
                 cause: ctx.cause,
                 failed: ctx.messages,
                 uncertain: 0,
@@ -754,10 +775,6 @@ impl ErrorCallback for PyErrorCallback {
                 stream_name: ctx.stream_name.into(),
                 topic_name: ctx.topic_name.into(),
             });
-            let Some(hook) = hook else {
-                log::error!("background send failed, its records are dropped: {error}");
-                return;
-            };
             let raised = hook
                 .call(|py| (to_pyerr(error).value(py).clone(),).into_pyobject(py))
                 .await;
@@ -862,9 +879,9 @@ impl PyProducer {
     /// Initialize the producer, including configured stream/topic creation.
     /// `send` and `send_batch` also initialize lazily, so calling this is useful
     /// when startup should fail before accepting work.
-    fn init<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn init<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let producer = self.producer();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             producer.await?;
             Ok(())
         })
@@ -880,11 +897,11 @@ impl PyProducer {
         headers: Option<&Bound<'_, PyDict>>,
         key: Option<&Bound<'_, PyAny>>,
         partition: Option<u32>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PySendMessagesResponse>> {
         let message = message(payload, headers)?;
         let routing = routing_override(key, partition)?;
         let producer = self.producer();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let producer = producer.await?;
             let response = match routing {
                 Some(routing) => producer.send_with_routing(message, routing).await,
@@ -904,11 +921,11 @@ impl PyProducer {
         messages: &Bound<'_, PyAny>,
         key: Option<&Bound<'_, PyAny>>,
         partition: Option<u32>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PySendMessagesResponse>> {
         let messages = self::messages(messages)?;
         let routing = routing_override(key, partition)?;
         let producer = self.producer();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             producer
                 .await?
                 .send_batch_with_routing(messages, routing)
@@ -923,12 +940,53 @@ impl PyProducer {
     /// flushed, and cancelling the call does not stop the flush. A direct
     /// producer has nothing to flush, so this only closes it. Later sends
     /// raise `InvalidError`, and a second shutdown returns at once.
-    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let cell = self.producer.clone();
-        future_into_py(
+        awaitable(
             py,
             async move { close_producer(cell).await.map_err(to_pyerr) },
         )
+    }
+
+    /// Wait until every record a `background`-mode send queued is written,
+    /// after the sends already in flight. A direct producer, or one that never
+    /// sent, has nothing to flush. Raises the background write failures no
+    /// `error_callback` took since the last flush as one `PublishFailedError`
+    /// that lists the records of every failed write.
+    fn flush<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
+        let cell = self.producer.clone();
+        awaitable(py, async move {
+            let state = cell.read().await;
+            match &*state {
+                ProducerState::Ready(producer) => producer.flush().await.map_err(to_pyerr),
+                ProducerState::Pending => Ok(()),
+                ProducerState::Closed => Err(InvalidError::new_err(
+                    "the producer is shut down, build a new one with Topic.producer",
+                )),
+            }
+        })
+    }
+
+    /// Enter `async with`: yield the producer. Exiting the block shuts it down.
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Awaitable<'py, Py<Self>>> {
+        awaitable(py, async move { Ok(slf) })
+    }
+
+    /// Exit `async with`: `shutdown`, then return `False` so an exception in
+    /// the body is not suppressed.
+    #[pyo3(signature = (_exc_type, _exc_value, _traceback))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, bool>> {
+        let cell = self.producer.clone();
+        awaitable(py, async move {
+            close_producer(cell).await.map_err(to_pyerr)?;
+            Ok(false)
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -947,7 +1005,7 @@ enum PyHeaderValue {
 }
 
 #[derive(Clone)]
-struct PyHeader {
+pub(crate) struct PyHeader {
     kind: String,
     value: PyHeaderValue,
 }
@@ -1044,6 +1102,42 @@ fn header_field<'a>(bytes: &mut &'a [u8]) -> Option<(u8, &'a [u8])> {
     let value = bytes.get(5..5 + length)?;
     *bytes = &bytes[5 + length..];
     Some((kind, value))
+}
+
+/// The typed headers of a record the Rust SDK already decoded, keyed by
+/// their string form.
+pub(crate) fn typed_headers(headers: Headers) -> BTreeMap<String, PyHeader> {
+    headers
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.to_string_value(), PyHeader::try_from(value).ok()?)))
+        .collect()
+}
+
+/// Headers as Python `bytes`, `str`, `bool`, `int`, or `float` values.
+pub(crate) fn header_dict(
+    py: Python<'_>,
+    headers: &BTreeMap<String, PyHeader>,
+) -> PyResult<Py<PyDict>> {
+    let values = PyDict::new(py);
+    for (key, header) in headers {
+        match &header.value {
+            PyHeaderValue::Raw(value) => values.set_item(key, PyBytes::new(py, value))?,
+            PyHeaderValue::String(value) => values.set_item(key, value)?,
+            PyHeaderValue::Bool(value) => values.set_item(key, value)?,
+            PyHeaderValue::Int(value) => values.set_item(key, value)?,
+            PyHeaderValue::Uint(value) => values.set_item(key, value)?,
+            PyHeaderValue::Float(value) => values.set_item(key, value)?,
+        }
+    }
+    Ok(values.unbind())
+}
+
+/// The exact Iggy value kind of each header (`uint16`, `string`, etc.).
+pub(crate) fn header_kinds(headers: &BTreeMap<String, PyHeader>) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .map(|(key, value)| (key.clone(), value.kind.clone()))
+        .collect()
 }
 
 /// One message yielded by a Laser consumer, including its exact log
@@ -1160,27 +1254,13 @@ impl PyConsumerMessage {
     /// when the receiver requires an exact numeric width.
     #[getter]
     fn headers(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let values = PyDict::new(py);
-        for (key, header) in &self.headers {
-            match &header.value {
-                PyHeaderValue::Raw(value) => values.set_item(key, PyBytes::new(py, value))?,
-                PyHeaderValue::String(value) => values.set_item(key, value)?,
-                PyHeaderValue::Bool(value) => values.set_item(key, value)?,
-                PyHeaderValue::Int(value) => values.set_item(key, value)?,
-                PyHeaderValue::Uint(value) => values.set_item(key, value)?,
-                PyHeaderValue::Float(value) => values.set_item(key, value)?,
-            }
-        }
-        Ok(values.unbind())
+        header_dict(py, &self.headers)
     }
 
     /// Exact Iggy value kind for each user header (`uint16`, `string`, etc.).
     #[getter]
     fn header_kinds(&self) -> BTreeMap<String, String> {
-        self.headers
-            .iter()
-            .map(|(key, value)| (key.clone(), value.kind.clone()))
-            .collect()
+        header_kinds(&self.headers)
     }
 
     /// Decode the payload as JSON.
@@ -1252,6 +1332,27 @@ impl PyConsumer {
         }
     }
 
+    // The work `shutdown` and an `async with` exit share. Only the first call
+    // stops the consumer.
+    fn closing(&self) -> impl Future<Output = PyResult<()>> + Send + 'static {
+        let already_shutdown = self.shutdown.send_replace(true);
+        let state = self.state.clone();
+        let returned = Arc::clone(&self.returned);
+        async move {
+            if already_shutdown {
+                return Ok(());
+            }
+            let taken = std::mem::replace(&mut *state.lock().await, ConsumerState::Closed);
+            match taken {
+                ConsumerState::Built(mut consumer) => {
+                    return_deliveries(&mut consumer, &returned).await?;
+                    consumer.shutdown().await.map_err(to_pyerr)
+                }
+                ConsumerState::Unbuilt(_) | ConsumerState::Closed => Ok(()),
+            }
+        }
+    }
+
     async fn receive(
         state: Arc<Mutex<ConsumerState>>,
         receiving: Arc<Mutex<()>>,
@@ -1309,19 +1410,19 @@ impl PyConsumer {
 impl PyConsumer {
     /// Initialize and join/create the configured group. Reads initialize lazily
     /// too, so call this when startup should fail before accepting work.
-    fn init<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn init<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let state = self.state.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             state.lock().await.built().await?;
             Ok(())
         })
     }
 
     /// Wait for the next message. Returns `None` after shutdown.
-    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Option<PyConsumerMessage>>> {
         let state = self.state.clone();
         let shutdown = self.shutdown.clone();
-        future_into_py_returning(
+        awaitable_returning(
             py,
             Self::receive(
                 state,
@@ -1337,7 +1438,11 @@ impl PyConsumer {
     /// Wait at most `wait_ms` milliseconds for the next message. Raises
     /// `TimeoutError` when none arrives in time and `InvalidError` when the
     /// consumer has shut down, matching the Rust `next_within`.
-    fn next_within<'py>(&self, py: Python<'py>, wait_ms: f64) -> PyResult<Bound<'py, PyAny>> {
+    fn next_within<'py>(
+        &self,
+        py: Python<'py>,
+        wait_ms: f64,
+    ) -> PyResult<Awaitable<'py, PyConsumerMessage>> {
         let wait = crate::convert::duration_ms(wait_ms, "wait_ms")?;
         let receive = Self::receive(
             self.state.clone(),
@@ -1346,7 +1451,7 @@ impl PyConsumer {
             self.shutdown.clone(),
             Arc::clone(&self.returned),
         );
-        future_into_py_returning(
+        awaitable_returning(
             py,
             async move {
                 match tokio::time::timeout(wait, receive).await {
@@ -1375,9 +1480,9 @@ impl PyConsumer {
         py: Python<'py>,
         offset: u64,
         partition: Option<u32>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let state = self.state.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             state
                 .lock()
                 .await
@@ -1396,13 +1501,13 @@ impl PyConsumer {
         &self,
         py: Python<'py>,
         message: &PyConsumerMessage,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let state = self.state.clone();
         let changed = Arc::clone(&self.changed);
         let delivered = message.delivered.clone();
         let offset = message.offset;
         let partition = message.partition_id;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut state = state.lock().await;
             let consumer = state.built().await?;
             let result = match delivered {
@@ -1410,6 +1515,33 @@ impl PyConsumer {
                 None => consumer.store_offset(offset, Some(partition)).await,
             }
             .map_err(to_pyerr);
+            drop(state);
+            changed.notify_one();
+            result
+        })
+    }
+
+    /// Pass the record a `FilterFaultError` or a `FilterOversizedRecordError`
+    /// stopped `partition_id` at, and read on after it, as
+    /// `FilteredReader.skip` does. A policy-aware group consumer only: a
+    /// native consumer runs no filter, so it raises `InvalidError`, and
+    /// `store_offset` moves it.
+    fn skip<'py>(
+        &self,
+        py: Python<'py>,
+        partition_id: u32,
+        offset: u64,
+    ) -> PyResult<Awaitable<'py, ()>> {
+        let state = self.state.clone();
+        let changed = Arc::clone(&self.changed);
+        awaitable(py, async move {
+            let mut state = state.lock().await;
+            let result = state
+                .built()
+                .await?
+                .skip(partition_id, offset)
+                .await
+                .map_err(to_pyerr);
             drop(state);
             changed.notify_one();
             result
@@ -1424,9 +1556,9 @@ impl PyConsumer {
         &self,
         py: Python<'py>,
         partition: Option<u32>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let state = self.state.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             state
                 .lock()
                 .await
@@ -1438,14 +1570,48 @@ impl PyConsumer {
         })
     }
 
+    /// Read `partition` next from the start `polling`, `offset` or
+    /// `timestamp_micros` names, like the Rust `seek`: the rest of the
+    /// partition's polled batch is dropped and a message delivered before the
+    /// seek commits nothing. Under `auto_commit="polling"` a seek to an offset
+    /// above zero first stores the offset before it. Refused like
+    /// `store_offset` by a policy-aware group consumer.
+    #[pyo3(signature = (partition, *, polling="next", offset=None, timestamp_micros=None))]
+    fn seek<'py>(
+        &self,
+        py: Python<'py>,
+        partition: u32,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['first', 'last', 'next', 'offset', 'timestamp']",
+            imports = ("typing",)
+        ))]
+        polling: &str,
+        offset: Option<u64>,
+        timestamp_micros: Option<u64>,
+    ) -> PyResult<Awaitable<'py, ()>> {
+        let start = consumer_start(polling, offset, timestamp_micros)?;
+        let state = self.state.clone();
+        let changed = Arc::clone(&self.changed);
+        let returned = Arc::clone(&self.returned);
+        awaitable(py, async move {
+            let mut state = state.lock().await;
+            let consumer = state.built().await?;
+            return_deliveries(consumer, &returned).await?;
+            let result = consumer.seek(partition, start).await.map_err(to_pyerr);
+            drop(state);
+            changed.notify_one();
+            result
+        })
+    }
+
     /// Last message offset yielded locally for `partition`.
     fn last_consumed_offset<'py>(
         &self,
         py: Python<'py>,
         partition: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Option<u64>>> {
         let state = self.state.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             Ok(match &*state.lock().await {
                 ConsumerState::Built(consumer) => consumer.last_consumed_offset(partition),
                 ConsumerState::Unbuilt(_) | ConsumerState::Closed => None,
@@ -1457,9 +1623,13 @@ impl PyConsumer {
     /// on `partition`, with the partition's current head. `None` when the
     /// server stores nothing for it yet. A server read, unlike the local
     /// bookkeeping of `last_stored_offset`.
-    fn stored_offset<'py>(&self, py: Python<'py>, partition: u32) -> PyResult<Bound<'py, PyAny>> {
+    fn stored_offset<'py>(
+        &self,
+        py: Python<'py>,
+        partition: u32,
+    ) -> PyResult<Awaitable<'py, Option<PyStoredOffset>>> {
         let state = self.state.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let stored = state
                 .lock()
                 .await
@@ -1480,9 +1650,9 @@ impl PyConsumer {
         &self,
         py: Python<'py>,
         partition: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Option<u64>>> {
         let state = self.state.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             Ok(match &*state.lock().await {
                 ConsumerState::Built(consumer) => consumer.last_stored_offset(partition),
                 ConsumerState::Unbuilt(_) | ConsumerState::Closed => None,
@@ -1495,22 +1665,29 @@ impl PyConsumer {
     /// On the group-aware path it commits the delivered prefix. Disabled
     /// auto-commit preserves the last explicit commit. Use explicit commits
     /// when shutdown must preserve only successfully processed records.
-    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let already_shutdown = self.shutdown.send_replace(true);
-        let state = self.state.clone();
-        let returned = Arc::clone(&self.returned);
-        future_into_py(py, async move {
-            if already_shutdown {
-                return Ok(());
-            }
-            let taken = std::mem::replace(&mut *state.lock().await, ConsumerState::Closed);
-            match taken {
-                ConsumerState::Built(mut consumer) => {
-                    return_deliveries(&mut consumer, &returned).await?;
-                    consumer.shutdown().await.map_err(to_pyerr)
-                }
-                ConsumerState::Unbuilt(_) | ConsumerState::Closed => Ok(()),
-            }
+    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
+        awaitable(py, self.closing())
+    }
+
+    /// Enter `async with`: yield the consumer. Exiting the block shuts it down.
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Awaitable<'py, Py<Self>>> {
+        awaitable(py, async move { Ok(slf) })
+    }
+
+    /// Exit `async with`: `shutdown`, then return `False` so an exception in
+    /// the body is not suppressed.
+    #[pyo3(signature = (_exc_type, _exc_value, _traceback))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, bool>> {
+        let closing = self.closing();
+        awaitable(py, async move {
+            closing.await?;
+            Ok(false)
         })
     }
 
@@ -1518,13 +1695,13 @@ impl PyConsumer {
         slf
     }
 
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyConsumerMessage>> {
         let state = self.state.clone();
         let shutdown = self.shutdown.clone();
         let returned = Arc::clone(&self.returned);
         let receiving = Arc::clone(&self.receiving);
         let changed = Arc::clone(&self.changed);
-        future_into_py_returning(
+        awaitable_returning(
             py,
             async move {
                 match Self::receive(state, receiving, changed, shutdown, returned).await? {
@@ -1750,7 +1927,7 @@ mod tests {
 
     #[test]
     fn given_retry_intervals_when_converted_then_zero_should_be_rejected() {
-        assert!(positive_duration_ms(1, "retry_interval_ms").is_ok());
-        assert!(positive_duration_ms(0, "retry_interval_ms").is_err());
+        assert!(positive_duration_ms(1.0, "retry_interval_ms").is_ok());
+        assert!(positive_duration_ms(0.0, "retry_interval_ms").is_err());
     }
 }

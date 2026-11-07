@@ -123,7 +123,11 @@ async fn install_roles(laser: &Laser, target_user: u32) -> Result<(), LaserError
     }
 
     let bindings = laser.get_bindings(target_principal).await?;
-    println!("user {target_user} is bound to: [{}]", bindings.join(", "));
+    println!(
+        "user {target_user} is bound to: [{}] at binding revision {}",
+        bindings.roles.join(", "),
+        bindings.revision
+    );
     Ok(())
 }
 
@@ -148,8 +152,8 @@ fn roles() -> Vec<Role> {
         Role {
             name: "agent-runner".to_owned(),
             grants: vec![
-                allow(Feature::Agent, Action::Read, ResourcePattern::all()),
-                allow(Feature::Agent, Action::Write, ResourcePattern::all()),
+                allow(Feature::Session, Action::Read, ResourcePattern::all()),
+                allow(Feature::Session, Action::Write, ResourcePattern::all()),
             ],
         },
         Role {
@@ -242,10 +246,7 @@ fn demonstrate_edge_auth() {
     );
     match authorize_edge(&missing_scope, "mcp.laserdata", "tool:write") {
         Ok(()) => println!("edge write authorized unexpectedly"),
-        Err(denial) => println!(
-            "edge write step-up challenge: {}",
-            denial.challenge().unwrap_or_default()
-        ),
+        Err(denial) => println!("edge write step-up challenge: {}", denial.challenge()),
     }
     println!(
         "foreign audience rejected: {}",

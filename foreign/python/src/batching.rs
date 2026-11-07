@@ -1,4 +1,4 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::convert::payload_bytes;
 use crate::errors::to_pyerr;
 use laser_sdk::batching::{BatchingProducer, BatchingProducerBuilder};
@@ -46,6 +46,18 @@ impl PyBatchingProducer {
             inner: Arc::new(Mutex::new(State::Pending(Box::new(builder)))),
         }
     }
+
+    // The work `close` and an `async with` exit share.
+    fn closing(&self) -> impl Future<Output = PyResult<()>> + Send + 'static {
+        let inner = self.inner.clone();
+        async move {
+            let mut guard = inner.lock().await;
+            match std::mem::replace(&mut *guard, State::Closed) {
+                State::Ready(producer) => producer.close().await.map_err(to_pyerr),
+                State::Pending(_) | State::Closed => Ok(()),
+            }
+        }
+    }
 }
 
 #[gen_stub_pymethods]
@@ -60,13 +72,14 @@ impl PyBatchingProducer {
     fn send<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         headers: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let payload = payload_bytes(payload)?;
         let headers = crate::transport::headers(headers)?;
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut guard = inner.lock().await;
             let producer = guard.producer()?;
             producer.send(payload, headers).await.map_err(to_pyerr)
@@ -75,9 +88,9 @@ impl PyBatchingProducer {
 
     /// Flush everything queued as one batch append, then raise the failure an
     /// earlier linger flush kept, if any. A no-op on an empty queue.
-    fn flush<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn flush<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut guard = inner.lock().await;
             guard.producer()?.flush().await.map_err(to_pyerr)
         })
@@ -85,14 +98,29 @@ impl PyBatchingProducer {
 
     /// Flush and stop the linger timer, then raise a kept linger failure.
     /// Later sends raise `InvalidError`.
-    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move {
-            let mut guard = inner.lock().await;
-            match std::mem::replace(&mut *guard, State::Closed) {
-                State::Ready(producer) => producer.close().await.map_err(to_pyerr),
-                State::Pending(_) | State::Closed => Ok(()),
-            }
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
+        awaitable(py, self.closing())
+    }
+
+    /// Enter `async with`: yield the producer. Exiting the block closes it.
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Awaitable<'py, Py<Self>>> {
+        awaitable(py, async move { Ok(slf) })
+    }
+
+    /// Exit `async with`: `close`, then return `False` so an exception in the
+    /// body is not suppressed.
+    #[pyo3(signature = (_exc_type, _exc_value, _traceback))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, bool>> {
+        let closing = self.closing();
+        awaitable(py, async move {
+            closing.await?;
+            Ok(false)
         })
     }
 }

@@ -1,5 +1,5 @@
 use crate::agent_runtime::static_topic;
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::convert::{duration_ms, json_to_py, payload_bytes, py_to_de, py_to_json, ser_to_py};
 use crate::errors::to_pyerr;
@@ -51,12 +51,12 @@ impl PyLaser {
         source: String,
         conversation_id: String,
         state: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
         let source = agent_id(&source)?;
         let conversation = parse_conversation(&conversation_id)?;
         let state = py_to_json(state)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .publish_state_snapshot(source, conversation, &state)
                 .await
@@ -72,12 +72,12 @@ impl PyLaser {
         source: String,
         conversation_id: String,
         patch: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
         let source = agent_id(&source)?;
         let conversation = parse_conversation(&conversation_id)?;
         let patch = py_to_json(patch)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .publish_state_delta(source, conversation, &patch)
                 .await
@@ -91,10 +91,10 @@ impl PyLaser {
         &self,
         py: Python<'py>,
         conversation_id: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.inner.clone();
         let conversation = parse_conversation(&conversation_id)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let state = laser
                 .reconstruct_state(conversation)
                 .await
@@ -112,10 +112,10 @@ impl PyLaser {
         py: Python<'py>,
         conversation_id: String,
         topic: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.inner.clone();
         let conversation = parse_conversation(&conversation_id)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let events = laser
                 .agui_events(conversation, static_topic(topic)?)
                 .await
@@ -167,15 +167,20 @@ impl PyA2aBridge {
     /// An A2A bridge mapping JSON-RPC methods onto agent topics over `laser`,
     /// publishing as `source`. Use it to drive an agent as an A2A task source
     /// from Python. `capabilities` (skill ids, or capability descriptor dicts)
-    /// become the card's skills. `signing_key` signs the published task
-    /// envelopes. Every record the bridge publishes carries its `bridge_hops`
-    /// loop-guard path, starting at `source`.
+    /// become the card's skills. `signing_key` signs every record the bridge
+    /// publishes, the task command and the cancel, so an agent with a
+    /// verifier accepts them. `target` addresses every task that names no
+    /// target to that agent, whose answer must then be signed by it when the
+    /// laser verifies replies. `public_url` is the absolute URL the card
+    /// advertises, `description` and `version` fill the card. Every record the
+    /// bridge publishes carries its `bridge_hops` loop-guard path, starting at
+    /// `source`.
     ///
     /// `task_binding_key` (32 bytes) with `task_binding_ttl_ms` binds every
     /// task id to the caller that submitted it, as Rust `with_task_binding`.
     /// Task methods then need `caller`, the authenticated principal.
     #[new]
-    #[pyo3(signature = (laser, source, request_topic, reply_topic, *, capabilities=None, signing_key=None, task_binding_key=None, task_binding_ttl_ms=None))]
+    #[pyo3(signature = (laser, source, request_topic, reply_topic, *, capabilities=None, signing_key=None, task_binding_key=None, task_binding_ttl_ms=None, target=None, public_url=None, description=None, version=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         laser: PyRef<'_, PyLaser>,
@@ -184,8 +189,13 @@ impl PyA2aBridge {
         reply_topic: String,
         capabilities: Option<Vec<Bound<'_, PyAny>>>,
         signing_key: Option<PyRef<'_, crate::sign::PySigningKey>>,
+        #[gen_stub(override_type(type_repr = "typing.Optional[builtins.bytes]", imports = ("typing", "builtins")))]
         task_binding_key: Option<Vec<u8>>,
         task_binding_ttl_ms: Option<f64>,
+        target: Option<String>,
+        public_url: Option<String>,
+        description: Option<String>,
+        version: Option<String>,
     ) -> PyResult<Self> {
         let mut bridge = A2aBridge::new(
             laser.inner.clone(),
@@ -203,6 +213,18 @@ impl PyA2aBridge {
         }
         if let Some(key) = signing_key {
             bridge = bridge.with_signing_key(key.inner.as_ref().clone());
+        }
+        if let Some(target) = target_agent(target)? {
+            bridge = bridge.with_target(target);
+        }
+        if let Some(url) = public_url {
+            bridge = bridge.with_public_url(url).map_err(to_pyerr)?;
+        }
+        if let Some(description) = description {
+            bridge = bridge.with_description(description);
+        }
+        if let Some(version) = version {
+            bridge = bridge.with_version(version);
         }
         match (task_binding_key, task_binding_ttl_ms) {
             (None, None) => {}
@@ -238,10 +260,10 @@ impl PyA2aBridge {
         py: Python<'py>,
         request: &Bound<'_, PyAny>,
         caller: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let bridge = self.inner.get();
         let request = py_to_json(request)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let response = match caller {
                 Some(caller) => bridge.caller(caller).handle_rpc(request).await,
                 None => bridge.handle_rpc(request).await,
@@ -252,27 +274,40 @@ impl PyA2aBridge {
 
     /// `SendMessage`: publish the params (a dict, or raw JSON str / bytes) as a
     /// task and return the submitted task as a dict. `target` addresses the
-    /// task to one agent. Without it every agent on a shared session topic
-    /// receives the task.
-    #[pyo3(signature = (params_json, *, target=None, caller=None))]
+    /// task to one agent, else the bridge's `target`. Without either every
+    /// agent on a shared session topic receives the task. `previous_hops` is
+    /// the `bridge_hops` of work that already crossed other bridges: the task
+    /// carries that path with this bridge appended, and a path that already
+    /// holds this bridge raises `InvalidError` before anything is published.
+    #[pyo3(signature = (params_json, *, target=None, caller=None, previous_hops=None))]
     fn submit<'py>(
         &self,
         py: Python<'py>,
         params_json: &Bound<'_, PyAny>,
         target: Option<String>,
         caller: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+        previous_hops: Option<Vec<String>>,
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let bridge = self.inner.get();
         let params = json_arg(params_json)?;
         let target = target_agent(target)?;
-        future_into_py(py, async move {
-            let task = match (target, caller) {
-                (Some(target), Some(caller)) => {
+        awaitable(py, async move {
+            let task = match (previous_hops, target, caller) {
+                (Some(previous), target, Some(caller)) => {
+                    bridge
+                        .caller(caller)
+                        .submit_with_hops(&previous, target, params)
+                        .await
+                }
+                (Some(previous), target, None) => {
+                    bridge.submit_with_hops(&previous, target, params).await
+                }
+                (None, Some(target), Some(caller)) => {
                     bridge.caller(caller).submit_to(target, params).await
                 }
-                (None, Some(caller)) => bridge.caller(caller).submit(params).await,
-                (Some(target), None) => bridge.submit_to(target, params).await,
-                (None, None) => bridge.submit(params).await,
+                (None, None, Some(caller)) => bridge.caller(caller).submit(params).await,
+                (None, Some(target), None) => bridge.submit_to(target, params).await,
+                (None, None, None) => bridge.submit(params).await,
             }
             .map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &task))
@@ -291,13 +326,13 @@ impl PyA2aBridge {
         root: Option<String>,
         target: Option<String>,
         caller: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let bridge = self.inner.get();
         let params = json_arg(params_json)?;
         let (parent, root) =
             crate::agent_runtime::parent_pair(Some(parent), root)?.expect("a parent was given");
         let target = target_agent(target)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let task = match (target, caller) {
                 (Some(target), Some(caller)) => {
                     bridge
@@ -314,18 +349,20 @@ impl PyA2aBridge {
         })
     }
 
-    /// `GetTask`: the task's current state (Working until an answer lands,
-    /// Unknown when the bounded lookup could not reach the end of the reply
-    /// topic). `caller` is required when the bridge binds tasks to callers.
+    /// `GetTask`: the task's current state, read forward from the time its id
+    /// was minted (Working until an answer lands, Unknown when the bounded
+    /// lookup could not reach the end of the topic). An id the bridge
+    /// published no task for raises `HandlerConfigError`. `caller` is
+    /// required when the bridge binds tasks to callers.
     #[pyo3(signature = (id, *, caller=None))]
     fn task<'py>(
         &self,
         py: Python<'py>,
         id: String,
         caller: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let bridge = self.inner.get();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let task = match caller {
                 Some(caller) => bridge.caller(caller).task(&id).await,
                 None => bridge.task(&id).await,
@@ -335,17 +372,19 @@ impl PyA2aBridge {
         })
     }
 
-    /// `CancelTask`: cancel the task and return it canceled. `caller` is
-    /// required when the bridge binds tasks to callers.
+    /// `CancelTask`: cancel a task still in progress and return it canceled.
+    /// An unknown task raises `HandlerConfigError`, one that already ended
+    /// `RejectedError`. `caller` is required when the bridge binds tasks to
+    /// callers.
     #[pyo3(signature = (id, *, caller=None))]
     fn cancel<'py>(
         &self,
         py: Python<'py>,
         id: String,
         caller: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let bridge = self.inner.get();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let task = match caller {
                 Some(caller) => bridge.caller(caller).cancel(&id).await,
                 None => bridge.cancel(&id).await,
@@ -355,9 +394,11 @@ impl PyA2aBridge {
         })
     }
 
-    /// The bridge's A2A Agent Card, for discovery.
+    /// The bridge's A2A Agent Card, for discovery. Raises
+    /// `HandlerConfigError` until `public_url` names the endpoint.
     fn card(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        ser_to_py(py, &self.inner.get().card())
+        let card = self.inner.get().card().map_err(to_pyerr)?;
+        ser_to_py(py, &card)
     }
 
     /// The Agent Card signed with `key`, so a client can verify who published
@@ -404,10 +445,13 @@ impl PyMcpBridge {
     /// input_schema}`, a prompt is `{prompt: {name, title?, description?,
     /// arguments?}, messages: [[role, text]]}`). `memory_tools=True` adds the
     /// conventional `remember` and `recall` tools. `timeout_ms` bounds each
-    /// tool call (default 30). Every tool call carries the `bridge_hops`
-    /// loop-guard path, starting at `source`.
+    /// tool call (default 30). `signing_key` signs every tool call, so an
+    /// agent with a verifier accepts them. `target` addresses every call that
+    /// names no target to that agent, whose reply must then be signed by it
+    /// when the laser verifies replies. Every tool call carries the
+    /// `bridge_hops` loop-guard path, starting at `source`.
     #[new]
-    #[pyo3(signature = (laser, source, tool_topic, reply_topic, server_name, *, tools=None, resources=None, prompts=None, timeout_ms=None, memory_tools=false))]
+    #[pyo3(signature = (laser, source, tool_topic, reply_topic, server_name, *, tools=None, resources=None, prompts=None, timeout_ms=None, memory_tools=false, signing_key=None, target=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         laser: PyRef<'_, PyLaser>,
@@ -420,6 +464,8 @@ impl PyMcpBridge {
         prompts: Option<&Bound<'_, PyAny>>,
         timeout_ms: Option<f64>,
         memory_tools: bool,
+        signing_key: Option<PyRef<'_, crate::sign::PySigningKey>>,
+        target: Option<String>,
     ) -> PyResult<Self> {
         let tools: Vec<ToolSpec> = tools.map(py_to_de).transpose()?.unwrap_or_default();
         let resources: Vec<ResourceSpec> = resources.map(py_to_de).transpose()?.unwrap_or_default();
@@ -454,20 +500,28 @@ impl PyMcpBridge {
         if memory_tools {
             bridge = bridge.with_memory_tools();
         }
+        if let Some(key) = signing_key {
+            bridge = bridge.with_signing_key(key.inner.as_ref().clone());
+        }
+        if let Some(target) = target_agent(target)? {
+            bridge = bridge.with_target(target);
+        }
         Ok(Self {
             inner: Held::new(bridge),
             source,
         })
     }
 
+    /// Handle one MCP JSON-RPC message. A notification, a message without an
+    /// `id`, is never answered and resolves to `None`.
     fn handle_rpc<'py>(
         &self,
         py: Python<'py>,
         request: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let bridge = self.inner.get();
         let request = py_to_json(request)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let response = bridge.handle_rpc(request).await;
             Python::attach(|py| ser_to_py(py, &response))
         })
@@ -509,23 +563,33 @@ impl PyMcpBridge {
 
     /// `tools/call`: route the call to the agent and return the tool result as a
     /// dict. `params_json` is the JSON the call carries to the agent, a dict or
-    /// raw JSON str / bytes. `target` addresses the call to one agent.
-    /// Without it every agent on a shared session topic receives the call.
-    #[pyo3(signature = (name, params_json, *, target=None))]
+    /// raw JSON str / bytes. `target` addresses the call to one agent, else
+    /// the bridge's `target`. Without either every agent on a shared session
+    /// topic receives the call. `previous_hops` is the `bridge_hops` of work
+    /// that already crossed other bridges: the call carries that path with
+    /// this bridge appended, and a path that already holds this bridge raises
+    /// `InvalidError` before anything is published.
+    #[pyo3(signature = (name, params_json, *, target=None, previous_hops=None))]
     fn call_tool<'py>(
         &self,
         py: Python<'py>,
         name: String,
         params_json: &Bound<'_, PyAny>,
         target: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+        previous_hops: Option<Vec<String>>,
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let bridge = self.inner.get();
         let arguments = json_arg(params_json)?;
         let target = target_agent(target)?;
-        future_into_py(py, async move {
-            let result = match target {
-                Some(target) => bridge.call_tool_to(target, &name, arguments).await,
-                None => bridge.call_tool(&name, arguments).await,
+        awaitable(py, async move {
+            let result = match (previous_hops, target) {
+                (Some(previous), target) => {
+                    bridge
+                        .call_tool_with_hops(&previous, target, &name, arguments)
+                        .await
+                }
+                (None, Some(target)) => bridge.call_tool_to(target, &name, arguments).await,
+                (None, None) => bridge.call_tool(&name, arguments).await,
             }
             .map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &result))
@@ -544,13 +608,13 @@ impl PyMcpBridge {
         params_json: &Bound<'_, PyAny>,
         root: Option<String>,
         target: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let bridge = self.inner.get();
         let arguments = json_arg(params_json)?;
         let (parent, root) =
             crate::agent_runtime::parent_pair(Some(parent), root)?.expect("a parent was given");
         let target = target_agent(target)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let result = match target {
                 Some(target) => {
                     bridge

@@ -20,6 +20,7 @@ import {
   type CborMap,
   expectMap,
   expectArray,
+  expectString,
   expectU32,
   expectU64,
   field,
@@ -29,7 +30,6 @@ import { type SourceRef, decodeSourceRef, encodeSourceRef } from "./graph.js"
 import {
   MAX_FILTER_SOURCE_NAME_BYTES,
   MAX_HEARTBEAT_SESSIONS,
-  MAX_SESSION_CURSOR_BYTES,
   MAX_SESSION_LABEL_BYTES,
   MAX_SESSION_TEXT_QUERY_BYTES
 } from "./limits.js"
@@ -106,10 +106,15 @@ export interface SessionList {
   readonly labelPrefix?: string
   readonly agent?: AgentId
   readonly text?: string
-  readonly cursor?: string
-  /** The page size. Zero leaves it to the server. */
-  readonly limit: number
-  readonly wantTotal: boolean
+  /** The 1-based page. Zero reads the first page. */
+  readonly page: number
+  /** The sessions per page. Zero leaves it to the server. */
+  readonly results: number
+  /** The bound of a walk: the `asOf` its first page returned, so sessions
+   * folded after it stay out of later pages. */
+  readonly asOf?: bigint
+  /** The change series `asOf` belongs to, from the same first page. */
+  readonly series?: bigint
 }
 
 /** Rust `SessionList::validate`, checked before the request is sent. */
@@ -122,8 +127,7 @@ export function validateSessionList(request: SessionList): void {
   }
   const bounded: readonly (readonly [string, string | undefined, number])[] = [
     ["label prefix", request.labelPrefix, MAX_SESSION_LABEL_BYTES],
-    ["text", request.text, MAX_SESSION_TEXT_QUERY_BYTES],
-    ["cursor", request.cursor, MAX_SESSION_CURSOR_BYTES]
+    ["text", request.text, MAX_SESSION_TEXT_QUERY_BYTES]
   ]
   for (const [label, value, cap] of bounded) {
     const bytes = value === undefined ? 0 : UTF8.encode(value).byteLength
@@ -132,6 +136,26 @@ export function validateSessionList(request: SessionList): void {
         `session list ${label} is ${String(bytes)}B, exceeds cap ${String(cap)}B`
       )
     }
+  }
+  if ((request.asOf === undefined) !== (request.series === undefined)) {
+    throw new InvalidError("session list as_of and series name one bound, set both or neither")
+  }
+}
+
+function encodeBound(map: Map<string, unknown>, asOf?: bigint, series?: bigint): void {
+  if (asOf !== undefined) map.set("as_of", encodeU64(asOf, "walk bound"))
+  if (series !== undefined) map.set("series", encodeU64(series, "walk series"))
+}
+
+function decodeBound(
+  map: CborMap,
+  context: string
+): { readonly asOf?: bigint; readonly series?: bigint } {
+  const asOf = field.optionalU64(map, "as_of", context)
+  const series = field.optionalU64(map, "series", context)
+  return {
+    ...(asOf !== undefined ? { asOf } : {}),
+    ...(series !== undefined ? { series } : {})
   }
 }
 
@@ -142,9 +166,9 @@ export function encodeSessionList(request: SessionList): Map<string, unknown> {
   if (request.labelPrefix !== undefined) map.set("label_prefix", request.labelPrefix)
   if (request.agent !== undefined) map.set("agent", parseAgentId(request.agent))
   if (request.text !== undefined) map.set("text", request.text)
-  if (request.cursor !== undefined) map.set("cursor", request.cursor)
-  map.set("limit", encodeU32(request.limit, "session list limit"))
-  map.set("want_total", request.wantTotal)
+  map.set("page", encodeU32(request.page, "session list page"))
+  map.set("results", encodeU32(request.results, "session list results"))
+  encodeBound(map, request.asOf, request.series)
   return map
 }
 
@@ -154,7 +178,6 @@ export function decodeSessionList(map: CborMap, context: string): SessionList {
   const labelPrefix = field.optionalString(map, "label_prefix", context)
   const agent = field.optionalString(map, "agent", context)
   const text = field.optionalString(map, "text", context)
-  const cursor = field.optionalString(map, "cursor", context)
   return {
     stream: field.requiredString(map, "stream", context),
     ...(status !== undefined ? { status: sessionStatusFromWire(status) } : {}),
@@ -162,37 +185,40 @@ export function decodeSessionList(map: CborMap, context: string): SessionList {
     ...(labelPrefix !== undefined ? { labelPrefix } : {}),
     ...(agent !== undefined ? { agent: parseAgentId(agent) } : {}),
     ...(text !== undefined ? { text } : {}),
-    ...(cursor !== undefined ? { cursor } : {}),
-    limit: field.requiredU32(map, "limit", context),
-    wantTotal: field.requiredBoolean(map, "want_total", context)
+    page: field.requiredU32(map, "page", context),
+    results: field.requiredU32(map, "results", context),
+    ...decodeBound(map, context)
   }
 }
 
 export interface SessionEvents {
   readonly stream: string
   readonly id: ConversationId
-  readonly cursor?: string
-  /** The page size. Zero leaves it to the server. */
-  readonly limit: number
-  readonly fixedFrontier: boolean
+  /** The 1-based page. Zero reads the first page. */
+  readonly page: number
+  /** The events per page. Zero leaves it to the server. */
+  readonly results: number
+  /** The bound of a walk: the `asOf` its first page returned, so events folded
+   * after it stay out of later pages. */
+  readonly asOf?: bigint
+  /** The change series `asOf` belongs to, from the same first page. */
+  readonly series?: bigint
 }
 
 export function encodeSessionEvents(request: SessionEvents): Map<string, unknown> {
   const map = encodeIdentity(request.stream, request.id)
-  if (request.cursor !== undefined) map.set("cursor", request.cursor)
-  map.set("limit", encodeU32(request.limit, "session events limit"))
-  map.set("fixed_frontier", request.fixedFrontier)
+  map.set("page", encodeU32(request.page, "session events page"))
+  map.set("results", encodeU32(request.results, "session events results"))
+  encodeBound(map, request.asOf, request.series)
   return map
 }
 
 export function decodeSessionEvents(map: CborMap, context: string): SessionEvents {
-  const identity = decodeIdentity(map, context)
-  const cursor = field.optionalString(map, "cursor", context)
   return {
-    ...identity,
-    ...(cursor !== undefined ? { cursor } : {}),
-    limit: field.requiredU32(map, "limit", context),
-    fixedFrontier: field.requiredBoolean(map, "fixed_frontier", context)
+    ...decodeIdentity(map, context),
+    page: field.requiredU32(map, "page", context),
+    results: field.requiredU32(map, "results", context),
+    ...decodeBound(map, context)
   }
 }
 
@@ -253,37 +279,30 @@ export function decodeSessionSources(map: CborMap, context: string): SessionSour
   return { ...decodeIdentity(map, context), ...(laneOnly === true ? { laneOnly } : {}) }
 }
 
+/** A page of the change feed. Page `p` of size `r` holds the changes with
+ * sequence `(p - 1) * r + 1` to `p * r`, so appends and pruning never shift a
+ * page. */
 export interface SessionChanges {
   readonly stream: string
-  readonly after: bigint
-  /** The page size. Zero leaves it to the server. */
-  readonly limit: number
-  /** The change series `after` was read from. A different series answers a
-   * resync with the current series and the newest sequence as `floor`, so `0n`
-   * with `after` zero is the one-call start of a follower. Absent skips the
-   * series check and returns the retained rows after `after`. */
-  readonly series?: bigint
+  /** The 1-based page. Zero reads the first page. */
+  readonly page: number
+  /** The changes per page. Zero leaves it to the server. */
+  readonly results: number
 }
 
 export function encodeSessionChanges(request: SessionChanges): Map<string, unknown> {
-  const map = new Map<string, unknown>([
+  return new Map<string, unknown>([
     ["stream", request.stream],
-    ["after", encodeU64(request.after, "session changes after")],
-    ["limit", encodeU32(request.limit, "session changes limit")]
+    ["page", encodeU32(request.page, "session changes page")],
+    ["results", encodeU32(request.results, "session changes results")]
   ])
-  if (request.series !== undefined) {
-    map.set("series", encodeU64(request.series, "session changes series"))
-  }
-  return map
 }
 
 export function decodeSessionChanges(map: CborMap, context: string): SessionChanges {
-  const series = field.optionalU64(map, "series", context)
   return {
     stream: field.requiredString(map, "stream", context),
-    after: field.requiredU64(map, "after", context),
-    limit: field.requiredU32(map, "limit", context),
-    ...(series === undefined ? {} : { series })
+    page: field.requiredU32(map, "page", context),
+    results: field.requiredU32(map, "results", context)
   }
 }
 
@@ -391,6 +410,8 @@ export interface SessionInfo {
   readonly idle: boolean
   readonly overBudget: boolean
   readonly pauseRequested: boolean
+  /** The participants of the pause in force that have not acknowledged it. */
+  readonly awaiting: readonly AgentId[]
   readonly cancelRequested: boolean
   readonly startedAt?: bigint
   readonly endedAt?: bigint
@@ -412,13 +433,23 @@ export interface SessionInfo {
   readonly frontier: readonly SourceFrontier[]
 }
 
+/** One page of session summaries, newest created first. `page` counts from 1. */
 export interface SessionPage {
   readonly items: readonly SessionInfo[]
-  readonly cursor?: string
-  readonly total?: bigint
+  readonly page: number
+  readonly totalPages: number
+  readonly totalResults: number
+  /** The newest change the page covers. Pass it back with `series` for the next
+   * page of the same walk. */
+  readonly asOf: bigint
+  /** The change series of the serving index. */
+  readonly series: bigint
+  /** The rows a substring search examined. */
   readonly searched?: bigint
+  /** A substring search filled its scan window, so `totalResults` counts only the matches
+   * inside it. */
   readonly truncated: boolean
-  /** The index is rebuilding on this node, so `items` and `total` can be incomplete. */
+  /** The index is rebuilding on this node, so `items` and the totals can be incomplete. */
   readonly rebuilding: boolean
 }
 
@@ -441,12 +472,20 @@ export interface SessionEvent {
   readonly summary: ReadonlyMap<string, unknown>
 }
 
+/** One page of a session timeline in server append time order. `page` counts
+ * from 1. */
 export interface SessionEventsPage {
   readonly items: readonly SessionEvent[]
-  readonly cursor?: string
+  readonly page: number
+  readonly totalPages: number
+  readonly totalResults: number
+  /** The newest change the page covers. Pass it back with `series` for the next
+   * page of the same walk. */
+  readonly asOf: bigint
+  /** The change series of the serving index. */
+  readonly series: bigint
   readonly ranges: readonly PayloadRange[]
   readonly frontier: readonly SourceFrontier[]
-  readonly fixedFrontier: boolean
   readonly gaps: readonly SourceGap[]
 }
 
@@ -496,16 +535,19 @@ export interface SessionChangeRow {
   readonly origin?: SessionChangeOrigin
 }
 
-/** Change rows after a sequence. On a series mismatch `floor` is the newest
- * sequence and `resync` is set. Otherwise `floor` is the oldest retained
- * sequence, or the next one when none is retained, and `resync` is set when
- * `after + 1 < floor`, even with rows present. On `resync` the reader adopts
- * `series` and `floor` and lists sessions again. */
+/** One page of the change feed in sequence order. `totalResults` is the newest
+ * sequence, pruned changes included, and `floor` the oldest retained sequence,
+ * or the next one when none is retained. A follower whose `series` differs, or
+ * whose next sequence is below `floor`, lists sessions again. */
 export interface SessionChangesView {
-  readonly rows: readonly SessionChangeRow[]
+  readonly items: readonly SessionChangeRow[]
+  readonly page: number
+  readonly totalPages: number
+  readonly totalResults: bigint
+  /** The page size the server used, which fixes the sequence range of a page. */
+  readonly results: number
   readonly floor: bigint
-  readonly resync: boolean
-  /** The change series these sequence numbers belong to, zero when unnamed. */
+  /** The registration's change series. */
   readonly series: bigint
 }
 
@@ -783,6 +825,7 @@ export function encodeSessionInfo(info: SessionInfo): Map<string, unknown> {
   map.set("idle", info.idle)
   map.set("over_budget", info.overBudget)
   map.set("pause_requested", info.pauseRequested)
+  setList(map, "awaiting", info.awaiting, parseAgentId)
   map.set("cancel_requested", info.cancelRequested)
   encodeU64Option(map, "started_at", info.startedAt)
   encodeU64Option(map, "ended_at", info.endedAt)
@@ -828,6 +871,9 @@ export function decodeSessionInfo(map: CborMap, context: string): SessionInfo {
     idle: field.requiredBoolean(map, "idle", context),
     overBudget: field.requiredBoolean(map, "over_budget", context),
     pauseRequested: field.requiredBoolean(map, "pause_requested", context),
+    awaiting: field.optionalArray(map, "awaiting", context, (item, index) =>
+      parseAgentId(expectString(item, `${context}.awaiting[${String(index)}]`))
+    ),
     cancelRequested: field.requiredBoolean(map, "cancel_requested", context),
     ...(startedAt !== undefined ? { startedAt } : {}),
     ...(endedAt !== undefined ? { endedAt } : {}),
@@ -850,9 +896,14 @@ export function decodeSessionInfo(map: CborMap, context: string): SessionInfo {
 }
 
 function encodeSessionPage(page: SessionPage): Map<string, unknown> {
-  const map = new Map<string, unknown>([["items", page.items.map(encodeSessionInfo)]])
-  if (page.cursor !== undefined) map.set("cursor", page.cursor)
-  encodeU64Option(map, "total", page.total)
+  const map = new Map<string, unknown>([
+    ["items", page.items.map(encodeSessionInfo)],
+    ["page", encodeU32(page.page, "page")],
+    ["total_pages", encodeU32(page.totalPages, "total pages")],
+    ["total_results", encodeU32(page.totalResults, "total results")],
+    ["as_of", encodeU64(page.asOf, "as of")],
+    ["series", encodeU64(page.series, "series")]
+  ])
   encodeU64Option(map, "searched", page.searched)
   map.set("truncated", page.truncated)
   setTrue(map, "rebuilding", page.rebuilding)
@@ -860,13 +911,14 @@ function encodeSessionPage(page: SessionPage): Map<string, unknown> {
 }
 
 function decodeSessionPage(map: CborMap, context: string): SessionPage {
-  const cursor = field.optionalString(map, "cursor", context)
-  const total = field.optionalU64(map, "total", context)
   const searched = field.optionalU64(map, "searched", context)
   return {
     items: readList(map, "items", context, decodeSessionInfo),
-    ...(cursor !== undefined ? { cursor } : {}),
-    ...(total !== undefined ? { total } : {}),
+    page: field.requiredU32(map, "page", context),
+    totalPages: field.requiredU32(map, "total_pages", context),
+    totalResults: field.requiredU32(map, "total_results", context),
+    asOf: field.requiredU64(map, "as_of", context),
+    series: field.requiredU64(map, "series", context),
     ...(searched !== undefined ? { searched } : {}),
     truncated: field.requiredBoolean(map, "truncated", context),
     rebuilding: field.optionalBoolean(map, "rebuilding", context) ?? false
@@ -934,23 +986,30 @@ function decodeSummary(map: CborMap | undefined, context: string): Map<string, u
 }
 
 function encodeEventsPage(page: SessionEventsPage): Map<string, unknown> {
-  const map = new Map<string, unknown>([["items", page.items.map(encodeSessionEvent)]])
-  if (page.cursor !== undefined) map.set("cursor", page.cursor)
+  const map = new Map<string, unknown>([
+    ["items", page.items.map(encodeSessionEvent)],
+    ["page", encodeU32(page.page, "page")],
+    ["total_pages", encodeU32(page.totalPages, "total pages")],
+    ["total_results", encodeU32(page.totalResults, "total results")],
+    ["as_of", encodeU64(page.asOf, "as of")],
+    ["series", encodeU64(page.series, "series")]
+  ])
   setList(map, "ranges", page.ranges, encodePayloadRange)
   setList(map, "frontier", page.frontier, encodeSourceFrontier)
-  map.set("fixed_frontier", page.fixedFrontier)
   setList(map, "gaps", page.gaps, encodeSourceGap)
   return map
 }
 
 function decodeEventsPage(map: CborMap, context: string): SessionEventsPage {
-  const cursor = field.optionalString(map, "cursor", context)
   return {
     items: readList(map, "items", context, decodeSessionEvent),
-    ...(cursor !== undefined ? { cursor } : {}),
+    page: field.requiredU32(map, "page", context),
+    totalPages: field.requiredU32(map, "total_pages", context),
+    totalResults: field.requiredU32(map, "total_results", context),
+    asOf: field.requiredU64(map, "as_of", context),
+    series: field.requiredU64(map, "series", context),
     ranges: readList(map, "ranges", context, decodePayloadRange),
     frontier: readFrontier(map, context),
-    fixedFrontier: field.requiredBoolean(map, "fixed_frontier", context),
     gaps: readList(map, "gaps", context, decodeSourceGap)
   }
 }
@@ -1057,21 +1116,26 @@ function decodeChangeRow(map: CborMap, context: string): SessionChangeRow {
 }
 
 function encodeChanges(changes: SessionChangesView): Map<string, unknown> {
-  const map = new Map<string, unknown>([
-    ["rows", changes.rows.map(encodeChangeRow)],
+  return new Map<string, unknown>([
+    ["items", changes.items.map(encodeChangeRow)],
+    ["page", encodeU32(changes.page, "page")],
+    ["total_pages", encodeU32(changes.totalPages, "total pages")],
+    ["total_results", encodeU64(changes.totalResults, "total results")],
+    ["results", encodeU32(changes.results, "results")],
     ["floor", encodeU64(changes.floor, "change floor")],
-    ["resync", changes.resync]
+    ["series", encodeU64(changes.series, "change series")]
   ])
-  if (changes.series !== 0n) map.set("series", encodeU64(changes.series, "change series"))
-  return map
 }
 
 function decodeChanges(map: CborMap, context: string): SessionChangesView {
   return {
-    rows: readList(map, "rows", context, decodeChangeRow),
+    items: readList(map, "items", context, decodeChangeRow),
+    page: field.requiredU32(map, "page", context),
+    totalPages: field.requiredU32(map, "total_pages", context),
+    totalResults: field.requiredU64(map, "total_results", context),
+    results: field.requiredU32(map, "results", context),
     floor: field.requiredU64(map, "floor", context),
-    resync: field.requiredBoolean(map, "resync", context),
-    series: field.optionalU64(map, "series", context) ?? 0n
+    series: field.requiredU64(map, "series", context)
   }
 }
 

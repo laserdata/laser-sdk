@@ -1,7 +1,6 @@
 use crate::codes::*;
 use crate::error::InvalidError;
-use crate::limits::MAX_ROLE_NAME_BYTES;
-use crate::{checkpoint::CheckpointRequestId, destination::DestinationId};
+use crate::limits::{MAX_AUTHZ_MUTATION_ID_BYTES, MAX_ROLE_NAME_BYTES};
 use serde::{Deserialize, Serialize};
 
 /// Whether a grant permits or forbids. `Deny` always wins over `Allow`.
@@ -54,7 +53,11 @@ pub enum Feature {
     Query,
     Agent,
     Workflow,
+    /// Retired with lakehouse destinations. Kept so the action mask positions
+    /// of the features after it stay fixed.
     Destination,
+    /// Retired with lakehouse destinations. Kept so the action mask positions
+    /// of the features after it stay fixed.
     Checkpoint,
     /// Administration of the authorization layer itself (defining roles and
     /// binding them). Gated by `authz:admin`, never derived from a command code.
@@ -62,7 +65,7 @@ pub enum Feature {
     /// Lease lifecycle in a coordination namespace: acquire, renew, and release
     /// (`kv_lease:admin`), including delegated acquisition for another subject.
     /// Split from [`Feature::Kv`] so a state writer's `kv:write` grant never
-    /// implies lease control; the action vocabulary stays the shared
+    /// implies lease control. The action vocabulary stays the shared
     /// read/write/delete/admin set (every action widens the coarse mask by one
     /// bit per feature, so features split, actions do not grow).
     KvLease,
@@ -180,85 +183,6 @@ fn prefix_stream(prefix: &str) -> Option<&str> {
         .strip_prefix(STREAM_RESOURCE_PREFIX)?
         .strip_suffix('/')
         .filter(|stream| !stream.is_empty() && !stream.contains('/'))
-}
-
-pub const OPERATOR_ASSERTION_VERSION: u32 = 1;
-pub const OPERATOR_ASSERTION_DOMAIN: &[u8] = b"agdx.operator-actor.v1";
-pub const MAX_OPERATOR_ASSERTION_TTL_MICROS: u64 = 5 * 60 * 1_000_000;
-pub const OPERATOR_ASSERTION_KEY_ID_BYTES: usize = 8;
-pub const OPERATOR_ASSERTION_SIGNATURE_BYTES: usize = 64;
-
-/// Canonical claims signed by the service operator for one high-risk Iggy mutation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OperatorActorClaims {
-    pub v: u32,
-    pub request_id: CheckpointRequestId,
-    pub deployment_id: u32,
-    pub cloud_user_id: u32,
-    pub action: OperatorAssertionAction,
-    pub destination_id: DestinationId,
-    pub destination_generation: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_revision: Option<u64>,
-    pub issued_at_micros: u64,
-    pub expires_at_micros: u64,
-}
-
-/// Signed cloud-user evidence accepted only for the exact action and destination.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OperatorActorAssertion {
-    pub claims: OperatorActorClaims,
-    #[serde(with = "crate::encoding::bin_bytes")]
-    pub key_id: Vec<u8>,
-    #[serde(with = "crate::encoding::bin_bytes")]
-    pub signature: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum OperatorAssertionAction {
-    AcceptRetentionGap,
-    SupersedeGeneration,
-    RecordRepair,
-}
-
-impl OperatorActorAssertion {
-    pub fn validate(&self) -> Result<(), InvalidError> {
-        let claims = &self.claims;
-        if claims.v != OPERATOR_ASSERTION_VERSION {
-            return Err(InvalidError::new(format!(
-                "operator assertion version must be {OPERATOR_ASSERTION_VERSION}"
-            )));
-        }
-        if claims.request_id.as_u128() == 0
-            || claims.deployment_id == 0
-            || claims.cloud_user_id == 0
-            || claims.destination_id.as_u128() == 0
-            || claims.destination_generation == 0
-        {
-            return Err(InvalidError::new(
-                "operator assertion identities must be nonzero",
-            ));
-        }
-        if claims.issued_at_micros == 0
-            || claims.expires_at_micros <= claims.issued_at_micros
-            || claims.expires_at_micros - claims.issued_at_micros
-                > MAX_OPERATOR_ASSERTION_TTL_MICROS
-        {
-            return Err(InvalidError::new(
-                "operator assertion validity window is invalid",
-            ));
-        }
-        if self.key_id.len() != OPERATOR_ASSERTION_KEY_ID_BYTES
-            || self.signature.len() != OPERATOR_ASSERTION_SIGNATURE_BYTES
-        {
-            return Err(InvalidError::new(
-                "operator assertion key id or signature length is invalid",
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// The verb a grant permits, derived from the command code by [`feature_action`].
@@ -397,18 +321,52 @@ pub fn validate_role_name(name: &str) -> Result<(), InvalidError> {
     crate::validate::validate_safelisted_name("role name", name, MAX_ROLE_NAME_BYTES)
 }
 
+/// The role definition rule: a valid name and grants only on features some
+/// request is authorized against. `memory`, `agent` and `workflow` have no
+/// command that checks them, and a feature this build does not know is never
+/// matched, so a grant on one would be stored and change nothing. Enforced on
+/// define, never on replay.
+pub fn validate_role(role: &Role) -> Result<(), InvalidError> {
+    validate_role_name(&role.name)?;
+    match role.grants.iter().find(|grant| {
+        matches!(
+            grant.feature,
+            Feature::Memory | Feature::Agent | Feature::Workflow | Feature::Unrecognized
+        )
+    }) {
+        Some(grant) => Err(InvalidError::new(format!(
+            "no request is authorized against the `{}` feature, so a grant on it has no effect",
+            grant.feature
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The canonical authorization mutation id rule: non-empty, at most
+/// [`MAX_AUTHZ_MUTATION_ID_BYTES`] bytes of ASCII letters, digits and `-`.
+pub fn validate_mutation_id(mutation_id: &str) -> Result<(), InvalidError> {
+    if mutation_id.is_empty() || mutation_id.len() > MAX_AUTHZ_MUTATION_ID_BYTES {
+        return Err(InvalidError::new(format!(
+            "mutation id must be 1 to {MAX_AUTHZ_MUTATION_ID_BYTES} bytes"
+        )));
+    }
+    if !mutation_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(InvalidError::new(
+            "mutation id may hold only ASCII letters, digits and '-'",
+        ));
+    }
+    Ok(())
+}
+
 /// The `(feature, action)` a managed command code authorizes against. `None` for
 /// a code with no capability semantics (hello, backend hello, client metadata,
 /// batch, and the authz band itself), which is gated another way.
 pub fn feature_action(code: u32) -> Option<(Feature, Action)> {
     let pair = match code {
-        AGDX_QUERY_CODE | AGDX_QUERY_PAGE_CODE | AGDX_QUERY_STATUS_CODE => {
-            (Feature::Query, Action::Read)
-        }
-        AGDX_QUERY_CANCEL_CODE => (Feature::Query, Action::Delete),
-        AGDX_DESTINATION_GET_CODE | AGDX_DESTINATION_LIST_CODE | AGDX_QUERY_ROUTE_LIST_CODE => {
-            (Feature::Destination, Action::Read)
-        }
+        AGDX_QUERY_CODE => (Feature::Query, Action::Read),
         AGDX_GET_PROJECTION_CODE
         | AGDX_LIST_PROJECTIONS_CODE
         | AGDX_GET_SCHEMA_CODE
@@ -419,8 +377,8 @@ pub fn feature_action(code: u32) -> Option<(Feature, Action)> {
             (Feature::Kv, Action::Read)
         }
         // A fenced CAS additionally requires `kv_fence:read` on its
-        // coordination namespace ([`crate::kv::KvCasFenced::fence_namespace`]);
-        // this map carries the primary target-namespace grant and the enforcer
+        // coordination namespace ([`crate::kv::KvCasFenced::fence_namespace`]).
+        // This map carries the primary target-namespace grant and the enforcer
         // checks the fence grant beside it.
         AGDX_KV_SET_CODE
         | AGDX_KV_CAS_CODE
@@ -576,11 +534,15 @@ pub struct GetBindingsReq {
     pub user_id: u32,
 }
 
-/// One user's bound role names.
+/// One user's bound role names and the binding revision they were read at.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindingsReply {
     pub v: u32,
     pub roles: Vec<String>,
+    /// The revision of the binding the roles were read from, the value a
+    /// [`BindRolesReq::expect_revision`] names to replace exactly this binding.
+    /// Zero for a user that was never bound.
+    pub revision: u64,
 }
 
 /// Define or replace a role (upsert, carries the full grant set).
@@ -712,6 +674,10 @@ pub enum AuthzError {
     /// A define or bind named a role that fails [`validate_role_name`].
     #[error("invalid role name: {0}")]
     InvalidName(String),
+    /// A define granted a feature no request is authorized against, see
+    /// [`validate_role`]. Nothing applied.
+    #[error("invalid grant: {0}")]
+    InvalidGrant(String),
     /// A compare-and-swap bind lost the precondition: the binding's current
     /// revision is not the one the request expected, so a concurrent admin got
     /// there first. The caller re-reads and retries.
@@ -724,11 +690,53 @@ pub enum AuthzError {
     /// streams.
     #[error("refused by stream tenancy: {0}")]
     TenancyViolation(String),
+    /// The mutation id already names a different request of the same account.
+    /// Nothing applied. A new operation needs a new mutation id.
+    #[error("mutation id conflict: {0}")]
+    MutationConflict(String),
+    /// No receipt capacity is free for a new mutation id inside the replay
+    /// window. Nothing applied. Retrying the same request later may succeed.
+    #[error("authorization receipt capacity exhausted: {0}")]
+    ResourceLimit(String),
 }
 
 #[cfg(all(test, feature = "cbor"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_grants_on_unenforced_features_when_a_role_is_validated_then_should_refuse_them() {
+        let grant = |feature| Grant {
+            effect: Effect::Allow,
+            feature,
+            action: Action::Read,
+            resource: ResourcePattern::all(),
+        };
+        let role = |grants| Role {
+            name: "reader".to_owned(),
+            grants,
+        };
+        for feature in [
+            Feature::Memory,
+            Feature::Agent,
+            Feature::Workflow,
+            Feature::Unrecognized,
+        ] {
+            assert!(
+                validate_role(&role(vec![grant(Feature::Kv), grant(feature)])).is_err(),
+                "{feature}"
+            );
+        }
+        validate_role(&role(vec![grant(Feature::Kv), grant(Feature::Session)]))
+            .expect("enforced features validate");
+        assert!(
+            validate_role(&Role {
+                name: "bad name".to_owned(),
+                grants: Vec::new(),
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn given_role_grants_when_attributed_then_should_name_one_stream_or_none() {
@@ -786,6 +794,32 @@ mod tests {
             "stream:a/"
         ))));
         assert!(!grant_spans_streams(&allow(ResourcePattern::literal("x"))));
+        for spanning in [
+            ResourcePattern::prefix("stream:"),
+            ResourcePattern::prefix("stream:acme"),
+            ResourcePattern::prefix("stream:/notes"),
+            ResourcePattern::prefix("acme/"),
+            ResourcePattern::prefix(""),
+        ] {
+            assert!(
+                grant_spans_streams(&allow(spanning.clone())),
+                "{spanning:?} reaches more than one stream"
+            );
+        }
+        for inside in [
+            ResourcePattern::literal("stream:acme"),
+            ResourcePattern::literal("stream:acme/notes"),
+            ResourcePattern::prefix("stream:acme/agent."),
+        ] {
+            assert!(
+                !grant_spans_streams(&allow(inside.clone())),
+                "{inside:?} stays inside one stream"
+            );
+        }
+        assert!(!grant_spans_streams(&Grant {
+            effect: Effect::Deny,
+            ..allow(ResourcePattern::all())
+        }));
         assert!(Tenancy::default().is_deployment());
     }
     use crate::framing::{decode_named, encode_named};
@@ -984,12 +1018,6 @@ mod tests {
             feature_action(AGDX_GRAPH_UPSERT_CODE),
             Some((Feature::Graph, Action::Write))
         );
-        assert_eq!(
-            feature_action(AGDX_DESTINATION_GET_CODE),
-            Some((Feature::Destination, Action::Read))
-        );
-        assert_eq!(feature_action(AGDX_CHECKPOINT_CODE), None);
-        assert_eq!(feature_action(AGDX_DESTINATION_HTTP_CODE), None);
         // No capability semantics: hello, batch, and the authz band self-gate.
         assert_eq!(feature_action(AGDX_HELLO_CODE), None);
         assert_eq!(feature_action(AGDX_BATCH_CODE), None);

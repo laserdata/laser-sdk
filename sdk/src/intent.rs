@@ -35,7 +35,7 @@ pub struct Intent {
     /// The policy version frozen when this intent was proposed.
     pub policy_version: u64,
     /// Epoch micros after which an incomplete intent aborts.
-    pub deadline_micros: u64,
+    pub deadline_at_micros: u64,
     /// Proposal time, in epoch micros.
     pub at_micros: u64,
 }
@@ -52,19 +52,19 @@ impl Intent {
         #[builder(default)] mandatory_voters: Vec<AgentId>,
         policy: IntentPolicy,
         policy_version: u64,
-        deadline_micros: u64,
+        deadline_at_micros: u64,
     ) -> Result<Self, IntentError> {
         let intent = Self {
             intent_id: IntentId::new(),
             conversation,
             proposer,
-            digest: digest_of(&body),
+            digest: digest_of(&body)?,
             body,
             eligible_voters,
             mandatory_voters,
             policy,
             policy_version,
-            deadline_micros,
+            deadline_at_micros,
             at_micros: now_micros(),
         };
         intent.validate()?;
@@ -102,13 +102,13 @@ impl Intent {
                 eligible: self.eligible_voters.len(),
             });
         }
-        if self.deadline_micros <= self.at_micros {
+        if self.deadline_at_micros <= self.at_micros {
             return Err(IntentError::InvalidDeadline {
                 proposed: self.at_micros,
-                deadline: self.deadline_micros,
+                deadline: self.deadline_at_micros,
             });
         }
-        if self.digest != digest_of(&self.body) {
+        if self.digest != digest_of(&self.body)? {
             return Err(IntentError::DigestMismatch);
         }
         Ok(())
@@ -132,10 +132,14 @@ pub enum IntentError {
     InvalidDeadline { proposed: u64, deadline: u64 },
     #[error("intent digest does not match its body")]
     DigestMismatch,
+    #[error("intent body does not encode for its digest: {0}")]
+    DigestEncoding(String),
     #[error("voter '{0}' is not eligible for this intent")]
     IneligibleVoter(String),
     #[error("decision is not bound to this intent body and policy version")]
     DecisionIntentMismatch,
+    #[error("decision votes do not meet this intent's quorum")]
+    DecisionQuorumNotMet,
 }
 
 // An intent rejected at construction, voting, or folding is a validation
@@ -188,6 +192,16 @@ impl Vote {
             at_micros: now_micros(),
         })
     }
+}
+
+/// One ballot as a reader saw it: the [`Vote`] record and the time the log
+/// assigned it, the record's server timestamp. [`decide`] windows and orders
+/// by `observed_at_micros` and keeps the voter's `at_micros` only as recorded
+/// evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservedVote {
+    pub vote: Vote,
+    pub observed_at_micros: u64,
 }
 
 /// A durable ballot choice.
@@ -247,7 +261,9 @@ pub struct Decision {
 
 impl Decision {
     /// Verify that this decision is bound to `intent` before releasing an
-    /// effect. An aborted decision is valid evidence but does not authorize.
+    /// effect. An aborted decision is valid evidence but does not authorize. A
+    /// committed one authorizes only when its considered votes meet the
+    /// intent's quorum, so a decision record without them is refused.
     pub fn authorizes(&self, intent: &Intent) -> Result<bool, IntentError> {
         intent.validate()?;
         if self.intent_id != intent.intent_id
@@ -256,49 +272,61 @@ impl Decision {
         {
             return Err(IntentError::DecisionIntentMismatch);
         }
-        Ok(self.outcome == IntentOutcome::Committed)
+        if self.outcome != IntentOutcome::Committed {
+            return Ok(false);
+        }
+        if !commit_supported(intent, &self.votes_considered) {
+            return Err(IntentError::DecisionQuorumNotMet);
+        }
+        Ok(true)
     }
 }
 
 /// Fold ballots into a decision, or return `None` while the outcome remains
 /// reachable before the deadline.
 ///
-/// Invalid ballots are ignored. Ballots outside the proposal-to-deadline
-/// window are invalid. Identical repeats are idempotent. Conflicting choices
-/// by one voter abort. Mandatory voters must allow before a quorum can commit.
-/// The valid ballot set is sorted before folding, so input and replay order do
-/// not affect the decision or its evidence.
+/// Each ballot is windowed and ordered by the time the reader observed it,
+/// the record's server timestamp, never by the voter's own `at_micros`, so a
+/// late ballot cannot claim an earlier time. Invalid ballots are ignored.
+/// Ballots observed outside the proposal-to-deadline window or after `now`
+/// are invalid. Identical repeats are idempotent. Conflicting choices by one
+/// voter abort. Mandatory voters must allow before a quorum can commit. The
+/// valid ballot set is sorted before folding, so input and replay order do not
+/// affect the decision or its evidence.
 pub fn decide(
     intent: &Intent,
-    votes: &[Vote],
+    votes: &[ObservedVote],
     now_micros: u64,
 ) -> Result<Option<Decision>, IntentError> {
     intent.validate()?;
-    let mut valid: Vec<&Vote> = votes
+    let mut valid: Vec<&ObservedVote> = votes
         .iter()
-        .filter(|vote| {
+        .filter(|observed| {
+            let vote = &observed.vote;
             vote.intent_id == intent.intent_id
                 && vote.intent_digest == intent.digest
                 && vote.policy_version == intent.policy_version
                 && intent.eligible_voters.contains(&vote.voter)
-                && vote.at_micros >= intent.at_micros
-                && vote.at_micros <= intent.deadline_micros
-                && vote.at_micros <= now_micros
+                && observed.observed_at_micros >= intent.at_micros
+                && observed.observed_at_micros <= intent.deadline_at_micros
+                && observed.observed_at_micros <= now_micros
         })
         .collect();
     valid.sort_by(|left, right| {
-        left.voter
+        left.vote
+            .voter
             .as_str()
-            .cmp(right.voter.as_str())
-            .then(left.at_micros.cmp(&right.at_micros))
-            .then(choice_rank(left.choice).cmp(&choice_rank(right.choice)))
+            .cmp(right.vote.voter.as_str())
+            .then(left.observed_at_micros.cmp(&right.observed_at_micros))
+            .then(choice_rank(left.vote.choice).cmp(&choice_rank(right.vote.choice)))
     });
 
     let mut ballots: HashMap<&AgentId, VoteChoice> = HashMap::new();
     let mut considered = Vec::new();
     let mut terminal_at = intent.at_micros;
-    for vote in valid {
-        terminal_at = terminal_at.max(vote.at_micros);
+    for observed in valid {
+        let vote = &observed.vote;
+        terminal_at = terminal_at.max(observed.observed_at_micros);
         match ballots.get(&vote.voter) {
             None => {
                 ballots.insert(&vote.voter, vote.choice);
@@ -342,12 +370,7 @@ pub fn decide(
         .mandatory_voters
         .iter()
         .all(|voter| ballots.get(voter) == Some(&VoteChoice::Allow));
-    let quorum_met = match intent.policy {
-        IntentPolicy::All => allow == total,
-        IntentPolicy::Any => allow >= 1,
-        IntentPolicy::AtLeast(required) => allow >= required,
-    };
-    if quorum_met && mandatory_met {
+    if quorum_met(intent.policy, allow, total) && mandatory_met {
         return Ok(Some(sealed(
             intent,
             IntentOutcome::Committed,
@@ -362,7 +385,7 @@ pub fn decide(
         IntentPolicy::Any => responded == total && allow == 0,
         IntentPolicy::AtLeast(required) => allow + (total - responded) < required,
     };
-    let deadline_passed = now_micros >= intent.deadline_micros;
+    let deadline_passed = now_micros >= intent.deadline_at_micros;
     if impossible || deadline_passed {
         let reason = if deadline_passed && !mandatory_met {
             "mandatory approval not reached by deadline".to_owned()
@@ -377,13 +400,45 @@ pub fn decide(
             reason,
             considered,
             if deadline_passed {
-                intent.deadline_micros
+                intent.deadline_at_micros
             } else {
                 terminal_at
             },
         )));
     }
     Ok(None)
+}
+
+fn quorum_met(policy: IntentPolicy, allow: usize, total: usize) -> bool {
+    match policy {
+        IntentPolicy::All => allow == total,
+        IntentPolicy::Any => allow >= 1,
+        IntentPolicy::AtLeast(required) => allow >= required,
+    }
+}
+
+// Whether `votes` alone justify committing `intent`: eligible voters, one
+// choice each, every mandatory voter allowing, and the quorum met.
+fn commit_supported(intent: &Intent, votes: &[(AgentId, VoteChoice)]) -> bool {
+    let mut ballots: HashMap<&AgentId, VoteChoice> = HashMap::with_capacity(votes.len());
+    for (voter, choice) in votes {
+        if !intent.eligible_voters.contains(voter)
+            || ballots
+                .insert(voter, *choice)
+                .is_some_and(|previous| previous != *choice)
+        {
+            return false;
+        }
+    }
+    let allow = ballots
+        .values()
+        .filter(|choice| **choice == VoteChoice::Allow)
+        .count();
+    intent
+        .mandatory_voters
+        .iter()
+        .all(|voter| ballots.get(voter) == Some(&VoteChoice::Allow))
+        && quorum_met(intent.policy, allow, intent.eligible_voters.len())
 }
 
 fn choice_rank(choice: VoteChoice) -> u8 {
@@ -412,13 +467,21 @@ fn sealed(
     }
 }
 
-fn digest_of(body: &[u8]) -> String {
+fn digest_of(body: &[u8]) -> Result<String, IntentError> {
     #[derive(Serialize)]
     struct DigestInput<'a> {
+        #[serde(serialize_with = "byte_string")]
         body: &'a [u8],
     }
-    let canonical = encode_named(&DigestInput { body }).expect("bytes always encode");
-    blake3::hash(&canonical).to_string()
+    let canonical = encode_named(&DigestInput { body })
+        .map_err(|error| IntentError::DigestEncoding(error.to_string()))?;
+    Ok(blake3::hash(&canonical).to_string())
+}
+
+// The body enters the digest as one CBOR byte string, the form every client
+// encodes, never serde's default array of integers.
+fn byte_string<S: serde::Serializer>(body: &&[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bytes(body)
 }
 
 fn now_micros() -> u64 {
@@ -457,21 +520,24 @@ mod tests {
             .mandatory_voters(mandatory.iter().map(|voter| agent(voter)).collect())
             .policy(policy)
             .policy_version(1)
-            .deadline_micros(u64::MAX)
+            .deadline_at_micros(u64::MAX)
             .build()
             .expect("intent is valid");
         intent.at_micros = 10;
-        intent.deadline_micros = 1_000;
+        intent.deadline_at_micros = 1_000;
         intent
     }
 
-    fn vote(intent: &Intent, voter: &str, choice: VoteChoice) -> Vote {
+    fn vote(intent: &Intent, voter: &str, choice: VoteChoice) -> ObservedVote {
         let mut vote = Vote::cast(intent, agent(voter), choice).expect("voter is eligible");
         vote.at_micros = 100;
-        vote
+        ObservedVote {
+            vote,
+            observed_at_micros: 100,
+        }
     }
 
-    fn decided(intent: &Intent, votes: &[Vote], now: u64) -> Decision {
+    fn decided(intent: &Intent, votes: &[ObservedVote], now: u64) -> Decision {
         decide(intent, votes, now)
             .expect("intent is valid")
             .expect("intent decides")
@@ -486,7 +552,7 @@ mod tests {
             .eligible_voters(Vec::new())
             .policy(IntentPolicy::Any)
             .policy_version(1)
-            .deadline_micros(u64::MAX)
+            .deadline_at_micros(u64::MAX)
             .build();
         assert_eq!(result, Err(IntentError::NoEligibleVoters));
 
@@ -508,7 +574,7 @@ mod tests {
                 .eligible_voters(vec![agent("a")])
                 .policy(IntentPolicy::AtLeast(required))
                 .policy_version(1)
-                .deadline_micros(u64::MAX)
+                .deadline_at_micros(u64::MAX)
                 .build();
             assert!(matches!(result, Err(IntentError::InvalidThreshold { .. })));
         }
@@ -601,7 +667,7 @@ mod tests {
     fn given_late_allow_when_decided_then_should_ignore_it_and_abort() {
         let intent = intent(IntentPolicy::Any, &["a"], &[]);
         let mut late = vote(&intent, "a", VoteChoice::Allow);
-        late.at_micros = 1_001;
+        late.observed_at_micros = 1_001;
         assert_eq!(
             decided(&intent, &[late], 1_001).outcome,
             IntentOutcome::Aborted
@@ -609,10 +675,22 @@ mod tests {
     }
 
     #[test]
+    fn given_a_ballot_claiming_an_in_window_time_but_observed_after_the_deadline_when_decided_then_should_not_count()
+     {
+        let intent = intent(IntentPolicy::Any, &["a"], &[]);
+        let mut backdated = vote(&intent, "a", VoteChoice::Allow);
+        backdated.observed_at_micros = 1_001;
+        assert_eq!(backdated.vote.at_micros, 100);
+        let decision = decided(&intent, &[backdated], 1_001);
+        assert_eq!(decision.outcome, IntentOutcome::Aborted);
+        assert!(decision.votes_considered.is_empty());
+    }
+
+    #[test]
     fn given_a_future_ballot_when_decided_then_should_ignore_it() {
         let intent = intent(IntentPolicy::Any, &["a"], &[]);
         let mut future = vote(&intent, "a", VoteChoice::Allow);
-        future.at_micros = 600;
+        future.observed_at_micros = 600;
         assert_eq!(decide(&intent, &[future], 500).expect("valid intent"), None);
     }
 
@@ -621,7 +699,7 @@ mod tests {
         let intent = intent(IntentPolicy::All, &["a", "b"], &[]);
         let allow = vote(&intent, "a", VoteChoice::Allow);
         let mut block = vote(&intent, "a", VoteChoice::Block);
-        block.at_micros = 200;
+        block.observed_at_micros = 200;
         let first = decided(&intent, &[allow.clone(), block.clone()], 500);
         let second = decided(&intent, &[block, allow], 500);
         assert_eq!(first, second);
@@ -642,7 +720,7 @@ mod tests {
     fn given_invalid_ballot_metadata_when_decided_then_should_ignore_it() {
         let intent = intent(IntentPolicy::Any, &["a"], &[]);
         let mut vote = vote(&intent, "a", VoteChoice::Allow);
-        vote.intent_digest = "wrong".to_owned();
+        vote.vote.intent_digest = "wrong".to_owned();
         assert_eq!(decide(&intent, &[vote], 500).expect("valid intent"), None);
     }
 
@@ -653,6 +731,68 @@ mod tests {
         let decoded: Intent = serde_json::from_slice(&json).expect("decodes");
         assert_eq!(decoded, intent);
         decoded.validate().expect("round trip remains valid");
+    }
+
+    #[test]
+    fn given_a_known_body_when_digested_then_should_hash_it_as_one_byte_string() {
+        assert_eq!(
+            digest_of(b"transfer $100").expect("a byte string encodes"),
+            "93daa878cad59dae1a8b72cba78631d5e752940cd3225723b8e5e1b00f51726a"
+        );
+    }
+
+    #[test]
+    fn given_the_shared_intent_json_when_rebuilt_then_should_validate_and_round_trip() {
+        let json = serde_json::json!({
+            "intent_id": "01JC0000000000000000000000",
+            "conversation": "01JC0000000000000000000001",
+            "proposer": "proposer",
+            "body": b"transfer $100".to_vec(),
+            "digest": "93daa878cad59dae1a8b72cba78631d5e752940cd3225723b8e5e1b00f51726a",
+            "eligible_voters": ["a", "b"],
+            "mandatory_voters": ["b"],
+            "policy": { "at_least": 1 },
+            "policy_version": 1,
+            "deadline_at_micros": 2_000_000_000_000_000_u64,
+            "at_micros": 1_700_000_000_000_000_u64,
+        });
+        let intent: Intent =
+            serde_json::from_value(json.clone()).expect("the shared intent decodes");
+        intent.validate().expect("the shared intent is valid");
+        assert_eq!(serde_json::to_value(&intent).expect("encodes"), json);
+    }
+
+    #[test]
+    fn given_a_committed_decision_without_votes_when_authorizing_then_should_refuse_it() {
+        let intent = intent(IntentPolicy::Any, &["a"], &[]);
+        let forged = sealed(
+            &intent,
+            IntentOutcome::Committed,
+            "quorum met".to_owned(),
+            Vec::new(),
+            100,
+        );
+        assert_eq!(
+            forged.authorizes(&intent),
+            Err(IntentError::DecisionQuorumNotMet)
+        );
+    }
+
+    #[test]
+    fn given_a_committed_decision_missing_a_mandatory_allow_when_authorizing_then_should_refuse_it()
+    {
+        let intent = intent(IntentPolicy::Any, &["safety", "llm"], &["safety"]);
+        let forged = sealed(
+            &intent,
+            IntentOutcome::Committed,
+            "quorum met".to_owned(),
+            vec![(agent("llm"), VoteChoice::Allow)],
+            100,
+        );
+        assert_eq!(
+            forged.authorizes(&intent),
+            Err(IntentError::DecisionQuorumNotMet)
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import { InvalidError, UnsupportedError } from "../client/errors.js"
+import type { CallOptions } from "../client/call-options.js"
 import type { Capabilities } from "../client/capabilities.js"
 import { executeManaged, type ManagedTransport } from "../client/managed.js"
 import {
@@ -66,7 +67,8 @@ function requiresFencedLeases(item: BatchItem): boolean {
 export async function executeBatch(
   transport: ManagedTransport,
   capabilities: Capabilities,
-  ops: readonly BatchItem[]
+  ops: readonly BatchItem[],
+  options: CallOptions = {}
 ): Promise<readonly Uint8Array[]> {
   validateBatchOps(ops)
   if (!capabilities.kv.fencedLeases && ops.some(requiresFencedLeases)) {
@@ -74,9 +76,12 @@ export async function executeBatch(
       "batch contains a fenced-lease request that this deployment must not decode under the old contract"
     )
   }
-  const reply = await executeManaged(transport, capabilities, BatchCommand, {
-    v: BATCH_OP_VERSION,
-    ops
-  })
+  const reply = await executeManaged(
+    transport,
+    capabilities,
+    BatchCommand,
+    { v: BATCH_OP_VERSION, ops },
+    options
+  )
   return reply.results
 }

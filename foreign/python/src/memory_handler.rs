@@ -1,6 +1,6 @@
 use crate::agent::PyAgentMessage;
-use crate::async_bridge::{PyHook, future_into_py};
-use crate::errors::to_pyerr;
+use crate::agent_runtime::PyAgentCtx;
+use crate::async_bridge::{Awaitable, PyHook, awaitable};
 use crate::memory::{Backend, PyMemory, RememberOptions, map_kind};
 use laser_sdk::memory::MemoryKind;
 use pyo3::prelude::*;
@@ -29,9 +29,13 @@ impl PyMemoryHandler {
         })
     }
 
-    /// Remember successful messages under their conversation. Memory failures do not repeat the handler.
+    /// Remember successful messages under their conversation, attributed to the handling agent. A memory failure is logged as a warning and does not repeat the handler.
     fn auto_remember<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['fact', 'message', 'summary', 'entity', 'feedback', 'procedure']",
+            imports = ("typing",)
+        ))]
         kind: &str,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.kind = Some(map_kind(kind)?);
@@ -43,28 +47,38 @@ impl PyMemoryHandler {
         py: Python<'py>,
         context: Py<PyAny>,
         message: Py<PyAgentMessage>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let handler = self.handler.clone();
         let memory = self.memory.clone();
         let kind = self.kind;
         let inner = message.borrow(py).inner.clone();
-        future_into_py(py, async move {
+        let agent = context
+            .bind(py)
+            .cast::<PyAgentCtx>()
+            .ok()
+            .and_then(|context| context.borrow().agent().cloned());
+        awaitable(py, async move {
             handler
                 .call(|py| (context, message).into_pyobject(py))
                 .await?;
             if let Some(kind) = kind {
-                let _ = memory
+                let conversation = inner.provenance.conversation_id;
+                if let Err(error) = memory
                     .remember(
                         RememberOptions {
-                            agent: inner.provenance.agent,
-                            conversation: Some(inner.provenance.conversation_id),
+                            agent,
+                            conversation: Some(conversation),
                             kind,
                             ..RememberOptions::default()
                         },
                         inner.payload,
                     )
                     .await
-                    .map_err(to_pyerr);
+                {
+                    log::warn!(
+                        "Memory handler could not remember the turn of conversation {conversation}: {error}"
+                    );
+                }
             }
             Ok(())
         })

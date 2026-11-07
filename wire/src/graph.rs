@@ -1,7 +1,7 @@
 use crate::agent::wire_id;
 use crate::error::InvalidError;
 use crate::limits::MAX_GRAPH_NAME_BYTES;
-use crate::query::{Consistency, Filter, Value};
+use crate::query::{Filter, Value};
 use serde::{Deserialize, Serialize};
 
 wire_id!(
@@ -72,8 +72,9 @@ pub enum GraphReturn {
 }
 
 /// One traversal step: follow edges of an optional type in `dir`, up to `max`
-/// hops at this step.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// hops at this step. The expanded hops of a traversal, each `max` summed,
+/// stay within [`MAX_GRAPH_TRAVERSE_DEPTH`](crate::limits::MAX_GRAPH_TRAVERSE_DEPTH).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Hop {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_type: Option<String>,
@@ -91,17 +92,17 @@ impl EdgeDir {
 
 /// Where a traversal starts: explicit node ids, the nodes matching a predicate,
 /// or the nodes nearest an embedding (vector-seeded traversal).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GraphStart {
     Ids(Vec<NodeId>),
     Match(Filter),
-    Nearest { embedding: Vec<f32>, k: usize },
+    Nearest { embedding: Vec<f32>, k: u32 },
 }
 
 /// A graph traversal: start, hop spec, optional node and edge filters, and what
 /// to return. Reuses the query [`Filter`] predicate language, so there is one
 /// filter grammar across query and graph.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GraphQuery {
     pub v: u32,
     pub graph: String,
@@ -114,11 +115,9 @@ pub struct GraphQuery {
     pub edge_filter: Option<Filter>,
     #[serde(default, skip_serializing_if = "GraphReturn::is_nodes")]
     pub return_: GraphReturn,
-    pub limit: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fork: Option<String>,
-    #[serde(default, skip_serializing_if = "Consistency::is_eventual")]
-    pub consistency: Consistency,
+    /// The element cap of the result. Zero means up to
+    /// [`MAX_GRAPH_RESULT_ELEMENTS`](crate::limits::MAX_GRAPH_RESULT_ELEMENTS).
+    pub limit: u32,
     /// Valid-time "as of" read (epoch micros): keep only edges whose valid-time
     /// window contains this instant. `None` traverses the current graph.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,7 +144,7 @@ impl GraphReturn {
 
 /// A one-hop neighbor read: the cheap, common traversal. `depth` follows the same
 /// hop repeatedly.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GraphNeighbors {
     pub v: u32,
     pub graph: String,
@@ -155,7 +154,9 @@ pub struct GraphNeighbors {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_type: Option<String>,
     pub depth: u32,
-    pub limit: usize,
+    /// The element cap of the result. Zero means up to
+    /// [`MAX_GRAPH_RESULT_ELEMENTS`](crate::limits::MAX_GRAPH_RESULT_ELEMENTS).
+    pub limit: u32,
     /// Valid-time "as of" read (epoch micros): keep only edges whose valid-time
     /// window contains this instant. `None` reads the current graph.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -263,9 +264,10 @@ pub struct GraphEdge {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attrs: Vec<(String, Value)>,
     /// Valid-time start (epoch micros): when the relationship became true. `None`
-    /// is open-ended. The system-time axis (when observed) is the upsert's log
-    /// offset, so a fact can be superseded by closing `valid_to` and opening a new
-    /// edge rather than overwriting. Absent on the wire when unset.
+    /// is open-ended. An upsert that sends none keeps the stored start, and
+    /// reopening a closed edge with a start at or after its end keeps the closed
+    /// interval as its own stored version, so `as_of` inside it still finds the
+    /// relationship. Absent on the wire when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_from: Option<u64>,
     /// Valid-time end (epoch micros): when the relationship stopped being true.
@@ -343,6 +345,14 @@ pub struct GraphResult {
     pub edges: Vec<GraphEdge>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<Path>,
+    /// The traversal stopped at its element limit while more matched. A result
+    /// that fits the limit exactly is not truncated.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Upsert nodes and edges into a graph. The projector path: idempotent on
@@ -445,8 +455,6 @@ mod tests {
             edge_filter: None,
             return_: GraphReturn::Paths,
             limit: 100,
-            fork: None,
-            consistency: Consistency::Eventual,
             as_of: Some(1_900_000_000_000_000),
             conversation: None,
             stream: None,
@@ -483,6 +491,7 @@ mod tests {
                 source: None,
             }],
             paths: Vec::new(),
+            truncated: false,
         });
         let bytes = encode_named(&reply).expect("serializes");
         let back: GraphReply = decode_named(&bytes).expect("deserializes");
@@ -507,8 +516,6 @@ mod tests {
             edge_filter: None,
             return_: GraphReturn::Nodes,
             limit: 10,
-            fork: None,
-            consistency: Consistency::Eventual,
             as_of: None,
             conversation: None,
             stream: None,
@@ -693,8 +700,6 @@ mod tests {
             edge_filter: None,
             return_: GraphReturn::Nodes,
             limit: 10,
-            fork: None,
-            consistency: Consistency::Eventual,
             as_of: None,
             conversation: Some("01KWM3K3XEP3NP5TN850J17YBP".to_owned()),
             stream: Some("acme".to_owned()),
@@ -790,6 +795,7 @@ mod tests {
             nodes,
             edges,
             paths: Vec::new(),
+            truncated: true,
         });
         let encoded = encode_named(&reply).expect("serializes");
         assert!(

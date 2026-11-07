@@ -191,7 +191,9 @@ class Rng:
         return choices[self.below(len(choices))]
 
 
-async def start_projector(laser, topic, fields, *, index=None, content_type="json") -> None:
+async def start_projector(
+    laser, topic, fields, *, index=None, content_type="json", invalid_records="block"
+) -> None:
     """Declare `index` (default `topic`'s own name) over `topic` on the managed
     backend and wait until it answers queries, the Python analog of the Rust
     example crate's projector. Naming the index apart from its source topic
@@ -224,6 +226,7 @@ async def start_projector(laser, topic, fields, *, index=None, content_type="jso
             # (laser.watch()) instead of re-querying blind.
             "notify": True,
             "index": index,
+            "invalid_records": invalid_records,
         }
     )
     # The registration is applied asynchronously: a query errors until the table
@@ -249,7 +252,7 @@ async def wait_for_projection(laser, index, expected) -> int:
     count only when the managed backend reported the view advanced. Elsewhere every tick
     queries, the plain bounded poll."""
     deadline = time.monotonic() + PROJECTOR_TIMEOUT
-    feed = laser.watch(index=index) if (await laser.capabilities()).watch else None
+    feed = await laser.watch(index=index) if (await laser.capabilities()).watch else None
     last = -1
     while True:
         advanced = last < 0 or feed is None or bool(await feed.poll())

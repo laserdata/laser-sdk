@@ -9,7 +9,6 @@ import {
   DEFAULT_RETRY_POLICY,
   provenanceAndEnvelope,
   provenanceFromEnvelope,
-  isRetryable,
   retryBackoff,
   retryDelayMs,
   ReliableConsumer,
@@ -18,6 +17,7 @@ import {
   type FenceSweepState,
   type ReceivedAgentMessage
 } from "../../src/agent/reliable-consumer.js"
+import { isRetryable } from "../../src/client/error-classify.js"
 import {
   AmbiguousMutationError,
   AuthzExecutionError,

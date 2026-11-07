@@ -2,8 +2,6 @@ import { CodecError, InvalidError } from "../client/errors.js"
 import { type CborMap, expectMap, expectString, field, singleVariantTag } from "./cbor.js"
 import {
   AGDX_DECODE_RECORD_CODE,
-  AGDX_DESTINATION_GET_CODE,
-  AGDX_DESTINATION_LIST_CODE,
   AGDX_FILTER_OPERATION_CODE,
   AGDX_FORK_CREATE_CODE,
   AGDX_FORK_DELETE_CODE,
@@ -39,7 +37,6 @@ import {
   AGDX_LIST_PROJECTIONS_CODE,
   AGDX_LIST_SCHEMAS_CODE,
   AGDX_QUERY_CODE,
-  AGDX_QUERY_ROUTE_LIST_CODE,
   AGDX_SESSION_GET_CODE,
   AGDX_SESSION_LIST_CODE,
   AGDX_SESSION_EVENTS_CODE,
@@ -50,7 +47,7 @@ import {
   AGDX_REGISTER_SCHEMA_CODE,
   AUTHZ_OP_VERSION
 } from "./codes.js"
-import { MAX_ROLE_NAME_BYTES } from "./limits.js"
+import { MAX_AUTHZ_MUTATION_ID_BYTES, MAX_ROLE_NAME_BYTES } from "./limits.js"
 import type { ResultCode } from "./result.js"
 
 export type Effect = "allow" | "deny"
@@ -270,6 +267,28 @@ export function decodeRoleBinding(map: CborMap, context: string): RoleBinding {
   }
 }
 
+const UNENFORCED_FEATURES: ReadonlySet<Feature> = new Set([
+  "memory",
+  "agent",
+  "workflow",
+  "unrecognized"
+])
+
+/**
+ * The role definition rule: a valid name and grants only on features some
+ * request is authorized against. `memory`, `agent` and `workflow` have no
+ * command that checks them, so a grant on one would be stored and change nothing.
+ */
+export function validateRole(role: Role): void {
+  validateRoleName(role.name)
+  const unenforced = role.grants.find((grant) => UNENFORCED_FEATURES.has(grant.feature))
+  if (unenforced !== undefined) {
+    throw new InvalidError(
+      `no request is authorized against the \`${unenforced.feature}\` feature, so a grant on it has no effect`
+    )
+  }
+}
+
 export function validateRoleName(name: string): void {
   if (name.length === 0) {
     throw new InvalidError("role name must not be empty")
@@ -287,14 +306,22 @@ export function validateRoleName(name: string): void {
   }
 }
 
+/** The canonical authorization mutation id rule, as Rust `validate_mutation_id`:
+ * non-empty, at most `MAX_AUTHZ_MUTATION_ID_BYTES` of ASCII letters, digits and `-`. */
+export function validateMutationId(mutationId: string): void {
+  const bytes = new TextEncoder().encode(mutationId)
+  if (bytes.length === 0 || bytes.length > MAX_AUTHZ_MUTATION_ID_BYTES) {
+    throw new InvalidError(`mutation id must be 1 to ${String(MAX_AUTHZ_MUTATION_ID_BYTES)} bytes`)
+  }
+  if (!/^[A-Za-z0-9-]+$/.test(mutationId)) {
+    throw new InvalidError("mutation id may hold only ASCII letters, digits and '-'")
+  }
+}
+
 export function featureAction(code: number): readonly [Feature, Action] | undefined {
   switch (code) {
     case AGDX_QUERY_CODE:
       return ["query", "read"]
-    case AGDX_DESTINATION_GET_CODE:
-    case AGDX_DESTINATION_LIST_CODE:
-    case AGDX_QUERY_ROUTE_LIST_CODE:
-      return ["destination", "read"]
     case AGDX_GET_PROJECTION_CODE:
     case AGDX_LIST_PROJECTIONS_CODE:
     case AGDX_GET_SCHEMA_CODE:
@@ -543,6 +570,10 @@ export interface GetBindingsReq {
   readonly userId: number
 }
 
+export function validateGetBindingsReq(req: GetBindingsReq): void {
+  requireU32("user id", req.userId)
+}
+
 export function encodeGetBindingsReq(req: GetBindingsReq): Map<string, unknown> {
   return new Map<string, unknown>([
     ["v", req.v ?? AUTHZ_OP_VERSION],
@@ -561,19 +592,23 @@ export interface BindingsReply {
   /** The operation version, the current one when absent. */
   readonly v?: number
   readonly roles: readonly string[]
+  /** The binding revision the roles were read at, the value `bindRolesExpectRevision` names. Zero for a user that was never bound. */
+  readonly revision: bigint
 }
 
 export function encodeBindingsReply(reply: BindingsReply): Map<string, unknown> {
   return new Map<string, unknown>([
     ["v", reply.v ?? AUTHZ_OP_VERSION],
-    ["roles", [...reply.roles]]
+    ["roles", [...reply.roles]],
+    ["revision", reply.revision]
   ])
 }
 
 export function decodeBindingsReply(map: CborMap, context: string): BindingsReply {
   return {
     v: field.requiredU32(map, "v", context),
-    roles: field.requiredArray(map, "roles", context, (item) => expectString(item, context))
+    roles: field.requiredArray(map, "roles", context, (item) => expectString(item, context)),
+    revision: field.requiredU64(map, "revision", context)
   }
 }
 
@@ -634,6 +669,11 @@ export interface BindRolesReq {
   readonly roles: readonly string[]
   readonly expectRevision?: bigint
   readonly mutationId?: string
+}
+
+export function validateBindRolesReq(req: BindRolesReq): void {
+  requireU32("user id", req.userId)
+  if (req.expectRevision !== undefined) requireU64("expected revision", req.expectRevision)
 }
 
 export function encodeBindRolesReq(req: BindRolesReq): Map<string, unknown> {
@@ -703,6 +743,26 @@ export interface AuthzHistoryReq {
   readonly subject: AuthzSubject
   readonly afterRevision?: bigint
   readonly limit: number
+}
+
+export function validateAuthzHistoryReq(req: AuthzHistoryReq): void {
+  if (req.subject.kind === "binding") requireU32("user id", req.subject.userId)
+  if (req.afterRevision !== undefined) requireU64("after revision", req.afterRevision)
+  requireU32("history limit", req.limit)
+}
+
+// The wire carries these as u32 and u64, so an out-of-range value is refused
+// before it is encoded rather than wrapped or rejected by the server.
+function requireU32(label: string, value: number): void {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffff_ffff) {
+    throw new InvalidError(`${label} must be an unsigned 32-bit integer, got ${String(value)}`)
+  }
+}
+
+function requireU64(label: string, value: bigint): void {
+  if (value < 0n || value > 0xffff_ffff_ffff_ffffn) {
+    throw new InvalidError(`${label} must be an unsigned 64-bit integer, got ${String(value)}`)
+  }
 }
 
 export function encodeAuthzHistoryReq(req: AuthzHistoryReq): Map<string, unknown> {
@@ -848,11 +908,19 @@ export type AuthzError =
   | { readonly kind: "unauthorized" }
   | { readonly kind: "unknownRole"; readonly name: string }
   | { readonly kind: "invalidName"; readonly name: string }
+  /** A define granted a feature no request is authorized against. Nothing applied. */
+  | { readonly kind: "invalidGrant"; readonly message: string }
   | { readonly kind: "conflict"; readonly currentRevision: bigint }
   | { readonly kind: "version"; readonly expected: number; readonly got: number }
   /** A grant refused because it reaches past one stream while the server runs
    * with stream tenancy, for example a wildcard or a prefix spanning streams. */
   | { readonly kind: "tenancyViolation"; readonly message: string }
+  /** The mutation id already names a different request of the same account.
+   * Nothing applied. */
+  | { readonly kind: "mutationConflict"; readonly message: string }
+  /** No receipt capacity is free for a new mutation id inside the replay
+   * window. Nothing applied. */
+  | { readonly kind: "resourceLimit"; readonly message: string }
   | { readonly kind: "unrecognized"; readonly tag: string; readonly value: unknown }
 
 export function encodeAuthzError(error: AuthzError): unknown {
@@ -865,6 +933,8 @@ export function encodeAuthzError(error: AuthzError): unknown {
       return new Map([["UnknownRole", error.name]])
     case "invalidName":
       return new Map([["InvalidName", error.name]])
+    case "invalidGrant":
+      return new Map([["InvalidGrant", error.message]])
     case "conflict":
       return new Map([
         ["Conflict", new Map<string, unknown>([["current_revision", error.currentRevision]])]
@@ -881,6 +951,10 @@ export function encodeAuthzError(error: AuthzError): unknown {
       ])
     case "tenancyViolation":
       return new Map([["TenancyViolation", error.message]])
+    case "mutationConflict":
+      return new Map([["MutationConflict", error.message]])
+    case "resourceLimit":
+      return new Map([["ResourceLimit", error.message]])
     case "unrecognized":
       return new Map([[error.tag, error.value]])
   }
@@ -896,12 +970,16 @@ export function authzErrorResultCode(error: AuthzError): ResultCode {
     case "unknownRole":
       return { kind: "known", name: "NotFound" }
     case "invalidName":
+    case "invalidGrant":
     case "tenancyViolation":
       return { kind: "known", name: "InvalidArgument" }
     case "conflict":
+    case "mutationConflict":
       return { kind: "known", name: "Conflict" }
     case "version":
       return { kind: "known", name: "VersionSkew" }
+    case "resourceLimit":
+      return { kind: "known", name: "ResourceLimit" }
     case "unrecognized":
       return { kind: "known", name: "Backend" }
   }
@@ -921,8 +999,14 @@ export function decodeAuthzError(value: unknown, context: string): AuthzError {
       return { kind: "unknownRole", name: expectString(inner, context) }
     case "InvalidName":
       return { kind: "invalidName", name: expectString(inner, context) }
+    case "InvalidGrant":
+      return { kind: "invalidGrant", message: expectString(inner, context) }
     case "TenancyViolation":
       return { kind: "tenancyViolation", message: expectString(inner, context) }
+    case "MutationConflict":
+      return { kind: "mutationConflict", message: expectString(inner, context) }
+    case "ResourceLimit":
+      return { kind: "resourceLimit", message: expectString(inner, context) }
     case "Conflict": {
       const conflictMap = expectMap(inner, context)
       return {

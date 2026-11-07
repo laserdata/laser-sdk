@@ -140,22 +140,24 @@ pub struct CatalogPosition {
         with = "crate::encoding::opt_u128_text"
     )]
     pub operation_id: Option<u128>,
+    /// How many catalog commands the catalog had applied when this outcome
+    /// was folded. It keeps counting across a recreated control log, so it
+    /// orders outcomes whose offsets restarted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
 }
 
 /// The policy a group is configured with in one step: a definition saved for
-/// this group alone under the caller's name, or a revision that already
-/// exists. The name follows the registered filter name rule and need not be
-/// unique, since every read returns the owning group with it.
+/// this group alone under the caller's name. The name follows the registered
+/// filter name rule and need not be unique, since every read returns the
+/// owning group with it. A group's binding never moves to another digest, so
+/// no revision of its own filter can be configured instead.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupFilterSpec {
     Definition {
         name: String,
         filter: ConsumerFilter,
-    },
-    Revision {
-        filter_id: u32,
-        revision: u32,
     },
 }
 
@@ -265,15 +267,16 @@ const fn default_max_catalog_bytes() -> u64 {
 }
 
 /// The mutation the catalog appends to its control log, stamped by the
-/// streaming server with the acting user and, for a bind or unbind, the
-/// group's verified identity, then by the managed backend with the caller's grants and,
-/// for a registration, the allocated filter id. Applying it is deterministic,
-/// so every replica, and every replay of the log, records the same outcome.
+/// streaming server, for a bind or unbind, with the group's verified identity,
+/// then by the managed backend with the caller's grants and, for a
+/// registration, the allocated filter id. The acting user is the caller on the
+/// record's [`ControlStamp`](crate::control::ControlStamp). Applying it is
+/// deterministic, so every replica, and every replay of the log, records the
+/// same outcome.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FilterCatalogCommand {
     #[serde(with = "crate::encoding::u128_text")]
     pub operation_id: u128,
-    pub actor_user_id: u32,
     pub mutation: FilterMutation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<FilterGroupIdentity>,
@@ -352,7 +355,8 @@ pub struct GetFilter {
     pub filter_id: u32,
 }
 
-/// List saved filters, newest first by id.
+/// List saved filters, newest first by id. `page` counts from 1, and 0 reads
+/// the first page too. `results` is the page length.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListFilters {
     pub v: u32,
@@ -360,45 +364,42 @@ pub struct ListFilters {
     pub name_contains: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<FilterState>,
-    /// Only filters with a lower id. Passing the last id of one page reads the
-    /// next page stably, while registrations and drops land in between.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub before_id: Option<u32>,
     /// Only the own filter of this consumer group incarnation, bound or not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<FilterGroupIdentity>,
     #[serde(default)]
     pub page: u32,
-    pub page_size: u32,
+    pub results: u32,
 }
 
-/// A page of saved filters.
+/// A page of saved filters. `page` counts from 1.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FilterPage {
     pub items: Vec<FilterSummary>,
     pub page: u32,
-    pub page_size: u32,
-    pub total: u32,
+    pub total_pages: u32,
+    pub total_results: u32,
 }
 
-/// List one filter's revisions, newest first.
+/// List one filter's revisions, newest first. `page` counts from 1, and 0
+/// reads the first page too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListFilterRevisions {
     pub v: u32,
     pub filter_id: u32,
     #[serde(default)]
     pub page: u32,
-    pub page_size: u32,
+    pub results: u32,
 }
 
-/// A page of revisions.
+/// A page of revisions. `page` counts from 1.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FilterRevisionPage {
     pub filter_id: u32,
     pub items: Vec<FilterRevisionInfo>,
     pub page: u32,
-    pub page_size: u32,
-    pub total: u32,
+    pub total_pages: u32,
+    pub total_results: u32,
 }
 
 /// Read one consumer group's binding. The streaming server stamps `identity`
@@ -411,7 +412,8 @@ pub struct GetFilterBinding {
     pub identity: Option<FilterGroupIdentity>,
 }
 
-/// List bindings, optionally narrowed to one filter or one source.
+/// List bindings, optionally narrowed to one filter or one source. `page`
+/// counts from 1, and 0 reads the first page too.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListFilterBindings {
     pub v: u32,
@@ -423,16 +425,16 @@ pub struct ListFilterBindings {
     pub topic: Option<String>,
     #[serde(default)]
     pub page: u32,
-    pub page_size: u32,
+    pub results: u32,
 }
 
-/// A page of bindings.
+/// A page of bindings. `page` counts from 1.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterBindingPage {
     pub items: Vec<FilterBinding>,
     pub page: u32,
-    pub page_size: u32,
-    pub total: u32,
+    pub total_pages: u32,
+    pub total_results: u32,
 }
 
 /// Read a mutation's outcome by its operation id.
@@ -536,10 +538,10 @@ fn validate_version(v: u32) -> Result<(), InvalidError> {
     }
 }
 
-fn validate_page_size(page_size: u32) -> Result<(), InvalidError> {
-    if page_size == 0 || page_size > MAX_FILTER_CATALOG_PAGE {
+fn validate_results(results: u32) -> Result<(), InvalidError> {
+    if results == 0 || results > MAX_FILTER_CATALOG_PAGE {
         return Err(InvalidError::new(format!(
-            "page_size must be 1..={MAX_FILTER_CATALOG_PAGE}"
+            "results must be 1..={MAX_FILTER_CATALOG_PAGE}"
         )));
     }
     Ok(())
@@ -617,19 +619,9 @@ impl Validate for FilterMutation {
                 if let Some(identity) = expected_identity {
                     validate_group_id(identity)?;
                 }
-                match policy {
-                    GroupFilterSpec::Definition { name, filter } => {
-                        validate_filter_name(name)?;
-                        filter.validate()
-                    }
-                    GroupFilterSpec::Revision { revision, .. } => {
-                        if *revision == 0 {
-                            Err(InvalidError::new("revision must be positive"))
-                        } else {
-                            Ok(())
-                        }
-                    }
-                }
+                let GroupFilterSpec::Definition { name, filter } = policy;
+                validate_filter_name(name)?;
+                filter.validate()
             }
         }
     }
@@ -648,7 +640,7 @@ impl Validate for FilterMutationRequest {
 impl Validate for ListFilters {
     fn validate(&self) -> Result<(), InvalidError> {
         validate_version(self.v)?;
-        validate_page_size(self.page_size)?;
+        validate_results(self.results)?;
         if let Some(fragment) = &self.name_contains
             && fragment.len() > MAX_FILTER_NAME_BYTES
         {
@@ -664,14 +656,14 @@ impl Validate for ListFilters {
 impl Validate for ListFilterRevisions {
     fn validate(&self) -> Result<(), InvalidError> {
         validate_version(self.v)?;
-        validate_page_size(self.page_size)
+        validate_results(self.results)
     }
 }
 
 impl Validate for ListFilterBindings {
     fn validate(&self) -> Result<(), InvalidError> {
         validate_version(self.v)?;
-        validate_page_size(self.page_size)?;
+        validate_results(self.results)?;
         if let Some(stream) = &self.stream {
             validate_name("stream", stream)?;
         }
@@ -718,6 +710,7 @@ mod tests {
             partition_id: 0,
             offset: 41,
             operation_id: Some(u128::MAX),
+            revision: None,
         };
         let json = serde_json::to_value(position).expect("position encodes");
         assert_eq!(json["operation_id"], u128::MAX.to_string());
@@ -737,6 +730,7 @@ mod tests {
             partition_id: 0,
             offset: 41,
             operation_id: Some(u128::MAX),
+            revision: None,
         };
         let bytes = crate::framing::encode_named(&position).expect("position encodes");
         assert_eq!(
@@ -851,6 +845,12 @@ mod tests {
     }
 
     #[test]
+    fn given_a_group_policy_naming_a_revision_when_decoded_then_should_be_refused() {
+        let revision = r#"{"v":1,"operation_id":"7","mutation":{"configure_group":{"group":{"stream":"orbit","topic":"fleet","group":"desk"},"policy":{"revision":{"filter_id":4,"revision":2}}}}}"#;
+        assert!(serde_json::from_str::<FilterMutationRequest>(revision).is_err());
+    }
+
+    #[test]
     fn given_a_summary_with_an_owner_when_encoded_then_should_round_trip_and_omit_an_absent_owner()
     {
         let owned = FilterSummary {
@@ -898,10 +898,9 @@ mod tests {
             v: FILTER_OP_VERSION,
             name_contains: None,
             state: None,
-            before_id: None,
             owner: Some(identity()),
-            page: 0,
-            page_size: 20,
+            page: 1,
+            results: 20,
         };
         list.validate().expect("valid");
         let oversized = ListFilters {
@@ -915,19 +914,26 @@ mod tests {
     }
 
     #[test]
-    fn given_list_requests_when_page_size_is_out_of_range_then_should_be_rejected() {
+    fn given_list_requests_when_results_are_out_of_range_then_should_be_rejected() {
         let list = ListFilters {
             v: FILTER_OP_VERSION,
             name_contains: None,
             state: Some(FilterState::Active),
-            before_id: None,
             owner: None,
-            page: 0,
-            page_size: MAX_FILTER_CATALOG_PAGE + 1,
+            page: 1,
+            results: MAX_FILTER_CATALOG_PAGE + 1,
         };
         assert!(list.validate().is_err());
+        assert!(
+            ListFilters {
+                results: 0,
+                ..list.clone()
+            }
+            .validate()
+            .is_err()
+        );
         let list = ListFilters {
-            page_size: 20,
+            results: 20,
             ..list
         };
         list.validate().expect("valid");

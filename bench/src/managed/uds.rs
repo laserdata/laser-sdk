@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use laser_sdk::wire::codes::{AGDX_KV_GET_CODE, KV_OP_VERSION};
-use laser_sdk::wire::forward::ForwardedCommand;
+use laser_sdk::wire::forward::{Caller, ForwardedCommand};
 use laser_sdk::wire::framing::{decode_named, encode_named, frame_encode};
 use laser_sdk::wire::kv::{KvGet, KvOutcome, KvReply};
 use laser_sdk::wire::limits::MAX_FRAME_BYTES;
@@ -117,7 +117,11 @@ fn request(arm: UdsArm) -> Result<Vec<u8>, BenchError> {
                 positioned_reply: false,
                 min_sessions: Vec::new(),
                 tenancy: laser_sdk::wire::authz::Tenancy::default(),
-                user_id: 1,
+                caller: Some(Caller {
+                    user_id: 1,
+                    agent: None,
+                    on_behalf_of: None,
+                }),
                 client_id: 0,
                 correlation: None,
                 operation_id: None,
@@ -126,8 +130,6 @@ fn request(arm: UdsArm) -> Result<Vec<u8>, BenchError> {
                 command_code: AGDX_KV_GET_CODE,
                 payload,
                 grants: Vec::new(),
-                agent: None,
-                on_behalf_of: None,
             })
             .map_err(|error| {
                 BenchError::Invalid(format!("encode UDS forwarded command: {error}"))
@@ -209,7 +211,7 @@ mod tests {
             decode_named(payload).expect("forwarded command should decode");
         assert_eq!(consumed, framed.len());
         assert_eq!(forwarded.command_code, AGDX_KV_GET_CODE);
-        assert_eq!(forwarded.user_id, 1);
+        assert_eq!(forwarded.caller.map(|caller| caller.user_id), Some(1));
     }
 
     #[test]

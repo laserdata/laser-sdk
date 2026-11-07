@@ -1,5 +1,5 @@
 use crate::agent::Laser;
-use crate::error::LaserError;
+use crate::error::{LaserError, TransportError};
 use crate::provenance::{AgentTopic, Provenance};
 use crate::types::{AgentId, ConversationId, MessageId};
 use iggy::prelude::*;
@@ -39,21 +39,60 @@ pub struct ContextMessage {
     pub topic_id: u32,
 }
 
+impl ContextMessage {
+    /// The envelope body of an AGDX message, else the raw payload: the text a
+    /// prompt carries and the bytes a token estimate counts.
+    pub fn body(&self) -> &[u8] {
+        self.envelope
+            .as_ref()
+            .map_or(&self.payload, |envelope| &envelope.body)
+    }
+}
+
 /// A point in a conversation's log: the next offset each partition of each
 /// named topic will write, as captured by
 /// [`ContextScope::checkpoint`](crate::context_scope::ContextScope::checkpoint).
 /// A [`ContextAssembler`] built with `to_checkpoint` folds history up to it,
 /// and one built with `from_checkpoint` resumes after it. It is a client-side
 /// bookmark keyed by topic ([`AgentTopic::topic_string`]), never a record on
-/// the log.
+/// the log. A captured checkpoint names its stream and the creation time of
+/// each topic, so a read on another stream or on a recreated topic is
+/// refused instead of reading offsets of another log.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Checkpoint {
     per_topic: BTreeMap<String, BTreeMap<u32, u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    generations: BTreeMap<String, u64>,
 }
 
 impl Checkpoint {
     pub(crate) fn from_topic_offsets(per_topic: BTreeMap<String, BTreeMap<u32, u64>>) -> Self {
-        Self { per_topic }
+        Self {
+            per_topic,
+            stream: None,
+            generations: BTreeMap::new(),
+        }
+    }
+
+    // Refuse a read of `topic` on `stream`, created at `generation`, when
+    // the checkpoint was taken on another stream or another generation of
+    // the topic.
+    fn check(&self, stream: &str, topic: &str, generation: u64) -> Result<(), LaserError> {
+        if let Some(taken) = &self.stream
+            && taken != stream
+        {
+            return Err(LaserError::Invalid(format!(
+                "the checkpoint was taken on stream `{taken}`, not `{stream}`"
+            )));
+        }
+        match self.generations.get(topic) {
+            Some(taken) if *taken != generation => Err(LaserError::Invalid(format!(
+                "the topic `{topic}` was recreated after the checkpoint was taken"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// The per-partition offsets for `topic` (by [`AgentTopic::topic_string`]),
@@ -83,15 +122,27 @@ pub async fn checkpoint(
     laser: &Laser,
     topics: &[AgentTopic<'static>],
 ) -> Result<Checkpoint, LaserError> {
-    let stream = Identifier::named(laser.stream_required()?)?;
+    let names: Vec<String> = topics.iter().map(AgentTopic::topic_string).collect();
+    checkpoint_of(laser, &names).await
+}
+
+// The current tail of the topics named `names`.
+pub(crate) async fn checkpoint_of(
+    laser: &Laser,
+    names: &[String],
+) -> Result<Checkpoint, LaserError> {
+    let stream_name = laser.stream_required()?.to_owned();
+    let stream = Identifier::named(&stream_name)?;
     let mut per_topic = BTreeMap::new();
-    for topic in topics {
-        let name = topic.topic_string();
-        let topic_id = topic.as_identifier();
+    let mut generations = BTreeMap::new();
+    for name in names {
+        let name = name.clone();
+        let topic_id = Identifier::named(&name)?;
         let Some(details) = laser.client().get_topic(&stream, &topic_id).await? else {
             per_topic.insert(name, BTreeMap::new());
             continue;
         };
+        generations.insert(name.clone(), details.created_at.as_micros());
         let count = crate::poll::bounded_partitions(details.partitions_count);
         let consumer = Consumer::new(Identifier::named("laser-checkpoint")?);
         let mut tails = tokio::task::JoinSet::new();
@@ -119,7 +170,11 @@ pub async fn checkpoint(
         }
         per_topic.insert(name, offsets);
     }
-    Ok(Checkpoint { per_topic })
+    Ok(Checkpoint {
+        per_topic,
+        stream: Some(stream_name),
+        generations,
+    })
 }
 
 /// Selects which assembled messages feed an LLM call.
@@ -224,21 +279,22 @@ impl ContextPolicy for Chain {
 /// Keep the most-recent messages that fit within `max_tokens`, estimated per
 /// message. Meets memory's `to_context_block(token_budget)` in the middle so a
 /// prompt built from history and recalled memory shares one budget notion. The
-/// default estimate is a coarse ~4-bytes-per-token heuristic over the payload.
-/// Pass a real tokenizer with [`with_estimator`](Self::with_estimator).
+/// default estimate is a coarse ~4-bytes-per-token heuristic over
+/// [`ContextMessage::body`]. Pass a real tokenizer with
+/// [`with_estimator`](Self::with_estimator).
 pub struct TokenBudget {
     max_tokens: usize,
     estimate: Box<dyn Fn(&ContextMessage) -> usize + Send + Sync>,
 }
 
 impl TokenBudget {
-    /// A budget using the coarse `payload.len() / 4` token heuristic.
+    /// A budget using the coarse `body().len() / 4` token heuristic.
     #[must_use]
     pub fn new(max_tokens: usize) -> Self {
         Self {
             max_tokens,
             estimate: Box::new(|message| {
-                usize::try_from(laser_wire::agent::estimate_tokens(message.payload.len()))
+                usize::try_from(laser_wire::agent::estimate_tokens(message.body().len()))
                     .unwrap_or(usize::MAX)
             }),
         }
@@ -306,9 +362,26 @@ pub struct ContextAssembler {
     /// Stop at a [`Checkpoint`], per topic and partition: the point-in-time
     /// read behind `ReplayBound::At`. `None` reads to the current tail.
     to_checkpoint: Option<Checkpoint>,
+    #[builder(skip)]
+    topic_names: Vec<String>,
+    #[builder(skip)]
+    partitions: PartitionScope,
 }
 
 impl ContextAssembler {
+    // Also read the topics named `names`, such as the declared topics of a
+    // per-agent topic layout.
+    pub(crate) fn with_topic_names(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.topic_names.extend(names);
+        self
+    }
+
+    // Read only the partitions the conversation's records land on.
+    pub(crate) fn conversation_partitions(mut self) -> Self {
+        self.partitions = PartitionScope::Conversation;
+        self
+    }
+
     /// Read the configured topics, order by Iggy timestamp, and apply the policy.
     /// Every (topic, partition) is drained concurrently: a conversation can span
     /// many partitions across several topics, and reading them serially makes
@@ -333,11 +406,14 @@ impl ContextAssembler {
         let mut seen = std::collections::BTreeSet::new();
         self.topics
             .retain(|topic| seen.insert(topic.topic_string()));
+        self.topic_names.retain(|name| seen.insert(name.clone()));
         let restart = self.from_offsets.is_empty()
             && self.from_checkpoint.is_none()
             && self.to_checkpoint.is_none();
         match self.read_once(laser, span).await {
-            Err(LaserError::Iggy(IggyError::HistoryUnavailable)) if restart => {
+            Err(LaserError::Transport(TransportError(IggyError::HistoryUnavailable)))
+                if restart =>
+            {
                 self.read_once(laser, span).await
             }
             result => result,
@@ -349,18 +425,29 @@ impl ContextAssembler {
         laser: &Laser,
         span: ReadSpan,
     ) -> Result<Vec<ContextMessage>, LaserError> {
-        let stream = Identifier::named(laser.stream_required()?)?;
+        let stream_name = laser.stream_required()?;
+        let stream = Identifier::named(stream_name)?;
         let Some(stream_details) = laser.client().get_stream(&stream).await? else {
             return Ok(Vec::new());
         };
         let stream_id = stream_details.id;
+        let mut topics = Vec::new();
+        for topic in &self.topics {
+            topics.push((topic.topic_string(), topic.as_identifier()));
+        }
+        for name in &self.topic_names {
+            topics.push((name.clone(), Identifier::named(name)?));
+        }
+        let layout = laser
+            .default_stream()
+            .and_then(|stream| laser.layout(stream));
 
         // Resolve each topic's id and partition count concurrently.
         let mut meta = tokio::task::JoinSet::new();
-        for (topic_idx, topic) in self.topics.iter().enumerate() {
+        for (topic_idx, (_, topic_id)) in topics.iter().enumerate() {
             let laser = laser.clone();
             let stream = stream.clone();
-            let topic_id = topic.as_identifier();
+            let topic_id = topic_id.clone();
             meta.spawn(async move {
                 let details = laser
                     .client()
@@ -369,7 +456,8 @@ impl ContextAssembler {
                     .map(|details| {
                         (
                             details.id,
-                            crate::poll::bounded_partitions(details.partitions_count),
+                            details.partitions_count,
+                            details.created_at.as_micros(),
                         )
                     });
                 Ok::<_, LaserError>((topic_idx, topic_id, details))
@@ -378,11 +466,19 @@ impl ContextAssembler {
         let mut sources = Vec::new();
         while let Some(joined) = meta.join_next().await {
             let (topic_idx, topic_id, details) = joined.map_err(join_failed)??;
-            let Some((numeric_topic, count)) = details else {
+            let Some((numeric_topic, count, generation)) = details else {
                 continue;
             };
-            for partition in 0..count {
-                sources.push((topic_idx, topic_id.clone(), numeric_topic, partition));
+            for checkpoint in [&self.from_checkpoint, &self.to_checkpoint]
+                .into_iter()
+                .flatten()
+            {
+                checkpoint.check(stream_name, &topics[topic_idx].0, generation)?;
+            }
+            for partition in 0..crate::poll::bounded_partitions(count) {
+                if self.covers(layout.as_ref(), &topics[topic_idx].0, partition, count) {
+                    sources.push((topic_idx, topic_id.clone(), numeric_topic, partition));
+                }
             }
         }
 
@@ -391,7 +487,7 @@ impl ContextAssembler {
         for (topic_idx, topic_id, numeric_topic, partition) in sources {
             let laser = laser.clone();
             let stream = stream.clone();
-            let topic_name = self.topics[topic_idx].topic_string();
+            let topic_name = topics[topic_idx].0.clone();
             let from = match &self.from_checkpoint {
                 Some(checkpoint) => checkpoint
                     .topic_offsets(&topic_name)
@@ -466,7 +562,10 @@ impl ContextAssembler {
                 ),
                 Err(error) => {
                     if failure.is_none()
-                        || !matches!(error, LaserError::Iggy(IggyError::HistoryUnavailable))
+                        || !matches!(
+                            error,
+                            LaserError::Transport(TransportError(IggyError::HistoryUnavailable))
+                        )
                     {
                         failure = Some(error);
                     }
@@ -495,6 +594,41 @@ impl ContextAssembler {
             .collect();
         Ok(self.policy.select(&ordered))
     }
+
+    // Whether the read covers `partition` of `topic`, a topic of `count`
+    // partitions. The conversation's records land on the partition its id
+    // keys to, and work on `agent.sessions` also on the partitions a declared
+    // per-agent partition layout names.
+    fn covers(
+        &self,
+        layout: Option<&crate::agent::SessionLayout>,
+        topic: &str,
+        partition: u32,
+        count: u32,
+    ) -> bool {
+        match self.partitions {
+            PartitionScope::All => true,
+            PartitionScope::Conversation => {
+                crate::agent::control::control_partition(self.conversation_id, count)
+                    == Some(partition)
+                    || (topic == laser_wire::topics::AGENT_SESSIONS
+                        && matches!(
+                            layout,
+                            Some(crate::agent::SessionLayout::PerAgentPartition(declared))
+                                if declared.values().any(|declared| *declared == partition)
+                        ))
+            }
+        }
+    }
+}
+
+// Which partitions of each topic a read covers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PartitionScope {
+    #[default]
+    All,
+    // Only the partitions the conversation's records land on.
+    Conversation,
 }
 
 // How much of its range one partition read covers.
@@ -623,15 +757,13 @@ mod tests {
 
     #[test]
     fn given_a_checkpoint_when_queried_by_topic_then_should_return_only_its_own_offsets() {
-        let checkpoint = Checkpoint {
-            per_topic: BTreeMap::from([
-                (
-                    "agent.sessions".to_owned(),
-                    BTreeMap::from([(0, 5), (1, 2)]),
-                ),
-                ("agent.streams".to_owned(), BTreeMap::new()),
-            ]),
-        };
+        let checkpoint = Checkpoint::from_topic_offsets(BTreeMap::from([
+            (
+                "agent.sessions".to_owned(),
+                BTreeMap::from([(0, 5), (1, 2)]),
+            ),
+            ("agent.streams".to_owned(), BTreeMap::new()),
+        ]));
         assert_eq!(
             checkpoint.topic_offsets("agent.sessions"),
             Some(&BTreeMap::from([(0, 5), (1, 2)]))
@@ -659,6 +791,125 @@ mod tests {
             stream_id: 1,
             topic_id: 1,
         }
+    }
+
+    fn enveloped(offset: u64, body: &[u8]) -> ContextMessage {
+        let mut message = message("a", offset);
+        let envelope = laser_wire::agent::AgentEnvelope::event(
+            laser_wire::agent::RecordId::from_u128(u128::from(offset) + 1),
+            message.provenance.conversation_id.into(),
+            "a".parse().expect("agent id is valid"),
+            body.to_vec(),
+        );
+        message.payload =
+            laser_wire::framing::encode_named(&envelope).expect("the envelope encodes");
+        message.envelope = Some(envelope);
+        message
+    }
+
+    #[test]
+    fn given_an_enveloped_message_when_reading_its_body_then_should_return_the_envelope_body_only()
+    {
+        let enveloped = enveloped(0, b"hello");
+        assert!(enveloped.payload.len() > b"hello".len());
+        assert_eq!(enveloped.body(), b"hello");
+        let mut plain = message("a", 1);
+        plain.payload = b"plain".to_vec();
+        assert_eq!(plain.body(), b"plain");
+    }
+
+    #[test]
+    fn given_enveloped_messages_when_budgeted_then_should_count_the_body_not_the_envelope() {
+        let history: Vec<ContextMessage> =
+            (0..5).map(|offset| enveloped(offset, b"word")).collect();
+        let selected = TokenBudget::new(5).select(&history);
+        assert_eq!(
+            selected.len(),
+            5,
+            "five one-token bodies fit a five-token budget"
+        );
+    }
+
+    #[test]
+    fn given_a_per_agent_partition_layout_when_scoped_to_a_conversation_then_should_cover_its_key_and_declared_partitions()
+     {
+        let conversation = ConversationId::new();
+        let assembler = ContextAssembler::builder()
+            .conversation_id(conversation)
+            .build()
+            .conversation_partitions();
+        let keyed =
+            crate::agent::control::control_partition(conversation, 8).expect("eight partitions");
+        let declared = (keyed + 3) % 8;
+        let layout = crate::agent::SessionLayout::per_agent_partition([(
+            "worker"
+                .parse::<laser_wire::agent::AgentId>()
+                .expect("agent id is valid"),
+            declared,
+        )]);
+        let sessions = laser_wire::topics::AGENT_SESSIONS;
+        let covered: Vec<u32> = (0..8)
+            .filter(|partition| assembler.covers(Some(&layout), sessions, *partition, 8))
+            .collect();
+        let mut expected = vec![keyed, declared];
+        expected.sort_unstable();
+        assert_eq!(covered, expected);
+        let control: Vec<u32> = (0..8)
+            .filter(|partition| {
+                assembler.covers(
+                    Some(&layout),
+                    laser_wire::topics::AGENT_CONTROL,
+                    *partition,
+                    8,
+                )
+            })
+            .collect();
+        assert_eq!(
+            control,
+            vec![keyed],
+            "a declared partition moves only session work"
+        );
+        let everything = ContextAssembler::builder()
+            .conversation_id(conversation)
+            .build();
+        assert!((0..8).all(|partition| everything.covers(None, sessions, partition, 8)));
+    }
+
+    #[test]
+    fn given_a_checkpoint_of_another_stream_or_topic_generation_when_read_then_should_refuse_it() {
+        let checkpoint = Checkpoint {
+            per_topic: BTreeMap::from([("agent.sessions".to_owned(), BTreeMap::from([(0, 5)]))]),
+            stream: Some("support".to_owned()),
+            generations: BTreeMap::from([("agent.sessions".to_owned(), 7)]),
+        };
+        assert!(checkpoint.check("support", "agent.sessions", 7).is_ok());
+        assert!(
+            checkpoint.check("billing", "agent.sessions", 7).is_err(),
+            "another stream"
+        );
+        assert!(
+            checkpoint.check("support", "agent.sessions", 8).is_err(),
+            "a recreated topic"
+        );
+        assert!(
+            checkpoint.check("support", "agent.streams", 1).is_ok(),
+            "a topic the checkpoint did not capture"
+        );
+        let json = serde_json::to_string(&checkpoint).expect("the checkpoint serializes");
+        assert_eq!(
+            json,
+            r#"{"per_topic":{"agent.sessions":{"0":5}},"stream":"support","generations":{"agent.sessions":7}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Checkpoint>(&json).expect("the checkpoint reads"),
+            checkpoint
+        );
+        assert!(
+            Checkpoint::from_topic_offsets(BTreeMap::new())
+                .check("billing", "agent.sessions", 8)
+                .is_ok(),
+            "a checkpoint without identity reads anywhere"
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ Managed by the managed backend in Laser Stack or LaserData Cloud, using the same
 ## What it shows
 
 - Declare the same view shape the `query` example builds under this run's own name, so this binary runs on its own with no shared state.
-- Open a change-feed reader: `laser.watch().index(&index).records()?`. The per-run view starts empty, so the first change it reports is this run's own publish.
+- Open a change-feed reader at the feed's end: `laser.watch().index(&index).from_end().records().await?`, so the first change it reports is this run's own publish. `poll_within` waits for it.
 - Publish a host reading that advances the view.
 - Poll until the advance arrives, and read the batch it reports: rows landed, and the source offsets they came from.
 

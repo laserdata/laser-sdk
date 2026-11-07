@@ -49,6 +49,22 @@ def test_given_a_graph_schema_when_built_then_should_mark_the_projection_graph()
     assert projection["entity_schema"]["nodes"][0]["label"] == "host"
 
 
+def test_given_a_keyed_builder_without_a_delete_header_when_built_then_should_omit_it():
+    key = {"kind": "header", "name": "order_id"}
+
+    never_deletes = ls.ProjectionBuilder("orders").record().keyed(key).build()
+    deletes = ls.ProjectionBuilder("orders").record().keyed(key, delete_header="deleted").build()
+
+    assert never_deletes["history"] == {"kind": "keyed", "key": key}
+    assert deletes["history"] == {"kind": "keyed", "key": key, "delete_header": "deleted"}
+
+
+def test_given_a_keyed_history_dict_without_a_delete_header_when_read_then_should_be_keyed():
+    history = {"kind": "keyed", "key": {"kind": "pointer", "pointer": "/id"}}
+
+    assert ls.is_append_projection_history(history) is False
+
+
 def test_given_a_spent_builder_when_built_again_then_should_raise_invalid():
     builder = ls.ProjectionBuilder("readings")
     builder.build()
@@ -96,13 +112,18 @@ def test_given_a_binding_builder_when_built_then_should_default_the_index_to_the
     assert binding["default_projection"] == "readings"
     assert binding["retention"] == {"kind": "time_to_live", "ttl_micros": 60_000_000}
     assert binding["notify"] is True
-    assert "skip_rejected" not in binding
+    assert "invalid_records" not in binding
 
 
 def test_given_a_binding_that_skips_rejected_records_when_built_then_should_carry_the_opt_in():
-    binding = ls.ProjectionBindingBuilder().source("telemetry", "readings").skip_rejected().build()
+    binding = (
+        ls.ProjectionBindingBuilder()
+        .source("telemetry", "readings")
+        .invalid_records("dead_letter")
+        .build()
+    )
 
-    assert binding["skip_rejected"] is True
+    assert binding["invalid_records"] == "dead_letter"
 
 
 def test_given_a_binding_without_source_when_built_then_should_raise_invalid():
@@ -137,3 +158,23 @@ def test_given_schema_dicts_when_classified_then_should_report_their_content_typ
 
     assert ls.schema_def_content_type(avro) == "avro"
     assert ls.schema_def_content_type(json_schema) == "json"
+
+
+def test_given_binding_policies_when_built_then_should_encode_both_nondefaults():
+    binding = (
+        ls.ProjectionBindingBuilder()
+        .source("telemetry", "readings")
+        .invalid_records("dead_letter")
+        .oversize("reference")
+        .build()
+    )
+    assert binding["invalid_records"] == "dead_letter"
+    assert binding["oversize"] == "reference"
+
+
+@pytest.mark.parametrize("policy", ["unknown", "invalid", ""])
+@pytest.mark.parametrize("method", ["invalid_records", "oversize"])
+def test_given_invalid_binding_policy_when_selected_then_should_raise_invalid(method, policy):
+    builder = ls.ProjectionBindingBuilder().source("telemetry", "readings")
+    with pytest.raises(ls.InvalidError):
+        getattr(builder, method)(policy)

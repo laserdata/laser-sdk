@@ -18,6 +18,7 @@ import {
   graphNodeEntity
 } from "../../src/wire/graph.js"
 import { ConversationId } from "../../src/wire/ids.js"
+import { filterPred } from "../../src/wire/query.js"
 
 const CAPS: Capabilities = managedCapabilitiesFrom({
   versions: { query: 1, control: 1, kv: 1, fork: 1, agent: 1, graph: 1, features: 0n },
@@ -52,10 +53,15 @@ function fakeTransport(scriptedReplies: readonly Uint8Array[]): {
   }
 }
 
-function graph(name: string, replies: readonly Uint8Array[], capabilities: Capabilities = CAPS) {
+function graph(
+  name: string,
+  replies: readonly Uint8Array[],
+  capabilities: Capabilities = CAPS,
+  nowMicros: () => bigint = () => 1_000n
+) {
   const transport = fakeTransport(replies)
   return {
-    graph: GraphHandle.create(transport, () => Promise.resolve(capabilities), name),
+    graph: GraphHandle.create(transport, () => Promise.resolve(capabilities), name, nowMicros),
     transport
   }
 }
@@ -183,4 +189,92 @@ void test("given_an_edge_when_a_source_is_attached_then_should_keep_its_id_and_c
   assert.equal(sourced.id.toString(), edge.id.toString())
   assert.deepEqual(sourced.source, { kind: "kv", namespace: "people", key: "ada" })
   assert.equal(edge.source, undefined)
+})
+
+void test("given_a_link_call_when_run_then_should_open_the_edge_at_the_current_valid_time", async () => {
+  const { graph: handle, transport } = graph("kg", [okFrame(EMPTY_RESULT)], CAPS, () => 4_200n)
+  await handle.link("host:node-7", "opened", "ticket:7")
+  const host = graphNodeEntity("host", "node-7")
+  const ticket = graphNodeEntity("ticket", "7")
+  assert.deepEqual(
+    transport.calls[0]?.payload,
+    encodeGraphUpsertFrame({
+      graph: "kg",
+      nodes: [host, ticket],
+      edges: [{ ...graphEdgeRelate(host, "opened", ticket), validFrom: 4_200n }]
+    })
+  )
+})
+
+void test("given_a_relink_call_when_run_then_should_close_and_open_at_the_same_instant", async () => {
+  const host = graphNodeEntity("host", "node-7")
+  const stale = graphEdgeRelate(host, "opened", graphNodeEntity("ticket", "7"))
+  let tick = 7_000n
+  const { graph: handle, transport } = graph(
+    "kg",
+    [
+      okFrame({ nodes: [], edges: [stale], paths: [] }),
+      okFrame(EMPTY_RESULT),
+      okFrame(EMPTY_RESULT)
+    ],
+    CAPS,
+    () => (tick += 1n)
+  )
+  await handle.relink("host:node-7", "opened", "ticket:9")
+  const ticket9 = graphNodeEntity("ticket", "9")
+  assert.deepEqual(
+    transport.calls[1]?.payload,
+    encodeGraphUpsertFrame({ graph: "kg", nodes: [], edges: [{ ...stale, validTo: 7_001n }] })
+  )
+  assert.deepEqual(
+    transport.calls[2]?.payload,
+    encodeGraphUpsertFrame({
+      graph: "kg",
+      nodes: [host, ticket9],
+      edges: [{ ...graphEdgeRelate(host, "opened", ticket9), validFrom: 7_001n }]
+    })
+  )
+})
+
+void test("given_filters_and_a_multi_step_hop_when_building_then_should_carry_them_in_the_query", () => {
+  const { graph: handle } = graph("kg", [])
+  const nodeFilter = filterPred("label", "eq", { kind: "string", value: "Person" })
+  const edgeFilter = filterPred("edge_type", "eq", { kind: "string", value: "knows" })
+  const query = handle
+    .startIds([])
+    .hop("both", undefined, 3)
+    .out("works_at")
+    .nodeFilter(nodeFilter)
+    .edgeFilter(edgeFilter)
+    .limit(7)
+    .intoQuery()
+  assert.deepEqual(query, {
+    v: 1,
+    graph: "kg",
+    start: { kind: "ids", ids: [] },
+    traverse: [
+      { dir: "both", max: 3 },
+      { edgeType: "works_at", dir: "out", max: 1 }
+    ],
+    return: "nodes",
+    limit: 7,
+    nodeFilter,
+    edgeFilter
+  })
+})
+
+void test("given_an_invalid_hop_or_limit_when_fetching_then_should_reject_before_the_transport", async () => {
+  for (const configure of [
+    (handle: GraphHandle) => handle.hop("out", "knows", 0),
+    (handle: GraphHandle) => handle.hop("out", "knows", 9),
+    (handle: GraphHandle) => handle.hop("out", "knows", 5).hop("out", "likes", 4),
+    (handle: GraphHandle) => handle.limit(Number.NaN),
+    (handle: GraphHandle) => handle.limit(-1),
+    (handle: GraphHandle) => handle.limit(1.5),
+    (handle: GraphHandle) => handle.limit(10_001)
+  ]) {
+    const { graph: handle, transport } = graph("kg", [])
+    await assert.rejects(() => configure(handle).fetch(), InvalidError)
+    assert.equal(transport.calls.length, 0)
+  }
 })

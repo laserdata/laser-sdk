@@ -1,4 +1,4 @@
-use crate::async_bridge::{HookLoop, call_hook, future_into_py};
+use crate::async_bridge::{Awaitable, HookLoop, awaitable, call_hook};
 use crate::convert::{duration_ms, payload_bytes, py_to_de, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::kv::PyLease;
@@ -27,6 +27,23 @@ impl ManagedKvTransport for Transport {
 
     async fn reset(&self) {
         self.0.as_ref().reset().await;
+    }
+
+    fn generation(&self) -> u64 {
+        self.0.as_ref().generation()
+    }
+
+    async fn send_on(
+        &self,
+        generation: u64,
+        code: u32,
+        frame: Vec<u8>,
+    ) -> Result<Vec<u8>, LaserError> {
+        self.0.as_ref().send_on(generation, code, frame).await
+    }
+
+    async fn reset_generation(&self, generation: u64) {
+        self.0.as_ref().reset_generation(generation).await;
     }
 
     async fn close(&self) {
@@ -110,9 +127,9 @@ impl PyDedicatedKvTransport {
         }
     }
 
-    fn ready<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn ready<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let transport = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             ManagedKvTransport::ready(transport.as_ref())
                 .await
                 .map_err(to_pyerr)
@@ -123,11 +140,12 @@ impl PyDedicatedKvTransport {
         &self,
         py: Python<'py>,
         code: u32,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         frame: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyBytes>>> {
         let transport = self.inner.clone();
         let frame = payload_bytes(frame)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let reply = ManagedKvTransport::send(transport.as_ref(), code, frame)
                 .await
                 .map_err(to_pyerr)?;
@@ -135,25 +153,28 @@ impl PyDedicatedKvTransport {
         })
     }
 
-    fn reset<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn reset<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let transport = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             ManagedKvTransport::reset(transport.as_ref()).await;
             Ok(())
         })
     }
 
     /// Close this transport permanently. `reset` permits later reuse.
-    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let transport = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             transport.close().await;
             Ok(())
         })
     }
 
-    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        future_into_py(py, async move { Ok(slf) })
+    fn __aenter__<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+    ) -> PyResult<Awaitable<'py, Py<PyDedicatedKvTransport>>> {
+        awaitable(py, async move { Ok(slf) })
     }
 
     #[pyo3(signature = (_exc_type, _exc_value, _traceback))]
@@ -163,9 +184,9 @@ impl PyDedicatedKvTransport {
         _exc_type: &Bound<'_, PyAny>,
         _exc_value: &Bound<'_, PyAny>,
         _traceback: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, bool>> {
         let transport = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             transport.close().await;
             Ok(false)
         })
@@ -279,7 +300,7 @@ impl PyFencedLeaseClient {
 #[pymethods]
 impl PyFencedLeaseClient {
     /// The transport supplies send(code, frame) and reset(), and optionally ready() and close(), each sync or async.
-    /// A send still running when its attempt times out is cancelled before reset() is called. Reset must stop all other in-flight work before it returns.
+    /// A send still running when its attempt times out is cancelled before reset() is called. Reset must stop all other in-flight work before it returns. A send that raises AmbiguousMutationError reports a frame it wrote without a reply, and the client raises it again carrying the operation id.
     #[new]
     fn new(transport: &Bound<'_, PyAny>) -> PyResult<Self> {
         let transport: SharedKvTransport =
@@ -369,10 +390,10 @@ impl PyFencedLeaseClient {
         &self,
         py: Python<'py>,
         op: &PyPreparedMutation,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyLease>> {
         let client = self.client();
         let operation = op.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             client
                 .acquire(&operation)
                 .await
@@ -381,10 +402,14 @@ impl PyFencedLeaseClient {
         })
     }
 
-    fn renew<'py>(&self, py: Python<'py>, op: &PyPreparedMutation) -> PyResult<Bound<'py, PyAny>> {
+    fn renew<'py>(
+        &self,
+        py: Python<'py>,
+        op: &PyPreparedMutation,
+    ) -> PyResult<Awaitable<'py, PyLease>> {
         let client = self.client();
         let operation = op.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             client
                 .renew(&operation)
                 .await
@@ -397,10 +422,10 @@ impl PyFencedLeaseClient {
         &self,
         py: Python<'py>,
         op: &PyPreparedMutation,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, bool>> {
         let client = self.client();
         let operation = op.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             client.release(&operation).await.map_err(to_pyerr)
         })
     }
@@ -409,34 +434,41 @@ impl PyFencedLeaseClient {
         &self,
         py: Python<'py>,
         op: &PyPreparedMutation,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, u64>> {
         let client = self.client();
         let operation = op.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             client.cas_fenced(&operation).await.map_err(to_pyerr)
         })
     }
 
-    fn get<'py>(&self, py: Python<'py>, request: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn get<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let client = self.client();
         let request: KvGet = py_to_de(request)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let entry = client.get(&request).await.map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &entry))
         })
     }
 
     /// Close this client and retire its transport. Later calls fail before sending.
-    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let client = self.client();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             client.close().await;
             Ok(())
         })
     }
 
-    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        future_into_py(py, async move { Ok(slf) })
+    fn __aenter__<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+    ) -> PyResult<Awaitable<'py, Py<PyFencedLeaseClient>>> {
+        awaitable(py, async move { Ok(slf) })
     }
 
     #[pyo3(signature = (_exc_type, _exc_value, _traceback))]
@@ -446,9 +478,9 @@ impl PyFencedLeaseClient {
         _exc_type: &Bound<'_, PyAny>,
         _exc_value: &Bound<'_, PyAny>,
         _traceback: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, bool>> {
         let client = self.client();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             client.close().await;
             Ok(false)
         })

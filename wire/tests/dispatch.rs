@@ -5,8 +5,8 @@
 // reliable consumer does with it.
 
 use laser_wire::agent::{
-    AgentEnvelope, AgentId, ConversationId, CorrelationId, METADATA_ROLE, RecordId, SdkInfo,
-    SessionEnd, SessionStart, SessionTransition, TaskState,
+    AgentEnvelope, AgentId, ConversationId, CorrelationId, METADATA_RECORDED, METADATA_ROLE,
+    RecordId, SdkInfo, SessionEnd, SessionStart, SessionTransition, TaskState,
 };
 use laser_wire::dispatch::{
     HandledOperations, SessionRecord, addressee_filter, broadcast_filter, classify,
@@ -185,11 +185,15 @@ fn envelope(kind: &str, record: &Json) -> AgentEnvelope {
     envelope.target = record["target"]
         .as_str()
         .map(|target| target.parse().expect("target"));
+    let mut metadata = BTreeMap::new();
     if let Some(role) = record["role"].as_str() {
-        envelope.metadata = Some(BTreeMap::from([(
-            METADATA_ROLE.to_owned(),
-            Value::Str(role.to_owned()),
-        )]));
+        metadata.insert(METADATA_ROLE.to_owned(), Value::Str(role.to_owned()));
+    }
+    if record["recorded"] == true {
+        metadata.insert(METADATA_RECORDED.to_owned(), Value::Bool(true));
+    }
+    if !metadata.is_empty() {
+        envelope.metadata = Some(metadata);
     }
     envelope
 }

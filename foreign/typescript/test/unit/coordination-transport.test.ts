@@ -108,9 +108,11 @@ void test("given_a_closed_dedicated_transport_when_readied_then_should_not_recon
   assert.equal(connects, 0)
 })
 
-void test("given_an_unsupported_deployment_when_readied_twice_then_should_keep_its_connection", async (t) => {
+void test("given_an_unsupported_deployment_when_readied_again_then_should_keep_its_connection_and_probe_at_most_once_a_second", async (t) => {
   let connects = 0
   let probes = 0
+  let nowMs = 0
+  t.mock.method(performance, "now", () => nowMs)
   t.mock.method(ApacheIggyTransport, "connect", () => {
     connects += 1
     return Promise.resolve({
@@ -124,8 +126,11 @@ void test("given_an_unsupported_deployment_when_readied_twice_then_should_keep_i
   await using transport = new DedicatedKvTransport("test")
   await assert.rejects(transport.ready(), UnsupportedError)
   await assert.rejects(transport.ready(), UnsupportedError)
+  assert.equal(probes, 1, "a refused call within a second answers from the last probe")
+  nowMs = 1_000
+  await assert.rejects(transport.ready(), UnsupportedError)
+  assert.equal(probes, 2, "a second later the connection probes again")
   assert.equal(connects, 1)
-  assert.equal(probes, 2)
 })
 
 const release = { namespace: "coord", key: new Uint8Array([1]), leaseToken: 7n, holderId: "worker" }
@@ -265,4 +270,73 @@ void test("given_a_transport_with_terminal_close_when_the_client_closes_then_sho
   await client.close()
   assert.equal(closed, 1)
   assert.equal(resets, 0)
+})
+
+void test("given_a_late_failure_from_a_retired_connection_when_a_newer_connection_serves_then_should_keep_the_newer_connection", async (t) => {
+  const entered = deferred<undefined>()
+  let failLate!: (error: Error) => void
+  const late = new Promise<Uint8Array>((_resolve, reject) => {
+    failLate = reject
+  })
+  const released = encodeOne(
+    encodeKvReply({ kind: "ok", outcome: { kind: "released", wasHeld: true } })
+  )
+  const closed: number[] = []
+  let connects = 0
+  t.mock.method(ApacheIggyTransport, "connect", () => {
+    connects += 1
+    const connection = connects
+    return Promise.resolve({
+      sendManaged: () => Promise.resolve(supported),
+      sendManagedPreframed: () => {
+        if (connection > 1) return Promise.resolve(released)
+        entered.resolve(undefined)
+        return late
+      },
+      close: () => {
+        closed.push(connection)
+        return Promise.resolve(undefined)
+      }
+    } as unknown as ApacheIggyTransport)
+  })
+  await using transport = new DedicatedKvTransport("test")
+  const client = new FencedLeaseClient(transport)
+  const stale = assert.rejects(
+    client.release(client.prepareRelease(release)),
+    AmbiguousMutationError
+  )
+  await entered.promise
+  // Another call's timeout retires the first connection, and a later call opens a second.
+  await transport.reset()
+  assert.equal(await client.release(client.prepareRelease(release)), true)
+  failLate(new TransportError("connection closed", true))
+  await stale
+  assert.deepEqual(closed, [1], "the late failure leaves the second connection running")
+  assert.equal(await client.release(client.prepareRelease(release)), true)
+  assert.equal(connects, 2)
+})
+
+void test("given_a_frame_the_connection_wrote_when_a_later_attempt_finds_the_transport_closed_then_should_report_ambiguity_with_the_identity", async (t) => {
+  t.mock.method(ApacheIggyTransport, "connect", () =>
+    Promise.resolve({
+      sendManaged: () => Promise.resolve(supported),
+      sendManagedPreframed: (
+        _code: number,
+        _frame: Uint8Array,
+        options?: { readonly written?: { written: boolean } }
+      ) => {
+        if (options?.written !== undefined) options.written.written = true
+        return Promise.reject(new TransportError("transport is closed", false))
+      },
+      close: () => Promise.resolve(undefined)
+    } as unknown as ApacheIggyTransport)
+  )
+  await using transport = new DedicatedKvTransport("test")
+  const client = new FencedLeaseClient(transport)
+  const operation = client.prepareRelease(release)
+  await assert.rejects(
+    client.release(operation),
+    (error: unknown) =>
+      error instanceof AmbiguousMutationError && error.operationId === operation.operationId
+  )
 })

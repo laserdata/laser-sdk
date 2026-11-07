@@ -224,14 +224,14 @@ def make_triage(llm, index: str):
 
         # Tool 2: the specialist, one deadline-bounded call per angle, each on
         # its own correlation conversation so the replies never cross.
-        deadline_micros = int(time.time() * 1_000_000) + int(TOOL_TIMEOUT * 1_000_000)
+        deadline_at_micros = int(time.time() * 1_000_000) + int(TOOL_TIMEOUT * 1_000_000)
 
         async def ask(angle: str):
             correlation = ls.Provenance(
                 conversation_id=ls.new_conversation_id(),
                 agent="triage",
                 target_agent_id="specialist",
-                deadline_micros=deadline_micros,
+                deadline_at_micros=deadline_at_micros,
             )
             reply = await ctx.request(
                 ls.AgentTopic.Sessions,

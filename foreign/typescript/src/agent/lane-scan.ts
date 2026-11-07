@@ -1,8 +1,7 @@
 import { INTERNAL_TRANSPORT } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
-import { CONTEXT_READ_WINDOW, LastN } from "../context.js"
+import { CONTEXT_READ_WINDOW } from "../context.js"
 import type { LaserTransport, PollWait, PolledMessage } from "../iggy/apache-iggy.js"
-import { AgentTopic } from "../provenance/agent-topic.js"
 import type { ConversationId } from "../types/ids.js"
 import {
   type AgentEnvelope,
@@ -235,7 +234,7 @@ export class LaneScan {
 export interface Window {
   readonly messages: readonly PolledMessage[]
   readonly nextOffset: bigint
-  /** The partition holds or held records before the window. */
+  /** The partition holds retained records before the window. */
   readonly truncated: boolean
 }
 
@@ -259,7 +258,7 @@ export async function readWindow(
   return {
     messages: drained.messages,
     nextOffset: drained.nextOffset,
-    truncated: first > 0n || start > first
+    truncated: start > first
   }
 }
 
@@ -381,17 +380,16 @@ class SourceCheck {
   }
 }
 
-/** The agents the lane of `session` shows working on it: the addressees of
- * its work commands and the agents that picked it up or acknowledged a
- * control request. Model, tool, and control records are not work.
+/** The agents the retained lane of `session` shows working on it: the
+ * addressees of its work commands and the agents that picked it up or
+ * acknowledged a control request. Model, tool, and control records are not
+ * work.
  * @internal */
 export async function laneParticipants(
   laser: Laser,
   session: ConversationId
 ): Promise<readonly AgentId[]> {
-  const records = await laser
-    .context(session)
-    .fetchWith([AgentTopic.Sessions], new LastN(Number.MAX_SAFE_INTEGER))
+  const records = await laser.sessions().open(session).laneRecords()
   const participants = new Set<AgentId>()
   for (const record of records) {
     const envelope = record.envelope

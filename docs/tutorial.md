@@ -13,7 +13,7 @@ Laser SDK is a streaming substrate, a managed query layer over it, and an agenti
 | layer | what it is | when you need it |
 | --- | --- | --- |
 | streaming (`streaming` feature, default) | typed publish, direct producers, live async consumer groups with server offsets, and the resumable `Cursor`. No agent concepts, no managed backend. | anywhere you stream messages against Apache Iggy. |
-| managed (`managed` feature, or the granular `query` / `projections` / `destinations` / `filters` / `kv` / `fork` / `graph` / `watch` / `rbac`) | declared projections, query DSL with filters / aggregates / vector recall, served by Laser Stack or LaserData Cloud. | agent / LLM observability, analytics, audit logs, market data, IoT, anywhere you want to query what you streamed. |
+| managed (`managed` feature, or the granular `query` / `projections` / `filters` / `kv` / `fork` / `graph` / `watch` / `rbac`) | declared projections, query DSL with filters / aggregates / vector recall, served by Laser Stack or LaserData Cloud. | agent / LLM observability, analytics, audit logs, market data, IoT, anywhere you want to query what you streamed. |
 | agentic (`agent` feature) | reliable consumer + DLQ, sessions, conversation/causality, `Router`, `Memory`, `Agent::builder` handlers. Builds on the streaming layer. | When you are orchestrating LLM agents, not just observing traffic. |
 
 Chapters 1-8 use streaming and managed data operations. Chapter 9 adds the agent runtime.
@@ -146,7 +146,7 @@ What runs on Apache Iggy is the open SDK's streaming, agent, provenance, dedup, 
 Laser Stack and LaserData Cloud serve two more read surfaces, both answering `LaserError::Unsupported` against Apache Iggy without a managed backend:
 
 - The `kv` feature exposes `Laser::kv` when `Capabilities::kv.available` is true. It supports `get`, `set`, `delete`, and `scan` with opaque keys and values. Use `.bytes`, `.json`, `.msgpack`, or `.encode_with::<C>` to write. Use `get`, `get_typed`, or `get_as::<C, _>` to read. Managed grants control namespace access.
-- Read projections through `laser.projections().get(id)` or `laser.projections().list().fetch()`. Read schemas through `laser.schemas().get(id)` or `laser.schemas().list()`. These calls require `Capabilities::managed`. Control-topic writes change projections and schemas.
+- Read projections through `laser.projections().get(id)` or `laser.projections().list().fetch()`, which returns one page (`page(n)` and `results(n)` pick it). Read schemas through `laser.schemas().get(id)` or `laser.schemas().list()`. These calls require `Capabilities::managed`. Control-topic writes change projections and schemas.
 
 ### Projection retention, decoupled from topic expiry
 
@@ -645,7 +645,7 @@ Managed models can retain the source conversation from `gen_ai.conversation.id`.
 
 Streaming, agents, provenance, duplicate suppression, `Cursor`, `StateStore`, and locally folded memory run on Apache Iggy. Queries, projections, KV, and forks require a managed backend. Without it, calls return `LaserError::Unsupported`.
 
-Capabilities group support under `managed`, `query`, `destinations`, `kv`, `graph`, `forks`, `sessions`, `a2a_gateway`, `watch`, `authz`, and `filters`. The server sets `sessions` only when it serves the managed session reads. Query includes `available`, `consistency`, `keyword`, `cursor_paging`, `cancellation`, and `execution_status`. KV includes `available`, `cas`, `cas_fenced`, and `fenced_leases`. Memory combines query and graph capabilities rather than defining another group:
+Capabilities group support under `managed`, `query`, `kv`, `graph`, `forks`, `sessions`, `a2a_gateway`, `watch`, `authz`, and `filters`. The server sets `sessions` only when it serves the managed session reads. Query includes `available`, `consistency`, and `keyword`. KV includes `available`, `cas`, `cas_fenced`, and `fenced_leases`. Memory combines query and graph capabilities rather than defining another group:
 
 | concern | open SDK (this crate, Apache Iggy) | managed runtime (LaserData Cloud or Laser Stack) |
 | --- | --- | --- |
@@ -703,7 +703,7 @@ Keep `worker` alive while the agent should serve work, because dropping the hand
 
 ### A contract: one directed task with a deadline
 
-`Laser::contract` hands a task to one capable agent and tells you whether it was consumed, completed, or timed out, with no hand-rolled correlation ids or timers. The deadline defaults to 30 seconds. `Contract::NotConsumed` is reported only when the contract sets `expire_if_not_consumed` and the target emits pickup acknowledgments through `ack_on_pickup`. `Contract::Failed` carries the target's terminal error reply.
+`Laser::contract` hands a task to one capable agent and tells you whether it was consumed, completed, or timed out, with no hand-rolled correlation ids or timers. The deadline defaults to 30 seconds. `Contract::NotConsumed` is reported only when the contract sets `expire_if_not_consumed` and the target answers that its consumer dropped the expired command, which a target with a `respond_on` topic does. `Contract::Failed` carries the target's terminal error reply.
 
 ```rust
 let outcome = laser
@@ -790,7 +790,7 @@ The setup can run separately from every consumer instance. The consumer needs no
 
 **Batch length 100 examines at most 100 source records per partition request.** It can deliver zero through 100 records. Empty selections retain progress and do not mean end of stream. The advanced `group.reader()` uses a separate matching-record `count` and `max_examined` scan budget. It also supports unbound groups. Its acknowledgment includes skipped records only through completed work.
 
-The name is the caller's label for the group's own filter. It follows the saved filter name rule and need not be unique. Use `group.filter().configure(name, filter)` for later setup, `summary()` to read the group's own filter row with its name and owner, and its `preview`, `test`, `revisions`, `revise` and `set_revision_enabled` methods for diagnostics and administration. A draft revision does not replace a group's active policy. Use another group for a different A/B policy.
+The name is the caller's label for the group's own filter. It follows the saved filter name rule and need not be unique. Use `group.filter().configure(name, filter)` for later setup, `summary()` to read the group's own filter row with its name and owner, and its `preview`, `test`, `revisions` and `set_revision_enabled` methods for diagnostics and administration. A group runs one policy for its lifetime, so the SDK offers no revision drafts of a group's own filter. Use another group for a different A/B policy.
 
 **The recorded CDC example saves 98.5% of payload transfer:** 4 of 240 records and 424 of 27,953 payload bytes. The example exists in Rust, Python and TypeScript. It demonstrates change evidence, numeric headers and JSON, CBOR, Avro and Protobuf policies.
 

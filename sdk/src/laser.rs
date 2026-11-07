@@ -1,17 +1,21 @@
 use crate::capabilities::{Capabilities, HelloOutcome};
 use crate::connect_options::{ConnectOptions, connect_before};
-use crate::error::LaserError;
-use crate::nodes::{Nodes, Target};
+use crate::error::{LaserError, TransportError};
+use crate::nodes::{Answered, Nodes, Target};
 pub use crate::publish_options::PublishOptions;
 use bytes::Bytes;
 use dashmap::DashMap;
 #[cfg(feature = "streaming")]
 use iggy::prelude::*;
-use iggy_common::MAX_REPLICATION_FACTOR;
+use iggy_common::{ConnectionString, MAX_REPLICATION_FACTOR, TcpConnectionStringOptions};
+use laser_wire::batch::BatchReply;
+use laser_wire::codes::AGDX_BATCH_CODE;
 use laser_wire::framing::decode_named;
 use laser_wire::validate::Validate;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+#[cfg(feature = "kv")]
+use std::sync::atomic::AtomicBool;
 use tokio::sync::OnceCell;
 use tokio::time::{Duration, sleep};
 use tracing::Instrument;
@@ -23,14 +27,129 @@ type SendFuture<'a> =
 
 /// How long a managed mutation keeps repeating its frame while its outcome is
 /// unknown, the shared client contract deadline.
-pub(crate) use crate::retry::MANAGED_MUTATION_DEADLINE;
+pub(crate) use crate::retry::{MANAGED_ATTEMPT_FIRST, MANAGED_MUTATION_DEADLINE};
 
-/// The message of a managed reply that leaves a mutation's outcome unknown, or
+/// What the attempts of one managed mutation know about its outcome. An
+/// attempt whose outcome is unknown makes every later refusal ambiguous too,
+/// because the earlier attempt may still apply.
+#[derive(Debug, Default)]
+struct MutationAttempts {
+    uncertain: Option<String>,
+    /// The unresolved items of a batch frame, by slot, empty for one mutation.
+    slots: Vec<Option<String>>,
+    batch: bool,
+}
+
+/// What one attempt of a managed mutation came back with.
+enum Attempt {
+    Answered(Vec<u8>),
+    /// The request may have left, but no outcome came back.
+    Lost(String),
+    Refused(LaserError),
+}
+
+impl MutationAttempts {
+    /// The attempts of one managed request. A batch frame settles item by item.
+    fn for_code(code: u32) -> Self {
+        Self {
+            batch: code == AGDX_BATCH_CODE,
+            ..Self::default()
+        }
+    }
+
+    /// The reply that settles the mutation, `None` to send it again, or the
+    /// error the caller gets.
+    fn settle(&mut self, attempt: Attempt) -> Result<Option<Vec<u8>>, LaserError> {
+        match attempt {
+            Attempt::Answered(reply) => {
+                if self.batch
+                    && let Ok(batch) = decode_named::<BatchReply>(&reply)
+                {
+                    return self.settle_batch(reply, batch);
+                }
+                if let Some(error) = unknown_outcome(&reply) {
+                    self.uncertain = Some(error.message);
+                    return Ok(None);
+                }
+                match (&self.uncertain, admission_refusal(&reply)) {
+                    (Some(earlier), Some(refusal)) => Err(self.ambiguous(earlier, &refusal)),
+                    _ => Ok(Some(reply)),
+                }
+            }
+            Attempt::Lost(error) => {
+                self.uncertain = Some(error);
+                Ok(None)
+            }
+            Attempt::Refused(error) => match &self.uncertain {
+                Some(earlier) => Err(self.ambiguous(earlier, &error.to_string())),
+                None => Err(error),
+            },
+        }
+    }
+
+    /// Settle a batch frame item by item. An item whose outcome is unknown
+    /// leaves the whole frame unresolved, so the same frame is sent again and
+    /// every item answers under its own derived identity: a mutation with its
+    /// recorded outcome, a read with a fresh result. An item that was unknown
+    /// and is then refused by admission may still apply, like a mutation.
+    fn settle_batch(
+        &mut self,
+        reply: Vec<u8>,
+        batch: BatchReply,
+    ) -> Result<Option<Vec<u8>>, LaserError> {
+        let frame_uncertain = self.uncertain.take();
+        self.slots.resize(batch.results.len(), None);
+        let mut unresolved = Vec::new();
+        for (index, slot) in batch.results.iter().enumerate() {
+            let earlier = self.slots[index].take().or_else(|| frame_uncertain.clone());
+            if let Some(error) = unknown_outcome(slot) {
+                self.slots[index] = Some(error.message);
+                unresolved.push(index);
+                continue;
+            }
+            if let (Some(earlier), Some(refusal)) = (earlier, admission_refusal(slot)) {
+                return Err(self.ambiguous(&format!("item {index}: {earlier}"), &refusal));
+            }
+        }
+        let Some(first) = unresolved.first() else {
+            return Ok(Some(reply));
+        };
+        self.uncertain = Some(format!(
+            "items {unresolved:?} are unresolved: {}",
+            self.slots[*first].clone().unwrap_or_default()
+        ));
+        Ok(None)
+    }
+
+    fn ambiguous(&self, earlier: &str, refusal: &str) -> LaserError {
+        LaserError::AmbiguousMutation {
+            operation_id: None,
+            message: format!(
+                "an earlier attempt's outcome is unknown ({earlier}), then the request was refused ({refusal})"
+            ),
+        }
+    }
+}
+
+/// A refusal that names no outcome of the mutation, only why this attempt was
+/// not admitted.
+fn admission_refusal(reply: &[u8]) -> Option<String> {
+    let error = decode_named::<laser_wire::result::CommandError>(reply).ok()?;
+    matches!(
+        error.code,
+        laser_wire::result::ResultCode::Forbidden
+            | laser_wire::result::ResultCode::Unauthenticated
+            | laser_wire::result::ResultCode::StepUpRequired
+    )
+    .then(|| format!("{:?}: {}", error.code, error.message))
+}
+
+/// The error of a managed reply that leaves a mutation's outcome unknown, or
 /// `None` for a final reply. `Pending` means the managed backend accepted the mutation
 /// and has not folded it yet. `BackendUnavailable` means the node's own backend did
 /// not answer, so the request may still apply. `Unavailable` means the node was
 /// too busy to forward it. Each is repeated under the same operation identity.
-fn unknown_outcome(reply: &[u8]) -> Option<laser_wire::result::CommandError> {
+pub(crate) fn unknown_outcome(reply: &[u8]) -> Option<laser_wire::result::CommandError> {
     let error = decode_named::<laser_wire::result::CommandError>(reply).ok()?;
     (error.code.is_pending()
         || error.code.is_backend_unavailable()
@@ -88,15 +207,6 @@ fn merge_frontier(
     }
 }
 
-/// The surface reply inside a positioned reply, and the frontier it carries.
-/// A reply the streaming server itself refused with comes unwrapped.
-fn open_positioned(reply: Vec<u8>) -> (Vec<u8>, Option<laser_wire::mutation::AppliedFrontier>) {
-    match decode_named::<laser_wire::mutation::ManagedReplyEnvelope>(&reply) {
-        Ok(envelope) => (envelope.reply, Some(envelope.frontier)),
-        Err(_) => (reply, None),
-    }
-}
-
 pub(crate) use crate::retry::jittered;
 
 // The generic correlation header and the header caps moved to laser-wire (they
@@ -126,8 +236,10 @@ const PUBLISH_BATCH_LENGTH: usize = 1000;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ResourceNaming {
     /// Scope every managed resource name to the default stream,
-    /// `stream:<stream>/<name>`. A name that already starts with `stream:` is
-    /// sent as is. A handle without a default stream sends bare names.
+    /// `stream:<stream>/<name>`. A name already scoped to that stream is sent
+    /// as is, a `stream:` name for another stream is scoped like a local name,
+    /// and a default stream containing `/` refuses managed calls. A handle
+    /// without a default stream sends bare names.
     #[default]
     Stream,
     /// Send every name exactly as the caller wrote it, deployment wide.
@@ -186,8 +298,6 @@ struct LaserInner {
     connection_string: Option<String>,
     #[cfg(feature = "kv")]
     coordination: OnceCell<Arc<crate::kv::FencedLeaseClient<crate::kv::DedicatedKvTransport>>>,
-    #[cfg(feature = "kv")]
-    coordination_acquire_gate: tokio::sync::Mutex<()>,
     producers: DashMap<ProducerKey, ProducerCell>,
     // The highest mutation position seen per surface, from mutation and read
     // replies. Every KV, fork and graph read sends it back, so whichever node
@@ -217,6 +327,8 @@ struct LaserInner {
     // where `advertise_presence` compiles (plus its unit test).
     #[cfg(all(feature = "agent", any(feature = "query", test)))]
     advertised_agent: std::sync::Mutex<Option<crate::types::AgentId>>,
+    #[cfg(all(feature = "agent", feature = "query"))]
+    presence_replica: tokio::sync::Mutex<Option<u8>>,
     // One shared reply dispatcher per (data stream, reply topic), so concurrent
     // request/reply waiters read the reply topic once between them instead of each
     // scanning it. Created lazily, driven by a background task that stops when this
@@ -239,9 +351,10 @@ struct NegotiatedState {
     probed_at: Option<tokio::time::Instant>,
 }
 
-// How long a set without a managed backend is trusted before `capabilities()`
-// probes again, so a backend that becomes ready after connect is picked up.
-const UNMANAGED_REPROBE_INTERVAL: Duration = Duration::from_secs(1);
+// How long a set without a managed backend, or with an enabled backend that
+// is not ready, is trusted before `capabilities()` probes again, so a backend
+// that becomes ready after connect is picked up.
+const REPROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Laser {
     #[cfg(all(feature = "agent", feature = "query"))]
@@ -250,6 +363,14 @@ impl Laser {
         requested: crate::types::AgentId,
     ) -> Result<(), LaserError> {
         claim_presence_slot(&self.inner.advertised_agent, requested)
+    }
+
+    /// The replica that holds this connection's advertised presence, pinned
+    /// by the first advertise and released by a clear that reached it. The
+    /// lock serializes advertise and clear, so one cannot overtake the other.
+    #[cfg(all(feature = "agent", feature = "query"))]
+    pub(crate) fn presence_pin(&self) -> &tokio::sync::Mutex<Option<u8>> {
+        &self.inner.presence_replica
     }
 
     #[cfg(all(feature = "agent", feature = "query"))]
@@ -368,8 +489,6 @@ impl Laser {
                 connection_string: None,
                 #[cfg(feature = "kv")]
                 coordination: OnceCell::new(),
-                #[cfg(feature = "kv")]
-                coordination_acquire_gate: tokio::sync::Mutex::new(()),
                 producers: DashMap::new(),
                 producer_statistics: Default::default(),
                 negotiated: std::sync::RwLock::new(NegotiatedState {
@@ -388,6 +507,8 @@ impl Laser {
                 #[cfg(feature = "agent")]
                 #[cfg(all(feature = "agent", any(feature = "query", test)))]
                 advertised_agent: std::sync::Mutex::new(None),
+                #[cfg(all(feature = "agent", feature = "query"))]
+                presence_replica: tokio::sync::Mutex::new(None),
                 #[cfg(feature = "agent")]
                 reply_hubs: DashMap::new(),
                 #[cfg(feature = "sign")]
@@ -440,9 +561,10 @@ impl Laser {
     /// Returns a clone of this `Laser` with the given capability set. The
     /// underlying connection + producer cache are shared with the original.
     #[must_use]
-    pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
-        self.capability_override = Some(capabilities);
-        self
+    pub fn with_capabilities(&self, capabilities: Capabilities) -> Self {
+        let mut scoped = self.clone();
+        scoped.capability_override = Some(capabilities);
+        scoped
     }
 
     /// Returns a clone of this `Laser` whose query/control surface rides
@@ -451,9 +573,10 @@ impl Laser {
     /// Production keeps the default, since one LaserData Cloud per deployment
     /// owns `_agdx`. Tests override it for per-case isolation.
     #[must_use]
-    pub fn with_ops_stream(mut self, ops_stream: impl Into<String>) -> Self {
-        self.ops_stream_override = Some(ops_stream.into());
-        self
+    pub fn with_ops_stream(&self, ops_stream: impl Into<String>) -> Self {
+        let mut scoped = self.clone();
+        scoped.ops_stream_override = Some(ops_stream.into());
+        scoped
     }
 
     /// Returns a clone of this `Laser` whose control commands publish to
@@ -462,9 +585,10 @@ impl Laser {
     /// shared. Production keeps the default, a deployment with its own ops-topic
     /// naming overrides it.
     #[must_use]
-    pub fn with_control_topic(mut self, control_topic: impl Into<String>) -> Self {
-        self.control_topic_override = Some(control_topic.into());
-        self
+    pub fn with_control_topic(&self, control_topic: impl Into<String>) -> Self {
+        let mut scoped = self.clone();
+        scoped.control_topic_override = Some(control_topic.into());
+        scoped
     }
 
     /// Returns a clone of this `Laser` whose dead-letter capsules publish to
@@ -472,9 +596,10 @@ impl Laser {
     /// underlying connection and producer cache are shared. Production keeps the
     /// default, a deployment with its own ops-topic naming overrides it.
     #[must_use]
-    pub fn with_dlq_topic(mut self, dlq_topic: impl Into<String>) -> Self {
-        self.dlq_topic_override = Some(dlq_topic.into());
-        self
+    pub fn with_dlq_topic(&self, dlq_topic: impl Into<String>) -> Self {
+        let mut scoped = self.clone();
+        scoped.dlq_topic_override = Some(dlq_topic.into());
+        scoped
     }
 
     /// Returns a clone of this `Laser` whose change-feed records publish to
@@ -482,9 +607,10 @@ impl Laser {
     /// underlying connection and producer cache are shared. Production keeps the
     /// default, a deployment with its own ops-topic naming overrides it.
     #[must_use]
-    pub fn with_changes_topic(mut self, changes_topic: impl Into<String>) -> Self {
-        self.changes_topic_override = Some(changes_topic.into());
-        self
+    pub fn with_changes_topic(&self, changes_topic: impl Into<String>) -> Self {
+        let mut scoped = self.clone();
+        scoped.changes_topic_override = Some(changes_topic.into());
+        scoped
     }
 
     /// A clone of this `Laser` pinned to a default data `stream`, sharing the one
@@ -517,8 +643,11 @@ impl Laser {
 
     /// The name this handle sends for the managed resource `name`:
     /// `stream:<default stream>/<name>` under [`ResourceNaming::Stream`] with a
-    /// default stream, else `name` unchanged. A name that already starts with
-    /// `stream:` is returned unchanged.
+    /// default stream, else `name` unchanged. A name already scoped to the
+    /// default stream is returned unchanged, and a `stream:` name for any other
+    /// stream is scoped like a local name. Re-scope with
+    /// [`with_default_stream`](Self::with_default_stream) or use
+    /// [`ResourceNaming::Bare`] to address another stream.
     pub fn resource_name(&self, name: &str) -> String {
         self.resource_name_in(self.default_stream(), name)
     }
@@ -538,11 +667,32 @@ impl Laser {
     }
 
     // `name` scoped to `stream` under this handle's naming. An empty name stays
-    // empty so the caller's validation still rejects it.
+    // empty so the caller's validation still rejects it. A name already scoped
+    // to `stream` is kept, and any other `stream:` name is scoped like a local
+    // name, so caller input never selects another stream's resources.
     pub(crate) fn resource_name_in(&self, stream: Option<&str>, name: &str) -> String {
         match self.resource_scope(stream) {
-            Some(stream) if !name.is_empty() => laser_wire::authz::scoped_resource(stream, name),
+            Some(stream) if !name.is_empty() => {
+                match laser_wire::authz::split_scoped_resource(name) {
+                    Some((owner, _)) if owner == stream => name.to_owned(),
+                    _ => format!("{}/{name}", laser_wire::authz::stream_resource(stream)),
+                }
+            }
             _ => name.to_owned(),
+        }
+    }
+
+    // A handle that scopes its names to a default stream containing `/` would
+    // send names every server reads as belonging to the stream before the
+    // first slash, so its managed calls are refused.
+    fn ensure_scopable(&self, code: u32) -> Result<(), LaserError> {
+        match self.resource_stream() {
+            Some(stream) if stream.contains('/') && code != laser_wire::codes::AGDX_HELLO_CODE => {
+                Err(LaserError::Invalid(format!(
+                    "default stream `{stream}` contains `/`, so managed names cannot be scoped to it, use ResourceNaming::Bare"
+                )))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -666,20 +816,16 @@ impl Laser {
         &self,
         request: laser_wire::kv::KvLease,
     ) -> Result<crate::kv::Lease, LaserError> {
+        self.ensure_scopable(laser_wire::codes::AGDX_KV_LEASE_CODE)?;
         let laser = self.clone();
-        // The owned task keeps the acquisition gate and TTL recovery alive if
-        // its caller cancels while the transport outcome is still unknown.
+        // The owned task keeps an attempt and its transport retirement running
+        // if the caller cancels while the outcome is still unknown.
         tokio::spawn(async move {
-            let _acquire = laser.inner.coordination_acquire_gate.lock().await;
             let coordination = laser.coordination_client().await?;
             let prepared = coordination.prepare_acquire(&request)?;
-            match coordination.acquire(&prepared).await {
-                Err(error @ LaserError::AmbiguousMutation(_)) => {
-                    sleep(Duration::from_micros(request.lease_ttl_micros)).await;
-                    Err(error)
-                }
-                result => result,
-            }
+            let lease = coordination.acquire_resolving(&prepared).await?;
+            laser.observe_kv_position(lease.position);
+            Ok(lease)
         })
         .await
         .map_err(|error| {
@@ -725,11 +871,12 @@ impl Laser {
         crate::agent::partitioning::destination_topic(layout.as_ref(), topic, kind, target)
     }
 
-    // The topic `agent` reads its addressed work and replies on under the
-    // default stream's declared per-agent topic layout, or `None` when the
-    // agent is not declared.
+    /// The topic `agent` reads its addressed work and replies on under the
+    /// default stream's declared per-agent topic layout, or `None` when the
+    /// agent is not declared. A language binding spawns its agents on it.
     #[cfg(feature = "agent")]
-    pub(crate) fn declared_topic(&self, agent: &laser_wire::agent::AgentId) -> Option<String> {
+    #[doc(hidden)]
+    pub fn declared_topic(&self, agent: &laser_wire::agent::AgentId) -> Option<String> {
         let layout = self.default_stream().and_then(|stream| self.layout(stream));
         crate::agent::partitioning::declared_topic(layout.as_ref(), agent)
     }
@@ -817,11 +964,12 @@ impl Laser {
     }
 
     /// The negotiated capability set (default [`Capabilities::OPEN`]). A set
-    /// without a managed backend is probed again when it is at least one second
-    /// old, so a backend that was not ready at connect is picked up without an
-    /// explicit [`refresh_capabilities`](Self::refresh_capabilities). A managed
-    /// set and an explicit override are returned as they are. Open features
-    /// work regardless of the result.
+    /// without a managed backend, or with an enabled backend that is not ready,
+    /// is probed again when it is at least one second old, so a backend that
+    /// was not ready at connect is picked up without an explicit
+    /// [`refresh_capabilities`](Self::refresh_capabilities). A set whose
+    /// backends are all ready and an explicit override are returned as they
+    /// are. Open features work regardless of the result.
     pub async fn capabilities(&self) -> Capabilities {
         if let Some(capabilities) = &self.capability_override {
             return capabilities.clone();
@@ -843,13 +991,18 @@ impl Laser {
             .negotiated
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        !negotiated.capabilities.managed
+        let unsettled = !negotiated.capabilities.managed
+            || negotiated.capabilities.unready_backends().next().is_some();
+        unsettled
             && negotiated
                 .probed_at
-                .is_none_or(|at| at.elapsed() >= UNMANAGED_REPROBE_INTERVAL)
+                .is_none_or(|at| at.elapsed() >= REPROBE_INTERVAL)
     }
 
-    pub(crate) fn current_capabilities(&self) -> Capabilities {
+    // The set held now, injected or last negotiated, without a reprobe. Public
+    // for the Python binding's synchronous `with_capabilities`.
+    #[doc(hidden)]
+    pub fn current_capabilities(&self) -> Capabilities {
         self.capability_override.clone().unwrap_or_else(|| {
             self.inner
                 .negotiated
@@ -1161,6 +1314,7 @@ impl Laser {
         payload: Vec<u8>,
         target: Target,
     ) -> Result<(Vec<u8>, Option<u8>), LaserError> {
+        self.ensure_scopable(code)?;
         if !laser_wire::codes::is_idempotent_managed_request(code) {
             let frame = bytes::Bytes::from(self.read_frame(code, &payload)?);
             let answered = self
@@ -1168,12 +1322,25 @@ impl Laser {
                 .nodes
                 .send(&self.client(), code, frame, target)
                 .await?;
-            return Ok((
-                self.take_positioned(answered.reply.to_vec()),
-                answered.replica,
+            return Ok((self.take_positioned(&answered), answered.replica));
+        }
+        self.send_managed_with_operation(code, payload, u128::from(ulid::Ulid::generate()), target)
+            .await
+    }
+
+    pub(crate) async fn send_managed_with_operation(
+        &self,
+        code: u32,
+        payload: Vec<u8>,
+        operation_id: u128,
+        target: Target,
+    ) -> Result<(Vec<u8>, Option<u8>), LaserError> {
+        self.ensure_scopable(code)?;
+        if operation_id == 0 {
+            return Err(LaserError::Invalid(
+                "operation id must be nonzero".to_owned(),
             ));
         }
-        let operation_id = u128::from(ulid::Ulid::generate());
         let frame =
             laser_wire::framing::encode_named(&laser_wire::mutation::ManagedRequestEnvelope {
                 v: laser_wire::mutation::MANAGED_REQUEST_VERSION,
@@ -1185,14 +1352,37 @@ impl Laser {
             .await
     }
 
+    /// Send managed read or control command `code` to `target` with the
+    /// reply awaited until `deadline`, naming the replica that answered.
+    #[cfg(all(feature = "agent", feature = "query"))]
+    pub(crate) async fn send_managed_within(
+        &self,
+        code: u32,
+        payload: Vec<u8>,
+        target: Target,
+        deadline: tokio::time::Instant,
+    ) -> Result<(Vec<u8>, Option<u8>), LaserError> {
+        self.ensure_scopable(code)?;
+        let frame = bytes::Bytes::from(self.read_frame(code, &payload)?);
+        let answered = self
+            .inner
+            .nodes
+            .send_held(&self.client(), code, frame, target, deadline.into_std())
+            .await?;
+        Ok((self.take_positioned(&answered), answered.replica))
+    }
+
     /// Send one managed mutation until its outcome is known. The frame, and
     /// with it the operation identity, never changes between attempts, so the
     /// server applies the mutation at most once and returns the recorded
     /// outcome to a repeat. A `Pending` reply or a transport failure after the
     /// request may have left leaves the outcome unknown, so the same frame is
-    /// sent again with jittered backoff. When [`MANAGED_MUTATION_DEADLINE`]
-    /// passes first, the caller gets [`LaserError::AmbiguousMutation`] naming
-    /// the identity: the mutation may still apply.
+    /// sent again with jittered backoff, and a refusal after that stays
+    /// ambiguous. Each attempt is bounded from [`MANAGED_ATTEMPT_FIRST`] up,
+    /// within the one [`MANAGED_MUTATION_DEADLINE`] that roster reads,
+    /// reconnects, attempts and backoff share. When the deadline passes first,
+    /// the caller gets [`LaserError::AmbiguousMutation`] naming the identity:
+    /// the mutation may still apply.
     async fn send_managed_mutation(
         &self,
         code: u32,
@@ -1202,34 +1392,50 @@ impl Laser {
     ) -> Result<(Vec<u8>, Option<u8>), LaserError> {
         let deadline = tokio::time::Instant::now() + MANAGED_MUTATION_DEADLINE;
         let mut delay = crate::retry::MANAGED_MUTATION.base;
+        let mut bound = MANAGED_ATTEMPT_FIRST;
+        let mut attempts = MutationAttempts::for_code(code);
         loop {
-            let unknown = match self
+            let attempt_deadline = (tokio::time::Instant::now() + bound).min(deadline);
+            let (attempt, replica) = match self
                 .inner
                 .nodes
-                .send(
+                .send_held(
                     &self.client(),
                     code,
                     bytes::Bytes::from(frame.clone()),
                     target,
+                    attempt_deadline.into_std(),
                 )
                 .await
             {
-                Ok(answered) => {
-                    let reply = self.take_positioned(answered.reply.to_vec());
-                    match unknown_outcome(&reply) {
-                        Some(error) => error.message,
-                        None => return Ok((reply, answered.replica)),
-                    }
+                Ok(answered) => (
+                    Attempt::Answered(self.take_positioned(&answered)),
+                    answered.replica,
+                ),
+                Err(error) if crate::error::is_transient_iggy_io_error(&error) => {
+                    (Attempt::Lost(error.to_string()), None)
                 }
-                Err(error) if crate::error::is_transient_iggy_io_error(&error) => error.to_string(),
-                Err(error) => return Err(error.into()),
+                Err(error) => (Attempt::Refused(error.into()), None),
             };
+            if let Some(reply) = attempts.settle(attempt).map_err(|error| match error {
+                LaserError::AmbiguousMutation { message, .. } => LaserError::AmbiguousMutation {
+                    operation_id: Some(operation_id),
+                    message: format!("operation {operation_id:032x}: {message}"),
+                },
+                error => error,
+            })? {
+                return Ok((reply, replica));
+            }
+            let unknown = attempts.uncertain.clone().unwrap_or_default();
             let wait = jittered(delay);
             if tokio::time::Instant::now() + wait >= deadline {
-                return Err(LaserError::AmbiguousMutation(format!(
-                    "operation {operation_id:032x} outcome is still unknown after {}s: {unknown}",
-                    MANAGED_MUTATION_DEADLINE.as_secs()
-                )));
+                return Err(LaserError::AmbiguousMutation {
+                    operation_id: Some(operation_id),
+                    message: format!(
+                        "operation {operation_id:032x} outcome is still unknown after {}s: {unknown}",
+                        MANAGED_MUTATION_DEADLINE.as_secs()
+                    ),
+                });
             }
             tracing::debug!(
                 target: "laser",
@@ -1242,6 +1448,7 @@ impl Laser {
             delay = delay
                 .saturating_mul(2)
                 .min(crate::retry::MANAGED_MUTATION.max);
+            bound = bound.saturating_mul(2);
         }
     }
 
@@ -1279,21 +1486,20 @@ impl Laser {
         .map_err(|error| LaserError::Codec(format!("encode managed read: {error}")))
     }
 
-    /// Open a positioned reply and raise the seen frontier to the one it
-    /// carries.
-    fn take_positioned(&self, reply: Vec<u8>) -> Vec<u8> {
-        let (reply, frontier) = open_positioned(reply);
-        if let Some(frontier) = frontier {
+    /// The opened reply, after raising the seen frontier to the one its
+    /// positioned envelope carried.
+    fn take_positioned(&self, answered: &Answered) -> Vec<u8> {
+        if let Some(frontier) = &answered.frontier {
             merge_frontier(
                 &mut self
                     .inner
                     .seen_frontier
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                &frontier,
+                frontier,
             );
         }
-        reply
+        answered.reply.to_vec()
     }
 
     /// The highest mutation position this client has seen per managed
@@ -1309,30 +1515,44 @@ impl Laser {
             .clone()
     }
 
+    // A grant or renewal answered over the dedicated coordination connection
+    // raises this handle's KV frontier, so a later read sees the acquisition.
+    #[cfg(feature = "kv")]
+    pub(crate) fn observe_kv_position(&self, position: laser_wire::mutation::MutationPosition) {
+        merge_frontier(
+            &mut self
+                .inner
+                .seen_frontier
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            &laser_wire::mutation::AppliedFrontier {
+                kv: Some(position),
+                ..Default::default()
+            },
+        );
+    }
+
     /// Send an already-framed managed command: the caller built (and holds)
     /// the `ManagedRequestEnvelope`, so nothing is wrapped here and a retry
     /// can reuse the exact bytes under the same operation id. The KV
     /// coordination client is the caller. Every other path uses
     /// [`send_raw_with_response`](Self::send_raw_with_response), which mints a
-    /// fresh operation id per call.
+    /// fresh operation id per call. `written` is marked once an attempt wrote
+    /// the frame to a connection.
     #[cfg(feature = "kv")]
     #[tracing::instrument(target = "laser", level = "debug", skip_all, fields(code = code, operation = "managed_preframed"))]
     pub(crate) async fn send_raw_preframed(
         &self,
         code: u32,
         payload: Vec<u8>,
+        written: &AtomicBool,
     ) -> Result<Vec<u8>, IggyError> {
         let answered = self
             .inner
             .nodes
-            .send(
-                &self.client(),
-                code,
-                bytes::Bytes::from(payload),
-                Target::Caller,
-            )
+            .send_to_caller_marking(&self.client(), code, bytes::Bytes::from(payload), written)
             .await?;
-        Ok(self.take_positioned(answered.reply.to_vec()))
+        Ok(self.take_positioned(&answered))
     }
 
     /// A Iggy `IggyProducerBuilder` for `(stream, topic)`. laser-sdk builds on
@@ -1485,14 +1705,14 @@ pub(crate) fn publish_failure(
 ) -> LaserError {
     let unsent = pending.get(attempted..).unwrap_or_default();
     let (source, stream, topic, unconfirmed) = match error {
-        LaserError::Iggy(IggyError::ProducerSendFailed {
+        LaserError::Transport(TransportError(IggyError::ProducerSendFailed {
             cause,
             failed,
             uncertain: _,
             committed,
             stream_name,
             topic_name,
-        }) => {
+        })) => {
             confirmations.extend(committed.iter().cloned());
             let unconfirmed = failed
                 .iter()
@@ -1500,7 +1720,7 @@ pub(crate) fn publish_failure(
                 .map(clone_iggy_message)
                 .collect();
             (
-                LaserError::Iggy(*cause),
+                LaserError::from(*cause),
                 stream_name.into(),
                 topic_name.into(),
                 unconfirmed,
@@ -1613,6 +1833,38 @@ enum ConnectionConfig {
         password: String,
     },
     Client(IggyClient),
+}
+
+impl ConnectionConfig {
+    // The normalized connection string a dialed connection carries. The
+    // client and every second connection dial through it, so each of them
+    // re-authenticates with the same credentials after a reconnect.
+    fn connection_string(&self) -> Result<String, LaserError> {
+        match self {
+            Self::Unset | Self::Client(_) => Err(LaserError::Config(
+                "connection_string, address+credentials, or client is required",
+            )),
+            Self::ConnectionString(value) => normalize_connection_string(value),
+            Self::Tcp {
+                address,
+                username,
+                password,
+            } => {
+                if address.is_empty() {
+                    return Err(LaserError::Config("address is required"));
+                }
+                if username.is_empty() {
+                    return Err(LaserError::Config("credentials are required"));
+                }
+                // Encoded, so a `:`, `@` or `?` in either part stays inside it.
+                normalize_connection_string(&format!(
+                    "iggy+tcp://{}:{}@{address}",
+                    percent_encode(username),
+                    percent_encode(password)
+                ))
+            }
+        }
+    }
 }
 
 impl LaserBuilder {
@@ -1841,41 +2093,13 @@ impl LaserBuilder {
             tokio::time::Instant::now() + ConnectOptions::from_env(self.connect_timeout)?.timeout;
         let stream = self.stream.filter(|value| !value.is_empty());
         let (client, connection_string) = match self.connection {
-            ConnectionConfig::Unset => {
-                return Err(LaserError::Config(
-                    "connection_string, address+credentials, or client is required",
-                ));
-            }
-            ConnectionConfig::ConnectionString(value) => {
-                let normalized = normalize_connection_string(&value)?;
-                let client = IggyClientBuilder::from_connection_string(&normalized)?.build()?;
+            ConnectionConfig::Client(client) => (client, None),
+            connection => {
+                let normalized = connection.connection_string()?;
+                let client = tcp_client(&normalized)?;
                 connect_before(&client, connect_deadline).await?;
                 (client, Some(normalized))
             }
-            ConnectionConfig::Tcp {
-                address,
-                username,
-                password,
-            } => {
-                if address.is_empty() {
-                    return Err(LaserError::Config("address is required"));
-                }
-                if username.is_empty() {
-                    return Err(LaserError::Config("credentials are required"));
-                }
-                // Build through a connection string so the client carries
-                // auto-login credentials: the Iggy SDK re-authenticates on every
-                // reconnect, so a dropped connection resumes transparently. A
-                // plain `with_tcp` + manual `login_user` reconnects the socket
-                // but leaves it unauthenticated after a server restart.
-                let with_tls = normalize_connection_string(&format!(
-                    "iggy+tcp://{username}:{password}@{address}"
-                ))?;
-                let client = IggyClientBuilder::from_connection_string(&with_tls)?.build()?;
-                connect_before(&client, connect_deadline).await?;
-                (client, Some(with_tls))
-            }
-            ConnectionConfig::Client(client) => (client, None),
         };
         // Probe the server's `AGDX_HELLO` managed command once. A ready managed
         // backend lights up only the surfaces and feature bits it announces.
@@ -1918,8 +2142,6 @@ impl LaserBuilder {
                 connection_string,
                 #[cfg(feature = "kv")]
                 coordination: OnceCell::new(),
-                #[cfg(feature = "kv")]
-                coordination_acquire_gate: tokio::sync::Mutex::new(()),
                 producers: DashMap::new(),
                 producer_statistics: Default::default(),
                 negotiated: std::sync::RwLock::new(NegotiatedState {
@@ -1938,6 +2160,8 @@ impl LaserBuilder {
                 #[cfg(feature = "agent")]
                 #[cfg(all(feature = "agent", any(feature = "query", test)))]
                 advertised_agent: std::sync::Mutex::new(None),
+                #[cfg(all(feature = "agent", feature = "query"))]
+                presence_replica: tokio::sync::Mutex::new(None),
                 #[cfg(feature = "agent")]
                 reply_hubs: DashMap::new(),
                 #[cfg(feature = "sign")]
@@ -2023,10 +2247,10 @@ fn merge_announcement(
             .filters
             .evaluation
             .clone_from(&announce.filters);
-        capabilities.filters.max_wait_ms = announce
-            .filters
-            .as_ref()
-            .map_or(0, |filters| filters.max_wait_ms);
+        capabilities.filters.max_wait =
+            announce.filters.as_ref().map_or(Duration::ZERO, |filters| {
+                Duration::from_millis(u64::from(filters.max_wait_ms))
+            });
     }
     if announce.ready {
         capabilities.managed = true;
@@ -2036,8 +2260,6 @@ fn merge_announcement(
         capabilities.kv.available |= versions.kv > 0;
         capabilities.forks |= versions.fork > 0;
         capabilities.graph |= versions.graph > 0;
-        capabilities.destinations.available |= versions.checkpoint > 0
-            && versions.has_feature(laser_wire::hello::feature::DESTINATIONS);
         capabilities.merge_features(&versions);
         for backend in announce
             .backends
@@ -2046,17 +2268,7 @@ fn merge_announcement(
         {
             if let Some(query) = &backend.query {
                 capabilities.query.available |= versions.query > 0;
-                capabilities.query.cursor_paging |= query
-                    .paging
-                    .contains(&laser_wire::hello::QueryPagingCapability::Cursor);
-                capabilities.query.cancellation |= query.cancellation;
-                capabilities.query.execution_status |= query.execution_status;
                 if query
-                    .consistency
-                    .contains(&laser_wire::query::Consistency::Strong)
-                {
-                    capabilities.query.consistency = laser_wire::query::Consistency::Strong;
-                } else if query
                     .consistency
                     .contains(&laser_wire::query::Consistency::ReadYourWrites)
                 {
@@ -2088,7 +2300,7 @@ mod announcement_tests {
     use laser_wire::hello::{
         BackendAnnounce, BackendDescriptor, BackendDesiredState, BackendImplementation,
         BackendMode, BackendObservedState, BackendReadiness, OpVersions, QueryCapabilities,
-        QueryPagingCapability, feature,
+        feature,
     };
 
     fn backend(id: u128, ready: bool) -> BackendDescriptor {
@@ -2114,13 +2326,12 @@ mod announcement_tests {
             )
             .with_query(QueryCapabilities {
                 dialects: vec![laser_wire::query::SqlDialect::Sqlite],
-                time_travel: Vec::new(),
                 consistency: vec![laser_wire::query::Consistency::Eventual],
                 logical_types: vec![laser_wire::schema::LogicalTypeKind::String],
-                paging: vec![QueryPagingCapability::Cursor],
-                cancellation: true,
-                execution_status: true,
                 raw_sql: true,
+                aggregates: Vec::new(),
+                vector_search: false,
+                text_search: false,
             })
             .with_limits(laser_wire::hello::BackendLimits {
                 max_query_rows: 1_000,
@@ -2129,7 +2340,7 @@ mod announcement_tests {
                 max_query_micros: 30_000_000,
                 max_concurrent_queries: 8,
                 max_schema_fields: 0,
-                max_materialization_file_bytes: 0,
+                max_payload_bytes: 0,
             })
     }
 
@@ -2164,7 +2375,7 @@ mod announcement_tests {
 
         merge_announcement(&mut capabilities, &announce);
 
-        assert_eq!(capabilities.filters.max_wait_ms, 20_000);
+        assert_eq!(capabilities.filters.max_wait, Duration::from_secs(20));
     }
 
     #[test]
@@ -2177,7 +2388,7 @@ mod announcement_tests {
 
         merge_announcement(&mut capabilities, &announce);
 
-        assert_eq!(capabilities.filters.max_wait_ms, 0);
+        assert_eq!(capabilities.filters.max_wait, Duration::ZERO);
     }
 
     #[test]
@@ -2205,7 +2416,7 @@ mod announcement_tests {
                 .with_features(
                     feature::KV_CAS
                         | feature::KV_CAS_FENCED
-                        | feature::STRONG_CONSISTENCY
+                        | feature::READ_YOUR_WRITES
                         | feature::SESSIONS
                         | feature::KEYWORD_SEARCH
                         | feature::WATCH
@@ -2275,10 +2486,28 @@ const CONNECTION_OPTIONS: [&str; 8] = [
     "nodelay",
 ];
 
+// The login a connection string's userinfo names, percent-decoded.
+enum Userinfo {
+    Password { username: String, password: String },
+    Token(String),
+}
+
+impl From<Userinfo> for Credentials {
+    fn from(userinfo: Userinfo) -> Self {
+        match userinfo {
+            Userinfo::Password { username, password } => {
+                Self::UsernamePassword(username, password.into())
+            }
+            Userinfo::Token(token) => Self::PersonalAccessToken(token.into()),
+        }
+    }
+}
+
 /// Validate and normalize a connection string. The scheme is optional and
 /// must be `iggy://` or `iggy+tcp://`, so a raw `user:pass@host:port` from a
 /// LaserData Cloud bootstrap endpoint works as-is. Credentials are required,
-/// either `user:password@` or `token@`, and are taken verbatim. A missing port
+/// either `user:password@` or `token@`, and are percent-decoded, so a `:`,
+/// `@`, `?` or `%` inside one is written `%3A`, `%40`, `%3F` or `%25`. A missing port
 /// defaults to 8090, the Apache Iggy TCP port. Only Apache Iggy's TCP options
 /// are accepted, each at most once. `tls_ca_file=` without `tls=` turns TLS on,
 /// and `tls=false` next to `tls_ca_file=` is refused. Then, for a LaserData
@@ -2298,7 +2527,7 @@ fn normalize_connection_string(value: &str) -> Result<String, LaserError> {
         ));
     }
     let userinfo = &rest[..authority - 1];
-    validate_credentials(userinfo)?;
+    decode_userinfo(userinfo)?;
     let (address, query) = match rest[authority..].split_once('?') {
         Some((address, query)) => (address, Some(query)),
         None => (&rest[authority..], None),
@@ -2313,6 +2542,35 @@ fn normalize_connection_string(value: &str) -> Result<String, LaserError> {
         }
     }
     resolve_tls(normalized).map(with_tls_domain)
+}
+
+/// A TCP client for a normalized connection string, logging in by itself
+/// after every reconnect.
+pub(crate) fn tcp_client(normalized: &str) -> Result<IggyClient, LaserError> {
+    let client = TcpClient::create(Arc::new(tcp_client_config(normalized)?))?;
+    Ok(IggyClientBuilder::new()
+        .with_client(ClientWrapper::Tcp(client))
+        .build()?)
+}
+
+// Apache Iggy's parser splits userinfo on `:` and `@` without decoding it, so
+// it reads the address and options next to a placeholder login, and the
+// decoded credentials replace that login.
+fn tcp_client_config(normalized: &str) -> Result<TcpClientConfig, LaserError> {
+    let (scheme, rest) = split_scheme(normalized)?;
+    let authority = authority_start(rest);
+    let Some(userinfo) = authority.checked_sub(1).map(|end| &rest[..end]) else {
+        return Err(LaserError::Config(
+            "connection string missing credentials: use user:password@host or token@host",
+        ));
+    };
+    let credentials = decode_userinfo(userinfo)?;
+    let mut config: TcpClientConfig = ConnectionString::<TcpConnectionStringOptions>::new(
+        &format!("{scheme}laser@{}", &rest[authority..]),
+    )?
+    .into();
+    config.auto_login = AutoLogin::Enabled(credentials.into());
+    Ok(config)
 }
 
 // Split off the scheme. A string with no scheme gets `iggy://`. A `://` after
@@ -2332,13 +2590,13 @@ fn split_scheme(value: &str) -> Result<(&'static str, &str), LaserError> {
     }
 }
 
-// Credentials are `user:password` or a personal access token, both non-empty.
-// Apache Iggy splits them on `:` and `@` without percent-decoding, so neither
-// character can appear inside a credential.
-fn validate_credentials(userinfo: &str) -> Result<(), LaserError> {
+// Credentials are `user:password` or a personal access token, both non-empty
+// and percent-decoded (RFC 3986). A raw `@` ends the userinfo and a raw `:`
+// ends the username, so either character inside a credential is encoded.
+fn decode_userinfo(userinfo: &str) -> Result<Userinfo, LaserError> {
     if userinfo.contains('@') {
         return Err(LaserError::Config(
-            "connection string credentials cannot contain `@`",
+            "connection string credentials cannot contain a raw `@`, write it as %40",
         ));
     }
     let mut parts = userinfo.split(':');
@@ -2347,15 +2605,57 @@ fn validate_credentials(userinfo: &str) -> Result<(), LaserError> {
         (None, _) if first.is_empty() => Err(LaserError::Config(
             "connection string has an empty access token",
         )),
-        (None, _) => Ok(()),
+        (None, _) => Ok(Userinfo::Token(percent_decode(first)?)),
         (Some(password), None) if first.is_empty() || password.is_empty() => Err(
             LaserError::Config("connection string has an empty username or password"),
         ),
-        (Some(_), None) => Ok(()),
+        (Some(password), None) => Ok(Userinfo::Password {
+            username: percent_decode(first)?,
+            password: percent_decode(password)?,
+        }),
         (Some(_), Some(_)) => Err(LaserError::Config(
-            "connection string credentials cannot contain more than one `:`",
+            "connection string credentials cannot contain more than one raw `:`, write it as %3A",
         )),
     }
+}
+
+fn percent_decode(value: &str) -> Result<String, LaserError> {
+    let malformed =
+        || LaserError::Config("connection string credentials hold a malformed % escape");
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte != b'%' {
+            decoded.push(byte);
+            continue;
+        }
+        let high = bytes
+            .next()
+            .and_then(|digit| char::from(digit).to_digit(16));
+        let low = bytes
+            .next()
+            .and_then(|digit| char::from(digit).to_digit(16));
+        let (Some(high), Some(low)) = (high, low) else {
+            return Err(malformed());
+        };
+        decoded.push(u8::try_from(high << 4 | low).map_err(|_| malformed())?);
+    }
+    String::from_utf8(decoded).map_err(|_| {
+        LaserError::Config("connection string credentials are not UTF-8 once percent-decoded")
+    })
+}
+
+// Every byte outside RFC 3986's unreserved set as `%XX`.
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 // `host` or `host:port`. A missing port becomes 8090. IPv6 literals are refused
@@ -2809,9 +3109,14 @@ mod builder_conflict_tests {
     #[cfg(feature = "agent")]
     use super::claim_presence_slot;
     use super::{Laser, clone_iggy_message, prepare_publish_messages};
-    use crate::error::LaserError;
+    use crate::error::{LaserError, TransportError};
     use bytes::Bytes;
     use iggy::prelude::IggyMessage;
+    use laser_wire::destination::BackendResourceId;
+    use laser_wire::hello::{
+        BackendDescriptor, BackendDesiredState, BackendImplementation, BackendMode,
+        BackendObservedState, BackendReadiness, BackendReadinessCode,
+    };
     #[cfg(feature = "agent")]
     use std::sync::Mutex;
     use std::time::Duration;
@@ -2875,7 +3180,7 @@ mod builder_conflict_tests {
             base_offset: 9,
         };
         let error = super::publish_failure(
-            LaserError::Iggy(IggyError::ProducerSendFailed {
+            LaserError::from(IggyError::ProducerSendFailed {
                 cause: Box::new(IggyError::Disconnected),
                 failed: Arc::new(vec![message(2)]),
                 uncertain: 0,
@@ -2898,7 +3203,7 @@ mod builder_conflict_tests {
         };
         assert!(matches!(
             failure.source,
-            LaserError::Iggy(IggyError::Disconnected)
+            LaserError::Transport(TransportError(IggyError::Disconnected))
         ));
         assert_eq!(
             failure
@@ -3003,24 +3308,66 @@ mod builder_conflict_tests {
     }
 
     #[test]
-    fn given_an_unmanaged_set_when_it_ages_then_should_be_due_for_a_reprobe() {
+    fn given_a_capability_set_when_it_ages_then_should_reprobe_only_while_a_backend_is_unready() {
         let laser = Laser::from_client(iggy::prelude::IggyClient::default());
         assert!(laser.reprobe_due(), "a set never probed is due");
-        let set_probe = |at: tokio::time::Instant, managed: bool| {
-            let mut negotiated = laser.inner.negotiated.write().expect("not poisoned");
-            negotiated.probed_at = Some(at);
-            negotiated.capabilities.managed = managed;
+        let backend = |ready: bool| {
+            let (observed, readiness) = if ready {
+                (BackendObservedState::Ready, BackendReadiness::ready(1))
+            } else {
+                (
+                    BackendObservedState::Starting,
+                    BackendReadiness::not_ready(BackendReadinessCode::ConfigurationPending),
+                )
+            };
+            BackendDescriptor::new(
+                BackendResourceId::from_u128(7),
+                BackendMode::Operational,
+                "Doris",
+                BackendImplementation {
+                    kind: "velodb".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+                1,
+                1,
+            )
+            .with_state(BackendDesiredState::Enabled, observed, readiness)
         };
+        let set_probe =
+            |at: tokio::time::Instant, managed: bool, backends: Vec<BackendDescriptor>| {
+                let mut negotiated = laser.inner.negotiated.write().expect("not poisoned");
+                negotiated.probed_at = Some(at);
+                negotiated.capabilities.managed = managed;
+                negotiated.capabilities.backends = backends;
+            };
         let now = tokio::time::Instant::now();
-        set_probe(now, false);
+        set_probe(now, false, Vec::new());
         assert!(!laser.reprobe_due(), "a fresh unmanaged set is trusted");
         let aged = now
-            .checked_sub(super::UNMANAGED_REPROBE_INTERVAL)
+            .checked_sub(super::REPROBE_INTERVAL)
             .expect("the clock is past one second");
-        set_probe(aged, false);
+        set_probe(aged, false, Vec::new());
         assert!(laser.reprobe_due(), "an aged unmanaged set is probed again");
-        set_probe(aged, true);
-        assert!(!laser.reprobe_due(), "a managed set is never probed again");
+        set_probe(now, true, vec![backend(false)]);
+        assert!(
+            !laser.reprobe_due(),
+            "a fresh set with a starting backend is trusted"
+        );
+        set_probe(aged, true, vec![backend(false)]);
+        assert!(
+            laser.reprobe_due(),
+            "an aged set with a starting backend is probed again"
+        );
+        set_probe(aged, true, vec![backend(true)]);
+        assert!(
+            !laser.reprobe_due(),
+            "a set whose backends are ready is never probed again"
+        );
+        set_probe(aged, true, Vec::new());
+        assert!(
+            !laser.reprobe_due(),
+            "a managed set without backends has nothing to wait for"
+        );
     }
 
     #[tokio::test]
@@ -3050,7 +3397,9 @@ mod builder_conflict_tests {
             .await;
         assert!(matches!(
             result,
-            Err(LaserError::Iggy(iggy::prelude::IggyError::ClientShutdown))
+            Err(LaserError::Transport(TransportError(
+                iggy::prelude::IggyError::ClientShutdown
+            )))
         ));
     }
 }
@@ -3058,9 +3407,70 @@ mod builder_conflict_tests {
 #[cfg(test)]
 mod connection_string_tests {
     use super::{
-        LaserError, PROD_CERT, flag_value_enabled, has_query_param, host_of, install_cert,
-        is_laserdata_host, normalize_connection_string, resolve_tls, resolve_tls_with,
+        ConnectionConfig, LaserError, PROD_CERT, flag_value_enabled, has_query_param, host_of,
+        install_cert, is_laserdata_host, normalize_connection_string, resolve_tls,
+        resolve_tls_with, tcp_client_config,
     };
+    use iggy::prelude::{AutoLogin, Credentials, TcpClientConfig};
+    use iggy_common::login_user::LoginUser;
+    use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
+
+    #[test]
+    fn given_a_password_with_a_colon_and_an_at_sign_when_given_as_credentials_then_should_log_in_with_it_exactly()
+     {
+        let connection = ConnectionConfig::Tcp {
+            address: "127.0.0.1".to_owned(),
+            username: "agent:one".to_owned(),
+            password: "pa:ss@w?rd%/#".to_owned(),
+        };
+        let normalized = connection
+            .connection_string()
+            .expect("any credential characters are accepted");
+        let config = tcp_client_config(&normalized).expect("a TCP client config");
+        assert_eq!(config.server_address, "127.0.0.1:8090");
+        assert_eq!(
+            login_of(&config),
+            Login::Password("agent:one".to_owned(), "pa:ss@w?rd%/#".to_owned())
+        );
+        let redialed = tcp_client_config(
+            &normalize_connection_string(&normalized).expect("the stored string normalizes again"),
+        )
+        .expect("a second connection's config");
+        assert_eq!(login_of(&redialed), login_of(&config));
+    }
+
+    #[test]
+    fn given_percent_encoded_credentials_when_connecting_by_string_then_should_log_in_with_the_decoded_secret()
+     {
+        let normalized =
+            normalize_connection_string("iggy+tcp://ag%40ent:pa%3Ass%40w%3Frd%25@host:8090")
+                .expect("percent-encoded credentials normalize");
+        let config = tcp_client_config(&normalized).expect("a TCP client config");
+        assert_eq!(
+            login_of(&config),
+            Login::Password("ag@ent".to_owned(), "pa:ss@w?rd%".to_owned())
+        );
+        let token = normalize_connection_string("tok%3Aen%40one@host")
+            .and_then(|normalized| tcp_client_config(&normalized))
+            .expect("a percent-encoded token normalizes");
+        assert_eq!(login_of(&token), Login::Token("tok:en@one".to_owned()));
+    }
+
+    #[test]
+    fn given_a_malformed_percent_escape_when_normalized_then_should_fail_as_config() {
+        for value in [
+            "user:pa%zz@host",
+            "user:pa%4@host",
+            "user:pa%@host",
+            "user:%FF%FE@host",
+        ] {
+            let result = normalize_connection_string(value);
+            assert!(
+                matches!(result, Err(LaserError::Config(_))),
+                "{value} must be refused, got {result:?}"
+            );
+        }
+    }
 
     #[test]
     fn given_a_tls_connection_string_when_normalized_then_should_verify_the_given_host_on_every_node()
@@ -3456,6 +3866,50 @@ mod connection_string_tests {
             "the cache directory must not be group or world writable"
         );
     }
+
+    #[derive(Debug, PartialEq)]
+    enum Login {
+        Password(String, String),
+        Token(String),
+    }
+
+    // A secret has no accessor outside `secrecy`, so it is read the way the
+    // HTTP login serializes it.
+    fn login_of(config: &TcpClientConfig) -> Login {
+        let secret = |value: serde_json::Value, field: &str| {
+            value[field]
+                .as_str()
+                .expect("the login serializes its secret")
+                .to_owned()
+        };
+        match &config.auto_login {
+            AutoLogin::Enabled(Credentials::UsernamePassword(username, password)) => {
+                let login = LoginUser {
+                    username: username.clone(),
+                    password: password.clone(),
+                    version: None,
+                    context: None,
+                };
+                Login::Password(
+                    username.clone(),
+                    secret(
+                        serde_json::to_value(login).expect("the login serializes"),
+                        "password",
+                    ),
+                )
+            }
+            AutoLogin::Enabled(Credentials::PersonalAccessToken(token)) => {
+                let login = LoginWithPersonalAccessToken {
+                    token: token.clone(),
+                };
+                Login::Token(secret(
+                    serde_json::to_value(login).expect("the login serializes"),
+                    "token",
+                ))
+            }
+            AutoLogin::Disabled => panic!("the client must log in by itself"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3467,6 +3921,32 @@ mod resource_naming_tests {
     }
 
     #[test]
+    fn given_a_borrowed_laser_when_scoping_with_every_with_method_then_should_leave_it_untouched() {
+        let original = laser();
+        let borrowed = &original;
+        let scoped = borrowed
+            .with_capabilities(crate::capabilities::Capabilities::OPEN.with_managed(true))
+            .with_ops_stream("acme-ops")
+            .with_control_topic("acme-control")
+            .with_dlq_topic("acme-dead")
+            .with_changes_topic("acme-changes")
+            .with_default_stream("acme")
+            .with_resource_naming(ResourceNaming::Bare);
+        assert_eq!(
+            [
+                scoped.ops_stream(),
+                scoped.control_topic(),
+                scoped.dlq_topic(),
+                scoped.changes_topic()
+            ],
+            ["acme-ops", "acme-control", "acme-dead", "acme-changes"]
+        );
+        assert!(scoped.current_capabilities().managed);
+        assert_eq!(original.ops_stream(), laser().ops_stream());
+        assert!(!original.current_capabilities().managed);
+    }
+
+    #[test]
     fn given_a_default_stream_when_naming_a_resource_then_should_scope_it_to_the_stream() {
         let laser = laser().with_default_stream("acme");
         assert_eq!(laser.resource_naming(), ResourceNaming::Stream);
@@ -3475,11 +3955,84 @@ mod resource_naming_tests {
     }
 
     #[test]
-    fn given_a_prefixed_name_when_naming_it_then_should_send_it_as_is() {
+    fn given_a_name_already_scoped_to_the_stream_when_naming_it_then_should_send_it_as_is() {
+        let laser = laser().with_default_stream("acme");
+        assert_eq!(
+            laser.resource_name("stream:acme/sessions"),
+            "stream:acme/sessions"
+        );
+    }
+
+    #[test]
+    fn given_a_name_scoped_to_another_stream_when_naming_it_then_should_stay_inside_the_handle_stream()
+     {
         let laser = laser().with_default_stream("acme");
         assert_eq!(
             laser.resource_name("stream:other/sessions"),
+            "stream:acme/stream:other/sessions"
+        );
+        assert_eq!(
+            laser.local_resource_name(&laser.resource_name("stream:other/sessions")),
+            Some("stream:other/sessions")
+        );
+        assert_eq!(
+            laser
+                .with_resource_naming(ResourceNaming::Bare)
+                .resource_name("stream:other/sessions"),
             "stream:other/sessions"
+        );
+        assert_eq!(
+            laser
+                .with_default_stream("other")
+                .resource_name("stream:other/sessions"),
+            "stream:other/sessions"
+        );
+    }
+
+    #[cfg(feature = "kv")]
+    #[tokio::test]
+    async fn given_a_default_stream_with_a_slash_when_a_managed_call_runs_then_should_refuse_it() {
+        let mut capabilities = crate::capabilities::Capabilities::OPEN;
+        capabilities.managed = true;
+        capabilities.kv.available = true;
+        let laser = laser()
+            .with_capabilities(capabilities)
+            .with_default_stream("tenants/acme");
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            laser.kv("profiles").get("user-1"),
+        )
+        .await
+        .expect("the refusal happens before any connection attempt");
+        assert!(
+            matches!(&read, Err(crate::error::LaserError::Invalid(message)) if message.contains('/')),
+            "{read:?}"
+        );
+        let bare = laser.with_resource_naming(ResourceNaming::Bare);
+        assert_eq!(bare.resource_name("profiles"), "profiles");
+    }
+
+    #[cfg(feature = "kv")]
+    #[tokio::test]
+    async fn given_a_default_stream_with_a_slash_when_a_lease_is_acquired_then_should_refuse_it() {
+        let mut capabilities = crate::capabilities::Capabilities::OPEN;
+        capabilities.managed = true;
+        capabilities.kv.available = true;
+        capabilities.kv.fenced_leases = true;
+        let laser = laser()
+            .with_capabilities(capabilities)
+            .with_default_stream("tenants/acme");
+        let lease = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            laser
+                .kv("locks")
+                .lease("job-1", "worker-1", std::time::Duration::from_secs(5)),
+        )
+        .await
+        .expect("the refusal happens before any connection attempt");
+        assert!(
+            matches!(&lease, Err(crate::error::LaserError::Invalid(message)) if message.contains('/')),
+            "{lease:?}"
         );
     }
 
@@ -3564,6 +4117,8 @@ mod managed_mutation_tests {
 #[cfg(test)]
 mod positioned_reply_tests {
     use super::Laser;
+    use crate::nodes::Answered;
+    use bytes::Bytes;
     use laser_wire::codes::{AGDX_KV_GET_CODE, AGDX_SESSION_GET_CODE};
     use laser_wire::framing::{decode_named, encode_named};
     use laser_wire::mutation::{
@@ -3601,13 +4156,45 @@ mod positioned_reply_tests {
         assert_eq!(first.min_position, None, "nothing seen yet");
         assert!(!first.log_head);
 
-        assert_eq!(laser.take_positioned(positioned(9, b"written")), b"written");
-        assert_eq!(laser.take_positioned(positioned(4, b"older")), b"older");
+        assert_eq!(
+            laser.take_positioned(&Answered::open(
+                Bytes::from(positioned(9, b"written")),
+                None
+            )),
+            b"written"
+        );
+        assert_eq!(
+            laser.take_positioned(&Answered::open(Bytes::from(positioned(4, b"older")), None)),
+            b"older"
+        );
         assert_eq!(laser.seen_positions().kv, Some(at(9)));
         let next: ManagedReadEnvelope =
             decode_named(&laser.read_frame(AGDX_KV_GET_CODE, b"get").unwrap()).unwrap();
         assert_eq!(next.min_position, Some(at(9)));
         assert!(!next.log_head);
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn given_a_grant_position_from_the_coordination_connection_when_observed_then_should_raise_the_kv_frontier()
+     {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        let granted = laser_wire::mutation::MutationPosition {
+            topic_generation: 1,
+            partition: 0,
+            offset: 9,
+        };
+        laser.observe_kv_position(granted);
+        assert_eq!(laser.seen_positions().kv, Some(granted));
+        laser.observe_kv_position(laser_wire::mutation::MutationPosition {
+            offset: 3,
+            ..granted
+        });
+        assert_eq!(
+            laser.seen_positions().kv,
+            Some(granted),
+            "an older position never lowers the frontier"
+        );
     }
 
     #[test]
@@ -3648,22 +4235,24 @@ mod positioned_reply_tests {
             offset,
         };
         let laser = Laser::from_client(iggy::prelude::IggyClient::default());
-        let answered = |sessions| {
-            encode_named(&ManagedReplyEnvelope {
-                v: MANAGED_REQUEST_VERSION,
-                frontier: AppliedFrontier {
-                    sessions,
-                    ..AppliedFrontier::default()
-                },
-                reply: b"page".to_vec(),
-            })
-            .expect("encodes")
+        let opened = |sessions| {
+            Answered::open(
+                Bytes::from(
+                    encode_named(&ManagedReplyEnvelope {
+                        v: MANAGED_REQUEST_VERSION,
+                        frontier: AppliedFrontier {
+                            sessions,
+                            ..AppliedFrontier::default()
+                        },
+                        reply: b"page".to_vec(),
+                    })
+                    .expect("encodes"),
+                ),
+                None,
+            )
         };
-        laser.take_positioned(answered(vec![
-            session(1, "lane", 5),
-            session(1, "inbox", 2),
-        ]));
-        laser.take_positioned(answered(vec![session(1, "lane", 3)]));
+        laser.take_positioned(&opened(vec![session(1, "lane", 5), session(1, "inbox", 2)]));
+        laser.take_positioned(&opened(vec![session(1, "lane", 3)]));
         assert_eq!(
             laser.seen_positions().sessions,
             vec![session(1, "lane", 5), session(1, "inbox", 2)],
@@ -3675,7 +4264,7 @@ mod positioned_reply_tests {
         assert_eq!(read.min_position, None);
         assert_eq!(read.min_sessions.len(), 2);
 
-        laser.take_positioned(answered(vec![session(2, "lane", 0)]));
+        laser.take_positioned(&opened(vec![session(2, "lane", 0)]));
         assert_eq!(
             laser.seen_positions().sessions,
             vec![session(2, "lane", 0)],
@@ -3695,7 +4284,216 @@ mod positioned_reply_tests {
         );
         let refusal = encode_named(&CommandError::new(ResultCode::BackendUnavailable, "down"))
             .expect("encodes");
-        assert_eq!(laser.take_positioned(refusal.clone()), refusal);
+        assert_eq!(
+            laser.take_positioned(&Answered::open(Bytes::from(refusal.clone()), None)),
+            refusal
+        );
         assert_eq!(laser.seen_positions(), AppliedFrontier::default());
+    }
+}
+
+#[cfg(all(test, feature = "agent", feature = "query"))]
+mod presence_pin_tests {
+    use super::Laser;
+    use crate::error::LaserError;
+    use laser_wire::agent::AgentPresence;
+    use laser_wire::result::ResultCode;
+
+    fn presence() -> AgentPresence {
+        AgentPresence {
+            v: 1,
+            agent: "risk".parse().expect("risk is a valid agent id"),
+            inbox: Some("risk.inbox".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_pinned_presence_replica_that_does_not_answer_when_clearing_or_advertising_then_should_report_unavailable_and_keep_the_pin()
+     {
+        let laser = Laser::from_client(crate::iggy::clients::client::IggyClient::default());
+        *laser.presence_pin().lock().await = Some(1);
+        laser
+            .claim_presence("risk".parse().expect("risk is a valid agent id"))
+            .expect("the slot is free");
+
+        let cleared = laser.clear_presence().await;
+        let LaserError::Command(error) = cleared.expect_err("the pinned replica does not answer")
+        else {
+            panic!("an unreachable pinned replica is reported as a command error");
+        };
+        assert_eq!(error.code, ResultCode::Unavailable);
+        assert!(
+            error
+                .message
+                .contains("replica 1 holds this connection's presence")
+        );
+        assert_eq!(
+            *laser.presence_pin().lock().await,
+            Some(1),
+            "the pin is kept until the replica answers"
+        );
+        assert!(
+            laser
+                .claim_presence("audit".parse().expect("audit is a valid agent id"))
+                .is_err(),
+            "the presence is still advertised"
+        );
+
+        let advertised = laser.advertise_presence(&presence()).await;
+        assert!(
+            matches!(advertised, Err(LaserError::Command(ref error)) if error.code == ResultCode::Unavailable),
+            "a new advertise never goes to another replica: {advertised:?}"
+        );
+        assert_eq!(*laser.presence_pin().lock().await, Some(1));
+    }
+}
+
+#[cfg(test)]
+mod mutation_attempt_tests {
+    use super::{Attempt, MutationAttempts};
+    use crate::error::LaserError;
+    use laser_wire::batch::BatchReply;
+    use laser_wire::codes::{AGDX_BATCH_CODE, AGDX_KV_SET_CODE};
+    use laser_wire::framing::encode_named;
+    use laser_wire::result::{CommandError, ResultCode};
+
+    fn reply(code: ResultCode) -> Vec<u8> {
+        encode_named(&CommandError::new(code, "reply")).expect("encoded")
+    }
+
+    fn batch(slots: Vec<Vec<u8>>) -> Vec<u8> {
+        encode_named(&BatchReply { results: slots }).expect("encoded batch")
+    }
+
+    #[test]
+    fn given_a_batch_with_an_unresolved_item_when_settled_then_should_repeat_the_frame_until_every_item_is_final()
+     {
+        let mut attempts = MutationAttempts::for_code(AGDX_BATCH_CODE);
+        let first = batch(vec![reply(ResultCode::Ok), reply(ResultCode::Pending)]);
+        assert!(
+            matches!(attempts.settle(Attempt::Answered(first)), Ok(None)),
+            "a pending item leaves the frame unresolved"
+        );
+        let unavailable = batch(vec![
+            reply(ResultCode::Ok),
+            reply(ResultCode::BackendUnavailable),
+        ]);
+        assert!(matches!(
+            attempts.settle(Attempt::Answered(unavailable)),
+            Ok(None)
+        ));
+        let settled = batch(vec![reply(ResultCode::Ok), reply(ResultCode::TooLarge)]);
+        assert_eq!(
+            attempts
+                .settle(Attempt::Answered(settled.clone()))
+                .expect("every item final"),
+            Some(settled),
+            "a frame whose items are all final settles, an item-level refusal included"
+        );
+    }
+
+    #[test]
+    fn given_a_batch_item_left_unresolved_when_a_later_attempt_refuses_it_by_admission_then_should_stay_ambiguous()
+     {
+        let mut attempts = MutationAttempts::for_code(AGDX_BATCH_CODE);
+        attempts
+            .settle(Attempt::Answered(batch(vec![
+                reply(ResultCode::Ok),
+                reply(ResultCode::Pending),
+            ])))
+            .expect("unresolved");
+        let settled = attempts.settle(Attempt::Answered(batch(vec![
+            reply(ResultCode::Ok),
+            reply(ResultCode::Forbidden),
+        ])));
+        assert!(
+            matches!(settled, Err(LaserError::AmbiguousMutation { ref message, .. }) if message.contains("item 1")),
+            "the refused item may still apply: {settled:?}"
+        );
+    }
+
+    #[test]
+    fn given_a_lost_batch_attempt_when_the_repeat_refuses_an_item_by_admission_then_should_stay_ambiguous()
+     {
+        let mut attempts = MutationAttempts::for_code(AGDX_BATCH_CODE);
+        attempts
+            .settle(Attempt::Lost("connection reset".to_owned()))
+            .expect("lost");
+        let settled = attempts.settle(Attempt::Answered(batch(vec![
+            reply(ResultCode::Unauthenticated),
+            reply(ResultCode::Ok),
+        ])));
+        assert!(matches!(settled, Err(LaserError::AmbiguousMutation { .. })));
+    }
+
+    #[test]
+    fn given_a_batch_whose_items_are_final_on_the_first_attempt_when_settled_then_should_settle_with_it()
+     {
+        let mut attempts = MutationAttempts::for_code(AGDX_BATCH_CODE);
+        let settled = batch(vec![reply(ResultCode::Forbidden), reply(ResultCode::Ok)]);
+        assert_eq!(
+            attempts
+                .settle(Attempt::Answered(settled.clone()))
+                .expect("a definite refusal of one item is final"),
+            Some(settled)
+        );
+        let mut single = MutationAttempts::for_code(AGDX_KV_SET_CODE);
+        let pending_batch = batch(vec![reply(ResultCode::Pending)]);
+        assert_eq!(
+            single
+                .settle(Attempt::Answered(pending_batch.clone()))
+                .expect("not a batch code"),
+            Some(pending_batch),
+            "only the batch code settles item by item"
+        );
+    }
+
+    #[test]
+    fn given_a_pending_attempt_when_a_later_one_is_forbidden_then_should_stay_ambiguous() {
+        let mut attempts = MutationAttempts::default();
+        assert!(matches!(
+            attempts.settle(Attempt::Answered(reply(ResultCode::Pending))),
+            Ok(None)
+        ));
+
+        let settled = attempts.settle(Attempt::Answered(reply(ResultCode::Forbidden)));
+
+        assert!(matches!(settled, Err(LaserError::AmbiguousMutation { .. })));
+    }
+
+    #[test]
+    fn given_a_lost_attempt_when_a_later_one_is_refused_by_the_transport_then_should_stay_ambiguous()
+     {
+        let mut attempts = MutationAttempts::default();
+        assert!(matches!(
+            attempts.settle(Attempt::Lost("connection reset".to_owned())),
+            Ok(None)
+        ));
+
+        let settled = attempts.settle(Attempt::Refused(LaserError::Invalid("refused".to_owned())));
+
+        assert!(matches!(settled, Err(LaserError::AmbiguousMutation { .. })));
+    }
+
+    #[test]
+    fn given_a_first_attempt_when_it_is_forbidden_or_answered_then_should_settle_with_it() {
+        let forbidden = reply(ResultCode::Forbidden);
+        assert_eq!(
+            MutationAttempts::default()
+                .settle(Attempt::Answered(forbidden.clone()))
+                .expect("a definite refusal"),
+            Some(forbidden)
+        );
+        let mut attempts = MutationAttempts::default();
+        attempts
+            .settle(Attempt::Answered(reply(ResultCode::Pending)))
+            .expect("pending");
+        let applied = reply(ResultCode::Ok);
+        assert_eq!(
+            attempts
+                .settle(Attempt::Answered(applied.clone()))
+                .expect("a durable outcome resolves it"),
+            Some(applied)
+        );
     }
 }

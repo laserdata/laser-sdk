@@ -44,8 +44,16 @@ import type { HeaderValue } from "../stream/header-value.js"
 import type { ConsumerMessage } from "../stream/consumer.js"
 import { storeSeeds } from "../stream/consumer-start.js"
 import { withMessageJson } from "../stream/message.js"
+import { Mutex } from "../runtime/mutex.js"
 import { mintUlidValue } from "../runtime/ulid.js"
 import { warn } from "../runtime/warn.js"
+import {
+  type CallOptions,
+  abortable,
+  cancellable,
+  delay,
+  throwIfAborted
+} from "../client/call-options.js"
 import { decodeOne, encodeNamed } from "../wire/cbor.js"
 import {
   AGDX_FILTERED_ACK_CODE,
@@ -68,9 +76,11 @@ import { CompiledFilter, type DecodeLimits } from "../wire/filter-eval.js"
 import {
   encodeFilteredAck,
   type AckContext,
+  type AckReceipt,
   type AppliedPolicy,
   type CatalogPosition,
   type ConsumerFilter,
+  type ExecutionMode,
   type FaultReason,
   type FilterBinding,
   type FilterBindingPage,
@@ -89,7 +99,6 @@ import {
   type FilterRef,
   type FilterReply,
   type FilterRevisionPage,
-  type FilterRevisionRef,
   type FilterSource,
   type FilterTestResult,
   type FilteredPage,
@@ -131,7 +140,7 @@ const DEFAULT_MAX_WAIT_MS = 5_000
 // A filtered wait gets this long past its server wait for the reply.
 const WAIT_REPLY_MARGIN_MS = 5_000
 const WAIT_CANCEL_DEADLINE_MS = 5_000
-const DEFAULT_PAGE_SIZE = 50
+const DEFAULT_PAGE_RESULTS = 50
 const DEFAULT_PREVIEW_RECORDS = 20
 const DEFAULT_MAX_UNACKED_PAGES = 1024
 const ASSIGNMENT_REFRESH_MS = 2_000
@@ -210,6 +219,18 @@ export interface MatchedPage {
   readonly [READER_TAG]?: ReaderTag
 }
 
+/**
+ * How the group's policy treated a delivered record: `selected` when the
+ * filter evaluated and selected it, `unevaluated` with its `reason` when a
+ * `pass` fault, foreign-record or mismatch policy delivered it without
+ * evaluating it, and `unfiltered` when the group has no policy and receives
+ * every record.
+ */
+export type RecordEvaluation =
+  | { readonly kind: "selected" }
+  | { readonly kind: "unevaluated"; readonly reason: FaultReason }
+  | { readonly kind: "unfiltered" }
+
 /** One matching record, unchanged from the stream. Acknowledge the original reader-owned object. Cloning payload data does not transfer acknowledgment ownership. */
 export interface MatchedRecord {
   readonly headersMalformed?: boolean
@@ -219,8 +240,8 @@ export interface MatchedRecord {
   readonly offset: bigint
   /** The partition head when the record was read. */
   readonly frontier: bigint
-  /** `false` when the filter could not evaluate the record and a `pass` fault, foreign-record, or mismatch policy returned it unevaluated. */
-  readonly evaluated: boolean
+  /** How the group's policy treated the record. */
+  readonly evaluation: RecordEvaluation
   /** The record as stored: payload, typed headers, id, and timestamps. Its
    * `currentOffset` is the partition head when the record was read. */
   readonly message: ConsumerMessage
@@ -234,9 +255,11 @@ export interface FilterPreviewOptions {
   readonly explain?: boolean
 }
 
+/** One catalog page: `page` counts from 1, and 0 reads the first page too.
+ * `results` is the page length. */
 export interface CatalogPageOptions {
   readonly page?: number
-  readonly pageSize?: number
+  readonly results?: number
 }
 
 /** A group mutation's binding with the control-log position the fold applied it at. */
@@ -336,10 +359,10 @@ export class Filters {
     const request = {
       v: FILTER_OP_VERSION,
       filterId,
-      page: options.page ?? 0,
-      pageSize: options.pageSize ?? DEFAULT_PAGE_SIZE
+      page: options.page ?? 1,
+      results: options.results ?? DEFAULT_PAGE_RESULTS
     }
-    validateCatalogPage(request.page, request.pageSize)
+    validateCatalogPage(request.page, request.results)
     const outcome = await this.catalog(ListFilterRevisionsCommand, request)
     if (outcome.kind === "revisions") return outcome.page
     throw unexpected("revisions")
@@ -352,7 +375,7 @@ export class Filters {
    * @internal
    */
   async owned(owner: FilterGroupIdentity): Promise<FilterSummary | undefined> {
-    const request: ListFilters = { v: FILTER_OP_VERSION, owner, page: 0, pageSize: 1 }
+    const request: ListFilters = { v: FILTER_OP_VERSION, owner, page: 1, results: 1 }
     validateListFilters(request)
     const outcome = await this.catalog(ListFiltersCommand, request)
     if (outcome.kind !== "filters") throw unexpected("filters")
@@ -366,8 +389,11 @@ export class Filters {
    *
    * @internal
    */
-  async dropFilter(filterId: number): Promise<CatalogPosition | undefined> {
-    const applied = await this.apply({ kind: "drop", filterId })
+  async dropFilter(
+    filterId: number,
+    options: CallOptions = {}
+  ): Promise<CatalogPosition | undefined> {
+    const applied = await this.apply({ kind: "drop", filterId }, undefined, options.signal)
     if (applied.result.kind === "dropped") return applied.catalogPosition
     throw unexpected("drop")
   }
@@ -393,10 +419,10 @@ export class Filters {
       ...(options.filterId !== undefined ? { filterId: options.filterId } : {}),
       ...(options.stream !== undefined ? { stream: options.stream } : {}),
       ...(options.topic !== undefined ? { topic: options.topic } : {}),
-      page: options.page ?? 0,
-      pageSize: options.pageSize ?? DEFAULT_PAGE_SIZE
+      page: options.page ?? 1,
+      results: options.results ?? DEFAULT_PAGE_RESULTS
     }
-    validateCatalogPage(request.page, request.pageSize)
+    validateCatalogPage(request.page, request.results)
     const outcome = await this.catalog(ListFilterBindingsCommand, request)
     if (outcome.kind === "bindings") return outcome.page
     throw unexpected("bindings")
@@ -412,31 +438,24 @@ export class Filters {
     throw unexpected("operation")
   }
 
-  /** Add a revision. `expectedRevision` must still be the latest one. */
-  async revise(
-    filterId: number,
-    expectedRevision: number,
-    filter: ConsumerFilter
-  ): Promise<FilterRevisionRef> {
-    const applied = await this.apply({
-      kind: "revise",
-      filterId,
-      expectedRevision,
-      filter: this.scopedFilter(filter)
-    })
-    if (applied.result.kind === "revised") return applied.result.revision
-    throw unexpected("revise")
-  }
-
   /** Pause or resume a revision without changing its executable content or digest. */
-  async setRevisionEnabled(filterId: number, revision: number, enabled: boolean): Promise<void> {
-    await this.apply({ kind: "set_revision_enabled", filterId, revision, enabled })
+  async setRevisionEnabled(
+    filterId: number,
+    revision: number,
+    enabled: boolean,
+    options: CallOptions = {}
+  ): Promise<void> {
+    await this.apply(
+      { kind: "set_revision_enabled", filterId, revision, enabled },
+      undefined,
+      options.signal
+    )
   }
 
   /**
    * Give `group` its policy in one catalog transaction: a definition saved as
-   * the group's own filter, or one of its existing revisions. A repeat with
-   * the same digest keeps the binding, another digest conflicts. The returned
+   * the group's own filter. A repeat with the same digest keeps the binding,
+   * another digest conflicts. The returned
    * position is where the fold applied it, carried by the group's reads so
    * they never see this configuration as absent.
    */
@@ -444,17 +463,21 @@ export class Filters {
     group: FilterGroupRef,
     policy: GroupFilterSpec,
     operationId: bigint = mintUlidValue(),
-    expectedIdentity?: FilterGroupIdentity
+    expectedIdentity?: FilterGroupIdentity,
+    options: CallOptions = {}
   ): Promise<ConfiguredGroup> {
+    throwIfAborted(options.signal, "filter mutation")
     const identity =
       expectedIdentity ?? (await nativeGroup(this.transport, group, group.group)).identity
-    const scoped: GroupFilterSpec =
-      policy.kind === "definition"
-        ? { kind: "definition", name: policy.name, filter: this.scopedFilter(policy.filter) }
-        : policy
+    const scoped: GroupFilterSpec = {
+      kind: "definition",
+      name: policy.name,
+      filter: this.scopedFilter(policy.filter)
+    }
     const applied = await this.apply(
       { kind: "configure_group", group, policy: scoped, expectedIdentity: identity },
-      operationId
+      operationId,
+      options.signal
     )
     if (applied.result.kind === "bound") return bound(applied.result.binding, applied)
     throw unexpected("configure_group")
@@ -464,13 +487,17 @@ export class Filters {
    * Release this exact saved binding, including a group incarnation that was
    * deleted and recreated under the same name.
    */
-  async releaseGroup(binding: FilterBinding): Promise<ConfiguredGroup> {
-    const applied = await this.apply({
-      kind: "unbind",
-      group: binding.group,
-      expectedDigest: binding.digest,
-      expectedIdentity: binding.identity
-    })
+  async releaseGroup(binding: FilterBinding, options: CallOptions = {}): Promise<ConfiguredGroup> {
+    const applied = await this.apply(
+      {
+        kind: "unbind",
+        group: binding.group,
+        expectedDigest: binding.digest,
+        expectedIdentity: binding.identity
+      },
+      undefined,
+      options.signal
+    )
     if (applied.result.kind === "unbound") return bound(applied.result.binding, applied)
     throw unexpected("unbind")
   }
@@ -491,12 +518,14 @@ export class Filters {
   // `AmbiguousMutationError` naming the operation id.
   private async apply(
     mutation: FilterMutation,
-    operationId: bigint = mintUlidValue()
+    operationId: bigint = mintUlidValue(),
+    signal?: AbortSignal
   ): Promise<AppliedMutation> {
-    const submitted = await this.submit(operationId, mutation)
+    throwIfAborted(signal, "filter mutation")
+    const submitted = await this.submit(operationId, mutation, signal)
     const outcome =
       submitted.status.kind === "pending"
-        ? await this.waitForOutcome(operationId, DEFAULT_OUTCOME_WAIT_MS)
+        ? await this.waitForOutcome(operationId, DEFAULT_OUTCOME_WAIT_MS, signal)
         : submitted
     return {
       result: settled(operationId, outcome.status),
@@ -506,7 +535,8 @@ export class Filters {
 
   private async waitForOutcome(
     operationId: bigint,
-    timeoutMs: number
+    timeoutMs: number,
+    signal?: AbortSignal
   ): Promise<FilterMutationOutcome> {
     const deadline = Date.now() + timeoutMs
     for (;;) {
@@ -518,16 +548,18 @@ export class Filters {
       }
       if (Date.now() >= deadline) {
         throw new AmbiguousMutationError(
-          `filter mutation ${operationId.toString()} has no outcome yet`
+          `filter mutation ${operationId.toString()} has no outcome yet`,
+          { operationId }
         )
       }
-      await sleep(OUTCOME_POLL_INTERVAL_MS)
+      await delay(OUTCOME_POLL_INTERVAL_MS, signal, "filter mutation")
     }
   }
 
   private async submit(
     operationId: bigint,
-    mutation: FilterMutation
+    mutation: FilterMutation,
+    signal?: AbortSignal
   ): Promise<FilterMutationOutcome> {
     for (let attempt = 1; ; attempt += 1) {
       try {
@@ -537,10 +569,10 @@ export class Filters {
         if (attempt >= MUTATION_ATTEMPTS) {
           throw new AmbiguousMutationError(
             `filter mutation ${operationId.toString()}: outcome is unknown`,
-            { cause: error }
+            { cause: error, operationId }
           )
         }
-        await sleep(MUTATION_RETRY_BACKOFF_MS)
+        await delay(MUTATION_RETRY_BACKOFF_MS, signal, "filter mutation")
       }
     }
   }
@@ -715,7 +747,7 @@ export class FilteredReaderBuilder {
     return this
   }
 
-  /** Re-evaluate returned records and fail on disagreement. Regex predicates cannot use this guard. */
+  /** Re-evaluate returned records with the shared evaluator and fail the page on any disagreement. */
   localGuard(enabled: boolean): this {
     this.guarded = enabled
     return this
@@ -754,13 +786,29 @@ export class FilteredReaderBuilder {
     return this
   }
 
-  async build(): Promise<FilteredReader> {
+  /** Opens the reader. A reader opened after an abort is closed, not leaked. */
+  async build(options: CallOptions = {}): Promise<FilteredReader> {
+    const signal = options.signal
+    throwIfAborted(signal, "filtered reader build")
+    const opening = this.open()
+    try {
+      return await abortable(opening, signal, "filtered reader build")
+    } catch (error) {
+      if (signal?.aborted === true) {
+        void opening.then((reader) => reader.close()).catch(() => undefined)
+      }
+      throw error
+    }
+  }
+
+  private async open(): Promise<FilteredReader> {
     const capabilities = await this.capabilities()
-    if (this.filter.kind === "group" && !capabilities.filters.groupPolicyReads) {
-      throw new UnsupportedError(
-        "this server serves consumer filters but not group-aware reads, upgrade it before reading groups through the Laser SDK",
-        { surface: "filters", feature: "group_policy_reads" }
-      )
+    // A group reader classifies the probe like the group consumer, and a
+    // server that positively lacks filters has no filtered read to offer.
+    if (this.filter.kind === "group" && !policyAware(capabilities)) {
+      throw new UnsupportedError("consumer filters are not served by this server", {
+        surface: "filters"
+      })
     }
     if (this.filter.kind !== "group" && !capabilities.filters.native) {
       throw new UnsupportedError("consumer filters are not served by this server", {
@@ -905,11 +953,15 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   // A ready answer the next round could not confirm would repeat at once, so
   // the wait after that round is paced instead.
   private readyUnconfirmed = false
-  // The filtered waits still held, by the node that holds them. A node holds
-  // at most one, kept across rounds until it answers or is cancelled.
+  // The filtered waits still held, by the slot of node partitions they name.
+  // A slot holds at most one, kept across rounds until it answers or is
+  // cancelled.
   private readonly heldWaits = new Map<string, HeldWait>()
   // Ends the idle wait in progress early.
   private idling: AbortController | undefined
+  // One public call at a time, so overlapping calls never read the same
+  // continuation twice.
+  private readonly calls = new Mutex()
   // The last wait was refused and sent again at once, so another refusal in
   // a row is paced instead.
   private waitRefused = false
@@ -947,34 +999,30 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   }
 
   /** The next page with at least one match. Waits while nothing is new, up to `timeoutMs` when given. */
-  async nextPage(options: { readonly timeoutMs?: number } = {}): Promise<MatchedPage> {
-    const deadline = options.timeoutMs === undefined ? undefined : Date.now() + options.timeoutMs
-    for (;;) {
-      const round = await this.round()
-      if (round.kind === "page") return round.page
-      if (deadline !== undefined && Date.now() >= deadline) {
-        throw new TimeoutError("a filtered page with a match")
-      }
-      if (round.kind === "idle") await this.waitForRecords()
-    }
+  nextPage(options: CallOptions & { readonly timeoutMs?: number } = {}): Promise<MatchedPage> {
+    return this.exclusive(options.signal, "filtered page", () => this.pageWithin(options))
   }
 
   /**
    * Read each partition in turn until a page matches or every partition has
    * nothing new, without the idle wait. `undefined` when nothing is new.
    */
-  async tryNextPage(): Promise<MatchedPage | undefined> {
-    for (;;) {
-      const round = await this.round()
-      if (round.kind === "page") return round.page
-      if (round.kind === "idle") return undefined
-    }
+  tryNextPage(options: CallOptions = {}): Promise<MatchedPage | undefined> {
+    return this.exclusive(options.signal, "filtered page", async () => {
+      for (;;) {
+        const round = await this.round()
+        if (round.kind === "page") return round.page
+        if (round.kind === "idle") return undefined
+      }
+    })
   }
 
   /** One bounded round without an idle wait. The flag means unmatched work remains. */
-  async readRound(): Promise<readonly [MatchedPage | undefined, boolean]> {
-    const round = await this.round()
-    return [round.kind === "page" ? round.page : undefined, round.kind === "busy"]
+  readRound(options: CallOptions = {}): Promise<readonly [MatchedPage | undefined, boolean]> {
+    return this.exclusive(options.signal, "filtered round", async () => {
+      const round = await this.round()
+      return [round.kind === "page" ? round.page : undefined, round.kind === "busy"] as const
+    })
   }
 
   /** Source records examined in the last bounded round, including empty pages. */
@@ -983,41 +1031,85 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   }
 
   /** The next matching record, one at a time over `nextPage`. */
-  async nextRecord(options: { readonly timeoutMs?: number } = {}): Promise<MatchedRecord> {
-    for (;;) {
-      this.requireOpen()
-      const record = this.buffered.shift()
-      if (record !== undefined) return record
-      const page = await this.nextPage(options)
-      this.requireOpen()
-      this.buffered.push(...page.records)
-    }
+  nextRecord(options: CallOptions & { readonly timeoutMs?: number } = {}): Promise<MatchedRecord> {
+    return this.exclusive(options.signal, "filtered record", async () => {
+      for (;;) {
+        this.requireOpen()
+        const record = this.buffered.shift()
+        if (record !== undefined) return record
+        const page = await this.pageWithin(options)
+        this.requireOpen()
+        this.buffered.push(...page.records)
+      }
+    })
   }
 
   /** Mark one record handled, and store the progress this completes. */
-  async ack(record: MatchedRecord): Promise<void> {
-    this.requireOpen()
-    const sequence = this.requireSequence(record)
-    this.partitionProgress(record.partitionId).completeRecord(sequence, record.offset)
-    await this.store(record.partitionId)
+  ack(record: MatchedRecord, options: CallOptions = {}): Promise<void> {
+    return this.exclusive(options.signal, "filtered ack", async () => {
+      this.requireOpen()
+      const sequence = this.requireSequence(record)
+      this.partitionProgress(record.partitionId).completeRecord(sequence, record.offset)
+      await this.store(record.partitionId)
+    })
   }
 
   /** Mark this partition's preceding records through `record` handled. Later records stay pending. */
-  async ackThrough(record: MatchedRecord): Promise<void> {
-    this.requireOpen()
-    const sequence = this.requireSequence(record)
-    if (!this.partitionProgress(record.partitionId).completeThrough(sequence, record.offset)) {
-      throw new InvalidError("the record is past the page acknowledgment boundary")
-    }
-    await this.store(record.partitionId)
+  ackThrough(record: MatchedRecord, options: CallOptions = {}): Promise<void> {
+    return this.exclusive(options.signal, "filtered ack", async () => {
+      this.requireOpen()
+      const sequence = this.requireSequence(record)
+      if (!this.partitionProgress(record.partitionId).completeThrough(sequence, record.offset)) {
+        throw new InvalidError("the record is past the page acknowledgment boundary")
+      }
+      await this.store(record.partitionId)
+    })
   }
 
   /** Mark every record of `page` handled, and store the progress this completes. */
-  async ackPage(page: MatchedPage): Promise<void> {
+  ackPage(page: MatchedPage, options: CallOptions = {}): Promise<void> {
+    return this.exclusive(options.signal, "filtered ack", async () => {
+      this.requireOpen()
+      const sequence = this.requireSequence(page)
+      this.partitionProgress(page.partitionId).completePage(sequence)
+      await this.store(page.partitionId)
+    })
+  }
+
+  /**
+   * Pass the record a `FilterFaultError` or a `FilterOversizedRecordError`
+   * stopped `partitionId` at, and read on after it, the way a native consumer
+   * seeks past a record. The skip is a fenced acknowledgment of `offset` under
+   * the policy and the owner the stopped page was read under, stored once
+   * every earlier record of the partition is handled. A policy changed since
+   * refuses it with a `conflict` and the partition restarts from its stored
+   * offset. Fails with `InvalidError` when the partition is not stopped at
+   * `offset`.
+   */
+  skip(partitionId: number, offset: bigint, options: CallOptions = {}): Promise<void> {
+    return this.exclusive(options.signal, "filtered skip", () =>
+      this.skipStopped(partitionId, offset)
+    )
+  }
+
+  private async skipStopped(partitionId: number, offset: bigint): Promise<void> {
     this.requireOpen()
-    const sequence = this.requireSequence(page)
-    this.partitionProgress(page.partitionId).completePage(sequence)
-    await this.store(page.partitionId)
+    this.sequence += 1
+    if (!this.partitionProgress(partitionId).skip(this.sequence, offset)) {
+      throw new InvalidError(
+        `partition ${String(partitionId)} is not stopped at offset ${offset.toString()}`
+      )
+    }
+    // A report of the block another partition's page held back is stale now.
+    const deferred = this.deferredError
+    if (
+      (deferred instanceof FilterFaultError || deferred instanceof FilterOversizedRecordError) &&
+      deferred.partitionId === partitionId &&
+      deferred.offset === offset
+    ) {
+      this.deferredError = undefined
+    }
+    await this.store(partitionId)
   }
 
   /**
@@ -1039,20 +1131,22 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
    *
    * @internal
    */
-  async flushCompleted(): Promise<void> {
-    let failure: unknown
-    for (const partitionId of [...this.progress.keys()]) {
-      try {
-        await this.store(partitionId)
-      } catch (error) {
-        failure ??= error
+  flushCompleted(): Promise<void> {
+    return this.calls.runExclusive(async () => {
+      let failure: unknown
+      for (const partitionId of [...this.progress.keys()]) {
+        try {
+          await this.store(partitionId)
+        } catch (error) {
+          failure ??= error
+        }
       }
-    }
-    if (failure !== undefined) {
-      throw failure instanceof Error
-        ? failure
-        : new TransportError("storing group progress failed", true, { cause: failure })
-    }
+      if (failure !== undefined) {
+        throw failure instanceof Error
+          ? failure
+          : new TransportError("storing group progress failed", true, { cause: failure })
+      }
+    })
   }
 
   /** The partitions this reader reads now. */
@@ -1074,20 +1168,38 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
    * without filtered waits, or after a wait that failed or answered empty long
    * before its time, it sleeps one idle interval instead.
    */
-  waitForRecords(): Promise<void> {
-    return this.waitForRecordsWithin(undefined)
+  waitForRecords(options: CallOptions = {}): Promise<void> {
+    return this.exclusive(options.signal, "filtered wait", async () => {
+      await this.waitForRecordsWithin(undefined, options.signal)
+    })
   }
 
   /**
-   * `waitForRecords` bounded by `limitMs`, for a caller with work due sooner.
+   * `waitForRecords` bounded by `limitMs`, for a caller with work due sooner,
+   * and ended early by `caller`. True when the wait ran out `limitMs`.
    *
    * @internal
    */
-  async waitForRecordsWithin(limitMs: number | undefined): Promise<void> {
+  async waitForRecordsWithin(limitMs: number | undefined, caller?: AbortSignal): Promise<boolean> {
     const idling = new AbortController()
     this.idling = idling
     const signal = idling.signal
     const pacing = Math.min(limitMs ?? Infinity, this.settings.idleIntervalMs)
+    let expired = false
+    // A held wait kept from an earlier round can outlast `limitMs`, so the
+    // bound is a timer of its own.
+    const bound =
+      limitMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            expired = true
+            idling.abort()
+          }, limitMs)
+    const ended = (): void => {
+      idling.abort()
+    }
+    if (caller?.aborted === true) idling.abort()
+    else caller?.addEventListener("abort", ended, { once: true })
     try {
       const waitMs = this.waitsServed
         ? Math.min(this.settings.maxWaitMs ?? 0, limitMs ?? Infinity)
@@ -1096,7 +1208,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       this.readyUnconfirmed = false
       if (waitMs <= 0 || unconfirmed) {
         await sleep(pacing, signal)
-        return
+        return expired
       }
       const answer = await this.heldWait(Math.floor(waitMs), signal)
       switch (answer.kind) {
@@ -1105,17 +1217,20 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
             answer.ready.filter((partitionId) => this.progress.has(partitionId))
           )
           this.readyUnconfirmed = true
-          return
+          return expired
         case "elapsed":
-          return
+          return expired
         case "unsupported":
           this.waitsServed = false
           await sleep(pacing, signal)
-          return
+          return expired
         case "sleep":
           await sleep(pacing, signal)
       }
+      return expired
     } finally {
+      clearTimeout(bound)
+      caller?.removeEventListener("abort", ended)
       if (this.idling === idling) this.idling = undefined
     }
   }
@@ -1176,8 +1291,56 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     await this.close()
   }
 
+  /** Yields matching records until `close()`, which ends the iteration like Python's. */
   async *[Symbol.asyncIterator](): AsyncIterator<MatchedRecord> {
-    for (;;) yield await this.nextRecord()
+    for (;;) {
+      let record: MatchedRecord
+      try {
+        record = await this.nextRecord()
+      } catch (error) {
+        if (this.closed) return
+        throw error
+      }
+      yield record
+    }
+  }
+
+  // Runs `run` once every earlier public call has settled. The caller's
+  // promise rejects at once on abort, while the lock is held until `run` ends.
+  private exclusive<T>(
+    signal: AbortSignal | undefined,
+    what: string,
+    run: () => Promise<T>
+  ): Promise<T> {
+    return cancellable(signal, what, () =>
+      this.calls.runExclusive(() => {
+        throwIfAborted(signal, what)
+        return run()
+      })
+    )
+  }
+
+  // The page loop of `nextPage`, with the idle wait bounded by what is left
+  // of `timeoutMs`.
+  private async pageWithin(
+    options: CallOptions & { readonly timeoutMs?: number }
+  ): Promise<MatchedPage> {
+    const deadline =
+      options.timeoutMs === undefined ? undefined : performance.now() + options.timeoutMs
+    // Timers count whole milliseconds, so a wait that ran out the time left
+    // ends the call even when `performance.now()` is a fraction short of it.
+    let expired = false
+    for (;;) {
+      throwIfAborted(options.signal, "filtered page")
+      const round = await this.round()
+      if (round.kind === "page") return round.page
+      const remainingMs = deadline === undefined ? undefined : deadline - performance.now()
+      if (expired || (remainingMs !== undefined && remainingMs <= 0)) {
+        throw new TimeoutError("a filtered page with a match")
+      }
+      if (round.kind === "idle")
+        expired = await this.waitForRecordsWithin(remainingMs, options.signal)
+    }
   }
 
   // One read of every partition that is not waiting, in turn from where the
@@ -1274,7 +1437,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       // from its stored offset and is read again at once under the policy the
       // group holds now. Only an explicit acknowledgment of a record read
       // under the old policy reports the change.
-      if (error instanceof FilterExecutionError && error.detail.reason === "conflict") {
+      if (error instanceof FilterExecutionError && error.detail?.reason === "conflict") {
         return { kind: "empty", more: true }
       }
       throw error
@@ -1284,7 +1447,12 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     const page = outcome.page
     this.examined += page.examined
     if (page.examined > 0) this.readyUnconfirmed = false
-    if (page.records.byteLength > request.maxReplyBytes + POLLED_HEAD_BYTES)
+    // A first record larger than the requested cap comes alone, within the page cap.
+    const recordCap =
+      page.matched === 1
+        ? Math.max(request.maxReplyBytes, MAX_FILTERED_PAGE_BYTES)
+        : request.maxReplyBytes
+    if (page.records.byteLength > recordCap + POLLED_HEAD_BYTES)
       throw new ProtocolError("filtered page exceeds the requested record byte limit")
     if (page.records.byteLength < POLLED_HEAD_BYTES)
       throw new ProtocolError("filtered record body is truncated")
@@ -1310,7 +1478,9 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
         })
       this.pinnedSource ??= current
     }
-    const unevaluated = new Set(page.unevaluated)
+    const unevaluated = new Map(
+      page.unevaluated.map((fault): [bigint, FaultReason] => [fault.offset, fault.reason])
+    )
     // An unfiltered page ran no filter, so there is nothing to check.
     if (page.policy.mode === "filtered") {
       if (this.settings.guardEnabled && this.guard === undefined) {
@@ -1346,7 +1516,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       }
       if (blocked !== undefined) {
         throw blocked.stop === "fault"
-          ? new FilterFaultError(partitionId, blocked.offset, blocked.reason)
+          ? new FilterFaultError(partitionId, blocked.offset, blocked.reason ?? "malformed")
           : new FilterOversizedRecordError(partitionId, blocked.offset)
       }
       return { kind: "empty", more: page.stop === "filled" || page.stop === "budget" }
@@ -1357,7 +1527,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       partitionId,
       offset: message.offset,
       frontier: page.frontier,
-      evaluated: page.policy.mode === "filtered" && !unevaluated.has(message.offset),
+      evaluation: recordEvaluation(page.policy.mode, unevaluated, message.offset),
       headersMalformed: message.headersMalformed !== undefined,
       message: matchedMessage(partitionId, page.frontier, message),
       [READER_TAG]: tag
@@ -1385,7 +1555,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       serverErrorCode(error) === HISTORY_UNAVAILABLE
         ? "source_changed"
         : error instanceof FilterExecutionError
-          ? error.detail.reason
+          ? error.detail?.reason
           : undefined
     if (reason !== "source_changed" && reason !== "conflict") return
     this.leaders.delete(partitionId)
@@ -1443,8 +1613,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       if (
         outcome.kind !== "acknowledged" ||
         outcome.receipt.partitionId !== partitionId ||
-        outcome.receipt.offset !== target.offset ||
-        !sameGeneration(outcome.receipt.generation, target.generation)
+        !this.partitionProgress(partitionId).acknowledged(target, outcome.receipt)
       ) {
         throw new ProtocolError("the acknowledgment receipt does not match its page")
       }
@@ -1453,7 +1622,6 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       this.restartAfter(partitionId, error)
       throw error
     }
-    this.progress.get(partitionId)?.stored(target)
     this.retire(partitionId)
   }
 
@@ -1467,16 +1635,25 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   ): Promise<FilterOutcome> {
     const payload = encodeNamed(request)
     let rerouted = false
+    let followed = false
     for (;;) {
       const target = await this.readTarget(partitionId)
       let reply: Uint8Array
       try {
         // A resend rechecks the route too: right after a crash the lookup can
         // still name the dead primary, whose link would hold the resend until
-        // the call deadline.
+        // the call deadline. The read follows a partition that moves while it
+        // waits once, a route that keeps moving is reported instead of chased.
         const sent = await this.sendUnlessMoved(partitionId, code, payload, target)
         if (sent === undefined) {
-          rerouted = true
+          if (followed) {
+            throw filterError({
+              code: { kind: "known", name: "Unavailable" },
+              reason: "unavailable",
+              message: `partition ${String(partitionId)} moved again during the read, retry`
+            })
+          }
+          followed = true
           continue
         }
         reply = sent
@@ -1572,8 +1749,9 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     )
   }
 
-  // Send one filtered wait to each node that serves a readable partition and
-  // holds no wait naming all of them, and take the first answer of any held wait.
+  // Send one filtered wait for each slot of readable partitions, a node's
+  // partitions in slices of at most the partitions one wait names, that holds
+  // no wait naming all of them, and take the first answer of any held wait.
   private async heldWait(waitMs: number, signal: AbortSignal): Promise<WaitAnswer> {
     const now = performance.now()
     const groups = new Map<string, { target: ManagedTarget; partitions: FilteredWaitPartition[] }>()
@@ -1587,12 +1765,22 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       groups.set(node, group)
     }
     const replaced: HeldWait[] = []
-    for (const [node, group] of groups) {
-      // A node holds one wait, so a reader of more partitions than one wait
-      // names waits on the first ones.
-      const partitions = group.partitions.slice(0, MAX_FILTERED_WAIT_PARTITIONS)
-      // A held wait stays while it names every partition the node leads now.
-      // One that misses a partition moved to the node is replaced.
+    const slots = [...groups].flatMap(([node, group]) =>
+      Array.from(
+        { length: Math.ceil(group.partitions.length / MAX_FILTERED_WAIT_PARTITIONS) },
+        (_, slice) => ({
+          node: `${node}#${String(slice)}`,
+          target: group.target,
+          partitions: group.partitions.slice(
+            slice * MAX_FILTERED_WAIT_PARTITIONS,
+            (slice + 1) * MAX_FILTERED_WAIT_PARTITIONS
+          )
+        })
+      )
+    )
+    for (const { node, target, partitions } of slots) {
+      // A held wait stays while it names every partition of its slot now.
+      // One that misses a partition moved to the slot is replaced.
       const held = this.heldWaits.get(node)
       if (held !== undefined) {
         if (partitions.every((partition) => held.partitions.has(partition.partitionId))) continue
@@ -1603,12 +1791,12 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       lastWaitId += 1n
       const waitId = lastWaitId
       this.heldWaits.set(node, {
-        target: group.target,
+        target,
         waitId,
         partitions: new Set(partitions.map((partition) => partition.partitionId)),
-        answer: this.waitOn({ target: group.target, partitions }, waitMs, waitId).then(
+        answer: this.waitOn({ target, partitions }, waitMs, waitId).then(
           (ready): HeldAnswer => ({ node, sent, ready }),
-          (error: unknown): HeldAnswer => ({ node, sent, error, target: group.target, partitions })
+          (error: unknown): HeldAnswer => ({ node, sent, error, target, partitions })
         )
       })
     }
@@ -1661,7 +1849,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     // up and waits again at once, as a read is resent once.
     const refused =
       (first.target?.kind === "replica" && isRouteStale(first.error)) ||
-      (first.error instanceof FilterExecutionError && first.error.detail.reason === "unavailable")
+      (first.error instanceof FilterExecutionError && first.error.detail?.reason === "unavailable")
     if (refused && !this.waitRefused) {
       this.waitRefused = true
       for (const partition of first.partitions ?? []) this.leaders.delete(partition.partitionId)
@@ -1926,7 +2114,14 @@ class PartitionProgress {
   private current: FilteredStart
   private pages: PendingPage[] = []
   private pendingStore: AckTarget | undefined
+  private storedOffset: bigint | undefined
+  // The durable offset the last receipt reported for a source generation,
+  // which another consumer can have moved past this reader's own progress.
+  private durable: { readonly generation: SourceGeneration; readonly offset: bigint } | undefined
   private stoppedAt: Blocked | undefined
+  // The acknowledgment that skips the blocking record, fenced like the page
+  // that reported the block.
+  private skipTarget: AckTarget | undefined
   private retryAt: number | undefined
   private firstSequence: number | undefined
   private settledSequence = 0
@@ -1969,7 +2164,10 @@ class PartitionProgress {
     this.current = start
     this.pages = []
     this.pendingStore = undefined
+    this.storedOffset = undefined
+    this.durable = undefined
     this.stoppedAt = undefined
+    this.skipTarget = undefined
     this.retryAt = undefined
     this.firstSequence = undefined
     this.settledSequence = 0
@@ -2015,6 +2213,16 @@ class PartitionProgress {
           : page.stop === "oversized_record"
             ? { stop: "oversized_record", offset: page.fault.offset }
             : undefined
+    this.skipTarget =
+      this.stoppedAt === undefined
+        ? undefined
+        : {
+            offset: this.stoppedAt.offset,
+            generation: page.generation,
+            ackContext: page.ackContext,
+            policy: page.policy,
+            ...(page.policy.groupId !== undefined ? { groupId: page.policy.groupId } : {})
+          }
     const target =
       page.safeAckOffset === undefined
         ? undefined
@@ -2052,7 +2260,7 @@ class PartitionProgress {
     }
     this.settle()
     if (this.pendingStore === undefined || this.pendingStore.offset < offset) {
-      this.pendingStore = { ...target, offset }
+      this.pend({ ...target, offset })
     }
     return true
   }
@@ -2062,8 +2270,75 @@ class PartitionProgress {
     this.settle()
   }
 
-  stored(target: AckTarget): void {
-    if (this.pendingStore === target) this.pendingStore = undefined
+  /**
+   * Pass the record the partition is blocked at, as a native consumer seeks
+   * past it. The skip is acknowledged under the fence of the page that
+   * reported the block and, like an empty page, only once every earlier page
+   * is handled. `false` refuses an offset the partition is not blocked at.
+   */
+  skip(sequence: number, offset: bigint): boolean {
+    const target = this.skipTarget
+    if (target?.offset !== offset) return false
+    const next = offset + 1n
+    this.skipTarget = undefined
+    this.stoppedAt = undefined
+    this.retryAt = undefined
+    this.waitFrom = next
+    this.current =
+      this.current.kind === "continue"
+        ? { kind: "continue", continuation: { ...this.current.continuation, nextScanOffset: next } }
+        : { kind: "offset", offset: next }
+    const newest = this.pages.at(-1)
+    if (newest !== undefined) newest.target = target
+    else this.pages.push({ sequence, target, outstanding: new Set() })
+    this.settle()
+    return true
+  }
+
+  /**
+   * `receipt` answered the store of `target`: the same source generation and
+   * an offset at least the target's. Its offset is the durable progress, which
+   * only covers later acknowledgments and never marks a local record handled.
+   * `false` refuses a receipt that does not answer the target.
+   */
+  acknowledged(target: AckTarget, receipt: AckReceipt): boolean {
+    if (!sameGeneration(receipt.generation, target.generation) || receipt.offset < target.offset) {
+      return false
+    }
+    if (this.storedOffset === undefined || this.storedOffset < target.offset) {
+      this.storedOffset = target.offset
+    }
+    const previous =
+      this.durable !== undefined && sameGeneration(this.durable.generation, receipt.generation)
+        ? this.durable.offset
+        : undefined
+    this.durable = {
+      generation: receipt.generation,
+      offset: previous !== undefined && previous > receipt.offset ? previous : receipt.offset
+    }
+    const pending = this.pendingStore
+    if (pending !== undefined && (pending === target || this.covered(pending))) {
+      this.pendingStore = undefined
+    }
+    return true
+  }
+
+  // Keep `target` to store unless stored or durable progress covers it. A
+  // covered target also covers an older one still pending.
+  private pend(target: AckTarget): void {
+    if (!this.covered(target)) this.pendingStore = target
+    else if (this.pendingStore !== undefined && this.pendingStore.offset <= target.offset) {
+      this.pendingStore = undefined
+    }
+  }
+
+  private covered(target: AckTarget): boolean {
+    return (
+      (this.storedOffset !== undefined && this.storedOffset >= target.offset) ||
+      (this.durable !== undefined &&
+        sameGeneration(this.durable.generation, target.generation) &&
+        this.durable.offset >= target.offset)
+    )
   }
 
   // Retire the completed prefix. Its newest safe offset supersedes any older
@@ -2072,7 +2347,7 @@ class PartitionProgress {
     while (this.pages[0]?.outstanding.size === 0) {
       const page = this.pages.shift()
       if (page !== undefined) this.settledSequence = page.sequence
-      if (page?.target !== undefined) this.pendingStore = page.target
+      if (page?.target !== undefined) this.pend(page.target)
     }
   }
 }
@@ -2276,6 +2551,40 @@ export interface NativeGroup {
   readonly identity: FilterGroupIdentity
 }
 
+function recordEvaluation(
+  mode: ExecutionMode,
+  unevaluated: ReadonlyMap<bigint, FaultReason>,
+  offset: bigint
+): RecordEvaluation {
+  if (mode !== "filtered") return { kind: "unfiltered" }
+  const reason = unevaluated.get(offset)
+  return reason === undefined ? { kind: "selected" } : { kind: "unevaluated", reason }
+}
+
+/**
+ * Whether a group consumer reads through the group reader. A server that
+ * advertises group-aware reads does. A server that serves consumer filters
+ * without them must be upgraded, because its groups may be bound and a native
+ * poll would read past their policies. A probe that established nothing is
+ * not a server without filters. Only a server whose announcement, or refusal
+ * to announce, positively lacks filters reads natively.
+ */
+export function policyAware(capabilities: Capabilities): boolean {
+  if (capabilities.filters.groupPolicyReads) return true
+  if (capabilities.filters.native) {
+    throw new UnsupportedError(
+      "this server serves consumer filters but not group-aware reads, upgrade it before consuming groups through the Laser SDK",
+      { surface: "filters", feature: "group_policy_reads" }
+    )
+  }
+  if (capabilities.hello === "failed" || capabilities.hello === "unknown") {
+    throw new TimeoutError(
+      "the managed probe that decides whether this server resolves consumer group policies, reconnect and build the consumer again"
+    )
+  }
+  return false
+}
+
 /**
  * Read a consumer group's native id and name, and the stream and topic
  * incarnations that scope it. Throws with reason `not_found` when the group
@@ -2351,7 +2660,7 @@ function checkGuard(
     readonly headers: ReadonlyMap<string, HeaderValue>
     readonly headersMalformed?: HeaderFault
   }[],
-  unevaluated: ReadonlySet<bigint>
+  unevaluated: ReadonlyMap<bigint, FaultReason>
 ): void {
   if (page.policy.digest === undefined || !sameBytes(page.policy.digest, guard.digest)) {
     throw filterError({
@@ -2407,11 +2716,13 @@ function checkGuard(
           },
           limits
         )
-    const agrees = unevaluated.has(message.offset)
-      ? outcome.verdict === "fault" &&
-        outcome.fault !== undefined &&
-        guard.policyFor(outcome.fault) === "pass"
-      : outcome.verdict === "selected"
+    const reason = unevaluated.get(message.offset)
+    const agrees =
+      reason === undefined
+        ? outcome.verdict === "selected"
+        : outcome.verdict === "fault" &&
+          outcome.fault === reason &&
+          guard.policyFor(reason) === "pass"
     if (!agrees) {
       throw filterError({
         code: { kind: "known", name: "Backend" },
@@ -2503,12 +2814,12 @@ async function boundDefinition(
   page: FilteredPage
 ): Promise<ConsumerFilter> {
   const source = page.generation
-  for (let index = 0; ; index += 1) {
+  for (let pageNumber = 1; ; pageNumber += 1) {
     const bindings = await filters.bindings({
       stream: requested.stream,
       topic: requested.topic,
-      page: index,
-      pageSize: MAX_FILTER_CATALOG_PAGE
+      page: pageNumber,
+      results: MAX_FILTER_CATALOG_PAGE
     })
     const binding = bindings.items.find(
       ({ identity }) =>
@@ -2527,7 +2838,7 @@ async function boundDefinition(
         revision: binding.revision
       })
     }
-    if ((index + 1) * MAX_FILTER_CATALOG_PAGE >= bindings.total)
+    if (pageNumber >= bindings.totalPages)
       throw filterError({
         code: { kind: "known", name: "NotFound" },
         reason: "not_found",
@@ -2541,11 +2852,11 @@ async function definition(filters: Filters, filter: FilterRef): Promise<Consumer
   if (filter.kind === "bound" || filter.kind === "group")
     throw new ConfigError("resolve a group guard from the served page")
   const { filterId, revision } = filter
-  for (let page = 0; ; page += 1) {
-    const revisions = await filters.revisions(filterId, { page, pageSize: MAX_FILTER_CATALOG_PAGE })
+  for (let page = 1; ; page += 1) {
+    const revisions = await filters.revisions(filterId, { page, results: MAX_FILTER_CATALOG_PAGE })
     const found = revisions.items.find((info) => info.revision === revision)
     if (found !== undefined) return found.filter
-    if ((page + 1) * MAX_FILTER_CATALOG_PAGE >= revisions.total) {
+    if (page >= revisions.totalPages) {
       throw filterError({
         code: { kind: "known", name: "NotFound" },
         reason: "not_found",
@@ -2558,12 +2869,14 @@ async function definition(filters: Filters, filter: FilterRef): Promise<Consumer
 function settled(operationId: bigint, status: FilterMutationStatus): FilterMutationResult {
   if (status.kind === "applied") return status.result
   if (status.kind === "rejected") throw filterError(status.error)
-  throw new AmbiguousMutationError(`filter mutation ${operationId.toString()} has no outcome yet`)
+  throw new AmbiguousMutationError(`filter mutation ${operationId.toString()} has no outcome yet`, {
+    operationId
+  })
 }
 
 function filterError(error: {
-  readonly code: FilterExecutionError["detail"]["code"]
-  readonly reason: FilterExecutionError["detail"]["reason"]
+  readonly code: NonNullable<FilterExecutionError["detail"]>["code"]
+  readonly reason: NonNullable<FilterExecutionError["detail"]>["reason"]
   readonly message: string
 }): LaserError {
   if (error.reason === "unsupported") return new UnsupportedError(error.message)
@@ -2577,12 +2890,12 @@ function filterError(error: {
 function isRouteMoved(error: unknown): boolean {
   return (
     isRouteStale(error) ||
-    (error instanceof FilterExecutionError && error.detail.reason === "unavailable")
+    (error instanceof FilterExecutionError && error.detail?.reason === "unavailable")
   )
 }
 
 function isAssignmentLost(error: unknown): boolean {
-  if (error instanceof FilterExecutionError) return error.detail.reason === "membership_stale"
+  if (error instanceof FilterExecutionError) return error.detail?.reason === "membership_stale"
   return serverErrorCode(error) === CONSUMER_GROUP_PARTITION_NOT_OWNED
 }
 
@@ -2592,9 +2905,11 @@ function isAssignmentLost(error: unknown): boolean {
 function isNotYetApplied(error: unknown): boolean {
   return (
     (error instanceof FilterExecutionError &&
-      error.detail.code.kind === "known" &&
+      error.detail?.code.kind === "known" &&
       error.detail.code.name === "NotFound") ||
-    (error instanceof FilterExecutionError && resultCodeIsRetryable(error.detail.code)) ||
+    (error instanceof FilterExecutionError &&
+      error.detail !== undefined &&
+      resultCodeIsRetryable(error.detail.code)) ||
     (error instanceof TransportError && error.retryable)
   )
 }
@@ -2602,7 +2917,9 @@ function isNotYetApplied(error: unknown): boolean {
 function isTransient(error: unknown): boolean {
   return (
     (error instanceof TransportError && error.retryable) ||
-    (error instanceof FilterExecutionError && resultCodeIsRetryable(error.detail.code))
+    (error instanceof FilterExecutionError &&
+      error.detail !== undefined &&
+      resultCodeIsRetryable(error.detail.code))
   )
 }
 
@@ -2757,8 +3074,8 @@ function validatePage(
     offsets.add(offset)
   }
   if (
-    new Set(page.unevaluated).size !== page.unevaluated.length ||
-    page.unevaluated.some((offset) => !offsets.has(offset))
+    new Set(page.unevaluated.map((fault) => fault.offset)).size !== page.unevaluated.length ||
+    page.unevaluated.some((fault) => !offsets.has(fault.offset))
   )
     invalid()
   if ((page.stop === "fault" || page.stop === "oversized_record") !== (page.fault !== undefined))

@@ -1,19 +1,26 @@
 use crate::error::LaserError;
 use crate::laser::Laser;
-use crate::provenance::AgentTopic;
+use crate::provenance::{AgentTopic, provenance_from_headers};
 use crate::types::{ConversationId, MintUlid};
 use async_trait::async_trait;
+use iggy::prelude::{HeaderKey, HeaderValue, IggyMessage};
 use laser_wire::agent::{AgentEnvelope, AgentId, RecordId, validate};
 use laser_wire::content::ContentType;
 use laser_wire::framing::{decode_named, encode_named};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The `operation` stamped on every policy-evidence event, so the audit topic
 /// filters governance decisions without decoding bodies.
 pub const POLICY_DECISION_OPERATION: &str = "policy_decision";
+
+/// The [`PolicyEvidence::decision`] recorded when the governor itself fails in
+/// [`GovernorMode::Observe`]. The effect proceeds and `reason` carries the failure.
+pub const GOVERNOR_ERROR_DECISION: &str = "error";
+
+const DEFAULT_VOTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The pre-effect policy hook: [`decide`](Self::decide) runs before the SDK
 /// publishes an agent send, a typed or raw topic publish, an AGDX verb, or a
@@ -23,8 +30,10 @@ pub const POLICY_DECISION_OPERATION: &str = "policy_decision";
 /// `Agent::builder().governor(..)`. Defense in depth at the effect boundary:
 /// RBAC on the managed surfaces stays server-owned, this hook cannot widen it.
 ///
-/// An `Err` fails the governed action (fail closed), so a broken governor
-/// never fails open.
+/// Under [`GovernorMode::Enforce`] an `Err` fails the governed action (fail
+/// closed), so a broken governor never fails open. Under
+/// [`GovernorMode::Observe`] the effect proceeds and the failure is recorded
+/// with decision [`GOVERNOR_ERROR_DECISION`].
 #[async_trait]
 pub trait ActionGovernor: Send + Sync {
     async fn decide(&self, action: &GovernedAction<'_>) -> Result<ActionDecision, LaserError>;
@@ -67,6 +76,10 @@ pub struct GovernedAction<'a> {
     pub signed: bool,
     /// Session counters at decision time, for rate and budget policies.
     pub counters: ActionCounters,
+    /// The approval the effect carries, from an
+    /// [`approval_gate`](crate::agent::AgentCtx::approval_gate). A step-up in
+    /// the grant's conversation proceeds on it instead of stepping up again.
+    pub approval: Option<&'a crate::agent::ApprovalGrant>,
 }
 
 /// The kind of side effect a [`GovernedAction`] describes. Displays as its
@@ -328,9 +341,13 @@ pub struct PolicyEvidence {
     pub risk_score: Option<f64>,
     /// BLAKE3 (hex) of this record's canonical encoding, digest field empty.
     pub receipt_digest: String,
-    /// The prior decision's `receipt_digest` in this conversation.
+    /// The prior decision's `receipt_digest` in this chain.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub previous_digest: Option<String>,
+    /// The chain this record extends (ULID). Each governed handle starts its
+    /// own chain per conversation, and a restart or retention eviction starts
+    /// a new one, so chains of several processes interleave on one topic.
+    pub chain_id: String,
     /// What the decision did to the effect: `effected` (the decision let it
     /// proceed, the publish itself can still fail downstream) | `blocked` |
     /// `step_up` | `deferred`.
@@ -360,21 +377,23 @@ impl PolicyEvidence {
     }
 }
 
-/// Whether `evidence`, in log order for one conversation, is an unbroken
-/// chain: every record reproduces its own `receipt_digest` and names the
-/// previous record's digest as its `previous_digest`. A reordered, dropped,
-/// or edited record breaks the chain.
+/// Whether `evidence`, in log order for one conversation, is a set of
+/// unbroken chains: within each [`chain_id`](PolicyEvidence::chain_id) every
+/// record reproduces its own `receipt_digest` and names the previous record's
+/// digest as its `previous_digest`, the first naming none. Chains of several
+/// processes may interleave. A reordered, dropped, or edited record breaks its
+/// chain.
 pub fn verify_evidence_chain(evidence: &[PolicyEvidence]) -> bool {
-    let mut previous: Option<&str> = None;
+    let mut heads: HashMap<&str, &str> = HashMap::new();
     for item in evidence {
-        if item.previous_digest.as_deref() != previous {
+        if item.previous_digest.as_deref() != heads.get(item.chain_id.as_str()).copied() {
             return false;
         }
         match item.clone().seal() {
             Ok(sealed) if sealed.receipt_digest == item.receipt_digest => {}
             _ => return false,
         }
-        previous = Some(item.receipt_digest.as_str());
+        heads.insert(item.chain_id.as_str(), item.receipt_digest.as_str());
     }
     true
 }
@@ -421,15 +440,29 @@ impl Laser {
             return Ok(None);
         };
         action.counters = state.snapshot();
-        let decision = state.governor.decide(&action).await?;
+        let (decision, decision_name) = match state.governor.decide(&action).await {
+            Ok(decision) => {
+                let name = decision.verdict.as_str();
+                (decision, name)
+            }
+            // Observing never impacts the effect, a failing governor included.
+            Err(error) if state.mode == GovernorMode::Observe => {
+                tracing::warn!(%error, "Governor decision failed in observe mode, the action proceeds");
+                (
+                    ActionDecision::observe().with_reason(error.to_string()),
+                    GOVERNOR_ERROR_DECISION,
+                )
+            }
+            Err(error) => return Err(error),
+        };
         match action.kind {
             ActionKind::Request => state.requests.fetch_add(1, Ordering::Relaxed),
             _ => state.sends.fetch_add(1, Ordering::Relaxed),
         };
-        let applied = apply(state.mode, decision.verdict.clone());
+        let applied = apply(state.mode, granted(&action, decision.verdict.clone()));
         if applied.recorded {
             let emitted = state
-                .emit_chained_evidence(self, &action, &decision, applied.outcome)
+                .emit_chained_evidence(self, &action, &decision, decision_name, applied.outcome)
                 .await;
             match state.mode {
                 // Shadow never impacts production: a failed evidence write warns.
@@ -451,12 +484,84 @@ impl Laser {
             }
         }
         if let Some(denial) = applied.denial {
-            return Err(denial);
+            return Err(explained(denial, decision.reason.as_deref()));
         }
         // Count what actually goes out: the replacement body when modified.
         let sent = applied.body.as_ref().map_or(action.payload.len(), Vec::len);
         state.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
         Ok(applied.body)
+    }
+
+    // Govern one raw publish to `topic` on `stream`, with the acting agent and
+    // conversation read from the provenance its headers carry. `Ok(None)`
+    // keeps the body.
+    pub(crate) async fn govern_publish(
+        &self,
+        stream: &str,
+        topic: &str,
+        payload: &[u8],
+        headers: Option<&BTreeMap<HeaderKey, HeaderValue>>,
+    ) -> Result<Option<Vec<u8>>, LaserError> {
+        if self.governor.is_none() {
+            return Ok(None);
+        }
+        let provenance = headers.and_then(|headers| provenance_from_headers(headers).ok());
+        self.govern(GovernedAction {
+            kind: ActionKind::Publish,
+            stream,
+            topic,
+            source: provenance
+                .as_ref()
+                .and_then(|provenance| provenance.agent.as_ref())
+                .map(|agent| agent.as_str()),
+            target: provenance
+                .as_ref()
+                .and_then(|provenance| provenance.target_agent_id.as_ref())
+                .map(|agent| agent.as_str()),
+            conversation: provenance
+                .as_ref()
+                .map(|provenance| provenance.conversation_id),
+            correlation: provenance
+                .as_ref()
+                .and_then(|provenance| provenance.correlation_id.as_deref()),
+            operation: None,
+            tool: None,
+            on_behalf_of: None,
+            purpose: None,
+            data_classification: None,
+            payload,
+            signed: false,
+            counters: ActionCounters::default(),
+            approval: None,
+        })
+        .await
+    }
+
+    // Govern every message of a raw batch in order, replacing a modified body
+    // in place. The first denial fails the whole batch before anything is sent.
+    pub(crate) async fn govern_messages(
+        &self,
+        stream: &str,
+        topic: &str,
+        messages: &mut [IggyMessage],
+    ) -> Result<(), LaserError> {
+        if self.governor.is_none() {
+            return Ok(());
+        }
+        for message in messages.iter_mut() {
+            let headers = message.user_headers_map()?;
+            if let Some(body) = self
+                .govern_publish(stream, topic, &message.payload, headers.as_ref())
+                .await?
+            {
+                *message = IggyMessage::builder()
+                    .id(message.header.id)
+                    .payload(bytes::Bytes::from(body))
+                    .maybe_user_headers(headers)
+                    .build()?;
+            }
+        }
+        Ok(())
     }
 
     // Publish `evidence` as an AGDX `event` on the audit topic of the action's
@@ -513,6 +618,7 @@ pub(crate) struct GovernorState {
 }
 
 struct ChainEntry {
+    id: String,
     digest: tokio::sync::Mutex<Option<String>>,
     touched_micros: AtomicU64,
 }
@@ -607,6 +713,7 @@ impl GovernorState {
                 }
                 if chain.len() < self.retention.capacity {
                     let entry = Arc::new(ChainEntry {
+                        id: ulid::Ulid::generate().to_string(),
                         digest: tokio::sync::Mutex::new(None),
                         touched_micros: AtomicU64::new(now),
                     });
@@ -636,12 +743,20 @@ impl GovernorState {
         laser: &Laser,
         action: &GovernedAction<'_>,
         decision: &ActionDecision,
+        decision_name: &str,
         outcome: &'static str,
     ) -> Result<(), LaserError> {
         let chain_key = action.conversation.map(|id| id.as_u128());
         let slot = self.acquire_chain(chain_key).await;
         let mut previous = slot.entry.digest.lock().await;
-        let evidence = self.seal_evidence(action, decision, outcome, previous.clone())?;
+        let evidence = self.seal_evidence(
+            action,
+            decision,
+            decision_name,
+            outcome,
+            &slot.entry.id,
+            previous.clone(),
+        )?;
         let digest = evidence.receipt_digest.clone();
         laser.emit_evidence(action, evidence).await?;
         *previous = Some(digest);
@@ -653,7 +768,9 @@ impl GovernorState {
         &self,
         action: &GovernedAction<'_>,
         decision: &ActionDecision,
+        decision_name: &str,
         outcome: &'static str,
+        chain_id: &str,
         previous_digest: Option<String>,
     ) -> Result<PolicyEvidence, LaserError> {
         let approved_scope = match &decision.verdict {
@@ -662,7 +779,7 @@ impl GovernorState {
         };
         PolicyEvidence {
             decision_id: ulid::Ulid::generate().to_string(),
-            decision: decision.verdict.as_str().to_owned(),
+            decision: decision_name.to_owned(),
             mode: self.mode.as_str().to_owned(),
             kind: action.kind.as_str().to_owned(),
             stream: action.stream.to_owned(),
@@ -680,6 +797,7 @@ impl GovernorState {
             risk_score: decision.risk_score,
             receipt_digest: String::new(),
             previous_digest,
+            chain_id: chain_id.to_owned(),
             outcome: outcome.to_owned(),
             at_micros: now_micros(),
         }
@@ -694,6 +812,21 @@ struct AppliedVerdict {
     outcome: &'static str,
     body: Option<Vec<u8>>,
     denial: Option<LaserError>,
+}
+
+// A step-up the action's approval answers proceeds as an observed effect,
+// recorded with the step-up decision and its scope.
+fn granted(action: &GovernedAction<'_>, verdict: Verdict) -> Verdict {
+    match verdict {
+        Verdict::StepUp { .. }
+            if action
+                .approval
+                .is_some_and(|grant| action.conversation == Some(grant.conversation())) =>
+        {
+            Verdict::Observe
+        }
+        verdict => verdict,
+    }
 }
 
 // The verdict-by-mode table. Observe mode records what enforcement would have
@@ -740,6 +873,19 @@ fn apply(mode: GovernorMode, verdict: Verdict) -> AppliedVerdict {
                 LaserError::PolicyDeferred("the governor deferred this action".to_owned())
             }),
         },
+    }
+}
+
+// A denial with the governor's reason appended, so a caller sees why.
+fn explained(denial: LaserError, reason: Option<&str>) -> LaserError {
+    match (denial, reason) {
+        (LaserError::PolicyBlocked(message), Some(reason)) => {
+            LaserError::PolicyBlocked(format!("{message}: {reason}"))
+        }
+        (LaserError::PolicyDeferred(message), Some(reason)) => {
+            LaserError::PolicyDeferred(format!("{message}: {reason}"))
+        }
+        (denial, _) => denial,
     }
 }
 
@@ -804,6 +950,7 @@ struct Voter {
 pub struct QuorumGovernor {
     voters: Vec<Voter>,
     policy: QuorumPolicy,
+    voter_timeout: std::time::Duration,
 }
 
 impl QuorumGovernor {
@@ -813,7 +960,17 @@ impl QuorumGovernor {
         Self {
             voters: Vec::new(),
             policy,
+            voter_timeout: DEFAULT_VOTER_TIMEOUT,
         }
+    }
+
+    /// How long each voter may take, 10 seconds unless set. A voter that does
+    /// not answer in time counts as an error: a mandatory one blocks, any
+    /// other abstains, so one hung voter never stalls every governed effect.
+    #[must_use]
+    pub fn voter_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.voter_timeout = timeout;
+        self
     }
 
     /// Enroll one named voter. A `mandatory` voter must return an affirmative
@@ -861,11 +1018,17 @@ impl ActionGovernor for QuorumGovernor {
                 duplicate.name
             )));
         }
-        let votes = futures::future::join_all(
-            self.voters
-                .iter()
-                .map(|voter| async move { (voter, voter.governor.decide(action).await) }),
-        )
+        if self.voter_timeout.is_zero() {
+            return Ok(ActionDecision::block(
+                "quorum voter timeout must be greater than zero",
+            ));
+        }
+        let votes = futures::future::join_all(self.voters.iter().map(|voter| async move {
+            let vote = tokio::time::timeout(self.voter_timeout, voter.governor.decide(action))
+                .await
+                .unwrap_or(Err(LaserError::Timeout("a quorum voter")));
+            (voter, vote)
+        }))
         .await;
 
         let mut ballot = Vec::with_capacity(votes.len());
@@ -1160,16 +1323,26 @@ mod tests {
             payload,
             signed: false,
             counters: ActionCounters::default(),
+            approval: None,
         };
         let first = state
-            .seal_evidence(&action, &ActionDecision::observe(), "effected", None)
+            .seal_evidence(
+                &action,
+                &ActionDecision::observe(),
+                "observe",
+                "effected",
+                "01J0000000000000000000001",
+                None,
+            )
             .expect("seals");
         assert_eq!(first.previous_digest, None);
         let second = state
             .seal_evidence(
                 &action,
                 &ActionDecision::block("no"),
+                "block",
                 "blocked",
+                "01J0000000000000000000001",
                 Some(first.receipt_digest.clone()),
             )
             .expect("seals");
@@ -1238,6 +1411,103 @@ mod tests {
         assert_eq!(*second.entry.digest.lock().await, None);
     }
 
+    #[test]
+    fn given_a_block_or_defer_with_a_reason_when_enforced_then_should_carry_the_reason() {
+        let block = ActionDecision::block("wire transfers need review");
+        let denied = apply(GovernorMode::Enforce, block.verdict.clone())
+            .denial
+            .map(|denial| explained(denial, block.reason.as_deref()));
+        assert!(
+            matches!(&denied, Some(LaserError::PolicyBlocked(message)) if message == "the governor blocked this action: wire transfers need review"),
+            "{denied:?}"
+        );
+        let defer = ActionDecision::defer("after the freeze");
+        let deferred = apply(GovernorMode::Enforce, defer.verdict.clone())
+            .denial
+            .map(|denial| explained(denial, defer.reason.as_deref()));
+        assert!(
+            matches!(&deferred, Some(LaserError::PolicyDeferred(message)) if message == "the governor deferred this action: after the freeze"),
+            "{deferred:?}"
+        );
+        let step_up = explained(
+            LaserError::StepUpRequired {
+                scope: "payments".to_owned(),
+            },
+            Some("needs approval"),
+        );
+        assert!(matches!(step_up, LaserError::StepUpRequired { scope } if scope == "payments"));
+    }
+
+    #[tokio::test]
+    async fn given_a_governor_when_publishing_through_every_raw_and_batch_path_then_should_govern_each_record()
+     {
+        let decided = Arc::new(AtomicU64::new(0));
+        let laser = offline_laser().with_governor(
+            Arc::new(Refusing {
+                decided: Arc::clone(&decided),
+            }),
+            GovernorMode::Enforce,
+        );
+        let topic = laser.topic("events");
+        let within = std::time::Duration::from_secs(5);
+        let batch = tokio::time::timeout(
+            within,
+            topic
+                .publish_batch()
+                .add_record(b"one".to_vec(), crate::stream::Record::builder().build())
+                .add_record(b"two".to_vec(), crate::stream::Record::builder().build())
+                .send(),
+        )
+        .await;
+        assert!(refused(&batch), "batch publish: {batch:?}");
+        let raw = tokio::time::timeout(
+            within,
+            topic.send(b"three".to_vec(), std::collections::BTreeMap::new(), None),
+        )
+        .await;
+        assert!(refused(&raw), "raw send: {raw:?}");
+        let message = iggy::prelude::IggyMessage::builder()
+            .payload(bytes::Bytes::from_static(b"four"))
+            .build()
+            .expect("a one-record message builds");
+        let messages = tokio::time::timeout(within, topic.batch(vec![message], None)).await;
+        assert!(refused(&messages), "raw batch: {messages:?}");
+        let batching = topic
+            .batching()
+            .expect("the topic has a default stream")
+            .build();
+        let queued = tokio::time::timeout(
+            within,
+            batching.send(b"five".to_vec(), std::collections::BTreeMap::new()),
+        )
+        .await;
+        assert!(refused(&queued), "batching send: {queued:?}");
+        assert_eq!(decided.load(Ordering::SeqCst), 4);
+    }
+
+    fn refused<T: std::fmt::Debug>(
+        result: &Result<Result<T, LaserError>, tokio::time::error::Elapsed>,
+    ) -> bool {
+        matches!(result, Ok(Err(LaserError::PolicyBlocked(message))) if message == "refused by test")
+    }
+
+    fn offline_laser() -> Laser {
+        Laser::from_client(iggy::prelude::IggyClient::default()).with_default_stream("acme")
+    }
+
+    // Fails every decision, so a governed path stops before any I/O.
+    struct Refusing {
+        decided: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl ActionGovernor for Refusing {
+        async fn decide(&self, _: &GovernedAction<'_>) -> Result<ActionDecision, LaserError> {
+            self.decided.fetch_add(1, Ordering::SeqCst);
+            Err(LaserError::PolicyBlocked("refused by test".to_owned()))
+        }
+    }
+
     struct AllowAll;
 
     #[async_trait]
@@ -1272,6 +1542,7 @@ mod tests {
             risk_score: Some(0.5),
             receipt_digest: String::new(),
             previous_digest: None,
+            chain_id: "01J0000000000000000000001".to_owned(),
             outcome: "blocked".to_owned(),
             at_micros: 1_717_171_777_000_000,
         }
@@ -1285,6 +1556,15 @@ mod tests {
             let mut decision = ActionDecision::of(self.0.clone());
             decision.reason = Some("fixed".to_owned());
             Ok(decision)
+        }
+    }
+
+    struct Hangs;
+
+    #[async_trait]
+    impl ActionGovernor for Hangs {
+        async fn decide(&self, _: &GovernedAction<'_>) -> Result<ActionDecision, LaserError> {
+            std::future::pending().await
         }
     }
 
@@ -1318,6 +1598,7 @@ mod tests {
             payload: b"body",
             signed: false,
             counters: ActionCounters::default(),
+            approval: None,
         }
     }
 
@@ -1499,6 +1780,81 @@ mod tests {
             QuorumGovernor::new(QuorumPolicy::Any).voter("flaky", Arc::new(AlwaysErrors), false);
         let decision = quorum.decide(&probe_action()).await.expect("decides");
         assert_eq!(decision.verdict, Verdict::Block);
+    }
+
+    #[tokio::test]
+    async fn given_a_hung_voter_when_the_quorum_decides_then_should_time_it_out() {
+        let bound = std::time::Duration::from_secs(5);
+        let abstaining = QuorumGovernor::new(QuorumPolicy::Any)
+            .voter("hung", Arc::new(Hangs), false)
+            .voter("ok", voter(Verdict::Allow), false)
+            .voter_timeout(std::time::Duration::from_millis(20));
+        let decision = tokio::time::timeout(bound, abstaining.decide(&probe_action()))
+            .await
+            .expect("the voter timeout bounds a hung voter")
+            .expect("decides");
+        assert_eq!(decision.verdict, Verdict::Allow);
+        assert!(
+            decision
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("hung=error(")),
+            "{decision:?}"
+        );
+        let mandatory = QuorumGovernor::new(QuorumPolicy::Any)
+            .voter("hung", Arc::new(Hangs), true)
+            .voter("ok", voter(Verdict::Allow), false)
+            .voter_timeout(std::time::Duration::from_millis(20));
+        let blocked = tokio::time::timeout(bound, mandatory.decide(&probe_action()))
+            .await
+            .expect("the voter timeout bounds a hung mandatory voter")
+            .expect("decides");
+        assert_eq!(blocked.verdict, Verdict::Block);
+    }
+
+    #[tokio::test]
+    async fn given_two_processes_governing_one_conversation_when_interleaved_then_should_verify_each_chain()
+     {
+        let conversation = ConversationId::new();
+        let first = GovernorState::new(Arc::new(AllowAll), GovernorMode::Enforce);
+        let second = GovernorState::new(Arc::new(AllowAll), GovernorMode::Enforce);
+        let action = GovernedAction {
+            conversation: Some(conversation),
+            ..probe_action()
+        };
+        let mut evidence = Vec::new();
+        for state in [&first, &second, &first, &second] {
+            let slot = state.acquire_chain(Some(conversation.as_u128())).await;
+            let mut head = slot.entry.digest.lock().await;
+            let sealed = state
+                .seal_evidence(
+                    &action,
+                    &ActionDecision::observe(),
+                    "observe",
+                    "effected",
+                    &slot.entry.id,
+                    head.clone(),
+                )
+                .expect("seals");
+            *head = Some(sealed.receipt_digest.clone());
+            evidence.push(sealed);
+        }
+        assert_ne!(
+            evidence[0].chain_id, evidence[1].chain_id,
+            "each process keeps its own chain"
+        );
+        assert!(
+            verify_evidence_chain(&evidence),
+            "interleaved honest chains verify"
+        );
+        assert!(
+            !verify_evidence_chain(&evidence[1..]),
+            "a chain missing its head fails"
+        );
+        assert!(
+            !verify_evidence_chain(&[evidence[2].clone(), evidence[0].clone()]),
+            "a reordered chain fails"
+        );
     }
 
     #[tokio::test]

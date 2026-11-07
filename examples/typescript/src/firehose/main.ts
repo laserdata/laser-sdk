@@ -73,6 +73,7 @@ async function registerOrg(laser: Laser, topic: string, index: string): Promise<
     name: index,
     version: 1,
     kind: { kind: "row" },
+    history: { kind: "append" },
     contentType: ContentType.Json,
     extraction: {
       fields: ["org", "service", "region", "status", "latency_ms", "ts"].map((name) => ({
@@ -89,7 +90,8 @@ async function registerOrg(laser: Laser, topic: string, index: string): Promise<
     defaultProjection: id,
     index,
     notify: true,
-    skipRejected: false
+    invalidRecords: "block",
+    oversize: "block"
   }
   await laser.projections().register(projection)
   await laser.bindings().apply(binding)

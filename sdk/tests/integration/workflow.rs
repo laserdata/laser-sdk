@@ -37,6 +37,7 @@ fn card(skill: &str) -> AgentCard {
             load: None,
         }],
         ttl_micros: None,
+        inbox: None,
     }
 }
 
@@ -418,4 +419,183 @@ async fn given_a_cancel_request_on_the_control_topic_when_a_workflow_runs_then_s
     })
     .await;
     assert!(matches!(result, Err(LaserError::Cancelled { .. })));
+}
+
+fn counted_run(laser: &Laser, run: Option<ConversationId>, steps: usize) -> StepHandle {
+    let mut workflow = laser
+        .workflow("windowflow")
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions));
+    if let Some(run) = run {
+        workflow = workflow.run_id(run);
+    }
+    let mut handle = workflow.step(
+        "step-0",
+        Router::to_capable("window-count", RoutePolicy::Any),
+        |_ctx: &StepContext<'_>| b"go".to_vec(),
+    );
+    for index in 1..steps {
+        handle = handle.step(
+            &format!("step-{index}"),
+            Router::to_capable("window-count", RoutePolicy::Any),
+            |_ctx: &StepContext<'_>| b"go".to_vec(),
+        );
+    }
+    handle
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_more_completed_steps_than_the_default_context_window_when_resumed_then_should_re_dispatch_none()
+ {
+    let laser = harness::laser().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut counter = Agent::builder()
+        .id("window-counter".parse().expect("counter id is valid"))
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
+        .capabilities(card("window-count").capabilities)
+        .handler(Counter {
+            calls: calls.clone(),
+        })
+        .build()
+        .spawn(laser.clone());
+    counter.ready().await.expect("counter joins its group");
+    let steps = 51;
+
+    let first = counted_run(&laser, None, steps)
+        .run()
+        .await
+        .expect("the first run completes");
+    assert_eq!(calls.load(Ordering::SeqCst), steps);
+
+    let resumed = counted_run(&laser, Some(first.run_id), steps)
+        .run()
+        .await
+        .expect("the resumed run completes");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        steps,
+        "a resumed run must not re-dispatch any journalled step",
+    );
+    assert_eq!(resumed.outputs.len(), steps);
+    counter.shutdown().await.expect("counter shuts down");
+}
+
+// Blocks the first verification until the test drops the run, so the step's
+// reply has landed while its completion was never journaled.
+struct HeldVerifier {
+    entered: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Verifier for HeldVerifier {
+    async fn verify(&self, _output: &[u8]) -> Result<bool, LaserError> {
+        self.entered.notify_one();
+        std::future::pending::<()>().await;
+        Ok(true)
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_step_whose_reply_landed_before_the_run_stopped_when_resumed_then_should_use_that_reply()
+ {
+    let laser = harness::laser().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut counter = Agent::builder()
+        .id("inflight-counter".parse().expect("counter id is valid"))
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
+        .capabilities(card("inflight-count").capabilities)
+        .handler(Counter {
+            calls: calls.clone(),
+        })
+        .build()
+        .spawn(laser.clone());
+    counter.ready().await.expect("counter joins its group");
+    let run = ConversationId::new();
+    let entered = Arc::new(tokio::sync::Notify::new());
+
+    let held = laser
+        .workflow("inflightflow")
+        .run_id(run)
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
+        .step(
+            "count",
+            Router::to_capable("inflight-count", RoutePolicy::Any),
+            |_ctx: &StepContext<'_>| b"go".to_vec(),
+        )
+        .verify_with(HeldVerifier {
+            entered: Arc::clone(&entered),
+        })
+        .run();
+    tokio::select! {
+        _ = held => panic!("the held verification never returns"),
+        () = entered.notified() => {}
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let resumed = laser
+        .workflow("inflightflow")
+        .run_id(run)
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
+        .step(
+            "count",
+            Router::to_capable("inflight-count", RoutePolicy::Any),
+            |_ctx: &StepContext<'_>| b"go".to_vec(),
+        )
+        .run()
+        .await
+        .expect("the resumed run completes");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the step whose reply already landed must not run again",
+    );
+    assert_eq!(
+        resumed.outputs.get("count").map(Vec::as_slice),
+        Some(b"counted".as_slice())
+    );
+    counter.shutdown().await.expect("counter shuts down");
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_verifier_that_never_answers_when_the_step_runs_then_should_fail_it_timed_out_at_its_deadline()
+ {
+    let laser = harness::laser().await;
+    let mut checker = worker(&laser, "hung-checker", "hung-check", "checked").await;
+    checker.ready().await.expect("checker joins its group");
+    wait_for_capable(&laser, "hung-check", 1).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+
+    let run = laser
+        .workflow("hungverifyflow")
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
+        .step(
+            "check",
+            Router::to_capable("hung-check", RoutePolicy::Any),
+            |_ctx: &StepContext<'_>| b"go".to_vec(),
+        )
+        .verify_with(HeldVerifier {
+            entered: Arc::clone(&entered),
+        })
+        .deadline(std::time::Duration::from_secs(3))
+        .run();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(20), run)
+        .await
+        .expect("the step deadline bounds a verifier that never answers")
+        .expect_err("the unverified step fails the run");
+
+    assert!(
+        matches!(
+            &error,
+            LaserError::StepFailed { step, reason, .. }
+                if step == "check" && *reason == StepFailure::TimedOut
+        ),
+        "{error:?}"
+    );
+    checker.shutdown().await.expect("checker shuts down");
 }

@@ -2,10 +2,14 @@ use crate::convert::{py_to_de, ser_to_py};
 use crate::transport::PySendMessagesConfirmation;
 use iggy::prelude::{HeaderKind, HeaderValue, IggyError, IggyMessage};
 use laser_sdk::LaserError as SdkError;
+use laser_sdk::wire::filter::FaultReason;
+use laser_sdk::wire::result::ResultCode;
 use pyo3::IntoPyObjectExt;
 use pyo3::conversion::FromPyObjectOwned;
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyPermissionError, PyTimeoutError, PyTypeError};
+use pyo3::exceptions::{
+    PyAttributeError, PyException, PyNameError, PyPermissionError, PyTimeoutError, PyTypeError,
+};
 use pyo3::prelude::*;
 use pyo3::sync::OnceLockExt;
 use pyo3::types::{PyBytes, PyDict, PyTuple, PyType};
@@ -36,7 +40,7 @@ const DETAIL: (&str, &str) = ("detail", "typing.Any");
 // A class constant naming one variant of a Rust error enum. Its value is the
 // lowercase constant name, the word a raised instance carries in `kind`.
 const VARIANT: &str = "typing.ClassVar[builtins.str]";
-const INTENT_FIELDS: [(&str, &str); 10] = [
+const INTENT_FIELDS: [(&str, &str); 12] = [
     ("kind", "builtins.str"),
     ("NO_ELIGIBLE_VOTERS", VARIANT),
     ("DUPLICATE_ELIGIBLE_VOTER", VARIANT),
@@ -45,8 +49,10 @@ const INTENT_FIELDS: [(&str, &str); 10] = [
     ("INVALID_THRESHOLD", VARIANT),
     ("INVALID_DEADLINE", VARIANT),
     ("DIGEST_MISMATCH", VARIANT),
+    ("DIGEST_ENCODING", VARIANT),
     ("INELIGIBLE_VOTER", VARIANT),
     ("DECISION_INTENT_MISMATCH", VARIANT),
+    ("DECISION_QUORUM_NOT_MET", VARIANT),
 ];
 const VALIDATE_FIELDS: [(&str, &str); 6] = [
     ("kind", "builtins.str"),
@@ -56,9 +62,8 @@ const VALIDATE_FIELDS: [(&str, &str); 6] = [
     ("TOO_LARGE", VARIANT),
     ("INVALID", VARIANT),
 ];
-const FILTER_FIELDS: [(&str, &str); 8] = [
+const FILTER_FIELDS: [(&str, &str); 7] = [
     ("reason", "builtins.str"),
-    ("fault_reason", "builtins.str | None"),
     ("partition_id", "builtins.int | None"),
     ("offset", "builtins.int | None"),
     ("group_id", "builtins.int | None"),
@@ -214,12 +219,6 @@ create_exception!(
 );
 create_exception!(
     laser_sdk,
-    CheckpointError,
-    LaserError,
-    "A destination or checkpoint operation returned a typed failure. `detail` is the typed cause."
-);
-create_exception!(
-    laser_sdk,
     FilterError,
     LaserError,
     "A consumer-filter operation returned a typed failure. `reason` names the cause \
@@ -230,8 +229,8 @@ create_exception!(
     FilterFaultError,
     FilterError,
     "A filtered read stopped in front of a record the filter could not evaluate. `reason` \
-     is `fault`, `fault_reason` names the decode fault, and `partition_id` and `offset` \
-     locate the record. The record and everything after it stay unacknowledged."
+     names the decode fault, and `partition_id` and `offset` locate the record. The record \
+     and everything after it stay unacknowledged until `skip(partition_id, offset)` passes it."
 );
 create_exception!(
     laser_sdk,
@@ -401,9 +400,38 @@ create_exception!(
 );
 create_exception!(
     laser_sdk,
+    CancelledError,
+    LaserError,
+    "A registered run's recorded cancel intent was observed at a step boundary. `run` names the run. Not retryable on the same run."
+);
+create_exception!(
+    laser_sdk,
     QuarantinedError,
     LaserError,
     "The `agent` was quarantined and may not act. Not retryable."
+);
+create_exception!(
+    laser_sdk,
+    StepFailedError,
+    LaserError,
+    "A workflow step did not complete. `run` and `step` name it, and `reason` is `timed_out`, \
+     `failed`, `not_consumed`, `unverified`, or `no_completion`. Only `timed_out` is retryable. \
+     The completed steps' compensations have run."
+);
+create_exception!(
+    laser_sdk,
+    JournalTruncatedError,
+    LaserError,
+    "A workflow resume found the run's journal shortened by retention, so the steps the run \
+     completed cannot be known. `run` names the run. Not retryable on the same run."
+);
+create_exception!(
+    laser_sdk,
+    SessionEndedError,
+    LaserError,
+    "`begin` named a session that already ended, or `resume` named one an agent or an operator \
+     canceled. `session` names it and `status` is `completed`, `failed`, or `canceled`. A \
+     completed or failed session reopens through `resume`."
 );
 create_exception!(
     laser_sdk,
@@ -411,13 +439,11 @@ create_exception!(
     LaserError,
     "Provenance headers failed to encode or decode."
 );
-// `TimeoutError` and `CancelledError` are synthesized with two bases each so the
-// SDK hierarchy stays catchable (`except LaserError`) while `except TimeoutError`
-// (the builtin) and `except asyncio.CancelledError` also catch them. The macro
-// takes a single base, so these are built with the `type(...)` builtin at
-// registration and cached for `to_pyerr`.
+// `TimeoutError` is synthesized with two bases so the SDK hierarchy stays
+// catchable (`except LaserError`) while the builtin `except TimeoutError` also
+// catches it. The macro takes a single base, so it is built with the
+// `type(...)` builtin at registration and cached for `to_pyerr`.
 static TIMEOUT_ERROR: OnceLock<Py<PyType>> = OnceLock::new();
-static CANCELLED_ERROR: OnceLock<Py<PyType>> = OnceLock::new();
 
 /// One record a failed publish left without a confirmation. It keeps the
 /// message id the attempts used, and it may already be on the server.
@@ -522,7 +548,7 @@ struct NativeError {
 // code raises it directly, and the attributes its SDK-raised instances carry.
 struct ExceptionClass<'py> {
     class: Bound<'py, PyType>,
-    code: Option<&'static str>,
+    code: Option<ResultCode>,
     retryable: Option<bool>,
     flags: &'static [&'static str],
     fields: &'static [(&'static str, &'static str)],
@@ -551,7 +577,10 @@ pub(crate) fn from_callback_error(error: PyErr) -> SdkError {
         if is(py.get_type::<AmbiguousMutationError>())
             || attribute::<bool>(value, "ambiguous_mutation") == Some(true)
         {
-            SdkError::AmbiguousMutation(message)
+            SdkError::AmbiguousMutation {
+                operation_id: attribute::<u128>(value, "operation_id"),
+                message,
+            }
         } else if is(py.get_type::<RoutePrincipalMismatchError>()) {
             SdkError::RoutePrincipalMismatch {
                 agent: text("agent").unwrap_or(message),
@@ -573,7 +602,7 @@ pub(crate) fn from_callback_error(error: PyErr) -> SdkError {
             }
         } else if is(py.get_type::<FenceViolationError>()) {
             SdkError::FenceViolation {
-                stale: number("held"),
+                held: number("held"),
                 current: number("current"),
             }
         } else if is(py.get_type::<BudgetExceededError>()) {
@@ -585,7 +614,26 @@ pub(crate) fn from_callback_error(error: PyErr) -> SdkError {
             SdkError::Quarantined {
                 agent: text("agent").unwrap_or(message),
             }
-        } else if error.is_instance_of::<pyo3::exceptions::asyncio::CancelledError>(py) {
+        } else if is(py.get_type::<StepFailedError>()) {
+            SdkError::StepFailed {
+                run: text("run").unwrap_or_default(),
+                step: text("step").unwrap_or(message),
+                reason: text("reason")
+                    .and_then(|reason| reason.parse().ok())
+                    .unwrap_or(laser_sdk::agent::StepFailure::Failed),
+            }
+        } else if is(py.get_type::<JournalTruncatedError>()) {
+            SdkError::JournalTruncated {
+                run: text("run").unwrap_or(message),
+            }
+        } else if is(py.get_type::<SessionEndedError>()) {
+            SdkError::SessionEnded {
+                session: text("session").unwrap_or(message),
+                status: text("status").unwrap_or_default(),
+            }
+        } else if is(py.get_type::<CancelledError>())
+            || error.is_instance_of::<pyo3::exceptions::asyncio::CancelledError>(py)
+        {
             // Cancellation is never a transient failure, whether the SDK
             // observed a run's cancel intent or the callback's task was cancelled.
             SdkError::Cancelled {
@@ -611,15 +659,43 @@ pub(crate) fn from_callback_error(error: PyErr) -> SdkError {
             SdkError::Rejected(message)
         } else if is(py.get_type::<HandlerError>()) {
             SdkError::Handler(message)
+        } else if is(py.get_type::<TransportError>()) {
+            SdkError::from(
+                attribute::<u32>(value, "iggy_error_code")
+                    .map_or(IggyError::Error, IggyError::from_code),
+            )
+        } else if is(py.get_type::<FilterFaultError>()) {
+            SdkError::FilterFault {
+                partition_id: attribute::<u32>(value, "partition_id").unwrap_or_default(),
+                offset: number("offset"),
+                reason: value
+                    .getattr("reason")
+                    .ok()
+                    .and_then(|reason| py_to_de(&reason).ok())
+                    .unwrap_or(FaultReason::Malformed),
+            }
+        } else if is(py.get_type::<FilterOversizedRecordError>()) {
+            SdkError::FilterOversizedRecord {
+                partition_id: attribute::<u32>(value, "partition_id").unwrap_or_default(),
+                offset: number("offset"),
+            }
+        } else if is(py.get_type::<ProvenanceError>()) {
+            SdkError::Codec(message)
         } else if attribute::<bool>(value, "permission_denied") == Some(true)
             || error.is_instance_of::<PyPermissionError>(py)
         {
-            SdkError::Iggy(IggyError::Unauthorized)
+            SdkError::from(IggyError::Unauthorized)
         } else if is(py.get_type::<NoStreamError>()) {
             SdkError::NoStream
         } else if is(py.get_type::<NoRespondTopicError>()) {
             SdkError::NoRespondTopic
-        } else if is(py.get_type::<ConfigError>()) || error.is_instance_of::<PyTypeError>(py) {
+        } else if is(py.get_type::<ConfigError>())
+            || error.is_instance_of::<PyTypeError>(py)
+            || error.is_instance_of::<PyAttributeError>(py)
+            || error.is_instance_of::<PyNameError>(py)
+        {
+            // A programming error in a callback is the counterpart of a Rust
+            // panic, so it is never retried.
             SdkError::HandlerConfig(message)
         } else if is(py.get_type::<UnsupportedError>())
             || attribute::<bool>(value, "unsupported") == Some(true)
@@ -704,8 +780,10 @@ pub(crate) fn intent_error(error: &laser_sdk::intent::IntentError) -> PyErr {
         Variant::InvalidThreshold { .. } => "invalid_threshold",
         Variant::InvalidDeadline { .. } => "invalid_deadline",
         Variant::DigestMismatch => "digest_mismatch",
+        Variant::DigestEncoding(_) => "digest_encoding",
         Variant::IneligibleVoter(_) => "ineligible_voter",
         Variant::DecisionIntentMismatch => "decision_intent_mismatch",
+        Variant::DecisionQuorumNotMet => "decision_quorum_not_met",
     };
     Python::attach(|py| {
         let pyerr = IntentError::new_err(error.to_string());
@@ -787,7 +865,7 @@ pub(crate) fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult
     // Graft `ValueError` in as a second base (the macro takes one base only):
     // a rejected argument is Python's value error, and the SDK hierarchy must
     // keep catching it as a `LaserError`. Same dual-base intent as the
-    // synthesized `TimeoutError`/`CancelledError`, applied to the macro class.
+    // synthesized `TimeoutError`, applied to the macro class.
     let invalid = py.get_type::<InvalidError>();
     if !invalid.is_subclass_of::<pyo3::exceptions::PyValueError>()? {
         let bases = PyTuple::new(
@@ -801,18 +879,22 @@ pub(crate) fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult
     }
     for entry in exception_classes(py) {
         let class = &entry.class;
-        if let Some(code) = entry.code {
-            class.setattr("code", code)?;
-        }
-        if let Some(retryable) = entry.retryable {
-            class.setattr("retryable", retryable)?;
-        }
         if class.is(py.get_type::<LaserError>()) {
             for flag in FLAGS {
                 class.setattr(flag, false)?;
             }
             class.setattr("iggy_error_code", py.None())?;
             class.setattr("filter_reason", py.None())?;
+        }
+        if let Some(code) = entry.code {
+            class.setattr("code", format!("{code:?}"))?;
+            class.setattr("retryable", code.is_retryable())?;
+            for (flag, value) in code_flags(code) {
+                class.setattr(flag, value)?;
+            }
+        }
+        if let Some(retryable) = entry.retryable {
+            class.setattr("retryable", retryable)?;
         }
         if class.is(py.get_type::<IdError>()) {
             class.setattr("kind", py.None())?;
@@ -852,13 +934,14 @@ pub(crate) fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult
     Ok(())
 }
 
-// Every class in registration order, parents before children. `code` and
-// `retryable` follow what Rust `LaserError::code` and `is_retryable` answer
-// for the variant the class stands for.
+// Every class in registration order, parents before children. `code` follows
+// what Rust `LaserError::code` answers for the variant the class stands for,
+// and the broad classifiers and `retryable` derive from it, so only a
+// retryable verdict the code does not carry is listed.
 fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
     fn class<'py>(
         class: Bound<'py, PyType>,
-        code: Option<&'static str>,
+        code: Option<ResultCode>,
         retryable: Option<bool>,
         flags: &'static [&'static str],
         fields: &'static [(&'static str, &'static str)],
@@ -892,30 +975,18 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
         ("quarantined", "builtins.bool"),
         ("not_leader", "builtins.bool"),
     ];
-    let invalid = Some("InvalidArgument");
+    let invalid = Some(ResultCode::InvalidArgument);
     vec![
         class(
             py.get_type::<LaserError>(),
-            Some("Backend"),
-            Some(false),
+            Some(ResultCode::Backend),
+            None,
             &[],
             &BASE_FIELDS,
         ),
         class(py.get_type::<ConfigError>(), invalid, None, &[], &[]),
-        class(
-            py.get_type::<NoStreamError>(),
-            Some("Unsupported"),
-            None,
-            &[],
-            &[],
-        ),
-        class(
-            py.get_type::<NoRespondTopicError>(),
-            Some("Unsupported"),
-            None,
-            &[],
-            &[],
-        ),
+        class(py.get_type::<NoStreamError>(), None, None, &[], &[]),
+        class(py.get_type::<NoRespondTopicError>(), None, None, &[], &[]),
         class(py.get_type::<HandlerConfigError>(), None, None, &[], &[]),
         class(py.get_type::<HandlerError>(), None, Some(true), &[], &[]),
         class(py.get_type::<RejectedError>(), invalid, None, &[], &[]),
@@ -925,7 +996,7 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
             None,
             None,
             &["ambiguous_mutation"],
-            &[],
+            &[("operation_id", "builtins.int | None")],
         ),
         class(py.get_type::<StateStoreError>(), None, None, &[], &[]),
         class(py.get_type::<QueryError>(), None, None, &[], &[DETAIL]),
@@ -935,7 +1006,6 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
         class(py.get_type::<GraphError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<SessionError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<AuthzError>(), None, None, &[], &[DETAIL]),
-        class(py.get_type::<CheckpointError>(), None, None, &[], &[DETAIL]),
         class(
             py.get_type::<FilterError>(),
             None,
@@ -946,7 +1016,7 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
         class(py.get_type::<FilterFaultError>(), invalid, None, &[], &[]),
         class(
             py.get_type::<FilterOversizedRecordError>(),
-            Some("TooLarge"),
+            Some(ResultCode::TooLarge),
             None,
             &[],
             &[],
@@ -960,16 +1030,16 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
         ),
         class(
             py.get_type::<SignatureError>(),
-            Some("Unauthenticated"),
+            Some(ResultCode::Unauthenticated),
             None,
             &[],
             &[],
         ),
         class(
             py.get_type::<UnsupportedError>(),
-            Some("Unsupported"),
+            Some(ResultCode::Unsupported),
             None,
-            &["unsupported"],
+            &[],
             &[
                 ("surface", "builtins.str"),
                 ("feature", "builtins.str | None"),
@@ -990,13 +1060,7 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
             &[],
             &VALIDATE_FIELDS,
         ),
-        class(
-            py.get_type::<IdError>(),
-            Some("Backend"),
-            None,
-            &[],
-            &ID_FIELDS,
-        ),
+        class(py.get_type::<IdError>(), None, None, &[], &ID_FIELDS),
         class(py.get_type::<CodecError>(), None, None, &[], &[]),
         class(
             py.get_type::<TypedDecodeError>(),
@@ -1034,14 +1098,14 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
         ),
         class(
             py.get_type::<PolicyBlockedError>(),
-            Some("Forbidden"),
+            Some(ResultCode::Forbidden),
             None,
             &[],
             &[],
         ),
         class(
             py.get_type::<StepUpRequiredError>(),
-            Some("StepUpRequired"),
+            Some(ResultCode::StepUpRequired),
             None,
             &[],
             &[("scope", "builtins.str")],
@@ -1055,7 +1119,7 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
         ),
         class(
             py.get_type::<RoutingError>(),
-            Some("NotFound"),
+            Some(ResultCode::NotFound),
             Some(true),
             &[],
             &[],
@@ -1076,9 +1140,9 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
         ),
         class(
             py.get_type::<RoutePrincipalMismatchError>(),
-            Some("Forbidden"),
-            Some(false),
-            &["permission_denied"],
+            Some(ResultCode::Forbidden),
+            None,
+            &[],
             &[
                 ("agent", "builtins.str"),
                 ("expected", "builtins.int"),
@@ -1087,7 +1151,7 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
         ),
         class(
             py.get_type::<PresenceConflictError>(),
-            Some("Conflict"),
+            Some(ResultCode::Conflict),
             None,
             &[],
             &[
@@ -1097,7 +1161,7 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
         ),
         class(
             py.get_type::<FenceViolationError>(),
-            Some("Conflict"),
+            Some(ResultCode::Conflict),
             None,
             &["fence_violation"],
             &[("held", "builtins.int"), ("current", "builtins.int")],
@@ -1110,18 +1174,43 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
             &[("ceiling", "builtins.int"), ("spent", "builtins.int")],
         ),
         class(
-            cancelled_error(py).clone(),
-            None,
+            py.get_type::<CancelledError>(),
+            Some(ResultCode::Cancelled),
             None,
             &[],
             &[("run", "builtins.str")],
         ),
         class(
             py.get_type::<QuarantinedError>(),
-            Some("Forbidden"),
+            Some(ResultCode::Forbidden),
             None,
             &["quarantined"],
             &[("agent", "builtins.str")],
+        ),
+        class(
+            py.get_type::<StepFailedError>(),
+            None,
+            None,
+            &[],
+            &[
+                ("run", "builtins.str"),
+                ("step", "builtins.str"),
+                ("reason", "builtins.str"),
+            ],
+        ),
+        class(
+            py.get_type::<JournalTruncatedError>(),
+            Some(ResultCode::ExpiredSnapshot),
+            None,
+            &[],
+            &[("run", "builtins.str")],
+        ),
+        class(
+            py.get_type::<SessionEndedError>(),
+            Some(ResultCode::Conflict),
+            None,
+            &[],
+            &[("session", "builtins.str"), ("status", "builtins.str")],
         ),
         class(
             py.get_type::<ProvenanceError>(),
@@ -1133,18 +1222,34 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
     ]
 }
 
+// The broad classifiers a class default code answers, the same `ResultCode`
+// predicates the Rust classifiers derive from.
+fn code_flags(code: ResultCode) -> [(&'static str, bool); 6] {
+    [
+        ("unavailable", code.is_unavailable()),
+        ("unsupported", code == ResultCode::Unsupported),
+        ("not_found", code == ResultCode::NotFound),
+        ("version_skew", code == ResultCode::VersionSkew),
+        ("stale", code == ResultCode::Stale),
+        ("permission_denied", code.is_permission_denied()),
+    ]
+}
+
 // The class standing for `err`'s variant. A send Apache Iggy's producer gave
 // up on is a failed publish too, the same as the SDK reports for its own.
 fn class_of<'py>(py: Python<'py>, err: &SdkError) -> Bound<'py, PyType> {
     match err {
-        SdkError::PublishFailed(_) | SdkError::Iggy(IggyError::ProducerSendFailed { .. }) => {
+        SdkError::PublishFailed(_) => py.get_type::<PublishFailedError>(),
+        SdkError::Transport(error)
+            if matches!(error.as_iggy(), IggyError::ProducerSendFailed { .. }) =>
+        {
             py.get_type::<PublishFailedError>()
         }
         SdkError::Handler(_) => py.get_type::<HandlerError>(),
         SdkError::HandlerConfig(_) => py.get_type::<HandlerConfigError>(),
         SdkError::Rejected(_) => py.get_type::<RejectedError>(),
         SdkError::Timeout(_) => timeout_error(py).clone(),
-        SdkError::AmbiguousMutation(_) => py.get_type::<AmbiguousMutationError>(),
+        SdkError::AmbiguousMutation { .. } => py.get_type::<AmbiguousMutationError>(),
         SdkError::NoRespondTopic => py.get_type::<NoRespondTopicError>(),
         SdkError::StateStore(_) => py.get_type::<StateStoreError>(),
         SdkError::Config(_) => py.get_type::<ConfigError>(),
@@ -1159,7 +1264,6 @@ fn class_of<'py>(py: Python<'py>, err: &SdkError) -> Bound<'py, PyType> {
         SdkError::FilterFault { .. } => py.get_type::<FilterFaultError>(),
         SdkError::FilterOversizedRecord { .. } => py.get_type::<FilterOversizedRecordError>(),
         SdkError::ConsumerGroupSetup { .. } => py.get_type::<ConsumerGroupSetupError>(),
-        SdkError::Checkpoint(_) => py.get_type::<CheckpointError>(),
         SdkError::Codec(_) => py.get_type::<CodecError>(),
         SdkError::Invalid(_) => py.get_type::<InvalidError>(),
         SdkError::Protocol(_) => py.get_type::<ProtocolError>(),
@@ -1176,9 +1280,12 @@ fn class_of<'py>(py: Python<'py>, err: &SdkError) -> Bound<'py, PyType> {
         SdkError::RoutePrincipalMismatch { .. } => py.get_type::<RoutePrincipalMismatchError>(),
         SdkError::FenceViolation { .. } => py.get_type::<FenceViolationError>(),
         SdkError::BudgetExceeded { .. } => py.get_type::<BudgetExceededError>(),
-        SdkError::Cancelled { .. } => cancelled_error(py).clone(),
+        SdkError::Cancelled { .. } => py.get_type::<CancelledError>(),
         SdkError::Quarantined { .. } => py.get_type::<QuarantinedError>(),
-        SdkError::Iggy(_) => py.get_type::<TransportError>(),
+        SdkError::SessionEnded { .. } => py.get_type::<SessionEndedError>(),
+        SdkError::StepFailed { .. } => py.get_type::<StepFailedError>(),
+        SdkError::JournalTruncated { .. } => py.get_type::<JournalTruncatedError>(),
+        SdkError::Transport(_) => py.get_type::<TransportError>(),
         SdkError::Id(_) => py.get_type::<IdError>(),
         SdkError::Provenance(_) => py.get_type::<ProvenanceError>(),
         _ => py.get_type::<LaserError>(),
@@ -1189,12 +1296,15 @@ fn class_of<'py>(py: Python<'py>, err: &SdkError) -> Bound<'py, PyType> {
 // so the message names its target and cause like the SDK's own failed publish.
 fn message_of(err: &SdkError) -> String {
     match err {
-        SdkError::Iggy(IggyError::ProducerSendFailed {
-            cause,
-            stream_name,
-            topic_name,
-            ..
-        }) => format!("publish failed to {stream_name}/{topic_name}: {cause}"),
+        SdkError::Transport(error) => match error.as_iggy() {
+            IggyError::ProducerSendFailed {
+                cause,
+                stream_name,
+                topic_name,
+                ..
+            } => format!("publish failed to {stream_name}/{topic_name}: {cause}"),
+            _ => err.to_string(),
+        },
         _ => err.to_string(),
     }
 }
@@ -1214,16 +1324,19 @@ fn set_fields(py: Python<'_>, pyerr: &PyErr, err: &SdkError) -> PyResult<()> {
             )?;
             pyerr.set_cause(py, Some(to_pyerr_ref(&failure.source)));
         }
-        SdkError::Iggy(IggyError::ProducerSendFailed {
-            cause,
-            failed,
-            uncertain: _,
-            committed,
-            stream_name,
-            topic_name,
-        }) => {
-            set_publish_failure(value, stream_name, topic_name, committed, failed)?;
-            pyerr.set_cause(py, Some(to_pyerr_ref(&SdkError::Iggy((**cause).clone()))));
+        SdkError::Transport(error) => {
+            if let IggyError::ProducerSendFailed {
+                cause,
+                failed,
+                uncertain: _,
+                committed,
+                stream_name,
+                topic_name,
+            } = error.as_iggy()
+            {
+                set_publish_failure(value, stream_name, topic_name, committed, failed)?;
+                pyerr.set_cause(py, Some(to_pyerr_ref(&SdkError::from((**cause).clone()))));
+            }
         }
         SdkError::Query(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Command(error) => value.setattr("detail", ser_to_py(py, error)?)?,
@@ -1232,11 +1345,10 @@ fn set_fields(py: Python<'_>, pyerr: &PyErr, err: &SdkError) -> PyResult<()> {
         SdkError::Graph(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Session(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Authz(error) => value.setattr("detail", ser_to_py(py, error)?)?,
-        SdkError::Checkpoint(error) => value.setattr("detail", ser_to_py(py, error.as_ref())?)?,
         SdkError::Id(error) => value.setattr("kind", id_kind(error))?,
         SdkError::Provenance(error) => value.setattr("kind", provenance_kind(error))?,
         SdkError::Filter(error) => {
-            set_filter_stop(value, &error.reason.to_string(), None, None, None)?;
+            set_filter_stop(value, &error.reason.to_string(), None, None)?;
             no_group(value)?;
             value.setattr("detail", ser_to_py(py, error)?)?;
         }
@@ -1247,8 +1359,7 @@ fn set_fields(py: Python<'_>, pyerr: &PyErr, err: &SdkError) -> PyResult<()> {
         } => {
             set_filter_stop(
                 value,
-                "fault",
-                Some(reason.to_string()),
+                &reason.to_string(),
                 Some(*partition_id),
                 Some(*offset),
             )?;
@@ -1262,7 +1373,6 @@ fn set_fields(py: Python<'_>, pyerr: &PyErr, err: &SdkError) -> PyResult<()> {
             set_filter_stop(
                 value,
                 "oversized_record",
-                None,
                 Some(*partition_id),
                 Some(*offset),
             )?;
@@ -1280,7 +1390,7 @@ fn set_fields(py: Python<'_>, pyerr: &PyErr, err: &SdkError) -> PyResult<()> {
             let reason = source
                 .filter_reason()
                 .map_or_else(|| "setup_failed".to_owned(), |reason| reason.to_string());
-            set_filter_stop(value, &reason, None, None, None)?;
+            set_filter_stop(value, &reason, None, None)?;
             value.setattr("group_id", group_id)?;
             value.setattr("group_name", name)?;
             value.setattr("identity", ser_to_py(py, identity)?)?;
@@ -1315,9 +1425,8 @@ fn set_fields(py: Python<'_>, pyerr: &PyErr, err: &SdkError) -> PyResult<()> {
             value.setattr("expected", expected)?;
             value.setattr("actual", actual)?;
         }
-        // `stale` is already the read-model classifier, so the held token is `held`.
-        SdkError::FenceViolation { stale, current } => {
-            value.setattr("held", stale)?;
+        SdkError::FenceViolation { held, current } => {
+            value.setattr("held", held)?;
             value.setattr("current", current)?;
         }
         SdkError::BudgetExceeded { ceiling, spent } => {
@@ -1325,6 +1434,19 @@ fn set_fields(py: Python<'_>, pyerr: &PyErr, err: &SdkError) -> PyResult<()> {
             value.setattr("spent", spent)?;
         }
         SdkError::Cancelled { run } => value.setattr("run", run)?,
+        SdkError::StepFailed { run, step, reason } => {
+            value.setattr("run", run)?;
+            value.setattr("step", step)?;
+            value.setattr("reason", reason.to_string())?;
+        }
+        SdkError::JournalTruncated { run } => value.setattr("run", run)?,
+        SdkError::AmbiguousMutation { operation_id, .. } => {
+            value.setattr("operation_id", operation_id)?;
+        }
+        SdkError::SessionEnded { session, status } => {
+            value.setattr("session", session)?;
+            value.setattr("status", status)?;
+        }
         _ => {}
     }
     Ok(())
@@ -1355,14 +1477,25 @@ fn set_publish_failure(
 fn set_filter_stop(
     value: &Bound<'_, pyo3::exceptions::PyBaseException>,
     reason: &str,
-    fault_reason: Option<String>,
     partition_id: Option<u32>,
     offset: Option<u64>,
 ) -> PyResult<()> {
     value.setattr("reason", reason)?;
-    value.setattr("fault_reason", fault_reason)?;
     value.setattr("partition_id", partition_id)?;
     value.setattr("offset", offset)
+}
+
+// A typed read whose poll failed answers for that failure, as the Rust
+// conversion and the other clients do. `source` is the raised failure.
+pub(crate) fn classify_as_source(py: Python<'_>, error: &PyErr, source: &PyErr) {
+    let value = error.value(py);
+    let source = source.value(py);
+    let names = ["code", "retryable", "iggy_error_code", "filter_reason"];
+    for name in names.into_iter().chain(FLAGS) {
+        if let Ok(classification) = source.getattr(name) {
+            let _ = value.setattr(name, classification);
+        }
+    }
 }
 
 // A filter failure that is not a group setup failure names no group.
@@ -1398,10 +1531,6 @@ fn typed_detail(
         py_to_de(&detail).ok().map(SdkError::Session)
     } else if is(py.get_type::<AuthzError>()) {
         py_to_de(&detail).ok().map(SdkError::Authz)
-    } else if is(py.get_type::<CheckpointError>()) {
-        py_to_de::<laser_sdk::wire::checkpoint::CheckpointError>(&detail)
-            .ok()
-            .map(SdkError::from)
     } else if is(py.get_type::<FilterError>()) {
         py_to_de(&detail).ok().map(SdkError::Filter)
     } else {
@@ -1493,26 +1622,6 @@ fn timeout_error(py: Python<'_>) -> &Bound<'_, PyType> {
         .bind(py)
 }
 
-// The synthesized `CancelledError` class (also an asyncio.CancelledError).
-fn cancelled_error(py: Python<'_>) -> &Bound<'_, PyType> {
-    CANCELLED_ERROR
-        .get_or_init_py_attached(py, || {
-            let asyncio_cancelled = py
-                .import("asyncio")
-                .and_then(|asyncio| asyncio.getattr("CancelledError"))
-                .and_then(|class| Ok(class.cast_into::<PyType>()?))
-                .expect("import asyncio.CancelledError");
-            synth_exception(
-                py,
-                "CancelledError",
-                &asyncio_cancelled,
-                "A registered run's recorded cancel intent was observed at a step boundary. \
-                 `run` names the run. Not retryable on the same run.",
-            )
-        })
-        .bind(py)
-}
-
 // The variant word of an id failure, one of the `IdError` class constants.
 fn id_kind(error: &laser_sdk::types::IdError) -> &'static str {
     use laser_sdk::types::IdError as Id;
@@ -1561,7 +1670,7 @@ mod tests {
                 IggyError::Disconnected,
             ] {
                 let code = error.as_code();
-                let error = SdkError::Iggy(error);
+                let error = SdkError::from(error);
                 let raised = to_pyerr_ref(&error);
                 assert!(raised.is_instance_of::<TransportError>(py));
                 let value = raised.value(py);
@@ -1576,8 +1685,8 @@ mod tests {
                     .expect("an iggy error code");
                 assert_eq!(iggy_code, Some(code));
             }
-            assert!(!SdkError::Iggy(IggyError::PartitionLaneBlocked(3, 7)).is_retryable());
-            assert!(!SdkError::Iggy(IggyError::FetchProgressUncertain(7)).is_retryable());
+            assert!(!SdkError::from(IggyError::PartitionLaneBlocked(3, 7)).is_retryable());
+            assert!(!SdkError::from(IggyError::FetchProgressUncertain(7)).is_retryable());
         });
     }
 }

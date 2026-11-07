@@ -4,19 +4,12 @@ import { test } from "node:test"
 import { Laser } from "../../src/client/laser.js"
 import { OPEN_CAPABILITIES } from "../../src/client/capabilities.js"
 import { isUnsupported, isVersionSkew } from "../../src/client/error-classify.js"
-import {
-  ProtocolError,
-  PublishFailedError,
-  QueryExecutionError,
-  CheckpointExecutionError
-} from "../../src/client/errors.js"
+import { ProtocolError, PublishFailedError, QueryExecutionError } from "../../src/client/errors.js"
 import { requireManagedCommand } from "../../src/client/managed.js"
 import type { IggyClient, LaserTransport } from "../../src/iggy/apache-iggy.js"
 import { Topic } from "../../src/stream/topic.js"
-import { QueryCommand, CheckpointCommand } from "../../src/wire/commands.js"
-import { QueryExecutionId } from "../../src/wire/ids.js"
-import { AGDX_QUERY_CODE, AGDX_QUERY_STATUS_CODE } from "../../src/wire/codes.js"
-import { encodeQueryReplyFrame, encodeQueryStatusReplyFrame } from "../../src/wire/query.js"
+import { QueryCommand } from "../../src/wire/commands.js"
+import { encodeQueryReplyFrame } from "../../src/wire/query.js"
 
 void test("given_a_partial_transport_failure_when_sending_a_topic_batch_then_should_preserve_its_confirmed_prefix_and_exact_tail", async () => {
   const tail = { payload: new Uint8Array([2]), headers: new Map() }
@@ -82,34 +75,6 @@ function oneNodeClient(
   } as unknown as IggyClient
 }
 
-void test("given_a_status_for_another_execution_when_reading_or_cancelling_then_should_reject_the_reply", async () => {
-  const bytes = encodeQueryStatusReplyFrame({
-    kind: "ok",
-    status: {
-      executionId: QueryExecutionId.fromU128(10n),
-      state: "running",
-      startedAtMicros: 1n,
-      scannedBytes: 0n,
-      producedBytes: 0n,
-      rowCount: 0n
-    }
-  })
-  const client = oneNodeClient(() => bytes)
-  await using base = await Laser.fromClient(client)
-  const laser = base.withCapabilities({
-    ...OPEN_CAPABILITIES,
-    query: {
-      ...OPEN_CAPABILITIES.query,
-      available: true,
-      executionStatus: true,
-      cancellation: true
-    }
-  })
-  const requested = QueryExecutionId.fromU128(9n)
-  await assert.rejects(laser.queryStatus(requested), ProtocolError)
-  await assert.rejects(laser.cancelQuery(requested), ProtocolError)
-})
-
 void test("given_an_unsupported_query_reply_when_fetching_then_should_raise_the_query_error_class", async () => {
   const bytes = encodeQueryReplyFrame({
     kind: "err",
@@ -130,11 +95,10 @@ void test("given_an_unsupported_query_reply_when_fetching_then_should_raise_the_
   })
 })
 
-void test("given_advertised_version_skew_when_using_query_or_checkpoint_then_should_preserve_the_typed_classifier", () => {
+void test("given_advertised_version_skew_when_using_query_then_should_preserve_the_typed_classifier", () => {
   const capabilities = {
     ...OPEN_CAPABILITIES,
     query: { ...OPEN_CAPABILITIES.query, available: true },
-    destinations: { ...OPEN_CAPABILITIES.destinations, available: true },
     versions: {
       query: 99,
       control: 1,
@@ -142,7 +106,6 @@ void test("given_advertised_version_skew_when_using_query_or_checkpoint_then_sho
       fork: 1,
       agent: 1,
       graph: 1,
-      checkpoint: 99,
       filter: 1,
       features: 0n
     }
@@ -157,54 +120,4 @@ void test("given_advertised_version_skew_when_using_query_or_checkpoint_then_sho
       return true
     }
   )
-  assert.throws(
-    () => {
-      requireManagedCommand(capabilities, CheckpointCommand)
-    },
-    (error: unknown) => {
-      assert.ok(error instanceof CheckpointExecutionError)
-      assert.equal(isVersionSkew(error), true)
-      return true
-    }
-  )
-})
-
-void test("given_a_query_that_ran_on_one_node_when_its_status_is_read_then_should_ask_that_node", async () => {
-  const asked: (readonly [number, number])[] = []
-  const status = (executionId: QueryExecutionId) =>
-    encodeQueryStatusReplyFrame({
-      kind: "ok",
-      status: {
-        executionId,
-        state: "running",
-        startedAtMicros: 1n,
-        scannedBytes: 0n,
-        producedBytes: 0n,
-        rowCount: 0n
-      }
-    })
-  const refused = encodeQueryReplyFrame({
-    kind: "err",
-    error: { kind: "unsupported", message: "vector search is not served" }
-  })
-  let executionId = QueryExecutionId.fromU128(0n)
-  const client = oneNodeClient(
-    (code, replica) => {
-      asked.push([code, replica])
-      return code === AGDX_QUERY_CODE ? refused : status(executionId)
-    },
-    [0, 1, 2]
-  )
-  await using base = await Laser.fromClient(client)
-  const laser = base.withCapabilities({
-    ...OPEN_CAPABILITIES,
-    query: { ...OPEN_CAPABILITIES.query, available: true, executionStatus: true }
-  })
-  const request = laser.query("readings")
-  await assert.rejects(request.fetch(), QueryExecutionError)
-  const [code, node] = asked[0] ?? []
-  assert.equal(code, AGDX_QUERY_CODE)
-  executionId = request.executionId()
-  await laser.queryStatus(executionId)
-  assert.deepEqual(asked[1], [AGDX_QUERY_STATUS_CODE, node], "the status reaches the query's node")
 })

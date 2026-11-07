@@ -1,5 +1,6 @@
 use crate::harness;
-use laser_sdk::iggy::prelude::{Identifier, StreamClient, TopicClient};
+use bytes::Bytes;
+use laser_sdk::iggy::prelude::{Identifier, IggyMessage, StreamClient, TopicClient};
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::snapshot::{FoldSnapshot, SnapshotOffset};
 
@@ -143,6 +144,104 @@ async fn given_a_multi_topic_snapshot_when_resumed_then_should_read_each_topic_a
     })
     .await;
     assert_eq!(count, 6);
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_snapshot_topic_with_several_partitions_when_conversations_save_then_should_find_each_latest_on_its_routed_partition()
+ {
+    let laser = harness::laser().await;
+    let stream = laser.default_stream().expect("default stream").to_owned();
+    laser
+        .topic("agent.snapshots")
+        .ensure(4, None)
+        .await
+        .expect("snapshot topic exists");
+    let store = TopicSnapshotStore::new(laser.clone(), "planner");
+    let conversations: Vec<ConversationId> = (0..8).map(|_| ConversationId::new()).collect();
+    for (index, conversation) in conversations.iter().enumerate() {
+        store
+            .save(&FoldSnapshot {
+                stream: stream.clone(),
+                stream_id: 0,
+                stream_created_at_micros: 0,
+                conversation: (*conversation).into(),
+                fold: "planner".to_owned(),
+                as_of: Vec::new(),
+                state: index.to_string().into_bytes(),
+            })
+            .await
+            .expect("snapshot saved");
+    }
+    for (index, conversation) in conversations.iter().enumerate() {
+        let latest = harness::eventually(|| async {
+            store
+                .latest((*conversation).into())
+                .await
+                .expect("latest reads")
+        })
+        .await;
+        assert_eq!(latest.state, index.to_string().into_bytes());
+    }
+    assert_eq!(
+        store
+            .latest(ConversationId::new().into())
+            .await
+            .expect("latest reads"),
+        None,
+        "a conversation never saved has no snapshot"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_memory_topic_more_than_one_drain_behind_when_recalled_folded_then_should_fold_every_record()
+ {
+    let laser = harness::laser().await;
+    let conversation = ConversationId::new();
+    // The backlog shares the item's partition key, so that one partition holds
+    // more records than one drain reads.
+    let key = conversation.to_string();
+    let topic = laser.topic(AgentTopic::Memory.topic_string());
+    for _ in 0..10 {
+        let foreign = (0..1_000)
+            .map(|_| {
+                IggyMessage::builder()
+                    .payload(Bytes::from_static(b"foreign traffic"))
+                    .build()
+                    .expect("message builds")
+            })
+            .collect();
+        topic
+            .batch(foreign, Some(&key))
+            .await
+            .expect("backlog sent");
+    }
+    let scope = MemoryScope::builder().conversation(conversation).build();
+    let id = LogMemory::new(laser.clone())
+        .remember(&scope, b"after the backlog".to_vec())
+        .await
+        .expect("remember after the backlog");
+    // A probe handle waits until the record is readable, then a fresh handle
+    // must fold past the drain cap in its one recall.
+    let probe = LogMemory::new(laser.clone());
+    harness::eventually(|| async {
+        let items = probe
+            .recall_folded(&scope, &MemoryQuery::builder().build())
+            .await
+            .expect("probe recall");
+        (!items.is_empty()).then_some(())
+    })
+    .await;
+    let items = LogMemory::new(laser)
+        .recall_folded(&scope, &MemoryQuery::builder().build())
+        .await
+        .expect("folded recall");
+    assert_eq!(
+        items.iter().map(|item| item.id).collect::<Vec<_>>(),
+        [id],
+        "one recall folds past the drain cap"
+    );
 }
 
 #[tokio::test]

@@ -70,7 +70,7 @@ async def main() -> None:
             deadline_ms=DEADLINE_MS,
         )
         if isinstance(reply, ls.Contract.Completed):
-            print(f"  contract completed: {bytes(reply[0].body()).decode()}")
+            print(f"  contract completed: {bytes(reply.reply.body()).decode()}")
         else:
             print(f"  contract ended without a reply: {reply!r}")
 

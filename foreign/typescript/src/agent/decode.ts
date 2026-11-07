@@ -50,7 +50,7 @@ export function provenanceFromEnvelope(envelope: AgentEnvelope): Provenance {
     ...(envelope.correlation !== undefined
       ? { correlationId: envelope.correlation.toString() }
       : {}),
-    ...(envelope.deadlineMicros !== undefined ? { deadlineMicros: envelope.deadlineMicros } : {}),
+    ...(envelope.deadlineMicros !== undefined ? { deadlineAtMicros: envelope.deadlineMicros } : {}),
     ...(fenceToken !== undefined ? { fenceToken } : {})
   }
 }

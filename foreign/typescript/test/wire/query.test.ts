@@ -10,6 +10,7 @@ import {
   consistencyIsEventual,
   decodeQueryEnvelope,
   decodeQueryResult,
+  describeQueryError,
   decodeQueryEnvelopeFrame,
   encodeQueryEnvelopeFrame,
   encodeQueryResult,
@@ -24,7 +25,6 @@ import {
   queryResultValueText,
   queryResultValueU64,
   validateQuery,
-  validateQueryExecutionStatus,
   validateQueryResult,
   type QueryResult
 } from "../../src/wire/query.js"
@@ -144,7 +144,7 @@ void test("given_a_query_reply_with_a_frontier_when_round_tripped_then_should_ke
 void test("query validation rejects ambiguous requests and malformed replies", () => {
   const query = {
     ...newQuery(operationalTarget("readings"), QueryExecutionId.fromU128(1n), 10_000n),
-    rawSql: { dialect: "data_fusion" as const, sql: "SELECT * FROM readings", params: [] },
+    rawSql: { dialect: "postgres" as const, sql: "SELECT * FROM readings", params: [] },
     select: { fields: ["id"], payload: false }
   }
   assert.throws(() => {
@@ -166,7 +166,7 @@ void test("query validation rejects ambiguous requests and malformed replies", (
         backendGeneration: 1n,
         runtimeConfigurationRevision: 1n
       },
-      requestedConsistency: "strong",
+      requestedConsistency: "read_your_writes",
       deliveredConsistency: "eventual",
       truncated: false,
       elapsedMicros: 1n,
@@ -181,23 +181,12 @@ void test("query validation rejects ambiguous requests and malformed replies", (
   }, /row value count/)
   assert.throws(() => {
     validateQueryResult({ ...invalid, rows: [], page: { limit: 50, hasMore: true } })
-  }, /delivered consistency|has_more/)
-  assert.throws(() => {
-    validateQueryExecutionStatus({
-      executionId,
-      state: "failed",
-      startedAtMicros: 10n,
-      finishedAtMicros: 9n,
-      scannedBytes: 0n,
-      producedBytes: 0n,
-      rowCount: 0n
-    })
-  }, /finish time/)
+  }, /delivered consistency/)
 })
 
 void test("consistency and page helpers do not fabricate stronger reads or totals", () => {
   assert.equal(consistencyGateCheck(100n, 100n, "read_your_writes", "readings"), undefined)
-  assert.deepEqual(consistencyGateCheck(41n, 57n, "strong", "readings"), {
+  assert.deepEqual(consistencyGateCheck(41n, 57n, "read_your_writes", "readings"), {
     kind: "stale",
     what: "readings",
     applied: 41n,
@@ -208,7 +197,7 @@ void test("consistency and page helpers do not fabricate stronger reads or total
   assert.equal(pageAtLeast({ limit: 20, hasMore: false }, 20), undefined)
   assert.equal(pageAtLeast({ offset: (1n << 64n) - 1n, limit: 20, hasMore: false }, 1), undefined)
   assert.ok(consistencyIsEventual("eventual"))
-  assert.equal(consistencyIsEventual("strong"), false)
+  assert.equal(consistencyIsEventual("read_your_writes"), false)
 })
 
 void test("given_an_operational_query_when_built_then_should_target_the_index", () => {
@@ -257,4 +246,77 @@ void test("given_a_query_with_integral_floats_when_encoded_then_should_keep_inte
   assert.equal(bytes[bytes.indexOf(Buffer.from("embedding")) + 10], 0xf9)
   const double = bytes.indexOf(Buffer.from("double"))
   assert.equal(bytes[bytes.indexOf(Buffer.from("value"), double) + 5], 0xf9)
+})
+
+void test("given_a_query_with_more_than_one_shape_when_validated_then_should_refuse_it", () => {
+  const base = newQuery(operationalTarget("docs"), QueryExecutionId.fromU128(1n), 10_000n)
+  const vector = { field: "embedding", embedding: [0.1, 0.2], topK: 10 }
+  const text = { query: "incident" }
+  const aggregate = { groupBy: [], funcs: [{ func: "count" as const, alias: "n" }] }
+  for (const query of [
+    { ...base, vector, aggregate },
+    { ...base, text, vector },
+    { ...base, text, distinct: true },
+    { ...base, aggregate, distinct: true }
+  ]) {
+    assert.throws(() => {
+      validateQuery(query)
+    }, /at most one of text, vector, aggregate and distinct/)
+  }
+  validateQuery({ ...base, vector })
+})
+
+void test("given_query_errors_when_described_then_should_carry_the_server_text_like_rust", () => {
+  assert.equal(
+    describeQueryError({ kind: "invalid", message: "query limit 0 is outside 1..=1000" }),
+    "invalid query: query limit 0 is outside 1..=1000"
+  )
+  assert.equal(
+    describeQueryError({ kind: "stale", what: "shop/orders#0", applied: 3n, required: 5n }),
+    "stale read: shop/orders#0 applied 3, required 5"
+  )
+  assert.equal(
+    describeQueryError({ kind: "too_large", what: "offset", size: 2_000_000n, cap: 1_000_000n }),
+    "result too large: offset 2000000 exceeds cap 1000000"
+  )
+})
+
+void test("given_a_time_range_of_one_instant_when_validated_then_should_accept_it", () => {
+  const base = newQuery(operationalTarget("docs"), QueryExecutionId.fromU128(1n), 10_000n)
+  validateQuery({ ...base, timeRange: [2n, 2n] })
+  assert.throws(() => {
+    validateQuery({ ...base, timeRange: [3n, 2n] })
+  }, /must not be after its end/)
+})
+
+void test("given_a_limit_or_top_k_that_is_not_a_whole_number_when_validated_then_should_refuse_it", () => {
+  const base = newQuery(operationalTarget("docs"), QueryExecutionId.fromU128(1n), 10_000n)
+  for (const limit of [Number.NaN, 2.5]) {
+    assert.throws(() => {
+      validateQuery({ ...base, page: { ...base.page, limit } })
+    }, /page limit is invalid/)
+    assert.throws(() => {
+      validateQuery({ ...base, vector: { field: "embedding", embedding: [0.1], topK: limit } })
+    }, /vector query is invalid/)
+  }
+})
+
+void test("given_a_ranked_query_with_paging_it_cannot_honour_when_validated_then_should_refuse_it", () => {
+  const base = newQuery(operationalTarget("docs"), QueryExecutionId.fromU128(1n), 10_000n)
+  const vector = { field: "embedding", embedding: [0.1, 0.2], topK: 10 }
+  const text = { query: "incident" }
+  const order = [{ field: "ts", dir: "desc" as const }]
+  const total = { ...base.page, wantTotal: true }
+  for (const query of [
+    { ...base, text, order },
+    { ...base, text, page: total },
+    { ...base, vector, order },
+    { ...base, vector, page: total },
+    { ...base, vector, page: { ...base.page, offset: 10n } }
+  ]) {
+    assert.throws(() => {
+      validateQuery(query)
+    }, /takes no/)
+  }
+  validateQuery({ ...base, text, page: { ...base.page, offset: 50n } })
 })

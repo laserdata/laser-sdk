@@ -11,7 +11,7 @@ use laser_wire::filter::{
 };
 use laser_wire::framing::{decode_named, encode_named};
 use laser_wire::limits::{MAX_FILTER_PARSE_DEPTH, MAX_FILTERED_PAGE_BYTES};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 // Selected records fit within the wire page cap. Pass-through faults use
 // the reported server bounds so tighter limits remain verifiable.
@@ -83,7 +83,11 @@ impl LocalGuard {
             )
             .into());
         }
-        let unevaluated: BTreeSet<u64> = page.unevaluated.iter().copied().collect();
+        let unevaluated: BTreeMap<u64, FaultReason> = page
+            .unevaluated
+            .iter()
+            .map(|fault| (fault.offset, fault.reason))
+            .collect();
         let filter = self.compiled.filter();
         if !unevaluated.is_empty()
             && filter.fault_policy != FaultPolicy::Pass
@@ -139,12 +143,13 @@ impl LocalGuard {
                     )
                 },
             );
-            let agrees = if unevaluated.contains(&offset) {
-                verdict == Verdict::Fault
-                    && fault
-                        .is_some_and(|reason| self.compiled.policy_for(reason) == FaultPolicy::Pass)
-            } else {
-                verdict == Verdict::Selected
+            let agrees = match unevaluated.get(&offset) {
+                Some(reason) => {
+                    verdict == Verdict::Fault
+                        && fault == Some(*reason)
+                        && self.compiled.policy_for(*reason) == FaultPolicy::Pass
+                }
+                None => verdict == Verdict::Selected,
             };
             if !agrees {
                 return Err(FilterError::new(FilterErrorReason::Backend,
@@ -159,7 +164,9 @@ impl LocalGuard {
 mod tests {
     use super::*;
     use laser_wire::codes::FILTER_OP_VERSION;
-    use laser_wire::filter::{AckContext, AppliedPolicy, FilterExpr, SourceGeneration, StopReason};
+    use laser_wire::filter::{
+        AckContext, AppliedPolicy, FilterExpr, RecordFault, SourceGeneration, StopReason,
+    };
     use laser_wire::query::CmpOp;
 
     fn filter() -> ConsumerFilter {
@@ -240,7 +247,10 @@ mod tests {
         let definition = filter();
         let guard = LocalGuard::new(&definition).expect("compiles");
         let mut page = page(definition.digest());
-        page.unevaluated = vec![0];
+        page.unevaluated = vec![RecordFault {
+            offset: 0,
+            reason: FaultReason::Malformed,
+        }];
         assert!(
             guard
                 .check(&page, &[message(r#"{"table":"ground_stations"}"#)])
@@ -254,7 +264,10 @@ mod tests {
         let definition = filter().with_fault_policy(FaultPolicy::Pass);
         let guard = LocalGuard::new(&definition).expect("compiles");
         let mut page = page(definition.digest());
-        page.unevaluated = vec![0];
+        page.unevaluated = vec![RecordFault {
+            offset: 0,
+            reason: FaultReason::TooLarge,
+        }];
         page.evaluation_limits = Some(Box::new(laser_wire::filter::FilterDecodeLimits {
             max_payload_bytes: 4,
             max_depth: 64,
@@ -275,11 +288,39 @@ mod tests {
     }
 
     #[test]
+    fn given_a_reason_the_local_evaluation_does_not_reproduce_when_checked_then_should_reject() {
+        let definition = filter()
+            .with_fault_policy(FaultPolicy::Pass)
+            .with_mismatch_policy(RecordPolicy::Pass);
+        let guard = LocalGuard::new(&definition).expect("compiles");
+        let mut page = page(definition.digest());
+        page.evaluation_limits = Some(Box::new(laser_wire::filter::FilterDecodeLimits {
+            max_payload_bytes: 1024,
+            max_depth: 64,
+        }));
+        page.unevaluated = vec![RecordFault {
+            offset: 0,
+            reason: FaultReason::Malformed,
+        }];
+        guard
+            .check(&page, &[message("broken json")])
+            .expect("the local evaluation reproduces the malformed payload");
+        page.unevaluated[0].reason = FaultReason::TypeMismatch;
+        assert!(
+            guard.check(&page, &[message("broken json")]).is_err(),
+            "the server named another reason than the payload has"
+        );
+    }
+
+    #[test]
     fn given_a_fault_with_the_wrong_pass_policy_when_checked_then_should_reject() {
         let definition = filter().with_foreign_policy(RecordPolicy::Pass);
         let guard = LocalGuard::new(&definition).expect("compiles");
         let mut page = page(definition.digest());
-        page.unevaluated = vec![0];
+        page.unevaluated = vec![RecordFault {
+            offset: 0,
+            reason: FaultReason::Malformed,
+        }];
         assert!(guard.check(&page, &[message("broken json")]).is_err());
     }
 }

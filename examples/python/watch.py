@@ -7,9 +7,9 @@ What it shows:
   - declare the same view shape query.py reads under this run's own
     "readings_v1_<token>" name, notify-enabled so the deployment publishes to
     the change feed on every materialized batch
-  - open a change-feed reader (`laser.watch(index=...)`, a flat call, not a
-    builder)
-  - publish a host reading and react to the change record instead of re-querying blind
+  - open a change-feed reader at the feed's end (`await laser.watch(index=...,
+    from_end=True)`, a flat call, not a builder), so it sees only this run's change
+  - publish a host reading and wait for the change instead of re-querying blind
 
 Watch rides the managed change feed: it needs Laser Stack or LaserData Cloud
 and skips on Apache Iggy without a managed backend.
@@ -24,7 +24,6 @@ Full scenario: event_analytics.py (a resumable cursor built the same await-then-
 from __future__ import annotations
 
 import asyncio
-import time
 
 import _common
 
@@ -32,8 +31,7 @@ EXAMPLE = "watch"
 TOPIC = "readings"
 INDEX = _common.index_for("readings_v1")
 FIELDS = ["host", "cpu", "status"]
-CHANGE_TIMEOUT = 10.0
-POLL_INTERVAL = 0.2
+CHANGE_TIMEOUT_MS = 10_000.0
 
 
 async def main() -> None:
@@ -51,19 +49,18 @@ async def main() -> None:
         # script runs on its own with no shared state.
         await _common.start_projector(laser, TOPIC, FIELDS, index=INDEX)
 
-        feed = laser.watch(index=INDEX)
+        feed = await laser.watch(index=INDEX, from_end=True)
 
         await laser.topic(TOPIC).publish({"host": "node-4", "cpu": 88, "status": "degraded"}).send()
 
-        deadline = time.monotonic() + CHANGE_TIMEOUT
-        while not (changes := await feed.poll()):
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"no change on '{INDEX}' arrived within {CHANGE_TIMEOUT:.0f}s")
-            await asyncio.sleep(POLL_INTERVAL)
-
-        for change in changes:
-            span = f"{change.from_offset}..{change.to_offset}"
-            print(f"  view advanced: {change.rows} row(s), source offsets {span}")
+        changes = await feed.poll_within(CHANGE_TIMEOUT_MS)
+        if not changes:
+            raise TimeoutError(f"no change on '{INDEX}' arrived in time")
+        for watched in changes:
+            span = f"{watched.change.from_offset}..{watched.change.to_offset}"
+            print(f"  view advanced: {watched.change.rows} row(s), source offsets {span}")
+        if feed.missed:
+            print(f"  the feed lost {feed.missed} change(s) to retention, re-read the view")
     finally:
         await laser.close()
 

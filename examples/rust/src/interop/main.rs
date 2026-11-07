@@ -37,6 +37,10 @@ async fn main() -> Result<(), LaserError> {
             .id("approver".parse()?)
             .listen_on(AgentTopic::Sessions)
             .handler(Approver)
+            // Input requests reach only an agent that serves them.
+            .operations(vec![
+                laser_sdk::wire::dispatch::OPERATION_INPUT_REQUEST.to_owned(),
+            ])
             .build()
             .spawn(laser.clone());
         approver.ready().await?;
@@ -65,7 +69,8 @@ async fn main() -> Result<(), LaserError> {
             completed
                 .artifacts
                 .first()
-                .map(|artifact| artifact.text.as_str())
+                .and_then(|artifact| artifact.parts.first())
+                .map(|part| part.text.as_str())
                 .unwrap_or("(no artifact)")
         );
 

@@ -268,12 +268,10 @@ async fn completed(sessions: &Sessions) -> u64 {
     sessions
         .list()
         .status(SessionStatus::Completed)
-        .total()
-        .limit(1)
+        .results(1)
         .fetch()
         .await
-        .ok()
-        .and_then(|page| page.total)
+        .map(|page| u64::from(page.total_results))
         .unwrap_or_default()
 }
 
@@ -365,7 +363,7 @@ struct Feed {
 // Every retained change row of the stream, checking that the sequences have
 // no holes.
 async fn feed(sessions: &Sessions) -> Feed {
-    let mut after = 0;
+    let mut page = 1;
     let mut feed = Feed {
         rows: 0,
         gaps: 0,
@@ -373,21 +371,21 @@ async fn feed(sessions: &Sessions) -> Feed {
     };
     let mut previous: Option<u64> = None;
     loop {
-        let page = sessions.changes(after, 0).await.expect("changes");
-        if page.rows.is_empty() {
-            return feed;
-        }
-        for row in &page.rows {
+        let changes = sessions.changes(page, 0).await.expect("changes");
+        for row in &changes.items {
             if let Some(previous) = previous
                 && row.seq != previous + 1
             {
                 feed.gaps += 1;
             }
             previous = Some(row.seq);
-            after = after.max(row.seq);
             feed.rows += 1;
             feed.named += count(row.sessions.len());
         }
+        if page >= changes.total_pages {
+            return feed;
+        }
+        page += 1;
     }
 }
 

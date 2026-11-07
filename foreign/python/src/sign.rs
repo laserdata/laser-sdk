@@ -1,4 +1,4 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::errors::{InvalidError, to_pyerr};
 use laser_sdk::sign::{
@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyMemoryView};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // An envelope arrives as the CBOR bytes on the log (`AgentMessage.payload`)
 // or as the dict `AgentMessage.envelope` returns.
@@ -26,7 +26,7 @@ pub(crate) fn envelope_of(value: &Bound<'_, PyAny>) -> PyResult<AgentEnvelope> {
     crate::convert::py_to_de(value)
 }
 
-fn signature_context(
+pub(crate) fn signature_context(
     content_type: Option<String>,
     agent_version: Option<u32>,
 ) -> PyResult<SignatureContext> {
@@ -107,13 +107,19 @@ pub struct PySigningKey {
 #[pymethods]
 impl PySigningKey {
     #[new]
-    fn new(secret: Vec<u8>) -> PyResult<Self> {
+    fn new(
+        #[gen_stub(override_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+        secret: Vec<u8>,
+    ) -> PyResult<Self> {
         Self::from_bytes(secret)
     }
 
     /// A signing key from its 32-byte secret seed, the same as the constructor.
     #[staticmethod]
-    fn from_bytes(secret: Vec<u8>) -> PyResult<Self> {
+    fn from_bytes(
+        #[gen_stub(override_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+        secret: Vec<u8>,
+    ) -> PyResult<Self> {
         let secret: [u8; 32] = secret.try_into().map_err(|_| {
             InvalidError::new_err("an Ed25519 signing key requires exactly 32 secret bytes")
         })?;
@@ -122,14 +128,31 @@ impl PySigningKey {
         })
     }
 
+    /// A fresh key from 32 bytes of the operating system's random source.
+    /// Store its seed (`to_bytes`) like any secret.
+    #[staticmethod]
+    fn generate() -> PyResult<Self> {
+        Ok(Self {
+            inner: Arc::new(SigningKey::generate().map_err(to_pyerr)?),
+        })
+    }
+
+    /// The 32-byte secret seed the constructor rebuilds this key from.
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+    fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.to_bytes())
+    }
+
     /// The 8-byte identifier stamped on signatures produced by this key.
     #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
     fn key_id(&self) -> Vec<u8> {
         self.inner.key_id().to_vec()
     }
 
     /// The 32-byte public verifying key safe to share with a registry operator.
     #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
     fn verifying_key(&self) -> Vec<u8> {
         self.inner.verifying_key().as_bytes().to_vec()
     }
@@ -163,27 +186,22 @@ impl PySigningKey {
     }
 }
 
-/// Enrolled verifying keys bound to authenticated principal names.
+/// Enrolled verifying keys bound to authenticated principal names. A shared
+/// handle: a `Laser` or agent configured with it sees every later enrollment,
+/// so enrolling a revoked record reaches a running client at once.
 #[gen_stub_pyclass]
-#[pyclass(name = "KeyRegistry")]
+#[pyclass(name = "KeyRegistry", frozen)]
 pub struct PyKeyRegistry {
-    inner: Mutex<KeyRegistry>,
+    inner: KeyRegistry,
 }
 
 impl PyKeyRegistry {
     fn from_inner(inner: KeyRegistry) -> Self {
-        Self {
-            inner: Mutex::new(inner),
-        }
+        Self { inner }
     }
 
     pub(crate) fn snapshot(&self) -> Arc<KeyRegistry> {
-        Arc::new(
-            self.inner
-                .lock()
-                .expect("python key registry mutex is not poisoned")
-                .clone(),
-        )
+        Arc::new(self.inner.clone())
     }
 }
 
@@ -202,21 +220,19 @@ impl PyKeyRecord {
     #[pyo3(signature = (principal, verifying, *, kind = "agent", valid_from_micros = 0, valid_to_micros = None, revoked = false))]
     fn new(
         principal: String,
+        #[gen_stub(override_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
         verifying: Vec<u8>,
+        #[gen_stub(override_type(type_repr = "typing.Literal['agent', 'operator']", imports = ("typing",)))]
         kind: &str,
         valid_from_micros: u64,
         valid_to_micros: Option<u64>,
         revoked: bool,
     ) -> PyResult<Self> {
         let kind = key_kind(kind)?;
-        if valid_to_micros.is_some_and(|end| end <= valid_from_micros) {
-            return Err(InvalidError::new_err(
-                "key validity end must be after its start",
-            ));
-        }
         let mut inner = KeyRecord::from_verifying_bytes(principal, &verifying, kind)
             .map_err(to_pyerr)?
-            .valid_window(valid_from_micros, valid_to_micros);
+            .valid_window(valid_from_micros, valid_to_micros)
+            .map_err(to_pyerr)?;
         if revoked {
             inner = inner.revoked();
         }
@@ -225,20 +241,31 @@ impl PyKeyRecord {
 
     /// An always-valid agent key from its 32-byte public verifying key.
     #[staticmethod]
-    fn agent(principal: String, verifying: Vec<u8>) -> PyResult<Self> {
+    fn agent(
+        principal: String,
+        #[gen_stub(override_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+        verifying: Vec<u8>,
+    ) -> PyResult<Self> {
         Self::from_verifying_bytes(principal, verifying, "agent")
     }
 
     /// An always-valid record from a 32-byte public verifying key of `kind`
     /// (`agent` or `operator`).
     #[staticmethod]
-    fn from_verifying_bytes(principal: String, verifying: Vec<u8>, kind: &str) -> PyResult<Self> {
+    fn from_verifying_bytes(
+        principal: String,
+        #[gen_stub(override_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+        verifying: Vec<u8>,
+        #[gen_stub(override_type(type_repr = "typing.Literal['agent', 'operator']", imports = ("typing",)))]
+        kind: &str,
+    ) -> PyResult<Self> {
         let inner = KeyRecord::from_verifying_bytes(principal, &verifying, key_kind(kind)?)
             .map_err(to_pyerr)?;
         Ok(Self { inner })
     }
 
     #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
     fn key_id(&self) -> Vec<u8> {
         self.inner.key_id()
     }
@@ -250,6 +277,7 @@ impl PyKeyRecord {
 
     /// The 32-byte public verifying key.
     #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
     fn verifying(&self) -> Vec<u8> {
         self.inner.verifying.as_bytes().to_vec()
     }
@@ -305,17 +333,18 @@ impl PyKvKeyRegistry {
         &self,
         py: Python<'py>,
         principal: String,
+        #[gen_stub(override_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
         verifying: Vec<u8>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let registry = self.inner.clone();
         let record = KeyRecord::from_verifying_bytes(principal, &verifying, KeyKind::Agent)
             .map_err(to_pyerr)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             registry
                 .enroll(&record.principal, &record.verifying)
                 .await
                 .map_err(to_pyerr)?;
-            Ok(Python::attach(|py| py.None()))
+            Ok(())
         })
     }
 
@@ -323,24 +352,29 @@ impl PyKvKeyRegistry {
         &self,
         py: Python<'py>,
         record: &PyKeyRecord,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, u64>> {
         let registry = self.inner.clone();
         let record = record.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             registry.enroll_record(&record).await.map_err(to_pyerr)
         })
     }
 
-    fn revoke<'py>(&self, py: Python<'py>, key_id: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+    fn revoke<'py>(
+        &self,
+        py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+        key_id: Vec<u8>,
+    ) -> PyResult<Awaitable<'py, u64>> {
         let registry = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             registry.revoke(key_id).await.map_err(to_pyerr)
         })
     }
 
-    fn registry<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn registry<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyKeyRegistry>> {
         let registry = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             registry
                 .registry()
                 .await
@@ -356,39 +390,40 @@ impl PyKeyRegistry {
     #[new]
     fn new() -> Self {
         Self {
-            inner: Mutex::new(KeyRegistry::new()),
+            inner: KeyRegistry::new(),
         }
     }
 
     /// Enroll a public agent verifying key bound to `principal`.
-    fn enroll(&self, principal: String, verifying: Vec<u8>) -> PyResult<()> {
+    fn enroll(
+        &self,
+        principal: String,
+        #[gen_stub(override_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+        verifying: Vec<u8>,
+    ) -> PyResult<()> {
         let record = KeyRecord::from_verifying_bytes(principal, &verifying, KeyKind::Agent)
             .map_err(to_pyerr)?;
-        self.inner
-            .lock()
-            .expect("python key registry mutex is not poisoned")
-            .enroll_record(record);
+        self.inner.enroll_record(record);
         Ok(())
     }
 
     /// Enroll a public operator verifying key for privileged control facts.
-    fn enroll_operator(&self, principal: String, verifying: Vec<u8>) -> PyResult<()> {
+    fn enroll_operator(
+        &self,
+        principal: String,
+        #[gen_stub(override_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+        verifying: Vec<u8>,
+    ) -> PyResult<()> {
         let record = KeyRecord::from_verifying_bytes(principal, &verifying, KeyKind::Operator)
             .map_err(to_pyerr)?;
-        self.inner
-            .lock()
-            .expect("python key registry mutex is not poisoned")
-            .enroll_record(record);
+        self.inner.enroll_record(record);
         Ok(())
     }
 
     /// Enroll a `KeyRecord` with its kind and lifecycle. A later enroll under
     /// the same key id replaces it.
     fn enroll_record(&self, record: &PyKeyRecord) {
-        self.inner
-            .lock()
-            .expect("python key registry mutex is not poisoned")
-            .enroll_record(record.inner.clone());
+        self.inner.enroll_record(record.inner.clone());
     }
 
     /// Verify the envelope's signature and return the enrolled principal.
@@ -396,11 +431,7 @@ impl PyKeyRegistry {
     /// check. Ignores the validity window. `verify_at` checks it.
     fn verify(&self, envelope: &Bound<'_, PyAny>) -> PyResult<String> {
         let envelope = envelope_of(envelope)?;
-        self.inner
-            .lock()
-            .expect("python key registry mutex is not poisoned")
-            .verify(&envelope)
-            .map_err(to_pyerr)
+        self.inner.verify(&envelope).map_err(to_pyerr)
     }
 
     /// Verify as of `at_micros` and return the `VerifiedPrincipal`. Raises
@@ -413,8 +444,6 @@ impl PyKeyRegistry {
         let envelope = envelope_of(envelope)?;
         let inner = self
             .inner
-            .lock()
-            .expect("python key registry mutex is not poisoned")
             .verify_at(&envelope, at_micros)
             .map_err(to_pyerr)?;
         Ok(PyVerifiedPrincipal { inner })
@@ -436,8 +465,6 @@ impl PyKeyRegistry {
         let observed = signature_context(content_type, agent_version)?;
         let inner = self
             .inner
-            .lock()
-            .expect("python key registry mutex is not poisoned")
             .verify_observed_at(&envelope, &observed, at_micros)
             .map_err(to_pyerr)?;
         Ok(PyVerifiedPrincipal { inner })

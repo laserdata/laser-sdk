@@ -15,7 +15,8 @@ use crate::headers::CONTENT_TYPE;
 use crate::limits::MAX_FILTER_PARSE_DEPTH;
 use crate::query::CmpOp;
 use crate::schema::{Digest32, TypedValue};
-use crate::validate::Validate;
+use crate::validate::{Validate, json_depth_within};
+use crate::writer_schema::Selection;
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
@@ -23,21 +24,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 
-/// Bounds on decoding one payload. Checked before the payload is parsed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DecodeLimits {
-    pub max_payload_bytes: usize,
-    pub max_depth: usize,
-}
-
-impl Default for DecodeLimits {
-    fn default() -> Self {
-        Self {
-            max_payload_bytes: 1024 * 1024,
-            max_depth: 64,
-        }
-    }
-}
+pub use crate::writer_schema::DecodeLimits;
 
 /// One record as the evaluator sees it. Headers are read only when the filter
 /// has header predicates, so a caller may pass them lazily decoded. Header
@@ -998,7 +985,7 @@ impl PathTrie {
         &mut self.keys[index].1
     }
 
-    pub(super) fn index(&self, index: u32) -> Option<&PathTrie> {
+    fn index(&self, index: u32) -> Option<&PathTrie> {
         self.indices
             .iter()
             .find_map(|(number, child)| (*number == index).then_some(child))
@@ -1029,6 +1016,24 @@ impl PathTrie {
         node.whole = true;
         node.keys.clear();
         node.indices.clear();
+    }
+}
+
+impl Selection for PathTrie {
+    fn field(&self, key: &str) -> Option<&Self> {
+        if self.whole {
+            Some(self)
+        } else {
+            self.child(key)
+        }
+    }
+
+    fn item(&self, index: u32) -> Option<&Self> {
+        if self.whole {
+            Some(self)
+        } else {
+            self.index(index)
+        }
     }
 }
 
@@ -1159,41 +1164,6 @@ impl<'de> Deserialize<'de> for JsonKey<'de> {
 
 // String bodies are skipped with memchr, which finds the next quote or
 // backslash many bytes at a time. Most payload bytes sit inside strings.
-fn json_depth_within(payload: &[u8], max_depth: usize) -> bool {
-    let mut depth = 0usize;
-    let mut index = 0;
-    while index < payload.len() {
-        match payload[index] {
-            b'"' => {
-                index += 1;
-                loop {
-                    let Some(found) = memchr::memchr2(b'"', b'\\', &payload[index..]) else {
-                        return true;
-                    };
-                    index += found;
-                    if payload[index] == b'"' {
-                        break;
-                    }
-                    index += 2;
-                    if index >= payload.len() {
-                        return true;
-                    }
-                }
-            }
-            b'[' | b'{' => {
-                depth += 1;
-                if depth > max_depth {
-                    return false;
-                }
-            }
-            b']' | b'}' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-        index += 1;
-    }
-    true
-}
-
 fn leaf_label(leaf: &NodeKind) -> String {
     match leaf {
         NodeKind::Compare { path, op, literal } => {

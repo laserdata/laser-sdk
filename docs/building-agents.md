@@ -22,11 +22,11 @@ All append, consume, reliable-agent, AGDX, cursor, and folded log-memory code ru
 | Stream a large result in chunks | `AgdxStream` | `laser.agdx(..).stream(corr, "chat").buffered(64, linger)` then `finish` |
 | Send a large body by reference | a claim-check | `.claim_check(&store, threshold)` on the publish, `resolve_body(&store)` on read |
 | Make an external effect happen once | a KV compare-and-swap | `laser.kv("effects").set(key).bytes(b).expect_absent().commit().await?` |
-| Look up structured facts | the query surface | `laser.query("readings").where_eq(..).fetch_typed::<Reading>().await?`, or `.raw_sql(SqlDialect::DataFusion, ..)` |
+| Look up structured facts | the query surface | `laser.query("readings").where_eq(..).fetch_typed::<Reading>().await?`, or `.raw_sql(SqlDialect::Sqlite, ..)` |
 | Reason over how things connect | the graph | `laser.graph("services").neighbors(node, EdgeDir::Out, None, 2).await?` |
 | Remember and recall | memory | `laser.memory("support").remember(fact).scope(c).dedup().send().await?` / `.recall(c).semantic(q).fetch()`, a vector handle built from a governed `Laser` applies the same pre-write policy locally |
 | Keep named working state | memory named items | `laser.memory("session").set("plan", json).await?` / `.fetch("plan")` |
-| Pause for a human, then resume | the human-input gate | `ctx.approval_gate(reply, prompt, timeout).await?`, an approver replies with `ctx.respond_input(..)` |
+| Pause for a human, then resume | the human-input gate | `ctx.approval_gate(approver, reply, prompt, timeout).await?` returns an `ApprovalGrant`, an approver that lists `input_request` among its operations replies with `ctx.respond_input(..)` |
 | Move a task through its lifecycle | the session lifecycle | `session.end()`, `fail(error)`, or `cancel()`, and responses carry `TaskState` (`Working`, `InputRequired`, `Completed`, `Failed`) |
 | Survive a crash mid-flow | replay + idempotency | `ConversationState::load(.., ReplayBound::Full, ..)`, and commit offsets only after the effect's key |
 | Never double-apply a redelivery | the reliable consumer | `Agent::builder().deduplicator(..)`, undecodable and retry-exhausted messages dead-letter |
@@ -111,7 +111,7 @@ let readings = laser
     .fetch_typed::<Reading>()
     .await?;
 // A read-only join the IR does not express:
-let prior = laser.query("tickets").raw_sql(SqlDialect::DataFusion, "SELECT ... JOIN ...").fetch().await?;
+let prior = laser.query("tickets").raw_sql(SqlDialect::Sqlite, "SELECT ... JOIN ...").fetch().await?;
 ```
 
 The resolver records an idempotency key and publishes a capacity grant. A repeated request can detect the stored key. These are separate operations, so this example does not guarantee exactly-once external effects across crashes. An `ActionGovernor` can also govern the final publication.
@@ -131,12 +131,30 @@ match laser
 }
 ```
 
-The escalator applies the approval policy. Above the threshold, it requests human input and waits for the decision. An approver reads the session topic and answers through `ctx.respond_input(..)`.
+The escalator applies the approval policy. Above the threshold, it asks a named approver and waits for the decision. The approver lists `input_request` among its operations, since a handler that serves every operation never receives an input request, and answers through `ctx.respond_input(..)`. Only the named approver's reply decides, signed by it when a verifier is configured. A governed effect re-sent with the grant does not step up again. On a stream with `agent.control` the runtime parks the ticket's session while the approver decides and keeps handling other tickets: the gate's first pass publishes the prompt and returns `PolicyDeferred`, and the decision replays the ticket through the handler, where the gate returns the grant. Everything the handler did before the gate runs again on that replay, so keep it idempotent (the claim step above already is).
 
 ```rust
-let decision = ctx
-    .approval_gate(AgentTopic::Sessions, prompt, Duration::from_secs(60))
+let grant = ctx
+    .approval_gate(approver_id, AgentTopic::Sessions, prompt, Duration::from_secs(60))
     .await?;
+ctx.laser()
+    .agdx(AgentTopic::Sessions, agent_id.wire_id(), ctx.message().provenance.conversation_id.into())
+    .command(correlation, body)
+    .with_grant(&grant)
+    .send()
+    .await?;
+```
+
+The approver opts in to input requests:
+
+```rust
+Agent::builder()
+    .id("approver".parse()?)
+    .listen_on(AgentTopic::Sessions)
+    .operations(vec![laser_sdk::wire::dispatch::OPERATION_INPUT_REQUEST.to_owned()])
+    .handler(Approver)
+    .build()
+    .spawn(laser.clone());
 ```
 
 `ConversationState::load` rebuilds the ticket conversation from retained records. Operators can inspect the recorded inputs and replies.
@@ -157,7 +175,7 @@ let (session, lease) = sessions
     .await?;
 ```
 
-`begin` writes the start record on the session lane and returns a lease that keeps the session in this process's heartbeat. `run` ends the session by the outcome: completed on success, failed on an error or a panic.
+`begin` writes the start record on the session lane and returns a lease that keeps the session in this process's heartbeat. `run` ends the session by the outcome: completed on success, failed on an error or a panic. A ticket that comes back after its session ended reopens it with `resume()` instead of `begin()`, which refuses an ended session with `LaserError::SessionEnded`. A canceled ticket stays ended.
 
 ```rust
 session
@@ -175,7 +193,7 @@ session
     .await?;
 ```
 
-The SDK never calls a model. `model` records the request and the context manifest, the application calls its provider, and `complete` records the answer with its usage. `tool(name, args)` records a tool call the same way, with secret-looking argument values redacted. `state()` keeps a JSON document per session as patches on the lane.
+The SDK never calls a model. `assemble` selects from the conversation records of the session, the user, agent, tool, and model response records, and leaves out lifecycle, state, and the model requests the session recorded, so the prompt built from `assembled.text()` never contains an earlier prompt and stays the size of the last 20 turns. `text()` joins the record bodies, not the encoded envelopes. `model` records the request and the context manifest, the application calls its provider, and `complete` records the answer with its usage. `tool(name, args)` records a tool call the same way, with secret-looking argument values redacted. `state()` keeps a JSON document per session as patches on the lane.
 
 A client can also hand a ticket to an agent. `submit` writes a submitted session and a command addressed to the agent. The agent's reliable consumer marks the session working when it picks the command up, and the handler reaches the session through `ctx.session()`.
 
@@ -204,6 +222,7 @@ Pick the layout by how many roles read the stream:
 - Keep the default `SessionLayout::Shared` when a stream has a few roles. All work rides `agent.sessions`, keyed by session.
 - Move to `SessionLayout::PerAgentTopic` when the roles are many or the lane is busy. On a shared lane the server examines the whole lane once for every filtered role: [session sizing](session-sizing.md) measured 2, 4, and 8 examined records per delivered record for 2, 4, and 8 roles. Per-agent topics remove that cost, and per-topic grants keep the roles apart.
 - Use `SessionLayout::PerAgentPartition(map)` when each declared agent's work should land on one known partition of `agent.sessions`. The roles still share the topic and its grants.
+- Session readers find the work a per-agent layout moved through the layout their own connection declares, so every process that reads the stream's sessions, an operator console included, opens them through `laser.sessions_with(SessionConfig::new().layout(..))` with the same layout.
 - Use `SessionLayout::SinglePartition` when everything must keep one order, for example in tests or a small app. The stream then has one partition's throughput.
 
 Partitions are how one role scales. Run more instances of a role to share its load. A consumer group gives each partition to one member at a time, so instances beyond the partition count sit idle. Bootstrap `agent.sessions` with at least as many partitions as the busiest role has instances. More partitions don't speed up the managed session index of one stream: on the measured embedded store the fold rate stayed flat from 1 to 8 partitions.
@@ -220,7 +239,7 @@ laser.memory("profiles").set("host:node-7", config_json).await?;
 
 A recorded `set` preserves the configuration change in log history. Read retained records to inspect the writer, time, and later changes.
 
-A human-input request publishes a prompt and waits for a correlated response. Consoles and agents can read its topic. With a verifier, only a valid signed response can resume the request. An approver with a signing key uses `ctx.respond_input(..)` to provide that response. `request_input` addresses the prompt to every agent on the topic. `request_input_from(approver, ..)` sends it to one agent, so no other agent on `agent.sessions` answers it.
+A human-input request publishes an `input-required` task status and the prompt as an `input_request` command, then waits for a correlated response. Consoles and agents can read its topic, and only an agent that lists `input_request` among its operations takes the prompt as work. With a verifier, only a valid signed response can resume the request. An approver with a signing key uses `ctx.respond_input(..)` to provide that response. `request_input` addresses the prompt to every agent on the topic. `request_input_from(approver, ..)` sends it to one agent and accepts only that agent's reply.
 
 ```rust
 let decision = laser
@@ -239,6 +258,8 @@ loop {
 ```
 
 Use stable idempotency keys to identify repeated requests after recovery. Recording a key separately from an external effect does not make those steps atomic. The effect handler needs a transaction or an external operation that is safe to repeat. A reassigned lease holder also needs fenced CAS in the workflow coordination namespace.
+
+A workflow does this for its own steps. Run it under a `run_id` you keep, and a run that crashed resumes without running a recorded step again: a step it dispatched before it stopped is answered by the reply that already landed, or sent again under the same idempotency key. Every step command carries the step deadline, so an agent that reaches it later drops it, and a handler still working when its message's deadline passes should stop, because its caller already failed or reassigned the step.
 
 Replay a production incident. Reconstruct a conversation from the log alone, or re-run a fixed agent version over historical offsets.
 

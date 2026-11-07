@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import { join } from "node:path"
 import { StateStoreError } from "./client/errors.js"
@@ -69,12 +69,24 @@ export class FileStore implements StateStore {
   }
 
   async set(key: string, value: Uint8Array): Promise<void> {
-    await mkdir(this.root, { recursive: true })
     const target = this.pathFor(key)
     const staging = `${target}.${randomUUID()}.tmp`
     try {
-      await writeFile(staging, value)
+      // Dedup keys, cursors, and conversation state are this store's content,
+      // so the directory is restricted to its owner rather than the umask.
+      await mkdir(this.root, { recursive: true, mode: 0o700 })
+      if (process.platform !== "win32") await chmod(this.root, 0o700)
+      // The staged bytes reach disk before the rename, or a crash after the
+      // rename could still surface an empty file.
+      const staged = await open(staging, "w", 0o600)
+      try {
+        await staged.writeFile(value)
+        await staged.sync()
+      } finally {
+        await staged.close()
+      }
       await rename(staging, target)
+      await syncDirectory(this.root)
     } catch (cause) {
       await rm(staging, { force: true })
       throw new StateStoreError(`failed to write state key \`${key}\``, { cause })
@@ -91,6 +103,21 @@ export class FileStore implements StateStore {
 
   private pathFor(key: string): string {
     return join(this.root, hexKey(key))
+  }
+}
+
+// Makes the rename itself durable. Best effort, as Rust: a platform that
+// cannot open a directory for syncing still has the synced file.
+async function syncDirectory(directory: string): Promise<void> {
+  try {
+    const handle = await open(directory, "r")
+    try {
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    // The rename already happened, only its durability is unconfirmed.
   }
 }
 

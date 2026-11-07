@@ -169,6 +169,23 @@ pub struct RouteCandidate<'a> {
     pub capability: Option<CapabilityDescriptor>,
 }
 
+// Pick by `policy` among the candidates outside `excluded`, and among all of
+// them only when that picks nobody, so a reassignment reuses the agent that
+// timed out only when no other agent is capable.
+fn select_preferring(
+    skill_id: &str,
+    candidates: &[&RegisteredCard],
+    policy: &RoutePolicy,
+    excluded: &[AgentId],
+) -> Option<AgentId> {
+    let preferred: Vec<&RegisteredCard> = candidates
+        .iter()
+        .copied()
+        .filter(|card| !excluded.contains(&card.agent))
+        .collect();
+    select(skill_id, &preferred, policy).or_else(|| select(skill_id, candidates, policy))
+}
+
 /// Pick one agent for `skill_id` from `candidates` (a registry
 /// [`resolve`](crate::agent::AgentRegistry::resolve) result) by `policy`, or
 /// `None` when there are no candidates. The class fields are advisory `u*` where
@@ -270,22 +287,59 @@ impl Router {
     /// `now_micros`: `To` is the one agent, `Broadcast` is the empty list (no
     /// target), `ToCapable` is the one the policy picks, and `AllCapable` is every
     /// capable agent. Errors with [`LaserError::NoCapableAgent`] when a capability
-    /// variant matches no live agent.
+    /// variant matches no live agent, and with [`LaserError::Quarantined`] when
+    /// a named route names an agent an operator quarantined.
     pub fn resolve_targets(
         &self,
         registry: &AgentRegistry,
         now_micros: u64,
     ) -> Result<Vec<AgentId>, LaserError> {
+        self.resolve_routed(registry, now_micros, &[], |_| true)
+    }
+
+    /// Resolve like [`resolve_targets`](Self::resolve_targets), keeping only
+    /// capability candidates `inbox_route` can send work to, so a capable agent
+    /// with no inbox never wins a pick over one that has one. A capability
+    /// route picks outside `excluded` unless no other agent is capable.
+    pub(crate) fn resolve_routable(
+        &self,
+        registry: &AgentRegistry,
+        inbox_route: &InboxRoute,
+        now_micros: u64,
+        excluded: &[AgentId],
+    ) -> Result<Vec<AgentId>, LaserError> {
+        self.resolve_routed(registry, now_micros, excluded, |agent| {
+            inbox_route
+                .resolve(agent, registry.inbox_for(agent))
+                .is_ok()
+        })
+    }
+
+    fn resolve_routed(
+        &self,
+        registry: &AgentRegistry,
+        now_micros: u64,
+        excluded: &[AgentId],
+        routable: impl Fn(&AgentId) -> bool,
+    ) -> Result<Vec<AgentId>, LaserError> {
         match self {
-            Self::To(agent) => Ok(vec![agent.clone()]),
+            Self::To(agent) => {
+                refuse_quarantined(registry, agent)?;
+                Ok(vec![agent.clone()])
+            }
             Self::ToPrincipal { agent, principal } => {
+                refuse_quarantined(registry, agent)?;
                 require_principal(registry, agent, *principal)?;
                 Ok(vec![agent.clone()])
             }
             Self::Broadcast => Ok(Vec::new()),
             Self::ToCapable(selector) => {
-                let candidates = trusted_candidates(registry, selector, now_micros)?;
-                select(&selector.skill, &candidates, &selector.policy)
+                let candidates: Vec<&RegisteredCard> =
+                    trusted_candidates(registry, selector, now_micros)?
+                        .into_iter()
+                        .filter(|card| routable(&card.agent))
+                        .collect();
+                select_preferring(&selector.skill, &candidates, &selector.policy, excluded)
                     .map(|agent| vec![agent])
                     .ok_or_else(|| LaserError::NoCapableAgent {
                         skill: selector.skill.clone(),
@@ -326,8 +380,19 @@ impl Router {
     }
 }
 
+// An operator-quarantined agent is refused by name, as capability
+// resolution already drops it.
+fn refuse_quarantined(registry: &AgentRegistry, agent: &AgentId) -> Result<(), LaserError> {
+    if registry.is_quarantined(agent) {
+        return Err(LaserError::Quarantined {
+            agent: agent.as_str().to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn trusted_candidates<'a>(
-    registry: &'a AgentRegistry<'_>,
+    registry: &'a AgentRegistry,
     selector: &CapabilitySelector,
     now_micros: u64,
 ) -> Result<Vec<&'a RegisteredCard>, LaserError> {
@@ -359,7 +424,7 @@ fn filter_candidates_by_principal<'a>(
 }
 
 fn require_principal(
-    registry: &AgentRegistry<'_>,
+    registry: &AgentRegistry,
     agent: &AgentId,
     principal: PrincipalId,
 ) -> Result<(), LaserError> {
@@ -371,7 +436,7 @@ fn require_principal(
 }
 
 fn principal_mismatch(
-    registry: &AgentRegistry<'_>,
+    registry: &AgentRegistry,
     agent: &AgentId,
     expected: PrincipalId,
 ) -> LaserError {
@@ -436,6 +501,7 @@ mod tests {
                     load,
                 }],
                 ttl_micros: None,
+                inbox: None,
             },
             observed_at_micros: 0,
         }
@@ -458,6 +524,23 @@ mod tests {
         );
         // Sticky to an absent agent falls back to a candidate.
         assert!(pick(RoutePolicy::Sticky("gone".parse().expect("valid agent id"))).is_some());
+    }
+
+    #[test]
+    fn given_a_timed_out_agent_when_selected_again_then_should_prefer_another_capable_agent() {
+        let cheap = card("cheap", Some(1), None, None);
+        let pricey = card("pricey", Some(9), None, None);
+        let candidates = [&cheap, &pricey];
+        let timed_out = [cheap.agent.clone()];
+
+        let pick = select_preferring("diagnose", &candidates, &RoutePolicy::Cheapest, &timed_out);
+        assert_eq!(pick.as_ref().map(AgentId::as_str), Some("pricey"));
+        let alone = select_preferring("diagnose", &[&cheap], &RoutePolicy::Cheapest, &timed_out);
+        assert_eq!(
+            alone.as_ref().map(AgentId::as_str),
+            Some("cheap"),
+            "the timed-out agent is reused only when no other is capable"
+        );
     }
 
     #[test]

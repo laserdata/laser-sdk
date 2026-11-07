@@ -1,6 +1,6 @@
 use crate::agent::PyProvenance;
 use crate::agent_runtime::static_topic;
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::convert::{json_to_py, payload_bytes, ser_to_py};
 use crate::errors::to_pyerr;
@@ -78,13 +78,14 @@ impl PyContextScope {
         &self,
         py: Python<'py>,
         topic: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
         let conversation = self.conversation;
         let topic = static_topic(topic)?;
         let payload = payload_bytes(payload)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .context(conversation)
                 .append(topic, payload)
@@ -105,7 +106,7 @@ impl PyContextScope {
         topics: Option<Vec<String>>,
         n: usize,
         token_budget: Option<usize>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Vec<PyContextMessage>>> {
         let policy = bounded_policy(n, token_budget);
         self.read(py, read_topics(topics)?, policy, None)
     }
@@ -117,7 +118,7 @@ impl PyContextScope {
         py: Python<'py>,
         topics: Vec<String>,
         policy: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Vec<PyContextMessage>>> {
         let (policy, failure) = PolicySpec::extract(policy)?.build();
         let topics = read_topics(Some(topics))?;
         self.read(py, topics, policy, Some(failure))
@@ -133,12 +134,12 @@ impl PyContextScope {
         topics: Option<Vec<String>>,
         n: usize,
         token_budget: Option<usize>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, String>> {
         let laser = self.laser.clone();
         let conversation = self.conversation;
         let topics = read_topics(topics)?;
         let policy = bounded_policy(n, token_budget);
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let messages = laser
                 .context(conversation)
                 .fetch_with(topics, policy)
@@ -172,7 +173,7 @@ impl PyContextScope {
         from_checkpoint: Option<PyRef<'_, PyCheckpoint>>,
         at: Option<PyRef<'_, PyCheckpoint>>,
         full: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let bound = replay_bound(
             last_n,
             from_offsets,
@@ -183,7 +184,7 @@ impl PyContextScope {
         let topics = read_topics(Some(topics))?;
         let laser = self.laser.clone();
         let conversation = self.conversation;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let messages = collect(&laser, conversation, topics, bound).await?;
             fold_messages(messages, init, fold)
         })
@@ -199,12 +200,12 @@ impl PyContextScope {
         topics: Vec<String>,
         init: Py<PyAny>,
         fold: Py<PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let store = SnapshotHandle::from_py(store)?;
         let topics = read_topics(Some(topics))?;
         let laser = self.laser.clone();
         let conversation = self.conversation;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let (seed, bound) = match store.latest(conversation.into()).await.map_err(to_pyerr)? {
                 Some(snapshot) => {
                     let state: serde_json::Value = serde_json::from_slice(&snapshot.state)
@@ -236,11 +237,11 @@ impl PyContextScope {
         &self,
         py: Python<'py>,
         topics: Option<Vec<String>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyCheckpoint>> {
         let topics = read_topics(topics)?;
         let laser = self.laser.clone();
         let conversation = self.conversation;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let checkpoint = laser
                 .context(conversation)
                 .checkpoint(&topics)
@@ -272,6 +273,7 @@ impl PyContextScope {
         &self,
         py: Python<'_>,
         namespace: String,
+        #[gen_stub(override_type(type_repr = "typing.Literal['auto', 'log', 'vector']", imports = ("typing",)))]
         backend: &str,
         embedder: Option<Py<PyAny>>,
     ) -> PyResult<PyScopedMemory> {
@@ -316,10 +318,10 @@ pub(crate) fn context_checkpoint<'py>(
     py: Python<'py>,
     laser: PyRef<'_, PyLaser>,
     topics: Vec<String>,
-) -> PyResult<Bound<'py, PyAny>> {
+) -> PyResult<Awaitable<'py, PyCheckpoint>> {
     let laser = laser.inner.clone();
     let topics = read_topics(Some(topics))?;
-    future_into_py(py, async move {
+    awaitable(py, async move {
         let checkpoint = laser_sdk::context::checkpoint(&laser, &topics)
             .await
             .map_err(to_pyerr)?;
@@ -362,8 +364,17 @@ impl PyContextMessage {
 
     /// The raw message body.
     #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
     fn payload(&self) -> Vec<u8> {
         self.inner.payload.clone()
+    }
+
+    /// The envelope body of an AGDX message, else the raw payload: the text a
+    /// prompt carries and the bytes a token estimate counts.
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+    fn body(&self) -> Vec<u8> {
+        self.inner.body().to_vec()
     }
 
     /// The decoded AGDX envelope as a dict, or `None` for a plain message.
@@ -414,10 +425,10 @@ impl PyContextScope {
         topics: Vec<AgentTopic<'static>>,
         policy: Box<dyn ContextPolicy>,
         failure: Option<EstimatorFailure>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Vec<PyContextMessage>>> {
         let laser = self.laser.clone();
         let conversation = self.conversation;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let messages = laser
                 .context(conversation)
                 .fetch_with(topics, policy)
@@ -989,11 +1000,11 @@ impl PyScopedMemory {
         stream: Option<String>,
         durable: bool,
         token_budget: Option<usize>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Vec<PyMemoryItem>>> {
         let backend = self.backend.clone();
         let scope = self.scope(agent, user, application, stream, durable)?;
         let query = recall_query(&scope, limit, semantic, strategy, token_budget)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let items = if folded {
                 backend.recall_folded(scope, query).await
             } else {
@@ -1015,17 +1026,22 @@ impl PyScopedMemory {
     fn remember<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         agent: Option<String>,
         stream: Option<String>,
         user: Option<String>,
         application: Option<String>,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['fact', 'message', 'summary', 'entity', 'feedback', 'procedure']",
+            imports = ("typing",)
+        ))]
         kind: &str,
         durable: bool,
         dedup: bool,
         origin: Option<&Bound<'_, PyAny>>,
         producer: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, String>> {
         let backend = self.backend.clone();
         let (origin, producer) = crate::memory::lineage(origin, producer)?;
         let options = RememberOptions {
@@ -1041,7 +1057,7 @@ impl PyScopedMemory {
             dedup,
         };
         let payload = payload_bytes(payload)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let id = backend.remember(options, payload).await.map_err(to_pyerr)?;
             Ok(id.to_string())
         })
@@ -1057,11 +1073,11 @@ impl PyScopedMemory {
         query: String,
         limit: usize,
         folded: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Vec<PyMemoryItem>>> {
         let backend = self.backend.clone();
         let scope = self.scope(None, None, None, None, false)?;
         let query = recall_query(&scope, limit, Some(query), Some("keyword".to_owned()), None)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let items = if folded {
                 backend.recall_folded(scope, query).await
             } else {
@@ -1083,10 +1099,10 @@ impl PyScopedMemory {
         &self,
         py: Python<'py>,
         token_budget: Option<usize>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, String>> {
         let backend = self.backend.clone();
         let conversation = self.conversation;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             backend
                 .context(conversation, token_budget)
                 .await
@@ -1104,13 +1120,13 @@ impl PyScopedMemory {
         max_items: usize,
         summarizer: Option<Py<PyAny>>,
         prune_summarized: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyConsolidationReport>> {
         let backend = self.backend.clone();
         let summarizer = summarizer.map(|callback| crate::memory::PySummarizer { callback });
         let scope = MemoryScope::builder()
             .conversation(self.conversation)
             .build();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let report = backend
                 .consolidate(scope, max_items, summarizer, prune_summarized)
                 .await
@@ -1131,13 +1147,13 @@ impl PyScopedMemory {
         target: String,
         weight: f32,
         note: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, String>> {
         let backend = self.backend.clone();
         let scope = self.scope(None, None, None, None, false)?;
         let target = MemoryId::from_str(&target).map_err(|e| to_pyerr(e.into()))?;
         let mut feedback = Feedback::new(target, weight);
         feedback.note = note;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let id = backend.improve(scope, feedback).await.map_err(to_pyerr)?;
             Ok(id.to_string())
         })
@@ -1146,11 +1162,11 @@ impl PyScopedMemory {
     /// Forget the item `id` if it was remembered in this conversation. The
     /// tombstone is limited to this conversation, so it changes nothing for an
     /// item of another conversation.
-    fn forget<'py>(&self, py: Python<'py>, id: String) -> PyResult<Bound<'py, PyAny>> {
+    fn forget<'py>(&self, py: Python<'py>, id: String) -> PyResult<Awaitable<'py, ()>> {
         let backend = self.backend.clone();
         let scope = self.scope(None, None, None, None, false)?;
         let id = MemoryId::from_str(&id).map_err(|e| to_pyerr(e.into()))?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             backend.forget(scope, id).await.map_err(to_pyerr)
         })
     }

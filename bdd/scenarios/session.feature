@@ -122,9 +122,33 @@ Feature: Agent sessions over the log
     When agent "planner" starts the session "incident"
     And the session records the message "first"
     And the session records the message "second"
-    And the session records a model call to "gpt-test" with the context assembled from its 3 records
+    And the session records a model call to "gpt-test" with the context assembled from its 2 records
     Then the session lane shows "session.started", "agent.message", "agent.message", "model.request", "context.assembled", "model.response"
     And the context manifest lists the address of every assembled fragment
+
+  Scenario: An assembled context holds the conversation bodies only
+    When agent "planner" starts the session "incident"
+    And the session records the message "first"
+    And the session records the message "second"
+    And the session state sets "step" to 1
+    Then the context assembled from the session reads "first", "second"
+
+  Scenario: A model call and a tool call the session recorded never reach its agent as work
+    Given agents "planner" and "observer" each record the commands they handle
+    When agent "planner" starts the session "incident"
+    And the session records a model call to "gpt-test" whose request carries an api key
+    And the session records a call of tool "lookup" whose arguments carry a token
+    And "client" sends work to agent "planner" in the session
+    Then agent "planner" handled exactly "work"
+
+  Scenario: An ended session refuses to begin again and resumes on request
+    When agent "planner" starts the session "incident"
+    And the session ends
+    And agent "planner" starts the session "incident" again
+    Then the call fails as a session that ended completed
+    When agent "planner" resumes the session "incident"
+    And the session ends
+    Then the session lane shows "session.started", "session.completed", "session.started", "session.completed"
 
   Scenario: A model call recorded without an assembled context writes no manifest
     When agent "planner" starts the session "incident"

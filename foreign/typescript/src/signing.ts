@@ -1,6 +1,7 @@
 import * as ed25519 from "@noble/ed25519"
 import { sha256, sha512 } from "@noble/hashes/sha2.js"
 import { bytesToHex } from "@noble/hashes/utils.js"
+import type { CallOptions } from "./client/call-options.js"
 import { InvalidError, SignatureError } from "./client/errors.js"
 import type { Laser } from "./client/laser.js"
 import {
@@ -24,6 +25,8 @@ const KEY_ID_BYTES = 8
 const PUBLIC_KEY_BYTES = 32
 const SECRET_KEY_BYTES = 32
 const SIGNATURE_BYTES = 64
+// The JWS algorithm of a card signature (RFC 8037 section 3.1).
+const CARD_SIGNATURE_ALGORITHM = "EdDSA"
 
 export const DEFAULT_KEY_NAMESPACE = "agent.keys"
 export interface VerifiedPrincipal {
@@ -43,6 +46,11 @@ export class SigningKey {
     private readonly id: Uint8Array
   ) {}
 
+  /** A fresh key from 32 bytes of the platform's cryptographic random source. Store its seed (`toBytes`) like any secret. */
+  static generate(): SigningKey {
+    return SigningKey.fromBytes(ed25519.utils.randomSecretKey())
+  }
+
   static fromBytes(secret: Uint8Array): SigningKey {
     if (secret.byteLength !== SECRET_KEY_BYTES) {
       throw new SignatureError(`Ed25519 secret seed must be ${String(SECRET_KEY_BYTES)} bytes`)
@@ -50,6 +58,11 @@ export class SigningKey {
     const owned = secret.slice()
     const publicBytes = ed25519.getPublicKey(owned)
     return new SigningKey(owned, publicBytes, sha256(publicBytes).slice(0, KEY_ID_BYTES))
+  }
+
+  /** The 32-byte secret seed `fromBytes` rebuilds this key from. */
+  toBytes(): Uint8Array {
+    return this.secret.slice()
   }
 
   keyId(): Uint8Array {
@@ -92,12 +105,12 @@ export class KeyRecord {
     readonly validToMicros?: bigint,
     readonly revoked = false
   ) {
-    if (principal.length === 0) throw new SignatureError("key principal must not be empty")
+    if (principal.length === 0) throw new InvalidError("key principal must not be empty")
     if (verifying.byteLength !== PUBLIC_KEY_BYTES) {
-      throw new SignatureError(`Ed25519 public key must be ${String(PUBLIC_KEY_BYTES)} bytes`)
+      throw new InvalidError(`Ed25519 public key must be ${String(PUBLIC_KEY_BYTES)} bytes`)
     }
     if (validToMicros !== undefined && validToMicros <= validFromMicros) {
-      throw new SignatureError("key validity end must be after its start")
+      throw new InvalidError("key validity end must be after its start")
     }
   }
 
@@ -228,44 +241,48 @@ export class KvKeyRegistry {
   ) {}
 
   /** Enrolls `verifyingKey` as `principal`'s agent key. */
-  async enroll(principal: string, verifyingKey: Uint8Array): Promise<void> {
-    await this.enrollRecord(KeyRecord.agent(principal, verifyingKey))
+  async enroll(
+    principal: string,
+    verifyingKey: Uint8Array,
+    options: CallOptions = {}
+  ): Promise<void> {
+    await this.enrollRecord(KeyRecord.agent(principal, verifyingKey), options)
   }
 
   /** Enrolls or replaces a lifecycle-aware key record with compare-and-swap protection. */
-  async enrollRecord(record: KeyRecord): Promise<bigint> {
+  async enrollRecord(record: KeyRecord, options: CallOptions = {}): Promise<bigint> {
     const kv = this.laser.kv(this.namespace)
     const key = new TextEncoder().encode(keyIdHex(record.verifying))
-    const current = await kv.getEntry(key)
+    const current = await kv.getEntry(key, options)
     const write = kv.set(key).bytes(encodeKeyRecord(record))
     return current === undefined
-      ? write.expectAbsent().commit()
-      : write.expectVersion(current.version).commit()
+      ? write.expectAbsent().commit(options)
+      : write.expectVersion(current.version).commit(options)
   }
 
-  async revoke(keyId: Uint8Array): Promise<bigint> {
+  async revoke(keyId: Uint8Array, options: CallOptions = {}): Promise<bigint> {
     if (keyId.byteLength !== KEY_ID_BYTES) {
-      throw new SignatureError(`Ed25519 key id must be ${String(KEY_ID_BYTES)} bytes`)
+      throw new InvalidError(`Ed25519 key id must be ${String(KEY_ID_BYTES)} bytes`)
     }
     const kv = this.laser.kv(this.namespace)
     const key = new TextEncoder().encode(bytesToHex(keyId))
-    const current = await kv.getEntry(key)
-    if (current === undefined) throw new SignatureError("signing key is not enrolled")
+    const current = await kv.getEntry(key, options)
+    if (current === undefined) throw new InvalidError("signing key is not enrolled")
     const record = decodeKeyRecord(current.value)
     if (keyIdHex(record.verifying) !== bytesToHex(keyId)) {
-      throw new SignatureError("key record identifier differs from its storage key")
+      throw new InvalidError("key record identifier differs from its storage key")
     }
     if (record.revoked) return current.version
     return kv
       .set(key)
       .bytes(encodeKeyRecord(record.revoke()))
       .expectVersion(current.version)
-      .commit()
+      .commit(options)
   }
 
-  async registry(): Promise<KeyRegistry> {
+  async registry(options: CallOptions = {}): Promise<KeyRegistry> {
     const registry = new KeyRegistry()
-    const entries = await this.laser.kv(this.namespace).scan().entries()
+    const entries = await this.laser.kv(this.namespace).scan().entries(options)
     for (const entry of entries) {
       try {
         const record = decodeKeyRecord(entry.value)
@@ -284,18 +301,33 @@ function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
   return left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index])
 }
 
+/**
+ * Verify an on-behalf-of envelope against the headers observed on its record and
+ * the record timestamp, and return the signer with its delegated user. The
+ * server authorizes only the authenticated caller, so the caller intersects the
+ * two principals' grants with `delegatedAllow`.
+ */
 export function verifyDelegation(
   registry: KeyRegistry,
-  envelope: AgentEnvelope
+  envelope: AgentEnvelope,
+  observed: SignatureContext,
+  atMicros: bigint
 ): readonly [string, string] | undefined {
-  const signer = registry.verify(envelope)
+  const signer = registry.verifyObservedAt(envelope, observed, atMicros).principal
   const delegated = envelope.metadata?.get(METADATA_DELEGATED_BY)
   return delegated?.kind === "str" ? [signer, delegated.value] : undefined
 }
 
+/**
+ * Sign an A2A card value as a detached JWS: EdDSA over the RFC 7515 signing
+ * input whose payload is the RFC 8785 canonical form of the card without its
+ * `signatures`. The protected header names the algorithm and the key id.
+ */
 export function signCardValue(key: SigningKey, card: unknown): AgentCardSignature {
   const payload = canonicalJson(withoutSignatures(card))
-  const protectedValue = base64url(new TextEncoder().encode('{"alg":"EdDSA"}'))
+  // Already canonical: `alg` sorts before `kid` and a hex id needs no escape.
+  const header = `{"alg":"${CARD_SIGNATURE_ALGORITHM}","kid":"${bytesToHex(key.keyId())}"}`
+  const protectedValue = base64url(new TextEncoder().encode(header))
   const input = `${protectedValue}.${base64url(new TextEncoder().encode(payload))}`
   return {
     protected: protectedValue,
@@ -309,6 +341,7 @@ export function verifyCard(
   verifyingKey: Uint8Array
 ): void {
   if (verifyingKey.byteLength !== PUBLIC_KEY_BYTES) throw new SignatureError("invalid public key")
+  checkCardHeader(signature.protected, verifyingKey)
   const payload = canonicalJson(withoutSignatures(card))
   const input = `${signature.protected}.${base64url(new TextEncoder().encode(payload))}`
   const bytes = fromBase64url(signature.signature)
@@ -358,7 +391,7 @@ function decodeKeyRecord(payload: Uint8Array): KeyRecord {
   const record = decodeStoredKeyRecord(expectMap(decodeOne(payload, context), context), context)
   const keyId = sha256(record.verifyingKey).slice(0, KEY_ID_BYTES)
   if (bytesToHex(record.keyId) !== bytesToHex(keyId)) {
-    throw new SignatureError("key record identifier does not match its verifying key")
+    throw new InvalidError("key record identifier does not match its verifying key")
   }
   return new KeyRecord(
     record.principal,
@@ -392,8 +425,9 @@ function canonicalJson(value: unknown): string {
   }
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`
   if (typeof value === "object") {
+    // String comparison orders UTF-16 code units, the RFC 8785 section 3.2.3 rule.
     const entries = Object.entries(value as Readonly<Record<string, unknown>>).toSorted(
-      ([a], [b]) => compareUtf8(a, b)
+      ([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)
     )
     return `{${entries.map(([key, item]) => `${canonicalString(key)}:${canonicalJson(item)}`).join(",")}}`
   }
@@ -407,18 +441,32 @@ function canonicalString(value: string): string {
   return JSON.stringify(value)
 }
 
-// Code point order is UTF-8 byte order, the order Rust sorts object keys in.
-function compareUtf8(left: string, right: string): number {
-  let leftIndex = 0
-  let rightIndex = 0
-  while (leftIndex < left.length && rightIndex < right.length) {
-    const leftPoint = left.codePointAt(leftIndex) ?? 0
-    const rightPoint = right.codePointAt(rightIndex) ?? 0
-    if (leftPoint !== rightPoint) return leftPoint - rightPoint
-    leftIndex += leftPoint > 0xffff ? 2 : 1
-    rightIndex += rightPoint > 0xffff ? 2 : 1
+// The protected header must name EdDSA, carry no `crit` extension (none is
+// understood, RFC 7515 section 4.1.11), and name the verifying key if it names one.
+function checkCardHeader(protectedValue: string, verifyingKey: Uint8Array): void {
+  let header: unknown
+  try {
+    header = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(fromBase64url(protectedValue))
+    )
+  } catch {
+    throw new SignatureError("card signature header does not decode")
   }
-  return left.length - leftIndex - (right.length - rightIndex)
+  if (header === null || Array.isArray(header) || typeof header !== "object") {
+    throw new SignatureError("card signature header does not decode")
+  }
+  const fields = header as Readonly<Record<string, unknown>>
+  if (fields["alg"] !== CARD_SIGNATURE_ALGORITHM) {
+    throw new SignatureError(`card signature header must name alg ${CARD_SIGNATURE_ALGORITHM}`)
+  }
+  if ("crit" in fields) {
+    throw new SignatureError(
+      "card signature header names a critical extension this verifier does not understand"
+    )
+  }
+  if ("kid" in fields && fields["kid"] !== keyIdHex(verifyingKey)) {
+    throw new SignatureError("card signature names another key")
+  }
 }
 
 function base64url(payload: Uint8Array): string {

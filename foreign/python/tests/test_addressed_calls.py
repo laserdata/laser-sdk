@@ -6,7 +6,7 @@ import pytest
 pytestmark = pytest.mark.integration
 
 
-async def _workers(laser, names, seen):
+async def _workers(laser, names, seen, operations=None):
     agents = []
     for name in names:
 
@@ -17,7 +17,7 @@ async def _workers(laser, names, seen):
             seen.append((name, bytes(envelope["body"])))
             await ctx.respond_input(ls.AgentTopic.Sessions, name.encode())
 
-        agent = laser.spawn_agent(name, ls.AgentTopic.Sessions, handle)
+        agent = laser.spawn_agent(name, ls.AgentTopic.Sessions, handle, operations=operations)
         await agent.ready()
         agents.append(agent)
     return agents
@@ -26,7 +26,7 @@ async def _workers(laser, names, seen):
 async def _settled(bridge, task_id):
     for _ in range(50):
         current = await bridge.task(task_id)
-        if current["status"]["state"].lower() not in ("working", "submitted"):
+        if current["status"]["state"] not in ("TASK_STATE_WORKING", "TASK_STATE_SUBMITTED"):
             return current
         await asyncio.sleep(0.2)
     raise AssertionError("the task never left the working state")
@@ -45,8 +45,10 @@ async def test_given_two_workers_when_submitting_to_one_then_only_that_worker_sh
         to_alpha = await bridge.submit_in(
             parent, {"message": {"text": "for alpha"}}, target="alpha"
         )
-        assert (await _settled(bridge, to_beta["id"]))["artifacts"][0]["text"] == "beta"
-        assert (await _settled(bridge, to_alpha["id"]))["artifacts"][0]["text"] == "alpha"
+        beta = await _settled(bridge, to_beta["id"])
+        alpha = await _settled(bridge, to_alpha["id"])
+        assert beta["artifacts"][0]["parts"][0]["text"] == "beta"
+        assert alpha["artifacts"][0]["parts"][0]["text"] == "alpha"
         assert sorted(name for name, _ in seen) == ["alpha", "beta"]
     finally:
         for agent in agents:
@@ -82,7 +84,7 @@ async def test_given_two_responders_when_asking_one_for_input_then_only_it_shoul
 ):
     await laser.bootstrap(partitions=2, retention=ls.TopicRetention.expire_after(86_400_000))
     seen = []
-    agents = await _workers(laser, ["approver", "bystander"], seen)
+    agents = await _workers(laser, ["approver", "bystander"], seen, operations=["input_request"])
     try:
         # One producer keeps both prompts in one session, so each responder
         # reads them in order: once the bystander has seen the broadcast, it

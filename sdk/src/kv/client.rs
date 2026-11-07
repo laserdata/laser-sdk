@@ -19,18 +19,33 @@ use laser_wire::mutation::MutationPosition;
 use laser_wire::validate::Validate;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// A granted revocable lease: the fencing token to present on protected
 /// mutations, the TTL the store granted (which may be shorter than requested),
-/// and the mutation position at which the answering fold applied the grant or
+/// the mutation position at which the answering fold applied the grant or
 /// renewal (the barrier a takeover read passes to
-/// [`Kv::get_entry_at_least`]).
+/// [`Kv::get_entry_at_least`]), and the monotonic instant the lease stops
+/// being valid for this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lease {
     pub token: u64,
     pub granted_ttl: Duration,
     pub position: MutationPosition,
+    /// The first send of the grant or renewal plus the granted TTL. The store
+    /// starts the TTL no earlier than it received the request, so work that
+    /// stops before this instant never outlives the lease, however late the
+    /// reply arrived.
+    pub valid_until: Instant,
+}
+
+/// The answer to a conditional read: the live version still equals the one
+/// the caller holds, so no value was sent, or the entry as it stands now.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KvRevalidation {
+    NotModified,
+    /// The current entry, or `None` when it is absent or expired.
+    Changed(Option<KvEntry>),
 }
 
 impl Laser {
@@ -64,7 +79,10 @@ impl Laser {
     /// scopes its resources to a stream lists only that stream's namespaces,
     /// under the names the caller gave them.
     pub async fn kv_namespaces(&self) -> Result<Vec<KvNamespaceInfo>, LaserError> {
-        let request = KvNamespaces { v: KV_OP_VERSION };
+        let request = KvNamespaces {
+            v: KV_OP_VERSION,
+            stream: self.resource_stream().map(str::to_owned),
+        };
         match self
             .execute_kv(None, AGDX_KV_NAMESPACES_CODE, &request)
             .await?
@@ -129,6 +147,7 @@ impl Laser {
 
 /// A namespace-scoped view of the key-value store. Build it with
 /// [`Laser::kv`](crate::laser::Laser::kv).
+#[derive(Clone)]
 pub struct Kv {
     laser: Laser,
     namespace: String,
@@ -184,6 +203,34 @@ impl Kv {
             .await?
         {
             KvOutcome::Value(entry) => Ok(entry),
+            other => Err(unexpected("get", &other)),
+        }
+    }
+
+    /// Conditional read: [`KvRevalidation::NotModified`] without the value
+    /// while `key` still holds `version` (the [`KvEntry::version`] of a prior
+    /// read), else the entry as it stands now. An up-to-date cache skips the
+    /// body transfer.
+    pub async fn get_entry_if_changed(
+        &self,
+        key: impl AsRef<[u8]>,
+        version: u64,
+    ) -> Result<KvRevalidation, LaserError> {
+        let key = validated_key(key.as_ref())?;
+        let request = KvGet {
+            v: KV_OP_VERSION,
+            namespace: self.namespace.clone(),
+            key,
+            if_none_match: Some(version),
+            min_position: None,
+        };
+        match self
+            .laser
+            .execute_kv(Some(&self.namespace), AGDX_KV_GET_CODE, &request)
+            .await?
+        {
+            KvOutcome::NotModified => Ok(KvRevalidation::NotModified),
+            KvOutcome::Value(entry) => Ok(KvRevalidation::Changed(entry)),
             other => Err(unexpected("get", &other)),
         }
     }
@@ -264,7 +311,7 @@ impl Kv {
             key: key.as_ref().to_vec(),
             value: Vec::new(),
             expires_at_micros: None,
-            expect: None,
+            ttl_micros: None,
         }
     }
 
@@ -286,9 +333,11 @@ impl Kv {
         KvCasFencedRequest {
             laser: self.laser.clone(),
             namespace: self.namespace.clone(),
+            session: self.session.clone(),
             key: key.as_ref().to_vec(),
             value: Vec::new(),
             expires_at_micros: None,
+            ttl_micros: None,
             expect: None,
             fence_namespace: self.laser.resource_name(&fence_namespace.into()),
             fence_key: fence_key.as_ref().to_vec(),
@@ -299,13 +348,29 @@ impl Kv {
     /// Delete `key`. Returns `true` when a live entry was removed, `false` when
     /// none existed.
     pub async fn delete(&self, key: impl AsRef<[u8]>) -> Result<bool, LaserError> {
-        let key = validated_key(key.as_ref())?;
+        self.delete_matching(key.as_ref(), None).await
+    }
+
+    /// Delete `key` only while it holds `version` (the [`KvEntry::version`] of
+    /// a prior read), a conditional delete. A live entry at another version is
+    /// [`KvError::VersionConflict`](laser_wire::kv::KvError::VersionConflict)
+    /// carrying the current version.
+    pub async fn delete_if_version(
+        &self,
+        key: impl AsRef<[u8]>,
+        version: u64,
+    ) -> Result<bool, LaserError> {
+        self.delete_matching(key.as_ref(), Some(version)).await
+    }
+
+    async fn delete_matching(&self, key: &[u8], if_match: Option<u64>) -> Result<bool, LaserError> {
+        let key = validated_key(key)?;
         let request = KvDelete {
             v: KV_OP_VERSION,
             namespace: self.namespace.clone(),
             session: self.session.clone(),
             key,
-            if_match: None,
+            if_match,
         };
         match self
             .laser
@@ -337,14 +402,16 @@ impl Kv {
     }
 
     /// Set or refresh the entry's expiry in place without rewriting its value.
-    /// `ttl` of `None` clears the expiry. Returns the entry's (unchanged) version.
+    /// `ttl` counts from the server's time of the write, so a client clock
+    /// cannot skew it. `None` clears the expiry. Returns the entry's
+    /// (unchanged) version.
     pub async fn expire(
         &self,
         key: impl AsRef<[u8]>,
         ttl: Option<Duration>,
     ) -> Result<u64, LaserError> {
-        let expires_at_micros = ttl.map(|ttl| now_micros().saturating_add(duration_micros(ttl)));
-        self.expire_at(key, expires_at_micros).await
+        self.expire_with(key.as_ref(), None, ttl.map(duration_micros))
+            .await
     }
 
     /// Set the entry's absolute expiry (epoch microseconds) in place without
@@ -355,12 +422,23 @@ impl Kv {
         key: impl AsRef<[u8]>,
         expires_at_micros: Option<u64>,
     ) -> Result<u64, LaserError> {
-        let key = validated_key(key.as_ref())?;
+        self.expire_with(key.as_ref(), expires_at_micros, None)
+            .await
+    }
+
+    async fn expire_with(
+        &self,
+        key: &[u8],
+        expires_at_micros: Option<u64>,
+        ttl_micros: Option<u64>,
+    ) -> Result<u64, LaserError> {
+        let key = validated_key(key)?;
         let request = KvExpire {
             v: KV_OP_VERSION,
             namespace: self.namespace.clone(),
             key,
             expires_at_micros,
+            ttl_micros,
         };
         match self
             .laser
@@ -380,14 +458,36 @@ impl Kv {
         key: impl AsRef<[u8]>,
         patch: impl Into<Vec<u8>>,
     ) -> Result<u64, LaserError> {
-        let key = validated_key(key.as_ref())?;
+        self.patch_matching(key.as_ref(), patch.into(), None).await
+    }
+
+    /// [`patch`](Self::patch) applied only while `key` holds `version`. A live
+    /// entry at another version is
+    /// [`KvError::VersionConflict`](laser_wire::kv::KvError::VersionConflict).
+    pub async fn patch_if_version(
+        &self,
+        key: impl AsRef<[u8]>,
+        patch: impl Into<Vec<u8>>,
+        version: u64,
+    ) -> Result<u64, LaserError> {
+        self.patch_matching(key.as_ref(), patch.into(), Some(version))
+            .await
+    }
+
+    async fn patch_matching(
+        &self,
+        key: &[u8],
+        patch: Vec<u8>,
+        if_match: Option<u64>,
+    ) -> Result<u64, LaserError> {
+        let key = validated_key(key)?;
         let request = KvPatch {
             v: KV_OP_VERSION,
             namespace: self.namespace.clone(),
             session: self.session.clone(),
             key,
-            patch: patch.into(),
-            if_match: None,
+            patch,
+            if_match,
         };
         match self
             .laser
@@ -404,18 +504,23 @@ impl Kv {
     /// The returned [`Lease`] carries the fencing token to present on protected
     /// mutations, the TTL the store granted, and the grant's applied mutation
     /// position. `ttl` is a requested maximum within
-    /// [`MIN_LEASE_TTL_MICROS`](laser_wire::limits::MIN_LEASE_TTL_MICROS)`..=`[`MAX_LEASE_TTL_MICROS`](laser_wire::limits::MAX_LEASE_TTL_MICROS);
-    /// the store may grant less and never more, so anything outside that range
+    /// [`MIN_LEASE_TTL_MICROS`](laser_wire::limits::MIN_LEASE_TTL_MICROS)`..=`[`MAX_LEASE_TTL_MICROS`](laser_wire::limits::MAX_LEASE_TTL_MICROS).
+    /// The store may grant less and never more, so anything outside that range
     /// is `LaserError::Invalid` before the round trip. A holder needing longer
-    /// renews. A live lease always conflicts: extend with
-    /// [`renew_lease`](Self::renew_lease), never by re-acquiring. Requires the
+    /// renews. A live lease always conflicts with
+    /// [`KvError::LeaseHeld`](laser_wire::kv::KvError::LeaseHeld), which names the
+    /// holder's expiry, and [`try_lease`](Self::try_lease) answers `None`
+    /// instead: extend with [`renew_lease`](Self::renew_lease), never by
+    /// re-acquiring. Requires the
     /// `kv_fenced_leases` capability, else `LaserError::Unsupported`. This path
     /// uses the connection-backed client's dedicated coordination transport. If
-    /// the outcome is ambiguous, it actively retires that transport and waits the
-    /// requested TTL before returning `LaserError::AmbiguousMutation`, so a caller
-    /// cannot immediately retry under a fresh operation identity. Acquisitions
-    /// are serialized per client, and recovery continues if the calling future
-    /// is dropped.
+    /// the outcome is ambiguous, it repeats the same operation identity, which
+    /// the store answers with its recorded outcome, until the requested TTL
+    /// since the first send has passed, and only then returns
+    /// `LaserError::AmbiguousMutation`. A grant that arrives after its
+    /// [`Lease::valid_until`] is `KvError::LeaseLost`. Recovery continues if the
+    /// calling future is dropped, and the grant position joins this handle's
+    /// read-your-writes frontier.
     pub async fn lease(
         &self,
         key: impl AsRef<[u8]>,
@@ -434,6 +539,44 @@ impl Kv {
         };
         request.validate()?;
         self.laser.acquire_lease(request).await
+    }
+
+    /// [`lease`](Self::lease) that answers `None` instead of failing when a
+    /// live lease holds `key`, the non-blocking acquire. Every other failure,
+    /// an ambiguous outcome included, is returned as `lease` returns it.
+    pub async fn try_lease(
+        &self,
+        key: impl AsRef<[u8]>,
+        holder: impl Into<String>,
+        ttl: Duration,
+    ) -> Result<Option<Lease>, LaserError> {
+        match self.lease(key, holder, ttl).await {
+            Ok(lease) => Ok(Some(lease)),
+            Err(LaserError::Kv(KvError::LeaseHeld { .. })) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// [`lease`](Self::lease) held by a [`LeaseGuard`], which releases it on
+    /// [`LeaseGuard::release`] and, when dropped unreleased inside a Tokio
+    /// runtime, in a background task, so no exit path keeps the key held
+    /// until its TTL.
+    pub async fn lease_guard(
+        &self,
+        key: impl AsRef<[u8]>,
+        holder: impl Into<String>,
+        ttl: Duration,
+    ) -> Result<LeaseGuard, LaserError> {
+        let key = key.as_ref().to_vec();
+        let holder = holder.into();
+        let lease = self.lease(&key, holder.clone(), ttl).await?;
+        Ok(LeaseGuard {
+            kv: self.clone(),
+            key,
+            holder,
+            lease,
+            held: true,
+        })
     }
 
     /// Extend a held lease without changing its token, presenting the same
@@ -462,6 +605,7 @@ impl Kv {
             lease_ttl_micros: duration_micros(ttl),
         };
         request.validate()?;
+        let sent = Instant::now();
         match self
             .laser
             .execute_kv(Some(&self.namespace), AGDX_KV_LEASE_RENEW_CODE, &request)
@@ -471,18 +615,22 @@ impl Kv {
                 lease_token,
                 granted_ttl_micros,
                 position,
-            } => Ok(Lease {
-                token: lease_token,
-                granted_ttl: Duration::from_micros(granted_ttl_micros),
-                position,
-            }),
+            } => {
+                let granted_ttl = Duration::from_micros(granted_ttl_micros);
+                Ok(Lease {
+                    token: lease_token,
+                    granted_ttl,
+                    position,
+                    valid_until: sent.checked_add(granted_ttl).unwrap_or(sent),
+                })
+            }
             other => Err(unexpected("renew_lease", &other)),
         }
     }
 
     /// Release a held lease early, presenting the same `holder` and the `token`
     /// the grant returned. Returns `true` when a held lease was released,
-    /// `false` when none was held (idempotent); a stale token surfaces as
+    /// `false` when none was held (idempotent). A stale token surfaces as
     /// [`KvError::LeaseLost`](laser_wire::kv::KvError::LeaseLost).
     pub async fn release(
         &self,
@@ -557,21 +705,18 @@ impl Kv {
         &self,
         keys: impl IntoIterator<Item = impl AsRef<[u8]>>,
     ) -> Result<Vec<Option<Vec<u8>>>, LaserError> {
-        let mut ops = Vec::new();
-        for key in keys {
-            let request = KvGet {
-                v: KV_OP_VERSION,
-                namespace: self.namespace.clone(),
-                key: validated_key(key.as_ref())?,
-                if_none_match: None,
-                min_position: None,
-            };
-            ops.push(laser_wire::batch::BatchItem {
-                code: AGDX_KV_GET_CODE,
-                payload: encode_named(&request)
-                    .map_err(|error| LaserError::Codec(format!("encode get: {error}")))?,
-            });
-        }
+        // Batch items travel without the read envelope a single read carries,
+        // so each read names the frontier itself. Only a server that honors the
+        // barrier gets it, as an older one would ignore it.
+        let frontier = self
+            .laser
+            .capabilities()
+            .await
+            .kv
+            .fenced_leases
+            .then(|| self.laser.seen_positions().kv)
+            .flatten();
+        let ops = self.get_many_items(keys, frontier)?;
         let results = self.laser.execute_batch(ops).await?;
         results
             .iter()
@@ -587,6 +732,29 @@ impl Kv {
                     )),
                 },
             )
+            .collect()
+    }
+
+    fn get_many_items(
+        &self,
+        keys: impl IntoIterator<Item = impl AsRef<[u8]>>,
+        frontier: Option<MutationPosition>,
+    ) -> Result<Vec<laser_wire::batch::BatchItem>, LaserError> {
+        keys.into_iter()
+            .map(|key| {
+                let request = KvGet {
+                    v: KV_OP_VERSION,
+                    namespace: self.namespace.clone(),
+                    key: validated_key(key.as_ref())?,
+                    if_none_match: None,
+                    min_position: frontier,
+                };
+                Ok(laser_wire::batch::BatchItem {
+                    code: AGDX_KV_GET_CODE,
+                    payload: encode_named(&request)
+                        .map_err(|error| LaserError::Codec(format!("encode get: {error}")))?,
+                })
+            })
             .collect()
     }
 
@@ -613,8 +781,10 @@ impl Kv {
         }
     }
 
-    /// Start a `scan` over this namespace. Finish with `.fetch().await` for one
-    /// page, or `.entries().await` to walk every match across pages.
+    /// Start a `scan` over this namespace, in key order. Choose the page with
+    /// `.page(n)` and its size with `.results(n)`, then finish with
+    /// `.fetch().await` for that page and its totals, or `.entries().await` to
+    /// walk every match across pages.
     pub fn scan(&self) -> KvScanRequest {
         KvScanRequest {
             laser: self.laser.clone(),
@@ -625,8 +795,11 @@ impl Kv {
             key_contains: None,
             conversation: None,
             stream: None,
-            limit: DEFAULT_SCAN_LIMIT,
-            cursor: None,
+            user: None,
+            agent: None,
+            app: None,
+            page: 0,
+            results: DEFAULT_SCAN_LIMIT as u32,
         }
     }
 }
@@ -654,12 +827,91 @@ impl crate::state_store::StateStore for Kv {
     }
 }
 
+/// A lease that releases itself, the scope guard over [`Kv::lease`]. Renew it
+/// with [`renew`](Self::renew) before [`Lease::valid_until`], and end it with
+/// [`release`](Self::release) to learn whether it was still held. Dropping it
+/// unreleased releases it in a background task on the current Tokio runtime,
+/// best effort, so an early return or a cancelled task frees the key at once
+/// instead of after its TTL.
+#[must_use = "a dropped guard releases its lease, keep it for the protected work"]
+pub struct LeaseGuard {
+    kv: Kv,
+    key: Vec<u8>,
+    holder: String,
+    lease: Lease,
+    held: bool,
+}
+
+impl LeaseGuard {
+    /// The current grant: the fencing token to present and its local deadline.
+    pub fn lease(&self) -> &Lease {
+        &self.lease
+    }
+
+    /// Renew the lease for `ttl`, keeping its token, and return the extended
+    /// grant. A lease that was lost answers
+    /// [`KvError::LeaseLost`](laser_wire::kv::KvError::LeaseLost), and the
+    /// guard then releases nothing.
+    pub async fn renew(&mut self, ttl: Duration) -> Result<&Lease, LaserError> {
+        match self
+            .kv
+            .renew_lease(&self.key, self.holder.clone(), self.lease.token, ttl)
+            .await
+        {
+            Ok(lease) => {
+                self.lease = lease;
+                Ok(&self.lease)
+            }
+            Err(error) => {
+                if error.is_lease_lost() {
+                    self.held = false;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Release the lease now. `true` when it was still held.
+    pub async fn release(mut self) -> Result<bool, LaserError> {
+        self.held = false;
+        self.kv
+            .release(&self.key, self.holder.clone(), self.lease.token)
+            .await
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let kv = self.kv.clone();
+        let key = std::mem::take(&mut self.key);
+        let holder = std::mem::take(&mut self.holder);
+        let token = self.lease.token;
+        runtime.spawn(async move {
+            if let Err(error) = kv.release(&key, holder, token).await {
+                tracing::warn!(
+                    target: "laser",
+                    namespace = kv.namespace(),
+                    %error,
+                    "Releasing a dropped lease in {} failed, it ends at its TTL: {error}",
+                    kv.namespace(),
+                );
+            }
+        });
+    }
+}
+
 /// Fluent builder for `Kv::set`. Supply a value with one of `.bytes` (raw),
 /// `.json` / `.msgpack` (built-in codecs), or `.encode_with::<C>` (any codec -
 /// Avro, Protobuf, CBOR, Arrow, your own), optionally an expiry, then
 /// `.send().await`. Values are stored as opaque bytes, and the codec is the
 /// caller's choice.
-#[must_use = "call .send().await to write, or .commit().await for a compare-and-swap"]
+#[must_use = "call .send().await to write, or set a precondition for a compare-and-swap"]
 pub struct KvSetRequest {
     laser: Laser,
     namespace: String,
@@ -667,7 +919,16 @@ pub struct KvSetRequest {
     key: Vec<u8>,
     value: Vec<u8>,
     expires_at_micros: Option<u64>,
-    expect: Option<CasExpect>,
+    ttl_micros: Option<u64>,
+}
+
+/// A compare-and-swap write, built by [`KvSetRequest::expect_version`] or
+/// [`KvSetRequest::expect_absent`]. It only commits, so a precondition can
+/// never be dropped by an unconditional send.
+#[must_use = "call .commit().await to apply the compare-and-swap"]
+pub struct KvCasRequest {
+    write: KvSetRequest,
+    expect: CasExpect,
 }
 
 impl KvSetRequest {
@@ -702,15 +963,19 @@ impl KvSetRequest {
         self.encode_with::<crate::stream::Msgpack, T>(value)
     }
 
-    /// Expire the entry `ttl` from now. Overrides any prior `expires_at`.
+    /// Expire the entry `ttl` after the server's time of the write, so a
+    /// client clock cannot skew it. Overrides any prior `expires_at`.
     pub fn ttl(mut self, ttl: Duration) -> Self {
-        self.expires_at_micros = Some(now_micros().saturating_add(duration_micros(ttl)));
+        self.ttl_micros = Some(duration_micros(ttl));
+        self.expires_at_micros = None;
         self
     }
 
     /// Expire the entry at an absolute epoch-microseconds timestamp.
+    /// Overrides any prior `ttl`.
     pub fn expires_at(mut self, epoch_micros: u64) -> Self {
         self.expires_at_micros = Some(epoch_micros);
+        self.ttl_micros = None;
         self
     }
 
@@ -727,76 +992,25 @@ impl KvSetRequest {
     /// let next = kv.set("counter").json(&(prev + 1))?.expect_version(entry.version).commit().await?;
     /// # let _ = next; Ok(()) }
     /// ```
-    pub fn expect_version(mut self, version: u64) -> Self {
-        self.expect = Some(CasExpect::Match(version));
-        self
+    pub fn expect_version(self, version: u64) -> KvCasRequest {
+        KvCasRequest {
+            write: self,
+            expect: CasExpect::Match(version),
+        }
     }
 
     /// Make this a compare-and-swap that applies only if the key does not yet
-    /// exist (a create-if-absent). Finish with [`commit`](Self::commit). A racing
-    /// writer that got there first surfaces as a conflict.
-    pub fn expect_absent(mut self) -> Self {
-        self.expect = Some(CasExpect::Absent);
-        self
-    }
-
-    /// Apply a compare-and-swap write set up by [`expect_version`](Self::expect_version)
-    /// or [`expect_absent`](Self::expect_absent), returning the entry's new
-    /// version. The precondition miss is a typed
-    /// [`KvError::VersionConflict`](laser_wire::kv::KvError::VersionConflict)
-    /// carrying the current version, so the caller can re-read and retry.
-    /// Returns `LaserError::Invalid` if no precondition was set (use `send` for
-    /// an unconditional write), and `LaserError::Unsupported` when the
-    /// deployment does not advertise the `kv_cas` capability.
-    pub async fn commit(self) -> Result<u64, LaserError> {
-        let Some(expect) = self.expect else {
-            return Err(LaserError::Invalid(
-                "commit() needs a precondition: call expect_version(..) or expect_absent()"
-                    .to_owned(),
-            ));
-        };
-        // Fail fast when the deployment does not advertise compare-and-swap.
-        // Unlike a plain set, CAS rides its own command code an unaware server
-        // rejects, but checking the advertised capability locally turns that
-        // into the documented `Unsupported` before the round-trip.
-        if !self.laser.capabilities().await.kv.cas {
-            return Err(LaserError::unsupported_feature(
-                "kv",
-                "cas",
-                "compare-and-swap is not advertised by this deployment",
-            ));
-        }
-        let key = validated_key(&self.key)?;
-        validated_value(&self.value)?;
-        let request = KvCas {
-            v: KV_OP_VERSION,
-            namespace: self.namespace,
-            session: self.session,
-            key,
-            value: self.value,
-            expires_at_micros: self.expires_at_micros,
-            expect,
-        };
-        match self
-            .laser
-            .execute_kv(Some(&request.namespace), AGDX_KV_CAS_CODE, &request)
-            .await?
-        {
-            KvOutcome::Committed { version } => Ok(version),
-            other => Err(unexpected("cas", &other)),
+    /// exist (a create-if-absent). Finish with [`commit`](KvCasRequest::commit).
+    /// A racing writer that got there first surfaces as a conflict.
+    pub fn expect_absent(self) -> KvCasRequest {
+        KvCasRequest {
+            write: self,
+            expect: CasExpect::Absent,
         }
     }
 
-    /// Apply the unconditional write. Returns `LaserError::Invalid` when a
-    /// precondition was set with [`expect_version`](Self::expect_version) or
-    /// [`expect_absent`](Self::expect_absent): finish those with
-    /// [`commit`](Self::commit), so a precondition is never dropped.
+    /// Apply the unconditional write.
     pub async fn send(self) -> Result<(), LaserError> {
-        if self.expect.is_some() {
-            return Err(LaserError::Invalid(
-                "a precondition was set: call commit() instead of send()".to_owned(),
-            ));
-        }
         let key = validated_key(&self.key)?;
         validated_value(&self.value)?;
         let request = KvSet {
@@ -806,6 +1020,7 @@ impl KvSetRequest {
             key,
             value: self.value,
             expires_at_micros: self.expires_at_micros,
+            ttl_micros: self.ttl_micros,
         };
         match self
             .laser
@@ -818,6 +1033,62 @@ impl KvSetRequest {
     }
 }
 
+impl KvCasRequest {
+    /// Expire the entry `ttl` after the server's time of the write.
+    /// Overrides any prior `expires_at`.
+    pub fn ttl(mut self, ttl: Duration) -> Self {
+        self.write = self.write.ttl(ttl);
+        self
+    }
+
+    /// Expire the entry at an absolute epoch-microseconds timestamp.
+    pub fn expires_at(mut self, epoch_micros: u64) -> Self {
+        self.write = self.write.expires_at(epoch_micros);
+        self
+    }
+
+    /// Apply the compare-and-swap, returning the entry's new version. The
+    /// precondition miss is a typed
+    /// [`KvError::VersionConflict`](laser_wire::kv::KvError::VersionConflict)
+    /// carrying the current version, so the caller can re-read and retry.
+    /// Returns `LaserError::Unsupported` when the deployment does not
+    /// advertise the `kv_cas` capability.
+    pub async fn commit(self) -> Result<u64, LaserError> {
+        let Self { write, expect } = self;
+        // Fail fast when the deployment does not advertise compare-and-swap.
+        // Unlike a plain set, CAS rides its own command code an unaware server
+        // rejects, but checking the advertised capability locally turns that
+        // into the documented `Unsupported` before the round-trip.
+        if !write.laser.capabilities().await.kv.cas {
+            return Err(LaserError::unsupported_feature(
+                "kv",
+                "cas",
+                "compare-and-swap is not advertised by this deployment",
+            ));
+        }
+        let key = validated_key(&write.key)?;
+        validated_value(&write.value)?;
+        let request = KvCas {
+            v: KV_OP_VERSION,
+            namespace: write.namespace,
+            session: write.session,
+            key,
+            value: write.value,
+            expires_at_micros: write.expires_at_micros,
+            ttl_micros: write.ttl_micros,
+            expect,
+        };
+        match write
+            .laser
+            .execute_kv(Some(&request.namespace), AGDX_KV_CAS_CODE, &request)
+            .await?
+        {
+            KvOutcome::Committed { version } => Ok(version),
+            other => Err(unexpected("cas", &other)),
+        }
+    }
+}
+
 /// Fluent builder for `Kv::cas_fenced`. Supply a value (`.bytes` / `.json` /
 /// `.msgpack` / `.encode_with`), a precondition (`.expect_absent` or
 /// `.expect_version`), an optional expiry, then `.commit().await`. The write
@@ -826,9 +1097,11 @@ impl KvSetRequest {
 pub struct KvCasFencedRequest {
     laser: Laser,
     namespace: String,
+    session: Option<laser_wire::agent::SessionRef>,
     key: Vec<u8>,
     value: Vec<u8>,
     expires_at_micros: Option<u64>,
+    ttl_micros: Option<u64>,
     expect: Option<CasExpect>,
     fence_namespace: String,
     fence_key: Vec<u8>,
@@ -862,15 +1135,19 @@ impl KvCasFencedRequest {
         self.encode_with::<crate::stream::Msgpack, T>(value)
     }
 
-    /// Expire the entry `ttl` from now.
+    /// Expire the entry `ttl` after the server's time of the write.
+    /// Overrides any prior `expires_at`.
     pub fn ttl(mut self, ttl: Duration) -> Self {
-        self.expires_at_micros = Some(now_micros().saturating_add(duration_micros(ttl)));
+        self.ttl_micros = Some(duration_micros(ttl));
+        self.expires_at_micros = None;
         self
     }
 
     /// Expire the entry at an absolute epoch-microseconds timestamp.
+    /// Overrides any prior `ttl`.
     pub fn expires_at(mut self, epoch_micros: u64) -> Self {
         self.expires_at_micros = Some(epoch_micros);
+        self.ttl_micros = None;
         self
     }
 
@@ -918,9 +1195,11 @@ impl KvCasFencedRequest {
         let request = KvCasFenced {
             v: KV_LEASE_OP_VERSION,
             namespace: self.namespace,
+            session: self.session,
             key,
             value: self.value,
             expires_at_micros: self.expires_at_micros,
+            ttl_micros: self.ttl_micros,
             expect,
             fence_namespace: self.fence_namespace,
             fence_key,
@@ -950,8 +1229,11 @@ pub struct KvScanRequest {
     key_contains: Option<String>,
     conversation: Option<String>,
     stream: Option<String>,
-    limit: usize,
-    cursor: Option<Vec<u8>>,
+    user: Option<String>,
+    agent: Option<String>,
+    app: Option<String>,
+    page: u32,
+    results: u32,
 }
 
 impl KvScanRequest {
@@ -986,19 +1268,20 @@ impl KvScanRequest {
         self
     }
 
-    /// Cap the page at `n` entries (clamped to `MAX_SCAN_LIMIT`).
-    pub fn limit(mut self, n: usize) -> Self {
-        self.limit = n.min(laser_wire::limits::MAX_SCAN_LIMIT);
+    /// The 1-based page to read. Zero reads the first page.
+    pub fn page(mut self, page: u32) -> Self {
+        self.page = page;
         self
     }
 
-    /// Resume after a previous page's cursor.
-    pub fn cursor(mut self, cursor: impl AsRef<[u8]>) -> Self {
-        self.cursor = Some(cursor.as_ref().to_vec());
+    /// The entries per page, clamped to `MAX_SCAN_LIMIT`. Zero reads the
+    /// server's default page size.
+    pub fn results(mut self, results: u32) -> Self {
+        self.results = results.min(laser_wire::limits::MAX_SCAN_LIMIT as u32);
         self
     }
 
-    /// Fetch one page (entries plus the cursor to continue).
+    /// Fetch the chosen page with the totals of the whole scan.
     pub async fn fetch(self) -> Result<KvPage, LaserError> {
         let request = self.request();
         match self
@@ -1011,11 +1294,14 @@ impl KvScanRequest {
         }
     }
 
-    /// Walk every matching entry across pages, following the cursor until the
-    /// scan is exhausted. Convenient when the working set fits in memory.
+    /// Walk every matching entry from the first page to the last the server
+    /// reports. Convenient when the working set fits in memory. Pages are read
+    /// by offset, so entries written or removed during the walk can shift the
+    /// page bounds.
     pub async fn entries(self) -> Result<Vec<KvEntry>, LaserError> {
         let laser = self.laser.clone();
         let mut request = self.request();
+        request.page = 1;
         let mut out = Vec::new();
         loop {
             let page = match laser
@@ -1025,11 +1311,12 @@ impl KvScanRequest {
                 KvOutcome::Page(page) => page,
                 other => return Err(unexpected("scan", &other)),
             };
-            out.extend(page.entries);
-            match page.cursor {
-                Some(cursor) => request.cursor = Some(cursor),
-                None => return Ok(out),
+            let last = page.items.is_empty() || page.page >= page.total_pages;
+            out.extend(page.items);
+            if last {
+                return Ok(out);
             }
+            request.page = page.page + 1;
         }
     }
 
@@ -1038,6 +1325,21 @@ impl KvScanRequest {
     #[cfg(feature = "agent")]
     pub(crate) fn lens_stream(mut self, stream: Option<String>) -> Self {
         self.stream = stream;
+        self
+    }
+
+    // The memory scope lenses, so a scoped recall reads only the rows of its
+    // user, agent, and app instead of the whole namespace.
+    #[cfg(feature = "agent")]
+    pub(crate) fn memory_lens(
+        mut self,
+        user: Option<String>,
+        agent: Option<String>,
+        app: Option<String>,
+    ) -> Self {
+        self.user = user;
+        self.agent = agent;
+        self.app = app;
         self
     }
 
@@ -1051,8 +1353,11 @@ impl KvScanRequest {
             key_contains: self.key_contains.clone(),
             conversation: self.conversation.clone(),
             stream: self.stream.clone(),
-            limit: self.limit,
-            cursor: self.cursor.clone(),
+            user: self.user.clone(),
+            agent: self.agent.clone(),
+            app: self.app.clone(),
+            page: self.page,
+            results: self.results,
         }
     }
 }
@@ -1206,13 +1511,6 @@ fn unexpected(op: &str, outcome: &KvOutcome) -> LaserError {
     LaserError::Protocol(format!("kv {op}: unexpected reply outcome {outcome:?}"))
 }
 
-fn now_micros() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(duration_micros)
-        .unwrap_or(0)
-}
-
 fn duration_micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
@@ -1221,6 +1519,7 @@ fn duration_micros(duration: Duration) -> u64 {
 mod tests {
     use super::*;
     use crate::capabilities::Capabilities;
+    use laser_wire::framing::decode_named;
 
     fn fenced_laser() -> Laser {
         let mut capabilities = Capabilities::OPEN;
@@ -1270,6 +1569,28 @@ mod tests {
             .conversation(conversation)
             .request();
         assert_eq!(bare.stream, None);
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn given_a_memory_lens_when_scanning_then_should_send_the_user_agent_and_app() {
+        let request = scoped(crate::laser::ResourceNaming::Stream)
+            .kv("memory")
+            .scan()
+            .memory_lens(
+                Some("reader".to_owned()),
+                Some("planner".to_owned()),
+                Some("desk".to_owned()),
+            )
+            .request();
+        assert_eq!(
+            (
+                request.user.as_deref(),
+                request.agent.as_deref(),
+                request.app.as_deref()
+            ),
+            (Some("reader"), Some("planner"), Some("desk"))
+        );
     }
 
     #[test]
@@ -1390,8 +1711,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_a_precondition_when_sending_then_should_reject_before_transport() {
-        for request in [
+    async fn given_a_precondition_when_building_then_should_yield_a_compare_and_swap_that_only_commits()
+     {
+        let requests: [KvCasRequest; 2] = [
             fenced_laser()
                 .kv("state")
                 .set("key")
@@ -1401,9 +1723,21 @@ mod tests {
                 .kv("state")
                 .set("key")
                 .bytes(b"value")
-                .expect_version(3),
-        ] {
-            assert!(matches!(request.send().await, Err(LaserError::Invalid(_))));
+                .expect_version(3)
+                .ttl(Duration::from_secs(5)),
+        ];
+        for request in requests {
+            let refused = request.commit().await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(LaserError::Unsupported {
+                        feature: Some("cas"),
+                        ..
+                    })
+                ),
+                "{refused:?}"
+            );
         }
     }
 
@@ -1418,6 +1752,67 @@ mod tests {
             .commit()
             .await;
         assert!(matches!(result, Err(LaserError::Invalid(_))));
+    }
+
+    #[test]
+    fn given_a_ttl_or_an_absolute_expiry_when_writing_then_should_send_exactly_one_of_them() {
+        let kv = fenced_laser().kv("sessions");
+        let relative = kv.set("user").ttl(Duration::from_secs(30));
+        assert_eq!(
+            (relative.expires_at_micros, relative.ttl_micros),
+            (None, Some(30_000_000)),
+            "a relative TTL is resolved by the server, never by this clock"
+        );
+        let absolute = kv.set("user").ttl(Duration::from_secs(30)).expires_at(7);
+        assert_eq!(
+            (absolute.expires_at_micros, absolute.ttl_micros),
+            (Some(7), None)
+        );
+        let fenced = kv
+            .cas_fenced("user", "coord", "run", 3)
+            .expires_at(7)
+            .ttl(Duration::from_secs(5));
+        assert_eq!(
+            (fenced.expires_at_micros, fenced.ttl_micros),
+            (None, Some(5_000_000))
+        );
+    }
+
+    #[test]
+    fn given_a_session_linked_handle_when_building_a_fenced_write_then_should_carry_the_session() {
+        let session = laser_wire::agent::SessionRef {
+            stream: "orders".to_owned(),
+            session: laser_wire::agent::ConversationId::from_u128(7),
+        };
+        let fenced = fenced_laser()
+            .kv("sessions")
+            .in_session(session.clone())
+            .cas_fenced("user", "coord", "run", 3);
+        assert_eq!(fenced.session, Some(session));
+    }
+
+    #[test]
+    fn given_a_seen_frontier_when_building_a_multi_get_then_should_carry_it_on_each_read() {
+        let kv = fenced_laser().kv("sessions");
+        let frontier = MutationPosition {
+            topic_generation: 1,
+            partition: 0,
+            offset: 41,
+        };
+        for (sent, expected) in [(Some(frontier), Some(frontier)), (None, None)] {
+            let items = kv
+                .get_many_items(["a", "b"], sent)
+                .expect("the items encode");
+            let barriers: Vec<Option<MutationPosition>> = items
+                .iter()
+                .map(|item| {
+                    decode_named::<KvGet>(&item.payload)
+                        .expect("the item is a get")
+                        .min_position
+                })
+                .collect();
+            assert_eq!(barriers, [expected, expected]);
+        }
     }
 
     #[test]

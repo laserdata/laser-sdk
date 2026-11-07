@@ -6,10 +6,11 @@ import {
   encodeNamed,
   expectMap,
   expectString,
+  expectU32,
   field,
   singleVariantTag
 } from "./cbor.js"
-import { BackendResourceId, DestinationId, QueryExecutionId } from "./ids.js"
+import { BackendResourceId, QueryExecutionId } from "./ids.js"
 import {
   type LogicalField,
   type TypedValue,
@@ -26,9 +27,9 @@ import {
 } from "./schema.js"
 import {
   MAX_PAGE_SIZE,
-  MAX_QUERY_CURSOR_BYTES,
   MAX_QUERY_FIELDS,
   MAX_QUERY_NAME_BYTES,
+  MAX_QUERY_OFFSET,
   MAX_QUERY_PARAMETERS,
   MAX_QUERY_PREDICATES,
   MAX_RAW_SQL_BYTES,
@@ -37,23 +38,16 @@ import {
 } from "./limits.js"
 import { QUERY_OP_VERSION } from "./codes.js"
 
-export type Consistency = "eventual" | "read_your_writes" | "strong"
+export type Consistency = "eventual" | "read_your_writes"
 
 export function consistencyIsEventual(consistency: Consistency): boolean {
   return consistency === "eventual"
 }
-export type SqlDialect = "data_fusion" | "postgres" | "my_sql" | "sqlite"
-export type QueryTarget =
-  | { readonly kind: "operational"; readonly index: string }
-  | {
-      readonly kind: "lakehouse"
-      readonly destinationId: DestinationId
-      readonly destinationGeneration: bigint
-      readonly snapshot?: SnapshotSelector
-    }
-export type SnapshotSelector =
-  | { readonly kind: "snapshot_id"; readonly value: bigint }
-  | { readonly kind: "timestamp_micros"; readonly value: bigint }
+export type SqlDialect = "postgres" | "my_sql" | "sqlite"
+export interface QueryTarget {
+  readonly kind: "operational"
+  readonly index: string
+}
 
 export interface KeyMatch {
   readonly field: string
@@ -113,7 +107,6 @@ export interface RawSql {
 export interface QueryPageRequest {
   readonly limit: number
   readonly offset?: bigint
-  readonly cursor?: string
   readonly wantTotal: boolean
 }
 
@@ -142,97 +135,8 @@ export interface QueryEnvelope {
   readonly v: number
   readonly query: Query
 }
-export interface QueryPageEnvelope {
-  readonly v: number
-  readonly executionId: QueryExecutionId
-  readonly cursor: string
-  readonly deadlineMicros: bigint
-}
-export interface QueryCancelEnvelope {
-  readonly v: number
-  readonly executionId: QueryExecutionId
-}
-export interface QueryStatusEnvelope {
-  readonly v: number
-  readonly executionId: QueryExecutionId
-}
-
-export function encodeQueryPageEnvelope(value: QueryPageEnvelope): Map<string, unknown> {
-  return mapOf([
-    ["v", value.v],
-    ["execution_id", value.executionId.toBytes()],
-    ["cursor", value.cursor],
-    ["deadline_micros", value.deadlineMicros]
-  ])
-}
-export function encodeQueryCancelEnvelope(value: QueryCancelEnvelope): Map<string, unknown> {
-  return mapOf([
-    ["v", value.v],
-    ["execution_id", value.executionId.toBytes()]
-  ])
-}
-export function encodeQueryStatusEnvelope(value: QueryStatusEnvelope): Map<string, unknown> {
-  return mapOf([
-    ["v", value.v],
-    ["execution_id", value.executionId.toBytes()]
-  ])
-}
-export function decodeQueryPageEnvelope(map: CborMap, context: string): QueryPageEnvelope {
-  return {
-    v: field.requiredU32(map, "v", context),
-    executionId: QueryExecutionId.fromBytes(field.requiredBytes(map, "execution_id", context)),
-    cursor: field.requiredString(map, "cursor", context),
-    deadlineMicros: field.requiredU64(map, "deadline_micros", context)
-  }
-}
-export function decodeQueryCancelEnvelope(map: CborMap, context: string): QueryCancelEnvelope {
-  return {
-    v: field.requiredU32(map, "v", context),
-    executionId: QueryExecutionId.fromBytes(field.requiredBytes(map, "execution_id", context))
-  }
-}
-export function decodeQueryStatusEnvelope(map: CborMap, context: string): QueryStatusEnvelope {
-  return {
-    v: field.requiredU32(map, "v", context),
-    executionId: QueryExecutionId.fromBytes(field.requiredBytes(map, "execution_id", context))
-  }
-}
-export function encodeQueryPageEnvelopeFrame(value: QueryPageEnvelope): Uint8Array {
-  return encodeNamed(encodeQueryPageEnvelope(value))
-}
-export function encodeQueryCancelEnvelopeFrame(value: QueryCancelEnvelope): Uint8Array {
-  return encodeNamed(encodeQueryCancelEnvelope(value))
-}
-export function encodeQueryStatusEnvelopeFrame(value: QueryStatusEnvelope): Uint8Array {
-  return encodeNamed(encodeQueryStatusEnvelope(value))
-}
-export function decodeQueryPageEnvelopeFrame(bytes: Uint8Array): QueryPageEnvelope {
-  const context = "QueryPageEnvelope"
-  return decodeQueryPageEnvelope(expectMap(decodeOne(bytes, context), context), context)
-}
-export function decodeQueryCancelEnvelopeFrame(bytes: Uint8Array): QueryCancelEnvelope {
-  const context = "QueryCancelEnvelope"
-  return decodeQueryCancelEnvelope(expectMap(decodeOne(bytes, context), context), context)
-}
-export function decodeQueryStatusEnvelopeFrame(bytes: Uint8Array): QueryStatusEnvelope {
-  const context = "QueryStatusEnvelope"
-  return decodeQueryStatusEnvelope(expectMap(decodeOne(bytes, context), context), context)
-}
-
 export function operationalTarget(index: string): QueryTarget {
   return { kind: "operational", index }
-}
-export function lakehouseTarget(
-  destinationId: DestinationId,
-  destinationGeneration: bigint,
-  snapshot?: SnapshotSelector
-): QueryTarget {
-  return {
-    kind: "lakehouse",
-    destinationId,
-    destinationGeneration,
-    ...(snapshot === undefined ? {} : { snapshot })
-  }
 }
 export function filterAll(filters: readonly Filter[]): Filter {
   return { kind: "all", filters }
@@ -416,44 +320,16 @@ function idBytes(id: { toBytes(): Uint8Array }): Uint8Array {
 }
 
 export function encodeQueryTarget(target: QueryTarget): Map<string, unknown> {
-  const map = new Map<string, unknown>([["kind", target.kind]])
-  if (target.kind === "operational") map.set("index", target.index)
-  else {
-    map.set("destination_id", idBytes(target.destinationId))
-    map.set("destination_generation", target.destinationGeneration)
-    optional(map, "snapshot", target.snapshot, encodeSnapshotSelector)
-  }
-  return map
+  return mapOf([
+    ["kind", target.kind],
+    ["index", target.index]
+  ])
 }
 
 export function decodeQueryTarget(map: CborMap, context: string): QueryTarget {
   const kind = field.requiredString(map, "kind", context)
   if (kind === "operational") return { kind, index: field.requiredString(map, "index", context) }
-  if (kind === "lakehouse") {
-    const snapshot = field.optionalMap(map, "snapshot", context)
-    return {
-      kind,
-      destinationId: DestinationId.fromBytes(field.requiredBytes(map, "destination_id", context)),
-      destinationGeneration: field.requiredU64(map, "destination_generation", context),
-      ...(snapshot === undefined
-        ? {}
-        : { snapshot: decodeSnapshotSelector(snapshot, `${context}.snapshot`) })
-    }
-  }
   throw new CodecError(`unknown query target \`${kind}\``, context, "kind")
-}
-
-function encodeSnapshotSelector(selector: SnapshotSelector): Map<string, unknown> {
-  return mapOf([
-    ["kind", selector.kind],
-    ["value", selector.value]
-  ])
-}
-function decodeSnapshotSelector(map: CborMap, context: string): SnapshotSelector {
-  const kind = field.requiredString(map, "kind", context)
-  const value = field.requiredI64(map, "value", context)
-  if (kind === "snapshot_id" || kind === "timestamp_micros") return { kind, value }
-  throw new CodecError(`unknown snapshot selector \`${kind}\``, context, "kind")
 }
 function encodeKeyMatch(value: KeyMatch): Map<string, unknown> {
   return mapOf([
@@ -648,7 +524,7 @@ function encodeRawSql(value: RawSql): Map<string, unknown> {
 }
 function decodeRawSql(map: CborMap, context: string): RawSql {
   return {
-    dialect: decodeWord(map, "dialect", context, ["data_fusion", "postgres", "my_sql", "sqlite"]),
+    dialect: decodeWord(map, "dialect", context, ["postgres", "my_sql", "sqlite"]),
     sql: field.requiredString(map, "sql", context),
     params: field.optionalArray(map, "params", context, (item, index) =>
       decodeTypedValue(item, `${context}.params[${String(index)}]`)
@@ -658,17 +534,14 @@ function decodeRawSql(map: CborMap, context: string): RawSql {
 function encodePageRequest(value: QueryPageRequest): Map<string, unknown> {
   const map = mapOf([["limit", value.limit]])
   optional(map, "offset", value.offset)
-  optional(map, "cursor", value.cursor)
   if (value.wantTotal) map.set("want_total", true)
   return map
 }
 function decodePageRequest(map: CborMap, context: string): QueryPageRequest {
   const offset = field.optionalU64(map, "offset", context)
-  const cursor = field.optionalString(map, "cursor", context)
   return {
     limit: field.requiredU32(map, "limit", context),
     ...(offset === undefined ? {} : { offset }),
-    ...(cursor === undefined ? {} : { cursor }),
     wantTotal: field.optionalBoolean(map, "want_total", context) ?? false
   }
 }
@@ -744,7 +617,7 @@ export function decodeQuery(map: CborMap, context: string): Query {
     ...(fork === undefined ? {} : { fork }),
     ...(rawSql === undefined ? {} : { rawSql: decodeRawSql(rawSql, `${context}.raw_sql`) }),
     consistency:
-      decodeOptionalWord(map, "consistency", context, ["eventual", "read_your_writes", "strong"]) ??
+      decodeOptionalWord(map, "consistency", context, ["eventual", "read_your_writes"]) ??
       "eventual"
   }
 }
@@ -752,20 +625,15 @@ export function decodeQuery(map: CborMap, context: string): Query {
 export function validateQuery(query: Query): void {
   if (query.executionId.asU128() === 0n || query.deadlineMicros === 0n)
     throw new InvalidError("query execution identity and deadline must be nonzero")
-  if (query.target.kind === "operational") validateName(query.target.index)
-  else {
-    if (query.target.destinationId.asU128() === 0n || query.target.destinationGeneration === 0n)
-      throw new InvalidError("lakehouse target identity must be nonzero")
-    if (query.target.snapshot !== undefined && query.target.snapshot.value <= 0n)
-      throw new InvalidError("snapshot selector must be positive")
-    if (query.fork !== undefined)
-      throw new InvalidError("lakehouse queries cannot use an operational fork")
-  }
-  if (query.page.limit < 1 || query.page.limit > MAX_PAGE_SIZE)
+  validateName(query.target.index)
+  if (
+    !Number.isSafeInteger(query.page.limit) ||
+    query.page.limit < 1 ||
+    query.page.limit > MAX_PAGE_SIZE
+  )
     throw new InvalidError("query page limit is invalid")
-  if (query.page.offset !== undefined && query.page.cursor !== undefined)
-    throw new InvalidError("query page cannot contain both an offset and a cursor")
-  if (query.page.cursor !== undefined) validateCursor(query.page.cursor)
+  if (query.page.offset !== undefined && query.page.offset > BigInt(MAX_QUERY_OFFSET))
+    throw new InvalidError(`query offset exceeds cap ${String(MAX_QUERY_OFFSET)}`)
   for (const [label, count] of [
     ["exact matches", query.byKey.length],
     ["sort fields", query.order.length],
@@ -779,9 +647,9 @@ export function validateQuery(query: Query): void {
     typedValueValidateCanonical(match.value)
   }
   if (query.messageType !== undefined) validateName(query.messageType)
-  if (query.timeRange !== undefined && query.timeRange[0] >= query.timeRange[1])
+  if (query.timeRange !== undefined && query.timeRange[0] > query.timeRange[1])
     throw new InvalidError(
-      "query time range start must be before its end, and both bounds are inclusive"
+      "query time range start must not be after its end, and both bounds are inclusive"
     )
   for (const sort of query.order) validateName(sort.field)
   for (const field of query.select.fields) validateName(field)
@@ -806,6 +674,7 @@ export function validateQuery(query: Query): void {
       query.vector.embedding.length === 0 ||
       query.vector.embedding.length > MAX_VECTOR_DIMENSIONS ||
       query.vector.embedding.some((value) => !Number.isFinite(value) || Object.is(value, -0)) ||
+      !Number.isSafeInteger(query.vector.topK) ||
       query.vector.topK < 1 ||
       query.vector.topK > MAX_PAGE_SIZE
     )
@@ -837,6 +706,23 @@ export function validateQuery(query: Query): void {
   visit(query.having)
   if (query.having !== undefined && query.aggregate === undefined)
     throw new InvalidError("having requires an aggregate")
+  const shapes = [
+    query.text !== undefined,
+    query.vector !== undefined,
+    query.aggregate !== undefined,
+    query.distinct
+  ].filter(Boolean).length
+  if (shapes > 1)
+    throw new InvalidError("a query takes at most one of text, vector, aggregate and distinct")
+  if (query.text !== undefined && (query.order.length > 0 || query.page.wantTotal))
+    throw new InvalidError("a text query ranks by relevance and takes no order or total")
+  if (
+    query.vector !== undefined &&
+    (query.order.length > 0 || query.page.wantTotal || (query.page.offset ?? 0n) > 0n)
+  )
+    throw new InvalidError(
+      "a vector query returns its nearest rows and takes no order, offset or total"
+    )
   if (query.aggregate !== undefined) {
     if (
       query.aggregate.funcs.length === 0 ||
@@ -907,33 +793,10 @@ export function validateQueryEnvelope(envelope: QueryEnvelope): void {
   validateQuery(envelope.query)
 }
 
-export function validateQueryPageEnvelope(envelope: QueryPageEnvelope): void {
-  validateQueryControl(envelope.v, envelope.executionId)
-  validateCursor(envelope.cursor)
-  if (envelope.deadlineMicros === 0n) throw new InvalidError("query page deadline must be nonzero")
-}
-
-export function validateQueryCancelEnvelope(envelope: QueryCancelEnvelope): void {
-  validateQueryControl(envelope.v, envelope.executionId)
-}
-
-export function validateQueryStatusEnvelope(envelope: QueryStatusEnvelope): void {
-  validateQueryControl(envelope.v, envelope.executionId)
-}
-
 function validateQueryControl(version: number, executionId: QueryExecutionId): void {
   if (version !== QUERY_OP_VERSION)
     throw new InvalidError(`query version must be ${String(QUERY_OP_VERSION)}`)
   if (executionId.asU128() === 0n) throw new InvalidError("query execution id must be nonzero")
-}
-
-function validateCursor(cursor: string): void {
-  if (
-    cursor.length === 0 ||
-    byteLength(cursor) > MAX_QUERY_CURSOR_BYTES ||
-    hasControlCharacter(cursor)
-  )
-    throw new InvalidError("query cursor is invalid")
 }
 
 export function encodeQueryEnvelope(envelope: QueryEnvelope): Map<string, unknown> {
@@ -967,39 +830,18 @@ export interface Page {
   readonly limit: number
   readonly total?: bigint
   readonly hasMore: boolean
-  readonly nextCursor?: string
 }
 export interface QueryEngine {
   readonly name: string
   readonly version: string
   readonly dialect?: SqlDialect
 }
-export type ResolvedQueryTarget =
-  | {
-      readonly kind: "operational"
-      readonly index: string
-      readonly backendResourceId: BackendResourceId
-      readonly backendGeneration: bigint
-      readonly runtimeConfigurationRevision: bigint
-    }
-  | {
-      readonly kind: "lakehouse"
-      readonly destinationId: DestinationId
-      readonly destinationGeneration: bigint
-      readonly backendResourceId: BackendResourceId
-      readonly backendGeneration: bigint
-      readonly runtimeConfigurationRevision: bigint
-      readonly tableUuid: Uint8Array
-      readonly namespace: readonly string[]
-      readonly table: string
-      readonly snapshotId: bigint
-      readonly schemaId: number
-      readonly partitionSpecId: number
-    }
-export type BoundaryRelation = "current" | "historical" | "ahead_of_observed_checkpoint"
-export interface MaterializationBoundary {
-  readonly digest: Uint8Array
-  readonly relationToCurrent: BoundaryRelation
+export interface ResolvedQueryTarget {
+  readonly kind: "operational"
+  readonly index: string
+  readonly backendResourceId: BackendResourceId
+  readonly backendGeneration: bigint
+  readonly runtimeConfigurationRevision: bigint
 }
 export interface QueryContext {
   readonly executionId: QueryExecutionId
@@ -1007,9 +849,6 @@ export interface QueryContext {
   readonly resolvedTarget: ResolvedQueryTarget
   readonly requestedConsistency: Consistency
   readonly deliveredConsistency: Consistency
-  readonly boundary?: MaterializationBoundary
-  readonly checkpointRevision?: bigint
-  readonly globalStateRevision?: bigint
   readonly truncated: boolean
   readonly elapsedMicros: bigint
   readonly scannedBytes: bigint
@@ -1059,19 +898,16 @@ function encodePage(value: Page): Map<string, unknown> {
   map.set("limit", value.limit)
   optional(map, "total", value.total)
   map.set("has_more", value.hasMore)
-  optional(map, "next_cursor", value.nextCursor)
   return map
 }
 function decodePage(map: CborMap, context: string): Page {
   const offset = field.optionalU64(map, "offset", context)
   const total = field.optionalU64(map, "total", context)
-  const nextCursor = field.optionalString(map, "next_cursor", context)
   return {
     ...(offset === undefined ? {} : { offset }),
     limit: field.requiredU32(map, "limit", context),
     ...(total === undefined ? {} : { total }),
-    hasMore: field.requiredBoolean(map, "has_more", context),
-    ...(nextCursor === undefined ? {} : { nextCursor })
+    hasMore: field.requiredBoolean(map, "has_more", context)
   }
 }
 function encodeEngine(value: QueryEngine): Map<string, unknown> {
@@ -1083,12 +919,7 @@ function encodeEngine(value: QueryEngine): Map<string, unknown> {
   return map
 }
 function decodeEngine(map: CborMap, context: string): QueryEngine {
-  const dialect = decodeOptionalWord(map, "dialect", context, [
-    "data_fusion",
-    "postgres",
-    "my_sql",
-    "sqlite"
-  ])
+  const dialect = decodeOptionalWord(map, "dialect", context, ["postgres", "my_sql", "sqlite"])
   return {
     name: field.requiredString(map, "name", context),
     version: field.requiredString(map, "version", context),
@@ -1096,18 +927,10 @@ function decodeEngine(map: CborMap, context: string): QueryEngine {
   }
 }
 function encodeResolvedTarget(value: ResolvedQueryTarget): Map<string, unknown> {
-  const map = mapOf([["kind", value.kind]])
-  if (value.kind === "operational") map.set("index", value.index)
-  else {
-    map.set("destination_id", idBytes(value.destinationId))
-    map.set("destination_generation", value.destinationGeneration)
-    map.set("table_uuid", value.tableUuid)
-    map.set("namespace", [...value.namespace])
-    map.set("table", value.table)
-    map.set("snapshot_id", value.snapshotId)
-    map.set("schema_id", value.schemaId)
-    map.set("partition_spec_id", value.partitionSpecId)
-  }
+  const map = mapOf([
+    ["kind", value.kind],
+    ["index", value.index]
+  ])
   map.set("backend_resource_id", idBytes(value.backendResourceId))
   map.set("backend_generation", value.backendGeneration)
   map.set("runtime_configuration_revision", value.runtimeConfigurationRevision)
@@ -1124,21 +947,6 @@ function decodeResolvedTarget(map: CborMap, context: string): ResolvedQueryTarge
   }
   if (kind === "operational")
     return { kind, index: field.requiredString(map, "index", context), ...common }
-  if (kind === "lakehouse")
-    return {
-      kind,
-      destinationId: DestinationId.fromBytes(field.requiredBytes(map, "destination_id", context)),
-      destinationGeneration: field.requiredU64(map, "destination_generation", context),
-      ...common,
-      tableUuid: fixedBytes(field.requiredBytes(map, "table_uuid", context), 16, context),
-      namespace: field.requiredArray(map, "namespace", context, (item, index) =>
-        expectString(item, `${context}.namespace[${String(index)}]`)
-      ),
-      table: field.requiredString(map, "table", context),
-      snapshotId: field.requiredI64(map, "snapshot_id", context),
-      schemaId: field.requiredI32(map, "schema_id", context),
-      partitionSpecId: field.requiredI32(map, "partition_spec_id", context)
-    }
   throw new CodecError(`unknown resolved target \`${kind}\``, context, "kind")
 }
 function encodeContext(value: QueryContext): Map<string, unknown> {
@@ -1149,14 +957,6 @@ function encodeContext(value: QueryContext): Map<string, unknown> {
     ["requested_consistency", value.requestedConsistency],
     ["delivered_consistency", value.deliveredConsistency]
   ])
-  optional(map, "boundary", value.boundary, (item) =>
-    mapOf([
-      ["digest", item.digest],
-      ["relation_to_current", item.relationToCurrent]
-    ])
-  )
-  optional(map, "checkpoint_revision", value.checkpointRevision)
-  optional(map, "global_state_revision", value.globalStateRevision)
   map.set("truncated", value.truncated)
   map.set("elapsed_micros", value.elapsedMicros)
   map.set("scanned_bytes", value.scannedBytes)
@@ -1179,9 +979,6 @@ function encodeContext(value: QueryContext): Map<string, unknown> {
   return map
 }
 function decodeContext(map: CborMap, context: string): QueryContext {
-  const boundary = field.optionalMap(map, "boundary", context)
-  const checkpointRevision = field.optionalU64(map, "checkpoint_revision", context)
-  const globalStateRevision = field.optionalU64(map, "global_state_revision", context)
   return {
     executionId: QueryExecutionId.fromBytes(field.requiredBytes(map, "execution_id", context)),
     engine: decodeEngine(field.requiredMap(map, "engine", context), `${context}.engine`),
@@ -1191,28 +988,12 @@ function decodeContext(map: CborMap, context: string): QueryContext {
     ),
     requestedConsistency: decodeWord(map, "requested_consistency", context, [
       "eventual",
-      "read_your_writes",
-      "strong"
+      "read_your_writes"
     ]),
     deliveredConsistency: decodeWord(map, "delivered_consistency", context, [
       "eventual",
-      "read_your_writes",
-      "strong"
+      "read_your_writes"
     ]),
-    ...(boundary === undefined
-      ? {}
-      : {
-          boundary: {
-            digest: fixedBytes(field.requiredBytes(boundary, "digest", context), 32, context),
-            relationToCurrent: decodeWord(boundary, "relation_to_current", context, [
-              "current",
-              "historical",
-              "ahead_of_observed_checkpoint"
-            ])
-          }
-        }),
-    ...(checkpointRevision === undefined ? {} : { checkpointRevision }),
-    ...(globalStateRevision === undefined ? {} : { globalStateRevision }),
     truncated: field.requiredBoolean(map, "truncated", context),
     elapsedMicros: field.requiredU64(map, "elapsed_micros", context),
     scannedBytes: field.requiredU64(map, "scanned_bytes", context),
@@ -1283,9 +1064,6 @@ export function validateQueryResult(result: QueryResult): void {
   validateQueryContext(result.context)
   if (result.page.limit < 1 || result.page.limit > MAX_PAGE_SIZE)
     throw new InvalidError("query result page limit is invalid")
-  if (result.page.hasMore !== (result.page.nextCursor !== undefined))
-    throw new InvalidError("query result has_more and next_cursor must agree")
-  if (result.page.nextCursor !== undefined) validateCursor(result.page.nextCursor)
 }
 
 function validateQueryContext(context: QueryContext): void {
@@ -1295,48 +1073,18 @@ function validateQueryContext(context: QueryContext): void {
   validateName(context.engine.version)
   const consistencyRank: Record<Consistency, number> = {
     eventual: 0,
-    read_your_writes: 1,
-    strong: 2
+    read_your_writes: 1
   }
   if (consistencyRank[context.deliveredConsistency] < consistencyRank[context.requestedConsistency])
     throw new InvalidError("delivered consistency is weaker than requested consistency")
   const target = context.resolvedTarget
-  if (target.kind === "operational") {
-    validateName(target.index)
-    if (
-      target.backendResourceId.asU128() === 0n ||
-      target.backendGeneration === 0n ||
-      target.runtimeConfigurationRevision === 0n
-    )
-      throw new InvalidError("operational query context is missing backend evidence")
-    if (
-      context.boundary !== undefined ||
-      context.checkpointRevision !== undefined ||
-      context.globalStateRevision !== undefined
-    )
-      throw new InvalidError("operational query context cannot carry lakehouse evidence")
-  } else {
-    if (
-      target.destinationId.asU128() === 0n ||
-      target.destinationGeneration === 0n ||
-      target.backendResourceId.asU128() === 0n ||
-      target.backendGeneration === 0n ||
-      target.runtimeConfigurationRevision === 0n ||
-      target.tableUuid.length !== 16 ||
-      target.namespace.length === 0 ||
-      target.snapshotId <= 0n ||
-      target.schemaId < 0 ||
-      target.partitionSpecId < 0 ||
-      context.boundary === undefined ||
-      context.checkpointRevision === undefined ||
-      context.globalStateRevision === undefined
-    )
-      throw new InvalidError("lakehouse query context is missing resolved target evidence")
-    for (const part of target.namespace) validateName(part)
-    validateName(target.table)
-  }
-  if (context.boundary !== undefined && context.boundary.digest.length !== 32)
-    throw new InvalidError("query materialization boundary digest must contain 32 bytes")
+  validateName(target.index)
+  if (
+    target.backendResourceId.asU128() === 0n ||
+    target.backendGeneration === 0n ||
+    target.runtimeConfigurationRevision === 0n
+  )
+    throw new InvalidError("operational query context is missing backend evidence")
 }
 export function queryResultFieldIndex(result: QueryResult, name: string): number | undefined {
   const index = result.fields.findIndex((item) => item.name === name)
@@ -1383,6 +1131,7 @@ export type QueryError =
   | {
       readonly kind:
         | "unsupported"
+        | "invalid"
         | "unauthorized"
         | "index_not_found"
         | "fork_not_found"
@@ -1396,6 +1145,7 @@ export type QueryError =
       readonly size: bigint
       readonly cap: bigint
     }
+  | { readonly kind: "schema_not_found"; readonly id: number }
   | { readonly kind: "version"; readonly expected: number; readonly got: number }
   | {
       readonly kind: "stale"
@@ -1403,20 +1153,12 @@ export type QueryError =
       readonly applied: bigint
       readonly required: bigint
     }
-  | { readonly kind: "cancelled" | "deadline_exceeded"; readonly executionId: QueryExecutionId }
-  | { readonly kind: "expired_snapshot"; readonly snapshotId: bigint }
+  | { readonly kind: "deadline_exceeded"; readonly executionId: QueryExecutionId }
   | {
       readonly kind: "stale_generation"
       readonly what: string
       readonly requested: bigint
       readonly observed: bigint
-    }
-  | { readonly kind: "target_unavailable"; readonly reason: string }
-  | {
-      readonly kind: "resource_limit"
-      readonly resource: string
-      readonly observed: bigint
-      readonly limit: bigint
     }
 export type QueryErrorCode = QueryError["kind"]
 export type QueryReply =
@@ -1432,9 +1174,42 @@ function snakeToRustVariant(value: string): string {
 function rustVariantToSnake(value: string): string {
   return value.replaceAll(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase()
 }
+/** The error text the Rust client shows for `error`. */
+export function describeQueryError(error: QueryError): string {
+  switch (error.kind) {
+    case "unsupported":
+      return `query not supported: ${error.message}`
+    case "invalid":
+      return `invalid query: ${error.message}`
+    case "unauthorized":
+      return `unauthorized: ${error.message}`
+    case "index_not_found":
+      return `index not found: ${error.message}`
+    case "fork_not_found":
+      return `fork not found: ${error.message}`
+    case "schema_not_found":
+      return `writer schema ${String(error.id)} is not registered`
+    case "backend":
+      return `backend error: ${error.message}`
+    case "unavailable":
+      return `temporarily unavailable: ${error.message}`
+    case "too_large":
+      return `result too large: ${error.what} ${String(error.size)} exceeds cap ${String(error.cap)}`
+    case "version":
+      return `unsupported envelope version (expected ${String(error.expected)}, got ${String(error.got)})`
+    case "stale":
+      return `stale read: ${error.what} applied ${String(error.applied)}, required ${String(error.required)}`
+    case "deadline_exceeded":
+      return `query ${error.executionId.toString()} exceeded its deadline`
+    case "stale_generation":
+      return `stale ${error.what} generation: requested ${String(error.requested)}, observed ${String(error.observed)}`
+  }
+}
+
 export function encodeQueryError(error: QueryError): Map<string, unknown> {
   const tag = snakeToRustVariant(error.kind)
   if ("message" in error) return mapOf([[tag, error.message]])
+  if (error.kind === "schema_not_found") return mapOf([[tag, BigInt(error.id)]])
   const body = new Map<string, unknown>()
   for (const [key, value] of Object.entries(error)) {
     if (key === "kind") continue
@@ -1449,6 +1224,7 @@ export function decodeQueryError(value: unknown, context: string): QueryError {
   if (
     [
       "unsupported",
+      "invalid",
       "unauthorized",
       "index_not_found",
       "fork_not_found",
@@ -1457,6 +1233,7 @@ export function decodeQueryError(value: unknown, context: string): QueryError {
     ].includes(kind)
   )
     return { kind: kind as "unsupported", message: expectString(body, context) }
+  if (kind === "schema_not_found") return { kind, id: expectU32(body, context) }
   const map = expectMap(body, context)
   switch (kind) {
     case "too_large":
@@ -1479,29 +1256,17 @@ export function decodeQueryError(value: unknown, context: string): QueryError {
         applied: field.requiredU64(map, "applied", context),
         required: field.requiredU64(map, "required", context)
       }
-    case "cancelled":
     case "deadline_exceeded":
       return {
         kind,
         executionId: QueryExecutionId.fromBytes(field.requiredBytes(map, "execution_id", context))
       }
-    case "expired_snapshot":
-      return { kind, snapshotId: field.requiredI64(map, "snapshot_id", context) }
     case "stale_generation":
       return {
         kind,
         what: field.requiredString(map, "what", context),
         requested: field.requiredU64(map, "requested", context),
         observed: field.requiredU64(map, "observed", context)
-      }
-    case "target_unavailable":
-      return { kind, reason: field.requiredString(map, "reason", context) }
-    case "resource_limit":
-      return {
-        kind,
-        resource: field.requiredString(map, "resource", context),
-        observed: field.requiredU64(map, "observed", context),
-        limit: field.requiredU64(map, "limit", context)
       }
     default:
       throw new CodecError(`unknown query error \`${tag}\``, context, "error")
@@ -1524,97 +1289,6 @@ export function decodeQueryReply(value: unknown, context: string): QueryReply {
 }
 export function decodeQueryReplyFrame(bytes: Uint8Array): QueryReply {
   return decodeQueryReply(decodeOne(bytes, "QueryReply"), "QueryReply")
-}
-
-export type QueryExecutionState =
-  "queued" | "planning" | "running" | "completed" | "cancelled" | "failed" | "expired"
-export interface QueryExecutionStatus {
-  readonly executionId: QueryExecutionId
-  readonly state: QueryExecutionState
-  readonly startedAtMicros: bigint
-  readonly finishedAtMicros?: bigint
-  readonly scannedBytes: bigint
-  readonly producedBytes: bigint
-  readonly rowCount: bigint
-  readonly error?: QueryError
-}
-export type QueryStatusReply =
-  | { readonly kind: "ok"; readonly status: QueryExecutionStatus }
-  | { readonly kind: "err"; readonly error: QueryError }
-export type QueryCancelReply = QueryStatusReply
-
-export function encodeQueryExecutionStatus(value: QueryExecutionStatus): Map<string, unknown> {
-  const map = mapOf([
-    ["execution_id", value.executionId.toBytes()],
-    ["state", value.state],
-    ["started_at_micros", value.startedAtMicros]
-  ])
-  optional(map, "finished_at_micros", value.finishedAtMicros)
-  map.set("scanned_bytes", value.scannedBytes)
-  map.set("produced_bytes", value.producedBytes)
-  map.set("row_count", value.rowCount)
-  optional(map, "error", value.error, encodeQueryError)
-  return map
-}
-export function decodeQueryExecutionStatus(map: CborMap, context: string): QueryExecutionStatus {
-  const finishedAtMicros = field.optionalU64(map, "finished_at_micros", context)
-  const error = map.get("error")
-  const status: QueryExecutionStatus = {
-    executionId: QueryExecutionId.fromBytes(field.requiredBytes(map, "execution_id", context)),
-    state: decodeWord(map, "state", context, [
-      "queued",
-      "planning",
-      "running",
-      "completed",
-      "cancelled",
-      "failed",
-      "expired"
-    ]),
-    startedAtMicros: field.requiredU64(map, "started_at_micros", context),
-    ...(finishedAtMicros === undefined ? {} : { finishedAtMicros }),
-    scannedBytes: field.requiredU64(map, "scanned_bytes", context),
-    producedBytes: field.requiredU64(map, "produced_bytes", context),
-    rowCount: field.requiredU64(map, "row_count", context),
-    ...(error === undefined ? {} : { error: decodeQueryError(error, `${context}.error`) })
-  }
-  validateQueryExecutionStatus(status)
-  return status
-}
-
-export function validateQueryExecutionStatus(status: QueryExecutionStatus): void {
-  if (status.executionId.asU128() === 0n || status.startedAtMicros === 0n)
-    throw new InvalidError("query execution identity and start time must be nonzero")
-  const terminal =
-    status.state === "completed" ||
-    status.state === "cancelled" ||
-    status.state === "failed" ||
-    status.state === "expired"
-  if (
-    (terminal &&
-      (status.finishedAtMicros === undefined ||
-        status.finishedAtMicros < status.startedAtMicros)) ||
-    (!terminal && status.finishedAtMicros !== undefined)
-  )
-    throw new InvalidError("query execution finish time does not match its state")
-  if ((status.state === "failed") !== (status.error !== undefined))
-    throw new InvalidError("query execution error must be present exactly for failed state")
-}
-export function encodeQueryStatusReplyFrame(reply: QueryStatusReply): Uint8Array {
-  return encodeNamed(
-    reply.kind === "ok"
-      ? mapOf([["Ok", encodeQueryExecutionStatus(reply.status)]])
-      : mapOf([["Err", encodeQueryError(reply.error)]])
-  )
-}
-export function decodeQueryStatusReply(value: unknown, context: string): QueryStatusReply {
-  const [tag, body] = singleVariantTag(value, context)
-  if (tag === "Ok")
-    return { kind: "ok", status: decodeQueryExecutionStatus(expectMap(body, context), context) }
-  if (tag === "Err") return { kind: "err", error: decodeQueryError(body, context) }
-  throw new CodecError(`unknown query status reply \`${tag}\``, context, "reply")
-}
-export function decodeQueryStatusReplyFrame(bytes: Uint8Array): QueryStatusReply {
-  return decodeQueryStatusReply(decodeOne(bytes, "QueryStatusReply"), "QueryStatusReply")
 }
 
 function decodeWord<const T extends string>(
@@ -1644,11 +1318,6 @@ function asU64(value: unknown, context: string): bigint {
   if (typeof value === "bigint" && value >= 0n) return value
   if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return BigInt(value)
   throw new CodecError("value must fit u64", context, "value")
-}
-function fixedBytes(value: Uint8Array, length: number, context: string): Uint8Array {
-  if (value.length !== length)
-    throw new CodecError(`expected ${String(length)} bytes`, context, "bytes")
-  return value
 }
 function validateName(value: string): void {
   if (
@@ -1683,7 +1352,7 @@ function hasDisallowedSqlControl(value: string): boolean {
 }
 
 export function parseConsistency(value: string, context: string): Consistency {
-  if (value === "eventual" || value === "read_your_writes" || value === "strong") return value
+  if (value === "eventual" || value === "read_your_writes") return value
   throw new CodecError(`unknown consistency \`${value}\``, context, "consistency")
 }
 export function consistencyToWord(value: Consistency): string {

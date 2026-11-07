@@ -14,6 +14,33 @@ AVRO_BLOB = json.dumps(
 )
 
 
+def test_given_json_schema_forms_when_validated_then_should_match_the_shared_cases():
+    path = Path(__file__).resolve().parents[3] / "wire/fixtures/schema_validation_cases.json"
+    for case in json.loads(path.read_text()):
+        schema = ls.CompiledSchema.compile(
+            {"kind": "json_schema", "schema": json.dumps(case["schema"])}
+        )
+        for value in case["accepted"]:
+            assert schema.validate_value(value), (case["name"], value)
+        for value in case["rejected"]:
+            assert not schema.validate_value(value), (case["name"], value)
+
+
+def test_given_an_avro_datum_with_trailing_bytes_when_decoded_then_should_reject_the_payload():
+    schema = ls.CompiledSchema.compile({"kind": "avro", "schema": '"long"'})
+    assert schema.decode(bytes([14])) == 7
+    with pytest.raises(ls.CodecError):
+        schema.decode(bytes([14, 0]))
+    assert not schema.validate(bytes([14, 0]))
+
+
+def test_given_invalid_utf8_inside_a_json_string_when_decoded_then_should_reject_the_payload():
+    schema = ls.CompiledSchema.compile({"kind": "json_schema", "schema": '{"type":"string"}'})
+    with pytest.raises(ls.CodecError):
+        schema.decode(bytes([34, 255, 34]))
+    assert not schema.validate(bytes([34, 255, 34]))
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
@@ -24,7 +51,7 @@ AVRO_BLOB = json.dumps(
         ("DEFAULT_LINGER_MS", 5),
         ("MIN_LINGER_MS", 1),
         ("DEFAULT_KEY_NAMESPACE", "agent.keys"),
-        ("DEFAULT_ATTEMPT_TIMEOUT_MS", 10_000),
+        ("DEFAULT_ATTEMPT_TIMEOUT_MS", 15_000),
         ("DEFAULT_SNAPSHOT_NAMESPACE", "agent.snapshots"),
         ("DEFAULT_SNAPSHOT_TOPIC", "agent.snapshots"),
         ("DEFAULT_MEMORY_TOPIC_TTL_MS", 30 * 24 * 60 * 60 * 1000),
@@ -57,8 +84,8 @@ def test_given_the_session_defaults_when_importing_then_should_match_the_rust_va
 
 
 @pytest.mark.parametrize("name", ["cursor_paging", "cancellation", "execution_status"])
-def test_given_capabilities_when_reading_query_execution_then_should_expose_the_rust_fields(name):
-    assert getattr(ls.Capabilities.OPEN.query, name) is False
+def test_given_capabilities_when_reading_retired_query_execution_fields_then_should_be_absent(name):
+    assert not hasattr(ls.Capabilities.OPEN.query, name)
     assert inspect.isgetsetdescriptor(ls.Capabilities.hello)
 
 
@@ -71,6 +98,21 @@ def test_given_a_bounded_row_walk_when_iterating_then_should_be_a_lazy_async_ite
     cls = getattr(ls, walk)
     for method in ("__aiter__", "__anext__", "next"):
         assert callable(getattr(cls, method))
+
+
+def test_given_a_session_watch_when_iterating_then_should_be_an_async_iterator():
+    for method in ("__aiter__", "__anext__", "next"):
+        assert callable(getattr(ls.SessionWatch, method))
+
+
+def test_given_session_reads_when_inspected_then_should_page_by_page_and_results():
+    for read in ("list", "events"):
+        parameters = set(inspect.signature(getattr(ls.Sessions, read)).parameters)
+        assert {"page", "results", "as_of", "series"} <= parameters
+        assert not {"cursor", "limit", "total", "fixed_frontier"} & parameters
+    changes = set(inspect.signature(ls.Sessions.changes).parameters)
+    assert {"page", "results"} <= changes
+    assert not {"after", "limit", "series"} & changes
 
 
 def test_given_a_bytes_field_when_encoding_avro_then_should_write_avro_bytes():

@@ -8,14 +8,20 @@ import {
   KvExecutionError,
   UnsupportedError
 } from "../../src/client/errors.js"
-import { isUnsupported } from "../../src/client/error-classify.js"
+import {
+  code,
+  isRetryable,
+  isStale,
+  isUnsupported,
+  isVersionConflict
+} from "../../src/client/error-classify.js"
 import { INTERNAL_TRANSPORT } from "../../src/client/internals.js"
 import { Laser } from "../../src/client/laser.js"
 import type { IggyClient } from "../../src/iggy/apache-iggy.js"
 import { FencedLeaseClient, LeaseCoordinator } from "../../src/managed/coordination.js"
-import { Kv } from "../../src/managed/kv.js"
+import { Kv, KvCasRequest, LeaseGuard } from "../../src/managed/kv.js"
 import { KvStore, type StateStore } from "../../src/state-store.js"
-import { encodeBatchReply } from "../../src/wire/batch.js"
+import { decodeBatchRequest, encodeBatchReply } from "../../src/wire/batch.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import {
   KvCasCommand,
@@ -28,8 +34,18 @@ import {
   KvSetCommand
 } from "../../src/wire/commands.js"
 import { ConversationId as WireConversationId } from "../../src/wire/ids.js"
-import { type KvOutcome, type KvReply, decodeKvScan, encodeKvReply } from "../../src/wire/kv.js"
+import {
+  type KvOutcome,
+  type KvReply,
+  decodeKvCasFenced,
+  decodeKvDelete,
+  decodeKvGet,
+  decodeKvPatch,
+  decodeKvScan,
+  encodeKvReply
+} from "../../src/wire/kv.js"
 import { MAX_SCAN_LIMIT, MIN_LEASE_TTL_MICROS } from "../../src/wire/limits.js"
+import type { AppliedFrontier } from "../../src/wire/mutation.js"
 import { encode as encodeMessagePack } from "@msgpack/msgpack"
 
 // The shortest lifetime the contract will accept, and twice it for a request the
@@ -129,27 +145,33 @@ void test("given_json_and_send_when_set_is_called_then_should_encode_and_send_th
   )
 })
 
-void test("given_a_pinned_clock_when_ttl_is_set_then_should_encode_an_absolute_expiry", async () => {
-  const { kv: store, transport } = kv("sessions", [okFrame({ kind: "written" })])
-  await store.set(Uint8Array.of(1)).bytes(Uint8Array.of(2)).ttl(0.05, 100n).send()
+void test("given_a_ttl_when_set_then_should_send_it_relative_for_the_server_to_resolve", async () => {
+  const { kv: store, transport } = kv("sessions", [
+    okFrame({ kind: "written" }),
+    okFrame({ kind: "written" })
+  ])
+  await store.set(Uint8Array.of(1)).bytes(Uint8Array.of(2)).ttl(0.05).send()
   assert.deepEqual(
     transport.calls[0]?.payload,
     KvSetCommand.encode({
       namespace: "sessions",
       key: Uint8Array.of(1),
       value: Uint8Array.of(2),
-      expiresAtMicros: 150n
-    })
+      ttlMicros: 50n
+    }),
+    "a client clock never turns a TTL into an absolute expiry"
   )
-})
-
-void test("given_no_precondition_when_commit_is_called_then_should_reject_before_the_capability_gate", async () => {
-  const { kv: store, transport } = kv("sessions", [], { ...CAPS, kv: { ...CAPS.kv, cas: false } })
-  await assert.rejects(
-    () => store.set(Uint8Array.of(1)).bytes(Uint8Array.of(2)).commit(),
-    InvalidError
+  await store.set(Uint8Array.of(1)).bytes(Uint8Array.of(2)).ttl(0.05).expiresAt(7n).send()
+  assert.deepEqual(
+    transport.calls[1]?.payload,
+    KvSetCommand.encode({
+      namespace: "sessions",
+      key: Uint8Array.of(1),
+      value: Uint8Array.of(2),
+      expiresAtMicros: 7n
+    }),
+    "the later of the two expiry forms wins"
   )
-  assert.equal(transport.calls.length, 0)
 })
 
 void test("given_cas_not_advertised_when_commit_is_called_then_should_reject_as_unsupported", async () => {
@@ -262,8 +284,14 @@ void test("given_a_lease_coordinator_when_lease_is_called_then_should_validate_a
   )
   const shared = fakeTransport([])
   const store = Kv.create(shared, () => Promise.resolve(CAS_CAPS), "sessions", coordinator)
-  const lease = await store.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MS)
+  const before = performance.now()
+  const { validUntilMs, ...lease } = await store.lease(
+    Uint8Array.of(1),
+    "worker-1",
+    REQUESTED_TTL_MS
+  )
   assert.deepEqual(lease, { token: 5n, grantedTtlMs: MIN_LEASE_TTL_MICROS / 1_000, position })
+  assert.ok(validUntilMs >= before + lease.grantedTtlMs)
   assert.equal(frames.length, 1)
   assert.equal(shared.calls.length, 0, "acquisition never rides the shared connection")
   await assert.rejects(store.lease(new Uint8Array(), "worker-1", REQUESTED_TTL_MS), InvalidError)
@@ -282,8 +310,40 @@ void test("given_a_renewed_outcome_when_renew_lease_is_called_then_should_return
     [okFrame({ kind: "renewed", leaseToken: 42n, grantedTtlMicros: MIN_TTL_MICROS, position })],
     CAS_CAPS
   )
-  const lease = await store.renewLease(Uint8Array.of(1), "worker-1", 42n, REQUESTED_TTL_MS)
+  const before = performance.now()
+  const { validUntilMs, ...lease } = await store.renewLease(
+    Uint8Array.of(1),
+    "worker-1",
+    42n,
+    REQUESTED_TTL_MS
+  )
+  const after = performance.now()
   assert.deepEqual(lease, { token: 42n, grantedTtlMs: MIN_LEASE_TTL_MICROS / 1_000, position })
+  assert.ok(validUntilMs >= before + lease.grantedTtlMs)
+  assert.ok(validUntilMs <= after + lease.grantedTtlMs)
+})
+
+void test("given_a_lease_granted_over_the_coordination_connection_when_acquired_then_should_raise_the_shared_kv_frontier", async () => {
+  const position = { topicGeneration: 1n, partition: 0, offset: 9n }
+  const coordinator = new LeaseCoordinator(
+    new FencedLeaseClient({
+      send: () =>
+        Promise.resolve(
+          okFrame({ kind: "leased", leaseToken: 5n, grantedTtlMicros: MIN_TTL_MICROS, position })
+        ),
+      reset: () => Promise.resolve()
+    })
+  )
+  const observed: AppliedFrontier[] = []
+  const shared = {
+    ...fakeTransport([]),
+    observePositions: (frontier: AppliedFrontier) => {
+      observed.push(frontier)
+    }
+  }
+  const store = Kv.create(shared, () => Promise.resolve(CAS_CAPS), "sessions", coordinator)
+  await store.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MS)
+  assert.deepEqual(observed, [{ kv: position }], "a later read waits for the acquisition")
 })
 
 void test("given_lease_not_advertised_when_lease_is_called_then_should_reject_as_unsupported", async () => {
@@ -319,41 +379,54 @@ void test("given_a_deleted_many_outcome_when_delete_many_is_sent_then_should_ret
   assert.equal(await store.deleteMany().prefix(Uint8Array.of(1)).send(), 3)
 })
 
-void test("given_two_pages_when_scan_entries_is_called_then_should_follow_the_cursor_until_exhausted", async () => {
+const emptyPage = { items: [], page: 1, totalPages: 0, totalResults: 0 }
+
+void test("given_two_pages_when_scan_entries_is_called_then_should_read_each_page_number_until_the_last", async () => {
   const entryA = { key: Uint8Array.of(1), value: Uint8Array.of(1), version: 1n }
   const entryB = { key: Uint8Array.of(2), value: Uint8Array.of(2), version: 1n }
   const { kv: store, transport } = kv("sessions", [
-    okFrame({ kind: "page", page: { entries: [entryA], cursor: Uint8Array.of(9) } }),
-    okFrame({ kind: "page", page: { entries: [entryB] } })
+    okFrame({ kind: "page", page: { items: [entryA], page: 1, totalPages: 2, totalResults: 2 } }),
+    okFrame({ kind: "page", page: { items: [entryB], page: 2, totalPages: 2, totalResults: 2 } })
   ])
-  const entries = await store.scan().limit(1).entries()
+  const entries = await store.scan().results(1).entries()
   assert.equal(entries.length, 2)
-  assert.equal(transport.calls.length, 2)
+  const pages = transport.calls.map(
+    (call) => decodeKvScan(expectMap(decodeOne(call.payload, "scan"), "scan"), "scan").page
+  )
+  assert.deepEqual(pages, [1, 2], "the walk asks for page numbers, never a cursor")
 })
 
-void test("given_scan_fetch_when_called_then_should_return_one_page", async () => {
-  const { kv: store } = kv("sessions", [okFrame({ kind: "page", page: { entries: [] } })])
-  const page = await store.scan().fetch()
-  assert.deepEqual(page.entries, [])
-})
-
-void test("given_a_scan_limit_when_set_then_should_clamp_to_the_cap_and_refuse_non_integers", async () => {
+void test("given_a_page_number_when_scan_fetch_is_called_then_should_send_it_and_return_the_totals", async () => {
   const { kv: store, transport } = kv("sessions", [
-    okFrame({ kind: "page", page: { entries: [] } })
+    okFrame({ kind: "page", page: { items: [], page: 4, totalPages: 3, totalResults: 21 } })
   ])
+  const page = await store.scan().page(4).results(7).fetch()
+  assert.deepEqual(page, { items: [], page: 4, totalPages: 3, totalResults: 21 })
+  const sent = decodeKvScan(
+    expectMap(decodeOne(transport.calls[0]?.payload ?? new Uint8Array(), "scan"), "scan"),
+    "scan"
+  )
+  assert.deepEqual([sent.page, sent.results], [4, 7])
+})
+
+void test("given_a_scan_page_size_when_set_then_should_clamp_to_the_cap_and_refuse_non_integers", async () => {
+  const { kv: store, transport } = kv("sessions", [okFrame({ kind: "page", page: emptyPage })])
   await store
     .scan()
-    .limit(MAX_SCAN_LIMIT + 5)
+    .results(MAX_SCAN_LIMIT + 5)
     .fetch()
   const sent = decodeKvScan(
     expectMap(decodeOne(transport.calls[0]?.payload ?? new Uint8Array(), "scan"), "scan"),
     "scan"
   )
-  assert.equal(sent.limit, MAX_SCAN_LIMIT)
-  for (const limit of [-1, 1.5, Number.NaN]) {
-    assert.throws(() => store.scan().limit(limit), InvalidError, String(limit))
+  assert.equal(sent.results, MAX_SCAN_LIMIT)
+  for (const results of [-1, 1.5, Number.NaN]) {
+    assert.throws(() => store.scan().results(results), InvalidError, String(results))
   }
-  assert.doesNotThrow(() => store.scan().limit(0))
+  for (const page of [-1, 1.5, 2 ** 32]) {
+    assert.throws(() => store.scan().page(page), InvalidError, String(page))
+  }
+  assert.doesNotThrow(() => store.scan().results(0).page(0))
 })
 
 void test("given_an_unsupported_kv_error_reply_when_called_then_should_keep_the_kv_class_and_classify_as_unsupported", async () => {
@@ -385,24 +458,56 @@ void test("given_multiple_keys_when_get_many_is_called_then_should_decode_each_b
   assert.equal(transport.calls.length, 1)
 })
 
-void test("given_a_precondition_when_send_is_called_then_should_refuse_instead_of_dropping_it", async () => {
+void test("given_a_precondition_when_building_then_should_yield_a_compare_and_swap_that_only_commits", async () => {
   const { kv: store, transport } = kv("config", [])
-  await assert.rejects(
-    store.set(Uint8Array.of(1)).bytes(Uint8Array.of(2)).expectVersion(3n).send(),
-    (error: unknown) =>
-      error instanceof InvalidError && error.message.includes("call commit() instead")
-  )
-  await assert.rejects(store.set(Uint8Array.of(1)).expectAbsent().send(), InvalidError)
+  const requests = [
+    store.set(Uint8Array.of(1)).bytes(Uint8Array.of(2)).expectVersion(3n).ttl(5000),
+    store.set(Uint8Array.of(1)).expectAbsent()
+  ]
+  for (const request of requests) {
+    assert.ok(request instanceof KvCasRequest)
+    assert.equal("send" in request, false, "a compare-and-swap cannot be sent unconditionally")
+    await assert.rejects(
+      request.commit(),
+      (error: unknown) => error instanceof UnsupportedError && error.feature === "cas"
+    )
+  }
   assert.equal(transport.calls.length, 0)
 })
 
-void test("given_a_ttl_when_expire_is_called_then_should_encode_now_plus_the_ttl", async () => {
+void test("given_a_ttl_when_expire_is_called_then_should_send_it_relative", async () => {
   const { kv: store, transport } = kv("config", [okFrame({ kind: "versioned", version: 2n })])
-  assert.equal(await store.expire(Uint8Array.of(1), 0.05, 100n), 2n)
+  assert.equal(await store.expire(Uint8Array.of(1), 0.05), 2n)
   assert.deepEqual(
     transport.calls[0]?.payload,
-    KvExpireCommand.encode({ namespace: "config", key: Uint8Array.of(1), expiresAtMicros: 150n })
+    KvExpireCommand.encode({ namespace: "config", key: Uint8Array.of(1), ttlMicros: 50n })
   )
+})
+
+void test("given_a_session_linked_store_when_a_fenced_write_commits_then_should_carry_the_session_and_a_relative_ttl", async () => {
+  const { kv: store, transport } = kv(
+    "sessions",
+    [okFrame({ kind: "committed", version: 1n })],
+    CAS_CAPS
+  )
+  const session = {
+    stream: "orders",
+    session: WireConversationId.parse("01KWM3K3XEP3NP5TN850J17YBP")
+  }
+  await store
+    .inSession(session)
+    .casFenced(Uint8Array.of(1), "coord", Uint8Array.of(2), 3n)
+    .bytes(Uint8Array.of(9))
+    .ttl(1)
+    .expectAbsent()
+    .commit()
+  const sent = decodeKvCasFenced(
+    expectMap(decodeOne(transport.calls[0]?.payload ?? new Uint8Array(), "fenced"), "fenced"),
+    "fenced"
+  )
+  assert.deepEqual(sent.session, session, "a fenced write keeps the store's session link")
+  assert.equal(sent.ttlMicros, 1_000n)
+  assert.equal(sent.expiresAtMicros, undefined)
 })
 
 void test("given_an_absolute_time_when_expire_at_is_called_then_should_encode_it_unchanged", async () => {
@@ -496,4 +601,143 @@ void test("given_a_kv_store_when_used_as_a_state_store_then_should_read_write_wi
   assert.deepEqual(await states.get("cursor/agent-1"), Uint8Array.of(7))
   await states.delete("cursor/agent-1")
   assert.equal(transport.calls.length, 3)
+})
+
+void test("given_a_held_lease_or_an_unreachable_barrier_when_classified_then_should_neither_retry_nor_report_a_version_conflict", () => {
+  const held = new KvExecutionError("kv command failed: leaseHeld", {
+    kind: "leaseHeld",
+    expiresAtMicros: 5n
+  })
+  assert.deepEqual(code(held), { kind: "known", name: "Conflict" })
+  assert.equal(isVersionConflict(held), false, "a held key is not a compare-and-swap miss")
+  const unreachable = new KvExecutionError("kv command failed: barrierUnreachable", {
+    kind: "barrierUnreachable",
+    required: { topicGeneration: 1n, partition: 0, offset: 2n }
+  })
+  assert.deepEqual(code(unreachable), { kind: "known", name: "StaleGeneration" })
+  assert.equal(isRetryable(unreachable), false, "no wait reaches a position on an older log")
+  assert.equal(isStale(unreachable), false)
+})
+
+void test("given_a_version_when_deleting_or_patching_conditionally_then_should_send_it_as_if_match", async () => {
+  const { kv: store, transport } = kv(
+    "sessions",
+    [okFrame({ kind: "deleted", removed: true }), okFrame({ kind: "versioned", version: 4n })],
+    CAS_CAPS
+  )
+  assert.equal(await store.deleteIfVersion(Uint8Array.of(1), 3n), true)
+  assert.equal(await store.patchIfVersion(Uint8Array.of(2), new TextEncoder().encode("{}"), 3n), 4n)
+  const [deleted, patched] = transport.calls.map((call) =>
+    expectMap(decodeOne(call.payload, "request"), "request")
+  )
+  assert.equal(decodeKvDelete(deleted ?? new Map(), "delete").ifMatch, 3n)
+  assert.equal(decodeKvPatch(patched ?? new Map(), "patch").ifMatch, 3n)
+})
+
+void test("given_a_held_key_when_try_lease_is_called_then_should_answer_undefined_instead_of_failing", async () => {
+  const coordinator = new LeaseCoordinator(
+    new FencedLeaseClient({
+      send: () =>
+        Promise.resolve(
+          replyFrame({ kind: "err", error: { kind: "leaseHeld", expiresAtMicros: 9n } })
+        ),
+      reset: () => Promise.resolve()
+    })
+  )
+  const store = Kv.create(
+    fakeTransport([]),
+    () => Promise.resolve(CAS_CAPS),
+    "sessions",
+    coordinator
+  )
+  assert.equal(await store.tryLease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MS), undefined)
+  await assert.rejects(
+    store.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MS),
+    (error: unknown) =>
+      error instanceof KvExecutionError &&
+      (error.detail as { readonly kind: string }).kind === "leaseHeld"
+  )
+})
+
+void test("given_a_held_version_when_read_if_changed_then_should_send_if_none_match_and_type_both_answers", async () => {
+  const entry = { key: Uint8Array.of(1), value: Uint8Array.of(9), version: 5n }
+  const { kv: store, transport } = kv("sessions", [
+    okFrame({ kind: "notModified" }),
+    okFrame({ kind: "value", entry })
+  ])
+  assert.deepEqual(await store.getEntryIfChanged(Uint8Array.of(1), 4n), { kind: "notModified" })
+  assert.deepEqual(await store.getEntryIfChanged(Uint8Array.of(1), 4n), { kind: "changed", entry })
+  const sent = decodeKvGet(
+    expectMap(decodeOne(transport.calls[0]?.payload ?? new Uint8Array(), "get"), "get"),
+    "get"
+  )
+  assert.equal(sent.ifNoneMatch, 4n)
+})
+
+void test("given_a_seen_kv_frontier_when_get_many_is_called_then_should_carry_it_on_each_read", async () => {
+  const position = { topicGeneration: 1n, partition: 0, offset: 41n }
+  const slot = okFrame({ kind: "value" })
+  const batchFrame = encodeNamed(encodeBatchReply({ results: [slot, slot] }))
+  const minPositions = async (capabilities: Capabilities) => {
+    const transport = { ...fakeTransport([batchFrame]), seenPositions: () => ({ kv: position }) }
+    await Kv.create(transport, () => Promise.resolve(capabilities), "sessions").getMany([
+      Uint8Array.of(1),
+      Uint8Array.of(2)
+    ])
+    const batch = decodeBatchRequest(
+      expectMap(decodeOne(transport.calls[0]?.payload ?? new Uint8Array(), "batch"), "batch"),
+      "batch"
+    )
+    return batch.ops.map(
+      (item) => decodeKvGet(expectMap(decodeOne(item.payload, "get"), "get"), "get").minPosition
+    )
+  }
+  assert.deepEqual(
+    await minPositions(CAS_CAPS),
+    [position, position],
+    "a batch read sees the writes"
+  )
+  assert.deepEqual(
+    await minPositions(CAPS),
+    [undefined, undefined],
+    "a deployment without the barrier gets no frontier it would ignore"
+  )
+})
+
+void test("given_a_lease_guard_when_disposed_then_should_release_once_and_never_after_the_lease_was_lost", async () => {
+  const position = { topicGeneration: 1n, partition: 0, offset: 1n }
+  const granted = {
+    token: 7n,
+    grantedTtlMs: 1_000,
+    position,
+    validUntilMs: performance.now() + 1_000
+  }
+  const released: bigint[] = []
+  let renewal: "renewed" | "lost" = "renewed"
+  const store = {
+    renewLease: () =>
+      renewal === "renewed"
+        ? Promise.resolve({ ...granted, validUntilMs: performance.now() + 1_000 })
+        : Promise.reject(
+            new KvExecutionError("kv command failed: leaseLost", { kind: "leaseLost" })
+          ),
+    release: (_key: Uint8Array, _holder: string, token: bigint) => {
+      released.push(token)
+      return Promise.resolve(true)
+    }
+  }
+  {
+    await using guard = LeaseGuard.create(store, Uint8Array.of(1), "worker-1", granted)
+    await guard.renew(1_000)
+  }
+  assert.deepEqual(released, [7n], "leaving the scope releases the lease")
+  const explicit = LeaseGuard.create(store, Uint8Array.of(1), "worker-1", granted)
+  assert.equal(await explicit.release(), true)
+  await explicit[Symbol.asyncDispose]()
+  assert.deepEqual(released, [7n, 7n], "a released guard does not release again")
+  renewal = "lost"
+  const lost = LeaseGuard.create(store, Uint8Array.of(1), "worker-1", granted)
+  await assert.rejects(lost.renew(1_000), KvExecutionError)
+  await lost[Symbol.asyncDispose]()
+  assert.deepEqual(released, [7n, 7n], "a lost lease is not released over its successor")
 })

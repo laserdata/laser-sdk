@@ -13,7 +13,12 @@ import {
 import { Laser } from "../../src/client/laser.js"
 import type { IggyClient, LaserTransport } from "../../src/iggy/apache-iggy.js"
 import { Filters } from "../../src/managed/filters.js"
-import { ConsumerGroup, GroupFilter, type GroupContext } from "../../src/stream/consumer-group.js"
+import {
+  ConsumerGroup,
+  GroupFilter,
+  type GroupContext,
+  supersedesPosition
+} from "../../src/stream/consumer-group.js"
 import type { ConsumerStart } from "../../src/stream/consumer-start.js"
 import { Topic } from "../../src/stream/topic.js"
 import { type CborMap, decodeOne, encodeNamed, expectMap, field } from "../../src/wire/cbor.js"
@@ -62,7 +67,6 @@ const capabilities: Capabilities = {
     kv: 1,
     fork: 1,
     graph: 1,
-    checkpoint: 1,
     agent: 1,
     filter: 1,
     features: 0n
@@ -516,14 +520,19 @@ function ownerSetup(rows: readonly FilterSummary[]) {
           failNextLookup = false
           return Promise.reject(new TransportError("catalog page unavailable", true))
         }
-        const pageSize = field.requiredU32(request, "page_size", "list")
+        const results = field.requiredU32(request, "results", "list")
         return Promise.resolve(
           encodeNamed(
             encodeFilterCatalogReply({
               kind: "ok",
               outcome: {
                 kind: "filters",
-                page: { items: items.slice(0, pageSize), page: 0, pageSize, total: items.length }
+                page: {
+                  items: items.slice(0, results),
+                  page: 1,
+                  totalPages: Math.ceil(items.length / results),
+                  totalResults: items.length
+                }
               }
             })
           )
@@ -603,9 +612,10 @@ void test("given_a_group_with_its_own_filter_when_summarized_then_should_look_it
   assert.deepEqual(await fixture.filter.summary(), own)
   const [lookup] = fixture.lookups
   assert.ok(lookup !== undefined)
-  assert.deepEqual([...lookup.keys()], ["v", "owner", "page", "page_size"])
+  assert.deepEqual([...lookup.keys()], ["v", "owner", "page", "results"])
   assert.equal(lookup.has("name_contains"), false, "no filter is looked up by a derived name")
-  assert.equal(field.requiredU32(lookup, "page_size", "list"), 1)
+  assert.equal(field.requiredU32(lookup, "page", "list"), 1, "pages count from 1")
+  assert.equal(field.requiredU32(lookup, "results", "list"), 1)
   assert.equal(
     field.requiredU64(expectMap(lookup.get("owner"), "owner"), "group_id", "owner"),
     fixture.ownIdentity.groupId
@@ -672,11 +682,7 @@ void test("given_a_named_definition_when_the_group_is_created_or_configured_then
   const names: string[] = []
   const fixture = setup({
     mutate: (request) => {
-      if (
-        request.mutation.kind === "configure_group" &&
-        request.mutation.policy.kind === "definition"
-      )
-        names.push(request.mutation.policy.name)
+      if (request.mutation.kind === "configure_group") names.push(request.mutation.policy.name)
       return applied(request.operationId)
     }
   })
@@ -726,4 +732,16 @@ void test("given_a_topic_when_addressing_its_group_then_should_hand_back_the_sam
   const group = topic.consumerGroup("workers")
   assert.equal(group.topic, topic)
   assert.equal(topic.consumerGroupId(7n).topic, topic)
+})
+
+void test("given_catalog_replies_that_arrive_reversed_across_a_recreated_log_when_remembered_then_should_keep_the_later_revision", () => {
+  const later = { partitionId: 0, offset: 5n, operationId: 2n, revision: 2n }
+  const earlier = { partitionId: 0, offset: 900n, operationId: 1n, revision: 1n }
+  assert.equal(supersedesPosition(later, earlier), false)
+  assert.equal(supersedesPosition(earlier, later), true)
+})
+
+void test("given_a_group_filter_when_inspected_then_should_offer_no_revision_drafts", () => {
+  assert.equal("revise" in GroupFilter.prototype, false)
+  assert.equal(typeof GroupFilter.prototype.setRevisionEnabled, "function")
 })

@@ -1,4 +1,5 @@
 import { BARE_SCOPE, type ResourceScope } from "../client/resource-scope.js"
+import { type CallOptions, cancellable } from "../client/call-options.js"
 import type { Capabilities } from "../client/capabilities.js"
 import { ForkExecutionError, InvalidError, ProtocolError } from "../client/errors.js"
 import { executeManaged, type ManagedTransport } from "../client/managed.js"
@@ -22,9 +23,10 @@ async function executeFork<Request>(
   backend: ManagedTransport,
   capabilities: Capabilities,
   command: ManagedCommand<Request, ForkReply>,
-  request: Request
+  request: Request,
+  options: CallOptions
 ): Promise<ForkOutcome> {
-  const reply = await executeManaged(backend, capabilities, command, request)
+  const reply = await executeManaged(backend, capabilities, command, request, options)
   if (reply.kind === "ok") return reply.outcome
   if (reply.kind === "err")
     throw new ForkExecutionError(`fork command failed: ${reply.error.kind}`, reply.error)
@@ -39,9 +41,17 @@ function unexpected(op: string, outcome: ForkOutcome): ProtocolError {
 
 async function fetchForks(
   backend: ManagedTransport,
-  capabilities: Capabilities
+  capabilities: Capabilities,
+  scope: ResourceScope,
+  options: CallOptions
 ): Promise<readonly ForkInfo[]> {
-  const outcome = await executeFork(backend, capabilities, ForkListCommand, undefined)
+  const outcome = await executeFork(
+    backend,
+    capabilities,
+    ForkListCommand,
+    scope.stream !== undefined ? { stream: scope.stream } : {},
+    options
+  )
   if (outcome.kind === "list") return outcome.forks
   throw unexpected("list", outcome)
 }
@@ -77,10 +87,11 @@ export class ForkHandle {
   static async forks(
     backend: ManagedTransport,
     getCapabilities: () => Promise<Capabilities>,
-    scope: ResourceScope = BARE_SCOPE
+    scope: ResourceScope = BARE_SCOPE,
+    options: CallOptions = {}
   ): Promise<readonly ForkInfo[]> {
-    const capabilities = await getCapabilities()
-    return (await fetchForks(backend, capabilities)).flatMap((fork) => {
+    const capabilities = await cancellable(options.signal, "fork list", getCapabilities)
+    return (await fetchForks(backend, capabilities, scope, options)).flatMap((fork) => {
       const id = scope.local(fork.forkId)
       if (id === undefined) return []
       const parent =
@@ -95,21 +106,29 @@ export class ForkHandle {
   }
 
   /** Applies speculative rows to the trunk and returns the applied row count. */
-  async promote(): Promise<number> {
-    const capabilities = await this.getCapabilities()
-    const outcome = await executeFork(this.backend, capabilities, ForkPromoteCommand, {
-      forkId: this.resourceId
-    })
+  async promote(options: CallOptions = {}): Promise<number> {
+    const capabilities = await cancellable(options.signal, "fork promote", this.getCapabilities)
+    const outcome = await executeFork(
+      this.backend,
+      capabilities,
+      ForkPromoteCommand,
+      { forkId: this.resourceId },
+      options
+    )
     if (outcome.kind === "promoted") return outcome.rows
     throw unexpected("promote", outcome)
   }
 
   /** Discards speculative rows and reports whether the fork existed. */
-  async squash(): Promise<boolean> {
-    const capabilities = await this.getCapabilities()
-    const outcome = await executeFork(this.backend, capabilities, ForkDeleteCommand, {
-      forkId: this.resourceId
-    })
+  async squash(options: CallOptions = {}): Promise<boolean> {
+    const capabilities = await cancellable(options.signal, "fork squash", this.getCapabilities)
+    const outcome = await executeFork(
+      this.backend,
+      capabilities,
+      ForkDeleteCommand,
+      { forkId: this.resourceId },
+      options
+    )
     if (outcome.kind === "deleted") return outcome.removed
     throw unexpected("squash", outcome)
   }
@@ -176,15 +195,21 @@ export class ForkCreateRequest {
   }
 
   /** Opens the fork and returns its metadata. */
-  async send(): Promise<ForkInfo> {
+  async send(options: CallOptions = {}): Promise<ForkInfo> {
     validateForkId(this.forkId)
-    const capabilities = await this.getCapabilities()
-    const outcome = await executeFork(this.backend, capabilities, ForkCreateCommand, {
-      forkId: this.forkId,
-      kind: this.forkKind,
-      tables: this.forkTables,
-      ...(this.forkParent !== undefined ? { parent: this.forkParent } : {})
-    })
+    const capabilities = await cancellable(options.signal, "fork create", this.getCapabilities)
+    const outcome = await executeFork(
+      this.backend,
+      capabilities,
+      ForkCreateCommand,
+      {
+        forkId: this.forkId,
+        kind: this.forkKind,
+        tables: this.forkTables,
+        ...(this.forkParent !== undefined ? { parent: this.forkParent } : {})
+      },
+      options
+    )
     if (outcome.kind === "created") return outcome.info
     throw unexpected("create", outcome)
   }
@@ -266,21 +291,27 @@ export class ForkPutRequest {
   }
 
   /** Writes the speculative row. */
-  async send(): Promise<void> {
-    const capabilities = await this.getCapabilities()
-    const outcome = await executeFork(this.backend, capabilities, ForkPutCommand, {
-      forkId: this.forkId,
-      table: this.table,
-      partitionId: this.partitionId,
-      offset: this.offset,
-      projectionId: this.forkProjectionId,
-      projectionVersion: this.forkProjectionVersion,
-      fields: this.forkFields,
-      metadata: this.forkMetadata,
-      tombstone: this.forkTombstone,
-      ...(this.forkPayload !== undefined ? { payload: this.forkPayload } : {}),
-      ...(this.forkEmbedding !== undefined ? { embedding: this.forkEmbedding } : {})
-    })
+  async send(options: CallOptions = {}): Promise<void> {
+    const capabilities = await cancellable(options.signal, "fork put", this.getCapabilities)
+    const outcome = await executeFork(
+      this.backend,
+      capabilities,
+      ForkPutCommand,
+      {
+        forkId: this.forkId,
+        table: this.table,
+        partitionId: this.partitionId,
+        offset: this.offset,
+        projectionId: this.forkProjectionId,
+        projectionVersion: this.forkProjectionVersion,
+        fields: this.forkFields,
+        metadata: this.forkMetadata,
+        tombstone: this.forkTombstone,
+        ...(this.forkPayload !== undefined ? { payload: this.forkPayload } : {}),
+        ...(this.forkEmbedding !== undefined ? { embedding: this.forkEmbedding } : {})
+      },
+      options
+    )
     if (outcome.kind === "written") return
     throw unexpected("put_row", outcome)
   }

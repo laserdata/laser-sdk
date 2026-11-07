@@ -1,12 +1,13 @@
-import { HandlerConfigError, TimeoutError } from "../client/errors.js"
+import { type CallOptions, abortable } from "../client/call-options.js"
+import { ConfigError, HandlerConfigError, TimeoutError } from "../client/errors.js"
 import { INTERNAL_LAYOUTS } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import { MAX_DEFERRED_POLL_WAIT_MS } from "../iggy/apache-iggy.js"
 import { ConsumerGroupName, type AgentId } from "../types/ids.js"
 import type { ActionGovernor, GovernorMode, GovernorRetention } from "../govern.js"
-import type { SessionConfig } from "../session.js"
+import { SessionConfig } from "../session.js"
 import type { KeyRegistry, SigningKey } from "../signing.js"
-import type { CapabilityDescriptor } from "../wire/agent.js"
+import type { AgentCard, CapabilityDescriptor } from "../wire/agent.js"
 import { AGENT_SESSIONS } from "../wire/topics.js"
 import type { Consolidator } from "../memory/types.js"
 import {
@@ -21,6 +22,13 @@ import {
 import type { InboxRoute } from "./router.js"
 import { longTimeout } from "./timer.js"
 import { declaredAgentTopic } from "./partitioning.js"
+import { advertiseAgent } from "./scope.js"
+
+// A spawned agent's card stays fresh for this many heartbeats, so one missed
+// refresh does not read a live agent as dead.
+const CARD_TTL_HEARTBEATS = 3
+// The longest delay a Node timer holds before it fires at once instead.
+const MAX_TIMER_MS = 2_147_483_647
 
 export interface AgentDefinition {
   readonly id: AgentId
@@ -124,8 +132,8 @@ export class AgentHandle implements AsyncDisposable {
     return new AgentHandle(definition, laser)
   }
 
-  ready(): Promise<void> {
-    return this.readyPromise
+  ready(options: CallOptions = {}): Promise<void> {
+    return abortable(this.readyPromise, options.signal, "agent ready")
   }
 
   /** Stops intake, drains active handlers, and joins background work. */
@@ -154,8 +162,8 @@ export class AgentHandle implements AsyncDisposable {
     return this.shutdown()
   }
 
-  async join(): Promise<void> {
-    const outcome = await this.task
+  async join(options: CallOptions = {}): Promise<void> {
+    const outcome = await abortable(this.task, options.signal, "agent join")
     this.consolidationController.abort("agent stopped")
     await this.consolidationTask
     if (outcome.kind === "error") throw outcome.error
@@ -184,7 +192,7 @@ export class AgentHandle implements AsyncDisposable {
         signal.addEventListener("abort", onAbort, { once: true })
       })
       try {
-        await Promise.race([consolidator.consolidate({ agent }, signal), stopped])
+        await Promise.race([consolidator.consolidate({ agent }, { signal }), stopped])
       } catch {
         // Consolidation failures do not stop message handling.
       } finally {
@@ -219,9 +227,27 @@ export class AgentHandle implements AsyncDisposable {
               definition.governorRetention
             )
           : laser
-      if (definition.capabilities.length > 0) {
-        await scoped.agent(definition.id).advertise(definition.listenOn, definition.capabilities)
-      }
+      const heartbeatMs = (definition.sessions ?? new SessionConfig()).heartbeatValue
+      const card =
+        definition.capabilities.length > 0
+          ? await advertiseAgent(
+              scoped,
+              definition.id,
+              definition.listenOn,
+              definition.capabilities,
+              BigInt(Math.round(heartbeatMs * CARD_TTL_HEARTBEATS)) * 1_000n
+            )
+          : undefined
+      const refresh =
+        card === undefined
+          ? undefined
+          : setInterval(
+              () => {
+                scoped.publishCard(definition.id, card).catch(() => undefined)
+              },
+              Math.min(Math.max(1, heartbeatMs), MAX_TIMER_MS)
+            )
+      refresh?.unref()
       // The agent's session configuration declares its stream's layout on this
       // connection, and a declared agent of a per-agent topic layout reads its
       // own topic in place of the lane.
@@ -260,15 +286,20 @@ export class AgentHandle implements AsyncDisposable {
         ...(definition.verifier !== undefined ? { verifier: definition.verifier } : {}),
         ...(definition.signingKey !== undefined ? { signingKey: definition.signingKey } : {})
       })
-      await consumer.run(scoped, definition.handler, {
-        signal: this.shutdownController.signal,
-        hardSignal: this.hardStopController.signal,
-        hardAborted: () => this.hardStopped,
-        ready: () => {
-          this.readySettled = true
-          this.resolveReady()
-        }
-      })
+      try {
+        await consumer.run(scoped, definition.handler, {
+          signal: this.shutdownController.signal,
+          hardSignal: this.hardStopController.signal,
+          hardAborted: () => this.hardStopped,
+          ready: () => {
+            this.readySettled = true
+            this.resolveReady()
+          }
+        })
+      } finally {
+        clearInterval(refresh)
+        if (card !== undefined && !this.hardStopped) await withdraw(scoped, definition.id, card)
+      }
       if (!this.readySettled) this.resolveReady()
       return { kind: "ok" }
     } catch (error) {
@@ -508,7 +539,31 @@ export class AgentBuilder {
   }
 }
 
+// A stopped agent marks every skill on its card unavailable and clears its
+// presence, so routing stops choosing it before the card's ttl runs out.
+async function withdraw(laser: Laser, id: AgentId, card: AgentCard): Promise<void> {
+  try {
+    await laser.publishCard(id, {
+      ...card,
+      capabilities: card.capabilities.map((capability) => ({
+        ...capability,
+        health: { kind: "known", name: "Unavailable" }
+      }))
+    })
+  } catch {
+    // The card's ttl still retires it.
+  }
+  try {
+    await laser.clearPresence()
+  } catch {
+    // Presence also ends with the connection.
+  }
+}
+
 function validateDefinition(definition: AgentDefinition): void {
+  if (definition.ackOnPickup && definition.respondOn === undefined) {
+    throw new ConfigError("ackOnPickup requires respondOn, the topic the pickup status is sent on")
+  }
   if (!Number.isFinite(definition.shutdownGraceMs) || definition.shutdownGraceMs < 0) {
     throw new HandlerConfigError("shutdownGrace must be a non-negative finite number")
   }

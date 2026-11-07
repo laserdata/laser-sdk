@@ -41,7 +41,6 @@ impl QueryEngine {
     pub fn execute(&self, query: &Query) -> QueryResult {
         let index = match &query.target {
             QueryTarget::Operational { index } => index,
-            QueryTarget::Lakehouse { .. } => return empty_result(query, "lakehouse"),
             _ => return empty_result(query, "unsupported"),
         };
         let rows = self
@@ -275,7 +274,6 @@ fn render_result(query: &Query, index: &str, matched: Vec<StoredRow>) -> QueryRe
             limit: query.page.limit,
             total: query.page.want_total.then_some(total as u64),
             has_more,
-            next_cursor: has_more.then(|| format!("offset:{}", offset + rows.len())),
         },
         context: context(query, index, rows.len()),
         rows,
@@ -330,9 +328,6 @@ fn context(query: &Query, index: &str, row_count: usize) -> QueryContext {
         },
         requested_consistency: query.consistency,
         delivered_consistency: query.consistency,
-        boundary: None,
-        checkpoint_revision: None,
-        global_state_revision: None,
         truncated: false,
         elapsed_micros: 0,
         scanned_bytes: 0,
@@ -357,7 +352,6 @@ fn empty_result(query: &Query, index: &str) -> QueryResult {
             limit: query.page.limit,
             total: query.page.want_total.then_some(0),
             has_more: false,
-            next_cursor: None,
         },
         context: context(query, index, 0),
     }
@@ -444,7 +438,8 @@ mod tests {
     }
 
     #[test]
-    fn cursor_page_reports_exact_total_only_when_requested() {
+    fn given_a_limited_page_when_a_total_is_requested_then_should_report_more_rows_and_the_exact_total()
+     {
         let engine = seeded();
         let mut query = query_on("api_calls");
         query.page.limit = 2;
@@ -452,7 +447,7 @@ mod tests {
         let result = engine.execute(&query);
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.page.total, Some(4));
-        assert!(result.page.next_cursor.is_some());
+        assert!(result.page.has_more);
     }
 
     #[test]

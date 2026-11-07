@@ -1,6 +1,7 @@
 import type { BlobStore } from "../blob.js"
 import { checkIn } from "../blob.js"
 import { type BytesLike, ownedBytes } from "../client/bytes.js"
+import { type CallOptions, abortable, throwIfAborted } from "../client/call-options.js"
 import { InvalidError } from "../client/errors.js"
 import type { Provenance } from "../provenance/provenance.js"
 import type { CompiledSchema } from "../schema-codecs.js"
@@ -145,23 +146,32 @@ export class PublishRequest {
     return this
   }
 
-  async send(): Promise<SendMessagesResponse> {
+  async send(options: CallOptions = {}): Promise<SendMessagesResponse> {
     if (this.body === undefined) {
       throw new InvalidError(
         "publish() requires a body, call payload()/json()/msgpack()/rawBytes() before send()"
       )
     }
-    let payload = this.body
+    throwIfAborted(options.signal, "publish")
+    // The governor decides the body itself, before claim-check stores it and
+    // swaps in the capsule, so a payload policy never sees only the capsule.
+    let payload = await abortable(
+      this.topic.governPayload(this.body.slice(), this.provenanceValue),
+      options.signal,
+      "publish"
+    )
     if (this.claimCheckValue !== undefined) {
       const checked = await checkIn(
         this.claimCheckValue.store,
         this.claimCheckValue.thresholdBytes,
-        payload
+        payload,
+        options
       )
       payload = checked.payload
       if (checked.contentType !== undefined) this.record.contentType(checked.contentType)
     }
-    return this.topic.send(payload, {
+    return this.topic.sendGoverned(payload, {
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
       ...(this.key !== undefined ? { key: this.key } : {}),
       ...(this.partitionId !== undefined ? { partition: this.partitionId } : {}),
       ...(this.provenanceValue !== undefined ? { provenance: this.provenanceValue } : {}),
@@ -382,7 +392,8 @@ export class BatchPublishRequest {
     return this
   }
 
-  async send(): Promise<SendMessagesResponse> {
+  async send(options: CallOptions = {}): Promise<SendMessagesResponse> {
+    throwIfAborted(options.signal, "publish")
     if (this.entries.length === 0) return { confirmations: [] }
     const entries = this.entries.map(({ payload, record }, index) => {
       try {
@@ -391,6 +402,9 @@ export class BatchPublishRequest {
         throw new InvalidError(`record #${String(index)} is invalid`, { cause })
       }
     })
-    return this.topic.sendRecords(entries, this.key === undefined ? {} : { key: this.key })
+    return this.topic.sendRecords(entries, {
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
+      ...(this.key !== undefined ? { key: this.key } : {})
+    })
   }
 }

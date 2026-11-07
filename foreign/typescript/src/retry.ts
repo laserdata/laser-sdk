@@ -33,6 +33,11 @@ export function backoffDelay(backoff: Backoff, attempt: number): number {
 export const MANAGED_MUTATION: Backoff = { baseMs: 100, maxMs: 2_000 }
 export const MANAGED_MUTATION_DEADLINE_MS = 30_000
 
+/** The first attempt of a managed mutation gets this long before it counts as
+ * lost, the scale the route recheck uses, and each later one twice as long,
+ * never past the operation deadline, as Rust `MANAGED_ATTEMPT_FIRST`. */
+export const MANAGED_ATTEMPT_FIRST_MS = 1_000
+
 /** A reliable consumer or pause runtime reopens on this backoff, and gives up
  * after this many consecutive failures. */
 export const CONSUMER: Backoff = { baseMs: 50, maxMs: 1_000 }
@@ -56,3 +61,8 @@ export const QUERY_REPLY_GRACE_MS = 2_000
 
 /** Producers racing to create the same stream or topic retry this often. */
 export const CREATE_RACE_ATTEMPTS = 10
+
+/** How long a presence advertise or clear waits for the replica that holds
+ * the presence before it reports the replica unavailable and keeps the pin,
+ * as Rust `PRESENCE_ATTEMPT`. */
+export const PRESENCE_ATTEMPT_MS = 5_000

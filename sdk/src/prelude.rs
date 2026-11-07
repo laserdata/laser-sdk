@@ -20,10 +20,8 @@ pub use crate::context::Checkpoint;
 pub use crate::context_scope::{ContextScope, ScopedMemory};
 #[cfg(feature = "streaming")]
 pub use crate::cursor::Cursor;
-#[cfg(feature = "destinations")]
-pub use crate::destinations::Destinations;
 #[cfg(feature = "streaming")]
-pub use crate::filters::FilteredReader;
+pub use crate::filters::{FilteredReader, FilteredRecords};
 #[cfg(feature = "fork")]
 pub use crate::fork::ForkHandle;
 #[cfg(feature = "kv")]
@@ -37,7 +35,7 @@ pub use crate::message::Message;
 #[cfg(feature = "provenance")]
 pub use crate::provenance::{AgentTopic, Provenance};
 #[cfg(feature = "query")]
-pub use crate::query::{QueryResult, Row};
+pub use crate::query::{QueryResult, QueryRow, QueryRowSet, Row};
 #[cfg(feature = "streaming")]
 pub use crate::stream::ContentType;
 #[cfg(feature = "streaming")]
@@ -49,7 +47,7 @@ pub use crate::stream::{
 #[cfg(feature = "streaming")]
 pub use crate::typed::{TypedDecodeError, TypedRecord, TypedRecords, TypedTopic};
 #[cfg(feature = "watch")]
-pub use crate::watch::{Watch, WatchReader};
+pub use crate::watch::{Watch, WatchReader, WatchedChange};
 #[cfg(feature = "graph")]
 pub use laser_wire::graph::EdgeDir;
 
@@ -65,18 +63,19 @@ pub mod full {
     #[cfg(feature = "a2a-http")]
     pub use crate::a2a::A2aMethod;
     #[cfg(feature = "a2a-bridge")]
-    pub use crate::a2a::{A2aBridge, Artifact, Task, TaskState, TaskStatus};
+    pub use crate::a2a::{A2aBridge, Artifact, Part, Task, TaskState, TaskStatus};
     #[cfg(feature = "agent")]
     pub use crate::agent::AgentScope;
     #[cfg(feature = "agent")]
     pub use crate::agent::MemoryHandler;
     #[cfg(feature = "agent")]
     pub use crate::agent::{
-        Agdx, AgdxSend, AgdxStream, AgentMiddleware, AgentRegistry, CapabilitySelector,
-        ChunkAssembler, ConcurrencyPolicy, ContractBuilder, DeadLetterSink, Deduplicator, Gather,
-        GatherPolicy, InboxRoute, RegisteredCard, RetryPolicy, RouteCandidate, RouteScorer,
-        ScatterOutcome, ScatterReport, SessionPolicy, SlidingWindow, StepContext, StepFn,
-        StepHandle, StreamEvent, Verifier, WorkflowBudget, WorkflowOutcome,
+        Agdx, AgdxSend, AgdxStream, AgentMiddleware, AgentRegistry, ApprovalGrant,
+        CapabilitySelector, ChunkAssembler, ConcurrencyPolicy, ContractBuilder, DeadLetterSink,
+        Deduplicator, Gather, GatherPolicy, InboxRoute, RegisteredCard, RetryPolicy,
+        RouteCandidate, RouteScorer, ScatterOutcome, ScatterReport, SessionPolicy, SlidingWindow,
+        StepContext, StepFailure, StepFn, StepHandle, StreamEvent, Verifier, WorkflowBudget,
+        WorkflowOutcome,
     };
     #[cfg(feature = "agui")]
     pub use crate::agui::AgUiEvent;
@@ -91,6 +90,7 @@ pub mod full {
     pub use crate::filters::{
         ConsumerFilter, ExecutionMode, FaultPolicy, FilterBinding, FilterExpr, FilterGroupRef,
         FilteredReaderBuilder, FilteredStart, GroupFilterSpec, MatchedPage, MatchedRecord,
+        RecordEvaluation,
     };
     #[cfg(feature = "fork")]
     pub use crate::fork::{ForkInfo, ForkKind, ForkStatus};
@@ -101,6 +101,8 @@ pub mod full {
     };
     #[cfg(feature = "graph")]
     pub use crate::graph::GraphHandle;
+    #[cfg(feature = "projections")]
+    pub use crate::materialize::{Materialization, MaterializationWait, MaterializeRequest};
     #[cfg(feature = "mcp-http")]
     pub use crate::mcp::McpMethod;
     #[cfg(feature = "mcp-bridge")]
@@ -116,7 +118,7 @@ pub mod full {
     };
     #[cfg(feature = "projections")]
     pub use crate::projections::{
-        Bindings, Projections, ProjectionsRequest, RegisterSchemaRequest, Schemas,
+        Bindings, Projections, ProjectionsRequest, RegisterSchemaRequest, Schemas, SchemasRequest,
     };
     #[cfg(feature = "provenance")]
     pub use crate::provenance::{LlmUsage, ProvenanceError, keys};
@@ -125,8 +127,8 @@ pub mod full {
         AggCall, AggFunc, Aggregate, CmpOp, Dir, EdgeExtract, EntitySchema, FieldType, Filter,
         IndexField, IndexSchema, KeyMatch, NodeExtract, Page, Predicate, Projection,
         ProjectionBinding, ProjectionId, ProjectionInfo, ProjectionKind, Query, QueryError,
-        QueryRequest, RawSql, RetentionPolicy, SchemaDef, SchemaInfo, SchemaSource, Select, Sort,
-        SourceSelector, Value, VectorQuery, Window,
+        QueryRequest, RawSql, RetentionPolicy, SchemaDef, SchemaInfo, SchemaPage, SchemaSource,
+        Select, Sort, SourceSelector, Value, VectorQuery, Window,
     };
     #[cfg(all(feature = "agent", feature = "kv"))]
     pub use crate::snapshot::KvSnapshotStore;
@@ -140,37 +142,18 @@ pub mod full {
     };
     #[cfg(feature = "streaming")]
     pub use crate::stream::{ConsumerGroupInfo, CreateConsumerGroup};
-    #[cfg(feature = "destinations")]
-    pub use laser_wire::checkpoint::{
-        AttemptColumnMetrics, AttemptObject, CheckpointError, CheckpointMutationResult,
-        CheckpointOwnerId, CheckpointOwnerLease, CheckpointReadConsistency,
-        CheckpointRequestEnvelope, CheckpointRequestId, CompletedAttempt, CredentialGeneration,
-        DestinationBlock, DestinationBlockCode, DestinationCheckpointPage,
-        DestinationCheckpointStatus, DestinationCheckpointView, DestinationEffectiveState,
-        DestinationListFilter, IcebergCommitRequirement, PartitionCheckpoint,
-        PartitionLifecycleChange, PartitionLifecycleState, PreparedAttempt, PreparedAttemptId,
-        PreparedAttemptSummary, PreparedTableRequirements, PublicCheckpointMutation,
-        QueryRoutePage, RepairAction, RepairRecord, RetentionGap, SourceOffsetRange,
-    };
-    #[cfg(feature = "destinations")]
-    pub use laser_wire::destination::{
-        BackendBinding, BackendResourceId, DestinationDesiredState, DestinationErrorPolicy,
-        DestinationId, DestinationOperationId, FileFormat, MaterializationDestination,
-        NewPartitionPolicy, PartitionStart, PhysicalTable, ProjectionRef, QueryRoute, QueryRouteId,
-        QueryRouteTarget, RecreatedPartitionPolicy, StartPolicy, TableFormat,
-    };
+    #[cfg(feature = "projections")]
+    pub use laser_wire::destination::{BackendBinding, BackendResourceId};
     #[cfg(feature = "graph")]
     pub use laser_wire::graph::{
         EdgeId, GraphEdge, GraphNode, GraphResult, GraphReturn, NodeId, SourceRef,
     };
-    #[cfg(feature = "destinations")]
+    #[cfg(feature = "query")]
     pub use laser_wire::schema::{
         BinaryValue, DecimalValue, Digest32, FieldValue, LogicalField, LogicalSchema,
         LogicalSchemaId, LogicalSchemaRef, LogicalType, LogicalTypeKind, MapEntry,
         SchemaFingerprint, TypedValue, UuidValue,
     };
-    #[cfg(feature = "destinations")]
-    pub use laser_wire::source::{PhysicalClusterIncarnation, SourceIncarnation, SourceScope};
     // `Json` and `Msgpack` are codec marker types, intentionally NOT here
     // because the short names collide too easily with user code
     // (`serde_json::Value::Json`, custom `Json` types, etc.). Import

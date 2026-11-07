@@ -38,6 +38,7 @@ pub struct Managed {
     worker: Option<AgentHandle>,
     lease: Option<SessionLease>,
     watch: Option<oneshot::Receiver<Result<SessionChange, String>>>,
+    walk: Option<laser_sdk::wire::session::SessionPage>,
     handled: Arc<Mutex<Vec<ConversationId>>>,
     retained: Option<laser_sdk::agent::Session>,
     retained_state: Option<laser_sdk::agent::SessionState>,
@@ -119,6 +120,23 @@ async fn managed_stream(config: SessionConfig) -> (Laser, Sessions) {
     assert!(
         bootstrap.registered,
         "a deployment that serves sessions registers the stream"
+    );
+    let output = tokio::process::Command::new("node")
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../session-lane-admin.mjs"))
+        .arg(format!(
+            "iggy:iggy@{}",
+            std::env::var("LASER_BDD_ADDR").expect("managed address")
+        ))
+        .arg(sessions.stream().expect("managed stream"))
+        .arg("readiness")
+        .arg("4")
+        .output()
+        .await
+        .expect("wait for managed partition reads");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
     (fresh.laser, sessions)
 }
@@ -238,11 +256,11 @@ async fn counts_completed(world: &mut LaserWorld, count: u64) {
         let page = sessions
             .list()
             .status(SessionStatus::Completed)
-            .total()
+            .results(100)
             .fetch()
             .await
             .ok()?;
-        (page.total == Some(count)).then_some(page)
+        (u64::from(page.total_results) == count).then_some(page)
     })
     .await;
     assert_eq!(page.items.len() as u64, count);
@@ -679,6 +697,48 @@ async fn state_history(world: &mut LaserWorld, deltas: usize) {
     assert_eq!(snapshot.old_digest, snapshot.new_digest, "{snapshot:?}");
 }
 
+#[when(regex = r"^a list walk of (\d+) sessions? per page reads its first page$")]
+async fn list_walk_first(world: &mut LaserWorld, results: u32) {
+    let page = world
+        .managed
+        .sessions()
+        .list()
+        .results(results)
+        .fetch()
+        .await
+        .expect("the first page reads");
+    world.managed.walk = Some(page);
+}
+
+#[then(regex = r#"^the list walk's second page completes "([^"]+)" and "([^"]+)" once each$"#)]
+async fn list_walk_second(world: &mut LaserWorld, first: String, second: String) {
+    let start = world.managed.walk.take().expect("a list walk");
+    let next = world
+        .managed
+        .sessions()
+        .list()
+        .page(2)
+        .results(u32::try_from(start.items.len()).expect("a page size"))
+        .as_of(start.as_of, start.series)
+        .fetch()
+        .await
+        .expect("the second page reads");
+    let mut walked: Vec<ConversationId> = start
+        .items
+        .iter()
+        .chain(&next.items)
+        .map(|item| ConversationId::from(item.id))
+        .collect();
+    walked.sort_by_cached_key(ToString::to_string);
+    let mut expected = vec![world.managed.id(&first), world.managed.id(&second)];
+    expected.sort_by_cached_key(ToString::to_string);
+    assert_eq!(
+        walked, expected,
+        "the session started between the pages stays out"
+    );
+    assert_eq!((start.total_results, next.total_results), (2, 2));
+}
+
 #[then(regex = r#"^the indexed session "([^"]+)" is active$"#)]
 async fn indexed_active(world: &mut LaserWorld, label: String) {
     let sessions = world.managed.sessions().clone();
@@ -924,9 +984,12 @@ async fn counts_records(world: &mut LaserWorld, records: u64) {
 async fn feed_rows(world: &mut LaserWorld, rows: usize) {
     let sessions = world.managed.sessions().clone();
     let id: laser_sdk::wire::agent::ConversationId = world.session().conversation().into();
-    let changes = sessions.changes(0, 0).await.expect("the change feed reads");
+    let changes = sessions
+        .changes(1, 100)
+        .await
+        .expect("the change feed reads");
     let naming = changes
-        .rows
+        .items
         .iter()
         .filter(|row| row.sessions.contains(&id))
         .count();
@@ -947,9 +1010,9 @@ async fn feed_isolated(world: &mut LaserWorld) {
         .into();
     // The second stream's own feed names it, so both folds have run.
     eventually("the second stream's feed", async || {
-        let changes = second.changes(0, 0).await.ok()?;
+        let changes = second.changes(1, 100).await.ok()?;
         changes
-            .rows
+            .items
             .iter()
             .any(|row| row.sessions.contains(&other))
             .then_some(())
@@ -958,12 +1021,12 @@ async fn feed_isolated(world: &mut LaserWorld) {
     let changes = world
         .managed
         .sessions()
-        .changes(0, 0)
+        .changes(1, 100)
         .await
         .expect("the change feed reads");
     assert!(
         changes
-            .rows
+            .items
             .iter()
             .all(|row| !row.sessions.contains(&other)),
         "{changes:?}"
@@ -1034,6 +1097,35 @@ async fn indexed_events(world: &mut LaserWorld, list: String) {
     assert_eq!(displays, expected);
 }
 
+#[then(regex = r"^the session timeline reads (\d+) events over (\d+) pages of (\d+)$")]
+async fn timeline_pages(world: &mut LaserWorld, total: u64, pages: u32, results: u32) {
+    let sessions = world.managed.sessions().clone();
+    let id = world.session().conversation();
+    let mut walked = Vec::new();
+    for page in 1..=pages {
+        let read = sessions
+            .events(id)
+            .page(page)
+            .results(results)
+            .fetch()
+            .await
+            .expect("the events page");
+        assert_eq!(
+            (u64::from(read.total_results), read.total_pages, read.page),
+            (total, pages, page)
+        );
+        walked.extend(read.items.into_iter().map(|event| event.display));
+    }
+    let whole = sessions
+        .events(id)
+        .results(100)
+        .fetch()
+        .await
+        .expect("the whole timeline");
+    let whole: Vec<String> = whole.items.into_iter().map(|event| event.display).collect();
+    assert_eq!(walked, whole);
+}
+
 #[then("the session sources show folded offsets within their heads")]
 async fn sources_cover(world: &mut LaserWorld) {
     let sessions = world.managed.sessions().clone();
@@ -1086,6 +1178,17 @@ impl AgentHandler for Counts {
             .push(message.provenance.conversation_id);
         ctx.respond(b"{}".to_vec()).await
     }
+}
+
+#[then(regex = r#"^agent "([^"]+)" handled (\d+) commands?$"#)]
+async fn handled_commands(world: &mut LaserWorld, name: String, count: usize) {
+    let handled = world
+        .managed
+        .handled
+        .lock()
+        .expect("the handled list")
+        .len();
+    assert_eq!(handled, count, "agent {name} handled {handled} commands");
 }
 
 #[given(regex = r#"^agent "([^"]+)" counts the work it handles$"#)]
@@ -1370,8 +1473,7 @@ async fn change_lane_source(world: &mut LaserWorld, change: String) {
         std::env::var("LASER_BDD_ADDR").expect("managed address")
     );
     let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../session-lane-admin.mjs");
-    let output = tokio::process::Command::new("rtk")
-        .args(["proxy", "node"])
+    let output = tokio::process::Command::new("node")
         .arg(helper)
         .arg(endpoint)
         .arg(stream)
@@ -1394,8 +1496,7 @@ async fn lane_record_count(world: &LaserWorld) -> u64 {
     );
     let stream = world.managed.sessions().stream().expect("stream");
     let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../session-lane-admin.mjs");
-    let output = tokio::process::Command::new("rtk")
-        .args(["proxy", "node"])
+    let output = tokio::process::Command::new("node")
         .arg(helper)
         .arg(endpoint)
         .arg(stream)
@@ -1520,12 +1621,15 @@ async fn recover_lane_registration(world: &mut LaserWorld) {
     })
     .await;
     let sessions = laser.sessions_with(SessionConfig::new().layout(world.managed.layout.clone()));
+    let bootstrap = sessions
+        .bootstrap(4, TopicRetention::expire_after(Duration::from_secs(86400)))
+        .await
+        .expect("explicit new registration");
     assert!(
-        sessions
-            .bootstrap(4, TopicRetention::expire_after(Duration::from_secs(86400)))
-            .await
-            .expect("explicit new registration")
-            .registered
+        bootstrap.registered,
+        "the new registration is not confirmed, sessions served: {}, changes read: {:?}",
+        laser.capabilities().await.sessions,
+        sessions.changes(0, 1).await.map(|changes| changes.page)
     );
     world.managed.second = Some(sessions);
 }
@@ -1614,8 +1718,7 @@ async fn native_lane_writer(world: &mut LaserWorld) {
     let username = format!("writer-{stream}");
     let address = std::env::var("LASER_BDD_ADDR").expect("managed address");
     let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../session-lane-admin.mjs");
-    let output = tokio::process::Command::new("rtk")
-        .args(["proxy", "node"])
+    let output = tokio::process::Command::new("node")
         .arg(helper)
         .arg(format!("iggy:iggy@{address}"))
         .arg(&stream)

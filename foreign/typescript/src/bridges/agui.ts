@@ -1,5 +1,6 @@
 import { InvalidError } from "../client/errors.js"
 import type { Laser } from "../client/laser.js"
+import { LastN, replayContext } from "../context.js"
 import type { AgentId, ConversationId } from "../types/ids.js"
 import {
   AgentKind,
@@ -34,7 +35,12 @@ export type AgUiEvent =
   | { readonly type: "TOOL_CALL_START"; readonly toolCallId: string; readonly toolCallName: string }
   | { readonly type: "TOOL_CALL_ARGS"; readonly toolCallId: string; readonly delta: string }
   | { readonly type: "TOOL_CALL_END"; readonly toolCallId: string }
-  | { readonly type: "TOOL_CALL_RESULT"; readonly toolCallId: string; readonly content: string }
+  | {
+      readonly type: "TOOL_CALL_RESULT"
+      readonly messageId: string
+      readonly toolCallId: string
+      readonly content: string
+    }
   | { readonly type: "STATE_SNAPSHOT"; readonly snapshot: unknown }
   | { readonly type: "STATE_DELTA"; readonly delta: unknown }
   | { readonly type: "RUN_ERROR"; readonly message: string }
@@ -93,10 +99,12 @@ export function envelopeToAgUi(envelope: AgentEnvelope): readonly AgUiEvent[] {
     (envelope.kind === AgentKind.Response || envelope.kind === AgentKind.Error) &&
     envelope.tool !== undefined
   ) {
+    const toolCallId = envelope.correlation?.toString() ?? ""
     return [
       {
         type: "TOOL_CALL_RESULT",
-        toolCallId: envelope.correlation?.toString() ?? "",
+        messageId: envelope.record?.toString() ?? toolCallId,
+        toolCallId,
         content: new TextDecoder().decode(envelope.body)
       }
     ]
@@ -128,20 +136,139 @@ export function envelopeToAgUi(envelope: AgentEnvelope): readonly AgUiEvent[] {
   return []
 }
 
+/** Render `envelopes`, one conversation in log order, as AG-UI runs a client
+ * verifier accepts: every event sits inside a run, a message or tool call
+ * opens before its content, and a run closes what it opened before it
+ * finishes. */
 export function envelopesToAgUi(envelopes: readonly AgentEnvelope[]): readonly AgUiEvent[] {
   const channels = new Map<string, ChunkKind>()
-  const events: AgUiEvent[] = []
+  const framer = new RunFramer()
   for (const envelope of envelopes) {
+    const threadId = envelope.conversation.toString()
+    const runId = envelope.correlation?.toString() ?? envelope.record?.toString() ?? threadId
     if (envelope.kind !== AgentKind.Chunk) {
-      events.push(...envelopeToAgUi(envelope))
+      for (const event of envelopeToAgUi(envelope)) framer.push(event, threadId, runId)
       continue
     }
     const id = envelope.channel?.toString() ?? ""
     const kind = envelope.sequence === 0n ? chunkKind(envelope) : (channels.get(id) ?? "chat")
     if (envelope.sequence === 0n) channels.set(id, kind)
-    events.push(...chunkEvents(envelope, kind))
+    for (const event of chunkEvents(envelope, kind)) framer.push(event, threadId, runId)
   }
-  return events
+  return framer.finish()
+}
+
+type SpanKind = "text" | "reasoning" | "tool"
+
+interface OpenRun {
+  readonly threadId: string
+  readonly runId: string
+  readonly spans: Map<string, SpanKind>
+}
+
+// Places rendered events into AG-UI runs: an event outside a run opens one, a
+// span whose opening fell outside the read opens before its content, and a
+// run closes its open spans before it finishes.
+class RunFramer {
+  private readonly events: AgUiEvent[] = []
+  private run: OpenRun | undefined
+
+  push(event: AgUiEvent, threadId: string, runId: string): void {
+    if (event.type === "RUN_STARTED") {
+      this.close()
+      this.run = { threadId: event.threadId, runId: event.runId, spans: new Map() }
+      this.events.push(event)
+      return
+    }
+    if (event.type === "RUN_FINISHED") {
+      this.close()
+      return
+    }
+    if (event.type === "RUN_ERROR") {
+      this.run = undefined
+      this.events.push(event)
+      return
+    }
+    const run = this.open(threadId, runId)
+    const span = spanOf(event)
+    if (span !== undefined) {
+      const [kind, id, opening, closing] = span
+      if (opening) {
+        if (run.spans.has(id)) return
+        run.spans.set(id, kind)
+      } else if (!run.spans.has(id)) {
+        this.events.push(openingOf(kind, id))
+        run.spans.set(id, kind)
+      }
+      if (closing) run.spans.delete(id)
+    }
+    this.events.push(event)
+  }
+
+  finish(): readonly AgUiEvent[] {
+    this.close()
+    return this.events
+  }
+
+  private open(threadId: string, runId: string): OpenRun {
+    if (this.run !== undefined) return this.run
+    const run: OpenRun = { threadId, runId, spans: new Map() }
+    this.events.push({ type: "RUN_STARTED", threadId, runId })
+    this.run = run
+    return run
+  }
+
+  private close(): void {
+    const run = this.run
+    if (run === undefined) return
+    for (const [id, kind] of [...run.spans].reverse()) this.events.push(closingOf(kind, id))
+    this.events.push({ type: "RUN_FINISHED", threadId: run.threadId, runId: run.runId })
+    this.run = undefined
+  }
+}
+
+// The span an event belongs to: its kind, id, and whether it opens or closes it.
+function spanOf(event: AgUiEvent): readonly [SpanKind, string, boolean, boolean] | undefined {
+  switch (event.type) {
+    case "TEXT_MESSAGE_START":
+      return ["text", event.messageId, true, false]
+    case "TEXT_MESSAGE_CONTENT":
+      return ["text", event.messageId, false, false]
+    case "TEXT_MESSAGE_END":
+      return ["text", event.messageId, false, true]
+    case "REASONING_MESSAGE_START":
+      return ["reasoning", event.messageId, true, false]
+    case "REASONING_MESSAGE_CONTENT":
+      return ["reasoning", event.messageId, false, false]
+    case "REASONING_MESSAGE_END":
+      return ["reasoning", event.messageId, false, true]
+    case "TOOL_CALL_START":
+      return ["tool", event.toolCallId, true, false]
+    case "TOOL_CALL_ARGS":
+      return ["tool", event.toolCallId, false, false]
+    case "TOOL_CALL_END":
+      return ["tool", event.toolCallId, false, true]
+    case "RUN_STARTED":
+    case "RUN_FINISHED":
+    case "RUN_ERROR":
+    case "TOOL_CALL_RESULT":
+    case "STATE_SNAPSHOT":
+    case "STATE_DELTA":
+      return undefined
+  }
+}
+
+function openingOf(kind: SpanKind, id: string): AgUiEvent {
+  if (kind === "text") return { type: "TEXT_MESSAGE_START", messageId: id, role: "assistant" }
+  if (kind === "reasoning")
+    return { type: "REASONING_MESSAGE_START", messageId: id, role: "reasoning" }
+  return { type: "TOOL_CALL_START", toolCallId: id, toolCallName: "" }
+}
+
+function closingOf(kind: SpanKind, id: string): AgUiEvent {
+  if (kind === "text") return { type: "TEXT_MESSAGE_END", messageId: id }
+  if (kind === "reasoning") return { type: "REASONING_MESSAGE_END", messageId: id }
+  return { type: "TOOL_CALL_END", toolCallId: id }
 }
 
 /** Replace the session state document of `conversation` with `state`, a JSON
@@ -188,7 +315,16 @@ export async function aguiEvents(
   conversation: ConversationId,
   topic: string
 ): Promise<readonly AgUiEvent[]> {
-  const messages = await laser.context(conversation).fetch([topic], Number.MAX_SAFE_INTEGER)
+  const messages = await replayContext(
+    {
+      conversation,
+      acrossSubconversations: false,
+      topics: [topic],
+      policy: new LastN(Number.MAX_SAFE_INTEGER),
+      fromOffsets: new Map()
+    },
+    laser
+  )
   return envelopesToAgUi(
     messages.flatMap((message) => (message.envelope === undefined ? [] : [message.envelope]))
   )

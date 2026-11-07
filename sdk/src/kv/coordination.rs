@@ -1,24 +1,34 @@
-use crate::error::LaserError;
-use crate::iggy::prelude::Client;
+use crate::error::{LaserError, driver_never_wrote, driver_wrote};
+use crate::iggy::prelude::{Client, IggyError};
 use crate::kv::{
     AGDX_KV_CAS_FENCED_CODE, AGDX_KV_GET_CODE, AGDX_KV_LEASE_CODE, AGDX_KV_LEASE_RENEW_CODE,
     AGDX_KV_RELEASE_CODE, KvCasFenced, KvEntry, KvGet, KvLease, KvLeaseRenew, KvRelease, Lease,
 };
-use crate::laser::Laser;
+use crate::laser::{Laser, unknown_outcome};
 use laser_wire::framing::encode_named;
 use laser_wire::kv::{KvOutcome, KvReply};
 use laser_wire::mutation::{MANAGED_REQUEST_VERSION, ManagedRequestEnvelope};
 use laser_wire::validate::Validate;
 use std::future::Future;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 /// Per-attempt bound before an in-flight coordination request is declared
 /// ambiguous and transport retirement begins. Retirement still waits for any
-/// cancellation-safe Iggy request task to stop before recovery proceeds.
-pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+/// cancellation-safe Iggy request task to stop before recovery proceeds. It
+/// sits above the managed backend's 10 second fold wait, so a mutation the fold
+/// has not applied yet comes back as a `Pending` reply rather than a timeout.
+pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The first pause before an ambiguous acquisition or renewal is repeated
+/// under its prepared identity. It doubles up to [`MAX_REPEAT_DELAY`].
+const FIRST_REPEAT_DELAY: Duration = Duration::from_millis(100);
+const MAX_REPEAT_DELAY: Duration = Duration::from_secs(2);
+/// How often a reused dedicated connection may probe again for the
+/// fenced-lease capability it lacked.
+const CAPABILITY_REPROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The transport seam under [`FencedLeaseClient`]: send one managed command
 /// frame and return the raw reply bytes, or discard connection state after a
@@ -40,6 +50,31 @@ pub trait LocalManagedKvTransport {
     /// an acquisition recovery wait and a lockstep transport cannot read a stale
     /// reply as the answer to the next request.
     async fn reset(&self);
+
+    /// The connection [`send_on`](Self::send_on) would use now, read when a
+    /// call starts. A transport without a replaceable connection answers 0.
+    fn generation(&self) -> u64 {
+        0
+    }
+
+    /// Send on the connection `generation` names. A transport that has
+    /// replaced it refuses with a retryable error before sending. The default
+    /// sends on the current connection.
+    fn send_on(
+        &self,
+        _generation: u64,
+        code: u32,
+        frame: Vec<u8>,
+    ) -> impl Future<Output = Result<Vec<u8>, LaserError>> {
+        self.send(code, frame)
+    }
+
+    /// [`reset`](Self::reset) only while the connection is still
+    /// `generation`, so a late failure on a retired connection never ends the
+    /// one that replaced it. The default resets.
+    fn reset_generation(&self, _generation: u64) -> impl Future<Output = ()> {
+        self.reset()
+    }
 
     /// Close the transport permanently when supported. The default retires its connection.
     fn close(&self) -> impl Future<Output = ()>
@@ -66,7 +101,7 @@ pub trait LocalManagedKvTransport {
 /// ```no_run
 /// # use std::sync::Arc;
 /// # use laser_sdk::kv::{DedicatedKvTransport, FencedLeaseClient, SharedKvTransport};
-/// let transport: SharedKvTransport = Arc::new(DedicatedKvTransport::new("iggy+tcp://…"));
+/// let transport: SharedKvTransport = Arc::new(DedicatedKvTransport::new("iggy+tcp://..."));
 /// let client = FencedLeaseClient::new(transport);
 /// ```
 ///
@@ -81,6 +116,26 @@ pub trait DynManagedKvTransport: Send + Sync {
     /// See [`ManagedKvTransport::reset`]. The same contract holds: in-flight
     /// work must stop before this returns.
     async fn reset(&self);
+
+    /// See [`ManagedKvTransport::generation`].
+    fn generation(&self) -> u64 {
+        0
+    }
+
+    /// See [`ManagedKvTransport::send_on`].
+    async fn send_on(
+        &self,
+        _generation: u64,
+        code: u32,
+        frame: Vec<u8>,
+    ) -> Result<Vec<u8>, LaserError> {
+        self.send(code, frame).await
+    }
+
+    /// See [`ManagedKvTransport::reset_generation`].
+    async fn reset_generation(&self, _generation: u64) {
+        self.reset().await;
+    }
 
     async fn close(&self) {
         self.reset().await;
@@ -106,6 +161,23 @@ impl<T: ManagedKvTransport + Send + Sync> DynManagedKvTransport for T {
         ManagedKvTransport::reset(self).await;
     }
 
+    fn generation(&self) -> u64 {
+        ManagedKvTransport::generation(self)
+    }
+
+    async fn send_on(
+        &self,
+        generation: u64,
+        code: u32,
+        frame: Vec<u8>,
+    ) -> Result<Vec<u8>, LaserError> {
+        ManagedKvTransport::send_on(self, generation, code, frame).await
+    }
+
+    async fn reset_generation(&self, generation: u64) {
+        ManagedKvTransport::reset_generation(self, generation).await;
+    }
+
     async fn close(&self) {
         ManagedKvTransport::close(self).await;
     }
@@ -127,6 +199,23 @@ impl ManagedKvTransport for SharedKvTransport {
         DynManagedKvTransport::reset(&**self).await;
     }
 
+    fn generation(&self) -> u64 {
+        DynManagedKvTransport::generation(&**self)
+    }
+
+    async fn send_on(
+        &self,
+        generation: u64,
+        code: u32,
+        frame: Vec<u8>,
+    ) -> Result<Vec<u8>, LaserError> {
+        DynManagedKvTransport::send_on(&**self, generation, code, frame).await
+    }
+
+    async fn reset_generation(&self, generation: u64) {
+        DynManagedKvTransport::reset_generation(&**self, generation).await;
+    }
+
     async fn close(&self) {
         DynManagedKvTransport::close(&**self).await;
     }
@@ -139,12 +228,17 @@ impl ManagedKvTransport for SharedKvTransport {
 /// stall unrelated traffic (and the reverse). The first readiness check after
 /// a reset reconnects and re-verifies the `kv_fenced_leases` capability, failing
 /// closed against a pre-fencing deployment. That deployment keeps its one
-/// connection, so each later call answers `Unsupported` without a new login.
+/// connection, so each later call answers `Unsupported` without a new login,
+/// and probes the capability again at most once a second.
 ///
 /// [`reset`]: ManagedKvTransport::reset
 pub struct DedicatedKvTransport {
     connection_string: String,
     slot: Mutex<Option<Laser>>,
+    // Moves on every retirement, under the slot lock, so it names the
+    // connection the slot holds.
+    generation: AtomicU64,
+    probed_at: std::sync::Mutex<Option<Instant>>,
     closed: AtomicBool,
     retirement: Mutex<()>,
 }
@@ -155,6 +249,8 @@ impl DedicatedKvTransport {
         Self {
             connection_string: connection_string.into(),
             slot: Mutex::new(None),
+            generation: AtomicU64::new(0),
+            probed_at: std::sync::Mutex::new(None),
             closed: AtomicBool::new(false),
             retirement: Mutex::new(()),
         }
@@ -177,11 +273,15 @@ impl DedicatedKvTransport {
             None => {
                 let laser = Laser::connect(&self.connection_string).await?;
                 *slot = Some(laser.clone());
+                *self
+                    .probed_at
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
                 (laser, false)
             }
         };
         let mut capabilities = laser.capabilities().await;
-        if reused && !capabilities.kv.fenced_leases {
+        if reused && !capabilities.kv.fenced_leases && self.reprobe_due() {
             capabilities = laser.refresh_capabilities().await;
         }
         if !capabilities.kv.fenced_leases {
@@ -192,6 +292,46 @@ impl DedicatedKvTransport {
             ));
         }
         Ok(laser)
+    }
+
+    // A connection that lacks the capability answers every later call from its
+    // last probe until a second has passed, so a refused call costs no round trip.
+    fn reprobe_due(&self) -> bool {
+        let mut probed_at = self
+            .probed_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let due = probed_at.is_none_or(|at| at.elapsed() >= CAPABILITY_REPROBE_INTERVAL);
+        if due {
+            *probed_at = Some(Instant::now());
+        }
+        due
+    }
+
+    // Retires the connection the slot holds, or only while it is still
+    // `generation` when a failing call names the one it used.
+    async fn retire(&self, generation: Option<u64>) {
+        let _retirement = self.retirement.lock().await;
+        let retired = {
+            let mut slot = self.slot.lock().await;
+            if generation.is_some_and(|used| used != self.generation.load(Ordering::Acquire)) {
+                return;
+            }
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            slot.take()
+        };
+        if let Some(laser) = retired {
+            let _ = laser.client().shutdown().await;
+        }
+    }
+
+    // Sends one frame, keeping the unknown outcome of a frame any attempt wrote.
+    async fn send_frame(laser: &Laser, code: u32, frame: Vec<u8>) -> Result<Vec<u8>, LaserError> {
+        let written = AtomicBool::new(false);
+        laser
+            .send_raw_preframed(code, frame, &written)
+            .await
+            .map_err(|error| written_outcome(error, written.load(Ordering::Acquire)).into())
     }
 }
 
@@ -204,18 +344,40 @@ impl ManagedKvTransport for DedicatedKvTransport {
         let laser = self.slot.lock().await.as_ref().cloned().ok_or_else(|| {
             LaserError::HandlerConfig("coordination transport is not ready".to_owned())
         })?;
-        laser
-            .send_raw_preframed(code, frame)
-            .await
-            .map_err(LaserError::from)
+        Self::send_frame(&laser, code, frame).await
     }
 
     async fn reset(&self) {
-        let _retirement = self.retirement.lock().await;
-        let retired = self.slot.lock().await.take();
-        if let Some(laser) = retired {
-            let _ = laser.client().shutdown().await;
+        self.retire(None).await;
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    async fn send_on(
+        &self,
+        generation: u64,
+        code: u32,
+        frame: Vec<u8>,
+    ) -> Result<Vec<u8>, LaserError> {
+        let laser = {
+            let slot = self.slot.lock().await;
+            // The connection this call readied was retired, so nothing is sent
+            // on its replacement.
+            if self.generation.load(Ordering::Acquire) != generation {
+                return Err(IggyError::NotConnected.into());
+            }
+            slot.as_ref().cloned()
         }
+        .ok_or_else(|| {
+            LaserError::HandlerConfig("coordination transport is not ready".to_owned())
+        })?;
+        Self::send_frame(&laser, code, frame).await
+    }
+
+    async fn reset_generation(&self, generation: u64) {
+        self.retire(Some(generation)).await;
     }
 
     async fn close(&self) {
@@ -235,6 +397,7 @@ pub struct PreparedMutation {
     operation_id: u128,
     frame: Vec<u8>,
     ambiguous_recovery: AmbiguousMutationRecovery,
+    first_sent: OnceLock<Instant>,
 }
 
 /// The recovery a caller must use when execution of a prepared mutation
@@ -242,8 +405,10 @@ pub struct PreparedMutation {
 /// recovery inspectable instead of asking a generic retry classifier to guess.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AmbiguousMutationRecovery {
-    /// Do not acquire again until this duration has elapsed after the
-    /// ambiguous result. A grant never outlives its requested TTL.
+    /// Do not acquire under a new identity until this duration has elapsed
+    /// after the ambiguous result. A grant never outlives its requested TTL.
+    /// Repeating this exact [`PreparedMutation`] first is safe: the backend
+    /// answers a repeated identity with its recorded outcome.
     WaitForLeaseExpiry(Duration),
     /// Repeat this exact [`PreparedMutation`], preserving its operation id.
     RepeatPrepared,
@@ -260,6 +425,13 @@ impl PreparedMutation {
     /// The operation-specific action required after an ambiguous result.
     pub fn ambiguous_recovery(&self) -> AmbiguousMutationRecovery {
         self.ambiguous_recovery
+    }
+
+    // A grant or renewal can apply no earlier than the first send, so a
+    // validity measured from it never outlasts the backend's own expiry.
+    fn valid_until(&self, granted_ttl: Duration) -> Instant {
+        let sent = *self.first_sent.get_or_init(Instant::now);
+        sent.checked_add(granted_ttl).unwrap_or(sent)
     }
 
     fn build(
@@ -283,6 +455,7 @@ impl PreparedMutation {
             operation_id,
             frame,
             ambiguous_recovery,
+            first_sent: OnceLock::new(),
         })
     }
 }
@@ -298,10 +471,15 @@ impl PreparedMutation {
 /// is not generically retryable: [`PreparedMutation::ambiguous_recovery`]
 /// provides the machine-readable recovery action. Renew and release may repeat
 /// the same prepared request, a fenced CAS reconciles through its target
-/// precondition, while an acquire whose reply was lost must wait through its
-/// requested maximum TTL before a fresh acquisition. The transport contract
-/// does not assume operation-id deduplication. Unexpected reply outcomes are
-/// rejected fail-closed, never coerced.
+/// precondition, while an acquire whose reply was lost may repeat the same
+/// prepared request and must otherwise wait through its requested maximum TTL
+/// before a fresh acquisition, because a grant that landed without its reply
+/// holds the key until it expires. A granted [`Lease`] is valid locally until
+/// its first send plus the granted TTL. The managed
+/// backend answers a repeated identity with its recorded outcome, and a reply
+/// that names no outcome yet (`Pending`, `BackendUnavailable`, `Unavailable`)
+/// is ambiguous like a lost one. Unexpected reply outcomes are rejected
+/// fail-closed, never coerced.
 pub struct FencedLeaseClient<T> {
     client_id: u128,
     transport: T,
@@ -410,6 +588,7 @@ impl<T: ManagedKvTransport + Sync> FencedLeaseClient<T> {
                 token: lease_token,
                 granted_ttl: Duration::from_micros(granted_ttl_micros),
                 position,
+                valid_until: op.valid_until(Duration::from_micros(granted_ttl_micros)),
             }),
             other => Err(unexpected("acquire", &other)),
         }
@@ -438,8 +617,72 @@ impl<T: ManagedKvTransport + Sync> FencedLeaseClient<T> {
                 token: lease_token,
                 granted_ttl: Duration::from_micros(granted_ttl_micros),
                 position,
+                valid_until: op.valid_until(Duration::from_micros(granted_ttl_micros)),
             }),
             other => Err(unexpected("renew", &other)),
+        }
+    }
+
+    /// Execute a prepared acquisition and resolve an ambiguous result by
+    /// repeating the same identity while the requested TTL since the first send
+    /// is open. A grant that comes back already past its
+    /// [`valid_until`](Lease::valid_until) is [`KvError::LeaseLost`].
+    ///
+    /// [`KvError::LeaseLost`]: laser_wire::kv::KvError::LeaseLost
+    pub(crate) async fn acquire_resolving(
+        &self,
+        op: &PreparedMutation,
+    ) -> Result<Lease, LaserError> {
+        let window = match op.ambiguous_recovery {
+            AmbiguousMutationRecovery::WaitForLeaseExpiry(ttl) => ttl,
+            _ => return self.acquire(op).await,
+        };
+        let mut delay = FIRST_REPEAT_DELAY;
+        loop {
+            match self.acquire(op).await {
+                Err(error @ LaserError::AmbiguousMutation { .. }) => {
+                    let elapsed = op.first_sent.get().map_or(window, Instant::elapsed);
+                    let remaining = window.saturating_sub(elapsed);
+                    if remaining.is_zero() {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(delay.min(remaining)).await;
+                    delay = delay.saturating_mul(2).min(MAX_REPEAT_DELAY);
+                }
+                Ok(lease) if lease.valid_until <= Instant::now() => {
+                    return Err(laser_wire::kv::KvError::LeaseLost.into());
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Execute a prepared renewal, repeating it under the same identity after
+    /// an ambiguous result until `deadline`, the instant the held lease stops
+    /// being valid locally.
+    #[cfg(any(feature = "agent", test))]
+    pub(crate) async fn renew_resolving(
+        &self,
+        op: &PreparedMutation,
+        deadline: Instant,
+    ) -> Result<Lease, LaserError> {
+        let mut delay = FIRST_REPEAT_DELAY;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(laser_wire::kv::KvError::LeaseLost.into());
+            }
+            match self
+                .renew_with_timeout(op, remaining.min(self.attempt_timeout))
+                .await
+            {
+                Err(LaserError::AmbiguousMutation { .. }) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    tokio::time::sleep(delay.min(remaining)).await;
+                    delay = delay.saturating_mul(2).min(MAX_REPEAT_DELAY);
+                }
+                result => return result,
+            }
         }
     }
 
@@ -482,16 +725,17 @@ impl<T: ManagedKvTransport + Sync> FencedLeaseClient<T> {
     pub async fn get(&self, request: &KvGet) -> Result<Option<KvEntry>, LaserError> {
         Self::ensure_attempt_timeout(self.attempt_timeout)?;
         self.ready().await?;
+        let generation = self.transport.generation();
         let frame = encode_named(request)
             .map_err(|error| LaserError::Codec(format!("encode request: {error}")))?;
-        let send = self.transport.send(AGDX_KV_GET_CODE, frame);
+        let send = self.transport.send_on(generation, AGDX_KV_GET_CODE, frame);
         let reply = match tokio::time::timeout(self.attempt_timeout, send).await {
             Err(_elapsed) => {
-                self.transport.reset().await;
+                self.transport.reset_generation(generation).await;
                 return Err(LaserError::Timeout("kv coordination get"));
             }
             Ok(Err(error)) => {
-                self.transport.reset().await;
+                self.transport.reset_generation(generation).await;
                 return Err(error);
             }
             Ok(Ok(bytes)) => bytes,
@@ -524,29 +768,55 @@ impl<T: ManagedKvTransport + Sync> FencedLeaseClient<T> {
             )));
         }
         self.ready_with_timeout(attempt_timeout).await?;
-        let send = self.transport.send(op.code, op.frame.clone());
+        // A failure retires only the connection this call used, never one a
+        // later call has opened since.
+        let generation = self.transport.generation();
+        op.first_sent.get_or_init(Instant::now);
+        let send = self
+            .transport
+            .send_on(generation, op.code, op.frame.clone());
         let reply = match tokio::time::timeout(attempt_timeout, send).await {
             Err(_elapsed) => {
-                self.transport.reset().await;
-                return Err(LaserError::AmbiguousMutation(format!(
-                    "{what} attempt exceeded {:?} and requires operation-specific recovery",
-                    attempt_timeout,
-                )));
+                self.transport.reset_generation(generation).await;
+                return Err(LaserError::AmbiguousMutation {
+                    operation_id: Some(op.operation_id),
+                    message: format!(
+                        "{what} attempt exceeded {attempt_timeout:?} and requires operation-specific recovery"
+                    ),
+                });
             }
-            Ok(Err(error)) if !error.is_retryable() || error.is_permission_denied() => {
-                self.transport.reset().await;
-                return Err(error);
-            }
-            // Once send has started, a retryable transport failure is ambiguous:
-            // the server may have applied the mutation before the connection died.
             Ok(Err(error)) => {
-                self.transport.reset().await;
-                return Err(LaserError::AmbiguousMutation(format!(
-                    "{what} transport failed mid-request: {error}"
-                )));
+                self.transport.reset_generation(generation).await;
+                // A frame never written cannot have applied. One written without
+                // a reply may have.
+                let may_have_written = match FrameWrite::from(&error) {
+                    FrameWrite::Written => true,
+                    FrameWrite::NotWritten => false,
+                    FrameWrite::Unknown => error.is_retryable() && !error.is_permission_denied(),
+                };
+                if !may_have_written {
+                    return Err(error);
+                }
+                return Err(LaserError::AmbiguousMutation {
+                    operation_id: Some(op.operation_id),
+                    message: format!("{what} transport failed mid-request: {error}"),
+                });
             }
             Ok(Ok(bytes)) => bytes,
         };
+        // The backend accepted the frame but names no outcome yet, or the node
+        // could not reach its backend: the mutation may still apply. The reply
+        // arrived whole, so the connection stays in step and other requests on
+        // it keep running.
+        if let Some(unknown) = unknown_outcome(&reply) {
+            return Err(LaserError::AmbiguousMutation {
+                operation_id: Some(op.operation_id),
+                message: format!(
+                    "{what} operation {:032x} outcome is unknown ({:?}: {}) and requires operation-specific recovery",
+                    op.operation_id, unknown.code, unknown.message
+                ),
+            });
+        }
         decode_reply(&reply)
     }
 
@@ -569,20 +839,52 @@ impl<T: ManagedKvTransport + Sync> FencedLeaseClient<T> {
         if self.closed.load(Ordering::Acquire) {
             return Err(crate::iggy::prelude::IggyError::ClientShutdown.into());
         }
+        let generation = self.transport.generation();
         match tokio::time::timeout(timeout, self.transport.ready()).await {
             Err(_elapsed) => {
-                self.transport.reset().await;
+                self.transport.reset_generation(generation).await;
                 Err(LaserError::Timeout("kv coordination connect"))
             }
             // A deployment without the capability stays connected, so the next call
             // answers the same way instead of reconnecting and logging in again.
             Ok(Err(error @ LaserError::Unsupported { .. })) => Err(error),
             Ok(Err(error)) => {
-                self.transport.reset().await;
+                self.transport.reset_generation(generation).await;
                 Err(error)
             }
             Ok(Ok(())) => Ok(()),
         }
+    }
+}
+
+// What a failed send did with its frame, as the driver error that ended it
+// tells.
+enum FrameWrite {
+    Written,
+    NotWritten,
+    Unknown,
+}
+
+impl From<&LaserError> for FrameWrite {
+    fn from(error: &LaserError) -> Self {
+        match error {
+            LaserError::AmbiguousMutation { .. } => Self::Written,
+            LaserError::Transport(transport) if driver_wrote(transport.as_iggy()) => Self::Written,
+            LaserError::Transport(transport) if driver_never_wrote(transport.as_iggy()) => {
+                Self::NotWritten
+            }
+            _ => Self::Unknown,
+        }
+    }
+}
+
+// A frame an earlier attempt wrote keeps its unknown outcome, whatever a later
+// attempt answered.
+fn written_outcome(error: IggyError, written: bool) -> IggyError {
+    if written && !driver_wrote(&error) {
+        IggyError::TransientNotCommitted
+    } else {
+        error
     }
 }
 
@@ -607,11 +909,14 @@ fn unexpected(what: &str, outcome: &KvOutcome) -> LaserError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::TransportError;
+    use crate::iggy::prelude::IggyClient;
     use crate::kv::{CasExpect, KV_LEASE_OP_VERSION, KV_OP_VERSION, KvError};
     use laser_wire::framing::decode_named;
     use laser_wire::mutation::MutationPosition;
+    use laser_wire::result::{CommandError, ResultCode};
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     struct StubTransport {
         replies: StdMutex<Vec<Result<Vec<u8>, LaserError>>>,
@@ -715,6 +1020,45 @@ mod tests {
         async fn reset(&self) {}
     }
 
+    // A transport whose connection another call replaces while a send is out.
+    struct ReplacedConnectionTransport {
+        generation: AtomicU64,
+        sent_on: StdMutex<Vec<u64>>,
+        retired: StdMutex<Vec<u64>>,
+        resets: AtomicUsize,
+    }
+
+    impl ManagedKvTransport for &ReplacedConnectionTransport {
+        async fn send(&self, _code: u32, _frame: Vec<u8>) -> Result<Vec<u8>, LaserError> {
+            Err(LaserError::Invalid(
+                "a send must name its connection".to_owned(),
+            ))
+        }
+
+        fn generation(&self) -> u64 {
+            self.generation.load(Ordering::SeqCst)
+        }
+
+        async fn send_on(
+            &self,
+            generation: u64,
+            _code: u32,
+            _frame: Vec<u8>,
+        ) -> Result<Vec<u8>, LaserError> {
+            self.sent_on.lock().expect("sent lock").push(generation);
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            Err(IggyError::Disconnected.into())
+        }
+
+        async fn reset(&self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn reset_generation(&self, generation: u64) {
+            self.retired.lock().expect("retired lock").push(generation);
+        }
+    }
+
     fn ok_reply(outcome: KvOutcome) -> Result<Vec<u8>, LaserError> {
         Ok(encode_named(&KvReply::Ok(outcome)).expect("reply encodes"))
     }
@@ -734,11 +1078,76 @@ mod tests {
         }
     }
 
+    fn renew_request() -> KvLeaseRenew {
+        KvLeaseRenew {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "connectors.coordination".to_owned(),
+            key: b"source-owner".to_vec(),
+            holder_id: "node-1".to_owned(),
+            subject_user_id: Some(42),
+            lease_token: 7,
+            lease_ttl_micros: 30_000_000,
+        }
+    }
+
+    fn release_request() -> KvRelease {
+        KvRelease {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "connectors.coordination".to_owned(),
+            key: b"source-owner".to_vec(),
+            lease_token: 7,
+            holder_id: "node-1".to_owned(),
+        }
+    }
+
     fn position() -> MutationPosition {
         MutationPosition {
             topic_generation: 1,
             partition: 0,
             offset: 512,
+        }
+    }
+
+    fn unknown_outcome_reply(code: ResultCode) -> Result<Vec<u8>, LaserError> {
+        Ok(
+            encode_named(&CommandError::new(code, "the outcome is not known yet"))
+                .expect("reply encodes"),
+        )
+    }
+
+    #[tokio::test]
+    async fn given_an_unknown_outcome_reply_when_executing_then_should_keep_the_transport_and_report_ambiguity_with_the_identity()
+     {
+        for code in [
+            ResultCode::Pending,
+            ResultCode::BackendUnavailable,
+            ResultCode::Unavailable,
+        ] {
+            let transport = StubTransport::answering(vec![unknown_outcome_reply(code)]);
+            let client = FencedLeaseClient::new(&transport);
+            let op = client
+                .prepare_acquire(&lease_request())
+                .expect("the request prepares");
+
+            let outcome = client.acquire(&op).await;
+
+            let Err(LaserError::AmbiguousMutation { operation_id, .. }) = outcome else {
+                panic!("{code:?} must be ambiguous, got {outcome:?}");
+            };
+            assert_eq!(
+                operation_id,
+                Some(op.operation_id()),
+                "the ambiguity carries the prepared identity to repeat"
+            );
+            assert_eq!(
+                transport.resets.load(Ordering::SeqCst),
+                0,
+                "a whole reply leaves the connection in step for other requests"
+            );
+            assert_eq!(
+                op.ambiguous_recovery(),
+                AmbiguousMutationRecovery::WaitForLeaseExpiry(Duration::from_secs(30))
+            );
         }
     }
 
@@ -770,7 +1179,7 @@ mod tests {
 
         let first = client.renew(&op).await;
         assert!(
-            matches!(first, Err(LaserError::AmbiguousMutation(_))),
+            matches!(first, Err(LaserError::AmbiguousMutation { .. })),
             "a transport failure is ambiguous, got {first:?}"
         );
         let lease = client.renew(&op).await.expect("retry succeeds");
@@ -850,7 +1259,7 @@ mod tests {
             AmbiguousMutationRecovery::WaitForLeaseExpiry(Duration::from_secs(30))
         );
         let outcome = client.acquire(&op).await;
-        assert!(matches!(outcome, Err(LaserError::AmbiguousMutation(_))));
+        assert!(matches!(outcome, Err(LaserError::AmbiguousMutation { .. })));
         assert_eq!(stub.resets.load(Ordering::SeqCst), 1);
     }
 
@@ -870,11 +1279,179 @@ mod tests {
     }
 
     #[test]
-    fn given_default_client_when_built_then_should_allow_ten_second_attempts() {
+    fn given_default_client_when_built_then_should_allow_attempts_beyond_the_server_fold_wait() {
         let stub = StubTransport::answering(Vec::new());
         let client = FencedLeaseClient::new(&stub);
 
-        assert_eq!(client.attempt_timeout, Duration::from_secs(10));
+        assert_eq!(client.attempt_timeout, Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn given_an_ambiguous_acquisition_when_the_repeat_is_answered_then_should_return_the_grant_under_the_same_identity()
+     {
+        let stub = StubTransport::answering(vec![
+            unknown_outcome_reply(ResultCode::Pending),
+            ok_reply(KvOutcome::Leased {
+                lease_token: 4,
+                granted_ttl_micros: 30_000_000,
+                position: position(),
+            }),
+        ]);
+        let client = FencedLeaseClient::new(&stub);
+        let op = client.prepare_acquire(&lease_request()).expect("prepares");
+
+        let lease = client
+            .acquire_resolving(&op)
+            .await
+            .expect("the repeat answers the recorded grant");
+
+        assert_eq!(lease.token, 4);
+        let sent = stub.sent.lock().expect("sent lock");
+        assert_eq!(sent.len(), 2, "one repeat after the unknown outcome");
+        assert_eq!(sent[0], sent[1], "the repeat carries the same identity");
+        assert_eq!(stub.resets.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn given_an_acquisition_that_stays_unknown_when_its_ttl_window_passes_then_should_report_ambiguity_without_a_further_wait()
+     {
+        let stub = StubTransport::answering(
+            (0..64)
+                .map(|_| unknown_outcome_reply(ResultCode::Pending))
+                .collect(),
+        );
+        let client = FencedLeaseClient::new(&stub);
+        let request = KvLease {
+            lease_ttl_micros: 1_000_000,
+            ..lease_request()
+        };
+        let op = client.prepare_acquire(&request).expect("prepares");
+        let started = Instant::now();
+
+        let outcome = client.acquire_resolving(&op).await;
+
+        assert!(
+            matches!(outcome, Err(LaserError::AmbiguousMutation { .. })),
+            "an outcome still unknown at the window's end stays ambiguous, got {outcome:?}"
+        );
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_secs(1), "repeats fill the window");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "no TTL sleep follows the window, took {elapsed:?}"
+        );
+        assert!(stub.sent.lock().expect("sent lock").len() > 2);
+    }
+
+    #[tokio::test]
+    async fn given_a_grant_answered_late_when_acquired_then_should_be_valid_from_the_first_send() {
+        let transport = SlowReadyTransport {
+            ready_delay: Duration::ZERO,
+            send_delay: Duration::from_millis(200),
+        };
+        let client = FencedLeaseClient::new(&transport);
+        let op = client.prepare_acquire(&lease_request()).expect("prepares");
+        let before = Instant::now();
+
+        let lease = client.acquire(&op).await.expect("acquires");
+
+        let after = Instant::now();
+        assert!(lease.valid_until >= before + lease.granted_ttl);
+        assert!(
+            lease.valid_until + Duration::from_millis(200) <= after + lease.granted_ttl,
+            "the reply delay is spent from the grant, not added to it"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_grant_that_arrives_after_its_validity_when_resolved_then_should_report_the_lease_lost()
+     {
+        struct LateGrant;
+
+        impl ManagedKvTransport for LateGrant {
+            async fn send(&self, _code: u32, _frame: Vec<u8>) -> Result<Vec<u8>, LaserError> {
+                tokio::time::sleep(Duration::from_millis(1_100)).await;
+                ok_reply(KvOutcome::Leased {
+                    lease_token: 9,
+                    granted_ttl_micros: 1_000_000,
+                    position: position(),
+                })
+            }
+
+            async fn reset(&self) {}
+        }
+
+        let client = FencedLeaseClient::new(LateGrant);
+        let request = KvLease {
+            lease_ttl_micros: 1_000_000,
+            ..lease_request()
+        };
+        let op = client.prepare_acquire(&request).expect("prepares");
+
+        let outcome = client.acquire_resolving(&op).await;
+
+        assert!(
+            matches!(outcome, Err(LaserError::Kv(KvError::LeaseLost))),
+            "a grant dead on arrival is never handed out as held, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_ambiguous_renewal_when_resolved_then_should_repeat_the_same_identity_until_answered()
+     {
+        let stub = StubTransport::answering(vec![
+            unknown_outcome_reply(ResultCode::Unavailable),
+            ok_reply(KvOutcome::Renewed {
+                lease_token: 7,
+                granted_ttl_micros: 30_000_000,
+                position: position(),
+            }),
+        ]);
+        let client = FencedLeaseClient::new(&stub);
+        let op = client.prepare_renew(&renew_request()).expect("prepares");
+
+        let lease = client
+            .renew_resolving(&op, Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("the repeat answers the renewal");
+
+        assert_eq!(lease.token, 7);
+        let sent = stub.sent.lock().expect("sent lock");
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], sent[1]);
+    }
+
+    #[tokio::test]
+    async fn given_an_ambiguous_renewal_when_the_lease_runs_out_then_should_report_the_lease_lost()
+    {
+        let stub = StubTransport::answering(
+            (0..64)
+                .map(|_| unknown_outcome_reply(ResultCode::Pending))
+                .collect(),
+        );
+        let client = FencedLeaseClient::new(&stub);
+        let op = client.prepare_renew(&renew_request()).expect("prepares");
+
+        let outcome = client
+            .renew_resolving(&op, Instant::now() + Duration::from_millis(300))
+            .await;
+
+        assert!(
+            matches!(outcome, Err(LaserError::Kv(KvError::LeaseLost))),
+            "work stops once the held lease is no longer valid, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn given_a_reused_connection_without_the_capability_when_checked_twice_within_a_second_then_should_probe_once()
+     {
+        let transport = DedicatedKvTransport::new("iggy://localhost:8090");
+
+        assert!(transport.reprobe_due(), "a connection never probed is due");
+        assert!(
+            !transport.reprobe_due(),
+            "a refused call within the interval answers from the last probe"
+        );
     }
 
     #[tokio::test]
@@ -889,7 +1466,7 @@ mod tests {
 
         let outcome = client.acquire(&op).await;
 
-        assert!(matches!(outcome, Err(LaserError::AmbiguousMutation(_))));
+        assert!(matches!(outcome, Err(LaserError::AmbiguousMutation { .. })));
         assert!(transport.reset_finished.load(Ordering::SeqCst));
         assert!(started.elapsed() >= Duration::from_millis(25));
     }
@@ -902,10 +1479,61 @@ mod tests {
         ManagedKvTransport::reset(&client.transport).await;
         assert!(matches!(
             ManagedKvTransport::ready(&client.transport).await,
-            Err(LaserError::Iggy(
+            Err(LaserError::Transport(TransportError(
                 crate::iggy::prelude::IggyError::ClientShutdown
-            ))
+            )))
         ));
+    }
+
+    #[tokio::test]
+    async fn given_a_send_whose_connection_was_replaced_when_it_fails_then_should_retire_only_the_connection_it_used()
+     {
+        let transport = ReplacedConnectionTransport {
+            generation: AtomicU64::new(1),
+            sent_on: StdMutex::new(Vec::new()),
+            retired: StdMutex::new(Vec::new()),
+            resets: AtomicUsize::new(0),
+        };
+        let client = FencedLeaseClient::new(&transport);
+        let op = client.prepare_renew(&renew_request()).expect("prepares");
+
+        let outcome = client.renew(&op).await;
+
+        assert!(matches!(outcome, Err(LaserError::AmbiguousMutation { .. })));
+        assert_eq!(*transport.sent_on.lock().expect("sent lock"), vec![1]);
+        assert_eq!(*transport.retired.lock().expect("retired lock"), vec![1]);
+        assert_eq!(
+            transport.resets.load(Ordering::SeqCst),
+            0,
+            "a plain reset would retire the replacement connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_late_failure_from_a_retired_connection_when_reset_then_should_keep_the_newer_connection()
+     {
+        let transport = DedicatedKvTransport::new("iggy://localhost:8090");
+        *transport.slot.lock().await = Some(Laser::from_client(IggyClient::default()));
+        let first = ManagedKvTransport::generation(&transport);
+
+        ManagedKvTransport::reset_generation(&transport, first).await;
+        assert!(
+            transport.slot.lock().await.is_none(),
+            "the failing call retires its own connection"
+        );
+        *transport.slot.lock().await = Some(Laser::from_client(IggyClient::default()));
+        ManagedKvTransport::reset_generation(&transport, first).await;
+
+        assert!(
+            transport.slot.lock().await.is_some(),
+            "a late failure from the old connection leaves the new one running"
+        );
+        let refused =
+            ManagedKvTransport::send_on(&transport, first, AGDX_KV_RELEASE_CODE, Vec::new()).await;
+        assert!(
+            refused.is_err_and(|error| error.is_retryable()),
+            "a send readied on the old connection is refused, not sent on the new one"
+        );
     }
 
     #[tokio::test]
@@ -948,7 +1576,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_an_authorization_send_failure_when_executing_then_should_preserve_the_error() {
-        let stub = StubTransport::answering(vec![Err(LaserError::Iggy(
+        let stub = StubTransport::answering(vec![Err(LaserError::from(
             crate::iggy::prelude::IggyError::Unauthorized,
         ))]);
         let client = FencedLeaseClient::new(&stub);
@@ -956,11 +1584,69 @@ mod tests {
         let outcome = client.acquire(&op).await;
         assert!(matches!(
             outcome,
-            Err(LaserError::Iggy(
+            Err(LaserError::Transport(TransportError(
                 crate::iggy::prelude::IggyError::Unauthorized
-            ))
+            )))
         ));
         assert_eq!(stub.resets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn given_a_driver_that_wrote_the_frame_and_lost_its_reply_when_executed_then_should_report_ambiguity_with_the_identity()
+     {
+        let stub = StubTransport::answering(vec![Err(IggyError::OperationUncertain(9).into())]);
+        let client = FencedLeaseClient::new(&stub);
+        let op = client
+            .prepare_release(&release_request())
+            .expect("prepares");
+
+        let outcome = client.release(&op).await;
+
+        let Err(LaserError::AmbiguousMutation { operation_id, .. }) = outcome else {
+            panic!("a written frame without a reply is ambiguous, got {outcome:?}");
+        };
+        assert_eq!(operation_id, Some(op.operation_id));
+        assert_eq!(stub.resets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn given_a_driver_that_stopped_before_writing_the_frame_when_executed_then_should_report_a_definite_failure()
+     {
+        let stub = StubTransport::answering(vec![Err(IggyError::NotConnected.into())]);
+        let client = FencedLeaseClient::new(&stub);
+        let op = client
+            .prepare_release(&release_request())
+            .expect("prepares");
+
+        let outcome = client.release(&op).await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(LaserError::Transport(TransportError(
+                    IggyError::NotConnected
+                )))
+            ),
+            "a frame never written cannot have applied, got {outcome:?}"
+        );
+        assert_eq!(stub.resets.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn given_a_frame_an_earlier_attempt_wrote_when_a_later_attempt_stops_before_writing_then_should_keep_the_unknown_outcome()
+     {
+        assert_eq!(
+            written_outcome(IggyError::ClientShutdown, true),
+            IggyError::TransientNotCommitted
+        );
+        assert_eq!(
+            written_outcome(IggyError::ClientShutdown, false),
+            IggyError::ClientShutdown
+        );
+        assert_eq!(
+            written_outcome(IggyError::OperationUncertain(4), true),
+            IggyError::OperationUncertain(4)
+        );
     }
 
     #[tokio::test]
@@ -1046,9 +1732,11 @@ mod tests {
         let cas = KvCasFenced {
             v: KV_LEASE_OP_VERSION,
             namespace: "connectors.state".to_owned(),
+            session: None,
             key: b"source_state/pg".to_vec(),
             value: b"cursor".to_vec(),
             expires_at_micros: None,
+            ttl_micros: None,
             expect: CasExpect::Match(4),
             fence_namespace: "connectors.coordination".to_owned(),
             fence_key: b"source-owner".to_vec(),

@@ -26,7 +26,6 @@ import {
 import {
   AmbiguousMutationError,
   BudgetExceededError,
-  CheckpointExecutionError,
   FenceViolationError,
   FilterExecutionError,
   ForkExecutionError,
@@ -44,13 +43,10 @@ import {
   publishCause
 } from "../../src/client/errors.js"
 import type { Laser } from "../../src/client/laser.js"
-import { isRetryable } from "../../src/agent/reliable-consumer.js"
+import { isRetryable } from "../../src/client/error-classify.js"
 import { CONTEXT_READ_WINDOW, Checkpoint, ContextAssembler, LastN } from "../../src/context.js"
 import { ScopedMemory } from "../../src/context-scope.js"
 import type { LaserTransport, PolledMessage } from "../../src/iggy/apache-iggy.js"
-import { Destinations } from "../../src/managed/destinations.js"
-import { encodeCheckpointReplyFrame } from "../../src/wire/checkpoint.js"
-import { DestinationId } from "../../src/wire/ids.js"
 import { MemoryHandle } from "../../src/memory/handle.js"
 import { type Memory, MemoryId, type MemoryItem, type MemoryScope } from "../../src/memory/types.js"
 import { encodeProvenanceHeaders } from "../../src/provenance/provenance.js"
@@ -59,7 +55,6 @@ import { Consumer } from "../../src/stream/consumer.js"
 import { Cursor } from "../../src/stream/cursor.js"
 import { Topic } from "../../src/stream/topic.js"
 import { ConversationId } from "../../src/types/ids.js"
-import { managedCapabilitiesFrom } from "../../src/client/capabilities.js"
 
 function iggyFailure(errorCode: number): TransportError {
   return new TransportError("rejected", false, { cause: { errorCode } })
@@ -69,10 +64,6 @@ void test("given_each_rust_classifier_when_applied_to_its_failure_then_should_an
   assert.equal(isPermissionDenied(iggyFailure(41)), true)
   assert.equal(isPermissionDenied(iggyFailure(40)), true)
   assert.equal(isPermissionDenied(new RoutePrincipalMismatchError("metrics", 1)), true)
-  assert.equal(
-    isPermissionDenied(new CheckpointExecutionError("denied", { kind: "unauthorized" })),
-    true
-  )
   assert.equal(isStreamOrTopicNotFound(iggyFailure(1009)), true)
   assert.equal(isNotFound(iggyFailure(2011)), true)
   assert.equal(isNotFound(iggyFailure(20)), true)
@@ -107,17 +98,13 @@ void test("given_a_failed_publish_when_classified_then_should_answer_for_its_cau
 
 void test("given_failures_when_coded_then_should_match_the_rust_result_codes", () => {
   assert.deepEqual(code(new UnsupportedError("x")), { kind: "known", name: "Unsupported" })
-  assert.deepEqual(code(new NoRespondTopicError()), { kind: "known", name: "Unsupported" })
+  assert.deepEqual(code(new NoRespondTopicError()), { kind: "known", name: "InvalidArgument" })
   assert.deepEqual(code(new InvalidError("x")), { kind: "known", name: "InvalidArgument" })
   assert.deepEqual(code(new FenceViolationError(1n, 2n)), { kind: "known", name: "Conflict" })
   assert.deepEqual(code(new QuarantinedError("metrics")), { kind: "known", name: "Forbidden" })
   assert.deepEqual(code(new KvExecutionError("x", { kind: "notLeader" })), {
     kind: "known",
     name: "Unavailable"
-  })
-  assert.deepEqual(code(new CheckpointExecutionError("x", { kind: "lease_lost" })), {
-    kind: "known",
-    name: "Conflict"
   })
   const filter = new FilterExecutionError("busy", {
     code: { kind: "known", name: "Unavailable" },
@@ -191,33 +178,6 @@ void test("given_a_vector_handle_when_named_verbs_are_called_then_should_refuse_
   assert.throws(() => handle.remove("plan"), UnsupportedError)
 })
 
-void test("given_a_checkpoint_error_when_mutating_then_should_raise_the_checkpoint_class", async () => {
-  const transport = {
-    sendManaged: () =>
-      Promise.resolve(encodeCheckpointReplyFrame({ kind: "err", error: { kind: "unauthorized" } }))
-  }
-  const caps = managedCapabilitiesFrom({
-    versions: {
-      query: 1,
-      control: 1,
-      kv: 1,
-      fork: 1,
-      agent: 1,
-      graph: 1,
-      checkpoint: 1,
-      features: 0n
-    },
-    backends: []
-  })
-  const destinations = Destinations.create(transport, () =>
-    Promise.resolve({ ...caps, destinations: { available: true, consistency: "linearizable" } })
-  )
-  await assert.rejects(
-    destinations.setDesiredState(0n, DestinationId.fromU128(1n), 1n, 1n, "enabled"),
-    (error: unknown) => error instanceof CheckpointExecutionError && isPermissionDenied(error)
-  )
-})
-
 void test("given_a_size_bound_when_batching_then_should_flush_one_append_per_full_batch", async () => {
   const batches: number[] = []
   const producer = BatchingProducerBuilder.create(
@@ -270,7 +230,7 @@ function polled(offset: bigint, body: unknown): PolledMessage {
   return { payload: utf8(JSON.stringify(body)), partitionId: 0, offset, headers: new Map() }
 }
 
-void test("given_an_each_policy_when_records_are_yielded_then_should_store_each_offset", async () => {
+void test("given_an_each_policy_when_records_are_yielded_then_should_store_each_offset_once_handled", async () => {
   const { transport, stored } = nativeTransport([
     polled(0n, { host: "node-1" }),
     polled(1n, { host: "node-2" })
@@ -285,12 +245,13 @@ void test("given_an_each_policy_when_records_are_yielded_then_should_store_each_
   const first = await consumer.nextWithin(100)
   assert.deepEqual(first.json(), { host: "node-1" })
   await consumer.nextWithin(100)
+  assert.deepEqual(stored, [[0, 0n]], "the record in hand is not stored yet")
+  assert.equal(consumer.lastStoredOffset(0), 0n)
+  await consumer.shutdown()
   assert.deepEqual(stored, [
     [0, 0n],
     [0, 1n]
   ])
-  assert.equal(consumer.lastStoredOffset(0), 1n)
-  await consumer.shutdown()
 })
 
 void test("given_a_native_consumer_when_offsets_are_stored_and_deleted_then_should_track_them", async () => {
@@ -615,14 +576,14 @@ void test("given_a_failed_offset_store_when_a_record_is_yielded_then_should_deli
     { commitPolicy: { kind: "each" }, maxWaitMs: 0 }
   )
   assert.equal((await consumer.nextWithin(100)).position.offset, 0n)
-  assert.equal(consumer.lastStoredOffset(0), undefined)
   assert.equal((await consumer.nextWithin(100)).position.offset, 1n)
-  assert.deepEqual(stored, [[0, 1n]])
+  assert.equal(consumer.lastStoredOffset(0), undefined, "the failed store is not recorded")
   await consumer.shutdown()
+  assert.deepEqual(stored, [[0, 1n]])
 })
 
 void test("given_a_deleted_offset_when_shutting_down_then_should_not_store_it_again", async () => {
-  const { transport, stored, deleted } = nativeTransport([polled(0n, {})])
+  const { transport, stored, deleted } = nativeTransport([polled(0n, {}), polled(1n, {})])
   const consumer = Consumer.create(
     transport,
     "fleet",
@@ -630,6 +591,7 @@ void test("given_a_deleted_offset_when_shutting_down_then_should_not_store_it_ag
     { kind: "single", partitionId: 0, name: "metrics" },
     { commitPolicy: { kind: "each" }, maxWaitMs: 0 }
   )
+  await consumer.nextWithin(100)
   await consumer.nextWithin(100)
   await consumer.deleteOffset()
   await consumer.shutdown()

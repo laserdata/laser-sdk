@@ -94,15 +94,15 @@ pub(crate) fn content_type_is_raw(content_type: &str) -> PyResult<bool> {
     Ok(parse_content_type(content_type)?.is_raw())
 }
 
-/// Whether the read-consistency `level` (`eventual`, `read_your_writes`, or
-/// `strong`) is the eventual level.
+/// Whether the read-consistency `level` (`eventual` or `read_your_writes`) is
+/// the eventual level.
 #[gen_stub_pyfunction]
 #[pyfunction]
 pub(crate) fn consistency_is_eventual(level: &str) -> PyResult<bool> {
     let level: Consistency = serde_json::from_value(serde_json::Value::String(level.to_owned()))
         .map_err(|_| {
             InvalidError::new_err(format!(
-                "consistency must be 'eventual', 'read_your_writes', or 'strong', got '{level}'"
+                "consistency must be 'eventual' or 'read_your_writes', got '{level}'"
             ))
         })?;
     Ok(level.is_eventual())
@@ -166,7 +166,7 @@ mod tests {
         assert!(!content_type_is_raw("cbor").expect("cbor"));
         assert!(content_type_code("yaml").is_err());
         assert!(consistency_is_eventual("eventual").expect("eventual"));
-        assert!(!consistency_is_eventual("strong").expect("strong"));
-        assert!(consistency_is_eventual("linearizable").is_err());
+        assert!(!consistency_is_eventual("read_your_writes").expect("read_your_writes"));
+        assert!(consistency_is_eventual("strong").is_err());
     }
 }

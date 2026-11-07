@@ -314,6 +314,73 @@
     },
     {
       "dispatch": "observational",
+      "display": "model.request",
+      "handled": "any",
+      "name": "recorded model call on the session lane",
+      "record": {
+        "kind": "command",
+        "operation": "chat",
+        "recorded": true,
+        "target": "planner"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "tool.call",
+      "handled": [
+        "execute_tool"
+      ],
+      "name": "recorded tool call for a handler that serves tools",
+      "record": {
+        "kind": "command",
+        "operation": "execute_tool",
+        "recorded": true,
+        "target": "planner"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "agent.message",
+      "handled": "any",
+      "name": "input request for a handler of every operation",
+      "record": {
+        "kind": "command",
+        "operation": "input_request"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "work",
+      "display": "agent.message",
+      "handled": [
+        "input_request"
+      ],
+      "name": "input request for an approver that serves it",
+      "record": {
+        "kind": "command",
+        "operation": "input_request",
+        "target": "planner"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "foreign",
+      "display": "agent.message",
+      "handled": [
+        "input_request"
+      ],
+      "name": "input request addressed to another approver",
+      "record": {
+        "kind": "command",
+        "operation": "input_request",
+        "target": "critic"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
       "display": "state.updated",
       "handled": "any",
       "name": "state delta",

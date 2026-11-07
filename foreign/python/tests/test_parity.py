@@ -212,10 +212,6 @@ def test_given_open_capabilities_when_read_then_should_nest_every_surface_switch
         "eventual",
         False,
     )
-    assert (caps.destinations.available, caps.destinations.consistency) == (
-        False,
-        "potentially_stale",
-    )
     assert (caps.kv.available, caps.kv.cas, caps.kv.cas_fenced, caps.kv.fenced_leases) == (
         False,
     ) * 4
@@ -232,7 +228,7 @@ def test_given_open_capabilities_when_read_then_should_nest_every_surface_switch
 SEND_KEYWORDS = {
     "cause",
     "cause_at",
-    "deadline_micros",
+    "deadline_at_micros",
     "idempotency_key",
     "metadata",
     "tool",
@@ -257,6 +253,23 @@ def text(value):
 @pytest.mark.parametrize("verb", ["command", "respond", "emit", "status", "fail"])
 def test_given_an_agdx_verb_when_inspecting_the_binding_then_should_accept_send_options(verb):
     assert keywords("Agdx", verb) >= SEND_KEYWORDS
+    assert "deadline_micros" not in keywords("Agdx", verb)
+
+
+@pytest.mark.parametrize(
+    ("class_name", "method", "parameter"),
+    [
+        ("AgdxStream", "with_deadline_at_micros", "deadline_at_micros"),
+        ("QueryRequest", "deadline_at_micros", "deadline_at_micros"),
+        ("QueryRequest", "deadline", "deadline_ms"),
+        ("QueryRequest", "window", "every_ms"),
+        ("TestClock", "advance", "by_ms"),
+    ],
+)
+def test_given_a_time_parameter_when_inspected_then_should_name_its_unit_and_kind(
+    class_name, method, parameter
+):
+    assert parameter in inspect.signature(getattr(getattr(ls, class_name), method)).parameters
 
 
 @pytest.mark.parametrize("method", ["add_json", "add_msgpack", "add_payload", "add_raw_bytes"])
@@ -281,7 +294,7 @@ def test_given_a_batch_when_inspecting_add_record_then_should_accept_record_opti
         ("Laser", "contract", "policy"),
         ("Laser", "scatter", "policy"),
         ("Laser", "scatter_report", "policy"),
-        ("AgentCtx", "fan_out", "route_policy"),
+        ("AgentCtx", "fan_out", "policy"),
         ("AgentScope", "contract", "policy"),
         ("Workflow", "step", "policy"),
     ],
@@ -358,6 +371,7 @@ def test_given_decoded_evidence_when_encoding_then_should_round_trip():
         "stream": "metrics",
         "topic": "readings",
         "receipt_digest": "abc123",
+        "chain_id": "01J0000000000000000001",
         "outcome": "delivered",
     }
     payload = (
@@ -382,6 +396,7 @@ def test_given_evidence_with_a_forged_digest_when_verifying_the_chain_then_shoul
         "stream": "metrics",
         "topic": "readings",
         "receipt_digest": "abc123",
+        "chain_id": "01J0000000000000000001",
         "outcome": "effected",
     }
     payload = (
@@ -560,22 +575,10 @@ def test_given_a_group_filter_when_inspected_then_should_mirror_the_rust_configu
     configure = inspect.signature(ls.GroupFilter.configure)
     assert list(configure.parameters)[1:] == ["name", "filter"]
     configure_with = inspect.signature(ls.GroupFilter.configure_with)
-    assert list(configure_with.parameters)[1:] == ["filter", "filter_name", "filter_id", "revision"]
+    assert list(configure_with.parameters)[1:] == ["filter", "filter_name"]
     configure_as = inspect.signature(ls.GroupFilter.configure_as)
-    assert list(configure_as.parameters)[1:] == [
-        "operation_id",
-        "filter",
-        "filter_name",
-        "filter_id",
-        "revision",
-    ]
-    assert keywords("ConsumerGroup", "create") == {
-        "filter",
-        "filter_name",
-        "filter_id",
-        "revision",
-        "operation_id",
-    }
+    assert list(configure_as.parameters)[1:] == ["operation_id", "filter", "filter_name"]
+    assert keywords("ConsumerGroup", "create") == {"filter", "filter_name", "operation_id"}
     assert list(inspect.signature(ls.GroupFilter.summary).parameters)[1:] == []
 
 
@@ -612,7 +615,6 @@ def test_given_the_name_limits_when_read_then_should_match_the_wire():
             "MAX_GRAPH_LABEL_BYTES",
             "MAX_MEMORY_ID_BYTES",
             "MAX_SESSION_TEXT_QUERY_BYTES",
-            "MAX_SESSION_CURSOR_BYTES",
         )
     } == {
         "MAX_PROJECTION_ID_BYTES": 255,
@@ -622,7 +624,6 @@ def test_given_the_name_limits_when_read_then_should_match_the_wire():
         "MAX_GRAPH_LABEL_BYTES": 128,
         "MAX_MEMORY_ID_BYTES": 255,
         "MAX_SESSION_TEXT_QUERY_BYTES": 1024,
-        "MAX_SESSION_CURSOR_BYTES": 512,
     }
 
 

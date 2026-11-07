@@ -14,7 +14,6 @@ import {
 export type ExampleFeature =
   | "managed"
   | "query"
-  | "destinations"
   | "kv"
   | "kvCas"
   | "kvCasFenced"
@@ -318,6 +317,7 @@ export async function ensureView(
     name: index,
     version: 1,
     kind: { kind: "row" },
+    history: { kind: "append" },
     contentType: ContentType.Json,
     extraction: {
       fields: fields.map((name) => ({ name, pointer: `/${name}` })),
@@ -331,7 +331,8 @@ export async function ensureView(
     defaultProjection: id,
     index,
     notify: true,
-    skipRejected: false
+    invalidRecords: "block",
+    oversize: "block"
   }
   await laser.projections().register(projection)
   await laser.bindings().apply(binding)
@@ -514,8 +515,6 @@ function surfaceAvailable(capabilities: Capabilities, feature: ExampleFeature): 
       return capabilities.managed
     case "query":
       return capabilities.query.available
-    case "destinations":
-      return capabilities.destinations.available
     case "kv":
       return capabilities.kv.available
     case "kvCas":

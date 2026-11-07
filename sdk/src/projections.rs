@@ -2,7 +2,7 @@ use crate::error::LaserError;
 use crate::laser::Laser;
 use laser_wire::browse::{
     BrowseOutcome, BrowseReply, GetProjection, GetSchema, ListProjections, ListSchemas,
-    ProjectionInfo, RegisterSchema, SchemaInfo,
+    ProjectionInfo, ProjectionPage, RegisterSchema, SchemaInfo, SchemaPage,
 };
 use laser_wire::codes::{
     AGDX_GET_PROJECTION_CODE, AGDX_GET_SCHEMA_CODE, AGDX_LIST_PROJECTIONS_CODE,
@@ -25,23 +25,29 @@ pub use laser_wire::limits::{
 impl Laser {
     /// Handle to the projection registry: `.register(projection)`,
     /// `.drop(id)`, `.get(id).await`, and the filterable `.list()` browse.
-    /// Cheap to create, it borrows the connection.
-    pub fn projections(&self) -> Projections<'_> {
-        Projections { laser: self }
+    /// Cheap to create, it shares the connection.
+    pub fn projections(&self) -> Projections {
+        Projections {
+            laser: self.clone(),
+        }
     }
 
     /// Handle to the binding surface: `.apply(binding)` routes a `(stream,
     /// topic)` source into registered projections, `.remove(source, ..)` stops
-    /// it. Cheap to create, it borrows the connection.
-    pub fn bindings(&self) -> Bindings<'_> {
-        Bindings { laser: self }
+    /// it. Cheap to create, it shares the connection.
+    pub fn bindings(&self) -> Bindings {
+        Bindings {
+            laser: self.clone(),
+        }
     }
 
-    /// Handle to the writer-schema registry (Avro, Protobuf):
-    /// `.register(def)`, `.drop(id)`, `.get(id).await`, `.list().await`.
-    /// Cheap to create, it borrows the connection.
-    pub fn schemas(&self) -> Schemas<'_> {
-        Schemas { laser: self }
+    /// Handle to the writer-schema registry (Avro, Protobuf, JSON Schema):
+    /// `.register(source)`, `.drop(id)`, `.get(id).await`, `.list()`. Cheap to
+    /// create, it shares the connection.
+    pub fn schemas(&self) -> Schemas {
+        Schemas {
+            laser: self.clone(),
+        }
     }
 
     // Read-only registry browse over the server's managed bridge, off the log. Gated
@@ -98,12 +104,12 @@ impl Laser {
         }
     }
 
-    fn scoped_projection(&self, mut projection: Projection) -> Projection {
+    pub(crate) fn scoped_projection(&self, mut projection: Projection) -> Projection {
         projection.id = self.scoped_projection_id(&projection.id);
         projection
     }
 
-    fn scoped_binding(&self, mut binding: ProjectionBinding) -> ProjectionBinding {
+    pub(crate) fn scoped_binding(&self, mut binding: ProjectionBinding) -> ProjectionBinding {
         for id in &mut binding.allowed_projections {
             *id = self.scoped_projection_id(id);
         }
@@ -136,6 +142,11 @@ impl Laser {
             .into_iter()
             .map(|binding| self.local_binding(binding))
             .collect();
+        for status in &mut info.status {
+            if let Some(local) = self.local_resource_name(&status.index) {
+                status.index = local.to_owned();
+            }
+        }
         info
     }
 }
@@ -146,11 +157,11 @@ impl Laser {
 /// and are applied asynchronously by LaserData Cloud (202-accepted semantics: poll
 /// `.get(id)` to observe the apply). Reads (`get` / `list`) are managed-command
 /// browses served off the registry snapshot.
-pub struct Projections<'a> {
-    laser: &'a Laser,
+pub struct Projections {
+    laser: Laser,
 }
 
-impl<'a> Projections<'a> {
+impl Projections {
     /// Register a [`Projection`] on LaserData Cloud by publishing a
     /// `RegisterProjection` control command. LaserData Cloud creates the backing
     /// table and starts applying the projection.
@@ -219,13 +230,34 @@ impl<'a> Projections<'a> {
             .await
     }
 
-    /// Read one projection's details by `id` (schema, content type, indexed
-    /// fields, bindings), or `None` when no projection has that id. Names
-    /// under this handle's stream come back as the caller wrote them.
-    pub async fn get(&self, id: impl Into<String>) -> Result<Option<ProjectionInfo>, LaserError> {
+    /// Each binding's materialization status for projection `id`, or `None`
+    /// when no projection has that id. A binding whose index the caller may
+    /// not read is left out. Names under this handle's stream come back as
+    /// the caller wrote them.
+    pub async fn status(
+        &self,
+        id: impl Into<String>,
+    ) -> Result<Option<Vec<laser_wire::browse::BindingStatus>>, LaserError> {
+        Ok(self.status_info(id).await?.map(|info| info.status))
+    }
+
+    // The projection with its bindings and their status, so a wait tells a
+    // removed binding from one that has not materialized yet.
+    pub(crate) async fn status_info(
+        &self,
+        id: impl Into<String>,
+    ) -> Result<Option<ProjectionInfo>, LaserError> {
+        let capabilities = self.laser.capabilities().await;
+        if !capabilities.managed || !capabilities.materializations {
+            return Err(LaserError::unsupported(
+                "materializations",
+                "materialization status is not served by this deployment",
+            ));
+        }
         let request = GetProjection {
             v: QUERY_OP_VERSION,
             id: self.laser.resource_name(&id.into()),
+            status: true,
         };
         match self
             .laser
@@ -233,7 +265,27 @@ impl<'a> Projections<'a> {
             .await?
         {
             BrowseOutcome::Projection(info) => {
-                Ok(info.map(|info| self.laser.local_projection_info(info)))
+                Ok(info.map(|info| self.laser.local_projection_info(*info)))
+            }
+            _ => Err(LaserError::Protocol(
+                "status: unexpected browse outcome".to_owned(),
+            )),
+        }
+    }
+
+    pub async fn get(&self, id: impl Into<String>) -> Result<Option<ProjectionInfo>, LaserError> {
+        let request = GetProjection {
+            v: QUERY_OP_VERSION,
+            id: self.laser.resource_name(&id.into()),
+            status: false,
+        };
+        match self
+            .laser
+            .execute_browse(AGDX_GET_PROJECTION_CODE, &request)
+            .await?
+        {
+            BrowseOutcome::Projection(info) => {
+                Ok(info.map(|info| self.laser.local_projection_info(*info)))
             }
             _ => Err(LaserError::Protocol(
                 "get: unexpected browse outcome".to_owned(),
@@ -242,16 +294,19 @@ impl<'a> Projections<'a> {
     }
 
     /// Browse the registry. Returns a builder: narrow with `.for_topic` /
-    /// `.name_contains` / `.id_prefix`, then `.fetch().await` for the matching
+    /// `.name_contains` / `.id_prefix`, pick a page with `.page` and
+    /// `.results`, then `.fetch().await` for one page of the matching
     /// projections (each with its extraction schema, content type, indexed
     /// fields, and bindings). No filter lists every projection.
-    pub fn list(&self) -> ProjectionsRequest<'a> {
+    pub fn list(&self) -> ProjectionsRequest {
         ProjectionsRequest {
-            laser: self.laser,
+            laser: self.laser.clone(),
             topics: Vec::new(),
             name_contains: None,
             id_prefix: None,
             search: None,
+            page: 0,
+            results: 0,
         }
     }
 }
@@ -261,11 +316,11 @@ impl<'a> Projections<'a> {
 /// commands to `<ops>/control.commands` (202-accepted, applied asynchronously
 /// by LaserData Cloud). Bindings are browsed through the projections they route to:
 /// `laser.projections().get(id)` returns each projection with its bindings.
-pub struct Bindings<'a> {
-    laser: &'a Laser,
+pub struct Bindings {
+    laser: Laser,
 }
 
-impl Bindings<'_> {
+impl Bindings {
     /// Apply a [`ProjectionBinding`] by publishing an `ApplyBinding` control
     /// command. LaserData Cloud starts a projector for the binding's `(stream,
     /// topic)` source. Register the referenced projection first, or LaserData Cloud
@@ -292,30 +347,34 @@ impl Bindings<'_> {
             .publish_scoped_control(ControlCommand::RemoveBinding {
                 source,
                 projection_ref,
+                generation: None,
             })
             .await
     }
 }
 
-/// Handle to the writer-schema registry (Avro, Protobuf), built with
-/// [`Laser::schemas`](crate::laser::Laser::schemas). Writes (`register` /
-/// `drop`) publish control commands and are applied asynchronously by the
-/// LaserData Cloud (202-accepted semantics: poll `.get(id)` until `Some` to observe the
-/// apply). Reads are managed-command browses.
-pub struct Schemas<'a> {
-    laser: &'a Laser,
+/// Handle to the writer-schema registry (Avro, Protobuf, JSON Schema), built
+/// with [`Laser::schemas`](crate::laser::Laser::schemas). Every call names
+/// the default stream's registry, or the deployment-wide one without a default
+/// stream or with bare naming, and ids are unique within one registry.
+/// `register` is synchronous and answers the allocated id. `drop` publishes a
+/// control command the server applies asynchronously, so poll `.get(id)` to
+/// observe it. Reads are managed-command browses.
+pub struct Schemas {
+    laser: Laser,
 }
 
-impl Schemas<'_> {
+impl Schemas {
     /// Register a writer schema. Synchronous: LaserData Cloud validates that the
-    /// definition compiles, allocates the next free id (ids are
-    /// LaserData-Cloud-allocated and permanent, concurrent callers never collide),
-    /// durably appends the control event, and `.send()` returns the id.
-    /// Producers then stamp it on `agdx.sid` via the publish builders'
-    /// `.schema_id(..)`. Browse visibility follows within the apply latency.
-    pub fn register(&self, source: SchemaSource) -> RegisterSchemaRequest<'_> {
+    /// definition compiles, allocates the lowest free id of the registry (ids
+    /// are permanent, concurrent callers never collide, and a registry holds
+    /// at most 1,024 schemas, tombstones included), durably appends the
+    /// control event, and `.send()` returns the id. Producers then stamp it on
+    /// `agdx.sid` via the publish builders' `.schema_id(..)`. Browse
+    /// visibility follows within the apply latency.
+    pub fn register(&self, source: SchemaSource) -> RegisterSchemaRequest {
         RegisterSchemaRequest {
-            laser: self.laser,
+            laser: self.laser.clone(),
             source,
             name: None,
             version: None,
@@ -353,23 +412,16 @@ impl Schemas<'_> {
         }
     }
 
-    /// List every known writer schema, active and tombstoned (see
-    /// [`SchemaInfo::dropped`]). Read-only browse, listing every schema.
-    pub async fn list(&self) -> Result<Vec<SchemaInfo>, LaserError> {
-        let request = ListSchemas {
-            v: QUERY_OP_VERSION,
+    /// One page of writer schemas, active and tombstoned (see
+    /// [`SchemaInfo::dropped`]), in id order. Narrow it with
+    /// `.name_contains`, pick a page with `.page` and `.results`, then
+    /// `.fetch().await`.
+    pub fn list(&self) -> SchemasRequest {
+        SchemasRequest {
+            laser: self.laser.clone(),
             name_contains: None,
-            stream: self.laser.resource_stream().map(str::to_owned),
-        };
-        match self
-            .laser
-            .execute_browse(AGDX_LIST_SCHEMAS_CODE, &request)
-            .await?
-        {
-            BrowseOutcome::Schemas(list) => Ok(list),
-            _ => Err(LaserError::Protocol(
-                "schemas: unexpected browse outcome".to_owned(),
-            )),
+            page: 0,
+            results: 0,
         }
     }
 }
@@ -377,14 +429,14 @@ impl Schemas<'_> {
 /// Builder for the synchronous schema register. Terminal `.send().await`
 /// returns LaserData Cloud-allocated id.
 #[must_use = "call .send().await to register the schema"]
-pub struct RegisterSchemaRequest<'a> {
-    laser: &'a Laser,
+pub struct RegisterSchemaRequest {
+    laser: Laser,
     source: SchemaSource,
     name: Option<String>,
     version: Option<u32>,
 }
 
-impl RegisterSchemaRequest<'_> {
+impl RegisterSchemaRequest {
     /// Optional human label, pure metadata: stored and returned by the
     /// LaserData Cloud, never dispatched on and not unique.
     pub fn name(mut self, name: impl Into<String>) -> Self {
@@ -399,9 +451,11 @@ impl RegisterSchemaRequest<'_> {
         self
     }
 
-    /// Execute the register and return LaserData Cloud-allocated id. Typed errors:
-    /// an uncompilable definition answers `Unsupported` (nothing allocated),
-    /// transport/server trouble answers `Backend`.
+    /// Execute the register and return LaserData Cloud-allocated id. A
+    /// definition the registry refuses (one that does not compile, a JSON
+    /// Schema of another draft than 2020-12, one past the 1 MiB and depth 64
+    /// bounds) fails with `Invalid` before or after the round trip, and
+    /// nothing is allocated.
     pub async fn send(self) -> Result<u32, LaserError> {
         let request = RegisterSchema {
             v: QUERY_OP_VERSION,
@@ -424,19 +478,74 @@ impl RegisterSchemaRequest<'_> {
     }
 }
 
+/// Fluent builder for [`Schemas::list`]: `.name_contains`, `.page`,
+/// `.results`, then `.fetch().await`.
+#[must_use = "call .fetch().await to list the schemas"]
+pub struct SchemasRequest {
+    laser: Laser,
+    name_contains: Option<String>,
+    page: u32,
+    results: u32,
+}
+
+impl SchemasRequest {
+    /// Keep only schemas whose optional name contains `substring`.
+    pub fn name_contains(mut self, substring: impl Into<String>) -> Self {
+        self.name_contains = Some(substring.into());
+        self
+    }
+
+    /// The 1-based page to read, in id order. Zero reads the first page.
+    pub fn page(mut self, page: u32) -> Self {
+        self.page = page;
+        self
+    }
+
+    /// The schemas per page. Zero leaves it to the server, which serves 10 by
+    /// default and at most 100.
+    pub fn results(mut self, results: u32) -> Self {
+        self.results = results;
+        self
+    }
+
+    /// Run the browse and return one page of the matching schemas.
+    pub async fn fetch(self) -> Result<SchemaPage, LaserError> {
+        let request = ListSchemas {
+            v: QUERY_OP_VERSION,
+            name_contains: self.name_contains,
+            stream: self.laser.resource_stream().map(str::to_owned),
+            page: self.page,
+            results: self.results,
+        };
+        match self
+            .laser
+            .execute_browse(AGDX_LIST_SCHEMAS_CODE, &request)
+            .await?
+        {
+            BrowseOutcome::Schemas(page) => Ok(page),
+            _ => Err(LaserError::Protocol(
+                "schemas: unexpected browse outcome".to_owned(),
+            )),
+        }
+    }
+}
+
 /// Fluent builder for [`Projections::list`]. Narrow the registry browse with
-/// `.for_topic` / `.for_topics` / `.name_contains` / `.id_prefix`, then
-/// `.fetch().await`. No filter lists every projection.
+/// `.for_topic` / `.for_topics` / `.name_contains` / `.id_prefix`, pick a page
+/// with `.page` and `.results`, then `.fetch().await`. No filter lists every
+/// projection.
 #[must_use = "call .fetch().await to list the projections"]
-pub struct ProjectionsRequest<'a> {
-    laser: &'a Laser,
+pub struct ProjectionsRequest {
+    laser: Laser,
     topics: Vec<String>,
     name_contains: Option<String>,
     id_prefix: Option<String>,
     search: Option<String>,
+    page: u32,
+    results: u32,
 }
 
-impl<'a> ProjectionsRequest<'a> {
+impl ProjectionsRequest {
     /// Keep only projections bound to `topic`. Repeatable.
     pub fn for_topic(mut self, topic: impl Into<String>) -> Self {
         self.topics.push(topic.into());
@@ -469,10 +578,23 @@ impl<'a> ProjectionsRequest<'a> {
         self
     }
 
-    /// Run the browse and return the matching projections. A handle that
-    /// scopes its resources to a stream lists only that stream's projections,
-    /// under the ids the caller gave them.
-    pub async fn fetch(self) -> Result<Vec<ProjectionInfo>, LaserError> {
+    /// The 1-based page to read, in id order. Zero reads the first page.
+    pub fn page(mut self, page: u32) -> Self {
+        self.page = page;
+        self
+    }
+
+    /// The projections per page. Zero leaves it to the server, which serves
+    /// 10 by default and at most 100.
+    pub fn results(mut self, results: u32) -> Self {
+        self.results = results;
+        self
+    }
+
+    /// Run the browse and return one page of the matching projections. A
+    /// handle that scopes its resources to a stream lists only that stream's
+    /// projections, under the ids the caller gave them.
+    pub async fn fetch(self) -> Result<ProjectionPage, LaserError> {
         let id_prefix = match self.laser.resource_stream() {
             Some(stream) => Some(laser_wire::authz::scoped_resource(
                 stream,
@@ -486,21 +608,29 @@ impl<'a> ProjectionsRequest<'a> {
             name_contains: self.name_contains,
             id_prefix,
             search: self.search,
+            kinds: Vec::new(),
+            stream: self.laser.resource_stream().map(str::to_owned),
+            page: self.page,
+            results: self.results,
         };
         match self
             .laser
             .execute_browse(AGDX_LIST_PROJECTIONS_CODE, &request)
             .await?
         {
-            BrowseOutcome::Projections(list) => Ok(list
-                .into_iter()
-                .filter(|info| {
-                    self.laser
-                        .local_resource_name(info.projection.id.as_str())
-                        .is_some()
-                })
-                .map(|info| self.laser.local_projection_info(info))
-                .collect()),
+            BrowseOutcome::Projections(page) => Ok(ProjectionPage {
+                items: page
+                    .items
+                    .into_iter()
+                    .filter(|info| {
+                        self.laser
+                            .local_resource_name(info.projection.id.as_str())
+                            .is_some()
+                    })
+                    .map(|info| self.laser.local_projection_info(info))
+                    .collect(),
+                ..page
+            }),
             _ => Err(LaserError::Protocol(
                 "list: unexpected browse outcome".to_owned(),
             )),
@@ -510,6 +640,7 @@ impl<'a> ProjectionsRequest<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::capabilities::Capabilities;
     use crate::error::LaserError;
     use crate::laser::{Laser, ResourceNaming};
     use laser_wire::browse::ProjectionInfo;
@@ -552,6 +683,7 @@ mod tests {
         let info = laser.local_projection_info(ProjectionInfo {
             projection,
             bindings: vec![laser.scoped_binding(binding())],
+            status: Vec::new(),
         });
         assert_eq!(info.projection.id.as_str(), "reading.v1");
         assert_eq!(
@@ -564,15 +696,18 @@ mod tests {
     #[tokio::test]
     async fn given_a_scoped_projection_id_over_the_wire_cap_when_dropped_then_should_refuse_it_before_sending()
      {
-        let laser = laser();
+        let managed = laser().with_capabilities(Capabilities {
+            managed: true,
+            ..Capabilities::OPEN
+        });
         let local_cap = MAX_PROJECTION_ID_BYTES - "stream:acme/".len();
-        let error = laser
+        let error = managed
             .projections()
             .drop("p".repeat(local_cap + 1))
             .await
             .expect_err("a scoped id over the cap is refused");
         assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
-        let error = laser
+        let error = managed
             .bindings()
             .apply(
                 ProjectionBinding::builder()
@@ -583,7 +718,7 @@ mod tests {
             .await
             .expect_err("a projection id with a control character is refused");
         assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
-        let error = laser
+        let error = laser()
             .projections()
             .drop("p".repeat(local_cap))
             .await
@@ -620,5 +755,60 @@ mod tests {
     fn given_bare_naming_when_scoping_a_binding_then_should_leave_it_unchanged() {
         let laser = laser().with_resource_naming(ResourceNaming::Bare);
         assert_eq!(laser.scoped_binding(binding()), binding());
+    }
+
+    #[tokio::test]
+    async fn given_owned_projection_handles_when_spawned_then_should_run_on_their_own_tasks() {
+        let laser = laser();
+        let projections = laser.projections();
+        let bindings = laser.bindings();
+        let listing = laser.projections().list().page(2).results(5);
+        let dropped = tokio::spawn(async move { projections.drop("reading.v1").await });
+        let applied = tokio::spawn(async move { bindings.apply(binding()).await });
+        let listed = tokio::spawn(async move { listing.fetch().await.map(|_| ()) });
+        for outcome in [dropped, applied, listed] {
+            let error = outcome
+                .await
+                .expect("the task joins")
+                .expect_err("an offline Laser has no managed backend");
+            assert!(matches!(error, LaserError::Unsupported { .. }), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_json_schema_of_another_draft_when_registered_then_should_refuse_it_before_sending()
+     {
+        let error = laser()
+            .schemas()
+            .register(SchemaSource::JsonSchema {
+                schema: r#"{"$schema":"http://json-schema.org/draft-07/schema#"}"#.to_owned(),
+            })
+            .send()
+            .await
+            .expect_err("only draft 2020-12 registers");
+        assert!(
+            matches!(&error, LaserError::Invalid(message) if message.contains("2020-12")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_owned_schema_handles_when_spawned_then_should_run_on_their_own_tasks() {
+        let laser = laser();
+        let schemas = laser.schemas();
+        let register = laser.schemas().register(SchemaSource::Avro {
+            schema: "\"long\"".to_owned(),
+        });
+        let listing = laser.schemas().list().name_contains("reading").page(2);
+        let dropped = tokio::spawn(async move { schemas.drop(7).await });
+        let registered = tokio::spawn(async move { register.send().await.map(|_| ()) });
+        let listed = tokio::spawn(async move { listing.fetch().await.map(|_| ()) });
+        for outcome in [dropped, registered, listed] {
+            let error = outcome
+                .await
+                .expect("the task joins")
+                .expect_err("an offline Laser has no managed backend");
+            assert!(matches!(error, LaserError::Unsupported { .. }), "{error:?}");
+        }
     }
 }

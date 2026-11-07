@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import { Laser } from "../../src/client/laser.js"
 import { NoStreamError, PresenceConflictError } from "../../src/client/errors.js"
-import type { IggyClient, LaserTransport } from "../../src/iggy/apache-iggy.js"
+import type { ApacheIggyTransport, IggyClient, ManagedTarget } from "../../src/iggy/apache-iggy.js"
 import { AgentId, ConversationId } from "../../src/types/ids.js"
 import { AgentTopic } from "../../src/provenance/agent-topic.js"
 import { encodeAgentPresence, newAgentPresence, parseAgentId } from "../../src/wire/agent.js"
@@ -99,12 +99,14 @@ void test("given_a_context_scope_when_reaching_further_primitives_then_should_bi
 void test("given_a_wire_presence_when_advertised_then_should_send_it_and_refuse_another_agent", async (t) => {
   await using laser = await Laser.fromClient(fakeClient())
   const sent: [number, Uint8Array][] = []
+  // Presence rides the answering send, so the pinned replica is learned.
   t.mock.method(
-    (laser as unknown as { transport: LaserTransport }).transport,
-    "sendManaged",
-    (code: number, payload: Uint8Array) => {
+    (laser as unknown as { transport: ApacheIggyTransport }).transport,
+    "sendManagedTo",
+    (code: number, payload: Uint8Array, target: ManagedTarget) => {
+      assert.equal(target.kind, "caller", "the first advertise goes to the caller's node")
       sent.push([code, payload])
-      return Promise.resolve(new Uint8Array())
+      return Promise.resolve({ reply: new Uint8Array(), replica: 0 })
     }
   )
   const presence = newAgentPresence(parseAgentId("worker"), "worker.work")

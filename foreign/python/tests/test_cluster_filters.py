@@ -210,6 +210,114 @@ async def test_given_a_group_reader_holding_its_filtered_waits_on_a_cluster_when
             await laser.close()
 
 
+async def test_given_a_later_record_acknowledged_through_when_an_earlier_one_is_acknowledged_after_then_should_keep_the_higher_progress():  # noqa: E501
+    async with catalog_cluster() as cluster:
+        stream = f"ack_order_{uuid.uuid4().hex[:12]}"
+        laser = await cluster_laser(cluster, stream)
+        try:
+            await alternating(laser)
+            group = await bound_group(laser)
+            reader = await group.reader(start="first", count=1)
+            records = []
+            while len(records) < 3:
+                record = await asyncio.wait_for(reader.next_record(), READ_TIMEOUT)
+                if record.partition_id == 0:
+                    records.append(record)
+            assert [record.offset for record in records] == [0, 2, 4]
+
+            await reader.ack_through(records[2])
+            await reader.ack(records[1])
+            await reader.close()
+            await wait_for_group_offsets(laser.topic(TOPIC).consumer_group(GROUP), {0: 4})
+
+            # A reader without a start resumes after the group's stored progress.
+            rejoined = await group.reader(count=1)
+            resumed = await asyncio.wait_for(rejoined.next_record(), READ_TIMEOUT)
+            while resumed.partition_id != 0:
+                resumed = await asyncio.wait_for(rejoined.next_record(), READ_TIMEOUT)
+            assert resumed.offset >= 6, (
+                "the stored progress never moved back below the higher offset"
+            )
+            await rejoined.close()
+        finally:
+            await laser.close()
+
+
+async def test_given_another_consumer_that_stored_higher_progress_when_a_closed_reader_acknowledges_then_should_refuse_it_and_resume_past_the_higher_offset():  # noqa: E501
+    async with catalog_cluster() as cluster:
+        stream = f"ack_higher_{uuid.uuid4().hex[:12]}"
+        laser = await cluster_laser(cluster, stream)
+        try:
+            await alternating(laser)
+            group = await bound_group(laser)
+            first = await group.reader(start="first", count=1)
+            held = await asyncio.wait_for(first.next_record(), READ_TIMEOUT)
+            while held.partition_id != 0:
+                held = await asyncio.wait_for(first.next_record(), READ_TIMEOUT)
+            assert held.offset == 0
+            await first.close()
+            # Another consumer of the same group reads and stores past the held record.
+            other = (
+                laser.topic(TOPIC)
+                .consumer_group(GROUP)
+                .consumer(polling="first", auto_commit="disabled", batch_length=16)
+            )
+            stored = None
+            try:
+                deadline = time.monotonic() + READ_TIMEOUT
+                while stored is None:
+                    message = await other.next_within(READ_TIMEOUT * 1000)
+                    if message.partition_id == 0 and message.position.offset >= 14:
+                        await other.commit(message)
+                        stored = message.position.offset
+                    assert time.monotonic() < deadline, "the other consumer reaches the tail"
+            finally:
+                await other.shutdown()
+            # Committing the match at 14 stores the contiguous prefix through the
+            # non-matching record at 15, the partition's last.
+            assert stored == 14
+            group_offsets = laser.topic(TOPIC).consumer_group(GROUP)
+            await wait_for_group_offsets(group_offsets, {0: 15})
+
+            with pytest.raises(ls.LaserError):
+                await first.ack(held)
+            # The other consumer's greater progress stands.
+            await wait_for_group_offsets(group_offsets, {0: 15})
+        finally:
+            await laser.close()
+
+
+async def test_given_a_recreated_topic_when_a_page_of_the_old_generation_is_acknowledged_then_should_refuse_the_mismatched_generation():  # noqa: E501
+    async with catalog_cluster() as cluster:
+        stream = f"ack_generation_{uuid.uuid4().hex[:12]}"
+        laser = await cluster_laser(cluster, stream)
+        try:
+            await alternating(laser)
+            group = await bound_group(laser)
+            reader = await group.reader(start="first", count=1)
+            page = await asyncio.wait_for(reader.next_page(), READ_TIMEOUT)
+            # The Python client deletes streams, not topics, and a recreated
+            # stream carries a recreated topic generation.
+            await laser.stream(stream).delete()
+            await laser.stream(stream).ensure()
+            await laser.topic(TOPIC).ensure(PARTITIONS)
+
+            with pytest.raises(ls.LaserError):
+                await reader.ack_page(page)
+            # The group of the old topic generation is gone with it.
+            with contextlib.suppress(ls.LaserError):
+                await reader.close()
+        finally:
+            await laser.close()
+
+
+async def alternating(laser):
+    """Sixteen records on partition 0, matches at the even offsets."""
+    await publish(
+        laser, [SAFE_MODE if index % 2 == 0 else GROUND_STATION for index in range(16)], 0
+    )
+
+
 @contextlib.asynccontextmanager
 async def catalog_cluster(max_waiting_reads=None):
     """Three nodes, each reaching one stand-in catalog over a socket of its own."""

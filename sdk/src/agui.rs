@@ -1,4 +1,4 @@
-use crate::context::ContextAssembler;
+use crate::context::{ContextAssembler, LastN};
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::provenance::AgentTopic;
@@ -87,6 +87,8 @@ pub enum AgUiEvent {
     },
     #[serde(rename = "TOOL_CALL_RESULT")]
     ToolCallResult {
+        #[serde(rename = "messageId")]
+        message_id: String,
         #[serde(rename = "toolCallId")]
         tool_call_id: String,
         content: String,
@@ -154,10 +156,12 @@ impl Laser {
         Ok((view.revision > 0 || view.complete).then_some(view.document))
     }
 
-    /// Render `conversation` on `topic` as AG-UI events by reading the log:
-    /// chat/reasoning chunk streams become `TEXT_MESSAGE_*` events, state events
-    /// become `STATE_SNAPSHOT`/`STATE_DELTA`, an error terminal becomes
-    /// `RUN_ERROR`. Log-native, replayable, over Iggy rather than SSE.
+    /// Render `conversation` on `topic` as AG-UI events by reading every
+    /// retained record of it: chat/reasoning chunk streams become
+    /// `TEXT_MESSAGE_*` events, state events become `STATE_SNAPSHOT`/
+    /// `STATE_DELTA`, an error terminal becomes `RUN_ERROR`. The events form
+    /// runs an AG-UI client verifier accepts. Log-native, replayable, over Iggy
+    /// rather than SSE.
     pub async fn agui_events(
         &self,
         conversation: ConversationId,
@@ -166,20 +170,27 @@ impl Laser {
         let messages = ContextAssembler::builder()
             .conversation_id(conversation)
             .topics(vec![topic])
+            .policy(Box::new(LastN(usize::MAX)))
             .build()
-            .assemble(self)
+            .replay(self)
             .await?;
         // The chunk-stream purpose rides only the opening chunk (sequence 0), so
         // track each channel's kind as the stream opens and reuse it for the
         // later chunks (a terminal chunk carries no purpose).
         let mut channels: std::collections::HashMap<String, ChunkKind> =
             std::collections::HashMap::new();
-        let mut events = Vec::new();
+        let mut framer = RunFramer::default();
         for message in &messages {
             let Some(envelope) = &message.envelope else {
                 continue;
             };
-            if envelope.kind == AgentKind::Chunk {
+            let thread_id = envelope.conversation.to_string();
+            let run_id = envelope
+                .correlation
+                .map(|correlation| correlation.to_string())
+                .or_else(|| envelope.record.map(|record| record.to_string()))
+                .unwrap_or_else(|| thread_id.clone());
+            let rendered = if envelope.kind == AgentKind::Chunk {
                 let id = envelope
                     .channel
                     .map(|channel| channel.to_string())
@@ -191,12 +202,15 @@ impl Laser {
                 } else {
                     channels.get(&id).copied().unwrap_or(ChunkKind::Chat)
                 };
-                events.extend(chunk_to_agui(envelope, kind));
+                chunk_to_agui(envelope, kind)
             } else {
-                events.extend(envelope_to_agui(envelope));
+                envelope_to_agui(envelope)
+            };
+            for event in rendered {
+                framer.push(event, &thread_id, &run_id);
             }
         }
-        Ok(events)
+        Ok(framer.finish())
     }
 }
 
@@ -207,6 +221,177 @@ enum ChunkKind {
     Chat,
     Reasoning,
     ToolArgs,
+}
+
+// Places rendered events into AG-UI runs: an event outside a run opens one, a
+// span whose opening fell outside the read opens before its content, and a
+// run closes its open spans before it finishes.
+#[derive(Default)]
+struct RunFramer {
+    events: Vec<AgUiEvent>,
+    run: Option<OpenRun>,
+}
+
+struct OpenRun {
+    thread_id: String,
+    run_id: String,
+    spans: Vec<(SpanKind, String)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpanKind {
+    Text,
+    Reasoning,
+    ToolCall,
+}
+
+// Where one event sits in its span.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpanStep {
+    Open,
+    Content,
+    Close,
+}
+
+impl RunFramer {
+    fn push(&mut self, event: AgUiEvent, thread_id: &str, run_id: &str) {
+        match &event {
+            AgUiEvent::RunStarted { thread_id, run_id } => {
+                self.close();
+                self.run = Some(OpenRun {
+                    thread_id: thread_id.clone(),
+                    run_id: run_id.clone(),
+                    spans: Vec::new(),
+                });
+                self.events.push(event);
+                return;
+            }
+            AgUiEvent::RunFinished { .. } => {
+                self.close();
+                return;
+            }
+            AgUiEvent::RunError { .. } => {
+                self.run = None;
+                self.events.push(event);
+                return;
+            }
+            _ => {}
+        }
+        if self.run.is_none() {
+            self.events.push(AgUiEvent::RunStarted {
+                thread_id: thread_id.to_owned(),
+                run_id: run_id.to_owned(),
+            });
+        }
+        let run = self.run.get_or_insert_with(|| OpenRun {
+            thread_id: thread_id.to_owned(),
+            run_id: run_id.to_owned(),
+            spans: Vec::new(),
+        });
+        if let Some((kind, id, step)) = span_of(&event) {
+            let open = run
+                .spans
+                .iter()
+                .position(|(open_kind, open_id)| *open_kind == kind && *open_id == id);
+            match (step, open) {
+                (SpanStep::Open, Some(_)) => return,
+                (SpanStep::Open, None) => run.spans.push((kind, id.to_owned())),
+                (_, None) => {
+                    self.events.push(opening_of(kind, id));
+                    if step == SpanStep::Content {
+                        run.spans.push((kind, id.to_owned()));
+                    }
+                }
+                (SpanStep::Close, Some(index)) => {
+                    run.spans.remove(index);
+                }
+                (SpanStep::Content, Some(_)) => {}
+            }
+        }
+        self.events.push(event);
+    }
+
+    fn finish(mut self) -> Vec<AgUiEvent> {
+        self.close();
+        self.events
+    }
+
+    fn close(&mut self) {
+        let Some(run) = self.run.take() else {
+            return;
+        };
+        for (kind, id) in run.spans.iter().rev() {
+            self.events.push(closing_of(*kind, id));
+        }
+        self.events.push(AgUiEvent::RunFinished {
+            thread_id: run.thread_id,
+            run_id: run.run_id,
+        });
+    }
+}
+
+// The span an event belongs to and where it sits in it.
+fn span_of(event: &AgUiEvent) -> Option<(SpanKind, &str, SpanStep)> {
+    let (kind, id, step) = match event {
+        AgUiEvent::TextMessageStart { message_id, .. } => {
+            (SpanKind::Text, message_id, SpanStep::Open)
+        }
+        AgUiEvent::TextMessageContent { message_id, .. } => {
+            (SpanKind::Text, message_id, SpanStep::Content)
+        }
+        AgUiEvent::TextMessageEnd { message_id } => (SpanKind::Text, message_id, SpanStep::Close),
+        AgUiEvent::ReasoningMessageStart { message_id, .. } => {
+            (SpanKind::Reasoning, message_id, SpanStep::Open)
+        }
+        AgUiEvent::ReasoningMessageContent { message_id, .. } => {
+            (SpanKind::Reasoning, message_id, SpanStep::Content)
+        }
+        AgUiEvent::ReasoningMessageEnd { message_id } => {
+            (SpanKind::Reasoning, message_id, SpanStep::Close)
+        }
+        AgUiEvent::ToolCallStart { tool_call_id, .. } => {
+            (SpanKind::ToolCall, tool_call_id, SpanStep::Open)
+        }
+        AgUiEvent::ToolCallArgs { tool_call_id, .. } => {
+            (SpanKind::ToolCall, tool_call_id, SpanStep::Content)
+        }
+        AgUiEvent::ToolCallEnd { tool_call_id } => {
+            (SpanKind::ToolCall, tool_call_id, SpanStep::Close)
+        }
+        _ => return None,
+    };
+    Some((kind, id.as_str(), step))
+}
+
+fn opening_of(kind: SpanKind, id: &str) -> AgUiEvent {
+    match kind {
+        SpanKind::Text => AgUiEvent::TextMessageStart {
+            message_id: id.to_owned(),
+            role: "assistant".to_owned(),
+        },
+        SpanKind::Reasoning => AgUiEvent::ReasoningMessageStart {
+            message_id: id.to_owned(),
+            role: "reasoning".to_owned(),
+        },
+        SpanKind::ToolCall => AgUiEvent::ToolCallStart {
+            tool_call_id: id.to_owned(),
+            tool_call_name: String::new(),
+        },
+    }
+}
+
+fn closing_of(kind: SpanKind, id: &str) -> AgUiEvent {
+    match kind {
+        SpanKind::Text => AgUiEvent::TextMessageEnd {
+            message_id: id.to_owned(),
+        },
+        SpanKind::Reasoning => AgUiEvent::ReasoningMessageEnd {
+            message_id: id.to_owned(),
+        },
+        SpanKind::ToolCall => AgUiEvent::ToolCallEnd {
+            tool_call_id: id.to_owned(),
+        },
+    }
 }
 
 // The kind an opening chunk's purpose declares (mid-stream chunks carry none).
@@ -258,6 +443,10 @@ fn envelope_to_agui(envelope: &AgentEnvelope) -> Vec<AgUiEvent> {
                 .map(|correlation| correlation.to_string())
                 .unwrap_or_default();
             vec![AgUiEvent::ToolCallResult {
+                message_id: envelope
+                    .record
+                    .map(|record| record.to_string())
+                    .unwrap_or_else(|| tool_call_id.clone()),
                 tool_call_id,
                 content: String::from_utf8_lossy(&envelope.body).into_owned(),
             }]
@@ -360,8 +549,108 @@ fn chunk_to_agui(envelope: &AgentEnvelope, kind: ChunkKind) -> Vec<AgUiEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use laser_wire::agent::{ConversationId as WireConversationId, RecordId, TaskState};
+    use laser_wire::agent::{
+        ConversationId as WireConversationId, CorrelationId, RecordId, TaskState,
+    };
     use laser_wire::query::Value;
+
+    #[test]
+    fn given_chunks_outside_a_run_when_framed_then_should_open_and_close_one_run() {
+        let events = framed(vec![
+            AgUiEvent::TextMessageStart {
+                message_id: "m".to_owned(),
+                role: "assistant".to_owned(),
+            },
+            content("m"),
+        ]);
+        assert_eq!(
+            events,
+            vec![
+                started(),
+                AgUiEvent::TextMessageStart {
+                    message_id: "m".to_owned(),
+                    role: "assistant".to_owned(),
+                },
+                content("m"),
+                AgUiEvent::TextMessageEnd {
+                    message_id: "m".to_owned(),
+                },
+                finished(),
+            ]
+        );
+    }
+
+    #[test]
+    fn given_content_whose_opening_is_gone_when_framed_then_should_open_its_message_first() {
+        let events = framed(vec![
+            content("m"),
+            AgUiEvent::TextMessageEnd {
+                message_id: "m".to_owned(),
+            },
+        ]);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgUiEvent::RunStarted { .. },
+                AgUiEvent::TextMessageStart { message_id, .. },
+                AgUiEvent::TextMessageContent { .. },
+                AgUiEvent::TextMessageEnd { .. },
+                AgUiEvent::RunFinished { .. },
+            ] if message_id == "m"
+        ));
+    }
+
+    #[test]
+    fn given_records_after_a_finished_run_when_framed_then_should_start_a_new_run() {
+        let events = framed(vec![
+            started(),
+            finished(),
+            AgUiEvent::RunError {
+                message: "boom".to_owned(),
+            },
+            content("m"),
+        ]);
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| {
+                serde_json::to_value(event).expect("an event encodes")["type"]
+                    .as_str()
+                    .map(|kind| match kind {
+                        "RUN_STARTED" => "start",
+                        "RUN_FINISHED" => "finish",
+                        "RUN_ERROR" => "error",
+                        _ => "other",
+                    })
+                    .expect("an event names its type")
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "start", "finish", "error", "start", "other", "other", "other", "finish"
+            ]
+        );
+    }
+
+    #[test]
+    fn given_a_tool_result_when_rendered_then_should_carry_its_message_id() {
+        let mut envelope = AgentEnvelope::response(
+            RecordId::from_u128(9),
+            WireConversationId::from_u128(2),
+            "worker".parse().expect("valid agent id"),
+            CorrelationId::from_u128(3),
+            b"42".to_vec(),
+        );
+        envelope.tool = Some("lookup".to_owned());
+        assert_eq!(
+            envelope_to_agui(&envelope),
+            vec![AgUiEvent::ToolCallResult {
+                message_id: RecordId::from_u128(9).to_string(),
+                tool_call_id: CorrelationId::from_u128(3).to_string(),
+                content: "42".to_owned(),
+            }]
+        );
+    }
 
     #[test]
     fn given_failed_task_status_when_rendered_then_should_emit_run_error() {
@@ -381,5 +670,34 @@ mod tests {
             envelope_to_agui(&envelope).as_slice(),
             [AgUiEvent::RunError { message }] if message == "worker failed"
         ));
+    }
+
+    fn framed(events: Vec<AgUiEvent>) -> Vec<AgUiEvent> {
+        let mut framer = RunFramer::default();
+        for event in events {
+            framer.push(event, "thread", "run");
+        }
+        framer.finish()
+    }
+
+    fn started() -> AgUiEvent {
+        AgUiEvent::RunStarted {
+            thread_id: "thread".to_owned(),
+            run_id: "run".to_owned(),
+        }
+    }
+
+    fn finished() -> AgUiEvent {
+        AgUiEvent::RunFinished {
+            thread_id: "thread".to_owned(),
+            run_id: "run".to_owned(),
+        }
+    }
+
+    fn content(message_id: &str) -> AgUiEvent {
+        AgUiEvent::TextMessageContent {
+            message_id: message_id.to_owned(),
+            delta: "part".to_owned(),
+        }
     }
 }

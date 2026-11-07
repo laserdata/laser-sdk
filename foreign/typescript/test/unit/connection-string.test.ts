@@ -139,12 +139,28 @@ void test("given_missing_or_malformed_credentials_when_parsed_then_should_refuse
   }
 })
 
-void test("given_credentials_with_percent_signs_or_slashes_when_parsed_then_should_keep_them_verbatim", () => {
-  assert.deepEqual(parseConnectionString("iggy://user:p%40ss/w0rd@host", {}).credentials, {
+void test("given_percent_encoded_credentials_when_parsed_then_should_carry_the_exact_secret", () => {
+  assert.deepEqual(parseConnectionString("user:p%3Ass%40w%3Frd@host", {}).credentials, {
     username: "user",
-    password: "p%40ss/w0rd"
+    password: "p:ss@w?rd"
   })
-  assert.deepEqual(parseConnectionString("tok%2Fen@host", {}).credentials, { token: "tok%2Fen" })
+  assert.deepEqual(parseConnectionString("iggy://us%40er:p%40ss/w0rd%25@host", {}).credentials, {
+    username: "us@er",
+    password: "p@ss/w0rd%"
+  })
+  assert.deepEqual(parseConnectionString("tok%2Fen@host", {}).credentials, { token: "tok/en" })
+})
+
+void test("given_a_raw_at_sign_or_a_broken_escape_in_the_credentials_when_parsed_then_should_refuse_them", () => {
+  for (const value of [
+    "user:p@ss@host",
+    "user:p%zzss@host",
+    "user:pass%@host",
+    "user:p%FFss@host",
+    "%:pass@host"
+  ]) {
+    assert.throws(() => parseConnectionString(value, {}), ConfigError, value)
+  }
 })
 
 void test("given_unknown_repeated_or_malformed_options_when_parsed_then_should_refuse_them", () => {

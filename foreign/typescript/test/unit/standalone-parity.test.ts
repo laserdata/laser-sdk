@@ -65,7 +65,7 @@ void test("given_a_snapshot_offset_above_u64_when_decoded_then_should_reject_it"
 
 void test("given_a_test_clock_at_u64_max_when_advanced_then_should_match_native_wrapping", () => {
   const clock = new TestClock(0xffff_ffff_ffff_ffffn)
-  clock.advance(1n)
+  clock.advance(0.001)
   assert.equal(clock.nowMicros(), 0n)
   clock.set(42n)
   assert.equal(clock.nowMicros(), 42n)
@@ -74,8 +74,10 @@ void test("given_a_test_clock_at_u64_max_when_advanced_then_should_match_native_
     assert.throws(() => {
       clock.set(value)
     }, InvalidError)
+  }
+  for (const byMs of [-1, Number.NaN, Number.POSITIVE_INFINITY, 1e300]) {
     assert.throws(() => {
-      clock.advance(value)
+      clock.advance(byMs)
     }, InvalidError)
   }
 })

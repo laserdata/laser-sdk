@@ -48,6 +48,24 @@ def start_session(world, owner, label):
     )
 
 
+@when(parsers.parse('agent "{owner}" starts the session "{label}" again'))
+def start_session_again(world, owner, label):
+    world.capture(lambda: _sessions(world).create(label).agent(owner).begin())
+
+
+@when(parsers.parse('agent "{owner}" resumes the session "{label}"'))
+def resume_session(world, owner, label):
+    world.session, world.lease = world.run(
+        lambda: _sessions(world).create(label).agent(owner).resume()
+    )
+
+
+@then(parsers.parse("the call fails as a session that ended {status}"))
+def fails_ended(world, status):
+    assert isinstance(world.error, ls.SessionEndedError), world.error
+    assert world.error.status == status
+
+
 @when("the session ends")
 def end_session(world):
     world.run(lambda: world.session.end())
@@ -653,10 +671,24 @@ def manifest_addresses(world):
         for message in world.assembled_context.fragments
     ]
     earlier = [
-        (turn.message.id.partition_id, turn.message.id.offset) for turn in turns[: len(assembled)]
-    ]
+        (turn.message.id.partition_id, turn.message.id.offset)
+        for turn in turns
+        if turn.display == "agent.message"
+    ][: len(assembled)]
     assert listed == assembled
     assert listed == earlier
+
+
+@then(parsers.re(r"the context assembled from the session reads (?P<listing>\".+\")$"))
+def assembled_reads(world, listing):
+    expected = _names(listing)
+    session = world.session
+
+    def read():
+        lines = world.run(lambda: session.assemble(ls.LastN(50))).text().splitlines()
+        return lines if len(lines) >= len(expected) else None
+
+    assert _eventually(world, read, "the assembled context") == expected
 
 
 @given(parsers.parse("sessions publish heartbeats every {millis:d} milliseconds"))

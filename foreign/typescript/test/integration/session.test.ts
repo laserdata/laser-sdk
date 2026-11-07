@@ -146,7 +146,8 @@ void test("given_a_session_run_when_the_work_throws_then_should_write_failed_and
     assert.deepEqual(nth(statuses, 1)[0], { kind: "known", name: "Failed" })
     const end = decoded(nth(statuses, 1)[1], decodeSessionEnd)
     assert.equal(end.error?.message, "model provider exploded")
-    assert.deepEqual(end.error.detail?.get("panic"), { kind: "bool", value: true })
+    assert.equal(end.error.detail?.get("panic"), undefined, "an exception is not a panic")
+    assert.deepEqual(end.error.detail?.get("exception"), { kind: "str", value: "TypeError" })
   } finally {
     await laser.close()
   }
@@ -251,10 +252,8 @@ void test("given_model_and_tool_calls_when_recorded_then_should_write_redacted_r
   const laser = await connect()
   try {
     const { session, lease } = await laser.sessions().start().agent(planner).begin()
-    const assembled = await eventually(async () => {
-      const assembled = await session.assemble(new LastN(10))
-      return assembled.manifest.fragments.length === 1 ? assembled : undefined
-    })
+    const assembled = await session.assemble(new LastN(10))
+    assert.deepEqual(assembled.manifest.fragments, [], "the start record never reaches a prompt")
     assert.equal(assembled.manifest.policy, "last_n(10)")
     const call = await session.model(
       new ModelRequest("gpt-test", new TextEncoder().encode('{"prompt":"hi","api_key":"k"}')),
@@ -459,7 +458,7 @@ void test("given_open_iggy_when_reading_the_session_index_then_should_be_unsuppo
     const id = ConversationId.new()
     await assert.rejects(sessions.get(id), (error: unknown) => isUnsupported(error))
     await assert.rejects(sessions.list().fetch(), (error: unknown) => isUnsupported(error))
-    await assert.rejects(sessions.changes(0n, 0), (error: unknown) => isUnsupported(error))
+    await assert.rejects(sessions.changes(0, 0), (error: unknown) => isUnsupported(error))
   } finally {
     await laser.close()
   }

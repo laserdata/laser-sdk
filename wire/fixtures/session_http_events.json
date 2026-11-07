@@ -50,7 +50,11 @@
       }
     }
   ],
-  "cursor": "page",
+  "page": 3,
+  "total_pages": 3,
+  "total_results": 41,
+  "as_of": 4405,
+  "series": 7654321098765432101,
   "ranges": [
     {
       "topic_id": 3,
@@ -70,7 +74,6 @@
       "retained_from": 7
     }
   ],
-  "fixed_frontier": true,
   "gaps": [
     {
       "topic_id": 3,

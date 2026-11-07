@@ -14,7 +14,7 @@ def test_given_the_required_fields_when_building_a_query_then_should_match_the_o
         .by_key([ls.key_match_new("host", "a")])
         .filter(ls.Filter.pred("cpu", "gt", 80))
         .distinct(True)
-        .consistency("strong")
+        .consistency("read_your_writes")
         .build()
     )
     plain = ls.query_operational(EXECUTION_ID, "readings", 42)
@@ -23,7 +23,7 @@ def test_given_the_required_fields_when_building_a_query_then_should_match_the_o
     assert built["page"] == plain["page"]
     assert built["by_key"] == [ls.key_match_new("host", "a")]
     assert built["distinct"] is True
-    assert built["consistency"] == "strong"
+    assert built["consistency"] == "read_your_writes"
     assert ls.query_new(EXECUTION_ID, target, 42) == plain
 
 
@@ -75,6 +75,31 @@ def test_given_tagged_values_when_read_then_should_delegate_to_the_typed_value()
     assert ls.logical_type_accepts_map_key(long_type) is True
     with pytest.raises(ls.InvalidError):
         ls.typed_value_validate_against(value, {"kind": "string"}, True)
+
+
+def test_given_a_page_when_bound_then_should_read_each_row_by_field_name_or_position():
+    host = ls.key_match_new("host", "node-7")["value"]
+    cpu = ls.key_match_new("cpu", 91)["value"]
+    fields = [
+        {"id": 1, "name": "host", "required": False, "field_type": {"kind": "string"}},
+        {"id": 2, "name": "cpu", "required": False, "field_type": {"kind": "variant"}},
+    ]
+    [row] = ls.QueryRow.from_page(fields, [{"values": [host, cpu]}])
+    assert row.keys() == ["host", "cpu"]
+    assert len(row) == 2
+    assert row["host"] == host
+    assert row[1] == row["cpu"] == row[-1] == cpu
+    assert row.value_text("host") == "node-7"
+    assert row.value_i64("cpu") == 91
+    assert row.field_index("cpu") == 1
+    assert row.value("absent") is None
+    assert row.fields[1]["field_type"] == {"kind": "variant"}
+    with pytest.raises(KeyError):
+        row["absent"]
+    with pytest.raises(IndexError):
+        row[2]
+    with pytest.raises(TypeError):
+        row[1.5]
 
 
 def test_given_logical_fields_when_building_a_schema_then_should_fingerprint_them():

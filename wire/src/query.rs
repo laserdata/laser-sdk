@@ -1,18 +1,18 @@
 use crate::agent::wire_id;
 use crate::codes::QUERY_OP_VERSION;
-use crate::destination::{BackendResourceId, DestinationId};
+use crate::destination::BackendResourceId;
 use crate::error::InvalidError;
 use crate::limits::{
-    MAX_PAGE_SIZE, MAX_QUERY_CURSOR_BYTES, MAX_QUERY_FIELDS, MAX_QUERY_NAME_BYTES,
-    MAX_QUERY_PARAMETERS, MAX_QUERY_PREDICATES, MAX_RAW_SQL_BYTES,
+    MAX_PAGE_SIZE, MAX_QUERY_FIELDS, MAX_QUERY_NAME_BYTES, MAX_QUERY_OFFSET, MAX_QUERY_PARAMETERS,
+    MAX_QUERY_PREDICATES, MAX_RAW_SQL_BYTES,
 };
-use crate::schema::{Digest32, LogicalField, TypedValue, UuidValue, validate_result_fields};
+use crate::schema::{LogicalField, TypedValue, validate_result_fields};
 use crate::validate::Validate;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 wire_id!(
-    /// Unguessable identity used for query status, paging, and cancellation.
+    /// Unguessable identity of one query execution, echoed by its reply.
     QueryExecutionId
 );
 
@@ -21,15 +21,7 @@ wire_id!(
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum QueryTarget {
-    Operational {
-        index: String,
-    },
-    Lakehouse {
-        destination_id: DestinationId,
-        destination_generation: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        snapshot: Option<SnapshotSelector>,
-    },
+    Operational { index: String },
 }
 
 impl QueryTarget {
@@ -40,21 +32,11 @@ impl QueryTarget {
     }
 }
 
-/// An optional time-travel selector resolved to one exact Iceberg snapshot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum SnapshotSelector {
-    SnapshotId(i64),
-    TimestampMicros(i64),
-}
-
 /// SQL grammar accepted by the selected query backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SqlDialect {
-    DataFusion,
     Postgres,
     MySql,
     Sqlite,
@@ -102,9 +84,7 @@ pub struct Query {
     pub filter: Option<Filter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector: Option<VectorQuery>,
-    // Lexical relevance search over the text-hinted indexed fields, additive
-    // like `vector`. An unaware server would silently drop it (the A8 additive
-    // hazard), so the client refuses an unadvertised `text` before sending.
+    // Refuse unadvertised text search because an unaware server could silently drop the filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<TextQuery>,
     #[cfg_attr(feature = "builders", builder(default))]
@@ -187,8 +167,6 @@ pub struct QueryPageRequest {
     pub limit: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub want_total: bool,
 }
@@ -198,7 +176,6 @@ impl Default for QueryPageRequest {
         Self {
             limit: 50,
             offset: Some(0),
-            cursor: None,
             want_total: false,
         }
     }
@@ -214,35 +191,6 @@ impl Validate for Query {
         }
         match &self.target {
             QueryTarget::Operational { index } => validate_query_name("index", index)?,
-            QueryTarget::Lakehouse {
-                destination_id,
-                destination_generation,
-                snapshot,
-            } => {
-                if destination_id.as_u128() == 0 || *destination_generation == 0 {
-                    return Err(InvalidError::new(
-                        "lakehouse destination identity and generation must be nonzero",
-                    ));
-                }
-                if let Some(selector) = snapshot {
-                    match selector {
-                        SnapshotSelector::SnapshotId(value)
-                        | SnapshotSelector::TimestampMicros(value)
-                            if *value <= 0 =>
-                        {
-                            return Err(InvalidError::new(
-                                "snapshot selector must contain a positive value",
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-                if self.fork.is_some() {
-                    return Err(InvalidError::new(
-                        "a lakehouse query cannot resolve against an operational fork",
-                    ));
-                }
-            }
         }
         if self.page.limit == 0 || self.page.limit > MAX_PAGE_SIZE as u32 {
             return Err(InvalidError::new(format!(
@@ -261,19 +209,12 @@ impl Validate for Query {
                 )));
             }
         }
-        if self.page.offset.is_some() && self.page.cursor.is_some() {
-            return Err(InvalidError::new(
-                "query page cannot contain both an offset and a cursor",
-            ));
-        }
-        if let Some(cursor) = &self.page.cursor
-            && (cursor.is_empty()
-                || cursor.len() > MAX_QUERY_CURSOR_BYTES
-                || cursor.chars().any(char::is_control))
+        if let Some(offset) = self.page.offset
+            && offset > MAX_QUERY_OFFSET
         {
-            return Err(InvalidError::new(
-                "query cursor must contain 1..=512 bytes without control characters",
-            ));
+            return Err(InvalidError::new(format!(
+                "query offset {offset} exceeds cap {MAX_QUERY_OFFSET}"
+            )));
         }
         for key_match in &self.by_key {
             validate_query_name("key-match field", &key_match.field)?;
@@ -283,10 +224,10 @@ impl Validate for Query {
             validate_query_name("message type", message_type)?;
         }
         if let Some((start, end)) = self.time_range
-            && start >= end
+            && start > end
         {
             return Err(InvalidError::new(
-                "query time range start must be before its end, and both bounds are inclusive",
+                "query time range start must not be after its end, and both bounds are inclusive",
             ));
         }
         for sort in &self.order {
@@ -314,6 +255,31 @@ impl Validate for Query {
         if self.aggregate.is_some() && (!self.select.fields.is_empty() || self.select.payload) {
             return Err(InvalidError::new(
                 "aggregate queries cannot request row selection",
+            ));
+        }
+        let shapes = [
+            self.text.is_some(),
+            self.vector.is_some(),
+            self.aggregate.is_some(),
+            self.distinct,
+        ];
+        if shapes.into_iter().filter(|set| *set).count() > 1 {
+            return Err(InvalidError::new(
+                "a query takes at most one of text, vector, aggregate and distinct",
+            ));
+        }
+        if self.text.is_some() && (!self.order.is_empty() || self.page.want_total) {
+            return Err(InvalidError::new(
+                "a text query ranks by relevance and takes no order or total",
+            ));
+        }
+        if self.vector.is_some()
+            && (!self.order.is_empty()
+                || self.page.want_total
+                || self.page.offset.is_some_and(|offset| offset > 0))
+        {
+            return Err(InvalidError::new(
+                "a vector query returns its nearest rows and takes no order, offset or total",
             ));
         }
         if let Some(raw_sql) = &self.raw_sql {
@@ -499,8 +465,8 @@ fn is_false(value: &bool) -> bool {
 /// of that lag, and the contract is fail-not-downgrade: a level that cannot be
 /// met returns [`QueryError::Stale`] rather than silently serving older data.
 // `Ord` follows the declaration order, which is the strength ladder
-// (Eventual < ReadYourWrites < Strong), so a stronger level compares greater and
-// a capability check is `want <= served`. A new variant must be appended to keep
+// (Eventual < ReadYourWrites), so a stronger level compares greater and a
+// capability check is `want <= served`. A new variant must be appended to keep
 // the order meaningful.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -511,17 +477,13 @@ pub enum Consistency {
     /// where a little lag is fine.
     #[default]
     Eventual,
-    /// Wait until the projector has applied the source log up to its current
-    /// head before serving, so a query issued after a publish sees that write
-    /// (read-your-writes). Bounded: if the projector cannot catch up within the
-    /// managed deadline the query returns [`QueryError::Stale`] instead of
-    /// downgrading to a stale read. Backend-gated by `read_your_writes`.
+    /// Wait until the projector has applied every source partition up to the
+    /// head the server read when the query arrived, so a query issued after a
+    /// publish was acknowledged sees that write (read-your-writes). Bounded: if
+    /// the projector cannot catch up before the query deadline the query
+    /// returns [`QueryError::Stale`] instead of downgrading to a stale read.
+    /// Backend-gated by `read_your_writes`.
     ReadYourWrites,
-    /// The strongest level: a linearizable read across replicas. Backend-gated
-    /// by `strong_consistency`. Where unavailable the query returns a clean
-    /// unsupported error. Semantics past read-your-writes are still being
-    /// pinned, so treat it as read-your-writes plus cross-replica agreement.
-    Strong,
 }
 
 impl Consistency {
@@ -533,16 +495,12 @@ impl Consistency {
 
 /// The server-side gate that enforces a [`Consistency`] level the same way on
 /// every backend. The client refuses an unadvertised level before sending,
-/// but a backend that does advertise `read_your_writes` or `strong_consistency`
-/// still has to honor the level, and the rule is fail-not-downgrade: serve only
-/// when the projector's `applied` offset for the queried source has reached the
-/// `required` offset (the source log head at query time), else return
-/// [`QueryError::Stale`] rather than a silently older read.
-///
-/// This is the offset obligation common to both non-`Eventual` levels.
-/// `Strong` is read-your-writes plus cross-replica agreement, so a backend
-/// serving `Strong` layers its own cross-replica check on top of a passing
-/// gate. `Eventual` always passes.
+/// but a backend that does advertise `read_your_writes` still has to honor the
+/// level, and the rule is fail-not-downgrade: serve only when the projector's
+/// `applied` offset for the queried source has reached the `required` offset
+/// (the source log head when the query arrived), else return
+/// [`QueryError::Stale`] rather than a silently older read. `Eventual` always
+/// passes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConsistencyGate {
     /// The projector's applied offset for the queried source.
@@ -988,13 +946,7 @@ impl Validate for QueryResult {
             ));
         }
         self.context.validate()?;
-        self.page.validate()?;
-        if self.page.has_more != self.page.next_cursor.is_some() {
-            return Err(InvalidError::new(
-                "query page has_more and next_cursor must agree",
-            ));
-        }
-        Ok(())
+        self.page.validate()
     }
 }
 
@@ -1028,54 +980,7 @@ impl Validate for QueryContext {
                         "operational query context is missing backend evidence",
                     ));
                 }
-                if self.boundary.is_some()
-                    || self.checkpoint_revision.is_some()
-                    || self.global_state_revision.is_some()
-                {
-                    return Err(InvalidError::new(
-                        "operational query context cannot carry lakehouse checkpoint evidence",
-                    ));
-                }
             }
-            ResolvedQueryTarget::Lakehouse {
-                destination_id,
-                destination_generation,
-                backend_resource_id,
-                backend_generation,
-                runtime_configuration_revision,
-                table_uuid,
-                namespace,
-                table,
-                snapshot_id,
-                schema_id,
-                partition_spec_id,
-            } => {
-                if destination_id.as_u128() == 0
-                    || *destination_generation == 0
-                    || backend_resource_id.as_u128() == 0
-                    || *backend_generation == 0
-                    || *runtime_configuration_revision == 0
-                    || table_uuid.as_bytes().len() != UuidValue::BYTES
-                    || namespace.is_empty()
-                    || *snapshot_id <= 0
-                    || *schema_id < 0
-                    || *partition_spec_id < 0
-                    || self.boundary.is_none()
-                    || self.checkpoint_revision.is_none()
-                    || self.global_state_revision.is_none()
-                {
-                    return Err(InvalidError::new(
-                        "lakehouse query context is missing resolved target evidence",
-                    ));
-                }
-                for part in namespace {
-                    validate_query_name("resolved table namespace", part)?;
-                }
-                validate_query_name("resolved table", table)?;
-            }
-        }
-        if let Some(boundary) = &self.boundary {
-            boundary.digest.validate()?;
         }
         Ok(())
     }
@@ -1112,12 +1017,6 @@ pub struct QueryContext {
     pub resolved_target: ResolvedQueryTarget,
     pub requested_consistency: Consistency,
     pub delivered_consistency: Consistency,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boundary: Option<MaterializationBoundary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkpoint_revision: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub global_state_revision: Option<u64>,
     pub truncated: bool,
     pub elapsed_micros: u64,
     pub scanned_bytes: u64,
@@ -1164,34 +1063,6 @@ pub enum ResolvedQueryTarget {
         backend_generation: u64,
         runtime_configuration_revision: u64,
     },
-    Lakehouse {
-        destination_id: DestinationId,
-        destination_generation: u64,
-        backend_resource_id: BackendResourceId,
-        backend_generation: u64,
-        runtime_configuration_revision: u64,
-        table_uuid: UuidValue,
-        namespace: Vec<String>,
-        table: String,
-        snapshot_id: i64,
-        schema_id: i32,
-        partition_spec_id: i32,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MaterializationBoundary {
-    pub digest: Digest32,
-    pub relation_to_current: BoundaryRelation,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum BoundaryRelation {
-    Current,
-    Historical,
-    AheadOfObservedCheckpoint,
 }
 
 /// Pagination info for a query result.
@@ -1213,8 +1084,6 @@ pub struct Page {
     pub total: Option<u64>,
     // Whether rows beyond this page exist. Always exact, always free.
     pub has_more: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
 }
 
 impl Page {
@@ -1243,18 +1112,6 @@ impl Validate for Page {
             return Err(InvalidError::new(format!(
                 "query result page limit exceeds cap {MAX_PAGE_SIZE}"
             )));
-        }
-        if self.has_more != self.next_cursor.is_some() {
-            return Err(InvalidError::new(
-                "query page has_more and next_cursor must agree",
-            ));
-        }
-        if let Some(cursor) = &self.next_cursor
-            && (cursor.is_empty()
-                || cursor.len() > MAX_QUERY_CURSOR_BYTES
-                || cursor.chars().any(char::is_control))
-        {
-            return Err(InvalidError::new("query result cursor is invalid"));
         }
         Ok(())
     }
@@ -1291,170 +1148,6 @@ impl Validate for QueryEnvelope {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueryPageEnvelope {
-    pub v: u32,
-    pub execution_id: QueryExecutionId,
-    pub cursor: String,
-    pub deadline_micros: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueryCancelEnvelope {
-    pub v: u32,
-    pub execution_id: QueryExecutionId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueryStatusEnvelope {
-    pub v: u32,
-    pub execution_id: QueryExecutionId,
-}
-
-impl QueryPageEnvelope {
-    pub fn new(
-        execution_id: QueryExecutionId,
-        cursor: impl Into<String>,
-        deadline_micros: u64,
-    ) -> Self {
-        Self {
-            v: QUERY_OP_VERSION,
-            execution_id,
-            cursor: cursor.into(),
-            deadline_micros,
-        }
-    }
-}
-
-impl QueryCancelEnvelope {
-    pub const fn new(execution_id: QueryExecutionId) -> Self {
-        Self {
-            v: QUERY_OP_VERSION,
-            execution_id,
-        }
-    }
-}
-
-impl QueryStatusEnvelope {
-    pub const fn new(execution_id: QueryExecutionId) -> Self {
-        Self {
-            v: QUERY_OP_VERSION,
-            execution_id,
-        }
-    }
-}
-
-impl Validate for QueryPageEnvelope {
-    fn validate(&self) -> Result<(), InvalidError> {
-        validate_query_control(self.v, self.execution_id)?;
-        if self.cursor.is_empty()
-            || self.cursor.len() > MAX_QUERY_CURSOR_BYTES
-            || self.cursor.chars().any(char::is_control)
-            || self.deadline_micros == 0
-        {
-            return Err(InvalidError::new(
-                "query page cursor or deadline is invalid",
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl Validate for QueryCancelEnvelope {
-    fn validate(&self) -> Result<(), InvalidError> {
-        validate_query_control(self.v, self.execution_id)
-    }
-}
-
-impl Validate for QueryStatusEnvelope {
-    fn validate(&self) -> Result<(), InvalidError> {
-        validate_query_control(self.v, self.execution_id)
-    }
-}
-
-fn validate_query_control(v: u32, execution_id: QueryExecutionId) -> Result<(), InvalidError> {
-    if v != QUERY_OP_VERSION {
-        return Err(InvalidError::new(format!(
-            "query version must be {QUERY_OP_VERSION}, got {v}"
-        )));
-    }
-    if execution_id.as_u128() == 0 {
-        return Err(InvalidError::new("query execution id must be nonzero"));
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueryExecutionStatus {
-    pub execution_id: QueryExecutionId,
-    pub state: QueryExecutionState,
-    pub started_at_micros: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub finished_at_micros: Option<u64>,
-    pub scanned_bytes: u64,
-    pub produced_bytes: u64,
-    pub row_count: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<QueryError>,
-}
-
-impl Validate for QueryExecutionStatus {
-    fn validate(&self) -> Result<(), InvalidError> {
-        if self.execution_id.as_u128() == 0 || self.started_at_micros == 0 {
-            return Err(InvalidError::new(
-                "query execution identity and start time must be nonzero",
-            ));
-        }
-        let terminal = matches!(
-            self.state,
-            QueryExecutionState::Completed
-                | QueryExecutionState::Cancelled
-                | QueryExecutionState::Failed
-                | QueryExecutionState::Expired
-        );
-        match (terminal, self.finished_at_micros) {
-            (true, Some(finished)) if finished >= self.started_at_micros => {}
-            (false, None) => {}
-            _ => Err(InvalidError::new(
-                "query execution finish time does not match its state",
-            ))?,
-        }
-        if matches!(self.state, QueryExecutionState::Failed) != self.error.is_some() {
-            return Err(InvalidError::new(
-                "query execution error must be present exactly for failed state",
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum QueryExecutionState {
-    Queued,
-    Planning,
-    Running,
-    Completed,
-    Cancelled,
-    Failed,
-    Expired,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum QueryStatusReply {
-    Ok(QueryExecutionStatus),
-    Err(QueryError),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum QueryCancelReply {
-    Ok(QueryExecutionStatus),
-    Err(QueryError),
-}
-
 /// A query reply: `Ok(QueryResult)` or `Err(QueryError)`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1469,12 +1162,19 @@ pub enum QueryReply {
 pub enum QueryError {
     #[error("query not supported: {0}")]
     Unsupported(String),
+    /// The request itself is malformed: it failed validation, did not decode,
+    /// or is a raw SQL statement the server refuses to run. Fix the request
+    /// rather than retrying it.
+    #[error("invalid query: {0}")]
+    Invalid(String),
     #[error("unauthorized: {0}")]
     Unauthorized(String),
     #[error("index not found: {0}")]
     IndexNotFound(String),
     #[error("fork not found: {0}")]
     ForkNotFound(String),
+    #[error("writer schema {0} is not registered")]
+    SchemaNotFound(u32),
     #[error("backend error: {0}")]
     Backend(String),
     /// The request could not be served right now and the identical request may
@@ -1487,8 +1187,8 @@ pub enum QueryError {
     /// above the page cap, or a result whose inline payloads exceed the
     /// LaserData Cloud's reply-byte budget. `what` names the bound hit ("limit" /
     /// "reply bytes"), `size` is what was requested or reached, `cap` is the
-    /// ceiling. Page with the returned cursor (or drop the payload request)
-    /// rather than retrying unchanged.
+    /// ceiling. Page with a smaller limit (or drop the payload request) rather
+    /// than retrying unchanged.
     #[error("result too large: {what} {size} exceeds cap {cap}")]
     TooLarge { what: String, size: u64, cap: u64 },
     #[error("unsupported envelope version (expected {expected}, got {got})")]
@@ -1504,25 +1204,13 @@ pub enum QueryError {
         applied: u64,
         required: u64,
     },
-    #[error("query {execution_id} was cancelled")]
-    Cancelled { execution_id: QueryExecutionId },
     #[error("query {execution_id} exceeded its deadline")]
     DeadlineExceeded { execution_id: QueryExecutionId },
-    #[error("snapshot {snapshot_id} is no longer available")]
-    ExpiredSnapshot { snapshot_id: i64 },
     #[error("stale {what} generation: requested {requested}, observed {observed}")]
     StaleGeneration {
         what: String,
         requested: u64,
         observed: u64,
-    },
-    #[error("query target unavailable: {reason}")]
-    TargetUnavailable { reason: String },
-    #[error("query resource limit exceeded: {resource} used {observed}, limit {limit}")]
-    ResourceLimit {
-        resource: String,
-        observed: u64,
-        limit: u64,
     },
 }
 
@@ -1532,40 +1220,36 @@ pub enum QueryError {
 #[non_exhaustive]
 pub enum QueryErrorCode {
     Unsupported,
+    Invalid,
     Unauthorized,
     IndexNotFound,
     ForkNotFound,
+    SchemaNotFound,
     Backend,
     Unavailable,
     TooLarge,
     Version,
     Stale,
-    Cancelled,
     DeadlineExceeded,
-    ExpiredSnapshot,
     StaleGeneration,
-    TargetUnavailable,
-    ResourceLimit,
 }
 
 impl QueryError {
     pub fn code(&self) -> QueryErrorCode {
         match self {
             Self::Unsupported(_) => QueryErrorCode::Unsupported,
+            Self::Invalid(_) => QueryErrorCode::Invalid,
             Self::Unauthorized(_) => QueryErrorCode::Unauthorized,
             Self::IndexNotFound(_) => QueryErrorCode::IndexNotFound,
             Self::ForkNotFound(_) => QueryErrorCode::ForkNotFound,
+            Self::SchemaNotFound(_) => QueryErrorCode::SchemaNotFound,
             Self::Backend(_) => QueryErrorCode::Backend,
             Self::Unavailable(_) => QueryErrorCode::Unavailable,
             Self::TooLarge { .. } => QueryErrorCode::TooLarge,
             Self::Version { .. } => QueryErrorCode::Version,
             Self::Stale { .. } => QueryErrorCode::Stale,
-            Self::Cancelled { .. } => QueryErrorCode::Cancelled,
             Self::DeadlineExceeded { .. } => QueryErrorCode::DeadlineExceeded,
-            Self::ExpiredSnapshot { .. } => QueryErrorCode::ExpiredSnapshot,
             Self::StaleGeneration { .. } => QueryErrorCode::StaleGeneration,
-            Self::TargetUnavailable { .. } => QueryErrorCode::TargetUnavailable,
-            Self::ResourceLimit { .. } => QueryErrorCode::ResourceLimit,
         }
     }
 }
@@ -1573,6 +1257,7 @@ impl QueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::LogicalType;
 
     #[test]
     fn given_dsl_enums_when_displayed_then_should_be_snake_case() {
@@ -1598,7 +1283,7 @@ mod tests {
                 .is_ok()
         );
         let stale = ConsistencyGate::new(41, 57)
-            .check(Consistency::Strong, "readings")
+            .check(Consistency::ReadYourWrites, "readings")
             .expect_err("a lagging projector must fail, never downgrade");
         assert!(matches!(
             stale,
@@ -1611,18 +1296,860 @@ mod tests {
     }
 
     #[test]
+    fn given_a_query_with_more_than_one_shape_when_validated_then_should_refuse_it() {
+        let vector = VectorQuery {
+            field: "embedding".to_owned(),
+            embedding: vec![0.1, 0.2],
+            top_k: 10,
+        };
+        let text = TextQuery {
+            field: None,
+            query: "incident".to_owned(),
+        };
+        let aggregate = Aggregate {
+            group_by: Vec::new(),
+            funcs: vec![AggCall {
+                func: AggFunc::Count,
+                field: None,
+                arg: None,
+                alias: "n".to_owned(),
+            }],
+            window: None,
+        };
+        let base = || Query::operational(QueryExecutionId::from_u128(1), "docs", 1_000_000);
+        let shapes: [(&str, Query); 4] = [
+            (
+                "vector and aggregate",
+                Query {
+                    vector: Some(vector.clone()),
+                    aggregate: Some(aggregate.clone()),
+                    ..base()
+                },
+            ),
+            (
+                "text and vector",
+                Query {
+                    text: Some(text.clone()),
+                    vector: Some(vector.clone()),
+                    ..base()
+                },
+            ),
+            (
+                "text and distinct",
+                Query {
+                    text: Some(text),
+                    distinct: true,
+                    ..base()
+                },
+            ),
+            (
+                "aggregate and distinct",
+                Query {
+                    aggregate: Some(aggregate),
+                    distinct: true,
+                    ..base()
+                },
+            ),
+        ];
+        for (label, query) in shapes {
+            let error = query
+                .validate()
+                .expect_err("a query with two shapes must be refused");
+            assert!(error.0.contains("one of"), "{label}: {error:?}");
+        }
+        assert!(
+            Query {
+                vector: Some(vector),
+                ..base()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn given_a_ranked_query_with_paging_it_cannot_honour_when_validated_then_should_refuse_it() {
+        let base = || Query::operational(QueryExecutionId::from_u128(1), "docs", 1_000_000);
+        let text = || {
+            Some(TextQuery {
+                field: None,
+                query: "incident".to_owned(),
+            })
+        };
+        let vector = || {
+            Some(VectorQuery {
+                field: "embedding".to_owned(),
+                embedding: vec![0.1, 0.2],
+                top_k: 10,
+            })
+        };
+        let order = || {
+            vec![Sort {
+                field: "ts".to_owned(),
+                dir: Dir::Desc,
+            }]
+        };
+        let total = QueryPageRequest {
+            want_total: true,
+            ..QueryPageRequest::default()
+        };
+        let refused: [(&str, Query); 5] = [
+            (
+                "text with an order",
+                Query {
+                    text: text(),
+                    order: order(),
+                    ..base()
+                },
+            ),
+            (
+                "text with a total",
+                Query {
+                    text: text(),
+                    page: total.clone(),
+                    ..base()
+                },
+            ),
+            (
+                "vector with an order",
+                Query {
+                    vector: vector(),
+                    order: order(),
+                    ..base()
+                },
+            ),
+            (
+                "vector with a total",
+                Query {
+                    vector: vector(),
+                    page: total,
+                    ..base()
+                },
+            ),
+            (
+                "vector with an offset",
+                Query {
+                    vector: vector(),
+                    page: QueryPageRequest {
+                        offset: Some(10),
+                        ..QueryPageRequest::default()
+                    },
+                    ..base()
+                },
+            ),
+        ];
+        for (label, query) in refused {
+            let error = query
+                .validate()
+                .expect_err("a ranked query cannot honour this paging");
+            assert!(error.0.contains("takes no"), "{label}: {error:?}");
+        }
+        let next_text_page = Query {
+            text: text(),
+            page: QueryPageRequest {
+                offset: Some(50),
+                ..QueryPageRequest::default()
+            },
+            ..base()
+        };
+        assert!(next_text_page.validate().is_ok());
+    }
+
+    #[test]
     fn given_a_page_when_computing_total_pages_then_should_divide_by_limit() {
         let page = Page {
             offset: Some(0),
             limit: 3,
             total: Some(10),
             has_more: true,
-            next_cursor: Some("next".to_owned()),
         };
         assert_eq!(page.total_pages(), Some(4));
         assert_eq!(page.at_least(3), Some(3), "offset 0 plus this page's rows");
         // Without a requested exact total there is no number to misread.
         assert_eq!(Page::default().total_pages(), None);
+    }
+
+    #[test]
+    fn given_query_bounds_when_validated_then_should_accept_each_cap_and_refuse_one_past_it() {
+        let paged = |limit: u32, offset: u64| Query {
+            page: QueryPageRequest {
+                limit,
+                offset: Some(offset),
+                want_total: false,
+            },
+            ..query()
+        };
+        let selecting = |fields: usize| Query {
+            select: Select {
+                fields: vec!["host".to_owned(); fields],
+                payload: false,
+            },
+            ..query()
+        };
+        let ranged = |start: u64, end: u64| Query {
+            time_range: Some((start, end)),
+            ..query()
+        };
+        for accepted in [
+            paged(MAX_PAGE_SIZE as u32, MAX_QUERY_OFFSET),
+            selecting(MAX_QUERY_FIELDS),
+            ranged(1, 2),
+            ranged(2, 2),
+        ] {
+            accepted.validate().expect("a query at its caps");
+        }
+        let refused = [
+            (
+                "a zero execution id",
+                Query {
+                    execution_id: QueryExecutionId::from_u128(0),
+                    ..query()
+                },
+            ),
+            (
+                "a zero deadline",
+                Query {
+                    deadline_micros: 0,
+                    ..query()
+                },
+            ),
+            ("a zero page limit", paged(0, 0)),
+            (
+                "a page limit past the cap",
+                paged(MAX_PAGE_SIZE as u32 + 1, 0),
+            ),
+            ("an offset past the cap", paged(1, MAX_QUERY_OFFSET + 1)),
+            (
+                "selected fields past the cap",
+                selecting(MAX_QUERY_FIELDS + 1),
+            ),
+            ("a range that ends before it starts", ranged(3, 2)),
+        ];
+        for (case, rejected) in refused {
+            assert!(rejected.validate().is_err(), "{case} must be refused");
+        }
+    }
+
+    #[test]
+    fn given_aggregate_clauses_when_combined_then_should_refuse_lone_having_and_row_selection() {
+        let aggregate = Aggregate {
+            group_by: Vec::new(),
+            funcs: vec![AggCall {
+                func: AggFunc::Count,
+                field: None,
+                arg: None,
+                alias: "rows".to_owned(),
+            }],
+            window: None,
+        };
+        Query {
+            aggregate: Some(aggregate.clone()),
+            ..query()
+        }
+        .validate()
+        .expect("an aggregate alone");
+        let refused = [
+            (
+                "a having filter without an aggregate",
+                Query {
+                    having: Some(Filter::pred("rows", CmpOp::Gt, 1i64)),
+                    ..query()
+                },
+            ),
+            (
+                "an aggregate with selected fields",
+                Query {
+                    aggregate: Some(aggregate),
+                    select: Select {
+                        fields: vec!["host".to_owned()],
+                        payload: false,
+                    },
+                    ..query()
+                },
+            ),
+        ];
+        for (case, rejected) in refused {
+            assert!(rejected.validate().is_err(), "{case} must be refused");
+        }
+    }
+
+    #[test]
+    fn given_raw_sql_with_any_structured_clause_when_validated_then_should_refuse_it() {
+        let raw_sql = Query {
+            raw_sql: Some(RawSql {
+                dialect: SqlDialect::Postgres,
+                sql: "SELECT 1".to_owned(),
+                params: Vec::new(),
+            }),
+            ..query()
+        };
+        raw_sql.validate().expect("raw SQL alone");
+        let aggregate = Aggregate {
+            group_by: Vec::new(),
+            funcs: vec![AggCall {
+                func: AggFunc::Count,
+                field: None,
+                arg: None,
+                alias: "rows".to_owned(),
+            }],
+            window: None,
+        };
+        // One clause per row, so every operand of the refusal is exercised alone.
+        let refused = [
+            (
+                "an exact match",
+                Query {
+                    by_key: vec![KeyMatch::new("host", "a")],
+                    ..raw_sql.clone()
+                },
+            ),
+            (
+                "a message type",
+                Query {
+                    message_type: Some("reading".to_owned()),
+                    ..raw_sql.clone()
+                },
+            ),
+            (
+                "a time range",
+                Query {
+                    time_range: Some((1, 2)),
+                    ..raw_sql.clone()
+                },
+            ),
+            (
+                "a filter",
+                Query {
+                    filter: Some(Filter::pred("host", CmpOp::Eq, "a")),
+                    ..raw_sql.clone()
+                },
+            ),
+            (
+                "a vector search",
+                Query {
+                    vector: Some(VectorQuery {
+                        field: "embedding".to_owned(),
+                        embedding: vec![0.5],
+                        top_k: 1,
+                    }),
+                    ..raw_sql.clone()
+                },
+            ),
+            (
+                "a text search",
+                Query {
+                    text: Some(TextQuery {
+                        field: None,
+                        query: "incident".to_owned(),
+                    }),
+                    ..raw_sql.clone()
+                },
+            ),
+            (
+                "a sort",
+                Query {
+                    order: vec![Sort {
+                        field: "ts".to_owned(),
+                        dir: Dir::Desc,
+                    }],
+                    ..raw_sql.clone()
+                },
+            ),
+            (
+                "an aggregate",
+                Query {
+                    aggregate: Some(aggregate.clone()),
+                    ..raw_sql.clone()
+                },
+            ),
+            (
+                "a having filter",
+                Query {
+                    aggregate: Some(aggregate),
+                    having: Some(Filter::pred("rows", CmpOp::Gt, 1i64)),
+                    ..raw_sql.clone()
+                },
+            ),
+            (
+                "distinct rows",
+                Query {
+                    distinct: true,
+                    ..raw_sql.clone()
+                },
+            ),
+            (
+                "selected fields",
+                Query {
+                    select: Select {
+                        fields: vec!["host".to_owned()],
+                        payload: false,
+                    },
+                    ..raw_sql.clone()
+                },
+            ),
+            (
+                "the payload",
+                Query {
+                    select: Select {
+                        fields: Vec::new(),
+                        payload: true,
+                    },
+                    ..raw_sql
+                },
+            ),
+        ];
+        for (clause, rejected) in refused {
+            assert!(
+                rejected.validate().is_err(),
+                "raw SQL with {clause} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_query_envelope_when_validated_then_should_require_the_current_version() {
+        let envelope = QueryEnvelope::new(query());
+        envelope.validate().expect("the current version");
+        let newer = QueryEnvelope {
+            v: QUERY_OP_VERSION + 1,
+            ..envelope
+        };
+        assert!(newer.validate().is_err());
+    }
+
+    #[test]
+    fn given_a_query_name_when_validated_then_should_refuse_empty_oversized_or_padded_text() {
+        let indexed = |index: &str| Query {
+            target: QueryTarget::operational(index),
+            ..query()
+        };
+        indexed(&"i".repeat(MAX_QUERY_NAME_BYTES))
+            .validate()
+            .expect("a name at the cap");
+        for index in [
+            String::new(),
+            "i".repeat(MAX_QUERY_NAME_BYTES + 1),
+            " readings".to_owned(),
+        ] {
+            assert!(
+                indexed(&index).validate().is_err(),
+                "{index:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn given_in_and_prefix_filters_when_validated_then_should_need_a_list_and_a_string() {
+        let filtered = |filter: Filter| Query {
+            filter: Some(filter),
+            ..query()
+        };
+        filtered(Filter::all([
+            Filter::pred("status", CmpOp::Eq, 5i64),
+            Filter::pred("host", CmpOp::In, vec!["a", "b"]),
+            Filter::pred("host", CmpOp::Prefix, "node-"),
+        ]))
+        .validate()
+        .expect("well-typed operators");
+        let refused = [
+            (
+                "an empty IN list",
+                Filter::pred("host", CmpOp::In, Vec::<&str>::new()),
+            ),
+            (
+                "a numeric prefix",
+                Filter::pred("host", CmpOp::Prefix, 5i64),
+            ),
+        ];
+        for (case, filter) in refused {
+            assert!(
+                filtered(filter).validate().is_err(),
+                "{case} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_filter_at_its_node_and_depth_caps_when_validated_then_should_refuse_one_more() {
+        let filtered = |filter: Filter| Query {
+            filter: Some(filter),
+            ..query()
+        };
+        let leaf = Filter::pred("host", CmpOp::Eq, "a");
+        let wide = |leaves: usize| Filter::All(vec![leaf.clone(); leaves]);
+        let nested = |depth: usize, wrap: fn(Filter) -> Filter| {
+            (1..depth).fold(leaf.clone(), |filter, _| wrap(filter))
+        };
+        let conjunction: fn(Filter) -> Filter = |filter| Filter::All(vec![filter]);
+        // The conjunction is a node too, so it plus 4095 leaves reach the node cap.
+        for accepted in [
+            wide(MAX_QUERY_PREDICATES - 1),
+            nested(64, Filter::negate),
+            nested(64, conjunction),
+        ] {
+            filtered(accepted).validate().expect("a filter at its caps");
+        }
+        for refused in [
+            wide(MAX_QUERY_PREDICATES),
+            nested(65, Filter::negate),
+            nested(65, conjunction),
+        ] {
+            assert!(filtered(refused).validate().is_err(), "one past a cap");
+        }
+    }
+
+    #[test]
+    fn given_aggregate_calls_when_validated_then_should_match_each_function_to_its_inputs() {
+        let aggregate = |func: AggFunc, field: Option<&str>, arg: Option<f64>| Aggregate {
+            group_by: Vec::new(),
+            funcs: vec![AggCall {
+                func,
+                field: field.map(str::to_owned),
+                arg,
+                alias: "value".to_owned(),
+            }],
+            window: None,
+        };
+        for accepted in [
+            aggregate(AggFunc::Count, None, None),
+            aggregate(AggFunc::Percentile, Some("latency"), Some(0.95)),
+            aggregate(AggFunc::Sum, Some("bytes"), None),
+        ] {
+            accepted.validate().expect("a well-formed call");
+        }
+        let refused = [
+            (
+                "a count with an argument",
+                aggregate(AggFunc::Count, None, Some(0.5)),
+            ),
+            (
+                "a percentile past one",
+                aggregate(AggFunc::Percentile, Some("latency"), Some(1.5)),
+            ),
+            (
+                "a percentile without a fraction",
+                aggregate(AggFunc::Percentile, Some("latency"), None),
+            ),
+            ("a sum without a field", aggregate(AggFunc::Sum, None, None)),
+        ];
+        for (case, rejected) in refused {
+            assert!(rejected.validate().is_err(), "{case} must be refused");
+        }
+    }
+
+    #[test]
+    fn given_an_aggregate_when_validated_then_should_bound_its_size_and_need_unique_aliases() {
+        let counts = |calls: usize| {
+            (0..calls)
+                .map(|index| AggCall {
+                    func: AggFunc::Count,
+                    field: None,
+                    arg: None,
+                    alias: format!("count_{index}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let shaped = |funcs: Vec<AggCall>, groups: usize, every_micros: u64| Aggregate {
+            group_by: vec!["host".to_owned(); groups],
+            funcs,
+            window: Some(Window {
+                field: "ts".to_owned(),
+                every_micros,
+            }),
+        };
+        shaped(counts(MAX_QUERY_PARAMETERS), MAX_QUERY_FIELDS, 60_000_000)
+            .validate()
+            .expect("an aggregate at its caps");
+        let refused = [
+            ("no calls", shaped(Vec::new(), 0, 60_000_000)),
+            (
+                "calls past the cap",
+                shaped(counts(MAX_QUERY_PARAMETERS + 1), 0, 60_000_000),
+            ),
+            (
+                "groups past the cap",
+                shaped(counts(1), MAX_QUERY_FIELDS + 1, 60_000_000),
+            ),
+            (
+                "a repeated alias",
+                shaped([counts(1), counts(1)].concat(), 0, 60_000_000),
+            ),
+            ("a zero window", shaped(counts(1), 0, 0)),
+        ];
+        for (case, rejected) in refused {
+            assert!(rejected.validate().is_err(), "{case} must be refused");
+        }
+    }
+
+    #[test]
+    fn given_raw_sql_when_validated_then_should_bound_its_text_and_parameters() {
+        let raw = |sql: String, params: usize| RawSql {
+            dialect: SqlDialect::Postgres,
+            sql,
+            params: vec![TypedValue::Long(1); params],
+        };
+        for accepted in [
+            raw("x".repeat(MAX_RAW_SQL_BYTES), MAX_QUERY_PARAMETERS),
+            raw("SELECT\n\t1\r".to_owned(), 0),
+        ] {
+            accepted.validate().expect("raw SQL within its caps");
+        }
+        let refused = [
+            ("blank text", raw("  ".to_owned(), 0)),
+            (
+                "text past the cap",
+                raw("x".repeat(MAX_RAW_SQL_BYTES + 1), 0),
+            ),
+            ("a control character", raw("SELECT 1\u{7}".to_owned(), 0)),
+            (
+                "parameters past the cap",
+                raw("SELECT 1".to_owned(), MAX_QUERY_PARAMETERS + 1),
+            ),
+        ];
+        for (case, rejected) in refused {
+            assert!(rejected.validate().is_err(), "{case} must be refused");
+        }
+    }
+
+    #[test]
+    fn given_distinct_and_want_total_when_round_tripped_then_should_omit_them_only_when_false() {
+        let flagged = Query {
+            distinct: true,
+            page: QueryPageRequest {
+                want_total: true,
+                ..QueryPageRequest::default()
+            },
+            ..query()
+        };
+        let json = serde_json::to_value(&flagged).expect("encode a flagged query");
+        let decoded: Query = serde_json::from_value(json).expect("decode a flagged query");
+        assert_eq!(decoded, flagged);
+        let plain = serde_json::to_value(query()).expect("encode a plain query");
+        assert_eq!(
+            (plain.get("distinct"), plain["page"].get("want_total")),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn given_typed_input_when_parsed_then_should_narrow_keywords_and_signed_decimals() {
+        assert_eq!(
+            ["null", "true", "false", "1.5", "-1.5", "+1.5"].map(Value::from_input),
+            [
+                Value::Null,
+                Value::Bool(true),
+                Value::Bool(false),
+                Value::Float(1.5),
+                Value::Float(-1.5),
+                Value::Float(1.5),
+            ]
+        );
+    }
+
+    #[test]
+    fn given_a_list_value_when_displayed_then_should_separate_its_bare_elements() {
+        let list = Value::List(vec![Value::Int(1), Value::from("a"), Value::Null]);
+        assert_eq!(list.to_string(), "[1, a, null]");
+    }
+
+    #[test]
+    fn given_a_query_result_when_validated_then_should_match_rows_to_the_schema_and_the_count() {
+        let valid = result();
+        valid.validate().expect("a well-formed result");
+        let refused = [
+            (
+                "a row missing values",
+                QueryResult {
+                    rows: vec![Row {
+                        values: Vec::new(),
+                        score: None,
+                    }],
+                    ..result()
+                },
+            ),
+            (
+                "a score that is not a number",
+                QueryResult {
+                    rows: vec![Row {
+                        score: Some(f32::NAN),
+                        ..valid.rows[0].clone()
+                    }],
+                    ..result()
+                },
+            ),
+            (
+                "a row count that disagrees with the rows",
+                QueryResult {
+                    context: QueryContext {
+                        row_count: 2,
+                        ..context()
+                    },
+                    ..result()
+                },
+            ),
+        ];
+        for (case, rejected) in refused {
+            assert!(rejected.validate().is_err(), "{case} must be refused");
+        }
+    }
+
+    #[test]
+    fn given_a_query_context_when_validated_then_should_need_evidence_and_enough_consistency() {
+        for accepted in [
+            context(),
+            QueryContext {
+                delivered_consistency: Consistency::ReadYourWrites,
+                ..context()
+            },
+        ] {
+            accepted
+                .validate()
+                .expect("a delivery at least as strong as requested");
+        }
+        let evidence = |resource: u128, generation: u64, revision: u64| QueryContext {
+            resolved_target: ResolvedQueryTarget::Operational {
+                index: "readings".to_owned(),
+                backend_resource_id: BackendResourceId::from_u128(resource),
+                backend_generation: generation,
+                runtime_configuration_revision: revision,
+            },
+            ..context()
+        };
+        let refused = [
+            (
+                "a zero execution id",
+                QueryContext {
+                    execution_id: QueryExecutionId::from_u128(0),
+                    ..context()
+                },
+            ),
+            (
+                "a weaker delivery than requested",
+                QueryContext {
+                    requested_consistency: Consistency::ReadYourWrites,
+                    ..context()
+                },
+            ),
+            ("a zero backend resource id", evidence(0, 1, 1)),
+            ("a zero backend generation", evidence(2, 0, 1)),
+            ("a zero configuration revision", evidence(2, 1, 0)),
+        ];
+        for (case, rejected) in refused {
+            assert!(rejected.validate().is_err(), "{case} must be refused");
+        }
+    }
+
+    #[test]
+    fn given_a_result_row_when_read_by_field_name_then_should_return_its_typed_values() {
+        let reply = result();
+        let row = &reply.rows[0];
+        assert_eq!(
+            (
+                reply.field_index("delta"),
+                reply.value(row, "count"),
+                reply.value_text(row, "reading_id"),
+                reply.value_u64(row, "count"),
+                reply.value_i64(row, "delta"),
+            ),
+            (
+                Some(2),
+                Some(&TypedValue::Long(7)),
+                Some("r-1".to_owned()),
+                Some(7),
+                Some(-3),
+            )
+        );
+    }
+
+    #[test]
+    fn given_a_page_limit_when_validated_then_should_accept_one_to_the_cap() {
+        let page = |limit: u32| Page {
+            offset: Some(0),
+            limit,
+            total: None,
+            has_more: false,
+        };
+        page(MAX_PAGE_SIZE as u32)
+            .validate()
+            .expect("a limit at the cap");
+        for limit in [0, MAX_PAGE_SIZE as u32 + 1] {
+            assert!(
+                page(limit).validate().is_err(),
+                "limit {limit} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_total_without_a_page_size_when_counting_pages_then_should_have_none() {
+        let page = Page {
+            offset: Some(0),
+            limit: 0,
+            total: Some(10),
+            has_more: false,
+        };
+        assert_eq!(page.total_pages(), None);
+    }
+
+    fn query() -> Query {
+        Query::operational(QueryExecutionId::from_u128(1), "readings", 1_000_000)
+    }
+
+    fn result() -> QueryResult {
+        let field = |id: u32, name: &str, field_type: LogicalType| LogicalField {
+            id,
+            name: name.to_owned(),
+            required: true,
+            field_type,
+            doc: None,
+        };
+        QueryResult {
+            fields: vec![
+                field(1, "reading_id", LogicalType::String),
+                field(2, "count", LogicalType::Long),
+                field(3, "delta", LogicalType::Long),
+            ],
+            rows: vec![Row {
+                values: vec![
+                    TypedValue::from("r-1"),
+                    TypedValue::Long(7),
+                    TypedValue::Long(-3),
+                ],
+                score: Some(0.25),
+            }],
+            page: Page {
+                offset: Some(0),
+                limit: 50,
+                total: None,
+                has_more: false,
+            },
+            context: context(),
+        }
+    }
+
+    fn context() -> QueryContext {
+        QueryContext {
+            execution_id: QueryExecutionId::from_u128(1),
+            engine: QueryEngine {
+                name: "postgres".to_owned(),
+                version: "17.0".to_owned(),
+                dialect: Some(SqlDialect::Postgres),
+            },
+            resolved_target: ResolvedQueryTarget::Operational {
+                index: "readings".to_owned(),
+                backend_resource_id: BackendResourceId::from_u128(2),
+                backend_generation: 1,
+                runtime_configuration_revision: 1,
+            },
+            requested_consistency: Consistency::Eventual,
+            delivered_consistency: Consistency::Eventual,
+            truncated: false,
+            elapsed_micros: 10,
+            scanned_bytes: 128,
+            produced_bytes: 32,
+            row_count: 1,
+            frontier: Vec::new(),
+        }
     }
 }
 
@@ -1698,11 +2225,7 @@ mod serde_tests {
 
     #[test]
     fn given_each_consistency_level_when_round_tripped_then_should_preserve_it_and_skip_eventual() {
-        for level in [
-            Consistency::Eventual,
-            Consistency::ReadYourWrites,
-            Consistency::Strong,
-        ] {
+        for level in [Consistency::Eventual, Consistency::ReadYourWrites] {
             let mut query = query();
             query.consistency = level;
             let bytes = encode_named(&QueryEnvelope::new(query)).expect("serializes");
@@ -1775,14 +2298,13 @@ mod serde_tests {
                 limit: 50,
                 total: Some(1),
                 has_more: false,
-                next_cursor: None,
             },
             context: QueryContext {
                 execution_id: QueryExecutionId::from_u128(1),
                 engine: QueryEngine {
-                    name: "datafusion".to_owned(),
-                    version: "50.0.0".to_owned(),
-                    dialect: Some(SqlDialect::DataFusion),
+                    name: "postgres".to_owned(),
+                    version: "17.0".to_owned(),
+                    dialect: Some(SqlDialect::Postgres),
                 },
                 resolved_target: ResolvedQueryTarget::Operational {
                     index: "readings".to_owned(),
@@ -1792,9 +2314,6 @@ mod serde_tests {
                 },
                 requested_consistency: Consistency::Eventual,
                 delivered_consistency: Consistency::Eventual,
-                boundary: None,
-                checkpoint_revision: None,
-                global_state_revision: None,
                 truncated: false,
                 elapsed_micros: 10,
                 scanned_bytes: 128,

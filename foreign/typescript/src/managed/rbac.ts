@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import type { CallOptions } from "../client/call-options.js"
 import type { Capabilities } from "../client/capabilities.js"
 import { AuthzExecutionError, ProtocolError, UnsupportedError } from "../client/errors.js"
 import { executeManaged, type ManagedTransport } from "../client/managed.js"
@@ -16,9 +17,12 @@ import {
 import {
   type AuthzHistoryReply,
   type AuthzReply,
+  type BindingsReply,
   type AuthzSubject,
   type Role,
   type WhoamiReply,
+  validateMutationId,
+  validateRole,
   validateRoleName
 } from "../wire/authz.js"
 
@@ -39,18 +43,20 @@ async function executeAuthzOk<Request>(
   backend: RbacBackend,
   capabilities: Capabilities,
   command: ManagedCommand<Request, AuthzReply>,
-  request: Request
+  request: Request,
+  options: CallOptions
 ): Promise<void> {
-  const reply = await executeManaged(backend, capabilities, command, request)
+  const reply = await executeManaged(backend, capabilities, command, request, options)
   if (reply.kind === "ok") return
   throw unexpected("write", reply)
 }
 
 export async function whoami(
   backend: RbacBackend,
-  capabilities: Capabilities
+  capabilities: Capabilities,
+  options: CallOptions = {}
 ): Promise<WhoamiReply> {
-  const reply = await executeManaged(backend, capabilities, WhoamiCommand, undefined)
+  const reply = await executeManaged(backend, capabilities, WhoamiCommand, undefined, options)
   if (reply.kind === "whoami") return reply.reply
   throw unexpected("whoami", reply)
 }
@@ -58,9 +64,16 @@ export async function whoami(
 export async function listRoles(
   backend: RbacBackend,
   capabilities: Capabilities,
-  options: { readonly namePrefix?: string; readonly search?: string } = {}
+  options: { readonly namePrefix?: string; readonly search?: string } & CallOptions = {}
 ): Promise<readonly Role[]> {
-  const reply = await executeManaged(backend, capabilities, ListRolesCommand, options)
+  const { signal, ...filter } = options
+  const reply = await executeManaged(
+    backend,
+    capabilities,
+    ListRolesCommand,
+    filter,
+    signal === undefined ? {} : { signal }
+  )
   if (reply.kind === "roles") return reply.reply.roles
   throw unexpected("listRoles", reply)
 }
@@ -68,10 +81,11 @@ export async function listRoles(
 export async function getRole(
   backend: RbacBackend,
   capabilities: Capabilities,
-  name: string
+  name: string,
+  options: CallOptions = {}
 ): Promise<Role | undefined> {
   validateRoleName(name)
-  const reply = await executeManaged(backend, capabilities, GetRoleCommand, { name })
+  const reply = await executeManaged(backend, capabilities, GetRoleCommand, { name }, options)
   if (reply.kind === "role") return reply.role
   throw unexpected("getRole", reply)
 }
@@ -79,35 +93,36 @@ export async function getRole(
 export async function getBindings(
   backend: RbacBackend,
   capabilities: Capabilities,
-  userId: number
-): Promise<readonly string[]> {
-  const reply = await executeManaged(backend, capabilities, GetBindingsCommand, { userId })
-  if (reply.kind === "bindings") return reply.reply.roles
+  userId: number,
+  options: CallOptions = {}
+): Promise<BindingsReply> {
+  const reply = await executeManaged(backend, capabilities, GetBindingsCommand, { userId }, options)
+  if (reply.kind === "bindings") return reply.reply
   throw unexpected("getBindings", reply)
 }
 
 export async function defineRole(
   backend: RbacBackend,
   capabilities: Capabilities,
-  role: Role
+  role: Role,
+  mutationId: string = randomUUID(),
+  options: CallOptions = {}
 ): Promise<void> {
-  validateRoleName(role.name)
-  await executeAuthzOk(backend, capabilities, DefineRoleCommand, {
-    role,
-    mutationId: randomUUID()
-  })
+  validateRole(role)
+  validateMutationId(mutationId)
+  await executeAuthzOk(backend, capabilities, DefineRoleCommand, { role, mutationId }, options)
 }
 
 export async function deleteRole(
   backend: RbacBackend,
   capabilities: Capabilities,
-  name: string
+  name: string,
+  mutationId: string = randomUUID(),
+  options: CallOptions = {}
 ): Promise<void> {
   validateRoleName(name)
-  await executeAuthzOk(backend, capabilities, DeleteRoleCommand, {
-    name,
-    mutationId: randomUUID()
-  })
+  validateMutationId(mutationId)
+  await executeAuthzOk(backend, capabilities, DeleteRoleCommand, { name, mutationId }, options)
 }
 
 export async function bindRoles(
@@ -115,15 +130,26 @@ export async function bindRoles(
   capabilities: Capabilities,
   userId: number,
   roles: readonly string[],
-  expectRevision?: bigint
-): Promise<void> {
+  expectRevision?: bigint,
+  mutationId: string = randomUUID(),
+  options: CallOptions = {}
+): Promise<BindingsReply> {
   for (const role of roles) validateRoleName(role)
-  await executeAuthzOk(backend, capabilities, BindRolesCommand, {
-    userId,
-    roles,
-    ...(expectRevision !== undefined ? { expectRevision } : {}),
-    mutationId: randomUUID()
-  })
+  validateMutationId(mutationId)
+  const reply = await executeManaged(
+    backend,
+    capabilities,
+    BindRolesCommand,
+    {
+      userId,
+      roles,
+      ...(expectRevision !== undefined ? { expectRevision } : {}),
+      mutationId
+    },
+    options
+  )
+  if (reply.kind === "bindings") return reply.reply
+  throw unexpected("bindRoles", reply)
 }
 
 export async function authzHistory(
@@ -131,13 +157,20 @@ export async function authzHistory(
   capabilities: Capabilities,
   subject: AuthzSubject,
   limit: number,
-  afterRevision?: bigint
+  afterRevision?: bigint,
+  options: CallOptions = {}
 ): Promise<AuthzHistoryReply> {
-  const reply = await executeManaged(backend, capabilities, AuthzHistoryCommand, {
-    subject,
-    limit,
-    ...(afterRevision !== undefined ? { afterRevision } : {})
-  })
+  const reply = await executeManaged(
+    backend,
+    capabilities,
+    AuthzHistoryCommand,
+    {
+      subject,
+      limit,
+      ...(afterRevision !== undefined ? { afterRevision } : {})
+    },
+    options
+  )
   if (reply.kind === "history") return reply.reply
   throw unexpected("authzHistory", reply)
 }

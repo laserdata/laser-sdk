@@ -234,7 +234,7 @@ impl GraphOperationContext {
                 let result = self
                     .laser
                     .graph(&self.graph)
-                    .limit(star_element_count(self.case.batch_size))
+                    .limit(result_limit(star_element_count(self.case.batch_size)))
                     .neighbors(self.root.id, EdgeDir::Out, Some(RELATION.to_owned()), 1)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -245,7 +245,9 @@ impl GraphOperationContext {
                     .laser
                     .graph(&self.graph)
                     .start_ids(vec![self.root.id])
-                    .limit(tree_element_count(self.expected_traversal_nodes));
+                    .limit(result_limit(tree_element_count(
+                        self.expected_traversal_nodes,
+                    )));
                 for _ in 0..self.case.partitions {
                     traversal = traversal.out(RELATION);
                 }
@@ -256,8 +258,11 @@ impl GraphOperationContext {
                 let result = self
                     .laser
                     .graph(&self.graph)
-                    .start_nearest(vec![0.0; self.vector_dimensions], self.case.batch_size)
-                    .limit(self.case.batch_size)
+                    .start_nearest(
+                        vec![0.0; self.vector_dimensions],
+                        result_limit(self.case.batch_size),
+                    )
+                    .limit(result_limit(self.case.batch_size))
                     .fetch()
                     .await
                     .map_err(|error| error.to_string())?;
@@ -304,7 +309,7 @@ async fn validate_graph(
             .laser
             .graph(&context.graph)
             .start_ids(ids)
-            .limit(context.case.batch_size)
+            .limit(result_limit(context.case.batch_size))
             .fetch()
             .await
             .map_err(|error| BenchError::Invalid(format!("validate graph nodes: {error}")))?;
@@ -320,7 +325,7 @@ async fn validate_graph(
         let result = context
             .laser
             .graph(&context.graph)
-            .limit(star_element_count(context.case.batch_size))
+            .limit(result_limit(star_element_count(context.case.batch_size)))
             .neighbors(
                 GraphOperationContext::edge_root(operation).id,
                 EdgeDir::Out,
@@ -415,6 +420,12 @@ fn star_element_count(fan_out: usize) -> usize {
 
 fn tree_element_count(nodes: usize) -> usize {
     nodes.saturating_mul(2).saturating_sub(1)
+}
+
+// The case validation keeps every element count within the graph result cap,
+// which fits a u32 limit.
+fn result_limit(elements: usize) -> u32 {
+    u32::try_from(elements).unwrap_or(u32::MAX)
 }
 
 fn elements_per_operation(arm: GraphArm, case: &ManagedCase, traversal: usize) -> u64 {

@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { Given, Then, When } from "@cucumber/cucumber";
-import { MemoryHandle, type Embedder } from "@laserdata/laser-sdk";
+import {
+  ConversationId,
+  MemoryHandle,
+  type Embedder,
+} from "@laserdata/laser-sdk";
 import type { LaserWorld } from "../world.js";
 
 const encoder = new TextEncoder();
@@ -39,6 +43,18 @@ When(
   async function (this: LaserWorld, body: string) {
     const id = await requireMemory(this)
       .remember(encoder.encode(body))
+      .dedup()
+      .send();
+    this.memoryIds.set(body, id);
+  },
+);
+
+When(
+  /^I remember "([^"]+)" with dedup in conversation "([^"]+)"$/,
+  async function (this: LaserWorld, body: string, conversation: string) {
+    const id = await requireMemory(this)
+      .remember(encoder.encode(body))
+      .scope(ConversationId.parse(conversation))
       .dedup()
       .send();
     this.memoryIds.set(body, id);
