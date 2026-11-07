@@ -2,16 +2,19 @@ use crate::content::ContentType;
 use crate::destination::BackendBinding;
 use crate::error::InvalidError;
 use crate::limits::{
-    MAX_GRAPH_LABEL_BYTES, MAX_INDEX_FIELD_BYTES, MAX_PROJECTION_ID_BYTES,
-    MAX_PROJECTION_NAME_BYTES, MAX_SCHEMA_NAME_BYTES,
+    MAX_FILTER_SCHEMA_BYTES, MAX_FILTER_SCHEMA_DEPTH, MAX_GRAPH_LABEL_BYTES, MAX_INDEX_FIELD_BYTES,
+    MAX_PROJECTION_ID_BYTES, MAX_PROJECTION_NAME_BYTES, MAX_SCHEMA_NAME_BYTES,
 };
-use crate::validate::{Validate, validate_bounded_text};
+use crate::validate::{Validate, json_depth_within, validate_bounded_text};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 /// Prefix no projection id may start with: activity keys an index-only
 /// binding under it, so it must never name a projection.
 pub const RESERVED_PROJECTION_ID_PREFIX: &str = "index:";
+
+/// The one JSON Schema dialect the registry accepts, named or implied.
+pub const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 
 /// One indexed scalar: the index key `name` and the RFC-6901 JSON `pointer` into
 /// the payload it is extracted from.
@@ -28,10 +31,9 @@ pub const RESERVED_PROJECTION_ID_PREFIX: &str = "index:";
 pub struct IndexField {
     pub name: String,
     pub pointer: String,
-    /// Optional storage-type hint. The embedded engine ignores it and keeps
-    /// native JSON types. A wide-column backend uses it to create a real typed
-    /// column instead of a text fallback. Absent on the wire when unset, so
-    /// pre-hint registries decode unchanged.
+    /// Optional field type: the query result type of the field, a stored value
+    /// that does not fit reading as null, and the column type of a wide-column
+    /// backend. Unset, the field is a `variant` and keeps each stored type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field_type: Option<FieldType>,
 }
@@ -46,7 +48,7 @@ impl IndexField {
         }
     }
 
-    /// An indexed field with an explicit storage-type hint for columnar backends.
+    /// An indexed field with a type its query results carry.
     pub fn typed(
         name: impl Into<String>,
         pointer: impl Into<String>,
@@ -60,9 +62,8 @@ impl IndexField {
     }
 }
 
-/// Storage-type hint for an indexed field. A hint, not a constraint: the
-/// projector stores whatever scalar the payload carries either way. Columnar
-/// backends use the hint for real column DDL.
+/// The type of an indexed field. The projector stores whatever scalar the
+/// payload carries, and a query reads the field as this type.
 #[derive(
     Clone,
     Copy,
@@ -218,6 +219,32 @@ impl From<String> for ProjectionId {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectionHistory {
+    #[default]
+    Append,
+    Keyed {
+        key: ProjectionKey,
+        /// The header whose presence deletes the record's key. Without one the view never deletes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delete_header: Option<String>,
+    },
+}
+
+impl ProjectionHistory {
+    pub fn is_append(&self) -> bool {
+        matches!(self, Self::Append)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectionKey {
+    Header { name: String },
+    Pointer { pointer: String },
+}
+
 /// What a projection materializes: queryable rows, or a knowledge graph of
 /// nodes and edges. Rides the wire as a u8 code (the growable-dictionary pattern)
 /// so a future kind flows through an old reader as
@@ -230,6 +257,9 @@ pub enum ProjectionKind {
     Row,
     /// Materialize a knowledge graph (nodes, edges, triplets).
     Graph,
+    /// Materialize every routed record whole: its body, headers and source
+    /// position, with no extraction.
+    Record,
     /// A code this build does not know, passed through.
     Unrecognized(u8),
 }
@@ -240,6 +270,7 @@ impl ProjectionKind {
         match self {
             ProjectionKind::Row => 0,
             ProjectionKind::Graph => 1,
+            ProjectionKind::Record => 2,
             ProjectionKind::Unrecognized(code) => code,
         }
     }
@@ -250,6 +281,7 @@ impl ProjectionKind {
         match code {
             0 => ProjectionKind::Row,
             1 => ProjectionKind::Graph,
+            2 => ProjectionKind::Record,
             other => ProjectionKind::Unrecognized(other),
         }
     }
@@ -343,6 +375,8 @@ pub struct Projection {
     /// What this projection materializes: rows (default) or a graph.
     #[serde(default, skip_serializing_if = "ProjectionKind::is_row")]
     pub kind: ProjectionKind,
+    #[serde(default, skip_serializing_if = "ProjectionHistory::is_append")]
+    pub history: ProjectionHistory,
     /// Expected payload codec. `Any` means best-effort decode: the extraction
     /// plan tolerates an opaque payload.
     pub content_type: ContentType,
@@ -367,6 +401,7 @@ impl Projection {
                 name: String::new(),
                 version: 1,
                 kind: ProjectionKind::Row,
+                history: ProjectionHistory::Append,
                 content_type: ContentType::Any,
                 // Default: inline the body alongside the indexed row so typed
                 // fetches can decode it without going back to the Iggy log.
@@ -390,6 +425,15 @@ pub struct ProjectionBuilder {
 }
 
 impl ProjectionBuilder {
+    /// Keep the current row of each key, deleted by a record carrying `delete_header` when one is named.
+    pub fn keyed(mut self, key: ProjectionKey, delete_header: Option<&str>) -> Self {
+        self.projection.history = ProjectionHistory::Keyed {
+            key,
+            delete_header: delete_header.map(str::to_owned),
+        };
+        self
+    }
+
     /// Set the human-readable projection name.
     pub fn name(mut self, value: impl Into<String>) -> Self {
         self.projection.name = value.into();
@@ -411,6 +455,16 @@ impl ProjectionBuilder {
     /// Set the full index schema (instead of `field`/`vector_field`).
     pub fn extraction(mut self, value: IndexSchema) -> Self {
         self.projection.extraction = value;
+        self
+    }
+
+    /// Make this a whole-record projection: every routed record materializes
+    /// with its body, headers and source position, and nothing is extracted.
+    pub fn record(mut self) -> Self {
+        self.projection.kind = ProjectionKind::Record;
+        self.projection.extraction = IndexSchema::default();
+        self.projection.entity_schema = None;
+        self.projection.inline_payload_default = false;
         self
     }
 
@@ -569,15 +623,13 @@ pub enum RetentionPolicy {
 /// projections, tell the worker what to consume. A binding pairs a source
 /// selector (stream and topic) with a set of allowed projection refs, an
 /// optional default, and one operational index. The index uses the replica-local
-/// backend unless an exact backend resource generation is bound. Shared
-/// lakehouse materializations are independent `MaterializationDestination`
-/// declarations, never mirrors on this operational cursor.
+/// backend unless an exact backend resource generation is bound.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectionBinding {
     pub source: SourceSelector,
     /// Projections allowed to fire on messages from this source. A record
-    /// stamped with an `agdx.ref` outside this set is either DLQ'd or skipped,
-    /// per worker policy.
+    /// stamped with an `agdx.ref` outside this set falls back to the default
+    /// projection, and is skipped when there is none.
     #[serde(default)]
     pub allowed_projections: Vec<ProjectionId>,
     /// Default projection applied to records that do not carry an `agdx.ref`.
@@ -602,16 +654,92 @@ pub struct ProjectionBinding {
     /// [`retention`](ProjectionBindingBuilder::retention).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionPolicy>,
-    /// Let the managed backend skip a record the destination or the extraction
-    /// deterministically rejects, instead of holding the partition until the
-    /// binding enables skipping. Operator skips also require this opt-in. The
-    /// backend skips only after it proved the rejection: the destination
-    /// accepted other records of the same batch and refused this
-    /// one twice. Every skip is an ordered control record, so every replica
-    /// skips the same record, and the record goes to the dead-letter topic.
-    /// Default off and skipped on the wire.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub skip_rejected: bool,
+    /// What happens to a record the destination or the extraction
+    /// deterministically rejects. `Block`, the default, holds the partition at
+    /// the record until an operator skips it. `DeadLetter` skips it through an
+    /// ordered control record, so every replica skips the same record, and
+    /// sends it to the dead-letter topic. A destination rejection counts only
+    /// after the destination accepted other records of the batch and refused
+    /// this one twice. Skipped on the wire at its default.
+    #[serde(default, skip_serializing_if = "InvalidRecordPolicy::is_block")]
+    pub invalid_records: InvalidRecordPolicy,
+    /// What a whole-record binding does with a body larger than its backend
+    /// stores. `Block`, the default, holds the partition at the record.
+    /// `Reference` keeps the row without the body, which the source log still
+    /// holds, and requires `MirrorLog` retention. Skipped on the wire at its
+    /// default.
+    #[serde(default, skip_serializing_if = "OversizePolicy::is_block")]
+    pub oversize: OversizePolicy,
+}
+
+/// What a binding does with a record it proved invalid.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum InvalidRecordPolicy {
+    /// Hold the partition at the record until an operator skips it.
+    #[default]
+    Block,
+    /// Skip the record and send it to the dead-letter topic.
+    DeadLetter,
+    /// A policy a newer server named that this build does not know.
+    #[serde(other)]
+    #[strum(disabled)]
+    Unknown,
+}
+
+impl InvalidRecordPolicy {
+    /// Whether this is the default `Block` policy (omitted on the wire).
+    pub fn is_block(&self) -> bool {
+        matches!(self, Self::Block)
+    }
+}
+
+/// What a whole-record binding does with a body its backend cannot store.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum OversizePolicy {
+    /// Hold the partition at the record.
+    #[default]
+    Block,
+    /// Keep the row without its body, which the source log still holds.
+    Reference,
+    /// A policy a newer server named that this build does not know.
+    #[serde(other)]
+    #[strum(disabled)]
+    Unknown,
+}
+
+impl OversizePolicy {
+    /// Whether this is the default `Block` policy (omitted on the wire).
+    pub fn is_block(&self) -> bool {
+        matches!(self, Self::Block)
+    }
 }
 
 impl ProjectionBinding {
@@ -631,7 +759,8 @@ pub struct ProjectionBindingBuilder {
     index: Option<String>,
     notify: bool,
     retention: Option<RetentionPolicy>,
-    skip_rejected: bool,
+    invalid_records: InvalidRecordPolicy,
+    oversize: OversizePolicy,
 }
 
 impl ProjectionBindingBuilder {
@@ -685,8 +814,7 @@ impl ProjectionBindingBuilder {
         self
     }
 
-    /// Set the replica-local operational index name. Omit it to use the source
-    /// topic name. External lakehouse destinations use the destination API.
+    /// Set the operational index name. Omit it to use the source topic name.
     pub fn index(mut self, index: impl Into<String>) -> Self {
         self.index = Some(index.into());
         self
@@ -700,12 +828,19 @@ impl ProjectionBindingBuilder {
         self
     }
 
-    /// Let the managed backend skip a record it proved the destination or the
-    /// extraction rejects, instead of holding the partition. The skipped record
-    /// goes to the dead-letter topic. See [`ProjectionBinding::skip_rejected`].
+    /// Set what happens to a record the binding proved invalid. See
+    /// [`ProjectionBinding::invalid_records`].
     #[must_use]
-    pub fn skip_rejected(mut self) -> Self {
-        self.skip_rejected = true;
+    pub fn invalid_records(mut self, policy: InvalidRecordPolicy) -> Self {
+        self.invalid_records = policy;
+        self
+    }
+
+    /// Set what a whole-record binding does with an oversized body. See
+    /// [`ProjectionBinding::oversize`].
+    #[must_use]
+    pub fn oversize(mut self, policy: OversizePolicy) -> Self {
+        self.oversize = policy;
         self
     }
 
@@ -732,7 +867,8 @@ impl ProjectionBindingBuilder {
             index,
             notify: self.notify,
             retention: self.retention,
-            skip_rejected: self.skip_rejected,
+            invalid_records: self.invalid_records,
+            oversize: self.oversize,
         })
     }
 }
@@ -778,6 +914,31 @@ pub struct SchemaDef {
     /// decode unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
+}
+
+/// A writer schema whose id the control fold chooses at the record's ordered log
+/// position: an identical definition of the same registry is reused, otherwise
+/// the lowest free id is taken. The id an explicit [`SchemaDef`] names is never
+/// renumbered, so the two stay distinct commands.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SchemaAllocation {
+    pub source: SchemaSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+}
+
+impl SchemaAllocation {
+    /// The definition this allocation registers under `id`.
+    pub fn definition(&self, id: u32) -> SchemaDef {
+        SchemaDef {
+            id,
+            source: self.source.clone(),
+            name: self.name.clone(),
+            version: self.version,
+        }
+    }
 }
 
 impl SchemaDef {
@@ -836,11 +997,19 @@ pub enum ControlCommand {
     RemoveBinding {
         source: SourceSelector,
         projection_ref: Option<String>,
+        /// Remove the binding only when it belongs to this incarnation of its
+        /// source stream or an earlier one. `None` removes it whatever its
+        /// incarnation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<ControlStreamGeneration>,
     },
     /// Register (or replace by `id`) a writer schema for a schema-first codec.
     RegisterSchema(SchemaDef),
     /// Drop the schema registered under this id.
     DropSchema(u32),
+    /// Register a writer schema under the id the control fold chooses. The
+    /// record's operation identity keeps the chosen id, so a retry returns it.
+    AllocateSchema(SchemaAllocation),
     /// Register (or replace by id) a graph projection: a [`Projection`] with
     /// `kind = Graph` and an `entity_schema`. A distinct command from
     /// [`RegisterProjection`](Self::RegisterProjection) so a deployment can gate
@@ -872,6 +1041,24 @@ pub enum ControlCommand {
     /// binding that opted in or after an operator asked. The streaming server
     /// never forwards it from a client.
     SkipRecord(RecordSkip),
+    /// The managed backend observed that one source partition incarnation
+    /// retains no record below `first_offset`. Record skips and accepted gaps
+    /// below it can never be reached again and leave the registry. Appended by
+    /// the backend itself. The streaming server never forwards it from a
+    /// client.
+    SourceRetained(SourceRetention),
+}
+
+/// The first offset one source partition incarnation still retains.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SourceRetention {
+    pub source: SourceSelector,
+    pub partition_id: u32,
+    /// Creation time of the source topic incarnation the floor belongs to.
+    pub topic_created_at_micros: u64,
+    /// No record below this offset can be read again, `u64::MAX` when the
+    /// incarnation is gone.
+    pub first_offset: u64,
 }
 
 /// One record a binding skips, on one topic incarnation.
@@ -969,9 +1156,6 @@ pub struct ControlStamp {
     /// The deployment whose backend appended the record. Zero for a
     /// standalone backend without a deployment identity.
     pub deployment_id: u64,
-    /// The authenticated user the request came from. Zero for a command the
-    /// streaming server issues itself.
-    pub actor_user_id: u32,
     /// Stable identity of the logical control operation. A retry keeps it, so
     /// a second append of the same operation applies once.
     pub operation_id: u128,
@@ -981,9 +1165,9 @@ pub struct ControlStamp {
     pub stream_generation: Option<ControlStreamGeneration>,
     /// Identifies the sealing key without revealing it.
     pub key_id: u64,
-    /// The client that asked for the record. Absent on a record the backend or
-    /// the streaming server issues on its own, so it tells the root user, id
-    /// zero, apart from them.
+    /// The client that asked for the record, the only actor the record names.
+    /// Absent on a record the backend or the streaming server issues on its
+    /// own, so the root user, id zero, is never mistaken for them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller: Option<crate::forward::Caller>,
 }
@@ -1005,11 +1189,65 @@ impl Validate for ProjectionId {
 impl Validate for Projection {
     fn validate(&self) -> Result<(), InvalidError> {
         self.id.validate()?;
+        if let ProjectionHistory::Keyed { key, delete_header } = &self.history {
+            if self.kind == ProjectionKind::Graph {
+                return Err(InvalidError::new(
+                    "graph projections do not support keyed history",
+                ));
+            }
+            if let Some(delete_header) = delete_header {
+                validate_bounded_text("deletion header", delete_header, MAX_INDEX_FIELD_BYTES)?;
+            }
+            match key {
+                ProjectionKey::Header { name } => {
+                    validate_bounded_text("key header", name, MAX_INDEX_FIELD_BYTES)?
+                }
+                ProjectionKey::Pointer { pointer } => {
+                    if self.kind != ProjectionKind::Row {
+                        return Err(InvalidError::new(
+                            "payload key pointers require a row projection",
+                        ));
+                    }
+                    if !pointer.is_empty() {
+                        validate_bounded_text("key pointer", pointer, MAX_INDEX_FIELD_BYTES)?;
+                        if !pointer.starts_with('/') {
+                            return Err(InvalidError::new("key pointer must be a JSON pointer"));
+                        }
+                    }
+                    let mut bytes = pointer.bytes();
+                    while let Some(byte) = bytes.next() {
+                        if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
+                            return Err(InvalidError::new("key pointer has an invalid escape"));
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.kind == ProjectionKind::Record
+            && (!self.extraction.fields.is_empty()
+                || self.extraction.vector_field.is_some()
+                || self.entity_schema.is_some())
+        {
+            return Err(InvalidError::new(
+                "a whole-record projection extracts nothing, so it declares no fields, vector field or entity schema",
+            ));
+        }
         if !self.name.is_empty() {
             validate_bounded_text("projection name", &self.name, MAX_PROJECTION_NAME_BYTES)?;
         }
         for field in &self.extraction.fields {
             validate_bounded_text("index field name", &field.name, MAX_INDEX_FIELD_BYTES)?;
+            let mut characters = field.name.chars();
+            let leads = characters
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_');
+            if !leads || !characters.all(|rest| rest.is_ascii_alphanumeric() || rest == '_') {
+                return Err(InvalidError::new(format!(
+                    "index field name `{}` must start with an ASCII letter or `_` and hold only ASCII letters, digits and `_`",
+                    field.name
+                )));
+            }
             validate_bounded_text("index field pointer", &field.pointer, MAX_INDEX_FIELD_BYTES)?;
         }
         if let Some(vector_field) = &self.extraction.vector_field {
@@ -1035,16 +1273,89 @@ impl Validate for ProjectionBinding {
         if let Some(projection) = &self.default_projection {
             projection.validate()?;
         }
+        if self.invalid_records == InvalidRecordPolicy::Unknown
+            || self.oversize == OversizePolicy::Unknown
+            || self.retention == Some(RetentionPolicy::Unknown)
+        {
+            return Err(InvalidError::new(
+                "a binding cannot apply a policy this build does not know",
+            ));
+        }
+        if matches!(
+            self.retention,
+            Some(
+                RetentionPolicy::TimeToLive { ttl_micros: 0 }
+                    | RetentionPolicy::MaxRows { rows: 0 }
+            )
+        ) {
+            return Err(InvalidError::new(
+                "a time to live retention needs a lifetime above zero, and a max rows retention at least one row",
+            ));
+        }
+        if self.oversize == OversizePolicy::Reference
+            && self
+                .retention
+                .is_some_and(|retention| retention != RetentionPolicy::MirrorLog)
+        {
+            return Err(InvalidError::new(
+                "a binding that keeps body references needs mirror_log retention, so no row outlives its record",
+            ));
+        }
         Ok(())
     }
 }
 
 impl Validate for SchemaDef {
     fn validate(&self) -> Result<(), InvalidError> {
-        if let Some(name) = &self.name {
-            validate_bounded_text("schema name", name, MAX_SCHEMA_NAME_BYTES)?;
+        if self.id == 0 {
+            return Err(InvalidError::new("writer schema ids start at 1"));
         }
-        Ok(())
+        validate_schema_metadata(&self.source, self.name.as_deref())
+    }
+}
+
+impl Validate for SchemaAllocation {
+    fn validate(&self) -> Result<(), InvalidError> {
+        validate_schema_metadata(&self.source, self.name.as_deref())
+    }
+}
+
+impl Validate for SchemaSource {
+    fn validate(&self) -> Result<(), InvalidError> {
+        match self {
+            Self::Avro { schema } => validate_schema_text("Avro schema", schema),
+            Self::JsonSchema { schema } => {
+                validate_schema_text("JSON Schema", schema)?;
+                let value: serde_json::Value = serde_json::from_str(schema).map_err(|error| {
+                    InvalidError::new(format!("JSON Schema is not valid JSON: {error}"))
+                })?;
+                match value.get("$schema") {
+                    None => Ok(()),
+                    Some(serde_json::Value::String(dialect))
+                        if dialect.trim_end_matches('#') == JSON_SCHEMA_DIALECT =>
+                    {
+                        Ok(())
+                    }
+                    Some(other) => Err(InvalidError::new(format!(
+                        "a JSON Schema uses draft 2020-12, not {other}"
+                    ))),
+                }
+            }
+            Self::Protobuf {
+                descriptor_set,
+                message_type,
+            } => {
+                if descriptor_set.len() > MAX_FILTER_SCHEMA_BYTES {
+                    return Err(InvalidError::new(format!(
+                        "Protobuf descriptor set exceeds {MAX_FILTER_SCHEMA_BYTES} bytes"
+                    )));
+                }
+                validate_bounded_text("Protobuf message type", message_type, MAX_SCHEMA_NAME_BYTES)
+            }
+            Self::Unknown => Err(InvalidError::new(
+                "a schema source of an unknown kind cannot be registered",
+            )),
+        }
     }
 }
 
@@ -1060,12 +1371,14 @@ impl Validate for ControlCommand {
                 .as_deref()
                 .map_or(Ok(()), validate_projection_id),
             Self::RegisterSchema(schema) => schema.validate(),
+            Self::AllocateSchema(allocation) => allocation.validate(),
             Self::FilterCatalog(command) => command.mutation.validate(),
             Self::DropSchema(_)
             | Self::RegisterSessionSource { .. }
             | Self::RemoveSessionSource { .. }
             | Self::AcceptGap(_)
-            | Self::SkipRecord(_) => Ok(()),
+            | Self::SkipRecord(_)
+            | Self::SourceRetained(_) => Ok(()),
         }
     }
 }
@@ -1080,14 +1393,102 @@ fn validate_projection_id(id: &str) -> Result<(), InvalidError> {
     Ok(())
 }
 
+fn validate_schema_metadata(source: &SchemaSource, name: Option<&str>) -> Result<(), InvalidError> {
+    if let Some(name) = name {
+        validate_bounded_text("schema name", name, MAX_SCHEMA_NAME_BYTES)?;
+    }
+    source.validate()
+}
+
+fn validate_schema_text(label: &str, text: &str) -> Result<(), InvalidError> {
+    if text.len() > MAX_FILTER_SCHEMA_BYTES {
+        return Err(InvalidError::new(format!(
+            "{label} exceeds {MAX_FILTER_SCHEMA_BYTES} bytes"
+        )));
+    }
+    if !json_depth_within(text.as_bytes(), MAX_FILTER_SCHEMA_DEPTH) {
+        return Err(InvalidError::new(format!(
+            "{label} nests deeper than {MAX_FILTER_SCHEMA_DEPTH}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::destination::ProjectionRef;
     use crate::limits::{
         MAX_GRAPH_LABEL_BYTES, MAX_INDEX_FIELD_BYTES, MAX_PROJECTION_ID_BYTES,
         MAX_PROJECTION_NAME_BYTES, MAX_SCHEMA_NAME_BYTES,
     };
+    use std::borrow::Borrow;
+
+    #[test]
+    fn given_keyed_projection_when_validated_then_should_check_kind_and_pointer() {
+        for pointer in ["", "/id", "/a~1b/~0"] {
+            Projection::builder("keyed")
+                .keyed(
+                    ProjectionKey::Pointer {
+                        pointer: pointer.to_owned(),
+                    },
+                    Some("deleted"),
+                )
+                .build()
+                .validate()
+                .expect("valid pointer");
+        }
+        for pointer in ["id", "/a~", "/a~2"] {
+            assert!(
+                Projection::builder("keyed")
+                    .keyed(
+                        ProjectionKey::Pointer {
+                            pointer: pointer.to_owned()
+                        },
+                        Some("deleted")
+                    )
+                    .build()
+                    .validate()
+                    .is_err()
+            );
+        }
+        assert!(
+            Projection::builder("keyed")
+                .record()
+                .keyed(
+                    ProjectionKey::Pointer {
+                        pointer: "/id".to_owned()
+                    },
+                    Some("deleted")
+                )
+                .build()
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Projection::builder("keyed")
+                .graph(EntitySchema::default())
+                .keyed(
+                    ProjectionKey::Header {
+                        name: "id".to_owned()
+                    },
+                    Some("deleted")
+                )
+                .build()
+                .validate()
+                .is_err()
+        );
+        Projection::builder("keyed")
+            .record()
+            .keyed(
+                ProjectionKey::Header {
+                    name: "id".to_owned(),
+                },
+                Some("deleted"),
+            )
+            .build()
+            .validate()
+            .expect("record header key");
+    }
 
     #[test]
     fn given_an_invalid_projection_id_when_any_command_names_it_then_should_refuse_it() {
@@ -1107,6 +1508,7 @@ mod tests {
         ControlCommand::RemoveBinding {
             source: SourceSelector::new("fleet", "readings"),
             projection_ref: None,
+            generation: None,
         }
         .validate()
         .expect("a whole-binding removal names no projection");
@@ -1146,14 +1548,7 @@ mod tests {
                 ControlCommand::RemoveBinding {
                     source: SourceSelector::new("fleet", "readings"),
                     projection_ref: Some(invalid.clone()),
-                }
-                .validate()
-                .is_err()
-            );
-            assert!(
-                ProjectionRef {
-                    id: ProjectionId::new(invalid.clone()),
-                    version: 1,
+                    generation: None,
                 }
                 .validate()
                 .is_err()
@@ -1276,20 +1671,82 @@ mod tests {
     }
 
     #[test]
-    fn given_a_binding_that_skips_rejected_records_when_encoded_then_should_carry_the_opt_in_only_when_set()
-     {
+    fn given_binding_policies_when_encoded_then_should_carry_them_only_when_not_the_default() {
         let plain = ProjectionBinding::builder().source("s", "t").build();
-        assert!(!plain.skip_rejected);
-        let plain_json = serde_json::to_value(&plain).unwrap();
-        assert!(plain_json.get("skip_rejected").is_none());
+        assert_eq!(plain.invalid_records, InvalidRecordPolicy::Block);
+        assert_eq!(plain.oversize, OversizePolicy::Block);
+        let plain_json = serde_json::to_value(&plain).expect("encode a default binding");
+        assert!(plain_json.get("invalid_records").is_none());
+        assert!(plain_json.get("oversize").is_none());
         let opted = ProjectionBinding::builder()
             .source("s", "t")
-            .skip_rejected()
+            .invalid_records(InvalidRecordPolicy::DeadLetter)
+            .oversize(OversizePolicy::Reference)
             .build();
-        let json = serde_json::to_value(&opted).unwrap();
-        assert_eq!(json["skip_rejected"], true);
-        let decoded: ProjectionBinding = serde_json::from_value(json).unwrap();
+        let json = serde_json::to_value(&opted).expect("encode an opted binding");
+        assert_eq!(json["invalid_records"], "dead_letter");
+        assert_eq!(json["oversize"], "reference");
+        let decoded: ProjectionBinding =
+            serde_json::from_value(json).expect("decode an opted binding");
         assert_eq!(decoded, opted);
+    }
+
+    #[test]
+    fn given_an_unknown_binding_policy_when_decoded_then_should_degrade_and_refuse_to_apply_it() {
+        let binding: ProjectionBinding = serde_json::from_value(serde_json::json!({
+            "source": {"stream": "s", "topic": "t"},
+            "index": "t",
+            "invalid_records": "quarantine",
+            "oversize": "truncate",
+        }))
+        .expect("an unknown policy decodes to Unknown");
+        assert_eq!(binding.invalid_records, InvalidRecordPolicy::Unknown);
+        assert_eq!(binding.oversize, OversizePolicy::Unknown);
+        assert!(binding.validate().is_err());
+    }
+
+    #[test]
+    fn given_body_references_when_retention_outlives_the_log_then_should_refuse_the_binding() {
+        let binding = |retention: Option<RetentionPolicy>| {
+            let builder = ProjectionBinding::builder()
+                .source("s", "t")
+                .oversize(OversizePolicy::Reference);
+            match retention {
+                Some(retention) => builder.retention(retention),
+                None => builder,
+            }
+            .build()
+        };
+        binding(None)
+            .validate()
+            .expect("the fleet default is checked by the backend");
+        binding(Some(RetentionPolicy::MirrorLog))
+            .validate()
+            .expect("references live as long as their records");
+        assert!(binding(Some(RetentionPolicy::Keep)).validate().is_err());
+        assert!(
+            binding(Some(RetentionPolicy::TimeToLive { ttl_micros: 1 }))
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn given_a_record_projection_when_validated_then_should_refuse_extraction_rules() {
+        let record = Projection::builder("orders").record().build();
+        assert_eq!(record.kind, ProjectionKind::Record);
+        assert_eq!(ProjectionKind::from_code(2), ProjectionKind::Record);
+        assert_eq!(ProjectionKind::Record.code(), 2);
+        record
+            .validate()
+            .expect("a bare record projection is valid");
+        let with_field = Projection::builder("orders").record().field("id").build();
+        assert!(with_field.validate().is_err());
+        let with_vector = Projection::builder("orders")
+            .record()
+            .vector_field("/embedding")
+            .build();
+        assert!(with_vector.validate().is_err());
     }
 
     #[test]
@@ -1432,6 +1889,182 @@ mod tests {
             "reading.v1"
         );
     }
+
+    #[test]
+    fn given_an_index_schema_builder_when_built_then_should_keep_every_declared_rule() {
+        let schema = IndexSchema::builder()
+            .field("host")
+            .field_at("cpu_pct", "/cpu/value")
+            .vector_field("/vectors/text")
+            .inline_payload()
+            .build();
+        assert_eq!(
+            schema,
+            IndexSchema {
+                fields: vec![
+                    IndexField::new("host", "/host"),
+                    IndexField::new("cpu_pct", "/cpu/value"),
+                ],
+                vector_field: Some("/vectors/text".to_owned()),
+                inline_payload: true,
+            }
+        );
+    }
+
+    #[test]
+    fn given_a_projection_id_from_a_string_when_read_as_text_then_should_expose_that_string() {
+        let id = ProjectionId::from("reading.v1".to_owned());
+        let viewed: &str = id.as_ref();
+        let borrowed: &str = id.borrow();
+        assert_eq!(id, ProjectionId::new("reading.v1"));
+        assert_eq!(
+            (id.to_string(), viewed, borrowed),
+            ("reading.v1".to_owned(), "reading.v1", "reading.v1")
+        );
+    }
+
+    #[test]
+    fn given_a_keyed_record_projection_when_encoded_then_should_round_trip_and_omit_defaults() {
+        let keyed = Projection::builder("orders.v1")
+            .record()
+            .keyed(
+                ProjectionKey::Header {
+                    name: "order_id".to_owned(),
+                },
+                Some("deleted"),
+            )
+            .build();
+        let json = serde_json::to_value(&keyed).expect("encode a keyed record projection");
+        let decoded: Projection =
+            serde_json::from_value(json).expect("decode a keyed record projection");
+        assert_eq!(decoded, keyed);
+        let plain = serde_json::to_value(Projection::builder("orders.v1").build())
+            .expect("encode a default projection");
+        assert_eq!((plain.get("kind"), plain.get("history")), (None, None));
+    }
+
+    #[test]
+    fn given_a_keyed_projection_without_a_delete_header_when_decoded_then_should_validate_and_encode_without_it()
+     {
+        let keyed = Projection::builder("orders.v1")
+            .record()
+            .keyed(
+                ProjectionKey::Header {
+                    name: "order_id".to_owned(),
+                },
+                Some("deleted"),
+            )
+            .build();
+        let mut json = serde_json::to_value(&keyed).expect("encode a keyed projection");
+        json["history"]
+            .as_object_mut()
+            .expect("a keyed history object")
+            .remove("delete_header");
+        let decoded: Projection = serde_json::from_value(json.clone())
+            .expect("decode a keyed projection without a delete header");
+        decoded
+            .validate()
+            .expect("a keyed view may name no delete header");
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("encode it again"),
+            json
+        );
+        json["history"]["delete_header"] = serde_json::Value::String(String::new());
+        let empty: Projection =
+            serde_json::from_value(json).expect("decode an empty delete header");
+        assert!(
+            empty.validate().is_err(),
+            "a named delete header must not be empty"
+        );
+    }
+
+    #[test]
+    fn given_a_selector_and_notify_when_a_binding_is_built_then_should_keep_both() {
+        let binding = ProjectionBinding::builder()
+            .notify()
+            .selector(SourceSelector::new("fleet", "readings"))
+            .try_build()
+            .expect("a selector is a source");
+        assert_eq!(
+            binding,
+            ProjectionBinding {
+                source: SourceSelector::new("fleet", "readings"),
+                allowed_projections: Vec::new(),
+                default_projection: None,
+                backend: None,
+                index: "readings".to_owned(),
+                notify: true,
+                retention: None,
+                invalid_records: InvalidRecordPolicy::Block,
+                oversize: OversizePolicy::Block,
+            }
+        );
+    }
+
+    #[test]
+    fn given_a_gap_acceptance_when_matched_then_should_cover_only_its_incarnation_and_range() {
+        let gap = GapAcceptance {
+            source: SourceSelector::new("s", "t"),
+            partition_id: 2,
+            topic_created_at_micros: 7,
+            from_offset: 10,
+            to_offset: 20,
+        };
+        assert!(gap.covers(7, 10, 20), "a resume at both accepted edges");
+        assert!(!gap.covers(8, 10, 20), "another incarnation");
+        assert!(!gap.covers(7, 9, 20), "a cursor before the accepted range");
+        assert!(
+            !gap.covers(7, 10, 21),
+            "a first record past the accepted range"
+        );
+    }
+
+    #[test]
+    fn given_an_index_field_name_that_is_not_an_identifier_when_validated_then_should_refuse_it() {
+        for name in ["user-id", "order.total", "9lives", "caf\u{e9}"] {
+            let projection = Projection::builder("orders")
+                .field_at(name, "/value")
+                .build();
+            assert!(projection.validate().is_err(), "`{name}` is refused");
+        }
+        for name in ["user_id", "_private", "total2"] {
+            let projection = Projection::builder("orders")
+                .field_at(name, "/value")
+                .build();
+            assert!(projection.validate().is_ok(), "`{name}` is accepted");
+        }
+    }
+
+    #[test]
+    fn given_a_retention_that_never_or_always_prunes_when_validated_then_should_refuse_the_binding()
+    {
+        for retention in [
+            RetentionPolicy::Unknown,
+            RetentionPolicy::TimeToLive { ttl_micros: 0 },
+            RetentionPolicy::MaxRows { rows: 0 },
+        ] {
+            let binding = ProjectionBinding::builder()
+                .source("s", "t")
+                .retention(retention)
+                .build();
+            assert!(binding.validate().is_err(), "{retention:?} is refused");
+        }
+        let bounded = ProjectionBinding::builder()
+            .source("s", "t")
+            .retention(RetentionPolicy::MaxRows { rows: 1 })
+            .build();
+        assert!(bounded.validate().is_ok());
+    }
+
+    #[test]
+    fn given_one_unknown_binding_policy_when_validated_then_should_refuse_the_binding() {
+        let binding = ProjectionBinding {
+            invalid_records: InvalidRecordPolicy::Unknown,
+            ..ProjectionBinding::builder().source("s", "t").build()
+        };
+        assert_eq!(binding.oversize, OversizePolicy::Block);
+        assert!(binding.validate().is_err());
+    }
 }
 
 #[cfg(all(test, feature = "cbor"))]
@@ -1530,14 +2163,17 @@ mod wire_tests {
             stream: Some("acme".to_owned()),
             stamp: Some(ControlStamp {
                 deployment_id: 42,
-                actor_user_id: 3,
                 operation_id: u128::MAX - 1,
                 stream_generation: Some(ControlStreamGeneration {
                     stream_id: 9,
                     created_at_micros: 1_700_000_000_000_000,
                 }),
                 key_id: u64::MAX,
-                caller: None,
+                caller: Some(crate::forward::Caller {
+                    user_id: 0,
+                    agent: None,
+                    on_behalf_of: None,
+                }),
             }),
         };
         let back: ControlEnvelope =

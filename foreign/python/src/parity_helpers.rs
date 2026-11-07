@@ -1,12 +1,12 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::blob::PyBlobStore;
 use crate::client::PyLaser;
 use crate::context::read_topics;
-use crate::convert::{json_to_py, payload_bytes, py_to_de, py_to_json, ser_to_py};
+use crate::convert::{duration_ms, json_to_py, payload_bytes, py_to_de, py_to_json, ser_to_py};
 use crate::errors::{CodecError, InvalidError, to_pyerr};
 use crate::memory::PyMemoryItem;
 use crate::session::PyCheckpoint;
-use crate::sign::{PyKeyRegistry, PySigningKey, envelope_of};
+use crate::sign::{PyKeyRegistry, PySigningKey, envelope_of, signature_context};
 use crate::snapshot::{snapshot_from_py, snapshot_to_py};
 use laser_sdk::agent::{Clock, SystemClock, TestClock};
 use laser_sdk::sign::{KeyKind, KeyRecord};
@@ -90,14 +90,13 @@ impl PyTestClock {
         self.inner.now_micros()
     }
 
-    /// Move the clock forward by `by_micros`, wrapping at the unsigned 64-bit
-    /// ceiling like Rust and TypeScript.
-    fn advance(
-        &self,
-        #[gen_stub(override_type(type_repr = "builtins.int", imports = ("builtins",)))]
-        by_micros: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        self.inner.advance(clock_micros(by_micros)?);
+    /// Move the clock forward by `by_ms` milliseconds, wrapping at the
+    /// unsigned 64-bit microsecond ceiling like Rust and TypeScript.
+    fn advance(&self, by_ms: f64) -> PyResult<()> {
+        let by = duration_ms(by_ms, "by_ms")?;
+        u64::try_from(by.as_micros())
+            .map_err(|_| InvalidError::new_err("by_ms must fit u64 microseconds"))?;
+        self.inner.advance(by);
         Ok(())
     }
 
@@ -139,6 +138,7 @@ pub fn sign_card_value(
 pub fn verify_card(
     card: &Bound<'_, PyAny>,
     signature: &Bound<'_, PyAny>,
+    #[gen_stub(override_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
     verifying: Vec<u8>,
 ) -> PyResult<()> {
     let key =
@@ -147,15 +147,28 @@ pub fn verify_card(
         .map_err(to_pyerr)
 }
 
-/// Verify the signer and return its signed delegated user, or None.
+/// Verify the signer against the headers observed on the record
+/// (`content_type`, `agent_version`) and its timestamp `at_micros`, and return
+/// it with its signed delegated user, or None. The server authorizes only the
+/// authenticated caller, so intersect the two principals' grants with
+/// `delegated_allow`.
 #[gen_stub_pyfunction]
 #[pyfunction]
+#[pyo3(signature = (registry, envelope, at_micros, *, content_type=None, agent_version=None))]
 pub fn verify_delegation(
     registry: PyRef<'_, PyKeyRegistry>,
     envelope: &Bound<'_, PyAny>,
+    at_micros: u64,
+    content_type: Option<String>,
+    agent_version: Option<u32>,
 ) -> PyResult<Option<(String, String)>> {
-    laser_sdk::sign::verify_delegation(&registry.snapshot(), &envelope_of(envelope)?)
-        .map_err(to_pyerr)
+    laser_sdk::sign::verify_delegation(
+        &registry.snapshot(),
+        &envelope_of(envelope)?,
+        &signature_context(content_type, agent_version)?,
+        at_micros,
+    )
+    .map_err(to_pyerr)
 }
 
 /// Encode a snapshot dict as the native named-field CBOR storage bytes.
@@ -169,7 +182,11 @@ pub fn encode_snapshot(py: Python<'_>, snapshot: &Bound<'_, PyAny>) -> PyResult<
 /// Decode snapshot storage bytes to a dict with conversation, as_of, and state.
 #[gen_stub_pyfunction]
 #[pyfunction]
-pub fn decode_snapshot(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+pub fn decode_snapshot(
+    py: Python<'_>,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+    payload: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
     let snapshot = laser_sdk::snapshot::decode(&payload_bytes(payload)?).map_err(to_pyerr)?;
     Ok(snapshot_to_py(py, &snapshot)?.unbind())
 }
@@ -407,6 +424,7 @@ pub fn encode_context_compaction(
 #[pyfunction]
 pub fn decode_context_compaction(
     py: Python<'_>,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
     payload: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let value: ContextCompaction = decode_named(&payload_bytes(payload)?)
@@ -426,7 +444,11 @@ pub fn encode_context_retrieval(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyR
 /// Decode a context retrieval record.
 #[gen_stub_pyfunction]
 #[pyfunction]
-pub fn decode_context_retrieval(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+pub fn decode_context_retrieval(
+    py: Python<'_>,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+    payload: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
     let value: ContextRetrieval = decode_named(&payload_bytes(payload)?)
         .map_err(|error| CodecError::new_err(error.to_string()))?;
     ser_to_py(py, &value)
@@ -501,11 +523,11 @@ pub fn checkpoint_from_snapshot<'py>(
     laser: &PyLaser,
     snapshot: &Bound<'_, PyAny>,
     topics: Vec<String>,
-) -> PyResult<Bound<'py, PyAny>> {
+) -> PyResult<Awaitable<'py, PyCheckpoint>> {
     let laser = laser.inner.clone();
     let snapshot = snapshot_from_py(snapshot)?;
     let topics = read_topics(Some(topics))?;
-    future_into_py(py, async move {
+    awaitable(py, async move {
         let checkpoint = laser_sdk::agent::checkpoint_from_snapshot(&laser, &snapshot, &topics)
             .await
             .map_err(to_pyerr)?;
@@ -524,15 +546,16 @@ pub fn snapshot_from_checkpoint<'py>(
     conversation: &str,
     fold: String,
     checkpoint: &PyCheckpoint,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
     state: &Bound<'_, PyAny>,
-) -> PyResult<Bound<'py, PyAny>> {
+) -> PyResult<Awaitable<'py, Py<PyAny>>> {
     let laser = laser.inner.clone();
     let conversation =
         <laser_sdk::types::ConversationId as std::str::FromStr>::from_str(conversation)
             .map_err(|error| to_pyerr(error.into()))?;
     let checkpoint = checkpoint.inner().clone();
     let state = payload_bytes(state)?;
-    future_into_py(py, async move {
+    awaitable(py, async move {
         let snapshot = laser_sdk::agent::snapshot_from_checkpoint(
             &laser,
             conversation,
@@ -596,6 +619,7 @@ pub fn command_from_message_send(
     conversation: String,
     source: String,
     correlation: String,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
     params_json: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let envelope = laser_sdk::a2a::command_from_message_send(
@@ -608,17 +632,19 @@ pub fn command_from_message_send(
     ser_to_py(py, &envelope)
 }
 
-/// Render an AGDX envelope as the native A2A task view.
+/// Render an AGDX envelope as the A2A v1.0 task view in the context
+/// `context_id`.
 #[gen_stub_pyfunction]
 #[pyfunction]
 pub fn task_from_envelope(
     py: Python<'_>,
     task_id: String,
+    context_id: String,
     envelope: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     ser_to_py(
         py,
-        &laser_sdk::a2a::task_from_envelope(task_id, &envelope_of(envelope)?),
+        &laser_sdk::a2a::task_from_envelope(task_id, context_id, &envelope_of(envelope)?),
     )
 }
 
@@ -632,6 +658,7 @@ pub fn tool_call_from_request(
     source: String,
     correlation: String,
     tool_name: String,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
     params_json: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let envelope = laser_sdk::mcp::tool_call_from_request(
@@ -665,10 +692,11 @@ pub fn check_in<'py>(
     py: Python<'py>,
     store: Py<PyAny>,
     threshold_bytes: usize,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
     payload: &Bound<'_, PyAny>,
-) -> PyResult<Bound<'py, PyAny>> {
+) -> PyResult<Awaitable<'py, (Py<PyBytes>, Option<String>)>> {
     let payload = payload_bytes(payload)?;
-    future_into_py(py, async move {
+    awaitable(py, async move {
         let store = PyBlobStore { hooks: store };
         let (payload, content_type) = laser_sdk::blob::check_in(&store, threshold_bytes, payload)
             .await
@@ -688,10 +716,11 @@ pub fn check_in<'py>(
 pub fn resolve_body<'py>(
     py: Python<'py>,
     store: Py<PyAny>,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
     payload: &Bound<'_, PyAny>,
-) -> PyResult<Bound<'py, PyAny>> {
+) -> PyResult<Awaitable<'py, Py<PyBytes>>> {
     let payload = payload_bytes(payload)?;
-    future_into_py(py, async move {
+    awaitable(py, async move {
         let store = PyBlobStore { hooks: store };
         let payload = laser_sdk::blob::resolve_body(&store, &payload)
             .await

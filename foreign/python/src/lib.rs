@@ -13,7 +13,6 @@ mod control;
 mod convert;
 mod coordination;
 mod crash_context;
-mod destinations;
 mod errors;
 mod filters;
 mod fork;
@@ -23,6 +22,7 @@ mod ids;
 mod intent;
 mod interop;
 mod kv;
+mod materialize;
 mod memory;
 mod memory_handler;
 mod parity_helpers;
@@ -113,7 +113,6 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<client::PyCapabilities>()?;
     module.add_class::<ids::PyMessageId>()?;
     module.add_class::<client::PyQueryCaps>()?;
-    module.add_class::<client::PyDestinationCaps>()?;
     module.add_class::<client::PyKvCaps>()?;
     module.add_class::<client::PyFilterCaps>()?;
     module.add_class::<client::PyFilterAnnounce>()?;
@@ -159,6 +158,8 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<sign::PyVerifiedPrincipal>()?;
     module.add_class::<query::PyQuery>()?;
     module.add_class::<query::PyRow>()?;
+    module.add_class::<query::PyQueryRow>()?;
+    module.add_class::<query::PyQueryRowSet>()?;
     module.add_class::<query::PyQueryResult>()?;
     module.add_class::<query::PyPage>()?;
     module.add_class::<query::PyQueryBuilder>()?;
@@ -175,6 +176,11 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
         query::result_code_is_backend_unavailable,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(query::result_code_is_unavailable, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        query::result_code_is_permission_denied,
+        module
+    )?)?;
     module.add_class::<query::PyQueryFilter>()?;
     module.add_class::<query::PyQueryRows>()?;
     module.add_class::<query::PyTypedQueryRows>()?;
@@ -184,12 +190,59 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<context::PyRoleFilter>()?;
     module.add_class::<context::PyChain>()?;
     module.add_class::<context::PySelection>()?;
-    module.add_class::<destinations::PyDestinations>()?;
     module.add_class::<projections::PyProjections>()?;
+    module.add_function(wrap_pyfunction!(
+        materialize::binding_status_readiness,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        materialize::binding_status_caught_up_to,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        materialize::binding_status_is_blocked,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        materialize::binding_status_is_failed,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        materialize::is_permanent_failure_class,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        materialize::binding_status_history_complete,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        materialize::is_block_invalid_record_policy,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        materialize::is_block_oversize_policy,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        materialize::materialization_operation_id,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        materialize::covers_gap_acceptance,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        materialize::is_append_projection_history,
+        module
+    )?)?;
+    module.add_class::<materialize::PyMaterialization>()?;
+    module.add_class::<client::PyQueryCapabilities>()?;
+    module.add_class::<materialize::PyMaterializeRequest>()?;
     module.add_class::<projections::PyBindings>()?;
     module.add_class::<projections::PySchemas>()?;
     module.add_class::<kv::PyKv>()?;
     module.add_class::<kv::PyLease>()?;
+    module.add_class::<kv::PyLeaseGuard>()?;
     module.add_class::<coordination::PyDedicatedKvTransport>()?;
     module.add_class::<coordination::PyFencedLeaseClient>()?;
     module.add_class::<coordination::PyPreparedMutation>()?;
@@ -200,11 +253,14 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<kv::PyKvEntry>()?;
     module.add_class::<kv::PyKvMetadata>()?;
     module.add_class::<kv::PyKvPage>()?;
+    module.add_class::<kv::PyKvRevalidation>()?;
     module.add_class::<stream::PyStream>()?;
     module.add_class::<stream::PyTopic>()?;
     module.add_class::<watch::PyWatchReader>()?;
+    module.add_class::<watch::PyWatchedChange>()?;
     module.add_class::<watch::PyChangeRecord>()?;
     module.add_class::<kv::PyKvSet>()?;
+    module.add_class::<kv::PyKvCas>()?;
     module.add_class::<kv::PyKvCopy>()?;
     module.add_class::<kv::PyKvCasFenced>()?;
     module.add_class::<kv::PyKvScan>()?;
@@ -260,6 +316,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(agdx::validate_signature, module)?)?;
     module.add_class::<agent_runtime::PyAgentCtx>()?;
     module.add_class::<agent_runtime::PyAgentHandle>()?;
+    module.add_class::<agent_runtime::PyApprovalGrant>()?;
     module.add_class::<agent_runtime::PyContract>()?;
     module.add_class::<agent_runtime::PyScatterOutcome>()?;
     module.add_class::<agent_runtime::PyScatterReport>()?;
@@ -278,6 +335,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<rbac::PyRole>()?;
     module.add_class::<rbac::PyResourcePattern>()?;
     module.add_class::<rbac::PyWhoamiReply>()?;
+    module.add_class::<rbac::PyBindingsReply>()?;
     module.add_class::<rbac::PyAuthzEvent>()?;
     module.add_class::<rbac::PyAuthzHistoryReply>()?;
     module.add_class::<rbac::PyEdgeDenial>()?;
@@ -317,6 +375,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<intent::PyIntentPolicy>()?;
     module.add_class::<intent::PyIntent>()?;
     module.add_class::<intent::PyVote>()?;
+    module.add_class::<intent::PyObservedVote>()?;
     module.add_class::<intent::PyDecision>()?;
     module.add_class::<context::PyContextScope>()?;
     module.add_class::<context::PyScopedMemory>()?;
@@ -401,7 +460,9 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(interop::enter_bridge, module)?)?;
     module.add_function(wrap_pyfunction!(rbac::grants_allow, module)?)?;
     module.add_function(wrap_pyfunction!(rbac::delegated_allow, module)?)?;
+    module.add_function(wrap_pyfunction!(rbac::validate_role, module)?)?;
     module.add_function(wrap_pyfunction!(rbac::validate_role_name, module)?)?;
+    module.add_function(wrap_pyfunction!(rbac::validate_mutation_id, module)?)?;
     module.add_function(wrap_pyfunction!(graph::node_id_content, module)?)?;
     module.add_function(wrap_pyfunction!(graph::edge_id_content, module)?)?;
     module.add_function(wrap_pyfunction!(graph::graph_node_entity, module)?)?;
@@ -413,19 +474,6 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(graph::graph_return_is_nodes, module)?)?;
     module.add_function(wrap_pyfunction!(
         snapshot::fold_snapshot_resume_offset,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        destinations::new_checkpoint_request_envelope,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        destinations::public_checkpoint_mutation_required_capability,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(destinations::new_source_scope, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        destinations::validate_operator_actor_assertion,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(intent::decide, module)?)?;

@@ -16,8 +16,16 @@ export function edgeDenialCode(denial: EdgeDenial): ResultCode {
   }
 }
 
-export function edgeDenialChallenge(denial: EdgeDenial): string | undefined {
-  return denial.kind === "stepUp" ? `Bearer scope="${denial.requiredScope}"` : undefined
+/**
+ * The RFC 6750 section 3 `WWW-Authenticate` challenge: `invalid_token` for a
+ * token minted for another audience, `insufficient_scope` with the scope to
+ * acquire for a step-up, the error MCP clients read to start re-authorization.
+ */
+export function edgeDenialChallenge(denial: EdgeDenial): string {
+  if (denial.kind === "wrongAudience") return 'Bearer error="invalid_token"'
+  // RFC 9110 section 5.6.4 quoted-string: escape `"` and `\` so a scope cannot end the parameter.
+  const scope = denial.requiredScope.replace(/["\\]/g, (character) => `\\${character}`)
+  return `Bearer error="insufficient_scope", scope="${scope}"`
 }
 
 export function authorizeEdge(

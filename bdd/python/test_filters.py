@@ -222,12 +222,13 @@ def read_unbound_reader(world):
     async def read():
         group = world.laser.topic(TOPIC).consumer_group("unbound-readers")
         await group.create()
-        if not (await world.laser.capabilities()).filters.group_policy_reads:
+        filters = (await world.laser.capabilities()).filters
+        if not filters.group_policy_reads:
             try:
                 await group.reader(count=2, max_examined=2)
             except ls.UnsupportedError as error:
                 assert error.surface == "filters"
-                assert error.feature == "group_policy_reads"
+                assert error.feature == ("group_policy_reads" if filters.native else None)
                 world.error = error
                 return []
             raise AssertionError("group-aware reads must be refused")
@@ -239,7 +240,7 @@ def read_unbound_reader(world):
                 assert page.policy["mode"] == "unfiltered"
                 assert page.examined == len(page.records)
                 assert len(page.records) <= 2
-                assert all(not record.evaluated for record in page.records)
+                assert all(record.evaluation == "unfiltered" for record in page.records)
                 delivered.extend(record.message.payload for record in page.records)
                 await reader.ack_page(page)
             return delivered
@@ -251,12 +252,13 @@ def read_unbound_reader(world):
 
 @then("the advanced reader follows the group-aware read capability")
 def advanced_reader_capability(world):
-    if world.run(world.laser.capabilities).filters.group_policy_reads:
+    filters = world.run(world.laser.capabilities).filters
+    if filters.group_policy_reads:
         assert world.filtered == [RECORDS[name] for name in FEED]
     else:
         assert isinstance(world.error, ls.UnsupportedError)
         assert world.error.surface == "filters"
-        assert world.error.feature == "group_policy_reads"
+        assert world.error.feature == ("group_policy_reads" if filters.native else None)
 
 
 @then("it receives every original feed record")
@@ -348,3 +350,42 @@ def reject_old_policy(world):
             await reader.close()
 
     world.filtered = world.run(run)
+
+
+@when(parsers.parse('a "{first}" record and a "{second}" record follow the feed'))
+def records_follow_feed(world, first, second):
+    async def publish():
+        producer = world.laser.topic(TOPIC).producer(partition=0, partitions=1)
+        await producer.send_batch([RECORDS[first], RECORDS[second]])
+
+    world.run(publish)
+
+
+@when(parsers.parse('the anomaly desk skips the record its "{name}" filter stops on'))
+def skip_fault(world, name):
+    async def run():
+        group = world.laser.topic(TOPIC).consumer_group("fault-skip")
+        await group.create(filter=FILTERS[name](), filter_name=policy_name(name))
+        reader = await group.reader(start="first")
+        try:
+            page = await asyncio.wait_for(reader.next_page(), READ_TIMEOUT)
+            await reader.ack_page(page)
+            try:
+                await asyncio.wait_for(reader.next_page(), READ_TIMEOUT)
+            except ls.FilterFaultError as fault:
+                assert fault.offset == len(FEED), "the broken record follows the feed"
+                await reader.skip(fault.partition_id, fault.offset)
+            else:
+                raise AssertionError("the broken record did not stop the read")
+            after = await asyncio.wait_for(reader.next_page(), READ_TIMEOUT)
+            await reader.ack_page(after)
+            return [record.message.payload for record in after.records]
+        finally:
+            await reader.close()
+
+    world.filtered = world.run(run)
+
+
+@then(parsers.parse('it receives the "{name}" record after it'))
+def receives_after(world, name):
+    assert world.filtered == [RECORDS[name]]

@@ -1,13 +1,16 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::convert::json_to_py;
 use crate::errors::to_pyerr;
+use crate::transport::{PyHeader, header_dict, header_kinds, typed_headers};
 use laser_sdk::laser::Laser;
 use laser_sdk::message::Message;
+use laser_sdk::types::MessageId;
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// A resumable reader over one topic. Build with `Topic.replay`.
 #[gen_stub_pyclass]
@@ -18,10 +21,18 @@ pub struct PyCursor {
     topic: String,
     batch: Option<u32>,
     // Shared so the 'static poll future can read the saved offsets and write back
-    // the advanced ones, keeping resumption correct across polls.
+    // the advanced ones, keeping resumption correct across polls. They move
+    // past each message `async for` hands out.
     offsets: Arc<Mutex<Vec<u64>>>,
     // Holds one poll's messages so `async for` yields them one at a time.
-    buffered: Arc<Mutex<VecDeque<Message>>>,
+    buffered: Arc<Mutex<Buffered>>,
+}
+
+// The messages of one poll not yet handed out, and the offsets after the poll.
+#[derive(Default)]
+struct Buffered {
+    messages: VecDeque<Message>,
+    watermark: Vec<u64>,
 }
 
 impl PyCursor {
@@ -38,7 +49,7 @@ impl PyCursor {
             topic,
             batch,
             offsets,
-            buffered: Arc::new(Mutex::new(VecDeque::new())),
+            buffered: Arc::new(Mutex::new(Buffered::default())),
         }
     }
 }
@@ -46,7 +57,9 @@ impl PyCursor {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyCursor {
-    /// The next offset to read on each partition. Persist this to resume later.
+    /// The next offset to read on each partition, past every message handed
+    /// out so far. Persist this after handling a message to resume right
+    /// after it.
     #[getter]
     fn offsets(&self) -> Vec<u64> {
         self.offsets.lock().expect("offsets lock").clone()
@@ -54,14 +67,28 @@ impl PyCursor {
 
     /// Drain everything appended since the last poll, advancing the cursor. Returns
     /// the new messages ordered by timestamp, or an empty list when caught up.
-    fn poll<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Messages an `async for` left unread come first.
+    fn poll<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Vec<PyMessage>>> {
         let laser = self.laser.clone();
         let stream = self.stream.clone();
         let topic = self.topic.clone();
         let batch = self.batch;
         let offsets = self.offsets.clone();
         let saved = offsets.lock().expect("offsets lock").clone();
-        future_into_py(py, async move {
+        let unread = {
+            let mut buffered = self.buffered.lock().unwrap_or_else(PoisonError::into_inner);
+            let messages: Vec<PyMessage> =
+                buffered.messages.drain(..).map(PyMessage::from).collect();
+            if !messages.is_empty() {
+                *offsets.lock().unwrap_or_else(PoisonError::into_inner) =
+                    std::mem::take(&mut buffered.watermark);
+            }
+            messages
+        };
+        awaitable(py, async move {
+            if !unread.is_empty() {
+                return Ok(unread);
+            }
             let handle = match &stream {
                 Some(stream) => laser.stream(stream.clone()).topic(&*topic),
                 None => laser.topic(&*topic),
@@ -87,15 +114,15 @@ impl PyCursor {
         slf
     }
 
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyMessage>> {
         let laser = self.laser.clone();
         let stream = self.stream.clone();
         let topic = self.topic.clone();
         let batch = self.batch;
         let offsets = self.offsets.clone();
         let buffered = self.buffered.clone();
-        future_into_py(py, async move {
-            if let Some(message) = buffered.lock().expect("buffer lock").pop_front() {
+        awaitable(py, async move {
+            if let Some(message) = hand_out(&buffered, &offsets) {
                 return Ok(PyMessage::from(message));
             }
             let saved = offsets.lock().expect("offsets lock").clone();
@@ -108,30 +135,30 @@ impl PyCursor {
                 cursor = cursor.batch(batch);
             }
             let messages = cursor.poll().await.map_err(to_pyerr)?;
-            *offsets.lock().expect("offsets lock") = cursor.offsets().to_vec();
-            let mut queue: VecDeque<Message> = messages.into_iter().collect();
-            match queue.pop_front() {
-                Some(message) => {
-                    buffered.lock().expect("buffer lock").extend(queue);
-                    Ok(PyMessage::from(message))
-                }
-                None => Err(PyStopAsyncIteration::new_err(())),
+            if messages.is_empty() {
+                *offsets.lock().unwrap_or_else(PoisonError::into_inner) = cursor.offsets().to_vec();
+                return Err(PyStopAsyncIteration::new_err(()));
             }
+            *buffered.lock().unwrap_or_else(PoisonError::into_inner) = Buffered {
+                messages: messages.into(),
+                watermark: cursor.offsets().to_vec(),
+            };
+            hand_out(&buffered, &offsets)
+                .map(PyMessage::from)
+                .ok_or_else(|| PyStopAsyncIteration::new_err(()))
         })
     }
 }
 
-/// One log record: raw payload, log position, and string user headers.
+/// One log record: raw payload, log position, and typed user headers.
 #[gen_stub_pyclass]
 #[pyclass(name = "Message", frozen)]
 pub struct PyMessage {
-    #[pyo3(get)]
     pub payload: Vec<u8>,
     /// Where the message sits on the log (partition and offset).
     #[pyo3(get)]
     pub id: crate::ids::PyMessageId,
-    #[pyo3(get)]
-    pub headers: BTreeMap<String, String>,
+    headers: BTreeMap<String, PyHeader>,
 }
 
 impl From<Message> for PyMessage {
@@ -139,7 +166,7 @@ impl From<Message> for PyMessage {
         Self {
             payload: message.payload,
             id: message.id.into(),
-            headers: message.headers,
+            headers: typed_headers(message.headers),
         }
     }
 }
@@ -147,6 +174,25 @@ impl From<Message> for PyMessage {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyMessage {
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+    fn payload(&self) -> Vec<u8> {
+        self.payload.clone()
+    }
+
+    /// Typed Iggy user headers as Python `bytes`, `str`, `bool`, `int`, or
+    /// `float` values, like `ConsumerMessage.headers`.
+    #[getter]
+    fn headers(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        header_dict(py, &self.headers)
+    }
+
+    /// Exact Iggy value kind for each user header (`uint16`, `string`, etc.).
+    #[getter]
+    fn header_kinds(&self) -> BTreeMap<String, String> {
+        header_kinds(&self.headers)
+    }
+
     /// Decode the payload as JSON into a Python value.
     fn json(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let value: serde_json::Value = serde_json::from_slice(&self.payload)
@@ -162,4 +208,27 @@ impl PyMessage {
             self.payload.len()
         )
     }
+}
+
+// Take the next buffered message and move the offsets past it, or to the
+// poll's watermark once the buffer is empty.
+fn hand_out(buffered: &Mutex<Buffered>, offsets: &Mutex<Vec<u64>>) -> Option<Message> {
+    let mut buffered = buffered.lock().unwrap_or_else(PoisonError::into_inner);
+    let message = buffered.messages.pop_front()?;
+    let mut offsets = offsets.lock().unwrap_or_else(PoisonError::into_inner);
+    if buffered.messages.is_empty() {
+        *offsets = std::mem::take(&mut buffered.watermark);
+    } else {
+        advance_past(&mut offsets, message.id);
+    }
+    Some(message)
+}
+
+/// Moves `offsets` past `position`, growing it for a partition it does not name.
+pub(crate) fn advance_past(offsets: &mut Vec<u64>, position: MessageId) {
+    let partition = position.partition_id as usize;
+    if offsets.len() <= partition {
+        offsets.resize(partition + 1, 0);
+    }
+    offsets[partition] = offsets[partition].max(position.offset + 1);
 }

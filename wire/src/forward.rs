@@ -66,11 +66,13 @@ pub struct ForwardedQuery {
 /// CBOR request the SDK sent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardedCommand {
-    /// Authenticated identity, set by the server. The key-value store scopes its
-    /// rows by this `user_id`, and the SDK cannot set it.
-    pub user_id: u32,
-    /// The caller's consensus client id, for logging and audit only. Never zero
-    /// for a client, zero on a request the server issues itself.
+    /// The client that asked, stamped by the server, so the SDK cannot set it.
+    /// The backend records it and authorizes with `grants`. Absent on a request
+    /// the server issues on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<Caller>,
+    /// The caller's consensus client id, for logs and correlation only, never
+    /// identity.
     pub client_id: u128,
     /// `gen_ai.conversation.id` echoed for the audit log, never used to route.
     pub correlation: Option<String>,
@@ -78,10 +80,9 @@ pub struct ForwardedCommand {
     /// mutation. Read-only commands leave it absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<u128>,
-    /// Set by the server, like `user_id`: true when the caller holds a global
-    /// read permission. Widens the read-side ops (key-value scan/namespaces,
-    /// fork list) to every user's rows, while writes stay scoped to `user_id`
-    /// regardless.
+    /// Vestigial. The server stamps `false`, the plane ignores it, and the
+    /// caller's grants govern access. It stays on the wire as the contract's
+    /// current structure, never as a widening flag.
     #[serde(default)]
     pub read_all: bool,
     /// Server-stamped stream identity. A session command without it fails closed.
@@ -121,17 +122,6 @@ pub struct ForwardedCommand {
     /// backend refuses a frame whose tenancy differs from its own.
     #[serde(default, skip_serializing_if = "crate::authz::Tenancy::is_deployment")]
     pub tenancy: crate::authz::Tenancy,
-    /// Set by the server on a mutation a client sent over the binary protocol:
-    /// the agent the calling connection declared in its presence. A claim the
-    /// client makes, never verified. Absent over HTTP and on the server's own
-    /// requests.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<crate::agent::AgentId>,
-    /// Set by the server from [`ON_BEHALF_OF_HEADER`](crate::http::ON_BEHALF_OF_HEADER)
-    /// on an HTTP write: the end user an intermediary wrote for. A claim, never
-    /// verified.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_behalf_of: Option<String>,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip predicate")]
@@ -181,7 +171,11 @@ mod tests {
             positioned_reply: false,
             min_sessions: Vec::new(),
             tenancy: Default::default(),
-            user_id: 7,
+            caller: Some(Caller {
+                user_id: 7,
+                agent: None,
+                on_behalf_of: None,
+            }),
             client_id: 42,
             correlation: None,
             operation_id: Some(17),
@@ -190,8 +184,6 @@ mod tests {
             command_code: 1_000_000,
             payload: vec![0x90; 5],
             grants: Vec::new(),
-            agent: None,
-            on_behalf_of: None,
         })
         .expect("encodes");
         assert!(
@@ -225,7 +217,11 @@ mod tests {
             positioned_reply: false,
             min_sessions: Vec::new(),
             tenancy: Default::default(),
-            user_id: 2,
+            caller: Some(Caller {
+                user_id: 2,
+                agent: Some("orbit-planner".parse().expect("agent id")),
+                on_behalf_of: Some("1793690355287073".to_owned()),
+            }),
             client_id: 9,
             correlation: None,
             operation_id: Some(9),
@@ -234,8 +230,6 @@ mod tests {
             command_code: 42,
             payload: vec![0xde, 0xad, 0xbe, 0xef],
             grants: Vec::new(),
-            agent: None,
-            on_behalf_of: None,
         };
         let back: ForwardedCommand =
             decode_named(&encode_named(&command).expect("encodes")).expect("decodes");
@@ -285,21 +279,15 @@ mod tests {
     }
 
     #[test]
-    fn given_a_forwarded_command_with_an_agent_when_read_without_the_field_then_should_ignore_it() {
-        #[derive(Debug, PartialEq, serde::Deserialize)]
-        struct BeforeAgent {
-            user_id: u32,
-            client_id: u128,
-            command_code: u32,
-        }
+    fn given_a_request_the_server_issues_on_its_own_when_encoded_then_should_carry_no_caller() {
         let command = ForwardedCommand {
             read_barrier: false,
             min_position: None,
             positioned_reply: false,
             min_sessions: Vec::new(),
             tenancy: Default::default(),
-            user_id: 0,
-            client_id: 9,
+            caller: None,
+            client_id: 0,
             correlation: None,
             operation_id: Some(9),
             read_all: false,
@@ -307,20 +295,17 @@ mod tests {
             command_code: 42,
             payload: vec![1],
             grants: Vec::new(),
-            agent: Some("orbit-planner".parse().expect("agent id")),
-            on_behalf_of: None,
         };
 
-        let before: BeforeAgent =
-            decode_named(&encode_named(&command).expect("encodes")).expect("decodes");
+        let frame = encode_named(&command).expect("encodes");
+        let back: ForwardedCommand = decode_named(&frame).expect("decodes");
 
-        assert_eq!(
-            before,
-            BeforeAgent {
-                user_id: 0,
-                client_id: 9,
-                command_code: 42,
-            }
+        assert_eq!(back, command);
+        assert!(
+            !frame
+                .windows(b"caller".len())
+                .any(|window| window == b"caller"),
+            "an absent caller is omitted from the frame"
         );
     }
 }

@@ -24,7 +24,10 @@ mod client;
 #[cfg(feature = "kv")]
 mod coordination;
 #[cfg(feature = "kv")]
-pub use client::{Kv, KvCopyRequest, KvDeleteManyRequest, KvScanRequest, KvSetRequest, Lease};
+pub use client::{
+    Kv, KvCasRequest, KvCopyRequest, KvDeleteManyRequest, KvRevalidation, KvScanRequest,
+    KvSetRequest, Lease, LeaseGuard,
+};
 #[cfg(feature = "kv")]
 pub use coordination::{
     AmbiguousMutationRecovery, DEFAULT_ATTEMPT_TIMEOUT, DedicatedKvTransport,

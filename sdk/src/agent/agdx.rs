@@ -1,3 +1,4 @@
+use crate::agent::clock::{Clock, SystemClock};
 use crate::error::LaserError;
 use crate::govern::{ActionCounters, ActionKind, GovernedAction};
 use crate::laser::Laser;
@@ -6,11 +7,12 @@ use crate::types::MintUlid;
 use iggy::prelude::{HeaderKey, HeaderValue};
 use laser_wire::agent::{
     AgentEnvelope, AgentErrorBody, AgentId, AgentKind, ChannelId, ConversationId, CorrelationId,
-    IdempotencyKey, LogPosition, RecordId, TaskState, TokenUsage, validate,
+    IdempotencyKey, LogPosition, OPERATION_TASK, RecordId, TaskState, TokenUsage, validate,
 };
 #[cfg(feature = "sign")]
 use laser_wire::codes::AGENT_OP_VERSION;
 use laser_wire::content::ContentType;
+use laser_wire::dispatch::OPERATION_INPUT_REQUEST;
 use laser_wire::framing::{decode_named, encode_named};
 use laser_wire::query::Value;
 use std::collections::BTreeMap;
@@ -25,6 +27,9 @@ pub const DEFAULT_CHUNK_FLUSH_BYTES: usize = 512;
 pub const DEFAULT_CHUNK_LINGER_MS: u64 = 20;
 /// Draft hard cap on one chunk's body.
 pub const MAX_CHUNK_BODY_BYTES: usize = 64 * 1024;
+/// How long after its opening a chunk stream may run before readers abandon
+/// it, unless the writer sets its own bound.
+pub const DEFAULT_CHUNK_ABANDON_MS: u64 = 600_000;
 
 /// The typed AGDX producer over one agent topic: every send is a validated
 /// [`AgentEnvelope`] (invalid envelopes are unrepresentable or rejected at
@@ -79,7 +84,7 @@ impl Agdx {
     }
 
     /// A `command`: expects a reply or effect under `correlation`.
-    pub fn command(&self, correlation: CorrelationId, body: Vec<u8>) -> AgdxSend<'_> {
+    pub fn command(&self, correlation: CorrelationId, body: Vec<u8>) -> AgdxSend<'static> {
         self.send_of(AgentEnvelope::command(
             RecordId::mint(),
             self.conversation,
@@ -90,7 +95,7 @@ impl Agdx {
     }
 
     /// A `response`: the paired answer to a command (same `correlation`).
-    pub fn respond(&self, correlation: CorrelationId, body: Vec<u8>) -> AgdxSend<'_> {
+    pub fn respond(&self, correlation: CorrelationId, body: Vec<u8>) -> AgdxSend<'static> {
         self.send_of(AgentEnvelope::response(
             RecordId::mint(),
             self.conversation,
@@ -101,7 +106,7 @@ impl Agdx {
     }
 
     /// An `event`: expects nothing.
-    pub fn emit(&self, body: Vec<u8>) -> AgdxSend<'_> {
+    pub fn emit(&self, body: Vec<u8>) -> AgdxSend<'static> {
         self.send_of(AgentEnvelope::event(
             RecordId::mint(),
             self.conversation,
@@ -114,7 +119,7 @@ impl Agdx {
     /// `progress`). Task updates additionally chain
     /// [`with_correlation`](AgdxSend::with_correlation) and
     /// [`with_task_state`](AgdxSend::with_task_state).
-    pub fn status(&self, operation: impl Into<String>) -> AgdxSend<'_> {
+    pub fn status(&self, operation: impl Into<String>) -> AgdxSend<'static> {
         self.send_of(AgentEnvelope::status(
             RecordId::mint(),
             self.conversation,
@@ -129,7 +134,7 @@ impl Agdx {
         &self,
         correlation: CorrelationId,
         error: &AgentErrorBody,
-    ) -> Result<AgdxSend<'_>, LaserError> {
+    ) -> Result<AgdxSend<'static>, LaserError> {
         let body = encode_named(error)?;
         Ok(self
             .send_of(AgentEnvelope::error(
@@ -152,37 +157,44 @@ impl Agdx {
             channel: ChannelId::mint(),
             purpose: purpose.into(),
             sequence: 0,
-            deadline_micros: None,
+            deadline_micros: Some(
+                SystemClock
+                    .now_micros()
+                    .saturating_add(DEFAULT_CHUNK_ABANDON_MS.saturating_mul(1_000)),
+            ),
             target: None,
             content_type: ContentType::Raw,
             buffer: None,
         }
     }
 
-    /// Human-in-the-loop interrupt/resume. Pauses on a human: publishes a prompt
-    /// `command` under a fresh interrupt correlation on this producer's topic,
-    /// then awaits the human's correlated `response` on `reply_topic` up to
-    /// `timeout` and returns its body. A responder answers with
+    /// Human-in-the-loop interrupt/resume. Pauses on a human: publishes an
+    /// `input-required` task status and the prompt as an `input_request`
+    /// command under a fresh interrupt correlation on this producer's topic,
+    /// then awaits the correlated `response` on `reply_topic` up to `timeout`
+    /// and returns its body. Only an agent that lists `input_request` among its
+    /// operations receives the prompt as work. A responder answers with
     /// [`AgentCtx::respond_input`](crate::agent::AgentCtx::respond_input) (a
     /// `response`) or rejects with an `error`, which surfaces here as
-    /// [`LaserError::Rejected`]. Composes existing verbs, so it adds nothing to
-    /// the wire. It blocks the caller until the response lands or the timeout
-    /// elapses, which is the point: the task is genuinely paused on a human.
-    /// The prompt is addressed to every agent (`agdx.to = *`), so on a shared
-    /// session topic every listening agent receives it. Use
-    /// [`request_input_from`](Self::request_input_from) to ask one agent.
+    /// [`LaserError::Rejected`]. It blocks the caller until the response lands
+    /// or the timeout elapses. The prompt is addressed to every agent
+    /// (`agdx.to = *`). Use [`request_input_from`](Self::request_input_from)
+    /// to ask one approver and accept only its answer.
     pub async fn request_input(
         &self,
         reply_topic: AgentTopic<'_>,
         prompt: impl Into<Vec<u8>>,
         timeout: Duration,
     ) -> Result<Vec<u8>, LaserError> {
-        self.request_input_addressed(None, reply_topic, prompt.into(), timeout)
-            .await
+        Ok(self
+            .input_reply(None, reply_topic, prompt.into(), timeout)
+            .await?
+            .body)
     }
 
     /// [`request_input`](Self::request_input) with the prompt addressed to
-    /// `target`, so only that agent answers it on a shared session topic.
+    /// `target`. Only a reply authored by `target`, and signed by it when a
+    /// verifier is configured, answers the request.
     pub async fn request_input_from(
         &self,
         target: impl Into<AgentId>,
@@ -190,18 +202,21 @@ impl Agdx {
         prompt: impl Into<Vec<u8>>,
         timeout: Duration,
     ) -> Result<Vec<u8>, LaserError> {
-        let target = target.into();
-        self.request_input_addressed(Some(target), reply_topic, prompt.into(), timeout)
-            .await
+        Ok(self
+            .input_reply(Some(target.into()), reply_topic, prompt.into(), timeout)
+            .await?
+            .body)
     }
 
-    async fn request_input_addressed(
+    // Publish one input request and await its approving reply, from `target`
+    // alone when the request names one.
+    pub(crate) async fn input_reply(
         &self,
         target: Option<AgentId>,
         reply_topic: AgentTopic<'_>,
         prompt: Vec<u8>,
         timeout: Duration,
-    ) -> Result<Vec<u8>, LaserError> {
+    ) -> Result<AgentEnvelope, LaserError> {
         let interrupt = CorrelationId::mint();
         // Seed the reply reader at the topic tail before sending the prompt, so it
         // reads only the human's response rather than the topic's history.
@@ -209,7 +224,19 @@ impl Agdx {
             .laser
             .agdx_reply_reader(reply_topic, Some(&self.source))
             .await?;
-        let command = self.command(interrupt, prompt);
+        #[cfg(feature = "sign")]
+        {
+            reader.expected_signer = target.as_ref().map(ToString::to_string);
+        }
+        reader.expected_source = target.clone();
+        self.status(OPERATION_TASK)
+            .with_correlation(interrupt)
+            .with_task_state(TaskState::InputRequired)
+            .send()
+            .await?;
+        let command = self
+            .command(interrupt, prompt)
+            .with_operation(OPERATION_INPUT_REQUEST);
         match target {
             Some(target) => command.with_target(target).send().await?,
             None => command.send().await?,
@@ -225,25 +252,61 @@ impl Agdx {
                 .unwrap_or_else(|| "the input request was rejected".to_owned());
             return Err(LaserError::Rejected(message));
         }
-        Ok(reply.body)
+        Ok(reply)
     }
 
-    // Publish an envelope built elsewhere, unchanged, on this producer's topic.
+    // Publish an envelope built elsewhere on this producer's topic, after the
+    // governor. A replacement body would void a signature the caller already
+    // attached, so a signed envelope the governor rewrites is refused.
     pub(crate) async fn publish_envelope(
         &self,
-        envelope: AgentEnvelope,
+        mut envelope: AgentEnvelope,
     ) -> Result<AgdxReceipt, LaserError> {
+        let signed = envelope.signature.is_some();
+        let correlation = envelope.correlation.map(|value| value.to_string());
+        let action = GovernedAction {
+            kind: action_kind(envelope.kind),
+            stream: self.laser.stream_required()?,
+            topic: &self.topic,
+            source: Some(envelope.source.as_str()),
+            target: envelope.target.as_ref().map(|target| target.as_str()),
+            conversation: Some(envelope.conversation.into()),
+            correlation: correlation.as_deref(),
+            operation: envelope.operation.as_deref(),
+            tool: envelope.tool.as_deref(),
+            on_behalf_of: metadata_str(&envelope, laser_wire::agent::METADATA_DELEGATED_BY),
+            purpose: metadata_str(&envelope, laser_wire::agent::METADATA_PURPOSE),
+            data_classification: metadata_str(
+                &envelope,
+                laser_wire::agent::METADATA_DATA_CLASSIFICATION,
+            ),
+            payload: &envelope.body,
+            signed,
+            approval: None,
+            counters: ActionCounters::default(),
+        };
+        if let Some(modified) = self.laser.govern(action).await?
+            && modified != envelope.body
+        {
+            if signed {
+                return Err(LaserError::PolicyBlocked(
+                    "the governor replaced the body of a signed envelope".to_owned(),
+                ));
+            }
+            envelope.body = modified;
+        }
         self.publish(envelope, ContentType::Raw).await
     }
 
-    fn send_of(&self, envelope: AgentEnvelope) -> AgdxSend<'_> {
+    fn send_of(&self, envelope: AgentEnvelope) -> AgdxSend<'static> {
         AgdxSend {
-            agdx: self,
+            agdx: self.clone(),
             envelope,
             content_type: ContentType::Raw,
             #[cfg(feature = "sign")]
             sign_key: None,
             claim_check: None,
+            approval: None,
         }
     }
 
@@ -390,10 +453,12 @@ pub struct AgdxReceipt {
 }
 
 /// One pending AGDX send: the envelope built by its verb, refined by the
-/// `with_*` setters, validated and published by [`send`](Self::send).
+/// `with_*` setters, validated and published by [`send`](Self::send). The
+/// lifetime is the borrowed signing key, claim-check store and approval grant,
+/// `'static` without them.
 #[must_use = "an unsent envelope does nothing until you call .send().await"]
 pub struct AgdxSend<'a> {
-    agdx: &'a Agdx,
+    agdx: Agdx,
     envelope: AgentEnvelope,
     content_type: ContentType,
     /// When set, the envelope is signed with this key just before encoding (the
@@ -406,6 +471,7 @@ pub struct AgdxSend<'a> {
     /// When set, a body at or over the threshold is externalized to the store
     /// and replaced by the `BodyRef` capsule at send (content-type `ref`).
     claim_check: Option<(&'a dyn crate::blob::BlobStore, usize)>,
+    approval: Option<&'a crate::agent::ApprovalGrant>,
 }
 
 impl<'a> AgdxSend<'a> {
@@ -425,6 +491,13 @@ impl<'a> AgdxSend<'a> {
     ) -> Self {
         self.envelope.parent = parent;
         self.envelope.root = root;
+        self
+    }
+
+    /// Carry `grant` to the action governor, so a step-up it asks for in the
+    /// grant's conversation proceeds on that approval.
+    pub fn with_grant(mut self, grant: &'a crate::agent::ApprovalGrant) -> Self {
+        self.approval = Some(grant);
         self
     }
 
@@ -453,8 +526,8 @@ impl<'a> AgdxSend<'a> {
     }
 
     /// Declare the drop-dead time, epoch micros.
-    pub fn with_deadline_micros(mut self, deadline_micros: u64) -> Self {
-        self.envelope = self.envelope.with_deadline_micros(deadline_micros);
+    pub fn with_deadline_at_micros(mut self, deadline_at_micros: u64) -> Self {
+        self.envelope = self.envelope.with_deadline_micros(deadline_at_micros);
         self
     }
 
@@ -587,6 +660,7 @@ impl<'a> AgdxSend<'a> {
             payload: &envelope.body,
             signed: will_sign,
             counters: ActionCounters::default(),
+            approval: self.approval,
         };
         if let Some(modified) = self.agdx.laser.govern(action).await? {
             envelope.body = modified;
@@ -633,14 +707,15 @@ pub struct AgdxStream {
     buffer: Option<ChunkBuffer>,
 }
 
-// The opt-in write buffer: assembled chunk messages held until `max_chunks`
-// or `linger` trips, then appended as ONE batch. Sequences are assigned at
+// The opt-in write buffer: chunk envelopes held until `max_chunks` or
+// `linger` trips, then appended as ONE batch. Sequences are assigned at
 // write, so reassembly semantics are untouched.
 struct ChunkBuffer {
     max_chunks: usize,
     linger: std::time::Duration,
     first_at: Option<std::time::Instant>,
-    messages: Vec<iggy::prelude::IggyMessage>,
+    // Envelopes, assembled at flush, so a failed append keeps them to resend.
+    envelopes: Vec<(AgentEnvelope, ContentType)>,
 }
 
 impl AgdxStream {
@@ -649,10 +724,11 @@ impl AgdxStream {
         self.channel
     }
 
-    /// Declare the reader-local abandonment bound (rides the opening chunk,
-    /// so set it before the first write).
-    pub fn with_deadline_micros(mut self, deadline_micros: u64) -> Self {
-        self.deadline_micros = deadline_micros.into();
+    /// Declare the reader-local abandonment bound, epoch micros (rides the
+    /// opening chunk, so set it before the first write). Defaults to
+    /// [`DEFAULT_CHUNK_ABANDON_MS`] after the writer opened.
+    pub fn with_deadline_at_micros(mut self, deadline_at_micros: u64) -> Self {
+        self.deadline_micros = deadline_at_micros.into();
         self
     }
 
@@ -681,29 +757,33 @@ impl AgdxStream {
             max_chunks: max_chunks.max(1),
             linger,
             first_at: None,
-            messages: Vec::new(),
+            envelopes: Vec::new(),
         });
         self
     }
 
     /// Publish the next chunk. The opening chunk (`sequence` 0) carries the
-    /// stream purpose and the abandonment bound.
+    /// stream purpose and the abandonment bound. A failed publish keeps the
+    /// sequence, so writing the body again continues the stream without a
+    /// gap. A buffered write whose flush fails keeps its chunks buffered for
+    /// the next [`flush`](Self::flush).
     pub async fn write(&mut self, body: Vec<u8>) -> Result<(), LaserError> {
         ensure_chunk_body_within_cap(&body)?;
         let envelope = self.chunk(body, false, None, None);
-        self.sequence += 1;
         match &mut self.buffer {
             None => {
                 self.agdx.publish(envelope, self.content_type).await?;
+                self.sequence += 1;
             }
             Some(buffer) => {
-                let (message, _) = self.agdx.assemble(envelope, self.content_type)?;
+                validate(&envelope)?;
+                self.sequence += 1;
                 buffer.first_at.get_or_insert_with(std::time::Instant::now);
-                buffer.messages.push(message);
+                buffer.envelopes.push((envelope, self.content_type));
                 let linger_tripped = buffer
                     .first_at
                     .is_some_and(|first| first.elapsed() >= buffer.linger);
-                if buffer.messages.len() >= buffer.max_chunks || linger_tripped {
+                if buffer.envelopes.len() >= buffer.max_chunks || linger_tripped {
                     self.flush().await?;
                 }
             }
@@ -712,19 +792,27 @@ impl AgdxStream {
     }
 
     /// Append everything buffered as one batch. A no-op unbuffered or empty.
+    /// A failed append keeps the chunks buffered, so the next flush sends them.
     pub async fn flush(&mut self) -> Result<(), LaserError> {
-        let Some(buffer) = &mut self.buffer else {
-            return Ok(());
-        };
-        if buffer.messages.is_empty() {
-            return Ok(());
-        }
-        let batch = std::mem::take(&mut buffer.messages);
-        buffer.first_at = None;
         let partitioning = self
             .agdx
             .partitioning(laser_wire::agent::AgentKind::Chunk, self.target.as_ref())?;
         let destination = self.destination();
+        let Some(buffer) = &mut self.buffer else {
+            return Ok(());
+        };
+        if buffer.envelopes.is_empty() {
+            return Ok(());
+        }
+        let batch = buffer
+            .envelopes
+            .iter()
+            .map(|(envelope, content_type)| {
+                self.agdx
+                    .assemble(envelope.clone(), *content_type)
+                    .map(|(message, _)| message)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         self.agdx
             .laser
             .send_batch_partitioned_on(
@@ -733,8 +821,10 @@ impl AgdxStream {
                 batch,
                 partitioning,
             )
-            .await
-            .map(|_| ())
+            .await?;
+        buffer.envelopes.clear();
+        buffer.first_at = None;
+        Ok(())
     }
 
     /// Publish the terminal chunk (`last = true`) with the reason the stream
@@ -782,8 +872,15 @@ impl AgdxStream {
             }
             Some(buffer) => {
                 let (message, partitioning) = self.agdx.assemble(envelope, content_type)?;
-                buffer.messages.push(message);
-                let batch = std::mem::take(&mut buffer.messages);
+                let mut batch = std::mem::take(&mut buffer.envelopes)
+                    .into_iter()
+                    .map(|(envelope, content_type)| {
+                        self.agdx
+                            .assemble(envelope, content_type)
+                            .map(|(message, _)| message)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                batch.push(message);
                 buffer.first_at = None;
                 let destination = self.destination();
                 self.agdx
@@ -913,6 +1010,57 @@ mod tests {
     use std::str::FromStr;
 
     #[tokio::test]
+    async fn given_an_owned_agdx_send_when_spawned_then_should_send_on_its_own_task() {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        let agdx = laser.agdx(
+            AgentTopic::Sessions,
+            AgentId::from_str("worker").expect("a valid agent id"),
+            ConversationId::mint(),
+        );
+        let sent = tokio::spawn(agdx.emit(b"event".to_vec()).send());
+        assert!(
+            sent.await
+                .expect("the send task joins")
+                .is_err_and(|error| matches!(error, LaserError::NoStream))
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_governor_when_a_prebuilt_envelope_is_published_then_should_govern_it_first() {
+        let decided = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default())
+            .with_default_stream("agdx-governed")
+            .with_governor(
+                std::sync::Arc::new(Refusing {
+                    decided: std::sync::Arc::clone(&decided),
+                }),
+                crate::govern::GovernorMode::Enforce,
+            );
+        let conversation = ConversationId::mint();
+        let agdx = laser.agdx(
+            AgentTopic::Sessions,
+            AgentId::from_str("worker").expect("a valid agent id"),
+            conversation,
+        );
+        let envelope = AgentEnvelope::event(
+            RecordId::mint(),
+            conversation,
+            AgentId::from_str("worker").expect("a valid agent id"),
+            b"appended".to_vec(),
+        );
+        let published = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agdx.publish_envelope(envelope),
+        )
+        .await;
+        assert!(
+            matches!(&published, Ok(Err(LaserError::PolicyBlocked(message))) if message == "refused by test"),
+            "{published:?}"
+        );
+        assert_eq!(decided.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn given_a_fail_with_another_content_type_when_sent_then_should_refuse_it() {
         let laser = Laser::from_client(iggy::prelude::IggyClient::default())
             .with_default_stream("agdx-fail");
@@ -934,6 +1082,70 @@ mod tests {
             .send_receipt()
             .await;
         assert!(matches!(result, Err(LaserError::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn given_a_chunk_publish_failure_when_writing_then_should_keep_the_sequence_for_the_retry()
+     {
+        // No default stream, so every publish fails before any IO.
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        let agdx = laser.agdx(
+            AgentTopic::Sessions,
+            AgentId::from_str("worker").expect("a valid agent id"),
+            ConversationId::mint(),
+        );
+        let mut stream = agdx.stream(CorrelationId::mint(), OPERATION_CHAT);
+        let failed = stream.write(b"t".to_vec()).await;
+        assert!(matches!(failed, Err(LaserError::NoStream)), "{failed:?}");
+        assert_eq!(stream.sequence, 0, "the unsent chunk keeps its sequence");
+
+        let mut buffered = agdx
+            .stream(CorrelationId::mint(), OPERATION_CHAT)
+            .buffered(1, Duration::from_secs(60));
+        let failed = buffered.write(b"t".to_vec()).await;
+        assert!(matches!(failed, Err(LaserError::NoStream)), "{failed:?}");
+        assert_eq!(buffered.sequence, 1);
+        assert_eq!(
+            buffered
+                .buffer
+                .as_ref()
+                .map_or(0, |buffer| buffer.envelopes.len()),
+            1,
+            "the unsent chunk stays buffered for the next flush"
+        );
+    }
+
+    #[test]
+    fn given_a_new_chunk_stream_when_opened_then_should_carry_the_default_abandonment_bound() {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default())
+            .with_default_stream("agdx-stream-bound");
+        let opened = SystemClock.now_micros();
+        let stream = laser
+            .agdx(
+                AgentTopic::Sessions,
+                AgentId::from_str("worker").expect("a valid agent id"),
+                ConversationId::mint(),
+            )
+            .stream(CorrelationId::mint(), OPERATION_CHAT);
+        let bound = stream
+            .deadline_micros
+            .expect("the opening chunk is bounded");
+        assert!(bound >= opened + DEFAULT_CHUNK_ABANDON_MS * 1_000);
+    }
+
+    #[test]
+    fn given_an_absolute_deadline_when_set_on_a_chunk_stream_then_should_carry_it_unchanged() {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default())
+            .with_default_stream("agdx-stream-deadline");
+        let stream = laser
+            .agdx(
+                AgentTopic::Sessions,
+                AgentId::from_str("worker").expect("a valid agent id"),
+                ConversationId::mint(),
+            )
+            .stream(CorrelationId::mint(), OPERATION_CHAT)
+            .with_deadline_at_micros(1_717_171_777_000_000);
+        assert_eq!(stream.deadline_micros, Some(1_717_171_777_000_000));
     }
 
     // Record conformance, the header half: the typed header encodings the
@@ -1125,5 +1337,22 @@ mod tests {
             "source-agent".parse().expect("valid agent id"),
             CorrelationId::from_u128(0x0190_3c1f_aa00_0000_0000_0000_0000_0005),
         )
+    }
+
+    // Fails every decision, so a governed path stops before any I/O.
+    struct Refusing {
+        decided: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::govern::ActionGovernor for Refusing {
+        async fn decide(
+            &self,
+            _: &crate::govern::GovernedAction<'_>,
+        ) -> Result<crate::govern::ActionDecision, LaserError> {
+            self.decided
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(LaserError::PolicyBlocked("refused by test".to_owned()))
+        }
     }
 }

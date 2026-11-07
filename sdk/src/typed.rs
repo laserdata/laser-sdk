@@ -2,12 +2,12 @@ use crate::cursor::Cursor;
 use crate::error::LaserError;
 use crate::message::Message;
 use crate::stream::{
-    BatchPublishRequest, Cbor, Codec, ContentType, Decoder, Json, PublishRequest, Topic,
+    BatchPublishRequest, Cbor, Codec, ContentType, Decoder, Headers, Json, PublishRequest, Topic,
 };
 use crate::types::MessageId;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 
 impl Topic {
@@ -71,7 +71,7 @@ impl<T> TypedTopic<T> {
     /// already stamped. Chain `.index(..)`, `.partition_key(..)`, or any other
     /// record option, then `.send()`. Encoding and schema validation happen
     /// HERE, so a body the schema rejects never reaches the wire.
-    pub fn publish(&self, body: &T) -> Result<PublishRequest<'_>, LaserError>
+    pub fn publish(&self, body: &T) -> Result<PublishRequest<'static>, LaserError>
     where
         T: Serialize,
     {
@@ -91,7 +91,7 @@ impl<T> TypedTopic<T> {
     pub fn publish_batch<'b>(
         &self,
         bodies: impl IntoIterator<Item = &'b T>,
-    ) -> Result<BatchPublishRequest<'_>, LaserError>
+    ) -> Result<BatchPublishRequest, LaserError>
     where
         T: Serialize + 'b,
     {
@@ -121,6 +121,7 @@ impl<T> TypedTopic<T> {
         Ok(TypedRecords {
             cursor,
             buffered: VecDeque::new(),
+            delivered: None,
             form: self.form.clone(),
             body: PhantomData,
         })
@@ -155,6 +156,9 @@ impl<T> TypedTopic<T> {
 pub struct TypedRecords<T> {
     cursor: Cursor,
     buffered: VecDeque<Message>,
+    // The next offset per partition past the records handed out so far, while
+    // the cursor's own offsets run ahead to the end of the buffered poll.
+    delivered: Option<Vec<u64>>,
     form: Form,
     body: PhantomData<fn() -> T>,
 }
@@ -165,6 +169,8 @@ impl<T: DeserializeOwned> TypedRecords<T> {
     #[must_use]
     pub fn from_offsets(mut self, offsets: Vec<u64>) -> Self {
         self.cursor = self.cursor.from_offsets(offsets);
+        self.buffered.clear();
+        self.delivered = None;
         self
     }
 
@@ -175,10 +181,13 @@ impl<T: DeserializeOwned> TypedRecords<T> {
         self
     }
 
-    /// The next offset to read on each partition. Persist this to resume later
-    /// with [`from_offsets`](Self::from_offsets).
+    /// The next offset to read on each partition, past every record handed
+    /// out so far. Persist this after handling a record to resume right after
+    /// it with [`from_offsets`](Self::from_offsets).
     pub fn offsets(&self) -> &[u64] {
-        self.cursor.offsets()
+        self.delivered
+            .as_deref()
+            .unwrap_or_else(|| self.cursor.offsets())
     }
 
     /// The next record, decoded. `None` when the reader is caught up. A record
@@ -188,8 +197,12 @@ impl<T: DeserializeOwned> TypedRecords<T> {
     /// next call polls again.
     pub async fn next(&mut self) -> Option<Result<TypedRecord<T>, TypedDecodeError>> {
         if self.buffered.is_empty() {
+            let before = self.cursor.offsets().to_vec();
             match self.cursor.poll().await {
-                Ok(messages) => self.buffered.extend(messages),
+                Ok(messages) => {
+                    self.buffered.extend(messages);
+                    self.delivered = Some(before);
+                }
                 Err(error) => {
                     return Some(Err(TypedDecodeError {
                         position: None,
@@ -199,17 +212,24 @@ impl<T: DeserializeOwned> TypedRecords<T> {
             }
         }
         let message = self.buffered.pop_front()?;
+        self.handed_out(message.id);
         Some(decode_message(&self.form, message))
     }
 
     /// This reader as a [`Stream`](futures::Stream) of decoded records, one at a
     /// time, ending once caught up (the same shape as the async typed reader in
     /// the Python binding). Each item is a value or its position-carrying decode
-    /// error, so one poison record does not end the stream. Drive it with
+    /// error, so one poison record does not end the stream. A failed poll is
+    /// yielded and ends the stream, like [`Cursor::stream`]. Drive it with
     /// `futures::StreamExt`.
     pub fn stream(self) -> impl futures::Stream<Item = Result<TypedRecord<T>, TypedDecodeError>> {
-        futures::stream::unfold(self, |mut records| async move {
-            records.next().await.map(|item| (item, records))
+        futures::stream::unfold((self, false), |(mut records, ended)| async move {
+            if ended {
+                return None;
+            }
+            let item = records.next().await?;
+            let failed_poll = matches!(&item, Err(error) if error.position.is_none());
+            Some((item, (records, failed_poll)))
         })
     }
 
@@ -235,7 +255,24 @@ impl<T: DeserializeOwned> TypedRecords<T> {
                 .map(|message| decode_message(&self.form, message))
                 .collect();
         }
+        self.delivered = None;
         Ok(decoded)
+    }
+
+    // A record leaves the buffer: the offsets move past it, and once the
+    // buffer is empty they are the cursor's own again.
+    fn handed_out(&mut self, position: MessageId) {
+        if self.buffered.is_empty() {
+            self.delivered = None;
+            return;
+        }
+        if let Some(delivered) = self.delivered.as_mut() {
+            let partition = position.partition_id as usize;
+            if delivered.len() <= partition {
+                delivered.resize(partition + 1, 0);
+            }
+            delivered[partition] = delivered[partition].max(position.offset + 1);
+        }
     }
 }
 
@@ -247,8 +284,8 @@ pub struct TypedRecord<T> {
     pub value: T,
     /// The record's log position, from its own message header.
     pub position: MessageId,
-    /// The record's user headers decoded to strings.
-    pub headers: BTreeMap<String, String>,
+    /// The record's exact user headers, each value with its wire type.
+    pub headers: Headers,
 }
 
 /// A typed read that could not produce a value: a record whose payload does
@@ -436,6 +473,8 @@ mod tests {
         use super::*;
         use crate::query::{SchemaDef, SchemaSource};
         use crate::schema_codecs::CompiledSchema;
+        use prost::Message as _;
+        use prost_reflect::{DynamicMessage, Value as ProtoValue};
 
         const READING_AVRO: &str = r#"{
             "type":"record","name":"Reading",
@@ -465,6 +504,38 @@ mod tests {
             assert_eq!(content_type, ContentType::Avro);
             assert_eq!(schema_id, Some(7));
             let back: Reading = form.decode(&payload).expect("datum decodes");
+            assert_eq!(back, reading());
+        }
+
+        #[test]
+        fn given_a_protobuf_schema_when_a_record_is_decoded_then_should_fit_an_i64_body_field() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let proto = directory.path().join("reading.proto");
+            std::fs::write(
+                &proto,
+                "syntax = \"proto3\";\npackage fleet;\nmessage Reading { string host = 1; int64 cpu = 2; }\n",
+            )
+            .expect("proto written");
+            let descriptor_set = protox::compile([&proto], [directory.path()])
+                .expect("proto compiles")
+                .encode_to_vec();
+            let form = schema_form(SchemaSource::Protobuf {
+                descriptor_set,
+                message_type: "fleet.Reading".to_owned(),
+            });
+            let Form::Schema {
+                compiled: CompiledSchema::Protobuf(descriptor),
+                ..
+            } = &form
+            else {
+                panic!("the form holds a Protobuf schema")
+            };
+            let mut message = DynamicMessage::new(descriptor.clone());
+            message.set_field_by_name("host", ProtoValue::String("node-7".to_owned()));
+            message.set_field_by_name("cpu", ProtoValue::I64(42));
+            let back: Reading = form
+                .decode(&message.encode_to_vec())
+                .expect("the record fits the body type");
             assert_eq!(back, reading());
         }
 

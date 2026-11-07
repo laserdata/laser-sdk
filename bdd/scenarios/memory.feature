@@ -11,6 +11,21 @@ Feature: Agentic memory recall semantics
     And I remember "the budget is 5000" with dedup
     Then the memory holds 1 item
 
+  Scenario: Remembering the same fact with dedup in two conversations stores one item each
+    Given an empty memory store
+    When I remember "the budget is 5000" with dedup in conversation "01KWM3K3XEP3NP5TN850J17YBQ"
+    And I remember "the budget is 5000" with dedup in conversation "01KWM3K3XEP3NP5TN850J17YBR"
+    And I remember "the budget is 5000" with dedup in conversation "01KWM3K3XEP3NP5TN850J17YBQ"
+    Then the memory holds 2 items
+
+  Scenario: Remembering a forgotten fact again brings it back
+    Given an empty memory store
+    When I remember "the budget is 5000" with dedup
+    And I forget "the budget is 5000"
+    And I remember "the budget is 5000" with dedup
+    Then the memory holds 1 item
+    And recalling 1 item returns "the budget is 5000"
+
   Scenario: Remembering the same fact without dedup stores two items
     Given an empty memory store
     When I remember "the budget is 5000"

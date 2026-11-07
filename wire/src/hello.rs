@@ -1,7 +1,7 @@
-use crate::destination::{BackendResourceId, FileFormat, TableFormat};
+use crate::destination::BackendResourceId;
 use crate::error::InvalidError;
 use crate::filter::{FILTER_EVALUATOR_VERSION, FilterCodec};
-use crate::query::{Consistency, SqlDialect};
+use crate::query::{AggFunc, Consistency, SqlDialect};
 use crate::schema::LogicalTypeKind;
 use crate::topology::WireTopology;
 use crate::validate::Validate;
@@ -19,7 +19,8 @@ pub mod feature {
     pub const KV_CAS: u64 = 1 << 0;
     /// The query surface honors `Consistency::ReadYourWrites`.
     pub const READ_YOUR_WRITES: u64 = 1 << 1;
-    /// The query surface honors `Consistency::Strong`.
+    /// Retired with linearizable query reads. No server sets it and the bit is
+    /// never reused.
     pub const STRONG_CONSISTENCY: u64 = 1 << 2;
     /// The key-value store serves fenced compare-and-swap (`AGDX_KV_CAS_FENCED`).
     pub const KV_CAS_FENCED: u64 = 1 << 3;
@@ -33,7 +34,8 @@ pub mod feature {
     pub const WATCH: u64 = 1 << 6;
     /// The streaming server serves the authorization control band (`AGDX_AUTHZ_*`).
     pub const AUTHZ: u64 = 1 << 7;
-    /// The deployment serves destination and checkpoint lifecycle operations.
+    /// Retired with lakehouse destinations. No server sets it and the bit is
+    /// never reused.
     pub const DESTINATIONS: u64 = 1 << 8;
     /// The key-value store serves the revocable fenced-lease contract at
     /// `KV_LEASE_OP_VERSION`: holder-scoped acquire, renewal
@@ -63,6 +65,10 @@ pub mod feature {
     /// scoped to one stream, and the change feed and dead letters of each
     /// stream ride their own ops topics.
     pub const STREAM_TENANCY: u64 = 1 << 13;
+    /// The managed backend serves whole-record projections, control replies
+    /// that wait for the applied outcome, and binding status on the projection
+    /// browse.
+    pub const MATERIALIZATIONS: u64 = 1 << 14;
 }
 
 /// The wire op versions a server accepts, one per surface, plus the capability
@@ -86,16 +92,13 @@ pub struct OpVersions {
     /// query surface, so it has no op version of its own.)
     #[serde(default, skip_serializing_if = "is_zero")]
     pub graph: u32,
-    /// Destination and checkpoint operation version. Zero means not served.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub checkpoint: u32,
     /// The consumer-filter catalog op version served by the managed backend. Zero
     /// means the catalog (saved filters and group bindings) is not served.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub filter: u32,
     /// Capability feature bits (see [`feature`]): managed sub-features served
-    /// beyond the base surface (compare-and-swap, read-your-writes, strong
-    /// consistency). `0` (the default) is skipped on encode, so a pre-feature
+    /// beyond the base surface (compare-and-swap, read-your-writes, and the
+    /// rest). `0` (the default) is skipped on encode, so a pre-feature
     /// hello reply stays byte-identical and an old client just sees no extra
     /// capabilities.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
@@ -121,7 +124,6 @@ impl OpVersions {
             fork,
             agent: 0,
             graph: 0,
-            checkpoint: 0,
             filter: 0,
             features: 0,
         }
@@ -138,13 +140,6 @@ impl OpVersions {
     #[must_use]
     pub fn with_graph(mut self, graph: u32) -> Self {
         self.graph = graph;
-        self
-    }
-
-    /// Returns a copy advertising the destination and checkpoint version.
-    #[must_use]
-    pub fn with_checkpoint(mut self, checkpoint: u32) -> Self {
-        self.checkpoint = checkpoint;
         self
     }
 
@@ -203,11 +198,9 @@ pub struct BackendDescriptor {
     pub desired_state: BackendDesiredState,
     pub observed_state: BackendObservedState,
     pub readiness: BackendReadiness,
-    pub materialization: Vec<MaterializationCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<QueryCapabilities>,
     pub schema: SchemaCapabilities,
-    pub maintenance: MaintenanceCapabilities,
     pub limits: BackendLimits,
 }
 
@@ -231,10 +224,8 @@ impl BackendDescriptor {
             desired_state: BackendDesiredState::Disabled,
             observed_state: BackendObservedState::Disabled,
             readiness: BackendReadiness::not_ready(BackendReadinessCode::Disabled),
-            materialization: Vec::new(),
             query: None,
             schema: SchemaCapabilities::default(),
-            maintenance: MaintenanceCapabilities::default(),
             limits: BackendLimits::default(),
         }
     }
@@ -253,12 +244,6 @@ impl BackendDescriptor {
     }
 
     #[must_use]
-    pub fn with_materialization(mut self, capabilities: Vec<MaterializationCapability>) -> Self {
-        self.materialization = capabilities;
-        self
-    }
-
-    #[must_use]
     pub fn with_query(mut self, capabilities: QueryCapabilities) -> Self {
         self.query = Some(capabilities);
         self
@@ -267,12 +252,6 @@ impl BackendDescriptor {
     #[must_use]
     pub fn with_schema(mut self, capabilities: SchemaCapabilities) -> Self {
         self.schema = capabilities;
-        self
-    }
-
-    #[must_use]
-    pub fn with_maintenance(mut self, capabilities: MaintenanceCapabilities) -> Self {
-        self.maintenance = capabilities;
         self
     }
 
@@ -310,15 +289,6 @@ impl Validate for BackendDescriptor {
                 "ready backend must report the ready observed state",
             ));
         }
-        let mut materialization = BTreeSet::new();
-        for capability in &self.materialization {
-            let key = (capability.file_format as u8, capability.table_format as u8);
-            if !materialization.insert(key) {
-                return Err(InvalidError::new(
-                    "backend repeats a materialization capability",
-                ));
-            }
-        }
         if let Some(query) = &self.query {
             query.validate()?;
         }
@@ -326,11 +296,6 @@ impl Validate for BackendDescriptor {
             if self.schema.logical_schema && self.limits.max_schema_fields == 0 {
                 return Err(InvalidError::new(
                     "ready logical-schema backend must advertise a schema-field limit",
-                ));
-            }
-            if !self.materialization.is_empty() && self.limits.max_materialization_file_bytes == 0 {
-                return Err(InvalidError::new(
-                    "ready materialization backend must advertise a file-size limit",
                 ));
             }
             if self.query.is_some()
@@ -354,7 +319,6 @@ impl Validate for BackendDescriptor {
 #[non_exhaustive]
 pub enum BackendMode {
     Operational,
-    Lakehouse,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,34 +420,28 @@ pub enum BackendReadinessCode {
     QueryRuntimeUnavailable,
     GenerationMismatch,
     ProbeFailed,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MaterializationCapability {
-    pub file_format: FileFormat,
-    pub table_format: TableFormat,
-    pub create_table: bool,
-    pub append: bool,
+    /// The provisioned or configured raw SQL query identity failed its privilege check, so raw SQL is refused while materialization continues.
+    QueryIdentityRejected,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryCapabilities {
     pub dialects: Vec<SqlDialect>,
-    pub time_travel: Vec<TimeTravelCapability>,
     pub consistency: Vec<Consistency>,
     pub logical_types: Vec<LogicalTypeKind>,
-    pub paging: Vec<QueryPagingCapability>,
-    pub cancellation: bool,
-    pub execution_status: bool,
     pub raw_sql: bool,
+    /// The aggregate functions the backend computes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aggregates: Vec<AggFunc>,
+    #[serde(default)]
+    pub vector_search: bool,
+    #[serde(default)]
+    pub text_search: bool,
 }
 
 impl Validate for QueryCapabilities {
     fn validate(&self) -> Result<(), InvalidError> {
-        if self.dialects.is_empty()
-            || self.consistency.is_empty()
-            || self.logical_types.is_empty()
-            || self.paging.is_empty()
+        if self.dialects.is_empty() || self.consistency.is_empty() || self.logical_types.is_empty()
         {
             return Err(InvalidError::new(
                 "query capabilities require dialect, consistency, and logical-type coverage",
@@ -494,10 +452,6 @@ impl Validate for QueryCapabilities {
             self.dialects.iter().map(|value| *value as u8),
         )?;
         ensure_unique(
-            "query time-travel capability",
-            self.time_travel.iter().map(|value| *value as u8),
-        )?;
-        ensure_unique(
             "query consistency",
             self.consistency.iter().map(|value| *value as u8),
         )?;
@@ -506,8 +460,8 @@ impl Validate for QueryCapabilities {
             self.logical_types.iter().map(|value| *value as u8),
         )?;
         ensure_unique(
-            "query paging capability",
-            self.paging.iter().map(|value| *value as u8),
+            "query aggregate",
+            self.aggregates.iter().map(|value| *value as u8),
         )?;
         if self.raw_sql && self.dialects.is_empty() {
             return Err(InvalidError::new(
@@ -536,34 +490,11 @@ fn validate_descriptor_text(label: &str, value: &str) -> Result<(), InvalidError
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum TimeTravelCapability {
-    SnapshotId,
-    TimestampMicros,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum QueryPagingCapability {
-    Offset,
-    Cursor,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaCapabilities {
     pub logical_schema: bool,
     pub arrow_ipc_stream: bool,
     pub schema_evolution: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MaintenanceCapabilities {
-    pub expire_snapshots: bool,
-    pub remove_orphan_files: bool,
-    pub compact_data_files: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,7 +505,9 @@ pub struct BackendLimits {
     pub max_query_micros: u64,
     pub max_concurrent_queries: u32,
     pub max_schema_fields: u32,
-    pub max_materialization_file_bytes: u64,
+    /// The largest record body a whole-record row stores.
+    #[serde(default)]
+    pub max_payload_bytes: u64,
 }
 
 /// The managed backend's capability announcement to the streaming server, sent over their
@@ -806,7 +739,12 @@ mod tests {
         ))
         .with_backends(vec![
             backend(1, BackendMode::Operational, "Embedded", "embedded"),
-            backend(2, BackendMode::Lakehouse, "Analytics warehouse", "columnar"),
+            backend(
+                2,
+                BackendMode::Operational,
+                "Analytics warehouse",
+                "columnar",
+            ),
         ]);
         let bytes = encode_named(&announce).expect("encodes");
         let back: BackendAnnounce = decode_named(&bytes).expect("decodes");
@@ -903,6 +841,317 @@ mod tests {
             encode_named(&BackendAnnounce::new(OpVersions::new(1, 1, 1, 1))).expect("serializes");
         let older: BackendAnnounce = decode_named(&plain).expect("deserializes");
         assert_eq!(older.filters, None);
+    }
+
+    #[test]
+    fn given_the_feature_bits_when_read_then_should_match_the_pinned_values() {
+        assert_eq!(
+            [
+                feature::KV_CAS,
+                feature::READ_YOUR_WRITES,
+                feature::STRONG_CONSISTENCY,
+                feature::KV_CAS_FENCED,
+                feature::AGENT_WORKFLOW,
+                feature::KEYWORD_SEARCH,
+                feature::WATCH,
+                feature::AUTHZ,
+                feature::DESTINATIONS,
+                feature::KV_FENCED_LEASES,
+                feature::CONSUMER_FILTERS,
+                feature::GROUP_POLICY_READS,
+                feature::SESSIONS,
+                feature::STREAM_TENANCY,
+                feature::MATERIALIZATIONS,
+            ],
+            [
+                1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384
+            ]
+        );
+    }
+
+    #[test]
+    fn given_op_versions_with_zero_surfaces_when_encoded_then_should_omit_them_and_keep_set_ones() {
+        let advertised = OpVersions::new(1, 1, 1, 1)
+            .with_agent(2)
+            .with_graph(3)
+            .with_filter(4);
+        let json = serde_json::to_value(advertised).expect("encode advertised surfaces");
+        let decoded: OpVersions = serde_json::from_value(json).expect("decode advertised surfaces");
+        assert_eq!(decoded, advertised);
+        let plain =
+            serde_json::to_value(OpVersions::new(1, 1, 1, 1)).expect("encode base surfaces");
+        assert_eq!(
+            (plain.get("agent"), plain.get("graph"), plain.get("filter")),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn given_a_ready_announce_with_a_filter_wait_when_encoded_then_should_keep_only_the_wait() {
+        let waiting =
+            BackendAnnounce::new(OpVersions::new(1, 1, 1, 1)).with_filters(FilterAnnounce {
+                max_wait_ms: 250,
+                ..FilterAnnounce::served()
+            });
+        let json = serde_json::to_value(&waiting).expect("encode a ready announce");
+        assert!(
+            json.get("ready").is_none(),
+            "a ready announce omits ready: {json}"
+        );
+        let decoded: BackendAnnounce =
+            serde_json::from_value(json).expect("decode a ready announce");
+        assert_eq!(decoded, waiting);
+        let served =
+            serde_json::to_value(FilterAnnounce::served()).expect("encode the served evaluation");
+        assert!(
+            served.get("max_wait_ms").is_none(),
+            "a zero wait is omitted: {served}"
+        );
+    }
+
+    #[test]
+    fn given_a_backend_descriptor_when_validated_then_should_refuse_each_broken_invariant() {
+        let ready = ready_backend(1);
+        ready.validate().expect("a ready backend with every limit");
+        backend(1, BackendMode::Operational, "Embedded", "embedded")
+            .validate()
+            .expect("a backend that is not ready");
+        BackendDescriptor {
+            label: "l".repeat(4096),
+            ..ready.clone()
+        }
+        .validate()
+        .expect("a label at the cap");
+        let refused = [
+            (
+                "another descriptor version",
+                BackendDescriptor {
+                    descriptor_version: BACKEND_DESCRIPTOR_VERSION + 1,
+                    ..ready.clone()
+                },
+            ),
+            (
+                "a zero resource id",
+                BackendDescriptor {
+                    resource_id: BackendResourceId::from_u128(0),
+                    ..ready.clone()
+                },
+            ),
+            (
+                "a zero backend generation",
+                BackendDescriptor {
+                    observed_backend_generation: 0,
+                    ..ready.clone()
+                },
+            ),
+            (
+                "a zero configuration revision",
+                BackendDescriptor {
+                    runtime_configuration_revision: 0,
+                    ..ready.clone()
+                },
+            ),
+            (
+                "an empty label",
+                BackendDescriptor {
+                    label: String::new(),
+                    ..ready.clone()
+                },
+            ),
+            (
+                "a label past the cap",
+                BackendDescriptor {
+                    label: "l".repeat(4097),
+                    ..ready.clone()
+                },
+            ),
+            (
+                "a ready backend still starting",
+                BackendDescriptor {
+                    observed_state: BackendObservedState::Starting,
+                    ..ready.clone()
+                },
+            ),
+            (
+                "a logical schema without a field limit",
+                BackendDescriptor {
+                    limits: BackendLimits {
+                        max_schema_fields: 0,
+                        ..ready.limits.clone()
+                    },
+                    ..ready.clone()
+                },
+            ),
+        ];
+        for (case, descriptor) in refused {
+            assert!(descriptor.validate().is_err(), "{case} must be refused");
+        }
+        let limits = &ready.limits;
+        let zero_query_limits = [
+            BackendLimits {
+                max_query_rows: 0,
+                ..limits.clone()
+            },
+            BackendLimits {
+                max_query_bytes: 0,
+                ..limits.clone()
+            },
+            BackendLimits {
+                max_scan_bytes: 0,
+                ..limits.clone()
+            },
+            BackendLimits {
+                max_query_micros: 0,
+                ..limits.clone()
+            },
+            BackendLimits {
+                max_concurrent_queries: 0,
+                ..limits.clone()
+            },
+        ];
+        for limits in zero_query_limits {
+            let descriptor = BackendDescriptor {
+                limits,
+                ..ready.clone()
+            };
+            assert!(
+                descriptor.validate().is_err(),
+                "a ready query backend needs every query limit"
+            );
+        }
+    }
+
+    #[test]
+    fn given_backend_readiness_when_validated_then_should_need_a_time_or_a_bounded_reason_list() {
+        let not_ready = |reasons: usize| BackendReadiness {
+            ready: false,
+            reasons: vec![
+                BackendReadinessReason {
+                    code: BackendReadinessCode::ProbeFailed,
+                    detail: None,
+                };
+                reasons
+            ],
+            observed_at_micros: 0,
+        };
+        BackendReadiness::ready(5)
+            .validate()
+            .expect("ready with an observation time");
+        not_ready(32).validate().expect("reasons at the cap");
+        assert!(not_ready(33).validate().is_err(), "reasons past the cap");
+        assert!(
+            BackendReadiness::ready(0).validate().is_err(),
+            "ready without an observation time"
+        );
+    }
+
+    #[test]
+    fn given_query_capabilities_when_validated_then_should_need_coverage_without_repeats() {
+        capabilities()
+            .validate()
+            .expect("full coverage with raw SQL");
+        let refused = [
+            (
+                "no dialect",
+                QueryCapabilities {
+                    dialects: Vec::new(),
+                    raw_sql: false,
+                    ..capabilities()
+                },
+            ),
+            (
+                "no consistency level",
+                QueryCapabilities {
+                    consistency: Vec::new(),
+                    ..capabilities()
+                },
+            ),
+            (
+                "no logical type",
+                QueryCapabilities {
+                    logical_types: Vec::new(),
+                    ..capabilities()
+                },
+            ),
+            (
+                "a repeated dialect",
+                QueryCapabilities {
+                    dialects: vec![SqlDialect::Postgres, SqlDialect::Postgres],
+                    ..capabilities()
+                },
+            ),
+        ];
+        for (case, rejected) in refused {
+            assert!(rejected.validate().is_err(), "{case} must be refused");
+        }
+    }
+
+    #[test]
+    fn given_a_backend_announce_when_validated_then_should_need_unique_ids_and_a_ready_backend() {
+        let versions = OpVersions::new(1, 1, 1, 1);
+        let not_ready = backend(2, BackendMode::Operational, "Analytics", "columnar");
+        BackendAnnounce::new(versions)
+            .validate()
+            .expect("a ready announce without backends");
+        BackendAnnounce::new(versions)
+            .with_backends(vec![ready_backend(1), not_ready.clone()])
+            .validate()
+            .expect("a ready announce with a ready backend");
+        assert!(
+            BackendAnnounce::new(versions)
+                .with_backends(vec![not_ready])
+                .validate()
+                .is_err(),
+            "a ready announce without a ready backend"
+        );
+        assert!(
+            BackendAnnounce::new(versions)
+                .with_backends(vec![ready_backend(1), ready_backend(1)])
+                .validate()
+                .is_err(),
+            "a repeated resource id"
+        );
+    }
+
+    fn ready_backend(resource_id: u128) -> BackendDescriptor {
+        backend(
+            resource_id,
+            BackendMode::Operational,
+            "Embedded",
+            "embedded",
+        )
+        .with_state(
+            BackendDesiredState::Enabled,
+            BackendObservedState::Ready,
+            BackendReadiness::ready(5),
+        )
+        .with_query(capabilities())
+        .with_schema(SchemaCapabilities {
+            logical_schema: true,
+            arrow_ipc_stream: false,
+            schema_evolution: false,
+        })
+        .with_limits(BackendLimits {
+            max_query_rows: 1000,
+            max_query_bytes: 1_048_576,
+            max_scan_bytes: 1_073_741_824,
+            max_query_micros: 1_000_000,
+            max_concurrent_queries: 8,
+            max_schema_fields: 64,
+            max_payload_bytes: 0,
+        })
+    }
+
+    fn capabilities() -> QueryCapabilities {
+        QueryCapabilities {
+            dialects: vec![SqlDialect::Postgres],
+            consistency: vec![Consistency::Eventual],
+            logical_types: vec![LogicalTypeKind::String],
+            raw_sql: true,
+            aggregates: vec![AggFunc::Count],
+            vector_search: false,
+            text_search: false,
+        }
     }
 }
 const fn is_zero_u32(value: &u32) -> bool {

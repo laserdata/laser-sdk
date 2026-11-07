@@ -1,19 +1,11 @@
-use crate::checkpoint::{
-    CheckpointMutationResult, CheckpointReadConsistency, CheckpointRequestEnvelope,
-    DestinationCheckpointStatus, PreparedAttemptSummary, RetentionGap,
-};
-use crate::destination::{
-    DestinationId, DestinationOperationId, MaterializationDestination, QueryRoute,
-};
 use crate::error::InvalidError;
 use crate::filter::FilterGroupIdentity;
 use crate::fork::{ForkError, ForkKind};
 use crate::graph::SourceRef;
 use crate::hello::{BackendDescriptor, FilterAnnounce, OpVersions};
 use crate::kv::KvError;
-use crate::query::{Consistency, QueryError, QueryExecutionId, QueryExecutionStatus, QueryResult};
+use crate::query::{Consistency, QueryError};
 use crate::result::ResultCode;
-use crate::schema::{Digest32, LogicalSchema, TypedValue, UuidValue};
 use crate::topology::WireTopology;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -23,10 +15,6 @@ use std::num::NonZeroU128;
 pub const CAPABILITIES_PATH: &str = "/agdx/capabilities";
 /// `POST /agdx/query` (and `GET` with the query as a parameter).
 pub const QUERY_PATH: &str = "/agdx/query";
-/// `GET` and `POST /agdx/destinations`.
-pub const DESTINATIONS_PATH: &str = "/agdx/destinations";
-/// `GET /agdx/query-routes`.
-pub const QUERY_ROUTES_PATH: &str = "/agdx/query-routes";
 /// `GET /agdx/projections` to list, `POST` to register.
 pub const PROJECTIONS_PATH: &str = "/agdx/projections";
 /// `POST /agdx/bindings` to apply, `DELETE` to remove.
@@ -149,339 +137,10 @@ pub fn path_segment(text: &str) -> String {
     out
 }
 
-pub fn destination_path(id: DestinationId) -> String {
-    format!("{DESTINATIONS_PATH}/{id}")
-}
-
-pub fn destination_enable_path(id: DestinationId) -> String {
-    format!("{}/{id}/enable", DESTINATIONS_PATH)
-}
-
-pub fn destination_disable_path(id: DestinationId) -> String {
-    format!("{}/{id}/disable", DESTINATIONS_PATH)
-}
-
-pub fn destination_status_path(id: DestinationId) -> String {
-    format!("{}/{id}/status", DESTINATIONS_PATH)
-}
-
-pub fn destination_checkpoint_path(id: DestinationId) -> String {
-    format!("{}/{id}/checkpoint", DESTINATIONS_PATH)
-}
-
-pub fn destination_retention_gap_path(id: DestinationId) -> String {
-    format!("{}/{id}/retention-gap", DESTINATIONS_PATH)
-}
-
-pub fn destination_prepared_attempt_path(id: DestinationId) -> String {
-    format!("{}/{id}/prepared-attempt", DESTINATIONS_PATH)
-}
-
-pub fn destination_table_path(id: DestinationId) -> String {
-    format!("{}/{id}/table", DESTINATIONS_PATH)
-}
-
-pub fn destination_table_schema_path(id: DestinationId) -> String {
-    format!("{}/{id}/table/schema", DESTINATIONS_PATH)
-}
-
-pub fn destination_snapshots_path(id: DestinationId) -> String {
-    format!("{}/{id}/table/snapshots", DESTINATIONS_PATH)
-}
-
-pub fn destination_current_snapshot_path(id: DestinationId) -> String {
-    format!("{}/{id}/table/current-snapshot", DESTINATIONS_PATH)
-}
-
-pub fn destination_snapshot_path(id: DestinationId, snapshot_id: i64) -> String {
-    format!("{}/{id}/table/snapshots/{snapshot_id}", DESTINATIONS_PATH)
-}
-
-pub fn destination_files_path(id: DestinationId) -> String {
-    format!("{}/{id}/table/files", DESTINATIONS_PATH)
-}
-
-pub fn destination_metrics_path(id: DestinationId) -> String {
-    format!("{}/{id}/table/metrics", DESTINATIONS_PATH)
-}
-
-pub fn query_execution_path(id: QueryExecutionId) -> String {
-    format!("{QUERY_PATH}/{id}")
-}
-
-pub fn query_page_path(id: QueryExecutionId) -> String {
-    format!("{QUERY_PATH}/{id}/pages")
-}
-
-pub fn query_cancel_path(id: QueryExecutionId) -> String {
-    format!("{QUERY_PATH}/{id}/cancel")
-}
-
-pub fn destination_operation_path(id: DestinationOperationId) -> String {
-    format!("{DESTINATIONS_PATH}/operations/{id}")
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CheckpointReadQuery {
-    pub consistency: CheckpointReadConsistency,
-}
-
-impl CheckpointReadQuery {
-    pub const fn new(consistency: CheckpointReadConsistency) -> Self {
-        Self { consistency }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DestinationListQuery {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_stream: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_topic: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name_contains: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-    pub consistency: CheckpointReadConsistency,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DestinationPageView {
-    pub destinations: Vec<DestinationView>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
-    pub global_state_revision: u64,
-    pub consistency: crate::checkpoint::CheckpointReadConsistency,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DestinationView {
-    pub destination: MaterializationDestination,
-    pub status: DestinationCheckpointStatus,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct DestinationMutationBody {
-    pub checkpoint: CheckpointRequestEnvelope,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AcceptedOperationView {
-    pub operation_id: DestinationOperationId,
-    pub request_id: crate::checkpoint::CheckpointRequestId,
-    pub state: OperationState,
-    pub submitted_at_micros: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completed_at_micros: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<OperationErrorView>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<CheckpointMutationResult>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OperationErrorView {
-    pub code: ResultCode,
-    pub message: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum OperationState {
-    Accepted,
-    Running,
-    Succeeded,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueryRouteListQuery {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name_contains: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-    pub consistency: CheckpointReadConsistency,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueryRoutePageView {
-    pub routes: Vec<QueryRoute>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
-    pub definition_revision: u64,
-    pub global_state_revision: u64,
-    pub consistency: CheckpointReadConsistency,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TableView {
-    pub table_uuid: UuidValue,
-    pub destination_id: DestinationId,
-    pub destination_generation: u64,
-    pub namespace: Vec<String>,
-    pub table: String,
-    pub current_snapshot_id: i64,
-    pub current_schema_id: i32,
-    pub current_partition_spec_id: i32,
-    pub metadata_identity: String,
-    pub properties: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TableSchemaView {
-    pub table_uuid: UuidValue,
-    pub iceberg_schema_id: i32,
-    pub logical_schema: LogicalSchema,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotListQuery {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub before_snapshot_id: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotPageView {
-    pub snapshots: Vec<TableSnapshotView>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_before_snapshot_id: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TableSnapshotView {
-    pub snapshot_id: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_snapshot_id: Option<i64>,
-    pub sequence_number: i64,
-    pub committed_at_micros: u64,
-    pub schema_id: i32,
-    pub partition_spec_id: i32,
-    pub materialization_boundary_digest: Digest32,
-    pub checkpoint_revision: u64,
-    pub summary: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TableFileListQuery {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot_id: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct TableFilePageView {
-    pub files: Vec<TableFileView>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct TableFileView {
-    pub object_identity: String,
-    pub file_size_bytes: u64,
-    pub row_count: u64,
-    pub partition: BTreeMap<String, TypedValue>,
-    pub lower_bounds: BTreeMap<u32, TypedValue>,
-    pub upper_bounds: BTreeMap<u32, TypedValue>,
-    pub null_value_counts: BTreeMap<u32, u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TableMetricsView {
-    pub snapshot_id: i64,
-    pub data_file_count: u64,
-    pub delete_file_count: u64,
-    pub total_rows: u64,
-    pub total_bytes: u64,
-    pub partition_count: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueryPageBody {
-    pub cursor: String,
-    pub deadline_micros: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct QueryExecutionView {
-    pub status: QueryExecutionStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<QueryResult>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DestinationIssueView {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retention_gap: Option<RetentionGap>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prepared_attempt: Option<PreparedAttemptSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub block: Option<crate::checkpoint::DestinationBlock>,
-    pub global_state_revision: u64,
-    pub checkpoint_revision: u64,
-    pub consistency: CheckpointReadConsistency,
-}
-
-/// One member of the closed destination HTTP operation set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum DestinationHttpOperation {
-    ListDestinations,
-    GetDestination,
-    CreateDestination,
-    EnableDestination,
-    DisableDestination,
-    GetOperation,
-    GetStatus,
-    GetCheckpoint,
-    GetRetentionGap,
-    GetPreparedAttempt,
-    ListQueryRoutes,
-    GetTable,
-    GetTableSchema,
-    GetCurrentSnapshot,
-    ListSnapshots,
-    GetSnapshot,
-    ListFiles,
-    GetMetrics,
-}
-
-/// One closed destination HTTP operation forwarded from the streaming server to the managed backend.
-///
-/// The operation enum prevents arbitrary paths or methods from crossing the
-/// sidecar boundary. Path parameters stay textual, while query and body carry
-/// the JSON encodings of the operation's already-declared HTTP types.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DestinationHttpRequest {
-    pub v: u32,
-    pub operation: DestinationHttpOperation,
-    pub parameters: Vec<String>,
-    pub query: Vec<u8>,
-    pub body: Vec<u8>,
-}
-
-/// The managed backend's HTTP-shaped response for one [`DestinationHttpRequest`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DestinationHttpReply {
-    pub status: u16,
-    pub body: Vec<u8>,
-}
-
-/// `GET`/`PUT`/`DELETE /agdx/authz/roles/{name}`.
+/// `GET`/`PUT`/`DELETE /agdx/authz/roles/{name}`, the name percent-encoded as
+/// one path segment.
 pub fn authz_role_path(name: &str) -> String {
-    format!("{AUTHZ_ROLES_PATH}/{name}")
+    format!("{AUTHZ_ROLES_PATH}/{}", path_segment(name))
 }
 
 /// `GET`/`PUT /agdx/authz/users/{id}/roles`: read or replace one user's role set.
@@ -578,8 +237,6 @@ pub struct Capabilities {
     /// The managed query surface, its registry browse views, and the strongest
     /// read-consistency it serves.
     pub query: QueryCapsView,
-    /// Destination declarations, checkpoint status, and table inspection.
-    pub destinations: DestinationCapsView,
     /// The managed key-value surface and its conditional-write support.
     pub kv: KvCapsView,
     /// Whether the knowledge-graph ops (traversal, neighbors) are served. The
@@ -632,8 +289,7 @@ pub struct QueryCapsView {
     /// Whether the schema registry browse routes are served.
     pub schemas: bool,
     /// The strongest read-consistency the surface serves (the ladder
-    /// `eventual < read_your_writes < strong`, so a level implies the weaker
-    /// ones). Defaults to `eventual`, which every query surface serves.
+    /// `eventual < read_your_writes`, so a level implies the weaker ones). Defaults to `eventual`, which every query surface serves.
     #[serde(default)]
     pub consistency: Consistency,
     /// Whether lexical relevance search (`Query.text`) is served. Defaults
@@ -641,36 +297,6 @@ pub struct QueryCapsView {
     /// unsupported into a silent wrong answer.
     #[serde(default)]
     pub keyword: bool,
-    /// Whether opaque cursor page retrieval is served.
-    #[serde(default)]
-    pub cursor_paging: bool,
-    /// Whether an executing query can be cancelled by its execution identity.
-    #[serde(default)]
-    pub cancellation: bool,
-    /// Whether execution status can be polled independently of the first page.
-    #[serde(default)]
-    pub execution_status: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DestinationCapsView {
-    pub available: bool,
-    #[serde(default)]
-    pub lifecycle: bool,
-    #[serde(default)]
-    pub checkpoint_status: bool,
-    #[serde(default)]
-    pub query_routes: bool,
-    #[serde(default)]
-    pub table_schema: bool,
-    #[serde(default)]
-    pub snapshots: bool,
-    #[serde(default)]
-    pub files: bool,
-    #[serde(default)]
-    pub metrics: bool,
-    #[serde(default)]
-    pub strongest_consistency: crate::checkpoint::CheckpointReadConsistency,
 }
 
 /// Consumer filters on the HTTP capabilities reply. Native evaluation is served
@@ -779,21 +405,6 @@ impl Capabilities {
                 schemas: enabled,
                 consistency: Consistency::Eventual,
                 keyword: false,
-                cursor_paging: false,
-                cancellation: false,
-                execution_status: false,
-            },
-            destinations: DestinationCapsView {
-                available: false,
-                lifecycle: false,
-                checkpoint_status: false,
-                query_routes: false,
-                table_schema: false,
-                snapshots: false,
-                files: false,
-                metrics: false,
-                strongest_consistency:
-                    crate::checkpoint::CheckpointReadConsistency::PotentiallyStale,
             },
             kv: KvCapsView {
                 available: enabled,
@@ -832,20 +443,6 @@ impl Capabilities {
     #[must_use]
     pub fn with_query_keyword(mut self, value: bool) -> Self {
         self.query.keyword = value;
-        self
-    }
-
-    #[must_use]
-    pub fn with_query_execution(mut self, paging: bool, cancellation: bool, status: bool) -> Self {
-        self.query.cursor_paging = paging;
-        self.query.cancellation = cancellation;
-        self.query.execution_status = status;
-        self
-    }
-
-    #[must_use]
-    pub fn with_destinations(mut self, destinations: DestinationCapsView) -> Self {
-        self.destinations = destinations;
         self
     }
 
@@ -926,15 +523,11 @@ impl Capabilities {
     /// these HTTP fields) cannot disagree: the one source drives both.
     pub fn from_versions(enabled: bool, versions: OpVersions) -> Self {
         use crate::hello::feature;
-        let consistency = if versions.has_feature(feature::STRONG_CONSISTENCY) {
-            Consistency::Strong
-        } else if versions.has_feature(feature::READ_YOUR_WRITES) {
+        let consistency = if versions.has_feature(feature::READ_YOUR_WRITES) {
             Consistency::ReadYourWrites
         } else {
             Consistency::Eventual
         };
-        let destinations_available =
-            enabled && versions.checkpoint > 0 && versions.has_feature(feature::DESTINATIONS);
         Self::new(enabled, versions)
             .with_kv_cas(versions.has_feature(feature::KV_CAS))
             .with_kv_cas_fenced(versions.has_feature(feature::KV_CAS_FENCED))
@@ -944,18 +537,6 @@ impl Capabilities {
             .with_sessions(enabled && versions.has_feature(feature::SESSIONS))
             .with_authz(versions.has_feature(feature::AUTHZ))
             .with_query_consistency(consistency)
-            .with_destinations(DestinationCapsView {
-                available: destinations_available,
-                lifecycle: destinations_available,
-                checkpoint_status: destinations_available,
-                query_routes: destinations_available,
-                table_schema: false,
-                snapshots: false,
-                files: false,
-                metrics: false,
-                strongest_consistency:
-                    crate::checkpoint::CheckpointReadConsistency::PotentiallyStale,
-            })
             // The graph surface needs a backend that serves it, advertised as a
             // non-zero graph op version, so it is gated on that rather than implied.
             .with_graph(enabled && versions.graph > 0)
@@ -972,15 +553,18 @@ impl Capabilities {
 /// One KV entry on the HTTP surface. `key` and `value` are URL-safe unpadded
 /// base64, because keys and values are arbitrary bytes that JSON strings
 /// cannot carry raw.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KvEntryView {
     pub key: String,
     pub value: String,
     pub expires_at_micros: Option<u64>,
+    /// The entry's version, the value a compare-and-swap expects.
+    pub version: u64,
     /// The memory scope, present only on a memory read-view row (kind, agent,
-    /// user, app, conversation, and a `SourceRef` source pointer to the origin
-    /// log record). Absent on a generic entry, so a UI can fold a recalled item
-    /// back to its source message. Skipped on the wire when absent.
+    /// user, app, conversation, the folded feedback weight, and a `SourceRef`
+    /// source pointer to the origin log record). Absent on a generic entry, so
+    /// a UI can fold a recalled item back to its source message. Skipped on the
+    /// wire when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<crate::kv::MemoryRowScope>,
     /// The origin log record this entry was folded from, mirroring
@@ -991,11 +575,13 @@ pub struct KvEntryView {
     pub source: Option<crate::graph::SourceRef>,
 }
 
-/// One KV scan page on the HTTP surface.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// One KV scan page on the HTTP surface, in key order. `page` counts from 1.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KvPageView {
-    pub entries: Vec<KvEntryView>,
-    pub cursor: Option<String>,
+    pub items: Vec<KvEntryView>,
+    pub page: u32,
+    pub total_pages: u32,
+    pub total_results: u32,
 }
 
 /// `DELETE /agdx/kv/{namespace}` reply: the number of entries removed.
@@ -1277,10 +863,6 @@ pub const PARAM_START: &str = "start";
 pub const PARAM_END: &str = "end";
 /// `?key_contains=`: base64url substring the key must contain.
 pub const PARAM_KEY_CONTAINS: &str = "key_contains";
-/// `?limit=`: page size.
-pub const PARAM_LIMIT: &str = "limit";
-/// `?cursor=`: opaque continuation token from the prior page.
-pub const PARAM_CURSOR: &str = "cursor";
 /// `?status=` on a session list: one session status.
 pub const PARAM_STATUS: &str = "status";
 /// `?agent=` on a session list: sessions this agent took part in.
@@ -1293,13 +875,17 @@ pub const PARAM_ROOT: &str = "root";
 pub const PARAM_LABEL_PREFIX: &str = "label_prefix";
 /// `?surface=` on session links: one link surface.
 pub const PARAM_SURFACE: &str = "surface";
-/// `?after=` on session changes: the last change sequence already seen.
-pub const PARAM_AFTER: &str = "after";
-/// `?total=` on a session list: also count every match.
-pub const PARAM_TOTAL: &str = "total";
-/// `?fixed_frontier=` on session events: pin the fold frontier of the first
-/// page for a historical walk.
-pub const PARAM_FIXED_FRONTIER: &str = "fixed_frontier";
+/// `?as_of=` on a session list or timeline page: the bound of a walk, the
+/// `as_of` its first page returned.
+pub const PARAM_AS_OF: &str = "as_of";
+/// `?series=` on a session list or timeline page: the change series of the
+/// walk's `as_of`.
+pub const PARAM_SERIES: &str = "series";
+/// `?page=`: the 1-based page of a list. Zero or none reads the first page.
+pub const PARAM_PAGE: &str = "page";
+/// `?results=`: the items per page of a list. Zero or none leaves it to the
+/// server.
+pub const PARAM_RESULTS: &str = "results";
 /// `?history_limit=` on session state: the most history rows to return.
 pub const PARAM_HISTORY_LIMIT: &str = "history_limit";
 /// `?expires_at_micros=` on a KV `PUT`: absolute expiry, epoch microseconds.
@@ -1317,6 +903,10 @@ pub const PARAM_EXPECT_ABSENT: &str = "expect_absent";
 /// out-of-band metadata a single-key read needs. Owned here so the name is a
 /// wire constant rather than an unscoped string. Absent means no expiry.
 pub const KV_EXPIRES_AT_MICROS_HEADER: &str = "agdx-expires-at-micros";
+
+/// Response header on `GET /agdx/kv/{namespace}/{key}` carrying the entry's
+/// version as a decimal string, the value a compare-and-swap expects.
+pub const KV_VERSION_HEADER: &str = "agdx-version";
 
 /// Request header an intermediary sets on a managed HTTP write to name the end
 /// user it writes for. The streaming server forwards it to the backend, which
@@ -1339,6 +929,16 @@ pub struct ProjectionListQuery {
     /// with a single filter box. Composes (AND) with `name_contains`/`id_prefix`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<String>,
+    /// The stream whose projections the listing covers, required in stream
+    /// tenancy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
+    /// The 1-based page. Absent or zero reads the first page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    /// The projections per page. Absent or zero leaves it to the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<u32>,
 }
 
 /// `GET /agdx/schemas` filters. `name_contains` is the substring filter on a
@@ -1350,6 +950,20 @@ pub struct SchemaListQuery {
     pub name_contains: Option<String>,
     /// The stream whose registry is listed. Absent lists the deployment-wide
     /// registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
+    /// The 1-based page. Absent or zero reads the first page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    /// The schemas per page. Absent or zero leaves it to the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<u32>,
+}
+
+/// `?stream=` on `GET /agdx/kv` and `GET /agdx/forks`: the stream whose
+/// namespaces or forks are listed, required in stream tenancy.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<String>,
 }
@@ -1410,9 +1024,6 @@ pub struct FilterListQuery {
     pub name_contains: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<crate::filter::FilterState>,
-    /// Only filters with a lower id, for stable paging.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub before_id: Option<u32>,
     /// The owner filter is the five fields of a group identity, all or none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_stream_id: Option<u32>,
@@ -1427,7 +1038,7 @@ pub struct FilterListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub page_size: Option<u32>,
+    pub results: Option<u32>,
 }
 
 impl FilterListQuery {
@@ -1480,7 +1091,7 @@ pub struct FilterRevisionListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub page_size: Option<u32>,
+    pub results: Option<u32>,
 }
 
 /// `GET /agdx/filter-bindings` query parameters.
@@ -1495,7 +1106,7 @@ pub struct FilterBindingListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub page_size: Option<u32>,
+    pub results: Option<u32>,
 }
 
 /// `POST /agdx/filters/test` body. The sample payload is given either as
@@ -1530,10 +1141,12 @@ pub struct KvScanQuery {
     /// conversation. Plain text, not base64url, since a conversation id is text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// The 1-based page. Absent or zero reads the first page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
+    pub page: Option<u32>,
+    /// The entries per page. Absent or zero reads the default page size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
+    pub results: Option<u32>,
 }
 
 /// `PUT /agdx/kv/{namespace}/{key}` query: an optional absolute expiry.
@@ -1557,7 +1170,7 @@ pub struct GraphNeighborsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depth: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
+    pub limit: Option<u32>,
     /// Valid-time "as of" read (epoch micros): only edges valid at this instant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<u64>,
@@ -1568,8 +1181,10 @@ pub struct GraphNeighborsQuery {
     pub conversation: Option<String>,
 }
 
-/// Filters for `GET /agdx/sessions/{stream}`. The stream is the path
-/// segment. A `limit` of zero or none leaves the page size to the server.
+/// Filters and page of `GET /agdx/sessions/{stream}`. The stream is the path
+/// segment. A `page` of zero or none reads the first page, `results` of zero
+/// or none leaves the page size to the server, and `as_of` with `series`
+/// bounds a walk.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1583,23 +1198,28 @@ pub struct SessionsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
+    pub page: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
-    #[serde(default, rename = "total")]
-    pub want_total: bool,
+    pub results: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series: Option<u64>,
 }
 
-/// Query of `GET /agdx/sessions/{stream}/{id}/events`. A `limit` of zero or
-/// none leaves the page size to the server.
+/// Page of `GET /agdx/sessions/{stream}/{id}/events`. A `page` of zero or
+/// none reads the first page, `results` of zero or none leaves the page size
+/// to the server, and `as_of` with `series` bounds a walk.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEventsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
+    pub page: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
-    #[serde(default)]
-    pub fixed_frontier: bool,
+    pub results: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series: Option<u64>,
 }
 
 /// Query of `GET /agdx/sessions/{stream}/{id}/state`. A `history_limit` of
@@ -1617,16 +1237,15 @@ pub struct SessionLinksQuery {
     pub surface: Option<String>,
 }
 
-/// Query of `GET /agdx/sessions/{stream}/changes`. A `limit` of zero or none
-/// leaves the page size to the server.
+/// Page of `GET /agdx/sessions/{stream}/changes`. A `page` of zero or none
+/// reads the first page, and `results` of zero or none leaves the page size
+/// to the server.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionChangesQuery {
-    #[serde(default)]
-    pub after: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+    pub page: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub series: Option<u64>,
+    pub results: Option<u32>,
 }
 
 /// `PUT /agdx/kv/{namespace}/{key}/cas` query: the compare-and-swap precondition
@@ -1814,23 +1433,6 @@ mod tests {
     }
 
     #[test]
-    fn given_destination_versions_when_building_capabilities_then_the_core_surface_is_available() {
-        use crate::codes::CHECKPOINT_OP_VERSION;
-        use crate::hello::feature;
-
-        let versions = OpVersions::new(2, 2, 1, 1)
-            .with_checkpoint(CHECKPOINT_OP_VERSION)
-            .with_features(feature::DESTINATIONS);
-        let caps = Capabilities::from_versions(true, versions);
-
-        assert!(caps.destinations.available);
-        assert!(caps.destinations.lifecycle);
-        assert!(caps.destinations.checkpoint_status);
-        assert!(caps.destinations.query_routes);
-        assert!(!caps.destinations.table_schema);
-    }
-
-    #[test]
     fn given_capabilities_backends_when_json_round_tripped_then_should_preserve_and_omit_empty() {
         use crate::destination::BackendResourceId;
         use crate::hello::{BackendDescriptor, BackendImplementation, BackendMode};
@@ -1848,7 +1450,7 @@ mod tests {
             ),
             BackendDescriptor::new(
                 BackendResourceId::from_u128(2),
-                BackendMode::Lakehouse,
+                BackendMode::Operational,
                 "Warehouse",
                 BackendImplementation {
                     kind: "columnar".to_owned(),
@@ -1913,14 +1515,16 @@ mod tests {
     fn given_scan_filters_when_url_encoded_then_should_omit_absent_fields() {
         let query = KvScanQuery {
             prefix: Some("dXNlcjo".to_owned()),
-            limit: Some(50),
+            page: Some(2),
+            results: Some(50),
             ..Default::default()
         };
         let encoded = serde_urlencoded::to_string(&query).expect("encodes");
-        assert_eq!(encoded, "prefix=dXNlcjo&limit=50");
+        assert_eq!(encoded, "prefix=dXNlcjo&page=2&results=50");
         // Field names are the PARAM_* consts verbatim.
         assert!(encoded.contains(&format!("{PARAM_PREFIX}=")));
-        assert!(encoded.contains(&format!("{PARAM_LIMIT}=")));
+        assert!(encoded.contains(&format!("{PARAM_PAGE}=")));
+        assert!(encoded.contains(&format!("{PARAM_RESULTS}=")));
     }
 
     #[test]
@@ -1948,15 +1552,15 @@ mod tests {
 
         let schemas = SchemaListQuery {
             name_contains: Some("Reading".to_owned()),
-            stream: None,
+            ..SchemaListQuery::default()
         };
         assert_eq!(
             serde_urlencoded::to_string(&schemas).expect("encodes"),
             "name_contains=Reading"
         );
         let scoped = SchemaListQuery {
-            name_contains: None,
             stream: Some("acme".to_owned()),
+            ..SchemaListQuery::default()
         };
         assert_eq!(
             serde_urlencoded::to_string(&scoped).expect("encodes"),

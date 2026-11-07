@@ -33,8 +33,13 @@ Feature: External protocols preserve AGDX lifecycle
     When I stream chat chunks "hello " and "world"
     Then AG-UI renders the chat lifecycle in order
 
+  Scenario: A long chunked chat renders from its opening chunk
+    When I stream 60 chat chunks
+    Then AG-UI renders one run with 60 text contents from its opening chunk
+
   Scenario: Addressed bridge calls and input requests reach only their addressee
-    Given responders "alpha" and "beta" answer every command with their own name
+    Given responder "alpha" answers every command with its own name
+    And responder "beta" answers A2A tasks and input requests with its own name
     When I submit an A2A task to "beta"
     And I call the MCP tool "search" on "alpha"
     And I request input from "beta"
@@ -43,3 +48,10 @@ Feature: External protocols preserve AGDX lifecycle
     And the input decision is "beta"
     And responder "alpha" answered exactly "tool"
     And responder "beta" answered exactly "task", "input"
+
+  Scenario: A finished A2A task refuses a cancel and an unknown task is not found
+    Given responders "alpha" and "beta" answer every command with their own name
+    When I submit an A2A task to "beta"
+    Then the A2A task completes with "beta"
+    And canceling the A2A task is refused
+    And an A2A task that was never submitted is not found

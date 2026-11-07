@@ -34,8 +34,9 @@ impl Sessions {
         }
     }
 
-    /// A page of this stream's sessions, newest first. Chain the filters and
-    /// finish with [`fetch`](SessionListRequest::fetch).
+    /// A page of this stream's sessions, newest created first. Chain the
+    /// filters and the page and finish with
+    /// [`fetch`](SessionListRequest::fetch).
     pub fn list(&self) -> SessionListRequest {
         SessionListRequest {
             sessions: self.clone(),
@@ -44,21 +45,21 @@ impl Sessions {
             label_prefix: None,
             agent: None,
             text: None,
-            cursor: None,
-            limit: 0,
-            total: false,
+            page: 0,
+            results: 0,
+            bound: None,
         }
     }
 
-    /// A page of one session's events in server append time order. Chain the paging
-    /// and finish with [`fetch`](SessionEventsRequest::fetch).
+    /// A page of one session's events in server append time order. Chain the
+    /// page and finish with [`fetch`](SessionEventsRequest::fetch).
     pub fn events(&self, id: ConversationId) -> SessionEventsRequest {
         SessionEventsRequest {
             sessions: self.clone(),
             id,
-            cursor: None,
-            limit: 0,
-            fixed_frontier: false,
+            page: 0,
+            results: 0,
+            bound: None,
         }
     }
 
@@ -126,25 +127,16 @@ impl Sessions {
         }
     }
 
-    /// The change rows of this stream after `after`, up to `limit`. Zero
-    /// leaves the page size to the server.
-    pub async fn changes(&self, after: u64, limit: u32) -> Result<SessionChanges, LaserError> {
-        self.changes_in(after, limit, None).await
-    }
-
-    /// [`changes`](Self::changes) within one change series. A node whose
-    /// series differs answers a resync.
-    async fn changes_in(
-        &self,
-        after: u64,
-        limit: u32,
-        series: Option<u64>,
-    ) -> Result<SessionChanges, LaserError> {
+    /// One page of this stream's change feed in sequence order. Page `page`
+    /// of size `results` holds the changes with sequence
+    /// `(page - 1) * results + 1 ..= page * results`, so appends and pruning
+    /// never shift it. Zero `results` leaves the page size to the server, and
+    /// the reply names the size it used.
+    pub async fn changes(&self, page: u32, results: u32) -> Result<SessionChanges, LaserError> {
         let request = request::SessionChanges {
             stream: self.stream()?.to_owned(),
-            after,
-            limit,
-            series,
+            page,
+            results,
         };
         match self.read(AGDX_SESSION_CHANGES_CODE, &request).await? {
             SessionOutcome::Changes(changes) => Ok(changes),
@@ -153,31 +145,23 @@ impl Sessions {
     }
 
     /// Follow this stream's session changes from now, polling every
-    /// `poll_every` and coalescing the changed session ids of each poll. The
-    /// watch starts at the change rows retained when this call returns, so a
-    /// change made after it is never missed.
+    /// `poll_every`, which must be above zero, and coalescing the changed
+    /// session ids of each poll. The watch starts in one read at the newest
+    /// change when this call returns, so a change made after it is never
+    /// missed and no retained change is replayed.
     pub async fn watch(&self, poll_every: Duration) -> Result<SessionWatch, LaserError> {
-        let mut after = 0;
-        let mut series = None;
-        loop {
-            let page = self.changes_in(after, 0, series).await?;
-            if page.series != 0 {
-                series = Some(page.series);
-            }
-            if page.resync {
-                after = page.floor;
-                continue;
-            }
-            match page.rows.iter().map(|row| row.seq).max() {
-                Some(seq) => after = seq,
-                None => break,
-            }
+        if poll_every.is_zero() {
+            return Err(LaserError::Invalid(
+                "session watch poll interval must be above zero".to_owned(),
+            ));
         }
+        let start = watch_start(|page, results| self.changes(page, results)).await?;
         Ok(SessionWatch {
             sessions: self.clone(),
             poll_every,
-            after,
-            series,
+            next: start.total_results.saturating_add(1),
+            results: start.results,
+            series: start.series,
             ready: VecDeque::new(),
         })
     }
@@ -222,9 +206,9 @@ pub struct SessionListRequest {
     label_prefix: Option<String>,
     agent: Option<laser_wire::agent::AgentId>,
     text: Option<String>,
-    cursor: Option<String>,
-    limit: u32,
-    total: bool,
+    page: u32,
+    results: u32,
+    bound: Option<(u64, u64)>,
 }
 
 impl SessionListRequest {
@@ -259,21 +243,22 @@ impl SessionListRequest {
         self
     }
 
-    /// Continue after the page that returned `cursor`.
-    pub fn cursor(mut self, cursor: impl Into<String>) -> Self {
-        self.cursor = Some(cursor.into());
+    /// The 1-based page to read. Zero reads the first page.
+    pub fn page(mut self, page: u32) -> Self {
+        self.page = page;
         self
     }
 
-    /// The page size. Zero leaves it to the server.
-    pub fn limit(mut self, limit: u32) -> Self {
-        self.limit = limit;
+    /// The sessions per page. Zero leaves it to the server.
+    pub fn results(mut self, results: u32) -> Self {
+        self.results = results;
         self
     }
 
-    /// Also count every match.
-    pub fn total(mut self) -> Self {
-        self.total = true;
+    /// Read within the bound of a walk: the `as_of` and `series` its first
+    /// page returned, so sessions folded after it stay out of every page.
+    pub fn as_of(mut self, as_of: u64, series: u64) -> Self {
+        self.bound = Some((as_of, series));
         self
     }
 
@@ -286,9 +271,10 @@ impl SessionListRequest {
             label_prefix: self.label_prefix,
             agent: self.agent,
             text: self.text,
-            cursor: self.cursor,
-            limit: self.limit,
-            want_total: self.total,
+            page: self.page,
+            results: self.results,
+            as_of: self.bound.map(|(as_of, _)| as_of),
+            series: self.bound.map(|(_, series)| series),
         };
         request.validate()?;
         match self.sessions.read(AGDX_SESSION_LIST_CODE, &request).await? {
@@ -303,27 +289,28 @@ impl SessionListRequest {
 pub struct SessionEventsRequest {
     sessions: Sessions,
     id: ConversationId,
-    cursor: Option<String>,
-    limit: u32,
-    fixed_frontier: bool,
+    page: u32,
+    results: u32,
+    bound: Option<(u64, u64)>,
 }
 
 impl SessionEventsRequest {
-    /// Continue after the page that returned `cursor`.
-    pub fn cursor(mut self, cursor: impl Into<String>) -> Self {
-        self.cursor = Some(cursor.into());
+    /// The 1-based page to read. Zero reads the first page.
+    pub fn page(mut self, page: u32) -> Self {
+        self.page = page;
         self
     }
 
-    /// The page size. Zero leaves it to the server.
-    pub fn limit(mut self, limit: u32) -> Self {
-        self.limit = limit;
+    /// The events per page. Zero leaves it to the server.
+    pub fn results(mut self, results: u32) -> Self {
+        self.results = results;
         self
     }
 
-    /// Pin the fold frontier of the first page, for a historical walk.
-    pub fn fixed_frontier(mut self) -> Self {
-        self.fixed_frontier = true;
+    /// Read within the bound of a walk: the `as_of` and `series` its first
+    /// page returned, so events folded after it stay out of every page.
+    pub fn as_of(mut self, as_of: u64, series: u64) -> Self {
+        self.bound = Some((as_of, series));
         self
     }
 
@@ -332,9 +319,10 @@ impl SessionEventsRequest {
         let request = request::SessionEvents {
             stream: self.sessions.stream()?.to_owned(),
             id: self.id.into(),
-            cursor: self.cursor,
-            limit: self.limit,
-            fixed_frontier: self.fixed_frontier,
+            page: self.page,
+            results: self.results,
+            as_of: self.bound.map(|(as_of, _)| as_of),
+            series: self.bound.map(|(_, series)| series),
         };
         match self
             .sessions
@@ -362,10 +350,12 @@ pub enum SessionChange {
 pub struct SessionWatch {
     sessions: Sessions,
     poll_every: Duration,
-    after: u64,
-    // The change series `after` belongs to. Sequence numbers from another
-    // node or a restored index never continue this cursor.
-    series: Option<u64>,
+    /// The next change sequence to report. The page to read follows from it.
+    next: u64,
+    results: u32,
+    // Sequence numbers of another node's or a restored index never continue
+    // this watch.
+    series: u64,
     ready: VecDeque<SessionChange>,
 }
 
@@ -376,7 +366,13 @@ impl SessionWatch {
             if let Some(change) = self.ready.pop_front() {
                 return Ok(change);
             }
-            let page = match self.sessions.changes_in(self.after, 0, self.series).await {
+            let page =
+                (self.next.saturating_sub(1) / u64::from(self.results.max(1))).saturating_add(1);
+            let page = match self
+                .sessions
+                .changes(u32::try_from(page).unwrap_or(u32::MAX), self.results)
+                .await
+            {
                 Ok(page) => page,
                 // A node that has not folded this stream far enough yet,
                 // typically the one a move just reached, answers Stale. The
@@ -387,30 +383,32 @@ impl SessionWatch {
                 }
                 Err(error) => return Err(error),
             };
-            if page.series != 0 {
-                self.series = Some(page.series);
-            }
-            if page.resync {
-                self.after = page.floor;
+            self.results = page.results;
+            // Another series numbers another index's changes, and a floor past
+            // the next sequence means retention pruned changes not reported.
+            if page.series != self.series || page.floor > self.next {
+                self.series = page.series;
+                self.next = page.total_results.saturating_add(1);
                 return Ok(SessionChange::Resync);
             }
-            if page.rows.is_empty() {
+            let rows: Vec<_> = page
+                .items
+                .into_iter()
+                .filter(|row| row.seq >= self.next)
+                .collect();
+            let Some(last) = rows.last().map(|row| row.seq) else {
                 tokio::time::sleep(self.poll_every).await;
                 continue;
-            }
+            };
+            self.next = last.saturating_add(1);
             // A truncated row does not name every changed session. The
-            // caller lists again after the resync, which covers this page, so
-            // the cursor moves past it instead of resyncing forever.
-            if page.rows.iter().any(|row| row.truncated) {
-                if let Some(seq) = page.rows.iter().map(|row| row.seq).max() {
-                    self.after = self.after.max(seq);
-                }
+            // caller lists again after the resync, which covers these rows.
+            if rows.iter().any(|row| row.truncated) {
                 return Ok(SessionChange::Resync);
             }
             let mut seen = BTreeSet::new();
             let mut changed = Vec::new();
-            for row in &page.rows {
-                self.after = self.after.max(row.seq);
+            for row in &rows {
                 for session in &row.sessions {
                     if seen.insert(*session) {
                         changed.push(*session);
@@ -419,6 +417,19 @@ impl SessionWatch {
             }
             self.ready.push_back(SessionChange::Changed(changed));
         }
+    }
+
+    /// This watch as a [`Stream`](futures::Stream) of changes. It follows
+    /// changes until the caller drops it and ends after the first failed read.
+    /// Drive it with `futures::StreamExt`.
+    pub fn stream(self) -> impl futures::Stream<Item = Result<SessionChange, LaserError>> {
+        futures::stream::unfold(Some(self), |watch| async move {
+            let mut watch = watch?;
+            match watch.next().await {
+                Ok(change) => Some((Ok(change), Some(watch))),
+                Err(error) => Some((Err(error), None)),
+            }
+        })
     }
 }
 
@@ -530,6 +541,16 @@ where
     Ok(Some((source, message)))
 }
 
+/// The one-call start of a change follower: any page names the series, the
+/// page size and the newest sequence, and the follower starts after it.
+async fn watch_start<F, Fut>(changes: F) -> Result<SessionChanges, LaserError>
+where
+    F: FnOnce(u32, u32) -> Fut,
+    Fut: std::future::Future<Output = Result<SessionChanges, LaserError>>,
+{
+    changes(1, 0).await
+}
+
 fn unexpected(read: &str) -> LaserError {
     LaserError::Protocol(format!("session {read}: unexpected reply shape"))
 }
@@ -538,9 +559,12 @@ fn unexpected(read: &str) -> LaserError {
 mod tests {
     use super::*;
     use crate::iggy::prelude::IggyClient;
-    use laser_wire::limits::{MAX_SESSION_CURSOR_BYTES, MAX_SESSION_TEXT_QUERY_BYTES};
-    use std::sync::Arc;
+    use futures::StreamExt;
+    use laser_wire::agent::ConversationId as WireConversationId;
+    use laser_wire::limits::MAX_SESSION_TEXT_QUERY_BYTES;
+    use laser_wire::session::{SessionChangeOrigin, SessionChangeRow};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     #[tokio::test]
     async fn given_a_session_list_over_its_caps_when_fetched_then_should_refuse_it_before_sending()
@@ -557,18 +581,85 @@ mod tests {
         let error = laser
             .sessions()
             .list()
-            .cursor("c".repeat(MAX_SESSION_CURSOR_BYTES + 1))
-            .fetch()
-            .await
-            .expect_err("an over-long cursor is refused");
-        assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
-        let error = laser
-            .sessions()
-            .list()
             .fetch()
             .await
             .expect_err("an offline Laser does not index sessions");
         assert!(matches!(error, LaserError::Unsupported { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn given_a_zero_poll_interval_when_watching_then_should_refuse_it_before_reading() {
+        let laser = Laser::from_client(IggyClient::default()).with_default_stream("agents");
+        let error = laser
+            .sessions()
+            .watch(Duration::ZERO)
+            .await
+            .err()
+            .expect("a zero poll interval is refused");
+        assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn given_retained_change_rows_when_a_watch_starts_then_should_start_in_one_read_without_draining_them()
+     {
+        let id = WireConversationId::from_u128(7);
+        let row = |seq| SessionChangeRow {
+            seq,
+            sessions: vec![id],
+            positions: Vec::new(),
+            truncated: false,
+            origin: SessionChangeOrigin::Records,
+        };
+        let replies = Mutex::new(VecDeque::from([SessionChanges {
+            items: vec![row(1), row(2)],
+            page: 1,
+            total_pages: 441,
+            total_results: 4405,
+            results: 10,
+            floor: 1,
+            series: 77,
+        }]));
+        let calls = Mutex::new(Vec::new());
+        let start = watch_start(|page, results| {
+            calls.lock().expect("calls lock").push((page, results));
+            let reply = replies.lock().expect("replies lock").pop_front();
+            async move { reply.ok_or_else(|| LaserError::Invalid("no scripted reply".to_owned())) }
+        })
+        .await
+        .expect("the watch starts");
+        assert_eq!(
+            (start.total_results, start.results, start.series),
+            (4405, 10, 77)
+        );
+        assert_eq!(*calls.lock().expect("calls lock"), vec![(1, 0)]);
+    }
+
+    #[tokio::test]
+    async fn given_a_watch_when_iterated_as_a_stream_then_should_yield_changes_and_end_after_a_failed_read()
+     {
+        let laser = Laser::from_client(IggyClient::default()).with_default_stream("agents");
+        let id = WireConversationId::from_u128(7);
+        let watch = SessionWatch {
+            sessions: laser.sessions(),
+            poll_every: Duration::from_millis(1),
+            next: 1,
+            results: 10,
+            series: 77,
+            ready: VecDeque::from([SessionChange::Changed(vec![id])]),
+        };
+        let mut stream = std::pin::pin!(watch.stream());
+        let first = stream
+            .next()
+            .await
+            .expect("a buffered change")
+            .expect("the buffered change reads");
+        assert_eq!(first, SessionChange::Changed(vec![id]));
+        let failed = stream.next().await.expect("the failed read is yielded");
+        assert!(
+            matches!(failed, Err(LaserError::Unsupported { .. })),
+            "{failed:?}"
+        );
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

@@ -1,6 +1,5 @@
 use crate::common::test_iggy::TestIggy;
 use cucumber::World;
-use laser_bdd::data_stack::{AcceptedOperation, DataStackModel, ModelError};
 use laser_bdd::graph_engine::GraphEngine;
 use laser_bdd::kv_engine::KvEngine;
 use laser_bdd::memory_engine::MemoryEngine;
@@ -9,6 +8,7 @@ use laser_sdk::kv::KvError;
 use laser_sdk::memory::MemoryId;
 use laser_sdk::prelude::{Checkpoint, ConversationId, Laser, QueryResult, Session};
 use laser_sdk::query::ResultCode;
+use laser_sdk::schema_codecs::CompiledSchema;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -18,6 +18,22 @@ use std::sync::Arc;
 /// `Then` steps to assert against.
 #[derive(Default, World)]
 pub struct LaserWorld {
+    pub materialization_status: Option<laser_sdk::wire::browse::BindingStatus>,
+    pub materialization_target: Option<laser_sdk::wire::browse::BindingStatus>,
+    pub materialization: Option<laser_sdk::materialize::Materialization>,
+    /// The declared SQL backend a remote materialization binds to, with the
+    /// dialect it serves.
+    pub sql_backend: Option<(
+        laser_sdk::wire::destination::BackendBinding,
+        laser_sdk::wire::query::SqlDialect,
+    )>,
+    pub writer_schema: Option<CompiledSchema>,
+    pub writer_payload_rejected: Option<bool>,
+    /// The writer schema corpus cases whose decode differed from the corpus.
+    pub writer_corpus_failures: Option<Vec<String>>,
+    /// Each writer schema a registry scenario registered: its stream, its
+    /// name, and the id the registry answered.
+    pub schema_registrations: Vec<(String, String, u32)>,
     pub laser: Option<Laser>,
     pub platform: Option<Arc<TestIggy>>,
     pub conversation: Option<ConversationId>,
@@ -43,6 +59,19 @@ pub struct LaserWorld {
     /// result-space scenarios.
     pub last_code: Option<ResultCode>,
     pub last_retryable: Option<bool>,
+    /// The lease each holder took, by holder, with the key it names, for the
+    /// managed lease scenarios.
+    pub leases: HashMap<String, (String, laser_sdk::kv::Lease)>,
+    pub renewed_lease: Option<laser_sdk::kv::Lease>,
+    pub lease_released: Option<bool>,
+    pub last_lease_lost: Option<bool>,
+    /// The entry the last barriered read returned, whose version the next
+    /// fenced write expects.
+    pub last_entry: Option<laser_sdk::kv::KvEntry>,
+    /// The latency_ms of every row an offset walk returned, in walk order.
+    pub walked_latencies: Vec<i64>,
+    /// Whether the last whole read saw its frontier move between pages.
+    pub walk_frontier_moved: Option<bool>,
     /// Whether a must-understand marker left a requirement unmet for a receiver
     /// that lacks the demanded feature bits.
     pub must_understand_unmet: Option<bool>,
@@ -52,7 +81,6 @@ pub struct LaserWorld {
     pub forks: Option<bool>,
     pub kv_cas: Option<bool>,
     pub read_your_writes: Option<bool>,
-    pub strong_consistency: Option<bool>,
     /// Payloads of the assembled conversation, in log order (lossy text view).
     pub assembled_payloads: Vec<String>,
     /// The same payloads as raw bytes, for decoding a binary AGDX envelope.
@@ -66,13 +94,9 @@ pub struct LaserWorld {
     /// for the query-semantics scenarios (no Iggy, no transport).
     pub query_engine: Option<QueryEngine>,
     pub last_query: Option<QueryResult>,
-    pub data_stack: Option<DataStackModel>,
     /// The binding the bindings scenarios build, and its wire form.
     pub binding_builder: Option<laser_sdk::query::ProjectionBindingBuilder>,
     pub binding_wire: Option<serde_json::Value>,
-    pub data_stack_operation: Option<AcceptedOperation>,
-    pub data_stack_error: Option<ModelError>,
-    pub data_stack_page: Option<(Vec<String>, Option<usize>)>,
     /// The in-memory reference KV store and the outcome of the last
     /// compare-and-swap, for the CAS-semantics scenarios (no Iggy, no transport).
     pub kv_engine: Option<KvEngine>,

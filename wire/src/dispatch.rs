@@ -1,7 +1,8 @@
 use crate::agent::{
-    AgentEnvelope, AgentId, AgentKind, METADATA_ROLE, OPERATION_CHAT, OPERATION_PROGRESS,
-    OPERATION_REASONING, OPERATION_SESSION, OPERATION_SESSION_PARKED, OPERATION_SESSION_UNPARKED,
-    OPERATION_STATE_DELTA, OPERATION_STATE_SNAPSHOT, OPERATION_TASK, TaskState,
+    AgentEnvelope, AgentId, AgentKind, METADATA_RECORDED, METADATA_ROLE, OPERATION_CHAT,
+    OPERATION_PROGRESS, OPERATION_REASONING, OPERATION_SESSION, OPERATION_SESSION_PARKED,
+    OPERATION_SESSION_UNPARKED, OPERATION_STATE_DELTA, OPERATION_STATE_SNAPSHOT, OPERATION_TASK,
+    TaskState,
 };
 use crate::filter::{ConsumerFilter, FilterExpr};
 use crate::headers::TARGET_AGENT_ID;
@@ -20,6 +21,9 @@ pub const OPERATION_SESSION_RESUME: &str = "session_resume";
 pub const OPERATION_SESSION_CANCEL: &str = "session_cancel";
 /// The `command` operation that ends a session as canceled without its agent.
 pub const OPERATION_FORCE_CANCEL: &str = "force_cancel";
+/// The `command` operation that asks a person or a named approver for input.
+/// Only a handler that lists it among its operations receives it as work.
+pub const OPERATION_INPUT_REQUEST: &str = "input_request";
 /// The OTel operation for a text completion model call.
 pub const OPERATION_TEXT_COMPLETION: &str = "text_completion";
 /// The OTel operation for a content generation model call.
@@ -250,6 +254,14 @@ fn is_model(operation: &str) -> bool {
     )
 }
 
+fn is_recorded(envelope: &AgentEnvelope) -> bool {
+    envelope
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(METADATA_RECORDED))
+        .is_some_and(|recorded| matches!(recorded, Value::Bool(true)))
+}
+
 fn is_user(envelope: &AgentEnvelope) -> bool {
     envelope
         .metadata
@@ -265,8 +277,9 @@ pub enum Dispatch {
     /// A command addressed to this agent for an operation its handler serves.
     Work,
     /// A record that informs the timeline and is never handled: events, model
-    /// and tool records for operations the handler does not serve, and control
-    /// operations found outside `agent.control`.
+    /// and tool records for operations the handler does not serve, model and
+    /// tool calls a session recorded, input requests for a handler that did
+    /// not list them, and control operations found outside `agent.control`.
     Observational,
     /// A response, error, or chunk. Reply waiters read it, handlers never do.
     Reply,
@@ -295,9 +308,10 @@ pub enum HandledOperations<'a> {
 }
 
 impl HandledOperations<'_> {
+    // An input request reaches only an approver that opted in to it.
     fn handles(self, operation: &str) -> bool {
         match self {
-            Self::Any => true,
+            Self::Any => operation != OPERATION_INPUT_REQUEST,
             Self::Only(operations) => operations.contains(&operation),
         }
     }
@@ -325,6 +339,7 @@ pub fn classify(
                 (true, true) => Dispatch::Control,
                 (true, false) => Dispatch::Observational,
                 (false, true) => Dispatch::Foreign,
+                (false, false) if is_recorded(envelope) => Dispatch::Observational,
                 (false, false) if handled.handles(operation) => Dispatch::Work,
                 (false, false) => Dispatch::Observational,
             }

@@ -1159,11 +1159,15 @@ export interface AgentCard {
   readonly version?: string
   readonly capabilities: readonly CapabilityDescriptor[]
   readonly ttlMicros?: bigint
+  /** The topic the agent consumes its work on, the durable inbox a route
+   * resolves to when no live presence advertises one. */
+  readonly inbox?: string
 }
 
 export function validateAgentCard(card: AgentCard): void {
   cappedString(card.name, "name", MAX_AGENT_STRING_BYTES)
   cappedString(card.version, "version", MAX_AGENT_STRING_BYTES)
+  cappedString(card.inbox, "inbox", MAX_AGENT_STRING_BYTES)
   if (card.capabilities.length > MAX_CARD_CAPABILITIES) {
     rejectValidation({
       kind: "tooLarge",
@@ -1185,6 +1189,7 @@ export function encodeAgentCard(card: AgentCard): Map<string, unknown> {
     map.set("capabilities", card.capabilities.map(encodeCapabilityDescriptor))
   }
   if (card.ttlMicros !== undefined) map.set("ttl_micros", card.ttlMicros)
+  if (card.inbox !== undefined) map.set("inbox", card.inbox)
   return map
 }
 
@@ -1192,13 +1197,15 @@ export function decodeAgentCard(map: CborMap, context: string): AgentCard {
   const name = field.optionalString(map, "name", context)
   const version = field.optionalString(map, "version", context)
   const ttlMicros = field.optionalU64(map, "ttl_micros", context)
+  const inbox = field.optionalString(map, "inbox", context)
   return {
     ...(name !== undefined ? { name } : {}),
     ...(version !== undefined ? { version } : {}),
     capabilities: field.optionalArray(map, "capabilities", context, (item) =>
       decodeCapabilityDescriptor(item, `${context}.capabilities`)
     ),
-    ...(ttlMicros !== undefined ? { ttlMicros } : {})
+    ...(ttlMicros !== undefined ? { ttlMicros } : {}),
+    ...(inbox !== undefined ? { inbox } : {})
   }
 }
 
@@ -1403,6 +1410,10 @@ export const METADATA_PROVIDER_NAME = "gen_ai.provider.name"
  * session. The receiving agent marks the session working when it picks the
  * command up. */
 export const METADATA_SUBMITTED = "submitted"
+/** The metadata key that marks a command a session recorded for its own model
+ * or tool call. `classify` keeps such a record observational, so it never
+ * reaches a handler as new work. */
+export const METADATA_RECORDED = "recorded"
 /** The metadata key for a call's duration in microseconds, measured by the
  * application around the provider or tool call. */
 export const METADATA_DURATION_MICROS = "duration_micros"
@@ -1744,7 +1755,12 @@ export function validateAgentEnvelope(envelope: AgentEnvelope): void {
     forbid(envelope.idempotencyKey === undefined, "idempotency_key")
   }
 
-  if (
+  const registryFact =
+    kind === AgentKind.Status &&
+    (envelope.operation === OPERATION_QUARANTINE || envelope.operation === OPERATION_UNQUARANTINE)
+  if (registryFact) {
+    require(envelope.deadlineMicros !== undefined, "deadline_micros")
+  } else if (
     kind === AgentKind.Response ||
     kind === AgentKind.Event ||
     kind === AgentKind.Status ||

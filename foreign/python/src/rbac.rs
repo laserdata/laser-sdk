@@ -1,12 +1,12 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::convert::{py_to_de, ser_to_py};
 use crate::errors::to_pyerr;
 use laser_sdk::LaserError;
 use laser_sdk::edge_auth::{EdgeClaims, EdgeDenial};
 use laser_sdk::rbac::{
-    Action, AuthzEvent, AuthzEventKind, AuthzHistoryReply, AuthzSubject, Effect, Feature, Grant,
-    ResourceKind, ResourcePattern, Role, WhoamiReply,
+    Action, AuthzEvent, AuthzEventKind, AuthzHistoryReply, AuthzSubject, BindingsReply, Effect,
+    Feature, Grant, ResourceKind, ResourcePattern, Role, WhoamiReply,
 };
 use laser_sdk::types::PrincipalId;
 use pyo3::exceptions::PyValueError;
@@ -77,6 +77,30 @@ pub fn validate_role_name(name: &str) -> PyResult<()> {
     laser_sdk::rbac::validate_role_name(name).map_err(|error| to_pyerr(LaserError::from(error)))
 }
 
+/// Check a role definition before sending it: a valid name and no grant on a
+/// feature no request is authorized against (`memory`, `agent`, `workflow`).
+/// An invalid role raises `InvalidError`.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn validate_role(name: String, grants: Vec<PyGrant>) -> PyResult<()> {
+    let grants = grants
+        .into_iter()
+        .map(Grant::try_from)
+        .collect::<PyResult<Vec<_>>>()?;
+    laser_sdk::rbac::validate_role(&Role { name, grants })
+        .map_err(|error| to_pyerr(LaserError::from(error)))
+}
+
+/// The shared authorization mutation id rule: 1 to 64 bytes of ASCII letters,
+/// digits and `-`, the receipt identity a caller may choose for `define_role`,
+/// `delete_role` and `bind_roles`.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn validate_mutation_id(mutation_id: &str) -> PyResult<()> {
+    laser_sdk::rbac::validate_mutation_id(mutation_id)
+        .map_err(|error| to_pyerr(LaserError::from(error)))
+}
+
 /// Authorize an external-edge (MCP / A2A) request against the decoded token
 /// claims `audience` and `scopes`: strict audience validation, then a scope
 /// check. Returns `None` when the token is minted for `expected_audience` and
@@ -103,9 +127,9 @@ impl PyLaser {
     /// flattened grants. Always answered to the authenticated caller. The
     /// authorization surface is server-side: against Apache Iggy it raises
     /// `UnsupportedError`.
-    fn whoami<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn whoami<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyWhoamiReply>> {
         let laser = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let reply = laser.whoami().await.map_err(to_pyerr)?;
             Ok(PyWhoamiReply::from(reply))
         })
@@ -120,9 +144,9 @@ impl PyLaser {
         py: Python<'py>,
         name_prefix: Option<String>,
         search: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Vec<PyRole>>> {
         let laser = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let roles = laser
                 .list_roles(name_prefix.as_deref(), search.as_deref())
                 .await
@@ -132,75 +156,115 @@ impl PyLaser {
     }
 
     /// One role by name, or `None`.
-    fn get_role<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+    fn get_role<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+    ) -> PyResult<Awaitable<'py, Option<PyRole>>> {
         let laser = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let role = laser.get_role(name).await.map_err(to_pyerr)?;
             Ok(role.map(PyRole::from))
         })
     }
 
-    /// The role names bound to the user `principal`.
-    fn get_bindings<'py>(&self, py: Python<'py>, principal: u32) -> PyResult<Bound<'py, PyAny>> {
+    /// The role names bound to the user `principal` and the binding revision
+    /// they were read at.
+    fn get_bindings<'py>(
+        &self,
+        py: Python<'py>,
+        principal: u32,
+    ) -> PyResult<Awaitable<'py, PyBindingsReply>> {
         let laser = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .get_bindings(PrincipalId::new(principal))
                 .await
+                .map(PyBindingsReply::from)
                 .map_err(to_pyerr)
         })
     }
 
-    /// Define or replace a role (upsert). Requires `authz:admin`.
+    /// Define or replace a role (upsert). Requires `authz:admin`. With
+    /// `mutation_id`, the caller chooses the receipt identity of the request:
+    /// a repeat with the same id and content after a lost reply returns the
+    /// original outcome without a second effect, and the same id with other
+    /// content raises `AuthzError` as a conflict.
+    #[pyo3(signature = (name, grants, *, mutation_id=None))]
     fn define_role<'py>(
         &self,
         py: Python<'py>,
         name: String,
         grants: Vec<PyGrant>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+        mutation_id: Option<String>,
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
         let grants = grants
             .into_iter()
             .map(Grant::try_from)
             .collect::<PyResult<Vec<_>>>()?;
-        future_into_py(py, async move {
-            laser
-                .define_role(Role { name, grants })
-                .await
-                .map_err(to_pyerr)
+        awaitable(py, async move {
+            let role = Role { name, grants };
+            match mutation_id {
+                Some(mutation_id) => laser.define_role_as(role, mutation_id).await,
+                None => laser.define_role(role).await,
+            }
+            .map_err(to_pyerr)
         })
     }
 
-    /// Delete a role by name. Requires `authz:admin`.
-    fn delete_role<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+    /// Delete a role by name. Requires `authz:admin`. `mutation_id` chooses
+    /// the receipt identity like `define_role`.
+    #[pyo3(signature = (name, *, mutation_id=None))]
+    fn delete_role<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        mutation_id: Option<String>,
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
-        future_into_py(py, async move {
-            laser.delete_role(name).await.map_err(to_pyerr)
+        awaitable(py, async move {
+            match mutation_id {
+                Some(mutation_id) => laser.delete_role_as(name, mutation_id).await,
+                None => laser.delete_role(name).await,
+            }
+            .map_err(to_pyerr)
         })
     }
 
     /// Bind the user `principal`'s whole role set (replace). Requires
     /// `authz:admin`. With `expect_revision`, bind only if the binding's
-    /// current revision matches, otherwise raise `AuthzError`.
-    #[pyo3(signature = (principal, roles, *, expect_revision=None))]
+    /// current revision matches, otherwise raise `AuthzError`. `mutation_id`
+    /// chooses the receipt identity like `define_role`: an administrator that
+    /// revokes its own administration keeps that request's receipt, so its
+    /// exact repeat after a lost reply returns the original success and the
+    /// binding revision moves once. Returns the binding as committed.
+    #[pyo3(signature = (principal, roles, *, expect_revision=None, mutation_id=None))]
     fn bind_roles<'py>(
         &self,
         py: Python<'py>,
         principal: u32,
         roles: Vec<String>,
         expect_revision: Option<u64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+        mutation_id: Option<String>,
+    ) -> PyResult<Awaitable<'py, PyBindingsReply>> {
         let laser = self.inner.clone();
         let principal = PrincipalId::new(principal);
-        future_into_py(py, async move {
-            match expect_revision {
-                Some(revision) => {
+        awaitable(py, async move {
+            match (expect_revision, mutation_id) {
+                (expect_revision, Some(mutation_id)) => {
+                    laser
+                        .bind_roles_as(principal, roles, expect_revision, mutation_id)
+                        .await
+                }
+                (Some(revision), None) => {
                     laser
                         .bind_roles_expect_revision(principal, roles, revision)
                         .await
                 }
-                None => laser.bind_roles(principal, roles).await,
+                (None, None) => laser.bind_roles(principal, roles).await,
             }
+            .map(PyBindingsReply::from)
             .map_err(to_pyerr)
         })
     }
@@ -216,10 +280,10 @@ impl PyLaser {
         subject: &Bound<'_, PyAny>,
         after_revision: Option<u64>,
         limit: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyAuthzHistoryReply>> {
         let subject: AuthzSubject = py_to_de(subject)?;
         let laser = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let reply = laser
                 .authz_history(subject, after_revision, limit)
                 .await
@@ -244,7 +308,11 @@ pub struct PyResourcePattern {
 impl PyResourcePattern {
     #[new]
     #[pyo3(signature = (kind="all", value=String::new()))]
-    fn new(kind: &str, value: String) -> PyResult<Self> {
+    fn new(
+        #[gen_stub(override_type(type_repr = "typing.Literal['all', 'literal', 'prefix']", imports = ("typing",)))]
+        kind: &str,
+        value: String,
+    ) -> PyResult<Self> {
         let kind = ResourceKind::from_str(kind)
             .map_err(|_| PyValueError::new_err(format!("unknown authz resource kind: {kind}")))?;
         Ok(Self {
@@ -330,6 +398,7 @@ impl PyGrant {
     fn new(
         feature: String,
         action: String,
+        #[gen_stub(override_type(type_repr = "typing.Literal['allow', 'deny']", imports = ("typing",)))]
         effect: String,
         resource: Option<PyResourcePattern>,
     ) -> Self {
@@ -419,6 +488,31 @@ impl From<WhoamiReply> for PyWhoamiReply {
             v: reply.v,
             roles: reply.roles,
             grants: reply.grants.into_iter().map(PyGrant::from).collect(),
+        }
+    }
+}
+
+/// One user's bound role names and the binding revision they were read at,
+/// the value `bind_roles_expect_revision` names. Zero for a user that was
+/// never bound.
+#[gen_stub_pyclass]
+#[pyclass(name = "BindingsReply", frozen)]
+pub struct PyBindingsReply {
+    /// The authorization operation version of the reply.
+    #[pyo3(get)]
+    pub v: u32,
+    #[pyo3(get)]
+    pub roles: Vec<String>,
+    #[pyo3(get)]
+    pub revision: u64,
+}
+
+impl From<BindingsReply> for PyBindingsReply {
+    fn from(reply: BindingsReply) -> Self {
+        Self {
+            v: reply.v,
+            roles: reply.roles,
+            revision: reply.revision,
         }
     }
 }
@@ -535,10 +629,10 @@ impl PyEdgeDenial {
         format!("{:?}", self.inner.code())
     }
 
-    /// The `WWW-Authenticate` challenge naming the scope to acquire, `None`
-    /// for a wrong audience.
+    /// The RFC 6750 `WWW-Authenticate` challenge: `invalid_token` for a wrong
+    /// audience, `insufficient_scope` with the scope to acquire for a step-up.
     #[getter]
-    fn challenge(&self) -> Option<String> {
+    fn challenge(&self) -> String {
         self.inner.challenge()
     }
 

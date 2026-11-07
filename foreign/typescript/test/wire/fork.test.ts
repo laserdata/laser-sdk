@@ -4,12 +4,15 @@ import path from "node:path"
 import { test } from "node:test"
 import {
   decodeForkCreate,
+  decodeForkList,
   decodeForkPut,
   decodeForkReply,
   encodeForkCreate,
+  encodeForkList,
   encodeForkPut,
   encodeForkReply,
-  validateForkId
+  validateForkId,
+  validateForkPut
 } from "../../src/wire/fork.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import { MAX_FORK_ID_BYTES } from "../../src/wire/limits.js"
@@ -84,4 +87,46 @@ void test("given_fork_ids_when_validated_then_should_enforce_charset_and_length"
   assert.throws(() => {
     validateForkId("f".repeat(MAX_FORK_ID_BYTES + 1))
   })
+})
+
+void test("given_a_fork_put_with_nul_text_when_validated_then_should_refuse_it", () => {
+  const valid = {
+    forkId: "draft",
+    table: "orders",
+    partitionId: 0,
+    offset: 1n,
+    projectionId: "orders.v1",
+    projectionVersion: 1,
+    fields: new Map([["status", "ok"]]),
+    metadata: new Map([["role", "user"]]),
+    tombstone: false
+  }
+  assert.doesNotThrow(() => {
+    validateForkPut(valid)
+  })
+  for (const put of [
+    { ...valid, fields: new Map([["status", "o\0k"]]) },
+    { ...valid, metadata: new Map([["ro\0le", "user"]]) },
+    { ...valid, table: "ord\0ers" },
+    { ...valid, projectionId: "orders\0" },
+    { ...valid, embedding: "[1.0\0]" },
+    { ...valid, forkId: "dr aft" }
+  ]) {
+    assert.throws(() => {
+      validateForkPut(put)
+    })
+  }
+})
+
+void test("given_a_fork_listing_with_a_stream_when_round_tripped_then_should_keep_the_stream", () => {
+  const bytes = encodeNamed(encodeForkList({ stream: "acme" }))
+  assert.equal(
+    decodeForkList(expectMap(decodeOne(bytes, "listing"), "listing"), "listing").stream,
+    "acme"
+  )
+  const bare = encodeNamed(encodeForkList())
+  assert.equal(
+    decodeForkList(expectMap(decodeOne(bare, "listing"), "listing"), "listing").stream,
+    undefined
+  )
 })

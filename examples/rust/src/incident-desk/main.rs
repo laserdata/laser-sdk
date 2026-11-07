@@ -541,7 +541,7 @@ impl AgentHandler for Triage {
                 .conversation_id(ConversationId::new())
                 .agent(triage_id.clone())
                 .target_agent_id(specialist_id.clone())
-                .deadline(deadline)
+                .deadline_at(deadline)
                 .build();
             let query = Vec::<u8>::from(format!("{angle} for: {incident}"));
             async move {

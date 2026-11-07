@@ -1,5 +1,5 @@
 use crate::agent_runtime::static_topic;
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::blob::PyBlobStore;
 use crate::client::PyLaser;
 use crate::convert::{duration_ms, payload_bytes, py_to_de, py_to_value, ser_to_py};
@@ -51,7 +51,7 @@ fn parse_content_type(value: Option<String>) -> PyResult<Option<ContentType>> {
 struct SendOptions {
     cause: Option<RecordId>,
     cause_at: Option<LogPosition>,
-    deadline_micros: Option<u64>,
+    deadline_at_micros: Option<u64>,
     idempotency_key: Option<IdempotencyKey>,
     metadata: Vec<(String, Value)>,
     tool: Option<String>,
@@ -65,6 +65,7 @@ struct SendOptions {
     correlation: Option<CorrelationId>,
     task_state: Option<TaskState>,
     last: bool,
+    grant: Option<laser_sdk::agent::ApprovalGrant>,
 }
 
 impl SendOptions {
@@ -97,7 +98,7 @@ impl SendOptions {
     fn new(
         cause: Option<String>,
         cause_at: Option<PyLogPosition>,
-        deadline_micros: Option<u64>,
+        deadline_at_micros: Option<u64>,
         idempotency_key: Option<String>,
         metadata: Option<&Bound<'_, PyDict>>,
         tool: Option<String>,
@@ -131,7 +132,7 @@ impl SendOptions {
         Ok(Self {
             cause,
             cause_at,
-            deadline_micros,
+            deadline_at_micros,
             idempotency_key,
             metadata,
             tool,
@@ -145,6 +146,7 @@ impl SendOptions {
             correlation: None,
             task_state: None,
             last: false,
+            grant: None,
         })
     }
 
@@ -153,12 +155,17 @@ impl SendOptions {
         self
     }
 
+    fn granting(mut self, grant: Option<PyRef<'_, crate::agent_runtime::PyApprovalGrant>>) -> Self {
+        self.grant = grant.map(|grant| grant.inner.clone());
+        self
+    }
+
     fn apply<'a>(&'a self, mut send: AgdxSend<'a>) -> AgdxSend<'a> {
         if let Some(cause) = self.cause {
             send = send.with_cause(cause, self.cause_at);
         }
-        if let Some(deadline_micros) = self.deadline_micros {
-            send = send.with_deadline_micros(deadline_micros);
+        if let Some(deadline_at_micros) = self.deadline_at_micros {
+            send = send.with_deadline_at_micros(deadline_at_micros);
         }
         if let Some(key) = &self.idempotency_key {
             send = send.with_idempotency_key(key.clone());
@@ -193,6 +200,9 @@ impl SendOptions {
         }
         if self.last {
             send = send.last();
+        }
+        if let Some(grant) = &self.grant {
+            send = send.with_grant(grant);
         }
         send
     }
@@ -415,6 +425,7 @@ pub fn command_envelope(
     conversation: String,
     source: String,
     correlation: String,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
     body: &Bound<'_, PyAny>,
     target: Option<String>,
     cause: Option<String>,
@@ -468,6 +479,7 @@ pub fn response_envelope(
     conversation: String,
     source: String,
     correlation: String,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
     body: &Bound<'_, PyAny>,
     target: Option<String>,
     cause: Option<String>,
@@ -521,6 +533,7 @@ pub fn error_envelope(
     conversation: String,
     source: String,
     correlation: String,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
     body: &Bound<'_, PyAny>,
     target: Option<String>,
     cause: Option<String>,
@@ -573,6 +586,7 @@ pub fn event_envelope(
     record: String,
     conversation: String,
     source: String,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
     body: &Bound<'_, PyAny>,
     target: Option<String>,
     cause: Option<String>,
@@ -628,6 +642,7 @@ pub fn chunk_envelope(
     correlation: String,
     channel: String,
     sequence: u64,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
     body: &Bound<'_, PyAny>,
     target: Option<String>,
     cause: Option<String>,
@@ -787,7 +802,7 @@ impl Refinements<'_, '_> {
         if let Some(key) = options.idempotency_key {
             envelope = envelope.with_idempotency_key(key);
         }
-        if let Some(deadline_micros) = options.deadline_micros {
+        if let Some(deadline_micros) = options.deadline_at_micros {
             envelope = envelope.with_deadline_micros(deadline_micros);
         }
         if let Some(finish_reason) = self.terminal {
@@ -831,17 +846,20 @@ pub struct PyAgdx {
 impl PyAgdx {
     /// Publish a `command` (expects a reply or effect under `correlation`).
     /// Returns the minted record id. `cause_at` is a `LogPosition` and requires `cause`.
-    /// `cause`, `deadline_micros`,
+    /// `cause`, `deadline_at_micros` (epoch microseconds),
     /// `idempotency_key`, `metadata`, `tool`, and `usage` refine the envelope.
     /// `claim_check=(store, threshold_bytes)` externalizes a large body.
     /// `signed_by` signs this one send, in place of the producer's
-    /// `signing_key`, on every verb that publishes an envelope.
-    #[pyo3(signature = (correlation, body, *, operation=None, content_type=None, target=None, task_state=None, last=false, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, receipt=false))]
+    /// `signing_key`, on every verb that publishes an envelope. `grant` carries
+    /// an `ApprovalGrant` to the action governor, so a step-up in the grant's
+    /// conversation proceeds on that approval.
+    #[pyo3(signature = (correlation, body, *, operation=None, content_type=None, target=None, task_state=None, last=false, cause=None, cause_at=None, deadline_at_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, grant=None, receipt=false))]
     #[allow(clippy::too_many_arguments)]
     fn command<'py>(
         &self,
         py: Python<'py>,
         correlation: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         body: &Bound<'_, PyAny>,
         operation: Option<String>,
         content_type: Option<String>,
@@ -850,7 +868,7 @@ impl PyAgdx {
         last: bool,
         cause: Option<String>,
         cause_at: Option<PyLogPosition>,
-        deadline_micros: Option<u64>,
+        deadline_at_micros: Option<u64>,
         idempotency_key: Option<String>,
         metadata: Option<&Bound<'_, PyDict>>,
         tool: Option<String>,
@@ -860,13 +878,14 @@ impl PyAgdx {
         parent: Option<String>,
         root: Option<String>,
         finish_reason: Option<String>,
+        grant: Option<PyRef<'_, crate::agent_runtime::PyApprovalGrant>>,
         receipt: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let agdx = self.inner.clone();
         let options = SendOptions::new(
             cause,
             cause_at,
-            deadline_micros,
+            deadline_at_micros,
             idempotency_key,
             metadata,
             tool,
@@ -876,13 +895,14 @@ impl PyAgdx {
         )?
         .with_ancestry(parent, root, receipt)?
         .finishing(finish_reason)
+        .granting(grant)
         .refining(None, task_state, last)?;
         let signing_key = self.signing_key.clone();
         let correlation = wire_correlation(&correlation)?;
         let body = payload_bytes(body)?;
         let content_type = parse_content_type(content_type)?;
         let target = target.map(|t| wire_agent(&t)).transpose()?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut send = agdx.command(correlation, body);
             if let Some(key) = signing_key.as_ref() {
                 send = send.signed_by(key);
@@ -904,12 +924,13 @@ impl PyAgdx {
     }
 
     /// Publish a `response` (the paired answer to a command, same `correlation`).
-    #[pyo3(signature = (correlation, body, *, operation=None, content_type=None, target=None, task_state=None, last=false, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, receipt=false))]
+    #[pyo3(signature = (correlation, body, *, operation=None, content_type=None, target=None, task_state=None, last=false, cause=None, cause_at=None, deadline_at_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, grant=None, receipt=false))]
     #[allow(clippy::too_many_arguments)]
     fn respond<'py>(
         &self,
         py: Python<'py>,
         correlation: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         body: &Bound<'_, PyAny>,
         operation: Option<String>,
         content_type: Option<String>,
@@ -918,7 +939,7 @@ impl PyAgdx {
         last: bool,
         cause: Option<String>,
         cause_at: Option<PyLogPosition>,
-        deadline_micros: Option<u64>,
+        deadline_at_micros: Option<u64>,
         idempotency_key: Option<String>,
         metadata: Option<&Bound<'_, PyDict>>,
         tool: Option<String>,
@@ -928,13 +949,14 @@ impl PyAgdx {
         parent: Option<String>,
         root: Option<String>,
         finish_reason: Option<String>,
+        grant: Option<PyRef<'_, crate::agent_runtime::PyApprovalGrant>>,
         receipt: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let agdx = self.inner.clone();
         let options = SendOptions::new(
             cause,
             cause_at,
-            deadline_micros,
+            deadline_at_micros,
             idempotency_key,
             metadata,
             tool,
@@ -944,13 +966,14 @@ impl PyAgdx {
         )?
         .with_ancestry(parent, root, receipt)?
         .finishing(finish_reason)
+        .granting(grant)
         .refining(None, task_state, last)?;
         let signing_key = self.signing_key.clone();
         let correlation = wire_correlation(&correlation)?;
         let body = payload_bytes(body)?;
         let content_type = parse_content_type(content_type)?;
         let target = target.map(|t| wire_agent(&t)).transpose()?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut send = agdx.respond(correlation, body);
             if let Some(key) = signing_key.as_ref() {
                 send = send.signed_by(key);
@@ -972,11 +995,12 @@ impl PyAgdx {
     }
 
     /// Publish an `event` (expects nothing back).
-    #[pyo3(signature = (body, *, operation=None, content_type=None, target=None, correlation=None, task_state=None, last=false, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, receipt=false))]
+    #[pyo3(signature = (body, *, operation=None, content_type=None, target=None, correlation=None, task_state=None, last=false, cause=None, cause_at=None, deadline_at_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, grant=None, receipt=false))]
     #[allow(clippy::too_many_arguments)]
     fn emit<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         body: &Bound<'_, PyAny>,
         operation: Option<String>,
         content_type: Option<String>,
@@ -986,7 +1010,7 @@ impl PyAgdx {
         last: bool,
         cause: Option<String>,
         cause_at: Option<PyLogPosition>,
-        deadline_micros: Option<u64>,
+        deadline_at_micros: Option<u64>,
         idempotency_key: Option<String>,
         metadata: Option<&Bound<'_, PyDict>>,
         tool: Option<String>,
@@ -996,13 +1020,14 @@ impl PyAgdx {
         parent: Option<String>,
         root: Option<String>,
         finish_reason: Option<String>,
+        grant: Option<PyRef<'_, crate::agent_runtime::PyApprovalGrant>>,
         receipt: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let agdx = self.inner.clone();
         let options = SendOptions::new(
             cause,
             cause_at,
-            deadline_micros,
+            deadline_at_micros,
             idempotency_key,
             metadata,
             tool,
@@ -1012,12 +1037,13 @@ impl PyAgdx {
         )?
         .with_ancestry(parent, root, receipt)?
         .finishing(finish_reason)
+        .granting(grant)
         .refining(correlation, task_state, last)?;
         let signing_key = self.signing_key.clone();
         let body = payload_bytes(body)?;
         let content_type = parse_content_type(content_type)?;
         let target = target.map(|t| wire_agent(&t)).transpose()?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut send = agdx.emit(body);
             if let Some(key) = signing_key.as_ref() {
                 send = send.signed_by(key);
@@ -1040,7 +1066,7 @@ impl PyAgdx {
 
     /// Publish a `status` signal. Task status updates require both
     /// `correlation` and `task_state`. Set `last` for a terminal update.
-    #[pyo3(signature = (operation, *, correlation=None, task_state=None, body=None, content_type=None, target=None, last=false, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, receipt=false))]
+    #[pyo3(signature = (operation, *, correlation=None, task_state=None, body=None, content_type=None, target=None, last=false, cause=None, cause_at=None, deadline_at_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, grant=None, receipt=false))]
     #[allow(clippy::too_many_arguments)]
     fn status<'py>(
         &self,
@@ -1054,7 +1080,7 @@ impl PyAgdx {
         last: bool,
         cause: Option<String>,
         cause_at: Option<PyLogPosition>,
-        deadline_micros: Option<u64>,
+        deadline_at_micros: Option<u64>,
         idempotency_key: Option<String>,
         metadata: Option<&Bound<'_, PyDict>>,
         tool: Option<String>,
@@ -1064,13 +1090,14 @@ impl PyAgdx {
         parent: Option<String>,
         root: Option<String>,
         finish_reason: Option<String>,
+        grant: Option<PyRef<'_, crate::agent_runtime::PyApprovalGrant>>,
         receipt: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let agdx = self.inner.clone();
         let options = SendOptions::new(
             cause,
             cause_at,
-            deadline_micros,
+            deadline_at_micros,
             idempotency_key,
             metadata,
             tool,
@@ -1079,7 +1106,8 @@ impl PyAgdx {
             signed_by,
         )?
         .with_ancestry(parent, root, receipt)?
-        .finishing(finish_reason);
+        .finishing(finish_reason)
+        .granting(grant);
         let correlation = correlation
             .map(|value| wire_correlation(&value))
             .transpose()?;
@@ -1088,7 +1116,7 @@ impl PyAgdx {
         let body = body.map(payload_bytes).transpose()?;
         let content_type = parse_content_type(content_type)?;
         let target = target.map(|value| wire_agent(&value)).transpose()?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut send = agdx.status(operation);
             if let Some(key) = signing_key.as_ref() {
                 send = send.signed_by(key);
@@ -1121,7 +1149,7 @@ impl PyAgdx {
     /// Publish a structured `error` terminal for `correlation`. The body is
     /// the CBOR-encoded `error` dict (an `AgentErrorBody`), so its content
     /// type is fixed.
-    #[pyo3(signature = (correlation, error, *, operation=None, target=None, task_state=None, last=false, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, receipt=false))]
+    #[pyo3(signature = (correlation, error, *, operation=None, target=None, task_state=None, last=false, cause=None, cause_at=None, deadline_at_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, grant=None, receipt=false))]
     #[allow(clippy::too_many_arguments)]
     fn fail<'py>(
         &self,
@@ -1134,7 +1162,7 @@ impl PyAgdx {
         last: bool,
         cause: Option<String>,
         cause_at: Option<PyLogPosition>,
-        deadline_micros: Option<u64>,
+        deadline_at_micros: Option<u64>,
         idempotency_key: Option<String>,
         metadata: Option<&Bound<'_, PyDict>>,
         tool: Option<String>,
@@ -1144,13 +1172,14 @@ impl PyAgdx {
         parent: Option<String>,
         root: Option<String>,
         finish_reason: Option<String>,
+        grant: Option<PyRef<'_, crate::agent_runtime::PyApprovalGrant>>,
         receipt: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let agdx = self.inner.clone();
         let options = SendOptions::new(
             cause,
             cause_at,
-            deadline_micros,
+            deadline_at_micros,
             idempotency_key,
             metadata,
             tool,
@@ -1160,12 +1189,13 @@ impl PyAgdx {
         )?
         .with_ancestry(parent, root, receipt)?
         .finishing(finish_reason)
+        .granting(grant)
         .refining(None, task_state, last)?;
         let signing_key = self.signing_key.clone();
         let correlation = wire_correlation(&correlation)?;
         let error: AgentErrorBody = py_to_de(error)?;
         let target = target.map(|value| wire_agent(&value)).transpose()?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut send = agdx.fail(correlation, &error).map_err(to_pyerr)?;
             if let Some(key) = signing_key.as_ref() {
                 send = send.signed_by(key);
@@ -1192,27 +1222,30 @@ impl PyAgdx {
         })
     }
 
-    /// Human-in-the-loop interrupt/resume: publish a prompt `command` under a
-    /// fresh correlation on this producer's topic, then await the human's
-    /// correlated `response` on `reply_topic` up to `timeout_ms` and return
-    /// its body bytes. A responder answers with `AgentCtx.respond_input`, or
-    /// rejects with an error which raises here. Blocks the caller until the
-    /// response lands or the timeout elapses, which is the point: the task is
-    /// genuinely paused on a human. `target` addresses the prompt to one
-    /// agent. Without it every agent on a shared session topic receives it.
+    /// Human-in-the-loop interrupt/resume: publish an `input-required` task
+    /// status and the prompt as an `input_request` command under a fresh
+    /// correlation on this producer's topic, then await the correlated
+    /// `response` on `reply_topic` up to `timeout_ms` and return its body
+    /// bytes. Only an agent that lists `input_request` among its `operations`
+    /// receives the prompt as work. A responder answers with
+    /// `AgentCtx.respond_input`, or rejects with an error which raises here.
+    /// `target` addresses the prompt to one approver and accepts only its
+    /// answer, signed by it when a verifier is configured. Without it every
+    /// agent on a shared session topic receives it.
     #[pyo3(signature = (reply_topic, prompt, *, timeout_ms, target=None))]
     fn request_input<'py>(
         &self,
         py: Python<'py>,
         reply_topic: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         prompt: &Bound<'_, PyAny>,
         timeout_ms: f64,
         target: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let agdx = self.inner.clone();
         let prompt = payload_bytes(prompt)?;
         let target = target.as_deref().map(wire_agent).transpose()?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let reply_topic = static_topic(reply_topic)?;
             let timeout = duration_ms(timeout_ms, "timeout_ms")?;
             let body = match target {
@@ -1277,11 +1310,11 @@ impl PyAgdxStream {
 
     /// Declare the reader-local abandonment bound. It rides the opening chunk,
     /// so set it before the first write.
-    fn with_deadline_micros(
+    fn with_deadline_at_micros(
         slf: PyRef<'_, Self>,
-        deadline_micros: u64,
+        deadline_at_micros: u64,
     ) -> PyResult<PyRef<'_, Self>> {
-        slf.configure(|stream| stream.with_deadline_micros(deadline_micros))?;
+        slf.configure(|stream| stream.with_deadline_at_micros(deadline_at_micros))?;
         Ok(slf)
     }
 
@@ -1318,9 +1351,9 @@ impl PyAgdxStream {
 
     /// Append everything buffered as one batch. A no-op when unbuffered or
     /// empty.
-    fn flush<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn flush<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let cell = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut guard = cell.lock().await;
             let stream = guard.as_mut().ok_or_else(|| {
                 to_pyerr(LaserError::HandlerConfig(
@@ -1331,10 +1364,15 @@ impl PyAgdxStream {
         })
     }
     /// Publish the next chunk (str, bytes, or bytearray).
-    fn write<'py>(&self, py: Python<'py>, body: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn write<'py>(
+        &self,
+        py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        body: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, ()>> {
         let cell = self.inner.clone();
         let body = payload_bytes(body)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut guard = cell.lock().await;
             let stream = guard.as_mut().ok_or_else(|| {
                 to_pyerr(LaserError::HandlerConfig(
@@ -1353,10 +1391,10 @@ impl PyAgdxStream {
         py: Python<'py>,
         finish_reason: String,
         usage: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let cell = self.inner.clone();
         let usage: Option<TokenUsage> = usage.map(py_to_de).transpose()?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let stream = cell.lock().await.take().ok_or_else(|| {
                 to_pyerr(LaserError::HandlerConfig(
                     "the stream is already finished".to_owned(),
@@ -1367,10 +1405,10 @@ impl PyAgdxStream {
     }
 
     /// Publish a structured `error` terminal for the stream.
-    fn fail<'py>(&self, py: Python<'py>, error: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn fail<'py>(&self, py: Python<'py>, error: &Bound<'_, PyAny>) -> PyResult<Awaitable<'py, ()>> {
         let cell = self.inner.clone();
         let error: AgentErrorBody = py_to_de(error)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let stream = cell.lock().await.take().ok_or_else(|| {
                 to_pyerr(LaserError::HandlerConfig(
                     "the stream is already finished".to_owned(),
@@ -1429,7 +1467,10 @@ impl PyLogPosition {
 
     /// Unpack a locator from its 20 big-endian bytes.
     #[staticmethod]
-    fn from_bytes(payload: Vec<u8>) -> PyResult<Self> {
+    fn from_bytes(
+        #[gen_stub(override_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+        payload: Vec<u8>,
+    ) -> PyResult<Self> {
         let payload = payload.as_slice().try_into().map_err(|_| {
             InvalidError::new_err(format!("a log position is 20 bytes, got {}", payload.len()))
         })?;

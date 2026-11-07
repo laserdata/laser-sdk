@@ -41,9 +41,9 @@
   "context": {
     "execution_id": "00000000000000000000000001",
     "engine": {
-      "name": "datafusion",
-      "version": "50.0.0",
-      "dialect": "data_fusion"
+      "name": "postgres",
+      "version": "17.0",
+      "dialect": "postgres"
     },
     "resolved_target": {
       "kind": "operational",

@@ -26,6 +26,7 @@ import {
   type SessionInfo,
   type SessionLayout,
   type SessionLease,
+  type SessionPage,
   type Sessions,
 } from "@laserdata/laser-sdk";
 import { wire } from "@laserdata/laser-sdk/full";
@@ -54,6 +55,7 @@ interface Managed {
   lease?: SessionLease;
   watch?: Promise<unknown>;
   watchAbort?: AbortController;
+  walk?: SessionPage;
   readonly handled: ConversationId[];
   writer?: Laser;
   retained?: Session;
@@ -151,6 +153,19 @@ async function managedStream(
   assert.ok(
     bootstrap.registered,
     "a deployment that serves sessions registers the stream",
+  );
+  await promisify(execFile)(
+    "node",
+    [
+      fileURLToPath(
+        new URL("../../../session-lane-admin.mjs", import.meta.url),
+      ),
+      world.endpoint,
+      sessions.stream(),
+      "readiness",
+      "4",
+    ],
+    { timeout: 60_000 },
   );
   return { laser, sessions };
 }
@@ -289,8 +304,12 @@ Then(
   async function (this: LaserWorld, count: string) {
     const sessions = sessionsOf(this);
     const page = await eventually("the completed count", async () => {
-      const page = await sessions.list().status("completed").total().fetch();
-      return page.total === BigInt(count) ? page : undefined;
+      const page = await sessions
+        .list()
+        .status("completed")
+        .results(100)
+        .fetch();
+      return page.totalResults === Number(count) ? page : undefined;
     });
     assert.equal(page.items.length, Number(count));
   },
@@ -920,8 +939,8 @@ Then(
   /^the change feed names the session in at most (\d+) rows$/,
   async function (this: LaserWorld, rows: string) {
     const id = this.requireSession().conversation;
-    const changes = await sessionsOf(this).changes(0n, 0);
-    const naming = changes.rows.filter((row) =>
+    const changes = await sessionsOf(this).changes(1, 100);
+    const naming = changes.items.filter((row) =>
       row.sessions.some((session) => same(session, id)),
     );
     assert.ok(naming.length >= 1, json(changes));
@@ -941,16 +960,16 @@ Then(
     assert.ok(second !== undefined && other !== undefined);
     // The second stream's own feed names it, so both folds have run.
     await eventually("the second stream's feed", async () => {
-      const changes = await second.changes(0n, 0);
-      return changes.rows.some((row) =>
+      const changes = await second.changes(1, 100);
+      return changes.items.some((row) =>
         row.sessions.some((session) => same(session, other)),
       )
         ? changes
         : undefined;
     });
-    const changes = await sessionsOf(this).changes(0n, 0);
+    const changes = await sessionsOf(this).changes(1, 100);
     assert.ok(
-      changes.rows.every(
+      changes.items.every(
         (row) => !row.sessions.some((session) => same(session, other)),
       ),
       json(changes),
@@ -1015,6 +1034,37 @@ Then(
 );
 
 Then(
+  /^the session timeline reads (\d+) events over (\d+) pages of (\d+)$/,
+  async function (
+    this: LaserWorld,
+    total: string,
+    pages: string,
+    results: string,
+  ) {
+    const sessions = sessionsOf(this);
+    const id = this.requireSession().conversation;
+    const walked: string[] = [];
+    for (let page = 1; page <= Number(pages); page += 1) {
+      const read = await sessions
+        .events(id)
+        .page(page)
+        .results(Number(results))
+        .fetch();
+      assert.deepEqual(
+        [read.totalResults, read.totalPages, read.page],
+        [Number(total), Number(pages), page],
+      );
+      walked.push(...read.items.map((event) => event.display));
+    }
+    const whole = await sessions.events(id).results(100).fetch();
+    assert.deepEqual(
+      walked,
+      whole.items.map((event) => event.display),
+    );
+  },
+);
+
+Then(
   "the session sources show folded offsets within their heads",
   async function (this: LaserWorld) {
     const sources = await sessionsOf(this).sources(
@@ -1035,6 +1085,39 @@ Then("the session has no links", async function (this: LaserWorld) {
   const view = await sessionsOf(this).links(this.requireSession().conversation);
   assert.deepEqual(view.links, [], json(view));
 });
+
+When(
+  /^a list walk of (\d+) sessions? per page reads its first page$/,
+  async function (this: LaserWorld, results: string) {
+    managed(this).walk = await sessionsOf(this)
+      .list()
+      .results(Number(results))
+      .fetch();
+  },
+);
+
+Then(
+  /^the list walk's second page completes "([^"]+)" and "([^"]+)" once each$/,
+  async function (this: LaserWorld, first: string, second: string) {
+    const state = managed(this);
+    const start = state.walk;
+    assert.ok(start !== undefined, "a list walk");
+    const next = await sessionsOf(this)
+      .list()
+      .page(2)
+      .results(start.items.length)
+      .asOf(start.asOf, start.series)
+      .fetch();
+    const walked = [...start.items, ...next.items]
+      .map((item) => item.id.toString())
+      .sort();
+    const expected = [first, second]
+      .map((label) => idOf(this, label).toString())
+      .sort();
+    assert.deepEqual(walked, expected);
+    assert.deepEqual([start.totalResults, next.totalResults], [2, 2]);
+  },
+);
 
 Then("the watch reports the session", async function (this: LaserWorld) {
   const state = managed(this);
@@ -1077,6 +1160,14 @@ Given(
       .spawn(laserOf(this));
     await worker.ready();
     state.worker = worker;
+  },
+);
+
+Then(
+  /^agent "([^"]+)" handled (\d+) commands?$/,
+  function (this: LaserWorld, name: string, count: string) {
+    const state = managed(this);
+    assert.equal(state.handled.length, Number(count), `agent ${name} handled`);
   },
 );
 
@@ -1229,10 +1320,8 @@ When(
       new URL("../../../session-lane-admin.mjs", import.meta.url),
     );
     await promisify(execFile)(
-      "rtk",
+      "node",
       [
-        "proxy",
-        "node",
         helper,
         this.endpoint,
         this.requireSession().stream(),
@@ -1245,8 +1334,20 @@ When(
 );
 
 async function laneRecordCount(world: LaserWorld): Promise<bigint> {
-  const helper = fileURLToPath(new URL("../../../session-lane-admin.mjs", import.meta.url));
-  const { stdout } = await promisify(execFile)("rtk", ["proxy", "node", helper, world.endpoint, world.requireSession().stream(), "record count", "1"], { timeout: 60_000 });
+  const helper = fileURLToPath(
+    new URL("../../../session-lane-admin.mjs", import.meta.url),
+  );
+  const { stdout } = await promisify(execFile)(
+    "node",
+    [
+      helper,
+      world.endpoint,
+      world.requireSession().stream(),
+      "record count",
+      "1",
+    ],
+    { timeout: 60_000 },
+  );
   return BigInt(stdout.trim());
 }
 
@@ -1484,17 +1585,8 @@ When(
       new URL("../../../session-lane-admin.mjs", import.meta.url),
     );
     await promisify(execFile)(
-      "rtk",
-      [
-        "proxy",
-        "node",
-        helper,
-        this.endpoint,
-        stream,
-        "writer credentials",
-        "4",
-        username,
-      ],
+      "node",
+      [helper, this.endpoint, stream, "writer credentials", "4", username],
       { timeout: 60_000 },
     );
     const address = this.endpoint.split("@").at(-1);

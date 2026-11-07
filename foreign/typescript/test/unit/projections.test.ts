@@ -6,10 +6,10 @@ import { InvalidError, QueryExecutionError, UnsupportedError } from "../../src/c
 import { Bindings, Projections, Schemas } from "../../src/managed/projections.js"
 import { encodeNamed } from "../../src/wire/cbor.js"
 import type { BrowseOutcome, BrowseReply } from "../../src/wire/browse.js"
-import { encodeBrowseReply } from "../../src/wire/browse.js"
+import { decodeListSchemas, encodeBrowseReply } from "../../src/wire/browse.js"
 import { ContentType } from "../../src/wire/content.js"
 import type { ControlCommand, Projection } from "../../src/wire/control.js"
-import { decodeOne } from "../../src/wire/cbor.js"
+import { decodeOne, expectMap } from "../../src/wire/cbor.js"
 import { AGDX_CONTROL_PUBLISH_CODE } from "../../src/wire/codes.js"
 import { INTERNAL_TRANSPORT } from "../../src/client/internals.js"
 import { Laser } from "../../src/client/laser.js"
@@ -64,6 +64,7 @@ const ROW_PROJECTION: Projection = {
   name: "readings",
   version: 1,
   kind: { kind: "row" },
+  history: { kind: "append" },
   contentType: ContentType.Json,
   extraction: { fields: [], inlinePayload: false },
   inlinePayloadDefault: false
@@ -169,7 +170,10 @@ void test("given_an_id_when_drop_and_drop_graph_are_called_then_should_publish_t
 
 void test("given_a_projection_outcome_when_get_is_called_then_should_return_it", async () => {
   const transport = fakeTransport([
-    okFrame({ kind: "projection", projection: { projection: ROW_PROJECTION, bindings: [] } })
+    okFrame({
+      kind: "projection",
+      projection: { projection: ROW_PROJECTION, bindings: [], status: [] }
+    })
   ])
   const projections = Projections.create(
     transport,
@@ -192,7 +196,15 @@ void test("given_an_absent_projection_outcome_when_get_is_called_then_should_ret
 
 void test("given_filters_when_list_is_fetched_then_should_send_them_and_return_the_matches", async () => {
   const transport = fakeTransport([
-    okFrame({ kind: "projections", projections: [{ projection: ROW_PROJECTION, bindings: [] }] })
+    okFrame({
+      kind: "projections",
+      page: {
+        items: [{ projection: ROW_PROJECTION, bindings: [], status: [] }],
+        page: 2,
+        totalPages: 3,
+        totalResults: 21
+      }
+    })
   ])
   const projections = Projections.create(
     transport,
@@ -205,9 +217,34 @@ void test("given_filters_when_list_is_fetched_then_should_send_them_and_return_t
     .nameContains("ord")
     .idPrefix("readings")
     .search("ord")
+    .page(2)
+    .results(10)
     .fetch()
-  assert.equal(list.length, 1)
+  assert.equal(list.items.length, 1)
+  assert.deepEqual([list.page, list.totalPages, list.totalResults], [2, 3, 21])
   assert.equal(transport.calls.length, 1)
+  assert.throws(() => projections.list().page(-1), InvalidError)
+  assert.throws(() => projections.list().results(1.5), InvalidError)
+})
+
+void test("given_a_browse_the_server_refuses_when_listed_then_should_carry_the_server_text", async () => {
+  const transport = fakeTransport([
+    replyFrame({
+      kind: "err",
+      error: { kind: "invalid", message: "decode browse request: unknown field" }
+    })
+  ])
+  const projections = Projections.create(
+    transport,
+    () => Promise.resolve(CAPS),
+    () => Promise.resolve()
+  )
+  await assert.rejects(
+    () => projections.list().fetch(),
+    (error: unknown) =>
+      error instanceof QueryExecutionError &&
+      error.message === "invalid query: decode browse request: unknown field"
+  )
 })
 
 void test("given_open_capabilities_when_get_is_called_then_should_reject_before_the_transport", async () => {
@@ -241,7 +278,8 @@ void test("given_a_binding_when_applied_and_removed_then_should_publish_the_righ
     allowedProjections: [ROW_PROJECTION.id],
     index: "events",
     notify: false,
-    skipRejected: false
+    invalidRecords: "block" as const,
+    oversize: "block" as const
   }
   await bindings.apply(binding)
   await bindings.remove({ stream: "readings", topic: "events" }, "reading.v1")
@@ -279,14 +317,48 @@ void test("given_a_schema_id_when_dropped_gotten_and_listed_then_should_use_the_
     }),
     okFrame({
       kind: "schemas",
-      schemas: [{ schema: { id: 7, source: { kind: "jsonSchema", schema: "{}" } }, dropped: false }]
+      page: {
+        items: [
+          { schema: { id: 7, source: { kind: "jsonSchema", schema: "{}" } }, dropped: false }
+        ],
+        page: 2,
+        totalPages: 2,
+        totalResults: 6
+      }
     })
   ])
   const schemas = Schemas.create(transport, () => Promise.resolve(CAPS), control.publish)
   await schemas.drop(7)
   const info = await schemas.get(7)
-  const list = await schemas.list()
+  const list = await schemas.list().nameContains("read").page(2).results(5).fetch()
   assert.deepEqual(control.calls, [{ kind: "dropSchema", id: 7 }])
   assert.equal(info?.schema.id, 7)
-  assert.equal(list.length, 1)
+  assert.deepEqual([list.items.length, list.page, list.totalResults], [1, 2, 6])
+  const sent = transport.calls[1]?.payload
+  assert.ok(sent !== undefined)
+  assert.deepEqual(decodeListSchemas(expectMap(decodeOne(sent, "list"), "list"), "list"), {
+    v: 1,
+    nameContains: "read",
+    page: 2,
+    results: 5
+  })
+})
+
+void test("given_a_json_schema_of_another_draft_when_registered_then_should_refuse_it_before_the_transport", async () => {
+  const transport = fakeTransport([])
+  const schemas = Schemas.create(
+    transport,
+    () => Promise.resolve(CAPS),
+    () => Promise.resolve()
+  )
+  await assert.rejects(
+    schemas
+      .register({
+        kind: "jsonSchema",
+        schema: JSON.stringify({ $schema: "http://json-schema.org/draft-07/schema#" })
+      })
+      .send(),
+    InvalidError
+  )
+  assert.equal(transport.calls.length, 0)
 })

@@ -45,6 +45,7 @@ def test_authz_types_are_exposed():
     assert ls.Grant is not None
     assert ls.Role is not None
     assert ls.WhoamiReply is not None
+    assert ls.BindingsReply is not None
     assert ls.AuthzHistoryReply is not None
 
 
@@ -85,18 +86,27 @@ def test_given_role_names_when_validated_then_should_reject_invalid_ones():
         ls.validate_role_name("bad name")
 
 
+def test_given_a_grant_on_an_unenforced_feature_when_a_role_is_validated_then_should_raise_invalid():  # noqa: E501
+    ls.validate_role("reader", [ls.Grant("kv", "read"), ls.Grant("session", "read")])
+    for feature in ("memory", "agent", "workflow"):
+        with pytest.raises(ls.InvalidError):
+            ls.validate_role("reader", [ls.Grant("kv", "read"), ls.Grant(feature, "read")])
+    with pytest.raises(ls.InvalidError):
+        ls.validate_role("bad name", [])
+
+
 def test_given_edge_claims_when_authorized_then_should_return_the_denial():
     assert ls.authorize_edge(["mcp.laserdata"], ["tool:read"], "mcp.laserdata", "tool:read") is None
     step_up = ls.authorize_edge(["mcp.laserdata"], ["tool:read"], "mcp.laserdata", "tool:write")
     assert step_up == ls.EdgeDenial.step_up("tool:write")
     assert step_up.kind == "step_up"
     assert step_up.code == "StepUpRequired"
-    assert step_up.challenge == 'Bearer scope="tool:write"'
+    assert step_up.challenge == 'Bearer error="insufficient_scope", scope="tool:write"'
     assert step_up.required_scope == "tool:write"
     assert step_up.expected is None
     foreign = ls.authorize_edge(["other.server"], ["tool:write"], "mcp.laserdata", "tool:write")
     assert foreign == ls.EdgeDenial.wrong_audience("mcp.laserdata")
     assert foreign.code == "Unauthenticated"
-    assert foreign.challenge is None
+    assert foreign.challenge == 'Bearer error="invalid_token"'
     assert foreign.expected == "mcp.laserdata"
     assert foreign.required_scope is None

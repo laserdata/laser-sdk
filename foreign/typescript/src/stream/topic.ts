@@ -3,9 +3,16 @@ import type {
   MessageWithHeaders,
   SendMessagesResponse
 } from "../iggy/apache-iggy.js"
+import type { Materialization, MaterializeRequest } from "../managed/materialize.js"
 import type { HeaderValue } from "./header-value.js"
 import { type BytesLike, ownedBytes } from "../client/bytes.js"
-import { InvalidError, PublishFailedError, UnsupportedError } from "../client/errors.js"
+import { type CallOptions, abortable, cancellable, throwIfAborted } from "../client/call-options.js"
+import {
+  CancelledError,
+  InvalidError,
+  PublishFailedError,
+  UnsupportedError
+} from "../client/errors.js"
 import { CompiledSchema } from "../schema-codecs.js"
 import type { SchemaDef } from "../wire/control.js"
 import { ContentType } from "../wire/content.js"
@@ -33,7 +40,7 @@ export type GovernPublish = (
   provenance?: Provenance
 ) => Promise<Uint8Array>
 
-export type ResolveSchema = (id: number) => Promise<SchemaDef | undefined>
+export type ResolveSchema = (id: number, options?: CallOptions) => Promise<SchemaDef | undefined>
 
 export type ObserveEffect = <T>(
   operation: string,
@@ -59,7 +66,8 @@ export class Topic {
     private readonly govern?: GovernPublish,
     private readonly resolveSchema?: ResolveSchema,
     private readonly observe?: ObserveEffect,
-    private readonly groups?: GroupContext
+    private readonly groups?: GroupContext,
+    private readonly materializeRequest?: () => MaterializeRequest
   ) {
     this.streamName = streamName
   }
@@ -72,9 +80,35 @@ export class Topic {
     govern?: GovernPublish,
     resolveSchema?: ResolveSchema,
     observe?: ObserveEffect,
-    groups?: GroupContext
+    groups?: GroupContext,
+    materializeRequest?: () => MaterializeRequest
   ): Topic {
-    return new Topic(transport, streamName, name, govern, resolveSchema, observe, groups)
+    return new Topic(
+      transport,
+      streamName,
+      name,
+      govern,
+      resolveSchema,
+      observe,
+      groups,
+      materializeRequest
+    )
+  }
+
+  materialize(): MaterializeRequest {
+    if (this.materializeRequest === undefined)
+      throw new UnsupportedError("materializations require a managed client", {
+        surface: "materializations"
+      })
+    return this.materializeRequest()
+  }
+
+  /** The handle `materialize().apply()` returned for the setup whose
+   * projection is `projectionId`, read under this topic's stream. A setup
+   * without an explicit projection id or typed projection uses the index
+   * name, which defaults to the topic name. */
+  materialization(projectionId: string): Materialization {
+    return this.materialize().attach(projectionId)
   }
 
   /** Idempotently creates this topic with `partitions`, creating its stream
@@ -82,29 +116,41 @@ export class Topic {
    * `replicationFactor` is how many nodes store each partition,
    * 1..=`MAX_REPLICATION_FACTOR` and at most the cluster's node count, the
    * server's default when left out. An existing topic is left as it is. */
-  async ensure(partitions: number = DEFAULT_PARTITIONS, replicationFactor?: number): Promise<void> {
-    await this.ensureWithExpiry(partitions, undefined, replicationFactor)
+  async ensure(
+    partitions: number = DEFAULT_PARTITIONS,
+    replicationFactor?: number,
+    options: CallOptions = {}
+  ): Promise<void> {
+    await this.ensureWithExpiry(partitions, undefined, replicationFactor, options)
   }
 
   /** @internal `ensure` that also sets the message expiry of the topic. */
   async ensureWithExpiry(
     partitions: number = DEFAULT_PARTITIONS,
     messageExpiryMicros?: bigint,
-    replicationFactor?: number
+    replicationFactor?: number,
+    options: CallOptions = {}
   ): Promise<void> {
+    const signal = options.signal
+    throwIfAborted(signal, "topic ensure")
     await this.observed("ensure", { partitions }, async () => {
-      await this.transport.ensureStream(this.streamName)
+      await abortable(this.transport.ensureStream(this.streamName), signal, "topic ensure")
       if (messageExpiryMicros !== undefined && this.transport.ensureTopicWithExpiry !== undefined) {
-        await this.transport.ensureTopicWithExpiry(
-          this.streamName,
-          this.name,
-          partitions,
-          messageExpiryMicros,
-          replicationFactor
+        const ensureTopicWithExpiry = this.transport.ensureTopicWithExpiry.bind(this.transport)
+        await cancellable(signal, "topic ensure", () =>
+          ensureTopicWithExpiry(
+            this.streamName,
+            this.name,
+            partitions,
+            messageExpiryMicros,
+            replicationFactor
+          )
         )
         return
       }
-      await this.transport.ensureTopic(this.streamName, this.name, partitions, replicationFactor)
+      await cancellable(signal, "topic ensure", () =>
+        this.transport.ensureTopic(this.streamName, this.name, partitions, replicationFactor)
+      )
     })
   }
 
@@ -113,21 +159,45 @@ export class Topic {
    * joining it or giving it a filter policy. `consumerGroup(name).create()`
    * configures a policy in the same step.
    */
-  async ensureConsumerGroup(name: string): Promise<void> {
+  async ensureConsumerGroup(name: string, options: CallOptions = {}): Promise<void> {
     await this.observed("ensure", { group: name }, async () => {
-      await this.consumerGroup(name).create()
+      await this.consumerGroup(name).create(options)
     })
   }
 
-  async send(payload: BytesLike, options: RawSendOptions = {}): Promise<SendMessagesResponse> {
+  async send(
+    payload: BytesLike,
+    options: RawSendOptions & CallOptions = {}
+  ): Promise<SendMessagesResponse> {
     if (options.key !== undefined && options.partition !== undefined) {
       throw new InvalidError("send() accepts a routing key or an explicit partition, not both")
     }
-    const input = ownedBytes(payload)
-    const bytes =
-      this.govern === undefined
-        ? input
-        : await this.govern(this.streamName, this.name, input, options.provenance)
+    throwIfAborted(options.signal, "topic publish")
+    return this.sendGoverned(
+      await abortable(
+        this.governPayload(ownedBytes(payload), options.provenance),
+        options.signal,
+        "topic publish"
+      ),
+      options
+    )
+  }
+
+  /** @internal The body this topic's governor lets through for `payload`. */
+  governPayload(payload: Uint8Array, provenance?: Provenance): Promise<Uint8Array> {
+    return this.govern === undefined
+      ? Promise.resolve(payload)
+      : this.govern(this.streamName, this.name, payload, provenance)
+  }
+
+  /** @internal `send` for a body the governor already decided. */
+  async sendGoverned(
+    bytes: Uint8Array,
+    options: RawSendOptions & CallOptions = {}
+  ): Promise<SendMessagesResponse> {
+    if (options.key !== undefined && options.partition !== undefined) {
+      throw new InvalidError("send() accepts a routing key or an explicit partition, not both")
+    }
     const routing: Routing =
       options.partition !== undefined
         ? { kind: "partition", partition: options.partition }
@@ -142,24 +212,33 @@ export class Topic {
     }
     if (headers.size > 0) {
       return this.observed("publish", { records: 1 }, () =>
-        this.published([{ payload: bytes, headers }], () =>
-          this.transport.sendMessageWithHeaders(
-            this.streamName,
-            this.name,
-            bytes,
-            headers,
-            options.key ??
-              (options.provenance !== undefined && options.partition === undefined
-                ? provenancePartitionKey(options.provenance)
-                : undefined),
-            options.partition
-          )
+        this.published(
+          [{ payload: bytes, headers }],
+          () =>
+            this.transport.sendMessageWithHeaders(
+              this.streamName,
+              this.name,
+              bytes,
+              headers,
+              options.key ??
+                (options.provenance !== undefined && options.partition === undefined
+                  ? provenancePartitionKey(options.provenance)
+                  : undefined),
+              options.partition,
+              { signal: options.signal }
+            ),
+          options.signal
         )
       )
     } else {
       return this.observed("publish", { records: 1 }, () =>
-        this.published([{ payload: bytes, headers }], () =>
-          this.transport.sendMessages(this.streamName, this.name, [bytes], routing)
+        this.published(
+          [{ payload: bytes, headers }],
+          () =>
+            this.transport.sendMessages(this.streamName, this.name, [bytes], routing, {
+              signal: options.signal
+            }),
+          options.signal
         )
       )
     }
@@ -172,11 +251,12 @@ export class Topic {
    * confirmed requests and the records from the failed request on. */
   async batch(
     messages: readonly (BytesLike | MessageWithHeaders)[],
-    options: RawSendOptions = {}
+    options: RawSendOptions & CallOptions = {}
   ): Promise<SendMessagesResponse> {
     if (options.key !== undefined && options.partition !== undefined) {
       throw new InvalidError("batch() accepts a routing key or an explicit partition, not both")
     }
+    throwIfAborted(options.signal, "topic publish")
     if (messages.length === 0) return { confirmations: [] }
     if (messages.some(isRecord)) return this.batchRecords(messages, options)
     const payloads = messages as readonly BytesLike[]
@@ -186,7 +266,11 @@ export class Topic {
       bytesList.push(
         this.govern === undefined
           ? input
-          : await this.govern(this.streamName, this.name, input, options.provenance)
+          : await abortable(
+              this.govern(this.streamName, this.name, input, options.provenance),
+              options.signal,
+              "topic publish"
+            )
       )
     }
     const routing: Routing =
@@ -204,24 +288,32 @@ export class Topic {
     if (headers.size > 0) {
       const records = bytesList.map((payload) => ({ payload, headers }))
       return this.observed("publish_batch", { records: bytesList.length }, () =>
-        this.published(records, () =>
-          this.transport.sendMessagesWithHeaders(
-            this.streamName,
-            this.name,
-            records,
-            options.key ??
-              (options.provenance !== undefined && options.partition === undefined
-                ? provenancePartitionKey(options.provenance)
-                : undefined),
-            options.partition
-          )
+        this.published(
+          records,
+          () =>
+            this.transport.sendMessagesWithHeaders(
+              this.streamName,
+              this.name,
+              records,
+              options.key ??
+                (options.provenance !== undefined && options.partition === undefined
+                  ? provenancePartitionKey(options.provenance)
+                  : undefined),
+              options.partition,
+              { signal: options.signal }
+            ),
+          options.signal
         )
       )
     } else {
       return this.observed("publish_batch", { records: bytesList.length }, () =>
         this.published(
           bytesList.map((payload) => ({ payload, headers })),
-          () => this.transport.sendMessages(this.streamName, this.name, bytesList, routing)
+          () =>
+            this.transport.sendMessages(this.streamName, this.name, bytesList, routing, {
+              signal: options.signal
+            }),
+          options.signal
         )
       )
     }
@@ -230,33 +322,44 @@ export class Topic {
   /** @internal Appends records with their own headers and ids. */
   async sendRecords(
     records: readonly MessageWithHeaders[],
-    options: { readonly key?: string | Uint8Array; readonly partition?: number } = {}
+    options: { readonly key?: string | Uint8Array; readonly partition?: number } & CallOptions = {}
   ): Promise<SendMessagesResponse> {
     if (options.key !== undefined && options.partition !== undefined) {
       throw new InvalidError(
         "sendRecords() accepts a routing key or an explicit partition, not both"
       )
     }
+    throwIfAborted(options.signal, "topic publish")
     if (records.length === 0) return { confirmations: [] }
     const governed: MessageWithHeaders[] = []
     for (const record of records) {
       const input = ownedBytes(record.payload)
       governed.push({
         payload:
-          this.govern === undefined ? input : await this.govern(this.streamName, this.name, input),
+          this.govern === undefined
+            ? input
+            : await abortable(
+                this.govern(this.streamName, this.name, input),
+                options.signal,
+                "topic publish"
+              ),
         headers: record.headers,
         ...(record.id !== undefined ? { id: record.id } : {})
       })
     }
     return this.observed("publish_batch", { records: governed.length }, () =>
-      this.published(governed, () =>
-        this.transport.sendMessagesWithHeaders(
-          this.streamName,
-          this.name,
-          governed,
-          options.key,
-          options.partition
-        )
+      this.published(
+        governed,
+        () =>
+          this.transport.sendMessagesWithHeaders(
+            this.streamName,
+            this.name,
+            governed,
+            options.key,
+            options.partition,
+            { signal: options.signal }
+          ),
+        options.signal
       )
     )
   }
@@ -265,7 +368,7 @@ export class Topic {
   // keep their own headers and id.
   private batchRecords(
     messages: readonly (BytesLike | MessageWithHeaders)[],
-    options: RawSendOptions
+    options: RawSendOptions & CallOptions
   ): Promise<SendMessagesResponse> {
     const headers = new Map(options.headers)
     if (options.provenance !== undefined) {
@@ -282,17 +385,20 @@ export class Topic {
         : undefined)
     return this.sendRecords(records, {
       ...(key === undefined ? {} : { key }),
-      ...(options.partition === undefined ? {} : { partition: options.partition })
+      ...(options.partition === undefined ? {} : { partition: options.partition }),
+      ...(options.signal === undefined ? {} : { signal: options.signal })
     })
   }
 
-  // Preserve confirmations and message IDs from a transport failure.
+  // Preserve confirmations and message IDs from a transport failure. An
+  // aborted publish is no failure report, its outcome is unknown.
   private published(
     records: readonly MessageWithHeaders[],
-    effect: () => Promise<SendMessagesResponse>
+    effect: () => Promise<SendMessagesResponse>,
+    signal: AbortSignal | undefined
   ): Promise<SendMessagesResponse> {
-    return effect().catch((error: unknown) => {
-      if (error instanceof PublishFailedError) throw error
+    return cancellable(signal, "topic publish", effect).catch((error: unknown) => {
+      if (error instanceof PublishFailedError || error instanceof CancelledError) throw error
       throw new PublishFailedError(this.streamName, this.name, [], records, error)
     })
   }
@@ -316,15 +422,26 @@ export class Topic {
   }
 
   producer(options?: ProducerOptions): Producer {
-    return Producer.create(this.transport, this.streamName, this.name, options)
+    return Producer.create(
+      this.transport,
+      this.streamName,
+      this.name,
+      options,
+      this.govern === undefined
+        ? undefined
+        : (payload, provenance) => this.governPayload(payload, provenance)
+    )
   }
 
   /** A size-and-time batching publisher over this topic. Each flushed batch is
    * one append under the handle's partition key, or balanced without one. */
   batching(): BatchingProducerBuilder {
     return BatchingProducerBuilder.create(
-      (records, partitionKey) =>
-        this.sendRecords(records, partitionKey === undefined ? {} : { key: partitionKey }),
+      (records, partitionKey, options) =>
+        this.sendRecords(records, {
+          ...(partitionKey === undefined ? {} : { key: partitionKey }),
+          signal: options.signal
+        }),
       this.streamName,
       this.name
     )
@@ -378,10 +495,19 @@ export class Topic {
     return ConsumerGroup.create(this.transport, this, { kind: "id", id: value }, this.groups)
   }
 
-  async replay(): Promise<Cursor> {
-    const partitionCount = await this.transport.getTopicPartitionCount(this.streamName, this.name)
+  /** A resumable reader over this topic. Each poll reads the partitions the
+   * topic has at that moment, so partitions added later are read too. */
+  async replay(options: CallOptions = {}): Promise<Cursor> {
+    throwIfAborted(options.signal, "topic replay")
+    const partitionCount = await abortable(
+      this.transport.getTopicPartitionCount(this.streamName, this.name),
+      options.signal,
+      "topic replay"
+    )
     const partitionIds = Array.from({ length: partitionCount }, (_, index) => index)
-    return Cursor.create(this.transport, this.streamName, this.name, partitionIds)
+    return Cursor.create(this.transport, this.streamName, this.name, partitionIds, () =>
+      this.transport.findTopicPartitionCount(this.streamName, this.name)
+    )
   }
 
   /** @internal The partition count, or `undefined` when the topic does not exist yet. */
@@ -431,14 +557,20 @@ export class Topic {
 
   async schema<T>(
     schemaId: number,
-    codecOrDecoder: Codec<T> | ((value: unknown) => T)
+    codecOrDecoder: Codec<T> | ((value: unknown) => T),
+    options: CallOptions = {}
   ): Promise<TypedTopic<T>> {
+    throwIfAborted(options.signal, "topic schema")
     if (this.resolveSchema === undefined) {
       throw new UnsupportedError("registered schema topics require a Laser-managed topic", {
         surface: "schemas"
       })
     }
-    const schema = await this.resolveSchema(schemaId)
+    const schema = await abortable(
+      this.resolveSchema(schemaId, options),
+      options.signal,
+      "topic schema"
+    )
     if (schema === undefined) {
       throw new InvalidError(`schema ${String(schemaId)} is not registered`)
     }

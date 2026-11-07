@@ -1,9 +1,11 @@
+import { type CallOptions, abortable, delay, throwIfAborted } from "./client/call-options.js"
 import { millis } from "./client/duration.js"
-import { ProtocolError, SessionError } from "./client/errors.js"
+import { InvalidError, ProtocolError, SessionError } from "./client/errors.js"
 import { INTERNAL_TRANSPORT } from "./client/internals.js"
 import { code } from "./client/error-classify.js"
 import { executeManaged } from "./client/managed.js"
 import type { Laser } from "./client/laser.js"
+import type { ManagedSendOptions } from "./iggy/apache-iggy.js"
 import type { AgentId, SessionStatus } from "./wire/agent.js"
 import {
   type ManagedCommand,
@@ -28,13 +30,16 @@ import {
 export async function readSession<Request>(
   laser: Laser,
   command: ManagedCommand<Request, SessionReply>,
-  request: Request
+  request: Request,
+  options?: ManagedSendOptions & CallOptions
 ): Promise<SessionOutcome> {
+  throwIfAborted(options?.signal, "session read")
   const reply = await executeManaged(
     laser[INTERNAL_TRANSPORT](),
-    await laser.capabilities(),
+    await abortable(laser.capabilities(), options?.signal, "session read"),
     command,
-    request
+    request,
+    options
   )
   switch (reply.kind) {
     case "ok":
@@ -58,9 +63,9 @@ export class SessionListRequest {
   private labelPrefixValue: string | undefined
   private agentValue: AgentId | undefined
   private textValue: string | undefined
-  private cursorValue: string | undefined
-  private limitValue = 0
-  private totalValue = false
+  private pageValue = 0
+  private resultsValue = 0
+  private bound: { readonly asOf: bigint; readonly series: bigint } | undefined
 
   private constructor(
     private readonly laser: Laser,
@@ -102,37 +107,43 @@ export class SessionListRequest {
     return this
   }
 
-  /** Continue after the page that returned `cursor`. */
-  cursor(cursor: string): this {
-    this.cursorValue = cursor
+  /** The 1-based page to read. Zero reads the first page. */
+  page(page: number): this {
+    this.pageValue = page
     return this
   }
 
-  /** The page size. Zero leaves it to the server. */
-  limit(limit: number): this {
-    this.limitValue = limit
+  /** The sessions per page. Zero leaves it to the server. */
+  results(results: number): this {
+    this.resultsValue = results
     return this
   }
 
-  /** Also count every match. */
-  total(): this {
-    this.totalValue = true
+  /** Read within the bound of a walk: the `asOf` and `series` its first page
+   * returned, so sessions folded after it stay out of every page. */
+  asOf(asOf: bigint, series: bigint): this {
+    this.bound = { asOf, series }
     return this
   }
 
   /** Read the page. */
-  async fetch(): Promise<SessionPage> {
-    const outcome = await readSession(this.laser, SessionListCommand, {
-      stream: this.stream,
-      ...(this.statusValue !== undefined ? { status: this.statusValue } : {}),
-      ...(this.rootValue !== undefined ? { root: this.rootValue } : {}),
-      ...(this.labelPrefixValue !== undefined ? { labelPrefix: this.labelPrefixValue } : {}),
-      ...(this.agentValue !== undefined ? { agent: this.agentValue } : {}),
-      ...(this.textValue !== undefined ? { text: this.textValue } : {}),
-      ...(this.cursorValue !== undefined ? { cursor: this.cursorValue } : {}),
-      limit: this.limitValue,
-      wantTotal: this.totalValue
-    })
+  async fetch(options: CallOptions = {}): Promise<SessionPage> {
+    const outcome = await readSession(
+      this.laser,
+      SessionListCommand,
+      {
+        stream: this.stream,
+        ...(this.statusValue !== undefined ? { status: this.statusValue } : {}),
+        ...(this.rootValue !== undefined ? { root: this.rootValue } : {}),
+        ...(this.labelPrefixValue !== undefined ? { labelPrefix: this.labelPrefixValue } : {}),
+        ...(this.agentValue !== undefined ? { agent: this.agentValue } : {}),
+        ...(this.textValue !== undefined ? { text: this.textValue } : {}),
+        page: this.pageValue,
+        results: this.resultsValue,
+        ...(this.bound ?? {})
+      },
+      options
+    )
     if (outcome.kind !== "page") throw unexpected("list")
     return outcome.page
   }
@@ -140,9 +151,9 @@ export class SessionListRequest {
 
 /** A session events read. Build it with `Sessions.events`. */
 export class SessionEventsRequest {
-  private cursorValue: string | undefined
-  private limitValue = 0
-  private fixedFrontierValue = false
+  private pageValue = 0
+  private resultsValue = 0
+  private bound: { readonly asOf: bigint; readonly series: bigint } | undefined
 
   private constructor(
     private readonly laser: Laser,
@@ -155,33 +166,39 @@ export class SessionEventsRequest {
     return new SessionEventsRequest(laser, stream, id)
   }
 
-  /** Continue after the page that returned `cursor`. */
-  cursor(cursor: string): this {
-    this.cursorValue = cursor
+  /** The 1-based page to read. Zero reads the first page. */
+  page(page: number): this {
+    this.pageValue = page
     return this
   }
 
-  /** The page size. Zero leaves it to the server. */
-  limit(limit: number): this {
-    this.limitValue = limit
+  /** The events per page. Zero leaves it to the server. */
+  results(results: number): this {
+    this.resultsValue = results
     return this
   }
 
-  /** Pin the fold frontier of the first page, for a historical walk. */
-  fixedFrontier(): this {
-    this.fixedFrontierValue = true
+  /** Read within the bound of a walk: the `asOf` and `series` its first page
+   * returned, so events folded after it stay out of every page. */
+  asOf(asOf: bigint, series: bigint): this {
+    this.bound = { asOf, series }
     return this
   }
 
   /** Read the page. */
-  async fetch(): Promise<SessionEventsPage> {
-    const outcome = await readSession(this.laser, SessionEventsCommand, {
-      stream: this.stream,
-      id: this.id,
-      ...(this.cursorValue !== undefined ? { cursor: this.cursorValue } : {}),
-      limit: this.limitValue,
-      fixedFrontier: this.fixedFrontierValue
-    })
+  async fetch(options: CallOptions = {}): Promise<SessionEventsPage> {
+    const outcome = await readSession(
+      this.laser,
+      SessionEventsCommand,
+      {
+        stream: this.stream,
+        id: this.id,
+        page: this.pageValue,
+        results: this.resultsValue,
+        ...(this.bound ?? {})
+      },
+      options
+    )
     if (outcome.kind !== "events") throw unexpected("events")
     return outcome.page
   }
@@ -194,78 +211,98 @@ export type SessionChange =
   | { readonly kind: "changed"; readonly sessions: readonly WireConversationId[] }
   | { readonly kind: "resync" }
 
-/** A follower of one stream's session changes. Build it with `Sessions.watch`. */
-export class SessionWatch {
+/** A follower of one stream's session changes. Build it with `Sessions.watch`.
+ * `for await (const change of watch)` yields each change as it lands and
+ * follows changes until the loop stops. */
+export class SessionWatch implements AsyncIterable<SessionChange> {
   private readonly ready: SessionChange[] = []
-  // The change series `after` belongs to. Sequence numbers from another node
-  // or a restored index never continue this cursor.
-  private series: bigint | undefined
 
   private constructor(
     private readonly laser: Laser,
     private readonly stream: string,
     private readonly pollEveryMs: number,
-    private after: bigint
+    // The next change sequence to report. The page to read follows from it.
+    private nextSequence: bigint,
+    private results: number,
+    // Sequence numbers of another node's or a restored index never continue
+    // this watch.
+    private series: bigint
   ) {}
 
-  /** A watch anchored at the change rows retained when it returns, so a
-   * change made after it is never missed.
+  /** A watch anchored at the newest change when it returns, so a change made
+   * after it is never missed. The start is one read: any page names the
+   * series, the page size and the newest sequence.
    * @internal */
-  static async create(laser: Laser, stream: string, pollEveryMs: number): Promise<SessionWatch> {
-    millis(pollEveryMs, "session watch pollEveryMs")
-    const watch = new SessionWatch(laser, stream, pollEveryMs, 0n)
-    for (;;) {
-      const page = await watch.changes(watch.after)
-      if (page.resync) {
-        watch.after = page.floor
-        continue
-      }
-      const seq = page.rows.reduce<bigint | undefined>(
-        (max, row) => (max === undefined || row.seq > max ? row.seq : max),
-        undefined
-      )
-      if (seq === undefined) return watch
-      watch.after = seq
+  static async create(
+    laser: Laser,
+    stream: string,
+    pollEveryMs: number,
+    options: CallOptions = {}
+  ): Promise<SessionWatch> {
+    if (millis(pollEveryMs, "session watch pollEveryMs") === 0) {
+      throw new InvalidError("session watch pollEveryMs must be above zero")
     }
+    const start = await readChanges(laser, stream, 1, 0, options)
+    return new SessionWatch(
+      laser,
+      stream,
+      pollEveryMs,
+      start.totalResults + 1n,
+      start.results,
+      start.series
+    )
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<SessionChange> {
+    for (;;) yield await this.next()
   }
 
   /** The next change, waiting until one lands. Aborting `signal` stops the
    * wait. */
-  async next(options: { readonly signal?: AbortSignal } = {}): Promise<SessionChange> {
+  async next(options: CallOptions = {}): Promise<SessionChange> {
     for (;;) {
-      options.signal?.throwIfAborted()
+      throwIfAborted(options.signal, "session watch")
       const ready = this.ready.shift()
       if (ready !== undefined) return ready
+      const size = BigInt(Math.max(this.results, 1))
       let page: SessionChangesView
       try {
-        page = await this.changes(this.after)
+        page = await readChanges(
+          this.laser,
+          this.stream,
+          Number((this.nextSequence - 1n) / size + 1n),
+          this.results,
+          options
+        )
       } catch (error) {
         // A node that has not folded this stream far enough yet, typically
         // the one a move just reached, answers Stale. The watch waits for it
         // as it waits for a new change.
         if (!isStale(error)) throw error
-        await pause(this.pollEveryMs, options.signal)
+        await delay(this.pollEveryMs, options.signal, "session watch")
         continue
       }
-      if (page.resync) {
-        this.after = page.floor
+      this.results = page.results
+      // Another series numbers another index's changes, and a floor past the
+      // next sequence means retention pruned changes not reported.
+      if (page.series !== this.series || page.floor > this.nextSequence) {
+        this.series = page.series
+        this.nextSequence = page.totalResults + 1n
         return { kind: "resync" }
       }
-      if (page.rows.length === 0) {
-        await pause(this.pollEveryMs, options.signal)
+      const rows = page.items.filter((row) => row.seq >= this.nextSequence)
+      const last = rows.at(-1)
+      if (last === undefined) {
+        await delay(this.pollEveryMs, options.signal, "session watch")
         continue
       }
+      this.nextSequence = last.seq + 1n
       // A truncated row does not name every changed session. The caller lists
-      // again after the resync, which covers this page, so the cursor moves
-      // past it instead of resyncing forever.
-      if (page.rows.some((row) => row.truncated)) {
-        for (const row of page.rows) if (row.seq > this.after) this.after = row.seq
-        return { kind: "resync" }
-      }
+      // again after the resync, which covers these rows.
+      if (rows.some((row) => row.truncated)) return { kind: "resync" }
       const seen = new Set<string>()
       const changed: WireConversationId[] = []
-      for (const row of page.rows) {
-        if (row.seq > this.after) this.after = row.seq
+      for (const row of rows) {
         for (const session of row.sessions) {
           if (!seen.has(session.toString())) {
             seen.add(session.toString())
@@ -276,32 +313,23 @@ export class SessionWatch {
       this.ready.push({ kind: "changed", sessions: changed })
     }
   }
-
-  private async changes(after: bigint): Promise<SessionChangesView> {
-    const outcome = await readSession(this.laser, SessionChangesCommand, {
-      stream: this.stream,
-      after,
-      limit: 0,
-      ...(this.series === undefined ? {} : { series: this.series })
-    })
-    if (outcome.kind !== "changes") throw unexpected("changes")
-    if (outcome.changes.series !== 0n) this.series = outcome.changes.series
-    return outcome.changes
-  }
 }
 
-function pause(ms: number, signal: AbortSignal | undefined): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", abort)
-      resolve()
-    }, ms)
-    const abort = (): void => {
-      clearTimeout(timer)
-      reject(signal?.reason as Error)
-    }
-    signal?.addEventListener("abort", abort, { once: true })
-  })
+async function readChanges(
+  laser: Laser,
+  stream: string,
+  page: number,
+  results: number,
+  options: CallOptions
+): Promise<SessionChangesView> {
+  const outcome = await readSession(
+    laser,
+    SessionChangesCommand,
+    { stream, page, results },
+    options
+  )
+  if (outcome.kind !== "changes") throw unexpected("changes")
+  return outcome.changes
 }
 
 function isStale(error: unknown): boolean {

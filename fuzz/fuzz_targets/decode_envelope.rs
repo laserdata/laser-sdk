@@ -13,24 +13,15 @@ use laser_wire::browse::{
     BrowseReply, DecodeRecord, GetProjection, GetSchema, ListProjections, ListSchemas,
     RegisterSchema,
 };
-use laser_wire::checkpoint::{
-    CheckpointReadReply, CheckpointReply, CheckpointRequestEnvelope, DestinationCheckpointStatus,
-    ReplicatedCheckpointMutation,
-};
 use laser_wire::control::ControlEnvelope;
-use laser_wire::destination::{MaterializationDestination, QueryRoute};
 use laser_wire::fork::{ForkCreate, ForkPut, ForkReply};
 use laser_wire::forward::{ForwardedCommand, ForwardedQuery};
 use laser_wire::framing::decode_named;
 use laser_wire::hello::{BackendAnnounce, HelloReply};
 use laser_wire::kv::{KvCas, KvDelete, KvDeleteMany, KvGet, KvReply, KvScan, KvSet};
-use laser_wire::query::{
-    QueryCancelEnvelope, QueryEnvelope, QueryPageEnvelope, QueryReply, QueryStatusEnvelope,
-    QueryStatusReply,
-};
+use laser_wire::query::{QueryEnvelope, QueryReply};
 use laser_wire::result::{CommandError, ResultCode};
 use laser_wire::schema::{LogicalSchema, LogicalType, TypedValue};
-use laser_wire::source::SourceCut;
 use laser_wire::validate::Validate;
 use libfuzzer_sys::fuzz_target;
 
@@ -62,26 +53,14 @@ fuzz_target!(|data: &[u8]| {
     validate_decoded!(data, LogicalSchema);
     let _ = decode_named::<LogicalType>(data);
     validate_decoded!(data, TypedValue);
-    validate_decoded!(data, SourceCut);
-    validate_decoded!(data, MaterializationDestination);
-    validate_decoded!(data, QueryRoute);
     validate_decoded!(data, ArrowIpcMessageMetadata);
     validate_decoded!(data, ArrowIpcPolicy);
-    validate_decoded!(data, CheckpointRequestEnvelope);
-    validate_decoded!(data, ReplicatedCheckpointMutation);
-    let _ = decode_named::<CheckpointReply>(data);
-    let _ = decode_named::<CheckpointReadReply>(data);
-    validate_decoded!(data, DestinationCheckpointStatus);
 
     // Server-decoded requests from an untrusted client (the security-critical
     // direction): the query IR (with its consistency level), the KV ops
     // including compare-and-swap, fork writes, registry browse, and the
     // forwarded frames the streaming server stamps.
     validate_decoded!(data, QueryEnvelope);
-    validate_decoded!(data, QueryPageEnvelope);
-    validate_decoded!(data, QueryCancelEnvelope);
-    validate_decoded!(data, QueryStatusEnvelope);
-    let _ = decode_named::<QueryStatusReply>(data);
     let _ = decode_named::<KvGet>(data);
     let _ = decode_named::<KvSet>(data);
     let _ = decode_named::<KvCas>(data);

@@ -12,7 +12,7 @@ This example publishes a satellite change feed and gives each consumer group its
 - Tests change evidence against a battery update and previews stored records without changing consumer progress.
 - Routes binary alerts through a one-byte numeric `priority` header without decoding their payloads.
 - Publishes and filters typed records in CBOR, Avro and Protobuf. Schema-first formats use registered writer schemas.
-- Uses separate groups for A/B policies and demonstrates draft revisions, pause, acknowledgment while paused, and resume.
+- Uses separate groups for A/B policies, since a group runs one policy for its lifetime, and demonstrates pause, acknowledgment while paused, and resume.
 
 ## Run it
 

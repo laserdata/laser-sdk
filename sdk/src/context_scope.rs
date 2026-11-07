@@ -79,7 +79,8 @@ impl ContextScope {
     }
 
     /// The last `n` messages rendered as one newline-joined text block, the
-    /// prompt-ready form (each payload as UTF-8, lossy). `token_budget` trims
+    /// prompt-ready form (each [`ContextMessage::body`] as UTF-8, lossy).
+    /// `token_budget` trims
     /// the selected messages to an estimated token count after `n`, so the
     /// block is bounded by turns and by prompt size at once.
     pub async fn block(
@@ -91,7 +92,7 @@ impl ContextScope {
         let messages = self.fetch(topics, n, token_budget).await?;
         Ok(messages
             .iter()
-            .map(|message| String::from_utf8_lossy(&message.payload))
+            .map(|message| String::from_utf8_lossy(message.body()))
             .collect::<Vec<_>>()
             .join("\n"))
     }
@@ -164,7 +165,7 @@ impl ContextScope {
     /// wants. Identical to [`Laser::graph`], offered here so one scope reaches
     /// every primitive. Feature `graph`.
     #[cfg(feature = "graph")]
-    pub fn graph(&self, name: impl Into<String>) -> crate::graph::GraphHandle<'_> {
+    pub fn graph(&self, name: impl Into<String>) -> crate::graph::GraphHandle {
         self.laser.graph(name)
     }
 

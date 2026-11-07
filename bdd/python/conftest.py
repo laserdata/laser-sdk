@@ -14,18 +14,26 @@ from iggy_test_server import IggyTestServer  # noqa: E402
 
 
 # `LASER_BDD_MANAGED=1` marks a stack with a managed backend, which skips the
-# `@unmanaged` scenarios.
+# `@unmanaged` scenarios. `LASER_BDD_SQL_BACKEND` names a declared SQL backend
+# and enables the `@remote_sql` scenarios.
 def pytest_configure(config):
     config.addinivalue_line("markers", "bridges: edge bridge interoperability scenarios")
+    config.addinivalue_line("markers", "materialization: materialization setup and progress")
+    config.addinivalue_line("markers", "operational_sql: authorized operational SQL")
+    config.addinivalue_line("markers", "bindings: projection binding policies")
     config.addinivalue_line("markers", "managed: requires a managed backend")
     config.addinivalue_line("markers", "unmanaged: requires a server without a managed backend")
+    config.addinivalue_line("markers", "remote_sql: requires a declared SQL backend")
 
 
 def pytest_collection_modifyitems(config, items):
     managed = bool(os.environ.get("LASER_BDD_MANAGED"))
+    remote_sql = bool(os.environ.get("LASER_BDD_SQL_BACKEND"))
     for item in items:
-        if (managed and "unmanaged" in item.keywords) or (
-            not managed and "managed" in item.keywords
+        if (
+            (managed and "unmanaged" in item.keywords)
+            or (not managed and "managed" in item.keywords)
+            or (not remote_sql and "remote_sql" in item.keywords)
         ):
             item.add_marker(
                 pytest.mark.skip(reason="scenario requires another deployment capability")
@@ -70,6 +78,7 @@ class World:
         self.noted_position = None
         self.clients = []
         self.client_user = None
+        self.schema_registrations = []
 
     def run(self, factory):
         # `factory` is a zero-arg callable returning a coroutine. The binding's
@@ -143,7 +152,6 @@ class Bench:
         self.memory_engine = None
         self.memory_ids = {}
         self.graph_engine = None
-        self.data_stack = None
         self.filter = None
         self.verdict = None
         self.binding_builder = None
@@ -176,6 +184,32 @@ def fresh_stream_bootstrapped(world, partitions):
             partitions, retention=ls.TopicRetention.expire_after(86_400_000)
         )
     )
+    world.run(lambda: wait_for_partition_reads(world.laser))
+
+
+async def wait_for_partition_reads(laser):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    conversation = ls.new_conversation_id()
+    while True:
+        try:
+            await laser.assemble_context(conversation)
+            return
+        except ls.LaserError as error:
+            if not error.unavailable or loop.time() >= deadline:
+                raise
+        await asyncio.sleep(0.1)
+
+
+@when(parsers.parse('I publish a JSON event to topic "{topic}"'))
+def publish_json(world, topic):
+    world.run(lambda: world.laser.topic(topic).publish().json({"hello": "world"}).send())
+    world.published = True
+
+
+@then("the publish succeeds")
+def publish_succeeds(world):
+    assert world.published is True
 
 
 @given("a new conversation")

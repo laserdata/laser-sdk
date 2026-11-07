@@ -75,6 +75,7 @@ const ROUTES: &[&str] = &[
 // by a random few seconds from here.
 const BASE_US: u64 = 1_900_000_000_000_000;
 const ONE_MINUTE_US: u64 = 60_000_000;
+const ONE_MINUTE: Duration = Duration::from_secs(60);
 const STEP_MAX_US: u64 = 30_000_000; // up to 30s between events
 
 const PROJECTOR_TIMEOUT: Duration = Duration::from_secs(60);
@@ -312,12 +313,10 @@ async fn wait_for_projection(laser: &Laser, expected: usize) -> Result<(), Laser
     // Cloud with a notifying binding): each tick drains the feed and re-runs the
     // count only when the backend reported the view advanced. Elsewhere (the local
     // managed change feed) every tick queries, the plain bounded poll.
-    let mut feed = laser
-        .capabilities()
-        .await
-        .watch
-        .then(|| laser.watch().index(&index).records())
-        .transpose()?;
+    let mut feed = match laser.capabilities().await.watch {
+        true => Some(laser.watch().index(&index).records().await?),
+        false => None,
+    };
     let mut last = usize::MAX;
     loop {
         let advanced = match &mut feed {
@@ -412,7 +411,7 @@ async fn run_analytics(laser: &Laser) -> Result<(), LaserError> {
     let per_minute = laser
         .query(&index)
         .count()
-        .window(TS, ONE_MINUTE_US)
+        .window(TS, ONE_MINUTE)
         .fetch()
         .await?;
     info!("events per minute:");

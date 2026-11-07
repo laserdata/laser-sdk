@@ -44,8 +44,7 @@ export class InMemoryStore implements StateStore {
 // @public (undocumented)
 export class TestClock implements Clock {
     constructor(startMicros: bigint);
-    // (undocumented)
-    advance(byMicros: bigint): void;
+    advance(byMs: number): void;
     // (undocumented)
     nowMicros(): bigint;
     // (undocumented)

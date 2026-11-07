@@ -15,7 +15,7 @@ import {
 } from "../../src/managed/rbac.js"
 import { decodeOne, encodeOne, expectMap } from "../../src/wire/cbor.js"
 import type { AuthzReply, Role } from "../../src/wire/authz.js"
-import { encodeAuthzReply } from "../../src/wire/authz.js"
+import { encodeAuthzReply, resourcePatternAll } from "../../src/wire/authz.js"
 import { feature } from "../../src/wire/hello.js"
 
 const CAPS: Capabilities = managedCapabilitiesFrom({
@@ -88,9 +88,39 @@ void test("given_an_absent_role_outcome_when_get_role_is_called_then_should_retu
   assert.equal(await getRole(transport, CAPS, "reader"), undefined)
 })
 
-void test("given_a_bindings_outcome_when_get_bindings_is_called_then_should_return_the_role_names", async () => {
-  const transport = fakeTransport([replyFrame({ kind: "bindings", reply: { roles: ["reader"] } })])
-  assert.deepEqual(await getBindings(transport, CAPS, 7), ["reader"])
+void test("given_a_bindings_outcome_when_get_bindings_is_called_then_should_return_the_role_names_and_revision", async () => {
+  const transport = fakeTransport([
+    replyFrame({ kind: "bindings", reply: { roles: ["reader"], revision: 4n } })
+  ])
+  assert.deepEqual(await getBindings(transport, CAPS, 7), {
+    v: 1,
+    roles: ["reader"],
+    revision: 4n
+  })
+})
+
+void test("given_a_grant_on_an_unenforced_feature_when_define_role_is_called_then_should_refuse_before_sending", async () => {
+  const transport = fakeTransport([replyFrame({ kind: "ok" })])
+  for (const feature of ["memory", "agent", "workflow", "unrecognized"] as const) {
+    await assert.rejects(
+      defineRole(transport, CAPS, {
+        name: "reader",
+        grants: [{ effect: "allow", feature, action: "read", resource: resourcePatternAll() }]
+      }),
+      InvalidError
+    )
+  }
+  assert.equal(transport.calls.length, 0)
+})
+
+void test("given_out_of_range_rbac_numbers_when_sent_then_should_refuse_before_sending", async () => {
+  const transport = fakeTransport([replyFrame({ kind: "ok" })])
+  for (const userId of [-1, 1.5, 0x1_0000_0000]) {
+    await assert.rejects(getBindings(transport, CAPS, userId), InvalidError)
+    await assert.rejects(bindRoles(transport, CAPS, userId, ["reader"]), InvalidError)
+  }
+  await assert.rejects(bindRoles(transport, CAPS, 7, ["reader"], -1n), InvalidError)
+  assert.equal(transport.calls.length, 0)
 })
 
 void test("given_an_ok_reply_when_define_role_is_called_then_should_resolve", async () => {
@@ -119,9 +149,15 @@ void test("given_invalid_role_names_when_bind_roles_is_called_then_should_reject
   assert.equal(transport.calls.length, 0)
 })
 
-void test("given_an_ok_reply_when_bind_roles_is_called_then_should_resolve", async () => {
-  const transport = fakeTransport([replyFrame({ kind: "ok" })])
-  await bindRoles(transport, CAPS, 7, ["reader"], 3n)
+void test("given_a_committed_binding_when_bind_roles_is_called_then_should_return_it", async () => {
+  const transport = fakeTransport([
+    replyFrame({ kind: "bindings", reply: { roles: ["reader"], revision: 4n } })
+  ])
+  assert.deepEqual(await bindRoles(transport, CAPS, 7, ["reader"], 3n), {
+    v: 1,
+    roles: ["reader"],
+    revision: 4n
+  })
   assert.equal(transport.calls.length, 1)
   assertMutationId(transport.calls[0]?.payload ?? new Uint8Array())
 })

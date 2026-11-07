@@ -19,7 +19,6 @@ import {
   MAX_PROJECTION_ID_BYTES,
   MAX_PROJECTION_NAME_BYTES,
   MAX_SCHEMA_NAME_BYTES,
-  MAX_SESSION_CURSOR_BYTES,
   MAX_SESSION_LABEL_BYTES,
   MAX_SESSION_TEXT_QUERY_BYTES
 } from "../../src/wire/limits.js"
@@ -141,15 +140,14 @@ void test("given_an_invalid_memory_id_kind_or_target_when_validated_then_should_
 })
 
 void test("given_session_list_filters_out_of_bounds_when_validated_then_should_refuse_them", () => {
-  const list: SessionList = { stream: "agents", limit: 0, wantTotal: false }
+  const list: SessionList = { stream: "agents", page: 0, results: 0 }
   validateSessionList({
     ...list,
     stream: "s".repeat(255),
     labelPrefix: "l".repeat(MAX_SESSION_LABEL_BYTES),
-    text: "t".repeat(MAX_SESSION_TEXT_QUERY_BYTES),
-    cursor: "c".repeat(MAX_SESSION_CURSOR_BYTES)
+    text: "t".repeat(MAX_SESSION_TEXT_QUERY_BYTES)
   })
-  validateSessionList({ ...list, text: "", cursor: "" })
+  validateSessionList({ ...list, text: "" })
   const cases: readonly [SessionList, string][] = [
     [{ ...list, stream: "" }, "session list stream must be 1..=255 bytes"],
     [{ ...list, stream: "s".repeat(256) }, "session list stream must be 1..=255 bytes"],
@@ -160,10 +158,6 @@ void test("given_session_list_filters_out_of_bounds_when_validated_then_should_r
     [
       { ...list, text: "t".repeat(MAX_SESSION_TEXT_QUERY_BYTES + 1) },
       "session list text is 1025B, exceeds cap 1024B"
-    ],
-    [
-      { ...list, cursor: "c".repeat(MAX_SESSION_CURSOR_BYTES + 1) },
-      "session list cursor is 513B, exceeds cap 512B"
     ]
   ]
   for (const [request, message] of cases) {

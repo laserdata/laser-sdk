@@ -326,6 +326,7 @@ void test("given_the_agent_card_fixture_when_decoded_then_should_re_encode_byte_
   assert.equal(card.name, "rollout-planner")
   assert.equal(card.version, "1.4.2")
   assert.equal(card.ttlMicros, 30_000_000n)
+  assert.equal(card.inbox, "rollout-planner.work")
   assert.equal(card.capabilities.length, 2)
 
   const [chat, planRollout] = card.capabilities

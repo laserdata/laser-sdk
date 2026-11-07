@@ -7,14 +7,22 @@ import {
   PolicyBlockedError,
   PolicyDeferredError,
   StepUpRequiredError,
+  TimeoutError,
   type LaserError
 } from "./client/errors.js"
 import { Mutex } from "./runtime/mutex.js"
 import { warn } from "./runtime/warn.js"
+import type { ApprovalGrant } from "./agent/context.js"
 import { IntentId, type ConversationId } from "./types/ids.js"
 import { decodeOne, encodeNamed, expectMap, field, type CborMap } from "./wire/cbor.js"
 
 export const POLICY_DECISION_OPERATION = "policy_decision"
+
+/** The `PolicyEvidence.decision` recorded when the governor itself fails in
+ * observe mode. The effect proceeds and `reason` carries the failure. */
+export const GOVERNOR_ERROR_DECISION = "error"
+
+const DEFAULT_VOTER_TIMEOUT_MS = 10_000
 
 export const ActionKind = {
   Send: "send",
@@ -54,6 +62,9 @@ export interface GovernedAction {
   readonly payload: Uint8Array
   readonly signed: boolean
   readonly counters: ActionCounters
+  /** The approval the effect carries, from `AgentCtx.approvalGate`. A step-up
+   * in the grant's conversation proceeds on it instead of stepping up again. */
+  readonly approval?: ApprovalGrant
 }
 
 export type Verdict =
@@ -127,7 +138,7 @@ export interface ActionGovernor {
 
 export interface PolicyEvidence {
   readonly decisionId: string
-  readonly decision: Verdict["kind"]
+  readonly decision: Verdict["kind"] | typeof GOVERNOR_ERROR_DECISION
   readonly mode: GovernorMode
   readonly kind: ActionKind
   readonly stream: string
@@ -145,6 +156,7 @@ export interface PolicyEvidence {
   readonly riskScore?: number
   readonly receiptDigest: string
   readonly previousDigest?: string
+  readonly chainId: string
   readonly outcome: "effected" | "blocked" | "step_up" | "deferred"
   readonly atMicros: bigint
 }
@@ -163,6 +175,7 @@ export interface GovernorRetention {
 
 interface ChainEntry {
   readonly lock: Mutex
+  readonly chainId: string
   digest?: string
   touchedMicros: bigint
   users: number
@@ -202,13 +215,24 @@ export class GovernorState {
     emit: (evidence: PolicyEvidence) => Promise<void>
   ): Promise<Uint8Array> {
     const complete: GovernedAction = { ...action, counters: this.counters() }
-    const decision = await this.governor.decide(complete)
+    let decision: ActionDecision
+    let decisionName: PolicyEvidence["decision"]
+    try {
+      decision = await this.governor.decide(complete)
+      decisionName = decision.verdict.kind
+    } catch (error) {
+      if (this.mode !== GovernorMode.Observe) throw error
+      // Observing never impacts the effect, a failing governor included.
+      warn(`governor decision failed (observe mode): ${errorText(error)}`)
+      decision = ActionDecision.observe().withReason(errorText(error))
+      decisionName = GOVERNOR_ERROR_DECISION
+    }
     if (action.kind === ActionKind.Request) this.requests += 1n
     else this.sends += 1n
-    const applied = apply(this.mode, decision.verdict)
+    const applied = apply(this.mode, granted(complete, decision))
     if (applied.recorded) {
       const key = action.conversation?.toString() ?? ""
-      const emission = this.emitChained(key, action, decision, applied.outcome, emit)
+      const emission = this.emitChained(key, action, decision, decisionName, applied.outcome, emit)
       if (this.mode === GovernorMode.Observe) {
         await emission.catch((error: unknown) => {
           warn(`policy evidence write failed (observe mode): ${errorText(error)}`)
@@ -234,6 +258,7 @@ export class GovernorState {
     key: string,
     action: Omit<GovernedAction, "counters">,
     decision: ActionDecision,
+    decisionName: PolicyEvidence["decision"],
     outcome: PolicyEvidence["outcome"],
     emit: (evidence: PolicyEvidence) => Promise<void>
   ): Promise<void> {
@@ -243,9 +268,11 @@ export class GovernorState {
         const evidence = sealEvidence(
           action,
           decision,
+          decisionName,
           this.mode,
           outcome,
           this.nowMicros(),
+          entry.chainId,
           entry.digest
         )
         await emit(evidence)
@@ -285,6 +312,7 @@ export class GovernorState {
       if (this.chains.size < this.retention.capacity) {
         const entry: ChainEntry = {
           lock: new Mutex(),
+          chainId: IntentId.new().toString(),
           touchedMicros: now,
           users: 1
         }
@@ -316,7 +344,7 @@ export function decodePolicyEvidence(payload: Uint8Array): PolicyEvidence {
   const riskScore = field.optionalF64(map, "risk_score", context)
   return {
     decisionId: field.requiredString(map, "decision_id", context),
-    decision: parseVerdictKind(field.requiredString(map, "decision", context), context),
+    decision: parseEvidenceDecision(field.requiredString(map, "decision", context), context),
     mode: parseGovernorMode(field.requiredString(map, "mode", context), context),
     kind: parseActionKind(field.requiredString(map, "kind", context), context),
     stream: field.requiredString(map, "stream", context),
@@ -334,17 +362,23 @@ export function decodePolicyEvidence(payload: Uint8Array): PolicyEvidence {
     ...(riskScore !== undefined ? { riskScore } : {}),
     receiptDigest: field.requiredString(map, "receipt_digest", context),
     ...optionalString(map, "previous_digest", context, "previousDigest"),
+    chainId: field.requiredString(map, "chain_id", context),
     outcome: parseEvidenceOutcome(field.requiredString(map, "outcome", context), context),
     atMicros: field.requiredU64(map, "at_micros", context)
   }
 }
 
+/** Whether `evidence`, in log order for one conversation, is a set of
+ * unbroken chains: within each `chainId` every record reproduces its own
+ * `receiptDigest` and names the previous record's digest as its
+ * `previousDigest`, the first naming none. Chains of different processes may
+ * interleave. A reordered, dropped, or edited record breaks its chain. */
 export function verifyEvidenceChain(evidence: readonly PolicyEvidence[]): boolean {
-  let previous: string | undefined
+  const heads = new Map<string, string>()
   for (const item of evidence) {
-    if (item.previousDigest !== previous) return false
+    if (item.previousDigest !== heads.get(item.chainId)) return false
     if (seal({ ...item, receiptDigest: "" }) !== item.receiptDigest) return false
-    previous = item.receiptDigest
+    heads.set(item.chainId, item.receiptDigest)
   }
   return true
 }
@@ -362,6 +396,7 @@ export class QuorumGovernor implements ActionGovernor {
     readonly governor: ActionGovernor
     readonly mandatory: boolean
   }[] = []
+  private voterTimeoutMs = DEFAULT_VOTER_TIMEOUT_MS
 
   /** A quorum under `policy`. Add voters with `voter`. An empty or otherwise
    * invalid configuration blocks when evaluated. */
@@ -369,6 +404,17 @@ export class QuorumGovernor implements ActionGovernor {
 
   voter(name: string, governor: ActionGovernor, mandatory: boolean): this {
     this.voters.push({ name, governor, mandatory })
+    return this
+  }
+
+  /** How long each voter may take, 10 seconds unless set. A voter that does
+   * not answer in time counts as an error: a mandatory one blocks, any other
+   * abstains. */
+  voterTimeout(timeoutMs: number): this {
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+      throw new InvalidError("quorum voter timeout must be a finite number of milliseconds")
+    }
+    this.voterTimeoutMs = timeoutMs
     return this
   }
 
@@ -385,6 +431,9 @@ export class QuorumGovernor implements ActionGovernor {
         `quorum threshold ${String(this.policy.required)} is invalid for ${String(this.voters.length)} voters`
       )
     }
+    if (this.voterTimeoutMs === 0) {
+      return ActionDecision.block("quorum voter timeout must be greater than zero")
+    }
     const names = new Set<string>()
     const duplicate = this.voters.find(({ name }) => names.size === names.add(name).size)
     if (duplicate !== undefined) {
@@ -392,7 +441,9 @@ export class QuorumGovernor implements ActionGovernor {
     }
     // A voter that throws before returning its promise abstains like one that rejects.
     const votes = await Promise.allSettled(
-      this.voters.map(async (voter) => voter.governor.decide(action))
+      this.voters.map(async (voter) =>
+        withinTimeout(voter.governor.decide(action), this.voterTimeoutMs)
+      )
     )
     const ballot: string[] = []
     let affirmative = 0
@@ -454,6 +505,24 @@ export class QuorumGovernor implements ActionGovernor {
   }
 }
 
+// `vote`, or a rejection once `timeoutMs` passes first.
+async function withinTimeout(
+  vote: Promise<ActionDecision>,
+  timeoutMs: number
+): Promise<ActionDecision> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new TimeoutError("timed out waiting for a quorum voter"))
+    }, timeoutMs)
+  })
+  try {
+    return await Promise.race([vote, expired])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 function quorumLabel(policy: QuorumPolicy): string {
   if (policy.kind === "all") return "All"
   if (policy.kind === "any") return "Any"
@@ -505,8 +574,21 @@ export class SwappableGovernor implements ActionGovernor {
   }
 }
 
-function apply(mode: GovernorMode, verdict: Verdict): Applied {
+// A step-up the action's approval answers proceeds as an observed effect,
+// recorded with the step-up decision and its scope.
+function granted(action: GovernedAction, decision: ActionDecision): ActionDecision {
+  const conversation = action.approval?.conversation.toString()
+  return decision.verdict.kind === "step_up" &&
+    conversation !== undefined &&
+    action.conversation?.toString() === conversation
+    ? ActionDecision.observe()
+    : decision
+}
+
+function apply(mode: GovernorMode, decision: ActionDecision): Applied {
   const enforced = mode === GovernorMode.Enforce
+  const verdict = decision.verdict
+  const detail = decision.reason === undefined ? "" : `: ${decision.reason}`
   switch (verdict.kind) {
     case "allow":
       return { recorded: false, outcome: "effected" }
@@ -518,7 +600,9 @@ function apply(mode: GovernorMode, verdict: Verdict): Applied {
       return {
         recorded: true,
         outcome: enforced ? "blocked" : "effected",
-        ...(enforced ? { denial: new PolicyBlockedError("the governor blocked this action") } : {})
+        ...(enforced
+          ? { denial: new PolicyBlockedError(`the governor blocked this action${detail}`) }
+          : {})
       }
     case "step_up":
       return {
@@ -531,7 +615,7 @@ function apply(mode: GovernorMode, verdict: Verdict): Applied {
         recorded: true,
         outcome: enforced ? "deferred" : "effected",
         ...(enforced
-          ? { denial: new PolicyDeferredError("the governor deferred this action") }
+          ? { denial: new PolicyDeferredError(`the governor deferred this action${detail}`) }
           : {})
       }
   }
@@ -540,14 +624,16 @@ function apply(mode: GovernorMode, verdict: Verdict): Applied {
 function sealEvidence(
   action: Omit<GovernedAction, "counters">,
   decision: ActionDecision,
+  decisionName: PolicyEvidence["decision"],
   mode: GovernorMode,
   outcome: PolicyEvidence["outcome"],
   atMicros: bigint,
+  chainId: string,
   previousDigest?: string
 ): PolicyEvidence {
   const evidence: PolicyEvidence = {
     decisionId: IntentId.new().toString(),
-    decision: decision.verdict.kind,
+    decision: decisionName,
     mode,
     kind: action.kind,
     stream: action.stream,
@@ -565,6 +651,7 @@ function sealEvidence(
     ...(decision.riskScore !== undefined ? { riskScore: decision.riskScore } : {}),
     receiptDigest: "",
     ...(previousDigest !== undefined ? { previousDigest } : {}),
+    chainId,
     outcome,
     atMicros
   }
@@ -611,6 +698,7 @@ function policyEvidenceMap(evidence: PolicyEvidence): Map<string, unknown> {
   optionalMap(map, "risk_score", evidence.riskScore)
   map.set("receipt_digest", evidence.receiptDigest)
   optionalMap(map, "previous_digest", evidence.previousDigest)
+  map.set("chain_id", evidence.chainId)
   map.set("outcome", evidence.outcome)
   map.set("at_micros", evidence.atMicros)
   return map
@@ -646,6 +734,10 @@ const VERDICT_KINDS: ReadonlySet<string> = new Set<Verdict["kind"]>([
   "modify",
   "defer"
 ])
+
+function parseEvidenceDecision(value: string, context: string): PolicyEvidence["decision"] {
+  return value === GOVERNOR_ERROR_DECISION ? value : parseVerdictKind(value, context)
+}
 
 function parseVerdictKind(value: string, context: string): Verdict["kind"] {
   if (!VERDICT_KINDS.has(value)) {

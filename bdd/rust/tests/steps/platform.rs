@@ -1,7 +1,8 @@
 use crate::common::test_iggy::fresh_laser;
 use crate::common::world::LaserWorld;
 use cucumber::{given, then, when};
-use laser_sdk::prelude::ConversationId;
+use laser_bdd::wait_for_partition_reads;
+use laser_sdk::prelude::{AgentTopic, ConversationId};
 
 #[given("a running data platform")]
 async fn running_platform(_world: &mut LaserWorld) {
@@ -27,6 +28,15 @@ async fn fresh_stream_bootstrapped(world: &mut LaserWorld, partitions: u32) {
         )
         .await
         .expect("bootstrap the stream");
+    let context = fresh.laser.context(ConversationId::new());
+    wait_for_partition_reads(async || {
+        context
+            .fetch(vec![AgentTopic::Sessions], 1, None)
+            .await
+            .map(|_| ())
+    })
+    .await
+    .expect("the session partitions are readable");
     world.platform = fresh.iggy;
     world.laser = Some(fresh.laser);
 }

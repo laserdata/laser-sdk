@@ -106,8 +106,7 @@ An accessor selects a feature on the connected client. A method performs an acti
 | Accessor | Primitive | Reach for it to |
 | --- | --- | --- |
 | `laser.stream(name).topic(name)` | Log | publish and consume records, replay by offset, batch |
-| `laser.query(index)` / `laser.query_lakehouse(destination, generation)` | Views | filter, aggregate, page, inspect or cancel operational and lakehouse queries |
-| `laser.destinations()` | Destinations | declare materialization targets, change desired state, inspect checkpoints and query routes |
+| `laser.query(index)` | Views | filter, aggregate and page operational queries |
 | `laser.graph(name)` | Graph | link entities, traverse, find neighbors and nearest vectors |
 | `laser.watch()` | Change feed | consume advancement records instead of re-querying blind |
 | `topic.consumer_group(...).filter()` | [Consumer filters](https://docs.laserdata.cloud/laser-sdk/consumer-filters) | read only the records a filter selects, on the server, with fenced acknowledgments, previews, saved filters, and bound consumer groups |
@@ -141,7 +140,7 @@ let rows = laser
     .fetch()
     .await?;
 let nearby = laser.graph("kg").neighbors(node, EdgeDir::Out, None, 2).await?;
-let mut feed = laser.watch().index("readings_v1").records()?; // await-then-query
+let mut feed = laser.watch().index("readings_v1").from_end().records().await?; // await-then-query
 
 // State: point reads and writes, optimistic concurrency, branches.
 laser
@@ -194,7 +193,7 @@ await audit.publish().json(event).send()
 # Views + graph + change feed
 rows = await laser.query("readings_v1").where_eq("status", "degraded").limit(10).fetch()
 nearby = await laser.graph("kg").neighbors(node, dir="out", depth=2)
-feed = laser.watch(index="readings_v1")
+feed = await laser.watch(index="readings_v1", from_end=True)
 
 # State
 await laser.kv("sessions").set("user:42").json(session).ttl(300_000).send()
@@ -235,7 +234,7 @@ const rows = await laser
   .limit(10)
   .fetch()
 const nearby = await laser.graph("kg").neighbors(node, "out", undefined, 2)
-const feed = await laser.watch().index("readings_v1").records()
+const feed = await laser.watch().index("readings_v1").fromEnd().records()
 
 // State
 await laser.kv("sessions").set(key).json(session).ttl(300_000_000n).send()
@@ -289,14 +288,14 @@ Agent fabric (opt in with the `agent` feature):
 | Primitive | What you get |
 | --- | --- |
 | Reliable runtime | A consumer with **dedup, retry, and dead-letter**, request/reply correlation, conversation and causality tracking, routing, sessions, and context assembly. |
-| Agentic memory | One durable model: `remember` / `recall` / `improve` / `forget` publish to the memory topic (`agent.memory` by default) that materializes to a versioned key-value read view and recalls by recency. The topic is configurable (`memory_topic(name).stream(..).partitions(n).ttl(d)`). The in-process vector backend and rerank seam add semantic / keyword / hybrid ranking. Consolidation, token-budgeted `to_context_block`, and content-addressed dedup compose above both. Vector memory created from a `Laser` inherits its action governor even though the index itself stays local. A scan over the read view narrows to one conversation with `conversation(id)`, the same lens the query and graph reads carry. |
+| Agentic memory | One durable model: `remember` / `recall` / `improve` / `forget` publish to the memory topic (`agent.memory` by default) that materializes to a versioned key-value read view and recalls by recency, ranked first by the summed feedback for every strategy except recent. A forget is a timed tombstone, so an older write stays forgotten whichever partition it rides. The topic is configurable (`memory_topic(name).stream(..).partitions(n).ttl(d)`). The in-process vector backend and rerank seam add semantic / keyword / hybrid ranking. Consolidation, token-budgeted `to_context_block`, and content-addressed dedup compose above both. Vector memory created from a `Laser` inherits its action governor even though the index itself stays local. A scan over the read view narrows to one conversation with `conversation(id)`, the same lens the query and graph reads carry. |
 | Discovery | Agents advertise a capability card and a live inbox, fused into one cached registry with health-aware resolution and reversible operator `quarantine` / `unquarantine`. One connection may advertise one agent. Sensitive routes can require the presence's server-authenticated principal. |
-| Coordination | `contract` (a directed task with a deadline and a real consumed / completed / timed-out answer), `fan_out` / `scatter` (ask every capable agent, gather under a policy), and `approval_gate` (pause for a human). With signing enabled, terminals fail closed on unsigned or wrongly signed replies and expose the verified principal. |
+| Coordination | `contract` (a directed task with a deadline and a real consumed / completed / timed-out answer), `fan_out` / `scatter` (ask every capable agent, gather under a policy), and `approval_gate` (pause for a named approver and get a grant a governed re-send carries). With signing enabled, terminals fail closed on unsigned or wrongly signed replies and expose the verified principal. |
 | Workflow engine | `laser.workflow(..).step(..)`: dependency-ordered steps, budgets, verifier panels, saga compensation, **crash-recovery replay from a journal**, and per-step fenced leases. Use `.exclusive_in(namespace)` when the handler commits an external effect with `kv(target_namespace).cas_fenced(key, namespace, ..)`. The engine races bounded renewal against completion, keeps the lease through verification and completion journaling, then releases it before `OnTimeout::Reassign` gives a fresh holder a new fence. |
 | Sessions | `laser.sessions()`: one conversation with a recorded lifecycle on `agent.sessions`. Start, end, fail, or cancel it, record model and tool calls with the context they received, keep a JSON state document, hand work to an agent with a budget that agents and workflows enforce, and stop it through the operator-only `agent.control` topic. Workflows run as root sessions with a child session per step. A registered stream gets a managed session index that `laser.sessions()` reads with `list`, `get`, `events`, `state`, `links`, `sources`, `changes`, and `watch`, and the log stays the truth. |
 | AGDX envelope | A typed, versioned, fixture-pinned agent message format on the log, with producer verbs, resumable token streams, and deterministic reassembly. ([notes](docs/agdx.md)) |
-| Action governance | A pre-effect policy hook (`ActionGovernor`) over everything an agent publishes: allow, observe, block, step-up, modify, or defer each send, typed or raw topic publish, AGDX verb, and memory write **before it runs**. Enforce or shadow mode records every non-allow decision as digest-chained evidence. `QuorumGovernor` runs named governors concurrently under `All` / `Any` / `AtLeast(n)`. Every mandatory voter must affirm, invalid configurations and mandatory errors block, and conflicting body replacements block. `SwappableGovernor` changes the active policy without reconnecting. Defense in depth above server-owned RBAC. |
-| Durable intent | SDK-level typed records for asynchronous effect approval, not an AGDX wire extension. Fallible `Intent::builder().build()` validates the frozen voter set, threshold, deadline, and body digest. Fallible `Vote::cast` binds an eligible voter to that digest and policy version. `decide` ignores invalid, early, late, and future ballots, then returns a canonical commit or abort. Mandatory voters must allow, conflicting repeats abort, and `Decision::authorizes` verifies the exact intent before an effect runs. Voter identity is trusted only under a signed-principal or topology-isolated deployment profile. |
+| Action governance | A pre-effect policy hook (`ActionGovernor`) over everything an agent publishes: allow, observe, block, step-up, modify, or defer each send, every record of a typed or raw topic publish, batch, producer send, or session append, AGDX verb, and memory write **before it runs**. Enforce or shadow mode records every non-allow decision as digest-chained evidence, one chain per governed handle and conversation. `QuorumGovernor` runs named governors concurrently under `All` / `Any` / `AtLeast(n)`, each bounded by a voter timeout. Every mandatory voter must affirm, invalid configurations and mandatory errors block, and conflicting body replacements block. `SwappableGovernor` changes the active policy without reconnecting. Defense in depth above server-owned RBAC. |
+| Durable intent | SDK-level typed records for asynchronous effect approval, not an AGDX wire extension. Fallible `Intent::builder().build()` validates the frozen voter set, threshold, deadline, and body digest. Fallible `Vote::cast` binds an eligible voter to that digest and policy version. `decide` takes each ballot with the time the log assigned it (`ObservedVote`), ignores invalid ballots and those observed early, late, or in the future, then returns a canonical commit or abort. Mandatory voters must allow, conflicting repeats abort, and `Decision::authorizes` verifies the exact intent and a quorum of considered votes before an effect runs. Voter identity is trusted only under a signed-principal or topology-isolated deployment profile. |
 | Swarm activity | A coordinator's replay-safe read model over governance evidence: `SwarmActivity::observe` deduplicates by decision id, `.agent(name)` reads one agent's counts and deterministic latest decision, and `.agents()` lists every folded agent busiest first. |
 | Crash context | A recovery tool's one-call bundle over an already-read journal tail, dead-letter capsule, and latest governance decision. `.summarize()` emits a bounded deterministic digest with control characters escaped, so untrusted payloads cannot forge diagnostic lines. It performs no I/O and never invokes a model. |
 | Edge bridges | A2A, MCP, and AG-UI mapped onto AGDX over the durable log, no SSE. ([interop](docs/interop.md)) |
@@ -337,7 +336,7 @@ Connections to `*.laserdata.cloud` and `*.laserdata.com` automatically use the p
 
 ## Consumer groups and offsets
 
-Provision a filtered group once, then consume it by name or ID. Every consumer in the group shares its policy and divides the partitions, so use separate groups for A/B revisions to keep their offsets independent. A fresh consumer that starts at `Next` begins at the first retained record. Under the polling commit policy a native consumer can store a polled batch's offset before the application has handled it, and a group-aware automatic commit advances only past records already delivered, on the next read or at shutdown. When that matters, disable automatic commits and commit after processing. Filtered readers acknowledge explicitly and keep at most 1024 unacknowledged record-bearing pages per partition by default (`max_unacked_pages` in Rust and Python, `maxUnackedPages` in TypeScript), so a reader that never acknowledges stops at the bound instead of growing without limit. An unnamed TypeScript consumer gets an isolated identity and does not commit automatically. Give it a stable name to resume durable progress. Codec profiles and examples are in the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+Provision a filtered group once, then consume it by name or ID. Every consumer in the group shares its policy and divides the partitions, so use separate groups for A/B revisions to keep their offsets independent. A fresh consumer that starts at `Next` begins at the first retained record. The default `all` commit policy stores a poll once its last record is handled. Under the polling commit policy a native consumer can store a polled batch's offset before the application has handled it, and a group-aware automatic commit advances only past records already delivered, on the next read or at shutdown. When that matters, disable automatic commits and commit after processing. Filtered readers acknowledge explicitly and keep at most 1024 unacknowledged record-bearing pages per partition by default (`max_unacked_pages` in Rust and Python, `maxUnackedPages` in TypeScript), so a reader that never acknowledges stops at the bound instead of growing without limit. A record the default `stop` fault policy stops on blocks its partition until the reader or the group consumer calls `skip(partition, offset)` with the offset the fault names, which acknowledges past it once the records before it are handled. An unnamed TypeScript consumer gets an isolated identity and does not commit automatically. Give it a stable name to resume durable progress. Codec profiles and examples are in the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
 
 ## Connect and publish limits
 
@@ -409,3 +408,13 @@ At-least-once with idempotent operations, per-conversation (per-partition) order
 ## License
 
 Apache-2.0. Copyright LaserData, Inc. Apache and Apache Iggy are trademarks of the Apache Software Foundation, and use does not imply endorsement.
+
+## Materialization and operational SQL
+
+Materialization setup is available in Rust, Python, and TypeScript through `topic.materialize().apply()`. It registers a whole-record projection by default. A typed projection selects extracted fields. Reuse the setup operation identity after an uncertain response. The resulting handle reports binding status and waits against a captured source target. Readiness and complete historical coverage are separate results. A wait also ends early as failed, blocked or not found, and `topic.materialization(projection_id)` returns the handle again in a later process, see [client behavior](docs/client-behavior.md#materialization-and-operational-sql).
+
+Projection history defaults to append. Keyed history selects a typed header key or a payload JSON pointer and can name a delete header. Without one, a keyed view never deletes a key. A key stays in one partition per topic incarnation. Older updates cannot replace a newer value or restore a deleted value. Keyed history does not claim complete append history. Projection and binding history cannot change in place.
+
+Bindings use `invalid_records` and `oversize` policies. Both default to block. Dead-letter handling permits automatic skips of rejected records. Reference handling omits an oversized body while retaining its source location. A record that fails its declared writer schema follows the invalid-record policy.
+
+Raw SQL requires an explicit dialect in every client. Rust uses `raw_sql(dialect, sql)` or `raw_sql_with(dialect, sql, params)`. Python uses `raw_sql(dialect, sql, params=None)`. TypeScript uses `rawSql(dialect, sql, params?)`. Every referenced index must be authorized for the caller and belong to the same stream and backend. Unsupported managed capabilities fail explicitly on original Apache Iggy. Standard streaming remains available.

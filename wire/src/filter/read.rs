@@ -253,7 +253,8 @@ pub struct FilteredPollRequest {
     pub start: FilteredStart,
     /// Most matching records to return.
     pub count: u32,
-    /// Most record bytes to return. The server may lower it.
+    /// Most record bytes to return. The server may lower it. A first record
+    /// larger than the cap comes alone, within the server's own cap.
     pub max_reply_bytes: u32,
     /// Most source records to examine. The server lowers it to its own
     /// budget. Absent means the server budget alone. A normal consumer sets
@@ -428,10 +429,10 @@ pub struct FilteredPage {
     pub stop: StopReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fault: Option<RecordFault>,
-    /// Offsets of returned records the filter could not evaluate (the `pass`
-    /// fault policy).
+    /// Returned records a `pass` fault, foreign or mismatch policy delivered
+    /// without evaluating them, each with the reason it was not evaluated.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unevaluated: Vec<u64>,
+    pub unevaluated: Vec<RecordFault>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation_limits: Option<Box<FilterDecodeLimits>>,
     #[serde(with = "crate::encoding::bin_bytes")]
@@ -1196,6 +1197,7 @@ mod tests {
             partition_id: 0,
             offset: 41,
             operation_id: Some(11),
+            revision: None,
         });
         automatic.validate().expect("valid");
     }

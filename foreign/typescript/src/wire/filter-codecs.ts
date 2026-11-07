@@ -59,45 +59,15 @@ export class PayloadDecoders {
         throw new InvalidError(`writer schema ${String(id)} does not match codec ${filter.codec}`)
       try {
         switch (found.source.kind) {
-          case "avro": {
-            if (new TextEncoder().encode(found.source.schema).byteLength > MAX_FILTER_SCHEMA_BYTES)
-              throw new InvalidError("writer schema exceeds 1 MiB")
-            parseCanonicalJson(found.source.schema, "payload")
-            const source = JSON.parse(found.source.schema) as unknown
-            const pending: [unknown, number][] = [[source, 1]]
-            while (pending.length > 0) {
-              const entry = pending.pop()
-              if (entry === undefined) break
-              const [value, depth] = entry
-              if (value !== null && typeof value === "object") {
-                if (depth > MAX_FILTER_SCHEMA_DEPTH)
-                  throw new InvalidError("writer schema exceeds depth 64")
-                for (const child of Object.values(value)) pending.push([child, depth + 1])
-              }
-            }
-            const schema = avro.Type.forSchema(source as never, {
-              wrapUnions: true,
-              typeHook: (schema) =>
-                schema === "long" ||
-                (typeof schema === "object" &&
-                  !Array.isArray(schema) &&
-                  "type" in schema &&
-                  schema.type === "long")
-                  ? exactLong
-                  : undefined
+          case "avro":
+            this.schemas.set(id, { kind: "avro", schema: compileAvroWriter(found.source.schema) })
+            break
+          case "protobuf":
+            this.schemas.set(id, {
+              kind: "protobuf",
+              schema: compileProtobufWriter(found.source.descriptorSet, found.source.messageType)
             })
-            this.schemas.set(id, { kind: "avro", schema })
             break
-          }
-          case "protobuf": {
-            if (found.source.descriptorSet.byteLength > MAX_FILTER_SCHEMA_BYTES)
-              throw new InvalidError("writer schema exceeds 1 MiB")
-            const root = protobuf.Root.fromDescriptor(found.source.descriptorSet)
-            const schema = root.lookupType(found.source.messageType.replace(/^\./, ""))
-            schema.resolveAll()
-            this.schemas.set(id, { kind: "protobuf", schema })
-            break
-          }
           case "unknown":
             throw new InvalidError(`writer schema ${String(id)} has no payload decoder`)
         }
@@ -136,6 +106,52 @@ export class PayloadDecoders {
       return error instanceof PayloadFault ? error : new PayloadFault("malformed")
     }
   }
+}
+
+/** An Avro writer type of at most 1 MiB and nesting 64, unions wrapped and
+ * longs exact, read as physical values as in Rust.
+ * @internal */
+export function compileAvroWriter(text: string): avro.Type {
+  if (new TextEncoder().encode(text).byteLength > MAX_FILTER_SCHEMA_BYTES)
+    throw new InvalidError("writer schema exceeds 1 MiB")
+  parseCanonicalJson(text, "payload")
+  const source = JSON.parse(text) as unknown
+  const pending: [unknown, number][] = [[source, 1]]
+  while (pending.length > 0) {
+    const entry = pending.pop()
+    if (entry === undefined) break
+    const [value, depth] = entry
+    if (value !== null && typeof value === "object") {
+      if (depth > MAX_FILTER_SCHEMA_DEPTH) throw new InvalidError("writer schema exceeds depth 64")
+      for (const child of Object.values(value)) pending.push([child, depth + 1])
+    }
+  }
+  return avro.Type.forSchema(source as never, {
+    wrapUnions: true,
+    typeHook: (schema) =>
+      schema === "long" ||
+      (typeof schema === "object" &&
+        !Array.isArray(schema) &&
+        "type" in schema &&
+        schema.type === "long")
+        ? exactLong
+        : undefined
+  })
+}
+
+/** A resolved Protobuf message type in a descriptor set of at most 1 MiB.
+ * @internal */
+export function compileProtobufWriter(
+  descriptorSet: Uint8Array,
+  messageType: string
+): protobuf.Type {
+  if (descriptorSet.byteLength > MAX_FILTER_SCHEMA_BYTES)
+    throw new InvalidError("writer schema exceeds 1 MiB")
+  // Field names stay as the schema spells them, as in Rust.
+  const root = protobuf.Root.fromDescriptor(descriptorSet, { keepCase: true })
+  const schema = root.lookupType(messageType.replace(/^\./, ""))
+  schema.resolveAll()
+  return schema
 }
 
 function normalize(value: unknown): JsonValue {
@@ -209,7 +225,9 @@ function avroValue(schema: avro.Type, value: unknown): JsonValue {
   }
 }
 
-function protobufMapKey(hash: string, unsigned: boolean): string {
+/** The 64-bit key a protobufjs map holds as its 8-character hash.
+ * @internal */
+export function protobufMapKey(hash: string, unsigned: boolean): string {
   if (hash.length !== 8) throw new PayloadFault("malformed")
   let value = 0n
   for (let index = 0; index < hash.length; index += 1) {
@@ -266,7 +284,9 @@ function protoMessage(schema: protobuf.Type, message: object): JsonValue {
   return result
 }
 
-class Input {
+/** The bounded pre-pass that refuses a body before a decoder allocates.
+ * @internal */
+export class Input {
   private position = 0
   private remaining: number
   constructor(
@@ -411,7 +431,7 @@ class Input {
           const bytes = this.take(Number(this.varint()))
           const field = declared
           if (
-            field?.type === "string" ||
+            (field?.type === "string" && !field.map) ||
             (mapValue !== undefined &&
               ((number === 1 &&
                 mapValue instanceof protobuf.MapField &&

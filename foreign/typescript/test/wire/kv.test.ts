@@ -29,6 +29,7 @@ import {
   encodeKvLease,
   encodeKvLeaseRenew,
   encodeKvMove,
+  decodeKvNamespaces,
   encodeKvNamespaces,
   encodeKvOutcome,
   encodeKvPatch,
@@ -112,6 +113,25 @@ void test("given_the_kv_cas_fenced_fixture_when_decoded_then_should_preserve_the
   assert.equal(cas.fenceToken, 3n)
   const reencoded = encodeNamed(encodeKvCasFenced(cas))
   assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
+})
+
+void test("given_the_kv_set_ttl_fixture_when_decoded_then_should_carry_a_relative_ttl_byte_identically", async () => {
+  const bytes = await readFixture("kv_set_ttl.bin")
+  const set = decodeKvSet(expectMap(decodeOne(bytes, "kv_set_ttl"), "kv_set_ttl"), "kv_set_ttl")
+  assert.equal(set.ttlMicros, 300_000_000n)
+  assert.equal(set.expiresAtMicros, undefined)
+  assert.deepEqual(Buffer.from(encodeNamed(encodeKvSet(set))), Buffer.from(bytes))
+})
+
+void test("given_the_kv_cas_fenced_session_fixture_when_decoded_then_should_carry_the_session_byte_identically", async () => {
+  const bytes = await readFixture("kv_cas_fenced_session.bin")
+  const cas = decodeKvCasFenced(
+    expectMap(decodeOne(bytes, "kv_cas_fenced_session"), "kv_cas_fenced_session"),
+    "kv_cas_fenced_session"
+  )
+  assert.equal(cas.session?.stream, "orders")
+  assert.equal(cas.ttlMicros, 60_000_000n)
+  assert.deepEqual(Buffer.from(encodeNamed(encodeKvCasFenced(cas))), Buffer.from(bytes))
 })
 
 void test("given_the_kv_lease_fixture_when_decoded_then_should_preserve_holder_and_subject", async () => {
@@ -233,7 +253,7 @@ void test("given_the_kv_scan_fixture_when_decoded_then_should_preserve_bounds_an
   const map = expectMap(decodeOne(bytes, "kv_scan"), "kv_scan")
   const scan = decodeKvScan(map, "kv_scan")
   assert.equal(scan.keyContains, "admin")
-  assert.equal(scan.limit, 50)
+  assert.deepEqual([scan.page, scan.results], [3, 50])
   const reencoded = encodeNamed(encodeKvScan(scan))
   assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
 })
@@ -264,11 +284,15 @@ void test("given_the_kv_reply_namespaces_fixture_when_decoded_then_should_carry_
   ])
 })
 
-void test("given_the_kv_reply_page_fixture_when_decoded_then_should_carry_the_entry_and_cursor", async () => {
+void test("given_the_kv_reply_page_fixture_when_decoded_then_should_carry_the_entry_and_totals", async () => {
   const reply = await assertKvReplyRoundTrips("kv_reply_page.bin")
   if (reply.kind !== "ok" || reply.outcome.kind !== "page") throw new Error("wrong shape")
-  assert.equal(reply.outcome.page.entries.length, 1)
-  const [entry] = reply.outcome.page.entries
+  assert.deepEqual(
+    [reply.outcome.page.page, reply.outcome.page.totalPages, reply.outcome.page.totalResults],
+    [3, 3, 101]
+  )
+  assert.equal(reply.outcome.page.items.length, 1)
+  const [entry] = reply.outcome.page.items
   assert.ok(entry !== undefined)
   assert.equal(kvEntryKeyStr(entry), "user:1")
   assert.equal(entry.version, 0n)
@@ -313,6 +337,25 @@ void test("given_the_kv_reply_stale_fixture_when_decoded_then_should_carry_the_r
   })
 })
 
+void test("given_the_kv_reply_barrier_unreachable_fixture_when_decoded_then_should_carry_the_required_position", async () => {
+  const reply = await assertKvReplyRoundTrips("kv_reply_barrier_unreachable.bin")
+  assert.deepEqual(reply, {
+    kind: "err",
+    error: {
+      kind: "barrierUnreachable",
+      required: { topicGeneration: 1n, partition: 0, offset: 512n }
+    }
+  })
+})
+
+void test("given_the_kv_reply_lease_held_fixture_when_decoded_then_should_carry_the_holder_expiry", async () => {
+  const reply = await assertKvReplyRoundTrips("kv_reply_lease_held.bin")
+  assert.deepEqual(reply, {
+    kind: "err",
+    error: { kind: "leaseHeld", expiresAtMicros: 1_700_000_030_000_000n }
+  })
+})
+
 void test("given_namespaces_when_validated_then_should_enforce_bounds", () => {
   assert.doesNotThrow(() => {
     validateNamespace("default")
@@ -337,6 +380,17 @@ void test("given_the_kv_namespaces_fixture_when_encoded_then_should_re_encode_by
   const bytes = await readFixture("kv_namespaces.bin")
   const reencoded = encodeNamed(encodeKvNamespaces())
   assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
+})
+
+void test("given_a_namespace_listing_with_a_stream_when_round_tripped_then_should_keep_the_stream", () => {
+  const bytes = encodeNamed(encodeKvNamespaces({ stream: "acme" }))
+  const decoded = decodeKvNamespaces(expectMap(decodeOne(bytes, "listing"), "listing"), "listing")
+  assert.equal(decoded.stream, "acme")
+  const bare = decodeKvNamespaces(
+    expectMap(decodeOne(encodeNamed(encodeKvNamespaces()), "listing"), "listing"),
+    "listing"
+  )
+  assert.equal(bare.stream, undefined)
 })
 
 void test("given_kv_delete_many_when_round_tripped_then_should_preserve_bounds", () => {
@@ -450,6 +504,27 @@ void test("given_the_memory_view_entry_fixture_when_decoded_then_should_keep_ser
   const scope = entry.scope
   assert.ok(scope !== undefined)
   assert.equal(scope.timestampMicros, 1_717_171_717_000_009n)
+  assert.equal(scope.weight, 2.5)
   assert.equal(scope.source?.kind, "message")
   assert.deepEqual(Buffer.from(encodeNamed(encodeKvEntry(entry))), Buffer.from(bytes))
+})
+
+void test("given_memory_scope_lenses_when_a_scan_is_encoded_then_should_follow_the_rust_field_order", () => {
+  const scan = {
+    namespace: "stream:acme/memory",
+    conversation: "01KWM3K3XEP3NP5TN850J17YBP",
+    stream: "acme",
+    user: "reader",
+    agent: "planner",
+    app: "desk",
+    page: 2,
+    results: 10
+  }
+  const encoded = encodeKvScan(scan)
+  assert.deepEqual(
+    [...encoded.keys()],
+    ["v", "namespace", "conversation", "stream", "user", "agent", "app", "page", "results"]
+  )
+  const back = decodeKvScan(expectMap(decodeOne(encodeNamed(encoded), "test"), "test"), "test")
+  assert.deepEqual([back.user, back.agent, back.app], ["reader", "planner", "desk"])
 })

@@ -10,6 +10,7 @@ import {
   MemoryId,
   MemoryKind,
   RecallStrategy,
+  type MemoryItem,
   type MemoryScope,
   type Embedder
 } from "../../src/memory/types.js"
@@ -32,22 +33,32 @@ function entry(id: bigint, conversation: ConversationId, user: string, app: stri
   }
 }
 
+interface ScanCall {
+  conversation?: string
+  page?: number
+  lens?: readonly (string | undefined)[]
+}
+
 function memory(pages: readonly KvPage[]) {
-  const calls: { conversation?: string; cursor?: Uint8Array }[] = []
+  const calls: ScanCall[] = []
   const laser = {
     defaultStream: "records",
     ...BARE_NAMING,
     kv: () => ({
       scan: () => {
-        const current: { conversation?: string; cursor?: Uint8Array } = {}
+        const current: ScanCall = {}
         const scan = {
           conversation: (value: string) => {
             current.conversation = value
             return scan
           },
           lensStream: () => scan,
-          cursor: (value: Uint8Array) => {
-            current.cursor = value
+          memoryLens: (user?: string, agent?: string, app?: string) => {
+            current.lens = [user, agent, app]
+            return scan
+          },
+          page: (value: number) => {
+            current.page = value
             return scan
           },
           fetch: () => {
@@ -70,18 +81,20 @@ void test("given_paged_user_and_application_memory_when_recalled_without_convers
   const second = ConversationId.derive("second")
   const { handle, calls } = memory([
     {
-      entries: [
-        entry(1n, first, "reader", "diagnostics"),
-        entry(2n, first, "other", "diagnostics")
-      ],
-      cursor: new Uint8Array([2])
+      items: [entry(1n, first, "reader", "diagnostics"), entry(2n, first, "other", "diagnostics")],
+      page: 1,
+      totalPages: 2,
+      totalResults: 5
     },
     {
-      entries: [
+      items: [
         entry(3n, second, "reader", "other"),
         entry(4n, second, "reader", "diagnostics"),
         entry(5n, first, "reader", "diagnostics")
-      ]
+      ],
+      page: 2,
+      totalPages: 2,
+      totalResults: 5
     }
   ])
   const items = await handle.recall({ user: "reader", app: "diagnostics" }, { limit: 2 })
@@ -91,7 +104,12 @@ void test("given_paged_user_and_application_memory_when_recalled_without_convers
   )
   assert.equal(items[0]?.provenance.conversationId.toString(), first.toString())
   assert.equal(items[1]?.provenance.conversationId.toString(), second.toString())
-  assert.deepEqual(calls, [{}, { cursor: new Uint8Array([2]) }])
+  // The scope narrows the scan on the server, and the rows are checked again.
+  const lens = ["reader", undefined, "diagnostics"]
+  assert.deepEqual(calls, [
+    { lens, page: 1 },
+    { lens, page: 2 }
+  ])
 })
 
 void test("given_managed_log_memory_when_searched_then_should_scan_past_unrelated_newer_items", async () => {
@@ -100,10 +118,13 @@ void test("given_managed_log_memory_when_searched_then_should_scan_past_unrelate
   const unrelated = entry(2n, conversation, "reader", "diagnostics")
   const { handle } = memory([
     {
-      entries: [
+      items: [
         { ...matching, value: new TextEncoder().encode("apple") },
         { ...unrelated, value: new TextEncoder().encode("orange") }
-      ]
+      ],
+      page: 1,
+      totalPages: 1,
+      totalResults: 2
     }
   ])
   const items = await handle.recall(
@@ -121,10 +142,13 @@ void test("given_a_conversation_filter_when_the_read_view_contains_other_rows_th
   const second = ConversationId.derive("second")
   const { handle, calls } = memory([
     {
-      entries: [
+      items: [
         entry(1n, first, "reader", "diagnostics"),
         entry(2n, second, "reader", "diagnostics")
-      ]
+      ],
+      page: 1,
+      totalPages: 1,
+      totalResults: 2
     }
   ])
   const items = await handle.recall({ conversation: first }, { limit: 2 })
@@ -135,8 +159,13 @@ void test("given_a_conversation_filter_when_the_read_view_contains_other_rows_th
   assert.equal(calls[0]?.conversation, first.toString())
 })
 
-void test("given_a_repeating_scan_cursor_when_memory_is_recalled_then_should_refuse_to_loop", async () => {
-  const page = { entries: [], cursor: new Uint8Array([1]) }
+void test("given_a_scan_answered_with_another_page_when_memory_is_recalled_then_should_refuse_to_loop", async () => {
+  const page = {
+    items: [entry(1n, ConversationId.derive("loop"), "reader", "diagnostics")],
+    page: 1,
+    totalPages: 3,
+    totalResults: 3
+  }
   const { handle } = memory([page, page])
   await assert.rejects(handle.recall({}, {}), ProtocolError)
 })
@@ -318,11 +347,97 @@ void test("given_content_ids_out_of_arrival_order_when_recalled_from_the_view_th
     }
   }
   const { handle } = memory([
-    { entries: [stamped(9n, 0, 10n), stamped(1n, 1, 30n), stamped(5n, 2, 20n)] }
+    {
+      items: [stamped(9n, 0, 10n), stamped(1n, 1, 30n), stamped(5n, 2, 20n)],
+      page: 1,
+      totalPages: 1,
+      totalResults: 3
+    }
   ])
   const items = await handle.recall({}, { limit: 2 })
   assert.deepEqual(
     items.map((item) => item.id.asU128()),
     [1n, 5n]
+  )
+})
+
+void test("given_feedback_weights_on_view_rows_when_recalled_then_should_rank_by_weight_except_recent", async () => {
+  const conversation = ConversationId.derive("weights")
+  const row = (id: bigint, timestampMicros: bigint, weight?: number): KvEntry => {
+    const base = entry(id, conversation, "reader", "diagnostics")
+    return {
+      ...base,
+      scope: { ...base.scope, timestampMicros, ...(weight === undefined ? {} : { weight }) }
+    }
+  }
+  const page = {
+    items: [row(1n, 10n, 3), row(2n, 20n, -1), row(3n, 30n), row(4n, 40n)],
+    page: 1,
+    totalPages: 1,
+    totalResults: 4
+  }
+  const ranked = await memory([page]).handle.recall({}, { limit: 3 })
+  assert.deepEqual(
+    ranked.map((item) => item.id.asU128()),
+    [1n, 4n, 3n]
+  )
+  const [top] = ranked
+  assert.ok(top !== undefined)
+  assert.equal(top.score, 3)
+  assert.deepEqual(top.signals, [{ strategy: RecallStrategy.Auto, rank: 0, score: 3 }])
+  const recent = await memory([page]).handle.recall(
+    {},
+    { limit: 3, strategy: RecallStrategy.Recent }
+  )
+  assert.deepEqual(
+    recent.map((item) => item.id.asU128()),
+    [4n, 3n, 2n]
+  )
+})
+
+void test("given_a_second_pass_over_the_same_turns_when_consolidated_then_should_summarize_once", async () => {
+  const conversation = ConversationId.parse("01KWM3K3XEP3NP5TN850J17YBQ")
+  const turn = (id: bigint, body: string): MemoryItem => ({
+    id: MemoryId.fromU128(id),
+    payload: new TextEncoder().encode(body),
+    kind: MemoryKind.Message,
+    provenance: { conversationId: conversation },
+    signals: []
+  })
+  const stored: MemoryItem[] = [turn(2n, "two"), turn(1n, "one")]
+  const appended: MemoryId[] = []
+  let calls = 0
+  const handle = MemoryHandle.custom({
+    remember: () => Promise.reject(new Error("typed append was bypassed")),
+    append: (scope, id, kind, payload) => {
+      appended.push(id)
+      stored.unshift({
+        id,
+        payload,
+        kind,
+        provenance: { conversationId: scope.conversation ?? conversation },
+        signals: []
+      })
+      return Promise.resolve(id)
+    },
+    recall: () => Promise.resolve([...stored]),
+    forget: () => Promise.resolve(),
+    improve: () => Promise.resolve(MemoryId.new())
+  })
+  const summarizer = {
+    summarize: () => {
+      calls += 1
+      return Promise.resolve(new TextEncoder().encode("summary"))
+    }
+  }
+  const first = await handle.consolidate({}, 10, { summarizer })
+  const second = await handle.consolidate({}, 10, { summarizer })
+  assert.equal(first.summarized, 2)
+  assert.equal(second.summarized, 0)
+  assert.equal(calls, 1)
+  // The id every SDK derives from the covered turns.
+  assert.deepEqual(
+    appended.map((id) => id.toString()),
+    ["7F2QS1XVSXGDJJPKXJTE739WP7"]
   )
 })

@@ -5,7 +5,7 @@ import { createAgdx } from "../../src/agent/agdx.js"
 import { type LeaseRegistry, SessionLease } from "../../src/agent/lease.js"
 import { HandlerError, InvalidError } from "../../src/client/errors.js"
 import type { Laser } from "../../src/client/laser.js"
-import { INTERNAL_TRANSPORT } from "../../src/client/internals.js"
+import { INTERNAL_LAYOUTS, INTERNAL_TRANSPORT } from "../../src/client/internals.js"
 import { Checkpoint } from "../../src/context.js"
 import type { LaserTransport, MessageWithHeaders } from "../../src/iggy/apache-iggy.js"
 import { MemoryId, MemoryKind } from "../../src/memory/types.js"
@@ -205,6 +205,7 @@ function fakeLaser(tails: ReadonlyMap<string, ReadonlyMap<number, bigint>> = new
     }) as unknown as LaserTransport
   const laser = {
     defaultStream: "agents",
+    [INTERNAL_LAYOUTS]: () => new Map(),
     [INTERNAL_TRANSPORT]: () => ({
       findSnapshotStream: () => Promise.resolve({ id: 0, createdAtMicros: 1n }),
       findSnapshotTopic: () => Promise.resolve({ id: 0, createdAtMicros: 2n, partitions: 4 })
@@ -326,7 +327,7 @@ void test("given_a_session_handle_when_ended_twice_then_should_repeat_the_record
   )
 })
 
-void test("given_a_session_run_when_the_work_throws_then_should_fail_the_session_and_rethrow_the_original", async () => {
+void test("given_a_session_run_when_the_work_throws_then_should_fail_the_session_with_the_error_class_and_rethrow_the_original", async () => {
   const { laser, sent } = fakeLaser()
   const session = Sessions.create(laser).open(ConversationId.new()).asAgent(planner)
   const thrown = new TypeError("model provider exploded")
@@ -342,7 +343,9 @@ void test("given_a_session_run_when_the_work_throws_then_should_fail_the_session
   assert.deepEqual(envelope.taskState, { kind: "known", name: "Failed" })
   const end = decodeSessionEnd(expectMap(decodeOne(envelope.body, "end"), "end"), "end")
   assert.equal(end.error?.message, "model provider exploded")
-  assert.deepEqual(end.error.detail?.get("panic"), { kind: "bool", value: true })
+  assert.equal(end.error.detail?.get("panic"), undefined, "an exception is not a panic")
+  assert.deepEqual(end.error.detail?.get("exception"), { kind: "str", value: "TypeError" })
+  assert.equal(end.error.detail.get("traceback")?.kind, "str")
 
   const failed = Sessions.create(laser).open(ConversationId.new()).asAgent(planner)
   const rejection = new HandlerError("tool timed out")
@@ -355,7 +358,7 @@ void test("given_a_session_run_when_the_work_throws_then_should_fail_the_session
     "end"
   )
   assert.equal(failure.error?.message, "tool timed out")
-  assert.equal(failure.error.detail, undefined)
+  assert.deepEqual(failure.error.detail?.get("exception"), { kind: "str", value: "HandlerError" })
 
   const done = Sessions.create(laser).open(ConversationId.new()).asAgent(planner)
   assert.equal(await done.run(heldLease(done.conversation).lease, () => 42), 42)
@@ -687,16 +690,44 @@ void test("given_a_stale_snapshot_after_the_baseline_when_folded_then_should_cha
     delta(4n, 5)
   ]
   const session = {
-    scope: { fetchWith: () => Promise.resolve(records) }
+    laneRecords: () => Promise.resolve(records)
   } as unknown as Session
   const view = await SessionState.create(session, {
     revision: 0n,
     document: undefined,
-    sinceSnapshot: 0
+    sinceSnapshot: 0,
+    tail: Promise.resolve()
   }).get()
   assert.equal(view.revision, 5n)
   assert.equal(view.complete, true)
   assert.deepEqual(JSON.parse(JSON.stringify(view.document)), { count: 5 })
+})
+
+void test("given_a_delta_writing_a_constructor_member_when_folded_then_should_apply_it_and_keep_folding", async () => {
+  const delta = (baseRevision: bigint, path: string, value: number) => ({
+    envelope: {
+      operation: OPERATION_STATE_DELTA,
+      body: encodeNamed(
+        encodeStateDelta({
+          baseRevision,
+          patch: [{ op: "add", path, value }],
+          opId: `op-${String(baseRevision)}`
+        })
+      )
+    }
+  })
+  const records = [delta(0n, "/constructor", 1), delta(1n, "/count", 2)]
+  const session = {
+    laneRecords: () => Promise.resolve(records)
+  } as unknown as Session
+  const view = await SessionState.create(session, {
+    revision: 0n,
+    document: undefined,
+    sinceSnapshot: 0,
+    tail: Promise.resolve()
+  }).get()
+  assert.equal(view.revision, 2n)
+  assert.deepEqual(JSON.parse(JSON.stringify(view.document)), { constructor: 1, count: 2 })
 })
 
 void test("given_a_lane_fold_and_a_managed_view_when_seeding_then_should_trust_the_fold_unless_the_view_is_not_behind", async () => {
@@ -721,7 +752,7 @@ void test("given_a_lane_fold_and_a_managed_view_when_seeding_then_should_trust_t
   ): Promise<bigint> => {
     const written: Uint8Array[] = []
     const session = {
-      scope: { fetchWith: () => Promise.resolve(records) },
+      laneRecords: () => Promise.resolve(records),
       managedStateView: managed,
       mintOpId: () => "op",
       writeEvent: (_operation: string, body: Uint8Array) => {
@@ -732,7 +763,8 @@ void test("given_a_lane_fold_and_a_managed_view_when_seeding_then_should_trust_t
     await SessionState.create(session, {
       revision: 0n,
       document: undefined,
-      sinceSnapshot: 0
+      sinceSnapshot: 0,
+      tail: Promise.resolve()
     }).set("k", 1)
     const [body] = written
     assert.ok(body !== undefined)

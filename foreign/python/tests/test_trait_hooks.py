@@ -66,7 +66,7 @@ async def test_given_custom_routes_when_called_then_should_preserve_candidates_a
             policy=Scorer(),
         )
         assert isinstance(reply, ls.Contract.Completed)
-        assert bytes(reply[0].body()) == b"route-two:work"
+        assert bytes(reply.reply.body()) == b"route-two:work"
         skill, candidates = seen[0]
         assert skill == "diagnose"
         assert {candidate.agent for candidate in candidates} == {"route-one", "route-two"}
@@ -74,9 +74,8 @@ async def test_given_custom_routes_when_called_then_should_preserve_candidates_a
         assert all(candidate.capability["skill_id"] == "diagnose" for candidate in candidates)
 
         report = await laser.agent("caller").contract(
-            None,
+            "diagnose",
             b"again",
-            skill="diagnose",
             fixed_inbox="agent.sessions",
             deadline_ms=10_000,
             policy=lambda skill, candidates: next(
@@ -86,7 +85,7 @@ async def test_given_custom_routes_when_called_then_should_preserve_candidates_a
             ),
         )
         assert isinstance(report, ls.Contract.Completed)
-        assert bytes(report[0].body()) == b"route-one:again"
+        assert bytes(report.reply.body()) == b"route-one:again"
 
         with pytest.raises(ls.LaserError) as refused:
             await laser.contract(

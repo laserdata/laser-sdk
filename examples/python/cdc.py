@@ -23,8 +23,9 @@ What it shows:
     filter, on their own topic, without decoding a payload
   - filter typed CBOR, Avro, and Protobuf readings, using registered writer
     schemas for Avro and Protobuf
-  - draft a stricter revision, run the variant in its own A/B group, pause
-    and resume it, see a running policy refuse another one, release and delete both
+  - list the revision a group runs, run a stricter variant in its own A/B
+    group, pause and resume it, see a running policy refuse another one,
+    release and delete both
 
 Consumer group filters need the managed backend of Laser Stack or LaserData
 Cloud, and skip elsewhere.
@@ -309,17 +310,13 @@ async def route_alerts(laser: ls.Laser) -> None:
 
 
 async def manage_revisions(laser: ls.Laser, desk, binding: dict, expected: int) -> None:
-    """Draft a stricter revision on the desk's own filter, run the variant in
-    its own group, pause and resume it, then release and delete both
-    policies."""
-    _common.phase("draft a stricter revision: readers keep running the active one")
-    draft = await desk.filter().revise(
-        binding["revision"], ls.ConsumerFilter.json(safe_mode_transition())
-    )
-    revisions = await desk.filter().revisions(page=0, page_size=10)
+    """List the desk's own revision, run a stricter variant in its own group,
+    pause and resume it, then release and delete both policies."""
+    _common.phase("a group runs one policy: its own filter lists the revision it runs")
+    revisions = await desk.filter().revisions(page=1, results=10)
     print(
-        f"  revision {draft['revision']} drafted, the group lists {revisions['total']} "
-        f"revisions and still runs revision {binding['revision']}"
+        f"  the group lists {revisions['total_results']} revision(s) "
+        f"and runs revision {binding['revision']}"
     )
 
     _common.phase("A/B: the transitions-only variant runs in its own group")

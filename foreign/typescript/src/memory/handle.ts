@@ -1,3 +1,4 @@
+import { type CallOptions, abortable, cancellable, throwIfAborted } from "../client/call-options.js"
 import { InvalidError, UnsupportedError } from "../client/errors.js"
 import type { Laser } from "../client/laser.js"
 import { type AgentId, ConversationId } from "../types/ids.js"
@@ -68,59 +69,83 @@ export class MemoryHandle implements Memory {
     const append = memory.append?.bind(memory)
     return new MemoryHandle({
       ...(append === undefined ? {} : { append }),
-      remember: (scope, payload) => memory.remember(scope, payload),
+      remember: (scope, payload, options) => memory.remember(scope, payload, options),
       recall: (scope, query) => memory.recall(scope, query),
-      improve: (scope, feedback) => memory.improve(scope, feedback),
-      forget: (scope, id) => memory.forget(scope, id)
+      improve: (scope, feedback, options) => memory.improve(scope, feedback, options),
+      forget: (scope, id, options) => memory.forget(scope, id, options)
     })
   }
 
   remember(payload: Uint8Array): RememberBuilder
-  remember(scope: MemoryScope, payload: Uint8Array): Promise<MemoryId>
+  remember(scope: MemoryScope, payload: Uint8Array, options?: CallOptions): Promise<MemoryId>
   remember(
     scopeOrPayload: MemoryScope | Uint8Array,
-    payload?: Uint8Array
+    payload?: Uint8Array,
+    options: CallOptions = {}
   ): RememberBuilder | Promise<MemoryId> {
     if (scopeOrPayload instanceof Uint8Array) return RememberBuilder.create(this, scopeOrPayload)
-    return this.store.remember(scopeOrPayload, required(payload))
+    const body = required(payload)
+    return cancellable(options.signal, "memory remember", () =>
+      this.store.remember(scopeOrPayload, body, options)
+    )
   }
 
   /** A recall builder scoped to `conversation`, or to every conversation
    * when it is omitted. */
   recall(conversation?: ConversationId): RecallBuilder
-  recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]>
+  recall(
+    scope: MemoryScope,
+    query: MemoryQuery,
+    options?: CallOptions
+  ): Promise<readonly MemoryItem[]>
   recall(
     scope?: MemoryScope | ConversationId,
-    query?: MemoryQuery
+    query?: MemoryQuery,
+    options: CallOptions = {}
   ): RecallBuilder | Promise<readonly MemoryItem[]> {
     if (scope === undefined) return RecallBuilder.create(this)
     if (scope instanceof ConversationId) return RecallBuilder.create(this, scope)
-    return this.store.recall(scope, query ?? {})
+    return cancellable(options.signal, "memory recall", () => this.store.recall(scope, query ?? {}))
   }
 
   /** Recall by folding the memory topic in process instead of reading the
    * managed view. The log backend folds, the vector backend is already in
    * process, and a reranked backend folds its inner backend then reranks. */
-  recallFolded(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]> {
-    return recallFoldedOn(this.store, scope, query)
+  recallFolded(
+    scope: MemoryScope,
+    query: MemoryQuery,
+    options: CallOptions = {}
+  ): Promise<readonly MemoryItem[]> {
+    return cancellable(options.signal, "memory recall", () =>
+      recallFoldedOn(this.store, scope, query)
+    )
   }
 
   /** Records `feedback` on the item it targets. With a conversation in
    * `scope`, the built-in backends apply it only to an item remembered in that
    * conversation, without one to the item in any conversation. */
-  improve(scope: MemoryScope, feedback: Feedback): Promise<MemoryId> {
-    return this.store.improve(scope, feedback)
+  improve(scope: MemoryScope, feedback: Feedback, options: CallOptions = {}): Promise<MemoryId> {
+    return cancellable(options.signal, "memory improve", () =>
+      this.store.improve(scope, feedback, options)
+    )
   }
 
   /** Forgets the item `id`. With a conversation in `scope`, the built-in
    * backends forget it only when it was remembered in that conversation,
    * without one in any conversation. */
-  forget(scope: MemoryScope, id: MemoryId): Promise<void> {
-    return this.store.forget(scope, id)
+  forget(scope: MemoryScope, id: MemoryId, options: CallOptions = {}): Promise<void> {
+    return cancellable(options.signal, "memory forget", () => this.store.forget(scope, id, options))
   }
 
-  async context(scope: MemoryScope, query: MemoryQuery = {}): Promise<string> {
-    return toContextBlock(await this.store.recall(scope, query), query.tokenBudget)
+  async context(
+    scope: MemoryScope,
+    query: MemoryQuery = {},
+    options: CallOptions = {}
+  ): Promise<string> {
+    return toContextBlock(
+      await cancellable(options.signal, "memory context", () => this.store.recall(scope, query)),
+      query.tokenBudget
+    )
   }
 
   /** One consolidation pass over `scope`: keeps the newest `maxItems` and
@@ -132,12 +157,15 @@ export class MemoryHandle implements Memory {
     maxItems: number,
     options: ConsolidateOptions = {}
   ): Promise<ConsolidationReport> {
+    const signal = options.signal
+    throwIfAborted(signal, "memory consolidate")
     if (!Number.isSafeInteger(maxItems) || maxItems < 0)
       throw new InvalidError("consolidation maxItems must be a non-negative safe integer")
-    const items = await this.store.recall(scope, {
-      limit: CONSOLIDATION_WINDOW,
-      strategy: RecallStrategy.Recent
-    })
+    const items = await abortable(
+      this.store.recall(scope, { limit: CONSOLIDATION_WINDOW, strategy: RecallStrategy.Recent }),
+      signal,
+      "memory consolidate"
+    )
     let remaining = items
     let summarized = 0
     let pruned = 0
@@ -145,26 +173,35 @@ export class MemoryHandle implements Memory {
       const sessions = items.filter((item) => item.kind === MemoryKind.Message)
       if (sessions.length > 0) {
         // One summary per conversation, so each stays recallable in the
-        // conversation it distills.
+        // conversation it distills. Its id covers the turns it distills, so a
+        // pass over turns that already have their summary skips the summarizer.
         for (const [conversation, turns] of byConversation(sessions)) {
-          const summary = await options.summarizer.summarize(
-            turns.map((item) => item.payload.slice())
+          const summaryScope = { ...scope, conversation, lifetime: Lifetime.Durable }
+          const summaryId = MemoryId.content(summaryScope, MemoryKind.Summary, coveredIds(turns))
+          if (items.some((item) => item.id.equals(summaryId))) continue
+          const summary = await abortable(
+            options.summarizer.summarize(turns.map((item) => item.payload.slice())),
+            signal,
+            "memory consolidate"
           )
-          await appendOn(
-            this.store,
-            { ...scope, conversation, lifetime: Lifetime.Durable },
-            MemoryId.new(),
-            MemoryKind.Summary,
-            summary
+          await abortable(
+            appendOn(this.store, summaryScope, summaryId, MemoryKind.Summary, summary, { signal }),
+            signal,
+            "memory consolidate"
           )
+          summarized += turns.length
         }
-        summarized = sessions.length
         if (options.pruneSummarized === true) {
           for (const item of sessions) {
             try {
-              await this.store.forget(scope, item.id)
+              await abortable(
+                this.store.forget(scope, item.id, { signal }),
+                signal,
+                "memory consolidate"
+              )
               pruned += 1
             } catch {
+              throwIfAborted(signal, "memory consolidate")
               // Failed forgets stay outside the successful prune count.
             }
           }
@@ -175,9 +212,10 @@ export class MemoryHandle implements Memory {
     const oldestFirst = [...remaining].reverse()
     for (const item of oldestFirst.slice(0, Math.max(0, oldestFirst.length - maxItems))) {
       try {
-        await this.store.forget(scope, item.id)
+        await abortable(this.store.forget(scope, item.id, { signal }), signal, "memory consolidate")
         pruned += 1
       } catch {
+        throwIfAborted(signal, "memory consolidate")
         // Failed forgets stay outside the successful prune count.
       }
     }
@@ -206,30 +244,37 @@ export class MemoryHandle implements Memory {
   /** Writes named point state under your own `key`. Every write is a durable
    * event on the memory topic. Only the log-backed handle has a key space, so
    * the vector handle refuses with `UnsupportedError`. */
-  set(key: string, payload: Uint8Array): Promise<void> {
-    return this.namedMemory("set").setNamed(key, payload)
+  set(key: string, payload: Uint8Array, options: CallOptions = {}): Promise<void> {
+    const memory = this.namedMemory("set")
+    return cancellable(options.signal, "memory set", () => memory.setNamed(key, payload, options))
   }
 
   /** Point-reads the named item written by `set`, from the managed key-value
    * view, or `undefined`. */
-  fetch(key: string): Promise<Uint8Array | undefined> {
-    return this.namedMemory("fetch").fetchNamed(key)
+  fetch(key: string, options: CallOptions = {}): Promise<Uint8Array | undefined> {
+    const memory = this.namedMemory("fetch")
+    return cancellable(options.signal, "memory fetch", () => memory.fetchNamed(key))
   }
 
   /** Point-reads the named item by folding the memory topic in process. */
-  fetchFolded(key: string): Promise<Uint8Array | undefined> {
-    return this.namedMemory("fetchFolded").fetchNamedFolded(key)
+  fetchFolded(key: string, options: CallOptions = {}): Promise<Uint8Array | undefined> {
+    const memory = this.namedMemory("fetchFolded")
+    return cancellable(options.signal, "memory fetch", () => memory.fetchNamedFolded(key))
   }
 
   /** Merge-patches the named item (RFC 7386 over a JSON value): fields in
    * `patch` overwrite, `null` removes. */
-  update(key: string, patch: Uint8Array): Promise<void> {
-    return this.namedMemory("update").updateNamed(key, patch)
+  update(key: string, patch: Uint8Array, options: CallOptions = {}): Promise<void> {
+    const memory = this.namedMemory("update")
+    return cancellable(options.signal, "memory update", () =>
+      memory.updateNamed(key, patch, options)
+    )
   }
 
   /** Deletes the named item. Removing an absent key is fine. */
-  remove(key: string): Promise<void> {
-    return this.namedMemory("remove").forgetNamed(key)
+  remove(key: string, options: CallOptions = {}): Promise<void> {
+    const memory = this.namedMemory("remove")
+    return cancellable(options.signal, "memory remove", () => memory.forgetNamed(key, options))
   }
 
   private namedMemory(verb: string): LogMemory {
@@ -247,9 +292,12 @@ export class MemoryHandle implements Memory {
     scope: MemoryScope,
     id: MemoryId,
     kind: MemoryKind,
-    payload: Uint8Array
+    payload: Uint8Array,
+    options: CallOptions = {}
   ): Promise<MemoryId> {
-    return appendOn(this.store, scope, id, kind, payload)
+    return cancellable(options.signal, "memory append", () =>
+      appendOn(this.store, scope, id, kind, payload, options)
+    )
   }
 }
 
@@ -321,11 +369,11 @@ export class RememberBuilder {
     return this
   }
 
-  send(): Promise<MemoryId> {
+  send(options: CallOptions = {}): Promise<MemoryId> {
     const id = this.deduplicate
       ? MemoryId.content(this.memoryScope, this.memoryKind, this.payload)
       : MemoryId.new()
-    return this.handle.append(this.memoryScope, id, this.memoryKind, this.payload)
+    return this.handle.append(this.memoryScope, id, this.memoryKind, this.payload, options)
   }
 }
 
@@ -403,16 +451,16 @@ export class RecallBuilder {
     return this
   }
 
-  fetch(): Promise<readonly MemoryItem[]> {
+  fetch(options: CallOptions = {}): Promise<readonly MemoryItem[]> {
     return this.foldInProcess
-      ? this.handle.recallFolded(this.scope, this.query)
-      : this.handle.recall(this.scope, this.query)
+      ? this.handle.recallFolded(this.scope, this.query, options)
+      : this.handle.recall(this.scope, this.query, options)
   }
 
   /** Runs the recall and renders the items as one prompt-ready block under
    * `tokenBudget` estimated tokens when given. */
-  async block(tokenBudget?: number): Promise<string> {
-    return toContextBlock(await this.fetch(), tokenBudget)
+  async block(tokenBudget?: number, options: CallOptions = {}): Promise<string> {
+    return toContextBlock(await this.fetch(options), tokenBudget)
   }
 }
 
@@ -438,12 +486,30 @@ function appendOn(
   scope: MemoryScope,
   id: MemoryId,
   kind: MemoryKind,
-  payload: Uint8Array
+  payload: Uint8Array,
+  options: CallOptions = {}
 ): Promise<MemoryId> {
-  if (memory instanceof VectorMemory || memory instanceof LogMemory)
-    return memory.append(scope, id, kind, payload)
-  if (memory instanceof RerankedMemory) return memory.append(scope, id, kind, payload)
-  return memory.append?.(scope, id, kind, payload) ?? memory.remember(scope, payload)
+  if (memory instanceof VectorMemory) return memory.append(scope, id, kind, payload)
+  if (memory instanceof LogMemory || memory instanceof RerankedMemory)
+    return memory.append(scope, id, kind, payload, options)
+  return (
+    memory.append?.(scope, id, kind, payload, options) ?? memory.remember(scope, payload, options)
+  )
+}
+
+// The turns a summary covers as its content: each id as 16 big-endian bytes,
+// in ascending order, the bytes every SDK hashes.
+function coveredIds(turns: readonly MemoryItem[]): Uint8Array {
+  const ids = turns
+    .map((item) => item.id.asU128())
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+  const bytes = new Uint8Array(ids.length * 16)
+  ids.forEach((id, index) => {
+    for (let byte = 0; byte < 16; byte += 1) {
+      bytes[index * 16 + byte] = Number((id >> BigInt(8 * (15 - byte))) & 0xffn)
+    }
+  })
+  return bytes
 }
 
 // Groups summarized turns by conversation, in the order each conversation first
@@ -493,17 +559,18 @@ export class RerankedMemory implements Memory {
     return { inner: this.inner, reranker: this.reranker }
   }
 
-  remember(scope: MemoryScope, payload: Uint8Array): Promise<MemoryId> {
-    return this.inner.remember(scope, payload)
+  remember(scope: MemoryScope, payload: Uint8Array, options: CallOptions = {}): Promise<MemoryId> {
+    return this.inner.remember(scope, payload, options)
   }
 
   append(
     scope: MemoryScope,
     id: MemoryId,
     kind: MemoryKind,
-    payload: Uint8Array
+    payload: Uint8Array,
+    options: CallOptions = {}
   ): Promise<MemoryId> {
-    return appendOn(this.inner, scope, id, kind, payload)
+    return appendOn(this.inner, scope, id, kind, payload, options)
   }
 
   async recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]> {
@@ -511,12 +578,12 @@ export class RerankedMemory implements Memory {
     return query.semantic === undefined ? items : this.reranker.rerank(query.semantic, items)
   }
 
-  improve(scope: MemoryScope, feedback: Feedback): Promise<MemoryId> {
-    return this.inner.improve(scope, feedback)
+  improve(scope: MemoryScope, feedback: Feedback, options: CallOptions = {}): Promise<MemoryId> {
+    return this.inner.improve(scope, feedback, options)
   }
 
-  forget(scope: MemoryScope, id: MemoryId): Promise<void> {
-    return this.inner.forget(scope, id)
+  forget(scope: MemoryScope, id: MemoryId, options: CallOptions = {}): Promise<void> {
+    return this.inner.forget(scope, id, options)
   }
 }
 

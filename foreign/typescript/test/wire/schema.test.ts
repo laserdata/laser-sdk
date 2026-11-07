@@ -3,13 +3,18 @@ import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { test } from "node:test"
 import { decodeOne, expectMap } from "../../src/wire/cbor.js"
+import { LogicalSchemaId } from "../../src/wire/ids.js"
 import {
   Digest32,
+  type LogicalType,
   SchemaFingerprint,
+  type TypedValue,
   UuidValue,
+  createLogicalSchema,
   decimalValueValidateCanonical,
   decodeLogicalSchema,
   decodeLogicalType,
+  encodeLogicalType,
   logicalSchemaCanonicalFingerprintBytes,
   logicalSchemaComputeFingerprint,
   logicalTypeAcceptsMapKey,
@@ -85,6 +90,35 @@ void test("given_typed_values_when_validated_then_should_enforce_canonical_form_
   assert.throws(() => {
     typedValueValidateAgainst({ kind: "int", value: 1 }, { kind: "long" }, true)
   })
+})
+
+void test("given_a_variant_field_when_validated_then_should_accept_every_canonical_value_and_refuse_a_map_key", () => {
+  const variant = decodeLogicalType(new Map([["kind", "variant"]]), "type")
+  assert.deepEqual(variant, { kind: "variant" })
+  assert.deepEqual(encodeLogicalType(variant), new Map([["kind", "variant"]]))
+  const values: readonly TypedValue[] = [
+    { kind: "null" },
+    { kind: "boolean", value: true },
+    { kind: "long", value: 9_223_372_036_854_775_807n },
+    { kind: "double", value: 2.5 },
+    { kind: "string", value: "text" }
+  ]
+  for (const value of values) typedValueValidateAgainst(value, variant, false)
+  assert.throws(() => {
+    typedValueValidateAgainst({ kind: "double", value: Number.NaN }, variant, false)
+  })
+  assert.throws(() => {
+    typedValueValidateAgainst({ kind: "null" }, variant, true)
+  })
+  assert.equal(logicalTypeAcceptsMapKey(variant), false)
+  const schema = (fieldType: LogicalType) =>
+    createLogicalSchema(LogicalSchemaId.fromU128(1n), 1, [
+      { id: 1, name: "value", required: false, fieldType }
+    ])
+  assert.notDeepEqual(
+    schema(variant).schema.fingerprint,
+    schema({ kind: "string" }).schema.fingerprint
+  )
 })
 
 void test("given_decimal_values_when_validated_then_should_reject_non_canonical_encodings", () => {

@@ -1,4 +1,4 @@
-use crate::error::{LaserError, decode_managed_reply};
+use crate::error::{LaserError, TransportError, decode_managed_reply};
 use crate::filters::group::Membership;
 #[cfg(feature = "filters")]
 use crate::filters::guard::LocalGuard;
@@ -6,14 +6,14 @@ use crate::filters::progress::{Blocked, PartitionProgress};
 #[cfg(test)]
 use crate::iggy::prelude::PartitionContext;
 use crate::iggy::prelude::{
-    Client, IggyClient, IggyClientBuilder, IggyError, IggyMessage, PolledMessages, PollingStrategy,
-    StreamClient, TopicClient,
+    Client, IggyClient, IggyError, IggyMessage, PolledMessages, PollingStrategy, StreamClient,
+    TopicClient,
 };
-use crate::laser::Laser;
+use crate::laser::{Laser, tcp_client};
 use crate::nodes::{Answered, Target, is_route_stale, partition_primary};
 use crate::retry::{MANAGED_MUTATION, MANAGED_MUTATION_DEADLINE};
 use crate::stream::ConsumerStart;
-use crate::stream::transport::seed_group_partition;
+use crate::stream::transport::{policy_aware, seed_group_partition};
 use bytes::Bytes;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -27,14 +27,16 @@ use laser_wire::codes::{
 #[cfg(feature = "filters")]
 use laser_wire::filter::ConsumerFilter;
 use laser_wire::filter::{
-    AppliedPolicy, CatalogPosition, ExecutionMode, FilterConsumer, FilterError, FilterErrorReason,
-    FilterOutcome, FilterRef, FilterReply, FilterSource, FilteredAck, FilteredPage,
-    FilteredPollRequest, FilteredStart, FilteredWaitCancel, FilteredWaitPartition,
+    AppliedPolicy, CatalogPosition, ExecutionMode, FaultReason, FilterConsumer, FilterError,
+    FilterErrorReason, FilterOutcome, FilterRef, FilterReply, FilterSource, FilteredAck,
+    FilteredPage, FilteredPollRequest, FilteredStart, FilteredWaitCancel, FilteredWaitPartition,
     FilteredWaitRequest, SourceGeneration, StopReason,
 };
 use laser_wire::framing::encode_named;
 #[cfg(feature = "filters")]
 use laser_wire::limits::MAX_FILTER_CATALOG_PAGE;
+use laser_wire::limits::MAX_FILTERED_PAGE_BYTES;
+use laser_wire::limits::MAX_FILTERED_WAIT_PARTITIONS;
 use laser_wire::result::ResultCode;
 use laser_wire::validate::Validate;
 use serde::de::DeserializeOwned;
@@ -62,14 +64,14 @@ const DEFAULT_MAX_UNACKED_PAGES: usize = 1024;
 // reader of the process, including readers sharing one client.
 static NEXT_WAIT_ID: AtomicU64 = AtomicU64::new(1);
 
-// A filtered wait in flight: its node, when it was sent, and its answer.
+// A filtered wait in flight: its slot, when it was sent, and its answer.
 type HeldWait =
-    Pin<Box<dyn Future<Output = (Target, Instant, Result<Vec<u32>, LaserError>)> + Send>>;
+    Pin<Box<dyn Future<Output = (WaitSlot, Instant, Result<Vec<u32>, LaserError>)> + Send>>;
 
 /// Builds a [`FilteredReader`] over one consumer group. Start from
 /// [`ConsumerGroup::reader`](crate::stream::ConsumerGroup::reader).
-pub struct FilteredReaderBuilder<'a> {
-    laser: &'a Laser,
+pub struct FilteredReaderBuilder {
+    laser: Laser,
     source: FilterSource,
     consumer: FilterConsumer,
     filter: FilterRef,
@@ -129,11 +131,11 @@ pub struct FilteredReader {
     max_wait: Duration,
     // The longest filtered wait the server announced, zero once it refused one.
     announced_wait_ms: u32,
-    // Waits still held when another node answered first, at most one per node,
-    // so a busy node never piles waits up on a quiet one, each node with the
-    // id its wait is cancelled by.
+    // Waits still held when another one answered first, at most one per
+    // slot, so a busy node never piles waits up on a quiet one, each slot with
+    // the id its wait is cancelled by.
     held_waits: Mutex<FuturesUnordered<HeldWait>>,
-    held_nodes: BTreeMap<Target, u64>,
+    held_slots: BTreeMap<WaitSlot, u64>,
     // Where a dropped reader sends the cancel of its held waits.
     runtime: Option<Handle>,
     // The partitions the last wait found ready, the only ones the next round
@@ -264,12 +266,23 @@ pub struct MatchedRecord {
     pub offset: u64,
     /// The partition head when the record was read.
     pub frontier: u64,
-    /// `false` when a pass fault, foreign-record, or mismatch policy delivered
-    /// the record without evaluating it.
-    pub evaluated: bool,
+    /// How the group's policy treated the record.
+    pub evaluation: RecordEvaluation,
     pub message: IggyMessage,
     sequence: u64,
     owner: Arc<()>,
+}
+
+/// How a group's policy treated a delivered record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordEvaluation {
+    /// The filter evaluated the record and selected it.
+    Selected,
+    /// A pass fault, foreign-record, or mismatch policy delivered the record
+    /// without evaluating it, for this reason.
+    Unevaluated(FaultReason),
+    /// The group has no policy and receives every record.
+    Unfiltered,
 }
 
 /// The handle a delivered record is acknowledged by: the partition read it
@@ -343,9 +356,9 @@ enum WaitAnswer {
     Unsupported,
 }
 
-impl<'a> FilteredReaderBuilder<'a> {
+impl FilteredReaderBuilder {
     pub(crate) fn new(
-        laser: &'a Laser,
+        laser: Laser,
         source: FilterSource,
         consumer: FilterConsumer,
         filter: FilterRef,
@@ -473,17 +486,16 @@ impl<'a> FilteredReaderBuilder<'a> {
             return Err(LaserError::Config("max_unacked_pages must be positive"));
         }
         let capabilities = self.laser.capabilities().await;
-        if !matches!(self.filter, FilterRef::Group) && !capabilities.filters.native {
+        // A group reader classifies the probe like the group consumer, and a
+        // server that positively lacks filters has no filtered read to offer.
+        let served = match self.filter {
+            FilterRef::Group => policy_aware(&capabilities)?,
+            _ => capabilities.filters.native,
+        };
+        if !served {
             return Err(LaserError::unsupported(
                 "filters",
                 "consumer filters are not served by this server",
-            ));
-        }
-        if matches!(self.filter, FilterRef::Group) && !capabilities.filters.group_policy_reads {
-            return Err(LaserError::unsupported_feature(
-                "filters",
-                "group_policy_reads",
-                "this server serves consumer filters but not group-aware reads, upgrade it before reading groups through the Laser SDK",
             ));
         }
         let consumer = self.consumer;
@@ -512,8 +524,7 @@ impl<'a> FilteredReaderBuilder<'a> {
         // shared client is the only one there is.
         let coordinator = match self.laser.connection_string() {
             Some(connection_string) => {
-                let client =
-                    IggyClientBuilder::from_connection_string(connection_string)?.build()?;
+                let client = tcp_client(connection_string)?;
                 client.connect().await?;
                 Arc::new(client)
             }
@@ -555,7 +566,7 @@ impl<'a> FilteredReaderBuilder<'a> {
         }
         Ok(FilteredReader {
             owner: Arc::new(()),
-            laser: self.laser.clone(),
+            laser: self.laser,
             coordinator,
             consumer,
             request,
@@ -564,9 +575,10 @@ impl<'a> FilteredReaderBuilder<'a> {
             leaders: BTreeMap::new(),
             idle_interval: self.idle_interval,
             max_wait: self.max_wait,
-            announced_wait_ms: capabilities.filters.max_wait_ms,
+            announced_wait_ms: u32::try_from(capabilities.filters.max_wait.as_millis())
+                .unwrap_or(u32::MAX),
             held_waits: Mutex::new(FuturesUnordered::new()),
-            held_nodes: BTreeMap::new(),
+            held_slots: BTreeMap::new(),
             runtime: Handle::try_current().ok(),
             ready: BTreeSet::new(),
             ready_unconfirmed: false,
@@ -692,8 +704,8 @@ impl FilteredReader {
         }
     }
 
-    // Send one filtered wait to each node that serves a readable partition
-    // and holds no wait yet, and take the first answer.
+    // Send one filtered wait for each slot of readable partitions that holds
+    // no wait yet, and take the first answer.
     async fn held_wait(&mut self, wait: Duration) -> WaitAnswer {
         let now = Instant::now();
         let mut partitions = Vec::new();
@@ -706,19 +718,22 @@ impl FilteredReader {
             }
             let offset = progress.wait_offset();
             let target = self.read_target(partition_id).await;
-            if !self.held_nodes.contains_key(&target) {
-                partitions.push((
-                    target,
-                    FilteredWaitPartition {
-                        partition_id,
-                        offset,
-                    },
-                ));
-            }
+            partitions.push((
+                target,
+                FilteredWaitPartition {
+                    partition_id,
+                    offset,
+                },
+            ));
         }
         let deadline = std::time::Instant::now() + wait + WAIT_REPLY_MARGIN;
         let next_wait_id = || NEXT_WAIT_ID.fetch_add(1, Ordering::Relaxed);
-        for (target, request) in wait_requests(&self.request, partitions, wait, next_wait_id) {
+        let requests = wait_requests(&self.request, partitions, wait, next_wait_id);
+        for (slot, request) in requests {
+            if self.held_slots.contains_key(&slot) {
+                continue;
+            }
+            let target = slot.target;
             let payload = match request.validate().map_err(LaserError::from).and_then(|()| {
                 encode_named(&request)
                     .map_err(|error| LaserError::Codec(format!("encode filtered wait: {error}")))
@@ -731,7 +746,7 @@ impl FilteredReader {
             };
             let laser = self.laser.clone();
             let coordinator = Arc::clone(&self.coordinator);
-            self.held_nodes.insert(target, request.wait_id);
+            self.held_slots.insert(slot, request.wait_id);
             self.held_waits
                 .get_mut()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -755,7 +770,7 @@ impl FilteredReader {
                         }
                     }
                     .await;
-                    (target, sent, answer)
+                    (slot, sent, answer)
                 }));
         }
         // The assignment is read again when it is due while every wait
@@ -782,10 +797,11 @@ impl FilteredReader {
                 },
             }
         };
-        let Some((target, sent, answer)) = first else {
+        let Some((slot, sent, answer)) = first else {
             return WaitAnswer::Sleep;
         };
-        self.held_nodes.remove(&target);
+        self.held_slots.remove(&slot);
+        let target = slot.target;
         if let Err(error) = &answer {
             tracing::debug!(target: "laser", %error, "A filtered wait failed.");
             // A node that no longer serves the partitions of its wait sends
@@ -807,8 +823,8 @@ impl FilteredReader {
                 .held_waits
                 .get_mut()
                 .unwrap_or_else(PoisonError::into_inner);
-            while let Some(Some((target, _, answered))) = held_waits.next().now_or_never() {
-                self.held_nodes.remove(&target);
+            while let Some(Some((slot, _, answered))) = held_waits.next().now_or_never() {
+                self.held_slots.remove(&slot);
                 if let Ok(more) = answered {
                     ready.extend(more);
                 }
@@ -839,13 +855,13 @@ impl FilteredReader {
     }
 
     // Forget the waits still held, dropping their pending answers, and return
-    // the id each node holds.
-    fn take_held_waits(&mut self) -> BTreeMap<Target, u64> {
+    // the id each slot holds.
+    fn take_held_waits(&mut self) -> BTreeMap<WaitSlot, u64> {
         self.held_waits
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-        std::mem::take(&mut self.held_nodes)
+        std::mem::take(&mut self.held_slots)
     }
 
     /// The connection that holds this reader's group membership, for tests
@@ -918,6 +934,38 @@ impl FilteredReader {
         self.progress(page.partition_id)?
             .complete_page(page.sequence);
         self.store(page.partition_id).await
+    }
+
+    /// Pass the record a [`LaserError::FilterFault`] or a
+    /// [`LaserError::FilterOversizedRecord`] stopped `partition_id` at, and
+    /// read on after it, the way a native consumer seeks past a record. The
+    /// skip is a fenced acknowledgment of `offset` under the policy and the
+    /// owner the stopped page was read under, stored once every earlier
+    /// record of the partition is handled. A policy changed since refuses it
+    /// with a `conflict` and the partition restarts from its stored offset.
+    ///
+    /// # Errors
+    ///
+    /// [`LaserError::Invalid`] when the partition is not stopped at `offset`.
+    pub async fn skip(&mut self, partition_id: u32, offset: u64) -> Result<(), LaserError> {
+        self.sequence += 1;
+        let sequence = self.sequence;
+        if !self.progress(partition_id)?.skip(sequence, offset) {
+            return Err(LaserError::Invalid(format!(
+                "partition {partition_id} is not stopped at offset {offset}"
+            )));
+        }
+        // A report of the block another partition's page held back is stale now.
+        if matches!(
+            self.deferred_error,
+            Some(
+                LaserError::FilterFault { partition_id: blocked, offset: at, .. }
+                    | LaserError::FilterOversizedRecord { partition_id: blocked, offset: at }
+            ) if blocked == partition_id && at == offset
+        ) {
+            self.deferred_error = None;
+        }
+        self.store(partition_id).await
     }
 
     /// Mark the partition's records through `delivery` handled without
@@ -1135,7 +1183,13 @@ impl FilteredReader {
                 return Err(error);
             }
         };
-        if page.records.len() > self.request.max_reply_bytes as usize + POLL_RESPONSE_HEADER_SIZE {
+        // A first record larger than the requested cap comes alone, within the page cap.
+        let record_cap = if page.matched == 1 {
+            self.request.max_reply_bytes.max(MAX_FILTERED_PAGE_BYTES)
+        } else {
+            self.request.max_reply_bytes
+        };
+        if page.records.len() > record_cap as usize + POLL_RESPONSE_HEADER_SIZE {
             return Err(LaserError::Protocol(
                 "filtered page exceeds the requested record byte limit".to_owned(),
             ));
@@ -1194,15 +1248,22 @@ impl FilteredReader {
                 more: matches!(page.stop, StopReason::Filled | StopReason::Budget),
             });
         }
-        let unevaluated: BTreeSet<u64> = page.unevaluated.iter().copied().collect();
+        let unevaluated: BTreeMap<u64, FaultReason> = page
+            .unevaluated
+            .iter()
+            .map(|fault| (fault.offset, fault.reason))
+            .collect();
         let records = messages
             .into_iter()
             .map(|message| MatchedRecord {
                 partition_id,
                 offset: message.header.offset,
                 frontier: page.frontier,
-                evaluated: page.policy.mode.is_filtered()
-                    && !unevaluated.contains(&message.header.offset),
+                evaluation: record_evaluation(
+                    page.policy.mode,
+                    &unevaluated,
+                    message.header.offset,
+                ),
                 message,
                 sequence,
                 owner: Arc::clone(&self.owner),
@@ -1228,7 +1289,7 @@ impl FilteredReader {
     // rebound filter, and the error reaches the caller once.
     fn restart_after(&mut self, partition_id: u32, error: LaserError) -> LaserError {
         let reason = match &error {
-            LaserError::Iggy(IggyError::HistoryUnavailable) => {
+            LaserError::Transport(TransportError(IggyError::HistoryUnavailable)) => {
                 Some(FilterErrorReason::SourceChanged)
             }
             error => error.filter_reason(),
@@ -1305,10 +1366,8 @@ impl FilteredReader {
         match stored {
             Ok(FilterOutcome::Acknowledged(receipt))
                 if receipt.partition_id == partition_id
-                    && receipt.offset == target.offset
-                    && receipt.generation == target.generation =>
+                    && self.progress(partition_id)?.acknowledged(&target, &receipt) =>
             {
-                self.progress(partition_id)?.stored(&target);
                 self.retire(partition_id);
                 Ok(())
             }
@@ -1517,6 +1576,15 @@ impl Drop for FilteredReader {
     }
 }
 
+// Where one filtered wait is held: its node and which slice of that node's
+// partitions it names, since one wait names at most
+// `MAX_FILTERED_WAIT_PARTITIONS` of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct WaitSlot {
+    target: Target,
+    slice: usize,
+}
+
 // The full definition a reader executes, for the local guard.
 #[cfg(feature = "filters")]
 async fn bound_definition(
@@ -1525,14 +1593,14 @@ async fn bound_definition(
     names: &FilterSource,
 ) -> Result<ConsumerFilter, LaserError> {
     let source = page.generation;
-    for index in 0_u32.. {
+    for page_number in 1_u32.. {
         let bindings = laser
             .filters()
             .bindings(
                 None,
                 Some(&names.stream),
                 Some(&names.topic),
-                index,
+                page_number,
                 MAX_FILTER_CATALOG_PAGE,
             )
             .await?;
@@ -1558,7 +1626,7 @@ async fn bound_definition(
             )
             .await;
         }
-        if (index + 1).saturating_mul(MAX_FILTER_CATALOG_PAGE) >= bindings.total {
+        if page_number >= bindings.total_pages {
             break;
         }
     }
@@ -1583,7 +1651,7 @@ async fn definition(laser: &Laser, filter: &FilterRef) -> Result<ConsumerFilter,
             ));
         }
     };
-    let mut page = 0;
+    let mut page = 1;
     loop {
         let revisions = laser
             .filters()
@@ -1596,14 +1664,14 @@ async fn definition(laser: &Laser, filter: &FilterRef) -> Result<ConsumerFilter,
         {
             return Ok(found.filter);
         }
-        page += 1;
-        if page.saturating_mul(MAX_FILTER_CATALOG_PAGE) >= revisions.total {
+        if page >= revisions.total_pages {
             return Err(FilterError::new(
                 FilterErrorReason::NotFound,
                 format!("filter {filter_id} has no revision {revision}"),
             )
             .into());
         }
+        page += 1;
     }
 }
 
@@ -1626,7 +1694,9 @@ fn pace_refusal(
         return None;
     };
     let refused = match error {
-        LaserError::Iggy(error) => matches!(target, Target::Replica(_)) && is_route_stale(error),
+        LaserError::Transport(TransportError(error)) => {
+            matches!(target, Target::Replica(_)) && is_route_stale(error)
+        }
         error => error.filter_reason() == Some(FilterErrorReason::Unavailable),
     };
     (refused && !std::mem::replace(refused_before, true)).then_some(WaitAnswer::Elapsed)
@@ -1634,7 +1704,7 @@ fn pace_refusal(
 
 fn is_route_moved(error: &LaserError) -> bool {
     match error {
-        LaserError::Iggy(error) => is_route_stale(error),
+        LaserError::Transport(TransportError(error)) => is_route_stale(error),
         error => error.filter_reason() == Some(FilterErrorReason::Unavailable),
     }
 }
@@ -1676,15 +1746,24 @@ async fn exchange_on(
     payload: Bytes,
 ) -> Result<FilterOutcome, LaserError> {
     let mut rerouted = false;
+    let mut followed = false;
     loop {
         let target = route_target(route, leaders, partition_id).await;
         // A resend rechecks the route too: right after a crash the lookup can
         // still name the dead primary, whose link holds the resend until the
-        // call deadline.
+        // call deadline. The read follows a partition that moves while it
+        // waits once, a route that keeps moving is reported instead of chased.
         let Some(sent) =
             send_unless_moved(route, leaders, partition_id, code, payload.clone(), target).await
         else {
-            rerouted = true;
+            if followed {
+                return Err(FilterError::new(
+                    FilterErrorReason::Unavailable,
+                    format!("partition {partition_id} moved again during the read, retry"),
+                )
+                .into());
+            }
+            followed = true;
             continue;
         };
         let reply = match sent {
@@ -1777,14 +1856,20 @@ async fn route_target(
 // The fork refuses a group offset store from a member that does not hold the
 // partition yet with `TransientNotAccepted`, a poll with `NotOwned`.
 fn seed_not_held(error: &LaserError) -> bool {
-    is_assignment_lost(error) || matches!(error, LaserError::Iggy(IggyError::TransientNotAccepted))
+    is_assignment_lost(error)
+        || matches!(
+            error,
+            LaserError::Transport(TransportError(IggyError::TransientNotAccepted))
+        )
 }
 
 fn is_assignment_lost(error: &LaserError) -> bool {
     error.filter_reason() == Some(FilterErrorReason::MembershipStale)
         || matches!(
             error,
-            LaserError::Iggy(IggyError::ConsumerGroupPartitionNotOwned(..))
+            LaserError::Transport(TransportError(IggyError::ConsumerGroupPartitionNotOwned(
+                ..
+            )))
         )
 }
 
@@ -1802,13 +1887,14 @@ const fn blocked_error(partition_id: u32, blocked: Blocked) -> LaserError {
     }
 }
 
-// One filtered wait per node, each naming that node's partitions.
+// One filtered wait per slot: each node's partitions in slices of at most
+// the partitions one wait names.
 fn wait_requests(
     template: &FilteredPollRequest,
     partitions: Vec<(Target, FilteredWaitPartition)>,
     wait: Duration,
     mut next_wait_id: impl FnMut() -> u64,
-) -> Vec<(Target, FilteredWaitRequest)> {
+) -> Vec<(WaitSlot, FilteredWaitRequest)> {
     let max_wait_ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX);
     let mut by_node: BTreeMap<Target, Vec<FilteredWaitPartition>> = BTreeMap::new();
     for (target, partition) in partitions {
@@ -1816,9 +1902,16 @@ fn wait_requests(
     }
     by_node
         .into_iter()
-        .map(|(target, partitions)| {
+        .flat_map(|(target, partitions)| {
+            partitions
+                .chunks(MAX_FILTERED_WAIT_PARTITIONS)
+                .enumerate()
+                .map(|(slice, partitions)| (WaitSlot { target, slice }, partitions.to_vec()))
+                .collect::<Vec<_>>()
+        })
+        .map(|(slot, partitions)| {
             (
-                target,
+                slot,
                 FilteredWaitRequest {
                     v: FILTER_OP_VERSION,
                     source: template.source.clone(),
@@ -1832,10 +1925,10 @@ fn wait_requests(
         .collect()
 }
 
-// Send one cancel per node that holds a wait of this reader. Each runs at
-// once, so a node that is gone never delays the others.
-async fn cancel_waits(laser: &Laser, coordinator: &IggyClient, held: BTreeMap<Target, u64>) {
-    let cancels = held.into_iter().map(|(target, wait_id)| async move {
+// Send one cancel per wait this reader holds. Each runs at once, so a node
+// that is gone never delays the others.
+async fn cancel_waits(laser: &Laser, coordinator: &IggyClient, held: BTreeMap<WaitSlot, u64>) {
+    let cancels = held.into_iter().map(|(WaitSlot { target, .. }, wait_id)| async move {
         let request = FilteredWaitCancel {
             v: FILTER_OP_VERSION,
             wait_ids: vec![wait_id],
@@ -2028,7 +2121,7 @@ fn validate_page(
     }
     // The returned offsets are strictly ascending, so a binary search proves
     // each unevaluated offset is one of them.
-    let unevaluated: BTreeSet<_> = page.unevaluated.iter().copied().collect();
+    let unevaluated: BTreeSet<_> = page.unevaluated.iter().map(|fault| fault.offset).collect();
     if unevaluated.len() != page.unevaluated.len()
         || unevaluated.iter().any(|offset| {
             polled
@@ -2051,10 +2144,28 @@ fn validate_page(
     Ok(())
 }
 
+fn record_evaluation(
+    mode: ExecutionMode,
+    unevaluated: &BTreeMap<u64, FaultReason>,
+    offset: u64,
+) -> RecordEvaluation {
+    if !mode.is_filtered() {
+        return RecordEvaluation::Unfiltered;
+    }
+    unevaluated
+        .get(&offset)
+        .map_or(RecordEvaluation::Selected, |reason| {
+            RecordEvaluation::Unevaluated(*reason)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use laser_wire::filter::{AckContext, FilterExpr, FilteredPage, FilteredWaitCancelled};
+    use crate::capabilities::{Capabilities, HelloOutcome};
+    use laser_wire::filter::{
+        AckContext, FilterExpr, FilteredPage, FilteredWaitCancelled, RecordFault,
+    };
 
     #[tokio::test]
     async fn given_a_rerouted_read_when_the_route_still_names_the_silent_primary_then_should_recheck_it_and_follow_the_successor()
@@ -2093,6 +2204,141 @@ mod tests {
             vec![Target::Replica(1), Target::Replica(1), Target::Replica(2)]
         );
         assert_eq!(leaders, BTreeMap::from([(0, 2)]));
+    }
+
+    #[test]
+    fn given_an_unbound_group_page_when_its_records_are_built_then_should_not_report_a_pass_delivery()
+     {
+        assert_eq!(
+            record_evaluation(ExecutionMode::Unfiltered, &BTreeMap::new(), 4),
+            RecordEvaluation::Unfiltered,
+            "an unbound group runs no filter, so no pass policy delivered the record"
+        );
+        assert_eq!(
+            record_evaluation(ExecutionMode::Filtered, &BTreeMap::new(), 4),
+            RecordEvaluation::Selected
+        );
+    }
+
+    #[test]
+    fn given_records_a_pass_policy_delivered_when_their_page_is_built_then_should_name_each_reason()
+    {
+        let unevaluated = BTreeMap::from([
+            (4, FaultReason::TypeMismatch),
+            (6, FaultReason::ForeignCodec),
+        ]);
+        assert_eq!(
+            record_evaluation(ExecutionMode::Filtered, &unevaluated, 4),
+            RecordEvaluation::Unevaluated(FaultReason::TypeMismatch)
+        );
+        assert_eq!(
+            record_evaluation(ExecutionMode::Filtered, &unevaluated, 5),
+            RecordEvaluation::Selected
+        );
+        assert_eq!(
+            record_evaluation(ExecutionMode::Filtered, &unevaluated, 6),
+            RecordEvaluation::Unevaluated(FaultReason::ForeignCodec)
+        );
+    }
+
+    #[test]
+    fn given_two_reasons_for_one_record_when_validated_then_should_refuse_the_page() {
+        let (request, mut page, polled) = sample();
+        let mut message = IggyMessage::builder()
+            .payload(Bytes::from_static(br#"{"mode":1}"#))
+            .build()
+            .expect("a message builds");
+        message.header.offset = 4;
+        let polled = PolledMessages::new(
+            polled.context(),
+            polled.partition_id,
+            polled.current_offset,
+            1,
+            vec![message],
+        );
+        page.matched = 1;
+        page.unevaluated = vec![RecordFault {
+            offset: 4,
+            reason: FaultReason::TypeMismatch,
+        }];
+        validate_page(&request, &page, &polled).expect("one reason names the returned record");
+        page.unevaluated.push(RecordFault {
+            offset: 4,
+            reason: FaultReason::Malformed,
+        });
+        assert!(
+            validate_page(&request, &page, &polled).is_err(),
+            "a record is unevaluated for one reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_server_without_group_reads_when_a_group_reader_builds_then_should_classify_the_probe_like_the_consumer()
+     {
+        let failed = Capabilities {
+            hello: HelloOutcome::Failed,
+            ..Capabilities::OPEN
+        };
+        assert!(matches!(
+            build_group_reader(failed).await,
+            Err(LaserError::Timeout(_))
+        ));
+        let absent = Capabilities {
+            hello: HelloOutcome::Rejected,
+            ..Capabilities::OPEN
+        };
+        assert!(matches!(
+            build_group_reader(absent).await,
+            Err(LaserError::Unsupported {
+                surface: "filters",
+                feature: None,
+                ..
+            })
+        ));
+        let mut outdated = Capabilities::OPEN.with_filters(true, true);
+        outdated.filters.group_policy_reads = false;
+        assert!(matches!(
+            build_group_reader(outdated).await,
+            Err(LaserError::Unsupported {
+                surface: "filters",
+                feature: Some("group_policy_reads"),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn given_an_owned_reader_builder_when_spawned_then_should_build_on_its_own_task() {
+        let laser = Laser::from_client(IggyClient::default()).with_capabilities(Capabilities {
+            hello: HelloOutcome::Rejected,
+            ..Capabilities::OPEN
+        });
+        let reader = tokio::spawn(
+            laser
+                .stream("orbit")
+                .topic("fleet")
+                .consumer_group("desk")
+                .reader()
+                .expect("a named stream has a reader")
+                .build(),
+        );
+        assert!(
+            reader
+                .await
+                .expect("the reader task joins")
+                .is_err_and(|error| error.is_unsupported())
+        );
+    }
+
+    async fn build_group_reader(capabilities: Capabilities) -> Result<FilteredReader, LaserError> {
+        let laser = Laser::from_client(IggyClient::default()).with_capabilities(capabilities);
+        laser
+            .stream("orbit")
+            .topic("fleet")
+            .consumer_group("desk")
+            .reader()?
+            .build()
+            .await
     }
 
     fn sample() -> (FilteredPollRequest, FilteredPage, PolledMessages) {
@@ -2454,7 +2700,10 @@ mod tests {
             requests,
             vec![
                 (
-                    Target::Caller,
+                    WaitSlot {
+                        target: Target::Caller,
+                        slice: 0
+                    },
                     wait(
                         vec![FilteredWaitPartition {
                             partition_id: 3,
@@ -2464,7 +2713,10 @@ mod tests {
                     )
                 ),
                 (
-                    Target::Replica(1),
+                    WaitSlot {
+                        target: Target::Replica(1),
+                        slice: 0
+                    },
                     wait(
                         vec![FilteredWaitPartition {
                             partition_id: 1,
@@ -2474,7 +2726,10 @@ mod tests {
                     )
                 ),
                 (
-                    Target::Replica(2),
+                    WaitSlot {
+                        target: Target::Replica(2),
+                        slice: 0
+                    },
                     wait(
                         vec![
                             FilteredWaitPartition {
@@ -2491,6 +2746,53 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn given_more_partitions_on_a_node_than_one_wait_names_when_waiting_then_should_split_them_into_valid_waits()
+     {
+        let (template, _, _) = sample();
+        let count = u32::try_from(2 * MAX_FILTERED_WAIT_PARTITIONS + 52).expect("fits");
+        let partitions = (0..count)
+            .map(|partition_id| {
+                (
+                    Target::Replica(1),
+                    FilteredWaitPartition {
+                        partition_id,
+                        offset: 0,
+                    },
+                )
+            })
+            .collect();
+        let mut wait_ids = 40..;
+        let requests = wait_requests(&template, partitions, Duration::from_millis(1500), || {
+            wait_ids.next().expect("wait ids never run out")
+        });
+
+        for (_, request) in &requests {
+            request
+                .validate()
+                .expect("every wait names at most the cap");
+        }
+        let slots: Vec<(WaitSlot, u64)> = requests
+            .iter()
+            .map(|(slot, request)| (*slot, request.wait_id))
+            .collect();
+        let slot = |slice| WaitSlot {
+            target: Target::Replica(1),
+            slice,
+        };
+        assert_eq!(slots, vec![(slot(0), 40), (slot(1), 41), (slot(2), 42)]);
+        let named: Vec<u32> = requests
+            .iter()
+            .flat_map(|(_, request)| {
+                request
+                    .partitions
+                    .iter()
+                    .map(|partition| partition.partition_id)
+            })
+            .collect();
+        assert_eq!(named, (0..count).collect::<Vec<_>>());
     }
 
     enum Answer {
@@ -2518,10 +2820,7 @@ mod tests {
             let answer = self.answers.lock().expect("answers lock").pop_front();
             match answer {
                 Some(Answer::Refuse(error)) => Err(error),
-                Some(Answer::Reply(reply)) => Ok(Answered {
-                    reply,
-                    replica: None,
-                }),
+                Some(Answer::Reply(reply)) => Ok(Answered::open(reply, None)),
                 Some(Answer::Silent) | None => std::future::pending().await,
             }
         }

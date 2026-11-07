@@ -249,7 +249,7 @@ async def wait_for_projection(laser, index, expected) -> int:
     count only when the managed backend reported the view advanced. Elsewhere every tick
     queries, the plain bounded poll."""
     deadline = time.monotonic() + PROJECTOR_TIMEOUT
-    feed = laser.watch(index=index) if (await laser.capabilities()).watch else None
+    feed = await laser.watch(index=index) if (await laser.capabilities()).watch else None
     last = -1
     while True:
         advanced = last < 0 or feed is None or bool(await feed.poll())

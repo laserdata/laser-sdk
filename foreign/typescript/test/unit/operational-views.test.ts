@@ -18,6 +18,7 @@ function evidence(
 ): PolicyEvidence {
   return {
     decisionId: id,
+    chainId: `chain-${id}`,
     decision,
     mode: GovernorMode.Enforce,
     kind: "send",

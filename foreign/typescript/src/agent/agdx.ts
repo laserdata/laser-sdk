@@ -1,6 +1,7 @@
 import { type BlobStore, checkIn } from "../blob.js"
 import { type BytesLike, ownedBytes } from "../client/bytes.js"
-import { CancelledError, InvalidError, RejectedError, TimeoutError } from "../client/errors.js"
+import { type CallOptions, abortable, delay, throwIfAborted } from "../client/call-options.js"
+import { InvalidError, PolicyBlockedError, RejectedError, TimeoutError } from "../client/errors.js"
 import type { LaserTransport, MessageWithHeaders } from "../iggy/apache-iggy.js"
 import type { HeaderValue } from "../stream/header-value.js"
 import type { UlidSource } from "../runtime/ulid.js"
@@ -15,6 +16,8 @@ import {
 } from "../types/ids.js"
 import {
   AgentKind,
+  OPERATION_TASK,
+  TaskStateName,
   type AgentEnvelope,
   type AgentErrorBody,
   type AgentId as WireAgentId,
@@ -38,10 +41,13 @@ import {
   withOperation,
   withTarget,
   withTaskState,
+  taskStateFromCode,
   withTool,
   withUsage
 } from "../wire/agent.js"
+import type { ApprovalGrant } from "./context.js"
 import { canonicalAgentRecord, type CanonicalHeader } from "../wire/agent-record.js"
+import { OPERATION_INPUT_REQUEST } from "../wire/dispatch.js"
 import { decodeOne, encodeNamed, expectMap } from "../wire/cbor.js"
 import { AGENT_OP_VERSION } from "../wire/codes.js"
 import { ContentType, contentTypeCode } from "../wire/content.js"
@@ -58,28 +64,13 @@ import type { Value } from "../wire/value.js"
 export const DEFAULT_CHUNK_FLUSH_BYTES = 512
 export const DEFAULT_CHUNK_LINGER_MS = 20
 export const MAX_CHUNK_BODY_BYTES = 64 * 1024
+/** How long after its opening a chunk stream may run before readers abandon
+ * it, unless the writer sets its own bound. */
+export const DEFAULT_CHUNK_ABANDON_MS = 600_000
 
 const REPLY_BATCH = 200
 const REPLY_POLL_INTERVAL_MS = 50
 const textDecoder = new TextDecoder("utf-8", { fatal: true })
-
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted === true) {
-      reject(new CancelledError("AGDX reply wait aborted", { cause: signal.reason }))
-      return
-    }
-    const onAbort = (): void => {
-      clearTimeout(timer)
-      reject(new CancelledError("AGDX reply wait aborted", { cause: signal?.reason }))
-    }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort)
-      resolve()
-    }, ms)
-    signal?.addEventListener("abort", onAbort, { once: true })
-  })
-}
 
 function u32FromLittleEndian(header: CanonicalHeader): number {
   if (header.bytes.byteLength !== 4) throw new InvalidError("AGDX u32 header must be 4 bytes")
@@ -141,21 +132,27 @@ function mintChannelId(source?: UlidSource): ChannelId {
 class AgdxReplyReader {
   private partitions: number | undefined
   private offsets: bigint[] = []
+  /** Whether the last pass read any record, so the caller polls again at once. */
+  readAny = false
 
   private constructor(
     private readonly transport: LaserTransport,
     private readonly stream: string,
     private readonly topic: string,
-    private readonly verifier?: KeyRegistry
+    private readonly verifier?: KeyRegistry,
+    private readonly expectedSource?: WireAgentId
   ) {}
 
+  /** A reader at the topic tail. With `expectedSource`, only a reply authored
+   * by that agent, and signed by it when a verifier is set, is accepted. */
   static async atTail(
     transport: LaserTransport,
     stream: string,
     topic: string,
-    verifier?: KeyRegistry
+    verifier?: KeyRegistry,
+    expectedSource?: WireAgentId
   ): Promise<AgdxReplyReader> {
-    const reader = new AgdxReplyReader(transport, stream, topic, verifier)
+    const reader = new AgdxReplyReader(transport, stream, topic, verifier, expectedSource)
     const partitions = await transport.findTopicPartitionCount(stream, topic)
     if (partitions === undefined) return reader
     reader.partitions = partitions
@@ -175,7 +172,8 @@ class AgdxReplyReader {
     return reader
   }
 
-  async next(correlation: CorrelationId): Promise<AgentEnvelope | undefined> {
+  async next(correlation: CorrelationId, signal?: AbortSignal): Promise<AgentEnvelope | undefined> {
+    this.readAny = false
     if (this.partitions === undefined) {
       this.partitions = await this.transport.findTopicPartitionCount(this.stream, this.topic)
       if (this.partitions === undefined) return undefined
@@ -190,9 +188,12 @@ class AgdxReplyReader {
         { kind: "single", partitionId },
         { kind: "offset", value: this.offsets[partitionId] ?? 0n },
         REPLY_BATCH,
-        false
+        false,
+        undefined,
+        signal
       )
       for (const message of messages) {
+        this.readAny = true
         this.offsets[partitionId] = message.offset + 1n
         const decoded = decodeAgentMessage({ ...message, partitionId })
         if (decoded.kind === "error") continue
@@ -200,7 +201,8 @@ class AgdxReplyReader {
         if (
           envelope === undefined ||
           envelope.correlation?.equals(correlation) !== true ||
-          (envelope.kind !== AgentKind.Response && envelope.kind !== AgentKind.Error)
+          (envelope.kind !== AgentKind.Response && envelope.kind !== AgentKind.Error) ||
+          (this.expectedSource !== undefined && envelope.source !== this.expectedSource)
         ) {
           continue
         }
@@ -209,11 +211,14 @@ class AgdxReplyReader {
             continue
           }
           try {
-            this.verifier.verifyObservedAt(
+            const verified = this.verifier.verifyObservedAt(
               envelope,
               decoded.signatureContext,
               decoded.observedAtMicros
             )
+            if (this.expectedSource !== undefined && verified.principal !== this.expectedSource) {
+              continue
+            }
           } catch {
             continue
           }
@@ -243,9 +248,12 @@ export interface Agdx {
   fail(correlation: CorrelationId, error: AgentErrorBody): AgdxSend
   stream(correlation: CorrelationId, purpose: string): AgdxStream
   /**
-   * Publishes a prompt command and waits for the correlated response on
-   * `replyTopic`. `target` addresses the prompt to one agent. Without it every
-   * agent on a shared session topic receives the prompt.
+   * Publishes an `input-required` task status and the prompt as an
+   * `input_request` command, then waits for the correlated response on
+   * `replyTopic`. Only an agent that lists `input_request` among its operations
+   * receives the prompt as work. `target` addresses the prompt to one approver
+   * and accepts only its answer. Without it every agent on a shared session
+   * topic receives the prompt.
    */
   requestInput(
     replyTopic: string,
@@ -253,9 +261,18 @@ export interface Agdx {
     timeoutMs: number,
     options?: { readonly signal?: AbortSignal; readonly target?: SdkAgentId }
   ): Promise<Uint8Array>
-  /** Publishes an envelope built elsewhere, unchanged, on this producer's topic.
+  /** The approving reply envelope of one input request.
    * @internal */
-  publishEnvelope(envelope: AgentEnvelope): Promise<AgdxReceipt>
+  inputReply(
+    replyTopic: string,
+    prompt: BytesLike,
+    timeoutMs: number,
+    options?: { readonly signal?: AbortSignal; readonly target?: SdkAgentId }
+  ): Promise<AgentEnvelope>
+  /** Publishes an envelope built elsewhere on this producer's topic, after the
+   * governor. A signed envelope whose body the governor replaces is refused.
+   * @internal */
+  publishEnvelope(envelope: AgentEnvelope, options?: CallOptions): Promise<AgdxReceipt>
   /** @internal */
   withLaneGuard(
     check: () => Promise<{
@@ -281,14 +298,20 @@ interface AgdxPublisher {
     envelope: AgentEnvelope,
     contentType: ContentType,
     signingKey?: SigningKey,
-    claimCheck?: ClaimCheck
+    claimCheck?: ClaimCheck,
+    approval?: ApprovalGrant
   ): Promise<PreparedSend>
-  publish(envelope: AgentEnvelope, contentType: ContentType): Promise<AgdxReceipt>
+  publish(
+    envelope: AgentEnvelope,
+    contentType: ContentType,
+    options?: CallOptions
+  ): Promise<AgdxReceipt>
   assemble(envelope: AgentEnvelope, contentType: ContentType): MessageWithHeaders
   publishBatch(
     messages: readonly MessageWithHeaders[],
     kind: AgentKind,
-    target: WireAgentId | undefined
+    target: WireAgentId | undefined,
+    options?: CallOptions
   ): Promise<void>
 }
 
@@ -300,7 +323,11 @@ class AgdxClient implements Agdx, AgdxPublisher {
     readonly sourceId: WireAgentId,
     readonly conversationId: ConversationId,
     private readonly ulidSource?: UlidSource,
-    private readonly govern?: (envelope: AgentEnvelope, willSign: boolean) => Promise<Uint8Array>,
+    private readonly govern?: (
+      envelope: AgentEnvelope,
+      willSign: boolean,
+      approval?: ApprovalGrant
+    ) => Promise<Uint8Array>,
     private readonly verifier?: KeyRegistry,
     private readonly layout?: () => SessionLayout | undefined,
     private readonly laneGuard?: () => Promise<{
@@ -403,24 +430,43 @@ class AgdxClient implements Agdx, AgdxPublisher {
     timeoutMs: number,
     options: { readonly signal?: AbortSignal; readonly target?: SdkAgentId } = {}
   ): Promise<Uint8Array> {
+    return (await this.inputReply(replyTopic, prompt, timeoutMs, options)).body
+  }
+
+  async inputReply(
+    replyTopic: string,
+    prompt: BytesLike,
+    timeoutMs: number,
+    options: { readonly signal?: AbortSignal; readonly target?: SdkAgentId } = {}
+  ): Promise<AgentEnvelope> {
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
       throw new InvalidError("requestInput() timeout must be a non-negative finite number")
     }
+    throwIfAborted(options.signal, "AGDX reply wait")
     const interrupt = mintCorrelationId(this.ulidSource)
-    const reader = await AgdxReplyReader.atTail(
-      this.transport,
-      this.streamName,
-      replyTopicFor(this.layout?.(), replyTopic, this.sourceId),
-      this.verifier
+    const reader = await abortable(
+      AgdxReplyReader.atTail(
+        this.transport,
+        this.streamName,
+        replyTopicFor(this.layout?.(), replyTopic, this.sourceId),
+        this.verifier,
+        options.target?.wireId()
+      ),
+      options.signal,
+      "AGDX reply wait"
     )
-    const command = this.command(interrupt, prompt)
-    await (options.target === undefined ? command : command.withTarget(options.target)).send()
+    await this.status(OPERATION_TASK)
+      .withCorrelation(interrupt)
+      .withTaskState(taskStateFromCode(TaskStateName.InputRequired))
+      .send(options)
+    const command = this.command(interrupt, prompt).withOperation(OPERATION_INPUT_REQUEST)
+    await (options.target === undefined ? command : command.withTarget(options.target)).send(
+      options
+    )
     const deadline = Date.now() + timeoutMs
     for (;;) {
-      if (options.signal?.aborted === true) {
-        throw new CancelledError("AGDX reply wait aborted", { cause: options.signal.reason })
-      }
-      const reply = await reader.next(interrupt)
+      throwIfAborted(options.signal, "AGDX reply wait")
+      const reply = await reader.next(interrupt, options.signal)
       if (reply !== undefined) {
         if (reply.kind === AgentKind.Error) {
           let message = "the input request was rejected"
@@ -434,20 +480,41 @@ class AgdxClient implements Agdx, AgdxPublisher {
           }
           throw new RejectedError(message)
         }
-        return reply.body
+        return reply
       }
       const remaining = deadline - Date.now()
       if (remaining <= 0) break
-      await delay(Math.min(REPLY_POLL_INTERVAL_MS, remaining), options.signal)
+      // A full batch without the reply means more records wait, so only a
+      // caught-up pass sleeps.
+      if (!reader.readAny) {
+        await delay(Math.min(REPLY_POLL_INTERVAL_MS, remaining), options.signal, "AGDX reply wait")
+      }
     }
     throw new TimeoutError("the AGDX reply")
   }
 
-  publishEnvelope(envelope: AgentEnvelope): Promise<AgdxReceipt> {
-    return this.publish(envelope, ContentType.Raw)
+  async publishEnvelope(envelope: AgentEnvelope, options: CallOptions = {}): Promise<AgdxReceipt> {
+    if (this.govern === undefined) return this.publish(envelope, ContentType.Raw, options)
+    const signed = envelope.signature !== undefined
+    const body = await this.govern(envelope, signed)
+    if (
+      body.byteLength === envelope.body.byteLength &&
+      body.every((byte, index) => byte === envelope.body[index])
+    ) {
+      return this.publish(envelope, ContentType.Raw, options)
+    }
+    // A replacement body would void the signature the caller already attached.
+    if (signed) {
+      throw new PolicyBlockedError("the governor replaced the body of a signed envelope")
+    }
+    return this.publish({ ...envelope, body }, ContentType.Raw, options)
   }
 
-  async publish(envelope: AgentEnvelope, contentType: ContentType): Promise<AgdxReceipt> {
+  async publish(
+    envelope: AgentEnvelope,
+    contentType: ContentType,
+    options: CallOptions = {}
+  ): Promise<AgdxReceipt> {
     const message = this.assemble(envelope, contentType)
     // A declared per-agent topic layout moves addressed work off the lane, and
     // the lane identity guard covers lane records only.
@@ -461,8 +528,9 @@ class AgdxClient implements Agdx, AgdxPublisher {
       envelope.conversation.toString(),
       this.partitionOf(envelope.kind, envelope.target),
       guard === undefined
-        ? undefined
+        ? { signal: options.signal }
         : {
+            signal: options.signal,
             beforeSend: async () => {
               const source = firstSource
               firstSource = undefined
@@ -484,12 +552,13 @@ class AgdxClient implements Agdx, AgdxPublisher {
     envelope: AgentEnvelope,
     contentType: ContentType,
     signingKey?: SigningKey,
-    claimCheck?: ClaimCheck
+    claimCheck?: ClaimCheck,
+    approval?: ApprovalGrant
   ): Promise<PreparedSend> {
     const body =
       this.govern === undefined
         ? envelope.body
-        : await this.govern(envelope, signingKey !== undefined)
+        : await this.govern(envelope, signingKey !== undefined, approval)
     let prepared = body === envelope.body ? envelope : { ...envelope, body }
     let preparedType = contentType
     // Claim-check runs after governance and before signing, so the signature
@@ -525,14 +594,16 @@ class AgdxClient implements Agdx, AgdxPublisher {
   async publishBatch(
     messages: readonly MessageWithHeaders[],
     kind: AgentKind,
-    target: WireAgentId | undefined
+    target: WireAgentId | undefined,
+    options: CallOptions = {}
   ): Promise<void> {
     await this.transport.sendMessagesWithHeaders(
       this.streamName,
       this.destinationOf(kind, target) ?? this.topicName,
       messages,
       this.conversationId.toString(),
-      this.partitionOf(kind, target)
+      this.partitionOf(kind, target),
+      { signal: options.signal }
     )
   }
 
@@ -560,7 +631,11 @@ export function createAgdx(
   source: SdkAgentId,
   conversation: SdkConversationId,
   ulidSource?: UlidSource,
-  govern?: (envelope: AgentEnvelope, willSign: boolean) => Promise<Uint8Array>,
+  govern?: (
+    envelope: AgentEnvelope,
+    willSign: boolean,
+    approval?: ApprovalGrant
+  ) => Promise<Uint8Array>,
   verifier?: KeyRegistry,
   layout?: () => SessionLayout | undefined
 ): Agdx {
@@ -589,7 +664,8 @@ export interface AgdxSend {
   withCause(cause: RecordId, causeAt?: LogPosition): this
   withCorrelation(correlation: CorrelationId): this
   withIdempotencyKey(key: IdempotencyKey): this
-  withDeadlineMicros(deadlineMicros: bigint): this
+  /** The drop-dead time, epoch microseconds. */
+  withDeadlineAtMicros(deadlineAtMicros: bigint): this
   withTaskState(state: TaskState): this
   withOperation(operation: string): this
   withTool(tool: string): this
@@ -601,15 +677,18 @@ export interface AgdxSend {
   contentType(contentType: ContentType): this
   body(body: BytesLike): this
   signedBy(key: SigningKey): this
+  /** Carries `grant` to the action governor, so a step-up it asks for in the
+   * grant's conversation proceeds on that approval. */
+  withGrant(grant: ApprovalGrant): this
   /**
    * Externalizes a body at or over `thresholdBytes` to `store` at send and
    * replaces it with the body reference capsule (content type `ref`). Applied
    * before signing, so a signature covers the capsule the log carries.
    */
   claimCheck(store: BlobStore, thresholdBytes: number): this
-  send(): Promise<RecordId | undefined>
+  send(options?: CallOptions): Promise<RecordId | undefined>
   /** Like `send`, and also returns where the record was committed. */
-  sendReceipt(): Promise<AgdxReceipt>
+  sendReceipt(options?: CallOptions): Promise<AgdxReceipt>
 }
 
 class AgdxSendBuilder implements AgdxSend {
@@ -617,6 +696,7 @@ class AgdxSendBuilder implements AgdxSend {
   private sent = false
   private signingKey: SigningKey | undefined
   private claimCheckValue: ClaimCheck | undefined
+  private approval: ApprovalGrant | undefined
 
   constructor(
     private readonly agdx: AgdxPublisher,
@@ -658,8 +738,8 @@ class AgdxSendBuilder implements AgdxSend {
     return this
   }
 
-  withDeadlineMicros(deadlineMicros: bigint): this {
-    this.envelope = withDeadlineMicros(this.envelope, deadlineMicros)
+  withDeadlineAtMicros(deadlineAtMicros: bigint): this {
+    this.envelope = withDeadlineMicros(this.envelope, deadlineAtMicros)
     return this
   }
 
@@ -713,6 +793,11 @@ class AgdxSendBuilder implements AgdxSend {
     return this
   }
 
+  withGrant(grant: ApprovalGrant): this {
+    this.approval = grant
+    return this
+  }
+
   claimCheck(store: BlobStore, thresholdBytes: number): this {
     if (!Number.isSafeInteger(thresholdBytes) || thresholdBytes < 0) {
       throw new InvalidError("claim-check threshold must be a non-negative safe integer")
@@ -721,25 +806,35 @@ class AgdxSendBuilder implements AgdxSend {
     return this
   }
 
-  async send(): Promise<RecordId | undefined> {
-    return (await this.sendReceipt()).record
+  async send(options: CallOptions = {}): Promise<RecordId | undefined> {
+    return (await this.sendReceipt(options)).record
   }
 
-  async sendReceipt(): Promise<AgdxReceipt> {
+  async sendReceipt(options: CallOptions = {}): Promise<AgdxReceipt> {
     if (this.sent) throw new InvalidError("an AGDX send can only be performed once")
     if (this.envelope.kind === AgentKind.Error && this.contentTypeValue !== ContentType.Cbor) {
       throw new InvalidError(
         "an error envelope carries a CBOR AgentErrorBody, so its content type cannot change"
       )
     }
+    throwIfAborted(options.signal, "AGDX send")
     this.sent = true
-    const prepared = await this.agdx.prepare(
-      this.envelope,
-      this.contentTypeValue,
-      this.signingKey,
-      this.claimCheckValue
+    const prepared = await abortable(
+      this.agdx.prepare(
+        this.envelope,
+        this.contentTypeValue,
+        this.signingKey,
+        this.claimCheckValue,
+        this.approval
+      ),
+      options.signal,
+      "AGDX send"
     )
-    return this.agdx.publish(prepared.envelope, prepared.contentType)
+    return abortable(
+      this.agdx.publish(prepared.envelope, prepared.contentType, options),
+      options.signal,
+      "AGDX send"
+    )
   }
 }
 
@@ -752,19 +847,21 @@ interface ChunkBuffer {
 
 export interface AgdxStream {
   readonly channel: ChannelId
-  withDeadlineMicros(deadlineMicros: bigint): this
+  /** The reader-local abandonment bound, epoch microseconds. */
+  withDeadlineAtMicros(deadlineAtMicros: bigint): this
   withTarget(target: SdkAgentId): this
   contentType(contentType: ContentType): this
   buffered(maxChunks: number, lingerMs: number): this
-  write(body: BytesLike): Promise<void>
-  flush(): Promise<void>
-  finish(finishReason: string, usage?: TokenUsage): Promise<void>
-  fail(error: AgentErrorBody): Promise<void>
+  write(body: BytesLike, options?: CallOptions): Promise<void>
+  flush(options?: CallOptions): Promise<void>
+  finish(finishReason: string, usage?: TokenUsage, options?: CallOptions): Promise<void>
+  fail(error: AgentErrorBody, options?: CallOptions): Promise<void>
 }
 
 class AgdxStreamWriter implements AgdxStream {
   private sequence = 0n
-  private deadlineMicros: bigint | undefined
+  private deadlineMicros: bigint | undefined =
+    BigInt(Date.now() + DEFAULT_CHUNK_ABANDON_MS) * 1_000n
   private target: WireAgentId | undefined
   private contentTypeValue: ContentType = ContentType.Raw
   private buffer: ChunkBuffer | undefined
@@ -780,8 +877,8 @@ class AgdxStreamWriter implements AgdxStream {
     private readonly ulidSource?: UlidSource
   ) {}
 
-  withDeadlineMicros(deadlineMicros: bigint): this {
-    this.deadlineMicros = deadlineMicros
+  withDeadlineAtMicros(deadlineAtMicros: bigint): this {
+    this.deadlineMicros = deadlineAtMicros
     return this
   }
 
@@ -811,7 +908,7 @@ class AgdxStreamWriter implements AgdxStream {
     return this
   }
 
-  async write(body: BytesLike): Promise<void> {
+  async write(body: BytesLike, options: CallOptions = {}): Promise<void> {
     this.assertOpen()
     const bytes = ownedBytes(body)
     if (bytes.byteLength > MAX_CHUNK_BODY_BYTES) {
@@ -819,40 +916,57 @@ class AgdxStreamWriter implements AgdxStream {
         `chunk body is ${String(bytes.byteLength)}B, exceeds cap ${String(MAX_CHUNK_BODY_BYTES)}B`
       )
     }
+    throwIfAborted(options.signal, "AGDX stream")
     const envelope = this.chunk(bytes, false)
-    this.sequence += 1n
+    // A failed publish keeps the sequence, so writing the body again continues
+    // the stream without a gap.
     if (this.buffer === undefined) {
-      await this.agdx.publish(envelope, this.contentTypeValue)
+      await abortable(
+        this.agdx.publish(envelope, this.contentTypeValue, options),
+        options.signal,
+        "AGDX stream"
+      )
+      this.sequence += 1n
       return
     }
+    const message = this.agdx.assemble(envelope, this.contentTypeValue)
+    this.sequence += 1n
     this.buffer.firstAt ??= Date.now()
-    this.buffer.messages.push(this.agdx.assemble(envelope, this.contentTypeValue))
+    this.buffer.messages.push(message)
     if (
       this.buffer.messages.length >= this.buffer.maxChunks ||
       Date.now() - this.buffer.firstAt >= this.buffer.lingerMs
     ) {
-      await this.flush()
+      await this.flush(options)
     }
   }
 
-  async flush(): Promise<void> {
+  /** A failed append keeps the chunks buffered, so the next flush sends them. */
+  async flush(options: CallOptions = {}): Promise<void> {
+    throwIfAborted(options.signal, "AGDX stream")
     if (this.buffer === undefined || this.buffer.messages.length === 0) return
-    const messages = this.buffer.messages
-    this.buffer.messages = []
+    const messages = [...this.buffer.messages]
+    await abortable(
+      this.agdx.publishBatch(messages, AgentKind.Chunk, this.target, options),
+      options.signal,
+      "AGDX stream"
+    )
+    this.buffer.messages.splice(0, messages.length)
     this.buffer.firstAt = undefined
-    await this.agdx.publishBatch(messages, AgentKind.Chunk, this.target)
   }
 
-  async finish(finishReason: string, usage?: TokenUsage): Promise<void> {
+  async finish(finishReason: string, usage?: TokenUsage, options: CallOptions = {}): Promise<void> {
     this.assertOpen()
+    throwIfAborted(options.signal, "AGDX stream")
     this.closed = true
     let envelope = this.chunk(new Uint8Array(0), true, finishReason)
     if (usage !== undefined) envelope = withUsage(envelope, usage)
-    await this.sendTerminal(envelope, this.contentTypeValue)
+    await this.sendTerminal(envelope, this.contentTypeValue, options.signal)
   }
 
-  async fail(error: AgentErrorBody): Promise<void> {
+  async fail(error: AgentErrorBody, options: CallOptions = {}): Promise<void> {
     this.assertOpen()
+    throwIfAborted(options.signal, "AGDX stream")
     this.closed = true
     let envelope = errorEnvelope(
       mintRecordId(this.ulidSource),
@@ -863,19 +977,27 @@ class AgdxStreamWriter implements AgdxStream {
     )
     envelope = { ...envelope, channel: this.channel, sequence: this.sequence }
     if (this.target !== undefined) envelope = withTarget(envelope, this.target)
-    await this.sendTerminal(envelope, ContentType.Cbor)
+    await this.sendTerminal(envelope, ContentType.Cbor, options.signal)
   }
 
-  private async sendTerminal(envelope: AgentEnvelope, contentType: ContentType): Promise<void> {
+  private async sendTerminal(
+    envelope: AgentEnvelope,
+    contentType: ContentType,
+    signal: AbortSignal | undefined
+  ): Promise<void> {
     if (this.buffer === undefined) {
-      await this.agdx.publish(envelope, contentType)
+      await abortable(this.agdx.publish(envelope, contentType, { signal }), signal, "AGDX stream")
       return
     }
     this.buffer.messages.push(this.agdx.assemble(envelope, contentType))
     const messages = this.buffer.messages
     this.buffer.messages = []
     this.buffer.firstAt = undefined
-    await this.agdx.publishBatch(messages, envelope.kind, envelope.target)
+    await abortable(
+      this.agdx.publishBatch(messages, envelope.kind, envelope.target, { signal }),
+      signal,
+      "AGDX stream"
+    )
   }
 
   private chunk(body: Uint8Array, last: boolean, finishReason?: string): AgentEnvelope {

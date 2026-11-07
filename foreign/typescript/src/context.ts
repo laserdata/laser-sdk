@@ -1,12 +1,16 @@
+import { type CallOptions, cancellable } from "./client/call-options.js"
 import { iggyErrorCode } from "./client/error-classify.js"
 import { ConfigError, InvalidError } from "./client/errors.js"
-import { INTERNAL_TRANSPORT } from "./client/internals.js"
+import { INTERNAL_LAYOUTS, INTERNAL_TRANSPORT } from "./client/internals.js"
 import type { Laser } from "./client/laser.js"
+import { controlPartition } from "./agent/control.js"
 import { decodeAgentMessage } from "./agent/decode.js"
 import { AgentTopic } from "./provenance/agent-topic.js"
 import type { Provenance } from "./provenance/provenance.js"
+import { Cursor } from "./stream/cursor.js"
 import type { AgentId, ConversationId, MessageId } from "./types/ids.js"
 import { type AgentEnvelope, estimateTokens } from "./wire/agent.js"
+import { AGENT_SESSIONS } from "./wire/topics.js"
 
 const HISTORY_UNAVAILABLE = 87
 const READ_BATCH = 1_000
@@ -43,13 +47,23 @@ export interface ContextMessage {
   readonly topicId: number
 }
 
+/** The envelope body of an AGDX message, else the raw payload: the text a
+ * prompt carries and the bytes a token estimate counts. */
+export function contextMessageBody(message: ContextMessage): Uint8Array {
+  return message.envelope?.body ?? message.payload
+}
+
 /** A point in a conversation's log: the next offset each partition of each
  * topic will write, as captured by `ContextScope.checkpoint`. A client-side
- * bookmark keyed by topic name, never a record on the log. `toJSON` and
+ * bookmark keyed by topic name, never a record on the log. A captured
+ * checkpoint names its stream and the creation time of each topic, so a read
+ * on another stream or on a recreated topic is refused. `toJSON` and
  * `Checkpoint.fromJSON` persist it. */
 export class Checkpoint {
   private constructor(
-    private readonly perTopic: ReadonlyMap<string, ReadonlyMap<number, bigint>>
+    private readonly perTopic: ReadonlyMap<string, ReadonlyMap<number, bigint>>,
+    private readonly stream?: string,
+    private readonly generations: ReadonlyMap<string, bigint> = new Map()
   ) {}
 
   /** @internal */
@@ -59,10 +73,40 @@ export class Checkpoint {
 
   /** @internal */
   static async capture(laser: Laser, topics: readonly string[]): Promise<Checkpoint> {
+    const stream = laser.defaultStream
+    const transport = laser[INTERNAL_TRANSPORT]()
     const entries = await Promise.all(
-      topics.map(async (topic) => [topic, await laser.topic(topic).tailOffsets()] as const)
+      topics.map(async (topic) => {
+        const offsets = await laser.topic(topic).tailOffsets()
+        const details =
+          stream === undefined ? undefined : await transport.findSnapshotTopic?.(stream, topic)
+        return [topic, offsets, details?.createdAtMicros] as const
+      })
     )
-    return new Checkpoint(new Map(entries))
+    const generations = new Map<string, bigint>()
+    for (const [topic, , generation] of entries) {
+      if (generation !== undefined) generations.set(topic, generation)
+    }
+    return new Checkpoint(
+      new Map(entries.map(([topic, offsets]) => [topic, offsets])),
+      stream,
+      generations
+    )
+  }
+
+  /** Refuse a read of `topic` on `stream`, created at `generation`, when the
+   * checkpoint was taken on another stream or another generation of the topic.
+   * @internal */
+  check(stream: string, topic: string, generation: bigint): void {
+    if (this.stream !== undefined && this.stream !== stream) {
+      throw new InvalidError(
+        `the checkpoint was taken on stream \`${this.stream}\`, not \`${stream}\``
+      )
+    }
+    const taken = this.generations.get(topic)
+    if (taken !== undefined && taken !== generation) {
+      throw new InvalidError(`the topic \`${topic}\` was recreated after the checkpoint was taken`)
+    }
   }
 
   /** The per-partition offsets for `topic`, or `undefined` when the checkpoint
@@ -80,10 +124,11 @@ export class Checkpoint {
     return this.perTopic.size === 0
   }
 
-  /** The Rust and Python JSON shape, `{"per_topic": {topic: {partition: offset}}}`,
-   * with every offset an exact JSON integer. */
+  /** The Rust and Python JSON shape, with exact integer offsets and generations. */
   toJSON(): {
     readonly per_topic: Readonly<Record<string, Readonly<Record<string, unknown>>>>
+    readonly stream?: string
+    readonly generations?: Readonly<Record<string, unknown>>
   } {
     return {
       per_topic: Object.fromEntries(
@@ -93,7 +138,15 @@ export class Checkpoint {
             [...offsets].map(([partition, offset]) => [String(partition), jsonInteger(offset)])
           )
         ])
-      )
+      ),
+      ...(this.stream === undefined ? {} : { stream: this.stream }),
+      ...(this.generations.size === 0
+        ? {}
+        : {
+            generations: Object.fromEntries(
+              [...this.generations].map(([topic, generation]) => [topic, jsonInteger(generation)])
+            )
+          })
     }
   }
 
@@ -123,15 +176,32 @@ export class Checkpoint {
       }
       perTopic.set(topic, partitions)
     }
-    return new Checkpoint(perTopic)
+    const object = jsonObject(parsed, "a checkpoint")
+    const stream = object["stream"]
+    if (stream !== undefined && typeof stream !== "string") {
+      throw new InvalidError("checkpoint stream must be a string")
+    }
+    const generations = new Map<string, bigint>()
+    if (object["generations"] !== undefined) {
+      for (const [topic, generation] of Object.entries(
+        jsonObject(object["generations"], "checkpoint generations")
+      )) {
+        generations.set(topic, offsetOf(generation, topic))
+      }
+    }
+    return new Checkpoint(perTopic, stream, generations)
   }
 }
 
 /** The current tail of `topics` on `laser`'s default stream, one entry per
  * topic. Fold up to it with the `at` replay bound or resume after it with
  * `from-checkpoint`. */
-export function contextCheckpoint(laser: Laser, topics: readonly string[]): Promise<Checkpoint> {
-  return Checkpoint.capture(laser, topics)
+export function contextCheckpoint(
+  laser: Laser,
+  topics: readonly string[],
+  options: CallOptions = {}
+): Promise<Checkpoint> {
+  return cancellable(options.signal, "context checkpoint", () => Checkpoint.capture(laser, topics))
 }
 
 /** Selects which assembled messages feed an LLM call. `name`, `version`, and
@@ -183,9 +253,14 @@ export function contextSelection(
   return { kept, dropped, reason: contextPolicyName(policy) }
 }
 
-/** Keep the most recent `count` messages. */
+/** Keep the most recent `count` messages. `count` is a non-negative safe
+ * integer. */
 export class LastN implements ContextPolicy {
-  constructor(readonly count: number) {}
+  constructor(readonly count: number) {
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new InvalidError("LastN takes a non-negative integer count")
+    }
+  }
 
   name(): string {
     return `last_n(${String(this.count)})`
@@ -256,15 +331,20 @@ export class Chain implements ContextPolicy {
   }
 }
 
-/** Keep the most recent messages that fit within `maxTokens`, estimated per
- * message with `estimateTokens` over the payload unless an estimator is given.
- * At least one message is always kept. */
+/** Keep the most recent messages that fit within `maxTokens`, a non-negative
+ * safe integer, estimated per message with `estimateTokens` over
+ * `contextMessageBody` unless an estimator is given. At least one message is
+ * always kept. */
 export class TokenBudget implements ContextPolicy {
   constructor(
     private readonly maxTokens: number,
     private readonly estimate: (message: ContextMessage) => number = (message) =>
-      Number(estimateTokens(message.payload.byteLength))
-  ) {}
+      Number(estimateTokens(contextMessageBody(message).byteLength))
+  ) {
+    if (!Number.isSafeInteger(maxTokens) || maxTokens < 0) {
+      throw new InvalidError("TokenBudget takes a non-negative integer token count")
+    }
+  }
 
   name(): string {
     return `token_budget(${String(this.maxTokens)})`
@@ -302,6 +382,8 @@ export interface ContextAssemblerOptions {
   readonly fromOffsets: ReadonlyMap<number, bigint>
   readonly fromCheckpoint?: Checkpoint
   readonly toCheckpoint?: Checkpoint
+  /** @internal Read only the partitions the conversation's records land on. */
+  readonly conversationPartitions?: boolean
 }
 
 export class ContextAssemblerBuilder {
@@ -381,8 +463,10 @@ export class ContextAssembler {
     return new ContextAssembler(options)
   }
 
-  assemble(laser: Laser): Promise<readonly ContextMessage[]> {
-    return readContext(this.options, laser, false)
+  assemble(laser: Laser, options: CallOptions = {}): Promise<readonly ContextMessage[]> {
+    return cancellable(options.signal, "context assembly", () =>
+      readContext(this.options, laser, false)
+    )
   }
 }
 
@@ -432,8 +516,24 @@ async function readCurrentContext(
         stream === undefined
           ? undefined
           : await laser[INTERNAL_TRANSPORT]().resolveStreamTopicIds?.(stream, topic)
-      const cursor = (await handle.replay()).batch(READ_BATCH)
+      const cursor = (
+        options.conversationPartitions === true && stream !== undefined
+          ? Cursor.create(
+              laser[INTERNAL_TRANSPORT](),
+              stream,
+              topic,
+              await conversationPartitions(options.conversation, laser, stream, topic)
+            )
+          : await handle.replay()
+      ).batch(READ_BATCH)
       const partitions = cursor.partitions
+      if (stream !== undefined) {
+        for (const checkpoint of [options.fromCheckpoint, options.toCheckpoint]) {
+          if (checkpoint === undefined) continue
+          const details = await laser[INTERNAL_TRANSPORT]().findSnapshotTopic?.(stream, topic)
+          if (details !== undefined) checkpoint.check(stream, topic, details.createdAtMicros)
+        }
+      }
       const resume = options.fromCheckpoint
       const from = (partition: number): bigint =>
         resume === undefined
@@ -502,6 +602,27 @@ async function readCurrentContext(
     return left.id.offset < right.id.offset ? -1 : left.id.offset > right.id.offset ? 1 : 0
   })
   return options.policy.select(ordered)
+}
+
+// The partitions of `topic` the records of `conversation` land on: the one
+// its id keys to, and on `agent.sessions` the partitions a declared per-agent
+// partition layout routes work to.
+async function conversationPartitions(
+  conversation: ConversationId,
+  laser: Laser,
+  stream: string,
+  topic: string
+): Promise<readonly number[]> {
+  const count = (await laser.topic(topic).partitionCount()) ?? 0
+  const keyed = controlPartition(conversation.toString(), count)
+  const layout = laser[INTERNAL_LAYOUTS]().get(stream)
+  const declared =
+    topic === AGENT_SESSIONS && layout?.kind === "perAgentPartition"
+      ? [...layout.partitions.values()]
+      : []
+  return Array.from({ length: count }, (_, partition) => partition).filter(
+    (partition) => partition === keyed || declared.includes(partition)
+  )
 }
 
 function inConversation(options: ContextAssemblerOptions, provenance: Provenance): boolean {

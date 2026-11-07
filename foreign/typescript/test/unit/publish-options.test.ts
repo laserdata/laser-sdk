@@ -7,10 +7,10 @@ import {
   TimeoutError,
   TransportError
 } from "../../src/client/errors.js"
-import { publishOptions } from "../../src/client/publish-options.js"
+import { publishOptions, retryDelayMs } from "../../src/client/publish-options.js"
 import { LaneBlockedError, OperationUncertainError } from "apache-iggy"
 import { Laser } from "../../src/client/laser.js"
-import { ApacheIggyTransport, type IggyClient } from "../../src/iggy/apache-iggy.js"
+import { ApacheIggyTransport, type IggyClient, xxHash32 } from "../../src/iggy/apache-iggy.js"
 import { isPermissionDenied } from "../../src/client/error-classify.js"
 import { ConversationId } from "../../src/types/ids.js"
 
@@ -34,6 +34,26 @@ async function transport(send: Send, maxRetries = 2, destroy = () => undefined) 
 
 void test("given_publish_defaults_when_resolved_then_should_allow_remote_latency", () => {
   assert.deepEqual(publishOptions(), { timeoutMs: 60_000, maxRetries: 3, retryBackoffMs: 250 })
+})
+
+void test("given_publish_retries_when_delayed_then_should_spread_each_delay_over_its_upper_half", () => {
+  const options = publishOptions({ retryBackoffMs: 250 }, {})
+  for (const [attempt, ceiling] of [
+    [0, 250],
+    [1, 500],
+    [2, 1_000],
+    [16, 30_000]
+  ] as const) {
+    const delays = Array.from({ length: 64 }, () => retryDelayMs(options, attempt))
+    assert.ok(
+      delays.every((delay) => delay >= ceiling / 2 && delay <= ceiling),
+      `attempt ${String(attempt)} stays within the upper half of ${String(ceiling)}`
+    )
+    assert.ok(
+      delays.some((delay) => delay !== ceiling),
+      `attempt ${String(attempt)} is jittered`
+    )
+  }
 })
 
 void test("given_invalid_publish_settings_when_connected_then_should_reject_before_io", async () => {
@@ -224,7 +244,7 @@ void test("given_slow_partition_lookup_when_timed_out_then_should_never_send_lat
 })
 
 void test("given_a_transient_partition_reply_when_publishing_then_should_retry_it", async () => {
-  for (const errorCode of [3004, 3007, 10002]) {
+  for (const errorCode of [3004, 10002]) {
     let attempts = 0
     const client = await transport(() => {
       attempts += 1
@@ -238,6 +258,95 @@ void test("given_a_transient_partition_reply_when_publishing_then_should_retry_i
     })
     assert.equal(attempts, 2)
   }
+})
+
+void test("given_a_missing_explicit_partition_when_publishing_then_should_fail_without_retrying", async () => {
+  let attempts = 0
+  const client = await transport(() => {
+    attempts += 1
+    return Promise.reject(Object.assign(new Error("partition not found"), { errorCode: 3007 }))
+  })
+  await assert.rejects(
+    client.sendMessages("stream", "topic", [new Uint8Array([1])], {
+      kind: "partition",
+      partition: 7
+    }),
+    (error: unknown) =>
+      error instanceof PublishFailedError &&
+      error.publishCause() instanceof TransportError &&
+      !(error.publishCause() as TransportError).retryable
+  )
+  assert.equal(attempts, 1)
+})
+
+void test("given_a_topic_that_lost_partitions_when_a_keyed_publish_misses_then_should_route_by_a_fresh_count_once", async () => {
+  const counts = [4, 2]
+  const partitions: number[] = []
+  const key = new TextEncoder().encode("order-4")
+  const client = {
+    clientProvider: () => Promise.resolve({}),
+    topic: { get: () => Promise.resolve({ partitionsCount: counts.shift() ?? 2 }) },
+    message: {
+      send: ({ partition }: { readonly partition: { readonly value: number } }) => {
+        partitions.push(partition.value)
+        return partition.value >= 2
+          ? Promise.reject(Object.assign(new Error("partition not found"), { errorCode: 3007 }))
+          : Promise.resolve({ confirmations: [] })
+      }
+    },
+    destroy: () => Promise.resolve()
+  } as unknown as IggyClient
+  const adapted = await ApacheIggyTransport.fromClient(client, "owned", {
+    timeoutMs: 20,
+    maxRetries: 2,
+    retryBackoffMs: 1
+  })
+  await adapted.sendMessages("stream", "topic", [new Uint8Array([1])], { kind: "key", key })
+  assert.deepEqual(partitions, [xxHash32(key) % 4, xxHash32(key) % 2])
+  assert.ok(xxHash32(key) % 4 >= 2, "the fixture key must land past the shrunk count")
+})
+
+void test("given_partitions_added_when_the_cached_count_ages_out_then_should_route_balanced_publishes_to_them", async (context) => {
+  context.mock.timers.enable({ apis: ["Date"] })
+  let count = 1
+  let reads = 0
+  const partitions = new Set<number>()
+  const client = {
+    clientProvider: () => Promise.resolve({}),
+    topic: {
+      get: () => {
+        reads += 1
+        return Promise.resolve({ partitionsCount: count })
+      }
+    },
+    message: {
+      send: ({ partition }: { readonly partition: { readonly value: number } }) => {
+        partitions.add(partition.value)
+        return Promise.resolve({ confirmations: [] })
+      }
+    },
+    destroy: () => Promise.resolve()
+  } as unknown as IggyClient
+  const adapted = await ApacheIggyTransport.fromClient(client, "owned", {
+    timeoutMs: 20,
+    maxRetries: 0,
+    retryBackoffMs: 1
+  })
+  const send = () =>
+    adapted.sendMessages("stream", "topic", [new Uint8Array([1])], { kind: "balanced" })
+  await send()
+  count = 3
+  for (let index = 0; index < 3; index += 1) await send()
+  assert.deepEqual([...partitions], [0], "a fresh count is reused")
+  assert.equal(reads, 1)
+  context.mock.timers.tick(5_000)
+  for (let index = 0; index < 3; index += 1) await send()
+  assert.deepEqual(
+    [...partitions].sort(),
+    [0, 1, 2],
+    "an aged count is read again and new partitions take traffic"
+  )
+  assert.equal(reads, 2)
 })
 
 void test("given_an_expired_session_on_an_injected_client_when_publishing_then_should_not_retry_without_a_reconnect", async () => {

@@ -1,17 +1,17 @@
 use crate::agent::{PyAgentMessage, PyProvenance};
 use crate::agent_runtime::{
-    ParsedRoutePolicy, inbox_route, route_policy, route_result, static_topic,
+    ParsedRoutePolicy, PyContract, inbox_route, route_policy, route_result, static_topic,
 };
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::convert::{payload_bytes, py_to_de, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
+use crate::query::PyQueryResult;
 use crate::sign::PySigningKey;
 use laser_sdk::agent::{
     AgentScope, CapabilitySelector, ConsumerRef, ConsumptionStatus, RegisteredCard, Router,
 };
 use laser_sdk::laser::Laser;
-use laser_sdk::query::QueryExecutionId;
 use laser_sdk::types::{AgentId, ConsumerGroupName, ConversationId, PrincipalId};
 use laser_sdk::wire::agent::{AgentCard, AgentPresence, CapabilityDescriptor, ChannelId};
 use pyo3::prelude::*;
@@ -45,10 +45,6 @@ pub(crate) fn capabilities(values: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<Capabi
         .collect()
 }
 
-fn execution_id(value: &str) -> PyResult<QueryExecutionId> {
-    QueryExecutionId::from_str(value).map_err(|error| InvalidError::new_err(error.to_string()))
-}
-
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyLaser {
@@ -70,11 +66,11 @@ impl PyLaser {
         py: Python<'py>,
         source: String,
         card: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
         let source = agent_id(source)?;
         let card: AgentCard = py_to_de(card)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser.publish_card(source, &card).await.map_err(to_pyerr)
         })
     }
@@ -87,12 +83,12 @@ impl PyLaser {
         operator: String,
         agent: String,
         key: PyRef<'_, PySigningKey>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
         let operator = agent_id(operator)?;
         let agent = agent_id(agent)?;
         let key = key.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .quarantine_signed(operator, &agent, &key)
                 .await
@@ -107,12 +103,12 @@ impl PyLaser {
         operator: String,
         agent: String,
         key: PyRef<'_, PySigningKey>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
         let operator = agent_id(operator)?;
         let agent = agent_id(agent)?;
         let key = key.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .unquarantine_signed(operator, &agent, &key)
                 .await
@@ -127,19 +123,19 @@ impl PyLaser {
         &self,
         py: Python<'py>,
         presence: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
         let presence: AgentPresence = py_to_de(presence)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser.advertise_presence(&presence).await.map_err(to_pyerr)
         })
     }
 
     /// Withdraw this connection's advertised presence. Disconnecting clears it
     /// too.
-    fn clear_presence<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn clear_presence<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
-        future_into_py(
+        awaitable(
             py,
             async move { laser.clear_presence().await.map_err(to_pyerr) },
         )
@@ -157,9 +153,9 @@ impl PyLaser {
         principal: Option<u32>,
         limit: Option<u32>,
         after: Option<u32>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyClientMetadataPage>> {
         let laser = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let page = client_metadata_request(&laser, metadata_only, principal, limit, after)
                 .page()
                 .await
@@ -184,9 +180,9 @@ impl PyLaser {
         principal: Option<u32>,
         limit: Option<u32>,
         after: Option<u32>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let clients = client_metadata_request(&laser, metadata_only, principal, limit, after)
                 .all()
                 .await
@@ -214,14 +210,14 @@ impl PyLaser {
         conversation: String,
         topic: String,
         channel: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.inner.clone();
         let conversation =
             ConversationId::from_str(&conversation).map_err(|e| to_pyerr(e.into()))?;
         let topic = static_topic(topic)?;
         let channel = ChannelId::from_str(&channel)
             .map_err(|error| InvalidError::new_err(error.to_string()))?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let events = laser
                 .reassemble_channel(conversation, topic, channel)
                 .await
@@ -237,11 +233,11 @@ impl PyLaser {
         py: Python<'py>,
         target: &PyConsumerRef,
         at: &crate::agdx::PyLogPosition,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyConsumptionStatus>> {
         let target = target.to_rust()?;
         let at = at.inner;
         let laser = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let status = laser.consumed(target, at).await.map_err(to_pyerr)?;
             Ok(PyConsumptionStatus::from(status))
         })
@@ -253,77 +249,12 @@ impl PyLaser {
         &self,
         py: Python<'py>,
         query: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyQueryResult>> {
         let laser = self.inner.clone();
         let query = py_to_de(query)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let result = laser.execute_query(query).await.map_err(to_pyerr)?;
             Ok(crate::query::PyQueryResult::from(result))
-        })
-    }
-
-    /// Fetch the page after `cursor` for an execution already started.
-    /// `deadline_micros` is the absolute deadline in epoch microseconds.
-    fn query_page<'py>(
-        &self,
-        py: Python<'py>,
-        execution_id: String,
-        cursor: String,
-        deadline_micros: u64,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.inner.clone();
-        let execution_id = self::execution_id(&execution_id)?;
-        future_into_py(py, async move {
-            let result = laser
-                .query_page(execution_id, cursor, deadline_micros)
-                .await
-                .map_err(to_pyerr)?;
-            Ok(crate::query::PyQueryResult::from(result))
-        })
-    }
-
-    /// Execute one raw checkpoint request (a dict mirroring the wire
-    /// `CheckpointRequestEnvelope`) and return the mutation result as a dict.
-    /// `Destinations.mutate` builds the common public mutation for you. Needs the
-    /// destinations capability, otherwise raises `UnsupportedError`.
-    fn execute_checkpoint<'py>(
-        &self,
-        py: Python<'py>,
-        request: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.inner.clone();
-        let request = py_to_de(request)?;
-        future_into_py(py, async move {
-            let result = laser.execute_checkpoint(request).await.map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &result))
-        })
-    }
-
-    /// Request cancellation of a query execution and return its observed state.
-    fn cancel_query<'py>(
-        &self,
-        py: Python<'py>,
-        execution_id: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.inner.clone();
-        let execution_id = self::execution_id(&execution_id)?;
-        future_into_py(py, async move {
-            let status = laser.cancel_query(execution_id).await.map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &status))
-        })
-    }
-
-    /// Read the current state of a query execution.
-    fn query_status<'py>(
-        &self,
-        py: Python<'py>,
-        execution_id: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.inner.clone();
-        let execution_id = self::execution_id(&execution_id)?;
-        future_into_py(py, async move {
-            let status = laser.query_status(execution_id).await.map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &status))
         })
     }
 }
@@ -439,7 +370,7 @@ pub struct PyAgentRegistry {
 impl PyAgentRegistry {
     fn read<T>(
         &self,
-        f: impl FnOnce(&laser_sdk::agent::AgentRegistry<'_>) -> PyResult<T>,
+        f: impl FnOnce(&laser_sdk::agent::AgentRegistry) -> PyResult<T>,
     ) -> PyResult<T> {
         let registry = self.laser.agent_registry().map_err(to_pyerr)?;
         f(&registry)
@@ -456,10 +387,10 @@ impl PyAgentRegistry {
         &self,
         py: Python<'py>,
         now_micros: Option<u64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, usize>> {
         let laser = self.laser.clone();
         let now = now_micros.unwrap_or_else(self::now_micros);
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut registry = laser.agent_registry().map_err(to_pyerr)?;
             registry.refresh(now).await.map_err(to_pyerr)
         })
@@ -467,9 +398,9 @@ impl PyAgentRegistry {
 
     /// Page the live connection table for advertised presence, reusing a read
     /// younger than the presence ttl. Returns the number of presences folded.
-    fn refresh_presence<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn refresh_presence<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, usize>> {
         let laser = self.laser.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut registry = laser.agent_registry().map_err(to_pyerr)?;
             registry.refresh_presence().await.map_err(to_pyerr)
         })
@@ -657,14 +588,15 @@ impl PyAgentScope {
         &self,
         py: Python<'py>,
         topic: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         provenance: &PyProvenance,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let scope = self.inner.clone();
         let topic = static_topic(topic)?;
         let payload = payload_bytes(payload)?;
         let provenance = provenance.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             scope
                 .send(topic, payload, &provenance)
                 .await
@@ -680,17 +612,18 @@ impl PyAgentScope {
         py: Python<'py>,
         request_topic: String,
         reply_topic: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         provenance: &PyProvenance,
         timeout_ms: f64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyAgentMessage>> {
         let scope = self.inner.clone();
         let request_topic = static_topic(request_topic)?;
         let reply_topic = static_topic(reply_topic)?;
         let payload = payload_bytes(payload)?;
         let provenance = provenance.inner.clone();
         let timeout = crate::convert::duration_ms(timeout_ms, "timeout_ms")?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let reply = scope
                 .ask(request_topic, reply_topic, payload, &provenance, timeout)
                 .await
@@ -699,30 +632,31 @@ impl PyAgentScope {
         })
     }
 
-    /// Open a directed contract from this agent to one named `agent`, awaiting
-    /// the reply up to `deadline_ms` (default 30000). Returns the terminal
-    /// `Contract`, as `Laser.contract` does. Use
-    /// `Laser.contract` for capability routing. Pass `agent=None` with `skill`
-    /// to route by capability under the route `policy` word.
-    #[pyo3(signature = (agent, payload, *, deadline_ms=30_000, skill=None, policy=None, fixed_inbox=None, principal=None, expire_if_not_consumed_ms=None, reply_on=None, conversation=None, fence=None, parent=None, root=None))]
+    /// Open a directed contract as this agent, awaiting the reply up to
+    /// `deadline_ms` (default 30000), with the arguments of `Laser.contract`
+    /// less `source`: route by capability with `skill` under the route
+    /// `policy`, or to one named agent with `agent=` (pass `skill=None`).
+    /// Returns the terminal `Contract`.
+    #[pyo3(signature = (skill, payload, *, agent=None, deadline_ms=30_000.0, policy=None, fixed_inbox=None, principal=None, expire_if_not_consumed_ms=None, reply_on=None, conversation=None, fence=None, parent=None, root=None))]
     #[allow(clippy::too_many_arguments)]
     fn contract<'py>(
         &self,
         py: Python<'py>,
-        agent: Option<String>,
-        payload: Vec<u8>,
-        deadline_ms: u64,
         skill: Option<String>,
+        #[gen_stub(override_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+        payload: Vec<u8>,
+        agent: Option<String>,
+        deadline_ms: f64,
         policy: Option<&Bound<'_, PyAny>>,
         fixed_inbox: Option<String>,
         principal: Option<u32>,
-        expire_if_not_consumed_ms: Option<u64>,
+        expire_if_not_consumed_ms: Option<f64>,
         reply_on: Option<String>,
         conversation: Option<String>,
         fence: Option<u64>,
         parent: Option<String>,
         root: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyContract>>> {
         let request = crate::agent_runtime::ContractRequest::new(
             skill,
             agent,
@@ -739,7 +673,7 @@ impl PyAgentScope {
             policy,
         )?;
         let laser = self.laser.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let outcome = request.send(&laser).await?;
             Python::attach(|py| crate::agent_runtime::PyContract::from_rust(py, outcome))
         })
@@ -750,10 +684,10 @@ impl PyAgentScope {
         &self,
         py: Python<'py>,
         card: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let scope = self.inner.clone();
         let card: AgentCard = py_to_de(card)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             scope.publish_card(&card).await.map_err(to_pyerr)
         })
     }
@@ -766,11 +700,11 @@ impl PyAgentScope {
         py: Python<'py>,
         listen_on: String,
         capabilities: Vec<Bound<'_, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let scope = self.inner.clone();
         let listen_on = static_topic(listen_on)?;
         let capabilities = self::capabilities(capabilities)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             scope
                 .advertise(listen_on, capabilities)
                 .await
@@ -785,7 +719,7 @@ fn client_metadata_request(
     principal: Option<u32>,
     limit: Option<u32>,
     after: Option<u32>,
-) -> laser_sdk::agent::ClientMetadataRequest<'_> {
+) -> laser_sdk::agent::ClientMetadataRequest {
     let mut request = laser.client_metadata().with_metadata_only(metadata_only);
     if let Some(principal) = principal {
         request = request.principal(PrincipalId::new(principal));

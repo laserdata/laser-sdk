@@ -1,5 +1,6 @@
 import { setWorldConstructor, type IWorldOptions } from "@cucumber/cucumber";
 import {
+  type CompiledSchema,
   type ConsumerFilter,
   ConversationId,
   type FilterVerdict,
@@ -11,6 +12,8 @@ import {
   type ContextMessage,
   type LaserError,
   type AgentHandle,
+  type KvEntry as ManagedKvEntry,
+  type Lease,
   type MemoryId,
   type MutationPosition,
   type Session,
@@ -20,6 +23,11 @@ import { randomUUID } from "node:crypto";
 import type { wire } from "@laserdata/laser-sdk/full";
 
 export class LaserWorld {
+  writerSchema?: CompiledSchema;
+  writerPayloadRejected?: boolean;
+  writerCorpusFailures?: string[];
+  /** Each writer schema a registry scenario registered: its stream, its name, and the id the registry answered. */
+  readonly schemaRegistrations: Array<readonly [string, string, number]> = [];
   readonly endpoint =
     process.env["LASER_BDD_URL"] ??
     (process.env["LASER_BDD_ADDR"] !== undefined
@@ -47,12 +55,26 @@ export class LaserWorld {
   readonly memoryIds = new Map<string, MemoryId>();
   query = new QueryEngine();
   queryResult?: QueryResult;
-  dataStack = new DataStackModel();
+  materializationStatus?: wire.BindingStatus;
+  materializationTarget?: wire.BindingStatus;
+  materialization?: import("@laserdata/laser-sdk").Materialization;
+  sqlBackend?: { binding: wire.BackendBinding; dialect: wire.SqlDialect };
   bindingBuilder?: wire.ProjectionBindingBuilder;
   bindingWire?: Map<string, unknown>;
   kv = new KvEngine();
   cas?: CasResult;
   notedPosition: MutationPosition | undefined;
+  /** The lease each holder took, with the key it names. */
+  readonly leases = new Map<string, readonly [string, Lease]>();
+  renewedLease?: Lease;
+  leaseReleased?: boolean;
+  /** The entry the last barriered read returned, whose version the next fenced write expects. */
+  lastEntry?: ManagedKvEntry;
+  /** The last managed query result and the latencies an offset walk returned. */
+  managedResult?: import("@laserdata/laser-sdk").QueryResult;
+  walkedLatencies: readonly bigint[] = [];
+  /** Whether the last whole read saw its frontier move between pages. */
+  walkFrontierMoved: boolean | undefined;
   clients: readonly ClientMetadata[] = [];
   clientUser: number | undefined;
   graph = new GraphEngine();
@@ -121,153 +143,6 @@ export class LaserWorld {
     if (this.worker !== undefined) await this.worker.shutdown();
     for (const responder of this.responders) await responder.shutdown();
     if (this.laser !== undefined) await this.laser.close();
-  }
-}
-
-interface DestinationState {
-  definitionRevision: number;
-  checkpointRevision: number;
-  effectiveState: "disabled" | "running" | "blocked";
-  nextOffset: number;
-  retainedOffset: number;
-}
-
-export type DataStackError =
-  | { readonly kind: "conflict"; readonly observedRevision: number }
-  | { readonly kind: "cancelled" }
-  | { readonly kind: "notFound" }
-  | { readonly kind: "invalid" };
-
-export class DataStackModel {
-  private globalRevision = 0;
-  private readonly destinations = new Map<string, DestinationState>();
-  private queryRows: readonly string[] = [];
-  private queryCursor = 0;
-  private cancelled = false;
-  operation?: { readonly id: string };
-  error?: DataStackError;
-  queryPage?: { readonly rows: readonly string[]; readonly cursor?: number };
-
-  register(name: string, expectedGlobalRevision: number): void {
-    if (!this.requireGlobal(expectedGlobalRevision)) return;
-    this.globalRevision += 1;
-    this.destinations.set(name, {
-      definitionRevision: 1,
-      checkpointRevision: 0,
-      effectiveState: "disabled",
-      nextOffset: 0,
-      retainedOffset: 0,
-    });
-    this.operation = { id: `operation-${String(this.globalRevision)}` };
-  }
-
-  enable(
-    name: string,
-    expectedGlobalRevision: number,
-    expectedDefinitionRevision: number,
-  ): void {
-    if (!this.requireGlobal(expectedGlobalRevision)) return;
-    const destination = this.destinations.get(name);
-    if (destination === undefined) {
-      this.error = { kind: "notFound" };
-      return;
-    }
-    if (destination.definitionRevision !== expectedDefinitionRevision) {
-      this.error = { kind: "conflict", observedRevision: this.globalRevision };
-      return;
-    }
-    this.globalRevision += 1;
-    destination.definitionRevision += 1;
-    destination.checkpointRevision += 1;
-    destination.effectiveState = "running";
-    this.operation = { id: `operation-${String(this.globalRevision)}` };
-  }
-
-  recordGap(
-    name: string,
-    requiredOffset: number,
-    retainedOffset: number,
-  ): void {
-    const destination = this.destinations.get(name);
-    if (destination === undefined) {
-      this.error = { kind: "notFound" };
-      return;
-    }
-    // A gap means the log no longer holds the offset the destination needs.
-    if (retainedOffset <= requiredOffset) {
-      this.error = { kind: "invalid" };
-      return;
-    }
-    destination.retainedOffset = retainedOffset;
-    this.globalRevision += 1;
-    destination.checkpointRevision += 1;
-    destination.effectiveState = "blocked";
-  }
-
-  acceptGap(
-    name: string,
-    nextOffset: number,
-    expectedCheckpointRevision: number,
-  ): void {
-    const destination = this.destinations.get(name);
-    if (destination === undefined) {
-      this.error = { kind: "notFound" };
-      return;
-    }
-    if (destination.checkpointRevision !== expectedCheckpointRevision) {
-      this.error = { kind: "conflict", observedRevision: this.globalRevision };
-      return;
-    }
-    // Accepting a gap resumes where the log still has records.
-    if (nextOffset < destination.retainedOffset) {
-      this.error = { kind: "invalid" };
-      return;
-    }
-    this.globalRevision += 1;
-    destination.checkpointRevision += 1;
-    destination.effectiveState = "running";
-    destination.nextOffset = nextOffset;
-  }
-
-  destination(name: string): Readonly<DestinationState> | undefined {
-    return this.destinations.get(name);
-  }
-
-  seedQuery(rows: readonly string[]): void {
-    this.queryRows = rows;
-    this.queryCursor = 0;
-    this.cancelled = false;
-  }
-
-  readPage(limit: number): void {
-    if (this.cancelled) {
-      this.error = { kind: "cancelled" };
-      return;
-    }
-    const start = this.queryCursor;
-    const end = Math.min(start + limit, this.queryRows.length);
-    this.queryCursor = end;
-    this.queryPage = {
-      rows: this.queryRows.slice(start, end),
-      ...(end < this.queryRows.length ? { cursor: end } : {}),
-    };
-  }
-
-  cancelQuery(): void {
-    this.cancelled = true;
-  }
-
-  queryIsCancelled(): boolean {
-    return this.cancelled;
-  }
-
-  private requireGlobal(expected: number): boolean {
-    if (expected === this.globalRevision) {
-      delete this.error;
-      return true;
-    }
-    this.error = { kind: "conflict", observedRevision: this.globalRevision };
-    return false;
   }
 }
 

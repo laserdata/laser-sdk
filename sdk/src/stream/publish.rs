@@ -6,36 +6,35 @@ use laser_wire::arrow::ArrowIpcMessageMetadata;
 use laser_wire::validate::Validate;
 use serde::Serialize;
 use std::collections::BTreeMap;
+#[cfg(not(feature = "agent"))]
+use std::marker::PhantomData;
 
 impl Laser {
-    pub(crate) fn publish<'a>(&'a self, topic: &'a str) -> PublishRequest<'a> {
-        PublishRequest::new(self, None, topic)
+    pub(crate) fn publish(&self, topic: &str) -> PublishRequest<'static> {
+        PublishRequest::new(self.clone(), None, topic.to_owned())
     }
 
-    pub(crate) fn publish_on<'a>(&'a self, stream: &'a str, topic: &'a str) -> PublishRequest<'a> {
-        PublishRequest::new(self, Some(stream), topic)
+    pub(crate) fn publish_on(&self, stream: &str, topic: &str) -> PublishRequest<'static> {
+        PublishRequest::new(self.clone(), Some(stream.to_owned()), topic.to_owned())
     }
 
-    pub(crate) fn publish_batch<'a>(&'a self, topic: &'a str) -> BatchPublishRequest<'a> {
-        BatchPublishRequest::new(self, None, topic)
+    pub(crate) fn publish_batch(&self, topic: &str) -> BatchPublishRequest {
+        BatchPublishRequest::new(self.clone(), None, topic.to_owned())
     }
 
-    pub(crate) fn publish_batch_on<'a>(
-        &'a self,
-        stream: &'a str,
-        topic: &'a str,
-    ) -> BatchPublishRequest<'a> {
-        BatchPublishRequest::new(self, Some(stream), topic)
+    pub(crate) fn publish_batch_on(&self, stream: &str, topic: &str) -> BatchPublishRequest {
+        BatchPublishRequest::new(self.clone(), Some(stream.to_owned()), topic.to_owned())
     }
 }
 
 /// Fluent builder for `Laser::publish`. Accumulates a `Record` + payload, then
-/// `.send().await` performs the publish.
+/// `.send().await` performs the publish. The lifetime is the borrowed
+/// [`claim_check`](Self::claim_check) store, `'static` without one.
 #[must_use = "call .send().await to publish the record"]
 pub struct PublishRequest<'a> {
-    laser: &'a Laser,
-    stream: Option<&'a str>,
-    topic: &'a str,
+    laser: Laser,
+    stream: Option<String>,
+    topic: String,
     record: Record,
     payload: Vec<u8>,
     partition_key: Option<String>,
@@ -43,10 +42,13 @@ pub struct PublishRequest<'a> {
     provenance: Option<crate::provenance::Provenance>,
     #[cfg(feature = "agent")]
     claim_check: Option<(&'a dyn crate::blob::BlobStore, usize)>,
+    // Without the agent feature there is no claim-check store to borrow.
+    #[cfg(not(feature = "agent"))]
+    claim_check: PhantomData<&'a ()>,
 }
 
 impl<'a> PublishRequest<'a> {
-    fn new(laser: &'a Laser, stream: Option<&'a str>, topic: &'a str) -> Self {
+    fn new(laser: Laser, stream: Option<String>, topic: String) -> Self {
         Self {
             laser,
             stream,
@@ -58,6 +60,8 @@ impl<'a> PublishRequest<'a> {
             provenance: None,
             #[cfg(feature = "agent")]
             claim_check: None,
+            #[cfg(not(feature = "agent"))]
+            claim_check: PhantomData,
         }
     }
 
@@ -105,9 +109,11 @@ impl<'a> PublishRequest<'a> {
         self
     }
 
-    /// Stamp a schema id on `agdx.sid`. **Reserved** for future
-    /// infrastructure-native validation and codec dispatch. The projector does
-    /// not use this for materialization routing, which is `projection_ref`'s job.
+    /// Stamp a writer schema id on `agdx.sid`. It is enforced: the managed
+    /// projector decodes or validates the body under that schema and refuses a
+    /// record whose body does not match it, or whose schema family differs from
+    /// `agdx.ct`, under the binding's invalid-record policy. Routing stays
+    /// `projection_ref`'s job.
     pub fn schema_id(mut self, value: u32) -> Self {
         self.record.schema_id = Some(value);
         self
@@ -281,7 +287,7 @@ impl<'a> PublishRequest<'a> {
         let this = self;
         #[cfg(feature = "agent")]
         {
-            let stream = match this.stream {
+            let stream = match this.stream.as_deref() {
                 Some(stream) => stream,
                 None => this.laser.stream_required()?,
             };
@@ -292,7 +298,7 @@ impl<'a> PublishRequest<'a> {
             let action = crate::govern::GovernedAction {
                 kind: crate::govern::ActionKind::Publish,
                 stream,
-                topic: this.topic,
+                topic: &this.topic,
                 source: provenance
                     .and_then(|provenance| provenance.agent.as_ref())
                     .map(|agent| agent.as_str()),
@@ -309,6 +315,7 @@ impl<'a> PublishRequest<'a> {
                 payload: this.payload.as_ref(),
                 signed: false,
                 counters: crate::govern::ActionCounters::default(),
+                approval: None,
             };
             if let Some(modified) = this.laser.govern(action).await? {
                 this.payload = modified;
@@ -331,13 +338,13 @@ impl<'a> PublishRequest<'a> {
         if let Some(provenance) = &self_.provenance {
             headers.extend(BTreeMap::<HeaderKey, HeaderValue>::try_from(provenance)?);
         }
-        match self_.stream {
+        match self_.stream.as_deref() {
             Some(stream) => {
                 self_
                     .laser
                     .send_with_headers_on(
                         stream,
-                        self_.topic,
+                        &self_.topic,
                         self_.payload,
                         headers,
                         self_.partition_key.as_deref(),
@@ -348,7 +355,7 @@ impl<'a> PublishRequest<'a> {
                 self_
                     .laser
                     .send_with_headers(
-                        self_.topic,
+                        &self_.topic,
                         self_.payload,
                         headers,
                         self_.partition_key.as_deref(),
@@ -371,10 +378,10 @@ impl<'a> PublishRequest<'a> {
 /// raw bodies). For per-record metadata, push a manually-built `Record` via
 /// [`add_record`](Self::add_record).
 #[must_use = "call .send().await to publish the batch"]
-pub struct BatchPublishRequest<'a> {
-    laser: &'a Laser,
-    stream: Option<&'a str>,
-    topic: &'a str,
+pub struct BatchPublishRequest {
+    laser: Laser,
+    stream: Option<String>,
+    topic: String,
     inline_payload: bool,
     content_type: Option<ContentType>,
     projection_ref: Option<String>,
@@ -385,8 +392,8 @@ pub struct BatchPublishRequest<'a> {
     partition_key: Option<String>,
 }
 
-impl<'a> BatchPublishRequest<'a> {
-    fn new(laser: &'a Laser, stream: Option<&'a str>, topic: &'a str) -> Self {
+impl BatchPublishRequest {
+    fn new(laser: Laser, stream: Option<String>, topic: String) -> Self {
         Self {
             laser,
             stream,
@@ -431,9 +438,9 @@ impl<'a> BatchPublishRequest<'a> {
         self
     }
 
-    /// Stamp `schema_id` on every record. **Reserved** for future
-    /// infrastructure-native validation and codec dispatch. The projector does
-    /// not route on this. Use `projection_ref` for materialization.
+    /// Stamp `schema_id` on every record. It is enforced like
+    /// [`PublishRequest::schema_id`]: the managed projector refuses a record
+    /// whose body breaks that writer schema. Routing stays `projection_ref`'s job.
     pub fn schema_id(mut self, value: u32) -> Self {
         self.schema_id = Some(value);
         self
@@ -743,12 +750,22 @@ impl<'a> BatchPublishRequest<'a> {
                     .build()?,
             );
         }
-        let response = match self.stream {
+        #[cfg(feature = "agent")]
+        {
+            let stream = match self.stream.as_deref() {
+                Some(stream) => stream,
+                None => self.laser.stream_required()?,
+            };
+            self.laser
+                .govern_messages(stream, &self.topic, &mut iggy_messages)
+                .await?;
+        }
+        let response = match self.stream.as_deref() {
             Some(stream) => {
                 self.laser
                     .send_batch_on(
                         stream,
-                        self.topic,
+                        &self.topic,
                         iggy_messages,
                         self.partition_key.as_deref(),
                     )
@@ -756,10 +773,41 @@ impl<'a> BatchPublishRequest<'a> {
             }
             None => {
                 self.laser
-                    .send_batch(self.topic, iggy_messages, self.partition_key.as_deref())
+                    .send_batch(&self.topic, iggy_messages, self.partition_key.as_deref())
                     .await?
             }
         };
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::iggy::prelude::IggyClient;
+
+    #[tokio::test]
+    async fn given_owned_publish_requests_when_spawned_then_should_send_on_their_own_tasks() {
+        let laser = Laser::from_client(IggyClient::default());
+        let topic = laser.topic("readings");
+        let single = tokio::spawn(topic.publish().payload(b"reading".to_vec()).send());
+        let batch = tokio::spawn(
+            topic
+                .publish_batch()
+                .add_payload(b"reading".to_vec())
+                .send(),
+        );
+        assert!(
+            single
+                .await
+                .expect("the publish task joins")
+                .is_err_and(|error| matches!(error, LaserError::NoStream))
+        );
+        assert!(
+            batch
+                .await
+                .expect("the batch task joins")
+                .is_err_and(|error| matches!(error, LaserError::NoStream))
+        );
     }
 }

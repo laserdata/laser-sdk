@@ -2,12 +2,13 @@ use crate::harness;
 use crate::test_iggy::TestIggyCluster;
 use laser_sdk::capabilities::{Capabilities, HelloOutcome};
 use laser_sdk::iggy::prelude::{
-    Consumer as OffsetOwner, ConsumerGroupClient, ConsumerOffsetClient, Identifier, IggyError,
-    StreamClient, TopicClient,
+    BackgroundConfig, Consumer as OffsetOwner, ConsumerGroupClient, ConsumerOffsetClient,
+    Identifier, IggyDuration, IggyError, StreamClient, SystemClient, TopicClient, UserClient,
+    UserCreateOptions, UserStatus,
 };
 use laser_sdk::prelude::full::{Consumer, Laser, LaserError, Producer};
 use laser_sdk::prelude::{CommitPolicy, ConsumerMessage, ConsumerStart, ProducerMessage, Routing};
-use laser_sdk::stream::{HeaderKey, HeaderValue};
+use laser_sdk::stream::{HeaderKey, HeaderValue, Topic};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::str::FromStr;
@@ -42,6 +43,33 @@ const REBALANCED: &str = "rebalanced";
 const REBALANCED_GROUP: &str = "rebalanced-readers";
 const REBALANCED_PARTITIONS: u32 = 3;
 const ROUND: u64 = 30;
+
+#[tokio::test]
+async fn given_a_native_consumer_when_skipping_then_should_refuse_it() {
+    let laser = harness::laser().await;
+    let topic = laser.topic("native-skip");
+    topic
+        .producer()
+        .partitions(1)
+        .build()
+        .await
+        .expect("the native producer initializes")
+        .send_batch([ProducerMessage::new(b"zero".as_slice())])
+        .await
+        .expect("the record publishes");
+    let mut consumer = topic
+        .consumer("native-skip", 0)
+        .start_at(ConsumerStart::First)
+        .build()
+        .await
+        .expect("the native consumer builds");
+
+    assert!(
+        matches!(consumer.skip(0, 0).await, Err(LaserError::Invalid(_))),
+        "a native consumer runs no filter, so no fault stops it"
+    );
+    consumer.shutdown().await.expect("the consumer shuts down");
+}
 
 #[tokio::test]
 async fn given_native_offset_history_when_rewound_and_deleted_then_should_follow_the_replay_option()
@@ -82,9 +110,16 @@ async fn given_native_offset_history_when_rewound_and_deleted_then_should_follow
             );
         }
         consumer.commit(&records[2]).await.expect("commit two");
-        consumer.commit(&records[1]).await.expect("commit one");
+        consumer
+            .commit(&records[1])
+            .await
+            .expect("an earlier record commits nothing");
+        assert_eq!(
+            consumer.last_stored_offset(0),
+            Some(2),
+            "a commit never moves the offset back, only store_offset rewinds it"
+        );
         let expected = if allow_replay { 1 } else { 2 };
-        assert_eq!(consumer.last_stored_offset(0), Some(expected));
         consumer.store_offset(2, Some(0)).await.expect("store two");
         consumer.store_offset(2, Some(0)).await.expect("repeat two");
         consumer.store_offset(1, Some(0)).await.expect("store one");
@@ -220,11 +255,19 @@ async fn given_production_profile_when_streaming_then_should_preserve_delivery_a
         consumer.next_within(Duration::from_millis(50)).await,
         Err(laser_sdk::LaserError::Timeout(_))
     ));
-    harness::eventually(|| async {
-        (consumer.last_stored_offset(batch.partition_id) == Some(batch.position.offset))
-            .then_some(())
-    })
-    .await;
+    // The call after a delivery stores it, and a probe that times out first
+    // leaves that store to the next call.
+    let deadline = Instant::now() + RECEIVE_TIMEOUT;
+    while consumer.last_stored_offset(batch.partition_id) != Some(batch.position.offset) {
+        assert!(
+            Instant::now() < deadline,
+            "the batch offset was never stored"
+        );
+        assert!(matches!(
+            consumer.next_within(Duration::from_secs(1)).await,
+            Err(laser_sdk::LaserError::Timeout(_))
+        ));
+    }
     consumer
         .shutdown()
         .await
@@ -531,7 +574,134 @@ async fn given_a_fresh_consumer_when_reading_next_then_should_start_at_zero_and_
 }
 
 #[tokio::test]
-async fn given_default_polling_when_shutdown_after_offset_zero_then_should_resume_at_one() {
+async fn given_the_default_policy_when_a_consumer_stops_without_shutdown_while_holding_a_record_then_should_deliver_it_again()
+ {
+    let laser = harness::laser().await;
+    let topic = laser.topic("default-crash");
+    publish_partition_zero(&topic, &[b"zero", b"one", b"two", b"three"]).await;
+    let build = || topic.consumer("crashed", 0).batch_length(4).build();
+    let mut crashed = build().await.expect("the consumer builds");
+    for expected in [0, 1] {
+        let record = crashed
+            .next_within(RECEIVE_TIMEOUT)
+            .await
+            .expect("a record arrives");
+        assert_eq!(record.position.offset, expected);
+    }
+    drop(crashed);
+
+    let mut restarted = build().await.expect("the restarted consumer builds");
+    let record = restarted
+        .next_within(RECEIVE_TIMEOUT)
+        .await
+        .expect("the unfinished poll is delivered again");
+    assert_eq!(record.position.offset, 0, "nothing of the poll was stored");
+    restarted.shutdown().await.expect("the consumer shuts down");
+}
+
+#[tokio::test]
+async fn given_a_native_consumer_when_it_seeks_back_then_should_read_from_there_and_store_nothing_for_records_read_before()
+ {
+    let laser = harness::laser().await;
+    let topic = laser.topic("native-seek");
+    publish_partition_zero(&topic, &[b"zero", b"one", b"two", b"three"]).await;
+    let mut consumer = topic
+        .consumer("seeker", 0)
+        .batch_length(4)
+        .commit_policy(CommitPolicy::Disabled)
+        .build()
+        .await
+        .expect("the consumer builds");
+    let mut read_before = Vec::new();
+    for _ in 0..3 {
+        read_before.push(
+            consumer
+                .next_within(RECEIVE_TIMEOUT)
+                .await
+                .expect("a record arrives"),
+        );
+    }
+
+    consumer
+        .seek(0, ConsumerStart::Offset(1))
+        .await
+        .expect("the consumer seeks its partition");
+    let sought = consumer
+        .next_within(RECEIVE_TIMEOUT)
+        .await
+        .expect("the sought record arrives");
+    assert_eq!(sought.position.offset, 1);
+    consumer
+        .commit(&read_before[2])
+        .await
+        .expect("a record read before the seek commits nothing, without an error");
+    assert_eq!(
+        consumer.stored_offset(0).await.expect("the offset reads"),
+        None,
+        "a record read before the seek must not move the stored offset"
+    );
+    consumer
+        .commit(&sought)
+        .await
+        .expect("the sought record commits");
+    assert_eq!(
+        consumer
+            .stored_offset(0)
+            .await
+            .expect("the offset reads")
+            .map(|stored| stored.stored_offset),
+        Some(1)
+    );
+    consumer.shutdown().await.expect("the consumer shuts down");
+}
+
+#[tokio::test]
+async fn given_a_password_with_a_colon_an_at_sign_and_a_question_mark_when_connecting_then_should_log_in_through_credentials_and_an_encoded_connection_string()
+ {
+    let root = harness::laser().await;
+    let username = format!(
+        "colon-{}",
+        ulid::Ulid::generate().to_string().to_lowercase()
+    );
+    let password = "pa:ss@w?rd%";
+    let created = root
+        .client()
+        .create_user(
+            &username,
+            password,
+            UserStatus::Active,
+            None,
+            &UserCreateOptions::default(),
+        )
+        .await
+        .expect("the user is created");
+    let connection_string = harness::connection_string().await;
+    let (_, address) = connection_string
+        .rsplit_once('@')
+        .expect("the root connection string names its address");
+
+    let structured = Laser::builder()
+        .address(address)
+        .credentials(username.clone(), password)
+        .build()
+        .await
+        .expect("the structured credentials log in");
+    let encoded = Laser::connect(&format!("{username}:pa%3Ass%40w%3Frd%25@{address}"))
+        .await
+        .expect("the percent-encoded connection string logs in");
+    for laser in [&structured, &encoded] {
+        let me = laser.client().get_me().await.expect("the session reads");
+        assert_eq!(me.user_id, Some(created.id));
+        laser.close().await.expect("the connection closes");
+    }
+    root.client()
+        .delete_user(&Identifier::numeric(created.id).expect("a valid user id"))
+        .await
+        .expect("the user is deleted");
+}
+
+#[tokio::test]
+async fn given_the_default_policy_when_shutdown_after_offset_zero_then_should_resume_at_one() {
     let laser = harness::connected_laser().await;
     let topic = laser.topic("default-shutdown-zero");
     let producer = topic
@@ -946,10 +1116,11 @@ async fn given_a_five_node_cluster_with_topics_of_replication_factor_three_and_o
     let refused = laser.topic("pulse-rf6").ensure(1, Some(6)).await;
     assert!(
         matches!(
-            refused,
-            Err(LaserError::Iggy(
+            &refused,
+            Err(LaserError::Transport(error)) if matches!(
+                error.as_iggy(),
                 IggyError::InvalidReplicationFactor | IggyError::InvalidOptionValue(_)
-            ))
+            )
         ),
         "a factor above the node count is refused by the server: {refused:?}"
     );
@@ -1245,6 +1416,78 @@ async fn given_a_policy_aware_group_started_at_the_last_record_when_it_gains_par
     );
     gainer.shutdown().await.expect("the gaining member stops");
     producer.shutdown().await.expect("the producer shuts down");
+}
+
+#[tokio::test]
+async fn given_a_background_producer_with_a_clone_when_one_handle_flushes_and_shuts_down_then_should_write_every_record_and_stop_both()
+ {
+    let laser = harness::connected_laser().await;
+    let topic = laser.topic("background-flush");
+    // A linger far past the read timeout, so only the flush can write the records.
+    let producer = topic
+        .producer()
+        .partitions(1)
+        .background(
+            BackgroundConfig::builder()
+                .linger_time(IggyDuration::from(Duration::from_secs(600)))
+                .batch_length(0)
+                .batch_size(0)
+                .build(),
+        )
+        .build()
+        .await
+        .expect("the background producer initializes");
+    let clone = producer.clone();
+    for index in 0..3 {
+        clone
+            .send(format!("reading-{index}").into_bytes())
+            .await
+            .expect("the record is queued");
+    }
+    producer
+        .flush()
+        .await
+        .expect("the queued records are written");
+    let mut consumer = topic
+        .consumer("background-flush-check", 0)
+        .start_at(ConsumerStart::First)
+        .commit_policy(CommitPolicy::Disabled)
+        .build()
+        .await
+        .expect("the consumer builds");
+    for index in 0..3 {
+        let record = consumer
+            .next_within(RECEIVE_TIMEOUT)
+            .await
+            .expect("a flushed record arrives");
+        assert_eq!(
+            record.payload.as_ref(),
+            format!("reading-{index}").as_bytes()
+        );
+    }
+    clone
+        .send(b"after-flush".as_slice())
+        .await
+        .expect("a send after the flush is queued");
+
+    producer
+        .shutdown()
+        .await
+        .expect("one handle shuts the producer down while a clone lives");
+    let after = consumer
+        .next_within(RECEIVE_TIMEOUT)
+        .await
+        .expect("shutdown writes the record queued after the flush");
+    assert_eq!(after.payload.as_ref(), b"after-flush");
+    assert!(matches!(
+        clone.send(b"late".as_slice()).await,
+        Err(LaserError::Invalid(_))
+    ));
+    clone
+        .shutdown()
+        .await
+        .expect("a second shutdown returns at once");
+    consumer.shutdown().await.expect("the consumer stops");
 }
 
 type Seen = Arc<Mutex<Vec<(u32, u64, u64)>>>;
@@ -1547,7 +1790,7 @@ async fn named_starts_seed_a_fresh_group(native: bool) {
         }
     };
     assert!(
-        matches!(refused, LaserError::Iggy(IggyError::InvalidOffset(_))),
+        matches!(&refused, LaserError::Transport(error) if matches!(error.as_iggy(), IggyError::InvalidOffset(_))),
         "an offset start past the end fails with the server's refusal, got {refused:?}"
     );
     let stream = Identifier::named(laser.default_stream().expect("the test stream")).expect("id");
@@ -1712,7 +1955,10 @@ async fn refused_partition_resumes(start: ConsumerStart) {
     assert!(
         refusals.iter().any(|error| matches!(
             error,
-            LaserError::Iggy(IggyError::TopicIdNotFound(..) | IggyError::TopicNameNotFound(..))
+            LaserError::Transport(transport) if matches!(
+                transport.as_iggy(),
+                IggyError::TopicIdNotFound(..) | IggyError::TopicNameNotFound(..)
+            )
         )),
         "the consumer reports the refusal of the deleted topic, reported {refusals:?}"
     );
@@ -1863,6 +2109,23 @@ async fn wait_for_sequence(seen: &Seen, sequence: u64, sent: Instant) {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+async fn publish_partition_zero(topic: &Topic, payloads: &[&[u8]]) {
+    topic
+        .producer()
+        .partitions(1)
+        .build()
+        .await
+        .expect("the producer initializes")
+        .send_batch_with_routing(
+            payloads
+                .iter()
+                .map(|payload| ProducerMessage::new(payload.to_vec())),
+            Some(Routing::Partition(0)),
+        )
+        .await
+        .expect("the records publish");
 }
 
 async fn wait_for_stored_offset(

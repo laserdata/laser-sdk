@@ -1,8 +1,9 @@
 import { type BytesLike, ownedBytes } from "./client/bytes.js"
+import { type CallOptions, abortable, cancellable, throwIfAborted } from "./client/call-options.js"
 import { InvalidError } from "./client/errors.js"
 import type { AgdxReceipt } from "./agent/agdx.js"
-import { type ContextMessage, LastN } from "./context.js"
-import { AgentTopic } from "./provenance/agent-topic.js"
+import { type ContextMessage, contextMessageBody } from "./context.js"
+import { warn } from "./runtime/warn.js"
 import type { Session } from "./session.js"
 import {
   type AgentErrorBody,
@@ -53,12 +54,14 @@ export function defaultRedact(value: unknown): unknown {
 }
 
 // The state one session handle has written: the revision it expects next, the
-// document after its own deltas, and how many deltas since the last snapshot.
+// document after its own deltas, how many deltas since the last snapshot, and
+// the write in flight, which the next write waits for.
 /** @internal */
 export interface StateCursor {
   revision: bigint
   document: unknown
   sinceSnapshot: number
+  tail: Promise<void>
 }
 
 /** One model call request. The SDK never calls a model: the application calls
@@ -99,10 +102,10 @@ export class AssembledContext {
     return new AssembledContext(fragments, manifest)
   }
 
-  /** The fragments' payloads as UTF-8, one per line. */
+  /** The fragments' bodies as UTF-8, one per line. */
   text(): string {
     const decoder = new TextDecoder()
-    return this.fragments.map((fragment) => decoder.decode(fragment.payload)).join("\n")
+    return this.fragments.map((fragment) => decoder.decode(contextMessageBody(fragment))).join("\n")
   }
 }
 
@@ -128,19 +131,26 @@ export class ModelCall {
 
   /** Record the model's response, with its usage, the answering model, the
    * finish reason, and the call duration. */
-  complete(response: ModelResponse): Promise<AgdxReceipt> {
+  complete(response: ModelResponse, options: CallOptions = {}): Promise<AgdxReceipt> {
     return this.session.writeResult(
       this.callCorrelation,
       this.operation,
       undefined,
       response,
-      response.durationMs ?? performance.now() - this.started
+      response.durationMs ?? performance.now() - this.started,
+      options
     )
   }
 
   /** Record that the call failed. */
-  fail(error: AgentErrorBody): Promise<AgdxReceipt> {
-    return this.session.writeFailure(this.callCorrelation, this.operation, undefined, error)
+  fail(error: AgentErrorBody, options: CallOptions = {}): Promise<AgdxReceipt> {
+    return this.session.writeFailure(
+      this.callCorrelation,
+      this.operation,
+      undefined,
+      error,
+      options
+    )
   }
 }
 
@@ -165,19 +175,26 @@ export class ToolCall {
   }
 
   /** Record the tool's result and the measured duration. */
-  complete(result: BytesLike): Promise<AgdxReceipt> {
+  complete(result: BytesLike, options: CallOptions = {}): Promise<AgdxReceipt> {
     return this.session.writeResult(
       this.callCorrelation,
       OPERATION_EXECUTE_TOOL,
       this.tool,
       { body: ownedBytes(result) },
-      performance.now() - this.started
+      performance.now() - this.started,
+      options
     )
   }
 
   /** Record that the tool failed. */
-  fail(error: AgentErrorBody): Promise<AgdxReceipt> {
-    return this.session.writeFailure(this.callCorrelation, OPERATION_EXECUTE_TOOL, this.tool, error)
+  fail(error: AgentErrorBody, options: CallOptions = {}): Promise<AgdxReceipt> {
+    return this.session.writeFailure(
+      this.callCorrelation,
+      OPERATION_EXECUTE_TOOL,
+      this.tool,
+      error,
+      options
+    )
   }
 }
 
@@ -195,77 +212,131 @@ export class SessionState {
   }
 
   /** Set `key` to `value`. */
-  set(key: string, value: unknown): Promise<AgdxReceipt> {
+  set(key: string, value: unknown, options: CallOptions = {}): Promise<AgdxReceipt> {
     const path = `/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`
-    return this.patch([{ op: "add", path, value }])
+    return this.patch([{ op: "add", path, value }], options)
   }
 
   /** Apply `patch` atomically against the revision this handle last saw.
    * Append success does not prove the patch applied: a reader learns the
    * outcome from the folded state. */
-  async patch(patch: readonly PatchOp[]): Promise<AgdxReceipt> {
-    await this.seed()
+  patch(patch: readonly PatchOp[], options: CallOptions = {}): Promise<AgdxReceipt> {
+    return this.exclusive(options, async () => {
+      await this.seed(options)
+      return this.writeDelta(patch, options)
+    })
+  }
+
+  /** Replace the whole document with `document`, a JSON object, as one
+   * revision-guarded patch that removes the keys it drops and sets every key
+   * it holds. */
+  replace(
+    document: Readonly<Record<string, unknown>>,
+    options: CallOptions = {}
+  ): Promise<AgdxReceipt> {
+    if (typeof document !== "object" || Array.isArray(document)) {
+      return Promise.reject(new InvalidError("a state document is a JSON object"))
+    }
+    return this.exclusive(options, async () => {
+      await this.seed(options)
+      const current = this.cursor.document
+      const pointer = (key: string): string => `/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`
+      const operations: PatchOp[] = []
+      if (typeof current === "object" && current !== null && !Array.isArray(current)) {
+        for (const key of Object.keys(current)) {
+          if (!Object.hasOwn(document, key)) operations.push({ op: "remove", path: pointer(key) })
+        }
+      }
+      for (const [key, value] of Object.entries(document)) {
+        operations.push({ op: "add", path: pointer(key), value })
+      }
+      return this.writeDelta(operations, options)
+    })
+  }
+
+  /** Write the whole document this handle holds as a snapshot. */
+  snapshot(options: CallOptions = {}): Promise<AgdxReceipt> {
+    return this.exclusive(options, async () => {
+      await this.seed(options)
+      return this.writeSnapshot(options)
+    })
+  }
+
+  // Every write runs after the earlier writes of this cursor settled, so the
+  // writes of one handle and the handles derived from it land in revision
+  // order. A write aborted while it waits for its turn never starts.
+  private exclusive<T>(options: CallOptions, write: () => Promise<T>): Promise<T> {
+    return cancellable(options.signal, "session state write", () => {
+      const run = this.cursor.tail.then(() => {
+        throwIfAborted(options.signal, "session state write")
+        return write()
+      })
+      this.cursor.tail = run.then(
+        () => undefined,
+        () => undefined
+      )
+      return run
+    })
+  }
+
+  // A failed publish leaves the lane revision unknown, so the next write
+  // reseeds from the folded lane instead of naming a revision nothing was
+  // written at.
+  private async writeDelta(patch: readonly PatchOp[], options: CallOptions): Promise<AgdxReceipt> {
     const next = applyJsonPatch(this.cursor.document ?? {}, patch)
     const delta = {
       baseRevision: this.cursor.revision,
       patch,
       opId: this.session.mintOpId()
     }
+    let receipt: AgdxReceipt
+    try {
+      receipt = await this.session.writeEvent(
+        OPERATION_STATE_DELTA,
+        encodeNamed(encodeStateDelta(delta)),
+        undefined,
+        options
+      )
+    } catch (error) {
+      this.cursor.document = undefined
+      throw error
+    }
     this.cursor.revision += 1n
     this.cursor.document = next
     this.cursor.sinceSnapshot += 1
-    const due = this.cursor.sinceSnapshot >= SNAPSHOT_EVERY_DELTAS
-    const receipt = await this.session.writeEvent(
-      OPERATION_STATE_DELTA,
-      encodeNamed(encodeStateDelta(delta))
-    )
-    if (due) await this.snapshot()
+    if (this.cursor.sinceSnapshot >= SNAPSHOT_EVERY_DELTAS) {
+      try {
+        await this.writeSnapshot(options)
+      } catch (error) {
+        warn(
+          `Writing the automatic state snapshot of session ${this.session.conversation.toString()} failed, the next write retries it: ${String(error)}`
+        )
+      }
+    }
     return receipt
   }
 
-  /** Replace the whole document with `document`, a JSON object, as one
-   * revision-guarded patch that removes the keys it drops and sets every key
-   * it holds. */
-  async replace(document: Readonly<Record<string, unknown>>): Promise<AgdxReceipt> {
-    if (typeof document !== "object" || Array.isArray(document)) {
-      throw new InvalidError("a state document is a JSON object")
-    }
-    await this.seed()
-    const current = this.cursor.document
-    const pointer = (key: string): string => `/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`
-    const operations: PatchOp[] = []
-    if (typeof current === "object" && current !== null && !Array.isArray(current)) {
-      for (const key of Object.keys(current)) {
-        if (!Object.hasOwn(document, key)) operations.push({ op: "remove", path: pointer(key) })
-      }
-    }
-    for (const [key, value] of Object.entries(document)) {
-      operations.push({ op: "add", path: pointer(key), value })
-    }
-    return this.patch(operations)
-  }
-
-  /** Write the whole document this handle holds as a snapshot. */
-  async snapshot(): Promise<AgdxReceipt> {
-    await this.seed()
-    const revision = this.cursor.revision
+  private async writeSnapshot(options: CallOptions): Promise<AgdxReceipt> {
     const receipt = await this.session.writeEvent(
       OPERATION_STATE_SNAPSHOT,
       encodeNamed(
-        encodeStateSnapshot({ baseRevision: revision, document: this.cursor.document ?? {} })
-      )
+        encodeStateSnapshot({
+          baseRevision: this.cursor.revision,
+          document: this.cursor.document ?? {}
+        })
+      ),
+      undefined,
+      options
     )
-    if (this.cursor.revision === revision) this.cursor.sinceSnapshot = 0
+    this.cursor.sinceSnapshot = 0
     return receipt
   }
 
-  // A handle that has not written yet starts from the folded lane, so its
-  // first delta names the revision the lane is at.
-  private async seed(): Promise<void> {
+  // A handle that has not written yet, or whose last write failed, starts from
+  // the folded lane, so its next delta names the revision the lane is at.
+  private async seed(options: CallOptions): Promise<void> {
     if (this.seeded()) return
-    const view = await this.currentView()
-    // A concurrent write may have seeded the cursor meanwhile.
-    if (this.seeded()) return
+    const view = await this.currentView(options)
     this.cursor.revision = view.revision
     this.cursor.document = view.document ?? {}
   }
@@ -274,13 +345,14 @@ export class SessionState {
    * sessions. Otherwise the managed state view, used only when it answers and
    * is not behind the lane fold.
    * @internal */
-  async currentView(): Promise<SessionStateView> {
-    const lane = await this.get()
+  async currentView(options: CallOptions = {}): Promise<SessionStateView> {
+    const lane = await this.get(options)
     if (lane.complete) return lane
     try {
-      const view = await this.session.managedStateView()
+      const view = await this.session.managedStateView(options)
       return view !== undefined && view.revision >= lane.revision ? view : lane
     } catch {
+      throwIfAborted(options.signal, "session state read")
       return lane
     }
   }
@@ -290,17 +362,24 @@ export class SessionState {
   }
 
   /** @internal */
-  async snapshotIfChanged(): Promise<void> {
-    if (this.cursor.sinceSnapshot > 0) await this.snapshot()
+  snapshotIfChanged(options: CallOptions = {}): Promise<void> {
+    return this.exclusive(options, async () => {
+      if (this.cursor.sinceSnapshot === 0) return
+      await this.seed(options)
+      await this.writeSnapshot(options)
+    })
   }
 
-  /** Fold the state from the retained session lane: the newest snapshot plus
-   * the deltas after it. `complete` is false when the lane no longer holds the
-   * records the document starts from. */
-  async get(): Promise<SessionStateView> {
-    const records = await this.session.scope.fetchWith(
-      [AgentTopic.Sessions],
-      new LastN(Number.MAX_SAFE_INTEGER)
+  /** Fold the state from the whole retained session lane: the newest snapshot
+   * plus the deltas after it. `complete` is false when retention removed the
+   * records the document starts from. A state record that does not decode is
+   * skipped, as the session index skips it. */
+  async get(options: CallOptions = {}): Promise<SessionStateView> {
+    throwIfAborted(options.signal, "session state read")
+    const records = await abortable(
+      this.session.laneRecords(),
+      options.signal,
+      "session state read"
     )
     let document: unknown = {}
     let revision = 0n
@@ -310,10 +389,10 @@ export class SessionState {
       if (envelope === undefined) continue
       const context = "session state"
       if (envelope.operation === OPERATION_STATE_SNAPSHOT) {
-        const snapshot = decodeStateSnapshot(
-          expectMap(decodeOne(envelope.body, context), context),
-          context
+        const snapshot = decodeState(() =>
+          decodeStateSnapshot(expectMap(decodeOne(envelope.body, context), context), context)
         )
+        if (snapshot === undefined) continue
         // The first snapshot is the baseline. A later one counts only at the
         // revision the fold has reached, so a stale snapshot from a second
         // writer changes nothing.
@@ -322,10 +401,10 @@ export class SessionState {
         revision = snapshot.baseRevision
         complete = true
       } else if (envelope.operation === OPERATION_STATE_DELTA) {
-        const delta = decodeStateDelta(
-          expectMap(decodeOne(envelope.body, context), context),
-          context
+        const delta = decodeState(() =>
+          decodeStateDelta(expectMap(decodeOne(envelope.body, context), context), context)
         )
+        if (delta === undefined) continue
         if (delta.baseRevision === 0n && revision === 0n) complete = true
         if (delta.baseRevision !== revision) continue
         try {
@@ -337,5 +416,13 @@ export class SessionState {
       }
     }
     return { revision, document, history: [], complete }
+  }
+}
+
+function decodeState<Record>(decode: () => Record): Record | undefined {
+  try {
+    return decode()
+  } catch {
+    return undefined
   }
 }

@@ -1,3 +1,4 @@
+import { type CallOptions, abortable } from "../client/call-options.js"
 import {
   INTERNAL_ASSIGNED_PARTITIONS,
   INTERNAL_COMMIT_HANDLED,
@@ -10,10 +11,12 @@ import {
   type LaserTransport,
   MAX_DEFERRED_POLL_WAIT_MS,
   MIN_DEFERRED_POLL_MAX_BYTES,
+  type PartitionContext,
   type PollWait,
   type PolledMessage,
   passWait,
-  resumesAfterStoredOffset
+  resumesAfterStoredOffset,
+  serverErrorCode
 } from "../iggy/apache-iggy.js"
 import {
   CancelledError,
@@ -68,9 +71,12 @@ export interface StoredOffset {
  * Rust `CommitPolicy` defines. `disabled` never stores on its own: call
  * `commit` after a record is handled. `polling` commits the polled batch on
  * the server before delivery, so a crash can skip records not yet processed.
- * `all` stores after every record of a poll was yielded, `each` after every
- * yielded record, `every` after every `count` yielded records, and the
- * `interval*` forms also store on a timer.
+ * The others store only handled records: a record counts as handled once the
+ * caller asks for the next one or shuts the consumer down, so a crash
+ * delivers the record in hand again. `all` stores once the last record of a
+ * poll is handled, `each` every handled record, `every` after `count` handled
+ * records, and the `interval*` forms also store the handled records on a
+ * timer.
  */
 export type CommitPolicy =
   | { readonly kind: "disabled" }
@@ -87,7 +93,7 @@ export type CommitPolicy =
 export interface ConsumerOptions {
   /** Most records one poll returns. Defaults to 1000, like Rust and Python. */
   readonly batchLength?: number
-  /** Defaults to `polling`, and to `disabled` for a consumer without a name. */
+  /** Defaults to `all`, and to `disabled` for a consumer without a name. */
   readonly commitPolicy?: CommitPolicy
   /** Where reading starts, `next` by default. A group consumer always resumes
    * after the group's stored offset: its start only seeds the partitions the
@@ -103,7 +109,8 @@ export interface ConsumerOptions {
    * rounds through the group reader. */
   readonly minCount?: number
   /** Most record bytes one poll returns. Defaults to 1 MiB. A record larger
-   * than the cap comes alone, so a poll always makes progress. Native only. */
+   * than the cap comes alone, so a poll always makes progress. A policy-aware
+   * group consumer caps its filtered pages with it, up to 8 MiB. */
   readonly maxBytes?: number
   /** Create the consumer group when it does not exist. Defaults to `true`. */
   readonly createGroup?: boolean
@@ -131,6 +138,9 @@ const DEFAULT_START_AT: ConsumerStart = { kind: "next" }
 const LASTING_REFUSALS = new Set([3, 5, 41, 1009, 1010, 2010, 2011, 3007, 5009])
 // The refusals that mean the partition's history is gone.
 const HISTORY_GONE = new Set([1009, 1010, 2010, 2011, 3007])
+// A store fenced to a delivery refused because the partition was recreated
+// since (87) or moved to another group member (5009).
+const STALE_DELIVERY = new Set([87, 5009])
 // Refused polls in a row on one partition before the refusal is reported,
 // the count after which the Apache Iggy reader stops a partition.
 const REFUSALS_PER_REPORT = 6
@@ -201,7 +211,7 @@ export function resolveConsumerOptions(
   anonymous: boolean
 ): ResolvedConsumerOptions {
   const commitPolicy: CommitPolicy =
-    options.commitPolicy ?? (anonymous ? { kind: "disabled" } : { kind: "polling" })
+    options.commitPolicy ?? (anonymous ? { kind: "disabled" } : { kind: "all" })
   validateCommitPolicy(commitPolicy)
   const initRetries = options.initRetries ?? { retries: 0, intervalMs: 0 }
   const resolved = {
@@ -284,6 +294,22 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
   // Native deliveries handed back, yielded again before the buffer.
   private readonly returned: ConsumerMessage[] = []
   private readonly storedOffsets = new Map<number, bigint>()
+  // Native: the delivery the caller holds, handled once it asks for the next
+  // record or shuts down, and the handled offsets the commit policy stores.
+  private uncounted: NativeDelivery | undefined
+  private readonly countedOffsets = new Map<number, Counted>()
+  // The partition history each native delivery was read under, which a
+  // store of its offset is fenced to.
+  private readonly deliveries = new WeakMap<ConsumerMessage, DeliveredUnder>()
+  // A sought start per partition, read by its next poll, and the seek count
+  // when each partition was last sought, so a poll in flight across a seek
+  // drops its records.
+  private readonly soughtStarts = new Map<number, ConsumerStart>()
+  private readonly soughtAt = new Map<number, number>()
+  private seeks = 0
+  // A native group consumer that sought holds each partition's position
+  // itself from then on, reading the partitions in turn.
+  private selectsPartitions = false
   private yieldedSinceStore = 0
   private commitTimer: ReturnType<typeof setInterval> | undefined
   private latestDelivered: ConsumerMessage | undefined
@@ -408,10 +434,7 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
       throwIfAborted(options.signal, "nextWithin aborted")
       await this.finishDelivery()
       const message = this.take()
-      if (message !== undefined) {
-        await this.afterYield(message)
-        return message
-      }
+      if (message !== undefined) return message
       await this.pollOnce(options.signal, deadline)
       throwIfAborted(options.signal, "nextWithin aborted")
       if (this.stopped()) throw new InvalidError("the live consumer stream ended")
@@ -432,7 +455,6 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
       await this.finishDelivery()
       const message = this.take()
       if (message !== undefined) {
-        await this.afterYield(message)
         yield message
         continue
       }
@@ -462,26 +484,63 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
       this.records.unshift(record)
       return
     }
+    if (this.uncounted?.message === message) this.uncounted = undefined
     this.returned.unshift(message)
   }
 
   /**
-   * Store a handled message's offset on the server. A group consumer on a
-   * server that resolves group policies stores the contiguous prefix of the
-   * partition through this message, and needs the message object it delivered.
+   * Store a handled message's offset on the server. It needs the message
+   * object this consumer delivered. A native consumer stores it fenced to the
+   * partition history the message was read under, so a commit after the
+   * partition was recreated or moved to another group member is refused
+   * instead of landing on the newer history. Under `polling` the server
+   * already stored the poll, and the commit stores the offset unfenced. A
+   * group consumer on a server that resolves group policies stores the
+   * contiguous prefix of the partition through this message.
    */
-  async commit(message: ConsumerMessage): Promise<void> {
+  async commit(message: ConsumerMessage, options: CallOptions = {}): Promise<void> {
+    throwIfAborted(options.signal, "consumer commit aborted")
     if (this.reader !== undefined) {
       const record = this.delivered.get(message)
       if (record === undefined) {
         throw new InvalidError("commit the message object this group consumer delivered")
       }
-      await this.reader.ackThrough(record)
+      await this.reader.ackThrough(record, options)
       this.explicitOffsets.set(message.partitionId, message.position.offset)
       this.storedOffsets.set(message.partitionId, message.position.offset)
       return
     }
-    await this.storeOffset(message.position.offset, message.partitionId)
+    const delivery = this.deliveries.get(message)
+    if (delivery === undefined) {
+      throw new InvalidError("commit the message object this consumer delivered")
+    }
+    const polling =
+      this.commitPolicy.kind === "polling" || this.commitPolicy.kind === "intervalOrPolling"
+    await abortable(
+      this.storeAt(
+        message.position.offset,
+        message.partitionId,
+        polling ? undefined : delivery.context
+      ),
+      options.signal,
+      "consumer commit"
+    )
+  }
+
+  /**
+   * Pass the record a `FilterFaultError` or a `FilterOversizedRecordError`
+   * stopped `partitionId` at, and read on after it, as `FilteredReader.skip`
+   * does. Policy-aware group consumers only: a native consumer runs no filter,
+   * so nothing stops it there, and `storeOffset` moves it.
+   */
+  async skip(partitionId: number, offset: bigint, options: CallOptions = {}): Promise<void> {
+    throwIfAborted(options.signal, "consumer skip aborted")
+    if (this.reader === undefined) {
+      throw new InvalidError(
+        "a native consumer runs no filter, so no fault stops it. Store an offset instead"
+      )
+    }
+    await this.reader.skip(partitionId, offset, options)
   }
 
   /**
@@ -534,26 +593,25 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
    * consumer refuses it, because an arbitrary offset bypasses the group's
    * acknowledgment contract. Commit a delivered record instead.
    */
-  async storeOffset(offset: bigint, partitionId?: number): Promise<void> {
+  async storeOffset(
+    offset: bigint,
+    partitionId?: number,
+    options: CallOptions = {}
+  ): Promise<void> {
+    throwIfAborted(options.signal, "consumer offset store aborted")
     this.requireNative("storeOffset")
     if (offset < 0n) throw new InvalidError("offset must be non-negative")
-    const partition = this.currentPartition(partitionId)
-    const stored = this.storedOffsets.get(partition)
-    if (!this.allowReplay && stored !== undefined && offset <= stored) return
-    await this.transport.storeOffset(
-      this.streamName,
-      this.topicName,
-      this.target,
-      partition,
-      offset
+    await abortable(
+      this.storeAt(offset, this.currentPartition(partitionId)),
+      options.signal,
+      "consumer offset store"
     )
-    this.explicitOffsets.set(partition, offset)
-    this.storedOffsets.set(partition, offset)
   }
 
   /** Deletes the server offset for `partitionId`, or for the partition of the
    * latest delivery when omitted. Native only, like `storeOffset`. */
-  async deleteOffset(partitionId?: number): Promise<void> {
+  async deleteOffset(partitionId?: number, options: CallOptions = {}): Promise<void> {
+    throwIfAborted(options.signal, "consumer offset delete aborted")
     this.requireNative("deleteOffset")
     if (this.transport.deleteOffset === undefined) {
       throw new UnsupportedError("the Apache Iggy client does not expose offset deletion", {
@@ -563,17 +621,91 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     const partition = this.currentPartition(partitionId)
     // Cancellation can hide a committed delete, so a later store must reach the server.
     this.storedOffsets.delete(partition)
-    await this.transport.deleteOffset(this.streamName, this.topicName, this.target, partition)
+    await abortable(
+      this.transport.deleteOffset(this.streamName, this.topicName, this.target, partition),
+      options.signal,
+      "consumer offset delete"
+    )
     this.explicitOffsets.delete(partition)
     const consumed = this.consumedOffsets.get(partition)
     if (consumed === undefined) this.deletedAt.delete(partition)
     else this.deletedAt.set(partition, consumed)
   }
 
+  /**
+   * Moves the next read of `partitionId` to `start`, as the Rust
+   * `Consumer::seek` does: `next` reads on after the stored offset. The
+   * records of the partition this consumer holds but has not handed out are
+   * dropped, a poll in flight for it is discarded, and the records delivered
+   * before the seek count no more, so no commit policy stores them. The
+   * sought records are delivered again, also without `allowReplay`. Under
+   * `polling` a seek to an offset above 0 first stores the offset before it,
+   * so a restart resumes at the new position. Every other seek stores
+   * nothing. A native group consumer then holds each partition's position
+   * itself, reading its partitions in turn. Native only: a policy-aware group
+   * consumer refuses it, because a position outside a delivery bypasses the
+   * group's acknowledgments.
+   */
+  async seek(partitionId: number, start: ConsumerStart, options: CallOptions = {}): Promise<void> {
+    throwIfAborted(options.signal, "consumer seek aborted")
+    this.requireNative("seek")
+    if (this.stopped()) throw new InvalidError("consumer has been shut down")
+    if (!Number.isSafeInteger(partitionId) || partitionId < 0) {
+      throw new InvalidError("seek partition must be a non-negative safe integer")
+    }
+    if (this.target.kind === "single" && this.target.partitionId !== partitionId) {
+      throw new InvalidError(
+        `this consumer reads partition ${String(this.target.partitionId)}, not ${String(partitionId)}`
+      )
+    }
+    if ((start.kind === "offset" || start.kind === "timestampMicros") && start.value < 0n) {
+      throw new InvalidError("seek start value must be non-negative")
+    }
+    if (this.target.kind === "group" && this.transport.syncConsumerGroup === undefined) {
+      throw new UnsupportedError("this transport cannot hold a group partition's position", {
+        surface: "stream"
+      })
+    }
+    const polling =
+      this.commitPolicy.kind === "polling" || this.commitPolicy.kind === "intervalOrPolling"
+    const storedBefore = polling && start.kind === "offset" && start.value > 0n
+    if (storedBefore) {
+      await this.transport.storeOffset(
+        this.streamName,
+        this.topicName,
+        this.target,
+        partitionId,
+        start.value - 1n
+      )
+    }
+    this.seeks += 1
+    this.soughtAt.set(partitionId, this.seeks)
+    this.soughtStarts.set(partitionId, start)
+    this.buffer = this.buffer.filter((message) => message.partitionId !== partitionId)
+    const handedBack = this.returned.filter((message) => message.partitionId !== partitionId)
+    this.returned.splice(0, this.returned.length, ...handedBack)
+    if (this.uncounted?.message.partitionId === partitionId) this.uncounted = undefined
+    if (this.latestDelivered?.partitionId === partitionId) this.latestDelivered = undefined
+    this.countedOffsets.delete(partitionId)
+    this.consumedOffsets.delete(partitionId)
+    this.nextOffsets.delete(partitionId)
+    this.resumeAfterStored.delete(partitionId)
+    this.explicitOffsets.delete(partitionId)
+    this.deletedAt.delete(partitionId)
+    // A store after the seek may move the offset back.
+    if (storedBefore) this.storedOffsets.set(partitionId, start.value - 1n)
+    else this.storedOffsets.delete(partitionId)
+    if (this.target.kind === "group") this.selectsPartitions = true
+  }
+
   /** The offset the server stores for this consumer, its group or its
    * name, on `partitionId`, with the partition head. `undefined` when nothing
    * is stored. */
-  async storedOffset(partitionId: number): Promise<StoredOffset | undefined> {
+  async storedOffset(
+    partitionId: number,
+    options: CallOptions = {}
+  ): Promise<StoredOffset | undefined> {
+    throwIfAborted(options.signal, "consumer stored offset aborted")
     if (this.transport.getConsumerOffset === undefined) {
       throw new UnsupportedError("the Apache Iggy client does not expose consumer offsets", {
         surface: "stream"
@@ -588,11 +720,10 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     if (offsetTarget === undefined) {
       throw new InvalidError("storedOffset() requires a named standalone consumer")
     }
-    return this.transport.getConsumerOffset(
-      this.streamName,
-      this.topicName,
-      offsetTarget,
-      partitionId
+    return abortable(
+      this.transport.getConsumerOffset(this.streamName, this.topicName, offsetTarget, partitionId),
+      options.signal,
+      "consumer stored offset"
     )
   }
 
@@ -626,18 +757,16 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     }
     try {
       if (this.autoCommit) {
-        for (const [partition, offset] of this.consumedOffsets) {
+        this.countDelivery()
+        for (const [partition, counted] of this.countedOffsets) {
+          const { offset } = counted
           const explicit = this.explicitOffsets.get(partition)
           if (this.deletedAt.get(partition) === offset) continue
+          if (this.storedOffsets.get(partition) === offset) continue
           if (explicit === undefined || explicit < offset) {
-            await this.transport.storeOffset(
-              this.streamName,
-              this.topicName,
-              this.target,
-              partition,
-              offset
-            )
-            this.storedOffsets.set(partition, offset)
+            if (await this.storeCountedOffset(partition, counted)) {
+              this.storedOffsets.set(partition, offset)
+            }
           }
         }
       }
@@ -657,15 +786,21 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
   // the prefix through it handled when the consumer commits on its own.
   private take(): ConsumerMessage | undefined {
     if (this.reader === undefined) {
-      const returned = this.returned.shift()
-      if (returned !== undefined) {
-        this.latestDelivered = returned
-        return returned
+      let message = this.returned.shift()
+      if (message === undefined) {
+        const polled = this.buffer.shift()
+        if (polled === undefined) return undefined
+        message = withJson(polled, polled.headersMalformed !== undefined)
+        this.deliveries.set(
+          message,
+          polled.context === undefined ? {} : { context: polled.context }
+        )
       }
-      const polled = this.buffer.shift()
-      if (polled === undefined) return undefined
-      this.consumedOffsets.set(polled.partitionId, polled.offset)
-      const message = withJson(polled, polled.headersMalformed !== undefined)
+      this.consumedOffsets.set(message.partitionId, message.position.offset)
+      this.uncounted = {
+        message,
+        endsBatch: this.returned.length === 0 && this.buffer.length === 0
+      }
       this.latestDelivered = message
       return message
     }
@@ -680,44 +815,98 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     return message
   }
 
-  // The native commit policies that store after yielding. `polling` stores on
-  // the server during the poll itself, and a group reader stores its handled
-  // prefix on its own. A failed store never costs the caller the record: the
-  // offset stays pending, and the next yield, timer tick, or shutdown stores
-  // it, like the Rust consumer.
-  private async afterYield(message: ConsumerMessage): Promise<void> {
-    if (this.reader !== undefined) return
-    const policy = this.commitPolicy
+  // The delivery the caller held is handled now, like the Rust consumer under
+  // `CommitAfter::Processing`. Reports whether its commit policy stores here.
+  private countDelivery(): NativeDelivery | undefined {
+    const delivery = this.uncounted
+    this.uncounted = undefined
+    if (delivery === undefined) return undefined
+    const offset = delivery.message.position.offset
+    const context = this.deliveries.get(delivery.message)?.context
+    this.countedOffsets.set(
+      delivery.message.partitionId,
+      context === undefined ? { offset } : { offset, context }
+    )
     this.yieldedSinceStore += 1
+    return delivery
+  }
+
+  // The native commit policies that store handled records. `polling` stores
+  // on the server during the poll itself, and a group reader stores its
+  // handled prefix on its own. A failed store never costs the caller the
+  // record: the offset stays pending, and the next handled record, timer
+  // tick, or shutdown stores it.
+  private async storeHandled(): Promise<void> {
+    const delivery = this.countDelivery()
+    if (delivery === undefined) return
+    const policy = this.commitPolicy
     const store =
       policy.kind === "each" ||
       policy.kind === "intervalOrEach" ||
-      ((policy.kind === "all" || policy.kind === "intervalOrAll") && this.buffer.length === 0) ||
+      ((policy.kind === "all" || policy.kind === "intervalOrAll") && delivery.endsBatch) ||
       ((policy.kind === "every" || policy.kind === "intervalOrEvery") &&
         this.yieldedSinceStore >= policy.count)
     if (!store) return
     try {
-      await this.storeConsumed(message.partitionId)
+      await this.storeCounted(delivery.message.partitionId)
       this.yieldedSinceStore = 0
     } catch {
       // Stored on a later attempt.
     }
   }
 
-  private async storeConsumed(only?: number): Promise<void> {
-    for (const [partition, offset] of this.consumedOffsets) {
+  private async storeCounted(only?: number): Promise<void> {
+    for (const [partition, counted] of this.countedOffsets) {
       if (only !== undefined && partition !== only) continue
-      if ((this.storedOffsets.get(partition) ?? -1n) >= offset) continue
-      if (this.deletedAt.get(partition) === offset) continue
+      if ((this.storedOffsets.get(partition) ?? -1n) >= counted.offset) continue
+      if (this.deletedAt.get(partition) === counted.offset) continue
+      if (await this.storeCountedOffset(partition, counted)) {
+        this.storedOffsets.set(partition, counted.offset)
+      }
+    }
+  }
+
+  // Stores a handled offset fenced to the history its record was read under.
+  // A refusal for an older history or owner drops it: the partition's current
+  // reader reads the record again. Reports whether it was stored.
+  private async storeCountedOffset(partition: number, counted: Counted): Promise<boolean> {
+    try {
       await this.transport.storeOffset(
         this.streamName,
         this.topicName,
         this.target,
         partition,
-        offset
+        counted.offset,
+        counted.context
       )
-      this.storedOffsets.set(partition, offset)
+      return true
+    } catch (error) {
+      const code = serverErrorCode(error)
+      if (code === undefined || !STALE_DELIVERY.has(code)) throw error
+      if (this.countedOffsets.get(partition) === counted) this.countedOffsets.delete(partition)
+      return false
     }
+  }
+
+  // Stores an offset unless one at or above it is stored already, which only
+  // `allowReplay` permits moving back.
+  private async storeAt(
+    offset: bigint,
+    partition: number,
+    context?: PartitionContext
+  ): Promise<void> {
+    const stored = this.storedOffsets.get(partition)
+    if (!this.allowReplay && stored !== undefined && offset <= stored) return
+    await this.transport.storeOffset(
+      this.streamName,
+      this.topicName,
+      this.target,
+      partition,
+      offset,
+      context
+    )
+    this.explicitOffsets.set(partition, offset)
+    this.storedOffsets.set(partition, offset)
   }
 
   private startCommitTimer(): void {
@@ -726,7 +915,7 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
       return
     }
     this.commitTimer = setInterval(() => {
-      this.storeConsumed().catch(() => undefined)
+      this.storeCounted().catch(() => undefined)
     }, interval)
     this.commitTimer.unref()
   }
@@ -860,7 +1049,10 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
   // handled prefix is stored now. A cancelled poll cannot complete a record
   // that the caller never received.
   private async finishDelivery(): Promise<void> {
-    if (this.reader === undefined) return
+    if (this.reader === undefined) {
+      await this.storeHandled()
+      return
+    }
     const delivery = this.lastDelivery
     this.lastDelivery = undefined
     // A disabled policy completes only what the caller commits.
@@ -891,7 +1083,7 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
         this.storedOffsets.set(record.partitionId, record.offset)
       } catch (error) {
         if (!(
-          error instanceof FilterExecutionError && error.detail.reason === "membership_stale"
+          error instanceof FilterExecutionError && error.detail?.reason === "membership_stale"
         )) {
           throw error
         }
@@ -910,7 +1102,7 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     try {
       await reader.flushCompleted()
     } catch (error) {
-      const reason = error instanceof FilterExecutionError ? error.detail.reason : undefined
+      const reason = error instanceof FilterExecutionError ? error.detail?.reason : undefined
       if (reason !== "conflict" && reason !== "source_changed") throw error
       const owned = this.records.filter((record) => reader.owns(record))
       this.records.splice(0, this.records.length, ...owned)
@@ -977,7 +1169,7 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     let target = this.target
     if (
       target.kind === "group" &&
-      (this.startAt.kind !== "next" || !this.autoCommit) &&
+      (this.startAt.kind !== "next" || !this.autoCommit || this.selectsPartitions) &&
       this.transport.syncConsumerGroup !== undefined
     ) {
       const assignment = await this.transport.syncConsumerGroup(
@@ -989,6 +1181,7 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
         throw new TransportError("the consumer group has no active assignment", true)
       if (assignment.rejoined) {
         this.nextOffsets.clear()
+        this.soughtStarts.clear()
         this.assignedPartitions.clear()
       }
       const assigned = new Set(assignment.partitions)
@@ -997,7 +1190,9 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
       if (this.seeds.size > 0 && !(await this.storeSeeds(target.name, assignment.partitions)))
         return
       for (const partition of this.assignedPartitions) {
-        if (!assigned.has(partition)) this.nextOffsets.delete(partition)
+        if (assigned.has(partition)) continue
+        this.nextOffsets.delete(partition)
+        this.soughtStarts.delete(partition)
       }
       this.assignedPartitions = assigned
       this.assignmentSeen = true
@@ -1009,13 +1204,16 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     }
     const partition = target.partitionId
     const next = partition === undefined ? undefined : this.nextOffsets.get(partition)
+    const sought = partition === undefined ? undefined : this.soughtStarts.get(partition)
     const strategy =
-      next !== undefined
+      sought ??
+      (next !== undefined
         ? { kind: "offset" as const, value: next }
         : target.kind === "group" ||
             (partition !== undefined && this.resumeAfterStored.has(partition))
           ? { kind: "next" as const }
-          : this.startAt
+          : this.startAt)
+    const seeksBefore = this.seeks
     const commitOnPoll =
       this.commitPolicy.kind === "polling" || this.commitPolicy.kind === "intervalOrPolling"
     // The consumer picks a group partition itself only on the synced path,
@@ -1023,9 +1221,9 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     // same when it picks the partition.
     const passes =
       target.kind === "group" && partition !== undefined ? this.assignedPartitions.size : 1
-    let polled: readonly PolledMessage[]
+    let read: readonly PolledMessage[]
     try {
-      polled = await this.transport.pollMessages(
+      read = await this.transport.pollMessages(
         this.streamName,
         this.topicName,
         target,
@@ -1041,8 +1239,11 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
         this.nextOffsets.delete(partition)
         this.resumeAfterStored.add(partition)
         // The records of a recreated stream or topic are a new history.
-        if (refusal !== undefined && HISTORY_GONE.has(refusal))
+        if (refusal !== undefined && HISTORY_GONE.has(refusal)) {
           this.consumedOffsets.delete(partition)
+          this.countedOffsets.delete(partition)
+          if (this.uncounted?.message.partitionId === partition) this.uncounted = undefined
+        }
       }
       if (refusal !== undefined) {
         const refused = (this.refusals.get(partition ?? -1) ?? 0) + 1
@@ -1056,10 +1257,17 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
       throw error
     }
     this.refusals.delete(partition ?? -1)
+    // A partition sought while the poll was in flight reads from its sought
+    // start next, so the records this poll brought for it are dropped.
+    const polled =
+      this.seeks === seeksBefore
+        ? read
+        : read.filter((message) => (this.soughtAt.get(message.partitionId) ?? 0) <= seeksBefore)
     this.idleReads = polled.length === 0 ? this.idleReads + 1 : 0
     for (const message of polled) {
       this.nextOffsets.set(message.partitionId, message.offset + 1n)
       this.resumeAfterStored.delete(message.partitionId)
+      this.soughtStarts.delete(message.partitionId)
     }
     const fresh = this.allowReplay
       ? polled
@@ -1109,6 +1317,23 @@ function withJson(
   // Not enumerable, so a delivered message still compares equal to its plain
   // fields.
   return Object.defineProperty(delivered, "json", { value: json }) as ConsumerMessage
+}
+
+// A native delivery the caller holds, and whether it ended its poll.
+interface NativeDelivery {
+  readonly message: ConsumerMessage
+  readonly endsBatch: boolean
+}
+
+// The partition history a native delivery was read under, absent when the
+// transport reported none.
+interface DeliveredUnder {
+  readonly context?: PartitionContext
+}
+
+// A handled offset a commit policy stores, with the history of its record.
+interface Counted extends DeliveredUnder {
+  readonly offset: bigint
 }
 
 /** When the group engine asks whether to store the handled prefix: a record

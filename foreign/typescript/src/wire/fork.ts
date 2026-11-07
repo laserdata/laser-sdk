@@ -3,6 +3,7 @@ import { CodecError, InvalidError } from "../client/errors.js"
 import { type CborMap, expectMap, expectString, field, singleVariantTag } from "./cbor.js"
 import { FORK_OP_VERSION } from "./codes.js"
 import { MAX_FORK_ID_BYTES } from "./limits.js"
+import { validateStoredText } from "./validate.js"
 
 export type ForkKind = "severed" | "continuous"
 
@@ -29,7 +30,7 @@ export interface ForkInfo {
   readonly userId: number
   readonly status: ForkStatus
   readonly createdAtMicros: bigint
-  readonly rowCount: number
+  readonly rowCount: bigint
 }
 
 export function encodeForkInfo(info: ForkInfo): Map<string, unknown> {
@@ -53,7 +54,7 @@ export function decodeForkInfo(map: CborMap, context: string): ForkInfo {
     userId: field.requiredU32(map, "user_id", context),
     status: parseForkStatus(field.requiredString(map, "status", context), context),
     createdAtMicros: field.requiredU64(map, "created_at_micros", context),
-    rowCount: field.requiredU32(map, "row_count", context)
+    rowCount: field.requiredU64(map, "row_count", context)
   }
 }
 
@@ -135,14 +136,19 @@ export function decodeForkPromote(map: CborMap, context: string): ForkPromote {
 export interface ForkList {
   /** The operation version, the current one when absent. */
   readonly v?: number
+  /** The stream whose forks are listed, required in stream tenancy. */
+  readonly stream?: string
 }
 
 export function encodeForkList(request: ForkList = {}): Map<string, unknown> {
-  return new Map<string, unknown>([["v", request.v ?? FORK_OP_VERSION]])
+  const map = new Map<string, unknown>([["v", request.v ?? FORK_OP_VERSION]])
+  if (request.stream !== undefined) map.set("stream", request.stream)
+  return map
 }
 
 export function decodeForkList(map: CborMap, context: string): ForkList {
-  return { v: field.requiredU32(map, "v", context) }
+  const stream = field.optionalString(map, "stream", context)
+  return { v: field.requiredU32(map, "v", context), ...(stream !== undefined ? { stream } : {}) }
 }
 
 export interface ForkPut {
@@ -382,6 +388,22 @@ export function decodeForkReply(value: unknown, context: string): ForkReply {
     default:
       return { kind: "unrecognized", tag, value: inner }
   }
+}
+
+/** Rust `ForkPut::validate`: the fork id rule and no NUL in any stored text. */
+export function validateForkPut(put: ForkPut): void {
+  validateForkId(put.forkId)
+  validateStoredText("fork table", put.table)
+  validateStoredText("fork projection id", put.projectionId)
+  for (const [name, value] of put.fields) {
+    validateStoredText("fork field name", name)
+    validateStoredText("fork field value", value)
+  }
+  for (const [name, value] of put.metadata) {
+    validateStoredText("fork metadata name", name)
+    validateStoredText("fork metadata value", value)
+  }
+  if (put.embedding !== undefined) validateStoredText("fork embedding", put.embedding)
 }
 
 /** Validate a fork id: ASCII letters, digits, `-`, `_`, and `.`, or a

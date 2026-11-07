@@ -4,7 +4,11 @@ import { test } from "node:test"
 import { OPEN_CAPABILITIES } from "../../src/client/capabilities.js"
 import { ConfigError } from "../../src/client/errors.js"
 import { Laser } from "../../src/client/laser.js"
-import type { IggyClient } from "../../src/iggy/apache-iggy.js"
+import {
+  ApacheIggyTransport,
+  type IggyClient,
+  parseConnectionString
+} from "../../src/iggy/apache-iggy.js"
 import type { LaserObserver } from "../../src/observe.js"
 
 function fakeClient(onDestroy: () => void): IggyClient {
@@ -27,6 +31,15 @@ void test("given_conflicting_builder_modes_when_connected_then_should_reject_bef
   await assert.rejects(Laser.builder().opsStream("").connect(), ConfigError)
 })
 
+void test("given_a_builder_without_a_connection_target_when_connected_then_should_reject_before_io", async () => {
+  await assert.rejects(
+    Laser.builder().connectTimeout(50).connect(),
+    (error: unknown) =>
+      error instanceof ConfigError &&
+      error.message === "connectionString, address+credentials, or client is required"
+  )
+})
+
 void test("given_an_address_without_credentials_or_with_bad_ones_when_connected_then_should_reject_before_io", async () => {
   await assert.rejects(Laser.builder().address("127.0.0.1").connect(), ConfigError)
   await assert.rejects(
@@ -34,13 +47,27 @@ void test("given_an_address_without_credentials_or_with_bad_ones_when_connected_
     ConfigError
   )
   await assert.rejects(
-    Laser.builder().address("127.0.0.1").credentials("us@er", "password").connect(),
-    ConfigError
-  )
-  await assert.rejects(
     Laser.builder().address("127.0.0.1", 0).credentials("user", "password").connect(),
     ConfigError
   )
+})
+
+void test("given_credentials_with_a_colon_an_at_sign_and_a_question_mark_when_connected_through_an_address_then_should_dial_the_exact_secret", async (context) => {
+  const dialed: string[] = []
+  context.mock.method(ApacheIggyTransport, "connect", (connectionString: string) => {
+    dialed.push(connectionString)
+    return Promise.reject(new ConfigError("not dialed in a unit test"))
+  })
+  await assert.rejects(
+    Laser.builder().address("127.0.0.1", 8090).credentials("us@er", "p:ss@w?rd%").connect(),
+    ConfigError
+  )
+  const [connectionString] = dialed
+  assert.ok(connectionString !== undefined)
+  assert.deepEqual(parseConnectionString(connectionString, {}).credentials, {
+    username: "us@er",
+    password: "p:ss@w?rd%"
+  })
 })
 
 void test("given_a_borrowed_injected_client_when_closed_then_should_leave_the_client_open", async () => {

@@ -1,17 +1,20 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::convert::{BodyValue, py_to_json};
-use crate::errors::{TypedDecodeError, to_pyerr};
+use crate::errors::{TypedDecodeError, classify_as_source, to_pyerr};
 use crate::ids::PyMessageId;
 use crate::publish::{PyBatchPublish, PyPublish};
+use crate::reader::advance_past;
 use crate::stream::PyTopic;
+use crate::transport::{PyHeader, header_dict, header_kinds, typed_headers};
 use laser_sdk::laser::Laser;
 use laser_sdk::typed::TypedTopic;
+use laser_sdk::types::MessageId;
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// One topic seen through one body type: `publish(body)` encodes, validates,
 /// and stamps the body, and `records(reader_name)` decodes every record back
@@ -156,21 +159,29 @@ pub struct PyTypedRecords {
 }
 
 // The reader state the 'static poll futures share: the advanced offsets write
-// back so resumption stays correct, the buffer holds one poll's decoded
-// records.
+// back so resumption stays correct and move past each record handed out, the
+// buffer holds one poll's decoded records.
 struct Reader {
     typed: TypedTopic<BodyValue>,
     cls: Option<Py<PyAny>>,
     reader_name: String,
     batch: Option<u32>,
     offsets: Arc<Mutex<Vec<u64>>>,
-    buffered: Arc<Mutex<VecDeque<Result<Entry, PyErr>>>>,
+    buffered: Arc<Mutex<Buffered>>,
+}
+
+// One poll's decoded records not yet handed out, each with its log position,
+// and the offsets after the poll.
+#[derive(Default)]
+struct Buffered {
+    entries: VecDeque<(Option<MessageId>, Result<Entry, PyErr>)>,
+    watermark: Vec<u64>,
 }
 
 struct Entry {
     value: Py<PyAny>,
     position: PyMessageId,
-    headers: BTreeMap<String, String>,
+    headers: BTreeMap<String, PyHeader>,
 }
 
 impl PyTypedRecords {
@@ -191,7 +202,7 @@ impl PyTypedRecords {
                 reader_name,
                 batch,
                 offsets: Arc::new(Mutex::new(from_offsets)),
-                buffered: Arc::new(Mutex::new(VecDeque::new())),
+                buffered: Arc::new(Mutex::new(Buffered::default())),
             },
         }
     }
@@ -212,7 +223,13 @@ impl Reader {
     // Poll the log once into the buffer when it holds nothing, decoding each
     // record as it lands. A failed poll raises the transport error itself.
     async fn fill(&self) -> PyResult<()> {
-        if !self.buffered.lock().expect("buffer lock").is_empty() {
+        if !self
+            .buffered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .is_empty()
+        {
             return Ok(());
         }
         let saved = self.offsets.lock().expect("offsets lock").clone();
@@ -225,21 +242,32 @@ impl Reader {
             records = records.batch(batch);
         }
         let polled = records.poll().await.map_err(to_pyerr)?;
-        *self.offsets.lock().expect("offsets lock") = records.offsets().to_vec();
+        let watermark = records.offsets().to_vec();
+        if polled.is_empty() {
+            *self.offsets.lock().unwrap_or_else(PoisonError::into_inner) = watermark;
+            return Ok(());
+        }
         Python::attach(|py| {
-            let mut buffer = self.buffered.lock().expect("buffer lock");
+            let mut buffer = self.buffered.lock().unwrap_or_else(PoisonError::into_inner);
+            buffer.watermark = watermark;
             for item in polled {
-                buffer.push_back(match item {
-                    Ok(record) => decode_entry(py, self.cls.as_ref(), record),
+                buffer.entries.push_back(match item {
+                    Ok(record) => (
+                        Some(record.position),
+                        decode_entry(py, self.cls.as_ref(), record),
+                    ),
                     Err(error) => {
                         let message = error.to_string();
-                        let position = error.position.map(PyMessageId::from);
-                        Err(typed_decode_error(
-                            py,
-                            message,
+                        let position = error.position;
+                        (
                             position,
-                            to_pyerr(*error.source),
-                        ))
+                            Err(typed_decode_error(
+                                py,
+                                message,
+                                position.map(PyMessageId::from),
+                                to_pyerr(*error.source),
+                            )),
+                        )
                     }
                 });
             }
@@ -247,16 +275,37 @@ impl Reader {
         Ok(())
     }
 
+    // The next record, with the offsets moved past it, or to the poll's
+    // watermark once the buffer is empty.
     fn pop(&self) -> Option<Result<Entry, PyErr>> {
-        self.buffered.lock().expect("buffer lock").pop_front()
+        let mut buffered = self.buffered.lock().unwrap_or_else(PoisonError::into_inner);
+        let (position, entry) = buffered.entries.pop_front()?;
+        let mut offsets = self.offsets.lock().unwrap_or_else(PoisonError::into_inner);
+        if buffered.entries.is_empty() {
+            *offsets = std::mem::take(&mut buffered.watermark);
+        } else if let Some(position) = position {
+            advance_past(&mut offsets, position);
+        }
+        Some(entry)
+    }
+
+    // Every buffered record, with the offsets moved to the poll's watermark.
+    fn drain(&self) -> Vec<Result<Entry, PyErr>> {
+        let mut buffered = self.buffered.lock().unwrap_or_else(PoisonError::into_inner);
+        if !buffered.entries.is_empty() {
+            *self.offsets.lock().unwrap_or_else(PoisonError::into_inner) =
+                std::mem::take(&mut buffered.watermark);
+        }
+        buffered.entries.drain(..).map(|(_, entry)| entry).collect()
     }
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyTypedRecords {
-    /// The next offset to read on each partition. Persist this to resume later
-    /// with `from_offsets=`.
+    /// The next offset to read on each partition, past every record handed
+    /// out so far. Persist this after handling a record to resume right after
+    /// it with `from_offsets=`.
     #[getter]
     fn offsets(&self) -> Vec<u64> {
         self.reader.offsets.lock().expect("offsets lock").clone()
@@ -268,9 +317,9 @@ impl PyTypedRecords {
     /// next call continues past it. Drive one reader from one task: awaiting
     /// two `next()` on the same reader concurrently would re-poll the same
     /// offset window and surface records twice.
-    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Option<PyTypedRecord>>> {
         let reader = self.reader.share(py);
-        future_into_py(py, async move {
+        awaitable(py, async move {
             reader.fill().await?;
             match reader.pop() {
                 None => Ok(None),
@@ -284,16 +333,11 @@ impl PyTypedRecords {
     /// `TypedDecodeError` of a record that does not decode, returned rather
     /// than raised so one poison record does not hide the rest. An empty list
     /// means caught up. A failed poll raises.
-    fn poll<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn poll<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Vec<Py<PyAny>>>> {
         let reader = self.reader.share(py);
-        future_into_py(py, async move {
+        awaitable(py, async move {
             reader.fill().await?;
-            let drained: Vec<_> = reader
-                .buffered
-                .lock()
-                .expect("buffer lock")
-                .drain(..)
-                .collect();
+            let drained = reader.drain();
             Python::attach(|py| {
                 drained
                     .into_iter()
@@ -314,9 +358,9 @@ impl PyTypedRecords {
         slf
     }
 
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyTypedRecord>> {
         let reader = self.reader.share(py);
-        future_into_py(py, async move {
+        awaitable(py, async move {
             reader.fill().await?;
             match reader.pop() {
                 None => Err(PyStopAsyncIteration::new_err(())),
@@ -334,7 +378,7 @@ impl PyTypedRecords {
 }
 
 /// One record decoded off the log: the `cls` instance, the `partition:offset`
-/// position, and the string user headers.
+/// position, and the typed user headers.
 #[gen_stub_pyclass]
 #[pyclass(name = "TypedRecord", frozen)]
 pub struct PyTypedRecord {
@@ -346,14 +390,25 @@ pub struct PyTypedRecord {
     /// header.
     #[pyo3(get)]
     pub position: PyMessageId,
-    /// The record's user headers decoded to strings.
-    #[pyo3(get)]
-    pub headers: BTreeMap<String, String>,
+    headers: BTreeMap<String, PyHeader>,
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyTypedRecord {
+    /// Typed Iggy user headers as Python `bytes`, `str`, `bool`, `int`, or
+    /// `float` values, like `ConsumerMessage.headers`.
+    #[getter]
+    fn headers(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        header_dict(py, &self.headers)
+    }
+
+    /// Exact Iggy value kind for each user header (`uint16`, `string`, etc.).
+    #[getter]
+    fn header_kinds(&self) -> BTreeMap<String, String> {
+        header_kinds(&self.headers)
+    }
+
     fn __repr__(&self) -> String {
         format!("TypedRecord(position={})", self.position.inner)
     }
@@ -448,7 +503,7 @@ fn decode_entry(
         Ok(value) => Ok(Entry {
             value,
             position,
-            headers: record.headers,
+            headers: typed_headers(record.headers),
         }),
         Err(error) => Err(typed_decode_error(
             py,
@@ -472,6 +527,9 @@ fn typed_decode_error(
     source: PyErr,
 ) -> PyErr {
     let error = TypedDecodeError::new_err(message);
+    if position.is_none() {
+        classify_as_source(py, &error, &source);
+    }
     let value = error.value(py);
     let position = position.and_then(|position| Py::new(py, position).ok());
     let _ = value.setattr("position", position);

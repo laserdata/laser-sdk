@@ -1,4 +1,4 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::convert::payload_bytes;
 use crate::errors::to_pyerr;
 use laser_sdk::LaserError;
@@ -40,9 +40,13 @@ pub struct PyKvStore;
 #[pymethods]
 impl PyStateStore {
     /// The value bytes at `key`, or `None` if absent.
-    fn get<'py>(&self, py: Python<'py>, key: String) -> PyResult<Bound<'py, PyAny>> {
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Awaitable[typing.Optional[builtins.bytes]]",
+        imports = ("typing", "builtins")
+    ))]
+    fn get<'py>(&self, py: Python<'py>, key: String) -> PyResult<Awaitable<'py, Option<Vec<u8>>>> {
         let inner = self.inner.clone();
-        future_into_py(py, async move { inner.get(&key).await.map_err(to_pyerr) })
+        awaitable(py, async move { inner.get(&key).await.map_err(to_pyerr) })
     }
 
     /// Store `value` (`str`, `bytes`, or `bytearray`) at `key`.
@@ -50,20 +54,21 @@ impl PyStateStore {
         &self,
         py: Python<'py>,
         key: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         value: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let inner = self.inner.clone();
         let value = payload_bytes(value)?;
-        future_into_py(
+        awaitable(
             py,
             async move { inner.set(&key, value).await.map_err(to_pyerr) },
         )
     }
 
     /// Remove `key`. A no-op if it was already absent.
-    fn delete<'py>(&self, py: Python<'py>, key: String) -> PyResult<Bound<'py, PyAny>> {
+    fn delete<'py>(&self, py: Python<'py>, key: String) -> PyResult<Awaitable<'py, ()>> {
         let inner = self.inner.clone();
-        future_into_py(
+        awaitable(
             py,
             async move { inner.delete(&key).await.map_err(to_pyerr) },
         )

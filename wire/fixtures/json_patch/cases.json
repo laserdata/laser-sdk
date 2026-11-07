@@ -76,5 +76,33 @@
     "document": {"a": 1},
     "patch": [{"op": "replace", "path": "/missing", "value": 2}],
     "error": true
+  },
+  {
+    "name": "object members named like prototype internals",
+    "document": {"name": "state"},
+    "patch": [
+      {"op": "add", "path": "/constructor", "value": {"a": 1}},
+      {"op": "add", "path": "/prototype", "value": 2},
+      {"op": "add", "path": "/__proto__", "value": {"polluted": true}},
+      {"op": "replace", "path": "/prototype", "value": 3}
+    ],
+    "result": {"name": "state", "constructor": {"a": 1}, "prototype": 3, "__proto__": {"polluted": true}}
+  },
+  {
+    "name": "copy and move through prototype-named members",
+    "document": {"constructor": {"a": 1}},
+    "patch": [
+      {"op": "copy", "from": "/constructor", "path": "/prototype"},
+      {"op": "move", "from": "/prototype", "path": "/__proto__"},
+      {"op": "add", "path": "/__proto__/b", "value": 2},
+      {"op": "test", "path": "/__proto__/a", "value": 1}
+    ],
+    "result": {"constructor": {"a": 1}, "__proto__": {"a": 1, "b": 2}}
+  },
+  {
+    "name": "a missing prototype-named parent",
+    "document": {"name": "state"},
+    "patch": [{"op": "add", "path": "/__proto__/polluted", "value": true}],
+    "error": true
   }
 ]

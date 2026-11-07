@@ -45,3 +45,9 @@ Feature: Consumer filters on a streaming server
   Scenario: A released policy cannot acknowledge an old page
     When the anomaly desk rejects a page after releasing its policy
     Then it receives every original feed record
+
+  @managed
+  Scenario: A skip passes the record a stop fault blocks
+    When a "malformed" record and a "decommission" record follow the feed
+    And the anomaly desk skips the record its "safe mode" filter stops on
+    Then it receives the "decommission" record after it

@@ -273,6 +273,10 @@ pub(crate) async fn execute_compose_run(
     result.and_then(|result| shutdown.map(|()| result))
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "awaits the restart path and layer futures, about 17 KB in debug"
+)]
 pub(crate) async fn execute_started_run(
     execution: DirectExecution<'_>,
     server: NativeIggy,
@@ -416,6 +420,10 @@ pub(crate) async fn execute_iggy_restart_path(
     Ok(None)
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "awaits the direct run future, about 17 KB in debug"
+)]
 pub(crate) async fn execute_layer(
     laser: &laser_sdk::laser::Laser,
     server: &NativeIggy,
@@ -588,6 +596,10 @@ pub(crate) fn execute_l1(
     )
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "awaits the pipeline pair future, about 17 KB in debug"
+)]
 pub(crate) async fn execute_direct(
     laser: &laser_sdk::laser::Laser,
     server: &NativeIggy,

@@ -34,15 +34,18 @@ impl EdgeDenial {
         }
     }
 
-    /// The `WWW-Authenticate` challenge for a step-up, naming the scope the
-    /// caller must acquire, or `None` for a wrong-audience reject (nothing to
-    /// step up to).
-    pub fn challenge(&self) -> Option<String> {
+    /// The RFC 6750 section 3 `WWW-Authenticate` challenge for the refusal:
+    /// `invalid_token` for a token minted for another audience (sent with the
+    /// `401`), `insufficient_scope` with the scope to acquire for a step-up
+    /// (sent with the `403`), the error MCP clients read to start
+    /// re-authorization.
+    pub fn challenge(&self) -> String {
         match self {
-            EdgeDenial::StepUp { required_scope } => {
-                Some(format!("Bearer scope=\"{required_scope}\""))
-            }
-            EdgeDenial::WrongAudience { .. } => None,
+            EdgeDenial::WrongAudience { .. } => r#"Bearer error="invalid_token""#.to_owned(),
+            EdgeDenial::StepUp { required_scope } => format!(
+                r#"Bearer error="insufficient_scope", scope="{}""#,
+                quoted_string_body(required_scope)
+            ),
         }
     }
 }
@@ -71,6 +74,19 @@ pub fn authorize_edge(
     Ok(())
 }
 
+// The RFC 9110 section 5.6.4 quoted-string escape: a backslash before every
+// `"` and `\`, so a scope cannot end the parameter early.
+fn quoted_string_body(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '"' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,7 +109,7 @@ mod tests {
         let c = claims(&["other.server"], &["tool:read"]);
         let denial = authorize_edge(&c, "mcp.laserdata", "tool:read").unwrap_err();
         assert!(matches!(denial, EdgeDenial::WrongAudience { .. }));
-        assert_eq!(denial.challenge(), None);
+        assert_eq!(denial.challenge(), r#"Bearer error="invalid_token""#);
         assert_eq!(denial.code(), ResultCode::Unauthenticated);
     }
 
@@ -104,8 +120,19 @@ mod tests {
         assert!(matches!(denial, EdgeDenial::StepUp { .. }));
         assert_eq!(denial.code(), ResultCode::StepUpRequired);
         assert_eq!(
-            denial.challenge().as_deref(),
-            Some("Bearer scope=\"tool:write\"")
+            denial.challenge(),
+            r#"Bearer error="insufficient_scope", scope="tool:write""#
+        );
+    }
+
+    #[test]
+    fn given_a_scope_with_quote_characters_when_challenged_then_should_escape_them() {
+        let denial = EdgeDenial::StepUp {
+            required_scope: r#"tool:"write\"#.to_owned(),
+        };
+        assert_eq!(
+            denial.challenge(),
+            r#"Bearer error="insufficient_scope", scope="tool:\"write\\""#
         );
     }
 }

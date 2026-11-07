@@ -139,6 +139,7 @@ const invalidFixtures: readonly [string, RegExp][] = [
   ["agent_invalid_response_channel.bin", /`channel` is invalid on response/],
   ["agent_invalid_status_bad_operation.bin", /status operation must be/],
   ["agent_invalid_status_no_operation.bin", /status requires `operation`/],
+  ["agent_invalid_status_fact_no_deadline.bin", /status requires `deadline_micros`/],
   ["agent_invalid_chunk_no_sequence.bin", /chunk requires `sequence`/],
   ["agent_invalid_chunk_open_no_operation.bin", /chunk requires `operation`/],
   ["agent_invalid_chunk_late_deadline.bin", /stream bound rides the opening chunk/]

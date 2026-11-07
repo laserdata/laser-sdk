@@ -1,3 +1,4 @@
+import { millis, millisToMicros } from "../client/duration.js"
 import { InvalidError } from "../client/errors.js"
 
 export interface Clock {
@@ -17,7 +18,9 @@ export class TestClock implements Clock {
     this.current = microseconds(startMicros)
   }
 
-  advance(byMicros: bigint): void {
+  /** Moves time forward by `byMs` milliseconds, kept to the microsecond. */
+  advance(byMs: number): void {
+    const byMicros = millisToMicros(millis(byMs, "byMs"))
     this.current = BigInt.asUintN(64, this.current + microseconds(byMicros))
   }
 

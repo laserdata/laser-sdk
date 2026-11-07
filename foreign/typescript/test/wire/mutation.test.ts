@@ -70,7 +70,6 @@ void test("given_a_mutation_command_with_an_empty_caller_agent_when_decoded_then
     new Map<string, unknown>([
       ["v", 1n],
       ["operation_id", 7n],
-      ["actor_user_id", 0n],
       ["deployment_id", 0n],
       ["timestamp_micros", 1n],
       ["command_code", 1n],

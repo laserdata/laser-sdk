@@ -1,0 +1,38 @@
+{
+  "secret_seed_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+  "card": {
+    "name": "jcs-vector",
+    "version": "1.0.0",
+    "skills": [],
+    "capabilities": {
+      "streaming": false,
+      "pushNotifications": false
+    },
+    "keys": {
+      "\u20ac": "Euro Sign",
+      "\r": "Carriage Return",
+      "\ufb33": "Hebrew Letter Dalet With Dagesh",
+      "1": "One",
+      "\ud83d\ude00": "Emoji: Grinning Face",
+      "\u0080": "Control",
+      "\u00f6": "Latin Small Letter O With Diaeresis",
+      "\ue000": "Private Use",
+      "": "Empty"
+    },
+    "limits": [
+      0,
+      -1,
+      9007199254740991,
+      "\u0001\n\"\\/\u2028"
+    ],
+    "signatures": [
+      {
+        "protected": "e30",
+        "signature": "AA"
+      }
+    ]
+  },
+  "canonical": "{\"capabilities\":{\"pushNotifications\":false,\"streaming\":false},\"keys\":{\"\":\"Empty\",\"\\r\":\"Carriage Return\",\"1\":\"One\",\"\u0080\":\"Control\",\"\u00f6\":\"Latin Small Letter O With Diaeresis\",\"\u20ac\":\"Euro Sign\",\"\ud83d\ude00\":\"Emoji: Grinning Face\",\"\ue000\":\"Private Use\",\"\ufb33\":\"Hebrew Letter Dalet With Dagesh\"},\"limits\":[0,-1,9007199254740991,\"\\u0001\\n\\\"\\\\/\u2028\"],\"name\":\"jcs-vector\",\"skills\":[],\"version\":\"1.0.0\"}",
+  "protected": "eyJhbGciOiJFZERTQSIsImtpZCI6ImZlODEyYzEyZjNhYjRjZTYifQ",
+  "signature": "E9o0g2orebRjrKWo4_KBbGWi7e9cNZgFQRjqi7rT27b3H7PlNfn9VoZi_WUDWohiM_D2de7RHTIP7Vcqn6ISAA"
+}

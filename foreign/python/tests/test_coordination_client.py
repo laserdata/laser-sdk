@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import laser_sdk as ls
 import pytest
@@ -43,6 +44,111 @@ async def test_given_release_when_repeated_after_ambiguity_then_should_keep_the_
     assert await client.release(operation)
     assert transport.frames[0] == transport.frames[1]
     assert transport.resets == 1
+
+
+def _text(value):
+    encoded = value.encode()
+    header = bytes([0x60 | len(encoded)]) if len(encoded) < 24 else bytes([0x78, len(encoded)])
+    return header + encoded
+
+
+def _command_error(code):
+    message = _text("message") + _text("the outcome is not known yet")
+    return b"\xa2" + _text("code") + _text(code) + message
+
+
+@pytest.mark.parametrize("code", ["pending", "backend_unavailable", "unavailable"])
+async def test_given_an_unknown_outcome_reply_when_acquiring_then_should_keep_the_transport_and_raise_ambiguity_with_the_identity(  # noqa: E501
+    code,
+):
+    reply = _command_error(code)
+
+    class Unknown:
+        def __init__(self):
+            self.resets = 0
+
+        async def send(self, code, frame):
+            return reply
+
+        async def reset(self):
+            self.resets += 1
+
+    transport = Unknown()
+    client = ls.FencedLeaseClient(transport)
+    operation = client.prepare_acquire(ACQUIRE)
+    with pytest.raises(ls.LaserError) as failure:
+        await client.acquire(operation)
+    assert failure.value.ambiguous_mutation
+    assert not failure.value.retryable
+    assert f"{operation.operation_id:032x}" in str(failure.value)
+    assert transport.resets == 0
+    assert operation.ambiguous_recovery == ls.AmbiguousMutationRecovery.wait_for_lease_expiry(1_000)
+
+
+def _uint(value):
+    if value < 24:
+        return bytes([value])
+    if value < 0x100:
+        return bytes([0x18, value])
+    if value < 0x10000:
+        return b"\x19" + value.to_bytes(2, "big")
+    return b"\x1a" + value.to_bytes(4, "big")
+
+
+def _map(entries):
+    return bytes([0xA0 | len(entries)]) + b"".join(_text(key) + value for key, value in entries)
+
+
+LEASED = _map(
+    [
+        (
+            "Ok",
+            _map(
+                [
+                    (
+                        "Leased",
+                        _map(
+                            [
+                                ("lease_token", _uint(4)),
+                                ("granted_ttl_micros", _uint(1_000_000)),
+                                (
+                                    "position",
+                                    _map(
+                                        [
+                                            ("topic_generation", _uint(1)),
+                                            ("partition", _uint(0)),
+                                            ("offset", _uint(512)),
+                                        ]
+                                    ),
+                                ),
+                            ]
+                        ),
+                    )
+                ]
+            ),
+        )
+    ]
+)
+
+
+async def test_given_a_grant_answered_late_when_acquired_then_should_be_valid_from_the_first_send():
+    class Late:
+        async def send(self, code, frame):
+            await asyncio.sleep(0.2)
+            return LEASED
+
+        async def reset(self):
+            pass
+
+    client = ls.FencedLeaseClient(Late())
+    before = time.monotonic()
+    lease = await client.acquire(client.prepare_acquire(ACQUIRE))
+    after = time.monotonic()
+    assert lease.token == 4
+    assert lease.valid_until >= before + lease.granted_ttl_ms / 1_000 - 0.005
+    assert lease.valid_until + 0.19 <= after + lease.granted_ttl_ms / 1_000, (
+        "the reply delay is spent from the grant, not added to it"
+    )
 
 
 def test_given_a_holder_id_with_a_control_character_when_preparing_a_lease_then_should_refuse_it():
@@ -125,6 +231,26 @@ async def test_given_a_permanent_transport_error_when_mutating_then_should_not_m
     assert transport.resets == 1
     if error_type is PermissionError:
         assert failure.value.permission_denied
+
+
+async def test_given_a_transport_that_wrote_the_frame_and_lost_its_reply_when_mutating_then_should_raise_ambiguity_with_the_identity():  # noqa: E501
+    class Written:
+        def __init__(self):
+            self.resets = 0
+
+        async def send(self, code, frame):
+            raise ls.AmbiguousMutationError("the frame was written and its reply was lost")
+
+        async def reset(self):
+            self.resets += 1
+
+    transport = Written()
+    client = ls.FencedLeaseClient(transport)
+    operation = client.prepare_release(RELEASE)
+    with pytest.raises(ls.AmbiguousMutationError) as failure:
+        await client.release(operation)
+    assert failure.value.operation_id == operation.operation_id
+    assert transport.resets == 1
 
 
 async def test_given_a_client_when_closed_twice_then_should_retire_once_and_refuse_sends():

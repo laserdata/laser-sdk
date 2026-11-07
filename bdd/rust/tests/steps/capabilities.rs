@@ -2,9 +2,10 @@ use crate::common::world::LaserWorld;
 use cucumber::{given, then, when};
 use laser_sdk::LaserError;
 use laser_sdk::kv::{FencedLeaseClient, KvRelease, ManagedKvTransport};
-use laser_sdk::prelude::Capabilities;
-use laser_sdk::query::{Consistency, ResultCode};
+use laser_sdk::prelude::{Capabilities, ConversationId};
+use laser_sdk::query::{Consistency, Projection, ResultCode, SchemaSource};
 use laser_sdk::wire::result::CommandError;
+use std::time::Duration;
 
 #[given("a managed-query connection that does not advertise read-your-writes")]
 async fn managed_query_without_read_your_writes(world: &mut LaserWorld) {
@@ -54,6 +55,36 @@ async fn prepared_release_error(world: &mut LaserWorld, code: u16) {
     world.last_result = Some(Err(error.to_string()));
 }
 
+#[when(regex = r"^a prepared release receives the unresolved result code (\d+)$")]
+async fn prepared_release_unresolved(world: &mut LaserWorld, code: u16) {
+    let client = FencedLeaseClient::new(CommandReply(ResultCode::from_code(code)));
+    let operation = client
+        .prepare_release(&KvRelease {
+            v: 1,
+            namespace: "coord".to_owned(),
+            key: b"lease".to_vec(),
+            lease_token: 1,
+            holder_id: "worker".to_owned(),
+        })
+        .expect("release prepares");
+    let error = client
+        .release(&operation)
+        .await
+        .expect_err("an unresolved attempt never succeeds");
+    world.last_retryable = Some(error.is_ambiguous_mutation());
+    world.last_result = Some(Err(error.to_string()));
+}
+
+#[then("the release fails as an ambiguous mutation")]
+fn release_is_ambiguous(world: &mut LaserWorld) {
+    assert_eq!(
+        world.last_retryable,
+        Some(true),
+        "an unresolved attempt may still apply: {:?}",
+        world.last_result
+    );
+}
+
 #[then(regex = r"^the command error keeps code (\d+) and retryability (true|false)$")]
 fn command_error_classifiers(world: &mut LaserWorld, code: u16, retryable: String) {
     assert_eq!(world.last_code, Some(ResultCode::from_code(code)));
@@ -64,7 +95,7 @@ fn command_error_classifiers(world: &mut LaserWorld, code: u16, retryable: Strin
 async fn read_capabilities(world: &mut LaserWorld) {
     // Read every field out under the borrow, then drop it before mutating the
     // world (the capabilities getter hands back a reference into the client).
-    let (query, kv_available, forks, kv_cas, read_your_writes, strong) = {
+    let (query, kv_available, forks, kv_cas, read_your_writes) = {
         let capabilities = world.laser().capabilities().await;
         (
             capabilities.query.available,
@@ -72,7 +103,6 @@ async fn read_capabilities(world: &mut LaserWorld) {
             capabilities.forks,
             capabilities.kv.cas,
             capabilities.serves_consistency(Consistency::ReadYourWrites),
-            capabilities.serves_consistency(Consistency::Strong),
         )
     };
     world.managed_query = Some(query);
@@ -80,7 +110,6 @@ async fn read_capabilities(world: &mut LaserWorld) {
     world.forks = Some(forks);
     world.kv_cas = Some(kv_cas);
     world.read_your_writes = Some(read_your_writes);
-    world.strong_consistency = Some(strong);
 }
 
 #[then("managed query is unavailable")]
@@ -109,11 +138,6 @@ async fn no_coordination_features(world: &mut LaserWorld) {
         world.read_your_writes,
         Some(false),
         "read_your_writes should be off"
-    );
-    assert_eq!(
-        world.strong_consistency,
-        Some(false),
-        "strong_consistency should be off"
     );
 }
 
@@ -145,24 +169,37 @@ async fn compare_and_swap(world: &mut LaserWorld, key: String, namespace: String
     world.last_result = Some(result.map(|_| ()).map_err(|error| format!("{error:?}")));
 }
 
-#[when(
-    regex = r#"^I send a set of key "([^"]+)" in namespace "([^"]+)" expecting version (\d+) without commit$"#
-)]
-async fn send_set_with_precondition(
-    world: &mut LaserWorld,
-    key: String,
-    namespace: String,
-    version: u64,
-) {
-    let result = world
-        .laser()
-        .kv(&namespace)
-        .set(&key)
-        .bytes(b"debug")
-        .expect_version(version)
-        .send()
-        .await;
-    world.last_code = result.as_ref().err().map(|error| error.code());
+#[when(regex = r"^I call the managed (.+) surface$")]
+async fn call_managed_surface(world: &mut LaserWorld, surface: String) {
+    let laser = world.laser().clone();
+    let result = match surface.as_str() {
+        "projection registration" => laser
+            .projections()
+            .register(Projection::builder("reading.v1").build())
+            .await
+            .map(drop),
+        "materialization" => laser.topic("events").materialize().apply().await.map(drop),
+        "schema registration" => laser
+            .schemas()
+            .register(SchemaSource::JsonSchema {
+                schema: "{\"type\":\"string\"}".to_owned(),
+            })
+            .send()
+            .await
+            .map(drop),
+        "graph upsert" => laser.graph("kg").upsert(Vec::new(), Vec::new()).await,
+        "fork creation" => laser.fork("experiment").create().send().await.map(drop),
+        "change feed" => laser.watch().records().await.map(drop),
+        "lease acquisition" => laser
+            .kv("coordination")
+            .lease(b"lock", "worker", Duration::from_secs(5))
+            .await
+            .map(drop),
+        "session read" => laser.sessions().get(ConversationId::new()).await.map(drop),
+        "batch" => laser.execute_batch(Vec::new()).await.map(drop),
+        other => panic!("no managed surface named {other}"),
+    };
+    world.last_code = result.as_ref().err().map(LaserError::code);
     world.last_result = Some(result.map_err(|error| format!("{error:?}")));
 }
 
@@ -175,15 +212,6 @@ async fn fails_invalid(world: &mut LaserWorld) {
         ),
         Ok(()) => panic!("expected the call to fail as invalid"),
     }
-}
-
-#[then("the unified result code is invalid argument")]
-async fn result_code_invalid_argument(world: &mut LaserWorld) {
-    assert_eq!(
-        world.last_code,
-        Some(ResultCode::InvalidArgument),
-        "the failure should classify as InvalidArgument in the unified result space"
-    );
 }
 
 #[then("the call fails as unsupported")]

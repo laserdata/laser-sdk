@@ -1,9 +1,7 @@
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::message::Message;
-use crate::types::MessageId;
 use iggy::prelude::*;
-use std::collections::BTreeMap;
 
 const DEFAULT_BATCH: u32 = 1000;
 
@@ -136,11 +134,7 @@ impl Cursor {
             .poll_iggy()
             .await?
             .into_iter()
-            .map(|(partition, message)| Message {
-                id: MessageId::new(partition, message.header.offset),
-                payload: message.payload.to_vec(),
-                headers: headers_to_strings(&message),
-            })
+            .map(|(partition, message)| Message::of(partition, message))
             .collect())
     }
 
@@ -187,26 +181,10 @@ impl Cursor {
     }
 }
 
-// The message's user headers decoded to strings. Non-UTF-8 keys/values are
-// dropped (the agent layer reconstructs `Provenance` from these same headers).
-fn headers_to_strings(message: &IggyMessage) -> BTreeMap<String, String> {
-    let Ok(Some(headers)) = message.user_headers_map() else {
-        return BTreeMap::new();
-    };
-    headers
-        .iter()
-        .filter_map(|(key, value)| {
-            Some((
-                key.as_str().ok()?.to_owned(),
-                value.as_str().ok()?.to_owned(),
-            ))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::MessageId;
     use axum::extract::{Query, State};
     use axum::http::StatusCode;
     use axum::response::{IntoResponse, Response};

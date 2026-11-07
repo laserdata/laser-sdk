@@ -75,7 +75,7 @@ void test("given_typed_numbers_and_a_broadcast_addressee_when_round_tripped_then
   const encoded = encodeProvenanceHeaders({
     conversationId,
     fenceToken: 7n,
-    deadlineMicros: 42n,
+    deadlineAtMicros: 42n,
     usage: { inputTokens: 3n, outputTokens: 4n, costUsd: 0.5 }
   })
   assert.deepEqual(encoded.get(DEADLINE), { kind: "uint64", value: 42n })
@@ -83,7 +83,7 @@ void test("given_typed_numbers_and_a_broadcast_addressee_when_round_tripped_then
     new Map([...encoded, ["agdx.to", { kind: "string", value: "*" }]])
   )
   assert.equal(decoded.fenceToken, 7n)
-  assert.equal(decoded.deadlineMicros, 42n)
+  assert.equal(decoded.deadlineAtMicros, 42n)
   assert.equal(decoded.usage?.costUsd, 0.5)
   assert.equal(decoded.targetAgentId, undefined)
 })

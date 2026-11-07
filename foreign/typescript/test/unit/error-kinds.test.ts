@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
+import { code, isRetryable } from "../../src/client/error-classify.js"
 import {
   AmbiguousMutationError,
   AuthzExecutionError,
@@ -18,6 +19,7 @@ import {
   HandlerError,
   IntegrityError,
   InvalidError,
+  JournalTruncatedError,
   KvExecutionError,
   LaserError,
   NoStreamError,
@@ -27,6 +29,7 @@ import {
   ProtocolError,
   QueryExecutionError,
   RejectedError,
+  StepFailedError,
   SignatureError,
   StateStoreError,
   StepUpRequiredError,
@@ -77,6 +80,16 @@ void test("given_a_surface_scoped_execution_error_when_constructed_then_should_k
     const error = new Kind("rejected by the engine", { code: 7 })
     assert.deepEqual(error.detail, { code: 7 }, `${Kind.name} detail`)
     assert.ok(error instanceof LaserError)
+  }
+})
+
+void test("given_authorization_receipt_refusals_when_classified_then_should_preserve_the_wire_codes", () => {
+  for (const [kind, name] of [
+    ["mutationConflict", "Conflict"],
+    ["resourceLimit", "ResourceLimit"]
+  ] as const) {
+    const error = new AuthzExecutionError("refused", { kind, message: "refused" })
+    assert.deepEqual(code(error), { kind: "known", name })
   }
 })
 
@@ -136,6 +149,20 @@ void test("given_the_self_describing_errors_when_constructed_then_should_build_t
   assert.equal(budget.ceiling, 100n)
   assert.equal(budget.spent, 140n)
   assert.match(budget.message, /spent 140, ceiling 100/u)
+})
+
+void test("given_workflow_failures_when_classified_then_should_match_the_rust_codes", () => {
+  const timedOut = new StepFailedError("run", "triage", "timed_out")
+  assert.equal(timedOut.kind, "step-failed")
+  assert.equal(timedOut.message, "workflow run run step `triage` failed: timed_out")
+  assert.equal(isRetryable(timedOut), true)
+  assert.deepEqual(code(timedOut), { kind: "known", name: "DeadlineExceeded" })
+  const rejected = new StepFailedError("run", "triage", "unverified")
+  assert.equal(isRetryable(rejected), false)
+  const truncated = new JournalTruncatedError("run")
+  assert.equal(truncated.run, "run")
+  assert.equal(isRetryable(truncated), false)
+  assert.deepEqual(code(truncated), { kind: "known", name: "ExpiredSnapshot" })
 })
 
 void test("given_an_unreachable_variant_when_asserted_then_should_throw_invalid_with_the_value", () => {

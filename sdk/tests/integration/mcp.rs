@@ -274,3 +274,89 @@ async fn given_two_tool_workers_when_calling_one_then_only_that_worker_should_ru
     assert_eq!(alpha.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(beta.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+// A tool worker that lets a rogue enrolled agent answer first, then answers
+// itself, both signed.
+struct RacedTool {
+    own: laser_sdk::sign::SigningKey,
+    rogue: laser_sdk::sign::SigningKey,
+}
+
+impl AgentHandler for RacedTool {
+    async fn handle(&self, message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
+        let command = message
+            .envelope
+            .as_ref()
+            .ok_or_else(|| LaserError::Handler("expected an AGDX command".to_owned()))?;
+        let correlation = command
+            .correlation
+            .ok_or_else(|| LaserError::Handler("the command carries no correlation".to_owned()))?;
+        for (signer, key, body) in [
+            ("rogue", &self.rogue, "forged"),
+            ("tool", &self.own, "honest"),
+        ] {
+            ctx.laser()
+                .agdx(
+                    AgentTopic::Sessions,
+                    signer
+                        .parse::<laser_sdk::types::AgentId>()
+                        .expect("the signer is a valid agent id"),
+                    command.conversation,
+                )
+                .respond(correlation, body.as_bytes().to_vec())
+                .signed_by(key)
+                .send()
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_an_addressed_tool_call_under_a_verifier_when_another_signer_answers_first_then_should_take_the_target_reply()
+ {
+    let laser = harness::laser().await;
+    let tool_key = laser_sdk::sign::SigningKey::from_bytes(&[81u8; 32]);
+    let rogue_key = laser_sdk::sign::SigningKey::from_bytes(&[82u8; 32]);
+    let registry = laser_sdk::sign::KeyRegistry::new();
+    registry.enroll("tool", tool_key.verifying_key());
+    registry.enroll("rogue", rogue_key.verifying_key());
+    let mut worker = Agent::builder()
+        .id("tool".parse().expect("tool is a valid agent id"))
+        .listen_on(AgentTopic::Sessions)
+        .handler(RacedTool {
+            own: tool_key,
+            rogue: rogue_key,
+        })
+        .build()
+        .spawn(laser.clone());
+    worker.ready().await.expect("the worker is ready");
+    let verified = harness::verified(&laser, std::sync::Arc::new(registry)).await;
+    let bridge = McpBridge::new(
+        verified,
+        "mcp-bridge"
+            .parse::<laser_sdk::types::AgentId>()
+            .expect("mcp-bridge is a valid agent id"),
+        AgentTopic::Sessions,
+        AgentTopic::Sessions,
+        "test-server",
+    )
+    .with_tool("search", None, json!({"type": "object"}))
+    .expect("an object schema")
+    .with_target(
+        "tool"
+            .parse::<laser_sdk::types::AgentId>()
+            .expect("tool is a valid agent id"),
+    )
+    .with_timeout(Duration::from_secs(15));
+    let response = bridge
+        .handle_rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "search", "arguments": {}}}))
+        .await
+        .expect("a request is answered");
+    assert_eq!(
+        response.result,
+        Some(json!({"content": [{"type": "text", "text": "honest"}]}))
+    );
+}

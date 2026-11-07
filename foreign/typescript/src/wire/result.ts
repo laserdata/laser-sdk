@@ -112,6 +112,27 @@ export function resultCodeIsRetryable(value: ResultCode): boolean {
 }
 
 /**
+ * Whether the request could not be served right now, the retryable codes other
+ * than a lagging read model, as in Rust `is_unavailable`.
+ */
+export function resultCodeIsUnavailable(value: ResultCode): boolean {
+  return (
+    value.kind === "known" &&
+    (value.name === "Unavailable" ||
+      value.name === "TargetUnavailable" ||
+      value.name === "BackendUnavailable")
+  )
+}
+
+/**
+ * Whether the caller's credential or grant was refused, as in Rust
+ * `is_permission_denied`. The fix is a credential or a grant, never a retry.
+ */
+export function resultCodeIsPermissionDenied(value: ResultCode): boolean {
+  return value.kind === "known" && (value.name === "Forbidden" || value.name === "Unauthenticated")
+}
+
+/**
  * Whether the mutation was accepted and its outcome is still unknown. Only the
  * exact request with the same operation identity may be repeated, as in Rust
  * `is_pending`.

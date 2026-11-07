@@ -1,13 +1,14 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::consumer_group::PyConsumerGroup;
 use crate::convert::BodyValue;
 use crate::errors::{InvalidError, to_pyerr};
+use crate::materialize::{PyMaterialization, PyMaterializeRequest};
 use crate::publish::{PyBatchPublish, PyPublish};
 use crate::reader::PyCursor;
 use crate::transport::{
-    ConsumerConfig, ProducerSettings, PyConsumer, PyProducer, configure_consumer,
-    positive_duration_ms, routing,
+    ConsumerConfig, ProducerSettings, PyConsumer, PyProducer, PySendMessagesResponse,
+    configure_consumer, positive_duration_ms, routing,
 };
 use crate::typed::{PyTypedTopic, TypedForm, body_to_json};
 use iggy::prelude::IggyExpiry;
@@ -17,7 +18,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 #[gen_stub_pymethods]
 #[pymethods]
@@ -64,19 +64,19 @@ impl PyStream {
     }
 
     /// Idempotently create this stream.
-    fn ensure<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn ensure<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
         let name = self.name.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser.stream(&name).ensure().await.map_err(to_pyerr)
         })
     }
 
     /// Delete this stream with every topic and message in it. Returns `False` when the stream did not exist.
-    fn delete<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn delete<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, bool>> {
         let laser = self.laser.clone();
         let name = self.name.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser.stream(&name).delete().await.map_err(to_pyerr)
         })
     }
@@ -127,6 +127,25 @@ impl PyTopic {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyTopic {
+    fn materialize(&self) -> PyMaterializeRequest {
+        PyMaterializeRequest {
+            inner: self.handle().materialize(),
+        }
+    }
+
+    /// The `Materialization` that `materialize().apply()` returned for the
+    /// setup whose projection is `projection_id`, read under this topic's
+    /// stream. A setup without an explicit projection id or typed projection
+    /// uses the index name, which defaults to the topic name.
+    fn materialization(&self, projection_id: String) -> PyResult<PyMaterialization> {
+        Ok(PyMaterialization {
+            inner: self
+                .handle()
+                .materialization(projection_id)
+                .map_err(to_pyerr)?,
+        })
+    }
+
     /// This topic's name.
     #[getter]
     fn name(&self) -> String {
@@ -176,10 +195,10 @@ impl PyTopic {
         py: Python<'py>,
         schema_id: u32,
         cls: Option<Py<PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyTypedTopic>> {
         let topic = PyTopic::new(self.laser.clone(), self.stream.clone(), self.name.clone());
         let handle = self.handle();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let typed = handle
                 .schema::<BodyValue>(schema_id)
                 .await
@@ -196,14 +215,15 @@ impl PyTopic {
     fn send<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         headers: Option<&Bound<'_, PyDict>>,
         partition_key: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PySendMessagesResponse>> {
         let handle = self.handle();
         let payload = crate::convert::payload_bytes(payload)?;
         let headers = crate::transport::headers(headers)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let response = handle
                 .send(payload, headers, partition_key.as_deref())
                 .await
@@ -224,7 +244,7 @@ impl PyTopic {
         #[gen_stub(override_type(type_repr = "typing.Sequence[typing.Union[builtins.bytes, builtins.bytearray, builtins.str, IggyMessage]]", imports = ("typing", "builtins")))]
         messages: Vec<Bound<'_, PyAny>>,
         partition_key: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PySendMessagesResponse>> {
         let handle = self.handle();
         let messages = messages
             .iter()
@@ -239,7 +259,7 @@ impl PyTopic {
                     .map_err(|error| to_pyerr(error.into()))
             })
             .collect::<PyResult<Vec<_>>>()?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let response = handle
                 .batch(messages, partition_key.as_deref())
                 .await
@@ -302,7 +322,7 @@ impl PyTopic {
         batch_length: u32,
         linger_ms: f64,
         retries: Option<u32>,
-        retry_interval_ms: Option<u64>,
+        retry_interval_ms: Option<f64>,
         key: Option<&Bound<'_, PyAny>>,
         partition: Option<u32>,
         create_stream: bool,
@@ -340,9 +360,9 @@ impl PyTopic {
                 "topic partitions must be greater than zero",
             ));
         }
-        if let Some(interval) = retry_interval_ms {
-            positive_duration_ms(interval, "retry_interval_ms")?;
-        }
+        let retry_interval = retry_interval_ms
+            .map(|interval| positive_duration_ms(interval, "retry_interval_ms"))
+            .transpose()?;
         let stream = self
             .stream
             .clone()
@@ -352,7 +372,7 @@ impl PyTopic {
             batch_length,
             linger: crate::convert::duration_ms(linger_ms, "linger_ms")?,
             retries,
-            retry_interval: retry_interval_ms.map(Duration::from_millis),
+            retry_interval,
             routing: routing(key, partition)?,
             create_stream,
             create_topic,
@@ -399,30 +419,41 @@ impl PyTopic {
 
     /// Build a Laser reader for one partition. It is an async iterator
     /// and supports the same polling, batching, replay, retry, and commit modes
-    /// as the Rust builder. Use `auto_commit="disabled"` plus
-    /// `commit(message)` for commit-after-handle delivery. The server holds a
+    /// as the Rust builder. The default `auto_commit="all"` stores once the
+    /// last message of a poll is handled, a message counting as handled when
+    /// the next one is asked for or the consumer shuts down. Use
+    /// `auto_commit="disabled"` plus `commit(message)` for
+    /// commit-after-handle delivery. The server holds a
     /// poll that finds fewer than `min_count` new records for up to
     /// `max_wait_ms` (0 to 600000, 0 answers at once), and `max_bytes` caps
     /// the record bytes of one reply.
-    #[pyo3(signature = (name, *, partition=0, batch_length=1000, max_wait_ms=5000, min_count=1, max_bytes=1048576, polling="next", offset=None, timestamp_micros=None, auto_commit="polling", commit_interval_ms=0, commit_every=None, polling_retry_interval_ms=1000, init_retries=None, init_retry_interval_ms=1000, allow_replay=false))]
+    #[pyo3(signature = (name, *, partition, batch_length=1000, max_wait_ms=5000.0, min_count=1, max_bytes=1048576, polling="next", offset=None, timestamp_micros=None, auto_commit="all", commit_interval_ms=0.0, commit_every=None, polling_retry_interval_ms=1000.0, init_retries=None, init_retry_interval_ms=1000.0, allow_replay=false))]
     #[allow(clippy::too_many_arguments)]
     fn consumer(
         &self,
         name: &str,
         partition: u32,
         batch_length: u32,
-        max_wait_ms: u64,
+        max_wait_ms: f64,
         min_count: u32,
         max_bytes: u32,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['first', 'last', 'next', 'offset', 'timestamp']",
+            imports = ("typing",)
+        ))]
         polling: &str,
         offset: Option<u64>,
         timestamp_micros: Option<u64>,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['disabled', 'interval', 'polling', 'all', 'each', 'every']",
+            imports = ("typing",)
+        ))]
         auto_commit: &str,
-        commit_interval_ms: u64,
+        commit_interval_ms: f64,
         commit_every: Option<u32>,
-        polling_retry_interval_ms: u64,
+        polling_retry_interval_ms: f64,
         init_retries: Option<u32>,
-        init_retry_interval_ms: u64,
+        init_retry_interval_ms: f64,
         allow_replay: bool,
     ) -> PyResult<PyConsumer> {
         let handle = match &self.stream {
@@ -499,11 +530,11 @@ impl PyTopic {
         py: Python<'py>,
         partitions: u32,
         replication_factor: Option<u32>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
         let stream = self.stream.clone();
         let name = self.name.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let handle = match &stream {
                 Some(stream) => laser.stream(stream.clone()).topic(&*name),
                 None => laser.topic(&*name),
@@ -521,11 +552,11 @@ impl PyTopic {
         &self,
         py: Python<'py>,
         name: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
         let stream = self.stream.clone();
         let topic = self.name.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let handle = match &stream {
                 Some(stream) => laser.stream(stream.clone()).topic(&*topic),
                 None => laser.topic(&*topic),

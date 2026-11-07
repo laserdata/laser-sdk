@@ -1,3 +1,4 @@
+import { type CallOptions, cancellable } from "./client/call-options.js"
 import type { Laser } from "./client/laser.js"
 import type { GraphHandle } from "./managed/graph.js"
 import {
@@ -5,6 +6,7 @@ import {
   Chain,
   ContextAssembler,
   contextCheckpoint,
+  contextMessageBody,
   LastN,
   type ContextMessage,
   type ContextPolicy,
@@ -39,8 +41,10 @@ export class ContextScope {
     return new ContextScope(laser, conversation)
   }
 
-  append(topic: string, payload: BytesLike): Promise<void> {
-    return this.laser.sendAgent(topic, payload, { conversationId: this.conversation })
+  append(topic: string, payload: BytesLike, options: CallOptions = {}): Promise<void> {
+    return cancellable(options.signal, "context append", () =>
+      this.laser.sendAgent(topic, payload, { conversationId: this.conversation }, options)
+    )
   }
 
   /** The newest `count` messages of this conversation on `topics`, then
@@ -49,35 +53,53 @@ export class ContextScope {
   fetch(
     topics: readonly string[],
     count: number,
-    tokenBudget?: number
+    tokenBudget?: number,
+    options: CallOptions = {}
   ): Promise<readonly ContextMessage[]> {
     return this.fetchWith(
       topics,
       tokenBudget === undefined
         ? new LastN(count)
-        : new Chain([new LastN(count), new TokenBudget(tokenBudget)])
+        : new Chain([new LastN(count), new TokenBudget(tokenBudget)]),
+      options
     )
   }
 
-  fetchWith(topics: readonly string[], policy: ContextPolicy): Promise<readonly ContextMessage[]> {
-    return ContextAssembler.builder()
-      .conversationId(this.conversation)
-      .topics(topics)
-      .policy(policy)
-      .build()
-      .assemble(this.laser)
+  fetchWith(
+    topics: readonly string[],
+    policy: ContextPolicy,
+    options: CallOptions = {}
+  ): Promise<readonly ContextMessage[]> {
+    return cancellable(options.signal, "context fetch", () =>
+      ContextAssembler.builder()
+        .conversationId(this.conversation)
+        .topics(topics)
+        .policy(policy)
+        .build()
+        .assemble(this.laser)
+    )
   }
 
-  /** `fetch` rendered as one newline-joined text block. */
-  async block(topics: readonly string[], count: number, tokenBudget?: number): Promise<string> {
-    const messages = await this.fetch(topics, count, tokenBudget)
-    return messages.map((message) => new TextDecoder().decode(message.payload)).join("\n")
+  /** `fetch` rendered as one newline-joined text block of each message's
+   * `contextMessageBody`. */
+  async block(
+    topics: readonly string[],
+    count: number,
+    tokenBudget?: number,
+    options: CallOptions = {}
+  ): Promise<string> {
+    const messages = await this.fetch(topics, count, tokenBudget, options)
+    return messages
+      .map((message) => new TextDecoder().decode(contextMessageBody(message)))
+      .join("\n")
   }
 
   /** The current tail of `topics` as a `Checkpoint`: fold up to it with the
    * `at` replay bound or resume after it with `from-checkpoint`. */
-  checkpoint(topics: readonly string[]): Promise<Checkpoint> {
-    return contextCheckpoint(this.laser, topics)
+  checkpoint(topics: readonly string[], options: CallOptions = {}): Promise<Checkpoint> {
+    return cancellable(options.signal, "context checkpoint", () =>
+      contextCheckpoint(this.laser, topics)
+    )
   }
 
   /** Binds a memory namespace or existing handle to this conversation. */
@@ -112,9 +134,12 @@ export class ContextScope {
     topics: readonly string[],
     bound: ReplayBound,
     initial: State,
-    fold: (state: State, message: ContextMessage) => State
+    fold: (state: State, message: ContextMessage) => State,
+    options: CallOptions = {}
   ): Promise<State> {
-    return ConversationState.load(this.laser, this.conversation, topics, bound, initial, fold)
+    return cancellable(options.signal, "context state", () =>
+      ConversationState.load(this.laser, this.conversation, topics, bound, initial, fold)
+    )
   }
 
   /** Like `state` but seeded through a `SnapshotStore`: the newest snapshot's
@@ -125,16 +150,19 @@ export class ContextScope {
     topics: readonly string[],
     init: State,
     fold: (state: State, message: ContextMessage) => State,
-    decodeState?: (bytes: Uint8Array) => State
+    decodeState?: (bytes: Uint8Array) => State,
+    options: CallOptions = {}
   ): Promise<State> {
-    return ConversationState.loadWith(
-      this.laser,
-      store,
-      this.conversation,
-      topics,
-      init,
-      fold,
-      decodeState
+    return cancellable(options.signal, "context state", () =>
+      ConversationState.loadWith(
+        this.laser,
+        store,
+        this.conversation,
+        topics,
+        init,
+        fold,
+        decodeState
+      )
     )
   }
 }
@@ -186,20 +214,21 @@ export class ScopedMemory {
    * reading the managed view. */
   search(
     query: string,
-    options: { readonly limit?: number; readonly folded?: boolean } = {}
+    options: CallOptions & { readonly limit?: number; readonly folded?: boolean } = {}
   ): Promise<readonly MemoryItem[]> {
     const recall = this.recall()
       .keyword(query)
       .limit(options.limit ?? DEFAULT_SEARCH_LIMIT)
-    return (options.folded === true ? recall.folded() : recall).fetch()
+    return (options.folded === true ? recall.folded() : recall).fetch(options)
   }
 
   /** This conversation's recalled items as one prompt-ready block, trimmed to
    * `tokenBudget` estimated tokens when given. */
-  block(tokenBudget?: number): Promise<string> {
+  block(tokenBudget?: number, options: CallOptions = {}): Promise<string> {
     return this.handle.context(
       { conversation: this.conversation },
-      tokenBudget === undefined ? {} : { tokenBudget }
+      tokenBudget === undefined ? {} : { tokenBudget },
+      options
     )
   }
 
@@ -212,13 +241,13 @@ export class ScopedMemory {
   /** Forgets the item `id` when it was remembered in this conversation. The
    * tombstone carries the conversation, and both the log fold and the managed
    * view leave an item of another conversation untouched. */
-  forget(id: MemoryId): Promise<void> {
-    return this.handle.forget({ conversation: this.conversation }, id)
+  forget(id: MemoryId, options: CallOptions = {}): Promise<void> {
+    return this.handle.forget({ conversation: this.conversation }, id, options)
   }
 
   /** Records `feedback` on the item it targets when that item was remembered
    * in this conversation, scoped like `forget`. */
-  improve(feedback: Feedback): Promise<MemoryId> {
-    return this.handle.improve({ conversation: this.conversation }, feedback)
+  improve(feedback: Feedback, options: CallOptions = {}): Promise<MemoryId> {
+    return this.handle.improve({ conversation: this.conversation }, feedback, options)
   }
 }

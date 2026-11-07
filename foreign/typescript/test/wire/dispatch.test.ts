@@ -5,6 +5,7 @@ import { test } from "node:test"
 import {
   type AgentEnvelope,
   type AgentKind,
+  METADATA_RECORDED,
   METADATA_ROLE,
   type TaskState,
   TaskStateName,
@@ -27,6 +28,7 @@ import {
 } from "../../src/wire/dispatch.js"
 import { consumerFilterDigest, validateFilterName } from "../../src/wire/filter.js"
 import { ConversationId } from "../../src/wire/ids.js"
+import type { Value } from "../../src/wire/value.js"
 
 interface Case {
   readonly name: string
@@ -38,6 +40,7 @@ interface Case {
     readonly body?: string
     readonly target?: string
     readonly role?: string
+    readonly recorded?: boolean
     readonly memory?: "item" | "forget" | "feedback"
     readonly other?: string
   }
@@ -86,6 +89,9 @@ function envelope(record: Case["record"]): AgentEnvelope {
         : record.body === "end"
           ? encodeNamed(encodeSessionEnd({}))
           : new TextEncoder().encode("{}")
+  const metadata = new Map<string, Value>()
+  if (record.role !== undefined) metadata.set(METADATA_ROLE, { kind: "str", value: record.role })
+  if (record.recorded === true) metadata.set(METADATA_RECORDED, { kind: "bool", value: true })
   return {
     kind: record.kind as AgentKind,
     conversation: ConversationId.fromU128(2n),
@@ -96,9 +102,7 @@ function envelope(record: Case["record"]): AgentEnvelope {
     ...(record.operation !== undefined ? { operation: record.operation } : {}),
     ...(record.task_state !== undefined ? { taskState: taskState(record.task_state) } : {}),
     ...(record.target !== undefined ? { target: parseAgentId(record.target) } : {}),
-    ...(record.role !== undefined
-      ? { metadata: new Map([[METADATA_ROLE, { kind: "str" as const, value: record.role }]]) }
-      : {})
+    ...(metadata.size > 0 ? { metadata } : {})
   }
 }
 
@@ -135,7 +139,7 @@ function hex(bytes: Uint8Array): string {
 void test("given_the_shared_table_when_records_are_classified_then_should_match_every_row", async () => {
   const table = JSON.parse(await readFile(TABLE, "utf8")) as Table
   const me = parseAgentId(table.agent)
-  assert.equal(table.cases.length, 50)
+  assert.equal(table.cases.length, 55)
   for (const row of table.cases) {
     const record = sessionRecord(row.record)
     assert.equal(displayType(record, row.topic), row.display, row.name)

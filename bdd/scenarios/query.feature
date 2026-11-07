@@ -1,9 +1,10 @@
 @query
 Feature: Query semantics over a materialized index
-  The query DSL run against a materialized read model, served here by the
-  reference in-memory engine (no Iggy, no transport). It mirrors LaserData
-  Cloud, so every SDK and the managed backend must return the same rows for the
-  same query. This is the cross-SDK query-semantics contract.
+  The query DSL semantics over a materialized read model, run by each runner's
+  own in-memory reference engine (no Iggy, no transport, no SDK query builder).
+  They describe the semantics and prove neither an SDK nor a managed backend.
+  The SDK builders run the same queries against a managed deployment in
+  query_managed.feature.
 
   Background:
     Given a query index "api_calls" seeded with sample api-call rows

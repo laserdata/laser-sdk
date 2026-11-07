@@ -1,6 +1,7 @@
 import { CodecError, InvalidError } from "../client/errors.js"
 import {
   type CborMap,
+  cborFloat,
   expectArray,
   expectBoolean,
   expectMap,
@@ -36,6 +37,8 @@ export interface MemoryRowScope {
   readonly conversation?: string
   readonly source?: SourceRef
   readonly timestampMicros?: bigint
+  /** The folded feedback weight, the sum of every feedback record for the item. */
+  readonly weight?: number
 }
 
 export function encodeMemoryRowScope(scope: MemoryRowScope): Map<string, unknown> {
@@ -47,6 +50,7 @@ export function encodeMemoryRowScope(scope: MemoryRowScope): Map<string, unknown
   if (scope.conversation !== undefined) map.set("conversation", scope.conversation)
   if (scope.source !== undefined) map.set("source", encodeSourceRef(scope.source))
   if (scope.timestampMicros !== undefined) map.set("timestamp_micros", scope.timestampMicros)
+  if (scope.weight !== undefined) map.set("weight", cborFloat(scope.weight))
   return map
 }
 
@@ -57,6 +61,7 @@ export function decodeMemoryRowScope(map: CborMap, context: string): MemoryRowSc
   const app = field.optionalString(map, "app", context)
   const conversation = field.optionalString(map, "conversation", context)
   const timestampMicros = field.optionalU64(map, "timestamp_micros", context)
+  const weight = field.optionalF64(map, "weight", context)
   return {
     ...(kind !== undefined ? { kind } : {}),
     ...(agent !== undefined ? { agent } : {}),
@@ -66,7 +71,8 @@ export function decodeMemoryRowScope(map: CborMap, context: string): MemoryRowSc
     ...(map.has("source")
       ? { source: decodeSourceRef(map.get("source"), `${context}.source`) }
       : {}),
-    ...(timestampMicros !== undefined ? { timestampMicros } : {})
+    ...(timestampMicros !== undefined ? { timestampMicros } : {}),
+    ...(weight !== undefined ? { weight } : {})
   }
 }
 
@@ -116,31 +122,38 @@ export function kvEntryKeyStr(entry: KvEntry): string | undefined {
   }
 }
 
+/** One page of scanned entries in key order. `page` counts from 1, and
+ * `totalResults` counts every live match of the scan. */
 export interface KvPage {
-  readonly entries: readonly KvEntry[]
-  readonly cursor?: Uint8Array
+  readonly items: readonly KvEntry[]
+  readonly page: number
+  readonly totalPages: number
+  readonly totalResults: number
 }
 
 export function encodeKvPage(page: KvPage): Map<string, unknown> {
   const map = new Map<string, unknown>()
   map.set(
-    "entries",
-    page.entries.map((entry) => encodeKvEntry(entry))
+    "items",
+    page.items.map((entry) => encodeKvEntry(entry))
   )
-  if (page.cursor !== undefined) map.set("cursor", page.cursor)
+  map.set("page", page.page)
+  map.set("total_pages", page.totalPages)
+  map.set("total_results", page.totalResults)
   return map
 }
 
 export function decodeKvPage(map: CborMap, context: string): KvPage {
-  const cursor = field.optionalBytes(map, "cursor", context)
   return {
-    entries: field.requiredArray(map, "entries", context, (item, index) =>
+    items: field.requiredArray(map, "items", context, (item, index) =>
       decodeKvEntry(
-        expectMap(item, `${context}.entries[${String(index)}]`),
-        `${context}.entries[${String(index)}]`
+        expectMap(item, `${context}.items[${String(index)}]`),
+        `${context}.items[${String(index)}]`
       )
     ),
-    ...(cursor !== undefined ? { cursor } : {})
+    page: field.requiredU32(map, "page", context),
+    totalPages: field.requiredU32(map, "total_pages", context),
+    totalResults: field.requiredU32(map, "total_results", context)
   }
 }
 
@@ -189,6 +202,9 @@ export interface KvSet {
   readonly key: Uint8Array
   readonly value: Uint8Array
   readonly expiresAtMicros?: bigint
+  /** Expire this long after the mutation's server timestamp, the form a
+   * client clock cannot skew. Mutually exclusive with `expiresAtMicros`. */
+  readonly ttlMicros?: bigint
 }
 
 export function encodeKvSet(set: KvSet): Map<string, unknown> {
@@ -199,11 +215,13 @@ export function encodeKvSet(set: KvSet): Map<string, unknown> {
   map.set("key", set.key)
   map.set("value", set.value)
   if (set.expiresAtMicros !== undefined) map.set("expires_at_micros", set.expiresAtMicros)
+  if (set.ttlMicros !== undefined) map.set("ttl_micros", set.ttlMicros)
   return map
 }
 
 export function decodeKvSet(map: CborMap, context: string): KvSet {
   const expiresAtMicros = field.optionalU64(map, "expires_at_micros", context)
+  const ttlMicros = field.optionalU64(map, "ttl_micros", context)
   const session = field.optionalMap(map, "session", context)
   return {
     v: field.requiredU32(map, "v", context),
@@ -211,7 +229,8 @@ export function decodeKvSet(map: CborMap, context: string): KvSet {
     ...(session !== undefined ? { session: decodeSessionRef(session, `${context}.session`) } : {}),
     key: field.requiredBytes(map, "key", context),
     value: field.requiredBytes(map, "value", context),
-    ...(expiresAtMicros !== undefined ? { expiresAtMicros } : {})
+    ...(expiresAtMicros !== undefined ? { expiresAtMicros } : {}),
+    ...(ttlMicros !== undefined ? { ttlMicros } : {})
   }
 }
 
@@ -242,6 +261,9 @@ export interface KvCas {
   readonly key: Uint8Array
   readonly value: Uint8Array
   readonly expiresAtMicros?: bigint
+  /** Expire this long after the mutation's server timestamp, the form a
+   * client clock cannot skew. Mutually exclusive with `expiresAtMicros`. */
+  readonly ttlMicros?: bigint
   readonly expect: CasExpect
 }
 
@@ -253,12 +275,14 @@ export function encodeKvCas(cas: KvCas): Map<string, unknown> {
   map.set("key", cas.key)
   map.set("value", cas.value)
   if (cas.expiresAtMicros !== undefined) map.set("expires_at_micros", cas.expiresAtMicros)
+  if (cas.ttlMicros !== undefined) map.set("ttl_micros", cas.ttlMicros)
   map.set("expect", encodeCasExpect(cas.expect))
   return map
 }
 
 export function decodeKvCas(map: CborMap, context: string): KvCas {
   const expiresAtMicros = field.optionalU64(map, "expires_at_micros", context)
+  const ttlMicros = field.optionalU64(map, "ttl_micros", context)
   const session = field.optionalMap(map, "session", context)
   return {
     v: field.requiredU32(map, "v", context),
@@ -267,6 +291,7 @@ export function decodeKvCas(map: CborMap, context: string): KvCas {
     key: field.requiredBytes(map, "key", context),
     value: field.requiredBytes(map, "value", context),
     ...(expiresAtMicros !== undefined ? { expiresAtMicros } : {}),
+    ...(ttlMicros !== undefined ? { ttlMicros } : {}),
     expect: decodeCasExpect(map.get("expect"), context)
   }
 }
@@ -275,9 +300,14 @@ export interface KvCasFenced {
   /** The operation version, the current one when absent. */
   readonly v?: number
   readonly namespace: string
+  /** The session this write is linked to, as on `KvCas`. */
+  readonly session?: SessionRef
   readonly key: Uint8Array
   readonly value: Uint8Array
   readonly expiresAtMicros?: bigint
+  /** Expire this long after the mutation's server timestamp, the form a
+   * client clock cannot skew. Mutually exclusive with `expiresAtMicros`. */
+  readonly ttlMicros?: bigint
   readonly expect: CasExpect
   /** The coordination namespace holding the lease and fence rows, authorized
    * separately from the target namespace. */
@@ -318,6 +348,8 @@ function validateKvCasFenced(cas: KvCasFenced): void {
     )
   }
   if (cas.fenceToken === 0n) throw new InvalidError("fence token must not be zero")
+  if (cas.expiresAtMicros !== undefined && cas.ttlMicros !== undefined)
+    throw new InvalidError("a write names either expires_at_micros or ttl_micros, not both")
 }
 
 function requireLeaseVersion(map: CborMap, context: string): void {
@@ -348,9 +380,11 @@ export function encodeKvCasFenced(cas: KvCasFenced): Map<string, unknown> {
   const map = new Map<string, unknown>()
   map.set("v", cas.v ?? KV_LEASE_OP_VERSION)
   map.set("namespace", cas.namespace)
+  if (cas.session !== undefined) map.set("session", encodeSessionRef(cas.session))
   map.set("key", cas.key)
   map.set("value", cas.value)
   if (cas.expiresAtMicros !== undefined) map.set("expires_at_micros", cas.expiresAtMicros)
+  if (cas.ttlMicros !== undefined) map.set("ttl_micros", cas.ttlMicros)
   map.set("expect", encodeCasExpect(cas.expect))
   map.set("fence_namespace", cas.fenceNamespace)
   map.set("fence_key", cas.fenceKey)
@@ -361,13 +395,19 @@ export function encodeKvCasFenced(cas: KvCasFenced): Map<string, unknown> {
 export function decodeKvCasFenced(map: CborMap, context: string): KvCasFenced {
   requireLeaseVersion(map, context)
   const expiresAtMicros = field.optionalU64(map, "expires_at_micros", context)
+  const ttlMicros = field.optionalU64(map, "ttl_micros", context)
+  const session = field.optionalMap(map, "session", context)
   return decodeValidated(
     {
       v: field.requiredU32(map, "v", context),
       namespace: field.requiredString(map, "namespace", context),
+      ...(session !== undefined
+        ? { session: decodeSessionRef(session, `${context}.session`) }
+        : {}),
       key: field.requiredBytes(map, "key", context),
       value: field.requiredBytes(map, "value", context),
       ...(expiresAtMicros !== undefined ? { expiresAtMicros } : {}),
+      ...(ttlMicros !== undefined ? { ttlMicros } : {}),
       expect: decodeCasExpect(map.get("expect"), context),
       fenceNamespace: field.requiredString(map, "fence_namespace", context),
       fenceKey: field.requiredBytes(map, "fence_key", context),
@@ -438,6 +478,9 @@ export interface KvExpire {
   readonly namespace: string
   readonly key: Uint8Array
   readonly expiresAtMicros?: bigint
+  /** Expire this long after the mutation's server timestamp, the form a
+   * client clock cannot skew. Mutually exclusive with `expiresAtMicros`. */
+  readonly ttlMicros?: bigint
 }
 
 export function encodeKvExpire(expire: KvExpire): Map<string, unknown> {
@@ -446,16 +489,19 @@ export function encodeKvExpire(expire: KvExpire): Map<string, unknown> {
   map.set("namespace", expire.namespace)
   map.set("key", expire.key)
   if (expire.expiresAtMicros !== undefined) map.set("expires_at_micros", expire.expiresAtMicros)
+  if (expire.ttlMicros !== undefined) map.set("ttl_micros", expire.ttlMicros)
   return map
 }
 
 export function decodeKvExpire(map: CborMap, context: string): KvExpire {
   const expiresAtMicros = field.optionalU64(map, "expires_at_micros", context)
+  const ttlMicros = field.optionalU64(map, "ttl_micros", context)
   return {
     v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
     key: field.requiredBytes(map, "key", context),
-    ...(expiresAtMicros !== undefined ? { expiresAtMicros } : {})
+    ...(expiresAtMicros !== undefined ? { expiresAtMicros } : {}),
+    ...(ttlMicros !== undefined ? { ttlMicros } : {})
   }
 }
 
@@ -740,14 +786,19 @@ export function decodeKvMetadata(map: CborMap, context: string): KvMetadata {
 export interface KvNamespaces {
   /** The operation version, the current one when absent. */
   readonly v?: number
+  /** The stream whose namespaces are listed, required in stream tenancy. */
+  readonly stream?: string
 }
 
 export function encodeKvNamespaces(request: KvNamespaces = {}): Map<string, unknown> {
-  return new Map<string, unknown>([["v", request.v ?? KV_OP_VERSION]])
+  const map = new Map<string, unknown>([["v", request.v ?? KV_OP_VERSION]])
+  if (request.stream !== undefined) map.set("stream", request.stream)
+  return map
 }
 
 export function decodeKvNamespaces(map: CborMap, context: string): KvNamespaces {
-  return { v: field.requiredU32(map, "v", context) }
+  const stream = field.optionalString(map, "stream", context)
+  return { v: field.requiredU32(map, "v", context), ...(stream !== undefined ? { stream } : {}) }
 }
 
 export interface KvNamespaceInfo {
@@ -781,8 +832,17 @@ export interface KvScan {
   /** The stream the lens conversation belongs to, set alongside
    * `conversation` by a client that scopes its resources to a stream. */
   readonly stream?: string
-  readonly limit: number
-  readonly cursor?: Uint8Array
+  /** The memory scope lenses: keep only memory-view rows stamped with this
+   * user, agent, or app. */
+  readonly user?: string
+  readonly agent?: string
+  readonly app?: string
+  /** The 1-based page, over the matches in key order. Zero reads the first
+   * page. */
+  readonly page: number
+  /** The entries per page, at most `MAX_SCAN_LIMIT`. Zero reads
+   * `DEFAULT_SCAN_LIMIT`. */
+  readonly results: number
 }
 
 export function encodeKvScan(scan: KvScan): Map<string, unknown> {
@@ -795,8 +855,11 @@ export function encodeKvScan(scan: KvScan): Map<string, unknown> {
   if (scan.keyContains !== undefined) map.set("key_contains", scan.keyContains)
   if (scan.conversation !== undefined) map.set("conversation", scan.conversation)
   if (scan.stream !== undefined) map.set("stream", scan.stream)
-  map.set("limit", scan.limit)
-  if (scan.cursor !== undefined) map.set("cursor", scan.cursor)
+  if (scan.user !== undefined) map.set("user", scan.user)
+  if (scan.agent !== undefined) map.set("agent", scan.agent)
+  if (scan.app !== undefined) map.set("app", scan.app)
+  map.set("page", scan.page)
+  map.set("results", scan.results)
   return map
 }
 
@@ -807,7 +870,9 @@ export function decodeKvScan(map: CborMap, context: string): KvScan {
   const keyContains = field.optionalString(map, "key_contains", context)
   const conversation = field.optionalString(map, "conversation", context)
   const stream = field.optionalString(map, "stream", context)
-  const cursor = field.optionalBytes(map, "cursor", context)
+  const user = field.optionalString(map, "user", context)
+  const agent = field.optionalString(map, "agent", context)
+  const app = field.optionalString(map, "app", context)
   return {
     v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
@@ -817,8 +882,11 @@ export function decodeKvScan(map: CborMap, context: string): KvScan {
     ...(keyContains !== undefined ? { keyContains } : {}),
     ...(conversation !== undefined ? { conversation } : {}),
     ...(stream !== undefined ? { stream } : {}),
-    limit: field.requiredU32(map, "limit", context),
-    ...(cursor !== undefined ? { cursor } : {})
+    ...(user !== undefined ? { user } : {}),
+    ...(agent !== undefined ? { agent } : {}),
+    ...(app !== undefined ? { app } : {}),
+    page: field.optionalU32(map, "page", context) ?? 0,
+    results: field.requiredU32(map, "results", context)
   }
 }
 
@@ -1044,9 +1112,13 @@ export type KvError =
   | { readonly kind: "version"; readonly expected: number; readonly got: number }
   | { readonly kind: "versionConflict"; readonly current?: bigint }
   | { readonly kind: "leaseLost" }
+  | { readonly kind: "leaseHeld"; readonly expiresAtMicros?: bigint }
   | { readonly kind: "notFound" }
   | { readonly kind: "notLeader" }
   | { readonly kind: "stale"; readonly required: MutationPosition }
+  | { readonly kind: "barrierUnreachable"; readonly required: MutationPosition }
+  | { readonly kind: "forbidden"; readonly message: string }
+  | { readonly kind: "invalidExpiry"; readonly message: string }
   | { readonly kind: "unrecognized"; readonly tag: string; readonly value: unknown }
 
 export function encodeKvError(error: KvError): unknown {
@@ -1088,6 +1160,13 @@ export function encodeKvError(error: KvError): unknown {
       ])
     case "leaseLost":
       return "LeaseLost"
+    case "leaseHeld":
+      return new Map([
+        [
+          "LeaseHeld",
+          new Map<string, unknown>([["expires_at_micros", error.expiresAtMicros ?? null]])
+        ]
+      ])
     case "notFound":
       return "NotFound"
     case "notLeader":
@@ -1096,6 +1175,17 @@ export function encodeKvError(error: KvError): unknown {
       return new Map([
         ["Stale", new Map<string, unknown>([["required", encodeMutationPosition(error.required)]])]
       ])
+    case "barrierUnreachable":
+      return new Map([
+        [
+          "BarrierUnreachable",
+          new Map<string, unknown>([["required", encodeMutationPosition(error.required)]])
+        ]
+      ])
+    case "forbidden":
+      return new Map([["Forbidden", error.message]])
+    case "invalidExpiry":
+      return new Map([["InvalidExpiry", error.message]])
     case "unrecognized":
       return new Map([[error.tag, error.value]])
   }
@@ -1152,6 +1242,25 @@ export function decodeKvError(value: unknown, context: string): KvError {
         )
       }
     }
+    case "BarrierUnreachable": {
+      const unreachableMap = expectMap(inner, context)
+      return {
+        kind: "barrierUnreachable",
+        required: decodeMutationPosition(
+          field.requiredMap(unreachableMap, "required", context),
+          `${context}.required`
+        )
+      }
+    }
+    case "LeaseHeld": {
+      const heldMap = expectMap(inner, context)
+      const expiresAtMicros = field.optionalU64(heldMap, "expires_at_micros", context)
+      return { kind: "leaseHeld", ...(expiresAtMicros !== undefined ? { expiresAtMicros } : {}) }
+    }
+    case "Forbidden":
+      return { kind: "forbidden", message: expectString(inner, context) }
+    case "InvalidExpiry":
+      return { kind: "invalidExpiry", message: expectString(inner, context) }
     default:
       return { kind: "unrecognized", tag, value: inner }
   }

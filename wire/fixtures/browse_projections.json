@@ -1,51 +1,56 @@
-[
-  {
-    "projection": {
-      "id": "reading.v1",
-      "name": "reading",
-      "version": 1,
-      "content_type": "json",
-      "extraction": {
-        "fields": [
-          {
-            "name": "reading_id",
-            "pointer": "/reading_id"
-          },
-          {
-            "name": "host",
-            "pointer": "/host/id"
-          },
-          {
-            "name": "cpu",
-            "pointer": "/cpu",
-            "field_type": "int"
-          }
-        ],
-        "vector_field": "/embedding",
-        "inline_payload": true
+{
+  "items": [
+    {
+      "projection": {
+        "id": "reading.v1",
+        "name": "reading",
+        "version": 1,
+        "content_type": "json",
+        "extraction": {
+          "fields": [
+            {
+              "name": "reading_id",
+              "pointer": "/reading_id"
+            },
+            {
+              "name": "host",
+              "pointer": "/host/id"
+            },
+            {
+              "name": "cpu",
+              "pointer": "/cpu",
+              "field_type": "int"
+            }
+          ],
+          "vector_field": "/embedding",
+          "inline_payload": true
+        },
+        "inline_payload_default": true
       },
-      "inline_payload_default": true
-    },
-    "bindings": [
-      {
-        "source": {
-          "stream": "fleet",
-          "topic": "readings"
-        },
-        "allowed_projections": [
-          "reading.v1"
-        ],
-        "default_projection": "reading.v1",
-        "backend": {
-          "resource_id": "00000000000000000000000004",
-          "generation": 2
-        },
-        "index": "readings_rows",
-        "retention": {
-          "kind": "time_to_live",
-          "ttl_micros": 3600000000
+      "bindings": [
+        {
+          "source": {
+            "stream": "fleet",
+            "topic": "readings"
+          },
+          "allowed_projections": [
+            "reading.v1"
+          ],
+          "default_projection": "reading.v1",
+          "backend": {
+            "resource_id": "00000000000000000000000004",
+            "generation": 2
+          },
+          "index": "readings_rows",
+          "retention": {
+            "kind": "time_to_live",
+            "ttl_micros": 3600000000
+          }
         }
-      }
-    ]
-  }
-]
+      ]
+    }
+  ],
+  "page": 1,
+  "total_pages": 1,
+  "total_results": 1
+}

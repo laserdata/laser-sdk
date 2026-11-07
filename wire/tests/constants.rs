@@ -6,6 +6,8 @@
 use laser_wire::agent;
 use laser_wire::codes::*;
 use laser_wire::content::ContentType;
+#[cfg(feature = "cbor")]
+use laser_wire::dispatch;
 use laser_wire::headers;
 use laser_wire::limits;
 use laser_wire::result::ResultCode;
@@ -19,10 +21,6 @@ fn given_managed_command_codes_when_compared_then_should_match_the_dictionary() 
     assert_eq!(AGDX_SET_CLIENT_METADATA_CODE, 1_000_002);
     assert_eq!(AGDX_GET_CLIENTS_METADATA_CODE, 1_000_003);
     assert_eq!(AGDX_BATCH_CODE, 1_000_020);
-    assert_eq!(AGDX_CHECKPOINT_CODE, 1_000_021);
-    assert_eq!(AGDX_DESTINATION_GET_CODE, 1_000_022);
-    assert_eq!(AGDX_DESTINATION_LIST_CODE, 1_000_023);
-    assert_eq!(AGDX_QUERY_ROUTE_LIST_CODE, 1_000_024);
     assert_eq!(AGDX_AUTHZ_BASE, 1_000_100);
     assert_eq!(AGDX_AUTHZ_WHOAMI_CODE, 1_000_100);
     assert_eq!(AGDX_AUTHZ_LIST_ROLES_CODE, 1_000_101);
@@ -33,12 +31,8 @@ fn given_managed_command_codes_when_compared_then_should_match_the_dictionary() 
     assert_eq!(AGDX_AUTHZ_BIND_ROLES_CODE, 1_000_106);
     assert_eq!(AGDX_AUTHZ_HISTORY_CODE, 1_000_107);
     assert_eq!(AGDX_CONTROL_PUBLISH_CODE, 1_000_108);
-    assert_eq!(AGDX_DESTINATION_HTTP_CODE, 1_000_025);
     assert_eq!(AGDX_QUERY_BASE, 1_000_200);
     assert_eq!(AGDX_QUERY_CODE, 1_000_200);
-    assert_eq!(AGDX_QUERY_PAGE_CODE, 1_000_201);
-    assert_eq!(AGDX_QUERY_CANCEL_CODE, 1_000_202);
-    assert_eq!(AGDX_QUERY_STATUS_CODE, 1_000_203);
     assert_eq!(AGDX_GET_PROJECTION_CODE, 1_000_210);
     assert_eq!(AGDX_LIST_PROJECTIONS_CODE, 1_000_211);
     assert_eq!(AGDX_GET_SCHEMA_CODE, 1_000_220);
@@ -112,8 +106,6 @@ fn given_op_versions_when_compared_then_should_match_the_pinned_values() {
     assert_eq!(BATCH_OP_VERSION, 1);
     assert_eq!(CHANGE_OP_VERSION, 1);
     assert_eq!(CLIENT_METADATA_OP_VERSION, 1);
-    assert_eq!(CHECKPOINT_OP_VERSION, 1);
-    assert_eq!(DESTINATION_HTTP_OP_VERSION, 1);
     assert_eq!(PRESENCE_OP_VERSION, 1);
     assert_eq!(FILTER_OP_VERSION, 1);
     assert_eq!(laser_wire::filter::FILTER_EVALUATOR_VERSION, 1);
@@ -196,6 +188,9 @@ fn given_agent_vocabulary_when_compared_then_should_match_the_dictionary() {
     assert_eq!(agent::OPERATION_SESSION_UNPARKED, "session_unparked");
     assert_eq!(agent::METADATA_ROLE, "role");
     assert_eq!(agent::METADATA_BRIDGE_HOPS, "bridge_hops");
+    assert_eq!(agent::METADATA_RECORDED, "recorded");
+    #[cfg(feature = "cbor")]
+    assert_eq!(dispatch::OPERATION_INPUT_REQUEST, "input_request");
     assert_eq!(agent::SIGNATURE_SCHEME_ED25519, 1);
     assert_eq!(agent::SIGNATURE_DOMAIN, b"agdx.signature.v1");
 }
@@ -267,6 +262,8 @@ fn given_limits_when_compared_then_should_match_the_pinned_values() {
     assert_eq!(limits::MAX_METADATA_TOTAL_BYTES, 8192);
     assert_eq!(limits::MAX_BODY_REFERENCE_BYTES, 1024);
     assert_eq!(limits::MAX_CARD_CAPABILITIES, 64);
+    assert_eq!(limits::REGISTRY_FACT_TTL_MICROS, 300_000_000);
+    assert_eq!(limits::MAX_REGISTRY_FACT_TTL_MICROS, 86_400_000_000);
     assert_eq!(limits::MAX_CLIENT_METADATA, 64 * 1024);
     assert_eq!(limits::MAX_PROJECTION_ID_BYTES, 255);
     assert_eq!(limits::MAX_PROJECTION_NAME_BYTES, 255);
@@ -276,7 +273,6 @@ fn given_limits_when_compared_then_should_match_the_pinned_values() {
     assert_eq!(limits::MAX_MEMORY_ID_BYTES, 255);
     assert_eq!(limits::MAX_SESSION_LABEL_BYTES, 256);
     assert_eq!(limits::MAX_SESSION_TEXT_QUERY_BYTES, 1024);
-    assert_eq!(limits::MAX_SESSION_CURSOR_BYTES, 512);
     assert_eq!(limits::MAX_HOLDER_ID_BYTES, 128);
 }
 
@@ -363,8 +359,10 @@ fn given_http_routes_when_compared_then_should_match_the_router() {
     assert_eq!(laser_wire::http::PARAM_STATUS, "status");
     assert_eq!(laser_wire::http::PARAM_AGENT, "agent");
     assert_eq!(laser_wire::http::PARAM_SURFACE, "surface");
-    assert_eq!(laser_wire::http::PARAM_AFTER, "after");
-    assert_eq!(laser_wire::http::PARAM_TOTAL, "total");
+    assert_eq!(laser_wire::http::PARAM_AS_OF, "as_of");
+    assert_eq!(laser_wire::http::PARAM_SERIES, "series");
+    assert_eq!(laser_wire::http::PARAM_PAGE, "page");
+    assert_eq!(laser_wire::http::PARAM_RESULTS, "results");
     assert_eq!(laser_wire::http::AUTHZ_WHOAMI_PATH, "/agdx/authz/whoami");
     assert_eq!(laser_wire::http::AUTHZ_ROLES_PATH, "/agdx/authz/roles");
     assert_eq!(
@@ -379,27 +377,22 @@ fn given_http_routes_when_compared_then_should_match_the_router() {
 
 #[test]
 fn given_session_queries_when_decoded_then_should_take_the_stream_from_the_path() {
-    let query: laser_wire::http::SessionsQuery =
-        serde_json::from_str(r#"{"status":"active","total":true}"#).expect("session query decodes");
+    let query: laser_wire::http::SessionsQuery = serde_json::from_str(
+        r#"{"status":"active","page":2,"results":25,"as_of":4405,"series":42}"#,
+    )
+    .expect("session query decodes");
     assert_eq!(query.status.as_deref(), Some("active"));
-    assert!(query.want_total);
+    assert_eq!((query.page, query.results), (Some(2), Some(25)));
+    assert_eq!((query.as_of, query.series), (Some(4405), Some(42)));
     let events: laser_wire::http::SessionEventsQuery =
-        serde_json::from_str(r#"{"fixed_frontier":true}"#).expect("events query decodes");
-    assert!(events.fixed_frontier);
-    assert_eq!(events.limit, None);
+        serde_json::from_str("{}").expect("events query decodes");
+    assert_eq!(events, laser_wire::http::SessionEventsQuery::default());
     let changes: laser_wire::http::SessionChangesQuery =
         serde_json::from_str("{}").expect("changes query decodes");
-    assert_eq!(changes.after, 0);
-    assert_eq!(changes.series, None);
+    assert_eq!((changes.page, changes.results), (None, None));
     let changes: laser_wire::http::SessionChangesQuery =
-        serde_json::from_str(r#"{"after":17,"limit":10,"series":42}"#)
-            .expect("changes query with series decodes");
-    assert_eq!(changes.series, Some(42));
-    assert_eq!(
-        serde_json::to_value(&changes).expect("changes query serializes"),
-        serde_json::json!({"after":17,"limit":10,"series":42})
-    );
-    assert_eq!(laser_wire::http::PARAM_FIXED_FRONTIER, "fixed_frontier");
+        serde_json::from_str(r#"{"page":45,"results":100}"#).expect("changes page decodes");
+    assert_eq!((changes.page, changes.results), (Some(45), Some(100)));
     assert_eq!(laser_wire::http::PARAM_HISTORY_LIMIT, "history_limit");
     assert_eq!(laser_wire::http::PARAM_TEXT, "text");
     assert_eq!(laser_wire::http::PARAM_ROOT, "root");
@@ -408,6 +401,13 @@ fn given_session_queries_when_decoded_then_should_take_the_stream_from_the_path(
         "stream:orders/_agdx/changes"
     );
     assert_eq!(laser_wire::hello::feature::STREAM_TENANCY, 1 << 13);
+    assert_eq!(laser_wire::hello::feature::MATERIALIZATIONS, 1 << 14);
+    assert_eq!(laser_wire::schema::ORIGINAL_HEADERS_FIELD_ID, 2_000_000_015);
+    assert_eq!(
+        laser_wire::schema::ORIGINAL_HEADERS_FIELD_NAME,
+        "__laser_original_headers"
+    );
+    assert_eq!(laser_wire::control::ProjectionKind::Record.code(), 2);
     assert_eq!(
         laser_wire::http::fork_rows_path("stream:acme/try"),
         "/agdx/forks/stream%3Aacme%2Ftry/rows"

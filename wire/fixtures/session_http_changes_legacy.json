@@ -1,5 +1,8 @@
 {
-  "rows": [],
-  "floor": 1,
-  "resync": false
+  "items": [],
+  "page": 1,
+  "total_pages": 0,
+  "total_results": 0,
+  "results": 10,
+  "floor": 1
 }

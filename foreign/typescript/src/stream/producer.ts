@@ -1,8 +1,21 @@
-import { CREATE_RACE_ATTEMPTS } from "../retry.js"
+import { CREATE_RACE_ATTEMPTS, jittered } from "../retry.js"
 import { millisToMicros } from "../client/duration.js"
 import { type BytesLike, ownedBytes } from "../client/bytes.js"
+import {
+  type CallOptions,
+  abortable,
+  cancellable,
+  delay,
+  throwIfAborted
+} from "../client/call-options.js"
 import { iggyErrorCode } from "../client/error-classify.js"
-import { InvalidError, PublishFailedError, TimeoutError, TransportError } from "../client/errors.js"
+import {
+  CancelledError,
+  InvalidError,
+  PublishFailedError,
+  TimeoutError,
+  TransportError
+} from "../client/errors.js"
 import { publishWithin } from "../client/publish-options.js"
 import {
   type LaserTransport,
@@ -15,6 +28,7 @@ import {
   withMessageIds,
   xxHash32
 } from "../iggy/apache-iggy.js"
+import { decodeProvenanceHeaders, type Provenance } from "../provenance/provenance.js"
 import type { HeaderValue } from "./header-value.js"
 import type { Headers } from "./message.js"
 import { ProducerRecorder } from "./producer-statistics.js"
@@ -25,8 +39,9 @@ export interface ProducerOptions {
   /** Resend attempts after a failed publish. Defaults to the connection's
    * publish retries. */
   readonly retries?: number
-  /** First retry delay, doubled on each later attempt up to 30 seconds. Must
-   * be positive. Defaults to the connection's publish retry backoff. */
+  /** First retry delay, doubled on each later attempt up to 30 seconds, each
+   * wait drawn from the upper half of its delay. Must be positive. Defaults to
+   * the connection's publish retry backoff. */
   readonly retryBackoffMs?: number
   /** Create the stream before the first send when it does not exist.
    * Defaults to `false`, like Rust and Python: a stream is provisioned with
@@ -253,12 +268,18 @@ function backgroundSettings(background: ProducerBackgroundOptions): BackgroundSe
   }
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
 function lowerMessage(message: ProducerMessage): MessageWithHeaders {
   return { payload: message.payload, headers: message.headers }
+}
+
+// The provenance a record's headers carry, `undefined` for a record without
+// a complete provenance, which the governor then sees unattributed.
+function headerProvenance(headers: ReadonlyMap<string, HeaderValue>): Provenance | undefined {
+  try {
+    return decodeProvenanceHeaders(headers)
+  } catch {
+    return undefined
+  }
 }
 
 /** Publishes directly with bounded retries and explicit routing. Unless told
@@ -288,17 +309,19 @@ export class Producer implements AsyncDisposable {
     private readonly transport: LaserTransport,
     private readonly streamName: string,
     private readonly topicName: string,
-    private readonly options: ProducerOptions = {}
+    private readonly options: ProducerOptions = {},
+    private readonly govern?: (payload: Uint8Array, provenance?: Provenance) => Promise<Uint8Array>
   ) {
     this.statistics = new ProducerRecorder(streamName, topicName, transport)
     this.routing =
       options.routing?.kind === "key"
         ? { kind: "key", key: routingKey(options.routing.key) }
         : (options.routing ?? { kind: "balanced" })
-    this.retries = options.retries ?? DEFAULT_RETRIES
+    const publish = transport.publishOptions?.()
+    this.retries = options.retries ?? publish?.maxRetries ?? DEFAULT_RETRIES
     this.retryBackoffMs =
       options.retryBackoffMs === undefined
-        ? DEFAULT_RETRY_BACKOFF_MS
+        ? (publish?.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS)
         : positiveDelay(options.retryBackoffMs, "producer retryBackoffMs")
     if (!Number.isSafeInteger(this.retries) || this.retries < 0) {
       throw new InvalidError("producer retries must be a non-negative safe integer")
@@ -347,9 +370,10 @@ export class Producer implements AsyncDisposable {
     transport: LaserTransport,
     streamName: string,
     topicName: string,
-    options: ProducerOptions = {}
+    options: ProducerOptions = {},
+    govern?: (payload: Uint8Array, provenance?: Provenance) => Promise<Uint8Array>
   ): Producer {
-    return new Producer(transport, streamName, topicName, options)
+    return new Producer(transport, streamName, topicName, options, govern)
   }
 
   /** @internal True when this producer queues sends in background mode. */
@@ -372,7 +396,8 @@ export class Producer implements AsyncDisposable {
           const retryable =
             error instanceof TimeoutError || (error instanceof TransportError && error.retryable)
           if (!retryable || attempt >= this.retries) throw error
-          await delay(this.directRetryDelayMs(attempt))
+          // Setup is shared by every send, so one caller's abort never stops it.
+          await delay(this.directRetryDelayMs(attempt), undefined, "producer setup")
         }
       }
     })().catch((error: unknown) => {
@@ -397,7 +422,7 @@ export class Producer implements AsyncDisposable {
         const code = iggyErrorCode(error)
         const raced = code === STREAM_NAME_ALREADY_EXISTS || code === TOPIC_NAME_ALREADY_EXISTS
         if (!raced || attempt >= CREATE_RACE_ATTEMPTS) throw error
-        await delay(50 * attempt)
+        await delay(50 * attempt, undefined, "producer setup")
       }
     }
   }
@@ -432,83 +457,103 @@ export class Producer implements AsyncDisposable {
   }
 
   private directRetryDelayMs(attempt: number): number {
-    return Math.min(this.retryBackoffMs * 2 ** Math.min(attempt, 16), MAX_RETRY_DELAY_MS)
+    return jittered(Math.min(this.retryBackoffMs * 2 ** Math.min(attempt, 16), MAX_RETRY_DELAY_MS))
   }
 
-  async send(payload: BytesLike, options: ProducerSendOptions = {}): Promise<SendMessagesResponse> {
+  /** An aborted send may still be written: the abort ends the wait and starts no new attempt. */
+  async send(
+    payload: BytesLike,
+    options: ProducerSendOptions & CallOptions = {}
+  ): Promise<SendMessagesResponse> {
     return this.sendMessage(
       new ProducerMessage(payload).withHeaders(headersMap(options.headers)),
-      optionRouting(options, this.routing)
+      optionRouting(options, this.routing),
+      options
     )
   }
 
   async sendMessage(
     message: ProducerMessage,
-    routing: Routing = this.routing
+    routing: Routing = this.routing,
+    options: CallOptions = {}
   ): Promise<SendMessagesResponse> {
     this.throwIfClosed("sendMessage")
-    return this.sendWithRetry([lowerMessage(message)], routing)
+    return this.sendWithRetry([lowerMessage(message)], routing, options.signal)
   }
 
-  async sendWithRouting(message: ProducerMessage, routing: Routing): Promise<SendMessagesResponse> {
+  async sendWithRouting(
+    message: ProducerMessage,
+    routing: Routing,
+    options: CallOptions = {}
+  ): Promise<SendMessagesResponse> {
     return this.sendMessage(
       message,
-      routing.kind === "key" ? { kind: "key", key: routingKey(routing.key) } : routing
+      routing.kind === "key" ? { kind: "key", key: routingKey(routing.key) } : routing,
+      options
     )
   }
 
-  async sendKeyed(message: ProducerMessage, key: BytesLike): Promise<SendMessagesResponse> {
-    return this.sendMessage(message, { kind: "key", key: routingKey(ownedBytes(key)) })
+  async sendKeyed(
+    message: ProducerMessage,
+    key: BytesLike,
+    options: CallOptions = {}
+  ): Promise<SendMessagesResponse> {
+    return this.sendMessage(message, { kind: "key", key: routingKey(ownedBytes(key)) }, options)
   }
 
   async sendToPartition(
     message: ProducerMessage,
-    partition: number
+    partition: number,
+    options: CallOptions = {}
   ): Promise<SendMessagesResponse> {
     if (!Number.isSafeInteger(partition) || partition < 0) {
       throw new InvalidError("partition must be a non-negative safe integer")
     }
-    return this.sendMessage(message, { kind: "partition", partition })
+    return this.sendMessage(message, { kind: "partition", partition }, options)
   }
 
   async sendBatch(
     messages: readonly (BytesLike | ProducerMessage)[],
-    options: ProducerSendOptions = {}
+    options: ProducerSendOptions & CallOptions = {}
   ): Promise<SendMessagesResponse> {
     const lowered = messages.map((message) =>
       message instanceof ProducerMessage
         ? lowerMessage(message)
         : { payload: ownedBytes(message), headers: headersMap(options.headers) }
     )
-    return this.sendLoweredBatch(lowered, optionRouting(options, this.routing))
+    return this.sendLoweredBatch(lowered, optionRouting(options, this.routing), options.signal)
   }
 
   async sendBatchWithRouting(
     messages: readonly ProducerMessage[],
-    routing: Routing = this.routing
+    routing: Routing = this.routing,
+    options: CallOptions = {}
   ): Promise<SendMessagesResponse> {
     return this.sendLoweredBatch(
       messages.map(lowerMessage),
-      routing.kind === "key" ? { kind: "key", key: routingKey(routing.key) } : routing
+      routing.kind === "key" ? { kind: "key", key: routingKey(routing.key) } : routing,
+      options.signal
     )
   }
 
   private async sendLoweredBatch(
     messages: readonly MessageWithHeaders[],
-    routing: Routing
+    routing: Routing,
+    signal: AbortSignal | undefined
   ): Promise<SendMessagesResponse> {
     this.throwIfClosed("sendBatch")
     if (messages.length === 0) return { confirmations: [] }
-    return this.sendWithRetry(messages, routing)
+    return this.sendWithRetry(messages, routing, signal)
   }
 
-  /** @internal Waits until every queued background send is written. A
-   * direct producer has nothing to flush. Rejects with the unreported
-   * background failures as one `PublishFailedError` that lists the records
-   * of every failed batch. */
-  async flush(): Promise<void> {
+  /** Waits until every queued background send is written. A direct producer
+   * has nothing to flush. Rejects with the background failures no `onError`
+   * callback took as one `PublishFailedError` that lists the records of every
+   * failed batch. */
+  async flush(options: CallOptions = {}): Promise<void> {
     if (this.closed) throw new InvalidError("flush() called after shutdown()")
-    await this.drainQueue()
+    throwIfAborted(options.signal, "producer flush")
+    await abortable(this.drainQueue(), options.signal, "producer flush")
     this.throwBackgroundFailure()
   }
 
@@ -543,20 +588,41 @@ export class Producer implements AsyncDisposable {
   }
 
   private async sendWithRetry(
-    messages: readonly MessageWithHeaders[],
-    routing: Routing
+    records: readonly MessageWithHeaders[],
+    routing: Routing,
+    signal: AbortSignal | undefined
   ): Promise<SendMessagesResponse> {
-    if (this.background !== undefined) return this.enqueue(messages, routing, this.background)
-    await this.waitForLinger()
-    return this.writeChunks(messages, routing)
+    throwIfAborted(signal, "producer send")
+    const messages = await abortable(this.governed(records), signal, "producer send")
+    if (this.background !== undefined)
+      return this.enqueue(messages, routing, this.background, signal)
+    await this.waitForLinger(signal)
+    return this.writeChunks(messages, routing, signal)
+  }
+
+  // Each record as the topic's governor lets it through, read with the
+  // provenance its headers carry, before it is queued or written.
+  private async governed(
+    records: readonly MessageWithHeaders[]
+  ): Promise<readonly MessageWithHeaders[]> {
+    const govern = this.govern
+    if (govern === undefined) return records
+    const governed: MessageWithHeaders[] = []
+    for (const record of records) {
+      governed.push({
+        ...record,
+        payload: await govern(record.payload, headerProvenance(record.headers))
+      })
+    }
+    return governed
   }
 
   // Waits out what is left of the linger gap since the previous direct send.
-  private async waitForLinger(): Promise<void> {
+  private async waitForLinger(signal: AbortSignal | undefined): Promise<void> {
     const now = Date.now()
     const wait = this.lingerMs - (now - this.lastSentAt)
     if (this.lingerMs > 0 && this.lastSentAt > 0 && wait > 0) {
-      await new Promise((resolve) => setTimeout(resolve, wait))
+      await delay(wait, signal, "producer send")
     }
     this.lastSentAt = Date.now()
   }
@@ -566,23 +632,25 @@ export class Producer implements AsyncDisposable {
   // and every record from the failed request on with the ids its attempts used.
   private async writeChunks(
     batch: readonly MessageWithHeaders[],
-    routing: Routing
+    routing: Routing,
+    signal?: AbortSignal
   ): Promise<SendMessagesResponse> {
     const messages = withMessageIds(batch)
     const finish = this.statistics.begin(messages.length, payloadBytes(messages))
     const confirmations: SendMessagesConfirmation[] = []
     let start = 0
     try {
-      await this.provision()
+      await abortable(this.provision(), signal, "producer send")
       for (; start < messages.length; start += this.batchLength) {
         const chunk = messages.slice(start, start + this.batchLength)
-        const response = await this.sendAttempts(chunk, routing)
+        const response = await this.sendAttempts(chunk, routing, signal)
         confirmations.push(...response.confirmations)
       }
       finish(true)
       return { confirmations }
     } catch (error) {
       finish(false)
+      if (error instanceof CancelledError) throw error
       throw new PublishFailedError(
         this.streamName,
         this.topicName,
@@ -600,12 +668,13 @@ export class Producer implements AsyncDisposable {
   private async enqueue(
     messages: readonly MessageWithHeaders[],
     routing: Routing,
-    background: BackgroundSettings
+    background: BackgroundSettings,
+    signal: AbortSignal | undefined
   ): Promise<SendMessagesResponse> {
-    await this.provision()
+    await abortable(this.provision(), signal, "producer send")
     this.throwIfClosed("send")
     const bytes = payloadBytes(messages)
-    await this.waitForRoom(messages, bytes, background)
+    await this.waitForRoom(messages, bytes, background, signal)
     const shard = this.pickShard(background)
     shard.queue.push({ messages, routing, bytes })
     shard.queuedBytes += bytes
@@ -631,7 +700,8 @@ export class Producer implements AsyncDisposable {
   private async waitForRoom(
     messages: readonly MessageWithHeaders[],
     bytes: number,
-    background: BackgroundSettings
+    background: BackgroundSettings,
+    signal: AbortSignal | undefined
   ): Promise<void> {
     const mode = background.failureMode
     const deadline = mode.kind === "blockWithTimeout" ? Date.now() + mode.timeoutMs : undefined
@@ -649,7 +719,7 @@ export class Producer implements AsyncDisposable {
           new TransportError("the background send buffer is full", false)
         )
       }
-      const woken = await this.roomOrDeadline(deadline)
+      const woken = await abortable(this.roomOrDeadline(deadline), signal, "producer send")
       this.throwIfClosed("send")
       if (!woken) {
         throw new PublishFailedError(
@@ -800,34 +870,41 @@ export class Producer implements AsyncDisposable {
   // batch committed.
   private async sendAttempts(
     messages: readonly MessageWithHeaders[],
-    routing: Routing
+    routing: Routing,
+    signal: AbortSignal | undefined
   ): Promise<SendMessagesResponse> {
     const background = this.background !== undefined
     if (this.transport.publishRetriesManaged === true) {
-      return this.transport.sendMessagesWithHeaders(
-        this.streamName,
-        this.topicName,
-        messages,
-        routing.kind === "key" ? routing.key : undefined,
-        routing.kind === "partition" ? routing.partition : undefined,
-        {
-          batchLength: this.batchLength,
-          ...(this.options.retries === undefined ? {} : { maxRetries: this.retries }),
-          ...(this.options.retryBackoffMs === undefined
-            ? {}
-            : { retryBackoffMs: this.retryBackoffMs }),
-          ...(background ? { fixedRetryIntervalMs: this.retryBackoffMs } : {})
-        }
-      )
-    }
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        return await this.transport.sendMessagesWithHeaders(
+      return cancellable(signal, "producer send", () =>
+        this.transport.sendMessagesWithHeaders(
           this.streamName,
           this.topicName,
           messages,
           routing.kind === "key" ? routing.key : undefined,
-          routing.kind === "partition" ? routing.partition : undefined
+          routing.kind === "partition" ? routing.partition : undefined,
+          {
+            batchLength: this.batchLength,
+            ...(this.options.retries === undefined ? {} : { maxRetries: this.retries }),
+            ...(this.options.retryBackoffMs === undefined
+              ? {}
+              : { retryBackoffMs: this.retryBackoffMs }),
+            ...(background ? { fixedRetryIntervalMs: this.retryBackoffMs } : {}),
+            signal
+          }
+        )
+      )
+    }
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await cancellable(signal, "producer send", () =>
+          this.transport.sendMessagesWithHeaders(
+            this.streamName,
+            this.topicName,
+            messages,
+            routing.kind === "key" ? routing.key : undefined,
+            routing.kind === "partition" ? routing.partition : undefined,
+            { signal }
+          )
         )
       } catch (error) {
         const retryable = background
@@ -840,7 +917,9 @@ export class Producer implements AsyncDisposable {
           : error instanceof TransportError && error.retryable
         if (!retryable || attempt >= this.retries) throw error
         await delay(
-          background ? (attempt === 0 ? 0 : this.retryBackoffMs) : this.directRetryDelayMs(attempt)
+          background ? (attempt === 0 ? 0 : this.retryBackoffMs) : this.directRetryDelayMs(attempt),
+          signal,
+          "producer send"
         )
       }
     }

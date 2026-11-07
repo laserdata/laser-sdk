@@ -1,4 +1,9 @@
-import { NoCapableAgentError, NoInboxError, RoutePrincipalMismatchError } from "../client/errors.js"
+import {
+  NoCapableAgentError,
+  NoInboxError,
+  QuarantinedError,
+  RoutePrincipalMismatchError
+} from "../client/errors.js"
 import type { Provenance } from "../provenance/provenance.js"
 import type { AgentId, PrincipalId } from "../types/ids.js"
 import type { CapabilityDescriptor } from "../wire/agent.js"
@@ -172,7 +177,7 @@ export function selectRoute(
   return chosen?.agent
 }
 
-export type RegistryView = Pick<AgentRegistry, "principalFor" | "resolve">
+export type RegistryView = Pick<AgentRegistry, "principalFor" | "resolve" | "isQuarantined">
 
 function principalMismatch(
   registry: RegistryView,
@@ -200,15 +205,50 @@ function trustedCandidates(
   return trusted
 }
 
+/** Throws `QuarantinedError` when a named route names an agent an operator
+ * quarantined, as capability resolution already drops it. */
 export function resolveTargets(
   router: Router,
   registry: RegistryView,
   nowMicros: bigint
 ): readonly AgentId[] {
+  return resolveRouted(router, registry, nowMicros, () => true)
+}
+
+/** Resolve like `resolveTargets`, keeping only capability candidates
+ * `inboxRoute` can send work to, so a capable agent with no inbox never wins a
+ * pick over one that has one. A capability route picks outside `excluded`
+ * and falls back to an excluded agent only when no other is capable.
+ * @internal */
+export function resolveRoutable(
+  router: Router,
+  registry: RegistryView & Pick<AgentRegistry, "inboxFor">,
+  inboxRoute: InboxRoute,
+  nowMicros: bigint,
+  excluded: readonly AgentId[] = []
+): readonly AgentId[] {
+  return resolveRouted(
+    router,
+    registry,
+    nowMicros,
+    (agent) => inboxRoute.kind === "fixed" || registry.inboxFor(agent) !== undefined,
+    excluded
+  )
+}
+
+function resolveRouted(
+  router: Router,
+  registry: RegistryView,
+  nowMicros: bigint,
+  routable: (agent: AgentId) => boolean,
+  excluded: readonly AgentId[] = []
+): readonly AgentId[] {
   switch (router.kind) {
     case "to":
+      refuseQuarantined(registry, router.agent)
       return [router.agent]
     case "toPrincipal":
+      refuseQuarantined(registry, router.agent)
       if (registry.principalFor(router.agent)?.get() !== router.principal.get()) {
         throw principalMismatch(registry, router.agent, router.principal)
       }
@@ -216,8 +256,15 @@ export function resolveTargets(
     case "broadcast":
       return []
     case "toCapable": {
-      const candidates = trustedCandidates(registry, router.selector, nowMicros)
-      const selected = selectRoute(router.selector.skill, candidates, router.selector.policy)
+      const candidates = trustedCandidates(registry, router.selector, nowMicros).filter((card) =>
+        routable(card.agent)
+      )
+      const preferred = candidates.filter(
+        (card) => !excluded.some((agent) => agent.equals(card.agent))
+      )
+      const selected =
+        selectRoute(router.selector.skill, preferred, router.selector.policy) ??
+        selectRoute(router.selector.skill, candidates, router.selector.policy)
       if (selected === undefined) {
         throw new NoCapableAgentError(router.selector.skill)
       }
@@ -231,6 +278,10 @@ export function resolveTargets(
       return candidates.map((card) => card.agent)
     }
   }
+}
+
+function refuseQuarantined(registry: RegistryView, agent: AgentId): void {
+  if (registry.isQuarantined(agent)) throw new QuarantinedError(agent.asStr())
 }
 
 export type InboxRoute =

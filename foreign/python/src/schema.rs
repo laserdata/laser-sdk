@@ -70,9 +70,9 @@ impl PyCompiledSchema {
         })
     }
 
-    /// Encode a Python `body` as a raw Avro datum (single-object encoding, no
+    /// Encode a Python `body` as a bare Avro datum (no single-object or
     /// container header), exactly the bytes a producer stamps alongside
-    /// `agdx.sid`. Avro schemas only: a Protobuf or JSON schema raises
+    /// `agdx.sid`. Values are physical: a decimal is its unscaled bytes. Avro schemas only: a Protobuf or JSON schema raises
     /// `InvalidError`. Encoding fails with `CodecError` when the value does not
     /// match the schema.
     fn encode_avro<'py>(
@@ -89,7 +89,11 @@ impl PyCompiledSchema {
     /// schema (Avro / Protobuf) or, for a JSON Schema, parses as JSON and
     /// passes validation. `False` means the record would fall back to
     /// header-only extraction.
-    fn validate(&self, payload: &Bound<'_, PyAny>) -> PyResult<bool> {
+    fn validate(
+        &self,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        payload: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
         Ok(self.inner.validate(&payload_bytes(payload)?))
     }
 
@@ -105,7 +109,12 @@ impl PyCompiledSchema {
     /// Decode `payload` under this schema into a Python value, the model the
     /// managed backend extracts indexed fields from. Raises `CodecError` when the
     /// payload does not decode.
-    fn decode(&self, py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    fn decode(
+        &self,
+        py: Python<'_>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        payload: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
         let value = self
             .inner
             .decode(&payload_bytes(payload)?)

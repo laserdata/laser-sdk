@@ -2,20 +2,8 @@ import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { test } from "node:test"
 import { decodeArrowIpcMessageMetadata, decodeArrowIpcPolicy } from "../../src/wire/arrow.js"
-import {
-  decodeCheckpointReply,
-  decodeCheckpointRequestFrame,
-  decodeDestinationCheckpointStatus
-} from "../../src/wire/checkpoint.js"
 import { decodeOne, expectMap } from "../../src/wire/cbor.js"
-import { decodeMaterializationDestination, decodeQueryRoute } from "../../src/wire/destination.js"
 import { decodeBackendAnnounce, decodeHelloReply } from "../../src/wire/hello.js"
-import {
-  decodeQueryCancelEnvelopeFrame,
-  decodeQueryPageEnvelopeFrame,
-  decodeQueryStatusEnvelopeFrame,
-  decodeQueryStatusReplyFrame
-} from "../../src/wire/query.js"
 import { decodeLogicalSchema } from "../../src/wire/schema.js"
 import { assertDecoderIsRobust } from "../wire/support/robustness.js"
 
@@ -50,26 +38,10 @@ void test("data stack decoders reject malformed fixture mutations without unstru
   const cases = [
     ["logical_schema.bin", mapDecoder("LogicalSchema", decodeLogicalSchema)],
     [
-      "materialization_destination.bin",
-      mapDecoder("MaterializationDestination", decodeMaterializationDestination)
-    ],
-    ["query_route.bin", mapDecoder("QueryRoute", decodeQueryRoute)],
-    [
       "arrow_ipc_metadata.bin",
       mapDecoder("ArrowIpcMessageMetadata", decodeArrowIpcMessageMetadata)
     ],
-    ["arrow_ipc_policy.bin", mapDecoder("ArrowIpcPolicy", decodeArrowIpcPolicy)],
-    [
-      "destination_checkpoint_status.bin",
-      mapDecoder("DestinationCheckpointStatus", decodeDestinationCheckpointStatus)
-    ],
-    ["checkpoint_request_public.bin", decodeCheckpointRequestFrame],
-    ["checkpoint_reply_destination.bin", decodeCheckpointReply],
-    ["checkpoint_reply_query_route.bin", decodeCheckpointReply],
-    ["query_page.bin", decodeQueryPageEnvelopeFrame],
-    ["query_cancel.bin", decodeQueryCancelEnvelopeFrame],
-    ["query_status.bin", decodeQueryStatusEnvelopeFrame],
-    ["query_status_reply.bin", decodeQueryStatusReplyFrame]
+    ["arrow_ipc_policy.bin", mapDecoder("ArrowIpcPolicy", decodeArrowIpcPolicy)]
   ] as const
 
   for (const [name, decode] of cases) {

@@ -6,6 +6,7 @@ import type { Session, Sessions } from "../session.js"
 import { heldRead } from "../stream/cursor.js"
 import { type AgentId, ConversationId } from "../types/ids.js"
 import {
+  AgentKind,
   type AgentId as WireAgentId,
   OPERATION_SESSION,
   OPERATION_SESSION_PARKED,
@@ -18,7 +19,7 @@ import {
 } from "../wire/agent.js"
 import { encodeNamed } from "../wire/cbor.js"
 import { ContentType } from "../wire/content.js"
-import type { LogPosition } from "../wire/ids.js"
+import type { CorrelationId, LogPosition } from "../wire/ids.js"
 import { AGENT_CONTROL } from "../wire/topics.js"
 import {
   type ControlBook,
@@ -44,6 +45,12 @@ import {
   scanLane
 } from "./lane-scan.js"
 import { type AgentMessage, type ReceivedAgentMessage, decodeAgentMessage } from "./decode.js"
+import {
+  type ApprovalInterrupt,
+  type ApprovalResume,
+  approvalCorrelation,
+  isApprovalCorrelation
+} from "./context.js"
 
 // The consecutive read failures after which the control follower stops.
 const MAX_CONSECUTIVE_READ_ERRORS = 10
@@ -54,6 +61,9 @@ const MAX_CONSECUTIVE_READ_ERRORS = 10
  * @internal */
 export interface Replay {
   replay(received: ReceivedAgentMessage): Promise<void>
+  /** Hands a record parked on an approval back to its handler with
+   * `resume`. True when the handler is still waiting for the approval. */
+  resume(received: ReceivedAgentMessage, resume: ApprovalResume): Promise<boolean>
 }
 
 /** What the pause check decided for one work record: handle it now, or
@@ -405,6 +415,8 @@ export class RoleState {
   readonly unrecoverable = new Set<string>()
   /** The role wrote a terminal status. */
   terminal = false
+  /** The deadline of each approval this process parked a record on. */
+  readonly approvalDeadlines = new Map<string, bigint>()
 
   /** Keep the acknowledgment latest on the lane. */
   recordAck(ack: Ack): void {
@@ -483,6 +495,13 @@ export class PauseRuntime {
   async hold(worker: Replay, message: AgentMessage): Promise<Hold> {
     const session = message.provenance.conversationId.toString()
     await this.ensureRecovered()
+    // A session waiting on an approval holds its later work behind it, in
+    // order, so the decision resumes the session as it left it.
+    const awaiting = this.awaitingApproval(session)
+    if (awaiting !== undefined) {
+      await this.parkAt(session, message, awaiting)
+      return "commit"
+    }
     for (;;) {
       const control = await this.controlState(session)
       const pauseRequest = pausedBy(control)
@@ -544,6 +563,7 @@ export class PauseRuntime {
 
   private async reconcileLocked(worker: Replay, session: string): Promise<void> {
     await this.ensureRecovered()
+    await this.expireApprovals(worker, session)
     const control = await this.controlState(session)
     const pauseRequest = pausedBy(control)
     if (pauseRequest !== undefined) {
@@ -664,6 +684,16 @@ export class PauseRuntime {
   // Append and confirm the parking record of `message` under `pause`. A
   // source this role already parked or handled is not parked again.
   private async park(session: string, message: AgentMessage, pause: PlacedRequest): Promise<void> {
+    await this.parkAt(session, message, this.controlPosition(pause.at))
+  }
+
+  // Append and confirm the parking record of `message` under `request`, a
+  // control pause or an approval's prompt.
+  private async parkAt(
+    session: string,
+    message: AgentMessage,
+    request: LogPosition
+  ): Promise<void> {
     const address = this.address(message)
     const role = this.roles.get(session)
     const sourceKey = addressKey(address)
@@ -683,7 +713,7 @@ export class PauseRuntime {
         conversation: session
       },
       role: this.meWire,
-      request: this.controlPosition(pause.at)
+      request
     }
     const parked = parkedOf(parking)
     if (parked === undefined) return
@@ -742,6 +772,153 @@ export class PauseRuntime {
     return "all"
   }
 
+  /** Park the record whose handler an approval gate interrupted, under the
+   * prompt's position, and wake the session at the approval deadline. A
+   * record already parked on its approval stays parked. */
+  async parkApproval(message: AgentMessage, interrupt: ApprovalInterrupt): Promise<void> {
+    const prompt = interrupt.prompt
+    if (prompt === undefined) return
+    const session = message.provenance.conversationId.toString()
+    await this.parkAt(session, message, prompt.at)
+    const parked = [...this.role(session).parked.values()].find(
+      (candidate) =>
+        addressKey(candidate.address) === addressKey(this.address(message)) &&
+        samePosition(candidate.parking.request, prompt.at)
+    )
+    if (parked !== undefined)
+      this.role(session).approvalDeadlines.set(parked.key, prompt.deadlineMicros)
+    const waitMs = Number((prompt.deadlineMicros - BigInt(Date.now()) * 1000n) / 1000n)
+    const timer = setTimeout(
+      () => {
+        this.reconcileLater(session)
+      },
+      Math.min(Math.max(0, waitMs), 2_147_483_647)
+    )
+    timer.unref()
+  }
+
+  /** Resume the session an approval decision answers: replay the record
+   * parked on that approval with the decision, then the session's work held
+   * behind it, in order. A reply that answers no parked approval of this role
+   * is left alone. */
+  async resumeApproval(worker: Replay, reply: AgentMessage): Promise<void> {
+    const envelope = reply.envelope
+    const correlation = envelope?.correlation
+    if (
+      envelope === undefined ||
+      correlation === undefined ||
+      (envelope.kind !== AgentKind.Response && envelope.kind !== AgentKind.Error) ||
+      envelope.target !== this.meWire ||
+      !isApprovalCorrelation(correlation)
+    ) {
+      return
+    }
+    const session = reply.provenance.conversationId.toString()
+    const release = await this.gate(session)
+    try {
+      await this.ensureRecovered()
+      if (this.approvalOf(session, correlation) === undefined) {
+        // A restart forgets parkings the recovery read did not need.
+        this.merge(await scanLane(this.laser, this.meWire, session))
+      }
+      const gated = this.approvalOf(session, correlation)
+      if (gated === undefined) return
+      await this.drainApproval(worker, session, gated, { kind: "decided", reply })
+    } finally {
+      release()
+    }
+  }
+
+  // Resume every approval of `session` whose deadline passed with the expiry.
+  private async expireApprovals(worker: Replay, session: string): Promise<void> {
+    const role = this.roles.get(session)
+    if (role === undefined) return
+    const now = BigInt(Date.now()) * 1000n
+    for (const [key, deadline] of [...role.approvalDeadlines]) {
+      const gated = role.parked.get(key)
+      if (gated === undefined || deadline > now) continue
+      await this.drainApproval(worker, session, gated, { kind: "expired" })
+    }
+  }
+
+  // Replay the approval's own record with `resume`, then the records held
+  // behind the same prompt, oldest first, each confirmed by an unparking. A
+  // record still waiting on an approval stops the drain, and the records after
+  // it move behind that approval.
+  private async drainApproval(
+    worker: Replay,
+    session: string,
+    gated: Parked,
+    resume: ApprovalResume
+  ): Promise<void> {
+    const held = [...this.role(session).parked.values()]
+      .filter((parked) => samePosition(parked.parking.request, gated.parking.request))
+      .sort((left, right) => compareAddresses(left.address, right.address))
+    let waiting: LogPosition | undefined
+    for (const parked of held) {
+      const received = await this.fetchSource(parked.address)
+      if (received === undefined) continue
+      if (waiting !== undefined) {
+        const decoded = decodeAgentMessage(received)
+        if (decoded.kind !== "message") continue
+        await this.parkAt(session, decoded.message, waiting)
+      } else if (parked.key === gated.key) {
+        if (await worker.resume(received, resume)) return
+      } else {
+        await worker.replay(received)
+        // A held record that parked on its own approval holds the records
+        // after it behind that approval.
+        waiting = [...this.role(session).parked.values()].find(
+          (other) =>
+            !samePosition(other.parking.request, gated.parking.request) &&
+            this.isApproval(other.parking)
+        )?.parking.request
+      }
+      await this.lens(session)
+        .lane()
+        .emit(encodeNamed(encodeSessionParking(parked.parking)))
+        .withOperation(OPERATION_SESSION_UNPARKED)
+        .contentType(ContentType.Cbor)
+        .sendReceipt()
+      const role = this.role(session)
+      role.parked.delete(parked.key)
+      role.approvalDeadlines.delete(parked.key)
+      role.handled.add(parked.key)
+    }
+  }
+
+  // The parking of the approval `correlation` answers in `session`.
+  private approvalOf(session: string, correlation: CorrelationId): Parked | undefined {
+    const role = this.roles.get(session)
+    if (role === undefined) return undefined
+    return [...role.parked.values()].find(
+      (parked) =>
+        this.isApproval(parked.parking) &&
+        approvalCorrelation({
+          streamId: parked.address.stream,
+          topicId: parked.address.topic,
+          partitionId: parked.address.partition,
+          offset: parked.address.offset
+        }).equals(correlation)
+    )
+  }
+
+  // The prompt position `session` waits on, when it has an approval parked.
+  private awaitingApproval(session: string): LogPosition | undefined {
+    const role = this.roles.get(session)
+    if (role === undefined) return undefined
+    return [...role.parked.values()].find((parked) => this.isApproval(parked.parking))?.parking
+      .request
+  }
+
+  // Whether `parking` holds a record on an approval rather than a pause: its
+  // request is a prompt, not a request on `agent.control`.
+  private isApproval(parking: SessionParking): boolean {
+    return (
+      parking.request.streamId !== this.control[0] || parking.request.topicId !== this.control[1]
+    )
+  }
+
   // The held records of `session` this runtime can handle: from its own
   // source topic and not already found unrecoverable, grouped by source and
   // oldest first.
@@ -753,7 +930,8 @@ export class PauseRuntime {
       if (
         parked.address.stream !== this.source.streamId ||
         parked.address.topic !== this.source.topicId ||
-        role.unrecoverable.has(parked.key)
+        role.unrecoverable.has(parked.key) ||
+        this.isApproval(parked.parking)
       ) {
         continue
       }
@@ -887,4 +1065,14 @@ export class PauseRequests {
     this.queued = []
     for (const session of queued) driver.request(session)
   }
+}
+
+// Whether two log positions name the same record.
+function samePosition(left: LogPosition, right: LogPosition): boolean {
+  return (
+    left.streamId === right.streamId &&
+    left.topicId === right.topicId &&
+    left.partitionId === right.partitionId &&
+    left.offset === right.offset
+  )
 }

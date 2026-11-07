@@ -3,7 +3,6 @@ import { decodeOne } from "../wire/cbor.js"
 import type { ManagedCommand } from "../wire/commands.js"
 import { ResultCodeName } from "../wire/result.js"
 import {
-  CheckpointExecutionError,
   CommandExecutionError,
   FilterExecutionError,
   ForkExecutionError,
@@ -15,6 +14,7 @@ import {
   QueryExecutionError,
   UnsupportedError
 } from "./errors.js"
+import { type CallOptions, abortable, throwIfAborted } from "./call-options.js"
 import { type Capabilities, requireCapability } from "./capabilities.js"
 
 export type ManagedTransport = Pick<LaserTransport, "sendManaged">
@@ -47,8 +47,6 @@ function requireVersion<Request, Reply>(
         throw new ForkExecutionError(message, detail)
       case "graph":
         throw new GraphExecutionError(message, detail)
-      case "checkpoint":
-        throw new CheckpointExecutionError(message, detail)
       case "filter":
       case "control":
         throw new ProtocolError(message, { commandCode: command.code })
@@ -69,12 +67,18 @@ export async function executeManaged<Request, Reply>(
   capabilities: Capabilities,
   command: ManagedCommand<Request, Reply>,
   request: Request,
-  options?: ManagedSendOptions
+  options?: ManagedSendOptions & CallOptions
 ): Promise<Reply> {
   requireManagedCommand(capabilities, command)
   command.validate?.(request)
   const payload = command.encode(request)
-  const reply = await transport.sendManaged(command.code, payload, options)
+  const signal = options?.signal
+  throwIfAborted(signal, "managed request")
+  const reply = await abortable(
+    transport.sendManaged(command.code, payload, options),
+    signal,
+    "managed request"
+  )
   return decodeManagedReply((bytes) => command.decode(bytes), reply)
 }
 

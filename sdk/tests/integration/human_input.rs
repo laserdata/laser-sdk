@@ -4,6 +4,7 @@ use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{
     AgentErrorBody, AgentErrorCode, AgentId as WireAgentId, ConversationId as WireConversationId,
 };
+use laser_sdk::wire::dispatch::OPERATION_INPUT_REQUEST;
 use std::time::Duration;
 
 // An approver that resolves every interrupt by approving, via `respond_input`.
@@ -67,6 +68,7 @@ async fn given_an_approver_when_requesting_input_then_should_resume_with_the_dec
         .id("approver".parse().expect("approver is a valid agent id"))
         .listen_on(AgentTopic::Sessions)
         .handler(Approver)
+        .operations(vec![OPERATION_INPUT_REQUEST.to_owned()])
         .build()
         .spawn(laser.clone());
 
@@ -90,6 +92,7 @@ async fn given_a_rejecter_when_requesting_input_then_should_surface_a_rejected_e
         .id("approver".parse().expect("approver is a valid agent id"))
         .listen_on(AgentTopic::Sessions)
         .handler(Rejecter)
+        .operations(vec![OPERATION_INPUT_REQUEST.to_owned()])
         .build()
         .spawn(laser.clone());
 
@@ -108,19 +111,29 @@ async fn given_a_rejecter_when_requesting_input_then_should_surface_a_rejected_e
 }
 
 // A handler that gates on a human decision via `ctx.approval_gate`, then reports
-// the decision on the audit topic so the test can observe it.
-struct Gatekeeper;
+// the decision on the audit topic so the test can observe it. It counts every
+// record it handles, so a prompt it took as its own work would show.
+struct Gatekeeper {
+    handled: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
 
 impl AgentHandler for Gatekeeper {
     async fn handle(&self, _message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
-        let decision = ctx
+        self.handled
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let grant = ctx
             .approval_gate(
+                "approver"
+                    .parse::<laser_sdk::types::AgentId>()
+                    .expect("approver is a valid agent id"),
                 AgentTopic::Sessions,
                 Bytes::from_static(b"approve draining node-7?"),
                 Duration::from_secs(10),
             )
             .await?;
-        ctx.reply_on(AgentTopic::Audit, decision).await
+        assert_eq!(grant.approver().as_str(), "approver");
+        ctx.reply_on(AgentTopic::Audit, grant.decision().to_vec())
+            .await
     }
 }
 
@@ -132,15 +145,19 @@ async fn given_a_handler_gating_on_a_human_when_approved_then_should_resume_with
         .id("approver".parse().expect("approver is a valid agent id"))
         .listen_on(AgentTopic::Sessions)
         .handler(Approver)
+        .operations(vec![OPERATION_INPUT_REQUEST.to_owned()])
         .build()
         .spawn(laser.clone());
+    let handled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut gatekeeper = Agent::builder()
         .id("gatekeeper"
             .parse()
             .expect("gatekeeper is a valid agent id"))
         .listen_on(AgentTopic::Sessions)
         .respond_on(AgentTopic::Sessions)
-        .handler(Gatekeeper)
+        .handler(Gatekeeper {
+            handled: handled.clone(),
+        })
         .build()
         .spawn(laser.clone());
     gatekeeper
@@ -177,6 +194,89 @@ async fn given_a_handler_gating_on_a_human_when_approved_then_should_resume_with
 
     assert_eq!(decision.as_slice(), b"approved");
     gatekeeper.shutdown().await.expect("gatekeeper shuts down");
+    assert_eq!(
+        handled.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the gatekeeper's own prompt is not its work"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_forged_answer_from_another_agent_when_requesting_input_from_an_approver_then_should_wait_for_the_approver()
+ {
+    let laser = harness::laser().await;
+    let conversation = WireConversationId::from(ConversationId::new());
+    let gate = laser.agdx(
+        AgentTopic::Sessions,
+        "orchestrator"
+            .parse::<WireAgentId>()
+            .expect("orchestrator is a valid agent id"),
+        conversation,
+    );
+    let request = tokio::spawn({
+        let gate = gate.clone();
+        async move {
+            gate.request_input_from(
+                "approver"
+                    .parse::<laser_sdk::types::AgentId>()
+                    .expect("approver is a valid agent id"),
+                AgentTopic::Sessions,
+                Bytes::from_static(b"approve draining node-7?"),
+                Duration::from_secs(20),
+            )
+            .await
+        }
+    });
+    // Another agent reads the prompt off the session topic and answers it
+    // under its own name before the approver runs.
+    let prompt = harness::eventually(|| {
+        let laser = laser.clone();
+        async move {
+            ContextAssembler::builder()
+                .conversation_id(conversation.into())
+                .topics(vec![AgentTopic::Sessions])
+                .build()
+                .assemble(&laser)
+                .await
+                .expect("reading the session topic should succeed")
+                .into_iter()
+                .filter_map(|message| message.envelope)
+                .find(|envelope| envelope.operation.as_deref() == Some(OPERATION_INPUT_REQUEST))
+        }
+    })
+    .await;
+    laser
+        .agdx(
+            AgentTopic::Sessions,
+            "mallory"
+                .parse::<WireAgentId>()
+                .expect("mallory is a valid agent id"),
+            conversation,
+        )
+        .respond(
+            prompt
+                .correlation
+                .expect("the prompt carries a correlation"),
+            b"forged".to_vec(),
+        )
+        .with_target(prompt.source.clone())
+        .send()
+        .await
+        .expect("the forged answer is published");
+    let _approver = Agent::builder()
+        .id("approver".parse().expect("approver is a valid agent id"))
+        .listen_on(AgentTopic::Sessions)
+        .handler(Approver)
+        .operations(vec![OPERATION_INPUT_REQUEST.to_owned()])
+        .build()
+        .spawn(laser.clone());
+
+    let decision = request
+        .await
+        .expect("the request task joins")
+        .expect("the approver answers");
+    assert_eq!(decision.as_slice(), b"approved");
 }
 
 #[tokio::test]
@@ -242,6 +342,7 @@ async fn given_two_responders_when_requesting_input_from_one_then_only_that_resp
                 .expect("the responder name is a valid agent id"))
             .listen_on(AgentTopic::Sessions)
             .handler(Witness { name, seen })
+            .operations(vec![OPERATION_INPUT_REQUEST.to_owned()])
             .build()
             .spawn(laser.clone())
     })
@@ -289,5 +390,142 @@ async fn given_two_responders_when_requesting_input_from_one_then_only_that_resp
     assert_eq!(
         approver_seen.lock().expect("the seen list is not poisoned")[0],
         b"addressed".to_vec()
+    );
+}
+
+// A handler that gates the work of one session on an approval and records
+// every pass, so a test can see the slot freed and the resume run once.
+struct ParkingGatekeeper {
+    gated: ConversationId,
+    passes: std::sync::Arc<std::sync::Mutex<Vec<(ConversationId, &'static str)>>>,
+}
+
+impl AgentHandler for ParkingGatekeeper {
+    async fn handle(&self, message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
+        let session = message.provenance.conversation_id;
+        let record = |stage| {
+            self.passes
+                .lock()
+                .expect("the passes are not poisoned")
+                .push((session, stage));
+        };
+        record("before");
+        if session == self.gated {
+            let grant = ctx
+                .approval_gate(
+                    "approver"
+                        .parse::<laser_sdk::types::AgentId>()
+                        .expect("approver is a valid agent id"),
+                    AgentTopic::Sessions,
+                    Bytes::from_static(b"approve draining node-7?"),
+                    Duration::from_secs(60),
+                )
+                .await?;
+            assert_eq!(grant.decision(), b"approved");
+        }
+        record("after");
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_handler_waiting_on_an_approval_when_another_session_sends_work_then_should_handle_it_and_resume_the_first_once()
+ {
+    let laser = harness::laser().await;
+    laser
+        .topic(AgentTopic::Control.topic_string())
+        .ensure(1, None)
+        .await
+        .expect("provisioning creates the control topic");
+    let gated = ConversationId::new();
+    let other = ConversationId::new();
+    let passes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut gatekeeper = Agent::builder()
+        .id("gatekeeper"
+            .parse()
+            .expect("gatekeeper is a valid agent id"))
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
+        .handler(ParkingGatekeeper {
+            gated,
+            passes: passes.clone(),
+        })
+        .build()
+        .spawn(laser.clone());
+    gatekeeper
+        .ready()
+        .await
+        .expect("gatekeeper joins its group");
+    let send = |session: ConversationId, body: &'static [u8]| {
+        let laser = laser.clone();
+        async move {
+            laser
+                .agdx(
+                    AgentTopic::Sessions,
+                    "client"
+                        .parse::<WireAgentId>()
+                        .expect("client is a valid agent id"),
+                    session.into(),
+                )
+                .command(
+                    <laser_sdk::wire::agent::CorrelationId as laser_sdk::types::MintUlid>::mint(),
+                    body.to_vec(),
+                )
+                .with_target(
+                    "gatekeeper"
+                        .parse::<laser_sdk::types::AgentId>()
+                        .expect("gatekeeper is a valid agent id"),
+                )
+                .send()
+                .await
+                .expect("the work is sent");
+        }
+    };
+    send(gated, b"drain").await;
+    // The second session's work runs while the first waits for its approver.
+    send(other, b"status").await;
+    harness::eventually(|| {
+        let passes = passes.clone();
+        async move {
+            passes
+                .lock()
+                .expect("the passes are not poisoned")
+                .contains(&(other, "after"))
+                .then_some(())
+        }
+    })
+    .await;
+
+    let _approver = Agent::builder()
+        .id("approver".parse().expect("approver is a valid agent id"))
+        .listen_on(AgentTopic::Sessions)
+        .handler(Approver)
+        .operations(vec![OPERATION_INPUT_REQUEST.to_owned()])
+        .build()
+        .spawn(laser.clone());
+    harness::eventually(|| {
+        let passes = passes.clone();
+        async move {
+            passes
+                .lock()
+                .expect("the passes are not poisoned")
+                .contains(&(gated, "after"))
+                .then_some(())
+        }
+    })
+    .await;
+    gatekeeper.shutdown().await.expect("gatekeeper shuts down");
+    let gated_passes: Vec<&str> = passes
+        .lock()
+        .expect("the passes are not poisoned")
+        .iter()
+        .filter(|(session, _)| *session == gated)
+        .map(|(_, stage)| *stage)
+        .collect();
+    assert_eq!(
+        gated_passes,
+        ["before", "before", "after"],
+        "the parked record replays once after the decision"
     );
 }

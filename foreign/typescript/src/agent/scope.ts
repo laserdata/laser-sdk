@@ -1,4 +1,5 @@
 import type { BytesLike } from "../client/bytes.js"
+import { type CallOptions, cancellable, throwIfAborted } from "../client/call-options.js"
 import { PresenceConflictError } from "../client/errors.js"
 import type { Laser } from "../client/laser.js"
 import type { Provenance } from "../provenance/provenance.js"
@@ -19,8 +20,15 @@ export class AgentScope {
     return new AgentScope(laser, id)
   }
 
-  send(topic: string, payload: BytesLike, provenance: Provenance): Promise<void> {
-    return this.laser.sendAgent(topic, payload, { ...provenance, agent: this.id })
+  send(
+    topic: string,
+    payload: BytesLike,
+    provenance: Provenance,
+    options: CallOptions = {}
+  ): Promise<void> {
+    return cancellable(options.signal, "agent send", () =>
+      this.laser.sendAgent(topic, payload, { ...provenance, agent: this.id }, options)
+    )
   }
 
   ask(
@@ -29,7 +37,7 @@ export class AgentScope {
     payload: BytesLike,
     provenance: Provenance,
     timeoutMs: number,
-    signal?: AbortSignal
+    options: CallOptions = {}
   ): Promise<AgentMessage> {
     return this.laser.request(
       requestTopic,
@@ -37,7 +45,7 @@ export class AgentScope {
       payload,
       { ...provenance, agent: this.id },
       timeoutMs,
-      signal
+      options
     )
   }
 
@@ -47,20 +55,53 @@ export class AgentScope {
     return this.laser.contract(router).from(this.id)
   }
 
-  publishCard(card: AgentCard): Promise<void> {
-    return this.laser.publishCard(this.id, card)
+  publishCard(card: AgentCard, options: CallOptions = {}): Promise<void> {
+    return cancellable(options.signal, "card publish", () => this.laser.publishCard(this.id, card))
   }
 
-  async advertise(listenOn: string, capabilities: readonly CapabilityDescriptor[]): Promise<void> {
+  /** Advertise `capabilities`: a durable card naming `listenOn` as this
+   * agent's inbox, with no ttl, plus the same inbox as live presence where the
+   * server serves it. A spawned agent refreshes a card with a ttl instead. */
+  async advertise(
+    listenOn: string,
+    capabilities: readonly CapabilityDescriptor[],
+    options: CallOptions = {}
+  ): Promise<void> {
+    await advertiseAgent(this.laser, this.id, listenOn, capabilities, undefined, options)
+  }
+}
+
+/** Publish a card naming `listenOn` as the inbox and fresh for `ttlMicros`
+ * (none never expires), then advertise the inbox as live presence. Both are
+ * best effort, except that a presence conflict is thrown. Returns the card as
+ * published, so a spawned agent can refresh and withdraw it.
+ * @internal */
+export function advertiseAgent(
+  laser: Laser,
+  id: AgentId,
+  listenOn: string,
+  capabilities: readonly CapabilityDescriptor[],
+  ttlMicros?: bigint,
+  options: CallOptions = {}
+): Promise<AgentCard> {
+  return cancellable(options.signal, "advertise", async () => {
+    const card: AgentCard = {
+      capabilities,
+      inbox: listenOn,
+      ...(ttlMicros !== undefined ? { ttlMicros } : {})
+    }
     try {
-      await this.publishCard({ capabilities })
+      await laser.publishCard(id, card)
     } catch {
       // Presence remains useful when card publication is unavailable.
     }
+    // A caller that gave up during the card publish advertises no presence.
+    throwIfAborted(options.signal, "advertise")
     try {
-      await this.laser.advertisePresence(newAgentPresence(this.id.wireId(), listenOn))
+      await laser.advertisePresence(newAgentPresence(id.wireId(), listenOn))
     } catch (error) {
       if (error instanceof PresenceConflictError) throw error
     }
-  }
+    return card
+  })
 }

@@ -50,6 +50,13 @@ Feature: Managed sessions on a deployment that indexes them
     And the workflow "triage" resumes the same run
     Then the session tree of the workflow run holds 1 child
 
+  Scenario: A resumed workflow run never runs a completed step again
+    Given a managed session stream in the shared layout
+    And agent "worker" counts the work it handles
+    When the workflow "triage" runs its one step on "worker"
+    And the workflow "triage" resumes the same run
+    Then agent "worker" handled 1 command
+
   Scenario: Untargeted low-altitude work reaches a filter-bound agent
     Given a managed session stream in the single partition layout
     And agent "worker" counts the work it handles
@@ -143,10 +150,22 @@ Feature: Managed sessions on a deployment that indexes them
     Then listing the stream finds "reads" as completed
     And the session list of the stream is not rebuilding
     And the indexed events of the session are "session.started", "tool.call", "tool.result", "state.updated", "state.updated", "session.completed"
+    And the session timeline reads 6 events over 2 pages of 4
     And the indexed state of the session is {"step": 1}
     And the session sources show folded offsets within their heads
     And the session has no links
     And the watch reports the session
+
+  Scenario: A session list walk keeps its first page's bound while a session starts
+    Given a managed session stream in the shared layout
+    When agent "planner" starts the session "first"
+    And agent "planner" starts the session "second"
+    Then the indexed session "first" is active
+    And the indexed session "second" is active
+    When a list walk of 1 session per page reads its first page
+    And agent "planner" starts the session "third"
+    Then the indexed session "third" is active
+    And the list walk's second page completes "first" and "second" once each
 
   Scenario: The runtime ends a session over its budget instead of handling its work
     Given a managed session stream in the single partition layout

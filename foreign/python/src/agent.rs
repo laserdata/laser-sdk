@@ -1,4 +1,4 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::convert::{duration_ms, payload_bytes, py_to_de, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
@@ -36,7 +36,7 @@ fn build_provenance(
     target_agent_id: Option<String>,
     idempotency_key: Option<String>,
     correlation_id: Option<String>,
-    deadline_micros: Option<u64>,
+    deadline_at_micros: Option<u64>,
     fence_token: Option<u64>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -83,7 +83,7 @@ fn build_provenance(
         .maybe_target_agent_id(target_agent_id)
         .maybe_idempotency_key(idempotency_key)
         .maybe_correlation_id(correlation_id)
-        .maybe_deadline(deadline_micros.map(IggyTimestamp::from))
+        .maybe_deadline_at(deadline_at_micros.map(IggyTimestamp::from))
         .maybe_fence_token(fence_token)
         .maybe_usage(usage)
         .build())
@@ -112,7 +112,7 @@ impl PyProvenance {
         target_agent_id=None,
         idempotency_key=None,
         correlation_id=None,
-        deadline_micros=None,
+        deadline_at_micros=None,
         fence_token=None,
         input_tokens=None,
         output_tokens=None,
@@ -128,7 +128,7 @@ impl PyProvenance {
         target_agent_id: Option<String>,
         idempotency_key: Option<String>,
         correlation_id: Option<String>,
-        deadline_micros: Option<u64>,
+        deadline_at_micros: Option<u64>,
         fence_token: Option<u64>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
@@ -144,7 +144,7 @@ impl PyProvenance {
                 target_agent_id,
                 idempotency_key,
                 correlation_id,
-                deadline_micros,
+                deadline_at_micros,
                 fence_token,
                 input_tokens,
                 output_tokens,
@@ -210,8 +210,10 @@ impl PyProvenance {
     /// The drop-dead time in microseconds since the Unix epoch. A consumer past
     /// it dead-letters the message.
     #[getter]
-    fn deadline(&self) -> Option<u64> {
-        self.inner.deadline.map(|deadline| deadline.as_micros())
+    fn deadline_at_micros(&self) -> Option<u64> {
+        self.inner
+            .deadline_at
+            .map(|deadline_at| deadline_at.as_micros())
     }
 
     /// The token and cost usage of the LLM call this message records, if any.
@@ -284,6 +286,7 @@ impl PyAgentMessage {
 #[pymethods]
 impl PyAgentMessage {
     #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
     fn payload(&self) -> Vec<u8> {
         self.inner.payload.clone()
     }
@@ -307,6 +310,7 @@ impl PyAgentMessage {
     /// The task body regardless of message shape: the AGDX envelope body for a
     /// command or response (its payload is the encoded envelope), else the raw
     /// payload. A handler reached by a contract or workflow reads this.
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
     fn body(&self) -> Vec<u8> {
         self.inner.body().to_vec()
     }
@@ -319,10 +323,18 @@ impl PyAgentMessage {
     /// returns `body()` as-is. `store` is a Python object with `async def get(reference:
     /// str) -> bytes` (and, for the publish side, `async def put(data: bytes) ->
     /// str`). The consume-side pairing of the publish builder's claim-check.
-    fn resolve_body<'py>(&self, py: Python<'py>, store: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Awaitable[builtins.bytes]",
+        imports = ("typing", "builtins")
+    ))]
+    fn resolve_body<'py>(
+        &self,
+        py: Python<'py>,
+        store: Py<PyAny>,
+    ) -> PyResult<Awaitable<'py, Vec<u8>>> {
         let message = self.inner.clone();
         let locals = get_current_locals(py)?;
-        future_into_py(
+        awaitable(
             py,
             scope(locals, async move {
                 let store = crate::blob::PyBlobStore { hooks: store };
@@ -378,10 +390,10 @@ impl PyLaser {
         py: Python<'py>,
         partitions: u32,
         retention: &crate::session::PyTopicRetention,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
         let retention = retention.inner;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .bootstrap(partitions, retention)
                 .await
@@ -395,13 +407,14 @@ impl PyLaser {
         &self,
         py: Python<'py>,
         topic: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         provenance: &PyProvenance,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
         let payload = payload_bytes(payload)?;
         let provenance = provenance.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let id = topic_from_name(&topic)?;
             let agent_topic = AgentTopic::Custom(&id);
             laser
@@ -420,14 +433,15 @@ impl PyLaser {
         py: Python<'py>,
         request_topic: String,
         reply_topic: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         provenance: &PyProvenance,
         timeout_ms: f64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyAgentMessage>> {
         let laser = self.inner.clone();
         let payload = payload_bytes(payload)?;
         let provenance = provenance.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let request_id = topic_from_name(&request_topic)?;
             let reply_id = topic_from_name(&reply_topic)?;
             let reply = laser
@@ -470,10 +484,10 @@ impl PyLaser {
         &self,
         py: Python<'py>,
         capsule: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
         let capsule = py_to_de(capsule)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser.redrive_dead_letter(&capsule).await.map_err(to_pyerr)
         })
     }

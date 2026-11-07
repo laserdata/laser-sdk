@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 
 import laser_sdk as ls
 import pytest
@@ -19,9 +20,31 @@ async def test_given_a_handled_message_when_remembered_then_should_retain_its_sc
     wrapped = ls.MemoryHandler(handle, memory).auto_remember("message")
     await wrapped(None, message)
     assert handled == [b"auth restarted"]
-    items = await memory.recall(conversation=conversation, agent="planner")
+    items = await memory.recall(conversation=conversation)
     assert [item.text() for item in items] == ["auth restarted"]
     assert items[0].kind == "message"
+    assert await memory.recall(conversation=conversation, agent="planner") == []
+
+
+@pytest.mark.integration
+async def test_given_another_agents_message_when_auto_remembered_then_should_stamp_the_handler(
+    laser,
+):
+    memory = ls.MemoryHandle.vector(lambda _: [1.0])
+    conversation = ls.new_conversation_id()
+    message = ls.agent_message(
+        b"auth restarted", ls.Provenance(conversation_id=conversation, agent="sender")
+    )
+
+    async def handle(context, incoming):
+        pass
+
+    context = ls.agent_ctx(laser, message, agent="worker")
+    await ls.MemoryHandler(handle, memory).auto_remember("message")(context, message)
+    items = await memory.recall(conversation=conversation, agent="worker")
+    assert [item.text() for item in items] == ["auth restarted"]
+    assert items[0].provenance.agent == "worker"
+    assert await memory.recall(conversation=conversation, agent="sender") == []
 
 
 async def test_given_a_handler_failure_when_remembering_then_should_skip_memory():
@@ -38,10 +61,11 @@ async def test_given_a_handler_failure_when_remembering_then_should_skip_memory(
     assert await memory.recall(conversation=conversation) == []
 
 
-async def test_given_failed_memory_when_the_handler_succeeds_then_should_not_retry():
+async def test_given_failed_memory_when_the_handler_succeeds_then_should_not_retry(caplog):
     def fail_embed(_):
         raise ValueError("embedding failed")
 
+    caplog.set_level(logging.WARNING)
     memory = ls.MemoryHandle.vector(fail_embed)
     message = ls.agent_message(b"auth restarted", ls.Provenance())
     handled = []
@@ -51,6 +75,32 @@ async def test_given_failed_memory_when_the_handler_succeeds_then_should_not_ret
 
     await ls.MemoryHandler(handle, memory).auto_remember("message")(None, message)
     assert handled == [b"auth restarted"]
+    assert any(
+        record.levelno == logging.WARNING
+        and "Memory handler could not remember" in record.getMessage()
+        and "embedding failed" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+async def test_given_summarized_turns_when_consolidated_again_then_should_summarize_once():
+    memory = ls.MemoryHandle.vector(lambda _: [1.0])
+    conversation = ls.new_conversation_id()
+    for body in (b"turn one", b"turn two"):
+        await memory.remember(body, conversation=conversation, kind="message")
+    calls = []
+
+    def summarize(bodies):
+        calls.append(len(bodies))
+        return b"summary"
+
+    first = await memory.consolidate(50, summarizer=summarize)
+    second = await memory.consolidate(50, summarizer=summarize)
+    assert first.summarized == 2
+    assert second.summarized == 0
+    assert calls == [2]
+    recalled = await memory.recall(strategy="recent")
+    assert [item.kind for item in recalled].count("summary") == 1
 
 
 def test_given_content_and_kind_when_reading_memory_helpers_then_should_match_the_reference():
@@ -61,9 +111,17 @@ def test_given_content_and_kind_when_reading_memory_helpers_then_should_match_th
         ls.memory_id_content(
             "fact", b"x", stream="laser", agent="agent", user="alice", application="console"
         )
-        == "28429K3B8MPSM8WHDQR474827P"
+        == "5B3SH6J7DVW950TXZG1D1CBJH4"
     )
-    assert ls.memory_id_content("procedure", b"x", user="alice") == "3E6HJGHKFDBMQ91TCJEHV28X40"
+    assert ls.memory_id_content("procedure", b"x", user="alice") == "7XEM2ZBKE6GR79DVYHWKFC48BM"
+    conversation = "01KWM3K3XEP3NP5TN850J17YBQ"
+    assert (
+        ls.memory_id_content("fact", b"x", agent="agent", conversation=conversation)
+        == "4GAH8VSNF79FNRKBW6NYVJ8GNN"
+    )
+    assert ls.memory_id_content(
+        "fact", b"x", agent="agent", conversation=conversation
+    ) != ls.memory_id_content("fact", b"x", agent="agent")
     assert ls.memory_kind_class("fact") == "semantic"
     assert ls.derive_session_id("agents", "", "x") != ls.derive_session_id("agents", "ns", "x")
 
@@ -309,7 +367,11 @@ async def test_given_an_arrow_record_when_a_fingerprint_is_set_then_should_stamp
         .send()
     )
     consumer = topic.consumer(
-        "fingerprint-reader", polling="first", auto_commit="disabled", allow_replay=True
+        "fingerprint-reader",
+        partition=0,
+        polling="first",
+        auto_commit="disabled",
+        allow_replay=True,
     )
     try:
         message = await consumer.next_within(2_000)

@@ -30,12 +30,6 @@ function jsonBytes(value: unknown): number {
   return new TextEncoder().encode(json).length
 }
 
-// Tokens that address an object's internals rather than its data. A patch is
-// peer-supplied, so `/__proto__/...` must never reach a property write: `in`
-// resolves it on every object and the assignment would land on
-// `Object.prototype`, polluting every object in the process.
-const FORBIDDEN_TOKENS = new Set(["__proto__", "constructor", "prototype"])
-
 function decodePointer(path: string): readonly string[] {
   if (path === "") return []
   if (!path.startsWith("/")) throw new InvalidError(`invalid JSON Pointer \`${path}\``)
@@ -44,11 +38,7 @@ function decodePointer(path: string): readonly string[] {
     .split("/")
     .map((part) => {
       if (/~(?:[^01]|$)/.test(part)) throw new InvalidError(`invalid JSON Pointer \`${path}\``)
-      const token = part.replaceAll("~1", "/").replaceAll("~0", "~")
-      if (FORBIDDEN_TOKENS.has(token)) {
-        throw new InvalidError(`JSON Patch path \`${path}\` addresses a reserved property`)
-      }
-      return token
+      return part.replaceAll("~1", "/").replaceAll("~0", "~")
     })
 }
 
@@ -110,8 +100,21 @@ function addValue(document: unknown, path: string, value: unknown): unknown {
   if (tokens.length === 0) return value
   const [parent, token] = parentAt(document, tokens, path)
   if (Array.isArray(parent)) parent.splice(arrayIndex(token, parent.length, true), 0, value)
-  else objectOf(parent, path)[token] = value
+  else defineMember(objectOf(parent, path), token, value)
   return document
+}
+
+// A patch is peer-supplied, so every member is written as an own data
+// property. An assignment would run the `__proto__` setter and repoint the
+// container's prototype, while a defined property stays plain data, as a
+// JSON parser stores it.
+function defineMember(object: Record<string, unknown>, token: string, value: unknown): void {
+  Object.defineProperty(object, token, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true
+  })
 }
 
 function removeValue(

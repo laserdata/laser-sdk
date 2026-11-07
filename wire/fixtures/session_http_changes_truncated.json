@@ -1,5 +1,5 @@
 {
-  "rows": [
+  "items": [
     {
       "seq": 4406,
       "sessions": [
@@ -32,7 +32,10 @@
       "truncated": true
     }
   ],
+  "page": 45,
+  "total_pages": 45,
+  "total_results": 4406,
+  "results": 100,
   "floor": 4401,
-  "resync": false,
   "series": 7654321098765432101
 }

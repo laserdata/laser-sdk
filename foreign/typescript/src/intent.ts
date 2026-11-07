@@ -2,8 +2,13 @@ import { blake3 } from "@noble/hashes/blake3.js"
 import { bytesToHex } from "@noble/hashes/utils.js"
 import { InvalidError } from "./client/errors.js"
 import { compareCodePoints } from "./runtime/compare.js"
-import { IntentId, type AgentId, type ConversationId } from "./types/ids.js"
+import { AgentId, ConversationId, IntentId } from "./types/ids.js"
 import { encodeNamed } from "./wire/cbor.js"
+
+const U64_MAX = 0xffff_ffff_ffff_ffffn
+
+// Node 22 writes and reads JSON integers beyond 2^53 exactly through these.
+const EXACT_JSON = JSON as unknown as { rawJSON(text: string): unknown }
 
 export const VoteChoice = { Allow: "allow", Block: "block", Abstain: "abstain" } as const
 export type VoteChoice = (typeof VoteChoice)[keyof typeof VoteChoice]
@@ -24,7 +29,7 @@ export interface IntentOptions {
   readonly mandatoryVoters?: readonly AgentId[]
   readonly policy: IntentPolicy
   readonly policyVersion: bigint
-  readonly deadlineMicros: bigint
+  readonly deadlineAtMicros: bigint
 }
 
 /** An invalid durable-intent configuration or operation. Each static
@@ -65,12 +70,20 @@ export class IntentError extends InvalidError {
     return new IntentError("intent digest does not match its body")
   }
 
+  static digestEncoding(reason: string): IntentError {
+    return new IntentError(`intent body does not encode for its digest: ${reason}`, { reason })
+  }
+
   static ineligibleVoter(voter: string): IntentError {
     return new IntentError(`voter '${voter}' is not eligible for this intent`, { voter })
   }
 
   static decisionIntentMismatch(): IntentError {
     return new IntentError("decision is not bound to this intent body and policy version")
+  }
+
+  static decisionQuorumNotMet(): IntentError {
+    return new IntentError("decision votes do not meet this intent's quorum")
   }
 }
 
@@ -84,7 +97,7 @@ export class Intent {
   readonly mandatoryVoters: readonly AgentId[]
   readonly policy: IntentPolicy
   readonly policyVersion: bigint
-  readonly deadlineMicros: bigint
+  readonly deadlineAtMicros: bigint
   readonly atMicros: bigint
 
   /** Mints the intent id, hashes the body, and stamps the proposal time now,
@@ -99,7 +112,7 @@ export class Intent {
     this.mandatoryVoters = [...(options.mandatoryVoters ?? [])]
     this.policy = options.policy
     this.policyVersion = options.policyVersion
-    this.deadlineMicros = options.deadlineMicros
+    this.deadlineAtMicros = options.deadlineAtMicros
     this.atMicros = BigInt(Date.now()) * 1_000n
     this.validate()
   }
@@ -124,10 +137,59 @@ export class Intent {
         throw IntentError.invalidThreshold(this.policy.required, this.eligibleVoters.length)
       }
     }
-    if (this.deadlineMicros <= this.atMicros) {
-      throw IntentError.invalidDeadline(this.atMicros, this.deadlineMicros)
+    if (this.deadlineAtMicros <= this.atMicros) {
+      throw IntentError.invalidDeadline(this.atMicros, this.deadlineAtMicros)
     }
     if (this.digest !== digestOf(this.body)) throw IntentError.digestMismatch()
+  }
+
+  /** The Rust and Python JSON shape of this intent, snake_case fields, the
+   * body as an array of bytes, and every integer exact. */
+  toJSON(): Readonly<Record<string, unknown>> {
+    return {
+      intent_id: this.intentId.toString(),
+      conversation: this.conversation.toString(),
+      proposer: this.proposer.asStr(),
+      body: [...this.body],
+      digest: this.digest,
+      eligible_voters: this.eligibleVoters.map((voter) => voter.asStr()),
+      mandatory_voters: this.mandatoryVoters.map((voter) => voter.asStr()),
+      policy:
+        this.policy.kind === "at-least" ? { at_least: this.policy.required } : this.policy.kind,
+      policy_version: jsonInteger(this.policyVersion),
+      deadline_at_micros: jsonInteger(this.deadlineAtMicros),
+      at_micros: jsonInteger(this.atMicros)
+    }
+  }
+
+  /** Rebuilds an intent another client published, from `toJSON` output or
+   * the Rust and Python JSON, as a string or an already parsed value. The id,
+   * digest, and proposal time are kept as written, then validated. */
+  static fromJSON(value: unknown): Intent {
+    let parsed: unknown = value
+    if (typeof value === "string") {
+      try {
+        parsed = JSON.parse(value, exactIntegers)
+      } catch (cause) {
+        throw new IntentError("an intent must be JSON", undefined, { cause })
+      }
+    }
+    const fields = jsonObject(parsed)
+    const intent = Object.assign(Object.create(Intent.prototype) as Intent, {
+      intentId: IntentId.parse(jsonString(fields, "intent_id")),
+      conversation: ConversationId.parse(jsonString(fields, "conversation")),
+      proposer: AgentId.new(jsonString(fields, "proposer")),
+      body: jsonBytes(fields["body"]),
+      digest: jsonString(fields, "digest"),
+      eligibleVoters: jsonAgents(fields, "eligible_voters"),
+      mandatoryVoters: jsonAgents(fields, "mandatory_voters"),
+      policy: jsonPolicy(fields["policy"]),
+      policyVersion: jsonU64(fields, "policy_version"),
+      deadlineAtMicros: jsonU64(fields, "deadline_at_micros"),
+      atMicros: jsonU64(fields, "at_micros")
+    })
+    intent.validate()
+    return intent
   }
 }
 
@@ -151,6 +213,15 @@ export class Vote {
   }
 }
 
+/** One ballot as a reader saw it: the `Vote` and the time the log assigned
+ * it, the record's server timestamp in epoch micros. `decide` windows and
+ * orders by `observedAtMicros` and keeps the voter's `atMicros` only as
+ * recorded evidence. */
+export interface ObservedVote {
+  readonly vote: Vote
+  readonly observedAtMicros: bigint
+}
+
 export class Decision {
   constructor(
     readonly intentId: IntentId,
@@ -171,39 +242,45 @@ export class Decision {
     ) {
       throw IntentError.decisionIntentMismatch()
     }
-    return this.outcome === IntentOutcome.Committed
+    if (this.outcome !== IntentOutcome.Committed) return false
+    if (!commitSupported(intent, this.votesConsidered)) throw IntentError.decisionQuorumNotMet()
+    return true
   }
 }
 
+/** Folds `votes` into a decision, or `undefined` while the outcome remains
+ * reachable before the deadline. Each ballot is windowed and ordered by its
+ * `observedAtMicros`, never by the voter's own claim, so a late ballot cannot
+ * claim an earlier time. */
 export function decide(
   intent: Intent,
-  votes: readonly Vote[],
+  votes: readonly ObservedVote[],
   nowMicros: bigint
 ): Decision | undefined {
   intent.validate()
   const eligible = new Set(intent.eligibleVoters.map((voter) => voter.asStr()))
   const valid = votes
     .filter(
-      (vote) =>
+      ({ vote, observedAtMicros }) =>
         vote.intentId.equals(intent.intentId) &&
         vote.intentDigest === intent.digest &&
         vote.policyVersion === intent.policyVersion &&
         eligible.has(vote.voter.asStr()) &&
-        vote.atMicros >= intent.atMicros &&
-        vote.atMicros <= intent.deadlineMicros &&
-        vote.atMicros <= nowMicros
+        observedAtMicros >= intent.atMicros &&
+        observedAtMicros <= intent.deadlineAtMicros &&
+        observedAtMicros <= nowMicros
     )
     .toSorted(
       (left, right) =>
-        compareCodePoints(left.voter.asStr(), right.voter.asStr()) ||
-        compareBigInt(left.atMicros, right.atMicros) ||
-        choiceRank(left.choice) - choiceRank(right.choice)
+        compareCodePoints(left.vote.voter.asStr(), right.vote.voter.asStr()) ||
+        compareBigInt(left.observedAtMicros, right.observedAtMicros) ||
+        choiceRank(left.vote.choice) - choiceRank(right.vote.choice)
     )
   const ballots = new Map<string, VoteChoice>()
   const considered: (readonly [AgentId, VoteChoice])[] = []
   let terminalAt = intent.atMicros
-  for (const vote of valid) {
-    if (vote.atMicros > terminalAt) terminalAt = vote.atMicros
+  for (const { vote, observedAtMicros } of valid) {
+    if (observedAtMicros > terminalAt) terminalAt = observedAtMicros
     const voter = vote.voter.asStr()
     const previous = ballots.get(voter)
     if (previous === undefined) {
@@ -238,13 +315,7 @@ export function decide(
   const mandatoryMet = intent.mandatoryVoters.every(
     (voter) => ballots.get(voter.asStr()) === VoteChoice.Allow
   )
-  const quorumMet =
-    intent.policy.kind === "all"
-      ? allow === total
-      : intent.policy.kind === "any"
-        ? allow >= 1
-        : allow >= intent.policy.required
-  if (quorumMet && mandatoryMet) {
+  if (quorumMet(intent.policy, allow, total) && mandatoryMet) {
     return sealed(intent, IntentOutcome.Committed, "quorum met", considered, terminalAt)
   }
   const impossible =
@@ -253,7 +324,7 @@ export function decide(
       : intent.policy.kind === "any"
         ? responded === total && allow === 0
         : allow + (total - responded) < intent.policy.required
-  const deadlinePassed = nowMicros >= intent.deadlineMicros
+  const deadlinePassed = nowMicros >= intent.deadlineAtMicros
   if (!impossible && !deadlinePassed) return undefined
   const reason =
     deadlinePassed && !mandatoryMet
@@ -266,7 +337,34 @@ export function decide(
     IntentOutcome.Aborted,
     reason,
     considered,
-    deadlinePassed ? intent.deadlineMicros : terminalAt
+    deadlinePassed ? intent.deadlineAtMicros : terminalAt
+  )
+}
+
+function quorumMet(policy: IntentPolicy, allow: number, total: number): boolean {
+  if (policy.kind === "all") return allow === total
+  return allow >= (policy.kind === "any" ? 1 : policy.required)
+}
+
+// Whether `votes` alone justify committing `intent`: eligible voters, one
+// choice each, every mandatory voter allowing, and the quorum met.
+function commitSupported(
+  intent: Intent,
+  votes: readonly (readonly [AgentId, VoteChoice])[]
+): boolean {
+  const eligible = new Set(intent.eligibleVoters.map((voter) => voter.asStr()))
+  const ballots = new Map<string, VoteChoice>()
+  for (const [voter, choice] of votes) {
+    const name = voter.asStr()
+    if (!eligible.has(name)) return false
+    const previous = ballots.get(name)
+    if (previous !== undefined && previous !== choice) return false
+    ballots.set(name, choice)
+  }
+  const allow = [...ballots.values()].filter((choice) => choice === VoteChoice.Allow).length
+  return (
+    intent.mandatoryVoters.every((voter) => ballots.get(voter.asStr()) === VoteChoice.Allow) &&
+    quorumMet(intent.policy, allow, intent.eligibleVoters.length)
   )
 }
 
@@ -285,6 +383,86 @@ function uniqueAgents(
     unique.add(value)
   }
   return unique
+}
+
+function jsonObject(value: unknown): Readonly<Record<string, unknown>> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new IntentError("an intent must be a JSON object")
+  }
+  return value as Readonly<Record<string, unknown>>
+}
+
+function jsonString(fields: Readonly<Record<string, unknown>>, key: string): string {
+  const value = fields[key]
+  if (typeof value !== "string") throw new IntentError(`intent ${key} must be a string`)
+  return value
+}
+
+function jsonAgents(fields: Readonly<Record<string, unknown>>, key: string): readonly AgentId[] {
+  const value = fields[key]
+  if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) {
+    throw new IntentError(`intent ${key} must be an array of agent ids`)
+  }
+  return value.map((name) => AgentId.new(name))
+}
+
+function jsonBytes(value: unknown): Uint8Array {
+  if (
+    !Array.isArray(value) ||
+    !value.every(
+      (byte) => typeof byte === "number" && Number.isInteger(byte) && byte >= 0 && byte <= 255
+    )
+  ) {
+    throw new IntentError("intent body must be an array of bytes")
+  }
+  return Uint8Array.from(value as readonly number[])
+}
+
+function jsonU64(fields: Readonly<Record<string, unknown>>, key: string): bigint {
+  const value = fields[key]
+  const integer =
+    typeof value === "bigint"
+      ? value
+      : typeof value === "number" && Number.isSafeInteger(value)
+        ? BigInt(value)
+        : undefined
+  if (integer === undefined || integer < 0n || integer > U64_MAX) {
+    throw new IntentError(`intent ${key} must be a u64`)
+  }
+  return integer
+}
+
+function jsonPolicy(value: unknown): IntentPolicy {
+  if (value === "all" || value === "any") return { kind: value }
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    const required: unknown = (value as Readonly<Record<string, unknown>>)["at_least"]
+    if (typeof required === "number" && Number.isSafeInteger(required)) {
+      return { kind: "at-least", required }
+    }
+    if (typeof required === "bigint" && required <= BigInt(Number.MAX_SAFE_INTEGER)) {
+      return { kind: "at-least", required: Number(required) }
+    }
+  }
+  throw new IntentError('intent policy must be "all", "any", or {"at_least": n}')
+}
+
+function jsonInteger(value: bigint): unknown {
+  return value <= BigInt(Number.MAX_SAFE_INTEGER)
+    ? Number(value)
+    : EXACT_JSON.rawJSON(String(value))
+}
+
+function exactIntegers(
+  _key: string,
+  value: unknown,
+  context?: { readonly source?: string }
+): unknown {
+  return typeof value === "number" &&
+    context?.source !== undefined &&
+    /^-?\d+$/.test(context.source) &&
+    !Number.isSafeInteger(value)
+    ? BigInt(context.source)
+    : value
 }
 
 function compareBigInt(left: bigint, right: bigint): number {

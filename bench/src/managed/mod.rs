@@ -507,17 +507,17 @@ async fn cas_hot_key(
 async fn scan_page(kv: &Kv, payload: &Bytes, page_size: usize) -> Result<(), String> {
     let page = kv
         .scan()
-        .limit(page_size)
+        .results(u32::try_from(page_size).map_err(|error| error.to_string())?)
         .fetch()
         .await
         .map_err(|error| error.to_string())?;
-    if page.entries.len() != page_size {
+    if page.items.len() != page_size {
         return Err(format!(
             "KV scan returned {} entries, expected {page_size}",
-            page.entries.len()
+            page.items.len()
         ));
     }
-    for entry in page.entries {
+    for entry in page.items {
         let id = key_id(&entry.key)?;
         if !is_expected_record(payload, id, &entry.value) {
             return Err("KV scan returned the wrong value".to_owned());
