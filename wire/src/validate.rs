@@ -4,7 +4,8 @@ use crate::clients::ClientMetadata;
 use crate::codes::AGDX_BATCH_CODE;
 use crate::codes::KV_LEASE_OP_VERSION;
 use crate::error::InvalidError;
-use crate::graph::{GraphEdge, GraphNode, GraphQuery, GraphUpsert, SourceRef};
+use crate::fork::ForkPut;
+use crate::graph::{GraphEdge, GraphNeighbors, GraphNode, GraphQuery, GraphUpsert, SourceRef};
 use crate::kv::{KvCasFenced, KvLease, KvLeaseRenew, KvRelease, KvScan, KvSet};
 use crate::limits::{
     MAX_BATCH_OPS, MAX_CLIENT_METADATA, MAX_FRAME_BYTES, MAX_GRAPH_LABEL_BYTES,
@@ -81,6 +82,53 @@ pub(crate) fn validate_bounded_text(
     Ok(())
 }
 
+/// The shared rule for stored text that keeps its existing caps: no NUL, which
+/// no text column of a relational store can hold.
+pub(crate) fn validate_stored_text(label: &str, value: &str) -> Result<(), InvalidError> {
+    if value.contains('\0') {
+        return Err(InvalidError::new(format!(
+            "{label} contains a NUL character"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether JSON text nests no deeper than `max_depth`, scanned before parsing.
+pub(crate) fn json_depth_within(payload: &[u8], max_depth: usize) -> bool {
+    let mut depth = 0usize;
+    let mut index = 0;
+    while index < payload.len() {
+        match payload[index] {
+            b'"' => {
+                index += 1;
+                loop {
+                    let Some(found) = memchr::memchr2(b'"', b'\\', &payload[index..]) else {
+                        return true;
+                    };
+                    index += found;
+                    if payload[index] == b'"' {
+                        break;
+                    }
+                    index += 2;
+                    if index >= payload.len() {
+                        return true;
+                    }
+                }
+            }
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > max_depth {
+                    return false;
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        index += 1;
+    }
+    true
+}
+
 impl Validate for BatchRequest {
     fn validate(&self) -> Result<(), InvalidError> {
         if self.ops.len() > MAX_BATCH_OPS {
@@ -118,6 +166,7 @@ impl Validate for BatchRequest {
 impl Validate for KvSet {
     fn validate(&self) -> Result<(), InvalidError> {
         crate::kv::validate_namespace(&self.namespace)?;
+        crate::kv::resolve_expiry(self.expires_at_micros, self.ttl_micros, 0)?;
         if self.key.is_empty() {
             return Err(InvalidError::new("key-value key is empty".to_owned()));
         }
@@ -140,10 +189,10 @@ impl Validate for KvSet {
 impl Validate for KvScan {
     fn validate(&self) -> Result<(), InvalidError> {
         crate::kv::validate_namespace(&self.namespace)?;
-        if self.limit > MAX_SCAN_LIMIT {
+        if self.results as usize > MAX_SCAN_LIMIT {
             return Err(InvalidError::new(format!(
-                "scan limit {} exceeds cap {MAX_SCAN_LIMIT}",
-                self.limit
+                "scan page size {} exceeds cap {MAX_SCAN_LIMIT}",
+                self.results
             )));
         }
         Ok(())
@@ -251,6 +300,7 @@ impl Validate for KvCasFenced {
         }
         crate::kv::validate_namespace(&self.namespace)?;
         crate::kv::validate_namespace(&self.fence_namespace)?;
+        crate::kv::resolve_expiry(self.expires_at_micros, self.ttl_micros, 0)?;
         validate_kv_key("key-value key", &self.key)?;
         validate_kv_key("fence key", &self.fence_key)?;
         if self.value.len() > MAX_VALUE_BYTES {
@@ -270,24 +320,56 @@ impl Validate for KvCasFenced {
 impl Validate for GraphQuery {
     fn validate(&self) -> Result<(), InvalidError> {
         crate::graph::validate_graph_name(&self.graph)?;
-        if self.traverse.len() > MAX_GRAPH_TRAVERSE_DEPTH as usize {
+        let mut depth = 0_u32;
+        for hop in &self.traverse {
+            if hop.max == 0 || hop.max > MAX_GRAPH_TRAVERSE_DEPTH {
+                return Err(InvalidError::new(format!(
+                    "graph hop max {} must be between 1 and {MAX_GRAPH_TRAVERSE_DEPTH}",
+                    hop.max
+                )));
+            }
+            depth = depth.saturating_add(hop.max);
+        }
+        if depth > MAX_GRAPH_TRAVERSE_DEPTH {
             return Err(InvalidError::new(format!(
-                "graph traversal depth {} exceeds cap {MAX_GRAPH_TRAVERSE_DEPTH}",
-                self.traverse.len()
+                "graph traversal depth {depth} exceeds cap {MAX_GRAPH_TRAVERSE_DEPTH}"
             )));
         }
-        if self.limit > MAX_GRAPH_RESULT_ELEMENTS {
-            return Err(InvalidError::new(format!(
-                "graph result limit {} exceeds cap {MAX_GRAPH_RESULT_ELEMENTS}",
-                self.limit
-            )));
-        }
-        Ok(())
+        validate_graph_limit(self.limit)
     }
+}
+
+impl Validate for GraphNeighbors {
+    fn validate(&self) -> Result<(), InvalidError> {
+        crate::graph::validate_graph_name(&self.graph)?;
+        if self.depth > MAX_GRAPH_TRAVERSE_DEPTH {
+            return Err(InvalidError::new(format!(
+                "graph neighbor depth {} exceeds cap {MAX_GRAPH_TRAVERSE_DEPTH}",
+                self.depth
+            )));
+        }
+        validate_graph_limit(self.limit)
+    }
+}
+
+fn validate_graph_limit(limit: u32) -> Result<(), InvalidError> {
+    if limit as usize > MAX_GRAPH_RESULT_ELEMENTS {
+        return Err(InvalidError::new(format!(
+            "graph result limit {limit} exceeds cap {MAX_GRAPH_RESULT_ELEMENTS}"
+        )));
+    }
+    Ok(())
 }
 
 impl Validate for SourceRef {
     fn validate(&self) -> Result<(), InvalidError> {
+        if let SourceRef::Message {
+            conversation: Some(conversation),
+            ..
+        } = self
+        {
+            validate_stored_text("source conversation", conversation)?;
+        }
         let size = match self {
             // A log pointer is fixed-width numerics plus an optional
             // conversation id, so only the id needs a bound.
@@ -367,6 +449,26 @@ impl Validate for GraphUpsert {
         }
         for edge in &self.edges {
             edge.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl Validate for ForkPut {
+    fn validate(&self) -> Result<(), InvalidError> {
+        crate::fork::validate_fork_id(&self.fork_id)?;
+        validate_stored_text("fork table", &self.table)?;
+        validate_stored_text("fork projection id", &self.projection_id)?;
+        for (name, value) in &self.fields {
+            validate_stored_text("fork field name", name)?;
+            validate_stored_text("fork field value", value)?;
+        }
+        for (name, value) in &self.metadata {
+            validate_stored_text("fork metadata name", name)?;
+            validate_stored_text("fork metadata value", value)?;
+        }
+        if let Some(embedding) = &self.embedding {
+            validate_stored_text("fork embedding", embedding)?;
         }
         Ok(())
     }
@@ -467,7 +569,7 @@ impl Validate for RegisterSchema {
         if let Some(name) = &self.name {
             validate_bounded_text("schema name", name, MAX_SCHEMA_NAME_BYTES)?;
         }
-        Ok(())
+        self.source.validate()
     }
 }
 
@@ -492,6 +594,7 @@ mod tests {
     };
     use crate::control::SchemaSource;
     use crate::limits::{MAX_GRAPH_LABEL_BYTES, MAX_MEMORY_ID_BYTES, MAX_SCHEMA_NAME_BYTES};
+    use std::collections::BTreeMap;
 
     #[test]
     fn given_an_invalid_graph_label_or_edge_type_when_upserted_then_should_refuse_it() {
@@ -564,6 +667,67 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn given_a_fork_put_with_nul_text_when_validated_then_should_refuse_it() {
+        let valid = ForkPut {
+            v: crate::codes::FORK_OP_VERSION,
+            fork_id: "draft".to_owned(),
+            table: "orders".to_owned(),
+            partition_id: 0,
+            offset: 1,
+            projection_id: "orders.v1".to_owned(),
+            projection_version: 1,
+            fields: BTreeMap::from([("status".to_owned(), "ok".to_owned())]),
+            metadata: BTreeMap::from([("role".to_owned(), "user".to_owned())]),
+            payload: None,
+            embedding: None,
+            tombstone: false,
+        };
+        valid.validate().expect("valid fork put");
+        let mut bad_field = valid.clone();
+        bad_field
+            .fields
+            .insert("status".to_owned(), "o\u{0}k".to_owned());
+        let mut bad_metadata = valid.clone();
+        bad_metadata
+            .metadata
+            .insert("ro\u{0}le".to_owned(), "user".to_owned());
+        let mut bad_table = valid.clone();
+        bad_table.table = "ord\u{0}ers".to_owned();
+        let mut bad_projection = valid.clone();
+        bad_projection.projection_id = "orders\u{0}".to_owned();
+        let mut bad_embedding = valid.clone();
+        bad_embedding.embedding = Some("[1.0\u{0}]".to_owned());
+        let mut bad_fork = valid;
+        bad_fork.fork_id = "dr aft".to_owned();
+        for request in [
+            bad_field,
+            bad_metadata,
+            bad_table,
+            bad_projection,
+            bad_embedding,
+            bad_fork,
+        ] {
+            assert!(request.validate().is_err(), "{request:?}");
+        }
+    }
+
+    #[test]
+    fn given_a_message_source_with_a_nul_conversation_when_validated_then_should_refuse_it() {
+        let source = |conversation: &str| SourceRef::Message {
+            stream: 1,
+            topic: 2,
+            partition: 0,
+            offset: 3,
+            generation: None,
+            conversation: Some(conversation.to_owned()),
+        };
+        source("01KWM3K3XEP3NP5TN850J17YBP")
+            .validate()
+            .expect("a plain conversation is valid");
+        assert!(source("01KWM3K3\u{0}").validate().is_err());
     }
 
     #[test]
@@ -815,9 +979,11 @@ mod tests {
         let valid = KvCasFenced {
             v: KV_LEASE_OP_VERSION,
             namespace: "connectors.state".to_owned(),
+            session: None,
             key: b"source_state/pg".to_vec(),
             value: b"cursor".to_vec(),
             expires_at_micros: None,
+            ttl_micros: None,
             expect: CasExpect::Absent,
             fence_namespace: "connectors.coordination".to_owned(),
             fence_key: b"source-owner".to_vec(),
@@ -853,6 +1019,7 @@ mod tests {
             key: vec![b'x'; MAX_KEY_BYTES + 1],
             value: vec![1, 2, 3],
             expires_at_micros: None,
+            ttl_micros: None,
         };
         assert!(over.validate().is_err());
         let ok = KvSet {
@@ -862,6 +1029,7 @@ mod tests {
             key: vec![b'x'; 8],
             value: vec![1, 2, 3],
             expires_at_micros: None,
+            ttl_micros: None,
         };
         assert!(ok.validate().is_ok());
     }

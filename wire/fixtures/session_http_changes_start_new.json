@@ -1,6 +1,9 @@
 {
-  "rows": [],
-  "floor": 0,
-  "resync": true,
+  "items": [],
+  "page": 1,
+  "total_pages": 0,
+  "total_results": 0,
+  "results": 100,
+  "floor": 1,
   "series": 7654321098765432101
 }

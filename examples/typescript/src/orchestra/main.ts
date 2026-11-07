@@ -30,7 +30,8 @@ import {
 // console's Orchestration view. `LASER_NON_INTERACTIVE=1` runs it straight
 // through. The phases mirror the Rust and Python `orchestra` examples.
 //
-// Routing uses a fixed inbox topic so it runs against Apache Iggy.
+// Routing resolves each agent's advertised inbox: the live presence on a
+// managed deployment, and the inbox its capability card names on Apache Iggy.
 
 export const EXAMPLE = "orchestra"
 const CLASSIFY = "classify"
@@ -40,7 +41,6 @@ const SLOW_TASK = "slow-task"
 const INCIDENT = "auth API latency spike"
 const ORCHESTRATOR = AgentId.new("orchestrator")
 const OPERATOR = AgentId.new("operator")
-const FIXED_INBOX = { kind: "fixed" as const, topic: AgentTopic.Sessions }
 const HEALTHY: Health = { kind: "known", name: "Healthy" }
 const UNAVAILABLE: Health = { kind: "known", name: "Unavailable" }
 
@@ -89,7 +89,6 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<Orchestra
   // sessions view shows the whole tree on any deployment.
   const workflow = await laser
     .workflow("incident-response")
-    .inboxRoute(FIXED_INBOX)
     // Cap the dispatches and wall clock so a runaway fan-out cannot spin.
     .budget(WorkflowBudget.unlimited().invocations(8).wallClock(60_000))
     .step("triage", routeToCapable(CLASSIFY, { kind: "any" }), () => utf8(INCIDENT))
@@ -124,8 +123,9 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<Orchestra
 
   phase("Expiry + recovery: a tight deadline times out, the orchestrator recovers")
   // The slow agent acks pickup but cannot finish inside the one-second deadline,
-  // so the contract expires. The orchestrator recovers by re-dispatching to a
-  // healthy fast agent, the pattern any real coordinator uses for a stuck task.
+  // so the contract expires. The task carries that deadline and the slow agent
+  // stops there instead of finishing late, so re-dispatching to a healthy agent
+  // cannot run the task twice.
   const slow = await contractSkill(laser, SLOW_TASK, 1_000)
   let recovered: string | undefined
   if (slow.kind === "completed") {
@@ -175,6 +175,15 @@ async function spawnWorker(
       .ackOnPickup()
       .handler({
         async handle(message, context): Promise<void> {
+          // A task carries its caller's deadline. Working past it would finish a
+          // task the caller already gave up on and sent elsewhere, so stop there.
+          const deadline = message.provenance.deadlineAtMicros
+          const remainingMs =
+            deadline === undefined ? delayMs : Number(deadline - BigInt(Date.now()) * 1000n) / 1000
+          if (remainingMs < delayMs) {
+            await new Promise((resolve) => setTimeout(resolve, Math.max(remainingMs, 0)))
+            return
+          }
           await new Promise((resolve) => setTimeout(resolve, delayMs))
           const task = decodeUtf8(agentMessageBody(message))
           await context.respond(utf8(workerReply(name, skill, task)))
@@ -204,7 +213,6 @@ async function contractSkill(laser: Laser, skill: string, deadlineMs: number): P
     .contract(routeToCapable(skill, { kind: "any" }))
     .from(ORCHESTRATOR)
     .payload(utf8(INCIDENT))
-    .inboxRoute(FIXED_INBOX)
     .deadline(deadlineMs)
     .send()
 }
@@ -216,7 +224,8 @@ async function diagnosePanel(laser: Laser): Promise<readonly Uint8Array[]> {
     ORCHESTRATOR,
     capabilitySelector(DIAGNOSE, { kind: "any" }),
     utf8(INCIDENT),
-    FIXED_INBOX,
+    { kind: "advertised" },
+    { kind: "requireAll" },
     10_000
   )
 }

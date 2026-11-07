@@ -1,4 +1,4 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::convert::{duration_ms, payload_bytes, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::filters::{PyConsumerFilter, PyFilteredReader, filter_headers, filtered_start};
@@ -68,26 +68,23 @@ impl PyConsumerGroup {
 
     /// Create the group, with an optional filter policy configured in the
     /// same call: a `filter` definition saved as the group's own filter under
-    /// `filter_name`, or one of its own revisions as `filter_id` and
-    /// `revision`. `filter_name` is required with `filter`, follows the
+    /// `filter_name`. `filter_name` is required with `filter`, follows the
     /// registered filter name rule and need not be unique. Idempotent: an
     /// existing group is kept and the same policy keeps its binding. A group
     /// that runs another policy raises `FilterError` with reason `conflict`.
     /// Pass `operation_id` to resume the same configuration after a crash.
     /// Returns the `ConsumerGroupInfo`.
-    #[pyo3(signature = (*, filter=None, filter_name=None, filter_id=None, revision=None, operation_id=None))]
+    #[pyo3(signature = (*, filter=None, filter_name=None, operation_id=None))]
     fn create<'py>(
         &self,
         py: Python<'py>,
         filter: Option<PyConsumerFilter>,
         filter_name: Option<String>,
-        filter_id: Option<u32>,
-        revision: Option<u32>,
         operation_id: Option<u128>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let policy = group_policy(filter, filter_name, filter_id, revision)?;
+    ) -> PyResult<Awaitable<'py, PyConsumerGroupInfo>> {
+        let policy = group_policy(filter, filter_name)?;
         let group = self.group.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut create = group.create();
             if let Some(policy) = policy {
                 create = create.policy(policy);
@@ -101,16 +98,16 @@ impl PyConsumerGroup {
     }
 
     /// The group as the server knows it.
-    fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn info<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyConsumerGroupInfo>> {
         let group = self.group.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let info = group.info().await.map_err(to_pyerr)?;
             Ok(PyConsumerGroupInfo { info })
         })
     }
 
-    /// The group's filter policy: configure it, inspect it, draft and pause
-    /// revisions, release it, preview and sample-test it.
+    /// The group's filter policy: configure it, inspect it, pause and resume
+    /// it, release it, preview and sample-test it.
     fn filter(&self) -> PyGroupFilter {
         PyGroupFilter {
             group: self.group.clone(),
@@ -122,9 +119,11 @@ impl PyConsumerGroup {
     /// the group's filter, or none, and commits through the group's fenced
     /// acknowledgments. On Apache Iggy it is the native group consumer, which
     /// always joins the group. It supports the same polling, batching,
-    /// replay, retry, and commit modes as the Rust builder. Use
-    /// `auto_commit="disabled"` plus `commit(message)` for
-    /// commit-after-handle delivery. `batch_length` also bounds the source
+    /// replay, retry, and commit modes as the Rust builder. The default
+    /// `auto_commit="all"` stores once the last message of a poll is handled,
+    /// a message counting as handled when the next one is asked for or the
+    /// consumer shuts down. Use `auto_commit="disabled"` plus
+    /// `commit(message)` for commit-after-handle delivery. `batch_length` also bounds the source
     /// records one partition poll examines. The server holds a poll that
     /// finds fewer than `min_count` new records for up to `max_wait_ms`
     /// (0 to 600000, 0 answers at once), and `max_bytes` caps the record
@@ -134,24 +133,32 @@ impl PyConsumerGroup {
     /// (the native consumer only those it holds when it joins), and a refused
     /// seed, such as an offset past a partition's end, fails `init` or the
     /// first `next` with the Iggy error.
-    #[pyo3(signature = (*, batch_length=1000, max_wait_ms=5000, min_count=1, max_bytes=1048576, polling="next", offset=None, timestamp_micros=None, auto_commit="polling", commit_interval_ms=0, commit_every=None, create_group=true, polling_retry_interval_ms=1000, init_retries=None, init_retry_interval_ms=1000, allow_replay=false))]
+    #[pyo3(signature = (*, batch_length=1000, max_wait_ms=5000.0, min_count=1, max_bytes=1048576, polling="next", offset=None, timestamp_micros=None, auto_commit="all", commit_interval_ms=0.0, commit_every=None, create_group=true, polling_retry_interval_ms=1000.0, init_retries=None, init_retry_interval_ms=1000.0, allow_replay=false))]
     #[allow(clippy::too_many_arguments)]
     fn consumer(
         &self,
         batch_length: u32,
-        max_wait_ms: u64,
+        max_wait_ms: f64,
         min_count: u32,
         max_bytes: u32,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['first', 'last', 'next', 'offset', 'timestamp']",
+            imports = ("typing",)
+        ))]
         polling: &str,
         offset: Option<u64>,
         timestamp_micros: Option<u64>,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['disabled', 'interval', 'polling', 'all', 'each', 'every']",
+            imports = ("typing",)
+        ))]
         auto_commit: &str,
-        commit_interval_ms: u64,
+        commit_interval_ms: f64,
         commit_every: Option<u32>,
         create_group: bool,
-        polling_retry_interval_ms: u64,
+        polling_retry_interval_ms: f64,
         init_retries: Option<u32>,
-        init_retry_interval_ms: u64,
+        init_retry_interval_ms: f64,
         allow_replay: bool,
     ) -> PyResult<PyConsumer> {
         configure_consumer(
@@ -218,7 +225,7 @@ impl PyConsumerGroup {
         idle_interval_ms: Option<f64>,
         max_wait_ms: Option<f64>,
         partitions: Option<Vec<u32>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyFilteredReader>> {
         let start = start
             .map(filtered_start)
             .transpose()?
@@ -230,7 +237,7 @@ impl PyConsumerGroup {
             .map(|ms| duration_ms(ms, "max_wait_ms"))
             .transpose()?;
         let group = self.group.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut builder = group
                 .reader()
                 .map_err(to_pyerr)?
@@ -314,9 +321,9 @@ impl PyGroupFilter {
         py: Python<'py>,
         operation_id: Option<u128>,
         policy: GroupFilterSpec,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let group = self.group.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let binding = group
                 .filter()
                 .configure_as(operation_id, policy)
@@ -327,18 +334,13 @@ impl PyGroupFilter {
     }
 }
 
-// A named definition or a revision, exactly one of them.
+// A named definition, required.
 fn required_policy(
     filter: Option<PyConsumerFilter>,
     filter_name: Option<String>,
-    filter_id: Option<u32>,
-    revision: Option<u32>,
 ) -> PyResult<GroupFilterSpec> {
-    group_policy(filter, filter_name, filter_id, revision)?.ok_or_else(|| {
-        InvalidError::new_err(
-            "pass `filter` with `filter_name`, or both `filter_id` and `revision`",
-        )
-    })
+    group_policy(filter, filter_name)?
+        .ok_or_else(|| InvalidError::new_err("pass `filter` with `filter_name`"))
 }
 
 #[gen_stub_pymethods]
@@ -356,7 +358,7 @@ impl PyGroupFilter {
         py: Python<'py>,
         name: String,
         filter: PyConsumerFilter,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         self.configure_policy(
             py,
             None,
@@ -367,42 +369,37 @@ impl PyGroupFilter {
         )
     }
 
-    /// `configure` with a `filter` definition saved under `filter_name`, or
-    /// one of the group's own revisions, named by `filter_id` and `revision`.
-    #[pyo3(signature = (*, filter=None, filter_name=None, filter_id=None, revision=None))]
+    /// `configure` with a `filter` definition saved under `filter_name`.
+    #[pyo3(signature = (*, filter=None, filter_name=None))]
     fn configure_with<'py>(
         &self,
         py: Python<'py>,
         filter: Option<PyConsumerFilter>,
         filter_name: Option<String>,
-        filter_id: Option<u32>,
-        revision: Option<u32>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let policy = required_policy(filter, filter_name, filter_id, revision)?;
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
+        let policy = required_policy(filter, filter_name)?;
         self.configure_policy(py, None, policy)
     }
 
     /// `configure_with` under a caller-chosen `operation_id`, so a caller that
     /// records the id first resumes the same configuration after a crash and
     /// reads its first outcome. `None` mints a fresh id.
-    #[pyo3(signature = (operation_id, *, filter=None, filter_name=None, filter_id=None, revision=None))]
+    #[pyo3(signature = (operation_id, *, filter=None, filter_name=None))]
     fn configure_as<'py>(
         &self,
         py: Python<'py>,
         operation_id: Option<u128>,
         filter: Option<PyConsumerFilter>,
         filter_name: Option<String>,
-        filter_id: Option<u32>,
-        revision: Option<u32>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let policy = required_policy(filter, filter_name, filter_id, revision)?;
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
+        let policy = required_policy(filter, filter_name)?;
         self.configure_policy(py, operation_id, policy)
     }
 
     /// The active binding dict, `None` for an unbound group.
-    fn get<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn get<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let group = self.group.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let binding = group.filter().get().await.map_err(to_pyerr)?;
             Python::attach(|py| match binding {
                 Some(binding) => ser_to_py(py, &binding),
@@ -411,41 +408,23 @@ impl PyGroupFilter {
         })
     }
 
-    /// One page of the group's own filter revisions, newest first.
-    #[pyo3(signature = (*, page=0, page_size=50))]
+    /// One page of the group's own filter revisions, newest first. `page`
+    /// counts from 1 and `results` is the page length.
+    #[pyo3(signature = (*, page=1, results=50))]
     fn revisions<'py>(
         &self,
         py: Python<'py>,
         page: u32,
-        page_size: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
+        results: u32,
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let group = self.group.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let revisions = group
                 .filter()
-                .revisions(page, page_size)
+                .revisions(page, results)
                 .await
                 .map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &revisions))
-        })
-    }
-
-    /// Draft a revision of the group's own filter. Readers keep running the
-    /// active revision. `expected_revision` must still be the latest.
-    fn revise<'py>(
-        &self,
-        py: Python<'py>,
-        expected_revision: u32,
-        filter: PyConsumerFilter,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let group = self.group.clone();
-        future_into_py(py, async move {
-            let revised = group
-                .filter()
-                .revise(expected_revision, filter.inner)
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &revised))
         })
     }
 
@@ -457,9 +436,9 @@ impl PyGroupFilter {
         py: Python<'py>,
         revision: u32,
         enabled: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let group = self.group.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             group
                 .filter()
                 .set_revision_enabled(revision, enabled)
@@ -471,9 +450,9 @@ impl PyGroupFilter {
     /// The group's own filter as a catalog row dict, bound or released: the
     /// caller's `name`, state, latest revision and the owning group under
     /// `owner`. `None` when the group has no filter of its own.
-    fn summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn summary<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let group = self.group.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let summary = group.filter().summary().await.map_err(to_pyerr)?;
             Python::attach(|py| match summary {
                 Some(summary) => ser_to_py(py, &summary),
@@ -486,9 +465,9 @@ impl PyGroupFilter {
     /// released first, so its consumers receive every record from their next
     /// poll. Nothing of the filter stays in the catalog. Returns `False` when
     /// the group has no filter of its own.
-    fn delete<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn delete<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, bool>> {
         let group = self.group.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             group.filter().delete().await.map_err(to_pyerr)
         })
     }
@@ -496,9 +475,9 @@ impl PyGroupFilter {
     /// Release the group's policy. Its readers then receive every record. A
     /// released group may only be configured with the digest it ran. Returns
     /// the released binding dict.
-    fn release<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn release<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let group = self.group.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let released = group.filter().release().await.map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &released))
         })
@@ -515,9 +494,9 @@ impl PyGroupFilter {
         max_examined: Option<u32>,
         max_records: Option<u32>,
         explain: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let group = self.group.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let filter = group.filter();
             let mut request = filter
                 .preview(partition_id)
@@ -542,13 +521,14 @@ impl PyGroupFilter {
     fn test<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         headers: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let payload = payload_bytes(payload)?;
         let headers = filter_headers(headers)?;
         let group = self.group.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let result = group
                 .filter()
                 .test(payload, headers)
@@ -570,24 +550,18 @@ fn label(group: &ConsumerGroup) -> String {
 fn group_policy(
     filter: Option<PyConsumerFilter>,
     filter_name: Option<String>,
-    filter_id: Option<u32>,
-    revision: Option<u32>,
 ) -> PyResult<Option<GroupFilterSpec>> {
-    match (filter, filter_name, filter_id, revision) {
-        (Some(filter), Some(name), None, None) => Ok(Some(GroupFilterSpec::Definition {
+    match (filter, filter_name) {
+        (Some(filter), Some(name)) => Ok(Some(GroupFilterSpec::Definition {
             name,
             filter: filter.inner,
         })),
-        (Some(_), None, None, None) => Err(InvalidError::new_err(
+        (Some(_), None) => Err(InvalidError::new_err(
             "`filter_name` is required with `filter`",
         )),
-        (None, None, Some(filter_id), Some(revision)) => Ok(Some(GroupFilterSpec::Revision {
-            filter_id,
-            revision,
-        })),
-        (None, None, None, None) => Ok(None),
-        _ => Err(InvalidError::new_err(
-            "pass either `filter` with `filter_name`, or both `filter_id` and `revision`",
+        (None, Some(_)) => Err(InvalidError::new_err(
+            "`filter` is required with `filter_name`",
         )),
+        (None, None) => Ok(None),
     }
 }

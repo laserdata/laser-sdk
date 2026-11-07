@@ -54,7 +54,6 @@ The helpers call `laser.projections().register(..)` and `laser.bindings().apply(
 ## Cross-SDK BDD conformance (`bdd/`)
 
 - Use the shared `bdd/scenarios/*.feature` files for Rust, Python, and TypeScript. Streaming and agent cases use Apache Iggy. Managed query, KV, graph, and memory cases use local reference engines. Run clients through `scripts/run-bdd-tests.sh`. `LASER_BDD_ADDR` selects an existing server address.
-- Keep `data_stack.feature` implemented in all three clients. It covers logical schemas, typed queries, explicit targets, paging, execution control, destinations, checkpoints, and Arrow metadata.
 - KV and fork _behavior_ is not exercised by the default Apache Iggy BDD gate: they are Iggy command codes (`send_raw_with_response`) only the managed backend dispatches. The default BDD covers the unsupported boundary and unified result-code classification. Their byte compatibility is covered by the fixture corpus, and managed behavior is tested in the managed backend and can be exercised through Laser Stack with the managed BDD option.
 - `bdd/rust` is a crate OUTSIDE the workspace (its own `[workspace]`), so `cargo test --workspace` does not touch it and it has its own fmt/sort/machete/clippy gate (the `lint-detached` CI job, `just lint`). Same for the `fuzz/` crate.
 - Reference files define encoded data, and BDD scenarios define shared behavior. A client must pass both. Use its public API in step definitions and keep scenario files shared. Read `bdd/README.md` for details.

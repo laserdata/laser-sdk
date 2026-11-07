@@ -1,4 +1,5 @@
 import { BARE_SCOPE, type ResourceScope } from "../client/resource-scope.js"
+import { type CallOptions, cancellable } from "../client/call-options.js"
 import type { Capabilities } from "../client/capabilities.js"
 import { GraphExecutionError, ProtocolError } from "../client/errors.js"
 import { executeManaged, type ManagedTransport } from "../client/managed.js"
@@ -12,6 +13,7 @@ import {
   type EdgeDir,
   type GraphEdge,
   type GraphNode,
+  type GraphQuery,
   type GraphReply,
   type GraphResult,
   type GraphReturn,
@@ -22,8 +24,11 @@ import {
   type SourceRef,
   graphEdgeRelate,
   graphNodeEntity,
-  validateGraphName
+  validateGraphLimit,
+  validateGraphName,
+  validateGraphQuery
 } from "../wire/graph.js"
+import { GRAPH_OP_VERSION } from "../wire/codes.js"
 import type { SessionRef } from "../wire/ids.js"
 import type { Filter } from "../wire/query.js"
 import { DEFAULT_RECALL_LIMIT } from "../wire/limits.js"
@@ -32,9 +37,10 @@ async function executeGraph<Request>(
   backend: ManagedTransport,
   capabilities: Capabilities,
   command: ManagedCommand<Request, GraphReply>,
-  request: Request
+  request: Request,
+  options: CallOptions
 ): Promise<GraphResult> {
-  const reply = await executeManaged(backend, capabilities, command, request)
+  const reply = await executeManaged(backend, capabilities, command, request, options)
   if (reply.kind === "ok") return reply.result
   if (reply.kind === "err") {
     throw new GraphExecutionError(`graph command failed: ${reply.error.kind}`, reply.error)
@@ -147,6 +153,27 @@ export class GraphHandle {
     return this
   }
 
+  /** Follows edges in `dir`, of `edgeType` or of any type when undefined, up to
+   * `max` steps at this hop. */
+  hop(dir: EdgeDir, edgeType: string | undefined, max: number): this {
+    this.hops.push({ ...(edgeType !== undefined ? { edgeType } : {}), dir, max })
+    return this
+  }
+
+  /** Admits only nodes matching `filter` at every hop. A rejected node is
+   * neither returned nor expanded. */
+  nodeFilter(filter: Filter): this {
+    this.nodeFilterValue = filter
+    return this
+  }
+
+  /** Follows only edges matching `filter`. A rejected edge is neither
+   * traversed nor returned. */
+  edgeFilter(filter: Filter): this {
+    this.edgeFilterValue = filter
+    return this
+  }
+
   /** Returns traversed edges. */
   returnEdges(): this {
     this.returnValue = "edges"
@@ -177,23 +204,30 @@ export class GraphHandle {
     return this
   }
 
-  /** Executes the configured traversal. */
-  async fetch(): Promise<GraphResult> {
-    validateGraphName(this.name)
-    const capabilities = await this.getCapabilities()
-    return executeGraph(this.backend, capabilities, GraphQueryCommand, {
+  /** The traversal request this handle sends, for inspection or the HTTP
+   * route's body. */
+  intoQuery(): GraphQuery {
+    return {
+      v: GRAPH_OP_VERSION,
       graph: this.name,
       start: this.startValue ?? { kind: "ids", ids: [] },
-      traverse: this.hops,
+      traverse: [...this.hops],
       return: this.returnValue,
       limit: this.limitValue,
-      consistency: "eventual",
       ...(this.nodeFilterValue !== undefined ? { nodeFilter: this.nodeFilterValue } : {}),
       ...(this.edgeFilterValue !== undefined ? { edgeFilter: this.edgeFilterValue } : {}),
       ...(this.asOfValue !== undefined ? { asOf: this.asOfValue } : {}),
       ...(this.conversationValue !== undefined ? { conversation: this.conversationValue } : {}),
       ...(this.streamValue !== undefined ? { stream: this.streamValue } : {})
-    })
+    }
+  }
+
+  /** Executes the configured traversal. */
+  async fetch(options: CallOptions = {}): Promise<GraphResult> {
+    const query = this.intoQuery()
+    validateGraphQuery(query)
+    const capabilities = await cancellable(options.signal, "graph fetch", this.getCapabilities)
+    return executeGraph(this.backend, capabilities, GraphQueryCommand, query, options)
   }
 
   /** Returns nodes reachable within a bounded depth. */
@@ -201,63 +235,101 @@ export class GraphHandle {
     node: NodeId,
     dir: EdgeDir,
     edgeType: string | undefined,
-    depth: number
+    depth: number,
+    options: CallOptions = {}
   ): Promise<GraphResult> {
     validateGraphName(this.name)
-    const capabilities = await this.getCapabilities()
-    return executeGraph(this.backend, capabilities, GraphNeighborsCommand, {
-      graph: this.name,
-      node,
-      dir,
-      depth,
-      limit: this.limitValue,
-      ...(edgeType !== undefined ? { edgeType } : {}),
-      ...(this.asOfValue !== undefined ? { asOf: this.asOfValue } : {}),
-      ...(this.conversationValue !== undefined ? { conversation: this.conversationValue } : {}),
-      ...(this.streamValue !== undefined ? { stream: this.streamValue } : {})
-    })
+    validateGraphLimit(this.limitValue)
+    const capabilities = await cancellable(options.signal, "graph neighbors", this.getCapabilities)
+    return executeGraph(
+      this.backend,
+      capabilities,
+      GraphNeighborsCommand,
+      {
+        graph: this.name,
+        node,
+        dir,
+        depth,
+        limit: this.limitValue,
+        ...(edgeType !== undefined ? { edgeType } : {}),
+        ...(this.asOfValue !== undefined ? { asOf: this.asOfValue } : {}),
+        ...(this.conversationValue !== undefined ? { conversation: this.conversationValue } : {}),
+        ...(this.streamValue !== undefined ? { stream: this.streamValue } : {})
+      },
+      options
+    )
   }
 
-  /** Upserts two kind:value entities and relates them. */
-  async link(from: string, relation: string, to: string): Promise<void> {
-    const fromNode = entityNode(from)
-    const toNode = entityNode(to)
-    const edge = graphEdgeRelate(fromNode, relation, toNode)
-    await this.upsert([fromNode, toNode], [edge])
+  /** Upserts two kind:value entities and relates them, valid from now. */
+  async link(from: string, relation: string, to: string, options: CallOptions = {}): Promise<void> {
+    await this.linkAt(from, relation, to, this.nowMicros(), options)
   }
 
   /** Supersedes other live targets before linking a single-valued relationship. */
-  async relink(from: string, relation: string, to: string): Promise<number> {
+  async relink(
+    from: string,
+    relation: string,
+    to: string,
+    options: CallOptions = {}
+  ): Promise<number> {
     const fromNode = entityNode(from)
     const toNode = entityNode(to)
-    const live = await this.neighbors(fromNode.id, "out", relation, 1)
+    const live = await this.neighbors(fromNode.id, "out", relation, 1, options)
     const now = this.nowMicros()
     const superseded = live.edges
       .filter((edge) => !edge.to.equals(toNode.id) && edge.validTo === undefined)
       .map((edge) => ({ ...edge, validTo: now }))
-    if (superseded.length > 0) await this.upsert([], superseded)
-    await this.link(from, relation, to)
+    if (superseded.length > 0) await this.upsert([], superseded, options)
+    await this.linkAt(from, relation, to, now, options)
     return superseded.length
   }
 
   /** Closes a relationship at the current valid time without deleting its nodes. */
-  async unlink(from: string, relation: string, to: string): Promise<void> {
+  async unlink(
+    from: string,
+    relation: string,
+    to: string,
+    options: CallOptions = {}
+  ): Promise<void> {
     const fromNode = entityNode(from)
     const toNode = entityNode(to)
     const edge = { ...graphEdgeRelate(fromNode, relation, toNode), validTo: this.nowMicros() }
-    await this.upsert([], [edge])
+    await this.upsert([], [edge], options)
   }
 
   /** Idempotently upserts content-addressed nodes and edges. */
-  async upsert(nodes: readonly GraphNode[], edges: readonly GraphEdge[]): Promise<void> {
+  async upsert(
+    nodes: readonly GraphNode[],
+    edges: readonly GraphEdge[],
+    options: CallOptions = {}
+  ): Promise<void> {
     validateGraphName(this.name)
-    const capabilities = await this.getCapabilities()
-    await executeGraph(this.backend, capabilities, GraphUpsertCommand, {
-      graph: this.name,
-      ...(this.sessionValue !== undefined ? { session: this.sessionValue } : {}),
-      nodes: nodes.map((node) => this.stamped(node)),
-      edges: edges.map((edge) => this.stamped(edge))
-    })
+    const capabilities = await cancellable(options.signal, "graph upsert", this.getCapabilities)
+    await executeGraph(
+      this.backend,
+      capabilities,
+      GraphUpsertCommand,
+      {
+        graph: this.name,
+        ...(this.sessionValue !== undefined ? { session: this.sessionValue } : {}),
+        nodes: nodes.map((node) => this.stamped(node)),
+        edges: edges.map((edge) => this.stamped(edge))
+      },
+      options
+    )
+  }
+
+  private async linkAt(
+    from: string,
+    relation: string,
+    to: string,
+    at: bigint,
+    options: CallOptions
+  ): Promise<void> {
+    const fromNode = entityNode(from)
+    const toNode = entityNode(to)
+    const edge = { ...graphEdgeRelate(fromNode, relation, toNode), validFrom: at }
+    await this.upsert([fromNode, toNode], [edge], options)
   }
 
   private stamped<Element extends GraphNode | GraphEdge>(element: Element): Element {

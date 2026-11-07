@@ -33,6 +33,18 @@ function envelope(): AgentEnvelope {
   )
 }
 
+void test("given_generated_keys_when_used_then_should_differ_sign_and_rebuild_from_their_seed", () => {
+  const first = SigningKey.generate()
+  const second = SigningKey.generate()
+  assert.notDeepEqual(first.toBytes(), second.toBytes())
+  const rebuilt = SigningKey.fromBytes(first.toBytes())
+  assert.deepEqual(rebuilt.keyId(), first.keyId())
+  const registry = new KeyRegistry()
+  registry.enroll("generated", first.verifyingKey())
+  const message = envelope()
+  assert.equal(registry.verify(withSignature(message, rebuilt.sign(message))), "generated")
+})
+
 void test("given_a_signed_envelope_when_verified_then_should_return_the_enrolled_principal", () => {
   const key = SigningKey.fromBytes(new Uint8Array(32).fill(7))
   const registry = new KeyRegistry()
@@ -64,6 +76,22 @@ void test("given_tampering_context_and_lifecycle_failures_when_verified_then_sho
   assert.throws(() => revoked.verify(withSignature(message, signature)), /revoked/)
 })
 
+void test("given_an_inverted_validity_window_when_a_record_is_built_then_should_refuse_it_as_invalid", () => {
+  const key = SigningKey.fromBytes(new Uint8Array(32).fill(16))
+  assert.throws(
+    () => KeyRecord.agent("agent-b", key.verifyingKey()).validWindow(200n, 100n),
+    InvalidError
+  )
+  assert.throws(
+    () => KeyRecord.agent("agent-b", key.verifyingKey()).validWindow(100n, 100n),
+    InvalidError
+  )
+  assert.equal(
+    KeyRecord.agent("agent-b", key.verifyingKey()).validWindow(100n).validFromMicros,
+    100n
+  )
+})
+
 void test("given_operator_and_agent_records_when_verified_then_should_preserve_key_kind", () => {
   const operator = SigningKey.fromBytes(new Uint8Array(32).fill(11))
   const agent = SigningKey.fromBytes(new Uint8Array(32).fill(12))
@@ -85,17 +113,36 @@ void test("given_a_signed_delegation_when_verified_then_should_bind_signer_and_u
   const key = SigningKey.fromBytes(new Uint8Array(32).fill(9))
   const registry = new KeyRegistry()
   registry.enroll("agent-a", key.verifyingKey())
+  const context: SignatureContext = { contentType: 1, agentVersion: 1 }
   const delegated = withMetadata(envelope(), METADATA_DELEGATED_BY, {
     kind: "str",
     value: "user-7"
   })
-  const signed = withSignature(delegated, key.sign(delegated))
-  assert.deepEqual(verifyDelegation(registry, signed), ["agent-a", "user-7"])
+  const signed = withSignature(delegated, key.signWithContext(delegated, context))
+  assert.deepEqual(verifyDelegation(registry, signed, context, 1n), ["agent-a", "user-7"])
   const forged = withMetadata(signed, METADATA_DELEGATED_BY, {
     kind: "str",
     value: "user-999"
   })
-  assert.throws(() => verifyDelegation(registry, forged), SignatureError)
+  assert.throws(() => verifyDelegation(registry, forged, context, 1n), SignatureError)
+})
+
+void test("given_an_expired_key_or_rewritten_headers_when_a_delegation_is_verified_then_should_reject_it", () => {
+  const key = SigningKey.fromBytes(new Uint8Array(32).fill(10))
+  const registry = new KeyRegistry()
+  registry.enrollRecord(KeyRecord.agent("agent-a", key.verifyingKey()).validWindow(100n, 200n))
+  const context: SignatureContext = { contentType: 1, agentVersion: 1 }
+  const delegated = withMetadata(envelope(), METADATA_DELEGATED_BY, {
+    kind: "str",
+    value: "user-7"
+  })
+  const signed = withSignature(delegated, key.signWithContext(delegated, context))
+  assert.deepEqual(verifyDelegation(registry, signed, context, 150n), ["agent-a", "user-7"])
+  assert.throws(() => verifyDelegation(registry, signed, context, 200n), SignatureError)
+  assert.throws(
+    () => verifyDelegation(registry, signed, { contentType: 3, agentVersion: 1 }, 150n),
+    SignatureError
+  )
 })
 
 void test("given_a_signed_card_when_verified_then_should_reject_tampering_and_ignore_its_signature_slot", () => {
@@ -114,21 +161,60 @@ void test("given_a_signed_card_when_verified_then_should_reject_tampering_and_ig
   })
 })
 
-void test("given_mixed_case_and_astral_keys_when_a_card_is_signed_then_should_sign_utf8_byte_ordered_json", () => {
-  const key = SigningKey.fromBytes(new Uint8Array(32).fill(7))
-  const card = {
-    b: 1,
-    "\u{1F600}": { z: "\u0001\n", Z: [true, null] },
-    a: 3,
-    "": 4,
-    B: 2,
-    signatures: []
+void test("given_the_shared_card_vector_when_signed_then_should_sign_the_rfc_8785_canonical_form", async () => {
+  const vector = JSON.parse(
+    await readFile(
+      new URL("../../../../../sdk/tests/fixtures/card_signature.json", import.meta.url),
+      "utf8"
+    )
+  ) as {
+    readonly secret_seed_hex: string
+    readonly card: unknown
+    readonly canonical: string
+    readonly protected: string
+    readonly signature: string
   }
-  const canonical = '{"B":2,"a":3,"b":1,"":4,"\u{1F600}":{"Z":[true,null],"z":"\\u0001\\n"}}'
-  const protectedValue = Buffer.from('{"alg":"EdDSA"}').toString("base64url")
-  const input = `${protectedValue}.${Buffer.from(canonical).toString("base64url")}`
+  const key = SigningKey.fromBytes(fromHex(vector.secret_seed_hex))
+  const input = `${vector.protected}.${Buffer.from(vector.canonical).toString("base64url")}`
   const expected = Buffer.from(key.signBytes(new TextEncoder().encode(input))).toString("base64url")
-  assert.deepEqual(signCardValue(key, card), { protected: protectedValue, signature: expected })
+  assert.deepEqual(signCardValue(key, vector.card), {
+    protected: vector.protected,
+    signature: expected
+  })
+  assert.equal(expected, vector.signature)
+  verifyCard(
+    vector.card,
+    { protected: vector.protected, signature: vector.signature },
+    key.verifyingKey()
+  )
+})
+
+void test("given_a_card_signature_header_when_verified_then_should_require_eddsa_no_crit_and_the_key_id", () => {
+  const key = SigningKey.fromBytes(new Uint8Array(32).fill(7))
+  const other = SigningKey.fromBytes(new Uint8Array(32).fill(8))
+  const card = { name: "planner", skills: [] }
+  const signed = signCardValue(key, card)
+  verifyCard(card, signed, key.verifyingKey())
+  const reheader = (header: string) => {
+    const protectedValue = Buffer.from(header).toString("base64url")
+    const payload = Buffer.from('{"name":"planner","skills":[]}').toString("base64url")
+    return {
+      protected: protectedValue,
+      signature: Buffer.from(
+        key.signBytes(new TextEncoder().encode(`${protectedValue}.${payload}`))
+      ).toString("base64url")
+    }
+  }
+  verifyCard(card, reheader('{"alg":"EdDSA"}'), key.verifyingKey())
+  assert.throws(() => {
+    verifyCard(card, reheader('{"alg":"none"}'), key.verifyingKey())
+  }, /alg EdDSA/)
+  assert.throws(() => {
+    verifyCard(card, reheader('{"alg":"EdDSA","crit":["exp"],"exp":1}'), key.verifyingKey())
+  }, /critical extension/)
+  assert.throws(() => {
+    verifyCard(card, signed, other.verifyingKey())
+  }, /another key/)
 })
 
 void test("given_a_lone_surrogate_when_a_card_is_signed_then_should_reject_it", () => {

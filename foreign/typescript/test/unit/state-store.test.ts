@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, readdir, rm } from "node:fs/promises"
+import { mkdtemp, readdir, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
@@ -31,3 +31,20 @@ void test("given_a_file_store_when_used_then_should_encode_keys_and_write_atomic
     await rm(root, { recursive: true, force: true })
   }
 })
+
+void test(
+  "given_a_file_store_when_written_then_should_restrict_its_directory_to_the_owner",
+  {
+    skip: process.platform === "win32"
+  },
+  async () => {
+    const parent = await mkdtemp(join(tmpdir(), "laser-ts-state-"))
+    const root = join(parent, "state")
+    try {
+      await new FileStore(root).set("cursor", new TextEncoder().encode("7"))
+      assert.equal((await stat(root)).mode & 0o777, 0o700, "dedup keys and cursors stay private")
+    } finally {
+      await rm(parent, { recursive: true, force: true })
+    }
+  }
+)

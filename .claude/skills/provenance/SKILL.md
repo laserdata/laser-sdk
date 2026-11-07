@@ -11,7 +11,7 @@ The TypeScript peer lives under `foreign/typescript/src/provenance` and uses the
 
 Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first. Repo rules in [AGENTS.md](../../../AGENTS.md).
 
-Managed authorization uses the authenticated `user_id` supplied by the server. The SDK cannot choose this identity. Provenance headers remain writer claims. Signed delegation uses `on_behalf_of` inside the envelope signature, while effective access intersects the permitted identities.
+Managed authorization uses the authenticated `user_id` supplied by the server. The SDK cannot choose this identity. Provenance headers remain writer claims. Signed delegation uses `on_behalf_of` inside the envelope signature. The server never reads it, so the application verifies it with `verify_delegation` (observed headers and record time) and intersects the permitted identities with `delegated_allow`.
 
 ## STOP and ask the user before
 

@@ -7,12 +7,16 @@ use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::provenance::AgentTopic;
 use crate::types::{AgentId, ConsumerGroupName};
-use laser_wire::agent::{AgentCard, CapabilityDescriptor};
+use laser_wire::agent::{AgentCard, CapabilityDescriptor, Health};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
+
+// A spawned agent's card stays fresh for this many heartbeats, so one missed
+// refresh does not read a live agent as dead.
+const CARD_TTL_HEARTBEATS: u32 = 3;
 
 /// One logical agent defaults to one Iggy consumer group.
 ///
@@ -163,6 +167,13 @@ where
         let id = self.id.clone();
         let listen_on = self.listen_on.clone();
         let capabilities = self.capabilities;
+        let heartbeat = self
+            .sessions
+            .as_ref()
+            .map_or(crate::agent::DEFAULT_SESSION_HEARTBEAT, |config| {
+                config.heartbeat_value()
+            });
+        let pickup_without_reply = self.ack_on_pickup && self.respond_on.is_none();
         let consumer_group = self.consumer_group;
         // The agent's session configuration declares its stream's layout on
         // this connection, so the agent reads and routes by it.
@@ -211,19 +222,22 @@ where
         };
         let task = tokio::spawn(async move {
             let agent = id.clone();
+            let agent_id = id.clone();
             let outcome = async move {
                 if zero_period {
                     return Err(LaserError::Config(
                         "consolidate_every must be greater than zero",
                     ));
                 }
+                if pickup_without_reply {
+                    return Err(LaserError::Config(
+                        "ack_on_pickup requires respond_on, the topic the pickup status is sent on",
+                    ));
+                }
                 let group = match consumer_group {
                     Some(group) => group,
                     None => ConsumerGroupName::for_agent(&id)?,
                 };
-                if !capabilities.is_empty() {
-                    advertise(&laser, &id, &listen_on, capabilities).await?;
-                }
                 let consumer = ReliableConsumer::builder()
                     .group(group)
                     .agent(id)
@@ -249,10 +263,15 @@ where
                 let consumer = consumer
                     .maybe_verifier(verifier)
                     .maybe_signing_key(signing_key);
-                consumer
-                    .build()
-                    .run(&laser, handler, ready_tx, shutdown_rx)
-                    .await
+                let consumer = consumer.build();
+                let advertisement =
+                    Advertisement::start(&laser, &agent_id, &listen_on, capabilities, heartbeat)
+                        .await?;
+                let outcome = consumer.run(&laser, handler, ready_tx, shutdown_rx).await;
+                if let Some(advertisement) = advertisement {
+                    advertisement.withdraw().await;
+                }
+                outcome
             }
             .await;
             if let Err(error) = &outcome {
@@ -270,22 +289,25 @@ where
 }
 
 /// Advertise a capability-bearing agent before it starts consuming: publish a
-/// non-expiring capability card to the registry (durable discovery), and, where
-/// the server serves the presence command, advertise its inbox (its `listen_on`
-/// topic) as live presence (so capability fan-out resolves where to send work).
-/// Both are best-effort: a failure logs and the agent still runs, since a missing
-/// advertisement degrades discovery but must not stop the agent.
+/// capability card to the registry (durable discovery) naming its inbox (its
+/// `listen_on` topic) and fresh for `ttl` (`None` never expires), and, where the
+/// server serves the presence command, advertise the inbox as live presence.
+/// Both are best-effort: a failure logs and the agent still runs, since a
+/// missing advertisement degrades discovery but must not stop the agent.
+/// Returns the card as published, so a caller can refresh and withdraw it.
 pub(crate) async fn advertise(
     laser: &Laser,
     id: &AgentId,
     listen_on: &AgentTopic<'static>,
     capabilities: Vec<CapabilityDescriptor>,
-) -> Result<(), LaserError> {
+    ttl: Option<Duration>,
+) -> Result<AgentCard, LaserError> {
     let card = AgentCard {
         name: None,
         version: None,
         capabilities,
-        ttl_micros: None,
+        ttl_micros: ttl.map(|ttl| u64::try_from(ttl.as_micros()).unwrap_or(u64::MAX)),
+        inbox: Some(listen_on.topic_string()),
     };
     if let Err(error) = laser.publish_card(id.clone(), &card).await {
         warn!(%error, agent = %id, "failed to publish the capability card");
@@ -299,13 +321,90 @@ pub(crate) async fn advertise(
                 return Err(error);
             }
             // Expected against a streaming server without the presence command,
-            // where routing falls back to a fixed inbox route. Not an error.
+            // where routing falls back to the card's inbox. Not an error.
             tracing::debug!(%error, agent = %id, "inbox presence not advertised");
         }
     }
-    #[cfg(not(feature = "query"))]
-    let _ = listen_on;
-    Ok(())
+    Ok(card)
+}
+
+/// A running agent's advertisement: its card, refreshed every heartbeat until
+/// `withdraw`. A language binding advertises its spawned agents through it.
+#[doc(hidden)]
+pub struct Advertisement {
+    laser: Laser,
+    id: AgentId,
+    card: AgentCard,
+    refresh: JoinHandle<()>,
+}
+
+impl Advertisement {
+    /// Advertise `capabilities` for `id` with a card fresh for a few heartbeats
+    /// and refreshed every `heartbeat`. `None` when there are no capabilities.
+    pub async fn start(
+        laser: &Laser,
+        id: &AgentId,
+        listen_on: &AgentTopic<'static>,
+        capabilities: Vec<CapabilityDescriptor>,
+        heartbeat: Duration,
+    ) -> Result<Option<Self>, LaserError> {
+        if capabilities.is_empty() {
+            return Ok(None);
+        }
+        let ttl = heartbeat.saturating_mul(CARD_TTL_HEARTBEATS);
+        let card = advertise(laser, id, listen_on, capabilities, Some(ttl)).await?;
+        let refresh = spawn_card_refresh(laser, id, card.clone(), heartbeat);
+        Ok(Some(Self {
+            laser: laser.clone(),
+            id: id.clone(),
+            card,
+            refresh,
+        }))
+    }
+
+    /// Stop the refresh, mark the card unavailable and clear the presence.
+    pub async fn withdraw(self) {
+        self.refresh.abort();
+        withdraw(&self.laser, &self.id, self.card).await;
+    }
+}
+
+// Republish the card every heartbeat while the agent runs, so it stays fresh
+// within its ttl. A failed refresh logs and the next tick tries again.
+fn spawn_card_refresh(
+    laser: &Laser,
+    id: &AgentId,
+    card: AgentCard,
+    heartbeat: Duration,
+) -> JoinHandle<()> {
+    let laser = laser.clone();
+    let id = id.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(heartbeat.max(Duration::from_millis(1)));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if let Err(error) = laser.publish_card(id.clone(), &card).await {
+                warn!(%error, agent = %id, "Agent {id} could not refresh its capability card: {error}");
+            }
+        }
+    })
+}
+
+// A stopped agent marks every skill on its card unavailable and clears its
+// presence, so routing stops choosing it before the card's ttl runs out.
+async fn withdraw(laser: &Laser, id: &AgentId, mut card: AgentCard) {
+    for capability in &mut card.capabilities {
+        capability.health = Some(Health::Unavailable);
+    }
+    if let Err(error) = laser.publish_card(id.clone(), &card).await {
+        warn!(%error, agent = %id, "Agent {id} could not withdraw its capability card: {error}");
+    }
+    #[cfg(feature = "query")]
+    if let Err(error) = laser.clear_presence().await {
+        tracing::debug!(%error, agent = %id, "inbox presence not cleared");
+    }
 }
 
 /// Owns a spawned agent. Dropping it signals a graceful stop and stops consolidation. Call `shutdown` or `join` to observe the consumer result.
@@ -341,6 +440,8 @@ impl AgentHandle {
     }
 
     /// Signal the agent to stop, wait for it, and surface any consumer error.
+    /// After a failed [`ready`](Self::ready), which already returned the
+    /// error, this reports that the agent stopped before it became ready.
     pub async fn shutdown(mut self) -> Result<(), LaserError> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
@@ -348,12 +449,12 @@ impl AgentHandle {
         if let Some(consolidation) = &self.consolidation {
             consolidation.abort();
         }
-        Self::join_task(self.task.take().expect("agent task is retained")).await
+        Self::join_task(self.task.take()).await
     }
 
     /// Wait for the agent to finish (it runs until its consumer ends or errors).
     pub async fn join(mut self) -> Result<(), LaserError> {
-        let result = Self::join_task(self.task.take().expect("agent task is retained")).await;
+        let result = Self::join_task(self.task.take()).await;
         if let Some(consolidation) = &self.consolidation {
             consolidation.abort();
         }
@@ -370,7 +471,12 @@ impl AgentHandle {
         }
     }
 
-    async fn join_task(task: JoinHandle<Result<(), LaserError>>) -> Result<(), LaserError> {
+    async fn join_task(task: Option<JoinHandle<Result<(), LaserError>>>) -> Result<(), LaserError> {
+        let Some(task) = task else {
+            return Err(LaserError::HandlerConfig(
+                "agent stopped before it became ready".to_owned(),
+            ));
+        };
         match task.await {
             Ok(result) => result,
             Err(join) => Err(LaserError::HandlerConfig(join.to_string())),
@@ -490,6 +596,43 @@ mod tests {
             .build()
             .spawn(laser);
         assert!(matches!(handle.ready().await, Err(LaserError::Config(_))));
+    }
+
+    #[tokio::test]
+    async fn given_ack_on_pickup_without_respond_on_when_spawned_then_should_fail_as_config() {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default())
+            .with_default_stream("pickup-without-reply");
+        let mut handle = Agent::builder()
+            .id("planner".parse().expect("valid agent id"))
+            .listen_on(AgentTopic::Sessions)
+            .handler(IgnoreHandler)
+            .ack_on_pickup(true)
+            .build()
+            .spawn(laser);
+        assert!(matches!(handle.ready().await, Err(LaserError::Config(_))));
+    }
+
+    #[tokio::test]
+    async fn given_a_failed_ready_when_shutting_down_then_should_report_the_stop_without_panicking()
+    {
+        let (passes, _scopes) = tokio::sync::mpsc::unbounded_channel();
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default())
+            .with_default_stream("zero-tick-shutdown");
+        let mut handle = Agent::builder()
+            .id("planner".parse().expect("valid agent id"))
+            .listen_on(AgentTopic::Sessions)
+            .handler(IgnoreHandler)
+            .consolidate_every(Duration::ZERO)
+            .consolidator(crate::memory::SharedConsolidator::new(
+                RecordingConsolidator(passes),
+            ))
+            .build()
+            .spawn(laser);
+        assert!(handle.ready().await.is_err());
+        assert!(matches!(
+            handle.shutdown().await,
+            Err(LaserError::HandlerConfig(_))
+        ));
     }
 
     #[tokio::test]

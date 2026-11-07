@@ -55,7 +55,7 @@ void test("given_a_directed_contract_when_the_agent_replies_then_should_complete
   }
 })
 
-void test("given_no_consumer_when_the_pickup_expiry_elapses_then_should_report_not_consumed", async () => {
+void test("given_no_running_target_when_a_contract_expires_unpicked_then_should_time_out_without_evidence", async () => {
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
   try {
@@ -68,7 +68,8 @@ void test("given_no_consumer_when_the_pickup_expiry_elapses_then_should_report_n
       .expireIfNotConsumed(80)
       .deadline(1_000)
       .send()
-    assert.deepEqual(outcome, { kind: "notConsumed" })
+    // Nothing reads the command, so nothing proves it went unconsumed.
+    assert.deepEqual(outcome, { kind: "timedOut" })
   } finally {
     await laser.close()
   }

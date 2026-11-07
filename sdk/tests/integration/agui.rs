@@ -80,9 +80,11 @@ async fn given_a_chat_stream_when_rendered_then_should_produce_agui_text_events(
     })
     .await;
 
-    // The chat chunk stream renders as TEXT_MESSAGE_START -> CONTENT -> END.
+    // The chat chunk stream renders as TEXT_MESSAGE_START -> CONTENT -> END
+    // inside one run.
+    assert!(matches!(&events[0], AgUiEvent::RunStarted { .. }));
     assert!(matches!(
-        &events[0],
+        &events[1],
         AgUiEvent::TextMessageStart { role, .. } if role == "assistant"
     ));
     assert!(events.iter().any(|event| matches!(
@@ -90,8 +92,11 @@ async fn given_a_chat_stream_when_rendered_then_should_produce_agui_text_events(
         AgUiEvent::TextMessageContent { delta, .. } if delta == "Hi"
     )));
     assert!(matches!(
-        events.last(),
-        Some(AgUiEvent::TextMessageEnd { .. })
+        &events[events.len() - 2..],
+        [
+            AgUiEvent::TextMessageEnd { .. },
+            AgUiEvent::RunFinished { .. }
+        ]
     ));
 }
 
@@ -131,10 +136,78 @@ async fn given_a_tool_args_stream_when_rendered_then_should_produce_agui_tool_ca
 
     // The tool_args chunk stream renders as TOOL_CALL_START -> ARGS -> END,
     // not as a text message.
-    assert!(matches!(&events[0], AgUiEvent::ToolCallStart { .. }));
+    assert!(matches!(&events[0], AgUiEvent::RunStarted { .. }));
+    assert!(matches!(&events[1], AgUiEvent::ToolCallStart { .. }));
     assert!(events.iter().any(|event| matches!(
         event,
         AgUiEvent::ToolCallArgs { delta, .. } if delta == r#"{"q":1}"#
     )));
-    assert!(matches!(events.last(), Some(AgUiEvent::ToolCallEnd { .. })));
+    assert!(matches!(
+        &events[events.len() - 2..],
+        [AgUiEvent::ToolCallEnd { .. }, AgUiEvent::RunFinished { .. }]
+    ));
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_chat_longer_than_fifty_chunks_when_rendered_then_should_keep_its_opening_and_frame_one_run()
+ {
+    let laser = harness::laser().await;
+    let conversation = ConversationId::new();
+    let correlation = CorrelationId::from_u128(0x0190_3c1f_aa00_0000_0000_0000_0000_0041);
+
+    let mut stream = laser
+        .agdx(
+            AgentTopic::Sessions,
+            "model"
+                .parse::<laser_sdk::types::AgentId>()
+                .expect("model is a valid agent id"),
+            WireConversationId::from(conversation),
+        )
+        .stream(correlation, OPERATION_CHAT);
+    for index in 0..60 {
+        stream
+            .write(format!("chunk {index} ").into_bytes())
+            .await
+            .expect("chunk writes");
+    }
+    stream.finish("stop", None).await.expect("terminal writes");
+
+    let events = harness::eventually(|| {
+        let laser = laser.clone();
+        async move {
+            let events = laser
+                .agui_events(conversation, AgentTopic::Sessions)
+                .await
+                .ok()?;
+            events
+                .iter()
+                .any(|event| matches!(event, AgUiEvent::TextMessageEnd { .. }))
+                .then_some(events)
+        }
+    })
+    .await;
+
+    assert!(
+        matches!(&events[0], AgUiEvent::RunStarted { .. }),
+        "{events:?}"
+    );
+    assert!(
+        matches!(&events[1], AgUiEvent::TextMessageStart { .. }),
+        "{events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgUiEvent::TextMessageContent { .. }))
+            .count(),
+        60
+    );
+    assert!(matches!(
+        &events[events.len() - 2..],
+        [
+            AgUiEvent::TextMessageEnd { .. },
+            AgUiEvent::RunFinished { .. }
+        ]
+    ));
 }

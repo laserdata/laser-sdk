@@ -74,7 +74,7 @@ void test("given_names_when_split_then_should_return_stream_and_local_part_only_
 })
 
 void test("given_lens_requests_when_encoded_then_should_carry_the_stream_only_when_set", () => {
-  const scan = { namespace: "n", conversation: "c", limit: 5 }
+  const scan = { namespace: "n", conversation: "c", page: 0, results: 5 }
   const bare = roundTrip(encodeKvScan, decodeKvScan, scan)
   const scoped = roundTrip(encodeKvScan, decodeKvScan, { ...scan, stream: "acme" })
   assert.equal(bare.back.stream, undefined)
@@ -87,12 +87,12 @@ void test("given_lens_requests_when_encoded_then_should_carry_the_stream_only_wh
   })
   assert.equal(many.back.stream, "acme")
   const query = roundTrip(encodeGraphQuery, decodeGraphQuery, {
+    v: 1,
     graph: "g",
     start: { kind: "ids", ids: [] },
     traverse: [],
     return: "nodes",
     limit: 1,
-    consistency: "eventual",
     conversation: "c",
     stream: "acme"
   })
@@ -183,4 +183,19 @@ void test("given_a_tenancy_violation_when_round_tripped_then_should_keep_the_rea
   )
   assert.deepEqual(back, error)
   assert.deepEqual(authzErrorResultCode(error), { kind: "known", name: "InvalidArgument" })
+})
+
+void test("given_receipt_refusals_when_round_tripped_then_should_keep_the_reason_and_map_to_their_codes", () => {
+  for (const [error, code] of [
+    [{ kind: "mutationConflict", message: "taken" }, "Conflict"],
+    [{ kind: "resourceLimit", message: "full" }, "ResourceLimit"],
+    [{ kind: "invalidGrant", message: "memory" }, "InvalidArgument"]
+  ] as const) {
+    const back = decodeAuthzError(
+      decodeOne(encodeNamed(encodeAuthzError(error) as ReadonlyMap<string, unknown>), "authz"),
+      "authz"
+    )
+    assert.deepEqual(back, error)
+    assert.deepEqual(authzErrorResultCode(error), { kind: "known", name: code })
+  }
 })

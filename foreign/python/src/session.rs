@@ -1,4 +1,5 @@
-use crate::async_bridge::future_into_py;
+use crate::agdx::PyAgdxReceipt;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::context::{
     PyContextMessage, PyContextScope, PyScopedMemory, bounded_policy, context_policy, take_failure,
@@ -347,10 +348,10 @@ impl PySessions {
         py: Python<'py>,
         partitions: u32,
         retention: &PyTopicRetention,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PySessionBootstrap>> {
         let sessions = self.inner.clone();
         let retention = retention.inner;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let bootstrap = sessions
                 .bootstrap(partitions, retention)
                 .await
@@ -364,9 +365,9 @@ impl PySessions {
     /// Stop the deployment from indexing this stream's sessions, through the
     /// authenticated managed control path. A later `bootstrap` registers the
     /// stream again.
-    fn unregister<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn unregister<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let sessions = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             sessions.unregister().await.map_err(to_pyerr)?;
             Ok(())
         })
@@ -568,17 +569,35 @@ impl PySessionBuilder {
     }
 
     /// Write the session start and take a lease. Returns `(Session, SessionLease)`.
-    fn begin<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// A labeled session or one with an explicit id that already ended raises
+    /// `SessionEndedError` before anything is written. Reopen a completed or
+    /// failed one with `resume`.
+    fn begin<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, (PySession, PySessionLease)>> {
         let builder = self.take()?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let (session, lease) = builder.begin().await.map_err(to_pyerr)?;
             Ok((PySession::new(session), PySessionLease::new(lease)))
         })
     }
 
-    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// `begin` that also reopens a session that ended completed or failed:
+    /// its new start record follows the earlier terminal, and the next end,
+    /// fail, or cancel ends it again. A session an agent or an operator
+    /// canceled stays ended and raises `SessionEndedError`.
+    fn resume<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Awaitable<'py, (PySession, PySessionLease)>> {
+        let builder = self.take()?;
+        awaitable(py, async move {
+            let (session, lease) = builder.resume().await.map_err(to_pyerr)?;
+            Ok((PySession::new(session), PySessionLease::new(lease)))
+        })
+    }
+
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Awaitable<'py, PySession>> {
         let builder = slf.borrow(py).take()?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let (session, lease) = builder.begin().await.map_err(to_pyerr)?;
             let handle = PySession::new(session.clone());
             Python::attach(|py| {
@@ -596,10 +615,14 @@ impl PySessionBuilder {
         exc_type: Option<Bound<'py, PyAny>>,
         exc_value: Option<Bound<'py, PyAny>>,
         traceback: Option<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, bool>> {
         let entered = self.entered.lock().expect("session entry lock").take();
+        let cancelled = match &exc_value {
+            Some(value) => value.is_instance_of::<pyo3::exceptions::asyncio::CancelledError>(),
+            None => false,
+        };
         let failure = match (&exc_type, &exc_value) {
-            (Some(kind), Some(value)) if !kind.is_none() => {
+            (Some(kind), Some(value)) if !kind.is_none() && !cancelled => {
                 let formatted = py
                     .import("traceback")?
                     .call_method1("format_exception", (kind, value, traceback))?
@@ -613,12 +636,14 @@ impl PySessionBuilder {
             }
             _ => None,
         };
-        let raised = failure.is_some();
-        future_into_py(py, async move {
+        let raised = failure.is_some() || cancelled;
+        awaitable(py, async move {
             let Some((session, lease)) = entered else {
                 return Ok(false);
             };
             let ended = match failure {
+                // A cancelled task ends its session canceled, not failed.
+                None if cancelled => session.cancel().await,
                 Some((message, kind, traceback)) => {
                     session
                         .fail(AgentErrorBody {
@@ -784,19 +809,19 @@ impl PySession {
         &self,
         py: Python<'py>,
         envelope: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         let session = self.inner.clone();
         let envelope: AgentEnvelope = py_to_de(envelope)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let receipt = session.append(envelope).await.map_err(to_pyerr)?;
             Ok(crate::agdx::PyAgdxReceipt::from(receipt))
         })
     }
 
     /// End the session as completed.
-    fn end<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn end<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let session = self.inner.clone();
-        future_into_py(py, async move { session.end().await.map_err(to_pyerr) })
+        awaitable(py, async move { session.end().await.map_err(to_pyerr) })
     }
 
     /// End the session as failed with `error`, an `AgentErrorBody` dict
@@ -807,41 +832,50 @@ impl PySession {
         py: Python<'py>,
         #[gen_stub(override_type(type_repr = "dict[str, typing.Any]", imports = ("typing",)))]
         error: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let error: AgentErrorBody = crate::convert::py_to_de(error)?;
         let session = self.inner.clone();
-        future_into_py(
+        awaitable(
             py,
             async move { session.fail(error).await.map_err(to_pyerr) },
         )
     }
 
     /// End the session as canceled.
-    fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let session = self.inner.clone();
-        future_into_py(py, async move { session.cancel().await.map_err(to_pyerr) })
+        awaitable(py, async move { session.cancel().await.map_err(to_pyerr) })
     }
 
     /// Run `work(session)`, which may be async, and end the session by its
-    /// outcome: completed on success, failed with the exception type and
-    /// traceback when it raises. The original exception is re-raised, and it
-    /// wins over a failed terminal write. The lease is released at the end.
+    /// outcome: completed on success, canceled when the task is cancelled,
+    /// failed with the exception type and traceback when it raises. The
+    /// original exception is re-raised, and it wins over a failed terminal
+    /// write. The lease is released at the end.
     fn run<'py>(
         &self,
         py: Python<'py>,
         lease: &PySessionLease,
         work: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let session = self.inner.clone();
         let held = lease.inner.lock().expect("session lease lock").take();
         let hook = crate::async_bridge::PyHook::new(work, "__call__", "session work")?;
         let handle = Py::new(py, PySession::new(session.clone()))?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let outcome = hook
                 .call(move |py| pyo3::types::PyTuple::new(py, [handle.clone_ref(py)]))
                 .await;
             let result = match outcome {
                 Ok(value) => session.end().await.map(|()| value).map_err(to_pyerr),
+                Err(error)
+                    if Python::attach(|py| {
+                        error.is_instance_of::<pyo3::exceptions::asyncio::CancelledError>(py)
+                    }) =>
+                {
+                    let _ = session.cancel().await;
+                    Err(error)
+                }
                 Err(error) => {
                     let body = Python::attach(|py| failure_body(py, &error));
                     let _ = session.fail(body).await;
@@ -862,14 +896,14 @@ impl PySession {
         py: Python<'py>,
         last_n: Option<usize>,
         token_budget: Option<usize>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Vec<PySessionTurn>>> {
         let session = self.inner.clone();
         let config = self.inner.config();
         let policy = bounded_policy(
             last_n.unwrap_or(config.context_turn_bound()),
             Some(token_budget.unwrap_or(config.context_token_bound())),
         );
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let turns = session.context_with(policy).await.map_err(to_pyerr)?;
             Ok(turns
                 .into_iter()
@@ -884,10 +918,10 @@ impl PySession {
         &self,
         py: Python<'py>,
         policy: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Vec<PySessionTurn>>> {
         let session = self.inner.clone();
         let (policy, failure) = context_policy(policy)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let turns = session.context_with(policy).await.map_err(to_pyerr)?;
             if let Some(error) = take_failure(&failure) {
                 return Err(error);
@@ -931,9 +965,9 @@ impl PySession {
     /// Where the session lane ends right now. Persist it with
     /// `Checkpoint.to_json` and hand it to `turns_at`, `turns_since`,
     /// `state_at`, or `replay`.
-    fn checkpoint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn checkpoint<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyCheckpoint>> {
         let session = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let checkpoint = session.checkpoint().await.map_err(to_pyerr)?;
             Ok(PyCheckpoint { inner: checkpoint })
         })
@@ -944,10 +978,10 @@ impl PySession {
         &self,
         py: Python<'py>,
         checkpoint: &PyCheckpoint,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Vec<PySessionTurn>>> {
         let session = self.inner.clone();
         let checkpoint = checkpoint.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let turns = session.turns_at(checkpoint).await.map_err(to_pyerr)?;
             Ok(turns
                 .into_iter()
@@ -961,10 +995,10 @@ impl PySession {
         &self,
         py: Python<'py>,
         checkpoint: &PyCheckpoint,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Vec<PySessionTurn>>> {
         let session = self.inner.clone();
         let checkpoint = checkpoint.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let turns = session.turns_since(checkpoint).await.map_err(to_pyerr)?;
             Ok(turns
                 .into_iter()
@@ -981,10 +1015,10 @@ impl PySession {
         checkpoint: &PyCheckpoint,
         init: Py<PyAny>,
         fold: Py<PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let session = self.inner.clone();
         let checkpoint = checkpoint.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let turns = session.turns_at(checkpoint).await.map_err(to_pyerr)?;
             fold_turns(turns, init, fold)
         })
@@ -998,10 +1032,10 @@ impl PySession {
         checkpoint: &PyCheckpoint,
         init: Py<PyAny>,
         fold: Py<PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let session = self.inner.clone();
         let checkpoint = checkpoint.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let turns = session.turns_since(checkpoint).await.map_err(to_pyerr)?;
             fold_turns(turns, init, fold)
         })

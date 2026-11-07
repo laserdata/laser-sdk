@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import type { Capabilities } from "../../src/client/capabilities.js"
 import { managedCapabilitiesFrom } from "../../src/client/capabilities.js"
-import { SignatureError } from "../../src/client/errors.js"
+import { InvalidError } from "../../src/client/errors.js"
 import type { Laser } from "../../src/client/laser.js"
 import { Kv } from "../../src/managed/kv.js"
 import { KeyRecord, KvKeyRegistry, SigningKey } from "../../src/signing.js"
@@ -132,7 +132,8 @@ void test("given_a_record_stored_under_a_foreign_key_when_revoked_then_should_re
   const { laser } = stubLaser([
     okFrame({ kind: "value", entry: { key, value: storedBytes(), version: 4n } })
   ])
-  await assert.rejects(new KvKeyRegistry(laser).revoke(other.keyId()), SignatureError)
+  await assert.rejects(new KvKeyRegistry(laser).revoke(other.keyId()), InvalidError)
+  await assert.rejects(new KvKeyRegistry(laser).revoke(new Uint8Array(7)), InvalidError)
 })
 
 void test("given_malformed_and_misplaced_records_when_snapshotting_then_should_skip_only_them", async () => {
@@ -141,7 +142,7 @@ void test("given_malformed_and_misplaced_records_when_snapshotting_then_should_s
     okFrame({
       kind: "page",
       page: {
-        entries: [
+        items: [
           { key, value: storedBytes(), version: 1n },
           {
             key: new TextEncoder().encode("misplaced"),
@@ -153,7 +154,10 @@ void test("given_malformed_and_misplaced_records_when_snapshotting_then_should_s
             value: new TextEncoder().encode("not a key record"),
             version: 3n
           }
-        ]
+        ],
+        page: 1,
+        totalPages: 1,
+        totalResults: 3
       }
     })
   ])

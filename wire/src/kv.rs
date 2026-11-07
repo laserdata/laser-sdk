@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// The memory scope a read-view row carries, stamped by the fold from the
 /// record's headers so recall reconstructs a memory item and narrows by scope.
 /// Absent on a generic key-value entry, which carries no scope.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRowScope {
     /// The item kind word, from the record body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -32,12 +32,17 @@ pub struct MemoryRowScope {
     /// source address, it orders items remembered on different partitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_micros: Option<u64>,
+    /// The feedback weight folded for this item, the sum of every feedback
+    /// record that targets it. Recall ranks every strategy except recent by it.
+    /// Absent when no feedback was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f32>,
 }
 
 /// One stored entry: an arbitrary-bytes key and value plus optional expiry. The
 /// key and value are owned `Vec<u8>`, so the public API never leaks the `bytes`
 /// crate, and they ride the wire as CBOR byte strings, byte-exact.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KvEntry {
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
@@ -83,17 +88,15 @@ impl KvEntry {
     }
 }
 
-/// A page of scanned entries plus the cursor to resume after the last one.
-/// `cursor` is `None` when the scan reached the end.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// One page of scanned entries in key order. `page` counts from 1, and
+/// `total_results` counts every live match of the scan, so a caller reads any
+/// page directly.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct KvPage {
-    pub entries: Vec<KvEntry>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::encoding::opt_bin_bytes"
-    )]
-    pub cursor: Option<Vec<u8>>,
+    pub items: Vec<KvEntry>,
+    pub page: u32,
+    pub total_pages: u32,
+    pub total_results: u32,
 }
 
 /// Request to read the value at `key` in `namespace`. With `if_none_match` set to
@@ -134,6 +137,12 @@ pub struct KvSet {
     pub value: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_micros: Option<u64>,
+    /// Expire the entry this long after the mutation's server timestamp. The
+    /// relative form a client clock cannot skew, resolved once at fold time
+    /// so every replica stores the same expiry. Mutually exclusive with
+    /// `expires_at_micros`, a request carrying both is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_micros: Option<u64>,
 }
 
 /// The precondition a [`KvCas`] write must satisfy to apply. The compare half
@@ -163,6 +172,12 @@ pub struct KvCas {
     pub value: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_micros: Option<u64>,
+    /// Expire the entry this long after the mutation's server timestamp. The
+    /// relative form a client clock cannot skew, resolved once at fold time
+    /// so every replica stores the same expiry. Mutually exclusive with
+    /// `expires_at_micros`, a request carrying both is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_micros: Option<u64>,
     pub expect: CasExpect,
 }
 
@@ -170,7 +185,7 @@ pub struct KvCas {
 /// one backend transaction that also requires a **live** lease at
 /// (`fence_namespace`, `fence_key`) and a fence sequence still equal to
 /// `fence_token`. A released or expired lease, or a stale token, maps to
-/// [`KvError::LeaseLost`] even before another holder acquires; a failed
+/// [`KvError::LeaseLost`] even before another holder acquires, and a failed
 /// precondition to [`KvError::VersionConflict`]. The request uses
 /// [`crate::codes::KV_LEASE_OP_VERSION`]. Required fence fields have no decode
 /// defaults and any other `v` fails [`crate::validate::Validate`] fail-closed.
@@ -178,12 +193,21 @@ pub struct KvCas {
 pub struct KvCasFenced {
     pub v: u32,
     pub namespace: String,
+    /// The session this write is linked to, as on [`KvCas`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::agent::SessionRef>,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub value: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_micros: Option<u64>,
+    /// Expire the entry this long after the mutation's server timestamp. The
+    /// relative form a client clock cannot skew, resolved once at fold time
+    /// so every replica stores the same expiry. Mutually exclusive with
+    /// `expires_at_micros`, a request carrying both is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_micros: Option<u64>,
     pub expect: CasExpect,
     /// The coordination namespace holding the lease and fence rows. Authorized
     /// separately from the target `namespace` (`kv_fence:read`), so a state
@@ -234,6 +258,12 @@ pub struct KvExpire {
     pub key: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_micros: Option<u64>,
+    /// Expire the entry this long after the mutation's server timestamp. The
+    /// relative form a client clock cannot skew, resolved once at fold time
+    /// so every replica stores the same expiry. Mutually exclusive with
+    /// `expires_at_micros`, a request carrying both is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_micros: Option<u64>,
 }
 
 /// Request to apply a merge patch to a structured value without transferring the
@@ -288,7 +318,7 @@ pub struct KvMove {
 
 /// Request to acquire a revocable lease (a bounded-TTL distributed lock) on
 /// `key`. On success the store atomically creates the live lease row and bumps
-/// the never-expiring fence sequence; the holder gets the new `lease_token`
+/// the never-expiring fence sequence. The holder gets the new `lease_token`
 /// and the granted TTL (the formal `LEASE` primitive). A live lease always
 /// conflicts: renewal is [`KvLeaseRenew`], never re-acquisition. The request
 /// uses [`crate::codes::KV_LEASE_OP_VERSION`] and requires holder identity.
@@ -302,7 +332,7 @@ pub struct KvLease {
     /// [`MIN_LEASE_TTL_MICROS`](crate::limits::MIN_LEASE_TTL_MICROS)`..=`[`MAX_LEASE_TTL_MICROS`](crate::limits::MAX_LEASE_TTL_MICROS).
     /// A successful grant is nonzero and never exceeds this duration, so this
     /// remains a conservative expiry bound when the grant reply is lost. The
-    /// store may grant less; it never grants more, which is why the range is
+    /// store may grant less but never more, which is why the range is
     /// validated on the request rather than clamped.
     pub lease_ttl_micros: u64,
     /// Stable identity of the acquiring holder (a node or worker id, never a
@@ -313,7 +343,7 @@ pub struct KvLease {
     /// The user the lease protects mutations for. `None` leases for the
     /// authenticated caller. `Some` is a delegated acquisition (an operator
     /// leasing on behalf of a runtime user) and requires the `kv_lease:admin`
-    /// grant; the fence then validates against the subject's rows.
+    /// grant. The fence then validates against the subject's rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_user_id: Option<u32>,
 }
@@ -346,7 +376,7 @@ pub struct KvLeaseRenew {
 /// token is validated against the fence sequence, never the lease-row version
 /// (which resets on re-acquire), and the live row is physically removed in the
 /// same transaction. A missing or expired row under a still-current fence is
-/// the idempotent [`KvOutcome::Released`]`(false)`; a stale fence is
+/// the idempotent [`KvOutcome::Released`]`(false)`. A stale fence is
 /// [`KvError::LeaseLost`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KvRelease {
@@ -372,6 +402,11 @@ pub struct KvMetadata {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KvNamespaces {
     pub v: u32,
+    /// The stream whose resources the listing covers. Required in stream
+    /// tenancy, where the server authorizes the stream and lists only its
+    /// resources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// One namespace summary in a `Namespaces` reply.
@@ -422,18 +457,28 @@ pub struct KvScan {
     /// Absent on the wire when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<String>,
-    pub limit: usize,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::encoding::opt_bin_bytes"
-    )]
-    pub cursor: Option<Vec<u8>>,
+    /// The memory scope lenses: keep only memory-view rows stamped with this
+    /// user (`agdx.mem.user`), agent (`gen_ai.agent.id`), or app
+    /// (`agdx.mem.app`). Generic key-value rows carry none, so a lens filters
+    /// them out. Absent on the wire when unfiltered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// The 1-based page, over the matches in key order. Zero reads the first
+    /// page.
+    #[serde(default)]
+    pub page: u32,
+    /// The entries per page, at most [`MAX_SCAN_LIMIT`](crate::limits::MAX_SCAN_LIMIT).
+    /// Zero reads [`DEFAULT_SCAN_LIMIT`](crate::limits::DEFAULT_SCAN_LIMIT).
+    pub results: u32,
 }
 
 /// Request to bulk-delete entries in `namespace` matching the same composed
 /// bounds as a scan (`prefix`/`start`/`end`/`key_contains`). With no bounds it
-/// clears the whole namespace. No `limit`/`cursor`, and expiry is ignored (a
+/// clears the whole namespace. No `page`/`results`, and expiry is ignored (a
 /// matching expired entry is removed too).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KvDeleteMany {
@@ -563,15 +608,25 @@ pub enum KvError {
     VersionConflict { current: Option<u64> },
     /// A held [`KvLease`] expired, was released, or was re-acquired by another
     /// holder, so its token no longer protects mutations. The caller must stop
-    /// its protected work; a new epoch needs a fresh acquisition.
+    /// its protected work. A new epoch needs a fresh acquisition.
     #[error("kv lease lost")]
     LeaseLost,
+    /// A [`KvLease`] found the key held by a live lease. `expires_at_micros`
+    /// is the holder's expiry in log time, the earliest a fresh acquisition can
+    /// succeed unless the holder renews.
+    #[error("kv lease held (expires at: {expires_at_micros:?})")]
+    LeaseHeld { expires_at_micros: Option<u64> },
     /// A barriered [`KvGet`] could not be answered: the local fold did not
-    /// reach `required` within the server's wait bound, or the request's topic
-    /// generation does not match the fold's. Explicitly never mapped to an
-    /// absent value; retry against a caught-up fold.
+    /// reach `required` within the server's wait bound. Explicitly never mapped
+    /// to an absent value. Retry against a caught-up fold.
     #[error("kv read barrier not reached (required: {required:?})")]
     Stale { required: MutationPosition },
+    /// A barriered [`KvGet`] named a position no wait can reach: an older
+    /// topic generation of the mutation log, or a partition it does not use.
+    /// Never retryable. The caller acquires again for a position on the
+    /// current log.
+    #[error("kv read barrier unreachable (required: {required:?})")]
+    BarrierUnreachable { required: MutationPosition },
     /// An in-place op (`expire`, `patch`) targeted a key that is absent or
     /// expired (the formal `NOT_FOUND`).
     #[error("kv key not found")]
@@ -580,6 +635,31 @@ pub enum KvError {
     /// may retry after the streaming client refreshes partition leadership.
     #[error("not the partition leader for this key")]
     NotLeader,
+    /// The caller authenticated but lacks the grant the operation needs on
+    /// the namespace (`kv:write`, `kv_lease:admin`, `kv_fence:read`).
+    #[error("kv operation not permitted: {0}")]
+    Forbidden(String),
+    /// A write named both an absolute expiry and a relative TTL.
+    #[error("invalid kv expiry: {0}")]
+    InvalidExpiry(String),
+}
+
+/// The absolute expiry a write stores: `expires_at_micros` as given, or
+/// `ttl_micros` after `now_micros`, the mutation's server timestamp, so every
+/// replica folding the same record stores the same expiry. A write naming
+/// both is refused.
+pub fn resolve_expiry(
+    expires_at_micros: Option<u64>,
+    ttl_micros: Option<u64>,
+    now_micros: u64,
+) -> Result<Option<u64>, InvalidError> {
+    match (expires_at_micros, ttl_micros) {
+        (Some(_), Some(_)) => Err(InvalidError::new(
+            "a write names either expires_at_micros or ttl_micros, not both",
+        )),
+        (Some(expires_at_micros), None) => Ok(Some(expires_at_micros)),
+        (None, ttl_micros) => Ok(ttl_micros.map(|ttl| now_micros.saturating_add(ttl))),
+    }
 }
 
 /// The canonical namespace rule, shared by the SDK client edge and every
@@ -609,6 +689,55 @@ mod tests {
     use super::*;
     use crate::codes::KV_OP_VERSION;
     use crate::framing::{decode_named, encode_named};
+    use crate::result::ResultCode;
+
+    #[test]
+    fn given_a_held_lease_or_an_unreachable_barrier_when_round_tripped_then_should_keep_fields_and_codes()
+     {
+        let required = MutationPosition {
+            topic_generation: 7,
+            partition: 0,
+            offset: 3,
+        };
+        for (error, code) in [
+            (
+                KvError::LeaseHeld {
+                    expires_at_micros: Some(1_700_000_000_000_000),
+                },
+                ResultCode::Conflict,
+            ),
+            (
+                KvError::BarrierUnreachable { required },
+                ResultCode::StaleGeneration,
+            ),
+        ] {
+            let bytes = encode_named(&KvReply::Err(error.clone())).expect("serializes");
+            let back: KvReply = decode_named(&bytes).expect("deserializes");
+            assert!(matches!(back, KvReply::Err(ref decoded) if *decoded == error));
+            assert_eq!(ResultCode::from(&error), code);
+        }
+        assert!(
+            !ResultCode::StaleGeneration.is_retryable(),
+            "an unreachable barrier is never retried"
+        );
+    }
+
+    #[test]
+    fn given_an_absolute_expiry_or_a_ttl_when_resolved_then_should_store_one_expiry_and_refuse_both()
+     {
+        assert_eq!(resolve_expiry(Some(9), None, 100), Ok(Some(9)));
+        assert_eq!(
+            resolve_expiry(None, Some(30), 100),
+            Ok(Some(130)),
+            "a TTL counts from the server timestamp of the write"
+        );
+        assert_eq!(resolve_expiry(None, None, 100), Ok(None));
+        assert_eq!(
+            resolve_expiry(None, Some(u64::MAX), 100),
+            Ok(Some(u64::MAX))
+        );
+        assert!(resolve_expiry(Some(9), Some(30), 100).is_err());
+    }
 
     #[test]
     fn given_kv_delete_many_when_round_tripped_then_should_preserve_bounds() {
@@ -648,6 +777,7 @@ mod tests {
             key: b"user:42".to_vec(),
             value: b"online".to_vec(),
             expires_at_micros: Some(1_700_000_000_000_000),
+            ttl_micros: None,
         };
         let bytes = encode_named(&request).expect("the request serializes");
         let back: KvSet = decode_named(&bytes).expect("the request deserializes");
@@ -677,9 +807,9 @@ mod tests {
     }
 
     #[test]
-    fn given_a_scan_page_when_round_tripped_then_should_preserve_cursor() {
-        let reply = KvReply::Ok(KvOutcome::Page(KvPage {
-            entries: vec![KvEntry {
+    fn given_a_scan_page_when_round_tripped_then_should_preserve_the_page_and_totals() {
+        let page = KvPage {
+            items: vec![KvEntry {
                 key: b"a".to_vec(),
                 value: b"1".to_vec(),
                 expires_at_micros: None,
@@ -687,16 +817,16 @@ mod tests {
                 scope: None,
                 source: None,
             }],
-            cursor: Some(b"a".to_vec()),
-        }));
-        let bytes = encode_named(&reply).expect("serializes");
+            page: 2,
+            total_pages: 3,
+            total_results: 21,
+        };
+        let bytes = encode_named(&KvReply::Ok(KvOutcome::Page(page.clone()))).expect("serializes");
         let back: KvReply = decode_named(&bytes).expect("deserializes");
-        let KvReply::Ok(KvOutcome::Page(page)) = back else {
+        let KvReply::Ok(KvOutcome::Page(decoded)) = back else {
             panic!("expected an Ok(Page) reply");
         };
-        assert_eq!(page.entries.len(), 1);
-        assert_eq!(page.entries[0].key_str(), Some("a"));
-        assert_eq!(page.cursor.as_deref(), Some(b"a".as_ref()));
+        assert_eq!(decoded, page);
     }
 
     #[test]
@@ -709,6 +839,7 @@ mod tests {
                 key: b"hits".to_vec(),
                 value: b"42".to_vec(),
                 expires_at_micros: None,
+                ttl_micros: None,
                 expect,
             };
             let bytes = encode_named(&request).expect("serializes");
@@ -1036,14 +1167,17 @@ mod tests {
             key_contains: Some("admin".to_owned()),
             conversation: None,
             stream: None,
-            limit: 50,
-            cursor: Some(b"user:9".to_vec()),
+            user: None,
+            agent: None,
+            app: None,
+            page: 3,
+            results: 50,
         };
         let bytes = encode_named(&scan).expect("serializes");
         let back: KvScan = decode_named(&bytes).expect("deserializes");
         assert_eq!(back.prefix.as_deref(), Some(b"user:".as_ref()));
         assert_eq!(back.key_contains.as_deref(), Some("admin"));
-        assert_eq!(back.cursor.as_deref(), Some(b"user:9".as_ref()));
+        assert_eq!((back.page, back.results), (3, 50));
         assert_eq!(back.stream, None);
     }
 
@@ -1059,12 +1193,23 @@ mod tests {
             key_contains: None,
             conversation: Some("01KWM3K3XEP3NP5TN850J17YBP".to_owned()),
             stream: Some("acme".to_owned()),
-            limit: 10,
-            cursor: None,
+            user: Some("reader".to_owned()),
+            agent: Some("planner".to_owned()),
+            app: Some("desk".to_owned()),
+            page: 0,
+            results: 10,
         };
         let back: KvScan =
             decode_named(&encode_named(&scan).expect("serializes")).expect("deserializes");
         assert_eq!(back.stream.as_deref(), Some("acme"));
+        assert_eq!(
+            (
+                back.user.as_deref(),
+                back.agent.as_deref(),
+                back.app.as_deref()
+            ),
+            (Some("reader"), Some("planner"), Some("desk"))
+        );
         let delete = KvDeleteMany {
             v: KV_OP_VERSION,
             namespace: "stream:acme/memory".to_owned(),

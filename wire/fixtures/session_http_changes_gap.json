@@ -1,7 +1,7 @@
 {
-  "rows": [
+  "items": [
     {
-      "seq": 4401,
+      "seq": 4403,
       "sessions": [
         "00000000000000000000000002"
       ],
@@ -32,7 +32,7 @@
       "truncated": false
     },
     {
-      "seq": 4402,
+      "seq": 4404,
       "sessions": [
         "00000000000000000000000002"
       ],
@@ -63,7 +63,10 @@
       "truncated": false
     }
   ],
-  "floor": 4401,
-  "resync": true,
+  "page": 45,
+  "total_pages": 45,
+  "total_results": 4404,
+  "results": 100,
+  "floor": 4403,
   "series": 7654321098765432101
 }

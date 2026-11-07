@@ -55,8 +55,7 @@ import { decodeOne, expectMap } from "../../src/wire/cbor.js"
 import { ContentType, contentTypeCode } from "../../src/wire/content.js"
 import { CONTENT_TYPE } from "../../src/wire/headers.js"
 import type { BackendDescriptor } from "../../src/wire/hello.js"
-import { BackendResourceId, CorrelationId, DestinationId } from "../../src/wire/ids.js"
-import { lakehouseTarget } from "../../src/wire/query.js"
+import { BackendResourceId, CorrelationId } from "../../src/wire/ids.js"
 
 const confirmation = (baseOffset: bigint) => ({
   streamId: 1,
@@ -239,20 +238,6 @@ void test("given_topic_size_limits_when_provisioning_then_should_create_the_topi
 
 const noopExecutor: QueryExecutor = () => Promise.reject(new Error("not executed"))
 
-void test("given_a_lakehouse_target_when_selecting_a_snapshot_then_should_set_the_selector", () => {
-  const target = lakehouseTarget(DestinationId.fromU128(7n), 1n)
-  const bySnapshot = QueryRequest.create(target, noopExecutor).atSnapshot(42n).intoQuery()
-  const byTime = QueryRequest.create(target, noopExecutor).atTimestampMicros(1_000n).intoQuery()
-  assert.deepEqual(bySnapshot.target.kind === "lakehouse" && bySnapshot.target.snapshot, {
-    kind: "snapshot_id",
-    value: 42n
-  })
-  assert.deepEqual(byTime.target.kind === "lakehouse" && byTime.target.snapshot, {
-    kind: "timestamp_micros",
-    value: 1_000n
-  })
-})
-
 void test("given_expiry_only_when_a_producer_provisions_then_should_use_create_if_absent", async () => {
   const created: TopicCreateSettings[] = []
   let updates = 0
@@ -278,14 +263,6 @@ void test("given_expiry_only_when_a_producer_provisions_then_should_use_create_i
   )
   assert.deepEqual(created, [{ messageExpiryMicros: 1_000_000n }])
   assert.equal(updates, 0)
-})
-
-void test("given_an_operational_target_when_selecting_a_snapshot_then_should_refuse_it", () => {
-  assert.throws(() => QueryRequest.create("readings", noopExecutor).atSnapshot(1n), InvalidError)
-  assert.throws(
-    () => QueryRequest.create("readings", noopExecutor).atTimestampMicros(1n),
-    InvalidError
-  )
 })
 
 void test("given_no_row_ceiling_when_streaming_typed_rows_then_should_refuse_it", () => {
@@ -805,7 +782,7 @@ void test("given_auto_remember_when_a_message_is_handled_then_should_remember_it
   }
   const handler = new MemoryHandler(inner, memory).autoRemember(MemoryKind.Message)
   await handler.handle(handledMessage(AgentId.new("triage")), noContext)
-  const items = await memory.recall(conversation).agent(AgentId.new("triage")).fetch()
+  const items = await memory.recall(conversation).fetch()
   assert.equal(seenBeforeRemember, 0)
   const [remembered] = items
   assert.ok(remembered !== undefined, "the handled message was remembered")

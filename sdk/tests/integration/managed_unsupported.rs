@@ -20,10 +20,6 @@ async fn given_open_iggy_when_capabilities_read_then_should_report_coordination_
         !caps.serves_consistency(Consistency::ReadYourWrites),
         "read-your-writes must not be advertised"
     );
-    assert!(
-        !caps.serves_consistency(Consistency::Strong),
-        "strong consistency must not be advertised"
-    );
 }
 
 // The refresh path re-probes the live connection and shares the outcome with
@@ -121,23 +117,6 @@ async fn given_open_iggy_when_read_your_writes_query_then_should_be_unsupported(
 
 #[tokio::test]
 #[serial_test::serial(integration)]
-async fn given_open_iggy_when_strong_consistency_query_then_should_be_unsupported() {
-    let laser = laser().await;
-    let error = laser
-        .query("events")
-        .consistency(Consistency::Strong)
-        .fetch()
-        .await
-        .expect_err("strong consistency must be unsupported on open Apache Iggy");
-    assert!(
-        error.is_unsupported(),
-        "expected Unsupported, got {error:?}"
-    );
-    assert_eq!(error.code(), ResultCode::Unsupported);
-}
-
-#[tokio::test]
-#[serial_test::serial(integration)]
 async fn given_open_iggy_when_graph_traversal_then_should_be_unsupported() {
     let laser = laser().await;
     let error = laser
@@ -187,28 +166,6 @@ async fn given_open_iggy_when_graph_upsert_then_should_be_unsupported() {
         "expected Unsupported, got {error:?}"
     );
     assert_eq!(error.code(), ResultCode::Unsupported);
-}
-
-// `commit()` requires a precondition (`expect_version`/`expect_absent`). Without
-// one it is a programmer error surfaced as a typed `Invalid`, never a panic and
-// never a round-trip. The check fires before the capability gate, so it holds
-// even on open Iggy.
-#[tokio::test]
-#[serial_test::serial(integration)]
-async fn given_a_set_without_a_precondition_when_committed_then_should_be_invalid() {
-    let laser = laser().await;
-    let error = laser
-        .kv("coordination")
-        .set("k")
-        .bytes(b"v")
-        .commit()
-        .await
-        .expect_err("a commit without a precondition must be Invalid");
-    assert_eq!(error.code(), ResultCode::InvalidArgument);
-    assert!(
-        !error.is_unsupported(),
-        "missing precondition is not Unsupported"
-    );
 }
 
 #[tokio::test]
@@ -298,29 +255,6 @@ async fn given_managed_query_without_read_your_writes_when_querying_then_should_
         .fetch()
         .await
         .expect_err("an unadvertised read-your-writes level must be refused locally");
-    assert!(
-        error.is_unsupported(),
-        "expected Unsupported, got {error:?}"
-    );
-    assert_eq!(error.code(), ResultCode::Unsupported);
-}
-
-#[tokio::test]
-#[serial_test::serial(integration)]
-async fn given_read_your_writes_only_when_querying_strong_then_should_refuse_the_level() {
-    // Read-your-writes does not imply strong, so a connection that advertises
-    // only the weaker level still refuses a strong query locally.
-    let laser = laser().await.with_capabilities(
-        Capabilities::OPEN
-            .with_query(true)
-            .with_query_consistency(Consistency::ReadYourWrites),
-    );
-    let error = laser
-        .query("events")
-        .consistency(Consistency::Strong)
-        .fetch()
-        .await
-        .expect_err("strong must be refused when only read-your-writes is advertised");
     assert!(
         error.is_unsupported(),
         "expected Unsupported, got {error:?}"

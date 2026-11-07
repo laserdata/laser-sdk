@@ -140,8 +140,13 @@ def make_intent(policy, voters, mandatory=None):
         mandatory_voters=list(mandatory) if mandatory else None,
         policy=policy,
         policy_version=1,
-        deadline_micros=time.time_ns() // 1_000 + 1_000_000,
+        deadline_at_micros=time.time_ns() // 1_000 + 1_000_000,
     )
+
+
+def observed(votes):
+    # Offline ballots are observed when they were cast.
+    return [ls.ObservedVote(vote, vote.at_micros) for vote in votes]
 
 
 def test_intent_digest_is_stable_over_the_same_body():
@@ -154,7 +159,7 @@ def test_intent_digest_is_stable_over_the_same_body():
 def test_intent_all_policy_commits_when_every_voter_allows():
     intent = make_intent(ls.IntentPolicy.all(), ["a", "b"])
     votes = [ls.Vote.cast(intent, "a", "allow"), ls.Vote.cast(intent, "b", "allow")]
-    decision = ls.decide(intent, votes, time.time_ns() // 1_000)
+    decision = ls.decide(intent, observed(votes), time.time_ns() // 1_000)
     assert decision.outcome == "committed"
     assert decision.authorizes(intent) is True
 
@@ -162,7 +167,7 @@ def test_intent_all_policy_commits_when_every_voter_allows():
 def test_intent_waits_while_the_outcome_is_still_reachable():
     intent = make_intent(ls.IntentPolicy.all(), ["a", "b"])
     votes = [ls.Vote.cast(intent, "a", "allow")]
-    assert ls.decide(intent, votes, time.time_ns() // 1_000) is None
+    assert ls.decide(intent, observed(votes), time.time_ns() // 1_000) is None
 
 
 def test_intent_mandatory_voter_block_aborts_regardless_of_policy():
@@ -171,7 +176,7 @@ def test_intent_mandatory_voter_block_aborts_regardless_of_policy():
         ls.Vote.cast(intent, "safety", "block"),
         ls.Vote.cast(intent, "llm", "allow"),
     ]
-    decision = ls.decide(intent, votes, time.time_ns() // 1_000)
+    decision = ls.decide(intent, observed(votes), time.time_ns() // 1_000)
     assert decision.outcome == "aborted"
     assert "safety" in decision.reason
 
@@ -183,15 +188,15 @@ def test_intent_vote_for_a_different_intent_is_discarded():
     intent = make_intent(ls.IntentPolicy.any(), ["a"])
     other_intent = make_intent(ls.IntentPolicy.any(), ["a"])
     misdirected_vote = ls.Vote.cast(other_intent, "a", "allow")
-    assert ls.decide(intent, [misdirected_vote], time.time_ns() // 1_000) is None
-    decision = ls.decide(intent, [misdirected_vote], intent.deadline_micros)
+    assert ls.decide(intent, observed([misdirected_vote]), time.time_ns() // 1_000) is None
+    decision = ls.decide(intent, observed([misdirected_vote]), intent.deadline_at_micros)
     assert decision.outcome == "aborted"
 
 
 def test_intent_conflicting_repeat_vote_aborts_as_a_protocol_violation():
     intent = make_intent(ls.IntentPolicy.all(), ["a", "b"])
     votes = [ls.Vote.cast(intent, "a", "allow"), ls.Vote.cast(intent, "a", "block")]
-    decision = ls.decide(intent, votes, time.time_ns() // 1_000)
+    decision = ls.decide(intent, observed(votes), time.time_ns() // 1_000)
     assert decision.outcome == "aborted"
     assert "conflicting" in decision.reason
 
@@ -216,7 +221,52 @@ def test_intent_invalid_configuration_and_outsider_fail_closed():
 def test_intent_mandatory_allow_is_required_before_commit():
     intent = make_intent(ls.IntentPolicy.any(), ["safety", "llm"], mandatory=["safety"])
     vote = ls.Vote.cast(intent, "llm", "allow")
-    assert ls.decide(intent, [vote], time.time_ns() // 1_000) is None
+    assert ls.decide(intent, observed([vote]), time.time_ns() // 1_000) is None
+
+
+# The JSON every client writes for one intent, pinned so Rust, Python, and
+# TypeScript rebuild the same record and digest.
+RUST_INTENT_JSON = {
+    "intent_id": "01JC0000000000000000000000",
+    "conversation": "01JC0000000000000000000001",
+    "proposer": "proposer",
+    "body": list(b"transfer $100"),
+    "digest": "93daa878cad59dae1a8b72cba78631d5e752940cd3225723b8e5e1b00f51726a",
+    "eligible_voters": ["a", "b"],
+    "mandatory_voters": ["b"],
+    "policy": {"at_least": 1},
+    "policy_version": 1,
+    "deadline_at_micros": 2_000_000_000_000_000,
+    "at_micros": 1_700_000_000_000_000,
+}
+
+
+def test_given_a_known_body_when_digested_then_should_match_the_pinned_digest():
+    assert make_intent(ls.IntentPolicy.any(), ["a"]).digest == RUST_INTENT_JSON["digest"]
+
+
+def test_given_the_shared_intent_json_when_rebuilt_then_should_validate_and_round_trip():
+    intent = ls.Intent.__laser_from_json__(RUST_INTENT_JSON)
+    assert intent.intent_id == RUST_INTENT_JSON["intent_id"]
+    assert intent.__laser_json__() == RUST_INTENT_JSON
+
+
+def test_given_a_committed_decision_without_votes_when_authorizing_then_should_raise():
+    intent = make_intent(ls.IntentPolicy.any(), ["a"])
+    forged = ls.Decision.__laser_from_json__(
+        {
+            "intent_id": intent.intent_id,
+            "intent_digest": intent.digest,
+            "policy_version": 1,
+            "outcome": "committed",
+            "reason": "quorum met",
+            "votes_considered": [],
+            "at_micros": intent.at_micros,
+        }
+    )
+    with pytest.raises(ls.IntentError) as raised:
+        forged.authorizes(intent)
+    assert raised.value.kind == "decision_quorum_not_met"
 
 
 def make_dead_letter_capsule(*, attempts=1, reason=1, detail=None, payload=b"poison"):
@@ -306,3 +356,13 @@ def test_given_no_cargo_and_no_built_binaries_when_resolved_then_should_name_the
             iggy_test_server._test_support_binaries()
     finally:
         iggy_test_server._test_support_binaries.cache_clear()
+
+
+def test_given_a_backdated_ballot_observed_after_the_deadline_when_decided_then_should_not_count():
+    intent = make_intent(ls.IntentPolicy.any(), ["a"])
+    vote = ls.Vote.cast(intent, "a", "allow")
+    late = ls.ObservedVote(vote, intent.deadline_at_micros + 1)
+    assert late.vote.at_micros < intent.deadline_at_micros
+    decision = ls.decide(intent, [late], intent.deadline_at_micros + 1)
+    assert decision.outcome == "aborted"
+    assert decision.votes_considered == []

@@ -136,6 +136,7 @@ async function registerTickets(laser: Laser): Promise<void> {
     name: TICKETS_INDEX,
     version: 1,
     kind: { kind: "row" },
+    history: { kind: "append" },
     contentType: ContentType.Json,
     extraction: {
       fields: ["ticket_id", "message_type", "cluster", "component", "severity", "status", "ts"].map(
@@ -151,7 +152,8 @@ async function registerTickets(laser: Laser): Promise<void> {
     defaultProjection: id,
     index: TICKETS_INDEX,
     notify: true,
-    skipRejected: false
+    invalidRecords: "block",
+    oversize: "block"
   }
   await laser.projections().register(projection)
   await laser.bindings().apply(binding)

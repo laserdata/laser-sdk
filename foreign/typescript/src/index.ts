@@ -37,6 +37,10 @@ export {
   StepUpRequiredError,
   PolicyDeferredError,
   BudgetExceededError,
+  SessionEndedError,
+  StepFailedError,
+  JournalTruncatedError,
+  RoutingError,
   NoCapableAgentError,
   NoInboxError,
   RoutePrincipalMismatchError,
@@ -44,9 +48,9 @@ export {
   FenceViolationError,
   QuarantinedError,
   NoRespondTopicError,
-  CheckpointExecutionError,
   publishCause
 } from "./client/errors.js"
+export type { StepFailure } from "./client/errors.js"
 export {
   code,
   filterReason,
@@ -60,6 +64,7 @@ export {
   isNotLeader,
   isPermissionDenied,
   isQuarantined,
+  isRetryable,
   isStale,
   isStreamOrTopicNotFound,
   isUnavailable,
@@ -70,6 +75,7 @@ export {
 export {
   ActionDecision,
   ActionKind,
+  GOVERNOR_ERROR_DECISION,
   GovernorMode,
   POLICY_DECISION_OPERATION,
   QuorumGovernor,
@@ -88,7 +94,16 @@ export type {
   QuorumPolicy,
   Verdict
 } from "./govern.js"
-export { Decision, Intent, IntentError, IntentOutcome, Vote, VoteChoice, decide } from "./intent.js"
+export {
+  Decision,
+  Intent,
+  IntentError,
+  IntentOutcome,
+  Vote,
+  VoteChoice,
+  decide,
+  type ObservedVote
+} from "./intent.js"
 export type { IntentOptions, IntentPolicy } from "./intent.js"
 export { AgentActivity, SwarmActivity } from "./swarm.js"
 export { CrashContext } from "./crash-context.js"
@@ -121,8 +136,14 @@ export {
   servesConsistency,
   unreadyBackends
 } from "./client/capabilities.js"
-export { QueryRequest } from "./managed/query.js"
-export { Destinations } from "./managed/destinations.js"
+export {
+  QueryRequest,
+  QueryRow,
+  QueryRowSet,
+  QueryRows,
+  type QueryValue,
+  TypedQueryRows
+} from "./managed/query.js"
 export type {
   Aggregate,
   CmpOp,
@@ -150,19 +171,6 @@ export {
 } from "./wire/query.js"
 export { typedValueDiagnosticText } from "./wire/schema.js"
 export type {
-  CheckpointMutationResult,
-  CheckpointReadConsistency,
-  DestinationCheckpointPage,
-  DestinationCheckpointStatus,
-  DestinationCheckpointView,
-  PublicCheckpointMutation
-} from "./wire/checkpoint.js"
-export type {
-  MaterializationDestination,
-  QueryRoute,
-  QueryRouteTarget
-} from "./wire/destination.js"
-export type {
   LogicalField,
   LogicalSchema,
   LogicalSchemaRef,
@@ -173,12 +181,14 @@ export type { Value } from "./wire/value.js"
 export {
   Kv,
   KvSetRequest,
+  KvCasRequest,
   KvCasFencedRequest,
   KvScanRequest,
   KvDeleteManyRequest,
-  KvCopyRequest
+  KvCopyRequest,
+  LeaseGuard
 } from "./managed/kv.js"
-export type { Lease } from "./managed/kv.js"
+export type { KvRevalidation, Lease } from "./managed/kv.js"
 export {
   DedicatedKvTransport,
   FencedLeaseClient,
@@ -198,7 +208,12 @@ export {
   FilteredReader,
   FilteredReaderBuilder
 } from "./managed/filters.js"
-export type { FilterPreviewOptions, MatchedPage, MatchedRecord } from "./managed/filters.js"
+export type {
+  FilterPreviewOptions,
+  MatchedPage,
+  MatchedRecord,
+  RecordEvaluation
+} from "./managed/filters.js"
 export {
   ConsumerFilter,
   FILTER_EVALUATOR_VERSION,
@@ -271,9 +286,10 @@ export {
   ProjectionsRequest,
   Bindings,
   Schemas,
+  SchemasRequest,
   RegisterSchemaRequest
 } from "./managed/projections.js"
-export type { ProjectionInfo, SchemaInfo } from "./wire/browse.js"
+export type { ProjectionInfo, ProjectionPage, SchemaInfo, SchemaPage } from "./wire/browse.js"
 export type {
   Projection,
   ProjectionKind,
@@ -297,6 +313,7 @@ export type {
   ResourceKind,
   ResourcePattern,
   WhoamiReply,
+  BindingsReply,
   AuthzSubject,
   AuthzHistoryReply,
   AuthzEvent,
@@ -307,13 +324,15 @@ export type {
 export {
   delegatedAllow,
   grantsAllow,
+  validateMutationId,
+  validateRole,
   validateRoleName,
   resourcePatternAll,
   resourcePatternLiteral,
   resourcePatternPrefix,
   resourcePatternMatches
 } from "./wire/authz.js"
-export { Watch, WatchReader } from "./managed/watch.js"
+export { Watch, WatchReader, type WatchedChange } from "./managed/watch.js"
 export type { ChangeRecord } from "./wire/change.js"
 export { GraphHandle } from "./managed/graph.js"
 export {
@@ -335,7 +354,7 @@ export {
 } from "./agent/registry.js"
 export type { ClientMetadataPage, RegisteredCard } from "./agent/registry.js"
 export type { ClientMetadata } from "./wire/clients.js"
-export { AgentCtx, gatherReplies } from "./agent/context.js"
+export { AgentCtx, ApprovalGrant, gatherReplies } from "./agent/context.js"
 export type { Gather, GatherPolicy } from "./agent/context.js"
 export { AgentScope } from "./agent/scope.js"
 export {
@@ -347,7 +366,8 @@ export {
   LastN,
   RoleFilter,
   TokenBudget,
-  contextCheckpoint
+  contextCheckpoint,
+  contextMessageBody
 } from "./context.js"
 export type { ContextMessage, ContextPolicy, Selection } from "./context.js"
 export { ContextScope, ScopedMemory } from "./context-scope.js"
@@ -470,10 +490,17 @@ export type {
   JsonRpcError,
   JsonRpcRequest,
   JsonRpcResponse,
+  Part,
   Task,
   TaskStatus
 } from "./bridges/a2a.js"
-export { McpBridge, McpMethod, toolCallFromRequest, toolResultFromEnvelope } from "./bridges/mcp.js"
+export {
+  MCP_SUPPORTED_PROTOCOL_VERSIONS,
+  McpBridge,
+  McpMethod,
+  toolCallFromRequest,
+  toolResultFromEnvelope
+} from "./bridges/mcp.js"
 export type {
   McpContent,
   McpPrompt,
@@ -488,19 +515,14 @@ export type {
 export type { AgUiEvent } from "./bridges/agui.js"
 export { authorizeEdge, edgeDenialChallenge, edgeDenialCode } from "./bridges/edge-auth.js"
 export type { EdgeClaims, EdgeDenial } from "./bridges/edge-auth.js"
-export { enterBridge } from "./bridges/hops.js"
+export { BRIDGE_HOPS_META_KEY, enterBridge } from "./bridges/hops.js"
 export { NOOP_OBSERVER } from "./observe.js"
 export type { LaserObserver, ObservationLevel, SpanScope } from "./observe.js"
 export { agentCtx, agentMessage } from "./testing.js"
 export type { ConsumerRef, ConsumptionStatus, ResourceNaming } from "./client/laser.js"
 export { ChunkAssembler, FINISH_REASON_ABANDONED, FINISH_REASON_GAP } from "./agent/assembler.js"
 export type { StreamEvent } from "./agent/assembler.js"
-export {
-  ReliableConsumer,
-  SlidingWindow,
-  isRetryable,
-  retryBackoff
-} from "./agent/reliable-consumer.js"
+export { ReliableConsumer, SlidingWindow, retryBackoff } from "./agent/reliable-consumer.js"
 export type {
   AgentHandler,
   AgentMiddleware,
@@ -532,6 +554,7 @@ export type {
   Router
 } from "./agent/router.js"
 export {
+  DEFAULT_CHUNK_ABANDON_MS,
   DEFAULT_CHUNK_FLUSH_BYTES,
   DEFAULT_CHUNK_LINGER_MS,
   MAX_CHUNK_BODY_BYTES
@@ -630,7 +653,7 @@ export type { CompiledSchemaKind } from "./schema-codecs.js"
 export { TypedTopic, TypedRecords } from "./stream/typed-topic.js"
 export type { TypedRecord } from "./stream/typed-topic.js"
 export type { GovernorRetention } from "./govern.js"
-export type { DestinationCaps, HelloOutcome, KvCaps, QueryCaps } from "./client/capabilities.js"
+export type { HelloOutcome, KvCaps, QueryCaps } from "./client/capabilities.js"
 export { Routing } from "./stream/routing.js"
 export type { ArrowIpcMessageMetadata } from "./wire/arrow.js"
 export type {
@@ -663,9 +686,7 @@ export type { GroupFilterSpec } from "./wire/filter.js"
 export type {
   Query,
   QueryContext,
-  QueryExecutionStatus,
   QueryFrontier,
-  SnapshotSelector,
   AggFunc,
   SqlDialect,
   Predicate,
@@ -673,7 +694,6 @@ export type {
 } from "./wire/query.js"
 export type { FieldValue, DecimalValue, MapEntry } from "./wire/schema.js"
 export type { FieldType } from "./wire/control.js"
-export type { CheckpointError, CheckpointRequestEnvelope } from "./wire/checkpoint.js"
 export type { FoldSnapshot } from "./wire/snapshot.js"
 export { foldSnapshotResumeOffset } from "./wire/snapshot.js"
 export {
@@ -714,11 +734,6 @@ export {
   schemaDefContentType
 } from "./wire/control.js"
 export {
-  publicCheckpointMutationRequiredCapability,
-  validateOperatorAssertion
-} from "./wire/checkpoint.js"
-export type { PartitionLifecycleChange } from "./wire/checkpoint.js"
-export {
   resultCodeFromCode,
   resultCodeHttpStatus,
   resultCodeIsPending,
@@ -726,7 +741,134 @@ export {
 } from "./wire/result.js"
 export { contentTypeCode, isRawContentType } from "./wire/content.js"
 export type { PublishOptions } from "./client/publish-options.js"
+export type { CallOptions } from "./client/call-options.js"
 export type { ObserveEffect } from "./stream/topic.js"
 
 export { DEFAULT_MEMORY_TOPIC_TTL_MS } from "./memory/topic.js"
 export { OPS_STREAM as OPS_STREAM_DEFAULT } from "./wire/topics.js"
+
+export {
+  MATERIALIZATION_POLL_MAX_MS,
+  MATERIALIZATION_POLL_START_MS,
+  Materialization,
+  MaterializeRequest,
+  type MaterializationWait
+} from "./managed/materialize.js"
+
+export {
+  bindingStatusReadiness,
+  bindingStatusIsBlocked,
+  bindingStatusIsFailed,
+  bindingStatusCaughtUpTo,
+  bindingStatusHistoryComplete,
+  failureClassIsPermanent,
+  type BindingStatus,
+  type FailureClass,
+  type PartitionProgress,
+  type Hold,
+  type HoldCause,
+  type RealizationState,
+  type StallReason,
+  type MaterializationReadiness
+} from "./wire/browse.js"
+export {
+  invalidRecordPolicyIsBlock,
+  oversizePolicyIsBlock,
+  gapAcceptanceCovers
+} from "./wire/control.js"
+
+export { materializationOperationId } from "./wire/hashing.js"
+
+export {
+  type ProjectionHistory,
+  type ProjectionKey,
+  projectionHistoryIsAppend
+} from "./wire/control.js"
+
+export type { LaserErrorKind } from "./client/errors.js"
+export type { BytesLike } from "./client/bytes.js"
+export type { ClientOwnership, IggyClient, MessageWithHeaders } from "./iggy/apache-iggy.js"
+export type { UlidSource } from "./runtime/ulid.js"
+export type { ConversationStateLoader } from "./conversation-state.js"
+export type { AgentDefinition } from "./agent/builder.js"
+export type { RegistryView } from "./agent/router.js"
+export type { ReliableConsumerControl } from "./agent/reliable-consumer.js"
+export type { ReaderTag } from "./managed/filters.js"
+export type { ProducerSendOptions } from "./stream/producer.js"
+export type { RawSendOptions } from "./stream/topic.js"
+export type { TypedPollResult } from "./stream/typed-topic.js"
+export {
+  AgentErrorCodeName,
+  AgentKind,
+  DeadLetterReasonName,
+  HealthName,
+  TaskStateName
+} from "./wire/agent.js"
+export type {
+  AgentCard as WireAgentCard,
+  AgentId as WireAgentId,
+  ContextCompaction,
+  ContextManifest,
+  PatchOp,
+  SdkInfo,
+  SessionParking,
+  SignatureContext,
+  TokenUsage
+} from "./wire/agent.js"
+export type { AggCall, QueryEngine, QueryError, ResolvedQueryTarget, Window } from "./wire/query.js"
+export type { BackendBinding } from "./wire/destination.js"
+export type {
+  BackendDesiredState,
+  BackendImplementation,
+  BackendLimits,
+  BackendMode,
+  BackendObservedState,
+  BackendReadinessCode,
+  QueryCapabilities,
+  SchemaCapabilities
+} from "./wire/hello.js"
+export {
+  BackendResourceId,
+  ConversationId as WireConversationId,
+  LogicalSchemaId,
+  WireId
+} from "./wire/ids.js"
+export type { BatchItem } from "./wire/batch.js"
+export { ResultCodeName } from "./wire/result.js"
+export type { CommandError } from "./wire/result.js"
+export type { Dispatch } from "./wire/dispatch.js"
+export type { FilterLiteral, FilterSummary } from "./wire/filter.js"
+export type {
+  GapAcceptance,
+  InvalidRecordPolicy,
+  OversizePolicy,
+  ProjectionId
+} from "./wire/control.js"
+export type { GraphAttr, GraphQuery, GraphStart, Hop, Path } from "./wire/graph.js"
+export type { LogicalTypeKind } from "./wire/schema.js"
+export type { MemoryRowScope } from "./wire/kv.js"
+export type {
+  PayloadRange,
+  SessionChangesView,
+  SessionError as WireSessionError,
+  SessionEvent,
+  SessionFlags,
+  SessionLink,
+  SessionSourcesView,
+  SourceFrontier,
+  SourceGap,
+  StateChange
+} from "./wire/session.js"
+export type { SnapshotOffset } from "./wire/snapshot.js"
+export type { Tenancy } from "./wire/authz.js"
+export type { CapabilitySurface } from "./client/capabilities.js"
+export type { Fragment } from "./wire/agent.js"
+export type { FilterOwner } from "./wire/filter.js"
+export type {
+  GapReason,
+  LinkRelation,
+  SessionChangeOrigin,
+  SessionChangeRow,
+  SessionErrorKind,
+  StateOutcome
+} from "./wire/session.js"

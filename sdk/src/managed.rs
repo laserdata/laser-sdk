@@ -72,9 +72,11 @@ mod tests {
         let request = KvCasFenced {
             v: KV_LEASE_OP_VERSION,
             namespace: "state".to_owned(),
+            session: None,
             key: b"value".to_vec(),
             value: b"next".to_vec(),
             expires_at_micros: None,
+            ttl_micros: None,
             expect: CasExpect::Absent,
             fence_namespace: "coordination".to_owned(),
             fence_key: b"owner".to_vec(),

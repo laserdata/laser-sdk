@@ -11,11 +11,18 @@ import {
 import {
   MANAGED_REQUEST_VERSION,
   decodeManagedReadEnvelope,
+  decodeManagedRequestEnvelope,
   encodeManagedReplyEnvelope,
   positionSurfaceOf
 } from "../../src/wire/mutation.js"
 import { encodeNamed, expectMap } from "../../src/wire/cbor.js"
-import { AGDX_KV_GET_CODE, AGDX_KV_SET_CODE, AGDX_SESSION_GET_CODE } from "../../src/wire/codes.js"
+import {
+  AGDX_BATCH_CODE,
+  AGDX_KV_GET_CODE,
+  AGDX_KV_SET_CODE,
+  AGDX_SESSION_GET_CODE
+} from "../../src/wire/codes.js"
+import { encodeBatchReply } from "../../src/wire/batch.js"
 import { decodeOne } from "../../src/wire/cbor.js"
 import {
   resultCodeFromCode,
@@ -43,17 +50,44 @@ const CONFLICT = encodeNamed(
   ])
 )
 const APPLIED = new Uint8Array([0xa1, 0x62, 0x6f, 0x6b, 0xf6])
+const FORBIDDEN = encodeNamed(
+  new Map<string, unknown>([
+    ["code", "forbidden"],
+    ["message", "revoked"]
+  ])
+)
+const TOO_LARGE = encodeNamed(
+  new Map<string, unknown>([
+    ["code", "too_large"],
+    ["message", "the item's reply has no room in the batch frame"]
+  ])
+)
+const batchReply = (slots: Uint8Array[]): Uint8Array =>
+  encodeNamed(encodeBatchReply({ results: slots }))
+const TRANSIENT_NOT_ACCEPTED = 58
+const INVALID_COMMAND = 3
 
-// A one-node client: every managed request reaches replica 0.
-function fakeClient(replies: Uint8Array[], requests: Uint8Array[]): IggyClient {
+// A one-node client: every managed request reaches replica 0, and an `Error`
+// reply fails the request.
+function fakeClient(replies: (Uint8Array | Error)[], requests: Uint8Array[]): IggyClient {
+  const answer = (payload: Buffer, replica: number | undefined): Buffer => {
+    assert.equal(replica, 0)
+    requests.push(new Uint8Array(payload))
+    const reply = replies.length > 1 ? replies.shift() : replies[0]
+    if (reply instanceof Error) throw reply
+    return Buffer.from(reply ?? APPLIED)
+  }
   return {
-    clientProvider: () => Promise.resolve({}),
-    sendBinaryRequestToReplica: (_code: number, payload: Buffer, replica: number) => {
-      assert.equal(replica, 0)
-      requests.push(new Uint8Array(payload))
-      const reply = replies.length > 1 ? replies.shift() : replies[0]
-      return Promise.resolve(Buffer.from(reply ?? APPLIED))
-    },
+    // A bounded attempt goes through the raw command with its deadline.
+    clientProvider: () =>
+      Promise.resolve({
+        sendCommand: (_code: number, payload: Buffer, options: { readonly replica?: number }) => {
+          const data = answer(payload, options.replica)
+          return Promise.resolve({ length: data.length, data })
+        }
+      }),
+    sendBinaryRequestToReplica: (_code: number, payload: Buffer, replica: number) =>
+      Promise.resolve(answer(payload, replica)),
     cluster: {
       getClusterMetadata: () =>
         Promise.resolve({ name: "single", nodes: [{ replicaId: 0, name: "node" }] })
@@ -87,16 +121,106 @@ void test("given_pending_replies_when_a_mutation_is_sent_then_should_repeat_the_
   assert.equal(pendingReplyMessage(APPLIED), undefined)
 })
 
+void test("given_a_batch_reply_with_an_unresolved_item_when_sent_then_should_repeat_the_same_frame_until_every_item_is_final", async () => {
+  const requests: Uint8Array[] = []
+  const final = batchReply([APPLIED, TOO_LARGE, APPLIED])
+  const transport = await ApacheIggyTransport.fromClient(
+    fakeClient(
+      [batchReply([APPLIED, PENDING, APPLIED]), batchReply([APPLIED, UNAVAILABLE, APPLIED]), final],
+      requests
+    )
+  )
+  const reply = await transport.sendManaged(AGDX_BATCH_CODE, new Uint8Array([1, 2, 3]))
+  assert.deepEqual(
+    reply,
+    final,
+    "a frame whose items are all final settles, a refused item included"
+  )
+  assert.equal(requests.length, 3)
+  assert.deepEqual(requests[1], requests[0], "a repeat carries the same parent frame and identity")
+  assert.deepEqual(requests[2], requests[0])
+})
+
+void test("given_a_batch_item_left_unresolved_when_the_repeat_refuses_it_by_admission_then_should_report_an_ambiguous_mutation", async () => {
+  const requests: Uint8Array[] = []
+  const transport = await ApacheIggyTransport.fromClient(
+    fakeClient([batchReply([APPLIED, PENDING]), batchReply([APPLIED, FORBIDDEN])], requests)
+  )
+  await assert.rejects(
+    transport.sendManaged(AGDX_BATCH_CODE, new Uint8Array([1])),
+    (error: unknown) =>
+      error instanceof AmbiguousMutationError &&
+      /^operation [0-9a-f]{32}: an earlier attempt's outcome is unknown \(item 1/.test(
+        error.message
+      )
+  )
+  assert.equal(requests.length, 2)
+})
+
 void test("given_a_mutation_that_stays_pending_when_the_deadline_passes_then_should_report_an_ambiguous_mutation", async () => {
   const requests: Uint8Array[] = []
   const transport = await ApacheIggyTransport.fromClient(fakeClient([PENDING], requests))
   await assert.rejects(
-    transport.sendManaged(AGDX_KV_SET_CODE, new Uint8Array([1]), { mutationDeadlineMs: 300 }),
+    transport.sendManaged(AGDX_KV_SET_CODE, new Uint8Array([1]), {
+      mutationDeadlineMs: 300,
+      operationId: 0x2an
+    }),
     (error: unknown) =>
-      error instanceof AmbiguousMutationError && error.message.includes("outcome is still unknown")
+      error instanceof AmbiguousMutationError &&
+      error.message.includes("outcome is still unknown") &&
+      error.operationId === 0x2an
   )
   assert.ok(requests.length >= 1)
   for (const request of requests) assert.deepEqual(request, requests[0])
+})
+
+void test("given_a_blocked_roster_read_when_a_managed_attempt_expires_then_should_end_at_its_deadline", async () => {
+  const requests: Uint8Array[] = []
+  let resolveMetadata: (value: unknown) => void = () => undefined
+  const metadata = new Promise<unknown>((resolve) => {
+    resolveMetadata = resolve
+  })
+  const client = fakeClient([APPLIED], requests)
+  Object.assign(client.cluster, { getClusterMetadata: () => metadata })
+  const transport = await ApacheIggyTransport.fromClient(client)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const operation = transport.sendManaged(AGDX_KV_SET_CODE, new Uint8Array([1]), {
+      mutationDeadlineMs: 20
+    })
+    await assert.rejects(
+      Promise.race([
+        operation,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error("the roster read exceeded the mutation deadline"))
+          }, 300)
+        })
+      ]),
+      (error: unknown) =>
+        error instanceof AmbiguousMutationError && /^operation [0-9a-f]{32}/.test(error.message)
+    )
+  } finally {
+    clearTimeout(timer)
+    resolveMetadata({ name: "single", nodes: [{ replicaId: 0, name: "node" }] })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  }
+  assert.equal(requests.length, 0, "the expired attempt must not send after discovery completes")
+})
+
+void test("given_a_lost_attempt_then_a_refusal_when_a_mutation_is_sent_then_should_report_an_ambiguous_mutation_naming_its_operation", async () => {
+  const requests: Uint8Array[] = []
+  const transport = await ApacheIggyTransport.fromClient(
+    fakeClient([refusal(TRANSIENT_NOT_ACCEPTED), refusal(INVALID_COMMAND)], requests)
+  )
+  await assert.rejects(
+    transport.sendManaged(AGDX_KV_SET_CODE, new Uint8Array([5])),
+    (error: unknown) =>
+      error instanceof AmbiguousMutationError &&
+      /^operation [0-9a-f]{32}: an earlier attempt's outcome is unknown/.test(error.message)
+  )
+  assert.equal(requests.length, 2)
+  assert.deepEqual(requests[1], requests[0])
 })
 
 void test("given_an_unavailable_backend_when_a_mutation_is_sent_then_should_repeat_the_same_identity", async () => {
@@ -194,4 +318,23 @@ void test("given_consumer_failures_when_backing_off_then_should_jitter_within_th
       )
     }
   }
+})
+
+function refusal(errorCode: number): Error {
+  return Object.assign(new Error(`refused with ${String(errorCode)}`), { errorCode })
+}
+
+void test("given_a_caller_operation_identity_when_sending_twice_then_should_reuse_the_same_envelope", async () => {
+  const requests: Uint8Array[] = []
+  const transport = await ApacheIggyTransport.fromClient(fakeClient([APPLIED, APPLIED], requests))
+  await transport.sendManaged(AGDX_KV_SET_CODE, new Uint8Array([1, 2, 3]), { operationId: 123n })
+  await transport.sendManaged(AGDX_KV_SET_CODE, new Uint8Array([1, 2, 3]), { operationId: 123n })
+  assert.deepEqual(requests[0], requests[1])
+  const first = requests[0]
+  assert.ok(first)
+  assert.equal(
+    decodeManagedRequestEnvelope(expectMap(decodeOne(first, "request"), "request"), "request")
+      .operationId,
+    123n
+  )
 })

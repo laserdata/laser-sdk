@@ -147,6 +147,7 @@ fn diagnose_card_with(health: Option<Health>) -> AgentCard {
             load: None,
         }],
         ttl_micros: None,
+        inbox: None,
     }
 }
 

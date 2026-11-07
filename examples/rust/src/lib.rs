@@ -337,7 +337,7 @@ pub async fn ensure_view(
 pub async fn wait_for_rows(laser: &Laser, index: &str, expected: u64) -> Result<u64, LaserError> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut feed = match laser.capabilities().await.watch {
-        true => Some(laser.watch().index(index).records()?),
+        true => Some(laser.watch().index(index).records().await?),
         false => None,
     };
     let mut last = None;

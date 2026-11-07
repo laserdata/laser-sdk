@@ -20,12 +20,12 @@ console shows a live, populated fabric the entire time. Each phase:
                   each step building its task from the prior steps' outputs.
   5. QUARANTINE   an operator pulls a misbehaving agent, and the panel routes around it.
   6. RECOVERY     the operator reinstates it (un-quarantine), and the panel is whole.
-  7. EXPIRY       a tight-deadline task to a slow agent times out, and the
-                  orchestrator recovers by re-dispatching to a healthy one.
+  7. EXPIRY       a tight-deadline task to a slow agent times out, the slow
+                  agent stops at the task's deadline, and the orchestrator
+                  recovers by re-dispatching to a healthy one.
 
-Routing uses a fixed inbox topic so it runs against Apache Iggy.
-Presence advertisement is best-effort: a managed deployment records it, and it is
-a no-op against Apache Iggy.
+Routing resolves each agent's advertised inbox: the live presence on a managed
+deployment, and the inbox its capability card names on Apache Iggy.
 
     python3 orchestra.py
 """
@@ -33,6 +33,7 @@ a no-op against Apache Iggy.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import _common
 import laser_sdk as ls
@@ -72,9 +73,7 @@ async def main() -> None:
         _common.phase("Contract: a directed task to one capable agent, with a deadline")
         # The orchestrator names a capability, not an agent. Routing resolves the one
         # classifier from the registry and waits for the reply or the deadline.
-        reply = await laser.contract(
-            CLASSIFY, INCIDENT, source=ORCHESTRATOR, fixed_inbox=SESSIONS, deadline_ms=10_000
-        )
+        reply = await laser.contract(CLASSIFY, INCIDENT, source=ORCHESTRATOR, deadline_ms=10_000)
         print("classifier replied:", completed_body(reply) or "<did not complete>")
         await pause("CONTRACT: a directed task completed (see it in the Contracts panel)")
 
@@ -86,7 +85,7 @@ async def main() -> None:
         await pause("FAN-OUT: two healthy diagnosers answered, the unavailable one was skipped")
 
         _common.phase("Workflow: triage, then a diagnose panel, then remediate (journalled)")
-        wf = laser.workflow("incident-response", fixed_inbox=SESSIONS)
+        wf = laser.workflow("incident-response")
         # Cap the dispatches and wall clock so a runaway fan-out cannot spin.
         wf.budget(ls.WorkflowBudget.unlimited().invocations(8).wall_clock(60_000))
         # The run is a session and every step a child session of it, so the
@@ -129,15 +128,14 @@ async def main() -> None:
 
         _common.phase("Expiry + recovery: a tight deadline times out, the orchestrator recovers")
         # The slow agent acks pickup but cannot finish inside the one-second deadline,
-        # so the contract expires. The orchestrator recovers by re-dispatching to a
-        # healthy fast agent, the pattern any real coordinator uses for a stuck task.
-        slow = await laser.contract(
-            SLOW_TASK, INCIDENT, source=ORCHESTRATOR, fixed_inbox=SESSIONS, deadline_ms=1_000
-        )
+        # so the contract expires. The task carries that deadline and the slow agent
+        # stops there instead of finishing late, so re-dispatching to a healthy agent
+        # cannot run the task twice.
+        slow = await laser.contract(SLOW_TASK, INCIDENT, source=ORCHESTRATOR, deadline_ms=1_000)
         if not isinstance(slow, ls.Contract.Completed):
             print("the slow agent missed the deadline, recovering on a healthy agent")
             recovered = await laser.contract(
-                REMEDIATE, INCIDENT, source=ORCHESTRATOR, fixed_inbox=SESSIONS, deadline_ms=10_000
+                REMEDIATE, INCIDENT, source=ORCHESTRATOR, deadline_ms=10_000
             )
             print("recovered:", completed_body(recovered) or "<did not complete>")
         else:
@@ -161,6 +159,12 @@ def worker(name: str, skill: str, delay: float):
     its skill produces."""
 
     async def handle(ctx, message):
+        # A task carries its caller's deadline. Working past it would finish a
+        # task the caller already gave up on and sent elsewhere, so stop there.
+        deadline = message.provenance.deadline_at_micros
+        if deadline is not None and deadline / 1_000_000 - time.time() < delay:
+            await asyncio.sleep(max(deadline / 1_000_000 - time.time(), 0))
+            return
         await asyncio.sleep(delay)
         task = message.body().decode("utf-8", "replace")
         if skill == CLASSIFY:
@@ -201,16 +205,14 @@ async def diagnose_panel(laser) -> int:
     """Scatter a diagnose panel to every capable agent and return how many
     answered. Unavailable agents are left out by capability resolution, so the
     count reflects who could actually answer."""
-    bodies = await laser.scatter(
-        DIAGNOSE, INCIDENT, source=ORCHESTRATOR, fixed_inbox=SESSIONS, deadline_ms=10_000
-    )
+    bodies = await laser.scatter(DIAGNOSE, INCIDENT, source=ORCHESTRATOR, deadline_ms=10_000)
     return len(bodies)
 
 
 def completed_body(outcome) -> str | None:
     """The reply text of a completed contract, or `None` for any other outcome."""
     if isinstance(outcome, ls.Contract.Completed):
-        return bytes(outcome[0].body()).decode()
+        return bytes(outcome.reply.body()).decode()
     return None
 
 

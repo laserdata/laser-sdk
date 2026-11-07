@@ -1,4 +1,4 @@
-use crate::async_bridge::{HookLoop, call_hook, future_into_py};
+use crate::async_bridge::{Awaitable, HookLoop, awaitable, call_hook};
 use crate::client::PyLaser;
 use crate::convert::{py_to_de, ser_to_py};
 use crate::errors::to_pyerr;
@@ -208,11 +208,15 @@ impl PySnapshotStore {
     }
 
     /// The newest snapshot as the dict `decode_snapshot` returns (stream, stream id and creation time, conversation, fold, `as_of` entries of `(topic_id, topic_created_at_micros, partition_id, offset)`, and state), or `None`. The offsets are inclusive.
-    fn latest<'py>(&self, py: Python<'py>, conversation: String) -> PyResult<Bound<'py, PyAny>> {
+    fn latest<'py>(
+        &self,
+        py: Python<'py>,
+        conversation: String,
+    ) -> PyResult<Awaitable<'py, Option<Py<PyAny>>>> {
         let conversation = ConversationId::from_str(&conversation)
             .map_err(|error| crate::errors::InvalidError::new_err(error.to_string()))?;
         let store = self.handle();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let snapshot = store.latest(conversation).await.map_err(to_pyerr)?;
             Python::attach(|py| match snapshot {
                 Some(snapshot) => Ok(Some(snapshot_to_py(py, &snapshot)?.unbind())),
@@ -226,10 +230,10 @@ impl PySnapshotStore {
         &self,
         py: Python<'py>,
         snapshot: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let snapshot = snapshot_from_py(snapshot)?;
         let store = self.handle();
-        future_into_py(
+        awaitable(
             py,
             async move { store.save(&snapshot).await.map_err(to_pyerr) },
         )

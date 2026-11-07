@@ -45,10 +45,10 @@ void test("given_session_read_requests_when_decoded_then_should_match_rust_bytes
   const list = await roundTrip("session_list.bin", decodeSessionList, encodeSessionList)
   assert.equal(list.status, "active")
   assert.equal(list.agent, "planner")
-  assert.equal(list.wantTotal, true)
-  assert.throws(() => encodeSessionList({ ...list, limit: -1 }))
+  assert.deepEqual([list.page, list.results], [2, 25])
+  assert.throws(() => encodeSessionList({ ...list, results: -1 }))
   const events = await roundTrip("session_events.bin", decodeSessionEvents, encodeSessionEvents)
-  assert.equal(events.fixedFrontier, true)
+  assert.deepEqual([events.page, events.results], [3, 20])
   const state = await roundTrip("session_state.bin", decodeSessionState, encodeSessionState)
   assert.equal(state.historyLimit, 10)
   const links = await roundTrip("session_links.bin", decodeSessionLinks, encodeSessionLinks)
@@ -64,8 +64,8 @@ void test("given_session_read_requests_when_decoded_then_should_match_rust_bytes
   assert.equal(lane.laneOnly, true)
   assert.equal(lane.stream, sources.stream)
   const changes = await roundTrip("session_changes.bin", decodeSessionChanges, encodeSessionChanges)
-  assert.equal(changes.after, 42n)
-  assert.throws(() => encodeSessionChanges({ ...changes, after: -1n }))
+  assert.deepEqual([changes.page, changes.results], [45, 100])
+  assert.throws(() => encodeSessionChanges({ ...changes, page: -1 }))
   for (const [name, value] of [
     ["session_link_surface.bin", "graph_node"],
     ["session_link_relation.bin", "recalled"]

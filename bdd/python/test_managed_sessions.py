@@ -34,6 +34,7 @@ class Managed:
         self.worker = None
         self.lease = None
         self.watch = None
+        self.walk = None
         self.handled = []
         self.retained_source = None
 
@@ -78,6 +79,20 @@ def _stream(world, layout=None, heartbeat_ms=None):
         lambda: sessions.bootstrap(4, ls.TopicRetention.expire_after(ONE_DAY_MS))
     )
     assert registered, "a deployment that serves sessions registers the stream"
+    subprocess.run(
+        [
+            "node",
+            str(SCENARIOS.parent / "session-lane-admin.mjs"),
+            world.endpoint,
+            stream,
+            "readiness",
+            "4",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
     return laser, sessions
 
 
@@ -180,8 +195,8 @@ def counts_completed(world, count):
     managed = _managed(world)
 
     def read():
-        page = _index(world, lambda: managed.sessions.list(status="completed", total=True))
-        return page if page is not None and page.get("total") == int(count) else None
+        page = _index(world, lambda: managed.sessions.list(status="completed", results=100))
+        return page if page is not None and page["total_results"] == int(count) else None
 
     page = _eventually(world, read, "the completed count")
     assert len(page["items"]) == int(count)
@@ -721,8 +736,8 @@ def counts_records(world, records):
 def feed_rows(world, rows):
     managed = _managed(world)
     session_id = world.session.conversation
-    changes = world.run(lambda: managed.sessions.changes(0))
-    naming = [row for row in changes["rows"] if session_id in row["sessions"]]
+    changes = world.run(lambda: managed.sessions.changes(page=1, results=100))
+    naming = [row for row in changes["items"] if session_id in row["sessions"]]
     assert naming, changes
     assert len(naming) <= rows, f"one row per fold batch, not per record: {changes}"
 
@@ -733,14 +748,14 @@ def feed_isolated(world):
     other = managed.second_session
 
     def read():
-        changes = _index(world, lambda: managed.second.changes(0))
-        named = changes is not None and any(other in row["sessions"] for row in changes["rows"])
+        changes = _index(world, lambda: managed.second.changes(page=1, results=100))
+        named = changes is not None and any(other in row["sessions"] for row in changes["items"])
         return changes if named else None
 
     # The second stream's own feed names it, so both folds have run.
     _eventually(world, read, "the second stream's feed")
-    changes = world.run(lambda: managed.sessions.changes(0))
-    assert all(other not in row["sessions"] for row in changes["rows"]), changes
+    changes = world.run(lambda: managed.sessions.changes(page=1, results=100))
+    assert all(other not in row["sessions"] for row in changes["items"]), changes
 
 
 @when("a watch follows the stream's session changes")
@@ -749,9 +764,10 @@ def watch_changes(world):
     watch = world.run(lambda: managed.sessions.watch(250))
 
     async def follow():
-        return await watch.next()
+        async for change in watch:
+            return change
 
-    # A follower awaits its next change from the start, as a console would.
+    # A follower iterates its changes from the start, as a console would.
     managed.watch = world.loop.create_task(follow())
 
 
@@ -804,6 +820,30 @@ def indexed_events(world, listing):
     assert _eventually(world, read, "the indexed events") == expected
 
 
+@then(
+    parsers.re(
+        r"the session timeline reads (?P<total>\d+) events over (?P<pages>\d+) pages of "
+        r"(?P<results>\d+)$"
+    )
+)
+def timeline_pages(world, total, pages, results):
+    managed = _managed(world)
+    session = world.session.conversation
+    walked = []
+    for page in range(1, int(pages) + 1):
+        read = world.run(
+            lambda page=page: managed.sessions.events(session, page=page, results=int(results))
+        )
+        assert (read["total_results"], read["total_pages"], read["page"]) == (
+            int(total),
+            int(pages),
+            page,
+        ), read
+        walked.extend(event["display"] for event in read["items"])
+    whole = world.run(lambda: managed.sessions.events(session, results=100))
+    assert walked == [event["display"] for event in whole["items"]]
+
+
 @then("the session sources show folded offsets within their heads")
 def sources_cover(world):
     managed = _managed(world)
@@ -821,6 +861,29 @@ def no_links(world):
     assert view["links"] == [], view
 
 
+@when(parsers.re(r"a list walk of (?P<results>\d+) sessions? per page reads its first page$"))
+def list_walk_first(world, results):
+    managed = _managed(world)
+    managed.walk = world.run(lambda: managed.sessions.list(results=int(results)))
+
+
+@then(parsers.parse('the list walk\'s second page completes "{first}" and "{second}" once each'))
+def list_walk_second(world, first, second):
+    managed = _managed(world)
+    start = managed.walk
+    following = world.run(
+        lambda: managed.sessions.list(
+            page=2,
+            results=len(start["items"]),
+            as_of=start["as_of"],
+            series=start["series"],
+        )
+    )
+    walked = sorted(item["id"] for item in start["items"] + following["items"])
+    assert walked == sorted([managed.labels[first], managed.labels[second]]), walked
+    assert (start["total_results"], following["total_results"]) == (2, 2)
+
+
 @then("the watch reports the session")
 def watch_reports(world):
     managed = _managed(world)
@@ -832,6 +895,12 @@ def watch_reports(world):
     change = world.run(wait)
     assert isinstance(change, ls.SessionChange.Changed), change
     assert world.session.conversation in change.sessions, change
+
+
+@then(parsers.re(r'agent "(?P<name>[^"]+)" handled (?P<count>\d+) commands?$'))
+def handled_commands(world, name, count):
+    managed = _managed(world)
+    assert len(managed.handled) == int(count), (name, managed.handled)
 
 
 @given(parsers.parse('agent "{name}" counts the work it handles'))
@@ -952,8 +1021,6 @@ def change_lane_source(world, change):
     helper = SCENARIOS.parent / "session-lane-admin.mjs"
     result = subprocess.run(
         [
-            "rtk",
-            "proxy",
             "node",
             str(helper),
             world.endpoint,
@@ -1029,8 +1096,6 @@ def refuse_replacement_source_record(world):
 def _lane_record_count(world):
     result = subprocess.run(
         [
-            "rtk",
-            "proxy",
             "node",
             str(SCENARIOS.parent / "session-lane-admin.mjs"),
             world.endpoint,
@@ -1152,8 +1217,6 @@ def native_lane_writer(world):
     username = f"writer-{stream}"
     result = subprocess.run(
         [
-            "rtk",
-            "proxy",
             "node",
             str(SCENARIOS.parent / "session-lane-admin.mjs"),
             world.endpoint,

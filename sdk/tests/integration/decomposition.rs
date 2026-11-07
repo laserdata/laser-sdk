@@ -35,6 +35,7 @@ fn card(skill: &str) -> AgentCard {
             load: None,
         }],
         ttl_micros: None,
+        inbox: None,
     }
 }
 
@@ -80,7 +81,7 @@ async fn given_a_contract_when_completed_then_should_decompose_to_one_command_on
     // The contract's entire ask is one AGDX command: correlated (via the envelope
     // correlation, what lets the reply match), targeted, and rebuildable by any
     // reader from the log alone. The business idempotency key is NOT overloaded
-    // with the correlation (R4), so it stays unset on a bare contract.
+    // with the correlation, so it stays unset on a bare contract.
     let commands = commands_on_log(&laser).await;
     assert_eq!(commands.len(), 1, "a contract is exactly one command");
     let command = &commands[0];
@@ -134,6 +135,7 @@ async fn given_a_scatter_when_gathered_then_should_decompose_to_one_contract_per
             &CapabilitySelector::new("scatter_skill", RoutePolicy::Any),
             b"fan-1",
             &InboxRoute::Fixed(AgentTopic::Sessions),
+            GatherPolicy::RequireAll,
             Duration::from_secs(10),
         )
         .await

@@ -47,6 +47,36 @@ def prepared_release_error(world, code):
         raise AssertionError("the command must be refused")
 
 
+@when(parsers.parse("a prepared release receives the unresolved result code {code:d}"))
+def prepared_release_unresolved(world, code):
+    words = {12: "unavailable", 19: "pending", 20: "backend_unavailable"}
+    word = words[code].encode()
+    reply = b"\xa2\x64code" + bytes([0x60 + len(word)]) + word + b"\x67message\x67refused"
+
+    class CommandReply:
+        async def send(self, command, frame):
+            return reply
+
+        async def reset(self):
+            pass
+
+    client = ls.FencedLeaseClient(CommandReply())
+    operation = client.prepare_release(
+        {"v": 1, "namespace": "coord", "key": b"lease", "lease_token": 1, "holder_id": "worker"}
+    )
+    try:
+        world.run(lambda: client.release(operation))
+    except ls.LaserError as error:
+        world.error = error
+    else:
+        raise AssertionError("an unresolved attempt never succeeds")
+
+
+@then("the release fails as an ambiguous mutation")
+def release_is_ambiguous(world):
+    assert world.error.ambiguous_mutation, world.error
+
+
 @then(parsers.parse("the command error keeps code {code:d} and retryability {retryable}"))
 def command_error_classifiers(world, code, retryable):
     names = {
@@ -64,12 +94,10 @@ def command_error_classifiers(world, code, retryable):
 
 @given("a managed-query connection that does not advertise read-your-writes")
 def inject_eventual_query(world):
-    world.laser = world.run(
-        lambda: world.laser.with_capabilities(
-            managed=True,
-            query=True,
-            query_consistency="eventual",
-        )
+    world.laser = world.laser.with_capabilities(
+        managed=True,
+        query=True,
+        query_consistency="eventual",
     )
 
 
@@ -117,27 +145,31 @@ def compare_and_swap(world, key, namespace):
     world.capture(lambda: world.laser.kv(namespace).set(key).bytes(b"x").expect_absent().commit())
 
 
-@when(
-    parsers.parse(
-        'I send a set of key "{key}" in namespace "{namespace}" expecting version {version:d}'
-        " without commit"
-    )
-)
-def send_set_with_precondition(world, key, namespace, version):
-    world.capture(
-        lambda: world.laser.kv(namespace).set(key).bytes(b"debug").expect_version(version).send()
-    )
+MANAGED_SURFACES = {
+    "projection registration": lambda laser: laser.projections().register(
+        ls.ProjectionBuilder("reading.v1").build()
+    ),
+    "materialization": lambda laser: laser.topic("events").materialize().apply(),
+    "schema registration": lambda laser: laser.schemas().register(
+        {"kind": "json_schema", "schema": '{"type":"string"}'}
+    ),
+    "graph upsert": lambda laser: laser.graph("kg").upsert([], []),
+    "fork creation": lambda laser: laser.fork("experiment").create(),
+    "change feed": lambda laser: read_change_feed(laser),
+    "lease acquisition": lambda laser: laser.kv("coordination").lease(b"lock", "worker", 5000),
+    "session read": lambda laser: laser.sessions().get(ls.new_conversation_id()),
+    "batch": lambda laser: laser.execute_batch([]),
+}
 
 
-@then("the call fails as invalid")
-def fails_invalid(world):
-    assert isinstance(world.error, ls.InvalidError)
+async def read_change_feed(laser):
+    reader = await laser.watch()
+    return await reader.poll()
 
 
-@then("the unified result code is invalid argument")
-def unified_code_invalid_argument(world):
-    assert world.error is not None
-    assert world.error.code == "InvalidArgument"
+@when(parsers.parse("I call the managed {surface} surface"))
+def call_managed_surface(world, surface):
+    world.capture(lambda: MANAGED_SURFACES[surface](world.laser))
 
 
 @then("the call fails as unsupported")

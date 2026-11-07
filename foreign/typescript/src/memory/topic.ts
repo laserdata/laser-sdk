@@ -1,3 +1,4 @@
+import { type CallOptions, abortable, throwIfAborted } from "../client/call-options.js"
 import { millis, millisToMicros } from "../client/duration.js"
 import { InvalidError, NoStreamError } from "../client/errors.js"
 import type { Laser } from "../client/laser.js"
@@ -52,17 +53,22 @@ export class MemoryTopicBuilder {
   }
 
   /** Ensures the topic and returns memory bound to it. */
-  async build(): Promise<MemoryHandle> {
+  async build(options: CallOptions = {}): Promise<MemoryHandle> {
+    throwIfAborted(options.signal, "memory topic build")
     const stream = this.streamValue ?? this.laser.defaultStream
     if (stream === undefined) throw new NoStreamError("memory topic requires a stream")
-    await this.laser.stream(stream).ensure()
-    await this.laser
-      .stream(stream)
-      .topic(this.topic)
-      .ensureWithExpiry(
-        this.partitionsValue,
-        this.ttlMs === undefined ? undefined : maxBigint(1n, millisToMicros(this.ttlMs))
-      )
+    await abortable(this.laser.stream(stream).ensure(), options.signal, "memory topic build")
+    await abortable(
+      this.laser
+        .stream(stream)
+        .topic(this.topic)
+        .ensureWithExpiry(
+          this.partitionsValue,
+          this.ttlMs === undefined ? undefined : maxBigint(1n, millisToMicros(this.ttlMs))
+        ),
+      options.signal,
+      "memory topic build"
+    )
     return MemoryHandle.logTopic(this.laser, this.topic, stream)
   }
 }

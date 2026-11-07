@@ -28,7 +28,8 @@ export const PROVENANCE_FIELDS: readonly (readonly [number, string])[] = [
   [2_000_000_011, "__laser_destination_generation"],
   [2_000_000_012, "__laser_original_payload"],
   [2_000_000_013, "__laser_original_content_type"],
-  [2_000_000_014, "__laser_original_schema_id"]
+  [2_000_000_014, "__laser_original_schema_id"],
+  [2_000_000_015, "__laser_original_headers"]
 ]
 
 export type LogicalType =
@@ -46,6 +47,7 @@ export type LogicalType =
         | "string"
         | "uuid"
         | "binary"
+        | "variant"
     }
   | { readonly kind: "decimal"; readonly precision: number; readonly scale: number }
   | { readonly kind: "fixed"; readonly length: number }
@@ -277,6 +279,7 @@ export function encodeLogicalType(value: LogicalType): Map<string, unknown> {
     case "string":
     case "uuid":
     case "binary":
+    case "variant":
       break
   }
   return map
@@ -294,7 +297,8 @@ const PRIMITIVE_TYPES = new Set([
   "timestamp_tz_micros",
   "string",
   "uuid",
-  "binary"
+  "binary",
+  "variant"
 ])
 
 export function decodeLogicalType(map: CborMap, context: string): LogicalType {
@@ -609,6 +613,8 @@ export function typedValueValidateAgainst(
   }
   validateTypedValue(value, 1)
   switch (logicalType.kind) {
+    case "variant":
+      return
     case "boolean":
     case "int":
     case "long":
@@ -827,7 +833,8 @@ function encodeFingerprintType(encoder: SchemaEncoder, type: LogicalType): void 
     binary: 13,
     struct: 14,
     list: 15,
-    map: 16
+    map: 16,
+    variant: 17
   }
   encoder.u8(tags[type.kind] ?? 255)
   if (type.kind === "decimal") {

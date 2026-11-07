@@ -5,8 +5,32 @@ use crate::headers::CONTENT_TYPE;
 /// entry under a non-text key is stepped over undecoded. A malformed value
 /// under a text key faults the whole record. Entries keep their order, and
 /// the evaluator reads the last entry of a repeated key.
-pub fn decode(mut bytes: &[u8]) -> Option<Vec<HeaderRef<'_>>> {
-    let mut headers: Vec<HeaderRef<'_>> = Vec::new();
+pub fn decode(bytes: &[u8]) -> Option<Vec<HeaderRef<'_>>> {
+    let mut headers = Vec::new();
+    decode_into(bytes, &mut headers)?;
+    Some(headers)
+}
+
+/// [`decode_for`] into the caller's buffer, so a scan reuses one allocation
+/// across records. The buffer is cleared first. On `Some` it holds the
+/// decoded entries, on `None` (a malformed block) it holds nothing.
+pub fn decode_for_into<'a>(
+    need: HeaderNeed,
+    bytes: &'a [u8],
+    headers: &mut Vec<HeaderRef<'a>>,
+) -> Option<()> {
+    headers.clear();
+    match need {
+        HeaderNeed::None => Some(()),
+        HeaderNeed::ContentType => {
+            headers.extend(content_type_one(bytes)?);
+            Some(())
+        }
+        HeaderNeed::All => decode_into(bytes, headers),
+    }
+}
+
+fn decode_into<'a>(mut bytes: &'a [u8], headers: &mut Vec<HeaderRef<'a>>) -> Option<()> {
     while !bytes.is_empty() {
         let (key_kind, key) = field(&mut bytes)?;
         let (value_kind, value) = field(&mut bytes)?;
@@ -17,7 +41,7 @@ pub fn decode(mut bytes: &[u8]) -> Option<Vec<HeaderRef<'_>>> {
         let value = scalar(value_kind, value)?;
         headers.push(HeaderRef { key, value });
     }
-    Some(headers)
+    Some(())
 }
 
 /// The headers a filter needs before evaluating, decoded from the raw block:
@@ -155,6 +179,42 @@ mod tests {
         truncated.truncate(truncated.len() - 1);
         assert!(content_type(&truncated).is_none());
         assert!(content_type(&entry("agdx.ct", 9, &[1, 2])).is_none());
+    }
+
+    // A scan decodes one record's headers into the same buffer each time, so
+    // the capacity is kept, every need fills it like the fresh decode would,
+    // and a malformed block leaves nothing of the previous record behind.
+    #[test]
+    fn given_a_reused_buffer_when_each_need_is_decoded_then_should_match_the_fresh_decode() {
+        let mut block = entry("priority", 9, &[2]);
+        block.extend(entry("agdx.ct", 9, &[3]));
+        block.extend(entry("future", 99, b"opaque"));
+        let mut buffer = Vec::new();
+        decode_for_into(HeaderNeed::All, &block, &mut buffer).expect("parses");
+        let fresh = decode(&block).expect("parses");
+        assert_eq!(buffer.len(), fresh.len());
+        assert!(
+            buffer
+                .iter()
+                .zip(&fresh)
+                .all(|(reused, fresh)| reused.key == fresh.key && reused.value == fresh.value)
+        );
+        let capacity = buffer.capacity();
+        decode_for_into(HeaderNeed::ContentType, &block, &mut buffer).expect("parses");
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer[0].value, HeaderValueRef::Uint(3));
+        decode_for_into(HeaderNeed::None, &block, &mut buffer).expect("parses");
+        assert!(buffer.is_empty());
+        assert_eq!(
+            buffer.capacity(),
+            capacity,
+            "the buffer keeps its allocation"
+        );
+        let mut truncated = entry("agdx.ct", 9, &[1]);
+        truncated.truncate(truncated.len() - 1);
+        decode_for_into(HeaderNeed::All, &block, &mut buffer).expect("parses");
+        assert!(decode_for_into(HeaderNeed::All, &truncated, &mut buffer).is_none());
+        assert!(buffer.is_empty(), "malformed input leaves nothing behind");
     }
 
     #[test]

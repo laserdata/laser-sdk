@@ -4,10 +4,13 @@ import {
   AgentId,
   AgentTopic,
   CorrelationId,
+  ConversationId,
   RecordId,
   TopicRetention,
   UnsupportedError,
+  code,
   eventEnvelope,
+  isUnavailable,
   requiring,
   unmetRequirements,
 } from "@laserdata/laser-sdk";
@@ -34,6 +37,16 @@ Given(
       Number(partitions),
       TopicRetention.expireAfter(86_400_000),
     );
+    const context = this.requireLaser().context(ConversationId.new());
+    await eventual(async () => {
+      try {
+        await context.fetch([AgentTopic.Sessions], 1);
+        return true;
+      } catch (error) {
+        if (isUnavailable(error)) return undefined;
+        throw error;
+      }
+    }, "session partitions are readable");
   },
 );
 
@@ -199,7 +212,7 @@ Then("the call fails as unsupported", function (this: LaserWorld) {
 });
 
 Then("the unified result code is unsupported", function (this: LaserWorld) {
-  assert.equal(this.error?.kind, "unsupported");
+  assert.deepEqual(code(this.error), { kind: "known", name: "Unsupported" });
 });
 
 async function sendCommand(

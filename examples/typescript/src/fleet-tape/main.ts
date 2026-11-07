@@ -135,6 +135,7 @@ async function registerTape(
     name: index,
     version: 1,
     kind: { kind: "row" },
+    history: { kind: "append" },
     contentType,
     extraction: {
       fields: COLUMNS.map((name) => ({ name, pointer: `/${name}` })),
@@ -148,7 +149,8 @@ async function registerTape(
     defaultProjection: id,
     index,
     notify: true,
-    skipRejected: false
+    invalidRecords: "block",
+    oversize: "block"
   }
   await laser.projections().register(projection)
   await laser.bindings().apply(binding)

@@ -1,4 +1,5 @@
-use crate::error::LaserError;
+use crate::error::{LaserError, TransportError};
+use crate::retry::jittered;
 use std::future::Future;
 use std::time::Duration;
 
@@ -107,7 +108,7 @@ impl PublishOptions {
                 Err(error) => {
                     let retryable = match &error {
                         LaserError::Timeout(_) => true,
-                        LaserError::Iggy(cause) => {
+                        LaserError::Transport(TransportError(cause)) => {
                             crate::error::is_transient_iggy_io_error(cause)
                                 || crate::error::needs_reauthentication(cause)
                         }
@@ -137,11 +138,13 @@ impl PublishOptions {
     }
 
     // The pause before retry `attempt`, counted from zero: the backoff doubled
-    // per attempt and capped at 30 seconds.
+    // per attempt, capped at 30 seconds and spread over its upper half.
     pub(crate) fn retry_delay(&self, attempt: u32) -> Duration {
-        self.retry_backoff
-            .saturating_mul(1u32 << attempt.min(16))
-            .min(Duration::from_secs(30))
+        jittered(
+            self.retry_backoff
+                .saturating_mul(1u32 << attempt.min(16))
+                .min(Duration::from_secs(30)),
+        )
     }
 }
 
@@ -159,7 +162,7 @@ pub(crate) fn env_number(name: &'static str) -> Result<Option<u64>, LaserError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy::prelude::IggyError;
+    use iggy::prelude::{Identifier, IggyError};
     use std::cell::Cell;
 
     fn options() -> PublishOptions {
@@ -210,7 +213,7 @@ mod tests {
                     let attempt = sends.get();
                     async move {
                         if attempt == 1 {
-                            return Err(LaserError::Iggy(IggyError::ProducerSendFailed {
+                            return Err(LaserError::from(IggyError::ProducerSendFailed {
                                 cause: Box::new(IggyError::Unauthenticated),
                                 failed: std::sync::Arc::new(Vec::new()),
                                 uncertain: 0,
@@ -241,7 +244,7 @@ mod tests {
             .run(
                 || {
                     sends.set(sends.get() + 1);
-                    async { Err::<(), _>(LaserError::Iggy(IggyError::Disconnected)) }
+                    async { Err::<(), _>(LaserError::from(IggyError::Disconnected)) }
                 },
                 || async { Ok(()) },
             )
@@ -257,13 +260,64 @@ mod tests {
             .run(
                 || {
                     sends.set(sends.get() + 1);
-                    async { Err::<(), _>(LaserError::Iggy(IggyError::Unauthorized)) }
+                    async { Err::<(), _>(LaserError::from(IggyError::Unauthorized)) }
                 },
                 || async { panic!("permanent failure must not reconnect") },
             )
             .await;
         assert!(result.is_err());
         assert_eq!(sends.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn given_a_missing_partition_when_publishing_then_should_not_retry_or_reconnect() {
+        let sends = Cell::new(0);
+        let result = options()
+            .run(
+                || {
+                    sends.set(sends.get() + 1);
+                    async {
+                        Err::<(), _>(LaserError::from(IggyError::ProducerSendFailed {
+                            cause: Box::new(IggyError::PartitionNotFound(
+                                7,
+                                Identifier::default(),
+                                Identifier::default(),
+                            )),
+                            failed: std::sync::Arc::new(Vec::new()),
+                            uncertain: 0,
+                            committed: std::sync::Arc::new(Vec::new()),
+                            stream_name: "s".into(),
+                            topic_name: "t".into(),
+                        }))
+                    }
+                },
+                || async { panic!("a missing partition must not reconnect the shared client") },
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(sends.get(), 1);
+    }
+
+    #[test]
+    fn given_publish_retries_when_delayed_then_should_spread_each_delay_over_its_upper_half() {
+        let config = PublishOptions {
+            retry_backoff: Duration::from_millis(250),
+            ..options()
+        };
+        for (attempt, ceiling) in [(0, 250), (1, 500), (2, 1_000), (16, 30_000)] {
+            let ceiling = Duration::from_millis(ceiling);
+            let delays: Vec<Duration> = (0..64).map(|_| config.retry_delay(attempt)).collect();
+            assert!(
+                delays
+                    .iter()
+                    .all(|delay| *delay >= ceiling / 2 && *delay <= ceiling),
+                "attempt {attempt} delays {delays:?} stay within the upper half of {ceiling:?}"
+            );
+            assert!(
+                delays.iter().any(|delay| *delay != ceiling),
+                "attempt {attempt} delays are jittered"
+            );
+        }
     }
 
     #[tokio::test]
@@ -296,7 +350,7 @@ mod tests {
         let offline = Cell::new(true);
         let send = || async {
             if offline.get() {
-                Err(LaserError::Iggy(IggyError::Disconnected))
+                Err(LaserError::from(IggyError::Disconnected))
             } else {
                 Ok(7)
             }
@@ -320,7 +374,7 @@ mod tests {
         };
         let result = config
             .run(
-                || async { Err::<(), _>(LaserError::Iggy(IggyError::Disconnected)) },
+                || async { Err::<(), _>(LaserError::from(IggyError::Disconnected)) },
                 std::future::pending::<Result<(), LaserError>>,
             )
             .await;
@@ -339,7 +393,7 @@ mod tests {
             let result = options()
                 .run(
                     || {
-                        std::future::ready(Err::<(), _>(LaserError::Iggy(
+                        std::future::ready(Err::<(), _>(LaserError::from(
                             failure.take().expect("must only send once"),
                         )))
                     },

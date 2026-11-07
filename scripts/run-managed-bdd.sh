@@ -2,9 +2,11 @@
 # Run the cross-SDK BDD scenarios against a local managed stack: the Laser
 # Streams server forwarding managed operations to the managed backend over a
 # local socket. The backend keeps its session store in the embedded engine,
-# or in Postgres with --postgres.
+# or in Postgres with --postgres. --postgres and --doris also declare that
+# database as an operational SQL backend, which enables the @remote_sql
+# scenarios. --doris runs the Doris all-in-one image on the host network.
 #
-# Usage: scripts/run-managed-bdd.sh [--postgres] [--release] <runner>...
+# Usage: scripts/run-managed-bdd.sh [--postgres | --doris] [--release] <runner>...
 #   runner: rust | python | typescript | all | stack
 #   stack starts the stack, prints its address, and waits for Ctrl-C, so a
 #   measurement or a single runner can be pointed at it by hand.
@@ -21,16 +23,18 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 profile=debug
 postgres=false
+doris=false
 runners=()
 runner_args=()
 while (($#)); do
   case "$1" in
     --postgres) postgres=true ;;
+    --doris) doris=true ;;
     --release) profile=release ;;
     --) shift; runner_args=("$@"); break ;;
     rust|python|py|typescript|ts|stack) runners+=("$1") ;;
     all) runners+=(rust python typescript) ;;
-    -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -108,12 +112,14 @@ state="$(mktemp -d "${TMPDIR:-/tmp}/laser-managed-bdd.XXXXXX")"
 iggy_pid=""
 backend_pid=""
 postgres_container=""
+doris_container=""
 
 teardown() {
   local status=$?
   [[ -n "$backend_pid" ]] && kill "$backend_pid" 2>/dev/null && wait "$backend_pid" 2>/dev/null
   [[ -n "$iggy_pid" ]] && kill "$iggy_pid" 2>/dev/null && wait "$iggy_pid" 2>/dev/null
-  [[ -n "$postgres_container" ]] && docker rm -f "$postgres_container" >/dev/null 2>&1
+  [[ -n "$postgres_container" ]] && docker rm -f -v "$postgres_container" >/dev/null 2>&1
+  [[ -n "$doris_container" ]] && docker rm -f -v "$doris_container" >/dev/null 2>&1
   if ((status == 0)) && [[ -z "${LASER_MANAGED_KEEP_STATE:-}" ]]; then
     rm -rf "$state"
   else
@@ -159,6 +165,20 @@ if [[ "$postgres" == true ]]; then
   wait_until "Postgres" 60 docker exec "$postgres_container" pg_isready -h 127.0.0.1 -U managed -d managed
   backends="[{\"id\":\"postgres\",\"kind\":\"postgres\",\"dsn\":\"postgres://managed:managed@127.0.0.1:$pg_port/managed\",\"ssl_mode\":\"disable\",\"serves\":\"kv,graph,sessions,folds,forks\"}]"
   backend_env+=("LD_PLANE_BACKENDS=$backends")
+  export LASER_BDD_SQL_BACKEND=postgres
+fi
+if [[ "$doris" == true ]]; then
+  doris_container="laser-managed-bdd-doris-$$"
+  # Backend storage on tmpfs keeps the frontend's capacity checks independent
+  # of how full the host disk is.
+  docker run -d --name "$doris_container" --network host \
+    --tmpfs /opt/apache-doris/be/storage \
+    apache/doris:doris-all-in-one-2.1.0 >/dev/null
+  wait_until "Doris" 240 docker exec "$doris_container" \
+    mysql -h127.0.0.1 -P9030 -uroot -e "CREATE DATABASE IF NOT EXISTS managed_bdd"
+  backends="[{\"id\":\"doris\",\"kind\":\"velodb\",\"dsn\":\"mysql://root@127.0.0.1:9030/managed_bdd\",\"fe_http_url\":\"http://127.0.0.1:8030\",\"buckets\":1,\"replication_num\":1}]"
+  backend_env+=("LD_PLANE_BACKENDS=$backends")
+  export LASER_BDD_SQL_BACKEND=velodb
 fi
 
 # The backend process reads its configuration under these names.

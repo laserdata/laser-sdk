@@ -171,8 +171,9 @@ jobs:
           - { runner: ubuntu-latest, target: x86_64, manylinux: auto }
           - { runner: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
           # One universal2 wheel (Intel + Apple Silicon) on an Apple Silicon
-          # runner, so this needs no scarce, deprecated macos-13 Intel runner.
-          - { runner: macos-14, target: universal2-apple-darwin, manylinux: "" }
+          # runner. GitHub retired the macos-14 label, so this names the
+          # current image and needs no Intel runner.
+          - { runner: macos-15, target: universal2-apple-darwin, manylinux: "" }
           # One abi3 wheel for 64-bit Windows: the native MSVC toolchain builds
           # the aws-lc-sys C backend, no manylinux container involved.
           - { runner: windows-latest, target: x64, manylinux: "" }
@@ -228,7 +229,7 @@ jobs:
         platform:
           - { runner: ubuntu-latest, target: x86_64 }
           - { runner: ubuntu-24.04-arm, target: aarch64 }
-          - { runner: macos-14, target: universal2-apple-darwin }
+          - { runner: macos-15, target: universal2-apple-darwin }
           - { runner: windows-latest, target: x64 }
     defaults:
       run:

@@ -1,5 +1,5 @@
 use crate::agent::PyProvenance;
-use crate::async_bridge::{HookLoop, PyHook, call_hook, future_into_py, hook_callable};
+use crate::async_bridge::{Awaitable, HookLoop, PyHook, awaitable, call_hook, hook_callable};
 use crate::client::PyLaser;
 use crate::convert::{duration_ms, json_to_py, payload_bytes};
 use crate::errors::to_pyerr;
@@ -734,29 +734,46 @@ impl PyMemory {
         &self,
         py: Python<'py>,
         key: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let backend = self.inner.clone();
         let payload = payload_bytes(payload)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             backend.handle().set(&key, payload).await.map_err(to_pyerr)
         })
     }
 
     /// Point-read the named item written by `set`, or `None`. Reads the managed
     /// key-value view.
-    fn fetch<'py>(&self, py: Python<'py>, key: String) -> PyResult<Bound<'py, PyAny>> {
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Awaitable[typing.Optional[builtins.bytes]]",
+        imports = ("typing", "builtins")
+    ))]
+    fn fetch<'py>(
+        &self,
+        py: Python<'py>,
+        key: String,
+    ) -> PyResult<Awaitable<'py, Option<Vec<u8>>>> {
         let backend = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             backend.handle().fetch(&key).await.map_err(to_pyerr)
         })
     }
 
     /// Point-read the named item by folding the topic in process, the opt-in for
     /// a deployment with no managed read view. Prefer `fetch`, which reads it.
-    fn fetch_folded<'py>(&self, py: Python<'py>, key: String) -> PyResult<Bound<'py, PyAny>> {
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Awaitable[typing.Optional[builtins.bytes]]",
+        imports = ("typing", "builtins")
+    ))]
+    fn fetch_folded<'py>(
+        &self,
+        py: Python<'py>,
+        key: String,
+    ) -> PyResult<Awaitable<'py, Option<Vec<u8>>>> {
         let backend = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             backend.handle().fetch_folded(&key).await.map_err(to_pyerr)
         })
     }
@@ -767,19 +784,20 @@ impl PyMemory {
         &self,
         py: Python<'py>,
         key: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         patch: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let backend = self.inner.clone();
         let patch = payload_bytes(patch)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             backend.handle().update(&key, patch).await.map_err(to_pyerr)
         })
     }
 
     /// Delete the named item. Idempotent: removing an absent key is fine.
-    fn remove<'py>(&self, py: Python<'py>, key: String) -> PyResult<Bound<'py, PyAny>> {
+    fn remove<'py>(&self, py: Python<'py>, key: String) -> PyResult<Awaitable<'py, ()>> {
         let backend = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             backend.handle().remove(&key).await.map_err(to_pyerr)
         })
     }
@@ -789,27 +807,34 @@ impl PyMemory {
     /// `summary`, `entity`, `feedback`, or `procedure`. `durable=True` sets the
     /// scope lifetime for custom backends. Built-ins do not persist or filter
     /// that value. Omit `conversation` on recall to read across conversations.
-    /// `dedup=True` derives the id from the owner scope (stream, agent, user, and
-    /// application), the kind, and the body, so remembering the same body twice
-    /// stores it once. `origin` is the `SourceRef` dict of the session record
+    /// `dedup=True` derives the id from the owner scope (stream, agent, user,
+    /// application, and conversation), the kind, and the body, so remembering
+    /// the same body twice in one conversation stores it once. A `stream` other
+    /// than the one a log memory writes to is refused with `InvalidError`.
+    /// `origin` is the `SourceRef` dict of the session record
     /// that motivated the item, and `producer` is a `{"name", "version"}` dict.
     #[pyo3(signature = (payload, *, agent=None, conversation=None, stream=None, user=None, application=None, kind="fact", durable=false, dedup=false, origin=None, producer=None))]
     #[allow(clippy::too_many_arguments)]
     fn remember<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         agent: Option<String>,
         conversation: Option<String>,
         stream: Option<String>,
         user: Option<String>,
         application: Option<String>,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['fact', 'message', 'summary', 'entity', 'feedback', 'procedure']",
+            imports = ("typing",)
+        ))]
         kind: &str,
         durable: bool,
         dedup: bool,
         origin: Option<&Bound<'_, PyAny>>,
         producer: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, String>> {
         let backend = self.inner.clone();
         let (origin, producer) = lineage(origin, producer)?;
         let options = RememberOptions {
@@ -825,7 +850,7 @@ impl PyMemory {
             dedup,
         };
         let payload = payload_bytes(payload)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let id = backend.remember(options, payload).await.map_err(to_pyerr)?;
             Ok(id.to_string())
         })
@@ -838,7 +863,12 @@ impl PyMemory {
         &self,
         py: Python<'py>,
         id: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['fact', 'message', 'summary', 'entity', 'feedback', 'procedure']",
+            imports = ("typing",)
+        ))]
         kind: &str,
         agent: Option<String>,
         conversation: Option<String>,
@@ -846,13 +876,13 @@ impl PyMemory {
         application: Option<String>,
         stream: Option<String>,
         durable: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, String>> {
         let backend = self.inner.clone();
         let id = MemoryId::from_str(&id).map_err(|error| to_pyerr(error.into()))?;
         let kind = map_kind(kind)?;
         let payload = payload_bytes(payload)?;
         let scope = build_full_scope(agent, conversation, user, application, stream, durable)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let stored = Memory::append(backend.handle(), &scope, id, kind, payload)
                 .await
                 .map_err(to_pyerr)?;
@@ -884,12 +914,12 @@ impl PyMemory {
         durable: bool,
         token_budget: Option<usize>,
         block: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let backend = self.inner.clone();
         let scope = build_full_scope(agent, conversation, user, application, stream, durable)?;
         let query_budget = if block { None } else { token_budget };
         let query = recall_query(&scope, limit, semantic, strategy, query_budget)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let items = if folded {
                 backend.recall_folded(scope, query).await
             } else {
@@ -922,11 +952,11 @@ impl PyMemory {
         py: Python<'py>,
         conversation: String,
         token_budget: Option<usize>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, String>> {
         let backend = self.inner.clone();
         let conversation =
             ConversationId::from_str(&conversation).map_err(|e| to_pyerr(e.into()))?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             backend
                 .context(conversation, token_budget)
                 .await
@@ -951,11 +981,11 @@ impl PyMemory {
         prune_summarized: bool,
         stream: Option<String>,
         durable: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyConsolidationReport>> {
         let backend = self.inner.clone();
         let scope = build_full_scope(agent, conversation, user, application, stream, durable)?;
         let summarizer = summarizer.map(|callback| PySummarizer { callback });
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let report = backend
                 .consolidate(scope, max_items, summarizer, prune_summarized)
                 .await
@@ -982,11 +1012,11 @@ impl PyMemory {
         stream: Option<String>,
         durable: bool,
         note: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, String>> {
         let backend = self.inner.clone();
         let scope = build_full_scope(agent, conversation, user, application, stream, durable)?;
         let target = MemoryId::from_str(&target).map_err(|e| to_pyerr(e.into()))?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let id = backend
                 .improve(
                     scope,
@@ -1015,11 +1045,11 @@ impl PyMemory {
         application: Option<String>,
         stream: Option<String>,
         durable: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let backend = self.inner.clone();
         let scope = build_full_scope(agent, conversation, user, application, stream, durable)?;
         let id = MemoryId::from_str(&id).map_err(|e| to_pyerr(e.into()))?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             backend.forget(scope, id).await.map_err(to_pyerr)
         })
     }
@@ -1072,6 +1102,7 @@ impl PyMemoryItem {
     }
 
     #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
     fn payload(&self) -> Vec<u8> {
         self.inner.payload.clone()
     }
@@ -1208,6 +1239,7 @@ impl PyLaser {
     fn memory_with(
         &self,
         namespace: String,
+        #[gen_stub(override_type(type_repr = "typing.Literal['auto', 'log', 'vector']", imports = ("typing",)))]
         backend: &str,
         embedder: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyMemory> {
@@ -1263,9 +1295,9 @@ impl PyLaser {
         stream: Option<String>,
         partitions: u32,
         ttl_ms: Option<f64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyMemory>> {
         let laser = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut builder = laser.memory_topic(&topic).partitions(partitions);
             if let Some(stream) = &stream {
                 builder = builder.stream(stream);
@@ -1357,11 +1389,12 @@ impl PyLogMemory {
         slf: PyRef<'_, Self>,
         py: Python<'py>,
         key: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         body: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let handle = slf.as_super().inner.handle.clone();
         let body = payload_bytes(body)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             log_memory(&handle)?
                 .set_named(&key, body)
                 .await
@@ -1374,11 +1407,12 @@ impl PyLogMemory {
         slf: PyRef<'_, Self>,
         py: Python<'py>,
         key: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         patch: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let handle = slf.as_super().inner.handle.clone();
         let patch = payload_bytes(patch)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             log_memory(&handle)?
                 .update_named(&key, patch)
                 .await
@@ -1391,9 +1425,9 @@ impl PyLogMemory {
         slf: PyRef<'_, Self>,
         py: Python<'py>,
         key: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let handle = slf.as_super().inner.handle.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             log_memory(&handle)?
                 .forget_named(&key)
                 .await
@@ -1403,13 +1437,17 @@ impl PyLogMemory {
 
     /// Point-read the named item `key` from the managed key-value view, the
     /// low-level form of `fetch`.
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Awaitable[typing.Optional[builtins.bytes]]",
+        imports = ("typing", "builtins")
+    ))]
     fn fetch_named<'py>(
         slf: PyRef<'_, Self>,
         py: Python<'py>,
         key: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Option<Vec<u8>>>> {
         let handle = slf.as_super().inner.handle.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             log_memory(&handle)?
                 .fetch_named(&key)
                 .await
@@ -1419,13 +1457,17 @@ impl PyLogMemory {
 
     /// Point-read the named item `key` by folding the topic in process, the
     /// low-level form of `fetch_folded`.
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Awaitable[typing.Optional[builtins.bytes]]",
+        imports = ("typing", "builtins")
+    ))]
     fn fetch_named_folded<'py>(
         slf: PyRef<'_, Self>,
         py: Python<'py>,
         key: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Option<Vec<u8>>>> {
         let handle = slf.as_super().inner.handle.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             log_memory(&handle)?
                 .fetch_named_folded(&key)
                 .await
@@ -1562,20 +1604,22 @@ pub fn to_context_block(
 }
 
 /// The content-derived memory id of `body` stored as `kind` under the owner
-/// `stream`, `agent`, `user`, and `application`. The same inputs always give
-/// the same id, in every SDK.
+/// `stream`, `agent`, `user`, `application`, and `conversation`. The same
+/// inputs always give the same id, in every SDK.
 #[gen_stub_pyfunction]
 #[pyfunction]
-#[pyo3(signature = (kind, body, *, stream=None, agent=None, user=None, application=None))]
+#[pyo3(signature = (kind, body, *, stream=None, agent=None, user=None, application=None, conversation=None))]
 pub fn memory_id_content(
     kind: &str,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
     body: &Bound<'_, PyAny>,
     stream: Option<String>,
     agent: Option<String>,
     user: Option<String>,
     application: Option<String>,
+    conversation: Option<String>,
 ) -> PyResult<String> {
-    let owner = build_full_scope(agent, None, user, application, stream, false)?;
+    let owner = build_full_scope(agent, conversation, user, application, stream, false)?;
     Ok(MemoryId::content(&owner, map_kind(kind)?, &payload_bytes(body)?).to_string())
 }
 

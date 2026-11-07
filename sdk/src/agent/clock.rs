@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// A source of the current time in epoch microseconds. The seam the SLA timer
 /// and any deadline check read, so a test can drive time deterministically
@@ -34,8 +35,9 @@ impl TestClock {
         }
     }
 
-    /// Move time forward by `by_micros`.
-    pub fn advance(&self, by_micros: u64) {
+    /// Move time forward by `by`, kept to the microsecond.
+    pub fn advance(&self, by: Duration) {
+        let by_micros = u64::try_from(by.as_micros()).unwrap_or(u64::MAX);
         self.now_micros.fetch_add(by_micros, Ordering::Relaxed);
     }
 
@@ -59,8 +61,10 @@ mod tests {
     fn given_a_test_clock_when_advanced_then_should_report_the_set_time() {
         let clock = TestClock::new(1_000);
         assert_eq!(clock.now_micros(), 1_000);
-        clock.advance(500);
+        clock.advance(Duration::from_micros(500));
         assert_eq!(clock.now_micros(), 1_500);
+        clock.advance(Duration::from_millis(2));
+        assert_eq!(clock.now_micros(), 3_500);
         clock.set(42);
         assert_eq!(clock.now_micros(), 42);
     }

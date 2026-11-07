@@ -32,7 +32,7 @@ void test("feature checks require every advertised bit", () => {
 void test("structured backend descriptor is secret-free and validates observed identity", () => {
   const backend = newBackendDescriptor(
     BackendResourceId.fromU128(1n),
-    "lakehouse",
+    "operational",
     "Warehouse",
     { kind: "iceberg", version: "1" },
     2n,

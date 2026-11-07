@@ -1,7 +1,8 @@
 use crate::convert::{py_to_de, ser_to_py};
 use crate::errors::InvalidError;
 use laser_sdk::intent::{
-    self, Decision, Intent, IntentError, IntentOutcome, IntentPolicy, Vote, VoteChoice,
+    self, Decision, Intent, IntentError, IntentOutcome, IntentPolicy, ObservedVote, Vote,
+    VoteChoice,
 };
 use laser_sdk::types::{AgentId, ConversationId};
 use pyo3::prelude::*;
@@ -96,18 +97,22 @@ impl PyIntent {
         eligible_voters,
         policy,
         policy_version,
-        deadline_micros,
+        deadline_at_micros,
         mandatory_voters=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         conversation: String,
         proposer: String,
+        #[gen_stub(override_type(
+            type_repr = "builtins.bytes",
+            imports = ("builtins",)
+        ))]
         body: Vec<u8>,
         eligible_voters: Vec<String>,
         policy: PyIntentPolicy,
         policy_version: u64,
-        deadline_micros: u64,
+        deadline_at_micros: u64,
         mandatory_voters: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let conversation = parse_conversation(&conversation)?;
@@ -122,7 +127,7 @@ impl PyIntent {
             .mandatory_voters(mandatory_voters)
             .policy(policy.inner)
             .policy_version(policy_version)
-            .deadline_micros(deadline_micros)
+            .deadline_at_micros(deadline_at_micros)
             .build()
             .map_err(intent_error)?;
         Ok(Self { inner })
@@ -194,8 +199,8 @@ impl PyIntent {
 
     /// The deadline (epoch micros) after which `decide` forces a decision.
     #[getter]
-    fn deadline_micros(&self) -> u64 {
-        self.inner.deadline_micros
+    fn deadline_at_micros(&self) -> u64 {
+        self.inner.deadline_at_micros
     }
 
     /// Build time, epoch micros.
@@ -292,6 +297,45 @@ impl PyVote {
     }
 }
 
+/// One ballot as a reader saw it: the `Vote` and the time the log assigned
+/// it, the record's server timestamp in epoch micros. `decide` windows and
+/// orders by `observed_at_micros` and keeps the voter's `at_micros` only as
+/// recorded evidence.
+#[gen_stub_pyclass]
+#[pyclass(name = "ObservedVote", from_py_object)]
+#[derive(Clone)]
+pub struct PyObservedVote {
+    inner: ObservedVote,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyObservedVote {
+    #[new]
+    fn new(vote: PyVote, observed_at_micros: u64) -> Self {
+        Self {
+            inner: ObservedVote {
+                vote: vote.inner,
+                observed_at_micros,
+            },
+        }
+    }
+
+    /// The ballot record.
+    #[getter]
+    fn vote(&self) -> PyVote {
+        PyVote {
+            inner: self.inner.vote.clone(),
+        }
+    }
+
+    /// When the log assigned the ballot, epoch micros.
+    #[getter]
+    fn observed_at_micros(&self) -> u64 {
+        self.inner.observed_at_micros
+    }
+}
+
 /// A deterministic decision over one intent, replaying to the same outcome
 /// from the same intent and vote set.
 #[gen_stub_pyclass]
@@ -368,17 +412,18 @@ impl PyDecision {
 
 /// Fold `votes` against `intent` and decide, or return `None` when the
 /// outcome is not yet reachable and `now_micros` has not passed the intent's
-/// deadline. Deterministic: the same intent, vote set, and `now_micros` (once
-/// past the deadline) always reach the same `Decision`, so a crashed decider
-/// replays to the identical outcome.
+/// deadline. Each ballot is windowed and ordered by its `observed_at_micros`,
+/// never by the voter's own claim. Deterministic: the same intent, vote set,
+/// and `now_micros` (once past the deadline) always reach the same
+/// `Decision`, so a crashed decider replays to the identical outcome.
 #[gen_stub_pyfunction]
 #[pyfunction]
 pub fn decide(
     intent: &PyIntent,
-    votes: Vec<PyVote>,
+    votes: Vec<PyObservedVote>,
     now_micros: u64,
 ) -> PyResult<Option<PyDecision>> {
-    let votes: Vec<Vote> = votes.into_iter().map(|vote| vote.inner).collect();
+    let votes: Vec<ObservedVote> = votes.into_iter().map(|vote| vote.inner).collect();
     intent::decide(&intent.inner, &votes, now_micros)
         .map(|decision| decision.map(|inner| PyDecision { inner }))
         .map_err(intent_error)

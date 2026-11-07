@@ -1,0 +1,22 @@
+# Mutation testing with cargo-mutants, passed by `--config mutants.toml`. Runs
+# name the package and files, for example
+# `cargo mutants --config mutants.toml -p laser-wire -f wire/src/framing.rs`.
+
+# Unit tests carry the codec and filter checks and run without a server.
+# Build only the lib test target too, so a mutant never rebuilds the suites.
+additional_cargo_args = ["--lib"]
+all_features = true
+exclude_globs = [
+  "**/tests/**",
+  "bdd/**",
+  "bench/**",
+  "examples/**",
+  "foreign/**",
+  "fuzz/**",
+  "test-support/**",
+]
+cap_lints = true
+gitignore = true
+minimum_test_timeout = 60.0
+timeout_multiplier = 3.0
+output = "target"

@@ -1,4 +1,5 @@
 use laser_examples::{PARTITIONS, env_bool, fresh_run, init_tracing, laser, phase, stream_for};
+use laser_sdk::agent::{Clock, SystemClock};
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{AgentCard, CapabilityDescriptor, Health};
 use std::time::Duration;
@@ -24,13 +25,13 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 //                   each step building its task from the prior steps' outputs.
 //   5. QUARANTINE   an operator pulls a misbehaving agent, and the panel routes around it.
 //   6. RECOVERY     the operator reinstates it (un-quarantine), and the panel is whole.
-//   7. EXPIRY       a tight-deadline task to a slow agent times out, and the
-//                   orchestrator recovers by re-dispatching to a healthy one.
+//   7. EXPIRY       a tight-deadline task to a slow agent times out, the slow
+//                   agent stops at the task's deadline, and the orchestrator
+//                   recovers by re-dispatching to a healthy one.
 //
-// Routing uses a fixed inbox topic so it runs against Apache Iggy: every
-// branch is addressed to its agent on `agent.sessions`. Presence advertisement
-// is best-effort: a managed deployment records it, and it is a no-op against
-// Apache Iggy. The registry, contracts, and workflows work on both.
+// Routing resolves each agent's advertised inbox: the live presence on a
+// managed deployment, and the inbox its capability card names on Apache Iggy.
+// The registry, contracts, and workflows work on both.
 //
 //   cargo run --release --example orchestra
 
@@ -130,7 +131,6 @@ async fn main() -> Result<(), LaserError> {
         // sessions view shows the whole tree on any deployment.
         let workflow = laser
             .workflow("incident-response")
-            .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
             // Cap the dispatches and wall clock so a runaway fan-out cannot spin.
             .budget(
                 WorkflowBudget::unlimited()
@@ -200,8 +200,9 @@ async fn main() -> Result<(), LaserError> {
 
         phase("Expiry + recovery: a tight deadline times out, the orchestrator recovers");
         // The slow agent acks pickup but cannot finish inside the one-second deadline,
-        // so the contract expires. The orchestrator recovers by re-dispatching to a
-        // healthy fast agent, the pattern any real coordinator uses for a stuck task.
+        // so the contract expires. The task carries that deadline and the slow agent
+        // stops there instead of finishing late, so re-dispatching to a healthy agent
+        // cannot run the task twice.
         let slow = contract_skill(&laser, SLOW_TASK, secs(1)).await?;
         if let Some(body) = completed_body(slow) {
             println!("unexpectedly fast: {body}");
@@ -239,6 +240,19 @@ struct Worker {
 
 impl AgentHandler for Worker {
     async fn handle(&self, message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
+        // A task carries its caller's deadline. Working past it would finish a
+        // task the caller already gave up on and sent elsewhere, so stop there.
+        let remaining = message.provenance.deadline_at.map(|deadline| {
+            Duration::from_micros(
+                deadline
+                    .as_micros()
+                    .saturating_sub(SystemClock.now_micros()),
+            )
+        });
+        if let Some(remaining) = remaining.filter(|remaining| *remaining < self.delay) {
+            tokio::time::sleep(remaining).await;
+            return Ok(());
+        }
         tokio::time::sleep(self.delay).await;
         let task = String::from_utf8_lossy(message.body());
         let reply = match self.skill.as_str() {
@@ -297,11 +311,12 @@ fn card(skill: &str, health: Option<Health>) -> AgentCard {
             ..Default::default()
         }],
         ttl_micros: None,
+        inbox: None,
     }
 }
 
-// Contract a task to one agent advertising `skill`, on a fixed inbox, with a
-// deadline. The orchestrator names the capability, routing picks the agent.
+// Contract a task to one agent advertising `skill`, at its advertised inbox,
+// with a deadline. The orchestrator names the capability, routing picks the agent.
 async fn contract_skill(
     laser: &Laser,
     skill: &str,
@@ -311,7 +326,6 @@ async fn contract_skill(
         .contract(Router::to_capable(skill, RoutePolicy::Any))
         .from(agent_id(ORCHESTRATOR))
         .payload(INCIDENT.as_bytes())
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .deadline(deadline)
         .send()
         .await
@@ -326,7 +340,8 @@ async fn diagnose_panel(laser: &Laser) -> Result<Vec<Vec<u8>>, LaserError> {
             agent_id(ORCHESTRATOR),
             &CapabilitySelector::new(DIAGNOSE, RoutePolicy::Any),
             INCIDENT.as_bytes(),
-            &InboxRoute::Fixed(AgentTopic::Sessions),
+            &InboxRoute::Advertised,
+            GatherPolicy::RequireAll,
             secs(10),
         )
         .await

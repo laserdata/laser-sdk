@@ -96,11 +96,12 @@ impl PositionSurface {
 /// for the read's surface has applied that position. A client sends the
 /// highest position it has seen for the surface, so a read never misses its
 /// own earlier writes or goes back behind an earlier read, whichever node
-/// answers. With `log_head`, the node first waits until its fold has applied
-/// every record the surface's log held when the read arrived. A client asks
-/// for it after its managed requests moved to another node, when a write whose
-/// reply was lost may sit on the log. A node that does not get there within
-/// its wait bound answers `Stale`, never older state.
+/// answers. With `log_head`, the streaming server forwards the read with a
+/// read barrier and the node first waits until its fold has applied every
+/// record the surface's log held when the read arrived. No Laser SDK sets it:
+/// the clients carry `min_position` instead, which covers their own earlier
+/// writes without waiting for the whole log. A node that does not get there
+/// within its wait bound answers `Stale`, never older state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedReadEnvelope {
@@ -181,8 +182,6 @@ fn is_false(value: &bool) -> bool {
 pub struct MutationCommandEnvelope {
     pub v: u32,
     pub operation_id: u128,
-    /// Authenticated principal stamped before the command enters the log.
-    pub actor_user_id: u32,
     pub deployment_id: u64,
     pub timestamp_micros: u64,
     pub command_code: u32,
@@ -191,8 +190,9 @@ pub struct MutationCommandEnvelope {
     pub scope: Option<crate::forward::ForwardedScope>,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub payload: Vec<u8>,
-    /// The client that asked for the command. Absent on a command the backend
-    /// issues on its own.
+    /// The client that asked for the command, stamped before the command
+    /// enters the log and the only actor it names. Absent on a command the
+    /// backend issues on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller: Option<crate::forward::Caller>,
 }
@@ -316,20 +316,23 @@ mod tests {
         let envelope = MutationCommandEnvelope {
             v: KV_OP_VERSION,
             operation_id: 42,
-            actor_user_id: 7,
             deployment_id: 3,
             timestamp_micros: 1_700_000_000_000_000,
             command_code: AGDX_KV_SET_CODE,
             scope: None,
             payload: vec![0, 1, 2, 255],
-            caller: None,
+            caller: Some(crate::forward::Caller {
+                user_id: 7,
+                agent: None,
+                on_behalf_of: None,
+            }),
         };
         let bytes = encode_named(&envelope).expect("encodes");
         let back: MutationCommandEnvelope = decode_named(&bytes).expect("decodes");
         back.validate().expect("the envelope is valid");
         assert_eq!(back.v, KV_OP_VERSION);
         assert_eq!(back.operation_id, 42);
-        assert_eq!(back.actor_user_id, 7);
+        assert_eq!(back.caller.map(|caller| caller.user_id), Some(7));
         assert_eq!(back.deployment_id, 3);
         assert_eq!(back.timestamp_micros, 1_700_000_000_000_000);
         assert_eq!(back.command_code, AGDX_KV_SET_CODE);
@@ -362,7 +365,6 @@ mod tests {
             v: KV_OP_VERSION,
             operation_id: 0,
             timestamp_micros: 1,
-            actor_user_id: 7,
             deployment_id: 3,
             command_code: AGDX_KV_SET_CODE,
             scope: None,

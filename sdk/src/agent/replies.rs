@@ -4,7 +4,9 @@ use crate::poll::{TopicFollower, bounded_partitions};
 use crate::types::MessageId;
 use dashmap::DashMap;
 use iggy::prelude::*;
+use laser_wire::agent::{AgentKind, OPERATION_TASK, TaskState};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -50,6 +52,9 @@ struct ReplyHubInner {
 struct ReplyWaiter {
     state: Mutex<ReplyWaiterState>,
     expected: ExpectedReply,
+    // Set by a `Working` status for this correlation in the request's session,
+    // the pickup acknowledgment a contract reads as consumption.
+    consumed: Arc<AtomicBool>,
     #[cfg(feature = "sign")]
     expected_signer: Option<String>,
 }
@@ -69,16 +74,13 @@ pub(crate) struct ExpectedReply {
 }
 
 impl ExpectedReply {
-    fn accepts(&self, message: &AgentMessage) -> bool {
+    pub(crate) fn accepts(&self, message: &AgentMessage) -> bool {
         if message.provenance.conversation_id != self.session {
             return false;
         }
         let addressee = match &message.envelope {
             Some(envelope) => {
-                if !matches!(
-                    envelope.kind,
-                    laser_wire::agent::AgentKind::Response | laser_wire::agent::AgentKind::Error
-                ) {
+                if !matches!(envelope.kind, AgentKind::Response | AgentKind::Error) {
                     return false;
                 }
                 envelope
@@ -97,6 +99,15 @@ impl ExpectedReply {
             (Some(_), None) => false,
             (None, _) => true,
         }
+    }
+
+    pub(crate) fn acknowledges(&self, message: &AgentMessage) -> bool {
+        message.provenance.conversation_id == self.session
+            && message.envelope.as_ref().is_some_and(|envelope| {
+                envelope.kind == AgentKind::Status
+                    && envelope.operation.as_deref() == Some(OPERATION_TASK)
+                    && envelope.task_state == Some(TaskState::Working)
+            })
     }
 }
 
@@ -195,6 +206,7 @@ impl ReplyHub {
         expected_signer: Option<String>,
     ) -> ReplyTicket {
         let (tx, rx) = oneshot::channel();
+        let consumed = Arc::new(AtomicBool::new(false));
         #[cfg(not(feature = "sign"))]
         let _ = expected_signer;
         self.inner.waiters.insert(
@@ -206,6 +218,7 @@ impl ReplyHub {
                     pending: Vec::new(),
                 }),
                 expected,
+                consumed: Arc::clone(&consumed),
                 #[cfg(feature = "sign")]
                 expected_signer,
             },
@@ -215,6 +228,7 @@ impl ReplyHub {
             hub: Arc::downgrade(&self.inner),
             correlation,
             rx,
+            consumed,
         }
     }
 }
@@ -225,6 +239,7 @@ pub(crate) struct ReplyTicket {
     hub: Weak<ReplyHubInner>,
     correlation: String,
     rx: oneshot::Receiver<AgentMessage>,
+    consumed: Arc<AtomicBool>,
 }
 
 impl ReplyTicket {
@@ -257,12 +272,28 @@ impl ReplyTicket {
 
     /// Await the correlated reply up to `timeout`, then deregister.
     pub(crate) async fn wait(mut self, timeout: Duration) -> Result<AgentMessage, LaserError> {
+        self.next_within(timeout)
+            .await?
+            .ok_or(LaserError::Timeout("reply"))
+    }
+
+    /// Await the correlated reply up to `timeout`, keeping the registration
+    /// when none landed so the caller can wait again.
+    pub(crate) async fn next_within(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<AgentMessage>, LaserError> {
         match tokio::time::timeout(timeout, &mut self.rx).await {
-            Ok(Ok(message)) => Ok(message),
-            // The sender dropped without a reply (the hub went away), or the wait
-            // timed out. Either way the caller sees a reply timeout.
-            Ok(Err(_)) | Err(_) => Err(LaserError::Timeout("reply")),
+            Ok(Ok(message)) => Ok(Some(message)),
+            // The sender dropped without a reply: the hub went away.
+            Ok(Err(_)) => Err(LaserError::Timeout("reply")),
+            Err(_) => Ok(None),
         }
+    }
+
+    /// Whether the target acknowledged pickup with a `Working` status.
+    pub(crate) fn consumed(&self) -> bool {
+        self.consumed.load(Ordering::Acquire)
     }
 }
 
@@ -439,6 +470,10 @@ fn dispatch_batch(inner: &ReplyHubInner, partition: u32, messages: Vec<IggyMessa
             content_type: decoded.content_type,
             verified_principal,
         };
+        if waiter.expected.acknowledges(&reply) {
+            waiter.consumed.store(true, Ordering::Release);
+            continue;
+        }
         if !waiter.expected.accepts(&reply) {
             continue;
         }

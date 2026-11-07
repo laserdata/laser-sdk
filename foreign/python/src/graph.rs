@@ -1,4 +1,4 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::convert::{py_to_de, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
@@ -138,11 +138,7 @@ struct Stamp {
 }
 
 impl Stamp {
-    fn open<'a>(
-        &'a self,
-        laser: &'a Laser,
-        name: &str,
-    ) -> PyResult<laser_sdk::graph::GraphHandle<'a>> {
+    fn open(&self, laser: &Laser, name: &str) -> PyResult<laser_sdk::graph::GraphHandle> {
         let mut graph = match &self.linked {
             Some(session) => session.linked_graph(name).map_err(to_pyerr)?,
             None => laser.graph(name),
@@ -246,7 +242,7 @@ impl PyGraph {
     fn start_nearest(
         mut slf: PyRefMut<'_, Self>,
         embedding: Vec<f32>,
-        k: usize,
+        k: u32,
     ) -> PyRefMut<'_, Self> {
         slf.traversal.start = Some(Start::Nearest(embedding, k));
         slf
@@ -254,19 +250,53 @@ impl PyGraph {
 
     /// Follow outgoing edges of `edge_type` one hop.
     fn out(mut slf: PyRefMut<'_, Self>, edge_type: String) -> PyRefMut<'_, Self> {
-        slf.traversal.hops.push((edge_type, EdgeDir::Out));
+        slf.traversal.hops.push((EdgeDir::Out, Some(edge_type), 1));
         slf
     }
 
     /// Follow incoming edges of `edge_type` one hop.
     fn incoming(mut slf: PyRefMut<'_, Self>, edge_type: String) -> PyRefMut<'_, Self> {
-        slf.traversal.hops.push((edge_type, EdgeDir::In));
+        slf.traversal.hops.push((EdgeDir::In, Some(edge_type), 1));
         slf
     }
 
     /// Follow edges of `edge_type` one hop in both directions.
     fn both(mut slf: PyRefMut<'_, Self>, edge_type: String) -> PyRefMut<'_, Self> {
-        slf.traversal.hops.push((edge_type, EdgeDir::Both));
+        slf.traversal.hops.push((EdgeDir::Both, Some(edge_type), 1));
+        slf
+    }
+
+    /// Follow edges in `dir` (`"out"`, `"in"`, or `"both"`), of `edge_type`
+    /// or of any type when `None`, up to `max` steps at this hop.
+    #[pyo3(signature = (dir="out", edge_type=None, max=1))]
+    fn hop<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        dir: &str,
+        edge_type: Option<String>,
+        max: u32,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let dir = parse_dir(dir)?;
+        slf.traversal.hops.push((dir, edge_type, max));
+        Ok(slf)
+    }
+
+    /// Admit only nodes matching the `Filter` at every hop. A rejected node is
+    /// neither returned nor expanded.
+    fn node_filter<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        filter: PyRef<'_, crate::query::PyQueryFilter>,
+    ) -> PyRefMut<'py, Self> {
+        slf.traversal.node_filter = Some(filter.inner.clone());
+        slf
+    }
+
+    /// Follow only edges matching the `Filter`. A rejected edge is neither
+    /// traversed nor returned.
+    fn edge_filter<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        filter: PyRef<'_, crate::query::PyQueryFilter>,
+    ) -> PyRefMut<'py, Self> {
+        slf.traversal.edge_filter = Some(filter.inner.clone());
         slf
     }
 
@@ -288,8 +318,8 @@ impl PyGraph {
         slf
     }
 
-    /// Cap the number of elements returned.
-    fn limit(mut slf: PyRefMut<'_, Self>, limit: usize) -> PyRefMut<'_, Self> {
+    /// Cap the number of elements returned. Zero means up to the element cap.
+    fn limit(mut slf: PyRefMut<'_, Self>, limit: u32) -> PyRefMut<'_, Self> {
         slf.traversal.limit = Some(limit);
         slf
     }
@@ -301,13 +331,26 @@ impl PyGraph {
         slf
     }
 
+    /// The traversal request dict this handle sends, for inspection or the
+    /// HTTP route's body.
+    #[allow(clippy::wrong_self_convention)]
+    fn into_query(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let query = self
+            .traversal
+            .clone()
+            .apply(self.laser.graph(self.name.clone()))
+            .into_query();
+        ser_to_py(py, &query)
+    }
+
     /// Run the traversal. Returns the result dict with `nodes`, `edges`, and
-    /// `paths`, each present when the traversal populated it.
-    fn fetch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// `paths`, each present when the traversal populated it, and `truncated`
+    /// when the element limit cut a larger result.
+    fn fetch<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.laser.clone();
         let name = self.name.clone();
         let traversal = self.traversal.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let result = traversal
                 .apply(laser.graph(name))
                 .fetch()
@@ -325,16 +368,17 @@ impl PyGraph {
         &self,
         py: Python<'py>,
         node: String,
+        #[gen_stub(override_type(type_repr = "typing.Literal['out', 'in', 'both']", imports = ("typing",)))]
         dir: &str,
         edge_type: Option<String>,
         depth: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let node = parse_node_id(&node)?;
         let dir = parse_dir(dir)?;
         let laser = self.laser.clone();
         let name = self.name.clone();
         let traversal = self.traversal.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let result = traversal
                 .apply(laser.graph(name))
                 .neighbors(node, dir, edge_type, depth)
@@ -354,11 +398,11 @@ impl PyGraph {
         from_: String,
         relation: String,
         to: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
         let name = self.name.clone();
         let stamp = self.stamp.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             stamp
                 .open(&laser, &name)?
                 .link(from_, relation, to)
@@ -376,11 +420,11 @@ impl PyGraph {
         from_: String,
         relation: String,
         to: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
         let name = self.name.clone();
         let stamp = self.stamp.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             stamp
                 .open(&laser, &name)?
                 .unlink(from_, relation, to)
@@ -399,11 +443,11 @@ impl PyGraph {
         from_: String,
         relation: String,
         to: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, usize>> {
         let laser = self.laser.clone();
         let name = self.name.clone();
         let stamp = self.stamp.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             stamp
                 .open(&laser, &name)?
                 .relink(from_, relation, to)
@@ -420,13 +464,13 @@ impl PyGraph {
         py: Python<'py>,
         nodes: &Bound<'_, PyAny>,
         edges: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let nodes: Vec<GraphNode> = py_to_de(nodes)?;
         let edges: Vec<GraphEdge> = py_to_de(edges)?;
         let laser = self.laser.clone();
         let name = self.name.clone();
         let stamp = self.stamp.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             stamp
                 .open(&laser, &name)?
                 .upsert(nodes, edges)
@@ -457,9 +501,11 @@ pub(crate) fn source_to_py(py: Python<'_>, source: &SourceRef) -> PyResult<Py<Py
 #[derive(Clone, Default)]
 struct Traversal {
     start: Option<Start>,
-    hops: Vec<(String, EdgeDir)>,
+    hops: Vec<(EdgeDir, Option<String>, u32)>,
+    node_filter: Option<Filter>,
+    edge_filter: Option<Filter>,
     returns: GraphReturn,
-    limit: Option<usize>,
+    limit: Option<u32>,
     as_of: Option<u64>,
     conversation: Option<ConversationId>,
 }
@@ -468,26 +514,25 @@ struct Traversal {
 enum Start {
     Ids(Vec<NodeId>),
     Match(Filter),
-    Nearest(Vec<f32>, usize),
+    Nearest(Vec<f32>, u32),
 }
 
 impl Traversal {
-    fn apply(
-        self,
-        mut handle: laser_sdk::graph::GraphHandle<'_>,
-    ) -> laser_sdk::graph::GraphHandle<'_> {
+    fn apply(self, mut handle: laser_sdk::graph::GraphHandle) -> laser_sdk::graph::GraphHandle {
         handle = match self.start {
             Some(Start::Ids(ids)) => handle.start_ids(ids),
             Some(Start::Match(filter)) => handle.start_match(filter),
             Some(Start::Nearest(embedding, k)) => handle.start_nearest(embedding, k),
             None => handle,
         };
-        for (edge_type, dir) in self.hops {
-            handle = match dir {
-                EdgeDir::Out => handle.out(edge_type),
-                EdgeDir::In => handle.incoming(edge_type),
-                EdgeDir::Both => handle.both(edge_type),
-            };
+        for (dir, edge_type, max) in self.hops {
+            handle = handle.hop(dir, edge_type, max);
+        }
+        if let Some(filter) = self.node_filter {
+            handle = handle.node_filter(filter);
+        }
+        if let Some(filter) = self.edge_filter {
+            handle = handle.edge_filter(filter);
         }
         handle = match self.returns {
             GraphReturn::Edges => handle.return_edges(),

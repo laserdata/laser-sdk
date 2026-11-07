@@ -32,6 +32,52 @@ void test("given_retryable_transport_failures_when_sending_then_should_retry_to_
   assert.equal(attempts, 3)
 })
 
+void test("given_retryable_transport_failures_when_sending_then_should_jitter_each_retry_delay", async (t) => {
+  t.mock.method(Math, "random", () => 0)
+  const delays: number[] = []
+  const schedule = globalThis.setTimeout
+  t.mock.method(globalThis, "setTimeout", ((callback: () => void, ms?: number) => {
+    delays.push(ms ?? 0)
+    return schedule(callback, ms)
+  }) as typeof setTimeout)
+  let attempts = 0
+  const transport = transportWithSend(() => {
+    attempts += 1
+    return attempts < 3
+      ? Promise.reject(new TransportError("transient", true))
+      : Promise.resolve({ confirmations: [] })
+  })
+  const producer = Producer.create(transport, "stream", "topic", {
+    retries: 2,
+    retryBackoffMs: 40,
+    createTopic: false,
+    createStream: false
+  })
+  await producer.send(new Uint8Array([1]))
+  assert.deepEqual(
+    delays.filter((ms) => ms < 1_000),
+    [20, 40],
+    "each doubled delay is spread over its upper half"
+  )
+})
+
+void test("given_no_retry_count_when_sending_then_should_inherit_the_connection_publish_retries", async () => {
+  let attempts = 0
+  const transport = {
+    ...transportWithSend(() => {
+      attempts += 1
+      return Promise.reject(new TransportError("transient", true))
+    }),
+    publishOptions: () => ({ timeoutMs: 1_000, maxRetries: 5, retryBackoffMs: 1 })
+  } as unknown as LaserTransport
+  const producer = Producer.create(transport, "stream", "topic", {
+    createTopic: false,
+    createStream: false
+  })
+  await assert.rejects(producer.send(new Uint8Array([1])), PublishFailedError)
+  assert.equal(attempts, 6, "the connection's five retries apply")
+})
+
 void test("given_a_non_retryable_transport_failure_when_sending_then_should_not_retry", async () => {
   let attempts = 0
   const transport = transportWithSend(() => {

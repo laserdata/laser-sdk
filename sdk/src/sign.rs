@@ -7,11 +7,19 @@ use laser_wire::framing::encode_named;
 pub use laser_wire::keys::KeyKind;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::{Arc, PoisonError, RwLock};
 
 /// The key id length: the first 8 bytes of the public key's SHA-256.
 const KEY_ID_BYTES: usize = 8;
 /// The Ed25519 detached-signature length.
 const SIGNATURE_BYTES: usize = 64;
+/// The JWS algorithm of a card signature (RFC 8037 section 3.1).
+#[cfg(feature = "a2a-bridge")]
+const CARD_SIGNATURE_ALGORITHM: &str = "EdDSA";
+/// The largest integer magnitude an IEEE 754 double holds exactly, the JCS
+/// number domain a card is held to.
+#[cfg(feature = "a2a-bridge")]
+const MAX_JCS_INTEGER: u64 = (1 << 53) - 1;
 /// The key-value namespace [`KvKeyRegistry::new`] uses.
 #[cfg(feature = "kv")]
 pub const DEFAULT_KEY_NAMESPACE: &str = "agent.keys";
@@ -58,11 +66,30 @@ pub struct SigningKey {
 }
 
 impl SigningKey {
+    /// A fresh key from 32 bytes of the operating system's random source.
+    /// Store its seed ([`to_bytes`](Self::to_bytes)) the way any secret is
+    /// stored, and enroll [`verifying_key`](Self::verifying_key).
+    pub fn generate() -> Result<Self, LaserError> {
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret).map_err(|error| {
+            LaserError::Signature(format!(
+                "the operating system random source failed: {error}"
+            ))
+        })?;
+        Ok(Self::from_bytes(&secret))
+    }
+
     /// Build from a 32-byte Ed25519 secret seed.
     pub fn from_bytes(secret: &[u8; 32]) -> Self {
         let inner = DalekSigningKey::from_bytes(secret);
         let key_id = key_id_of(&inner.verifying_key());
         Self { inner, key_id }
+    }
+
+    /// The 32-byte secret seed, the value [`from_bytes`](Self::from_bytes)
+    /// rebuilds this key from.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.inner.to_bytes()
     }
 
     /// This key's 8-byte id, the [`Signature::key_id`] it stamps.
@@ -112,13 +139,22 @@ impl SigningKey {
 /// Sign a v1.0 A2A card value as a detached JWS (`sign` feature): EdDSA over
 /// `base64url(protected) || "." || base64url(JCS(card without signatures))`,
 /// the RFC 7515 signing input with the RFC 8785 canonical form as the payload.
+/// The protected header names the algorithm and the signing key's id (`kid`,
+/// the lowercase hex of [`SigningKey::key_id`]).
 #[cfg(feature = "a2a-bridge")]
 pub fn sign_card_value(
     key: &SigningKey,
     card: &serde_json::Value,
 ) -> Result<crate::a2a::AgentCardSignature, LaserError> {
     let payload = jcs_bytes(&without_signatures(card))?;
-    let protected = base64url(br#"{"alg":"EdDSA"}"#);
+    // Already canonical: `alg` sorts before `kid` and a hex id needs no escape.
+    let protected = base64url(
+        format!(
+            r#"{{"alg":"{CARD_SIGNATURE_ALGORITHM}","kid":"{}"}}"#,
+            key_id_hex(key.key_id())
+        )
+        .as_bytes(),
+    );
     let input = jws_signing_input(&protected, &payload);
     let signature = key.inner.sign(input.as_bytes());
     Ok(crate::a2a::AgentCardSignature {
@@ -130,13 +166,16 @@ pub fn sign_card_value(
 /// Verify one detached JWS signature over a v1.0 A2A card value against
 /// `verifying`. The payload is reconstructed from the card itself (minus
 /// `signatures`), so a tampered field fails, exactly the discovery-integrity
-/// property the signature exists for.
+/// property the signature exists for. The protected header must name `EdDSA`,
+/// carry no `crit` extension (none is understood, RFC 7515 section 4.1.11),
+/// and, when it names a `kid`, name the id of `verifying`.
 #[cfg(feature = "a2a-bridge")]
 pub fn verify_card(
     card: &serde_json::Value,
     signature: &crate::a2a::AgentCardSignature,
     verifying: &VerifyingKey,
 ) -> Result<(), LaserError> {
+    check_card_header(&signature.protected, verifying)?;
     let payload = jcs_bytes(&without_signatures(card))?;
     let input = jws_signing_input(&signature.protected, &payload);
     let payload = base64url_decode(&signature.signature)?;
@@ -247,7 +286,7 @@ impl KvKeyRegistry {
     /// enrollment must not poison every other principal's verification).
     pub async fn registry(&self) -> Result<KeyRegistry, LaserError> {
         let entries = self.laser.kv(&self.namespace).scan().entries().await?;
-        let mut registry = KeyRegistry::default();
+        let registry = KeyRegistry::default();
         for entry in entries {
             if let Ok(stored) =
                 laser_wire::framing::decode_named::<laser_wire::keys::KeyRecord>(&entry.value)
@@ -285,7 +324,7 @@ fn stored_key_record(record: &KeyRecord) -> laser_wire::keys::KeyRecord {
     }
 }
 
-#[cfg(feature = "kv")]
+#[cfg(any(feature = "kv", feature = "a2a-bridge"))]
 fn key_id_hex(key_id: &[u8]) -> String {
     key_id
         .iter()
@@ -295,28 +334,101 @@ fn key_id_hex(key_id: &[u8]) -> String {
         .join("")
 }
 
-/// RFC 8785 (JCS) canonical bytes of `value` for the card's value domain:
-/// serde_json's plain `Value` already holds objects sorted (BTreeMap) and
-/// serializes compact, which IS the canonical form for a tree of strings,
-/// booleans, integers, arrays, and objects. A non-integer number is refused
-/// rather than canonicalized wrong: the card schema carries none, so hitting
-/// one means the input is not a card.
+/// RFC 8785 (JCS) canonical bytes of `value`: object members sorted by the
+/// UTF-16 code units of their names (section 3.2.3), whatever order the map
+/// iterates in, strings escaped as ECMAScript `JSON.stringify` does, no
+/// whitespace. Numbers are limited to integers an IEEE 754 double holds
+/// exactly, which is every number a card carries, so the serialization of
+/// section 3.2.2.3 is the decimal integer.
 #[cfg(feature = "a2a-bridge")]
 fn jcs_bytes(value: &serde_json::Value) -> Result<Vec<u8>, LaserError> {
-    fn assert_no_floats(value: &serde_json::Value) -> Result<(), LaserError> {
-        match value {
-            serde_json::Value::Number(number) if !number.is_i64() && !number.is_u64() => {
-                Err(LaserError::Signature(
-                    "card canonicalization does not cover non-integer numbers".to_owned(),
-                ))
+    let mut out = String::new();
+    write_jcs(value, &mut out)?;
+    Ok(out.into_bytes())
+}
+
+#[cfg(feature = "a2a-bridge")]
+fn write_jcs(value: &serde_json::Value, out: &mut String) -> Result<(), LaserError> {
+    match value {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        serde_json::Value::Number(number) => {
+            let integer = number
+                .as_i64()
+                .filter(|integer| integer.unsigned_abs() <= MAX_JCS_INTEGER)
+                .ok_or_else(|| {
+                    LaserError::Signature(
+                        "card canonicalization only accepts integers up to 2^53 - 1".to_owned(),
+                    )
+                })?;
+            out.push_str(&integer.to_string());
+        }
+        serde_json::Value::String(text) => write_jcs_string(text, out)?,
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_jcs(item, out)?;
             }
-            serde_json::Value::Array(items) => items.iter().try_for_each(assert_no_floats),
-            serde_json::Value::Object(fields) => fields.values().try_for_each(assert_no_floats),
-            _ => Ok(()),
+            out.push(']');
+        }
+        serde_json::Value::Object(fields) => {
+            let mut members: Vec<(&String, &serde_json::Value)> = fields.iter().collect();
+            members.sort_by(|(left, _), (right, _)| left.encode_utf16().cmp(right.encode_utf16()));
+            out.push('{');
+            for (index, (name, item)) in members.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_jcs_string(name, out)?;
+                out.push(':');
+                write_jcs(item, out)?;
+            }
+            out.push('}');
         }
     }
-    assert_no_floats(value)?;
-    serde_json::to_vec(value).map_err(|error| LaserError::Codec(format!("canonicalize: {error}")))
+    Ok(())
+}
+
+// serde_json escapes exactly the JCS set: `"`, `\`, the short forms of
+// U+0008, U+0009, U+000A, U+000C, U+000D, and `\u00xx` in lowercase for the
+// other controls, everything else literal.
+#[cfg(feature = "a2a-bridge")]
+fn write_jcs_string(text: &str, out: &mut String) -> Result<(), LaserError> {
+    let quoted = serde_json::to_string(text)
+        .map_err(|error| LaserError::Codec(format!("canonicalize: {error}")))?;
+    out.push_str(&quoted);
+    Ok(())
+}
+
+// The protected header a card signature must carry, see [`verify_card`]. The
+// header is an open parameter set (RFC 7515 section 4), so it is read as a map:
+// a `crit` of any value, `null` included, is refused.
+#[cfg(feature = "a2a-bridge")]
+fn check_card_header(protected: &str, verifying: &VerifyingKey) -> Result<(), LaserError> {
+    let header: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&base64url_decode(protected)?).map_err(|_| {
+            LaserError::Signature("card signature header does not decode".to_owned())
+        })?;
+    if header.get("alg").and_then(serde_json::Value::as_str) != Some(CARD_SIGNATURE_ALGORITHM) {
+        return Err(LaserError::Signature(format!(
+            "card signature header must name alg {CARD_SIGNATURE_ALGORITHM}"
+        )));
+    }
+    if header.contains_key("crit") {
+        return Err(LaserError::Signature(
+            "card signature header names a critical extension this verifier does not understand"
+                .to_owned(),
+        ));
+    }
+    match header.get("kid") {
+        Some(kid) if kid.as_str() != Some(key_id_hex(&key_id_of(verifying)).as_str()) => Err(
+            LaserError::Signature("card signature names another key".to_owned()),
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// The card value with its `signatures` slot removed: the JWS payload covers
@@ -468,12 +580,21 @@ impl KeyRecord {
         }
     }
 
-    /// Bound the validity window (epoch micros).
-    #[must_use]
-    pub fn valid_window(mut self, from_micros: u64, to_micros: Option<u64>) -> Self {
+    /// Bound the validity window (epoch micros). An end at or before the start
+    /// is refused as invalid, since such a key could never verify.
+    pub fn valid_window(
+        mut self,
+        from_micros: u64,
+        to_micros: Option<u64>,
+    ) -> Result<Self, LaserError> {
+        if to_micros.is_some_and(|end| end <= from_micros) {
+            return Err(LaserError::Invalid(
+                "key validity end must be after its start".to_owned(),
+            ));
+        }
         self.valid_from_micros = from_micros;
         self.valid_to_micros = to_micros;
-        self
+        Ok(self)
     }
 
     /// Mark the key revoked.
@@ -490,10 +611,12 @@ impl KeyRecord {
 /// authorship binding: a key proves its enrolled principal, never the
 /// self-asserted `source`). A key carries a kind (agent vs operator) and a
 /// lifecycle window, so a privileged-fact verifier can require an operator key
-/// valid at fold time.
+/// valid at fold time. A registry is a shared handle: its clones, and every
+/// verifier configured with it, read the same enrollments, so enrolling a
+/// revoked record reaches a running client at once.
 #[derive(Clone, Default)]
 pub struct KeyRegistry {
-    keys: HashMap<Vec<u8>, KeyRecord>,
+    keys: Arc<RwLock<HashMap<Vec<u8>, KeyRecord>>>,
 }
 
 impl KeyRegistry {
@@ -504,19 +627,24 @@ impl KeyRegistry {
 
     /// Enroll `verifying` as an always-valid agent key bound to `principal` (the
     /// authenticated `user_id`). A later enroll under the same key id replaces it.
-    pub fn enroll(&mut self, principal: impl Into<String>, verifying: VerifyingKey) {
+    pub fn enroll(&self, principal: impl Into<String>, verifying: VerifyingKey) {
         self.enroll_record(KeyRecord::agent(principal, verifying));
     }
 
     /// Enroll `verifying` as an always-valid operator key (may sign privileged
     /// control facts).
-    pub fn enroll_operator(&mut self, principal: impl Into<String>, verifying: VerifyingKey) {
+    pub fn enroll_operator(&self, principal: impl Into<String>, verifying: VerifyingKey) {
         self.enroll_record(KeyRecord::operator(principal, verifying));
     }
 
-    /// Enroll a key with an explicit kind and lifecycle.
-    pub fn enroll_record(&mut self, record: KeyRecord) {
-        self.keys.insert(key_id_of(&record.verifying), record);
+    /// Enroll a key with an explicit kind and lifecycle. Enrolling a record
+    /// under an enrolled key id replaces it, which is how a key is revoked or
+    /// its window changed.
+    pub fn enroll_record(&self, record: KeyRecord) {
+        self.keys
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key_id_of(&record.verifying), record);
     }
 
     /// Verify the envelope's signature, returning the enrolled principal on
@@ -580,8 +708,8 @@ impl KeyRegistry {
                 signature.scheme
             )));
         }
-        let record = self
-            .keys
+        let keys = self.keys.read().unwrap_or_else(PoisonError::into_inner);
+        let record = keys
             .get(signature.key_id.as_slice())
             .ok_or_else(|| LaserError::Signature("signing key is not enrolled".to_owned()))?;
         if record.revoked {
@@ -616,16 +744,23 @@ impl KeyRegistry {
 }
 
 /// Verify an on-behalf-of envelope and return `(signer, delegated_user)`. The
-/// signature must verify against an enrolled key (so the signer cannot forge the
-/// claim), and the delegated user is read from the signed metadata span. `None`
-/// when the envelope carries no delegation. The caller then authorizes with
-/// [`laser_wire::authz::delegated_allow`], intersecting the two principals'
-/// grants so the agent can never exceed the user it acts for.
+/// signature must verify through [`KeyRegistry::verify_observed_at`] against the
+/// headers `observed` on the record and its server timestamp `at_micros` (so an
+/// expired or revoked key, or a rewritten header, cannot carry the claim), and
+/// the delegated user is read from the signed metadata span. `None` when the
+/// envelope carries no delegation. The server authorizes only the authenticated
+/// caller, so the caller authorizes with [`laser_wire::authz::delegated_allow`],
+/// intersecting the two principals' grants so the agent can never exceed the
+/// user it acts for.
 pub fn verify_delegation(
     registry: &KeyRegistry,
     envelope: &AgentEnvelope,
+    observed: &SignatureContext,
+    at_micros: u64,
 ) -> Result<Option<(String, String)>, LaserError> {
-    let signer = registry.verify(envelope)?;
+    let signer = registry
+        .verify_observed_at(envelope, observed, at_micros)?
+        .principal;
     let delegated = envelope
         .metadata
         .as_ref()
@@ -653,9 +788,22 @@ mod tests {
     }
 
     #[test]
+    fn given_generated_keys_when_used_then_should_differ_sign_and_rebuild_from_their_seed() {
+        let first = SigningKey::generate().expect("the random source answers");
+        let second = SigningKey::generate().expect("the random source answers");
+        assert_ne!(first.to_bytes(), second.to_bytes());
+        let rebuilt = SigningKey::from_bytes(&first.to_bytes());
+        assert_eq!(rebuilt.key_id(), first.key_id());
+        let registry = KeyRegistry::new();
+        registry.enroll("generated", first.verifying_key());
+        let signed = envelope().with_signature(rebuilt.sign(&envelope()).expect("signs"));
+        assert_eq!(registry.verify(&signed).expect("verifies"), "generated");
+    }
+
+    #[test]
     fn given_a_signed_envelope_when_verified_then_should_return_the_enrolled_principal() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
-        let mut registry = KeyRegistry::new();
+        let registry = KeyRegistry::new();
         registry.enroll("user-42", key.verifying_key());
 
         let signed = envelope().with_signature(key.sign(&envelope()).expect("signs"));
@@ -665,7 +813,7 @@ mod tests {
     #[test]
     fn given_a_tampered_body_when_verified_then_should_fail() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
-        let mut registry = KeyRegistry::new();
+        let registry = KeyRegistry::new();
         registry.enroll("user-42", key.verifying_key());
 
         let signature = key.sign(&envelope()).expect("signs");
@@ -699,31 +847,67 @@ mod tests {
     #[test]
     fn given_a_signed_delegation_when_verified_then_should_return_the_signer_and_user() {
         let key = SigningKey::from_bytes(&[9u8; 32]);
-        let mut registry = KeyRegistry::new();
+        let registry = KeyRegistry::new();
         registry.enroll("agent-a", key.verifying_key());
+        let context = delegation_context();
 
         let env = envelope().with_metadata(laser_wire::agent::METADATA_DELEGATED_BY, "user-7");
-        let signed = env.clone().with_signature(key.sign(&env).expect("signs"));
+        let signed = env
+            .clone()
+            .with_signature(key.sign_with_context(&env, context.clone()).expect("signs"));
         assert_eq!(
-            verify_delegation(&registry, &signed).expect("verifies"),
+            verify_delegation(&registry, &signed, &context, 1).expect("verifies"),
             Some(("agent-a".to_owned(), "user-7".to_owned()))
         );
 
         // No delegation claim: verifies, reports None.
-        let plain = envelope().with_signature(key.sign(&envelope()).expect("signs"));
+        let plain = envelope().with_signature(
+            key.sign_with_context(&envelope(), context.clone())
+                .expect("signs"),
+        );
         assert_eq!(
-            verify_delegation(&registry, &plain).expect("verifies"),
+            verify_delegation(&registry, &plain, &context, 1).expect("verifies"),
             None
         );
 
         // A forged claim (unsigned mutation) fails signature verification.
-        let mut forged = envelope().with_signature(key.sign(&envelope()).expect("signs"));
-        forged = forged.with_metadata(laser_wire::agent::METADATA_DELEGATED_BY, "user-999");
+        let forged = signed.with_metadata(laser_wire::agent::METADATA_DELEGATED_BY, "user-999");
         assert!(matches!(
-            verify_delegation(&registry, &forged),
+            verify_delegation(&registry, &forged, &context, 1),
             Err(LaserError::Signature(_))
         ));
     }
+
+    #[test]
+    fn given_an_expired_key_or_rewritten_headers_when_a_delegation_is_verified_then_should_reject_it()
+     {
+        let key = SigningKey::from_bytes(&[10u8; 32]);
+        let registry = KeyRegistry::new();
+        registry.enroll_record(
+            KeyRecord::agent("agent-a", key.verifying_key())
+                .valid_window(100, Some(200))
+                .expect("the window is ordered"),
+        );
+        let context = delegation_context();
+        let env = envelope().with_metadata(laser_wire::agent::METADATA_DELEGATED_BY, "user-7");
+        let signed = env
+            .clone()
+            .with_signature(key.sign_with_context(&env, context.clone()).expect("signs"));
+        assert!(verify_delegation(&registry, &signed, &context, 150).is_ok());
+        assert!(matches!(
+            verify_delegation(&registry, &signed, &context, 200),
+            Err(LaserError::Signature(_))
+        ));
+        let rewritten = SignatureContext {
+            content_type: Some(3),
+            agent_version: Some(1),
+        };
+        assert!(matches!(
+            verify_delegation(&registry, &signed, &rewritten, 150),
+            Err(LaserError::Signature(_))
+        ));
+    }
+
     #[cfg(feature = "a2a-bridge")]
     #[test]
     fn given_a_signed_card_when_verified_then_should_pass_and_fail_on_tamper() {
@@ -757,7 +941,7 @@ mod tests {
     #[test]
     fn given_a_context_signature_when_the_interpretation_flips_then_should_fail() {
         let key = SigningKey::from_bytes(&[21u8; 32]);
-        let mut registry = KeyRegistry::new();
+        let registry = KeyRegistry::new();
         registry.enroll("user-1", key.verifying_key());
         let context = SignatureContext {
             content_type: Some(1),
@@ -781,7 +965,7 @@ mod tests {
     #[test]
     fn given_an_operator_key_when_verified_at_then_should_report_the_operator_kind() {
         let key = SigningKey::from_bytes(&[11u8; 32]);
-        let mut registry = KeyRegistry::new();
+        let registry = KeyRegistry::new();
         registry.enroll_operator("op-1", key.verifying_key());
         let signed = envelope().with_signature(key.sign(&envelope()).expect("signs"));
         let verified = registry.verify_at(&signed, 1_000).expect("verifies");
@@ -803,9 +987,11 @@ mod tests {
     #[test]
     fn given_a_key_outside_its_window_when_verified_at_then_should_fail() {
         let key = SigningKey::from_bytes(&[13u8; 32]);
-        let mut registry = KeyRegistry::new();
+        let registry = KeyRegistry::new();
         registry.enroll_record(
-            KeyRecord::operator("op-2", key.verifying_key()).valid_window(100, Some(200)),
+            KeyRecord::operator("op-2", key.verifying_key())
+                .valid_window(100, Some(200))
+                .expect("the window is ordered"),
         );
         let signed = envelope().with_signature(key.sign(&envelope()).expect("signs"));
         assert!(
@@ -822,13 +1008,118 @@ mod tests {
     }
 
     #[test]
+    fn given_a_registry_held_by_a_verifier_when_its_key_is_revoked_then_should_refuse_it_at_once() {
+        let key = SigningKey::from_bytes(&[15u8; 32]);
+        let registry = KeyRegistry::new();
+        registry.enroll_operator("op-4", key.verifying_key());
+        let held = std::sync::Arc::new(registry.clone());
+        let signed = envelope().with_signature(key.sign(&envelope()).expect("signs"));
+        assert!(held.verify(&signed).is_ok());
+        registry.enroll_record(KeyRecord::operator("op-4", key.verifying_key()).revoked());
+        assert!(matches!(
+            held.verify(&signed),
+            Err(LaserError::Signature(_))
+        ));
+    }
+
+    #[test]
+    fn given_an_inverted_validity_window_when_a_record_is_built_then_should_refuse_it_as_invalid() {
+        let key = SigningKey::from_bytes(&[16u8; 32]);
+        for (from, to) in [(200, Some(100)), (100, Some(100))] {
+            assert!(matches!(
+                KeyRecord::agent("agent-b", key.verifying_key()).valid_window(from, to),
+                Err(LaserError::Invalid(_))
+            ));
+        }
+        assert!(
+            KeyRecord::agent("agent-b", key.verifying_key())
+                .valid_window(100, None)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn given_a_revoked_key_when_verified_then_should_fail_regardless_of_time() {
         let key = SigningKey::from_bytes(&[14u8; 32]);
-        let mut registry = KeyRegistry::new();
+        let registry = KeyRegistry::new();
         registry.enroll_record(KeyRecord::operator("op-3", key.verifying_key()).revoked());
         let signed = envelope().with_signature(key.sign(&envelope()).expect("signs"));
         assert!(registry.verify(&signed).is_err());
         assert!(registry.verify_at(&signed, 1_000).is_err());
+    }
+
+    #[cfg(feature = "a2a-bridge")]
+    #[test]
+    fn given_the_shared_card_vector_when_signed_then_should_sign_the_rfc_8785_canonical_form() {
+        let vector: CardVector =
+            serde_json::from_str(include_str!("../tests/fixtures/card_signature.json"))
+                .expect("the card vector parses");
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        assert_eq!(vector.secret_seed_hex, "07".repeat(32));
+        assert_eq!(
+            String::from_utf8(jcs_bytes(&without_signatures(&vector.card)).expect("canonicalizes"))
+                .expect("utf8"),
+            vector.canonical
+        );
+        let signature = sign_card_value(&key, &vector.card).expect("signs");
+        assert_eq!(signature.protected, vector.protected);
+        assert_eq!(signature.signature, vector.signature);
+        verify_card(&vector.card, &signature, &key.verifying_key()).expect("verifies");
+    }
+
+    #[cfg(feature = "a2a-bridge")]
+    #[test]
+    fn given_a_card_signature_header_when_verified_then_should_require_eddsa_no_crit_and_the_key_id()
+     {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let other = SigningKey::from_bytes(&[8u8; 32]);
+        let card = serde_json::json!({ "name": "planner", "skills": [] });
+        let signed = sign_card_value(&key, &card).expect("signs");
+        verify_card(&card, &signed, &key.verifying_key()).expect("verifies");
+        let reheader = |header: &str| {
+            let protected = base64url(header.as_bytes());
+            let input = jws_signing_input(&protected, br#"{"name":"planner","skills":[]}"#);
+            crate::a2a::AgentCardSignature {
+                protected,
+                signature: base64url(&key.inner.sign(input.as_bytes()).to_bytes()),
+            }
+        };
+        verify_card(&card, &reheader(r#"{"alg":"EdDSA"}"#), &key.verifying_key())
+            .expect("a header without kid verifies");
+        for header in [
+            r#"{"alg":"none"}"#,
+            r#"{"alg":"EdDSA","crit":["exp"],"exp":1}"#,
+            r#"{"alg":"EdDSA","crit":null}"#,
+            r#"["alg"]"#,
+        ] {
+            assert!(
+                matches!(
+                    verify_card(&card, &reheader(header), &key.verifying_key()),
+                    Err(LaserError::Signature(_))
+                ),
+                "{header}"
+            );
+        }
+        assert!(matches!(
+            verify_card(&card, &signed, &other.verifying_key()),
+            Err(LaserError::Signature(_))
+        ));
+    }
+
+    #[cfg(feature = "a2a-bridge")]
+    #[test]
+    fn given_numbers_past_the_double_integer_range_when_canonicalized_then_should_refuse_them() {
+        for number in [
+            serde_json::json!(9_007_199_254_740_992_u64),
+            serde_json::json!(-9_007_199_254_740_992_i64),
+            serde_json::json!(1.5),
+        ] {
+            assert!(matches!(jcs_bytes(&number), Err(LaserError::Signature(_))));
+        }
+        assert_eq!(
+            jcs_bytes(&serde_json::json!(-9_007_199_254_740_991_i64)).expect("in range"),
+            b"-9007199254740991"
+        );
     }
 
     #[test]
@@ -840,5 +1131,22 @@ mod tests {
                 input.to_vec()
             );
         }
+    }
+
+    fn delegation_context() -> SignatureContext {
+        SignatureContext {
+            content_type: Some(1),
+            agent_version: Some(1),
+        }
+    }
+
+    #[cfg(feature = "a2a-bridge")]
+    #[derive(serde::Deserialize)]
+    struct CardVector {
+        secret_seed_hex: String,
+        card: serde_json::Value,
+        canonical: String,
+        protected: String,
+        signature: String,
     }
 }

@@ -1,3 +1,4 @@
+import type { CallOptions } from "../client/call-options.js"
 import { InvalidError } from "../client/errors.js"
 import { mintUlidValue, type UlidSource } from "../runtime/ulid.js"
 import { Json } from "../stream/codecs.js"
@@ -83,10 +84,10 @@ export class MemoryId {
   }
 
   /** A deterministic id over `owner`, `kind`, and `body`, so a deduped remember
-   * stores one item. The owner is the durable scope (stream, agent, user, and
-   * application, never the conversation), so the same fact in two
-   * conversations is one durable memory and two users never share an id. The
-   * segments match Rust `MemoryId::content` byte for byte. */
+   * stores one item. The owner is the stream, agent, user, application, and
+   * conversation, so the same fact in two conversations is two items and two
+   * users never share an id. The segments match Rust `MemoryId::content` byte
+   * for byte. */
   static content(owner: MemoryScope, kind: MemoryKind, body: Uint8Array): MemoryId {
     const encoder = new TextEncoder()
     const separator = Uint8Array.of(0)
@@ -98,6 +99,8 @@ export class MemoryId {
       encoder.encode(owner.user ?? ""),
       separator,
       encoder.encode(owner.app ?? ""),
+      separator,
+      encoder.encode(owner.conversation?.toString() ?? ""),
       separator,
       Uint8Array.of(memoryKindCode(kind)),
       body
@@ -185,17 +188,19 @@ export interface Feedback {
   readonly note?: string
 }
 
+/** A memory backend. A write gets the caller's options, so it can stop retrying on abort. */
 export interface Memory {
   append?(
     scope: MemoryScope,
     id: MemoryId,
     kind: MemoryKind,
-    payload: Uint8Array
+    payload: Uint8Array,
+    options?: CallOptions
   ): Promise<MemoryId>
-  remember(scope: MemoryScope, payload: Uint8Array): Promise<MemoryId>
+  remember(scope: MemoryScope, payload: Uint8Array, options?: CallOptions): Promise<MemoryId>
   recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]>
-  improve(scope: MemoryScope, feedback: Feedback): Promise<MemoryId>
-  forget(scope: MemoryScope, id: MemoryId): Promise<void>
+  improve(scope: MemoryScope, feedback: Feedback, options?: CallOptions): Promise<MemoryId>
+  forget(scope: MemoryScope, id: MemoryId, options?: CallOptions): Promise<void>
 }
 
 export interface Embedder {
@@ -219,6 +224,7 @@ export interface ConsolidateOptions {
   readonly summarizer?: Summarizer
   /** Forgets the items a summarize pass folded, so the summary replaces them. */
   readonly pruneSummarized?: boolean
+  readonly signal?: AbortSignal
 }
 
 export interface ConsolidationReport {
@@ -233,7 +239,7 @@ export interface ConsolidationReport {
 }
 
 export interface Consolidator {
-  consolidate(scope: MemoryScope, signal?: AbortSignal): Promise<ConsolidationReport>
+  consolidate(scope: MemoryScope, options?: CallOptions): Promise<ConsolidationReport>
 }
 
 export function toContextBlock(items: readonly MemoryItem[], tokenBudget?: number): string {

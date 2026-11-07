@@ -379,7 +379,7 @@ async fn given_a_message_past_its_deadline_when_consumed_then_should_dead_letter
     let provenance = Provenance::builder()
         .conversation_id(conversation)
         // A deadline far in the past, so the message is dropped on arrival.
-        .deadline(IggyTimestamp::from(1u64))
+        .deadline_at(IggyTimestamp::from(1u64))
         .build();
     laser
         .send_agent(

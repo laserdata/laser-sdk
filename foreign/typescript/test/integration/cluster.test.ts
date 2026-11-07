@@ -63,6 +63,7 @@ void test(
       await topic.ensure(3)
       const native = topic.consumer("tape-reader", 0, {
         startAt: { kind: "first" },
+        commitPolicy: { kind: "polling" },
         batchLength: 100,
         maxWaitMs: MAX_WAIT_MS
       })
@@ -609,6 +610,13 @@ void test(
       const reader = await group.reader().maxWait(20_000).idleInterval(30_000).build()
       try {
         await ownsEvery(reader, primaries.size)
+        // A primary that has not applied the new member's ownership yet refuses
+        // its reads, and the reader reports the second refusal in a row, so one
+        // pass over the partitions goes untimed and reads past that refusal.
+        for (const partition of primaries.keys()) {
+          await topic.send(new TextEncoder().encode(`warm-${String(partition)}`), { partition })
+          await reader.ackPage(await pageOf(reader, partition, 60_000))
+        }
         let answered = 0
         for (const partition of primaries.keys()) {
           const pending = reader.nextPage({ timeoutMs: 30_000 })

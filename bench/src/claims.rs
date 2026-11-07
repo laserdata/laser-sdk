@@ -43,7 +43,7 @@ impl ClaimsRegister {
     ///
     /// # Errors
     ///
-    /// Returns an error for an unsupported schema, duplicate claim, incomplete claim, or invalid C2 bound.
+    /// Returns an error for an unsupported schema, duplicate claim, incomplete claim, or invalid direct-streaming throughput or latency bound.
     pub fn validate(&self) -> Result<(), BenchError> {
         if self.schema_version != 1 {
             return Err(BenchError::Invalid(format!(

@@ -11,3 +11,5 @@ The [AGDX specification](docs/agdx.md) defines streams, topics, headers, envelop
 Client defaults each have one owning page: [connect timeout](docs/connect-timeout.md), [publish recovery](docs/publish-recovery.md), [producer statistics](docs/producer-statistics.md), and [client behavior](docs/client-behavior.md). Link to them instead of copying their text.
 
 Keep affected documentation consistent with authorized code or contract changes. This includes `README.md`, `sdk/README.md`, `wire/README.md`, `AGENTS.md`, this file, relevant `.claude/skills/*`, `docs/*`, and the AGDX specification. Do not report completion while affected documentation is stale.
+
+Materialization setup lives in `sdk/src/materialize.rs`, `foreign/python/src/materialize.rs`, and `foreign/typescript/src/managed/materialize.ts`. The shared scenarios are `bdd/scenarios/materialization.feature` and `bdd/scenarios/operational_sql.feature`. Keep append and keyed history, rejection policies, captured-target readiness, and explicit raw SQL dialects aligned in every client. Read `docs/client-behavior.md` from the repository root for the public contract.

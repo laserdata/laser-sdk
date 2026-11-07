@@ -186,6 +186,19 @@ impl BatchingProducer {
         headers: BTreeMap<HeaderKey, HeaderValue>,
     ) -> Result<(), LaserError> {
         let payload = payload.into();
+        // The action governor exists only with the agent runtime.
+        #[cfg(feature = "agent")]
+        let payload = self
+            .inner
+            .laser
+            .govern_publish(
+                &self.inner.stream,
+                &self.inner.topic,
+                &payload,
+                Some(&headers),
+            )
+            .await?
+            .unwrap_or(payload);
         let message = IggyMessage::builder()
             .payload(payload.into())
             .user_headers(headers)

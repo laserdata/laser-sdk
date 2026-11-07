@@ -432,14 +432,13 @@ export function decodeMutationPosition(map: CborMap, context: string): MutationP
 export interface MutationCommandEnvelope {
   readonly v: number
   readonly operationId: bigint
-  readonly actorUserId: number
   readonly deploymentId: bigint
   readonly timestampMicros: bigint
   readonly commandCode: number
   readonly scope?: ForwardedScope
   readonly payload: Uint8Array
-  /** The client that asked for the command. Absent on a command the backend
-   * issues on its own. */
+  /** The client that asked for the command, the only actor it names. Absent
+   * on a command the backend issues on its own. */
   readonly caller?: Caller
 }
 
@@ -449,7 +448,6 @@ export function encodeMutationCommandEnvelope(
   const map = new Map<string, unknown>([
     ["v", BigInt(envelope.v)],
     ["operation_id", envelope.operationId],
-    ["actor_user_id", BigInt(envelope.actorUserId)],
     ["deployment_id", envelope.deploymentId],
     ["timestamp_micros", envelope.timestampMicros],
     ["command_code", BigInt(envelope.commandCode)]
@@ -480,7 +478,6 @@ export function decodeMutationCommandEnvelope(
   }
   return {
     v: version,
-    actorUserId: field.requiredU32(map, "actor_user_id", context),
     deploymentId: field.requiredU64(map, "deployment_id", context),
     operationId,
     timestampMicros: field.requiredU64(map, "timestamp_micros", context),

@@ -11,6 +11,7 @@ use laser_wire::fork::{
 use laser_wire::framing::encode_named;
 #[cfg(test)]
 use laser_wire::limits::MAX_FORK_ID_BYTES;
+use laser_wire::validate::Validate;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -20,9 +21,9 @@ impl Laser {
     /// (`query(...).fork(id)`), and finally [`promote`](ForkHandle::promote) or
     /// [`squash`](ForkHandle::squash) it. The id is sent as
     /// [`resource_name`](Self::resource_name) names it.
-    pub fn fork<'a>(&'a self, fork_id: impl Into<String>) -> ForkHandle<'a> {
+    pub fn fork(&self, fork_id: impl Into<String>) -> ForkHandle {
         ForkHandle {
-            laser: self,
+            laser: self.clone(),
             fork_id: self.resource_name(&fork_id.into()),
         }
     }
@@ -32,7 +33,13 @@ impl Laser {
     /// caller gave them.
     pub async fn forks(&self) -> Result<Vec<ForkInfo>, LaserError> {
         match self
-            .execute_fork(AGDX_FORK_LIST_CODE, &ForkList { v: FORK_OP_VERSION })
+            .execute_fork(
+                AGDX_FORK_LIST_CODE,
+                &ForkList {
+                    v: FORK_OP_VERSION,
+                    stream: self.resource_stream().map(str::to_owned),
+                },
+            )
             .await?
         {
             ForkOutcome::List(forks) => Ok(self.local_forks(forks)),
@@ -92,13 +99,14 @@ impl Laser {
     }
 }
 
-/// A handle to one fork. Build it with [`Laser::fork`].
-pub struct ForkHandle<'a> {
-    laser: &'a Laser,
+/// A handle to one fork. Build it with [`Laser::fork`]. It owns a clone of
+/// the `Laser`, so it and its requests can move into a spawned task.
+pub struct ForkHandle {
+    laser: Laser,
     fork_id: String,
 }
 
-impl<'a> ForkHandle<'a> {
+impl ForkHandle {
     /// The fork id this handle is bound to, as the caller named it.
     pub fn id(&self) -> &str {
         self.laser
@@ -116,9 +124,9 @@ impl<'a> ForkHandle<'a> {
     /// Start opening this fork. Choose `.severed()` or `.continuous()` (default
     /// continuous), optionally narrow the snapshot with `.tables([...])`, then
     /// `.send().await` for the fork's metadata.
-    pub fn create(&self) -> ForkCreateRequest<'a> {
+    pub fn create(&self) -> ForkCreateRequest {
         ForkCreateRequest {
-            laser: self.laser,
+            laser: self.laser.clone(),
             fork_id: self.fork_id.clone(),
             parent: None,
             kind: ForkKind::Continuous,
@@ -173,9 +181,9 @@ impl<'a> ForkHandle<'a> {
         table: impl Into<String>,
         partition_id: u32,
         offset: u64,
-    ) -> ForkPutRequest<'a> {
+    ) -> ForkPutRequest {
         ForkPutRequest {
-            laser: self.laser,
+            laser: self.laser.clone(),
             fork_id: self.fork_id.clone(),
             table: self.laser.resource_name(&table.into()),
             partition_id,
@@ -193,15 +201,15 @@ impl<'a> ForkHandle<'a> {
 
 /// Fluent builder for [`ForkHandle::create`].
 #[must_use = "call .send().await to create the fork"]
-pub struct ForkCreateRequest<'a> {
-    laser: &'a Laser,
+pub struct ForkCreateRequest {
+    laser: Laser,
     fork_id: String,
     parent: Option<String>,
     kind: ForkKind,
     tables: Vec<String>,
 }
 
-impl<'a> ForkCreateRequest<'a> {
+impl ForkCreateRequest {
     /// Make a frozen snapshot at the trunk's current offsets (later appends hidden).
     pub fn severed(mut self) -> Self {
         self.kind = ForkKind::Severed;
@@ -252,8 +260,8 @@ impl<'a> ForkCreateRequest<'a> {
 
 /// Fluent builder for [`ForkHandle::put_row`].
 #[must_use = "call .send().await to write the speculative row"]
-pub struct ForkPutRequest<'a> {
-    laser: &'a Laser,
+pub struct ForkPutRequest {
+    laser: Laser,
     fork_id: String,
     table: String,
     partition_id: u32,
@@ -267,7 +275,7 @@ pub struct ForkPutRequest<'a> {
     tombstone: bool,
 }
 
-impl<'a> ForkPutRequest<'a> {
+impl ForkPutRequest {
     /// Set the projection id/version this speculative row belongs to.
     pub fn projection(mut self, id: impl Into<String>, version: u32) -> Self {
         self.projection_id = self.laser.resource_name(&id.into());
@@ -328,6 +336,7 @@ impl<'a> ForkPutRequest<'a> {
             embedding,
             tombstone: self.tombstone,
         };
+        request.validate()?;
         match self
             .laser
             .execute_fork(AGDX_FORK_PUT_CODE, &request)
@@ -390,6 +399,27 @@ mod tests {
         let put = fork.put_row("readings", 0, 1).projection("reading.v1", 1);
         assert_eq!(put.table, "stream:acme/readings");
         assert_eq!(put.projection_id, "stream:acme/reading.v1");
+    }
+
+    #[tokio::test]
+    async fn given_a_put_row_with_a_nul_field_when_sent_then_should_refuse_it_before_the_wire() {
+        let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default());
+        for put in [
+            laser
+                .fork("experiment")
+                .put_row("readings", 0, 1)
+                .field("status", "o\u{0}k"),
+            laser
+                .fork("experiment")
+                .put_row("readings", 0, 1)
+                .metadata("ro\u{0}le", "user"),
+            laser
+                .fork("experiment")
+                .put_row("readings", 0, 1)
+                .projection("reading\u{0}", 1),
+        ] {
+            assert!(matches!(put.send().await, Err(LaserError::Invalid(_))));
+        }
     }
 
     #[test]

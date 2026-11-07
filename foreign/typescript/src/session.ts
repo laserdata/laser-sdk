@@ -1,13 +1,20 @@
+import {
+  type CallOptions,
+  abortable,
+  cancellable,
+  delay,
+  throwIfAborted
+} from "./client/call-options.js"
 import { millisToMicros } from "./client/duration.js"
 import type { Laser } from "./client/laser.js"
-import { isUnavailable } from "./client/error-classify.js"
-import { publishOptions } from "./client/publish-options.js"
+import { isStale, isUnavailable } from "./client/error-classify.js"
+import { publishOptions, publishWithin } from "./client/publish-options.js"
 import { warn } from "./runtime/warn.js"
 import { type BytesLike, ownedBytes } from "./client/bytes.js"
 import {
   InvalidError,
-  LaserError,
   NoStreamError,
+  SessionEndedError,
   SessionError,
   UnsupportedError
 } from "./client/errors.js"
@@ -34,25 +41,29 @@ import {
 import {
   BUDGET_END_REASON,
   type BudgetBreach,
+  LaneLifecycle,
   breachErrorBody,
   breachOfInfo,
-  laneBreach,
-  unknownToIndex
+  indexUnusable,
+  laneBreach
 } from "./agent/budget.js"
 import { type ParkedRecords, laneParticipants, readParked } from "./agent/lane-scan.js"
 import type { MemoryItem } from "./memory/types.js"
 import {
   type Checkpoint,
   Chain,
+  ContextAssembler,
   LastN,
   TokenBudget,
   type ContextMessage,
   type ContextPolicy,
+  contextCheckpoint,
+  contextMessageBody,
   contextPolicyName,
-  contextPolicyVersion
+  contextPolicyVersion,
+  replayContext
 } from "./context.js"
 import { ContextScope, type ScopedMemory } from "./context-scope.js"
-import type { ReplayBound } from "./conversation-state.js"
 import { mintUlidValue } from "./runtime/ulid.js"
 import {
   AssembledContext,
@@ -69,10 +80,12 @@ import { AgentId, ConversationId, MintUlid } from "./types/ids.js"
 import {
   type AgentEnvelope,
   type AgentErrorBody,
+  AgentKind,
   type Budget,
   type Fragment,
   METADATA_DURATION_MICROS,
   METADATA_PROVIDER_NAME,
+  METADATA_RECORDED,
   METADATA_REQUEST_MODEL,
   METADATA_RESPONSE_MODEL,
   METADATA_SUBMITTED,
@@ -257,12 +270,12 @@ export class SessionConfig {
 
   /** The idle timeout a session start records unless it sets its own. */
   idleTimeout(timeoutMs: number): SessionConfig {
-    return this.with({ idleTimeoutMs: duration(timeoutMs, "idle timeout") })
+    return this.with({ idleTimeoutMs: positiveDuration(timeoutMs, "idle timeout") })
   }
 
   /** How often a process with session leases publishes its heartbeat. */
   heartbeat(intervalMs: number): SessionConfig {
-    return this.with({ heartbeatMs: duration(intervalMs, "heartbeat interval") })
+    return this.with({ heartbeatMs: positiveDuration(intervalMs, "heartbeat interval") })
   }
 
   /** Whether bootstrap registers the stream as a session source on a
@@ -416,11 +429,19 @@ class LaneGuard {
     return this.identity
   }
 
-  async check(laser: Laser, conversation: ConversationId): Promise<LaneIdentity> {
-    const identity = await this.observe(laser)
-    if (!this.registered && (await laser.capabilities()).sessions) {
+  async check(
+    laser: Laser,
+    conversation: ConversationId,
+    options: CallOptions = {}
+  ): Promise<LaneIdentity> {
+    throwIfAborted(options.signal, "session lane check")
+    const identity = await abortable(this.observe(laser), options.signal, "session lane check")
+    if (
+      !this.registered &&
+      (await abortable(laser.capabilities(), options.signal, "session lane check")).sessions
+    ) {
       try {
-        const lane = await laser.sessions().registeredLane(conversation)
+        const lane = await laser.sessions().registeredLane(conversation, options)
         if (
           lane?.[0] !== identity.topicId ||
           lane[1] !== identity.topicGeneration ||
@@ -485,59 +506,81 @@ export class Sessions {
    * stream as a session source. A refused registration is reported as
    * `registered: false`, never an error, because an account without session
    * administration rights relies on provisioning to register the stream. */
-  async bootstrap(partitions: number, retention: TopicRetention): Promise<SessionBootstrap> {
+  async bootstrap(
+    partitions: number,
+    retention: TopicRetention,
+    options: CallOptions = {}
+  ): Promise<SessionBootstrap> {
+    const signal = options.signal
+    throwIfAborted(signal, "session bootstrap")
     const layout = this.config.layoutKind
     const count = layout.kind === "singlePartition" ? 1 : partitions
     const declared = layout.kind === "perAgentTopic" ? declaredTopics(layout.topics) : []
-    await this.laser.bootstrap(count, retention)
+    await this.laser.bootstrap(count, retention, options)
     // Each declared agent topic carries a share of the session's work, so it
     // takes the lane's partition count and retention.
     for (const topic of declared) {
-      await this.laser[INTERNAL_ENSURE_RETAINED](topic, count, retention)
+      await abortable(
+        this.laser[INTERNAL_ENSURE_RETAINED](topic, count, retention),
+        signal,
+        "session bootstrap"
+      )
     }
-    await this.laneGuard.observe(this.laser)
-    if (!this.config.registersSource || !(await this.laser.capabilities()).sessions) {
+    await abortable(this.laneGuard.observe(this.laser), signal, "session bootstrap")
+    if (
+      !this.config.registersSource ||
+      !(await abortable(this.laser.capabilities(), signal, "session bootstrap")).sessions
+    ) {
       return { registered: false }
     }
     try {
-      await this.laser[INTERNAL_PUBLISH_CONTROL]({
-        kind: "registerSessionSource",
-        stream: this.stream(),
-        topics: { kind: "all" }
-      })
+      await this.laser[INTERNAL_PUBLISH_CONTROL](
+        { kind: "registerSessionSource", stream: this.stream(), topics: { kind: "all" } },
+        options
+      )
     } catch (error) {
+      throwIfAborted(signal, "session bootstrap")
       warn(`session source registration refused: ${String(error)}`)
       return { registered: false }
     }
-    return { registered: await this.registrationVisible() }
+    return { registered: await this.registrationVisible(options) }
   }
 
   /** Stop the deployment from indexing this stream's sessions, through the
    * authenticated managed control path, as Rust `Sessions::unregister`. A later
    * `bootstrap` registers the stream again. */
-  async unregister(): Promise<void> {
-    if (!(await this.laser.capabilities()).sessions) {
+  async unregister(options: CallOptions = {}): Promise<void> {
+    throwIfAborted(options.signal, "session unregister")
+    if (
+      !(await abortable(this.laser.capabilities(), options.signal, "session unregister")).sessions
+    ) {
       throw new UnsupportedError("this deployment does not index sessions", { surface: "sessions" })
     }
-    await this.laser[INTERNAL_PUBLISH_CONTROL]({
-      kind: "removeSessionSource",
-      stream: this.stream()
-    })
+    await this.laser[INTERNAL_PUBLISH_CONTROL](
+      { kind: "removeSessionSource", stream: this.stream() },
+      options
+    )
   }
 
   // Wait until the deployment serves reads for the registered stream, up to
   // the publish timeout. Registration applies after its control record folds,
   // so reads and linked writes right after bootstrap would otherwise race it.
-  private async registrationVisible(): Promise<boolean> {
+  private async registrationVisible(options: CallOptions): Promise<boolean> {
+    const signal = options.signal
     const transport = this.laser[INTERNAL_TRANSPORT]()
     const deadline = Date.now() + (transport.publishTimeoutMs?.() ?? publishOptions().timeoutMs)
     let lastUnavailable: string | undefined
-    for (;;) {
+    while (Date.now() < deadline) {
       try {
-        await this.changes(0n, 1)
+        await publishWithin(
+          this.readChanges(0, 1, { ...options, deadline }),
+          Math.max(0, deadline - Date.now())
+        )
         return true
       } catch (error) {
-        if (isUnavailable(error)) {
+        throwIfAborted(signal, "session bootstrap")
+        if (Date.now() >= deadline) break
+        if (isUnavailable(error) || isStale(error)) {
           lastUnavailable = String(error)
         } else if (!(
           error instanceof SessionError &&
@@ -547,14 +590,16 @@ export class Sessions {
           return false
         }
       }
-      if (Date.now() >= deadline) {
-        warn(
-          `session source registration not visible before the publish timeout${lastUnavailable === undefined ? "" : `: ${lastUnavailable}`}`
-        )
-        return false
-      }
-      await new Promise((resolve) => setTimeout(resolve, REGISTRATION_POLL_INTERVAL_MS))
+      await delay(
+        Math.min(REGISTRATION_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())),
+        signal,
+        "session bootstrap"
+      )
     }
+    warn(
+      `session source registration not visible before the publish timeout${lastUnavailable === undefined ? "" : `: ${lastUnavailable}`}`
+    )
+    return false
   }
 
   /** Whether the deployment indexes sessions.
@@ -574,11 +619,13 @@ export class Sessions {
   }
 
   /** One session's summary from the deployment's session index. */
-  async get(id: ConversationId): Promise<SessionInfo> {
-    const outcome = await readSession(this.laser, SessionGetCommand, {
-      stream: this.stream(),
-      id: wireConversation(id)
-    })
+  async get(id: ConversationId, options: CallOptions = {}): Promise<SessionInfo> {
+    const outcome = await readSession(
+      this.laser,
+      SessionGetCommand,
+      { stream: this.stream(), id: wireConversation(id) },
+      options
+    )
     if (outcome.kind !== "info") throw unexpected("get")
     return outcome.info
   }
@@ -597,67 +644,106 @@ export class Sessions {
 
   /** One session's folded state document with up to `historyLimit` history
    * rows. Zero leaves the history size to the server. */
-  async state(id: ConversationId, historyLimit: number): Promise<SessionStateView> {
-    const outcome = await readSession(this.laser, SessionStateCommand, {
-      stream: this.stream(),
-      id: wireConversation(id),
-      historyLimit
-    })
+  async state(
+    id: ConversationId,
+    historyLimit: number,
+    options: CallOptions = {}
+  ): Promise<SessionStateView> {
+    const outcome = await readSession(
+      this.laser,
+      SessionStateCommand,
+      { stream: this.stream(), id: wireConversation(id), historyLimit },
+      options
+    )
     if (outcome.kind !== "state") throw unexpected("state")
     return outcome.state
   }
 
   /** The resources one session wrote, recalled, or touched, narrowed to
    * `surface` when given. */
-  async links(id: ConversationId, surface?: LinkSurface): Promise<SessionLinksView> {
-    const outcome = await readSession(this.laser, SessionLinksCommand, {
-      stream: this.stream(),
-      id: wireConversation(id),
-      ...(surface !== undefined ? { surface } : {})
-    })
+  async links(
+    id: ConversationId,
+    surface?: LinkSurface,
+    options: CallOptions = {}
+  ): Promise<SessionLinksView> {
+    const outcome = await readSession(
+      this.laser,
+      SessionLinksCommand,
+      {
+        stream: this.stream(),
+        id: wireConversation(id),
+        ...(surface !== undefined ? { surface } : {})
+      },
+      options
+    )
     if (outcome.kind !== "links") throw unexpected("links")
     return outcome.links
   }
 
   /** The source partitions that hold one session's records. */
-  async sources(id: ConversationId): Promise<SessionSourcesView> {
-    const outcome = await readSession(this.laser, SessionSourcesCommand, {
-      stream: this.stream(),
-      id: wireConversation(id)
-    })
+  async sources(id: ConversationId, options: CallOptions = {}): Promise<SessionSourcesView> {
+    const outcome = await readSession(
+      this.laser,
+      SessionSourcesCommand,
+      { stream: this.stream(), id: wireConversation(id) },
+      options
+    )
     if (outcome.kind !== "sources") throw unexpected("sources")
     return outcome.sources
   }
 
   /** @internal */
-  async registeredLane(id: ConversationId): Promise<readonly [number, bigint, number] | undefined> {
-    const outcome = await readSession(this.laser, SessionSourcesCommand, {
-      stream: this.stream(),
-      id: wireConversation(id),
-      laneOnly: true
-    })
+  async registeredLane(
+    id: ConversationId,
+    options: CallOptions = {}
+  ): Promise<readonly [number, bigint, number] | undefined> {
+    const outcome = await readSession(
+      this.laser,
+      SessionSourcesCommand,
+      { stream: this.stream(), id: wireConversation(id), laneOnly: true },
+      options
+    )
     if (outcome.kind !== "sources") throw unexpected("sources")
     return outcome.sources.lane
   }
 
-  /** The change rows of this stream after `after`, up to `limit`. Zero leaves
-   * the page size to the server. */
-  async changes(after: bigint, limit: number): Promise<SessionChangesView> {
-    const outcome = await readSession(this.laser, SessionChangesCommand, {
-      stream: this.stream(),
-      after,
-      limit
-    })
+  /** One page of this stream's change feed in sequence order. Page `page` of
+   * size `results` holds the changes with sequence `(page - 1) * results + 1`
+   * to `page * results`, so appends and pruning never shift it. Zero `results`
+   * leaves the page size to the server, and the reply names the size it used. */
+  async changes(
+    page: number,
+    results: number,
+    options: CallOptions = {}
+  ): Promise<SessionChangesView> {
+    return this.readChanges(page, results, options)
+  }
+
+  private async readChanges(
+    page: number,
+    results: number,
+    options: CallOptions & { readonly deadline?: number }
+  ): Promise<SessionChangesView> {
+    const outcome = await readSession(
+      this.laser,
+      SessionChangesCommand,
+      {
+        stream: this.stream(),
+        page,
+        results
+      },
+      options
+    )
     if (outcome.kind !== "changes") throw unexpected("changes")
     return outcome.changes
   }
 
   /** Follow this stream's session changes from now, polling every
    * `pollEveryMs` and coalescing the changed session ids of each poll. The
-   * watch starts at the change rows retained when this call resolves, so a
-   * change made after it is never missed. */
-  watch(pollEveryMs: number): Promise<SessionWatch> {
-    return SessionWatch.create(this.laser, this.stream(), pollEveryMs)
+   * watch starts in one read at the newest change when this call resolves, so
+   * a change made after it is never missed and no retained change replays. */
+  watch(pollEveryMs: number, options: CallOptions = {}): Promise<SessionWatch> {
+    return SessionWatch.create(this.laser, this.stream(), pollEveryMs, options)
   }
 
   /** Operator control of the session `id` in `stream`. */
@@ -683,6 +769,10 @@ export class SubmitBuilder {
   private budgetValue: Budget | undefined
   private readonly tags: string[] = []
 
+  // The id of an unlabeled submission, minted once so `id` names the
+  // session `send` writes.
+  private readonly fresh = ConversationId.new()
+
   private constructor(
     private readonly sessions: Sessions,
     private readonly laser: Laser,
@@ -698,6 +788,14 @@ export class SubmitBuilder {
     input: Uint8Array
   ): SubmitBuilder {
     return new SubmitBuilder(sessions, laser, agent, input)
+  }
+
+  /** The id of the session `send` writes: the label's derived id, or one fresh
+   * id minted for this submission. */
+  id(): ConversationId {
+    return this.labelValue === undefined
+      ? this.fresh
+      : deriveSessionId(this.sessions.stream(), this.namespaceName ?? "", this.labelValue)
   }
 
   /** The agent that submits the session. Required. */
@@ -736,15 +834,16 @@ export class SubmitBuilder {
     return this
   }
 
-  /** Write the submitted status and the command. */
-  async send(): Promise<Submitted> {
+  /** Write the submitted status and the command. A labeled session that ended
+   * completed or failed resumes, and one an agent or an operator canceled is
+   * refused with `SessionEndedError`. When the command cannot be published
+   * after the status was written, the session is ended failed, so it never
+   * stays submitted with no work, and the publish error is rethrown. */
+  async send(options: CallOptions = {}): Promise<Submitted> {
+    throwIfAborted(options.signal, "session submit")
     const submitter = this.submitter
     if (submitter === undefined) throw new InvalidError("a submission needs `.from(submitter)`")
-    const stream = this.sessions.stream()
-    const session =
-      this.labelValue === undefined
-        ? ConversationId.new()
-        : deriveSessionId(stream, this.namespaceName ?? "", this.labelValue)
+    const session = this.id()
     const config = this.sessions.config
     const start: SessionStart = {
       ...(this.labelValue !== undefined ? { label: this.labelValue } : {}),
@@ -756,7 +855,21 @@ export class SubmitBuilder {
       tags: [...this.tags]
     }
     const body = encodeNamed(encodeSessionStart(start))
-    const lane = this.sessions.open(session).asAgent(submitter).lane()
+    const handle = this.sessions.open(session).asAgent(submitter)
+    if (this.labelValue !== undefined && (await handle.endedAs(options)) === "canceled") {
+      throw new SessionEndedError(session.toString(), "canceled")
+    }
+    // An abort after the status write starts leaves the command to follow, so
+    // the session never stays submitted with no work.
+    return cancellable(options.signal, "session submit", () => this.write(handle, session, body))
+  }
+
+  private async write(
+    handle: Session,
+    session: ConversationId,
+    body: Uint8Array
+  ): Promise<Submitted> {
+    const lane = handle.lane()
     await lane
       .status(OPERATION_SESSION)
       .withTaskState(taskStateFromCode(TaskStateName.Submitted))
@@ -764,12 +877,27 @@ export class SubmitBuilder {
       .contentType(ContentType.Cbor)
       .send()
     const correlation = MintUlid.mint(CorrelationId)
-    await lane
-      .command(correlation, this.input)
-      .withOperation(this.operationName)
-      .withTarget(this.agent)
-      .withMetadata(METADATA_SUBMITTED, { kind: "bool", value: true })
-      .send()
+    try {
+      await lane
+        .command(correlation, this.input)
+        .withOperation(this.operationName)
+        .withTarget(this.agent)
+        .withMetadata(METADATA_SUBMITTED, { kind: "bool", value: true })
+        .send()
+    } catch (error) {
+      try {
+        await handle.fail({
+          code: { kind: "known", name: "Internal" },
+          message: `the submitted command was not published: ${error instanceof Error ? error.message : String(error)}`,
+          retryable: true
+        })
+      } catch (ended) {
+        warn(
+          `Ending submitted session ${session.toString()} after its command failed to publish also failed: ${String(ended)}`
+        )
+      }
+      throw error
+    }
     return { session, correlation }
   }
 }
@@ -819,41 +947,56 @@ export class SessionControl {
    * addressees of its work commands and the agents that picked it up. Every
    * agent that receives work for the session holds it until the resume, named
    * or not. */
-  async pause(): Promise<AgdxReceipt> {
-    const participants = this.named ?? (await laneParticipants(this.laser, this.session))
-    return this.request(OPERATION_SESSION_PAUSE, encodeSessionPauseRequestJson({ participants }))
+  async pause(options: CallOptions = {}): Promise<AgdxReceipt> {
+    throwIfAborted(options.signal, "session control")
+    const participants =
+      this.named ??
+      (await abortable(
+        laneParticipants(this.laser, this.session),
+        options.signal,
+        "session control"
+      ))
+    return this.request(
+      OPERATION_SESSION_PAUSE,
+      options,
+      encodeSessionPauseRequestJson({ participants })
+    )
   }
 
   /** Ask a paused session's agents to resume. */
-  async resume(): Promise<AgdxReceipt> {
-    return this.request(OPERATION_SESSION_RESUME)
+  async resume(options: CallOptions = {}): Promise<AgdxReceipt> {
+    return this.request(OPERATION_SESSION_RESUME, options)
   }
 
   /** Ask the session's agents to end it as canceled at their next boundary. */
-  async cancel(): Promise<AgdxReceipt> {
-    return this.request(OPERATION_SESSION_CANCEL)
+  async cancel(options: CallOptions = {}): Promise<AgdxReceipt> {
+    return this.request(OPERATION_SESSION_CANCEL, options)
   }
 
   /** End the session as canceled without its agents, for a session whose agent
    * is gone. */
-  async forceCancel(): Promise<AgdxReceipt> {
-    return this.sign(
-      this.producer()
-        .status(OPERATION_SESSION)
-        .withTaskState(taskStateFromCode(TaskStateName.Canceled))
-        .body(encodeNamed(encodeSessionEnd({ reason: "forced" })))
-        .contentType(ContentType.Cbor)
-        .last()
-    ).sendReceipt()
+  async forceCancel(options: CallOptions = {}): Promise<AgdxReceipt> {
+    return cancellable(options.signal, "session control", () =>
+      this.sign(
+        this.producer()
+          .status(OPERATION_SESSION)
+          .withTaskState(taskStateFromCode(TaskStateName.Canceled))
+          .body(encodeNamed(encodeSessionEnd({ reason: "forced" })))
+          .contentType(ContentType.Cbor)
+          .last()
+      ).sendReceipt(options)
+    )
   }
 
-  private request(operation: string, body = "{}"): Promise<AgdxReceipt> {
-    return this.sign(
-      this.producer()
-        .command(MintUlid.mint(CorrelationId), new TextEncoder().encode(body))
-        .withOperation(operation)
-        .contentType(ContentType.Json)
-    ).sendReceipt()
+  private request(operation: string, options: CallOptions, body = "{}"): Promise<AgdxReceipt> {
+    return cancellable(options.signal, "session control", () =>
+      this.sign(
+        this.producer()
+          .command(MintUlid.mint(CorrelationId), new TextEncoder().encode(body))
+          .withOperation(operation)
+          .contentType(ContentType.Json)
+      ).sendReceipt(options)
+    )
   }
 
   private sign(send: AgdxSend): AgdxSend {
@@ -917,7 +1060,7 @@ export class SessionBuilder {
 
   /** The idle timeout, instead of the configured default. */
   idleTimeout(timeoutMs: number): this {
-    this.idleTimeoutMs = duration(timeoutMs, "idle timeout")
+    this.idleTimeoutMs = positiveDuration(timeoutMs, "idle timeout")
     return this
   }
 
@@ -942,10 +1085,36 @@ export class SessionBuilder {
   }
 
   /** Write the session start on the lane and take a lease that keeps the
-   * session listed in this process's heartbeat. */
-  async begin(): Promise<{ readonly session: Session; readonly lease: SessionLease }> {
+   * session listed in this process's heartbeat. A labeled session or one with
+   * an explicit id that already ended is refused with `SessionEndedError`
+   * before anything is written. Reopen a completed or failed one with
+   * `resume`. */
+  begin(
+    options: CallOptions = {}
+  ): Promise<{ readonly session: Session; readonly lease: SessionLease }> {
+    return this.open(false, options)
+  }
+
+  /** `begin` that also reopens a session that ended completed or failed: its
+   * new start record follows the earlier terminal, and the next `end`, `fail`,
+   * or `cancel` ends it again. A session an agent or an operator canceled
+   * stays ended and is refused with `SessionEndedError`. */
+  resume(
+    options: CallOptions = {}
+  ): Promise<{ readonly session: Session; readonly lease: SessionLease }> {
+    return this.open(true, options)
+  }
+
+  // The lease is taken only after every wait returned, so an aborted begin
+  // leaves no lease behind.
+  private async open(
+    resume: boolean,
+    options: CallOptions
+  ): Promise<{ readonly session: Session; readonly lease: SessionLease }> {
+    throwIfAborted(options.signal, "session begin")
     const agent = this.agentId
     if (agent === undefined) throw new InvalidError("a session needs an agent")
+    const named = this.explicitId !== undefined || this.label !== undefined
     const id = this.id()
     const config = this.sessions.config
     const idleTimeoutMs = this.idleTimeoutMs ?? config.idleTimeoutValue
@@ -962,17 +1131,26 @@ export class SessionBuilder {
     }
     const body = encodeNamed(encodeSessionStart(start))
     const session = this.sessions.open(id).asAgent(agent).withAncestry(this.parentId, this.rootId)
-    const generation = await session.streamGeneration()
-    await session
-      .withEnvelopeAncestry(
-        session
-          .lane()
-          .status(OPERATION_SESSION)
-          .withTaskState(taskStateFromCode(TaskStateName.Working))
-          .body(body)
-          .contentType(ContentType.Cbor)
-      )
-      .send()
+    if (named) {
+      const ended = await session.endedAs(options)
+      if (ended !== undefined && (!resume || ended === "canceled"))
+        throw new SessionEndedError(id.toString(), ended)
+    }
+    const generation = await session.streamGeneration(options)
+    await abortable(
+      session
+        .withEnvelopeAncestry(
+          session
+            .lane(options)
+            .status(OPERATION_SESSION)
+            .withTaskState(taskStateFromCode(TaskStateName.Working))
+            .body(body)
+            .contentType(ContentType.Cbor)
+        )
+        .send(options),
+      options.signal,
+      "session begin"
+    )
     return { session, lease: session.lease(generation, idleTimeoutMs) }
   }
 }
@@ -1024,7 +1202,7 @@ export class Session {
     return new Session(laser, config, conversation, {
       laneGuard: new LaneGuard(),
       terminal: {},
-      state: { revision: 0n, document: undefined, sinceSnapshot: 0 },
+      state: { revision: 0n, document: undefined, sinceSnapshot: 0, tail: Promise.resolve() },
       redactor: defaultRedact
     })
   }
@@ -1100,61 +1278,76 @@ export class Session {
 
   /** Append one typed envelope to the session lane. The envelope must name this
    * session as its conversation. */
-  append(envelope: AgentEnvelope): Promise<AgdxReceipt> {
-    if (envelope.conversation.toString() !== this.conversation.toString()) {
-      return Promise.reject(new InvalidError("an appended envelope must belong to this session"))
-    }
-    return this.laser
-      .agdx(AgentTopic.Sessions, AgentId.new(envelope.source), this.conversation)
-      .withLaneGuard(() => this.parts.laneGuard.check(this.laser, this.conversation))
-      .publishEnvelope(envelope)
+  append(envelope: AgentEnvelope, options: CallOptions = {}): Promise<AgdxReceipt> {
+    return cancellable(options.signal, "session append", () => {
+      if (envelope.conversation.toString() !== this.conversation.toString()) {
+        return Promise.reject(new InvalidError("an appended envelope must belong to this session"))
+      }
+      return this.laser
+        .agdx(AgentTopic.Sessions, AgentId.new(envelope.source), this.conversation)
+        .withLaneGuard(() => this.parts.laneGuard.check(this.laser, this.conversation, options))
+        .publishEnvelope(envelope, options)
+    })
   }
 
   /** End the session as completed. State changed since the last snapshot is
    * snapshotted first, so a reader can start from the final document. */
-  async end(): Promise<void> {
-    await this.state().snapshotIfChanged()
-    await this.terminate("Completed", {})
+  async end(options: CallOptions = {}): Promise<void> {
+    await this.state().snapshotIfChanged(options)
+    await this.terminate("Completed", {}, options)
   }
 
   /** End the session as failed with `error`. */
-  fail(error: AgentErrorBody): Promise<void> {
-    return this.terminate("Failed", { error })
+  fail(error: AgentErrorBody, options: CallOptions = {}): Promise<void> {
+    return this.terminate("Failed", { error }, options)
   }
 
   /** End the session as canceled. */
-  cancel(): Promise<void> {
-    return this.terminate("Canceled", {})
+  cancel(options: CallOptions = {}): Promise<void> {
+    return this.terminate("Canceled", {}, options)
   }
 
   /** Run `work` inside the session and end it by the outcome: completed on
    * success, failed on a throw or a rejection, which is rethrown unchanged
-   * after the failure is written. A thrown value that is not a `LaserError`
-   * marks the failure as a panic. When the terminal write also fails, the
-   * error from `work` is what surfaces. The lease is released either way. A
+   * after the failure is written. A thrown `Error` records its class name and
+   * stack. When the terminal write also fails, the error from `work` is what
+   * surfaces. The lease is released either way. A
    * process that dies mid-run is not captured, and the session then shows idle
    * once its heartbeat stops. */
-  async run<T>(lease: SessionLease, work: (session: Session) => T | Promise<T>): Promise<T> {
+  async run<T>(
+    lease: SessionLease,
+    work: (session: Session) => T | Promise<T>,
+    options: CallOptions = {}
+  ): Promise<T> {
     try {
+      throwIfAborted(options.signal, "session run")
       let value: T
       try {
-        value = await work(this)
+        value = await abortable(Promise.resolve(work(this)), options.signal, "session run")
       } catch (error) {
+        // An aborted run stops waiting and writes no terminal, as a run whose
+        // process stopped, so the session shows idle once the lease is gone.
+        throwIfAborted(options.signal, "session run")
         try {
-          await this.fail(failureBody(error))
+          await this.fail(failureBody(error), options)
         } catch {
           // The work error is the one that surfaces.
         }
         throw error
       }
-      await this.end()
+      await this.end(options)
       return value
     } finally {
       lease.release()
     }
   }
 
-  private async terminate(state: TerminalState, end: SessionEnd): Promise<void> {
+  private async terminate(
+    state: TerminalState,
+    end: SessionEnd,
+    options: CallOptions = {}
+  ): Promise<void> {
+    throwIfAborted(options.signal, "session end")
     let intent = this.parts.terminal.intent
     if (intent !== undefined && intent.state !== state) {
       throw new InvalidError(`session already ending as ${intent.state.toLowerCase()}`)
@@ -1163,7 +1356,7 @@ export class Session {
       intent = { state, end, record: MintUlid.mint(RecordId) }
       this.parts.terminal.intent = intent
     }
-    const status = this.lane()
+    const status = this.lane(options)
       .status(OPERATION_SESSION)
       .withTaskState(taskStateFromCode(TaskStateName[intent.state]))
       .withRecord(intent.record)
@@ -1171,7 +1364,11 @@ export class Session {
       .contentType(ContentType.Cbor)
       .last()
     const key = this.parts.key
-    await this.withEnvelopeAncestry(key === undefined ? status : status.signedBy(key)).send()
+    await abortable(
+      this.withEnvelopeAncestry(key === undefined ? status : status.signedBy(key)).send(options),
+      options.signal,
+      "session end"
+    )
   }
 
   /** @internal */
@@ -1205,76 +1402,112 @@ export class Session {
   /** The managed state view of this session, `undefined` on a deployment
    * that does not index sessions.
    * @internal */
-  async managedStateView(): Promise<SessionStateView | undefined> {
-    if (!(await this.laser.capabilities()).sessions) return undefined
-    return this.laser.sessions(this.config).state(this.conversation, 0)
+  async managedStateView(options: CallOptions = {}): Promise<SessionStateView | undefined> {
+    throwIfAborted(options.signal, "session state read")
+    if (
+      !(await abortable(this.laser.capabilities(), options.signal, "session state read")).sessions
+    )
+      return undefined
+    return this.laser.sessions(this.config).state(this.conversation, 0, options)
   }
 
-  /** Assemble the model context under `policy` from the session lane and
-   * describe it in a manifest. Nothing is written. */
-  async assemble(policy: ContextPolicy): Promise<AssembledContext> {
+  /** Assemble the model context under `policy` from the conversation records
+   * of the session and describe it in a manifest. `policy` selects from the
+   * user, agent, tool, and model response records only: lifecycle, state,
+   * context bookkeeping, and the model requests the session recorded never
+   * reach a prompt. Nothing is written, and a selection over the manifest's
+   * fragment cap is refused before any write. */
+  async assemble(policy: ContextPolicy, options: CallOptions = {}): Promise<AssembledContext> {
+    throwIfAborted(options.signal, "session assemble")
     const name = contextPolicyName(policy)
     const version = contextPolicyVersion(policy)
-    const fragments = await this.scope.fetchWith(LANE_TOPICS, policy)
-    const lane = await this.laneIdentity()
+    const fragments = await abortable(
+      this.laneContext(new ConversationRecords(policy)),
+      options.signal,
+      "session assemble"
+    )
+    const generations = await abortable(
+      this.topicGenerations(fragments),
+      options.signal,
+      "session assemble"
+    )
     let tokens = 0n
     let bytes = 0n
-    const frontier = new Map<number, bigint>()
+    const frontier = new Map<string, readonly [number, number, bigint]>()
     const manifestFragments = fragments.map((message): Fragment => {
-      const size = message.payload.byteLength
+      const size = contextMessageBody(message).byteLength
       const estimate = estimateTokens(size)
       tokens += estimate
       bytes += BigInt(size)
-      const seen = frontier.get(message.id.partitionId)
-      if (seen === undefined || message.id.offset > seen)
-        frontier.set(message.id.partitionId, message.id.offset)
+      const key = `${String(message.topicId)}:${String(message.id.partitionId)}`
+      const seen = frontier.get(key)
+      if (seen === undefined || message.id.offset > seen[2])
+        frontier.set(key, [message.topicId, message.id.partitionId, message.id.offset])
+      const generation = generations.get(message.topic)
       return {
         kind: "message",
         at: {
           kind: "message",
-          stream: lane.streamId,
-          topic: lane.topicId,
+          stream: message.streamId,
+          topic: message.topicId,
           partition: message.id.partitionId,
           offset: message.id.offset,
-          generation: lane.generation,
+          ...(generation !== undefined ? { generation } : {}),
           conversation: this.conversation.toString()
         },
         tokens: Number(estimate > U32_MAX ? U32_MAX : estimate),
         bytes: Math.min(size, Number(U32_MAX))
       }
     })
-    return AssembledContext.create(fragments, {
+    const manifest = {
       policy: name,
       policyVersion: version,
       fragments: manifestFragments,
       tokens,
       bytes,
-      frontier: [...frontier]
-        .sort(([left], [right]) => left - right)
-        .map(([partition, offset]) => [lane.topicId, partition, offset] as const)
-    })
+      frontier: [...frontier.values()].sort(
+        (left, right) => left[0] - right[0] || left[1] - right[1]
+      )
+    }
+    // Encoding validates the manifest, so an oversized selection fails here.
+    encodeContextManifest(manifest)
+    return AssembledContext.create(fragments, manifest)
   }
 
   /** Record a model request addressed to this agent, and the context it
    * received when `assembled` is given. Finish the returned call when the
-   * application's provider answers. */
-  async model(request: ModelRequest, assembled?: AssembledContext): Promise<ModelCall> {
+   * application's provider answers. The request is marked recorded, so the
+   * agent's own runtime never takes it as new work. */
+  async model(
+    request: ModelRequest,
+    assembled?: AssembledContext,
+    options: CallOptions = {}
+  ): Promise<ModelCall> {
+    throwIfAborted(options.signal, "session model call")
     const correlation = MintUlid.mint(CorrelationId)
-    await this.writeModelRequest(correlation, request, assembled)
+    await this.writeModelRequest(correlation, request, assembled, options)
     return ModelCall.create(this, correlation, request.operation)
   }
 
-  /** Record a tool call addressed to this agent, with `args` redacted. */
-  async tool(name: string, args: unknown): Promise<ToolCall> {
+  /** Record a tool call addressed to this agent, with `args` redacted. The
+   * call is marked recorded, so the agent's own runtime never takes it as new
+   * work. */
+  async tool(name: string, args: unknown, options: CallOptions = {}): Promise<ToolCall> {
+    throwIfAborted(options.signal, "session tool call")
     const agent = this.requireAgent()
     const correlation = MintUlid.mint(CorrelationId)
-    await this.lane()
-      .command(correlation, new TextEncoder().encode(JSON.stringify(this.parts.redactor(args))))
-      .withOperation(OPERATION_EXECUTE_TOOL)
-      .withTool(name)
-      .withTarget(agent)
-      .contentType(ContentType.Json)
-      .send()
+    await abortable(
+      this.lane(options)
+        .command(correlation, new TextEncoder().encode(JSON.stringify(this.parts.redactor(args))))
+        .withOperation(OPERATION_EXECUTE_TOOL)
+        .withTool(name)
+        .withTarget(agent)
+        .withMetadata(METADATA_RECORDED, { kind: "bool", value: true })
+        .contentType(ContentType.Json)
+        .send(options),
+      options.signal,
+      "session tool call"
+    )
     return ToolCall.create(this, correlation, name)
   }
 
@@ -1284,16 +1517,19 @@ export class Session {
   async recordModelCall(
     request: ModelRequest,
     response: ModelResponse,
-    assembled?: AssembledContext
+    assembled?: AssembledContext,
+    options: CallOptions = {}
   ): Promise<AgdxReceipt> {
+    throwIfAborted(options.signal, "session model call")
     const correlation = MintUlid.mint(CorrelationId)
-    await this.writeModelRequest(correlation, request, assembled)
+    await this.writeModelRequest(correlation, request, assembled, options)
     return this.writeResult(
       correlation,
       request.operation,
       undefined,
       response,
-      response.durationMs ?? 0
+      response.durationMs ?? 0,
+      options
     )
   }
 
@@ -1311,8 +1547,8 @@ export class Session {
 
   /** This session's summary from the deployment's session index: status,
    * participants, counters, and the derived idle and over-budget flags. */
-  status(): Promise<SessionInfo> {
-    return this.laser.sessions().get(this.conversation)
+  status(options: CallOptions = {}): Promise<SessionInfo> {
+    return this.laser.sessions().get(this.conversation, options)
   }
 
   /** The pause and cancel requests operators sent this session on
@@ -1321,21 +1557,21 @@ export class Session {
    * and the first read of a session folds its retained control records.
    * Outside a runtime every call reads the retained records. The runtime only
    * records requests: the handler decides when to stop. */
-  async pendingControl(): Promise<PendingControl> {
-    return (await this.controlState()).flags
+  async pendingControl(options: CallOptions = {}): Promise<PendingControl> {
+    return (await this.controlState(options)).flags
   }
 
   /** The control state of this session, from the runtime's control book when
    * it is current, otherwise folded from the retained control records.
    * @internal */
-  async controlState(): Promise<ControlState> {
+  async controlState(options: CallOptions = {}): Promise<ControlState> {
+    throwIfAborted(options.signal, "session control read")
     const conversation = this.conversation.toString()
     const known = this.parts.control?.state(conversation)
     if (known !== undefined) return known
     const me = this.parts.agent?.wireId()
-    const records = [
-      ...(await this.scope.fetchWith([AgentTopic.Control], new LastN(Number.MAX_SAFE_INTEGER)))
-    ].sort(
+    const retained = await abortable(this.controlRecords(), options.signal, "session control read")
+    const records = [...retained].sort(
       (left, right) =>
         compareBigint(left.timestampMicros, right.timestampMicros) ||
         left.id.partitionId - right.id.partitionId ||
@@ -1345,7 +1581,11 @@ export class Session {
     const partitions =
       stream === undefined
         ? undefined
-        : await this.laser[INTERNAL_TRANSPORT]().findTopicPartitionCount(stream, AGENT_CONTROL)
+        : await abortable(
+            this.laser[INTERNAL_TRANSPORT]().findTopicPartitionCount(stream, AGENT_CONTROL),
+            options.signal,
+            "session control read"
+          )
     const [state, last] = foldControl(
       records.flatMap((record) => {
         const request =
@@ -1367,27 +1607,39 @@ export class Session {
    * start record against the `usage` of every record. A session without a
    * budget is never over it. The answer is eventually consistent, so a
    * budget is a cooperative limit, not a hard spending cap. */
-  async overBudget(): Promise<boolean> {
-    return (await this.budgetBreach()) !== undefined
+  async overBudget(options: CallOptions = {}): Promise<boolean> {
+    return (await this.budgetBreach(options)) !== undefined
   }
 
   /** How this session passed its budget, `undefined` while within it.
    * @internal */
-  async budgetBreach(): Promise<BudgetBreach | undefined> {
-    if ((await this.laser.capabilities()).sessions) {
+  async budgetBreach(options: CallOptions = {}): Promise<BudgetBreach | undefined> {
+    throwIfAborted(options.signal, "session budget read")
+    if (
+      (await abortable(this.laser.capabilities(), options.signal, "session budget read")).sessions
+    ) {
       try {
-        return breachOfInfo(await this.status())
+        return breachOfInfo(await this.status(options))
       } catch (error) {
-        if (!unknownToIndex(error)) throw error
+        if (!indexUnusable(error)) throw error
       }
     }
-    const records = await this.scope.fetchWith(
-      [AgentTopic.Sessions],
-      new LastN(Number.MAX_SAFE_INTEGER)
+    const records = await abortable(this.laneRecords(), options.signal, "session budget read")
+    const onLane = new Set(
+      records.flatMap((record) =>
+        record.topic === AGENT_SESSIONS && record.envelope !== undefined ? [record.envelope] : []
+      )
     )
-    return laneBreach(
-      records.flatMap((record) => (record.envelope === undefined ? [] : [record.envelope]))
+    const breach = laneBreach(
+      records.flatMap((record) => (record.envelope === undefined ? [] : [record.envelope])),
+      (envelope) => onLane.has(envelope)
     )
+    if (!breach.started && records.length > 0) {
+      warn(
+        `The retained lane of session ${this.conversation.toString()} no longer holds its start record, so its budget is unknown and it reads as within budget`
+      )
+    }
+    return breach.breach
   }
 
   /** End the session failed with reason `budget`. The terminal latch makes a
@@ -1404,29 +1656,27 @@ export class Session {
    * have not reported handled. A session canceled while paused keeps its held
    * records here unprocessed. The read covers the newest
    * `CONTEXT_READ_WINDOW` records of each `agent.sessions` partition. */
-  parked(): Promise<ParkedRecords> {
-    return readParked(this.laser, this.conversation.toString())
+  parked(options: CallOptions = {}): Promise<ParkedRecords> {
+    return cancellable(options.signal, "session parked read", () =>
+      readParked(this.laser, this.conversation.toString())
+    )
   }
 
   /** Whether an operator asked to cancel this session on `agent.control`, by a
-   * cancel request or a forced cancel. Reads the retained control records of
-   * this session, so it answers on open Apache Iggy too. */
-  async cancelRequested(): Promise<boolean> {
-    const records = await this.scope.fetchWith(
-      [AgentTopic.Control],
-      new LastN(Number.MAX_SAFE_INTEGER)
-    )
-    return records.some(
-      (record) =>
-        record.envelope?.operation === OPERATION_SESSION_CANCEL ||
-        (record.envelope?.taskState?.kind === "known" &&
-          record.envelope.taskState.name === "Canceled")
-    )
+   * cancel request or a forced cancel addressed to this handle's agent or to
+   * every agent, on the session's control route: the `cancelRequested` flag of
+   * `pendingControl`. It answers on open Apache Iggy too. */
+  async cancelRequested(options: CallOptions = {}): Promise<boolean> {
+    return (await this.controlState(options)).flags.cancelRequested
   }
 
   /** Record that `items`, recalled for `query` when there was one, entered
    * the session's context, with each item's id and score. */
-  recordRetrieval(query: string | undefined, items: readonly MemoryItem[]): Promise<AgdxReceipt> {
+  recordRetrieval(
+    query: string | undefined,
+    items: readonly MemoryItem[],
+    options: CallOptions = {}
+  ): Promise<AgdxReceipt> {
     return this.writeEvent(
       OPERATION_CONTEXT_RETRIEVED,
       encodeNamed(
@@ -1435,16 +1685,20 @@ export class Session {
           items: items.map((item) => [item.id.toString(), item.score ?? 0] as const)
         }),
         { forceFloatNumbers: true }
-      )
+      ),
+      undefined,
+      options
     )
   }
 
   /** Record that a summary replaced the covered records of the session's
    * context. */
-  recordCompaction(compaction: ContextCompaction): Promise<AgdxReceipt> {
+  recordCompaction(compaction: ContextCompaction, options: CallOptions = {}): Promise<AgdxReceipt> {
     return this.writeEvent(
       OPERATION_CONTEXT_COMPACTED,
-      encodeNamed(encodeContextCompaction(compaction))
+      encodeNamed(encodeContextCompaction(compaction)),
+      undefined,
+      options
     )
   }
 
@@ -1460,10 +1714,12 @@ export class Session {
     operation: string,
     tool: string | undefined,
     response: Omit<ModelResponse, "duration">,
-    durationMs: number
+    durationMs: number,
+    options: CallOptions = {}
   ): Promise<AgdxReceipt> {
+    throwIfAborted(options.signal, "session write")
     const agent = this.requireAgent()
-    let send = this.lane()
+    let send = this.lane(options)
       .respond(correlation, response.body)
       .withOperation(operation)
       .withTarget(agent)
@@ -1476,7 +1732,7 @@ export class Session {
     if (response.model !== undefined)
       send = send.withMetadata(METADATA_RESPONSE_MODEL, { kind: "str", value: response.model })
     if (response.finishReason !== undefined) send = send.withFinishReason(response.finishReason)
-    return send.sendReceipt()
+    return abortable(send.sendReceipt(options), options.signal, "session write")
   }
 
   /** @internal */
@@ -1484,23 +1740,35 @@ export class Session {
     correlation: CorrelationId,
     operation: string,
     tool: string | undefined,
-    error: AgentErrorBody
+    error: AgentErrorBody,
+    options: CallOptions = {}
   ): Promise<AgdxReceipt> {
-    const agent = this.requireAgent()
-    let send = this.lane().fail(correlation, error).withOperation(operation).withTarget(agent)
-    if (tool !== undefined) send = send.withTool(tool)
-    return send.sendReceipt()
+    return cancellable(options.signal, "session write", () => {
+      const agent = this.requireAgent()
+      let send = this.lane(options)
+        .fail(correlation, error)
+        .withOperation(operation)
+        .withTarget(agent)
+      if (tool !== undefined) send = send.withTool(tool)
+      return send.sendReceipt(options)
+    })
   }
 
   /** @internal */
   writeEvent(
     operation: string,
     body: Uint8Array,
-    correlation?: CorrelationId
+    correlation?: CorrelationId,
+    options: CallOptions = {}
   ): Promise<AgdxReceipt> {
-    let send = this.lane().emit(body).withOperation(operation).contentType(ContentType.Cbor)
-    if (correlation !== undefined) send = send.withCorrelation(correlation)
-    return send.sendReceipt()
+    return cancellable(options.signal, "session write", () => {
+      let send = this.lane(options)
+        .emit(body)
+        .withOperation(operation)
+        .contentType(ContentType.Cbor)
+      if (correlation !== undefined) send = send.withCorrelation(correlation)
+      return send.sendReceipt(options)
+    })
   }
 
   /** @internal */
@@ -1511,7 +1779,8 @@ export class Session {
   private async writeModelRequest(
     correlation: CorrelationId,
     request: ModelRequest,
-    assembled: AssembledContext | undefined
+    assembled: AssembledContext | undefined,
+    options: CallOptions
   ): Promise<void> {
     const agent = this.requireAgent()
     let body = request.body
@@ -1521,19 +1790,21 @@ export class Session {
     } catch {
       // A body that is not JSON is published as it is.
     }
-    let send = this.lane()
+    let send = this.lane(options)
       .command(correlation, body)
       .withOperation(request.operation)
       .withTarget(agent)
+      .withMetadata(METADATA_RECORDED, { kind: "bool", value: true })
       .withMetadata(METADATA_REQUEST_MODEL, { kind: "str", value: request.model })
     if (request.provider !== undefined)
       send = send.withMetadata(METADATA_PROVIDER_NAME, { kind: "str", value: request.provider })
-    await send.send()
+    await abortable(send.send(options), options.signal, "session model call")
     if (assembled !== undefined) {
       await this.writeEvent(
         OPERATION_CONTEXT_ASSEMBLED,
         encodeNamed(encodeContextManifest({ ...assembled.manifest, correlation })),
-        correlation
+        correlation,
+        options
       )
     }
   }
@@ -1552,20 +1823,24 @@ export class Session {
     return agent
   }
 
-  private async laneIdentity(): Promise<{
-    readonly streamId: number
-    readonly topicId: number
-    readonly generation: bigint
-  }> {
+  // The creation time of each topic the fragments were read from, the
+  // generation a fragment's source reference proves its numeric ids with.
+  private async topicGenerations(
+    fragments: readonly ContextMessage[]
+  ): Promise<ReadonlyMap<string, bigint>> {
     const stream = this.stream()
     const transport = this.laser[INTERNAL_TRANSPORT]()
-    if (transport.findSnapshotStream === undefined || transport.findSnapshotTopic === undefined)
+    if (transport.findSnapshotTopic === undefined)
       throw new UnsupportedError("the session lane identity is unavailable")
-    const details = await transport.findSnapshotStream(stream)
-    if (details === undefined) throw new InvalidError("the session stream does not exist")
-    const topic = await transport.findSnapshotTopic(stream, AgentTopic.Sessions)
-    if (topic === undefined) throw new InvalidError("agent.sessions does not exist")
-    return { streamId: details.id, topicId: topic.id, generation: topic.createdAtMicros }
+    const generations = new Map<string, bigint>()
+    for (const message of fragments) {
+      if (generations.has(message.topic)) continue
+      const topic = await transport.findSnapshotTopic(stream, message.topic)
+      if (topic === undefined)
+        throw new InvalidError(`the topic \`${message.topic}\` does not exist`)
+      generations.set(message.topic, topic.createdAtMicros)
+    }
+    return generations
   }
 
   private with(change: Partial<SessionParts>): Session {
@@ -1573,11 +1848,11 @@ export class Session {
   }
 
   /** @internal */
-  lane(): Agdx {
+  lane(options: CallOptions = {}): Agdx {
     if (this.parts.agent === undefined) throw new InvalidError("this session handle has no agent")
     return this.laser
       .agdx(AgentTopic.Sessions, this.parts.agent, this.conversation)
-      .withLaneGuard(() => this.parts.laneGuard.check(this.laser, this.conversation))
+      .withLaneGuard(() => this.parts.laneGuard.check(this.laser, this.conversation, options))
   }
 
   /** @internal */
@@ -1589,8 +1864,9 @@ export class Session {
   }
 
   /** @internal */
-  async streamGeneration(): Promise<bigint> {
-    return (await this.parts.laneGuard.check(this.laser, this.conversation)).streamGeneration
+  async streamGeneration(options: CallOptions = {}): Promise<bigint> {
+    return (await this.parts.laneGuard.check(this.laser, this.conversation, options))
+      .streamGeneration
   }
 
   /** @internal */
@@ -1609,20 +1885,111 @@ export class Session {
     )
   }
 
-  /** The model-ready context: the configured last records on the session lane,
-   * trimmed to the configured estimated token bound. */
-  context(): Promise<readonly SessionTurn[]> {
-    return this.contextWith(
-      new Chain([
-        new LastN(this.config.contextTurnBound),
-        new TokenBudget(this.config.contextTokenBound)
-      ])
+  /** The configured last records of the session, every kind, trimmed to the
+   * configured estimated token bound of their bodies. A model prompt reads
+   * `assemble`, which keeps the conversation records only. */
+  async context(options: CallOptions = {}): Promise<readonly SessionTurn[]> {
+    return turnsOf(
+      await cancellable(options.signal, "session context", () =>
+        this.laneContext(
+          new Chain([
+            new LastN(this.config.contextTurnBound),
+            new TokenBudget(this.config.contextTokenBound)
+          ])
+        )
+      )
     )
   }
 
   /** `context` under an explicit policy. */
-  async contextWith(policy: ContextPolicy): Promise<readonly SessionTurn[]> {
-    return turnsOf(await this.scope.fetchWith(LANE_TOPICS, policy))
+  async contextWith(
+    policy: ContextPolicy,
+    options: CallOptions = {}
+  ): Promise<readonly SessionTurn[]> {
+    return turnsOf(
+      await cancellable(options.signal, "session context", () => this.laneContext(policy))
+    )
+  }
+
+  /** The topics this session's records ride: `agent.sessions` and the declared
+   * topics of the stream's per-agent topic layout.
+   * @internal */
+  laneTopics(): readonly string[] {
+    const topics: string[] = [AGENT_SESSIONS]
+    const layout = this.laser[INTERNAL_LAYOUTS]().get(this.stream())
+    if (layout?.kind === "perAgentTopic") {
+      for (const topic of layout.topics.values()) if (!topics.includes(topic)) topics.push(topic)
+    }
+    return topics
+  }
+
+  /** The newest records of this session under `policy`, within the context
+   * window of each partition its records land on.
+   * @internal */
+  laneContext(policy: ContextPolicy): Promise<readonly ContextMessage[]> {
+    return ContextAssembler.create({
+      conversation: this.conversation,
+      acrossSubconversations: false,
+      topics: this.laneTopics(),
+      policy,
+      fromOffsets: new Map(),
+      conversationPartitions: true
+    }).assemble(this.laser)
+  }
+
+  /** Every retained record of this session, read whole from the partitions
+   * its records land on, for a fold that must see every record.
+   * @internal */
+  laneRecords(): Promise<readonly ContextMessage[]> {
+    return this.replayLane(this.laneTopics(), {})
+  }
+
+  /** How this session ended, `undefined` while it is open or never started.
+   * The retained lane and control route decide, as the session index folds
+   * them, since they are never behind a terminal already written.
+   * @internal */
+  async endedAs(
+    options: CallOptions = {}
+  ): Promise<"completed" | "failed" | "canceled" | undefined> {
+    throwIfAborted(options.signal, "session read")
+    const lifecycle = new LaneLifecycle()
+    for (const record of await abortable(this.laneRecords(), options.signal, "session read")) {
+      if (record.topic === AGENT_SESSIONS && record.envelope !== undefined)
+        lifecycle.add(record.envelope)
+    }
+    const forced = (await abortable(this.controlRecords(), options.signal, "session read")).some(
+      (record) =>
+        record.envelope?.kind === AgentKind.Status &&
+        record.envelope.taskState?.kind === "known" &&
+        record.envelope.taskState.name === "Canceled"
+    )
+    return forced ? "canceled" : lifecycle.ended
+  }
+
+  /** Every retained control record of this session, read whole from its
+   * control route, the one partition of `agent.control` its requests apply
+   * on.
+   * @internal */
+  controlRecords(): Promise<readonly ContextMessage[]> {
+    return this.replayLane([AGENT_CONTROL], {})
+  }
+
+  private replayLane(
+    topics: readonly string[],
+    bounds: { readonly fromCheckpoint?: Checkpoint; readonly toCheckpoint?: Checkpoint }
+  ): Promise<readonly ContextMessage[]> {
+    return replayContext(
+      {
+        conversation: this.conversation,
+        acrossSubconversations: false,
+        topics,
+        policy: new LastN(Number.MAX_SAFE_INTEGER),
+        fromOffsets: new Map(),
+        conversationPartitions: true,
+        ...bounds
+      },
+      this.laser
+    )
   }
 
   /** This session's memory in the configured namespace, scoped to the session. */
@@ -1635,47 +2002,57 @@ export class Session {
     return this.scope.graph(name)
   }
 
-  /** Where the session lane ends right now. Persist it and hand it to
-   * `turnsAt`, `turnsSince`, `stateAt`, or `replay`. */
-  checkpoint(): Promise<Checkpoint> {
-    return this.scope.checkpoint(LANE_TOPICS)
+  /** Where the session lane and the declared agent topics end right now.
+   * Persist it and hand it to `turnsAt`, `turnsSince`, `stateAt`, or
+   * `replay`. */
+  checkpoint(options: CallOptions = {}): Promise<Checkpoint> {
+    return cancellable(options.signal, "session checkpoint", () =>
+      contextCheckpoint(this.laser, this.laneTopics())
+    )
   }
 
   /** The records up to `checkpoint`. */
-  turnsAt(checkpoint: Checkpoint): Promise<readonly SessionTurn[]> {
-    return this.turns({ kind: "at", checkpoint })
+  async turnsAt(
+    checkpoint: Checkpoint,
+    options: CallOptions = {}
+  ): Promise<readonly SessionTurn[]> {
+    return turnsOf(
+      await cancellable(options.signal, "session replay", () =>
+        this.replayLane(this.laneTopics(), { toCheckpoint: checkpoint })
+      )
+    )
   }
 
   /** The records appended after `checkpoint`. */
-  turnsSince(checkpoint: Checkpoint): Promise<readonly SessionTurn[]> {
-    return this.turns({ kind: "from-checkpoint", checkpoint })
+  async turnsSince(
+    checkpoint: Checkpoint,
+    options: CallOptions = {}
+  ): Promise<readonly SessionTurn[]> {
+    return turnsOf(
+      await cancellable(options.signal, "session replay", () =>
+        this.replayLane(this.laneTopics(), { fromCheckpoint: checkpoint })
+      )
+    )
   }
 
   /** Fold the records up to `checkpoint`: state as it stood then. */
   async stateAt<State>(
     checkpoint: Checkpoint,
     initial: State,
-    fold: (state: State, turn: SessionTurn) => State
+    fold: (state: State, turn: SessionTurn) => State,
+    options: CallOptions = {}
   ): Promise<State> {
-    return (await this.turnsAt(checkpoint)).reduce(fold, initial)
+    return (await this.turnsAt(checkpoint, options)).reduce(fold, initial)
   }
 
   /** Fold the records appended after `checkpoint`: bring state saved there up to date. */
   async replay<State>(
     checkpoint: Checkpoint,
     initial: State,
-    fold: (state: State, turn: SessionTurn) => State
+    fold: (state: State, turn: SessionTurn) => State,
+    options: CallOptions = {}
   ): Promise<State> {
-    return (await this.turnsSince(checkpoint)).reduce(fold, initial)
-  }
-
-  private async turns(bound: ReplayBound): Promise<readonly SessionTurn[]> {
-    return turnsOf(
-      await this.scope.state(LANE_TOPICS, bound, [] as ContextMessage[], (acc, message) => {
-        acc.push(message)
-        return acc
-      })
-    )
+    return (await this.turnsSince(checkpoint, options)).reduce(fold, initial)
   }
 }
 
@@ -1692,7 +2069,47 @@ export function sessionTurnText(turn: SessionTurn): string {
   return new TextDecoder().decode(turn.message.envelope?.body ?? turn.message.payload)
 }
 
-const LANE_TOPICS: readonly string[] = [AgentTopic.Sessions]
+// Narrows a history to the conversation records of a session before the inner
+// policy selects from them: no lifecycle, state, or context bookkeeping, and no
+// model request the session recorded, whose body repeats an earlier context.
+class ConversationRecords implements ContextPolicy {
+  constructor(private readonly inner: ContextPolicy) {}
+
+  name(): string {
+    return contextPolicyName(this.inner)
+  }
+
+  version(): string {
+    return contextPolicyVersion(this.inner)
+  }
+
+  select(history: readonly ContextMessage[]): readonly ContextMessage[] {
+    return this.inner.select(history.filter(isConversation))
+  }
+}
+
+// The timeline types of the records a model prompt holds.
+const CONVERSATION_DISPLAYS: ReadonlySet<DisplayType> = new Set<DisplayType>([
+  "user.message",
+  "agent.handoff",
+  "agent.message",
+  "tool.call",
+  "tool.result",
+  "model.response",
+  "error"
+])
+
+function isConversation(message: ContextMessage): boolean {
+  const envelope = message.envelope
+  if (envelope === undefined) return true
+  if (envelope.kind === AgentKind.Status || envelope.kind === AgentKind.Chunk) return false
+  const display = displayType({ kind: "envelope", envelope }, AGENT_SESSIONS)
+  if (display === "model.request") {
+    const recorded = envelope.metadata?.get(METADATA_RECORDED)
+    return !(recorded?.kind === "bool" && recorded.value)
+  }
+  return CONVERSATION_DISPLAYS.has(display)
+}
 
 function turnsOf(messages: readonly ContextMessage[]): readonly SessionTurn[] {
   return messages.map((message) => ({
@@ -1704,15 +2121,23 @@ function turnsOf(messages: readonly ContextMessage[]): readonly SessionTurn[] {
   }))
 }
 
+// A failed session's error body from a thrown value: its message, and for an
+// `Error` its class name and stack, as Python records an exception's type and
+// traceback.
 function failureBody(error: unknown): AgentErrorBody {
   const message = error instanceof Error ? error.message : String(error)
   return {
     code: { kind: "known", name: "Internal" },
     message,
     retryable: false,
-    ...(error instanceof LaserError
-      ? {}
-      : { detail: new Map([["panic", { kind: "bool" as const, value: true }]]) })
+    ...(error instanceof Error
+      ? {
+          detail: new Map([
+            ["exception", { kind: "str" as const, value: error.name }],
+            ["traceback", { kind: "str" as const, value: error.stack ?? "" }]
+          ])
+        }
+      : {})
   }
 }
 
@@ -1737,6 +2162,15 @@ function micros(ms: number): bigint {
 function duration(ms: number, name: string): number {
   if (!Number.isFinite(ms) || ms < 0) {
     throw new InvalidError(`a session ${name} must be a non-negative finite number of milliseconds`)
+  }
+  return ms
+}
+
+// A zero idle timeout or heartbeat would drive the process heartbeat at its
+// floor for every session of the stream.
+function positiveDuration(ms: number, name: string): number {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    throw new InvalidError(`a session ${name} must be a positive finite number of milliseconds`)
   }
   return ms
 }

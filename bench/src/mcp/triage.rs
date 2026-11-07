@@ -162,6 +162,10 @@ pub async fn run_agdx_triage_evidence(
     })
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "awaits the contract send future, about 20 KB in debug"
+)]
 fn triage_operation(
     laser: Laser,
     source: AgentId,

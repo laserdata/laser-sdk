@@ -1,3 +1,4 @@
+import type { CallOptions } from "../client/call-options.js"
 import {
   CancelledError,
   CodecError,
@@ -60,7 +61,7 @@ export class TypedTopic<T> {
     return new TypedTopic(topic, codec, kind, contract)
   }
 
-  async publish(value: T, options?: RawSendOptions): Promise<SendMessagesResponse> {
+  async publish(value: T, options?: RawSendOptions & CallOptions): Promise<SendMessagesResponse> {
     if (options?.key !== undefined && options.partition !== undefined) {
       throw new CodecError(
         "typed publish accepts a routing key or an explicit partition, not both",
@@ -80,20 +81,20 @@ export class TypedTopic<T> {
         headers: this.contractHeaders(options.headers)
       })
     }
-    return request.send()
+    return request.send(options)
   }
 
   async publishBatch(
     values: readonly T[],
-    options?: RawSendOptions
+    options?: RawSendOptions & CallOptions
   ): Promise<SendMessagesResponse> {
     const payloads = values.map((value) => this.encode(value))
     const headers = this.contractHeaders(options?.headers)
     return this.topic.batch(payloads, { ...options, headers })
   }
 
-  async records(readerName: string): Promise<TypedRecords<T>> {
-    const cursor = (await this.topic.replay()).named(readerName)
+  async records(readerName: string, options: CallOptions = {}): Promise<TypedRecords<T>> {
+    const cursor = (await this.topic.replay(options)).named(readerName)
     return TypedRecords.create(cursor, this.codec, this.contract.compiled)
   }
 
@@ -160,6 +161,9 @@ function decodeRecord<T>(
 
 export class TypedRecords<T> {
   private buffered: TypedPollResult<T>[] = []
+  // The next offset per partition past the records handed out so far, while
+  // the cursor's own offsets run ahead to the end of the buffered poll.
+  private delivered: Map<number, bigint> | undefined
 
   private constructor(
     private readonly cursor: Cursor,
@@ -173,16 +177,20 @@ export class TypedRecords<T> {
   }
 
   /**
-   * The next offset to read on each partition. Empty before the first poll
-   * unless `fromOffsets` seeded it. Persist this to resume with `fromOffsets`.
+   * The next offset to read on each partition, past every record handed out
+   * so far. Empty before the first poll unless `fromOffsets` seeded it.
+   * Persist this after handling a record to resume right after it with
+   * `fromOffsets`.
    */
   get offsets(): ReadonlyMap<number, bigint> {
-    return this.cursor.offsets
+    return this.delivered === undefined ? this.cursor.offsets : new Map(this.delivered)
   }
 
   /** Resumes from offsets an earlier `offsets` returned. */
   fromOffsets(offsets: ReadonlyMap<number, bigint>): this {
     this.cursor.fromOffsets(offsets)
+    this.buffered = []
+    this.delivered = undefined
     return this
   }
 
@@ -200,14 +208,24 @@ export class TypedRecords<T> {
    */
   async next(options?: { readonly signal?: AbortSignal }): Promise<TypedPollResult<T> | undefined> {
     if (this.buffered.length === 0) {
+      const before = this.cursor.offsets
       try {
         this.buffered = [...(await this.pollCursor(options))]
       } catch (cause) {
         if (cause instanceof CancelledError) throw cause
         return { kind: "error", error: pollFailure(cause) }
       }
+      this.delivered = new Map(before)
     }
-    return this.buffered.shift()
+    const item = this.buffered.shift()
+    const position = item?.kind === "record" ? item.record.position : item?.error.position
+    if (this.buffered.length === 0) this.delivered = undefined
+    else if (position !== undefined && this.delivered !== undefined) {
+      const past = position.offset + 1n
+      if ((this.delivered.get(position.partitionId) ?? -1n) < past)
+        this.delivered.set(position.partitionId, past)
+    }
+    return item
   }
 
   /**
@@ -216,6 +234,7 @@ export class TypedRecords<T> {
    * Records `next` already buffered come first. A failed poll throws.
    */
   async poll(options?: { readonly signal?: AbortSignal }): Promise<readonly TypedPollResult<T>[]> {
+    this.delivered = undefined
     if (this.buffered.length > 0) return this.buffered.splice(0)
     return this.pollCursor(options)
   }

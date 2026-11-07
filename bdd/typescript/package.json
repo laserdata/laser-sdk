@@ -9,11 +9,14 @@
     "test:run": "cucumber-js --config cucumber.js"
   },
   "dependencies": {
-    "@cucumber/cucumber": "13.2.1",
+    "@cucumber/cucumber": "13.3.0",
     "@laserdata/laser-sdk": "file:../../foreign/typescript"
   },
   "devDependencies": {
-    "@types/node": "22.20.4",
+    "@types/node": "22.20.5",
     "typescript": "7.0.2"
+  },
+  "overrides": {
+    "@cucumber/query": "16.1.1"
   }
 }

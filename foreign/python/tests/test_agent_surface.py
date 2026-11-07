@@ -77,7 +77,7 @@ def test_given_an_intent_without_voters_when_building_it_then_should_raise_its_v
             eligible_voters=[],
             policy=ls.IntentPolicy.any(),
             policy_version=1,
-            deadline_micros=2**62,
+            deadline_at_micros=2**62,
         )
     assert caught.value.kind == ls.IntentError.NO_ELIGIBLE_VOTERS
     assert ls.IntentError.NO_ELIGIBLE_VOTERS == "no_eligible_voters"
@@ -104,8 +104,9 @@ def test_given_a_value_without_decide_when_enrolled_as_a_governor_then_should_ra
 
 
 def test_given_a_deadline_when_building_provenance_then_should_read_it_back():
-    assert ls.Provenance(deadline_micros=1_700_000_000_000_000).deadline == (1_700_000_000_000_000)
-    assert ls.Provenance().deadline is None
+    provenance = ls.Provenance(deadline_at_micros=1_700_000_000_000_000)
+    assert provenance.deadline_at_micros == 1_700_000_000_000_000
+    assert ls.Provenance().deadline_at_micros is None
 
 
 def test_given_a_plain_message_when_reading_its_content_type_then_should_be_none():
@@ -154,7 +155,7 @@ def test_given_fault_reasons_when_resolving_policies_then_should_follow_the_reco
 
 
 def test_given_an_agent_owner_when_deriving_a_content_id_then_should_match_the_pinned_vector():
-    assert ls.memory_id_content("fact", b"x", agent="agent") == "63FZWE3WTSCVXAY845QK4TMVWM"
+    assert ls.memory_id_content("fact", b"x", agent="agent") == "4NEP7F11MYT484GKAGSAS5079E"
 
 
 @pytest.mark.integration
@@ -267,7 +268,7 @@ async def test_given_a_task_binding_when_another_caller_uses_the_task_id_then_sh
     )
     assert refused.get("error") is not None
     canceled = await bridge.cancel(task["id"], caller="alice")
-    assert canceled["status"]["state"].lower() == "canceled"
+    assert canceled["status"]["state"] == "TASK_STATE_CANCELED"
     owned = await bridge.handle_rpc(
         {"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task["id"]}},
         caller="alice",

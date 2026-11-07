@@ -1,5 +1,5 @@
 use crate::agent::PyProvenance;
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::convert::{
     BodyValue, codec_content_type, codec_encode, payload_bytes, py_to_de, py_to_json,
 };
@@ -206,6 +206,7 @@ impl PyPublish {
     /// Use raw payload bytes (str, bytes, or bytearray) with no content-type tag.
     fn payload<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.typed = None;
@@ -218,6 +219,7 @@ impl PyPublish {
     /// hand the bytes and the codec tag in one call.
     fn raw_bytes<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         content_type: String,
     ) -> PyResult<PyRefMut<'py, Self>> {
@@ -234,6 +236,7 @@ impl PyPublish {
     /// Publish one complete self-contained Arrow IPC stream with validated metadata.
     fn arrow_ipc<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         metadata: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
@@ -284,7 +287,7 @@ impl PyPublish {
     }
 
     /// Publish the record.
-    fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn send<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PySendMessagesResponse>> {
         let claim_check = self.claim_check.as_ref().map(|(store, threshold)| {
             (
                 crate::blob::PyBlobStore {
@@ -305,7 +308,7 @@ impl PyPublish {
         let provenance = self.provenance.clone();
         let body = self.body.clone();
         let typed = self.typed.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let handle = match &stream {
                 Some(stream) => laser.stream(stream.clone()).topic(&*topic),
                 None => laser.topic(&*topic),
@@ -531,6 +534,7 @@ impl PyBatchPublish {
     #[pyo3(signature = (payload, *, projection_ref=None))]
     fn add_payload<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         projection_ref: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
@@ -547,6 +551,7 @@ impl PyBatchPublish {
     #[pyo3(signature = (payload, content_type, *, projection_ref=None))]
     fn add_raw_bytes<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         content_type: String,
         projection_ref: Option<String>,
@@ -625,6 +630,7 @@ impl PyBatchPublish {
     #[allow(clippy::too_many_arguments)]
     fn add_record<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         content_type: Option<String>,
         index: Option<std::collections::BTreeMap<String, String>>,
@@ -665,6 +671,7 @@ impl PyBatchPublish {
     /// Append one complete self-contained Arrow IPC stream with validated metadata.
     fn add_arrow_ipc<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
         metadata: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
@@ -728,7 +735,7 @@ impl PyBatchPublish {
 
     /// Flush every queued record in a single Iggy send. Returns the
     /// `SendMessagesResponse` with one confirmation per committed range.
-    fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn send<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PySendMessagesResponse>> {
         let laser = self.laser.clone();
         let stream = self.stream.clone();
         let topic = self.topic.clone();
@@ -740,7 +747,7 @@ impl PyBatchPublish {
         let partition_key = self.partition_key.clone();
         let bodies = self.bodies.clone();
         let typed = self.typed.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let handle = match &stream {
                 Some(stream) => laser.stream(stream.clone()).topic(&*topic),
                 None => laser.topic(&*topic),

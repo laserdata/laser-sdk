@@ -63,7 +63,7 @@ pub struct ForkInfo {
     pub user_id: u32,
     pub status: ForkStatus,
     pub created_at_micros: u64,
-    pub row_count: usize,
+    pub row_count: u64,
 }
 
 /// Wire form of the `AGDX_FORK_CREATE` request. Wire-stability-bound, built
@@ -98,6 +98,11 @@ pub struct ForkPromote {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ForkList {
     pub v: u32,
+    /// The stream whose resources the listing covers. Required in stream
+    /// tenancy, where the server authorizes the stream and lists only its
+    /// resources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// Wire form of the `AGDX_FORK_PUT` request. Wire-stability-bound, built through

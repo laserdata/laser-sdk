@@ -4,10 +4,11 @@ use serde::{Deserialize, Serialize};
 /// ([`AGDX_BATCH_CODE`](crate::codes::AGDX_BATCH_CODE)): up to
 /// [`MAX_BATCH_OPS`](crate::limits::MAX_BATCH_OPS) managed requests in one
 /// round trip, each carrying its own command code and encoded payload. The
-/// batch amortizes the round trip and nothing else: items execute
-/// independently in order, each yields its own result, and a failed item
-/// fails alone (explicitly NOT a transaction). A nested batch (an item whose
-/// code is the batch code) is rejected.
+/// batch amortizes the round trip and nothing else: items execute one after
+/// another in input order, so a later item sees an earlier one's effect, each
+/// yields its own result, and a failed item fails alone (explicitly NOT a
+/// transaction). A nested batch (an item whose code is the batch code) is
+/// rejected.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BatchRequest {
     /// Op version, [`BATCH_OP_VERSION`](crate::codes::BATCH_OP_VERSION).

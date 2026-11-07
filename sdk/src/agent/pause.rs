@@ -1,8 +1,12 @@
+use crate::agent::clock::{Clock, SystemClock};
 use crate::agent::consumer::{
     AgentMessage, MAX_CONSECUTIVE_POLL_ERRORS, backoff_for, decode_agent_record,
 };
 use crate::agent::control::{
     ControlBook, ControlPosition, ControlState, PlacedRequest, control_request,
+};
+use crate::agent::ctx::{
+    ApprovalInterrupt, ApprovalResume, approval_correlation, is_approval_correlation,
 };
 use crate::agent::{Session, Sessions};
 use crate::context::READ_BATCH;
@@ -11,7 +15,6 @@ use crate::laser::Laser;
 use crate::poll::{
     DrainRange, TopicFollower, bounded_partitions, drain_partition, tail_anchored_offset,
 };
-use crate::provenance::AgentTopic;
 use crate::retry::CONTROL_DISCOVERY_MAX;
 use crate::stream::ConsumerMessage;
 use crate::types::ConversationId;
@@ -144,20 +147,15 @@ impl<'a> SourceCheck<'a> {
     }
 }
 
-/// The agents the lane of `session` shows working on it: the addressees of
-/// its work commands and the agents that picked it up or acknowledged a
-/// control request. Model, tool, and control records are not work.
+/// The agents the retained lane of `session` shows working on it: the
+/// addressees of its work commands and the agents that picked it up or
+/// acknowledged a control request. Model, tool, and control records are not
+/// work.
 pub(crate) async fn lane_participants(
     laser: &Laser,
     session: ConversationId,
 ) -> Result<Vec<AgentId>, LaserError> {
-    let records = laser
-        .context(session)
-        .fetch_with(
-            vec![AgentTopic::Sessions],
-            Box::new(crate::context::LastN(usize::MAX)),
-        )
-        .await?;
+    let records = laser.sessions().open(session).lane_records().await?;
     let mut participants = BTreeSet::new();
     for envelope in records.into_iter().filter_map(|record| record.envelope) {
         let operation = envelope.operation.as_deref().unwrap_or_default();
@@ -196,6 +194,14 @@ fn is_work(operation: &str) -> bool {
 pub(crate) trait Replay: Send + Sync {
     fn replay<'a>(&'a self, received: &'a ConsumerMessage)
     -> BoxFuture<'a, Result<(), LaserError>>;
+
+    /// Hand a record parked on an approval back to its handler with `resume`.
+    /// `true` when the handler is still waiting for the approval.
+    fn resume<'a>(
+        &'a self,
+        received: &'a ConsumerMessage,
+        resume: ApprovalResume,
+    ) -> BoxFuture<'a, Result<bool, LaserError>>;
 }
 
 /// What the pause check decided for one work record.
@@ -225,8 +231,8 @@ pub(crate) struct ControlFeed {
     // The creation time of the control topic the feed reads.
     topic_gen: u64,
     next: BTreeMap<u32, u64>,
-    /// Some partition holds more than the bounded read covered, or already
-    /// expired records, so requests older than the read may be missing.
+    /// Some partition holds more retained records than the bounded read
+    /// covered, so requests older than the read may be missing.
     truncated: bool,
 }
 
@@ -475,7 +481,7 @@ fn observe_control(
     }
 }
 
-/// The pause and resume runtime of one agent role (D7a). Work for a paused
+/// The pause and resume runtime of one agent role. Work for a paused
 /// session is durably parked on the session lane before its source offset is
 /// committed, the role acknowledges each pause and resume request it takes
 /// part in on the lane, and a resume handles the held work again before new
@@ -550,6 +556,12 @@ impl PauseRuntime {
     ) -> Result<Hold, LaserError> {
         let session = message.provenance.conversation_id;
         self.ensure_recovered().await?;
+        // A session waiting on an approval holds its later work behind it, in
+        // order, so the decision resumes the session as it left it.
+        if let Some(request) = self.awaiting_approval(session) {
+            self.park_at(session, message, request).await?;
+            return Ok(Hold::Commit);
+        }
         loop {
             let control = self.control_state(session).await?;
             if let Some(pause) = control.paused() {
@@ -624,6 +636,7 @@ impl PauseRuntime {
         session: ConversationId,
     ) -> Result<(), LaserError> {
         self.ensure_recovered().await?;
+        self.expire_approvals(worker, session).await?;
         let control = self.control_state(session).await?;
         if let Some(pause) = control.paused() {
             if control.flags.cancel_requested {
@@ -772,6 +785,18 @@ impl PauseRuntime {
         message: &AgentMessage,
         pause: PlacedRequest,
     ) -> Result<(), LaserError> {
+        self.park_at(session, message, self.control_position(pause.at))
+            .await
+    }
+
+    // Append and confirm the parking record of `message` under `request`, a
+    // control pause or an approval's prompt.
+    async fn park_at(
+        &self,
+        session: ConversationId,
+        message: &AgentMessage,
+        request: LogPosition,
+    ) -> Result<(), LaserError> {
         let address = self.address(message);
         let known = lock(&self.roles).get(&session).is_some_and(|role| {
             role.parked
@@ -793,7 +818,7 @@ impl PauseRuntime {
                 conversation: Some(session.to_string()),
             },
             role: self.me.clone(),
-            request: self.control_position(pause.at),
+            request,
         };
         let key = ParkingKey::of(&parking).expect("a parking names a log record");
         let lens = self.lens(session);
@@ -872,6 +897,214 @@ impl PauseRuntime {
         Ok(Drained::All)
     }
 
+    /// Park the record whose handler an approval gate interrupted, under the
+    /// prompt's position, and wake the session at the approval deadline. A
+    /// record already parked on its approval stays parked.
+    pub(crate) async fn park_approval(
+        &self,
+        message: &AgentMessage,
+        interrupt: &ApprovalInterrupt,
+    ) -> Result<(), LaserError> {
+        let Some((prompt_at, deadline_micros)) = interrupt.prompt else {
+            return Ok(());
+        };
+        let session = message.provenance.conversation_id;
+        self.park_at(session, message, prompt_at).await?;
+        let key = ParkingKey {
+            source: self.address(message),
+            role: self.me.as_str().to_owned(),
+            request: prompt_at.to_bytes(),
+        };
+        lock(&self.roles)
+            .entry(session)
+            .or_default()
+            .approval_deadlines
+            .insert(key, deadline_micros);
+        let reconcile = self.reconcile.clone();
+        let wait = Duration::from_micros(deadline_micros.saturating_sub(SystemClock.now_micros()));
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            let _ = reconcile.send(session);
+        });
+        debug!(%session, source = %message.id, "parked a record on its approval");
+        Ok(())
+    }
+
+    /// Resume the session an approval decision answers: replay the record
+    /// parked on that approval with the decision, then the session's work
+    /// held behind it, in order. A reply that answers no parked approval of
+    /// this role is left alone.
+    pub(crate) async fn resume_approval(
+        &self,
+        worker: &dyn Replay,
+        reply: &AgentMessage,
+    ) -> Result<(), LaserError> {
+        let Some(correlation) = reply
+            .envelope
+            .as_ref()
+            .filter(|envelope| matches!(envelope.kind, AgentKind::Response | AgentKind::Error))
+            .filter(|envelope| envelope.target.as_ref() == Some(&self.me))
+            .and_then(|envelope| envelope.correlation)
+            .filter(|correlation| is_approval_correlation(*correlation))
+        else {
+            return Ok(());
+        };
+        let session = reply.provenance.conversation_id;
+        let _gate = self.gate(session).await;
+        self.ensure_recovered().await?;
+        if self.approval_of(session, correlation).is_none() {
+            // A restart forgets parkings the recovery read did not need.
+            self.merge(scan_lane(&self.laser, Some(&self.me), Some(session)).await?);
+        }
+        let Some(gated) = self.approval_of(session, correlation) else {
+            return Ok(());
+        };
+        self.drain_approval(
+            worker,
+            session,
+            gated,
+            ApprovalResume::Decided(Box::new(reply.clone())),
+        )
+        .await
+    }
+
+    // Resume every approval of `session` whose deadline passed with the
+    // expiry.
+    async fn expire_approvals(
+        &self,
+        worker: &dyn Replay,
+        session: ConversationId,
+    ) -> Result<(), LaserError> {
+        let now = SystemClock.now_micros();
+        let expired: Vec<ParkingKey> = lock(&self.roles)
+            .get(&session)
+            .map(|role| {
+                role.approval_deadlines
+                    .iter()
+                    .filter(|(key, deadline)| **deadline <= now && role.parked.contains_key(*key))
+                    .map(|(key, _)| key.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for gated in expired {
+            self.drain_approval(worker, session, gated, ApprovalResume::Expired)
+                .await?;
+        }
+        Ok(())
+    }
+
+    // Replay the approval's own record with `resume`, then the records held
+    // behind the same prompt, oldest first, each confirmed by an unparking.
+    // A record still waiting on an approval stops the drain, and the records
+    // after it move behind that approval.
+    async fn drain_approval(
+        &self,
+        worker: &dyn Replay,
+        session: ConversationId,
+        gated: ParkingKey,
+        resume: ApprovalResume,
+    ) -> Result<(), LaserError> {
+        let held: Vec<(ParkingKey, SessionParking)> = lock(&self.roles)
+            .get(&session)
+            .map(|role| {
+                role.parked
+                    .iter()
+                    .filter(|(key, _)| key.request == gated.request)
+                    .map(|(key, parking)| (key.clone(), parking.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut resume = Some(resume);
+        let mut waiting: Option<LogPosition> = None;
+        for (key, parking) in held {
+            let Some(received) = self.fetch_source(key.source).await? else {
+                warn!(%session, source = ?key.source, "a record parked on an approval cannot be recovered: its source expired or its topic was recreated, it stays listed as held");
+                continue;
+            };
+            if let Some(request) = waiting {
+                let Some(message) = AgentMessage::of_record(&received) else {
+                    continue;
+                };
+                self.park_at(session, &message, request).await?;
+            } else {
+                if key == gated {
+                    let still_waiting = match resume.take() {
+                        Some(resume) => worker.resume(&received, resume).await?,
+                        None => false,
+                    };
+                    if still_waiting {
+                        return Ok(());
+                    }
+                } else {
+                    worker.replay(&received).await?;
+                    // A held record that parked on its own approval holds the
+                    // records after it behind that approval.
+                    waiting = lock(&self.roles).get(&session).and_then(|role| {
+                        role.parked
+                            .iter()
+                            .find(|(other, parking)| {
+                                other.request != gated.request && self.is_approval(parking)
+                            })
+                            .map(|(_, parking)| parking.request)
+                    });
+                }
+            }
+            let lens = self.lens(session);
+            lens.lane()?
+                .emit(encode_named(&parking)?)
+                .with_operation(OPERATION_SESSION_UNPARKED)
+                .content_type(ContentType::Cbor)
+                .send_receipt()
+                .await?;
+            let mut roles = lock(&self.roles);
+            let role = roles.entry(session).or_default();
+            role.parked.remove(&key);
+            role.approval_deadlines.remove(&key);
+            role.handled.insert(key);
+        }
+        debug!(%session, "resumed a session on its approval");
+        Ok(())
+    }
+
+    // The parking of the approval `correlation` answers in `session`.
+    fn approval_of(
+        &self,
+        session: ConversationId,
+        correlation: laser_wire::agent::CorrelationId,
+    ) -> Option<ParkingKey> {
+        lock(&self.roles).get(&session).and_then(|role| {
+            role.parked
+                .iter()
+                .filter(|(_, parking)| self.is_approval(parking))
+                .map(|(key, _)| key)
+                .find(|key| {
+                    approval_correlation(LogPosition::new(
+                        key.source.stream,
+                        key.source.topic,
+                        key.source.partition,
+                        key.source.offset,
+                    )) == correlation
+                })
+                .cloned()
+        })
+    }
+
+    // The prompt position `session` waits on, when it has an approval parked.
+    fn awaiting_approval(&self, session: ConversationId) -> Option<LogPosition> {
+        lock(&self.roles).get(&session).and_then(|role| {
+            role.parked
+                .values()
+                .find(|parking| self.is_approval(parking))
+                .map(|parking| parking.request)
+        })
+    }
+
+    // Whether `parking` holds a record on an approval rather than a pause:
+    // its request is a prompt, not a request on `agent.control`.
+    fn is_approval(&self, parking: &SessionParking) -> bool {
+        (parking.request.stream_id, parking.request.topic_id) != self.control
+    }
+
     // The held records of `session` this runtime can handle: from its own
     // source topic and not already found unrecoverable, grouped by source.
     fn pending(
@@ -888,6 +1121,7 @@ impl PauseRuntime {
             if key.source.stream != self.source.stream_id
                 || key.source.topic != self.source.topic_id
                 || role.unrecoverable.contains(key)
+                || self.is_approval(parking)
             {
                 continue;
             }
@@ -1062,6 +1296,8 @@ struct RoleState {
     unrecoverable: BTreeSet<ParkingKey>,
     /// The role wrote a terminal status.
     terminal: bool,
+    /// The deadline of each approval this process parked a record on.
+    approval_deadlines: BTreeMap<ParkingKey, u64>,
 }
 
 impl RoleState {
@@ -1265,7 +1501,7 @@ async fn scan_lane(
 struct Window {
     messages: Vec<IggyMessage>,
     next_offset: u64,
-    /// The partition holds or held records before the window.
+    /// The partition holds retained records before the window.
     truncated: bool,
 }
 
@@ -1313,7 +1549,7 @@ async fn read_window(
     Ok(Window {
         messages: batch.messages,
         next_offset: batch.next_offset,
-        truncated: first > 0 || start > first,
+        truncated: start > first,
     })
 }
 

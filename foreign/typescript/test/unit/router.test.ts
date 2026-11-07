@@ -3,6 +3,7 @@ import { test } from "node:test"
 import {
   NoCapableAgentError,
   NoInboxError,
+  QuarantinedError,
   RoutePrincipalMismatchError
 } from "../../src/client/errors.js"
 import { AgentTopic } from "../../src/provenance/agent-topic.js"
@@ -14,6 +15,7 @@ import {
   filterCandidatesByPrincipal,
   requiredPrincipal,
   resolveInboxRoute,
+  resolveRoutable,
   resolveTargets,
   routeAllCapable,
   routeBroadcast,
@@ -29,12 +31,22 @@ import { AgentId, ConversationId, PrincipalId } from "../../src/types/ids.js"
 
 function registry(
   cards: readonly RegisteredCard[],
-  principals: Readonly<Record<string, number>> = {}
+  principals: Readonly<Record<string, number>> = {},
+  quarantined: readonly string[] = [],
+  inboxes: Readonly<Record<string, string>> = {}
 ): {
   resolve(skill: string, nowMicros: bigint): readonly RegisteredCard[]
   principalFor(agent: AgentId): PrincipalId | undefined
+  isQuarantined(agent: AgentId): boolean
+  inboxFor(agent: AgentId): string | undefined
 } {
   return {
+    isQuarantined(agent: AgentId): boolean {
+      return quarantined.includes(agent.asStr())
+    },
+    inboxFor(agent: AgentId): string | undefined {
+      return inboxes[agent.asStr()]
+    },
     resolve(skill: string): readonly RegisteredCard[] {
       return cards.filter((candidate) =>
         candidate.card.capabilities.some((entry) => entry.skillId === skill)
@@ -226,4 +238,52 @@ void test("given_an_advertised_route_when_an_inbox_is_present_then_should_resolv
 void test("given_an_advertised_route_when_no_inbox_then_should_error_without_a_fallback", () => {
   const agent = AgentId.new("metrics")
   assert.throws(() => resolveInboxRoute(ADVERTISED_INBOX_ROUTE, agent, undefined), NoInboxError)
+})
+
+void test("given_a_quarantined_agent_when_routing_to_it_by_name_then_should_refuse_it", () => {
+  const view = registry([], { metrics: 7 }, ["metrics"])
+  assert.throws(() => resolveTargets(routeTo(AgentId.new("metrics")), view, 0n), QuarantinedError)
+  assert.throws(
+    () => resolveTargets(routeToPrincipal(AgentId.new("metrics"), PrincipalId.new(7)), view, 0n),
+    QuarantinedError
+  )
+})
+
+void test("given_a_capable_agent_without_an_inbox_sorted_first_when_routing_then_should_pick_the_one_with_an_inbox", () => {
+  const view = registry([card("alpha", 1, 1, 1), card("beta", 1, 1, 1)], {}, [], {
+    beta: "beta.inbox"
+  })
+  assert.deepEqual(
+    resolveRoutable(
+      routeToCapable("diagnose", { kind: "any" }),
+      view,
+      ADVERTISED_INBOX_ROUTE,
+      0n
+    ).map((agent) => agent.asStr()),
+    ["beta"]
+  )
+  assert.deepEqual(
+    resolveRoutable(
+      routeToCapable("diagnose", { kind: "any" }),
+      view,
+      { kind: "fixed", topic: "work" },
+      0n
+    ).map((agent) => agent.asStr()),
+    ["alpha"]
+  )
+})
+
+void test("given_a_timed_out_agent_when_resolving_again_then_should_prefer_another_capable_agent", () => {
+  const view = registry([card("cheap", 1, 1, 1), card("pricier", 5, 1, 1)])
+  const route = routeToCapable("diagnose", { kind: "cheapest" })
+  const fixed = { kind: "fixed", topic: "work" } as const
+  assert.deepEqual(
+    resolveRoutable(route, view, fixed, 0n, [AgentId.new("cheap")]).map((agent) => agent.asStr()),
+    ["pricier"]
+  )
+  const alone = registry([card("cheap", 1, 1, 1)])
+  assert.deepEqual(
+    resolveRoutable(route, alone, fixed, 0n, [AgentId.new("cheap")]).map((agent) => agent.asStr()),
+    ["cheap"]
+  )
 })

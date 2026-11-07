@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import type { Client as IggyClient } from "apache-iggy"
-import { TransportError } from "../../src/client/errors.js"
+import { AmbiguousMutationError, TransportError } from "../../src/client/errors.js"
 import { encodeNamed } from "../../src/wire/cbor.js"
 import {
   ApacheIggyTransport,
@@ -37,19 +37,31 @@ function cluster(
   const sent: Sent[] = []
   let rosterReads = 0
   let attempt = 0
+  const toReplica = (code: number, replica: number): Promise<Buffer> => {
+    sent.push({ code, replica })
+    const failure = fail(replica, attempt)
+    attempt += 1
+    if (failure instanceof Error) return Promise.reject(failure)
+    return Promise.resolve(Buffer.from(failure ?? OK))
+  }
   const client = {
-    clientProvider: () => Promise.resolve({}),
+    clientProvider: () =>
+      Promise.resolve({
+        sendCommand: async (
+          code: number,
+          _payload: Buffer,
+          options: { readonly replica?: number }
+        ) => {
+          const data = await toReplica(code, options.replica ?? 0)
+          return { length: data.length, data }
+        }
+      }),
     sendBinaryRequest: (code: number) => {
       sent.push({ code })
       return Promise.resolve(Buffer.from(OK))
     },
-    sendBinaryRequestToReplica: (code: number, _payload: Buffer, replica: number) => {
-      sent.push({ code, replica })
-      const failure = fail(replica, attempt)
-      attempt += 1
-      if (failure instanceof Error) return Promise.reject(failure)
-      return Promise.resolve(Buffer.from(failure ?? OK))
-    },
+    sendBinaryRequestToReplica: (code: number, _payload: Buffer, replica: number) =>
+      toReplica(code, replica),
     cluster: {
       getClusterMetadata: () => {
         rosterReads += 1
@@ -95,15 +107,6 @@ void test("given_authorization_writes_and_standard_commands_when_targeted_then_s
     assert.deepEqual(managedTargetOf(code), { kind: "metadata_primary" }, String(code))
   for (const code of [AGDX_AUTHZ_WHOAMI_CODE, AGDX_KV_GET_CODE, AGDX_QUERY_CODE])
     assert.deepEqual(managedTargetOf(code), { kind: "caller" }, String(code))
-})
-
-void test("given_pinned_queries_when_the_list_is_full_then_should_drop_the_oldest", () => {
-  const nodes = new Nodes(0n)
-  nodes.pinQuery(1n << 100n, 2)
-  assert.deepEqual(nodes.queryTarget(1n << 100n), { kind: "replica", replica: 2 })
-  for (let id = 0n; id < 1024n; id += 1n) nodes.pinQuery(id, 1)
-  assert.deepEqual(nodes.queryTarget(1n << 100n), { kind: "caller" })
-  assert.deepEqual(nodes.queryTarget(0n), { kind: "replica", replica: 1 })
 })
 
 void test("given_managed_requests_when_sent_then_should_spread_by_caller_and_keep_authorization_writes_on_the_primary", async () => {
@@ -166,6 +169,39 @@ void test("given_an_unavailable_backend_when_sending_then_should_repeat_the_fram
   assert.deepEqual(
     sent.map((request) => request.replica),
     [0, 1, 1]
+  )
+})
+
+void test("given_an_expired_attempt_deadline_when_a_caller_link_fails_then_should_leave_the_next_node_to_the_next_attempt", async () => {
+  const { client, sent } = cluster([0, 1, 2], () => new TransportError("the link dropped", true))
+  const nodes = new Nodes(0n)
+  await assert.rejects(
+    nodes.send(
+      (operation) => operation(client),
+      AGDX_KV_GET_CODE,
+      OK,
+      { kind: "caller" },
+      Date.now() - 1
+    )
+  )
+  assert.deepEqual(
+    sent.map((request) => request.replica),
+    [0],
+    "the expired attempt stops on its first node"
+  )
+  await assert.rejects(
+    nodes.send(
+      (operation) => operation(client),
+      AGDX_KV_GET_CODE,
+      OK,
+      { kind: "caller" },
+      Date.now() - 1
+    )
+  )
+  assert.deepEqual(
+    sent.map((request) => request.replica),
+    [0, 1],
+    "the next attempt starts on the next node"
   )
 })
 
@@ -244,4 +280,42 @@ void test("given_a_named_replica_when_sent_then_should_reach_that_replica_only",
     TransportError
   )
   assert.deepEqual(sent, [{ code: AGDX_QUERY_CODE, replica: 2 }])
+})
+
+void test("given_a_driver_that_wrote_the_frame_when_the_next_node_stops_before_writing_then_should_mark_the_frame_written", async () => {
+  const { client } = cluster([0, 1], (_replica, attempt) =>
+    attempt === 0
+      ? new AmbiguousMutationError("managed command failed: outcome is unknown")
+      : new TransportError("transport is closed", false)
+  )
+  const written = { written: false }
+  await assert.rejects(
+    new Nodes(0n).send(
+      (operation) => operation(client),
+      AGDX_KV_GET_CODE,
+      OK,
+      { kind: "caller" },
+      undefined,
+      written
+    ),
+    (error: unknown) => error instanceof TransportError && !error.retryable
+  )
+  assert.equal(written.written, true, "the first node wrote the frame before the transport closed")
+})
+
+void test("given_a_driver_that_stops_before_writing_when_walked_then_should_leave_the_frame_unwritten", async () => {
+  const { client } = cluster([0, 1], () => new TransportError("transport is closed", false))
+  const written = { written: false }
+  await assert.rejects(
+    new Nodes(0n).send(
+      (operation) => operation(client),
+      AGDX_KV_GET_CODE,
+      OK,
+      { kind: "caller" },
+      undefined,
+      written
+    ),
+    TransportError
+  )
+  assert.equal(written.written, false)
 })

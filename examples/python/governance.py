@@ -71,7 +71,9 @@ async def install_roles(laser, target_user: int | None) -> None:
         print(f"set {TARGET_USER_ENV} to bind the roles to a user")
         return
     bindings = await laser.get_bindings(target_user)
-    print(f"user {target_user} is bound to: {bindings}")
+    print(
+        f"user {target_user} is bound to: {bindings.roles} at binding revision {bindings.revision}"
+    )
 
 
 def roles() -> dict[str, list[ls.Grant]]:
@@ -85,8 +87,8 @@ def roles() -> dict[str, list[ls.Grant]]:
             )
         ],
         "agent-runner": [
-            ls.Grant("agent", "read"),
-            ls.Grant("agent", "write"),
+            ls.Grant("session", "read"),
+            ls.Grant("session", "write"),
         ],
         "safety-deny": [
             ls.Grant("kv", "delete", effect="deny"),

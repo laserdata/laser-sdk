@@ -1,4 +1,4 @@
-use crate::error::{LaserError, decode_managed_reply};
+use crate::error::{LaserError, TransportError, decode_managed_reply};
 use crate::iggy::prelude::Identifier;
 use crate::laser::Laser;
 use crate::nodes::{Target, is_route_stale, partition_primary};
@@ -18,9 +18,9 @@ use laser_wire::filter::{
     FilterError, FilterErrorReason, FilterGroupIdentity, FilterGroupRef, FilterHeader,
     FilterMutation, FilterMutationOutcome, FilterMutationRequest, FilterMutationResult,
     FilterMutationStatus, FilterOutcome, FilterPreview, FilterPreviewRequest, FilterRef,
-    FilterReply, FilterRevisionPage, FilterRevisionRef, FilterSource, FilterSummary,
-    FilterTestRequest, FilterTestResult, GetFilterBinding, GetFilterOperation, GroupFilterSpec,
-    ListFilterRevisions, ListFilters,
+    FilterReply, FilterRevisionPage, FilterSource, FilterSummary, FilterTestRequest,
+    FilterTestResult, GetFilterBinding, GetFilterOperation, GroupFilterSpec, ListFilterRevisions,
+    ListFilters,
 };
 #[cfg(feature = "filters")]
 use laser_wire::filter::{FilterBindingPage, ListFilterBindings};
@@ -60,7 +60,7 @@ pub(crate) struct AppliedMutation {
     pub(crate) catalog_position: Option<CatalogPosition>,
 }
 
-impl<'a> Filters<'a> {
+impl Filters<'_> {
     /// Evaluate `filter` against one supplied record and explain the verdict.
     /// Nothing is read from a stream and nothing is stored.
     pub async fn test(
@@ -90,9 +90,9 @@ impl<'a> Filters<'a> {
         topic: impl Into<String>,
         partition_id: u32,
         filter: FilterRef,
-    ) -> FilterPreviewBuilder<'a> {
+    ) -> FilterPreviewBuilder {
         FilterPreviewBuilder {
-            filters: Filters { laser: self.laser },
+            laser: self.laser.clone(),
             request: FilterPreviewRequest {
                 v: FILTER_OP_VERSION,
                 source: FilterSource {
@@ -109,18 +109,19 @@ impl<'a> Filters<'a> {
         }
     }
 
-    /// One page of a filter's revisions, newest first.
+    /// One page of a filter's revisions, newest first. `page` counts from 1
+    /// and `results` is the page length.
     pub async fn revisions(
         &self,
         filter_id: u32,
         page: u32,
-        page_size: u32,
+        results: u32,
     ) -> Result<FilterRevisionPage, LaserError> {
         let request = ListFilterRevisions {
             v: FILTER_OP_VERSION,
             filter_id,
             page,
-            page_size,
+            results,
         };
         request.validate()?;
         match self
@@ -142,10 +143,9 @@ impl<'a> Filters<'a> {
             v: FILTER_OP_VERSION,
             name_contains: None,
             state: None,
-            before_id: None,
             owner: Some(owner),
-            page: 0,
-            page_size: 1,
+            page: 1,
+            results: 1,
         };
         request.validate()?;
         match self.catalog(AGDX_LIST_FILTERS_CODE, &request).await? {
@@ -189,7 +189,8 @@ impl<'a> Filters<'a> {
     }
 
     /// One page of bindings, optionally narrowed to one filter, one stream,
-    /// or one stream and topic.
+    /// or one stream and topic. `page` counts from 1 and `results` is the page
+    /// length.
     #[cfg(feature = "filters")]
     pub async fn bindings(
         &self,
@@ -197,7 +198,7 @@ impl<'a> Filters<'a> {
         stream: Option<&str>,
         topic: Option<&str>,
         page: u32,
-        page_size: u32,
+        results: u32,
     ) -> Result<FilterBindingPage, LaserError> {
         let request = ListFilterBindings {
             v: FILTER_OP_VERSION,
@@ -205,7 +206,7 @@ impl<'a> Filters<'a> {
             stream: stream.map(str::to_owned),
             topic: topic.map(str::to_owned),
             page,
-            page_size,
+            results,
         };
         request.validate()?;
         match self
@@ -225,32 +226,14 @@ impl<'a> Filters<'a> {
             operation_id,
         };
         match self.catalog(AGDX_FILTER_OPERATION_CODE, &request).await? {
-            FilterCatalogOutcome::Mutation(outcome) => Ok(outcome),
+            FilterCatalogOutcome::Mutation(outcome) => checked_outcome(operation_id, outcome),
             _ => Err(unexpected("operation")),
         }
     }
 
-    /// Add a revision. `expected_revision` must still be the latest one.
-    pub async fn revise(
-        &self,
-        filter_id: u32,
-        expected_revision: u32,
-        filter: ConsumerFilter,
-    ) -> Result<FilterRevisionRef, LaserError> {
-        let mutation = FilterMutation::Revise {
-            filter_id,
-            expected_revision,
-            filter: self.scoped_filter(filter),
-        };
-        match self.apply(mutation).await?.result {
-            FilterMutationResult::Revised(revision) => Ok(revision),
-            _ => Err(unexpected("revise")),
-        }
-    }
-
     /// Give `group` its policy in one catalog transaction: a definition saved
-    /// as the group's own filter, or one of its existing revisions. A repeat
-    /// with the same digest keeps the binding, another digest conflicts. The
+    /// as the group's own filter. A repeat with the same digest keeps the
+    /// binding, another digest conflicts. The
     /// returned position is where the fold applied it, carried by the group's
     /// reads so they never see this configuration as absent.
     pub(crate) async fn configure_group(
@@ -261,12 +244,10 @@ impl<'a> Filters<'a> {
         expected_identity: FilterGroupIdentity,
     ) -> Result<(FilterBinding, Option<CatalogPosition>), LaserError> {
         let operation_id = operation_id.unwrap_or_else(|| u128::from(ulid::Ulid::generate()));
-        let policy = match policy {
-            GroupFilterSpec::Definition { name, filter } => GroupFilterSpec::Definition {
-                name,
-                filter: self.scoped_filter(filter),
-            },
-            other => other,
+        let GroupFilterSpec::Definition { name, filter } = policy;
+        let policy = GroupFilterSpec::Definition {
+            name,
+            filter: self.scoped_filter(filter),
         };
         let applied = self
             .apply_positioned(
@@ -373,7 +354,7 @@ impl<'a> Filters<'a> {
         };
         request.validate()?;
         match self.catalog(AGDX_FILTER_MUTATE_CODE, &request).await? {
-            FilterCatalogOutcome::Mutation(outcome) => Ok(outcome),
+            FilterCatalogOutcome::Mutation(outcome) => checked_outcome(operation_id, outcome),
             _ => Err(unexpected("mutate")),
         }
     }
@@ -395,9 +376,10 @@ impl<'a> Filters<'a> {
                 Err(error) => return Err(error),
             }
             if Instant::now() >= deadline {
-                return Err(LaserError::AmbiguousMutation(format!(
-                    "filter mutation {operation_id} has no outcome yet"
-                )));
+                return Err(LaserError::AmbiguousMutation {
+                    operation_id: Some(operation_id),
+                    message: format!("filter mutation {operation_id} has no outcome yet"),
+                });
             }
             sleep(OUTCOME_POLL_INTERVAL).await;
         }
@@ -416,9 +398,10 @@ impl<'a> Filters<'a> {
                     sleep(MUTATION_RETRY_BACKOFF).await;
                 }
                 Err(error) if error.is_retryable() => {
-                    return Err(LaserError::AmbiguousMutation(format!(
-                        "filter mutation {operation_id}: {error}"
-                    )));
+                    return Err(LaserError::AmbiguousMutation {
+                        operation_id: Some(operation_id),
+                        message: format!("filter mutation {operation_id}: {error}"),
+                    });
                 }
                 result => return result,
             }
@@ -454,7 +437,9 @@ impl<'a> Filters<'a> {
             .send_managed_to(code, payload.clone(), target)
             .await
         {
-            Err(LaserError::Iggy(error)) if target != Target::Caller && is_route_stale(&error) => {
+            Err(LaserError::Transport(TransportError(error)))
+                if target != Target::Caller && is_route_stale(&error) =>
+            {
                 self.laser
                     .send_managed_to(code, payload, Target::Caller)
                     .await?
@@ -510,12 +495,12 @@ impl<'a> Filters<'a> {
 
 /// A preview request. Build it with
 /// [`GroupFilter::preview`](crate::stream::GroupFilter::preview).
-pub struct FilterPreviewBuilder<'a> {
-    filters: Filters<'a>,
+pub struct FilterPreviewBuilder {
+    laser: Laser,
     request: FilterPreviewRequest,
 }
 
-impl FilterPreviewBuilder<'_> {
+impl FilterPreviewBuilder {
     /// The first offset to examine. Defaults to `0`.
     #[must_use]
     pub fn from_offset(mut self, offset: u64) -> Self {
@@ -547,7 +532,7 @@ impl FilterPreviewBuilder<'_> {
     pub async fn send(self) -> Result<FilterPreview, LaserError> {
         self.request.validate()?;
         let target = match partition_primary(
-            &self.filters.laser.client(),
+            &self.laser.client(),
             &Identifier::named(&self.request.source.stream)?,
             &Identifier::named(&self.request.source.topic)?,
             self.request.partition_id,
@@ -558,7 +543,8 @@ impl FilterPreviewBuilder<'_> {
             Err(_) => Target::Caller,
         };
         match self
-            .filters
+            .laser
+            .filters()
             .native_to(AGDX_FILTER_PREVIEW_CODE, &self.request, target)
             .await?
         {
@@ -575,12 +561,112 @@ fn settled(
     match status {
         FilterMutationStatus::Applied(result) => Ok(result),
         FilterMutationStatus::Rejected(error) => Err(error.into()),
-        FilterMutationStatus::Pending => Err(LaserError::AmbiguousMutation(format!(
-            "filter mutation {operation_id} has no outcome yet"
-        ))),
+        FilterMutationStatus::Pending => Err(LaserError::AmbiguousMutation {
+            operation_id: Some(operation_id),
+            message: format!("filter mutation {operation_id} has no outcome yet"),
+        }),
     }
+}
+
+// An outcome is the requested operation's only when its version and every
+// operation id it carries match the request.
+fn checked_outcome(
+    operation_id: u128,
+    outcome: FilterMutationOutcome,
+) -> Result<FilterMutationOutcome, LaserError> {
+    let position_id = outcome
+        .catalog_position
+        .and_then(|position| position.operation_id);
+    if outcome.v != FILTER_OP_VERSION
+        || outcome.operation_id != operation_id
+        || position_id.is_some_and(|position_id| position_id != operation_id)
+    {
+        return Err(LaserError::Protocol(
+            "filter mutation outcome does not match the requested operation".to_owned(),
+        ));
+    }
+    Ok(outcome)
 }
 
 fn unexpected(verb: &str) -> LaserError {
     LaserError::Protocol(format!("filters {verb}: unexpected reply variant"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capabilities::Capabilities;
+    use crate::iggy::prelude::IggyClient;
+
+    #[tokio::test]
+    async fn given_an_owned_preview_builder_when_spawned_then_should_send_on_its_own_task() {
+        let laser = Laser::from_client(IggyClient::default()).with_capabilities(Capabilities::OPEN);
+        let preview = tokio::spawn(
+            laser
+                .filters()
+                .preview(
+                    "orbit",
+                    "fleet",
+                    0,
+                    FilterRef::Revision {
+                        filter_id: 1,
+                        revision: 1,
+                    },
+                )
+                .max_examined(0)
+                .send(),
+        );
+        assert!(
+            preview
+                .await
+                .expect("the preview task joins")
+                .is_err_and(|error| matches!(error, LaserError::Invalid(_)))
+        );
+    }
+
+    #[test]
+    fn given_an_outcome_for_another_operation_when_checked_then_should_refuse_it() {
+        let outcome = |v, operation_id, position_id: Option<u128>| FilterMutationOutcome {
+            v,
+            operation_id,
+            status: FilterMutationStatus::Pending,
+            catalog_position: position_id.map(|position_id| CatalogPosition {
+                partition_id: 0,
+                offset: 4,
+                operation_id: Some(position_id),
+                revision: None,
+            }),
+        };
+        for (name, mismatched) in [
+            ("outcome id", outcome(FILTER_OP_VERSION, 8, None)),
+            ("position id", outcome(FILTER_OP_VERSION, 7, Some(8))),
+            ("version", outcome(FILTER_OP_VERSION + 1, 7, None)),
+        ] {
+            let checked = checked_outcome(7, mismatched);
+            assert!(
+                matches!(&checked, Err(LaserError::Protocol(_))),
+                "{name}: {checked:?}"
+            );
+        }
+        let matching = outcome(FILTER_OP_VERSION, 7, Some(7));
+        assert_eq!(
+            checked_outcome(7, matching.clone()).expect("the matching outcome passes"),
+            matching
+        );
+    }
+
+    #[test]
+    fn given_a_pending_outcome_when_settled_then_should_name_the_operation_to_repeat() {
+        let refused = settled(7, FilterMutationStatus::Pending);
+        assert!(
+            matches!(
+                refused,
+                Err(LaserError::AmbiguousMutation {
+                    operation_id: Some(7),
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+    }
 }

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import {
+  type Capabilities,
   OPEN_CAPABILITIES,
   advertisedTopology,
   backend,
+  capabilityReprobeDue,
   enabledBackends,
   isReady,
   isOpenOnly,
@@ -14,7 +16,7 @@ import {
   servesConsistency,
   unreadyBackends
 } from "../../src/client/capabilities.js"
-import { policyAware } from "../../src/stream/consumer-group.js"
+import { policyAware } from "../../src/managed/filters.js"
 import { TimeoutError, UnsupportedError } from "../../src/client/errors.js"
 import { BackendResourceId } from "../../src/wire/ids.js"
 import { feature, newBackendDescriptor, newOpVersions } from "../../src/wire/hello.js"
@@ -69,48 +71,26 @@ void test("given_an_unconfirmed_probe_when_building_a_group_consumer_then_should
 })
 
 void test("open capabilities reject every managed surface", () => {
-  for (const surface of ["query", "destinations", "kv", "forks", "graph", "authz"] as const) {
-    assert.throws(() => {
-      requireCapability(OPEN_CAPABILITIES, surface)
-    }, UnsupportedError)
+  for (const surface of ["query", "kv", "forks", "graph", "authz"] as const) {
+    assert.throws(
+      () => {
+        requireCapability(OPEN_CAPABILITIES, surface)
+      },
+      (error: unknown) => error instanceof UnsupportedError && error.surface === surface
+    )
   }
 })
 
-void test("structured ready backend drives query and destination capabilities", () => {
-  const backend = {
-    ...newBackendDescriptor(
-      BackendResourceId.fromU128(1n),
-      "lakehouse",
-      "Warehouse",
-      { kind: "iceberg", version: "1" },
-      2n,
-      3n
-    ),
-    desiredState: "enabled" as const,
-    observedState: "ready" as const,
-    readiness: { ready: true, reasons: [], observedAtMicros: 4n },
-    query: {
-      dialects: ["data_fusion" as const],
-      timeTravel: ["snapshot_id" as const],
-      consistency: ["eventual" as const, "read_your_writes" as const],
-      logicalTypes: ["long" as const],
-      paging: ["cursor" as const],
-      cancellation: true,
-      executionStatus: true,
-      rawSql: true
-    }
-  }
+void test("given_retired_strong_and_destination_bits_when_merged_then_should_light_neither", () => {
   const capabilities = managedCapabilitiesFrom({
     versions: {
       ...newOpVersions(2, 2, 1, 1),
-      checkpoint: 1,
       features: feature.STRONG_CONSISTENCY | feature.DESTINATIONS
     },
-    backends: [backend]
+    backends: [readyQueryBackend(1n, ["eventual", "read_your_writes"])]
   })
-  assert.equal(capabilities.query.cursorPaging, true)
-  assert.equal(capabilities.query.cancellation, true)
-  assert.equal(capabilities.destinations.available, true)
+  assert.equal(capabilities.query.available, true)
+  assert.equal(capabilities.query.consistency, "read_your_writes")
   assert.equal(servesConsistency(capabilities, "read_your_writes"), true)
 })
 
@@ -140,7 +120,6 @@ void test("unavailable announcement fails closed", () => {
   })
   assert.equal(capabilities.managed, false)
   assert.equal(capabilities.query.available, false)
-  assert.equal(capabilities.destinations.available, false)
   assert.equal(capabilities.backends.length, 1)
   assert.equal(backend(capabilities, resourceId)?.label, "Embedded")
   assert.equal(enabledBackends(capabilities).length, 1)
@@ -149,10 +128,7 @@ void test("unavailable announcement fails closed", () => {
   assert.equal(isReady(capabilities), false)
 })
 
-function readyQueryBackend(
-  id: bigint,
-  consistency: readonly ("eventual" | "read_your_writes" | "strong")[]
-) {
+function readyQueryBackend(id: bigint, consistency: readonly ("eventual" | "read_your_writes")[]) {
   return {
     ...newBackendDescriptor(
       BackendResourceId.fromU128(id),
@@ -167,13 +143,12 @@ function readyQueryBackend(
     readiness: { ready: true, reasons: [], observedAtMicros: 1n },
     query: {
       dialects: ["sqlite" as const],
-      timeTravel: [],
       consistency,
       logicalTypes: ["string" as const],
-      paging: [],
-      cancellation: false,
-      executionStatus: false,
-      rawSql: true
+      rawSql: true,
+      aggregates: [],
+      vectorSearch: false,
+      textSearch: false
     }
   }
 }
@@ -192,10 +167,10 @@ void test("given_a_ready_announcement_without_a_query_backend_when_merged_then_s
 void test("given_a_ready_query_backend_when_merged_then_should_take_its_strongest_consistency", () => {
   const capabilities = managedCapabilitiesFrom({
     versions: newOpVersions(1, 1, 1, 1),
-    backends: [readyQueryBackend(1n, ["eventual", "strong"])]
+    backends: [readyQueryBackend(1n, ["eventual", "read_your_writes"])]
   })
   assert.equal(capabilities.query.available, true)
-  assert.equal(capabilities.query.consistency, "strong")
+  assert.equal(capabilities.query.consistency, "read_your_writes")
   const readYourWrites = managedCapabilitiesFrom({
     versions: newOpVersions(1, 1, 1, 1),
     backends: [readyQueryBackend(1n, ["read_your_writes"])]
@@ -203,21 +178,10 @@ void test("given_a_ready_query_backend_when_merged_then_should_take_its_stronges
   assert.equal(readYourWrites.query.consistency, "read_your_writes")
 })
 
-void test("given_announced_destinations_when_merged_then_should_serve_linearizable_checkpoint_reads", () => {
-  assert.equal(OPEN_CAPABILITIES.destinations.consistency, "potentially_stale")
-  const capabilities = managedCapabilitiesFrom({
-    versions: { ...newOpVersions(1, 1, 1, 1), checkpoint: 1, features: feature.DESTINATIONS },
-    backends: []
-  })
-  assert.equal(capabilities.destinations.available, true)
-  assert.equal(capabilities.destinations.consistency, "linearizable")
-})
-
 void test("given_a_seeded_surface_when_a_ready_announcement_merges_then_should_keep_it_and_apply_seed_dependent_rules", () => {
   const seed = {
     ...OPEN_CAPABILITIES,
     a2aGateway: true,
-    destinations: { available: true, consistency: "potentially_stale" as const },
     filters: { native: true, catalog: false, groupPolicyReads: false, maxWaitMs: 0 }
   }
   const announce = {
@@ -233,7 +197,6 @@ void test("given_a_seeded_surface_when_a_ready_announcement_merges_then_should_k
   )
   assert.equal(merged.a2aGateway, true)
   assert.equal(merged.hello, "answered")
-  assert.equal(merged.destinations.consistency, "linearizable")
   assert.equal(merged.filters.catalog, true, "a seeded native filter surface enables the catalog")
   assert.deepEqual(merged.filters.evaluation, announce.filters)
 })
@@ -272,4 +235,33 @@ void test("given_open_capabilities_when_the_probe_outcome_changes_then_should_st
     assert.equal(isOpenOnly({ ...OPEN_CAPABILITIES, hello }), true)
     assert.equal(isOpenOnly({ ...OPEN_CAPABILITIES, hello, managed: true }), false)
   }
+})
+
+void test("given_a_capability_set_when_it_ages_then_should_reprobe_only_while_a_backend_is_unready", () => {
+  const now = 10_000
+  const aged = now - 1_000
+  const starting = {
+    ...readyQueryBackend(7n, ["eventual"]),
+    observedState: "starting" as const,
+    readiness: {
+      ready: false,
+      reasons: [{ code: "configuration_pending" as const }],
+      observedAtMicros: 1n
+    }
+  }
+  const managed = (backends: Capabilities["backends"]): Capabilities => ({
+    ...OPEN_CAPABILITIES,
+    managed: true,
+    backends
+  })
+  assert.equal(capabilityReprobeDue(OPEN_CAPABILITIES, undefined, now), true)
+  assert.equal(capabilityReprobeDue(OPEN_CAPABILITIES, now, now), false)
+  assert.equal(capabilityReprobeDue(OPEN_CAPABILITIES, aged, now), true)
+  assert.equal(capabilityReprobeDue(managed([starting]), now, now), false)
+  assert.equal(capabilityReprobeDue(managed([starting]), aged, now), true)
+  assert.equal(
+    capabilityReprobeDue(managed([readyQueryBackend(7n, ["eventual"])]), aged, now),
+    false
+  )
+  assert.equal(capabilityReprobeDue(managed([]), aged, now), false)
 })

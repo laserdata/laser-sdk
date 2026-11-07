@@ -1,4 +1,4 @@
-import { SingleClient } from "apache-iggy"
+import { Consumer, SingleClient } from "apache-iggy"
 import { FilterExecutionError } from "../../src/client/errors.js"
 import { decodeOne, encodeNamed } from "../../src/wire/cbor.js"
 import { AGDX_FILTER_VALIDATE_CODE } from "../../src/wire/codes.js"
@@ -227,6 +227,107 @@ void test("given_out_of_order_acks_when_acked_then_should_store_only_the_complet
   })
 })
 
+// Sixteen records, matches at the even offsets.
+async function alternating(laser: Laser, stream: string): Promise<void> {
+  await publish(
+    laser,
+    stream,
+    Array.from({ length: 16 }, (_, index) => (index % 2 === 0 ? SAFE_MODE : GROUND_STATION))
+  )
+}
+
+async function storedGroupOffset(
+  laser: Laser,
+  stream: string,
+  group: string
+): Promise<bigint | undefined> {
+  const stored = await laser.client.offset
+    .get({ streamId: stream, topicId: TOPIC, consumer: Consumer.Group(group), partitionId: 0 })
+    .catch(() => undefined)
+  return stored === undefined || stored === null ? undefined : stored.storedOffset
+}
+
+void test("given_a_later_record_acknowledged_through_when_an_earlier_one_is_acknowledged_after_then_should_keep_the_higher_stored_offset", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    await alternating(laser, stream)
+    const first = await reader(laser, stream, "ack-order", (builder) =>
+      builder.start({ kind: "first" }).count(1)
+    )
+    const zero = await first.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
+    const second = await first.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
+    const third = await first.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
+    assert.deepEqual([zero.offset, second.offset, third.offset], [0n, 2n, 4n])
+    await first.ackThrough(third)
+    const highest = await storedGroupOffset(laser, stream, "ack-order")
+    assert.ok(highest !== undefined && highest >= 4n, String(highest))
+    await first.ack(second)
+    assert.equal(
+      await storedGroupOffset(laser, stream, "ack-order"),
+      highest,
+      "progress never moves back below the acknowledged offset"
+    )
+    const following = await first.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
+    assert.equal(following.offset, 6n, "local reading continues where this reader left off")
+    await first.close()
+  })
+})
+
+void test("given_another_consumer_that_stored_higher_progress_when_a_closed_reader_acknowledges_then_should_refuse_it_and_resume_past_the_higher_offset", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    await alternating(laser, stream)
+    const group = await boundGroup(laser, stream, "ack-higher")
+    const first = await group.reader().start({ kind: "first" }).count(1).build()
+    const held = await first.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
+    assert.equal(held.offset, 0n)
+    await first.close()
+    // Another consumer of the same group reads and stores past the held record.
+    const other = await group.consumer({
+      startAt: { kind: "first" },
+      commitPolicy: { kind: "disabled" }
+    })
+    let stored: bigint | undefined
+    try {
+      const deadline = Date.now() + READ_TIMEOUT_MS
+      while (stored === undefined) {
+        const message = await other.nextWithin(READ_TIMEOUT_MS)
+        if (message.position.offset >= 14n) {
+          await other.commit(message)
+          stored = message.position.offset
+        }
+        assert.ok(Date.now() < deadline, "the other consumer reaches the tail")
+      }
+    } finally {
+      await other.shutdown()
+    }
+    assert.equal(await storedGroupOffset(laser, stream, "ack-higher"), stored)
+
+    await assert.rejects(first.ack(held), "a closed reader never acknowledges its held page")
+    // A reader without a start resumes after the group's stored progress.
+    const rejoined = await group.reader().count(1).build()
+    const resumed = await rejoined.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
+    assert.ok(resumed.offset > stored, "the other consumer's greater progress stands")
+    await rejoined.close()
+  })
+})
+
+void test("given_a_recreated_topic_when_a_page_of_the_old_generation_is_acknowledged_then_should_refuse_the_mismatched_generation", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    await alternating(laser, stream)
+    const filtered = await reader(laser, stream, "ack-generation", (builder) =>
+      builder.start({ kind: "first" }).count(1)
+    )
+    const page = await filtered.nextPage({ timeoutMs: READ_TIMEOUT_MS })
+    await laser.client.topic.delete({ streamId: stream, topicId: TOPIC, partitionsCount: 1 })
+    await laser.stream(stream).topic(TOPIC).ensure(1)
+    await assert.rejects(
+      filtered.ackPage(page),
+      "a page of the old generation never stores into the new one"
+    )
+    assert.equal(await storedGroupOffset(laser, stream, "ack-generation"), undefined)
+    await filtered.close()
+  })
+})
+
 void test("given_a_malformed_record_when_reading_then_should_deliver_matches_then_the_fault", async (context) => {
   await withSource(context, async (laser, stream) => {
     await publish(laser, stream, [SAFE_MODE, "not json", DECOMMISSION])
@@ -292,7 +393,7 @@ void test("given_a_sample_when_tested_against_the_group_filter_then_should_expla
     const revisions = await group.filter().revisions()
 
     assert.equal(tested.explanation.verdict, "rejected")
-    assert.equal(revisions.total, 1)
+    assert.equal(revisions.totalResults, 1)
     assert.deepEqual(revisions.items[0]?.digest, consumerFilterDigest(safeModeFilter()))
   })
 })
@@ -392,7 +493,7 @@ void test("given_a_group_with_a_filter_when_consumed_then_should_deliver_only_ma
     await assert.rejects(
       group.filter().configure("kind-present", ConsumerFilter.json(FilterExpr.present("kind"))),
       (error: unknown) =>
-        error instanceof FilterExecutionError && error.detail.reason === "conflict"
+        error instanceof FilterExecutionError && error.detail?.reason === "conflict"
     )
     const released = await group.filter().release()
     assert.deepEqual(released.digest, binding.digest)
@@ -499,10 +600,10 @@ void test("given_pass_through_decode_faults_when_guarded_then_should_verify_the_
     )
     const page = await filtered.nextPage({ timeoutMs: READ_TIMEOUT_MS })
     assert.deepEqual(
-      page.records.map((record) => [record.offset, record.evaluated]),
+      page.records.map((record) => [record.offset, record.evaluation]),
       [
-        [0n, false],
-        [1n, true]
+        [0n, { kind: "unevaluated", reason: "malformed" }],
+        [1n, { kind: "selected" }]
       ]
     )
     await filtered.ackPage(page)
@@ -750,10 +851,10 @@ void test("given_a_recreated_topic_when_a_numeric_member_rejoins_then_should_lea
         try {
           await stale.tryNextPage()
         } catch (error) {
-          if (error instanceof FilterExecutionError && error.detail.reason === "not_found")
+          if (error instanceof FilterExecutionError && error.detail?.reason === "not_found")
             refused = true
           else if (!(
-            error instanceof FilterExecutionError && error.detail.reason === "source_changed"
+            error instanceof FilterExecutionError && error.detail?.reason === "source_changed"
           ))
             throw error
         }

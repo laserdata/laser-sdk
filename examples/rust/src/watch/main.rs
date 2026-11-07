@@ -4,7 +4,7 @@ use laser_examples::{
 };
 use laser_sdk::prelude::full::*;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // The Change feed primitive: consume lightweight advancement records instead
 // of rerunning a query on a timer. Rides the same view shape as the Views
@@ -38,7 +38,9 @@ async fn main() -> Result<(), LaserError> {
         let index = index_for("readings_v1");
         ensure_view(&laser, TOPIC, &index, ContentType::Json, &FIELDS).await?;
 
-        let mut feed = laser.watch().index(&index).records()?;
+        // Open at the feed's end before publishing, so the reader sees this
+        // run's change and none of the history before it.
+        let mut feed = laser.watch().index(&index).from_end().records().await?;
 
         laser
             .topic(TOPIC)
@@ -51,25 +53,25 @@ async fn main() -> Result<(), LaserError> {
             .send()
             .await?;
 
-        let deadline = Instant::now() + CHANGE_TIMEOUT;
-        loop {
-            let changes = feed.poll().await?;
-            if !changes.is_empty() {
-                for change in changes {
-                    println!(
-                        "  view advanced: {} row(s), source offsets {}..{}",
-                        change.rows, change.from_offset, change.to_offset
-                    );
-                }
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(LaserError::Invalid(format!(
-                    "no change on `{index}` arrived in time"
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        let changes = feed.poll_within(CHANGE_TIMEOUT).await?;
+        if changes.is_empty() {
+            return Err(LaserError::Invalid(format!(
+                "no change on `{index}` arrived in time"
+            )));
         }
+        for watched in changes {
+            println!(
+                "  view advanced: {} row(s), source offsets {}..{}",
+                watched.change.rows, watched.change.from_offset, watched.change.to_offset
+            );
+        }
+        if feed.missed() > 0 {
+            println!(
+                "  the feed lost {} change(s) to retention, re-read the view",
+                feed.missed()
+            );
+        }
+        Ok(())
     })
     .await
 }

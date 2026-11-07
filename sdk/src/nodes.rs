@@ -1,4 +1,4 @@
-use crate::error::is_transient_iggy_io_error;
+use crate::error::{driver_wrote, is_transient_iggy_io_error};
 use crate::iggy::prelude::{ClusterClient, Identifier, IggyClient, IggyError};
 use bytes::Bytes;
 use iggy_binary_protocol::codes::GET_PARTITION_ROUTE_CODE;
@@ -6,20 +6,17 @@ use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
 use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::{WireDecode, WireEncode};
 use iggy_common::wire_conversions::identifier_to_wire;
+use iggy_common::with_binary_deadline;
 use laser_wire::codes::{
     AGDX_AUTHZ_BIND_ROLES_CODE, AGDX_AUTHZ_DEFINE_ROLE_CODE, AGDX_AUTHZ_DELETE_ROLE_CODE,
 };
 use laser_wire::framing::decode_named;
-#[cfg(feature = "query")]
-use laser_wire::query::QueryExecutionId;
+use laser_wire::mutation::{AppliedFrontier, ManagedReplyEnvelope};
 use laser_wire::result::CommandError;
-#[cfg(feature = "query")]
-use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
-
-#[cfg(feature = "query")]
-const PINNED_QUERIES: usize = 1024;
 
 /// The node a managed request goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -60,16 +57,35 @@ struct State {
     roster: Vec<u8>,
     // Failed links so far, each one moves the caller to the next node.
     moved: u64,
-    // The node each recent query ran on, newest last.
-    #[cfg(feature = "query")]
-    queries: VecDeque<(QueryExecutionId, u8)>,
 }
 
 /// The reply of a managed request and the replica that sent it, `None` when
 /// the metadata primary answered.
 pub(crate) struct Answered {
+    /// The reply, opened from the positioned envelope a managed node may wrap
+    /// it in.
     pub(crate) reply: Bytes,
+    /// The applied frontier the positioned envelope carried.
+    pub(crate) frontier: Option<AppliedFrontier>,
     pub(crate) replica: Option<u8>,
+}
+
+impl Answered {
+    /// Open a positioned reply once, keeping its frontier beside the reply.
+    pub(crate) fn open(reply: Bytes, replica: Option<u8>) -> Self {
+        match decode_named::<ManagedReplyEnvelope>(&reply) {
+            Ok(envelope) => Self {
+                reply: Bytes::from(envelope.reply),
+                frontier: Some(envelope.frontier),
+                replica,
+            },
+            Err(_) => Self {
+                reply,
+                frontier: None,
+                replica,
+            },
+        }
+    }
 }
 
 impl Nodes {
@@ -104,8 +120,11 @@ impl Nodes {
         target: Target,
         deadline: Instant,
     ) -> Result<Answered, IggyError> {
-        self.send_until(client, code, payload, target, Some(deadline))
-            .await
+        with_binary_deadline(
+            deadline.into(),
+            self.send_until(client, code, payload, target, Some(deadline)),
+        )
+        .await
     }
 
     async fn send_until(
@@ -117,8 +136,8 @@ impl Nodes {
         deadline: Option<Instant>,
     ) -> Result<Answered, IggyError> {
         match target {
-            Target::MetadataPrimary => Ok(Answered {
-                reply: match deadline {
+            Target::MetadataPrimary => Ok(Answered::open(
+                match deadline {
                     Some(deadline) => {
                         client
                             .send_binary_request_with_deadline(code, payload, deadline)
@@ -126,12 +145,12 @@ impl Nodes {
                     }
                     None => client.send_binary_request(code, payload).await?,
                 },
-                replica: None,
-            }),
-            Target::Replica(replica) => Ok(Answered {
-                reply: send_to_replica(client, code, payload, replica, deadline).await?,
-                replica: Some(replica),
-            }),
+                None,
+            )),
+            Target::Replica(replica) => Ok(Answered::open(
+                send_to_replica(client, code, payload, replica, deadline).await?,
+                Some(replica),
+            )),
             Target::Caller => self.send_to_caller(client, code, payload, deadline).await,
         }
     }
@@ -143,25 +162,61 @@ impl Nodes {
         payload: Bytes,
         deadline: Option<Instant>,
     ) -> Result<Answered, IggyError> {
+        self.walk_caller(client, deadline, &AtomicBool::new(false), |replica| {
+            send_to_replica(client, code, payload.clone(), replica, deadline)
+        })
+        .await
+    }
+
+    /// A request to the caller's node that marks `written` once an attempt
+    /// wrote its frame, so a later attempt's failure cannot hide that the
+    /// outcome is unknown.
+    #[cfg(feature = "kv")]
+    pub(crate) async fn send_to_caller_marking(
+        &self,
+        client: &IggyClient,
+        code: u32,
+        payload: Bytes,
+        written: &AtomicBool,
+    ) -> Result<Answered, IggyError> {
+        self.walk_caller(client, None, written, |replica| {
+            send_to_replica(client, code, payload.clone(), replica, None)
+        })
+        .await
+    }
+
+    async fn walk_caller<Attempt, Sent>(
+        &self,
+        client: &IggyClient,
+        deadline: Option<Instant>,
+        written: &AtomicBool,
+        mut attempt: Attempt,
+    ) -> Result<Answered, IggyError>
+    where
+        Attempt: FnMut(u8) -> Sent,
+        Sent: Future<Output = Result<Bytes, IggyError>>,
+    {
         let mut roster_read = false;
         let mut failed_links = 0;
         loop {
             let (replica, nodes) = self.caller_node(client).await?;
-            match send_to_replica(client, code, payload.clone(), replica, deadline).await {
+            let sent = attempt(replica).await;
+            if sent.as_ref().map_or_else(driver_wrote, |_| true) {
+                written.store(true, Ordering::Release);
+            }
+            match sent {
                 Ok(reply) => {
-                    if decode_named::<CommandError>(&reply)
-                        .is_ok_and(|error| error.code.is_backend_unavailable())
+                    let answered = Answered::open(reply, Some(replica));
+                    if reply_error(&answered.reply)
+                        .is_some_and(|error| error.code.is_backend_unavailable())
                     {
                         self.failed(replica);
                         failed_links += 1;
-                        if failed_links < nodes {
+                        if walks_on(failed_links, nodes, deadline, Instant::now()) {
                             continue;
                         }
                     }
-                    return Ok(Answered {
-                        reply,
-                        replica: Some(replica),
-                    });
+                    return Ok(answered);
                 }
                 Err(IggyError::InvalidIdentifier) if !roster_read => {
                     roster_read = true;
@@ -170,7 +225,7 @@ impl Nodes {
                 Err(error) if is_transient_iggy_io_error(&error) => {
                     self.failed(replica);
                     failed_links += 1;
-                    if failed_links >= nodes {
+                    if !walks_on(failed_links, nodes, deadline, Instant::now()) {
                         return Err(error);
                     }
                 }
@@ -204,28 +259,6 @@ impl Nodes {
 
     pub(crate) fn forget_roster(&self) {
         self.lock().roster.clear();
-    }
-
-    #[cfg(feature = "query")]
-    /// Remember the node a query ran on, so its pages, status and
-    /// cancellation reach the plane that holds its state.
-    pub(crate) fn pin_query(&self, execution_id: QueryExecutionId, replica: u8) {
-        let mut state = self.lock();
-        state.queries.retain(|(pinned, _)| *pinned != execution_id);
-        if state.queries.len() == PINNED_QUERIES {
-            state.queries.pop_front();
-        }
-        state.queries.push_back((execution_id, replica));
-    }
-
-    #[cfg(feature = "query")]
-    /// The node of a pinned query, or the caller's node.
-    pub(crate) fn query_target(&self, execution_id: QueryExecutionId) -> Target {
-        self.lock()
-            .queries
-            .iter()
-            .find(|(pinned, _)| *pinned == execution_id)
-            .map_or(Target::Caller, |(_, replica)| Target::Replica(*replica))
     }
 
     fn pick(&self) -> Option<(u8, usize)> {
@@ -286,8 +319,23 @@ async fn send_to_replica(
 /// Whether the node a partition request went to no longer leads the
 /// partition or cannot be reached, so its route is looked up again.
 pub(crate) fn is_route_stale(error: &IggyError) -> bool {
-    matches!(error, IggyError::NotPrimary | IggyError::InvalidIdentifier)
-        || is_transient_iggy_io_error(error)
+    matches!(
+        error,
+        IggyError::NotPrimary | IggyError::InvalidIdentifier | IggyError::PartitionNotFound(..)
+    ) || is_transient_iggy_io_error(error)
+}
+
+/// The command error an opened reply carries. A recovering node's positioned
+/// refusal is opened first by [`Answered::open`], so both route the same way.
+fn reply_error(reply: &[u8]) -> Option<CommandError> {
+    decode_named::<CommandError>(reply).ok()
+}
+
+/// Whether a caller request whose link failed on `failed_links` nodes moves to
+/// the next one. An expired attempt deadline ends the walk, so the next attempt
+/// starts on the next node with a fresh deadline.
+fn walks_on(failed_links: usize, nodes: usize, deadline: Option<Instant>, now: Instant) -> bool {
+    failed_links < nodes && deadline.is_none_or(|deadline| now < deadline)
 }
 
 fn pick(roster: &[u8], caller_key: u64, moved: u64) -> Option<u8> {
@@ -301,8 +349,127 @@ fn pick(roster: &[u8], caller_key: u64, moved: u64) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "query")]
-    use laser_wire::query::QueryExecutionId;
+    use iggy_common::locking::IggyRwLockFn;
+    use laser_wire::codes::AGDX_KV_SET_CODE;
+    use laser_wire::framing::encode_named;
+    use laser_wire::mutation::AppliedFrontier;
+    use laser_wire::result::ResultCode;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn given_a_blocked_roster_read_when_a_managed_attempt_expires_then_should_end_at_its_deadline()
+     {
+        let client = IggyClient::default();
+        let handle = client.client();
+        let _guard = handle.write().await;
+        let nodes = Nodes::new(0);
+        let result = tokio::time::timeout(
+            Duration::from_millis(300),
+            nodes.send_held(
+                &client,
+                AGDX_KV_SET_CODE,
+                Bytes::new(),
+                Target::Caller,
+                Instant::now() + Duration::from_millis(20),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Err(IggyError::TransientNotAccepted))),
+            "the attempt deadline must cover the roster read"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_driver_that_wrote_the_frame_when_the_next_node_stops_before_writing_then_should_mark_the_frame_written()
+     {
+        let client = IggyClient::default();
+        let nodes = Nodes::new(0);
+        nodes.lock().roster = vec![0, 1];
+        let written = AtomicBool::new(false);
+        let mut attempts = vec![
+            Err(IggyError::ClientShutdown),
+            Err(IggyError::TransientNotCommitted),
+        ];
+
+        let outcome = nodes
+            .walk_caller(&client, None, &written, |_replica| {
+                std::future::ready(attempts.pop().expect("an attempt per node"))
+            })
+            .await;
+
+        assert!(matches!(outcome, Err(IggyError::ClientShutdown)));
+        assert!(
+            written.load(Ordering::SeqCst),
+            "the first node wrote the frame before the client shut down"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_driver_that_stops_before_writing_when_walked_then_should_leave_the_frame_unwritten()
+     {
+        let client = IggyClient::default();
+        let nodes = Nodes::new(0);
+        nodes.lock().roster = vec![0, 1];
+        let written = AtomicBool::new(false);
+
+        let outcome = nodes
+            .walk_caller(&client, None, &written, |_replica| {
+                std::future::ready(Err(IggyError::ClientShutdown))
+            })
+            .await;
+
+        assert!(matches!(outcome, Err(IggyError::ClientShutdown)));
+        assert!(!written.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn given_a_backend_unavailable_reply_with_a_frontier_when_routed_then_should_read_like_a_plain_one()
+     {
+        let refusal = encode_named(&CommandError::new(
+            ResultCode::BackendUnavailable,
+            "the plane is recovering",
+        ))
+        .expect("encoded");
+        let positioned = encode_named(&ManagedReplyEnvelope {
+            v: 1,
+            frontier: AppliedFrontier::default(),
+            reply: refusal.clone(),
+        })
+        .expect("encoded");
+
+        for reply in [refusal, positioned] {
+            let answered = Answered::open(Bytes::from(reply), Some(1));
+            assert!(
+                reply_error(&answered.reply)
+                    .is_some_and(|error| error.code.is_backend_unavailable())
+            );
+        }
+    }
+
+    #[test]
+    fn given_an_expired_attempt_deadline_when_a_caller_link_fails_then_should_stop_walking_the_roster()
+     {
+        let now = Instant::now();
+        let ahead = now + Duration::from_secs(1);
+        assert!(walks_on(1, 3, None, now));
+        assert!(walks_on(1, 3, Some(ahead), now));
+        assert!(!walks_on(3, 3, Some(ahead), now), "every node failed");
+        assert!(
+            !walks_on(1, 3, Some(now), now),
+            "an expired attempt leaves the next node to the next attempt"
+        );
+    }
+
+    #[test]
+    fn given_a_missing_partition_on_a_routed_node_when_classified_then_should_look_the_route_up_again()
+     {
+        assert!(is_route_stale(&IggyError::PartitionNotFound(
+            7,
+            Identifier::default(),
+            Identifier::default(),
+        )));
+    }
 
     #[test]
     fn given_a_roster_when_picking_then_should_keep_one_node_per_caller_key() {
@@ -341,23 +508,6 @@ mod tests {
             nodes.pick(),
             Some((1, 3)),
             "a late failure of the old node keeps the new one"
-        );
-    }
-
-    #[cfg(feature = "query")]
-    #[test]
-    fn given_pinned_queries_when_the_list_is_full_then_should_drop_the_oldest() {
-        let nodes = Nodes::new(0);
-        let first = QueryExecutionId::from(u128::MAX);
-        nodes.pin_query(first, 2);
-        assert_eq!(nodes.query_target(first), Target::Replica(2));
-        for id in (0_u128..).take(PINNED_QUERIES) {
-            nodes.pin_query(QueryExecutionId::from(id), 1);
-        }
-        assert_eq!(nodes.query_target(first), Target::Caller);
-        assert_eq!(
-            nodes.query_target(QueryExecutionId::from(0_u128)),
-            Target::Replica(1)
         );
     }
 

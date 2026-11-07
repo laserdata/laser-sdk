@@ -21,27 +21,24 @@ class LatePause {
     this.settle(undefined)
   }
 }
-import { code } from "../client/error-classify.js"
+import { isRetryable } from "../client/error-classify.js"
 import {
   CancelledError,
-  ConsumerGroupSetupError,
-  FilterExecutionError,
-  FilterFaultError,
-  FilterOversizedRecordError,
+  ConfigError,
+  HandlerConfigError,
   HandlerError,
   InvalidError,
   LaserError,
   NoStreamError,
-  TimeoutError,
-  TransportError,
-  publishCause
+  TimeoutError
 } from "../client/errors.js"
 import {
   INTERNAL_ASSIGNED_PARTITIONS,
   INTERNAL_COMMIT_HANDLED,
   INTERNAL_DIALED,
   INTERNAL_NATIVE_CONSUMER,
-  INTERNAL_TRANSPORT
+  INTERNAL_TRANSPORT,
+  INTERNAL_VERIFIER
 } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import type { LaserTransport } from "../iggy/apache-iggy.js"
@@ -52,12 +49,7 @@ import { SystemClock, type Clock } from "../runtime/clock.js"
 import { warn } from "../runtime/warn.js"
 import type { KeyRegistry, SigningKey } from "../signing.js"
 import type { SessionConfig, Sessions } from "../session.js"
-import {
-  type AgentId,
-  ConversationId,
-  type ConsumerGroupName,
-  type MessageId
-} from "../types/ids.js"
+import { AgentId, ConversationId, type ConsumerGroupName, type MessageId } from "../types/ids.js"
 import {
   AgentKind,
   OPERATION_TASK,
@@ -68,10 +60,11 @@ import {
   parseAgentId,
   taskStateFromCode,
   type AgentDeadLetter,
+  type AgentErrorBody,
+  type SignatureContext,
   type AgentId as WireAgentId,
   type DeadLetterReasonName
 } from "../wire/agent.js"
-import { resultCodeIsRetryable } from "../wire/result.js"
 import { encodeNamed } from "../wire/cbor.js"
 import {
   ADDRESSEE_FILTER_NAME,
@@ -84,9 +77,9 @@ import { CONVERSATION_ID } from "../wire/headers.js"
 import { type LogPosition, crockfordEncode } from "../wire/ids.js"
 import { AGENT_CONTROL, AGENT_SESSIONS } from "../wire/topics.js"
 import type { Consumer, ConsumerMessage } from "../stream/consumer.js"
-import { policyAware } from "../stream/consumer-group.js"
+import { policyAware } from "../managed/filters.js"
 import { readThrough } from "../stream/cursor.js"
-import { AgentCtx } from "./context.js"
+import { AgentCtx, ApprovalSlot, type ApprovalResume } from "./context.js"
 import {
   type AgentMessage,
   type ReceivedAgentMessage,
@@ -122,6 +115,11 @@ const VERIFIED_RECORD_WINDOW = 16_384
 const ANONYMOUS_AGENT = "anonymous"
 // How long the server holds a read that finds nothing new, as Rust.
 const DEFAULT_MAX_WAIT_MS = 5_000
+
+/** The error detail key that carries the dead-letter reason code, on a failed
+ * session and on the error a dead-lettered command answers its source with.
+ * @internal */
+export const DEAD_LETTER_REASON_DETAIL = "dead_letter_reason"
 
 export {
   agentMessageBody,
@@ -292,77 +290,16 @@ export interface ReliableConsumerControl {
   readonly hardAborted?: () => boolean
 }
 
+// A programming error in the handler is the counterpart of a Rust panic, so
+// it dead-letters at once like one. Any other foreign error is transient.
 function handlerError(error: unknown): LaserError {
-  return error instanceof LaserError
-    ? error
-    : new HandlerError(error instanceof Error ? error.message : String(error), { cause: error })
-}
-
-/** Whether retrying the same call can succeed, the classifier the Rust
- * `LaserError::is_retryable` defines. A failed publish answers for its cause.
- * Managed failures follow the canonical result-code classifier, while
- * transport, handler, routing, timeout, and deferred-policy failures keep
- * their local semantics. */
-export function isRetryable(error: LaserError): boolean {
-  const cause = publishCause(error)
-  if (!(cause instanceof LaserError)) return false
-  switch (cause.kind) {
-    case "config":
-    case "no-stream":
-    case "no-respond-topic":
-    case "ambiguous-mutation":
-    case "unsupported":
-    case "invalid":
-    case "id":
-    case "provenance":
-    case "codec":
-    case "protocol":
-    case "handler-config":
-    case "state-store":
-    case "integrity":
-    case "rejected":
-    case "presence-conflict":
-    case "policy-blocked":
-    case "step-up-required":
-    case "cancelled":
-    case "typed-decode":
-    case "authz":
-    case "signature":
-    case "budget-exceeded":
-    case "fence-violation":
-    case "quarantined":
-      return false
-    case "publish-failed":
-      return false
-    case "transport":
-      return cause instanceof TransportError ? cause.retryable : true
-    case "routing":
-      return !(
-        "reason" in cause &&
-        (cause as { readonly reason?: { readonly kind?: string } }).reason?.kind ===
-          "principalMismatch"
-      )
-    case "query":
-    case "kv":
-    case "fork":
-    case "graph":
-    case "checkpoint":
-    case "session":
-    case "command":
-      return resultCodeIsRetryable(code(cause))
-    case "filter":
-      if (cause instanceof ConsumerGroupSetupError) {
-        return cause.cause instanceof LaserError && isRetryable(cause.cause)
-      }
-      if (cause instanceof FilterFaultError || cause instanceof FilterOversizedRecordError) {
-        return false
-      }
-      return cause instanceof FilterExecutionError && resultCodeIsRetryable(cause.detail.code)
-    case "timeout":
-    case "handler":
-    case "policy-deferred":
-      return true
-  }
+  if (error instanceof LaserError) return error
+  const message = error instanceof Error ? error.message : String(error)
+  return error instanceof TypeError ||
+    error instanceof ReferenceError ||
+    error instanceof SyntaxError
+    ? new HandlerConfigError(`handler failed: ${message}`, { cause: error })
+    : new HandlerError(message, { cause: error })
 }
 
 // The next record, or undefined when none arrived within `waitMs`.
@@ -488,6 +425,8 @@ function shutdownControl(control: ReliableConsumerControl, graceMs: number) {
 }
 
 class ReliableWorker {
+  /** The dead-letter publish failure that stopped this worker, if any. */
+  deadLetterFailure: LaserError | undefined
   private readonly highWaterFence = new Map<string, FenceEntry>()
   private readonly fenceSweep: FenceSweepState = { lastSweepMicros: 0n }
   // A signature binds the envelope to no log position, so the exact signed
@@ -558,6 +497,64 @@ class ReliableWorker {
     await this.deliver(received, false)
   }
 
+  /** Hand a record parked on an approval back to its handler with `resume`.
+   * True when the handler is still waiting for the approval. */
+  async resume(received: ReceivedAgentMessage, resume: ApprovalResume): Promise<boolean> {
+    const decoded = decodeAgentMessage(received, this.options.understoodFeatures)
+    if (decoded.kind === "error") return false
+    const verifier = this.options.verifier
+    let message = decoded.message
+    if (
+      verifier !== undefined &&
+      message.envelope !== undefined &&
+      decoded.signatureContext !== undefined &&
+      decoded.observedAtMicros !== undefined
+    ) {
+      try {
+        message = {
+          ...message,
+          verifiedPrincipal: verifier.verifyObservedAt(
+            message.envelope,
+            decoded.signatureContext,
+            decoded.observedAtMicros
+          ).principal
+        }
+      } catch {
+        // The replay runs unverified, as the live delivery would refuse it.
+      }
+    }
+    return this.handle(message, resume)
+  }
+
+  // Record who signed a reply, against the connection's reply verifier, so
+  // an approval gate accepts only its approver's signed decision.
+  private verifiedReply(
+    message: AgentMessage,
+    decoded: { readonly signatureContext?: SignatureContext; readonly observedAtMicros?: bigint }
+  ): AgentMessage {
+    const verifier = this.laser[INTERNAL_VERIFIER]()
+    if (
+      verifier === undefined ||
+      message.envelope === undefined ||
+      decoded.signatureContext === undefined ||
+      decoded.observedAtMicros === undefined
+    ) {
+      return message
+    }
+    try {
+      return {
+        ...message,
+        verifiedPrincipal: verifier.verifyObservedAt(
+          message.envelope,
+          decoded.signatureContext,
+          decoded.observedAtMicros
+        ).principal
+      }
+    } catch {
+      return message
+    }
+  }
+
   // The pause runtime, set at start or once a missing control topic appears.
   private latePause: PauseRuntime | undefined
 
@@ -604,7 +601,16 @@ class ReliableWorker {
     // Only work for an operation this handler serves reaches it. Replies,
     // status, events, control, and records for another agent are skipped and
     // still committed. The author is never a discriminator.
-    if (this.dispatch(message) !== "work") return
+    const dispatched = this.dispatch(message)
+    if (dispatched !== "work") {
+      // An approval decision addressed to this agent resumes the session it
+      // parked.
+      const pause = this.pauseRuntime()
+      if (dispatched === "reply" && live && pause !== undefined) {
+        await pause.resumeApproval(this, this.verifiedReply(message, decoded))
+      }
+      return
+    }
     if (this.options.verifier !== undefined) {
       try {
         const envelope = message.envelope
@@ -680,8 +686,8 @@ class ReliableWorker {
     const key = dedupKey(message.provenance)
     if (key !== undefined && !(await this.options.deduplicator.observe(key))) return
     if (
-      message.provenance.deadlineMicros !== undefined &&
-      this.options.clock.nowMicros() > message.provenance.deadlineMicros
+      message.provenance.deadlineAtMicros !== undefined &&
+      this.options.clock.nowMicros() > message.provenance.deadlineAtMicros
     ) {
       await this.deadLetter(message, "DeadlineExceeded", 0, "message past its deadline")
       return
@@ -699,7 +705,13 @@ class ReliableWorker {
     }
   }
 
-  private async handle(message: AgentMessage): Promise<void> {
+  // Run the middleware and the handler of an admitted record, retrying a
+  // retryable failure, and park the record when its approval gate
+  // interrupted the handler. A replayed gate decides on `resume`. True when
+  // the record waits on an approval.
+  private async handle(message: AgentMessage, resume?: ApprovalResume): Promise<boolean> {
+    const pause = this.pauseRuntime()
+    const approval = pause === undefined ? undefined : new ApprovalSlot(this.options.topic, resume)
     const context = AgentCtx.create(this.laser, message, {
       ...(this.options.agent !== undefined ? { agent: this.options.agent } : {}),
       ...(this.options.respondOn !== undefined ? { respondOn: this.options.respondOn } : {}),
@@ -707,20 +719,33 @@ class ReliableWorker {
       inboxRoute: this.options.inboxRoute,
       requestAt: this.position(message.id),
       sessions: this.options.sessions,
-      control: this.options.control
+      control: this.options.control,
+      ...(approval !== undefined ? { approval } : {})
     })
+    // A non-retryable rejection dead-letters the message without running the
+    // handler. A retryable one is retried under the retry policy.
     for (const middleware of this.options.middleware) {
-      if (this.cancelled()) return
-      try {
-        await middleware.beforeHandle?.(message)
-      } catch (error) {
-        const rejected = handlerError(error)
-        await this.deadLetter(message, "Rejected", 0, rejected.message)
-        return
+      for (let attempt = 0; ; attempt += 1) {
+        if (this.cancelled()) return false
+        try {
+          await middleware.beforeHandle?.(message)
+          break
+        } catch (error) {
+          const failure = handlerError(error)
+          if (!isRetryable(failure)) {
+            await this.deadLetter(message, "Rejected", 0, failure.message)
+            return false
+          }
+          if (attempt + 1 >= this.options.retry.maxAttempts) {
+            await this.deadLetter(message, "RetryExhausted", attempt + 1, failure.message)
+            return false
+          }
+          await sleep(retryDelayMs(this.options.retry, attempt), this.options.hardSignal)
+        }
       }
     }
     for (let attempt = 0; ; attempt += 1) {
-      if (this.cancelled()) return
+      if (this.cancelled()) return false
       let result: HandlerResult
       try {
         await this.handler.handle(message, context)
@@ -728,23 +753,31 @@ class ReliableWorker {
       } catch (error) {
         result = { kind: "error", error: handlerError(error) }
       }
-      if (this.cancelled()) return
+      if (this.cancelled()) return false
       for (const middleware of this.options.middleware) {
-        if (this.cancelled()) return
+        if (this.cancelled()) return false
         try {
           await middleware.afterHandle?.(message, result, attempt + 1)
         } catch {
           // Middleware observation cannot change the handler result.
         }
       }
-      if (result.kind === "ok") return
+      // An approval gate interrupted the handler, whatever it returned: park
+      // the record instead of committing or retrying it.
+      const interrupt = approval?.interrupt
+      if (approval !== undefined && interrupt !== undefined) {
+        approval.interrupt = undefined
+        await pause?.parkApproval(message, interrupt)
+        return true
+      }
+      if (result.kind === "ok") return false
       if (!isRetryable(result.error)) {
         await this.deadLetter(message, "Rejected", attempt + 1, result.error.message)
-        return
+        return false
       }
       if (attempt + 1 >= this.options.retry.maxAttempts) {
         await this.deadLetter(message, "RetryExhausted", attempt + 1, result.error.message)
-        return
+        return false
       }
       await sleep(retryDelayMs(this.options.retry, attempt), this.options.hardSignal)
     }
@@ -790,6 +823,7 @@ class ReliableWorker {
         .status(OPERATION_TASK)
         .withCorrelation(envelope.correlation)
         .withTaskState(taskStateFromCode(TaskStateName.Working))
+        .withTarget(AgentId.new(envelope.source))
       if (this.options.signingKey !== undefined) {
         acknowledgment = acknowledgment.signedBy(this.options.signingKey)
       }
@@ -814,7 +848,7 @@ class ReliableWorker {
     attempts: number,
     detail: string
   ): Promise<void> {
-    const { deadlineMicros, ...provenance } = message.provenance
+    const { deadlineAtMicros, ...provenance } = message.provenance
     await this.publishDeadLetter(
       {
         ...provenance,
@@ -830,6 +864,43 @@ class ReliableWorker {
       message,
       message.provenance.conversationId
     )
+    await this.answerDeadLetter(message, reason, detail)
+  }
+
+  // A correlated command that was dead-lettered answers its source with an
+  // AGDX error on `respondOn`, so a contract or request reads the refusal at
+  // once instead of waiting out its deadline. Best effort: the dead letter is
+  // published, so a failed answer leaves the record to commit.
+  private async answerDeadLetter(
+    message: AgentMessage,
+    reason: keyof typeof DeadLetterReasonName,
+    detail: string
+  ): Promise<void> {
+    const envelope = message.envelope
+    const agent = this.options.agent
+    const respondOn = this.options.respondOn
+    if (
+      agent === undefined ||
+      respondOn === undefined ||
+      envelope?.kind !== AgentKind.Command ||
+      envelope.correlation === undefined
+    ) {
+      return
+    }
+    try {
+      let failure = this.laser
+        .agdx(respondOn, agent, message.provenance.conversationId)
+        .fail(envelope.correlation, deadLetterError(reason, detail))
+        .withTarget(AgentId.new(envelope.source))
+        .withAncestry(envelope.parent, envelope.root)
+      if (envelope.record !== undefined) {
+        failure = failure.withCause(envelope.record, this.position(message.id))
+      }
+      if (this.options.signingKey !== undefined) failure = failure.signedBy(this.options.signingKey)
+      await failure.send()
+    } catch (error) {
+      warn(`Answering the dead-lettered command failed: ${handlerError(error).message}`)
+    }
   }
 
   // The capsule keeps the record's own conversation when its header still
@@ -878,22 +949,36 @@ class ReliableWorker {
     session: ConversationId | undefined
   ): Promise<void> {
     let publishError: LaserError | undefined
-    try {
-      await this.laser.sendAgent(
-        AgentTopic.Dlq,
-        encodeNamed(encodeAgentDeadLetter(capsule)),
-        provenance,
-        { contentType: "cbor" }
-      )
-    } catch (error) {
-      publishError = handlerError(error)
+    // A retryable failure is retried in place on the consumer backoff, so a
+    // brief outage neither loses the record nor stops the consumer.
+    for (let failures = 0; ;) {
+      try {
+        await this.laser.sendAgent(
+          AgentTopic.Dlq,
+          encodeNamed(encodeAgentDeadLetter(capsule)),
+          provenance,
+          { contentType: "cbor" }
+        )
+        publishError = undefined
+        break
+      } catch (error) {
+        publishError = handlerError(error)
+        failures += 1
+        if (!isRetryable(publishError) || failures >= CONSUMER_FAILURE_BUDGET) break
+        await sleep(consumerBackoff(failures), this.options.hardSignal)
+      }
     }
     try {
       await this.options.onDeadLetter?.onDeadLetter(message, capsule, publishError)
     } catch {
       // Dead-letter sinks observe the terminal delivery decision.
     }
-    if (publishError !== undefined) throw publishError
+    if (publishError !== undefined) {
+      // The record stays uncommitted and the consumer stops, as reopening
+      // would read it again past the dedup window and commit it unhandled.
+      this.deadLetterFailure = publishError
+      throw publishError
+    }
     if (session !== undefined) await this.failSessionOnDeadLetter(session, capsule)
   }
 
@@ -922,7 +1007,7 @@ class ReliableWorker {
           retryable: false,
           detail: new Map([
             [
-              "dead_letter_reason",
+              DEAD_LETTER_REASON_DETAIL,
               { kind: "int", value: BigInt(deadLetterReasonCode(capsule.reason)) }
             ],
             [
@@ -937,6 +1022,33 @@ class ReliableWorker {
     } catch {
       // The dead letter is published, so the record still commits.
     }
+  }
+}
+
+// The error a dead-lettered command answers its source with: the reason code
+// in the detail, so a contract can tell a command dropped unconsumed.
+function deadLetterError(
+  reason: keyof typeof DeadLetterReasonName,
+  detail: string
+): AgentErrorBody {
+  return {
+    code: {
+      kind: "known",
+      name:
+        reason === "DeadlineExceeded"
+          ? "DeadlineExceeded"
+          : reason === "RetryExhausted"
+            ? "Internal"
+            : "InvalidRequest"
+    },
+    message: detail,
+    retryable: reason === "RetryExhausted",
+    detail: new Map([
+      [
+        DEAD_LETTER_REASON_DETAIL,
+        { kind: "int", value: BigInt(deadLetterReasonCode({ kind: "known", name: reason })) }
+      ]
+    ])
   }
 }
 
@@ -982,6 +1094,11 @@ export class ReliableConsumer {
     const grace = options.shutdownGraceMs ?? 30_000
     if (!Number.isFinite(grace) || grace < 0)
       throw new InvalidError("shutdownGraceMs must be a non-negative finite number")
+    if (options.ackOnPickup === true && options.respondOn === undefined) {
+      throw new ConfigError(
+        "ackOnPickup requires respondOn, the topic the pickup status is sent on"
+      )
+    }
     this.options = options
   }
 
@@ -1224,8 +1341,13 @@ export class ReliableConsumer {
           return
         } catch (error) {
           const failure = handlerError(error)
-          if (runtime.signal.aborted || runtime.hardAborted() || !isRetryable(failure))
-            throw failure
+          if (
+            runtime.signal.aborted ||
+            runtime.hardAborted() ||
+            worker.deadLetterFailure !== undefined ||
+            !isRetryable(failure)
+          )
+            throw worker.deadLetterFailure ?? failure
           // A consumer that ran healthily before failing starts a new budget,
           // as Rust resets its count on the next record.
           if (Date.now() - started >= CONSUMER_HEALTHY_RUN_MS) failures = 0

@@ -3,43 +3,28 @@ import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { test } from "node:test"
 import {
-  decodeAcceptedOperationJson,
   decodeCapabilitiesJson,
-  decodeDestinationIssueJson,
-  decodeDestinationPageJson,
   decodeErrorBodyJson,
   decodeForkInfoJson,
   decodeKvPageJson,
-  decodeProjectionListJson,
-  decodeQueryExecutionJson,
-  decodeQueryRoutePageJson,
+  decodeProjectionPageJson,
   decodeQueryResultJson,
   decodeSchemaDefJson,
   decodeSchemaListJson,
-  decodeSnapshotPageJson,
-  decodeTableFilePageJson,
-  decodeTableMetricsJson,
-  decodeTableSchemaJson,
-  decodeTableViewJson,
-  encodeAcceptedOperationJson,
   encodeCapabilitiesJson,
-  encodeDestinationIssueJson,
-  encodeDestinationPageJson,
   encodeErrorBodyJson,
   encodeForkInfoJson,
   encodeKvPageJson,
-  encodeProjectionListJson,
-  encodeQueryExecutionJson,
-  encodeQueryRoutePageJson,
+  encodeProjectionPageJson,
   encodeQueryResultJson,
   encodeSchemaDefJson,
   encodeSchemaListJson,
-  encodeSnapshotPageJson,
-  encodeTableFilePageJson,
-  encodeTableMetricsJson,
-  encodeTableSchemaJson,
-  encodeTableViewJson,
+  authzRolePath,
   forkPath,
+  graphPath,
+  graphQueryPath,
+  kvEntryPath,
+  projectionPath,
   forkPromotePath,
   forkRowsPath,
   sessionsPath,
@@ -65,8 +50,9 @@ import {
   sessionStateQueryParams,
   sessionLinksQueryParams,
   sessionErrorBody,
-  PARAM_FIXED_FRONTIER,
   PARAM_HISTORY_LIMIT,
+  PARAM_PAGE,
+  PARAM_RESULTS,
   PARAM_TEXT
 } from "../../src/wire/http.js"
 import { ConversationId } from "../../src/wire/ids.js"
@@ -92,6 +78,14 @@ void test("given_a_stream_scoped_session_when_paths_are_built_then_should_encode
   assert.equal(sessionSourcesPath(stream, id), `${base}/sources`)
 })
 
+void test("given_names_with_reserved_characters_when_building_role_graph_projection_and_kv_paths_then_should_encode_each_segment", () => {
+  assert.equal(authzRolePath("ops/admin team"), "/agdx/authz/roles/ops%2Fadmin%20team")
+  assert.equal(graphPath("stream:acme/kg"), "/agdx/graphs/stream%3Aacme%2Fkg")
+  assert.equal(graphQueryPath("stream:acme/kg"), "/agdx/graph/stream%3Aacme%2Fkg/query")
+  assert.equal(projectionPath("orders/v1"), "/agdx/projections/orders%2Fv1")
+  assert.equal(kvEntryPath("stream:acme/state", "a-b_c"), "/agdx/kv/stream%3Aacme%2Fstate/a-b_c")
+})
+
 void test("given_a_stream_scoped_fork_id_when_paths_are_built_then_should_encode_it_as_one_segment", () => {
   assert.equal(forkPath("stream:acme/try"), "/agdx/forks/stream%3Aacme%2Ftry")
   assert.equal(forkPromotePath("stream:acme/try"), "/agdx/forks/stream%3Aacme%2Ftry/promote")
@@ -105,35 +99,35 @@ void test("given_session_queries_when_decoded_then_should_take_the_stream_from_t
   assert.equal(scoped.root, "r1")
   assert.equal(scoped.labelPrefix, "t-")
   assert.equal(sessionsQueryParams(scoped).toString(), "status=active&root=r1&label_prefix=t-")
-  const query = decodeSessionsQuery(new URLSearchParams("status=active&total=true"))
+  const query = decodeSessionsQuery(new URLSearchParams("status=active&page=2&results=25"))
   assert.equal(query.status, "active")
-  assert.equal(query.wantTotal, true)
-  assert.equal(sessionsQueryParams(query).toString(), "status=active&total=true")
+  assert.deepEqual([query.page, query.results], [2, 25])
+  assert.equal(sessionsQueryParams(query).toString(), "status=active&page=2&results=25")
   assert.equal(
-    sessionsQueryParams({ agent: "planner", text: "check", cursor: "c1", limit: 0 }).toString(),
-    "agent=planner&text=check&cursor=c1&limit=0"
+    sessionsQueryParams({ agent: "planner", text: "check", page: 1, results: 0 }).toString(),
+    "agent=planner&text=check&page=1&results=0"
   )
-  const events = decodeSessionEventsQuery(new URLSearchParams("fixed_frontier=true"))
-  assert.equal(events.fixedFrontier, true)
-  assert.equal(events.limit, undefined)
+  const events = decodeSessionEventsQuery(new URLSearchParams("page=3"))
+  assert.equal(events.page, 3)
+  assert.equal(events.results, undefined)
+  assert.equal(sessionEventsQueryParams({ page: 3, results: 5 }).toString(), "page=3&results=5")
+  assert.deepEqual(decodeSessionEventsQuery(new URLSearchParams()), {})
+  assert.deepEqual(decodeSessionChangesQuery(new URLSearchParams()), {})
   assert.equal(
-    sessionEventsQueryParams({ cursor: "c", limit: 5, fixedFrontier: true }).toString(),
-    "cursor=c&limit=5&fixed_frontier=true"
+    sessionChangesQueryParams({ page: 45, results: 100 }).toString(),
+    "page=45&results=100"
   )
-  assert.deepEqual(decodeSessionEventsQuery(new URLSearchParams()), { fixedFrontier: false })
-  const changes = decodeSessionChangesQuery(new URLSearchParams())
-  assert.equal(changes.after, 0n)
-  assert.equal(sessionChangesQueryParams({ after: 42n, limit: 10 }).toString(), "after=42&limit=10")
-  assert.deepEqual(decodeSessionChangesQuery(new URLSearchParams("after=42&limit=10")), {
-    after: 42n,
-    limit: 10
+  assert.deepEqual(decodeSessionChangesQuery(new URLSearchParams("page=45&results=100")), {
+    page: 45,
+    results: 100
   })
-  const seriesQuery = { after: 42n, limit: 10, series: 0xffff_ffff_ffff_ffffn }
-  const seriesParams = sessionChangesQueryParams(seriesQuery)
-  assert.equal(seriesParams.toString(), "after=42&limit=10&series=18446744073709551615")
-  assert.deepEqual(decodeSessionChangesQuery(seriesParams), seriesQuery)
+  const bound = { page: 2, asOf: 4405n, series: 0xffff_ffff_ffff_ffffn }
+  const boundParams = sessionsQueryParams(bound)
+  assert.equal(boundParams.toString(), "page=2&as_of=4405&series=18446744073709551615")
+  assert.deepEqual(decodeSessionsQuery(boundParams), bound)
+  assert.deepEqual(decodeSessionEventsQuery(sessionEventsQueryParams(bound)), bound)
   for (const series of ["-1", "x", "18446744073709551616"]) {
-    assert.throws(() => decodeSessionChangesQuery(new URLSearchParams({ series })), CodecError)
+    assert.throws(() => decodeSessionsQuery(new URLSearchParams({ series })), CodecError)
   }
   assert.deepEqual(decodeSessionStateQuery(new URLSearchParams("history_limit=7")), {
     historyLimit: 7
@@ -143,13 +137,11 @@ void test("given_session_queries_when_decoded_then_should_take_the_stream_from_t
     surface: "memory"
   })
   assert.equal(sessionLinksQueryParams({ surface: "memory" }).toString(), "surface=memory")
-  assert.throws(() => decodeSessionsQuery(new URLSearchParams("limit=-1")), CodecError)
-  assert.throws(
-    () => decodeSessionEventsQuery(new URLSearchParams("fixed_frontier=yes")),
-    CodecError
-  )
-  assert.throws(() => decodeSessionChangesQuery(new URLSearchParams("after=x")), CodecError)
-  assert.equal(PARAM_FIXED_FRONTIER, "fixed_frontier")
+  assert.throws(() => decodeSessionsQuery(new URLSearchParams("results=-1")), CodecError)
+  assert.throws(() => decodeSessionEventsQuery(new URLSearchParams("page=x")), CodecError)
+  assert.throws(() => decodeSessionChangesQuery(new URLSearchParams("page=x")), CodecError)
+  assert.equal(PARAM_PAGE, "page")
+  assert.equal(PARAM_RESULTS, "results")
   assert.equal(PARAM_HISTORY_LIMIT, "history_limit")
   assert.equal(PARAM_TEXT, "text")
   assert.equal(streamResource("agents"), "stream:agents")
@@ -191,7 +183,8 @@ void test("given_the_session_http_json_fixtures_when_parsed_exactly_then_should_
     assert.ok(parsed instanceof Map, json)
     const page = await binaryPage(binary)
     assert.equal(parsed.get("rebuilding") ?? false, page.rebuilding, json)
-    assert.equal(parsed.get("total"), page.total, json)
+    assert.equal(parsed.get("total_results"), BigInt(page.totalResults), json)
+    assert.equal(parsed.get("total_pages"), BigInt(page.totalPages), json)
     const items: unknown = parsed.get("items")
     assert.ok(Array.isArray(items), json)
     assert.deepEqual(
@@ -205,13 +198,18 @@ void test("given_the_session_http_json_fixtures_when_parsed_exactly_then_should_
   const start = parseCanonicalJson(text)
   assert.ok(start instanceof Map)
   assert.equal(start.get("series"), series)
-  assert.equal(start.get("floor"), 0n)
-  assert.equal(start.get("resync"), true)
+  assert.equal(start.get("floor"), 1n)
+  assert.equal(start.get("total_results"), 0n)
   const { series: rounded } = JSON.parse(text) as { readonly series: number }
   assert.notEqual(BigInt(rounded), series)
-  const legacy = parseCanonicalJson(await fixture("session_http_changes_legacy.json"))
-  assert.ok(legacy instanceof Map)
-  assert.equal(legacy.has("series"), false)
+})
+
+void test("given_a_session_changes_reply_without_its_series_when_decoded_then_should_reject", async () => {
+  const changes = parseCanonicalJson(await fixture("session_http_changes_legacy.json"))
+  assert.throws(
+    () => decodeSessionReply(new Map([["Ok", new Map([["Changes", changes]])]]), "session reply"),
+    CodecError
+  )
 })
 
 async function fixture(name: string): Promise<string> {
@@ -229,25 +227,15 @@ async function binaryPage(name: string): Promise<SessionPage> {
 
 void test("given_the_http_json_fixtures_when_decoded_then_should_re_encode_byte_identically", async () => {
   const cases = [
-    ["accepted_operation.json", decodeAcceptedOperationJson, encodeAcceptedOperationJson],
-    ["browse_projections.json", decodeProjectionListJson, encodeProjectionListJson],
+    ["browse_projections.json", decodeProjectionPageJson, encodeProjectionPageJson],
     ["browse_schemas.json", decodeSchemaListJson, encodeSchemaListJson],
     ["capabilities.json", decodeCapabilitiesJson, encodeCapabilitiesJson],
-    ["destination_issue.json", decodeDestinationIssueJson, encodeDestinationIssueJson],
-    ["destination_page.json", decodeDestinationPageJson, encodeDestinationPageJson],
     ["error_body.json", decodeErrorBodyJson, encodeErrorBodyJson],
     ["fork_info.json", decodeForkInfoJson, encodeForkInfoJson],
     ["kv_page_view.json", decodeKvPageJson, encodeKvPageJson],
-    ["query_execution.json", decodeQueryExecutionJson, encodeQueryExecutionJson],
-    ["query_route_page.json", decodeQueryRoutePageJson, encodeQueryRoutePageJson],
     ["query_result.json", decodeQueryResultJson, encodeQueryResultJson],
     ["schema_def.json", decodeSchemaDefJson, encodeSchemaDefJson],
-    ["session_http_error.json", decodeErrorBodyJson, encodeErrorBodyJson],
-    ["snapshot_page.json", decodeSnapshotPageJson, encodeSnapshotPageJson],
-    ["table_file_page.json", decodeTableFilePageJson, encodeTableFilePageJson],
-    ["table_metrics.json", decodeTableMetricsJson, encodeTableMetricsJson],
-    ["table_schema_view.json", decodeTableSchemaJson, encodeTableSchemaJson],
-    ["table_view.json", decodeTableViewJson, encodeTableViewJson]
+    ["session_http_error.json", decodeErrorBodyJson, encodeErrorBodyJson]
   ] as const
 
   for (const [name, decode, encode] of cases) {
@@ -259,16 +247,9 @@ void test("given_the_http_json_fixtures_when_decoded_then_should_re_encode_byte_
 void test("given_http_json_views_when_decoded_then_should_preserve_typed_fields", async () => {
   const capabilities = decodeCapabilitiesJson(await fixture("capabilities.json"))
   assert.equal(capabilities.query.consistency, "read_your_writes")
-  assert.equal(capabilities.query.cursorPaging, true)
-  assert.equal(capabilities.query.cancellation, true)
-  assert.equal(capabilities.query.executionStatus, true)
   assert.equal(capabilities.kv.fencedLeases, false)
-  assert.equal(capabilities.destinations.available, true)
-  assert.equal(capabilities.destinations.tableSchema, true)
-  assert.equal(capabilities.destinations.strongestConsistency, "linearizable")
   assert.equal(capabilities.versions.query, 1)
   assert.equal(capabilities.versions.control, 1)
-  assert.equal(capabilities.versions.checkpoint, 1)
   assert.equal(capabilities.kv.cas, true)
   assert.equal(capabilities.backends[1]?.label, "Analytics warehouse")
 
@@ -281,30 +262,19 @@ void test("given_http_json_views_when_decoded_then_should_preserve_typed_fields"
   ])
 
   const page = decodeKvPageJson(await fixture("kv_page_view.json"))
-  assert.equal(page.entries[0]?.expiresAtMicros, 1_700_000_000_000_000n)
+  assert.equal(page.items[0]?.expiresAtMicros, 1_700_000_000_000_000n)
+  assert.deepEqual([page.page, page.totalPages, page.totalResults], [1, 1, 1])
 
   const error = decodeErrorBodyJson(await fixture("error_body.json"))
   assert.deepEqual(error.code, { kind: "known", name: "Conflict" })
-
-  const destinations = decodeDestinationPageJson(await fixture("destination_page.json"))
-  assert.equal(destinations.destinations[0]?.destination.name, "readings-lakehouse")
-  assert.equal(destinations.consistency, "linearizable")
-
-  const files = decodeTableFilePageJson(await fixture("table_file_page.json"))
-  assert.deepEqual(files.files[0]?.partition.get("day"), { kind: "date", value: 20_000 })
 })
 
-void test("given_a_legacy_json_id_array_when_decoded_then_should_reject_it", () => {
-  assert.throws(
-    () =>
-      decodeAcceptedOperationJson(`{
-        "operation_id": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 88],
-        "request_id": "000000000000000000000000CG",
-        "state": "succeeded",
-        "submitted_at_micros": 1717171717000000
-      }`),
-    /operation_id.*Crockford base32 id/
+void test("given_a_legacy_json_id_array_when_decoded_then_should_reject_it", async () => {
+  const legacy = (await fixture("query_result.json")).replace(
+    /"execution_id":\s*"[^"]*"/,
+    '"execution_id": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]'
   )
+  assert.throws(() => decodeQueryResultJson(legacy), /execution_id.*Crockford base32 id/)
 })
 
 void test("given_a_filter_list_query_when_the_owner_is_complete_or_partial_then_should_resolve_or_refuse", () => {

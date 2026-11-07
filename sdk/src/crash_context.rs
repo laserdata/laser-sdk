@@ -184,6 +184,7 @@ mod tests {
             risk_score: None,
             receipt_digest: String::new(),
             previous_digest: None,
+            chain_id: "01J0000000000000000000001".to_owned(),
             outcome: outcome.to_owned(),
             at_micros: 1,
         }

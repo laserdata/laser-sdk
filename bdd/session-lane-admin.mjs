@@ -1,4 +1,8 @@
-import { Laser, TopicRetention } from "../foreign/typescript/dist/index.js";
+import {
+  Laser,
+  TopicRetention,
+  isUnavailable,
+} from "../foreign/typescript/dist/index.js";
 
 const [endpoint, stream, change, countText, username] = process.argv.slice(2);
 const count = Number(countText);
@@ -14,9 +18,15 @@ if (
 const laser = await Laser.connectWithStream(endpoint, stream);
 try {
   switch (change) {
+    case "readiness":
+      break;
     case "record count": {
-      const topic = await laser.client.topic.get({ streamId: stream, topicId: "agent.sessions" });
-      if (topic === null) throw new Error("the current session lane is missing");
+      const topic = await laser.client.topic.get({
+        streamId: stream,
+        topicId: "agent.sessions",
+      });
+      if (topic === null)
+        throw new Error("the current session lane is missing");
       process.stdout.write(topic.messagesCount.toString());
       break;
     }
@@ -97,6 +107,37 @@ try {
       break;
     default:
       throw new Error(`unknown lane mutation ${change}`);
+  }
+  if (
+    [
+      "readiness",
+      "partition count",
+      "topic generation",
+      "stream generation",
+    ].includes(change)
+  ) {
+    const reader =
+      change === "readiness"
+        ? laser
+        : await Laser.connectWithStream(endpoint, stream);
+    try {
+      const topics = await reader.client.topic.list({ streamId: stream });
+      const deadline = performance.now() + 5000;
+      for (const topic of topics) {
+        while (true) {
+          try {
+            await reader.topic(topic.name).tailOffsets();
+            break;
+          } catch (error) {
+            if (!isUnavailable(error) || performance.now() >= deadline)
+              throw error;
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+        }
+      }
+    } finally {
+      if (reader !== laser) await reader.close();
+    }
   }
 } finally {
   await laser.close();

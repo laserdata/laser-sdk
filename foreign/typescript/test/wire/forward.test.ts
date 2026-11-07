@@ -48,6 +48,7 @@ void test("given_the_forwarded_command_fixture_when_decoded_then_should_preserve
     expectMap(decodeOne(bytes, "forwarded_command"), "forwarded_command"),
     "forwarded_command"
   )
+  assert.deepEqual(command.caller, { userId: 7 })
   assert.equal(command.correlation, undefined)
   assert.equal(command.readAll, true)
   assert.equal(command.readBarrier, false)
@@ -97,20 +98,19 @@ void test("given_a_forwarded_command_with_an_agent_when_round_tripped_then_shoul
     expectMap(decodeOne(bytes, "forwarded_command_agent"), "forwarded_command_agent"),
     "forwarded_command_agent"
   )
-  assert.equal(command.userId, 0)
-  assert.equal(command.agent, "orbit-planner")
+  assert.deepEqual(command.caller, { userId: 0, agent: "orbit-planner" })
   assert.deepEqual(Buffer.from(encodeNamed(encodeForwardedCommand(command))), Buffer.from(bytes))
 })
 
-void test("given_the_plain_forwarded_command_fixture_when_decoded_then_should_carry_no_agent", async () => {
-  const plain = decodeForwardedCommand(
-    expectMap(
-      decodeOne(await readFixture("forwarded_command.bin"), "forwarded_command"),
-      "forwarded_command"
-    ),
-    "forwarded_command"
+void test("given_a_request_the_server_issues_on_its_own_when_round_tripped_then_should_carry_no_caller", async () => {
+  const bytes = await readFixture("forwarded_command_internal.bin")
+  const command = decodeForwardedCommand(
+    expectMap(decodeOne(bytes, "forwarded_command_internal"), "forwarded_command_internal"),
+    "forwarded_command_internal"
   )
-  assert.ok(!("agent" in plain))
+  assert.ok(!("caller" in command))
+  assert.equal(command.clientId, 0n)
+  assert.deepEqual(Buffer.from(encodeNamed(encodeForwardedCommand(command))), Buffer.from(bytes))
 })
 
 void test("given_a_forwarded_http_write_for_an_end_user_when_round_tripped_then_should_keep_who_it_was_for", async () => {
@@ -119,8 +119,7 @@ void test("given_a_forwarded_http_write_for_an_end_user_when_round_tripped_then_
     expectMap(decodeOne(bytes, "forwarded_command_on_behalf_of"), "forwarded_command_on_behalf_of"),
     "forwarded_command_on_behalf_of"
   )
-  assert.equal(command.onBehalfOf, "1793690355287073")
-  assert.equal(command.agent, undefined)
+  assert.deepEqual(command.caller, { userId: 3, onBehalfOf: "1793690355287073" })
   assert.deepEqual(Buffer.from(encodeNamed(encodeForwardedCommand(command))), Buffer.from(bytes))
 })
 

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use laser_sdk::iggy::prelude::{HeaderKey, HeaderValue};
 use laser_sdk::prelude::full::*;
 use laser_sdk::sign::{KeyRecord, KeyRegistry, SigningKey};
+use laser_sdk::types::MintUlid;
 use laser_sdk::wire::agent::{
     AgentDeadLetter, AgentEnvelope, AgentId as WireAgentId, ConversationId as WireConversationId,
     CorrelationId as WireCorrelationId, DeadLetterReason, RecordId as WireRecordId,
@@ -10,6 +11,7 @@ use laser_sdk::wire::agent::{
 };
 use laser_sdk::wire::codes::AGENT_OP_VERSION;
 use laser_sdk::wire::content::ContentType;
+use laser_sdk::wire::dispatch::OPERATION_INPUT_REQUEST;
 use laser_sdk::wire::framing::encode_named;
 use laser_sdk::wire::headers::{AGENT_VERSION, CONTENT_TYPE};
 use std::collections::BTreeMap;
@@ -128,7 +130,7 @@ async fn given_a_verified_consumer_when_transport_headers_are_mutated_then_shoul
  {
     let laser = harness::laser().await;
     let caller_key = SigningKey::from_bytes(&[21u8; 32]);
-    let mut registry = KeyRegistry::new();
+    let registry = KeyRegistry::new();
     registry.enroll("caller", caller_key.verifying_key());
 
     let principals = Arc::new(Mutex::new(Vec::new()));
@@ -200,7 +202,7 @@ async fn given_a_verified_consumer_when_transport_headers_are_mutated_then_shoul
                     && capsule.detail.as_deref() == Some("signature verification failed")
             })
             .count();
-        // The two header mutations fail context binding; the flipped wire
+        // The two header mutations fail context binding. The flipped wire
         // version fails decode before verification.
         assert_eq!(rejected, 2);
         assert_eq!(
@@ -249,13 +251,17 @@ async fn given_lifecycle_bound_keys_when_verified_at_the_server_timestamp_then_s
     let future_key = SigningKey::from_bytes(&[32u8; 32]);
     let expired_key = SigningKey::from_bytes(&[33u8; 32]);
     let revoked_key = SigningKey::from_bytes(&[34u8; 32]);
-    let mut registry = KeyRegistry::new();
+    let registry = KeyRegistry::new();
     registry.enroll_record(KeyRecord::agent("valid", valid_key.verifying_key()));
     registry.enroll_record(
-        KeyRecord::agent("future", future_key.verifying_key()).valid_window(now + hour, None),
+        KeyRecord::agent("future", future_key.verifying_key())
+            .valid_window(now + hour, None)
+            .expect("the window is ordered"),
     );
     registry.enroll_record(
-        KeyRecord::agent("expired", expired_key.verifying_key()).valid_window(0, Some(now - hour)),
+        KeyRecord::agent("expired", expired_key.verifying_key())
+            .valid_window(0, Some(now - hour))
+            .expect("the window is ordered"),
     );
     registry.enroll_record(KeyRecord::agent("revoked", revoked_key.verifying_key()).revoked());
 
@@ -277,7 +283,7 @@ async fn given_lifecycle_bound_keys_when_verified_at_the_server_timestamp_then_s
 
     // Each key signs an otherwise identical command. The streaming server stamps the
     // record timestamp on ingest, so only the key whose window covers that
-    // stamp may pass; the future, expired, and revoked keys must dead-letter.
+    // stamp may pass. The future, expired, and revoked keys must dead-letter.
     let conversation = WireConversationId::from_u128(0x0190_3c1f_aa00_0000_0000_0000_0000_0102u128);
     for (index, (source, key)) in [
         ("future", &future_key),
@@ -344,7 +350,7 @@ async fn given_a_verifier_when_reply_hub_replies_are_forged_then_should_accept_o
     let laser = harness::laser().await;
     let tool_key = SigningKey::from_bytes(&[41u8; 32]);
     let other_key = SigningKey::from_bytes(&[42u8; 32]);
-    let mut registry = KeyRegistry::new();
+    let registry = KeyRegistry::new();
     registry.enroll("tool", tool_key.verifying_key());
     registry.enroll("other", other_key.verifying_key());
     let caller = harness::verified(&laser, Arc::new(registry)).await;
@@ -437,7 +443,7 @@ async fn given_a_verifier_when_input_replies_are_forged_then_should_resume_only_
  {
     let laser = harness::laser().await;
     let approver_key = SigningKey::from_bytes(&[51u8; 32]);
-    let mut registry = KeyRegistry::new();
+    let registry = KeyRegistry::new();
     registry.enroll("approver", approver_key.verifying_key());
     let caller = harness::verified(&laser, Arc::new(registry)).await;
 
@@ -460,6 +466,7 @@ async fn given_a_verifier_when_input_replies_are_forged_then_should_resume_only_
     let mut faker = Agent::builder()
         .id("faker".parse().expect("faker is a valid agent id"))
         .listen_on(AgentTopic::Sessions)
+        .operations(vec![OPERATION_INPUT_REQUEST.to_owned()])
         .handler(Approve { answer: b"forged" })
         .build()
         .spawn(laser.clone());
@@ -489,6 +496,7 @@ async fn given_a_verifier_when_input_replies_are_forged_then_should_resume_only_
     let mut approver = Agent::builder()
         .id("approver".parse().expect("approver is a valid agent id"))
         .listen_on(AgentTopic::Sessions)
+        .operations(vec![OPERATION_INPUT_REQUEST.to_owned()])
         .signing_key(Arc::new(approver_key))
         .handler(Approve {
             answer: b"approved-signed",
@@ -539,10 +547,11 @@ async fn given_an_expired_key_when_replaying_a_record_signed_in_its_window_then_
         .await
         .expect("the signed command should publish");
     let expires_at = now_micros();
-    let mut registry = KeyRegistry::new();
+    let registry = KeyRegistry::new();
     registry.enroll_record(
         KeyRecord::agent("historic", key.verifying_key())
-            .valid_window(now.saturating_sub(3_600_000_000), Some(expires_at)),
+            .valid_window(now.saturating_sub(3_600_000_000), Some(expires_at))
+            .expect("the window is ordered"),
     );
     harness::eventually(|| async { (now_micros() > expires_at).then_some(()) }).await;
 
@@ -579,7 +588,7 @@ async fn given_a_verifying_registry_when_facts_arrive_then_should_fold_only_oper
     let laser = harness::laser().await;
     let operator_key = SigningKey::from_bytes(&[71u8; 32]);
     let agent_key = SigningKey::from_bytes(&[72u8; 32]);
-    let mut registry = KeyRegistry::new();
+    let registry = KeyRegistry::new();
     registry.enroll_operator("operator", operator_key.verifying_key());
     registry.enroll("agent-signer", agent_key.verifying_key());
     let caller = harness::verified(&laser, Arc::new(registry)).await;
@@ -628,4 +637,106 @@ async fn given_a_verifying_registry_when_facts_arrive_then_should_fold_only_oper
     }
     assert!(!folded.is_quarantined(&unsigned_target));
     assert!(!folded.is_quarantined(&agent_kind_target));
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_signed_unquarantine_past_its_deadline_when_folded_then_should_keep_the_quarantine()
+{
+    let laser = harness::laser().await;
+    let operator_key = SigningKey::from_bytes(&[73u8; 32]);
+    let registry = KeyRegistry::new();
+    registry.enroll_operator("operator", operator_key.verifying_key());
+    let caller = harness::verified(&laser, Arc::new(registry)).await;
+    let operator: AgentId = "operator".parse().expect("the id is valid");
+    let target: AgentId = "q-target".parse().expect("the id is valid");
+    let sentinel: AgentId = "q-sentinel".parse().expect("the id is valid");
+    laser
+        .quarantine_signed(operator.clone(), &target, &operator_key)
+        .await
+        .expect("the quarantine publishes");
+    // A captured unquarantine re-appended after its signed deadline.
+    laser
+        .agdx(
+            AgentTopic::Registry,
+            operator.wire_id(),
+            WireConversationId::mint(),
+        )
+        .status("unquarantine")
+        .with_deadline_at_micros(1)
+        .body(target.as_str().as_bytes().to_vec())
+        .signed_by(&operator_key)
+        .send()
+        .await
+        .expect("the late unquarantine publishes");
+    laser
+        .quarantine_signed(operator, &sentinel, &operator_key)
+        .await
+        .expect("the sentinel quarantine publishes");
+
+    let mut folded = caller
+        .agent_registry()
+        .expect("the verified caller builds a registry");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !folded.is_quarantined(&sentinel) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sentinel fact should fold within 15s",
+        );
+        folded
+            .refresh(now_micros())
+            .await
+            .expect("refreshing the registry should succeed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        folded.is_quarantined(&target),
+        "a late unquarantine lifted the quarantine"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_running_verifier_when_its_operator_key_is_revoked_then_should_refuse_later_facts()
+{
+    let laser = harness::laser().await;
+    let revoked_key = SigningKey::from_bytes(&[74u8; 32]);
+    let live_key = SigningKey::from_bytes(&[75u8; 32]);
+    let registry = KeyRegistry::new();
+    registry.enroll_operator("operator", revoked_key.verifying_key());
+    registry.enroll_operator("operator", live_key.verifying_key());
+    let caller = harness::verified(&laser, Arc::new(registry.clone())).await;
+    let operator: AgentId = "operator".parse().expect("the id is valid");
+    let after_revocation: AgentId = "q-after-revocation".parse().expect("the id is valid");
+    let sentinel: AgentId = "q-revocation-sentinel".parse().expect("the id is valid");
+
+    registry.enroll_record(KeyRecord::operator("operator", revoked_key.verifying_key()).revoked());
+    laser
+        .quarantine_signed(operator.clone(), &after_revocation, &revoked_key)
+        .await
+        .expect("the fact signed by the revoked key publishes");
+    laser
+        .quarantine_signed(operator, &sentinel, &live_key)
+        .await
+        .expect("the sentinel fact publishes");
+
+    let mut folded = caller
+        .agent_registry()
+        .expect("the verified caller builds a registry");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !folded.is_quarantined(&sentinel) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sentinel fact should fold within 15s",
+        );
+        folded
+            .refresh(now_micros())
+            .await
+            .expect("refreshing the registry should succeed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        !folded.is_quarantined(&after_revocation),
+        "a key revoked after the client started still verified"
+    );
 }

@@ -1,0 +1,1559 @@
+{
+  "classifiers": [
+    "retryable",
+    "unavailable",
+    "unsupported",
+    "not_found",
+    "version_skew",
+    "permission_denied",
+    "stale",
+    "version_conflict",
+    "ambiguous_mutation",
+    "not_leader",
+    "lease_lost",
+    "fence_violation",
+    "budget_exceeded",
+    "quarantined",
+    "no_capable_agent",
+    "stream_or_topic_not_found"
+  ],
+  "cases": [
+    {
+      "name": "query unsupported",
+      "failure": {
+        "query": {
+          "Unsupported": "refused"
+        }
+      },
+      "code": "Unsupported",
+      "flags": [
+        "unsupported"
+      ]
+    },
+    {
+      "name": "query invalid",
+      "failure": {
+        "query": {
+          "Invalid": "refused"
+        }
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "query unauthorized",
+      "failure": {
+        "query": {
+          "Unauthorized": "refused"
+        }
+      },
+      "code": "Forbidden",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "query index not found",
+      "failure": {
+        "query": {
+          "IndexNotFound": "refused"
+        }
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found"
+      ]
+    },
+    {
+      "name": "query fork not found",
+      "failure": {
+        "query": {
+          "ForkNotFound": "refused"
+        }
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found"
+      ]
+    },
+    {
+      "name": "query schema not found",
+      "failure": {
+        "query": {
+          "SchemaNotFound": 7
+        }
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found"
+      ]
+    },
+    {
+      "name": "query backend",
+      "failure": {
+        "query": {
+          "Backend": "refused"
+        }
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "query unavailable",
+      "failure": {
+        "query": {
+          "Unavailable": "refused"
+        }
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "query too large",
+      "failure": {
+        "query": {
+          "TooLarge": {
+            "what": "limit",
+            "size": 2,
+            "cap": 1
+          }
+        }
+      },
+      "code": "TooLarge",
+      "flags": []
+    },
+    {
+      "name": "query version",
+      "failure": {
+        "query": {
+          "Version": {
+            "expected": 1,
+            "got": 2
+          }
+        }
+      },
+      "code": "VersionSkew",
+      "flags": [
+        "version_skew"
+      ]
+    },
+    {
+      "name": "query stale",
+      "failure": {
+        "query": {
+          "Stale": {
+            "what": "readings",
+            "applied": 1,
+            "required": 2
+          }
+        }
+      },
+      "code": "Stale",
+      "flags": [
+        "retryable",
+        "stale"
+      ]
+    },
+    {
+      "name": "query stale generation",
+      "failure": {
+        "query": {
+          "StaleGeneration": {
+            "what": "route",
+            "requested": 1,
+            "observed": 2
+          }
+        }
+      },
+      "code": "StaleGeneration",
+      "flags": []
+    },
+    {
+      "name": "kv unsupported",
+      "failure": {
+        "kv": {
+          "Unsupported": "refused"
+        }
+      },
+      "code": "Unsupported",
+      "flags": [
+        "unsupported"
+      ]
+    },
+    {
+      "name": "kv invalid key",
+      "failure": {
+        "kv": {
+          "InvalidKey": "refused"
+        }
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "kv invalid namespace",
+      "failure": {
+        "kv": {
+          "InvalidNamespace": "refused"
+        }
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "kv too large",
+      "failure": {
+        "kv": {
+          "TooLarge": {
+            "what": "value",
+            "size": 2,
+            "cap": 1
+          }
+        }
+      },
+      "code": "TooLarge",
+      "flags": []
+    },
+    {
+      "name": "kv backend",
+      "failure": {
+        "kv": {
+          "Backend": "refused"
+        }
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "kv unavailable",
+      "failure": {
+        "kv": {
+          "Unavailable": "refused"
+        }
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "kv version",
+      "failure": {
+        "kv": {
+          "Version": {
+            "expected": 1,
+            "got": 2
+          }
+        }
+      },
+      "code": "VersionSkew",
+      "flags": [
+        "version_skew"
+      ]
+    },
+    {
+      "name": "kv version conflict",
+      "failure": {
+        "kv": {
+          "VersionConflict": {
+            "current": 3
+          }
+        }
+      },
+      "code": "Conflict",
+      "flags": [
+        "version_conflict"
+      ]
+    },
+    {
+      "name": "kv lease lost",
+      "failure": {
+        "kv": "LeaseLost"
+      },
+      "code": "Conflict",
+      "flags": [
+        "lease_lost"
+      ]
+    },
+    {
+      "name": "kv stale",
+      "failure": {
+        "kv": {
+          "Stale": {
+            "required": {
+              "topic_generation": 1,
+              "partition": 0,
+              "offset": 9
+            }
+          }
+        }
+      },
+      "code": "Stale",
+      "flags": [
+        "retryable",
+        "stale"
+      ]
+    },
+    {
+      "name": "kv not found",
+      "failure": {
+        "kv": "NotFound"
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found"
+      ]
+    },
+    {
+      "name": "kv not leader",
+      "failure": {
+        "kv": "NotLeader"
+      },
+      "code": "Unavailable",
+      "flags": [
+        "not_leader",
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "kv forbidden",
+      "failure": {
+        "kv": {
+          "Forbidden": "refused"
+        }
+      },
+      "code": "Forbidden",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "fork unsupported",
+      "failure": {
+        "fork": {
+          "Unsupported": "refused"
+        }
+      },
+      "code": "Unsupported",
+      "flags": [
+        "unsupported"
+      ]
+    },
+    {
+      "name": "fork not found",
+      "failure": {
+        "fork": {
+          "NotFound": "refused"
+        }
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found"
+      ]
+    },
+    {
+      "name": "fork invalid",
+      "failure": {
+        "fork": {
+          "InvalidFork": "refused"
+        }
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "fork conflict",
+      "failure": {
+        "fork": {
+          "Conflict": "refused"
+        }
+      },
+      "code": "Conflict",
+      "flags": []
+    },
+    {
+      "name": "fork backend",
+      "failure": {
+        "fork": {
+          "Backend": "refused"
+        }
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "fork unavailable",
+      "failure": {
+        "fork": {
+          "Unavailable": "refused"
+        }
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "fork version",
+      "failure": {
+        "fork": {
+          "Version": {
+            "expected": 1,
+            "got": 2
+          }
+        }
+      },
+      "code": "VersionSkew",
+      "flags": [
+        "version_skew"
+      ]
+    },
+    {
+      "name": "fork not leader",
+      "failure": {
+        "fork": "NotLeader"
+      },
+      "code": "Unavailable",
+      "flags": [
+        "not_leader",
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "graph unsupported",
+      "failure": {
+        "graph": {
+          "Unsupported": "refused"
+        }
+      },
+      "code": "Unsupported",
+      "flags": [
+        "unsupported"
+      ]
+    },
+    {
+      "name": "graph unauthorized",
+      "failure": {
+        "graph": {
+          "Unauthorized": "refused"
+        }
+      },
+      "code": "Forbidden",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "graph invalid name",
+      "failure": {
+        "graph": {
+          "InvalidName": "refused"
+        }
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "graph not found",
+      "failure": {
+        "graph": {
+          "NotFound": "refused"
+        }
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found"
+      ]
+    },
+    {
+      "name": "graph too large",
+      "failure": {
+        "graph": {
+          "TooLarge": {
+            "what": "depth",
+            "size": 2,
+            "cap": 1
+          }
+        }
+      },
+      "code": "TooLarge",
+      "flags": []
+    },
+    {
+      "name": "graph backend",
+      "failure": {
+        "graph": {
+          "Backend": "refused"
+        }
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "graph unavailable",
+      "failure": {
+        "graph": {
+          "Unavailable": "refused"
+        }
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "graph version",
+      "failure": {
+        "graph": {
+          "Version": {
+            "expected": 1,
+            "got": 2
+          }
+        }
+      },
+      "code": "VersionSkew",
+      "flags": [
+        "version_skew"
+      ]
+    },
+    {
+      "name": "session unsupported",
+      "failure": {
+        "session": {
+          "Unsupported": "refused"
+        }
+      },
+      "code": "Unsupported",
+      "flags": [
+        "unsupported"
+      ]
+    },
+    {
+      "name": "session not found",
+      "failure": {
+        "session": {
+          "NotFound": "refused"
+        }
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found"
+      ]
+    },
+    {
+      "name": "session stream not registered",
+      "failure": {
+        "session": {
+          "NotRegistered": "refused"
+        }
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found"
+      ]
+    },
+    {
+      "name": "session invalid",
+      "failure": {
+        "session": {
+          "Invalid": "refused"
+        }
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "session unauthorized",
+      "failure": {
+        "session": {
+          "Unauthorized": "refused"
+        }
+      },
+      "code": "Forbidden",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "session stale generation",
+      "failure": {
+        "session": {
+          "Stale": "refused"
+        }
+      },
+      "code": "StaleGeneration",
+      "flags": []
+    },
+    {
+      "name": "session backend",
+      "failure": {
+        "session": {
+          "Backend": "refused"
+        }
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "session unavailable",
+      "failure": {
+        "session": {
+          "Unavailable": "refused"
+        }
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "authz unsupported",
+      "failure": {
+        "authz": {
+          "Unsupported": "refused"
+        }
+      },
+      "code": "Unsupported",
+      "flags": [
+        "unsupported"
+      ]
+    },
+    {
+      "name": "authz unauthorized",
+      "failure": {
+        "authz": "Unauthorized"
+      },
+      "code": "Forbidden",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "authz unknown role",
+      "failure": {
+        "authz": {
+          "UnknownRole": "refused"
+        }
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found"
+      ]
+    },
+    {
+      "name": "authz invalid name",
+      "failure": {
+        "authz": {
+          "InvalidName": "refused"
+        }
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "authz revision conflict",
+      "failure": {
+        "authz": {
+          "Conflict": {
+            "current_revision": 3
+          }
+        }
+      },
+      "code": "Conflict",
+      "flags": []
+    },
+    {
+      "name": "authz version",
+      "failure": {
+        "authz": {
+          "Version": {
+            "expected": 1,
+            "got": 2
+          }
+        }
+      },
+      "code": "VersionSkew",
+      "flags": [
+        "version_skew"
+      ]
+    },
+    {
+      "name": "authz tenancy violation",
+      "failure": {
+        "authz": {
+          "TenancyViolation": "refused"
+        }
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "authz mutation conflict",
+      "failure": {
+        "authz": {
+          "MutationConflict": "refused"
+        }
+      },
+      "code": "Conflict",
+      "flags": []
+    },
+    {
+      "name": "authz resource limit",
+      "failure": {
+        "authz": {
+          "ResourceLimit": "refused"
+        }
+      },
+      "code": "ResourceLimit",
+      "flags": []
+    },
+    {
+      "name": "filter not_found",
+      "failure": {
+        "filter": {
+          "code": "not_found",
+          "reason": "not_found",
+          "message": "refused"
+        }
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found"
+      ]
+    },
+    {
+      "name": "filter unsupported",
+      "failure": {
+        "filter": {
+          "code": "unsupported",
+          "reason": "unsupported",
+          "message": "refused"
+        }
+      },
+      "code": "Unsupported",
+      "flags": [
+        "unsupported"
+      ]
+    },
+    {
+      "name": "filter forbidden",
+      "failure": {
+        "filter": {
+          "code": "forbidden",
+          "reason": "forbidden",
+          "message": "refused"
+        }
+      },
+      "code": "Forbidden",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "filter unauthenticated",
+      "failure": {
+        "filter": {
+          "code": "unauthenticated",
+          "reason": "unauthenticated",
+          "message": "refused"
+        }
+      },
+      "code": "Unauthenticated",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "filter version_skew",
+      "failure": {
+        "filter": {
+          "code": "version_skew",
+          "reason": "version_skew",
+          "message": "refused"
+        }
+      },
+      "code": "VersionSkew",
+      "flags": [
+        "version_skew"
+      ]
+    },
+    {
+      "name": "filter catalog_unavailable",
+      "failure": {
+        "filter": {
+          "code": "unavailable",
+          "reason": "catalog_unavailable",
+          "message": "refused"
+        }
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "filter membership_stale",
+      "failure": {
+        "filter": {
+          "code": "stale",
+          "reason": "membership_stale",
+          "message": "refused"
+        }
+      },
+      "code": "Stale",
+      "flags": [
+        "retryable",
+        "stale"
+      ]
+    },
+    {
+      "name": "filter conflict",
+      "failure": {
+        "filter": {
+          "code": "conflict",
+          "reason": "conflict",
+          "message": "refused"
+        }
+      },
+      "code": "Conflict",
+      "flags": []
+    },
+    {
+      "name": "filter source_changed",
+      "failure": {
+        "filter": {
+          "code": "stale_generation",
+          "reason": "source_changed",
+          "message": "refused"
+        }
+      },
+      "code": "StaleGeneration",
+      "flags": []
+    },
+    {
+      "name": "command unsupported",
+      "failure": {
+        "command": {
+          "code": "unsupported",
+          "message": "refused"
+        }
+      },
+      "code": "Unsupported",
+      "flags": [
+        "unsupported"
+      ]
+    },
+    {
+      "name": "command invalid_argument",
+      "failure": {
+        "command": {
+          "code": "invalid_argument",
+          "message": "refused"
+        }
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "command not_found",
+      "failure": {
+        "command": {
+          "code": "not_found",
+          "message": "refused"
+        }
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found"
+      ]
+    },
+    {
+      "name": "command forbidden",
+      "failure": {
+        "command": {
+          "code": "forbidden",
+          "message": "refused"
+        }
+      },
+      "code": "Forbidden",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "command unauthenticated",
+      "failure": {
+        "command": {
+          "code": "unauthenticated",
+          "message": "refused"
+        }
+      },
+      "code": "Unauthenticated",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "command version_skew",
+      "failure": {
+        "command": {
+          "code": "version_skew",
+          "message": "refused"
+        }
+      },
+      "code": "VersionSkew",
+      "flags": [
+        "version_skew"
+      ]
+    },
+    {
+      "name": "command stale",
+      "failure": {
+        "command": {
+          "code": "stale",
+          "message": "refused"
+        }
+      },
+      "code": "Stale",
+      "flags": [
+        "retryable",
+        "stale"
+      ]
+    },
+    {
+      "name": "command unavailable",
+      "failure": {
+        "command": {
+          "code": "unavailable",
+          "message": "refused"
+        }
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "command target_unavailable",
+      "failure": {
+        "command": {
+          "code": "target_unavailable",
+          "message": "refused"
+        }
+      },
+      "code": "TargetUnavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "command backend_unavailable",
+      "failure": {
+        "command": {
+          "code": "backend_unavailable",
+          "message": "refused"
+        }
+      },
+      "code": "BackendUnavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "command pending",
+      "failure": {
+        "command": {
+          "code": "pending",
+          "message": "refused"
+        }
+      },
+      "code": "Pending",
+      "flags": []
+    },
+    {
+      "name": "command conflict",
+      "failure": {
+        "command": {
+          "code": "conflict",
+          "message": "refused"
+        }
+      },
+      "code": "Conflict",
+      "flags": []
+    },
+    {
+      "name": "command backend",
+      "failure": {
+        "command": {
+          "code": "backend",
+          "message": "refused"
+        }
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "command unrecognized",
+      "failure": {
+        "command": {
+          "code": {
+            "unrecognized": 42
+          },
+          "message": "refused"
+        }
+      },
+      "code": "Unrecognized(42)",
+      "flags": []
+    },
+    {
+      "name": "transport code 20",
+      "failure": {
+        "transport": 20
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found"
+      ]
+    },
+    {
+      "name": "transport code 40",
+      "failure": {
+        "transport": 40
+      },
+      "code": "Unauthenticated",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "transport code 41",
+      "failure": {
+        "transport": 41
+      },
+      "code": "Forbidden",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "transport code 1009",
+      "failure": {
+        "transport": 1009
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found",
+        "stream_or_topic_not_found"
+      ]
+    },
+    {
+      "name": "transport code 1010",
+      "failure": {
+        "transport": 1010
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found",
+        "stream_or_topic_not_found"
+      ]
+    },
+    {
+      "name": "transport code 2010",
+      "failure": {
+        "transport": 2010
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found",
+        "stream_or_topic_not_found"
+      ]
+    },
+    {
+      "name": "transport code 2011",
+      "failure": {
+        "transport": 2011
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found",
+        "stream_or_topic_not_found"
+      ]
+    },
+    {
+      "name": "transport code 57",
+      "failure": {
+        "transport": 57
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "transport code 58",
+      "failure": {
+        "transport": 58
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "transport code 3004",
+      "failure": {
+        "transport": 3004
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "transport code 3007",
+      "failure": {
+        "transport": 3007
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "transport code 10002",
+      "failure": {
+        "transport": 10002
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "transport code 4",
+      "failure": {
+        "transport": 4
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "transport code 14009",
+      "failure": {
+        "transport": 14009
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "transport code 14010",
+      "failure": {
+        "transport": 14010
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "local link lost",
+      "failure": {
+        "local": "link_lost"
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ]
+    },
+    {
+      "name": "local no stream",
+      "failure": {
+        "local": "no_stream"
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "local no respond topic",
+      "failure": {
+        "local": "no_respond_topic"
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "local config",
+      "failure": {
+        "local": "config"
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "local handler config",
+      "failure": {
+        "local": "handler_config"
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "local handler",
+      "failure": {
+        "local": "handler"
+      },
+      "code": "Backend",
+      "flags": [
+        "retryable"
+      ]
+    },
+    {
+      "name": "local rejected",
+      "failure": {
+        "local": "rejected"
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "local timeout",
+      "failure": {
+        "local": "timeout"
+      },
+      "code": "Backend",
+      "flags": [
+        "retryable"
+      ]
+    },
+    {
+      "name": "local ambiguous mutation",
+      "failure": {
+        "local": "ambiguous_mutation"
+      },
+      "code": "Backend",
+      "flags": [
+        "ambiguous_mutation"
+      ]
+    },
+    {
+      "name": "local unsupported",
+      "failure": {
+        "local": "unsupported"
+      },
+      "code": "Unsupported",
+      "flags": [
+        "unsupported"
+      ]
+    },
+    {
+      "name": "local invalid",
+      "failure": {
+        "local": "invalid"
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "local codec",
+      "failure": {
+        "local": "codec"
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "local protocol",
+      "failure": {
+        "local": "protocol"
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "local state store",
+      "failure": {
+        "local": "state_store"
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "local integrity",
+      "failure": {
+        "local": "integrity"
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "local signature",
+      "failure": {
+        "local": "signature"
+      },
+      "code": "Unauthenticated",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "local policy blocked",
+      "failure": {
+        "local": "policy_blocked"
+      },
+      "code": "Forbidden",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "local step up required",
+      "failure": {
+        "local": "step_up_required"
+      },
+      "code": "StepUpRequired",
+      "flags": []
+    },
+    {
+      "name": "local policy deferred",
+      "failure": {
+        "local": "policy_deferred"
+      },
+      "code": "Backend",
+      "flags": [
+        "retryable"
+      ]
+    },
+    {
+      "name": "local no capable agent",
+      "failure": {
+        "local": "no_capable_agent"
+      },
+      "code": "NotFound",
+      "flags": [
+        "no_capable_agent",
+        "not_found",
+        "retryable"
+      ]
+    },
+    {
+      "name": "local no inbox",
+      "failure": {
+        "local": "no_inbox"
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found",
+        "retryable"
+      ]
+    },
+    {
+      "name": "local presence conflict",
+      "failure": {
+        "local": "presence_conflict"
+      },
+      "code": "Conflict",
+      "flags": []
+    },
+    {
+      "name": "local route principal mismatch",
+      "failure": {
+        "local": "route_principal_mismatch"
+      },
+      "code": "Forbidden",
+      "flags": [
+        "permission_denied"
+      ]
+    },
+    {
+      "name": "local fence violation",
+      "failure": {
+        "local": "fence_violation"
+      },
+      "code": "Conflict",
+      "flags": [
+        "fence_violation"
+      ]
+    },
+    {
+      "name": "local budget exceeded",
+      "failure": {
+        "local": "budget_exceeded"
+      },
+      "code": "Backend",
+      "flags": [
+        "budget_exceeded"
+      ]
+    },
+    {
+      "name": "local cancelled",
+      "failure": {
+        "local": "cancelled"
+      },
+      "code": "Cancelled",
+      "flags": []
+    },
+    {
+      "name": "local quarantined",
+      "failure": {
+        "local": "quarantined"
+      },
+      "code": "Forbidden",
+      "flags": [
+        "permission_denied",
+        "quarantined"
+      ]
+    },
+    {
+      "name": "local filter fault",
+      "failure": {
+        "local": "filter_fault"
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "local filter oversized record",
+      "failure": {
+        "local": "filter_oversized_record"
+      },
+      "code": "TooLarge",
+      "flags": []
+    },
+    {
+      "name": "local id",
+      "failure": {
+        "local": "id"
+      },
+      "code": "InvalidArgument",
+      "flags": []
+    },
+    {
+      "name": "local provenance",
+      "failure": {
+        "local": "provenance"
+      },
+      "code": "Backend",
+      "flags": []
+    },
+    {
+      "name": "publish failed over a transient send",
+      "failure": {
+        "publish_failed": {
+          "transport": 57
+        }
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ],
+      "hand_raised": false
+    },
+    {
+      "name": "publish failed over a refused grant",
+      "failure": {
+        "publish_failed": {
+          "transport": 41
+        }
+      },
+      "code": "Forbidden",
+      "flags": [
+        "permission_denied"
+      ],
+      "hand_raised": false
+    },
+    {
+      "name": "publish failed over a missing stream",
+      "failure": {
+        "publish_failed": {
+          "transport": 1009
+        }
+      },
+      "code": "NotFound",
+      "flags": [
+        "not_found",
+        "stream_or_topic_not_found"
+      ],
+      "hand_raised": false
+    },
+    {
+      "name": "group setup over a catalog conflict",
+      "failure": {
+        "consumer_group_setup": {
+          "filter": {
+            "code": "conflict",
+            "reason": "conflict",
+            "message": "refused"
+          }
+        }
+      },
+      "code": "Conflict",
+      "flags": [],
+      "hand_raised": false
+    },
+    {
+      "name": "group setup over a lost link",
+      "failure": {
+        "consumer_group_setup": {
+          "local": "link_lost"
+        }
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ],
+      "hand_raised": false
+    },
+    {
+      "name": "typed decode of a positioned record",
+      "failure": {
+        "typed_decode": null
+      },
+      "code": "Backend",
+      "flags": [],
+      "hand_raised": false
+    },
+    {
+      "name": "typed decode over a lost link",
+      "failure": {
+        "typed_decode": {
+          "local": "link_lost"
+        }
+      },
+      "code": "Unavailable",
+      "flags": [
+        "retryable",
+        "unavailable"
+      ],
+      "hand_raised": false
+    },
+    {
+      "name": "typed decode over a refused grant",
+      "failure": {
+        "typed_decode": {
+          "transport": 41
+        }
+      },
+      "code": "Forbidden",
+      "flags": [
+        "permission_denied"
+      ],
+      "hand_raised": false
+    }
+  ]
+}

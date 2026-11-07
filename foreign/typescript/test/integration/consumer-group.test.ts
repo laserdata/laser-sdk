@@ -136,7 +136,7 @@ void test("given_an_unbound_group_id_when_consumed_then_should_preserve_payloads
           page.records.map((record) => record.message.payload),
           payloads
         )
-        assert.ok(page.records.every((record) => !record.evaluated))
+        assert.ok(page.records.every((record) => record.evaluation.kind === "unfiltered"))
       } finally {
         await advanced.close()
       }

@@ -10,7 +10,7 @@ import {
 import { NOOP_OBSERVER, type LaserObserver } from "../observe.js"
 import type { KeyRegistry } from "../signing.js"
 import { Cursor, heldRead } from "../stream/cursor.js"
-import { AgentKind, type AgentEnvelope } from "../wire/agent.js"
+import { AgentKind, OPERATION_TASK, type AgentEnvelope } from "../wire/agent.js"
 import type { CorrelationId } from "../wire/ids.js"
 import type { ConversationId, MessageId } from "../types/ids.js"
 import {
@@ -95,6 +95,7 @@ interface StreamWaiter {
   readonly queued: AgentMessage[]
   readonly pending: PendingReply[]
   readonly expectedSigner?: string
+  readonly expected?: ExpectedReply
 }
 
 /** What a record must carry to answer one request: the request's session, a
@@ -117,6 +118,19 @@ function accepts(expected: ExpectedReply, message: AgentMessage): boolean {
     addressee = message.provenance.targetAgentId?.asStr()
   }
   return expected.requester === undefined || expected.requester === addressee
+}
+
+// A pickup acknowledgment for the request: a `Working` task status in the
+// request's session.
+function acknowledges(expected: ExpectedReply, message: AgentMessage): boolean {
+  const envelope = message.envelope
+  return (
+    message.provenance.conversationId.equals(expected.session) &&
+    envelope?.kind === AgentKind.Status &&
+    envelope.operation === OPERATION_TASK &&
+    envelope.taskState?.kind === "known" &&
+    envelope.taskState.name === "Working"
+  )
 }
 
 interface ReplyWaiter extends PendingReply {
@@ -169,6 +183,82 @@ export async function findAgdxReply(
     }
   }
   return { kind: "incomplete" }
+}
+
+// The next offset of every partition of a reply topic, the point a reply to
+// a request sent now lands at or after.
+async function replyPositions(
+  transport: LaserTransport,
+  stream: string,
+  topic: string
+): Promise<readonly bigint[]> {
+  const partitionCount = await transport.findTopicPartitionCount(stream, topic)
+  if (partitionCount === undefined) return []
+  const offsets = new Array<bigint>(partitionCount).fill(0n)
+  for (let partitionId = 0; partitionId < partitionCount; partitionId += 1) {
+    const target: ConsumerTarget = { kind: "single", partitionId }
+    const polled = await transport.pollMessages(stream, topic, target, { kind: "last" }, 1, false)
+    const last = polled[polled.length - 1]
+    if (last !== undefined) offsets[partitionId] = last.offset + 1n
+  }
+  return offsets
+}
+
+// A terminal reply for `correlation` that already landed after `positions`,
+// for a request sent before the process stopped. Only a reply in the
+// request's session, addressed to its requester, and verified when a
+// verifier is enrolled counts.
+async function landedTerminal(
+  transport: LaserTransport,
+  stream: string,
+  topic: string,
+  positions: readonly bigint[],
+  correlation: string,
+  expected: ExpectedReply,
+  verifier?: KeyRegistry,
+  expectedSigner?: string
+): Promise<AgentMessage | undefined> {
+  const partitions = await transport.findTopicPartitionCount(stream, topic)
+  if (partitions === undefined) return undefined
+  const cursor = Cursor.create(
+    transport,
+    stream,
+    topic,
+    Array.from({ length: partitions }, (_, partition) => partition)
+  )
+    .batch(LOOKUP_BATCH)
+    .fromOffsets(new Map(positions.map((offset, partition) => [partition, offset])))
+  for (;;) {
+    const messages = await cursor.pollRecords()
+    if (messages.length === 0) return undefined
+    for (const message of messages) {
+      const decoded = decodeAgentMessage(message)
+      if (decoded.kind === "error") continue
+      let reply = decoded.message
+      if (reply.provenance.correlationId !== correlation || !accepts(expected, reply)) continue
+      if (verifier !== undefined) {
+        if (
+          reply.envelope === undefined ||
+          decoded.signatureContext === undefined ||
+          decoded.observedAtMicros === undefined
+        ) {
+          continue
+        }
+        try {
+          const principal = verifier.verifyObservedAt(
+            reply.envelope,
+            decoded.signatureContext,
+            decoded.observedAtMicros
+          ).principal
+          if (expectedSigner !== undefined && expectedSigner !== principal) continue
+          reply = { ...reply, verifiedPrincipal: principal }
+        } catch {
+          continue
+        }
+      }
+      return reply
+    }
+  }
 }
 
 export class ReplyHub {
@@ -269,11 +359,16 @@ export class ReplyHub {
     }
   }
 
-  subscribeStream(correlation: string, expectedSigner?: string): ReplyStreamTicket {
+  subscribeStream(
+    correlation: string,
+    expectedSigner?: string,
+    expected?: ExpectedReply
+  ): ReplyStreamTicket {
     const waiter: StreamWaiter = {
       queued: [],
       pending: [],
-      ...(expectedSigner !== undefined ? { expectedSigner } : {})
+      ...(expectedSigner !== undefined ? { expectedSigner } : {}),
+      ...(expected !== undefined ? { expected } : {})
     }
     this.streamWaiters.set(correlation, waiter)
     this.wake?.()
@@ -306,6 +401,33 @@ export class ReplyHub {
         return removed
       }
     }
+  }
+
+  /** The next offset of every partition of this hub's topic.
+   * @internal */
+  positions(): Promise<readonly bigint[]> {
+    return replyPositions(this.transport, this.stream, this.topic)
+  }
+
+  /** A terminal for `correlation` that landed on this hub's topic after
+   * `positions`, for a request sent before the process stopped.
+   * @internal */
+  landed(
+    positions: readonly bigint[],
+    correlation: string,
+    expected: ExpectedReply,
+    expectedSigner?: string
+  ): Promise<AgentMessage | undefined> {
+    return landedTerminal(
+      this.transport,
+      this.stream,
+      this.topic,
+      positions,
+      correlation,
+      expected,
+      this.verifier,
+      expectedSigner
+    )
   }
 
   private release(correlation: string): boolean {
@@ -504,7 +626,14 @@ export class ReplyHub {
         waiter.settle(reply)
       }
     }
-    if (streamWaiter !== undefined) {
+    // A stream waiter that names its request takes the request's ack and its
+    // terminal, nothing from another session or addressed to another agent.
+    const streamed =
+      streamWaiter !== undefined &&
+      (streamWaiter.expected === undefined ||
+        acknowledges(streamWaiter.expected, reply) ||
+        accepts(streamWaiter.expected, reply))
+    if (streamWaiter !== undefined && streamed) {
       const pending = streamWaiter.pending.shift()
       if (pending === undefined) {
         // Bounded: a flood on a subscribed correlation must not retain every
@@ -514,7 +643,7 @@ export class ReplyHub {
         if (streamWaiter.queued.length > MAX_QUEUED_REPLIES) streamWaiter.queued.shift()
       } else pending.settle(reply)
     }
-    return waiter !== undefined || streamWaiter !== undefined
+    return waiter !== undefined || streamed
   }
 }
 

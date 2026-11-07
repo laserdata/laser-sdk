@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { Given, Then, When } from "@cucumber/cucumber";
-import { CommandExecutionError, FencedLeaseClient, InvalidError, code, isRetryable } from "@laserdata/laser-sdk";
+import { CommandExecutionError, ConversationId, FencedLeaseClient, InvalidError, ProjectionBuilder, code, isAmbiguousMutation, isRetryable, type Laser, type LaserError } from "@laserdata/laser-sdk";
 import { wire } from "@laserdata/laser-sdk/full";
 import type { LaserWorld } from "../world.js";
 
@@ -19,10 +19,47 @@ When("a prepared release receives managed result code {int}", async function (th
   }
 });
 
+When("a prepared release receives the unresolved result code {int}", async function (this: LaserWorld, number: number) {
+  const result = wire.resultCodeFromCode(number);
+  assert.equal(result.kind, "known");
+  const reply = wire.encodeNamed(new Map<string, unknown>([["code", wire.resultCodeWord(result)], ["message", "refused"]]));
+  const client = new FencedLeaseClient({send: () => Promise.resolve(reply), reset: () => Promise.resolve()});
+  const operation = client.prepareRelease({v: 1, namespace: "coord", key: new TextEncoder().encode("lease"), leaseToken: 1n, holderId: "worker"});
+  try {
+    await client.release(operation);
+    throw new Error("an unresolved attempt never succeeds");
+  } catch (error) {
+    assert.ok(isAmbiguousMutation(error), String(error));
+    this.error = error as LaserError;
+  }
+});
+
+Then("the release fails as an ambiguous mutation", function (this: LaserWorld) {
+  assert.ok(isAmbiguousMutation(this.error), String(this.error));
+});
+
 Then("the command error keeps code {int} and retryability {word}", function (this: LaserWorld, number: number, retryable: string) {
   assert.ok(this.error instanceof CommandExecutionError);
   assert.deepEqual(code(this.error), wire.resultCodeFromCode(number));
   assert.equal(isRetryable(this.error), retryable === "true");
+});
+
+const MANAGED_SURFACES: Readonly<Record<string, (laser: Laser) => Promise<unknown>>> = {
+  "projection registration": (laser) => laser.projections().register(new ProjectionBuilder("reading.v1").build()),
+  materialization: (laser) => laser.topic("events").materialize().apply(),
+  "schema registration": (laser) => laser.schemas().register({kind: "jsonSchema", schema: '{"type":"string"}'}).send(),
+  "graph upsert": (laser) => laser.graph("kg").upsert([], []),
+  "fork creation": (laser) => laser.fork("experiment").create().send(),
+  "change feed": (laser) => laser.watch().records(),
+  "lease acquisition": (laser) => laser.kv("coordination").lease(new TextEncoder().encode("lock"), "worker", 5000),
+  "session read": (laser) => laser.sessions().get(ConversationId.new()),
+  batch: (laser) => laser.executeBatch([]),
+};
+
+When(/^I call the managed (.+) surface$/, async function (this: LaserWorld, surface: string) {
+  const call = MANAGED_SURFACES[surface];
+  assert.ok(call !== undefined, `no managed surface named ${surface}`);
+  await this.capture(() => call(this.requireLaser()));
 });
 
 When("I read the negotiated capabilities", async function (this: LaserWorld) {
@@ -93,35 +130,6 @@ When(
   },
 );
 
-When(
-  /^I send a set of key "([^"]+)" in namespace "([^"]+)" expecting version (\d+) without commit$/,
-  async function (
-    this: LaserWorld,
-    key: string,
-    namespace: string,
-    version: string,
-  ) {
-    await this.capture(() =>
-      this.requireLaser()
-        .kv(namespace)
-        .set(new TextEncoder().encode(key))
-        .bytes(new TextEncoder().encode("debug"))
-        .expectVersion(BigInt(version))
-        .send(),
-    );
-  },
-);
-
 Then("the call fails as invalid", function (this: LaserWorld) {
   assert.ok(this.error instanceof InvalidError);
 });
-
-Then(
-  "the unified result code is invalid argument",
-  function (this: LaserWorld) {
-    assert.deepEqual(code(this.error), {
-      kind: "known",
-      name: "InvalidArgument",
-    });
-  },
-);

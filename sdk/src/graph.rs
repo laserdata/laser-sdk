@@ -1,6 +1,9 @@
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::types::ConversationId;
+use laser_wire::graph::{EdgeDir, GraphEdge, GraphNeighbors, GraphReply, GraphUpsert};
+use laser_wire::validate::Validate;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use laser_wire::limits::MAX_GRAPH_LABEL_BYTES;
 
@@ -10,16 +13,16 @@ impl Laser {
     /// transport. Against Apache Iggy a fetch returns
     /// [`LaserError::Unsupported`]. The name is sent as
     /// [`resource_name`](Self::resource_name) names it.
-    pub fn graph(&self, name: impl Into<String>) -> GraphHandle<'_> {
+    pub fn graph(&self, name: impl Into<String>) -> GraphHandle {
         GraphHandle {
-            laser: self,
+            laser: self.clone(),
             name: self.resource_name(&name.into()),
             start: None,
             hops: Vec::new(),
             node_filter: None,
             edge_filter: None,
             return_: laser_wire::graph::GraphReturn::Nodes,
-            limit: laser_wire::limits::DEFAULT_RECALL_LIMIT,
+            limit: laser_wire::limits::DEFAULT_RECALL_LIMIT as u32,
             as_of: None,
             conversation: None,
             stream: None,
@@ -33,16 +36,17 @@ impl Laser {
 /// A fluent knowledge-graph traversal, created by [`Laser::graph`]. Set a start
 /// (`start_ids`/`start_match`/`start_nearest`), add hops (`out`/`incoming`), pick
 /// what to return, and finish with `.fetch().await`. Gated on the `graph`
-/// feature: a traversal rides the managed binary transport.
-pub struct GraphHandle<'a> {
-    laser: &'a Laser,
+/// feature: a traversal rides the managed binary transport. It owns a clone
+/// of the `Laser`, so a traversal can move into a spawned task.
+pub struct GraphHandle {
+    laser: Laser,
     name: String,
     start: Option<laser_wire::graph::GraphStart>,
     hops: Vec<laser_wire::graph::Hop>,
     node_filter: Option<laser_wire::query::Filter>,
     edge_filter: Option<laser_wire::query::Filter>,
     return_: laser_wire::graph::GraphReturn,
-    limit: usize,
+    limit: u32,
     as_of: Option<u64>,
     conversation: Option<String>,
     stream: Option<String>,
@@ -51,7 +55,7 @@ pub struct GraphHandle<'a> {
     source: Option<laser_wire::graph::SourceRef>,
 }
 
-impl GraphHandle<'_> {
+impl GraphHandle {
     /// Link every upsert to `session`, so the deployment records which session
     /// wrote each element.
     #[must_use]
@@ -100,7 +104,7 @@ impl GraphHandle<'_> {
 
     /// Start from the nodes nearest an embedding (vector-seeded traversal).
     #[must_use]
-    pub fn start_nearest(mut self, embedding: Vec<f32>, k: usize) -> Self {
+    pub fn start_nearest(mut self, embedding: Vec<f32>, k: u32) -> Self {
         self.start = Some(laser_wire::graph::GraphStart::Nearest { embedding, k });
         self
     }
@@ -138,6 +142,39 @@ impl GraphHandle<'_> {
         self
     }
 
+    /// Follow edges in `dir`, of `edge_type` or of any type when `None`, up to
+    /// `max` steps at this hop.
+    #[must_use]
+    pub fn hop(
+        mut self,
+        dir: laser_wire::graph::EdgeDir,
+        edge_type: Option<String>,
+        max: u32,
+    ) -> Self {
+        self.hops.push(laser_wire::graph::Hop {
+            edge_type,
+            dir,
+            max,
+        });
+        self
+    }
+
+    /// Admit only nodes matching `filter` at every hop. A rejected node is
+    /// neither returned nor expanded.
+    #[must_use]
+    pub fn node_filter(mut self, filter: laser_wire::query::Filter) -> Self {
+        self.node_filter = Some(filter);
+        self
+    }
+
+    /// Follow only edges matching `filter`. A rejected edge is neither
+    /// traversed nor returned.
+    #[must_use]
+    pub fn edge_filter(mut self, filter: laser_wire::query::Filter) -> Self {
+        self.edge_filter = Some(filter);
+        self
+    }
+
     /// Return the traversed edges instead of the reachable nodes.
     #[must_use]
     pub fn return_edges(mut self) -> Self {
@@ -160,9 +197,10 @@ impl GraphHandle<'_> {
         self
     }
 
-    /// Cap the number of elements returned.
+    /// Cap the number of elements returned. Zero means up to
+    /// [`MAX_GRAPH_RESULT_ELEMENTS`](laser_wire::limits::MAX_GRAPH_RESULT_ELEMENTS).
     #[must_use]
-    pub fn limit(mut self, limit: usize) -> Self {
+    pub fn limit(mut self, limit: u32) -> Self {
         self.limit = limit;
         self
     }
@@ -176,30 +214,39 @@ impl GraphHandle<'_> {
         self
     }
 
-    /// Run the traversal. Requires `managed_graph`. Otherwise returns
-    /// [`LaserError::Unsupported`].
-    pub async fn fetch(self) -> Result<laser_wire::graph::GraphResult, LaserError> {
-        use laser_wire::graph::{GraphQuery, GraphStart};
-        self.require_graph()?;
-        let query = GraphQuery {
+    /// The traversal request this handle sends, for inspection or the HTTP
+    /// route's body.
+    pub fn into_query(self) -> laser_wire::graph::GraphQuery {
+        laser_wire::graph::GraphQuery {
             v: laser_wire::codes::GRAPH_OP_VERSION,
             graph: self.name,
-            start: self.start.unwrap_or(GraphStart::Ids(Vec::new())),
+            start: self
+                .start
+                .unwrap_or(laser_wire::graph::GraphStart::Ids(Vec::new())),
             traverse: self.hops,
             node_filter: self.node_filter,
             edge_filter: self.edge_filter,
             return_: self.return_,
             limit: self.limit,
-            fork: None,
-            consistency: laser_wire::query::Consistency::Eventual,
             as_of: self.as_of,
             conversation: self.conversation,
             stream: self.stream,
-        };
+        }
+    }
+
+    /// Run the traversal. Refuses a hop step outside one to
+    /// [`MAX_GRAPH_TRAVERSE_DEPTH`](laser_wire::limits::MAX_GRAPH_TRAVERSE_DEPTH),
+    /// an expanded depth past it, or a limit past the element cap with
+    /// [`LaserError::Invalid`] before sending. Requires `managed_graph`.
+    /// Otherwise returns [`LaserError::Unsupported`].
+    pub async fn fetch(self) -> Result<laser_wire::graph::GraphResult, LaserError> {
+        let laser = self.laser.clone();
+        let query = self.into_query();
+        query.validate()?;
+        graph_served(&laser).await?;
         let payload = laser_wire::framing::encode_named(&query)
             .map_err(|error| LaserError::Codec(format!("encode graph query: {error}")))?;
-        let payload = self
-            .laser
+        let payload = laser
             .send_raw_with_response(laser_wire::codes::AGDX_GRAPH_QUERY_CODE, payload)
             .await?;
         decode_graph_reply(&payload)
@@ -216,8 +263,7 @@ impl GraphHandle<'_> {
         edge_type: Option<String>,
         depth: u32,
     ) -> Result<laser_wire::graph::GraphResult, LaserError> {
-        use laser_wire::graph::GraphNeighbors;
-        self.require_graph()?;
+        self.require_graph().await?;
         let request = GraphNeighbors {
             v: laser_wire::codes::GRAPH_OP_VERSION,
             graph: self.name,
@@ -230,6 +276,7 @@ impl GraphHandle<'_> {
             conversation: self.conversation,
             stream: self.stream,
         };
+        request.validate()?;
         let payload = laser_wire::framing::encode_named(&request)
             .map_err(|error| LaserError::Codec(format!("encode graph neighbors: {error}")))?;
         let payload = self
@@ -241,25 +288,24 @@ impl GraphHandle<'_> {
 
     /// Relate two entities in one call: `link("operator:42", "opened",
     /// "ticket:7")` upserts both content-addressed entity nodes and the typed
-    /// edge between them. Sugar over [`upsert`](Self::upsert), so re-linking
-    /// the same triple converges on the same nodes and edge. The entity ids
-    /// double as their labels' values (`kind:value` strings work well).
+    /// edge between them, valid from now. Sugar over [`upsert`](Self::upsert),
+    /// so re-linking the same triple converges on the same nodes and edge. The
+    /// entity ids double as their labels' values (`kind:value` strings work
+    /// well).
     pub async fn link(
         self,
         from: impl Into<String>,
         relation: impl Into<String>,
         to: impl Into<String>,
     ) -> Result<(), LaserError> {
-        use laser_wire::graph::GraphEdge;
-        let from = entity_node(&from.into());
-        let to = entity_node(&to.into());
-        let edge = GraphEdge::relate(&from, relation, &to);
-        self.upsert(vec![from, to], vec![edge]).await
+        let (nodes, edge) = linked(&from.into(), relation.into(), &to.into(), now_micros());
+        self.upsert(nodes, vec![edge]).await
     }
 
     /// Assert the latest value of a single-valued relationship: close every
     /// live `relation` edge from `from` that points at a DIFFERENT target
-    /// (`valid_to` now, the bitemporal supersede), then link `from` to `to`.
+    /// (`valid_to` now, the bitemporal supersede), then link `from` to `to`
+    /// valid from that same instant.
     /// The deterministic fact-invalidation mechanics (same subject, same
     /// predicate, new object supersedes the old), returning how many edges
     /// were closed. Contradiction detection beyond same-subject-same-predicate
@@ -271,8 +317,7 @@ impl GraphHandle<'_> {
         relation: impl Into<String>,
         to: impl Into<String>,
     ) -> Result<usize, LaserError> {
-        use laser_wire::graph::EdgeDir;
-        let laser = self.laser;
+        let laser = self.laser.clone();
         let graph = self.name.clone();
         let from = from.into();
         let relation = relation.into();
@@ -284,33 +329,26 @@ impl GraphHandle<'_> {
             .neighbors(from_node.id, EdgeDir::Out, Some(relation.clone()), 1)
             .await?;
         let now = now_micros();
-        let superseded: Vec<laser_wire::graph::GraphEdge> = live
-            .edges
-            .into_iter()
-            .filter(|edge| edge.to != to_node.id && edge.valid_to.is_none())
-            .map(|mut edge| {
-                edge.valid_to = Some(now);
-                edge
-            })
-            .collect();
-        let closed = superseded.len();
-        if !superseded.is_empty() {
-            laser.graph(&graph).upsert(Vec::new(), superseded).await?;
+        let closing = superseded(live.edges, to_node.id, now);
+        let closed = closing.len();
+        if !closing.is_empty() {
+            laser.graph(&graph).upsert(Vec::new(), closing).await?;
         }
-        self.link(from, relation, to).await?;
+        let (nodes, edge) = linked(&from, relation, &to, now);
+        self.upsert(nodes, vec![edge]).await?;
         Ok(closed)
     }
 
     /// Close the relationship `link` opened: rewrite the edge with `valid_to`
     /// now, so the fact is superseded without being destroyed (a bitemporal
-    /// close). The nodes stay.
+    /// close). The deployment keeps the stored `valid_from`, and a later
+    /// `link` keeps this closed interval for `as_of` reads. The nodes stay.
     pub async fn unlink(
         self,
         from: impl Into<String>,
         relation: impl Into<String>,
         to: impl Into<String>,
     ) -> Result<(), LaserError> {
-        use laser_wire::graph::GraphEdge;
         let from = entity_node(&from.into());
         let to = entity_node(&to.into());
         let mut edge = GraphEdge::relate(&from, relation, &to);
@@ -330,9 +368,7 @@ impl GraphHandle<'_> {
         nodes: Vec<laser_wire::graph::GraphNode>,
         edges: Vec<laser_wire::graph::GraphEdge>,
     ) -> Result<(), LaserError> {
-        use laser_wire::graph::GraphUpsert;
-        use laser_wire::validate::Validate;
-        self.require_graph()?;
+        self.require_graph().await?;
         let (mut nodes, mut edges) = (nodes, edges);
         for node in &mut nodes {
             if node.producer.is_none() {
@@ -370,24 +406,37 @@ impl GraphHandle<'_> {
         decode_graph_reply(&payload).map(|_| ())
     }
 
-    // Every graph op rides the managed binary transport, so it is unavailable
-    // against Apache Iggy. Fail the same way before encoding any request.
-    fn require_graph(&self) -> Result<(), LaserError> {
+    async fn require_graph(&self) -> Result<(), LaserError> {
         laser_wire::graph::validate_graph_name(&self.name)?;
-        if self.laser.current_capabilities().graph {
-            Ok(())
-        } else {
-            Err(LaserError::unsupported(
-                "graph",
-                "graph traversal is not served by this deployment",
-            ))
+        graph_served(&self.laser).await
+    }
+}
+
+// Every graph op rides the managed binary transport, so it is unavailable
+// against Apache Iggy. Fail the same way before encoding any request. The
+// capability read reprobes a deployment that was not managed at connect.
+async fn graph_served(laser: &Laser) -> Result<(), LaserError> {
+    let capabilities = laser.capabilities().await;
+    if !capabilities.graph {
+        return Err(LaserError::unsupported(
+            "graph",
+            "graph traversal is not served by this deployment",
+        ));
+    }
+    match capabilities.versions {
+        Some(versions) if versions.graph != laser_wire::codes::GRAPH_OP_VERSION => {
+            Err(laser_wire::graph::GraphError::Version {
+                expected: versions.graph,
+                got: laser_wire::codes::GRAPH_OP_VERSION,
+            }
+            .into())
         }
+        _ => Ok(()),
     }
 }
 
 // Decode a managed `GraphReply` into the `Ok` result or its typed error.
 fn decode_graph_reply(payload: &[u8]) -> Result<laser_wire::graph::GraphResult, LaserError> {
-    use laser_wire::graph::GraphReply;
     match crate::error::decode_managed_reply::<GraphReply>(payload)? {
         GraphReply::Ok(result) => Ok(result),
         GraphReply::Err(error) => Err(error.into()),
@@ -405,8 +454,39 @@ fn entity_node(id: &str) -> laser_wire::graph::GraphNode {
     laser_wire::graph::GraphNode::entity(label, value)
 }
 
+// The two entity nodes a link upserts and the edge between them, valid from
+// `at`, so an `as_of` before the link does not see it.
+fn linked(
+    from: &str,
+    relation: String,
+    to: &str,
+    at: u64,
+) -> (
+    Vec<laser_wire::graph::GraphNode>,
+    laser_wire::graph::GraphEdge,
+) {
+    let from = entity_node(from);
+    let to = entity_node(to);
+    let edge = GraphEdge::relate(&from, relation, &to).valid(Some(at), None);
+    (vec![from, to], edge)
+}
+
+// The live edges of `live` that point at a target other than `to`, closed at `at`.
+fn superseded(
+    live: Vec<laser_wire::graph::GraphEdge>,
+    to: laser_wire::graph::NodeId,
+    at: u64,
+) -> Vec<laser_wire::graph::GraphEdge> {
+    live.into_iter()
+        .filter(|edge| edge.to != to && edge.valid_to.is_none())
+        .map(|mut edge| {
+            edge.valid_to = Some(at);
+            edge
+        })
+        .collect()
+}
+
 fn now_micros() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
@@ -415,11 +495,112 @@ fn now_micros() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::{linked, superseded};
+    use crate::capabilities::Capabilities;
+    use crate::error::LaserError;
     use crate::laser::{Laser, ResourceNaming};
     use crate::types::ConversationId;
+    use laser_wire::codes::GRAPH_OP_VERSION;
+    use laser_wire::graph::{
+        EdgeDir, EdgeId, GraphEdge, GraphNode, GraphQuery, GraphReturn, GraphStart, Hop,
+    };
+    use laser_wire::limits::{MAX_GRAPH_RESULT_ELEMENTS, MAX_GRAPH_TRAVERSE_DEPTH};
+    use laser_wire::query::{CmpOp, Filter};
 
-    fn laser() -> Laser {
-        Laser::from_client(crate::iggy::prelude::IggyClient::default()).with_default_stream("acme")
+    #[test]
+    fn given_a_link_when_built_then_should_open_the_edge_at_the_given_instant() {
+        let (nodes, edge) = linked("host:node-7", "opened".to_owned(), "ticket:7", 42);
+        let host = GraphNode::entity("host", "node-7");
+        let ticket = GraphNode::entity("ticket", "7");
+        assert_eq!(nodes, vec![host.clone(), ticket.clone()]);
+        assert_eq!(
+            edge,
+            GraphEdge::relate(&host, "opened", &ticket).valid(Some(42), None)
+        );
+        assert_eq!(edge.id, EdgeId::content(host.id, "opened", ticket.id));
+    }
+
+    #[test]
+    fn given_live_and_closed_edges_when_superseding_then_should_close_only_live_edges_to_other_targets()
+     {
+        let host = GraphNode::entity("host", "node-7");
+        let old = GraphNode::entity("ticket", "7");
+        let kept = GraphNode::entity("ticket", "9");
+        let live = GraphEdge::relate(&host, "opened", &old).valid(Some(10), None);
+        let closed = GraphEdge::relate(&host, "opened", &old).valid(Some(1), Some(5));
+        let current = GraphEdge::relate(&host, "opened", &kept).valid(Some(20), None);
+        let closing = superseded(vec![live.clone(), closed, current], kept.id, 99);
+        assert_eq!(closing, vec![live.valid(Some(10), Some(99))]);
+    }
+
+    #[test]
+    fn given_filters_and_a_multi_step_hop_when_building_then_should_carry_them_in_the_query() {
+        let laser = laser().with_resource_naming(ResourceNaming::Bare);
+        let node_filter = Filter::pred("label", CmpOp::Eq, "Person");
+        let edge_filter = Filter::pred("edge_type", CmpOp::Eq, "knows");
+        let query = laser
+            .graph("kg")
+            .hop(EdgeDir::Both, None, 3)
+            .out("works_at")
+            .node_filter(node_filter.clone())
+            .edge_filter(edge_filter.clone())
+            .limit(7)
+            .into_query();
+        assert_eq!(
+            query,
+            GraphQuery {
+                v: GRAPH_OP_VERSION,
+                graph: "kg".to_owned(),
+                start: GraphStart::Ids(Vec::new()),
+                traverse: vec![
+                    Hop {
+                        edge_type: None,
+                        dir: EdgeDir::Both,
+                        max: 3,
+                    },
+                    Hop {
+                        edge_type: Some("works_at".to_owned()),
+                        dir: EdgeDir::Out,
+                        max: 1,
+                    },
+                ],
+                node_filter: Some(node_filter),
+                edge_filter: Some(edge_filter),
+                return_: GraphReturn::Nodes,
+                limit: 7,
+                as_of: None,
+                conversation: None,
+                stream: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_invalid_hop_or_limit_when_fetching_then_should_refuse_before_sending() {
+        let laser =
+            laser().with_capabilities(Capabilities::OPEN.with_managed(true).with_graph(true));
+        let past_cap = u32::try_from(MAX_GRAPH_RESULT_ELEMENTS + 1).expect("the cap fits u32");
+        let refusals = [
+            laser.graph("kg").hop(EdgeDir::Out, None, 0).fetch().await,
+            laser
+                .graph("kg")
+                .hop(EdgeDir::Out, None, MAX_GRAPH_TRAVERSE_DEPTH + 1)
+                .fetch()
+                .await,
+            laser
+                .graph("kg")
+                .hop(EdgeDir::Out, None, 5)
+                .hop(EdgeDir::Out, None, 4)
+                .fetch()
+                .await,
+            laser.graph("kg").limit(past_cap).fetch().await,
+        ];
+        for refusal in refusals {
+            assert!(
+                matches!(refusal, Err(LaserError::Invalid(_))),
+                "refused before the transport, got {refusal:?}"
+            );
+        }
     }
 
     #[test]
@@ -440,5 +621,32 @@ mod tests {
             .conversation(ConversationId::derive("lens"));
         assert_eq!(handle.name, "knowledge");
         assert_eq!(handle.stream, None);
+    }
+
+    #[tokio::test]
+    async fn given_another_graph_op_version_when_upserting_then_should_report_version_skew() {
+        let laser = laser().with_capabilities(
+            Capabilities::OPEN
+                .with_managed(true)
+                .with_graph(true)
+                .with_versions(Some(
+                    crate::capabilities::OpVersions::new(1, 1, 1, 1)
+                        .with_graph(GRAPH_OP_VERSION + 1),
+                )),
+        );
+        // A refusal answers at once, a request that passed goes on to send.
+        let upsert = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            laser.graph("kg").upsert(Vec::new(), Vec::new()),
+        )
+        .await;
+        assert!(
+            matches!(&upsert, Ok(Err(error)) if error.is_version_skew()),
+            "{upsert:?}"
+        );
+    }
+
+    fn laser() -> Laser {
+        Laser::from_client(crate::iggy::prelude::IggyClient::default()).with_default_stream("acme")
     }
 }

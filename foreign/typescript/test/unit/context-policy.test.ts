@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { ConfigError, TransportError } from "../../src/client/errors.js"
+import { INTERNAL_TRANSPORT } from "../../src/client/internals.js"
 import type { Laser } from "../../src/client/laser.js"
 import {
   Chain,
@@ -64,6 +65,13 @@ void test("given_topics_when_capturing_a_context_checkpoint_then_should_record_e
     ["agent.streams", new Map()]
   ])
   const laser = {
+    defaultStream: "support",
+    [INTERNAL_TRANSPORT]: () => ({
+      findSnapshotTopic: (_stream: string, topic: string) =>
+        Promise.resolve(
+          topic === "agent.sessions" ? { id: 1, createdAtMicros: 9n, partitions: 1 } : undefined
+        )
+    }),
     topic: (name: string) => ({ tailOffsets: () => Promise.resolve(tails.get(name)) })
   } as unknown as Laser
   const checkpoint = await contextCheckpoint(laser, ["agent.sessions", "agent.streams"])
@@ -72,7 +80,11 @@ void test("given_topics_when_capturing_a_context_checkpoint_then_should_record_e
   const scoped = await ContextScope.create(laser, ConversationId.new()).checkpoint([
     "agent.sessions"
   ])
-  assert.deepEqual(scoped.toJSON(), { per_topic: { "agent.sessions": { "0": 7 } } })
+  assert.deepEqual(scoped.toJSON(), {
+    per_topic: { "agent.sessions": { "0": 7 } },
+    stream: "support",
+    generations: { "agent.sessions": 9 }
+  })
 })
 
 void test("given_a_context_scope_when_reading_its_laser_then_should_be_the_client_it_was_opened_on", () => {

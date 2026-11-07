@@ -10,6 +10,7 @@ import {
   HandlerConfigError,
   InvalidError,
   McpBridge,
+  RejectedError,
   enterBridge,
 } from "@laserdata/laser-sdk";
 import { wire } from "@laserdata/laser-sdk/full";
@@ -170,31 +171,69 @@ Then(
 When(
   /^I stream chat chunks "([^"]+)" and "([^"]+)"$/,
   async function (this: LaserWorld, first: string, second: string) {
-    const laser = this.requireLaser();
-    const conversation = this.requireConversation();
-    const stream = laser
-      .agdx(AgentTopic.Sessions, AgentId.new("assistant"), conversation)
-      .stream(
-        CorrelationId.parse(conversation.toString()),
-        wire.OPERATION_CHAT,
-      );
-    await stream.write(encoder.encode(first));
-    await stream.write(encoder.encode(second));
-    await stream.finish("stop");
-    this.aguiEventTypes = (
-      await laser.aguiEvents(conversation, AgentTopic.Sessions)
-    ).map((event) => event.type);
+    await streamChatChunks(this, [first, second]);
+  },
+);
+
+When(
+  /^I stream (\d+) chat chunks$/,
+  async function (this: LaserWorld, count: string) {
+    await streamChatChunks(
+      this,
+      Array.from({ length: Number(count) }, (_, index) => `chunk ${String(index)} `),
+    );
   },
 );
 
 Then("AG-UI renders the chat lifecycle in order", function (this: LaserWorld) {
   assert.deepEqual(this.aguiEventTypes, [
+    "RUN_STARTED",
     "TEXT_MESSAGE_START",
     "TEXT_MESSAGE_CONTENT",
     "TEXT_MESSAGE_CONTENT",
     "TEXT_MESSAGE_END",
+    "RUN_FINISHED",
   ]);
 });
+
+Then(
+  /^AG-UI renders one run with (\d+) text contents from its opening chunk$/,
+  function (this: LaserWorld, count: string) {
+    const types = this.aguiEventTypes;
+    assert.deepEqual(types.slice(0, 2), ["RUN_STARTED", "TEXT_MESSAGE_START"]);
+    assert.equal(
+      types.filter((type) => type === "TEXT_MESSAGE_CONTENT").length,
+      Number(count),
+    );
+    assert.deepEqual(types.slice(-2), ["TEXT_MESSAGE_END", "RUN_FINISHED"]);
+  },
+);
+
+// Streams `chunks` as one chat channel and keeps the AG-UI event types once
+// the rendered stream reaches its end.
+async function streamChatChunks(
+  world: LaserWorld,
+  chunks: readonly string[],
+): Promise<void> {
+  const laser = world.requireLaser();
+  const conversation = world.requireConversation();
+  const stream = laser
+    .agdx(AgentTopic.Sessions, AgentId.new("assistant"), conversation)
+    .stream(CorrelationId.parse(conversation.toString()), wire.OPERATION_CHAT);
+  for (const chunk of chunks) await stream.write(encoder.encode(chunk));
+  await stream.finish("stop");
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const types = (await laser.aguiEvents(conversation, AgentTopic.Sessions)).map(
+      (event) => event.type,
+    );
+    if (types.includes("TEXT_MESSAGE_END")) {
+      world.aguiEventTypes = types;
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail("chat events did not become visible");
+}
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -204,35 +243,55 @@ Given(
   /^responders "([^"]+)" and "([^"]+)" answer every command with their own name$/,
   async function (this: LaserWorld, first: string, second: string) {
     for (const name of [first, second]) {
-      const answered: string[] = [];
-      const responder = Agent.builder()
-        .id(AgentId.new(name))
-        .listenOn(AgentTopic.Sessions)
-        .handler({
-          async handle(message, context): Promise<void> {
-            const envelope = message.envelope;
-            if (envelope?.kind !== wire.AgentKind.Command) return;
-            answered.push(
-              envelope.tool !== undefined
-                ? "tool"
-                : envelope.operation === "chat"
-                  ? "task"
-                  : "input",
-            );
-            await context.respondInput(
-              AgentTopic.Sessions,
-              encoder.encode(name),
-            );
-          },
-        })
-        .build()
-        .spawn(this.requireLaser());
-      await responder.ready();
-      this.responders.push(responder);
-      this.answered.set(name, answered);
+      await spawnResponder(this, name, undefined);
     }
   },
 );
+
+Given(
+  /^responder "([^"]+)" answers every command with its own name$/,
+  async function (this: LaserWorld, name: string) {
+    await spawnResponder(this, name, undefined);
+  },
+);
+
+// An input request reaches only an agent that lists its operation.
+Given(
+  /^responder "([^"]+)" answers A2A tasks and input requests with its own name$/,
+  async function (this: LaserWorld, name: string) {
+    await spawnResponder(this, name, ["chat", "input_request"]);
+  },
+);
+
+async function spawnResponder(
+  world: LaserWorld,
+  name: string,
+  operations: readonly string[] | undefined,
+): Promise<void> {
+  const answered: string[] = [];
+  let builder = Agent.builder()
+    .id(AgentId.new(name))
+    .listenOn(AgentTopic.Sessions)
+    .handler({
+      async handle(message, context): Promise<void> {
+        const envelope = message.envelope;
+        if (envelope?.kind !== wire.AgentKind.Command) return;
+        answered.push(
+          envelope.tool !== undefined
+            ? "tool"
+            : envelope.operation === "chat"
+              ? "task"
+              : "input",
+        );
+        await context.respondInput(AgentTopic.Sessions, encoder.encode(name));
+      },
+    });
+  if (operations !== undefined) builder = builder.operations(operations);
+  const responder = builder.build().spawn(world.requireLaser());
+  await responder.ready();
+  world.responders.push(responder);
+  world.answered.set(name, answered);
+}
 
 When(
   /^I submit an A2A task to "([^"]+)"$/,
@@ -301,12 +360,52 @@ Then(
       const task = await bridge.task(id);
       const state = task.status.state;
       if (state.kind === "known" && state.name === "Completed") {
-        assert.equal(task.artifacts[0]?.text, text);
+        assert.equal(task.artifacts[0]?.parts[0]?.text, text);
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     throw new Error("the addressed A2A task did not complete");
+  },
+);
+
+Then("canceling the A2A task is refused", async function (this: LaserWorld) {
+  const bridge = new A2aBridge(
+    this.requireLaser(),
+    AgentId.new("a2a-gateway"),
+    AgentTopic.Sessions,
+    AgentTopic.Sessions,
+  );
+  const id = this.bridgeTask;
+  assert.ok(id !== undefined, "a task was submitted");
+  await assert.rejects(bridge.cancel(id), RejectedError);
+  const response = await bridge.handleRpc({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "CancelTask",
+    params: { id },
+  });
+  assert.equal(response.error?.code, -32_002);
+});
+
+Then(
+  "an A2A task that was never submitted is not found",
+  async function (this: LaserWorld) {
+    const bridge = new A2aBridge(
+      this.requireLaser(),
+      AgentId.new("a2a-gateway"),
+      AgentTopic.Sessions,
+      AgentTopic.Sessions,
+    );
+    const unknown = ConversationId.new().toString();
+    await assert.rejects(bridge.task(unknown), HandlerConfigError);
+    const response = await bridge.handleRpc({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "GetTask",
+      params: { id: unknown },
+    });
+    assert.equal(response.error?.code, -32_001);
   },
 );
 

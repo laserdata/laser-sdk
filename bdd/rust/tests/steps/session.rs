@@ -90,6 +90,40 @@ async fn start_session(world: &mut LaserWorld, owner: String, label: String) {
     world.session_lease = Some(lease);
 }
 
+#[when(regex = r#"^agent "([^"]+)" starts the session "([^"]+)" again$"#)]
+async fn start_session_again(world: &mut LaserWorld, owner: String, label: String) {
+    let begun = sessions(world)
+        .create(label)
+        .agent(agent(&owner))
+        .begin()
+        .await
+        .map(drop);
+    world.last_result = Some(begun.map_err(|error| format!("{error:?}")));
+}
+
+#[when(regex = r#"^agent "([^"]+)" resumes the session "([^"]+)"$"#)]
+async fn resume_session(world: &mut LaserWorld, owner: String, label: String) {
+    let (session, lease) = sessions(world)
+        .create(label)
+        .agent(agent(&owner))
+        .resume()
+        .await
+        .expect("the session resumes");
+    world.session = Some(session);
+    world.session_lease = Some(lease);
+}
+
+#[then(regex = r#"^the call fails as a session that ended (\w+)$"#)]
+async fn fails_ended(world: &mut LaserWorld, status: String) {
+    match world.last_result.as_ref().expect("a call was attempted") {
+        Err(error) => assert!(
+            error.contains("SessionEnded") && error.contains(&format!("status: \"{status}\"")),
+            "expected a session that ended {status}, got: {error}"
+        ),
+        Ok(()) => panic!("expected the call to fail as an ended session"),
+    }
+}
+
 #[when("the session ends")]
 async fn end_session(world: &mut LaserWorld) {
     world.session().end().await.expect("the session ends");
@@ -1024,9 +1058,27 @@ async fn manifest_addresses(world: &mut LaserWorld) {
         .iter()
         .map(|message| (message.id.partition_id, message.id.offset))
         .collect();
-    let earlier: Vec<(u32, u64)> = turns.iter().take(assembled.len()).map(position).collect();
+    let earlier: Vec<(u32, u64)> = turns
+        .iter()
+        .filter(|turn| turn.display.as_str() == "agent.message")
+        .take(assembled.len())
+        .map(position)
+        .collect();
     assert_eq!(listed, assembled);
     assert_eq!(listed, earlier);
+}
+
+#[then(regex = r#"^the context assembled from the session reads (".+")$"#)]
+async fn assembled_reads(world: &mut LaserWorld, list: String) {
+    let expected = names(&list);
+    let session = world.session().clone();
+    let text = eventually(async || {
+        let assembled = session.assemble(Box::new(LastN(50))).await.ok()?;
+        let lines: Vec<String> = assembled.text().lines().map(str::to_owned).collect();
+        (lines.len() >= expected.len()).then_some(lines)
+    })
+    .await;
+    assert_eq!(text, expected);
 }
 
 #[given(regex = r"^sessions publish heartbeats every (\d+) milliseconds$")]

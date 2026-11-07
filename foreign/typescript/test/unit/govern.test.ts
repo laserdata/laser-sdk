@@ -5,9 +5,12 @@ import {
   ActionKind,
   ConversationId,
   CodecError,
+  GOVERNOR_ERROR_DECISION,
+  HandlerError,
   InvalidError,
   GovernorMode,
   PolicyBlockedError,
+  PolicyDeferredError,
   QuorumGovernor,
   SwappableGovernor,
   decodePolicyEvidence,
@@ -148,6 +151,31 @@ void test("given_a_full_chain_table_when_a_slot_releases_then_should_admit_witho
   await first
   await second
   assert.equal(secondEmitted, true)
+})
+
+void test("given_observe_mode_when_the_governor_fails_then_should_record_the_failure_and_proceed", async () => {
+  const failing: ActionGovernor = {
+    decide: () => Promise.reject(new HandlerError("policy engine offline"))
+  }
+  const evidence: PolicyEvidence[] = []
+  const payload = await new GovernorState(failing, GovernorMode.Observe).govern(
+    action(),
+    (item) => {
+      evidence.push(item)
+      return Promise.resolve()
+    }
+  )
+  assert.deepEqual(payload, encoder.encode("wire-funds"))
+  const first = evidence[0]
+  assert.ok(first !== undefined)
+  assert.equal(first.decision, GOVERNOR_ERROR_DECISION)
+  assert.equal(first.outcome, "effected")
+  assert.ok(first.reason?.includes("policy engine offline"))
+  assert.deepEqual(decodePolicyEvidence(encodePolicyEvidence(first)), first)
+  await assert.rejects(
+    new GovernorState(failing, GovernorMode.Enforce).govern(action(), () => Promise.resolve()),
+    HandlerError
+  )
 })
 
 void test("given_an_unknown_evidence_vocabulary_when_decoded_then_should_reject_it", async () => {
@@ -325,3 +353,74 @@ void test("given_a_zero_retention_capacity_when_constructed_then_should_keep_one
     InvalidError
   )
 })
+
+void test("given_a_block_or_defer_with_a_reason_when_enforced_then_should_carry_the_reason", async () => {
+  const blocking = new GovernorState(
+    { decide: () => Promise.resolve(ActionDecision.block("wire transfers need review")) },
+    GovernorMode.Enforce
+  )
+  await assert.rejects(
+    blocking.govern(action(), () => Promise.resolve()),
+    (error: unknown) =>
+      error instanceof PolicyBlockedError &&
+      error.message === "the governor blocked this action: wire transfers need review"
+  )
+  const deferring = new GovernorState(
+    { decide: () => Promise.resolve(ActionDecision.defer("after the freeze")) },
+    GovernorMode.Enforce
+  )
+  await assert.rejects(
+    deferring.govern(action(), () => Promise.resolve()),
+    (error: unknown) =>
+      error instanceof PolicyDeferredError &&
+      error.message === "the governor deferred this action: after the freeze"
+  )
+})
+
+void test("given_a_hung_voter_when_the_quorum_decides_then_should_time_it_out", async () => {
+  const hung: ActionGovernor = { decide: () => new Promise<ActionDecision>(() => undefined) }
+  const abstaining = new QuorumGovernor({ kind: "any" })
+    .voter("hung", hung, false)
+    .voter("ok", allow, false)
+    .voterTimeout(20)
+  const decision = await abstaining.decide({ ...action(), counters: counters() })
+  assert.equal(decision.verdict.kind, "allow")
+  assert.match(decision.reason ?? "", /hung=error\(timed out waiting for a quorum voter\)/u)
+  const mandatory = new QuorumGovernor({ kind: "any" })
+    .voter("hung", hung, true)
+    .voter("ok", allow, false)
+    .voterTimeout(20)
+  const blocked = await mandatory.decide({ ...action(), counters: counters() })
+  assert.equal(blocked.verdict.kind, "block")
+  assert.throws(() => new QuorumGovernor({ kind: "any" }).voterTimeout(-1), InvalidError)
+  const zero = new QuorumGovernor({ kind: "any" }).voter("ok", allow, false).voterTimeout(0)
+  assert.equal((await zero.decide({ ...action(), counters: counters() })).verdict.kind, "block")
+})
+
+void test("given_two_processes_governing_one_conversation_when_interleaved_then_should_verify_each_chain", async () => {
+  const observe: ActionGovernor = { decide: () => Promise.resolve(ActionDecision.observe()) }
+  const first = new GovernorState(observe, GovernorMode.Enforce)
+  const second = new GovernorState(observe, GovernorMode.Enforce)
+  const evidence: PolicyEvidence[] = []
+  const emit = (item: PolicyEvidence): Promise<void> => {
+    evidence.push(item)
+    return Promise.resolve()
+  }
+  for (const state of [first, second, first, second]) await state.govern(action(), emit)
+  assert.notEqual(evidence[0]?.chainId, evidence[1]?.chainId)
+  assert.ok(verifyEvidenceChain(evidence))
+  assert.ok(
+    !verifyEvidenceChain(
+      [evidence[1], evidence[2], evidence[3]].flatMap((item) => (item === undefined ? [] : [item]))
+    )
+  )
+  assert.ok(
+    !verifyEvidenceChain(
+      [evidence[2], evidence[0]].flatMap((item) => (item === undefined ? [] : [item]))
+    )
+  )
+})
+
+function counters() {
+  return { sends: 0n, requests: 0n, bytesSent: 0n }
+}

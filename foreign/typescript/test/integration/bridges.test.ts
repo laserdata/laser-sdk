@@ -110,15 +110,15 @@ void test("given_state_snapshots_and_deltas_when_replayed_then_should_reconstruc
     const events = await laser.aguiEvents(conversation, AgentTopic.Sessions)
     assert.deepEqual(
       events.map((event) => event.type),
-      ["STATE_DELTA", "STATE_SNAPSHOT", "STATE_DELTA"]
+      ["RUN_STARTED", "STATE_DELTA", "STATE_SNAPSHOT", "STATE_DELTA", "RUN_FINISHED"]
     )
     // Decoded documents have no prototype, so compare their JSON.
     const plain = (value: unknown): unknown => JSON.parse(JSON.stringify(value))
-    assert.deepEqual(plain(events[1]), {
+    assert.deepEqual(plain(events[2]), {
       type: "STATE_SNAPSHOT",
       snapshot: { phase: "start", items: ["one"] }
     })
-    assert.deepEqual(plain(events[2]), {
+    assert.deepEqual(plain(events[3]), {
       type: "STATE_DELTA",
       delta: [
         { op: "replace", path: "/phase", value: "done" },

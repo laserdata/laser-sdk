@@ -1,5 +1,5 @@
 use crate::agent_runtime::{route_policy, static_topic, take_route_failure};
-use crate::async_bridge::{HookLoop, call_hook, future_into_py, hook_callable};
+use crate::async_bridge::{Awaitable, HookLoop, awaitable, call_hook, hook_callable};
 use crate::errors::to_pyerr;
 use laser_sdk::agent::{
     InboxRoute, OnTimeout, Router, StepContext, StepFn, Verifier, Workflow, WorkflowBudget,
@@ -88,6 +88,7 @@ struct StepSpec {
     exclusive: bool,
     fence_namespace: Option<String>,
     on_timeout: OnTimeout,
+    deadline: Option<Duration>,
     build: Arc<Py<PyAny>>,
     verify: Option<Arc<Py<PyAny>>>,
     compensate: Option<Arc<Py<PyAny>>>,
@@ -202,9 +203,14 @@ impl PyWorkflow {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyWorkflow {
-    /// Resume an earlier run: the engine replays that run's journal and skips
-    /// the steps already recorded complete, re-dispatching only the unfinished
-    /// ones. Omit it to start a fresh run with its own id.
+    /// Run under `run_id`: the engine replays that run's whole journal, skips
+    /// the steps recorded complete, and dispatches only the unfinished ones. A
+    /// step dispatched before the run stopped is answered by its reply if one
+    /// landed, and sent again under the same idempotency key otherwise. A
+    /// journal that retention shortened past the run's first record raises
+    /// `JournalTruncatedError`. The run session reopens, so a run that ended
+    /// completed or failed runs again under the same id and a canceled one
+    /// raises `SessionEndedError`. Omit it to start a fresh run with its own id.
     fn run_id(&mut self, run_id: String) -> PyResult<()> {
         let run_id = run_id
             .parse::<ConversationId>()
@@ -229,13 +235,17 @@ impl PyWorkflow {
     /// backend). `fence_namespace` also makes the step exclusive and aligns the
     /// lease with a handler's fenced KV effect. `on_timeout` is `"fail"`
     /// (default) or `"reassign"` (re-acquire the
-    /// lease, bumping the fence, and hand the task to a fresh holder. Needs an
-    /// exclusive step). `compensate(outputs) -> bytes` is the rollback run if a
-    /// later step fails.
+    /// lease, bumping the fence, and hand the task to a fresh holder, a capable
+    /// agent other than the ones that timed out when one exists. Needs an
+    /// exclusive step). `deadline_ms` bounds the step's build, dispatch,
+    /// verification, and completion record (default 30000), never past the
+    /// wall-clock budget left, and rides the command so a target that picks it
+    /// up later drops it. `compensate(outputs) -> bytes` is the rollback run if
+    /// a later step fails, sent to the agent that ran this step.
     #[pyo3(signature = (
         label, *, build, to=None, to_capable=None, all_capable=None, principal=None, after=None,
         verify=None, exclusive=false, fence_namespace=None, on_timeout="fail", compensate=None,
-        policy=None
+        policy=None, deadline_ms=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn step(
@@ -250,9 +260,11 @@ impl PyWorkflow {
         verify: Option<Py<PyAny>>,
         exclusive: bool,
         fence_namespace: Option<String>,
+        #[gen_stub(override_type(type_repr = "typing.Literal['fail', 'reassign']", imports = ("typing",)))]
         on_timeout: &str,
         compensate: Option<Py<PyAny>>,
         policy: Option<&Bound<'_, PyAny>>,
+        deadline_ms: Option<f64>,
     ) -> PyResult<()> {
         let parsed = route_policy(policy)?;
         let saved_policy = policy.map(|policy| Arc::new(policy.clone().unbind()));
@@ -302,6 +314,9 @@ impl PyWorkflow {
             exclusive: exclusive || fence_namespace.is_some(),
             fence_namespace,
             on_timeout,
+            deadline: deadline_ms
+                .map(|deadline| crate::convert::duration_ms(deadline, "deadline_ms"))
+                .transpose()?,
             build: Arc::new(build),
             verify: verify.map(Arc::new),
             compensate: compensate.map(Arc::new),
@@ -313,11 +328,16 @@ impl PyWorkflow {
     /// outputs keyed by label and the run id.
     /// The workflow name is the orchestrator identity it dispatches as, so it must
     /// be a valid agent id. A failed step runs the compensations in reverse and
-    /// raises. The run is a session whose id is the run id, and each step and
-    /// compensation is a child session of it. A cancel request on
+    /// raises `StepFailedError`, whose `reason` says how the step ended. A
+    /// misconfigured workflow (a duplicate label, a broadcast step, an exclusive
+    /// all-capable step, reassignment without exclusivity) raises before
+    /// anything is written. The run is a session whose id is the run id, and
+    /// each step and compensation is a child session of it. A cancel request on
     /// `agent.control` stops the run at the next step boundary with
-    /// `CancelledError` after the compensations.
-    fn run<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// `CancelledError` after the compensations. Cancelling the Python task
+    /// stops the run at once without compensating and releases a held
+    /// exclusive lease, so the run resumes by its id.
+    fn run<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyWorkflowOutcome>> {
         let laser = self.laser.clone();
         let name = self.name.clone();
         let budget = self.budget;
@@ -328,7 +348,7 @@ impl PyWorkflow {
             .transpose()?;
         let specs = self.steps.clone();
         let run_id = self.run_id;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut workflow = laser.workflow(&name).budget(budget);
             if let Some(route) = route {
                 workflow = workflow.inbox_route(route);
@@ -338,9 +358,9 @@ impl PyWorkflow {
             }
             // Thread the move-based Rust builder: the first step turns the workflow
             // into a step handle, each later step chains onto the handle.
-            enum Builder<'a> {
-                Fresh(Workflow<'a>),
-                Step(laser_sdk::agent::StepHandle<'a>),
+            enum Builder {
+                Fresh(Workflow),
+                Step(laser_sdk::agent::StepHandle),
             }
             let mut builder = Builder::Fresh(workflow);
             let mut route_failures = Vec::new();
@@ -375,6 +395,9 @@ impl PyWorkflow {
                     handle = handle.exclusive();
                 }
                 handle = handle.on_timeout(spec.on_timeout);
+                if let Some(deadline) = spec.deadline {
+                    handle = handle.deadline(deadline);
+                }
                 if let Some(compensate) = spec.compensate {
                     handle = handle.compensate_with(PyStepFn(compensate));
                 }

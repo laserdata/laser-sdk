@@ -26,9 +26,8 @@ void test("given_the_backend_announce_fixture_when_decoded_then_should_preserve_
   assert.equal(announce.versions.control, 1)
   assert.equal(announce.versions.kv, 1)
   assert.equal(announce.versions.fork, 1)
-  assert.equal(announce.versions.checkpoint, 1)
   assert.ok(opVersionsHasFeature(announce.versions, feature.KV_CAS))
-  assert.ok(opVersionsHasFeature(announce.versions, feature.DESTINATIONS))
+  assert.ok(!opVersionsHasFeature(announce.versions, feature.DESTINATIONS))
   assert.equal(announce.topology, undefined)
 
   assert.equal(announce.backends.length, 2)
@@ -41,7 +40,7 @@ void test("given_the_backend_announce_fixture_when_decoded_then_should_preserve_
   assert.equal(warehouse.implementation.kind, "columnar")
   assert.equal(warehouse.label, "Analytics warehouse")
   assert.equal(warehouse.implementation.version, "2.1.0")
-  assert.ok(warehouse.query?.dialects.includes("data_fusion"))
+  assert.ok(warehouse.query?.dialects.includes("postgres"))
 
   const reencoded = encodeBackendAnnounce(announce)
   assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
@@ -77,12 +76,11 @@ void test("given_the_hello_reply_agent_fixture_when_decoded_then_should_preserve
 void test("given_the_hello_reply_features_fixture_when_decoded_then_should_preserve_feature_bits_and_re_encode_byte_identically", async () => {
   const bytes = await readFixture("hello_reply_features.bin")
   const reply = decodeHelloReply(bytes)
-  assert.equal(reply.versions.features, 259n)
-  assert.equal(reply.versions.checkpoint, 1)
+  assert.equal(reply.versions.features, 3n)
   assert.ok(opVersionsHasFeature(reply.versions, feature.KV_CAS))
   assert.ok(opVersionsHasFeature(reply.versions, feature.READ_YOUR_WRITES))
   assert.ok(!opVersionsHasFeature(reply.versions, feature.STRONG_CONSISTENCY))
-  assert.ok(opVersionsHasFeature(reply.versions, feature.DESTINATIONS))
+  assert.ok(!opVersionsHasFeature(reply.versions, feature.DESTINATIONS))
   assert.deepEqual(Buffer.from(encodeHelloReply(reply)), Buffer.from(bytes))
 })
 
@@ -99,8 +97,18 @@ void test("given_the_backend_announce_topology_fixture_when_decoded_then_should_
   assert.equal(announce.topology.kvMutationsTopic, "acme.kv.mutations")
   assert.equal(announce.topology.forkMutationsTopic, "acme.fork.mutations")
   assert.equal(announce.topology.graphMutationsTopic, "acme.graph.mutations")
-  assert.equal(announce.topology.checkpointMutationsTopic, "acme.checkpoint.mutations")
 
   const reencoded = encodeBackendAnnounce(announce)
   assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
+})
+
+void test("given_empty_aggregate_capabilities_when_omitted_on_the_wire_then_should_decode_as_empty", async () => {
+  const announce = decodeBackendAnnounce(await readFixture("backend_announce.bin"))
+  const backends = announce.backends.map((backend) => ({
+    ...backend,
+    ...(backend.query === undefined ? {} : { query: { ...backend.query, aggregates: [] } })
+  }))
+  const decoded = decodeBackendAnnounce(encodeBackendAnnounce({ ...announce, backends }))
+  for (const backend of decoded.backends)
+    if (backend.query !== undefined) assert.deepEqual(backend.query.aggregates, [])
 })

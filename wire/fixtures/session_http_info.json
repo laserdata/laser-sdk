@@ -9,7 +9,10 @@
   "status": "active",
   "idle": false,
   "over_budget": false,
-  "pause_requested": false,
+  "pause_requested": true,
+  "awaiting": [
+    "writer"
+  ],
   "cancel_requested": true,
   "started_at": 1717171717000000,
   "first_event_at": 1717171717000000,

@@ -11,8 +11,11 @@ import {
   pausedBy,
   xxh32
 } from "../../src/agent/control.js"
-import { SessionFacts, isWork, parkedOf } from "../../src/agent/lane-scan.js"
+import { SessionFacts, isWork, parkedOf, readParked } from "../../src/agent/lane-scan.js"
 import { ControlFollower, RoleState } from "../../src/agent/pause.js"
+import { INTERNAL_TRANSPORT } from "../../src/client/internals.js"
+import type { Laser } from "../../src/client/laser.js"
+import { CONTEXT_READ_WINDOW } from "../../src/context.js"
 import type { LaserTransport, PollWait, PolledMessage } from "../../src/iggy/apache-iggy.js"
 import { ConversationId } from "../../src/types/ids.js"
 import {
@@ -176,6 +179,37 @@ void test("given_parkings_and_completions_when_folded_then_should_keep_only_unha
       [7n, 2n]
     ]
   )
+})
+
+void test("given_a_lane_whose_head_expired_when_read_whole_then_should_report_the_parked_read_complete", async () => {
+  const lane = (first: number, length: number): Laser => {
+    const records: PolledMessage[] = Array.from({ length }, (_, index) => ({
+      partitionId: 0,
+      offset: BigInt(first + index),
+      payload: new Uint8Array([0xff]),
+      headers: new Map()
+    }))
+    const transport = {
+      findTopicPartitionCount: () => Promise.resolve(1),
+      pollMessages: (
+        _stream: string,
+        _topic: string,
+        _target: unknown,
+        strategy: { readonly kind: string; readonly value?: bigint },
+        count: number
+      ) => {
+        if (strategy.kind === "first") return Promise.resolve(records.slice(0, 1))
+        if (strategy.kind === "last") return Promise.resolve(records.slice(-1))
+        const from = records.findIndex((record) => record.offset >= (strategy.value ?? 0n))
+        return Promise.resolve(from < 0 ? [] : records.slice(from, from + count))
+      }
+    }
+    return { defaultStream: "agents", [INTERNAL_TRANSPORT]: () => transport } as unknown as Laser
+  }
+  const session = ConversationId.new().toString()
+
+  assert.equal((await readParked(lane(100, 10), session)).complete, true)
+  assert.equal((await readParked(lane(0, CONTEXT_READ_WINDOW + 10), session)).complete, false)
 })
 
 void test("given_lane_operations_when_classified_then_should_count_only_work_commands", () => {

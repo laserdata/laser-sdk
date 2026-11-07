@@ -1,4 +1,4 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::convert::{duration_ms, py_to_de};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::sign::PyKeyRegistry;
@@ -7,7 +7,6 @@ use laser_sdk::capabilities::{
 };
 use laser_sdk::laser::Laser;
 use laser_sdk::wire::batch::BatchItem;
-use laser_sdk::wire::checkpoint::CheckpointReadConsistency;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
@@ -38,8 +37,11 @@ constants! {
     "DEFAULT_SNAPSHOT_TOPIC": &str = laser_sdk::snapshot::DEFAULT_SNAPSHOT_TOPIC,
     "DEFAULT_MEMORY_TOPIC_TTL_MS": u128 = laser_sdk::memory::DEFAULT_MEMORY_TOPIC_TTL.as_millis(),
     "POLICY_DECISION_OPERATION": &str = laser_sdk::govern::POLICY_DECISION_OPERATION,
+    "GOVERNOR_ERROR_DECISION": &str = laser_sdk::govern::GOVERNOR_ERROR_DECISION,
     "A2A_PROTOCOL_VERSION": &str = laser_sdk::a2a::A2A_PROTOCOL_VERSION,
     "A2A_JSONRPC_BINDING": &str = laser_sdk::a2a::A2A_JSONRPC_BINDING,
+    "BRIDGE_HOPS_META_KEY": &str = laser_sdk::a2a::BRIDGE_HOPS_META_KEY,
+    "MCP_SUPPORTED_PROTOCOL_VERSIONS": Vec<&str> = laser_sdk::mcp::MCP_SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
     "DEFAULT_OUTCOME_WAIT_MS": u128 = laser_sdk::filters::DEFAULT_OUTCOME_WAIT.as_millis(),
     "FILTER_EVALUATOR_VERSION": u32 = laser_sdk::filters::FILTER_EVALUATOR_VERSION,
     "FINISH_REASON_ABANDONED": &str = laser_sdk::agent::FINISH_REASON_ABANDONED,
@@ -50,6 +52,7 @@ constants! {
     "DEFAULT_SESSION_CONTEXT_TURNS": usize = laser_sdk::agent::DEFAULT_SESSION_CONTEXT_TURNS,
     "DEFAULT_SESSION_CONTEXT_TOKENS": usize = laser_sdk::agent::DEFAULT_SESSION_CONTEXT_TOKENS,
     "WORKFLOW_FENCE_NAMESPACE": &str = laser_sdk::agent::WORKFLOW_FENCE_NAMESPACE,
+    "DEFAULT_CHUNK_ABANDON_MS": u64 = laser_sdk::agent::DEFAULT_CHUNK_ABANDON_MS,
     "DEFAULT_CHUNK_FLUSH_BYTES": usize = laser_sdk::agent::DEFAULT_CHUNK_FLUSH_BYTES,
     "DEFAULT_CHUNK_LINGER_MS": u64 = laser_sdk::agent::DEFAULT_CHUNK_LINGER_MS,
     "MAX_CHUNK_BODY_BYTES": usize = laser_sdk::agent::MAX_CHUNK_BODY_BYTES,
@@ -102,10 +105,7 @@ constants! {
     "AGDX_LIST_FILTER_REVISIONS_CODE": u32 = laser_sdk::wire::codes::AGDX_LIST_FILTER_REVISIONS_CODE,
     "AGDX_LIST_PROJECTIONS_CODE": u32 = laser_sdk::wire::codes::AGDX_LIST_PROJECTIONS_CODE,
     "AGDX_LIST_SCHEMAS_CODE": u32 = laser_sdk::wire::codes::AGDX_LIST_SCHEMAS_CODE,
-    "AGDX_QUERY_CANCEL_CODE": u32 = laser_sdk::wire::codes::AGDX_QUERY_CANCEL_CODE,
     "AGDX_QUERY_CODE": u32 = laser_sdk::wire::codes::AGDX_QUERY_CODE,
-    "AGDX_QUERY_PAGE_CODE": u32 = laser_sdk::wire::codes::AGDX_QUERY_PAGE_CODE,
-    "AGDX_QUERY_STATUS_CODE": u32 = laser_sdk::wire::codes::AGDX_QUERY_STATUS_CODE,
     "AGDX_REGISTER_SCHEMA_CODE": u32 = laser_sdk::wire::codes::AGDX_REGISTER_SCHEMA_CODE,
     "AUTHZ_OP_VERSION": u32 = laser_sdk::wire::codes::AUTHZ_OP_VERSION,
     "CONTROL_OP_VERSION": u32 = laser_sdk::wire::codes::CONTROL_OP_VERSION,
@@ -133,13 +133,15 @@ constants! {
     "MAX_LEASE_TTL_MICROS": u64 = laser_sdk::wire::limits::MAX_LEASE_TTL_MICROS,
     "MAX_MEMORY_ID_BYTES": usize = laser_sdk::wire::limits::MAX_MEMORY_ID_BYTES,
     "MAX_PAGE_SIZE": usize = laser_sdk::wire::limits::MAX_PAGE_SIZE,
+    "MAX_QUERY_OFFSET": u64 = laser_sdk::wire::limits::MAX_QUERY_OFFSET,
+    "MATERIALIZATION_POLL_START_MS": u128 = laser_sdk::materialize::MATERIALIZATION_POLL_START.as_millis(),
+    "MATERIALIZATION_POLL_MAX_MS": u128 = laser_sdk::materialize::MATERIALIZATION_POLL_MAX.as_millis(),
     "MAX_PROJECTION_ID_BYTES": usize = laser_sdk::wire::limits::MAX_PROJECTION_ID_BYTES,
     "MAX_PROJECTION_NAME_BYTES": usize = laser_sdk::wire::limits::MAX_PROJECTION_NAME_BYTES,
     "MAX_ROLE_NAME_BYTES": usize = laser_sdk::wire::limits::MAX_ROLE_NAME_BYTES,
     "MAX_REPLICATION_FACTOR": u32 = laser_sdk::stream::MAX_REPLICATION_FACTOR,
     "MAX_SCAN_LIMIT": usize = laser_sdk::wire::limits::MAX_SCAN_LIMIT,
     "MAX_SCHEMA_NAME_BYTES": usize = laser_sdk::wire::limits::MAX_SCHEMA_NAME_BYTES,
-    "MAX_SESSION_CURSOR_BYTES": usize = laser_sdk::wire::limits::MAX_SESSION_CURSOR_BYTES,
     "MAX_SESSION_TEXT_QUERY_BYTES": usize = laser_sdk::wire::limits::MAX_SESSION_TEXT_QUERY_BYTES,
     "MAX_VALUE_BYTES": usize = laser_sdk::wire::limits::MAX_VALUE_BYTES,
     "MIN_LEASE_TTL_MICROS": u64 = laser_sdk::wire::limits::MIN_LEASE_TTL_MICROS,
@@ -184,11 +186,24 @@ constants! {
 #[pyclass(name = "Laser", frozen)]
 pub struct PyLaser {
     pub(crate) inner: Laser,
+    // Only the handle a connect call returned closes the connection on
+    // `async with` exit. Every derived handle borrows it.
+    owns_connection: bool,
 }
 
 impl PyLaser {
     pub(crate) fn from_inner(inner: Laser) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            owns_connection: false,
+        }
+    }
+
+    fn owning(inner: Laser) -> Self {
+        Self {
+            inner,
+            owns_connection: true,
+        }
     }
 }
 
@@ -223,12 +238,21 @@ impl PyLaser {
         governor: Option<&Bound<'_, PyAny>>,
         governor_mode: Option<&str>,
         governor_retention: Option<crate::govern::PyGovernorRetention>,
-        connect_timeout_ms: Option<u64>,
-        publish_timeout_ms: Option<u64>,
+        connect_timeout_ms: Option<f64>,
+        publish_timeout_ms: Option<f64>,
         publish_max_retries: Option<u32>,
-        publish_retry_backoff_ms: Option<u64>,
+        publish_retry_backoff_ms: Option<f64>,
         resource_naming: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyLaser>> {
+        let connect_timeout = connect_timeout_ms
+            .map(|ms| duration_ms(ms, "connect_timeout_ms"))
+            .transpose()?;
+        let publish_timeout = publish_timeout_ms
+            .map(|ms| duration_ms(ms, "publish_timeout_ms"))
+            .transpose()?;
+        let publish_retry_backoff = publish_retry_backoff_ms
+            .map(|ms| duration_ms(ms, "publish_retry_backoff_ms"))
+            .transpose()?;
         let verifier = verifier.map(PyKeyRegistry::snapshot);
         let capabilities = capabilities.map(|value| value.inner.clone());
         let governor = match governor {
@@ -240,7 +264,7 @@ impl PyLaser {
             )),
             None => None,
         };
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut builder = Laser::builder();
             if let Some(naming) = resource_naming {
                 builder = builder.resource_naming(parse_resource_naming(&naming)?);
@@ -265,17 +289,17 @@ impl PyLaser {
                     None => builder.governor(governor, mode),
                 };
             }
-            if let Some(value) = connect_timeout_ms {
-                builder = builder.connect_timeout(std::time::Duration::from_millis(value));
+            if let Some(value) = connect_timeout {
+                builder = builder.connect_timeout(value);
             }
-            if let Some(value) = publish_timeout_ms {
-                builder = builder.publish_timeout(std::time::Duration::from_millis(value));
+            if let Some(value) = publish_timeout {
+                builder = builder.publish_timeout(value);
             }
             if let Some(value) = publish_max_retries {
                 builder = builder.publish_max_retries(value);
             }
-            if let Some(value) = publish_retry_backoff_ms {
-                builder = builder.publish_retry_backoff(std::time::Duration::from_millis(value));
+            if let Some(value) = publish_retry_backoff {
+                builder = builder.publish_retry_backoff(value);
             }
             if let Some(stream) = stream {
                 builder = builder.stream(stream);
@@ -296,7 +320,7 @@ impl PyLaser {
                 builder = builder.verifier(verifier);
             }
             let laser = builder.build().await.map_err(to_pyerr)?;
-            Ok(PyLaser::from_inner(laser))
+            Ok(PyLaser::owning(laser))
         })
     }
 
@@ -305,20 +329,20 @@ impl PyLaser {
     /// and publish variables (`LASER_CONNECT_TIMEOUT_MS` and the `LASER_PUBLISH_*`
     /// family) apply as on `connect`.
     #[staticmethod]
-    fn connect_env(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
-        future_into_py(py, async move {
+    fn connect_env(py: Python<'_>) -> PyResult<Awaitable<'_, PyLaser>> {
+        awaitable(py, async move {
             let laser = Laser::connect_env().await.map_err(to_pyerr)?;
-            Ok(PyLaser::from_inner(laser))
+            Ok(PyLaser::owning(laser))
         })
     }
 
     /// Connect to a local Apache Iggy on `iggy:iggy@127.0.0.1:8090`, the Laser
     /// Stack default.
     #[staticmethod]
-    fn local(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
-        future_into_py(py, async move {
+    fn local(py: Python<'_>) -> PyResult<Awaitable<'_, PyLaser>> {
+        awaitable(py, async move {
             let laser = Laser::local().await.map_err(to_pyerr)?;
-            Ok(PyLaser::from_inner(laser))
+            Ok(PyLaser::owning(laser))
         })
     }
 
@@ -329,12 +353,12 @@ impl PyLaser {
         py: Python<'_>,
         connection_string: String,
         stream: String,
-    ) -> PyResult<Bound<'_, PyAny>> {
-        future_into_py(py, async move {
+    ) -> PyResult<Awaitable<'_, PyLaser>> {
+        awaitable(py, async move {
             let laser = Laser::connect_with_stream(&connection_string, &stream)
                 .await
                 .map_err(to_pyerr)?;
-            Ok(PyLaser::from_inner(laser))
+            Ok(PyLaser::owning(laser))
         })
     }
 
@@ -369,20 +393,18 @@ impl PyLaser {
         PyLaser::from_inner(self.inner.clone().with_changes_topic(changes_topic))
     }
 
-    /// Return a clone with selected negotiated capabilities overridden. This is
-    /// intended for bring-your-own backends and deterministic pre-gate tests.
-    /// Omitted fields preserve the current capability set.
+    /// Return a clone with selected negotiated capabilities overridden, at
+    /// once, like every other `with_*`. This is intended for bring-your-own
+    /// backends and deterministic pre-gate tests. Omitted fields keep the set
+    /// this handle holds now, injected or last negotiated, without a probe.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, destinations=None, destinations_consistency=None, kv=None, kv_cas=None, kv_cas_fenced=None, kv_fenced_leases=None, graph=None, forks=None, sessions=None, stream_tenancy=None, watch=None, authz=None, filters=None, filters_catalog=None, filters_group_policy_reads=None, a2a_gateway=None, query_execution=None, versions=None, backends=None))]
-    fn with_capabilities<'py>(
+    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, kv=None, kv_cas=None, kv_cas_fenced=None, kv_fenced_leases=None, graph=None, forks=None, sessions=None, materializations=None, stream_tenancy=None, watch=None, authz=None, filters=None, filters_catalog=None, filters_group_policy_reads=None, a2a_gateway=None, versions=None, backends=None))]
+    fn with_capabilities(
         &self,
-        py: Python<'py>,
         managed: Option<bool>,
         query: Option<bool>,
         query_consistency: Option<String>,
         query_keyword: Option<bool>,
-        destinations: Option<bool>,
-        destinations_consistency: Option<String>,
         kv: Option<bool>,
         kv_cas: Option<bool>,
         kv_cas_fenced: Option<bool>,
@@ -390,6 +412,7 @@ impl PyLaser {
         graph: Option<bool>,
         forks: Option<bool>,
         sessions: Option<bool>,
+        materializations: Option<bool>,
         stream_tenancy: Option<bool>,
         watch: Option<bool>,
         authz: Option<bool>,
@@ -397,95 +420,79 @@ impl PyLaser {
         filters_catalog: Option<bool>,
         filters_group_policy_reads: Option<bool>,
         a2a_gateway: Option<bool>,
-        query_execution: Option<(bool, bool, bool)>,
         versions: Option<PyRef<'_, PyOpVersions>>,
         backends: Option<Vec<PyRef<'_, PyBackendDescriptor>>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
+    ) -> PyResult<PyLaser> {
         let versions = versions.map(|value| OpVersions::from(&*value));
         let backends: Option<Vec<BackendDescriptor>> =
             backends.map(|values| values.iter().map(|value| value.inner.clone()).collect());
-        future_into_py(py, async move {
-            let mut capabilities = inner.capabilities().await.clone();
-            if let Some(value) = managed {
-                capabilities.managed = value;
-            }
-            if let Some(value) = query {
-                capabilities.query.available = value;
-            }
-            if let Some(value) = query_consistency {
-                capabilities.query.consistency = consistency_level(&value)?;
-            }
-            if let Some(value) = query_keyword {
-                capabilities.query.keyword = value;
-            }
-            if let Some(value) = destinations {
-                capabilities.destinations.available = value;
-            }
-            if let Some(value) = destinations_consistency {
-                capabilities.destinations.consistency = match value.as_str() {
-                    "linearizable" => CheckpointReadConsistency::Linearizable,
-                    "potentially_stale" => CheckpointReadConsistency::PotentiallyStale,
-                    _ => {
-                        return Err(InvalidError::new_err(
-                            "destinations_consistency must be linearizable or potentially_stale",
-                        ));
-                    }
-                };
-            }
-            if let Some(value) = kv {
-                capabilities.kv.available = value;
-            }
-            if let Some(value) = kv_cas {
-                capabilities.kv.cas = value;
-            }
-            if let Some(value) = kv_cas_fenced {
-                capabilities.kv.cas_fenced = value;
-            }
-            if let Some(value) = kv_fenced_leases {
-                capabilities.kv.fenced_leases = value;
-            }
-            if let Some(value) = graph {
-                capabilities.graph = value;
-            }
-            if let Some(value) = forks {
-                capabilities.forks = value;
-            }
-            if let Some(value) = sessions {
-                capabilities.sessions = value;
-            }
-            if let Some(value) = stream_tenancy {
-                capabilities.stream_tenancy = value;
-            }
-            if let Some(value) = watch {
-                capabilities.watch = value;
-            }
-            if let Some(value) = authz {
-                capabilities.authz = value;
-            }
-            if let Some(value) = filters {
-                capabilities.filters.native = value;
-            }
-            if let Some(value) = filters_catalog {
-                capabilities.filters.catalog = value;
-            }
-            if let Some(value) = filters_group_policy_reads {
-                capabilities.filters.group_policy_reads = value;
-            }
-            if let Some(value) = a2a_gateway {
-                capabilities.a2a_gateway = value;
-            }
-            if let Some((paging, cancellation, status)) = query_execution {
-                capabilities = capabilities.with_query_execution(paging, cancellation, status);
-            }
-            if let Some(value) = versions {
-                capabilities = capabilities.with_versions(Some(value));
-            }
-            if let Some(value) = backends {
-                capabilities = capabilities.with_backends(value);
-            }
-            Ok(PyLaser::from_inner(inner.with_capabilities(capabilities)))
-        })
+        let mut capabilities = self.inner.current_capabilities();
+        if let Some(value) = managed {
+            capabilities.managed = value;
+        }
+        if let Some(value) = query {
+            capabilities.query.available = value;
+        }
+        if let Some(value) = query_consistency {
+            capabilities.query.consistency = consistency_level(&value)?;
+        }
+        if let Some(value) = query_keyword {
+            capabilities.query.keyword = value;
+        }
+        if let Some(value) = kv {
+            capabilities.kv.available = value;
+        }
+        if let Some(value) = kv_cas {
+            capabilities.kv.cas = value;
+        }
+        if let Some(value) = kv_cas_fenced {
+            capabilities.kv.cas_fenced = value;
+        }
+        if let Some(value) = kv_fenced_leases {
+            capabilities.kv.fenced_leases = value;
+        }
+        if let Some(value) = graph {
+            capabilities.graph = value;
+        }
+        if let Some(value) = forks {
+            capabilities.forks = value;
+        }
+        if let Some(value) = sessions {
+            capabilities.sessions = value;
+        }
+        if let Some(value) = materializations {
+            capabilities.materializations = value;
+        }
+        if let Some(value) = stream_tenancy {
+            capabilities.stream_tenancy = value;
+        }
+        if let Some(value) = watch {
+            capabilities.watch = value;
+        }
+        if let Some(value) = authz {
+            capabilities.authz = value;
+        }
+        if let Some(value) = filters {
+            capabilities.filters.native = value;
+        }
+        if let Some(value) = filters_catalog {
+            capabilities.filters.catalog = value;
+        }
+        if let Some(value) = filters_group_policy_reads {
+            capabilities.filters.group_policy_reads = value;
+        }
+        if let Some(value) = a2a_gateway {
+            capabilities.a2a_gateway = value;
+        }
+        if let Some(value) = versions {
+            capabilities = capabilities.with_versions(Some(value));
+        }
+        if let Some(value) = backends {
+            capabilities = capabilities.with_backends(value);
+        }
+        Ok(PyLaser::from_inner(
+            self.inner.with_capabilities(capabilities),
+        ))
     }
 
     /// This client's default data stream, or `None` for a connection-only handle.
@@ -519,19 +526,23 @@ impl PyLaser {
     }
 
     /// The capability set this client negotiated with the connected infrastructure.
-    /// A set without a managed backend is probed again when it is at least one second
-    /// old, so a backend that was not ready at connect is picked up.
-    fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// A set without a managed backend, or with an enabled backend that is not ready,
+    /// is probed again when it is at least one second old, so a backend that was not
+    /// ready at connect is picked up.
+    fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyCapabilities>> {
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             Ok(PyCapabilities::from(inner.capabilities().await))
         })
     }
 
     /// Refresh managed readiness, operation versions, backends, and announced topology.
-    fn refresh_capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn refresh_capabilities<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Awaitable<'py, PyCapabilities>> {
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             Ok(PyCapabilities::from(inner.refresh_capabilities().await))
         })
     }
@@ -540,10 +551,10 @@ impl PyLaser {
         &self,
         py: Python<'py>,
         timeout_ms: f64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyCapabilities>> {
         let timeout = duration_ms(timeout_ms, "timeout_ms")?;
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             inner
                 .wait_until_ready(timeout)
                 .await
@@ -559,10 +570,10 @@ impl PyLaser {
         &self,
         py: Python<'py>,
         ops: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let inner = self.inner.clone();
         let ops: Vec<BatchItem> = py_to_de(ops)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let results = inner.execute_batch(ops).await.map_err(to_pyerr)?;
             Python::attach(|py| {
                 let results = results
@@ -574,26 +585,24 @@ impl PyLaser {
         })
     }
 
-    /// Enter `async with`: yield the client for the block. The client is cheap to
-    /// clone and shares one connection, so `async with await Laser.connect(...) as
-    /// laser:` reads naturally. Note the `with_default_stream` / `with_ops_stream` /
-    /// `with_control_topic` / `with_dlq_topic` / `with_changes_topic` methods
-    /// return aliasing clones over the *same* connection: exiting the block does
-    /// not close a clone still in use elsewhere.
-    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        future_into_py(py, async move { Ok(slf) })
+    /// Enter `async with`: yield the client for the block, so `async with await
+    /// Laser.connect(...) as laser:` reads naturally. Exiting the block closes the
+    /// connection when this handle came from a connect call. A handle from
+    /// `with_default_stream` or another `with_*` method only borrows the
+    /// connection, so exiting its block leaves it open.
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Awaitable<'py, Py<PyLaser>>> {
+        awaitable(py, async move { Ok(slf) })
     }
 
     /// Close the shared connection. Every clone from `with_default_stream` and the other `with_*` methods loses it too. Safe to call more than once.
-    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
-        future_into_py(py, async move { laser.close().await.map_err(to_pyerr) })
+        awaitable(py, async move { laser.close().await.map_err(to_pyerr) })
     }
 
-    /// Exit `async with`. The connection is reference-counted and closes when the
-    /// last handle is dropped, so exiting does not disconnect a clone still in use.
-    /// Call `close` to end the connection explicitly. Returns `False` so an
-    /// exception in the body is not suppressed.
+    /// Exit `async with`: close the connection when this handle came from a
+    /// connect call, like `close`, and leave it open for a borrowing `with_*`
+    /// handle. Returns `False` so an exception in the body is not suppressed.
     #[pyo3(signature = (_exc_type, _exc_value, _traceback))]
     fn __aexit__<'py>(
         &self,
@@ -601,8 +610,14 @@ impl PyLaser {
         _exc_type: &Bound<'_, PyAny>,
         _exc_value: &Bound<'_, PyAny>,
         _traceback: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        future_into_py(py, async move { Ok(false) })
+    ) -> PyResult<Awaitable<'py, bool>> {
+        let laser = self.owns_connection.then(|| self.inner.clone());
+        awaitable(py, async move {
+            if let Some(laser) = laser {
+                laser.close().await.map_err(to_pyerr)?;
+            }
+            Ok(false)
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -672,9 +687,6 @@ pub struct PyCapabilities {
     /// The managed query surface and the read consistency it serves.
     #[pyo3(get)]
     pub query: PyQueryCaps,
-    /// Materialization destination declarations and the checkpoint lifecycle.
-    #[pyo3(get)]
-    pub destinations: PyDestinationCaps,
     /// The managed key-value surface and its conditional-write support.
     #[pyo3(get)]
     pub kv: PyKvCaps,
@@ -687,6 +699,8 @@ pub struct PyCapabilities {
     /// Managed session reads are served.
     #[pyo3(get)]
     pub sessions: bool,
+    #[pyo3(get)]
+    pub materializations: bool,
     /// Every managed name is scoped to one stream, and each stream's change
     /// feed rides its own ops topic.
     #[pyo3(get)]
@@ -727,17 +741,11 @@ pub struct PyCapabilities {
 pub struct PyQueryCaps {
     /// Whether `Laser.query` is served.
     pub available: bool,
-    /// The strongest read consistency the surface honors (`eventual`,
-    /// `read_your_writes`, or `strong`). A level implies every weaker one.
+    /// The strongest read consistency the surface honors (`eventual` or
+    /// `read_your_writes`). A level implies every weaker one.
     pub consistency: String,
     /// Whether the surface serves lexical keyword search (`Query.text(...)`).
     pub keyword: bool,
-    /// Whether an executing query continues through opaque cursor pages.
-    pub cursor_paging: bool,
-    /// Whether query cancellation is served.
-    pub cancellation: bool,
-    /// Whether query execution status is served.
-    pub execution_status: bool,
 }
 
 impl From<laser_sdk::capabilities::QueryCaps> for PyQueryCaps {
@@ -746,39 +754,10 @@ impl From<laser_sdk::capabilities::QueryCaps> for PyQueryCaps {
             available: value.available,
             consistency: match value.consistency {
                 laser_sdk::query::Consistency::ReadYourWrites => "read_your_writes",
-                laser_sdk::query::Consistency::Strong => "strong",
                 _ => "eventual",
             }
             .to_owned(),
             keyword: value.keyword,
-            cursor_paging: value.cursor_paging,
-            cancellation: value.cancellation,
-            execution_status: value.execution_status,
-        }
-    }
-}
-
-/// Materialization destination declarations and managed checkpoint lifecycle.
-#[gen_stub_pyclass]
-#[pyclass(name = "DestinationCaps", frozen, get_all, skip_from_py_object)]
-#[derive(Clone)]
-pub struct PyDestinationCaps {
-    /// Whether destination declarations and checkpoints are served.
-    pub available: bool,
-    /// The checkpoint read consistency served (`linearizable` or
-    /// `potentially_stale`).
-    pub consistency: String,
-}
-
-impl From<laser_sdk::capabilities::DestinationCaps> for PyDestinationCaps {
-    fn from(value: laser_sdk::capabilities::DestinationCaps) -> Self {
-        Self {
-            available: value.available,
-            consistency: match value.consistency {
-                CheckpointReadConsistency::Linearizable => "linearizable",
-                _ => "potentially_stale",
-            }
-            .to_owned(),
         }
     }
 }
@@ -833,7 +812,7 @@ pub struct PyFilterCaps {
     /// The longest filtered wait the server holds, in milliseconds. Zero when
     /// it serves none, so a filtered reader paces idle rounds itself.
     #[pyo3(get)]
-    pub max_wait_ms: u32,
+    pub max_wait_ms: f64,
     inner: laser_sdk::capabilities::FilterCaps,
 }
 
@@ -844,7 +823,7 @@ impl From<laser_sdk::capabilities::FilterCaps> for PyFilterCaps {
             catalog: value.catalog,
             group_policy_reads: value.group_policy_reads,
             evaluation: value.evaluation.clone().map(PyFilterAnnounce::from),
-            max_wait_ms: value.max_wait_ms,
+            max_wait_ms: value.max_wait.as_secs_f64() * 1000.0,
             inner: value,
         }
     }
@@ -871,11 +850,11 @@ impl From<Capabilities> for PyCapabilities {
             inner,
             managed: value.managed,
             query: PyQueryCaps::from(value.query),
-            destinations: PyDestinationCaps::from(value.destinations),
             kv: PyKvCaps::from(value.kv),
             graph: value.graph,
             forks: value.forks,
             sessions: value.sessions,
+            materializations: value.materializations,
             stream_tenancy: value.stream_tenancy,
             watch: value.watch,
             authz: value.authz,
@@ -945,8 +924,8 @@ impl PyCapabilities {
         self.inner.is_open_only()
     }
 
-    /// True when the query surface serves reads at `level` (`eventual`,
-    /// `read_your_writes`, or `strong`) or stronger.
+    /// True when the query surface serves reads at `level` (`eventual` or
+    /// `read_your_writes`) or stronger.
     fn serves_consistency(&self, level: &str) -> PyResult<bool> {
         Ok(self.inner.serves_consistency(consistency_level(level)?))
     }
@@ -957,10 +936,9 @@ impl PyCapabilities {
 
     fn __repr__(&self) -> String {
         format!(
-            "Capabilities(managed={}, query={}, destinations={}, kv={}, graph={}, forks={}, kv_cas={}, backends={})",
+            "Capabilities(managed={}, query={}, kv={}, graph={}, forks={}, kv_cas={}, backends={})",
             self.managed,
             self.query.available,
-            self.destinations.available,
             self.kv.available,
             self.graph,
             self.forks,
@@ -974,9 +952,8 @@ fn consistency_level(level: &str) -> PyResult<laser_sdk::query::Consistency> {
     match level {
         "eventual" => Ok(laser_sdk::query::Consistency::Eventual),
         "read_your_writes" => Ok(laser_sdk::query::Consistency::ReadYourWrites),
-        "strong" => Ok(laser_sdk::query::Consistency::Strong),
         _ => Err(InvalidError::new_err(
-            "query consistency must be eventual, read_your_writes, or strong",
+            "query consistency must be eventual or read_your_writes",
         )),
     }
 }
@@ -992,7 +969,6 @@ pub struct PyOpVersions {
     pub fork: u32,
     pub agent: u32,
     pub graph: u32,
-    pub checkpoint: u32,
     pub filter: u32,
     pub features: u64,
 }
@@ -1006,7 +982,6 @@ impl From<OpVersions> for PyOpVersions {
             fork: value.fork,
             agent: value.agent,
             graph: value.graph,
-            checkpoint: value.checkpoint,
             filter: value.filter,
             features: value.features,
         }
@@ -1022,7 +997,6 @@ impl From<&PyOpVersions> for OpVersions {
             "fork": value.fork,
             "agent": value.agent,
             "graph": value.graph,
-            "checkpoint": value.checkpoint,
             "filter": value.filter,
             "features": value.features,
         }))
@@ -1036,7 +1010,7 @@ impl PyOpVersions {
     /// Operation versions for `Laser.with_capabilities(versions=)`, the
     /// bring-your-own backend and test path. Zero means not advertised.
     #[new]
-    #[pyo3(signature = (*, query=1, control=1, kv=1, fork=1, agent=0, graph=0, checkpoint=0, filter=0, features=0))]
+    #[pyo3(signature = (*, query=1, control=1, kv=1, fork=1, agent=0, graph=0, filter=0, features=0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         query: u32,
@@ -1045,7 +1019,6 @@ impl PyOpVersions {
         fork: u32,
         agent: u32,
         graph: u32,
-        checkpoint: u32,
         filter: u32,
         features: u64,
     ) -> Self {
@@ -1056,7 +1029,6 @@ impl PyOpVersions {
             fork,
             agent,
             graph,
-            checkpoint,
             filter,
             features,
         }
@@ -1070,11 +1042,6 @@ impl PyOpVersions {
     /// A copy advertising this knowledge-graph op version.
     fn with_graph(&self, graph: u32) -> Self {
         OpVersions::from(self).with_graph(graph).into()
-    }
-
-    /// A copy advertising this destination and checkpoint version.
-    fn with_checkpoint(&self, checkpoint: u32) -> Self {
-        OpVersions::from(self).with_checkpoint(checkpoint).into()
     }
 
     /// A copy advertising this consumer-filter catalog version.
@@ -1094,14 +1061,13 @@ impl PyOpVersions {
 
     fn __repr__(&self) -> String {
         format!(
-            "OpVersions(query={}, control={}, kv={}, fork={}, agent={}, graph={}, checkpoint={}, filter={}, features={})",
+            "OpVersions(query={}, control={}, kv={}, fork={}, agent={}, graph={}, filter={}, features={})",
             self.query,
             self.control,
             self.kv,
             self.fork,
             self.agent,
             self.graph,
-            self.checkpoint,
             self.filter,
             self.features
         )
@@ -1149,7 +1115,7 @@ impl From<BackendDescriptor> for PyBackendDescriptor {
 #[pymethods]
 impl PyBackendDescriptor {
     /// A descriptor for one backend resource, disabled and not ready until
-    /// `with_state` reports otherwise. `mode` is `operational` or `lakehouse`,
+    /// `with_state` reports otherwise. `mode` is `operational`,
     /// `implementation` a `{"kind", "version"}` dict.
     #[new]
     fn new(
@@ -1197,15 +1163,6 @@ impl PyBackendDescriptor {
         )))
     }
 
-    /// A copy advertising the materialization capability dicts in `capabilities`.
-    fn with_materialization(&self, capabilities: &Bound<'_, PyAny>) -> PyResult<Self> {
-        Ok(Self::from(
-            self.inner
-                .clone()
-                .with_materialization(py_to_de(capabilities)?),
-        ))
-    }
-
     /// A copy advertising the query capability dict `capabilities`.
     fn with_query(&self, capabilities: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self::from(
@@ -1217,13 +1174,6 @@ impl PyBackendDescriptor {
     fn with_schema(&self, capabilities: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self::from(
             self.inner.clone().with_schema(py_to_de(capabilities)?),
-        ))
-    }
-
-    /// A copy advertising the maintenance capability dict `capabilities`.
-    fn with_maintenance(&self, capabilities: &Bound<'_, PyAny>) -> PyResult<Self> {
-        Ok(Self::from(
-            self.inner.clone().with_maintenance(py_to_de(capabilities)?),
         ))
     }
 
@@ -1255,23 +1205,13 @@ impl PyBackendDescriptor {
     }
 
     #[getter]
-    fn materialization(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        crate::convert::ser_to_py(py, &self.inner.materialization)
-    }
-
-    #[getter]
-    fn query(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        crate::convert::ser_to_py(py, &self.inner.query)
+    fn query(&self) -> Option<PyQueryCapabilities> {
+        self.inner.query.clone().map(PyQueryCapabilities::from)
     }
 
     #[getter]
     fn schema(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         crate::convert::ser_to_py(py, &self.inner.schema)
-    }
-
-    #[getter]
-    fn maintenance(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        crate::convert::ser_to_py(py, &self.inner.maintenance)
     }
 
     #[getter]
@@ -1311,7 +1251,7 @@ fn serde_word<T: serde::Serialize>(value: &T) -> String {
         .unwrap_or_default()
 }
 
-// The wire word of a unit enum variant (`lakehouse`, `ready`) into the enum.
+// The wire word of a unit enum variant (`operational`, `ready`) into the enum.
 fn serde_word_value<T: serde::de::DeserializeOwned>(word: &str, label: &str) -> PyResult<T> {
     serde_json::from_value(serde_json::Value::String(word.to_owned()))
         .map_err(|_| InvalidError::new_err(format!("unknown {label} '{word}'")))
@@ -1354,5 +1294,56 @@ impl PyLaser {
     /// The name `name` is sent as under this handle's naming.
     fn resource_name(&self, name: &str) -> String {
         self.inner.resource_name(name)
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(name = "QueryCapabilities", frozen)]
+pub struct PyQueryCapabilities {
+    inner: laser_sdk::capabilities::QueryCapabilities,
+}
+
+impl From<laser_sdk::capabilities::QueryCapabilities> for PyQueryCapabilities {
+    fn from(inner: laser_sdk::capabilities::QueryCapabilities) -> Self {
+        Self { inner }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyQueryCapabilities {
+    #[new]
+    fn new(value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            inner: py_to_de(value)?,
+        })
+    }
+    #[getter]
+    fn dialects(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::convert::ser_to_py(py, &self.inner.dialects)
+    }
+    #[getter]
+    fn consistency(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::convert::ser_to_py(py, &self.inner.consistency)
+    }
+    #[getter]
+    fn logical_types(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::convert::ser_to_py(py, &self.inner.logical_types)
+    }
+    #[getter]
+    fn aggregates(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::convert::ser_to_py(py, &self.inner.aggregates)
+    }
+    #[getter]
+    fn raw_sql(&self) -> bool {
+        self.inner.raw_sql
+    }
+    #[getter]
+    fn vector_search(&self) -> bool {
+        self.inner.vector_search
+    }
+    #[getter]
+    fn text_search(&self) -> bool {
+        self.inner.text_search
     }
 }

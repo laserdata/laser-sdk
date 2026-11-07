@@ -1,5 +1,5 @@
 use crate::agdx::PyAgdxReceipt;
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::context::{PyContextMessage, PyScopedMemory, context_policy, take_failure};
 use crate::convert::{json_to_py, payload_bytes, py_to_de, py_to_json, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
@@ -50,6 +50,7 @@ impl PyModelRequest {
     #[pyo3(signature = (model, body, *, provider=None, operation=None))]
     fn new(
         model: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         body: &Bound<'_, PyAny>,
         provider: Option<String>,
         operation: Option<String>,
@@ -80,6 +81,7 @@ impl PyModelRequest {
     }
 
     #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
     fn body(&self) -> Vec<u8> {
         self.inner.body.clone()
     }
@@ -101,6 +103,7 @@ impl PyModelResponse {
     #[new]
     #[pyo3(signature = (body, *, model=None, finish_reason=None, usage=None, duration_ms=None))]
     fn new(
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         body: &Bound<'_, PyAny>,
         model: Option<String>,
         finish_reason: Option<String>,
@@ -121,6 +124,7 @@ impl PyModelResponse {
     }
 
     #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
     fn body(&self) -> Vec<u8> {
         self.inner.body.clone()
     }
@@ -181,7 +185,7 @@ impl PyAssembledContext {
         ser_to_py(py, &self.inner.manifest)
     }
 
-    /// The fragments' payloads as UTF-8, one per line.
+    /// The fragments' bodies as UTF-8, one per line.
     fn text(&self) -> String {
         self.inner.text()
     }
@@ -209,20 +213,24 @@ impl PyModelCall {
         &self,
         py: Python<'py>,
         response: &PyModelResponse,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         let call = take(&self.inner, "model call")?;
         let response = response.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let receipt = call.complete(response).await.map_err(to_pyerr)?;
             Ok(PyAgdxReceipt::from(receipt))
         })
     }
 
     /// Record that the call failed with `error`, an `AgentErrorBody` dict.
-    fn fail<'py>(&self, py: Python<'py>, error: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn fail<'py>(
+        &self,
+        py: Python<'py>,
+        error: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         let call = take(&self.inner, "model call")?;
         let error: AgentErrorBody = py_to_de(error)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let receipt = call.fail(error).await.map_err(to_pyerr)?;
             Ok(PyAgdxReceipt::from(receipt))
         })
@@ -251,21 +259,26 @@ impl PyToolCall {
     fn complete<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         result: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         let call = take(&self.inner, "tool call")?;
         let result = payload_bytes(result)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let receipt = call.complete(result).await.map_err(to_pyerr)?;
             Ok(PyAgdxReceipt::from(receipt))
         })
     }
 
     /// Record that the tool failed with `error`, an `AgentErrorBody` dict.
-    fn fail<'py>(&self, py: Python<'py>, error: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn fail<'py>(
+        &self,
+        py: Python<'py>,
+        error: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         let call = take(&self.inner, "tool call")?;
         let error: AgentErrorBody = py_to_de(error)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let receipt = call.fail(error).await.map_err(to_pyerr)?;
             Ok(PyAgdxReceipt::from(receipt))
         })
@@ -296,10 +309,10 @@ impl PySessionState {
         py: Python<'py>,
         key: String,
         value: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         let state = self.inner.clone();
         let value = py_to_json(value)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let receipt = state.set(&key, value).await.map_err(to_pyerr)?;
             Ok(PyAgdxReceipt::from(receipt))
         })
@@ -308,10 +321,14 @@ impl PySessionState {
     /// Apply `patch`, a list of RFC 6902 operation dicts, atomically against
     /// the revision this handle last saw. Append success does not prove the
     /// patch applied: a reader learns the outcome from the folded state.
-    fn patch<'py>(&self, py: Python<'py>, patch: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn patch<'py>(
+        &self,
+        py: Python<'py>,
+        patch: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         let state = self.inner.clone();
         let patch = py_to_de(patch)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let receipt = state.patch(patch).await.map_err(to_pyerr)?;
             Ok(PyAgdxReceipt::from(receipt))
         })
@@ -323,19 +340,19 @@ impl PySessionState {
         &self,
         py: Python<'py>,
         document: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         let state = self.inner.clone();
         let document = py_to_json(document)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let receipt = state.replace(document).await.map_err(to_pyerr)?;
             Ok(PyAgdxReceipt::from(receipt))
         })
     }
 
     /// Write the whole document this handle holds as a snapshot.
-    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         let state = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let receipt = state.snapshot().await.map_err(to_pyerr)?;
             Ok(PyAgdxReceipt::from(receipt))
         })
@@ -344,9 +361,9 @@ impl PySessionState {
     /// Fold the state from the retained session lane, as a `SessionStateView`
     /// dict. `complete` is false when the lane no longer holds the records the
     /// document starts from.
-    fn get<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn get<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let state = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let view = state.get().await.map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &view))
         })
@@ -389,9 +406,9 @@ impl PySession {
     /// Whether an operator asked to cancel this session on `agent.control`,
     /// by a cancel request or a forced cancel. Reads the retained control
     /// records of this session, so it answers on open Apache Iggy too.
-    fn cancel_requested<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn cancel_requested<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, bool>> {
         let session = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             session.cancel_requested().await.map_err(to_pyerr)
         })
     }
@@ -399,9 +416,9 @@ impl PySession {
     /// The operator requests recorded for this session on `agent.control`, as
     /// a `PendingControl`. Inside an agent runtime the control follower keeps
     /// it current. The handler decides when to stop.
-    fn pending_control<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn pending_control<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyPendingControl>> {
         let session = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let pending = session.pending_control().await.map_err(to_pyerr)?;
             Ok(PyPendingControl {
                 pause_requested: pending.pause_requested,
@@ -419,9 +436,9 @@ impl PySession {
 
     /// The work records this session's agents held while it was paused and
     /// have not reported handled, as a `ParkedRecords`.
-    fn parked<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn parked<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyParkedRecords>> {
         let session = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let parked = session.parked().await.map_err(to_pyerr)?;
             Python::attach(|py| {
                 Ok(PyParkedRecords {
@@ -450,10 +467,10 @@ impl PySession {
         &self,
         py: Python<'py>,
         policy: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyAssembledContext>> {
         let session = self.inner.clone();
         let (policy, failure) = context_policy(policy)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let assembled = session.assemble(policy).await.map_err(to_pyerr)?;
             if let Some(error) = take_failure(&failure) {
                 return Err(error);
@@ -471,11 +488,11 @@ impl PySession {
         py: Python<'py>,
         request: &PyModelRequest,
         assembled: Option<&PyAssembledContext>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyModelCall>> {
         let session = self.inner.clone();
         let request = request.inner.clone();
         let assembled = assembled.map(|assembled| assembled.inner.clone());
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let call = session
                 .model(request, assembled.as_ref())
                 .await
@@ -494,10 +511,10 @@ impl PySession {
         py: Python<'py>,
         name: String,
         args: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyToolCall>> {
         let session = self.inner.clone();
         let args = py_to_json(args)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let call = session.tool(name, args).await.map_err(to_pyerr)?;
             Ok(PyToolCall {
                 correlation: call.correlation().to_string(),
@@ -516,12 +533,12 @@ impl PySession {
         request: &PyModelRequest,
         response: &PyModelResponse,
         assembled: Option<&PyAssembledContext>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         let session = self.inner.clone();
         let request = request.inner.clone();
         let response = response.inner.clone();
         let assembled = assembled.map(|assembled| assembled.inner.clone());
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let receipt = session
                 .record_model_call(request, response, assembled.as_ref())
                 .await
@@ -539,10 +556,10 @@ impl PySession {
         py: Python<'py>,
         query: Option<String>,
         items: Vec<PyRef<'_, crate::memory::PyMemoryItem>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         let session = self.inner.clone();
         let items: Vec<_> = items.iter().map(|item| item.inner.clone()).collect();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let receipt = session
                 .record_retrieval(query, &items)
                 .await
@@ -558,10 +575,10 @@ impl PySession {
         &self,
         py: Python<'py>,
         compaction: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         let session = self.inner.clone();
         let compaction = py_to_de(compaction)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let receipt = session
                 .record_compaction(compaction)
                 .await
@@ -693,15 +710,29 @@ impl PySubmitBuilder {
         Ok(slf)
     }
 
-    /// Write the submitted status and the command. Returns `Submitted`.
-    fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// The id of the session `send` writes: the label's derived id, or one
+    /// fresh id minted for this submission.
+    fn id(&self) -> PyResult<String> {
+        let inner = self.inner.lock().expect("submit builder lock");
+        let builder = inner
+            .as_ref()
+            .ok_or_else(|| InvalidError::new_err("this submission was already sent"))?;
+        Ok(builder.id().map_err(to_pyerr)?.to_string())
+    }
+
+    /// Write the submitted status and the command. Returns `Submitted`. A
+    /// labeled session that ended completed or failed resumes, and one an
+    /// agent or an operator canceled raises `SessionEndedError`. When the
+    /// command cannot be published after the status was written, the session
+    /// is ended failed and the publish error is raised.
+    fn send<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PySubmitted>> {
         let builder = self
             .inner
             .lock()
             .expect("submit builder lock")
             .take()
             .ok_or_else(|| InvalidError::new_err("this submission was already sent"))?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let submitted = builder.send().await.map_err(to_pyerr)?;
             Ok(PySubmitted {
                 session: submitted.session.to_string(),
@@ -758,7 +789,7 @@ impl PySessionControl {
         &self,
         py: Python<'py>,
         verb: fn(laser_sdk::agent::SessionControl) -> ControlFuture,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         let mut control = self.sessions.control(&self.stream, self.session);
         if let Some(operator) = &self.operator {
             control = control.as_operator(operator.clone());
@@ -769,7 +800,7 @@ impl PySessionControl {
         if let Some(participants) = &self.participants {
             control = control.participants(participants.clone());
         }
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let receipt = verb(control).await.map_err(to_pyerr)?;
             Ok(PyAgdxReceipt::from(receipt))
         })
@@ -831,19 +862,19 @@ impl PySessionControl {
     }
 
     /// Ask the session's agents to pause. Returns an `AgdxReceipt`.
-    fn pause<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn pause<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         self.verb(py, |control| Box::pin(async move { control.pause().await }))
     }
 
     /// Ask a paused session's agents to resume.
-    fn resume<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn resume<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         self.verb(py, |control| {
             Box::pin(async move { control.resume().await })
         })
     }
 
     /// Ask the session's agents to end it as canceled at their next boundary.
-    fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         self.verb(py, |control| {
             Box::pin(async move { control.cancel().await })
         })
@@ -851,7 +882,7 @@ impl PySessionControl {
 
     /// End the session as canceled without its agents, for a session whose
     /// agent is gone.
-    fn force_cancel<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn force_cancel<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyAgdxReceipt>> {
         self.verb(py, |control| {
             Box::pin(async move { control.force_cancel().await })
         })
@@ -863,7 +894,12 @@ impl PySessionControl {
 impl PySessions {
     /// Hand a new session to `agent` with `input` (str or bytes) as its first
     /// command. Chain `from_(submitter)` and `await send()`.
-    fn submit(&self, agent_id: &str, input: &Bound<'_, PyAny>) -> PyResult<PySubmitBuilder> {
+    fn submit(
+        &self,
+        agent_id: &str,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        input: &Bound<'_, PyAny>,
+    ) -> PyResult<PySubmitBuilder> {
         Ok(PySubmitBuilder {
             inner: Mutex::new(Some(
                 self.inner.submit(agent(agent_id)?, payload_bytes(input)?),

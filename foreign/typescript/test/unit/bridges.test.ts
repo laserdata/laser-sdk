@@ -22,7 +22,6 @@ import {
 import { applyJsonPatch, envelopeToAgUi, envelopesToAgUi } from "../../src/bridges/agui.js"
 import { authorizeEdge, edgeDenialChallenge, edgeDenialCode } from "../../src/bridges/edge-auth.js"
 import {
-  MCP_APP_ERROR_CODE,
   McpBridge,
   toolResultFromEnvelope,
   type McpContent,
@@ -59,6 +58,7 @@ import { AGENT_VERSION, CONTENT_TYPE } from "../../src/wire/headers.js"
 import {
   AgentKind,
   encodeAgentEnvelope,
+  OPERATION_CHAT,
   OPERATION_REASONING,
   OPERATION_TASK,
   errorEnvelope,
@@ -99,11 +99,15 @@ void test("given_edge_claims_when_authorized_then_should_distinguish_rejection_f
   )
   assert.deepEqual(wrongAudience, { kind: "wrongAudience", expected: "mcp" })
   assert.deepEqual(edgeDenialCode(wrongAudience), { kind: "known", name: "Unauthenticated" })
-  assert.equal(edgeDenialChallenge(wrongAudience), undefined)
+  assert.equal(edgeDenialChallenge(wrongAudience), 'Bearer error="invalid_token"')
   const stepUp = authorizeEdge({ audience: ["mcp"], scopes: [] }, "mcp", "tool:write")
   assert.deepEqual(stepUp, { kind: "stepUp", requiredScope: "tool:write" })
   assert.deepEqual(edgeDenialCode(stepUp), { kind: "known", name: "StepUpRequired" })
-  assert.equal(edgeDenialChallenge(stepUp), 'Bearer scope="tool:write"')
+  assert.equal(edgeDenialChallenge(stepUp), 'Bearer error="insufficient_scope", scope="tool:write"')
+  assert.equal(
+    edgeDenialChallenge({ kind: "stepUp", requiredScope: 'tool:"write\\' }),
+    'Bearer error="insufficient_scope", scope="tool:\\"write\\\\"'
+  )
 })
 
 void test("given_a2a_capabilities_and_replies_when_projected_then_should_use_protocol_spellings", () => {
@@ -119,14 +123,18 @@ void test("given_a2a_capabilities_and_replies_when_projected_then_should_use_pro
     correlation,
     new TextEncoder().encode("answer")
   )
-  const task: Task = taskFromEnvelope("task-1", envelope)
+  const task: Task = taskFromEnvelope("task-1", "context-1", envelope)
   const status: TaskStatus = { state: { kind: "known", name: "Completed" } }
-  const artifact: Artifact = { text: "answer" }
-  assert.deepEqual(task, { id: "task-1", status, artifacts: [artifact] })
+  const artifact: Artifact = {
+    artifactId: RecordId.fromU128(1n).toString(),
+    parts: [{ text: "answer" }]
+  }
+  assert.deepEqual(task, { id: "task-1", contextId: "context-1", status, artifacts: [artifact] })
   assert.deepEqual(taskToJson(task), {
     id: "task-1",
-    status: { state: "completed" },
-    artifacts: [{ text: "answer" }]
+    contextId: "context-1",
+    status: { state: "TASK_STATE_COMPLETED" },
+    artifacts: [artifact]
   })
 })
 
@@ -176,8 +184,106 @@ void test("given_task_and_reasoning_envelopes_when_rendered_then_should_emit_agu
   } as const
   assert.deepEqual(
     envelopesToAgUi([submitted, chunk]).map((event) => event.type),
-    ["RUN_STARTED", "REASONING_MESSAGE_START", "REASONING_MESSAGE_CONTENT", "REASONING_MESSAGE_END"]
+    [
+      "RUN_STARTED",
+      "REASONING_MESSAGE_START",
+      "REASONING_MESSAGE_CONTENT",
+      "REASONING_MESSAGE_END",
+      "RUN_FINISHED"
+    ]
   )
+})
+
+function chatChunk(sequence: bigint, last: boolean): AgentEnvelope {
+  return {
+    kind: AgentKind.Chunk,
+    conversation,
+    source,
+    correlation,
+    body: new TextEncoder().encode(`part ${String(sequence)}`),
+    ...(sequence === 0n ? { operation: OPERATION_CHAT } : {}),
+    channel: ChannelId.fromU128(7n),
+    sequence,
+    last,
+    mustUnderstand: 0n
+  }
+}
+
+void test("given_a_chat_stream_without_a_run_when_rendered_then_should_frame_one_run", () => {
+  const events = envelopesToAgUi([chatChunk(0n, false), chatChunk(1n, true)])
+  assert.deepEqual(
+    events.map((event) => event.type),
+    [
+      "RUN_STARTED",
+      "TEXT_MESSAGE_START",
+      "TEXT_MESSAGE_CONTENT",
+      "TEXT_MESSAGE_CONTENT",
+      "TEXT_MESSAGE_END",
+      "RUN_FINISHED"
+    ]
+  )
+  assert.deepEqual(events[0], {
+    type: "RUN_STARTED",
+    threadId: conversation.toString(),
+    runId: correlation.toString()
+  })
+})
+
+void test("given_records_after_a_finished_run_when_rendered_then_should_start_a_new_run", () => {
+  const submitted = withTaskState(
+    withCorrelation(
+      statusEnvelope(RecordId.fromU128(1n), conversation, source, OPERATION_TASK),
+      correlation
+    ),
+    { kind: "known", name: "Submitted" }
+  )
+  const completed = withTaskState(submitted, { kind: "known", name: "Completed" })
+  assert.deepEqual(
+    envelopesToAgUi([submitted, completed, chatChunk(0n, true)]).map((event) => event.type),
+    [
+      "RUN_STARTED",
+      "RUN_FINISHED",
+      "RUN_STARTED",
+      "TEXT_MESSAGE_START",
+      "TEXT_MESSAGE_CONTENT",
+      "TEXT_MESSAGE_END",
+      "RUN_FINISHED"
+    ]
+  )
+})
+
+void test("given_an_unfinished_or_headless_stream_when_rendered_then_should_open_and_close_its_message", () => {
+  assert.deepEqual(
+    envelopesToAgUi([chatChunk(1n, false)]).map((event) => event.type),
+    [
+      "RUN_STARTED",
+      "TEXT_MESSAGE_START",
+      "TEXT_MESSAGE_CONTENT",
+      "TEXT_MESSAGE_END",
+      "RUN_FINISHED"
+    ]
+  )
+})
+
+void test("given_a_tool_result_when_rendered_then_should_carry_its_message_id", () => {
+  const result = {
+    ...responseEnvelope(
+      RecordId.fromU128(9n),
+      conversation,
+      source,
+      correlation,
+      new TextEncoder().encode("42")
+    ),
+    tool: "lookup"
+  }
+  assert.deepEqual(envelopeToAgUi(result), [
+    {
+      type: "TOOL_CALL_RESULT",
+      messageId: RecordId.fromU128(9n).toString(),
+      toolCallId: correlation.toString(),
+      content: "42"
+    }
+  ])
 })
 
 void test("given_failed_task_status_when_rendered_then_should_emit_run_error", () => {
@@ -259,6 +365,27 @@ function taskReply(task: TaskConversationId, body: string, offset: bigint, signe
   } satisfies PolledMessage
 }
 
+// The bridge's own command for `task`, the record a lookup proves the task by.
+function taskCommand(task: TaskConversationId): PolledMessage {
+  const envelope = {
+    ...responseEnvelope(
+      RecordId.fromU128(0x0fn),
+      conversation,
+      parseAgentId("bridge"),
+      CorrelationId.parse(task.toString()),
+      new TextEncoder().encode("{}")
+    ),
+    kind: AgentKind.Command
+  }
+  return {
+    payload: encodeNamed(encodeAgentEnvelope(envelope)),
+    partitionId: 0,
+    offset: 0n,
+    timestampMicros: BigInt(Date.now()) * 1000n,
+    headers: new Map()
+  }
+}
+
 function bridgeOver(messages: readonly PolledMessage[], verifier?: KeyRegistry, stream = "s") {
   const transport = {
     findTopicPartitionCount: () => Promise.resolve(1),
@@ -267,7 +394,12 @@ function bridgeOver(messages: readonly PolledMessage[], verifier?: KeyRegistry, 
       _topic: string,
       _target: unknown,
       strategy: { readonly kind: string; readonly value?: bigint }
-    ) => Promise.resolve(messages.filter((message) => message.offset >= (strategy.value ?? 0n)))
+    ) =>
+      Promise.resolve(
+        strategy.kind === "timestampMicros"
+          ? messages.slice(0, 1)
+          : messages.filter((message) => message.offset >= (strategy.value ?? 0n))
+      )
   } as unknown as LaserTransport
   const laser = {
     defaultStream: stream === "" ? undefined : stream,
@@ -281,25 +413,32 @@ void test("given_a_verifier_when_an_a2a_task_has_only_an_unsigned_reply_then_sho
   const task = TaskConversationId.new()
   const registry = new KeyRegistry()
   registry.enroll("worker", replyKey.verifyingKey())
-  const forged = bridgeOver([taskReply(task, "forged", 0n, false)], registry)
+  const forged = bridgeOver([taskCommand(task), taskReply(task, "forged", 1n, false)], registry)
   assert.deepEqual((await forged.task(task.toString())).status.state, {
     kind: "known",
     name: "Working"
   })
   const honest = bridgeOver(
-    [taskReply(task, "forged", 0n, false), taskReply(task, "honest", 1n, true)],
+    [taskCommand(task), taskReply(task, "forged", 1n, false), taskReply(task, "honest", 2n, true)],
     registry
   )
-  assert.deepEqual((await honest.task(task.toString())).artifacts, [{ text: "honest" }])
+  assert.deepEqual(
+    (await honest.task(task.toString())).artifacts.map((artifact) => artifact.parts),
+    [[{ text: "honest" }]]
+  )
 })
 
-void test("given_two_replies_when_an_a2a_task_is_read_then_should_report_the_first", async () => {
+void test("given_two_terminal_replies_when_an_a2a_task_is_read_then_should_report_the_first", async () => {
   const task = TaskConversationId.new()
   const bridge = bridgeOver([
-    taskReply(task, "first", 0n, false),
-    taskReply(task, "second", 1n, false)
+    taskCommand(task),
+    taskReply(task, "first", 1n, false),
+    taskReply(task, "second", 2n, false)
   ])
-  assert.deepEqual((await bridge.task(task.toString())).artifacts, [{ text: "first" }])
+  assert.deepEqual(
+    (await bridge.task(task.toString())).artifacts.map((artifact) => artifact.parts),
+    [[{ text: "first" }]]
+  )
   await assert.rejects(bridgeOver([], undefined, "").task(task.toString()), NoStreamError)
 })
 
@@ -314,7 +453,7 @@ void test("given_bridge_failures_when_rendered_then_should_match_rust_public_res
   for (const error of [new TimeoutError("private"), new CancelledError("private")]) {
     assert.equal(publicErrorMessage(error), "internal error")
   }
-  assert.equal(publicErrorMessage(new NoStreamError("private")), "unsupported operation")
+  assert.equal(publicErrorMessage(new NoStreamError("private")), "invalid request")
 })
 
 void test("given_a2a_capabilities_when_the_card_is_built_then_should_carry_the_v1_fields", () => {
@@ -325,11 +464,16 @@ void test("given_a2a_capabilities_when_the_card_is_built_then_should_carry_the_v
       output: { kind: "schemaId", value: "summary.v1" }
     }
   ])
-  const card: AgentCard = bridge.card()
+  const card: AgentCard = bridge.withPublicUrl("https://agents.example.com/a2a").card()
   assert.equal(card.name, "bridge")
   assert.equal(card.description, "LaserData AGDX bridge over the durable log")
+  assert.equal(card.capabilities.streaming, false)
   assert.deepEqual(card.supportedInterfaces, [
-    { url: "/", protocolBinding: A2A_JSONRPC_BINDING, protocolVersion: A2A_PROTOCOL_VERSION }
+    {
+      url: "https://agents.example.com/a2a",
+      protocolBinding: A2A_JSONRPC_BINDING,
+      protocolVersion: A2A_PROTOCOL_VERSION
+    }
   ])
   assert.deepEqual(card.defaultInputModes, ["text/plain"])
   assert.deepEqual(card.defaultOutputModes, ["text/plain"])
@@ -354,7 +498,7 @@ void test("given_a2a_capabilities_when_the_card_is_built_then_should_carry_the_v
 void test("given_an_unknown_a2a_method_when_handled_then_should_answer_a_json_rpc_error", async () => {
   const request: JsonRpcRequest = { id: 7, method: "ListTasks", params: {} }
   const response = await bridgeOver([]).handleRpc(request)
-  const error: JsonRpcError = { code: -32_000, message: "invalid request" }
+  const error: JsonRpcError = { code: -32_601, message: "method not found" }
   assert.deepEqual(response, { jsonrpc: "2.0", id: 7, error })
 })
 
@@ -419,14 +563,16 @@ void test("given_an_mcp_tool_call_when_handled_then_should_spell_the_content_kin
     new TextEncoder().encode("called")
   )
   const request: McpRpcRequest = { id: "1", method: "tools/call", params: { name: "search" } }
-  const response = await mcpOver(reply).handleRpc(request)
+  const response = await mcpOver(reply)
+    .withTool("search", undefined, { type: "object" })
+    .handleRpc(request)
   assert.deepEqual(response, {
     jsonrpc: "2.0",
     id: "1",
     result: { content: [{ type: "text", text: "called" }] }
   })
   const failed = await mcpOver(reply).handleRpc({ id: "2", method: "tasks/list" })
-  const error: McpRpcError = { code: MCP_APP_ERROR_CODE, message: "invalid request" }
+  const error: McpRpcError = { code: -32_601, message: "method not found" }
   assert.deepEqual(failed, { jsonrpc: "2.0", id: "2", error })
 })
 
@@ -526,8 +672,10 @@ function capturingLaser(sent: AgentEnvelope[], reply?: AgentEnvelope, generation
     capabilities: () => Promise.resolve({ sessions: false }),
     [INTERNAL_TRANSPORT]: () => ({
       findSnapshotStream: () => Promise.resolve({ id: 0, createdAtMicros: generation }),
-      findSnapshotTopic: () => Promise.resolve({ id: 0, createdAtMicros: 2n, partitions: 4 })
+      findSnapshotTopic: () => Promise.resolve({ id: 0, createdAtMicros: 2n, partitions: 4 }),
+      findTopicPartitionCount: () => Promise.resolve(0)
     }),
+    [INTERNAL_VERIFIER]: () => undefined,
     agdx: (topic: string, source: AgentId, conversation: TaskConversationId) =>
       createAgdx(transport, "agents", topic, source, conversation),
     sessions: (): Sessions => Sessions.create(laser),

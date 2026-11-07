@@ -25,18 +25,35 @@ def test_given_a_native_system_clock_when_read_then_should_return_epoch_microsec
 
 def test_given_a_test_clock_when_advanced_then_should_use_native_unsigned_time():
     clock = ls.TestClock(1_000)
-    clock.advance(500)
+    clock.advance(0.5)
     assert clock.now_micros() == 1_500
+    clock.advance(2)
+    assert clock.now_micros() == 3_500
     clock.set(U64_MAX)
-    clock.advance(1)
+    clock.advance(0.001)
     assert clock.now_micros() == 0
     assert ls.TestClock().now_micros() == 0
     with pytest.raises(ls.InvalidError):
         clock.set(-1)
-    with pytest.raises(ls.InvalidError):
-        clock.advance(U64_MAX + 1)
+    for refused in (-1.0, float("nan"), float("inf"), 1e17):
+        with pytest.raises(ls.InvalidError):
+            clock.advance(refused)
+    assert clock.now_micros() == 0
     with pytest.raises(ls.InvalidError):
         ls.TestClock(-5)
+
+
+def test_given_generated_keys_when_used_then_should_differ_sign_and_rebuild_from_their_seed():
+    first = ls.SigningKey.generate()
+    second = ls.SigningKey.generate()
+    assert first.to_bytes() != second.to_bytes()
+    rebuilt = ls.SigningKey(first.to_bytes())
+    assert rebuilt.key_id == first.key_id
+    registry = ls.KeyRegistry()
+    registry.enroll("generated", first.verifying_key)
+    envelope = command()
+    envelope["signature"] = rebuilt.sign(envelope)
+    assert registry.verify(envelope) == "generated"
 
 
 def test_given_a_signed_card_when_changed_then_should_refuse_the_signature():
@@ -51,6 +68,18 @@ def test_given_a_signed_card_when_changed_then_should_refuse_the_signature():
         ls.verify_card(card, signature, key.verifying_key)
 
 
+def test_given_the_shared_card_vector_when_signed_then_should_sign_the_rfc_8785_canonical_form():
+    vector = json.loads(
+        (FIXTURES.parents[1] / "sdk" / "tests" / "fixtures" / "card_signature.json").read_text()
+    )
+    key = ls.SigningKey(bytes.fromhex(vector["secret_seed_hex"]))
+    signature = ls.sign_card_value(key, vector["card"])
+    assert signature == {"protected": vector["protected"], "signature": vector["signature"]}
+    assert ls.verify_card(vector["card"], signature, key.verifying_key) is None
+    with pytest.raises(ls.SignatureError):
+        ls.verify_card(vector["card"], signature, ls.SigningKey(bytes([8]) * 32).verifying_key)
+
+
 def test_given_non_integer_card_numbers_when_signed_then_should_match_native_refusal():
     with pytest.raises(ls.LaserError):
         ls.sign_card_value(ls.SigningKey(bytes(range(32))), {"version": 1.5})
@@ -62,11 +91,35 @@ def test_given_signed_delegation_when_changed_then_should_refuse_the_claim():
     registry.enroll_record(ls.KeyRecord("enrolled-signer", key.verifying_key))
     envelope = command()
     envelope["metadata"] = {"on_behalf_of": "user-7"}
-    envelope["signature"] = key.sign(envelope)
-    assert ls.verify_delegation(registry, envelope) == ("enrolled-signer", "user-7")
+    envelope["signature"] = key.sign_with_context(envelope, content_type="cbor", agent_version=1)
+    assert ls.verify_delegation(registry, envelope, 1, content_type="cbor", agent_version=1) == (
+        "enrolled-signer",
+        "user-7",
+    )
     envelope["metadata"]["on_behalf_of"] = "user-8"
     with pytest.raises(ls.LaserError):
-        ls.verify_delegation(registry, envelope)
+        ls.verify_delegation(registry, envelope, 1, content_type="cbor", agent_version=1)
+
+
+def test_given_an_expired_key_or_rewritten_headers_when_a_delegation_is_verified_then_should_reject_it():  # noqa: E501
+    key = ls.SigningKey(bytes(range(32)))
+    registry = ls.KeyRegistry()
+    registry.enroll_record(
+        ls.KeyRecord(
+            "enrolled-signer", key.verifying_key, valid_from_micros=100, valid_to_micros=200
+        )
+    )
+    envelope = command()
+    envelope["metadata"] = {"on_behalf_of": "user-7"}
+    envelope["signature"] = key.sign_with_context(envelope, content_type="cbor", agent_version=1)
+    assert ls.verify_delegation(registry, envelope, 150, content_type="cbor", agent_version=1) == (
+        "enrolled-signer",
+        "user-7",
+    )
+    with pytest.raises(ls.SignatureError):
+        ls.verify_delegation(registry, envelope, 200, content_type="cbor", agent_version=1)
+    with pytest.raises(ls.SignatureError):
+        ls.verify_delegation(registry, envelope, 150, content_type="json", agent_version=1)
 
 
 def test_given_no_delegation_when_verified_then_should_return_none():
@@ -74,8 +127,8 @@ def test_given_no_delegation_when_verified_then_should_return_none():
     registry = ls.KeyRegistry()
     registry.enroll_record(ls.KeyRecord("enrolled-signer", key.verifying_key))
     envelope = command()
-    envelope["signature"] = key.sign(envelope)
-    assert ls.verify_delegation(registry, envelope) is None
+    envelope["signature"] = key.sign_with_context(envelope, content_type="cbor", agent_version=1)
+    assert ls.verify_delegation(registry, envelope, 1, content_type="cbor", agent_version=1) is None
 
 
 def test_given_the_golden_snapshot_when_reencoded_then_should_keep_exact_bytes():
@@ -226,6 +279,17 @@ def test_given_session_read_reply_when_reencoded_then_should_match_rust_and_type
         assert reply["Ok"]["Page"]["items"] == []
 
 
+def test_given_a_session_changes_reply_without_its_series_when_decoded_then_should_reject():
+    payload = bytes.fromhex(
+        "a1624f6ba1674368616e676573a6656974656d73806470616765016b746f74616c5f7061676573006d746f74616c5f726573756c74730067726573756c74730a65666c6f6f7201"
+    )
+    with pytest.raises(ls.CodecError, match="series"):
+        ls.decode_session_reply(payload)
+    missing_series = json.loads(FIXTURES.joinpath("session_http_changes_legacy.json").read_text())
+    with pytest.raises(ls.CodecError, match="series"):
+        ls.encode_session_reply({"Ok": {"Changes": missing_series}})
+
+
 @pytest.mark.parametrize("name", ["info", "page", "page_rebuilding"])
 def test_given_a_session_reply_dict_when_compared_to_the_http_json_then_should_match(name):
     reply = ls.decode_session_reply(FIXTURES.joinpath(f"session_reply_{name}.bin").read_bytes())
@@ -239,10 +303,11 @@ def test_given_a2a_params_when_converted_then_should_preserve_exact_body_bytes()
     envelope = command(payload)
     assert bytes(envelope["body"]) == payload
     assert envelope["operation"] == "chat"
-    task = ls.task_from_envelope("task-7", envelope)
+    task = ls.task_from_envelope("task-7", "context-7", envelope)
     assert task["id"] == "task-7"
-    assert task["status"]["state"] == "completed"
-    assert task["artifacts"] == [{"text": payload.decode()}]
+    assert task["contextId"] == "context-7"
+    assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+    assert task["artifacts"] == [{"artifactId": RECORD, "parts": [{"text": payload.decode()}]}]
 
 
 def test_given_mcp_params_when_converted_then_should_preserve_tool_and_body():
@@ -259,10 +324,13 @@ def test_given_mcp_params_when_converted_then_should_preserve_tool_and_body():
 
 def test_given_error_and_empty_envelopes_when_rendered_then_should_map_terminal_views():
     error = FIXTURES.joinpath("agent_error.bin").read_bytes()
-    assert ls.task_from_envelope("task-7", error)["status"]["state"] == "failed"
+    assert (
+        ls.task_from_envelope("task-7", "context-7", error)["status"]["state"]
+        == "TASK_STATE_FAILED"
+    )
     assert ls.tool_result_from_envelope(error)["isError"] is True
     empty = command(b"")
-    assert ls.task_from_envelope("task-7", empty).get("artifacts", []) == []
+    assert ls.task_from_envelope("task-7", "context-7", empty).get("artifacts", []) == []
     assert ls.tool_result_from_envelope(empty) == {"content": []}
 
 

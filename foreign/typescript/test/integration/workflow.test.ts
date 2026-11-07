@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto"
 import { test } from "node:test"
 import { Agent, type AgentHandle } from "../../src/agent/builder.js"
 import { WorkflowBudget } from "../../src/agent/workflow.js"
-import { BudgetExceededError, CancelledError, HandlerConfigError } from "../../src/client/errors.js"
+import { BudgetExceededError, CancelledError, StepFailedError } from "../../src/client/errors.js"
 import { Laser } from "../../src/client/laser.js"
 import { AgentTopic } from "../../src/provenance/agent-topic.js"
 import { AgentId, ConversationId } from "../../src/types/ids.js"
@@ -104,7 +104,7 @@ void test("given_a_later_verifier_failure_when_running_then_should_compensate_co
         .after("apply")
         .verifyWith(() => false)
         .run(),
-      HandlerConfigError
+      (error: unknown) => error instanceof StepFailedError && error.reason === "unverified"
     )
     assert.deepEqual(bodies, ["apply", "verify", "undo-apply"])
   } finally {

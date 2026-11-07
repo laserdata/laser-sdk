@@ -33,7 +33,10 @@ async function completedTask(
     const task = await bridge.task(id)
     const state = task.status.state
     if (state.kind === "known" && state.name === "Completed") {
-      return { state: state.name.toLowerCase(), text: task.artifacts[0]?.text ?? "(no artifact)" }
+      return {
+        state: state.name.toLowerCase(),
+        text: task.artifacts[0]?.parts[0]?.text ?? "(no artifact)"
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
@@ -101,6 +104,8 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<InteropSu
     Agent.builder()
       .id(AgentId.new("approver"))
       .listenOn(AgentTopic.Sessions)
+      // Input requests reach only an agent that serves them.
+      .operations(["input_request"])
       .handler({
         handle(_message, context): Promise<void> {
           return context.respondInput(AgentTopic.Sessions, utf8("approved"))

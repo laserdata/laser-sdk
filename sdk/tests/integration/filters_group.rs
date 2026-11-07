@@ -10,11 +10,11 @@ use laser_sdk::capabilities::{Capabilities, HelloOutcome};
 use laser_sdk::filters::{
     ConsumerFilter, ExecutionMode, FaultReason, FilterBinding, FilterErrorReason, FilterExpr,
     FilterGroupIdentity, FilterGroupRef, FilteredReader, FilteredStart, GroupFilterSpec,
-    MatchedPage,
+    MatchedPage, RecordEvaluation,
 };
 use laser_sdk::iggy::prelude::{
     Consumer, ConsumerGroupClient, ConsumerOffsetClient, HeaderKey, HeaderValue, Identifier,
-    PartitionClient,
+    PartitionClient, TopicClient,
 };
 use laser_sdk::prelude::full::{Consumer as LaserConsumer, ConsumerGroup, Laser, LaserError};
 use laser_sdk::prelude::{CommitPolicy, ConsumerStart, ProducerMessage, Routing};
@@ -227,7 +227,6 @@ async fn deletion_group(laser: &Laser, collisions: usize) -> (ConsumerGroup, Fil
             .mutate(FilterCatalogCommand {
                 limits: None,
                 operation_id: u128::from(group_id),
-                actor_user_id: 0,
                 mutation: FilterMutation::ConfigureGroup {
                     group: FilterGroupRef {
                         group: format!("collision-{group_id}"),
@@ -368,7 +367,11 @@ async fn given_an_unbound_group_when_reading_pages_then_should_return_records_wi
         .expect("page");
     assert_eq!(offsets(&page), vec![0, 1, 2]);
     assert_eq!(page.policy.mode, ExecutionMode::Unfiltered);
-    assert!(page.records.iter().all(|record| !record.evaluated));
+    assert!(
+        page.records
+            .iter()
+            .all(|record| record.evaluation == RecordEvaluation::Unfiltered)
+    );
     reader.ack_page(&page).await.expect("acknowledge");
     reader.close().await.expect("close");
     assert_eq!(stored_group_offset(&laser, &stream, 0).await, Some(2));
@@ -379,7 +382,7 @@ async fn given_an_idle_group_reader_when_a_record_lands_during_its_filtered_wait
  {
     let laser = harness::connected_laser_at(&catalog_server().await.connection_string()).await;
     assert!(
-        laser.capabilities().await.filters.max_wait_ms > 0,
+        laser.capabilities().await.filters.max_wait > Duration::ZERO,
         "the test server holds filtered waits"
     );
     group_source(&laser).await;
@@ -1172,6 +1175,208 @@ async fn given_out_of_order_acks_when_acknowledging_then_should_store_only_the_c
     reader.close().await.expect("the reader closes");
 }
 
+/// Publish sixteen records on partition 0, matches at the even offsets.
+async fn alternating_source(laser: &Laser) -> String {
+    let payloads: Vec<&str> = (0..16)
+        .map(|index| {
+            if index % 2 == 0 {
+                SAFE_MODE
+            } else {
+                GROUND_STATION
+            }
+        })
+        .collect();
+    publish(laser, TOPIC, &payloads, 0).await;
+    laser.default_stream().expect("stream").to_owned()
+}
+
+#[tokio::test]
+async fn given_a_later_record_acknowledged_through_when_an_earlier_one_is_acknowledged_after_then_should_keep_the_higher_stored_offset()
+ {
+    let laser = harness::connected_laser_at(&catalog_server().await.connection_string()).await;
+    let stream = alternating_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
+        .start(FilteredStart::First)
+        .count(1)
+        .build()
+        .await
+        .expect("the reader builds");
+    let mut records = Vec::new();
+    for _ in 0..3 {
+        records.push(
+            tokio::time::timeout(READ_TIMEOUT, reader.next_record())
+                .await
+                .expect("a record arrives")
+                .expect("the read succeeds"),
+        );
+    }
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.offset)
+            .collect::<Vec<_>>(),
+        vec![0, 2, 4]
+    );
+
+    reader
+        .ack_through(&records[2])
+        .await
+        .expect("the highest record acknowledges everything before it");
+    let highest = stored_group_offset(&laser, &stream, 0).await;
+    assert!(highest.is_some_and(|offset| offset >= 4), "{highest:?}");
+
+    reader
+        .ack(&records[1])
+        .await
+        .expect("an earlier record completed after is still accepted");
+    assert_eq!(
+        stored_group_offset(&laser, &stream, 0).await,
+        highest,
+        "progress never moves back below the acknowledged offset"
+    );
+    let next = tokio::time::timeout(READ_TIMEOUT, reader.next_record())
+        .await
+        .expect("a record arrives")
+        .expect("the read succeeds");
+    assert_eq!(
+        next.offset, 6,
+        "local reading continues where this reader left off"
+    );
+    reader.close().await.expect("the reader closes");
+}
+
+#[tokio::test]
+async fn given_another_member_that_stored_higher_progress_when_the_displaced_reader_acknowledges_its_page_then_should_refuse_it_and_keep_the_higher_offset()
+ {
+    let laser = harness::connected_laser_at(&catalog_server().await.connection_string()).await;
+    let stream = alternating_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let stream_id = Identifier::named(&stream).expect("stream");
+    let topic_id = Identifier::named(TOPIC).expect("topic");
+    let group_id = Identifier::named(GROUP).expect("group");
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
+        .start(FilteredStart::First)
+        .count(1)
+        .build()
+        .await
+        .expect("the reader builds");
+    let first = tokio::time::timeout(READ_TIMEOUT, reader.next_record())
+        .await
+        .expect("a record arrives")
+        .expect("the read succeeds");
+    assert_eq!(first.offset, 0);
+    // The reader leaves the group, and another member takes the partition
+    // and stores progress past every record the reader holds.
+    reader
+        .coordinator()
+        .leave_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .expect("the reader's membership is removed");
+    let other = harness::connected_laser_at(&catalog_server().await.connection_string()).await;
+    other
+        .client()
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .expect("the other member joins");
+    harness::eventually(|| async {
+        other
+            .client()
+            .get_consumer_group(&stream_id, &topic_id, &group_id)
+            .await
+            .expect("the group reads")
+            .is_some_and(|group| group.members.iter().any(|member| member.partitions == [0]))
+            .then_some(())
+    })
+    .await;
+    other
+        .client()
+        .store_consumer_offset(
+            &Consumer::group(group_id.clone()),
+            &stream_id,
+            &topic_id,
+            Some(0),
+            15,
+        )
+        .await
+        .expect("the other member stores its progress");
+
+    assert!(
+        reader.ack(&first).await.is_err(),
+        "a displaced reader never claims the other member's receipt for its own page"
+    );
+    assert_eq!(
+        stored_group_offset(&laser, &stream, 0).await,
+        Some(15),
+        "the other member's greater progress stands"
+    );
+    // The reader left its group above, so its close has no membership to end.
+    let _ = reader.close().await;
+}
+
+#[tokio::test]
+async fn given_a_recreated_topic_when_a_page_of_the_old_generation_is_acknowledged_then_should_refuse_the_mismatched_generation()
+ {
+    let laser = harness::connected_laser_at(&catalog_server().await.connection_string()).await;
+    let stream = alternating_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let stream_id = Identifier::named(&stream).expect("stream");
+    let topic_id = Identifier::named(TOPIC).expect("topic");
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
+        .start(FilteredStart::First)
+        .count(1)
+        .build()
+        .await
+        .expect("the reader builds");
+    let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("a page arrives")
+        .expect("the read succeeds");
+    laser
+        .client()
+        .delete_topic(&stream_id, &topic_id)
+        .await
+        .expect("the topic is deleted");
+    laser
+        .topic(TOPIC)
+        .ensure(CLUSTER_PARTITIONS, None)
+        .await
+        .expect("the topic is created again");
+
+    let refused = reader
+        .ack_page(&page)
+        .await
+        .expect_err("a page of the old generation never stores into the new one");
+    assert!(
+        !refused.is_retryable() || refused.filter_reason().is_some(),
+        "the mismatch is a definite refusal: {refused:?}"
+    );
+    assert_eq!(
+        laser
+            .client()
+            .get_consumer_offset(
+                &Consumer::group(Identifier::named(GROUP).expect("group")),
+                &stream_id,
+                &topic_id,
+                Some(0)
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|offset| offset.stored_offset),
+        None,
+        "the new generation holds no progress from the old page"
+    );
+    // The group of the old topic generation is gone with it.
+    let _ = reader.close().await;
+}
+
 #[tokio::test]
 async fn given_a_malformed_record_under_stop_when_reading_then_should_deliver_earlier_matches_then_the_fault()
  {
@@ -1213,6 +1418,108 @@ async fn given_a_malformed_record_under_stop_when_reading_then_should_deliver_ea
         "the fault stays unacknowledged"
     );
     reader.close().await.expect("the reader closes");
+}
+
+#[tokio::test]
+async fn given_a_malformed_record_under_stop_when_skipped_then_should_store_its_offset_and_read_on_after_it()
+ {
+    let laser = harness::connected_laser_at(&catalog_server().await.connection_string()).await;
+    publish(&laser, TOPIC, &[SAFE_MODE, "not json", DECOMMISSION], 0).await;
+    let stream = laser.default_stream().expect("stream").to_owned();
+    let group = bound_group(&laser).await;
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
+        .start(FilteredStart::First)
+        .build()
+        .await
+        .expect("the reader builds");
+    let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("a page arrives")
+        .expect("the read succeeds");
+    reader.ack_page(&page).await.expect("the page acknowledges");
+    let fault = reader
+        .next_page()
+        .await
+        .expect_err("the fault stops the reader");
+    assert!(matches!(
+        fault,
+        LaserError::FilterFault {
+            partition_id: 0,
+            offset: 1,
+            ..
+        }
+    ));
+
+    assert!(
+        matches!(reader.skip(0, 2).await, Err(LaserError::Invalid(_))),
+        "the partition is stopped at offset 1"
+    );
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, Some(0));
+    reader.skip(0, 1).await.expect("the fault is skipped");
+    assert_eq!(
+        stored_group_offset(&laser, &stream, 0).await,
+        Some(1),
+        "the skip stores the fault's offset"
+    );
+    let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("a page arrives")
+        .expect("the read after the fault succeeds");
+    assert_eq!(offsets(&page), vec![2]);
+    assert!(
+        matches!(reader.skip(0, 1).await, Err(LaserError::Invalid(_))),
+        "the block is gone"
+    );
+    reader.close().await.expect("the reader closes");
+}
+
+#[tokio::test]
+async fn given_a_malformed_record_under_stop_when_the_group_consumer_skips_it_then_should_deliver_the_next_match()
+ {
+    let laser = harness::connected_laser_at(&catalog_server().await.connection_string()).await;
+    publish(&laser, TOPIC, &[SAFE_MODE, "not json", DECOMMISSION], 0).await;
+    let stream = laser.default_stream().expect("stream").to_owned();
+    let group = bound_group(&laser).await;
+    let mut consumer = group
+        .consumer()
+        .start_at(ConsumerStart::First)
+        .commit_policy(CommitPolicy::Disabled)
+        .build()
+        .await
+        .expect("the group consumer builds");
+    let first = consumer
+        .next_within(READ_TIMEOUT)
+        .await
+        .expect("the first match arrives");
+    consumer.commit(&first).await.expect("the record commits");
+    let fault = consumer
+        .next_within(READ_TIMEOUT)
+        .await
+        .expect_err("the fault stops the consumer");
+    assert!(matches!(
+        fault,
+        LaserError::FilterFault {
+            partition_id: 0,
+            offset: 1,
+            ..
+        }
+    ));
+
+    assert!(matches!(
+        consumer.skip(0, 0).await,
+        Err(LaserError::Invalid(_))
+    ));
+    consumer.skip(0, 1).await.expect("the fault is skipped");
+    let next = consumer
+        .next_within(READ_TIMEOUT)
+        .await
+        .expect("the match after the fault arrives");
+    assert_eq!(next.position.offset, 2);
+    consumer.commit(&next).await.expect("the record commits");
+    consumer.shutdown().await.expect("the consumer shuts down");
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, Some(2));
 }
 
 #[tokio::test]
@@ -1281,10 +1588,10 @@ async fn given_a_paused_revision_when_reading_then_should_refuse_new_reads_until
     assert_eq!(second.offset, 2);
     let revisions = group
         .filter()
-        .revisions(0, 10)
+        .revisions(1, 10)
         .await
         .expect("revisions list");
-    assert_eq!(revisions.total, 1);
+    assert_eq!(revisions.total_results, 1);
     reader.close().await.expect("close");
 }
 
@@ -1817,7 +2124,7 @@ async fn given_a_three_node_cluster_when_an_idle_group_reader_waits_then_should_
     let capabilities = laser.capabilities().await;
     assert!(capabilities.filters.group_policy_reads);
     assert!(
-        capabilities.filters.max_wait_ms > 0,
+        capabilities.filters.max_wait > Duration::ZERO,
         "the cluster holds filtered waits"
     );
     let primaries =

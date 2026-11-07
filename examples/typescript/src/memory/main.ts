@@ -243,6 +243,7 @@ async function graphPhase(laser: Laser): Promise<void> {
     name: GRAPH,
     version: 1,
     kind: { kind: "graph" },
+    history: { kind: "append" },
     contentType: ContentType.Json,
     extraction: { fields: [], inlinePayload: false },
     entitySchema: {

@@ -1118,6 +1118,12 @@ export interface CatalogPosition {
   readonly offset: bigint
   /** The applied operation that proves this position across control-log recreation. */
   readonly operationId?: bigint
+  /**
+   * How many catalog commands the catalog had applied when this outcome was
+   * folded. It keeps counting across a recreated control log, so it orders
+   * outcomes whose offsets restarted.
+   */
+  readonly revision?: bigint
 }
 
 /**
@@ -1309,7 +1315,8 @@ export interface FilteredPage {
   readonly stop: StopReason
   readonly fault?: RecordFault
   readonly evaluationLimits?: { readonly maxPayloadBytes: number; readonly maxDepth: number }
-  readonly unevaluated: readonly bigint[]
+  /** Returned records a `pass` policy delivered without evaluation, each with its reason. */
+  readonly unevaluated: readonly RecordFault[]
   readonly records: Uint8Array
 }
 
@@ -1536,13 +1543,15 @@ export interface FilterBinding {
 
 /**
  * The policy a group is configured with in one step: a definition saved for
- * this group alone under the caller's name, or a revision that already
- * exists. The name follows the registered filter name rule and need not be
- * unique, since every read returns the owning group with it.
+ * this group alone under the caller's name. The name follows the registered
+ * filter name rule and need not be unique, since every read returns the
+ * owning group with it.
  */
-export type GroupFilterSpec =
-  | { readonly kind: "definition"; readonly name: string; readonly filter: ConsumerFilter }
-  | { readonly kind: "revision"; readonly filterId: number; readonly revision: number }
+export interface GroupFilterSpec {
+  readonly kind: "definition"
+  readonly name: string
+  readonly filter: ConsumerFilter
+}
 
 /** A verified consumer group without a filter policy: every record is delivered. */
 export interface GroupPolicyUnbound {
@@ -1603,12 +1612,6 @@ export interface FilterMutationRequest {
   readonly mutation: FilterMutation
 }
 
-/**
- * The mutation the catalog appends to its control log, stamped by the
- * streaming server with the actor and group identity, then by the managed
- * backend with the caller's grants and, for a registration, the allocated
- * filter id.
- */
 export interface FilterCatalogLimits {
   readonly maxDefinitions: number
   readonly maxTombstones: number
@@ -1618,10 +1621,15 @@ export interface FilterCatalogLimits {
   readonly maxCatalogBytes: bigint
 }
 
+/**
+ * The mutation the catalog appends to its control log. The streaming server
+ * adds the group identity to a bind or unbind. The managed backend adds the
+ * caller's grants and, for a registration, the new filter id. The user who
+ * asked is the caller on the record's control stamp.
+ */
 export interface FilterCatalogCommand {
   readonly limits?: FilterCatalogLimits
   readonly operationId: bigint
-  readonly actorUserId: number
   readonly mutation: FilterMutation
   readonly identity?: FilterGroupIdentity
   /** The id a registration takes, allocated before the append. */
@@ -1669,38 +1677,38 @@ export interface GetFilter {
   readonly filterId: number
 }
 
+/** `page` counts from 1, and 0 reads the first page too. `results` is the page length. */
 export interface ListFilters {
   readonly v: number
   readonly nameContains?: string
   readonly state?: FilterState
-  /** Only filters with a lower id, so paging stays stable while the catalog changes. */
-  readonly beforeId?: number
   /** Only the own filter of this consumer group incarnation, bound or not. */
   readonly owner?: FilterGroupIdentity
   readonly page: number
-  readonly pageSize: number
+  readonly results: number
 }
 
+/** `page` counts from 1. */
 export interface FilterPage {
   readonly items: readonly FilterSummary[]
   readonly page: number
-  readonly pageSize: number
-  readonly total: number
+  readonly totalPages: number
+  readonly totalResults: number
 }
 
 export interface ListFilterRevisions {
   readonly v: number
   readonly filterId: number
   readonly page: number
-  readonly pageSize: number
+  readonly results: number
 }
 
 export interface FilterRevisionPage {
   readonly filterId: number
   readonly items: readonly FilterRevisionInfo[]
   readonly page: number
-  readonly pageSize: number
-  readonly total: number
+  readonly totalPages: number
+  readonly totalResults: number
 }
 
 export interface GetFilterBinding {
@@ -1715,14 +1723,14 @@ export interface ListFilterBindings {
   readonly stream?: string
   readonly topic?: string
   readonly page: number
-  readonly pageSize: number
+  readonly results: number
 }
 
 export interface FilterBindingPage {
   readonly items: readonly FilterBinding[]
   readonly page: number
-  readonly pageSize: number
-  readonly total: number
+  readonly totalPages: number
+  readonly totalResults: number
 }
 
 export interface GetFilterOperation {
@@ -2007,12 +2015,8 @@ export function validateFilterMutation(mutation: FilterMutation): void {
         mutation.expectedIdentity.groupId > 0xffff_ffffn
       )
         throw new InvalidError("consumer group id exceeds the native offset-key range")
-      if (mutation.policy.kind === "definition") {
-        validateFilterName(mutation.policy.name)
-        validateConsumerFilter(mutation.policy.filter)
-      } else if (mutation.policy.revision === 0) {
-        throw new InvalidError("revision must be positive")
-      }
+      validateFilterName(mutation.policy.name)
+      validateConsumerFilter(mutation.policy.filter)
   }
 }
 
@@ -2038,10 +2042,10 @@ export function validateFilterName(name: string): void {
 
 const SAFELISTED_NAME_BYTE = /^[A-Za-z0-9._-]$/
 
-/** Rust `ListFilters::validate`: the page size, the name fragment, and an owner's native group id. */
+/** Rust `ListFilters::validate`: the page length, the name fragment, and an owner's native group id. */
 export function validateListFilters(request: ListFilters): void {
   validateVersion(request.v)
-  validateCatalogPage(request.page, request.pageSize)
+  validateCatalogPage(request.page, request.results)
   if (
     request.nameContains !== undefined &&
     UTF8.encode(request.nameContains).byteLength > MAX_FILTER_NAME_BYTES
@@ -2065,11 +2069,11 @@ export function validateFilterMutationRequest(request: FilterMutationRequest): v
   validateFilterMutation(request.mutation)
 }
 
-export function validateCatalogPage(page: number, pageSize: number): void {
+export function validateCatalogPage(page: number, results: number): void {
   if (!Number.isInteger(page) || page < 0 || page > 0xffff_ffff)
     throw new InvalidError("page must be a whole number that fits in 32 bits")
-  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > MAX_FILTER_CATALOG_PAGE) {
-    throw new InvalidError(`page_size must be 1..=${String(MAX_FILTER_CATALOG_PAGE)}`)
+  if (!Number.isInteger(results) || results < 1 || results > MAX_FILTER_CATALOG_PAGE) {
+    throw new InvalidError(`results must be 1..=${String(MAX_FILTER_CATALOG_PAGE)}`)
   }
 }
 
@@ -2260,16 +2264,21 @@ export function encodeCatalogPosition(position: CatalogPosition): Map<string, un
   return mapOf([
     ["partition_id", position.partitionId],
     ["offset", position.offset],
-    ...(position.operationId === undefined ? [] : [["operation_id", position.operationId] as const])
+    ...(position.operationId === undefined
+      ? []
+      : [["operation_id", position.operationId] as const]),
+    ...(position.revision === undefined ? [] : [["revision", position.revision] as const])
   ])
 }
 
 export function decodeCatalogPosition(value: unknown, context: string): CatalogPosition {
   const map = expectMap(value, context)
+  const revision = field.optionalU64(map, "revision", context)
   return {
     partitionId: requiredU32(map, "partition_id", context),
     offset: field.requiredU64(map, "offset", context),
-    ...(map.has("operation_id") ? { operationId: operationIdOf(map, context) } : {})
+    ...(map.has("operation_id") ? { operationId: operationIdOf(map, context) } : {}),
+    ...(revision !== undefined ? { revision } : {})
   }
 }
 
@@ -2287,6 +2296,13 @@ export function encodeSourceGeneration(generation: SourceGeneration): Map<string
     ["topic_created_at_micros", generation.topicCreatedAtMicros],
     ["partition_id", generation.partitionId],
     ["partition_incarnation", generation.partitionIncarnation]
+  ])
+}
+
+function encodeRecordFault(fault: RecordFault): Map<string, unknown> {
+  return mapOf([
+    ["offset", fault.offset],
+    ["reason", fault.reason]
   ])
 }
 
@@ -2469,16 +2485,8 @@ export function encodeFilteredPage(page: FilteredPage): Map<string, unknown> {
   map.set("examined", page.examined)
   map.set("matched", page.matched)
   map.set("stop", page.stop)
-  if (page.fault !== undefined) {
-    map.set(
-      "fault",
-      mapOf([
-        ["offset", page.fault.offset],
-        ["reason", page.fault.reason]
-      ])
-    )
-  }
-  if (page.unevaluated.length > 0) map.set("unevaluated", [...page.unevaluated])
+  if (page.fault !== undefined) map.set("fault", encodeRecordFault(page.fault))
+  if (page.unevaluated.length > 0) map.set("unevaluated", page.unevaluated.map(encodeRecordFault))
   if (page.evaluationLimits !== undefined)
     map.set(
       "evaluation_limits",
@@ -2715,28 +2723,15 @@ export function encodeFilterMutation(mutation: FilterMutation): Map<string, unkn
 }
 
 function encodeGroupFilterSpec(spec: GroupFilterSpec): Map<string, unknown> {
-  switch (spec.kind) {
-    case "definition":
-      return mapOf([
-        [
-          "definition",
-          mapOf([
-            ["name", spec.name],
-            ["filter", encodeConsumerFilter(spec.filter)]
-          ])
-        ]
+  return mapOf([
+    [
+      "definition",
+      mapOf([
+        ["name", spec.name],
+        ["filter", encodeConsumerFilter(spec.filter)]
       ])
-    case "revision":
-      return mapOf([
-        [
-          "revision",
-          mapOf([
-            ["filter_id", spec.filterId],
-            ["revision", spec.revision]
-          ])
-        ]
-      ])
-  }
+    ]
+  ])
 }
 
 function decodeGroupFilterSpec(value: unknown, context: string): GroupFilterSpec {
@@ -2747,14 +2742,6 @@ function decodeGroupFilterSpec(value: unknown, context: string): GroupFilterSpec
       kind: "definition",
       name: field.requiredString(map, "name", `${context}.definition`),
       filter: decodeConsumerFilter(map.get("filter"), `${context}.definition.filter`)
-    }
-  }
-  if (tag === "revision") {
-    const map = expectMap(inner, `${context}.revision`)
-    return {
-      kind: "revision",
-      filterId: requiredU32(map, "filter_id", context),
-      revision: requiredU32(map, "revision", context)
     }
   }
   throw new CodecError(`\`${tag}\` is not a recognized group filter policy`, context, "policy")
@@ -2771,7 +2758,6 @@ export function encodeFilterMutationRequest(request: FilterMutationRequest): Map
 export function encodeFilterCatalogCommand(command: FilterCatalogCommand): Map<string, unknown> {
   const map = mapOf([
     ["operation_id", command.operationId],
-    ["actor_user_id", command.actorUserId],
     ["mutation", encodeFilterMutation(command.mutation)]
   ])
   if (command.identity !== undefined) {
@@ -2810,10 +2796,9 @@ export function encodeListFilters(request: ListFilters): Map<string, unknown> {
   const map = mapOf([["v", request.v]])
   setIf(map, "name_contains", request.nameContains)
   setIf(map, "state", request.state)
-  setIf(map, "before_id", request.beforeId)
   if (request.owner !== undefined) map.set("owner", encodeFilterGroupIdentity(request.owner))
   map.set("page", request.page)
-  map.set("page_size", request.pageSize)
+  map.set("results", request.results)
   return map
 }
 
@@ -2822,7 +2807,7 @@ export function encodeListFilterRevisions(request: ListFilterRevisions): Map<str
     ["v", request.v],
     ["filter_id", request.filterId],
     ["page", request.page],
-    ["page_size", request.pageSize]
+    ["results", request.results]
   ])
 }
 
@@ -2843,7 +2828,7 @@ export function encodeListFilterBindings(request: ListFilterBindings): Map<strin
   setIf(map, "stream", request.stream)
   setIf(map, "topic", request.topic)
   map.set("page", request.page)
-  map.set("page_size", request.pageSize)
+  map.set("results", request.results)
   return map
 }
 
@@ -2971,8 +2956,8 @@ function encodeCatalogOutcome(outcome: FilterCatalogOutcome): Map<string, unknow
           mapOf([
             ["items", outcome.page.items.map(encodeSummary)],
             ["page", outcome.page.page],
-            ["page_size", outcome.page.pageSize],
-            ["total", outcome.page.total]
+            ["total_pages", outcome.page.totalPages],
+            ["total_results", outcome.page.totalResults]
           ])
         ]
       ])
@@ -2984,8 +2969,8 @@ function encodeCatalogOutcome(outcome: FilterCatalogOutcome): Map<string, unknow
             ["filter_id", outcome.page.filterId],
             ["items", outcome.page.items.map(encodeRevisionInfo)],
             ["page", outcome.page.page],
-            ["page_size", outcome.page.pageSize],
-            ["total", outcome.page.total]
+            ["total_pages", outcome.page.totalPages],
+            ["total_results", outcome.page.totalResults]
           ])
         ]
       ])
@@ -2998,8 +2983,8 @@ function encodeCatalogOutcome(outcome: FilterCatalogOutcome): Map<string, unknow
           mapOf([
             ["items", outcome.page.items.map(encodeFilterBinding)],
             ["page", outcome.page.page],
-            ["page_size", outcome.page.pageSize],
-            ["total", outcome.page.total]
+            ["total_pages", outcome.page.totalPages],
+            ["total_results", outcome.page.totalResults]
           ])
         ]
       ])
@@ -3444,6 +3429,14 @@ function decodeFaultReason(value: unknown, context: string): FaultReason {
   return oneOf<FaultReason>(value, FAULT_REASONS, context)
 }
 
+function decodeRecordFault(value: unknown, context: string): RecordFault {
+  const map = expectMap(value, context)
+  return {
+    offset: field.requiredU64(map, "offset", context),
+    reason: decodeFaultReason(map.get("reason"), `${context}.reason`)
+  }
+}
+
 export function decodeFilteredPage(value: unknown, context: string): FilteredPage {
   const map = expectMap(value, context)
   const nextScanOffset = field.optionalU64(map, "next_scan_offset", context)
@@ -3462,14 +3455,7 @@ export function decodeFilteredPage(value: unknown, context: string): FilteredPag
     examined: requiredU32(map, "examined", context),
     matched: requiredU32(map, "matched", context),
     stop: oneOf<StopReason>(map.get("stop"), STOP_REASONS, `${context}.stop`),
-    ...(fault !== undefined
-      ? {
-          fault: {
-            offset: field.requiredU64(fault, "offset", `${context}.fault`),
-            reason: decodeFaultReason(fault.get("reason"), `${context}.fault.reason`)
-          }
-        }
-      : {}),
+    ...(fault !== undefined ? { fault: decodeRecordFault(fault, `${context}.fault`) } : {}),
     ...(evaluationLimits === undefined
       ? {}
       : {
@@ -3479,7 +3465,7 @@ export function decodeFilteredPage(value: unknown, context: string): FilteredPag
           }
         }),
     unevaluated: field.optionalArray(map, "unevaluated", context, (item, index) =>
-      expectU64(item, `${context}.unevaluated[${String(index)}]`)
+      decodeRecordFault(item, `${context}.unevaluated[${String(index)}]`)
     ),
     records: requiredBytes(map, "records", context)
   }
@@ -3779,7 +3765,6 @@ export function decodeFilterCatalogCommand(value: unknown, context: string): Fil
       ? { limits: decodeFilterCatalogLimits(map.get("limits"), `${context}.limits`) }
       : {}),
     operationId: operationIdOf(map, context),
-    actorUserId: requiredU32(map, "actor_user_id", context),
     mutation: decodeFilterMutation(map.get("mutation"), `${context}.mutation`),
     ...(map.has("identity")
       ? { identity: decodeFilterGroupIdentity(map.get("identity"), `${context}.identity`) }
@@ -3938,8 +3923,8 @@ function decodeCatalogOutcome(value: unknown, context: string): FilterCatalogOut
       decode(item, `${innerContext}.items[${String(index)}]`)
     ),
     page: requiredU32(map, "page", innerContext),
-    pageSize: requiredU32(map, "page_size", innerContext),
-    total: requiredU32(map, "total", innerContext)
+    totalPages: requiredU32(map, "total_pages", innerContext),
+    totalResults: requiredU32(map, "total_results", innerContext)
   })
   switch (tag) {
     case "filter":

@@ -37,6 +37,7 @@ import {
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import { AGENT_OP_VERSION } from "../../src/wire/codes.js"
 import { contentTypeCode, ContentType } from "../../src/wire/content.js"
+import { OPERATION_INPUT_REQUEST } from "../../src/wire/dispatch.js"
 import {
   TARGET_AGENT_ID,
   AGENT_VERSION,
@@ -925,7 +926,7 @@ void test("given_deadline_fence_and_dedup_records_when_consumed_then_should_appl
     const duplicateConversation = ConversationId.new()
     await laser.sendAgent(AgentTopic.Sessions, new TextEncoder().encode("expired"), {
       conversationId: ConversationId.new(),
-      deadlineMicros: BigInt(Date.now()) * 1_000n - 1n
+      deadlineAtMicros: BigInt(Date.now()) * 1_000n - 1n
     })
     await laser.sendAgent(AgentTopic.Sessions, new TextEncoder().encode("fresh-fence"), {
       conversationId: fencedConversation,
@@ -1013,13 +1014,16 @@ void test("given_a_verified_agent_when_signed_and_unsigned_commands_arrive_then_
     let rejected: AgentDeadLetter | undefined
     const responsePending = () => responseEnvelope === undefined || rejected === undefined
     for (let attempt = 0; attempt < 160 && responsePending(); attempt += 1) {
-      const response = (await responses.poll())[0]
-      if (response !== undefined) {
+      // The topic also carries both commands and the error the worker answers
+      // the dead-lettered one with, so only the reply to the signed one counts.
+      for (const record of await responses.poll()) {
         const context = "signed response"
-        responseEnvelope = decodeAgentEnvelope(
-          expectMap(decodeOne(response.payload, context), context),
+        const envelope = decodeAgentEnvelope(
+          expectMap(decodeOne(record.payload, context), context),
           context
         )
+        if (envelope.kind === AgentKind.Response && envelope.correlation?.asU128() === 91n)
+          responseEnvelope = envelope
       }
       const deadLetter = (await dlq.poll())[0]
       if (deadLetter !== undefined) {
@@ -1272,6 +1276,7 @@ void test("given_a_verifier_when_input_replies_are_forged_then_should_resume_onl
       Agent.builder()
         .id(AgentId.new("faker"))
         .listenOn(AgentTopic.Sessions)
+        .operations([OPERATION_INPUT_REQUEST])
         .handler({
           handle: (_message, context) =>
             context.respondInput(AgentTopic.Sessions, new TextEncoder().encode("forged"))
@@ -1297,6 +1302,7 @@ void test("given_a_verifier_when_input_replies_are_forged_then_should_resume_onl
       Agent.builder()
         .id(AgentId.new("approver"))
         .listenOn(AgentTopic.Sessions)
+        .operations([OPERATION_INPUT_REQUEST])
         .signingKey(approverKey)
         .handler({
           handle: (_message, context) =>

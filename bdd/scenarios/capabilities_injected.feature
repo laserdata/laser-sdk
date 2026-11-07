@@ -26,6 +26,14 @@ Feature: The read-consistency pre-gate under injected capabilities
       | 10   | false     |
       | 2    | false     |
       | 7    | false     |
-      | 19   | false     |
-      | 20   | true      |
       | 42   | false     |
+
+  Scenario Outline: A prepared mutation reports an unresolved attempt as ambiguous
+    When a prepared release receives the unresolved result code <code>
+    Then the release fails as an ambiguous mutation
+
+    Examples:
+      | code |
+      | 12   |
+      | 19   |
+      | 20   |

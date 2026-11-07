@@ -1,5 +1,10 @@
 {
   "items": [],
+  "page": 0,
+  "total_pages": 0,
+  "total_results": 0,
+  "as_of": 0,
+  "series": 0,
   "truncated": false,
   "rebuilding": true
 }

@@ -16,6 +16,7 @@ import {
   ModelRequest,
   RecordId,
   SessionConfig,
+  SessionEndedError,
   TopicRetention,
   deriveSessionId,
   eventEnvelope,
@@ -70,6 +71,35 @@ When(
       .begin();
     this.session = session;
     this.sessionLease = lease;
+  },
+);
+
+When(
+  /^agent "([^"]+)" starts the session "([^"]+)" again$/,
+  async function (this: LaserWorld, owner: string, label: string) {
+    await this.capture(() =>
+      sessionsOf(this).create(label).agent(AgentId.new(owner)).begin(),
+    );
+  },
+);
+
+When(
+  /^agent "([^"]+)" resumes the session "([^"]+)"$/,
+  async function (this: LaserWorld, owner: string, label: string) {
+    const { session, lease } = await sessionsOf(this)
+      .create(label)
+      .agent(AgentId.new(owner))
+      .resume();
+    this.session = session;
+    this.sessionLease = lease;
+  },
+);
+
+Then(
+  /^the call fails as a session that ended (\w+)$/,
+  function (this: LaserWorld, status: string) {
+    assert.ok(this.error instanceof SessionEndedError, String(this.error));
+    assert.equal(this.error.status, status);
   },
 );
 
@@ -965,6 +995,7 @@ Then(
         `${String(message.id.partitionId)}:${String(message.id.offset)}`,
     );
     const earlier = turns
+      .filter((turn) => turn.display === "agent.message")
       .slice(0, fragments.length)
       .map(
         (turn) =>
@@ -972,6 +1003,24 @@ Then(
       );
     assert.deepEqual(listed, fragments);
     assert.deepEqual(listed, earlier);
+  },
+);
+
+Then(
+  /^the context assembled from the session reads (".+")$/,
+  async function (this: LaserWorld, list: string) {
+    const expected = names(list);
+    const session = this.requireSession();
+    const lines = await eventual(
+      async () => {
+        const text = (await session.assemble(new LastN(50))).text();
+        const read = text === "" ? [] : text.split("\n");
+        return read.length >= expected.length ? read : undefined;
+      },
+      "the assembled context",
+      10_000,
+    );
+    assert.deepEqual(lines, expected);
   },
 );
 

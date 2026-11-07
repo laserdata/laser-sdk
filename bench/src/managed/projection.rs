@@ -166,6 +166,7 @@ async fn prepare_watch(
         .watch()
         .index(index)
         .records()
+        .await
         .map(|reader| Some(Arc::new(Mutex::new(reader))))
         .map_err(|error| BenchError::Invalid(format!("open projection change feed: {error}")))
 }
@@ -267,7 +268,7 @@ impl ProjectionOperationContext {
                 .await
                 .map_err(|error| error.to_string())?
                 .iter()
-                .any(|change| change.rows > 0)
+                .any(|watched| watched.change.rows > 0)
             {
                 return Ok(());
             }

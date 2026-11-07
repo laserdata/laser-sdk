@@ -1,16 +1,21 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::convert::{
     codec_decode, codec_encode, duration_ms, json_to_py, payload_bytes, py_to_json, ser_to_py,
 };
 use crate::errors::{InvalidError, to_pyerr};
-use laser_sdk::kv::{KvEntry, KvMetadata, KvPage, Lease, MutationPosition};
+use laser_sdk::kv::{
+    KvEntry, KvMetadata, KvPage, KvRevalidation, Lease, LeaseGuard, MutationPosition,
+};
 use laser_sdk::laser::Laser;
 use laser_sdk::types::ConversationId;
 use laser_sdk::wire::agent::SessionRef;
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::Mutex;
 
 // Parse the optional conversation-lens filter: a Crockford conversation id, or
 // `None` to scan every row.
@@ -93,9 +98,9 @@ impl PyLaser {
     }
 
     /// Every KV namespace holding at least one entry for this caller.
-    fn kv_namespaces<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn kv_namespaces<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let list = laser.kv_namespaces().await.map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &list))
         })
@@ -260,6 +265,99 @@ impl PyAppliedFrontier {
     }
 }
 
+/// The scope guard `Kv.lease_guard` returns. Use it with `async with`, which
+/// acquires on entry and releases on exit. `renew` extends the lease and
+/// `release` ends it early.
+#[gen_stub_pyclass]
+#[pyclass(name = "LeaseGuard")]
+pub struct PyLeaseGuard {
+    laser: Laser,
+    namespace: String,
+    session: Option<SessionRef>,
+    key: Vec<u8>,
+    holder: String,
+    ttl: std::time::Duration,
+    guard: Arc<Mutex<Option<LeaseGuard>>>,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyLeaseGuard {
+    /// Acquire the lease and bind the guard.
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Awaitable<'py, Py<Self>>> {
+        let this = slf.borrow(py);
+        let kv = this
+            .laser
+            .kv(this.namespace.clone())
+            .linked(this.session.clone());
+        let key = this.key.clone();
+        let holder = this.holder.clone();
+        let ttl = this.ttl;
+        let guard = Arc::clone(&this.guard);
+        drop(this);
+        awaitable(py, async move {
+            let acquired = kv.lease_guard(key, holder, ttl).await.map_err(to_pyerr)?;
+            *guard.lock().await = Some(acquired);
+            Ok(slf)
+        })
+    }
+
+    /// Release the lease, then return `False` so an exception in the body is
+    /// not suppressed.
+    #[pyo3(signature = (_exc_type, _exc_value, _traceback))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, bool>> {
+        let guard = Arc::clone(&self.guard);
+        awaitable(py, async move {
+            if let Some(held) = guard.lock().await.take() {
+                held.release().await.map_err(to_pyerr)?;
+            }
+            Ok(false)
+        })
+    }
+
+    /// The current grant, `None` before entry or after release.
+    #[getter]
+    fn lease(&self) -> Option<PyLease> {
+        self.guard
+            .try_lock()
+            .ok()
+            .and_then(|held| held.as_ref().map(|held| PyLease::from(*held.lease())))
+    }
+
+    /// Renew the lease for `ttl_ms`, keeping its token.
+    fn renew<'py>(&self, py: Python<'py>, ttl_ms: f64) -> PyResult<Awaitable<'py, PyLease>> {
+        let ttl = duration_ms(ttl_ms, "ttl_ms")?;
+        let guard = Arc::clone(&self.guard);
+        awaitable(py, async move {
+            let mut held = guard.lock().await;
+            let Some(held) = held.as_mut() else {
+                return Err(to_pyerr(laser_sdk::LaserError::Invalid(
+                    "the lease guard holds no lease, enter it with async with".to_owned(),
+                )));
+            };
+            let lease = *held.renew(ttl).await.map_err(to_pyerr)?;
+            Ok(PyLease::from(lease))
+        })
+    }
+
+    /// Release the lease now. `True` when it was still held.
+    fn release<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, bool>> {
+        let guard = Arc::clone(&self.guard);
+        awaitable(py, async move {
+            match guard.lock().await.take() {
+                Some(held) => held.release().await.map_err(to_pyerr),
+                None => Ok(false),
+            }
+        })
+    }
+}
+
 /// A revocable lease grant and the mutation barrier it established.
 #[gen_stub_pyclass]
 #[pyclass(name = "Lease", frozen)]
@@ -269,6 +367,7 @@ pub struct PyLease {
     #[pyo3(get)]
     pub granted_ttl_ms: f64,
     position: PyMutationPosition,
+    valid_until: Instant,
 }
 
 impl From<Lease> for PyLease {
@@ -277,6 +376,7 @@ impl From<Lease> for PyLease {
             token: value.token,
             granted_ttl_ms: value.granted_ttl.as_secs_f64() * 1000.0,
             position: value.position.into(),
+            valid_until: value.valid_until,
         }
     }
 }
@@ -287,6 +387,19 @@ impl PyLease {
     #[getter]
     fn position(&self) -> PyMutationPosition {
         self.position.clone()
+    }
+
+    /// The `time.monotonic()` instant, in seconds, the lease stops being valid
+    /// for this process: the first send of the grant or renewal plus the
+    /// granted TTL. Work that stops before it never outlives the lease.
+    #[getter]
+    fn valid_until(&self, py: Python<'_>) -> PyResult<f64> {
+        let monotonic: f64 = py.import("time")?.call_method0("monotonic")?.extract()?;
+        let now = Instant::now();
+        Ok(match self.valid_until.checked_duration_since(now) {
+            Some(remaining) => monotonic + remaining.as_secs_f64(),
+            None => monotonic - now.duration_since(self.valid_until).as_secs_f64(),
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -337,12 +450,21 @@ impl PyKv {
     }
 
     /// Fetch the raw value bytes at `key`, or `None` if absent or expired.
-    fn get<'py>(&self, py: Python<'py>, key: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Awaitable[typing.Optional[builtins.bytes]]",
+        imports = ("typing", "builtins")
+    ))]
+    fn get<'py>(
+        &self,
+        py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, Option<Vec<u8>>>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
         let key = payload_bytes(key)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let value = laser
                 .kv(namespace)
                 .linked(session)
@@ -359,14 +481,15 @@ impl PyKv {
     fn get_as<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         key: &Bound<'_, PyAny>,
         codec: Py<PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
         let key = payload_bytes(key)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let value = laser
                 .kv(namespace)
                 .linked(session)
@@ -381,16 +504,42 @@ impl PyKv {
     }
 
     /// Fetch the full entry (key, value, version, expiry) at `key`, or `None`.
-    fn get_entry<'py>(
+    /// Conditional read: a `KvRevalidation` of kind `NOT_MODIFIED`, and no
+    /// value sent, while `key` still holds `version` (the entry version of a
+    /// prior read), else of kind `CHANGED` with the entry as it stands now.
+    fn get_entry_if_changed<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         key: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+        version: u64,
+    ) -> PyResult<Awaitable<'py, PyKvRevalidation>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
         let key = payload_bytes(key)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
+            laser
+                .kv(namespace)
+                .linked(session)
+                .get_entry_if_changed(key, version)
+                .await
+                .map(PyKvRevalidation::from)
+                .map_err(to_pyerr)
+        })
+    }
+
+    fn get_entry<'py>(
+        &self,
+        py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let session = self.session.clone();
+        let key = payload_bytes(key)?;
+        awaitable(py, async move {
             let entry = laser
                 .kv(namespace)
                 .linked(session)
@@ -414,15 +563,16 @@ impl PyKv {
     fn get_entry_at_least<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         key: &Bound<'_, PyAny>,
         min_position: PyRef<'_, PyMutationPosition>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
         let key = payload_bytes(key)?;
         let min_position = MutationPosition::from(&*min_position);
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let entry = laser
                 .kv(namespace)
                 .linked(session)
@@ -443,13 +593,14 @@ impl PyKv {
     fn get_typed<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         key: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
         let key = payload_bytes(key)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let value = laser
                 .kv(namespace)
                 .linked(session)
@@ -467,10 +618,14 @@ impl PyKv {
         })
     }
 
-    /// Start a set. Supply a value (`bytes` / `json` / `msgpack`), optional
-    /// `ttl` / `expires_at` / `expect_*`, then `await .send()` (or `.commit()`
-    /// for a compare-and-swap).
-    fn set(&self, key: &Bound<'_, PyAny>) -> PyResult<PyKvSet> {
+    /// Start a set. Supply a value (`bytes` / `json` / `msgpack`), an optional
+    /// `ttl` / `expires_at`, then `await .send()`. `expect_version` or
+    /// `expect_absent` turn it into a `KvCasRequest` that only commits.
+    fn set(
+        &self,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<PyKvSet> {
         Ok(PyKvSet {
             laser: self.laser.clone(),
             namespace: self.namespace.clone(),
@@ -479,7 +634,6 @@ impl PyKv {
             body: Body::Unset,
             ttl_ms: None,
             expires_at_micros: None,
-            expect: None,
         })
     }
 
@@ -499,10 +653,13 @@ impl PyKv {
     #[allow(clippy::too_many_arguments)]
     fn cas_fenced(
         &self,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         key: &Bound<'_, PyAny>,
         fence_namespace: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         fence_key: &Bound<'_, PyAny>,
         fence_token: u64,
+        #[gen_stub(override_type(type_repr = "typing.Optional[builtins.str | builtins.bytes | builtins.bytearray]", imports = ("typing", "builtins")))]
         value: Option<&Bound<'_, PyAny>>,
         expect_version: Option<u64>,
         expect_absent: bool,
@@ -537,12 +694,17 @@ impl PyKv {
     }
 
     /// Delete `key`. Returns `True` when a live entry was removed.
-    fn delete<'py>(&self, py: Python<'py>, key: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn delete<'py>(
+        &self,
+        py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, bool>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
         let key = payload_bytes(key)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .kv(namespace)
                 .linked(session)
@@ -552,14 +714,43 @@ impl PyKv {
         })
     }
 
-    /// Test presence and read metadata without the value. Returns the
-    /// `KvMetadata`, or `None` when absent.
-    fn exists<'py>(&self, py: Python<'py>, key: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    /// Delete `key` only while it holds `version` (the entry version of a prior
+    /// read), a conditional delete. A live entry at another version raises
+    /// `KvError` with `version_conflict` set.
+    fn delete_if_version<'py>(
+        &self,
+        py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        key: &Bound<'_, PyAny>,
+        version: u64,
+    ) -> PyResult<Awaitable<'py, bool>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
         let key = payload_bytes(key)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
+            laser
+                .kv(namespace)
+                .linked(session)
+                .delete_if_version(key, version)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Test presence and read metadata without the value. Returns the
+    /// `KvMetadata`, or `None` when absent.
+    fn exists<'py>(
+        &self,
+        py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, Option<PyKvMetadata>>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let session = self.session.clone();
+        let key = payload_bytes(key)?;
+        awaitable(py, async move {
             let meta = laser
                 .kv(namespace)
                 .linked(session)
@@ -576,9 +767,10 @@ impl PyKv {
     fn expire<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         key: &Bound<'_, PyAny>,
         ttl_ms: Option<f64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, u64>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
@@ -586,7 +778,7 @@ impl PyKv {
         let ttl = ttl_ms
             .map(|ttl_ms| duration_ms(ttl_ms, "ttl_ms"))
             .transpose()?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .kv(namespace)
                 .linked(session)
@@ -603,14 +795,15 @@ impl PyKv {
     fn expire_at<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         key: &Bound<'_, PyAny>,
         expires_at_micros: Option<u64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, u64>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
         let key = payload_bytes(key)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .kv(namespace)
                 .linked(session)
@@ -625,15 +818,17 @@ impl PyKv {
     fn patch<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         key: &Bound<'_, PyAny>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         patch: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, u64>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
         let key = payload_bytes(key)?;
         let patch = payload_bytes(patch)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .kv(namespace)
                 .linked(session)
@@ -643,28 +838,105 @@ impl PyKv {
         })
     }
 
-    /// Acquire a revocable lease on `key` for `ttl_ms` as `holder` (a stable
-    /// node or worker id). Returns a `Lease` with `token`, `granted_ttl_ms`,
-    /// and the `position` to pass to `get_entry_at_least`. A live
-    /// lease always conflicts: extend with `renew_lease`, never by
-    /// re-acquiring. `ttl_ms` is a requested maximum between 1,000 and
-    /// 300,000 milliseconds; the store may grant less and never more, so a value outside that
-    /// range raises before the round trip and a holder needing longer renews.
-    /// Needs the `kv_fenced_leases` capability. If acquisition is
-    /// ambiguous, the SDK closes the dedicated coordination connection and waits
-    /// `ttl_ms` before raising the non-retryable ambiguous-mutation error.
-    fn lease<'py>(
+    /// `patch` applied only while `key` holds `version`. A live entry at another
+    /// version raises `KvError` with `version_conflict` set.
+    fn patch_if_version<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         key: &Bound<'_, PyAny>,
-        holder: String,
-        ttl_ms: f64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        patch: &Bound<'_, PyAny>,
+        version: u64,
+    ) -> PyResult<Awaitable<'py, u64>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
         let key = payload_bytes(key)?;
-        future_into_py(py, async move {
+        let patch = payload_bytes(patch)?;
+        awaitable(py, async move {
+            laser
+                .kv(namespace)
+                .linked(session)
+                .patch_if_version(key, patch, version)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// A lease scope for `async with kv.lease_guard(key, holder, ttl_ms) as
+    /// guard:`. Entering acquires the lease, `guard.lease` is the grant, and
+    /// leaving the block releases it however the block ends, unless a renewal
+    /// reported it lost.
+    fn lease_guard(
+        &self,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        key: &Bound<'_, PyAny>,
+        holder: String,
+        ttl_ms: f64,
+    ) -> PyResult<PyLeaseGuard> {
+        Ok(PyLeaseGuard {
+            laser: self.laser.clone(),
+            namespace: self.namespace.clone(),
+            session: self.session.clone(),
+            key: payload_bytes(key)?,
+            holder,
+            ttl: duration_ms(ttl_ms, "ttl_ms")?,
+            guard: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// `lease` that returns `None` instead of raising when a live lease holds
+    /// `key`, the non-blocking acquire. Every other failure raises as `lease`
+    /// raises it.
+    fn try_lease<'py>(
+        &self,
+        py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        key: &Bound<'_, PyAny>,
+        holder: String,
+        ttl_ms: f64,
+    ) -> PyResult<Awaitable<'py, Option<PyLease>>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let session = self.session.clone();
+        let key = payload_bytes(key)?;
+        awaitable(py, async move {
+            let lease = laser
+                .kv(namespace)
+                .linked(session)
+                .try_lease(key, holder, duration_ms(ttl_ms, "ttl_ms")?)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(lease.map(PyLease::from))
+        })
+    }
+
+    /// Acquire a revocable lease on `key` for `ttl_ms` as `holder` (a stable
+    /// node or worker id). Returns a `Lease` with `token`, `granted_ttl_ms`,
+    /// the `position` to pass to `get_entry_at_least`, and `valid_until`. A live
+    /// lease always conflicts with a `KvError` whose detail is the lease-held
+    /// error naming the holder's expiry, and `try_lease` returns `None`
+    /// instead: extend with `renew_lease`, never by re-acquiring. `ttl_ms` is a
+    /// requested maximum between 1,000 and 300,000 milliseconds. The store may
+    /// grant less and never more, so a value outside that range raises before
+    /// the round trip and a holder needing longer renews. Needs the
+    /// `kv_fenced_leases` capability. If acquisition is ambiguous, the SDK
+    /// repeats the same operation identity until `ttl_ms` since the first send
+    /// has passed before raising the non-retryable ambiguous-mutation error.
+    fn lease<'py>(
+        &self,
+        py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        key: &Bound<'_, PyAny>,
+        holder: String,
+        ttl_ms: f64,
+    ) -> PyResult<Awaitable<'py, PyLease>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let session = self.session.clone();
+        let key = payload_bytes(key)?;
+        awaitable(py, async move {
             let lease = laser
                 .kv(namespace)
                 .linked(session)
@@ -684,16 +956,17 @@ impl PyKv {
     fn renew_lease<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         key: &Bound<'_, PyAny>,
         holder: String,
         token: u64,
         ttl_ms: f64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyLease>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
         let key = payload_bytes(key)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let lease = laser
                 .kv(namespace)
                 .linked(session)
@@ -709,15 +982,16 @@ impl PyKv {
     fn release<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         key: &Bound<'_, PyAny>,
         holder: String,
         token: u64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, bool>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
         let key = payload_bytes(key)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .kv(namespace)
                 .linked(session)
@@ -758,11 +1032,15 @@ impl PyKv {
 
     /// Point-read several keys in ONE round trip (the mixed-operation batch):
     /// one `bytes | None` per key, in key order.
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Awaitable[builtins.list[typing.Optional[builtins.bytes]]]",
+        imports = ("typing", "builtins")
+    ))]
     fn get_many<'py>(
         &self,
         py: Python<'py>,
         keys: Vec<Bound<'_, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Vec<Option<Vec<u8>>>>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
@@ -770,7 +1048,7 @@ impl PyKv {
             .iter()
             .map(payload_bytes)
             .collect::<PyResult<Vec<_>>>()?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .kv(namespace)
                 .linked(session)
@@ -804,8 +1082,8 @@ impl PyKv {
             range: None,
             key_contains: None,
             conversation: None,
-            limit: None,
-            cursor: None,
+            page: 0,
+            results: None,
         }
     }
 }
@@ -854,7 +1132,7 @@ impl PyKvCopy {
     }
 
     /// Run the copy or move. Returns the destination's new version.
-    fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn send<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, u64>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
@@ -862,7 +1140,7 @@ impl PyKvCopy {
         let to_key = self.to_key.clone();
         let to_namespace = self.to_namespace.clone();
         let delete_source = self.delete_source;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let kv = laser.kv(namespace).linked(session);
             let mut request = if delete_source {
                 kv.move_to(key, to_key)
@@ -876,8 +1154,12 @@ impl PyKvCopy {
         })
     }
 
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Generator[typing.Any, None, builtins.int]",
+        imports = ("typing", "builtins")
+    ))]
     fn __await__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.send(py)?.call_method0("__await__")
+        self.send(py)?.into_pyobject(py)?.call_method0("__await__")
     }
 }
 
@@ -905,6 +1187,7 @@ impl PyKvCasFenced {
     /// Store raw bytes (str, bytes, or bytearray).
     fn bytes<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.body = Body::Bytes(payload_bytes(payload)?);
@@ -940,7 +1223,7 @@ impl PyKvCasFenced {
         Ok(slf)
     }
 
-    /// Expire the entry `ttl_ms` milliseconds from now.
+    /// Expire the entry `ttl_ms` milliseconds after the server's time of the write.
     fn ttl(mut slf: PyRefMut<'_, Self>, ttl_ms: f64) -> PyRefMut<'_, Self> {
         slf.ttl_ms = Some(ttl_ms);
         slf
@@ -965,7 +1248,7 @@ impl PyKvCasFenced {
     }
 
     /// Apply the fenced compare-and-swap. Returns the new version.
-    fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn commit<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, u64>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
@@ -977,7 +1260,7 @@ impl PyKvCasFenced {
         let ttl_ms = self.ttl_ms;
         let expires_at_micros = self.expires_at_micros;
         let expect = self.expect;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut request = laser.kv(namespace).linked(session).cas_fenced(
                 key,
                 fence_namespace,
@@ -1010,8 +1293,14 @@ impl PyKvCasFenced {
         })
     }
 
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Generator[typing.Any, None, builtins.int]",
+        imports = ("typing", "builtins")
+    ))]
     fn __await__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.commit(py)?.call_method0("__await__")
+        self.commit(py)?
+            .into_pyobject(py)?
+            .call_method0("__await__")
     }
 }
 
@@ -1020,9 +1309,7 @@ impl PyKvCasFenced {
 #[pyclass(name = "KvEntry", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyKvEntry {
-    #[pyo3(get)]
     pub key: Vec<u8>,
-    #[pyo3(get)]
     pub value: Vec<u8>,
     #[pyo3(get)]
     pub version: u64,
@@ -1048,6 +1335,18 @@ impl From<KvEntry> for PyKvEntry {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyKvEntry {
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+    fn key(&self) -> Vec<u8> {
+        self.key.clone()
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+    fn value(&self) -> Vec<u8> {
+        self.value.clone()
+    }
+
     /// The key decoded as UTF-8, or `None` for a binary key.
     fn key_str(&self) -> Option<String> {
         String::from_utf8(self.key.clone()).ok()
@@ -1124,21 +1423,79 @@ impl PyKvMetadata {
     }
 }
 
-/// A page of scanned entries plus the cursor to resume after the last one.
+/// The answer to a conditional read. `kind` is `NOT_MODIFIED` while the key
+/// still held the version the caller sent, and then `entry` is `None`, or
+/// `CHANGED` with `entry` as it stands now, `None` when absent or expired.
+#[gen_stub_pyclass]
+#[pyclass(name = "KvRevalidation", frozen)]
+pub struct PyKvRevalidation {
+    kind: &'static str,
+    #[pyo3(get)]
+    pub entry: Option<PyKvEntry>,
+}
+
+impl From<KvRevalidation> for PyKvRevalidation {
+    fn from(value: KvRevalidation) -> Self {
+        match value {
+            KvRevalidation::NotModified => Self {
+                kind: Self::NOT_MODIFIED,
+                entry: None,
+            },
+            KvRevalidation::Changed(entry) => Self {
+                kind: Self::CHANGED,
+                entry: entry.map(PyKvEntry::from),
+            },
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyKvRevalidation {
+    /// The `kind` of an answer whose key still held the version sent.
+    #[classattr]
+    const NOT_MODIFIED: &'static str = "not_modified";
+    /// The `kind` of an answer that carries the entry as it stands now.
+    #[classattr]
+    const CHANGED: &'static str = "changed";
+
+    /// `KvRevalidation.NOT_MODIFIED` or `CHANGED`.
+    #[getter]
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "KvRevalidation(kind={}, entry={})",
+            self.kind,
+            self.entry.is_some()
+        )
+    }
+}
+
+/// One page of scanned entries in key order. `page` counts from 1, and
+/// `total_results` counts every live match of the scan.
 #[gen_stub_pyclass]
 #[pyclass(name = "KvPage", frozen)]
 pub struct PyKvPage {
     #[pyo3(get)]
-    pub entries: Vec<PyKvEntry>,
+    pub items: Vec<PyKvEntry>,
     #[pyo3(get)]
-    pub cursor: Option<Vec<u8>>,
+    pub page: u32,
+    #[pyo3(get)]
+    pub total_pages: u32,
+    #[pyo3(get)]
+    pub total_results: u32,
 }
 
 impl From<KvPage> for PyKvPage {
     fn from(page: KvPage) -> Self {
         Self {
-            entries: page.entries.into_iter().map(PyKvEntry::from).collect(),
-            cursor: page.cursor,
+            items: page.items.into_iter().map(PyKvEntry::from).collect(),
+            page: page.page,
+            total_pages: page.total_pages,
+            total_results: page.total_results,
         }
     }
 }
@@ -1147,13 +1504,14 @@ impl From<KvPage> for PyKvPage {
 #[pymethods]
 impl PyKvPage {
     fn __len__(&self) -> usize {
-        self.entries.len()
+        self.items.len()
     }
 }
 
-/// Fluent builder for a KV set / compare-and-swap.
+/// Fluent builder for a KV set. A precondition turns it into a `KvCasRequest`.
 #[gen_stub_pyclass]
-#[pyclass(name = "KvSetRequest")]
+#[pyclass(name = "KvSetRequest", skip_from_py_object)]
+#[derive(Clone)]
 pub struct PyKvSet {
     laser: Laser,
     namespace: String,
@@ -1162,7 +1520,16 @@ pub struct PyKvSet {
     body: Body,
     ttl_ms: Option<f64>,
     expires_at_micros: Option<u64>,
-    expect: Option<Expect>,
+}
+
+/// A compare-and-swap write, built by `KvSetRequest.expect_version` or
+/// `expect_absent`. It only commits, so a precondition is never dropped by an
+/// unconditional send. Await it, or call `commit()`.
+#[gen_stub_pyclass]
+#[pyclass(name = "KvCasRequest")]
+pub struct PyKvCas {
+    write: PyKvSet,
+    expect: Expect,
 }
 
 #[gen_stub_pymethods]
@@ -1171,6 +1538,7 @@ impl PyKvSet {
     /// Store raw bytes (str, bytes, or bytearray).
     fn bytes<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.body = Body::Bytes(payload_bytes(payload)?);
@@ -1206,7 +1574,7 @@ impl PyKvSet {
         Ok(slf)
     }
 
-    /// Expire the entry `ttl_ms` milliseconds from now.
+    /// Expire the entry `ttl_ms` milliseconds after the server's time of the write.
     fn ttl(mut slf: PyRefMut<'_, Self>, ttl_ms: f64) -> PyRefMut<'_, Self> {
         slf.ttl_ms = Some(ttl_ms);
         slf
@@ -1219,88 +1587,81 @@ impl PyKvSet {
     }
 
     /// Compare-and-swap precondition: apply only if the key holds `version`.
-    fn expect_version(mut slf: PyRefMut<'_, Self>, version: u64) -> PyRefMut<'_, Self> {
-        slf.expect = Some(Expect::Version(version));
-        slf
+    fn expect_version(&self, version: u64) -> PyKvCas {
+        PyKvCas {
+            write: self.clone(),
+            expect: Expect::Version(version),
+        }
     }
 
     /// Compare-and-swap precondition: apply only if the key does not exist.
-    fn expect_absent(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
-        slf.expect = Some(Expect::Absent);
-        slf
+    fn expect_absent(&self) -> PyKvCas {
+        PyKvCas {
+            write: self.clone(),
+            expect: Expect::Absent,
+        }
     }
 
-    /// Apply an unconditional write. Raises `InvalidError` when a precondition
-    /// was set: a conditional write goes through `commit()`.
-    fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let (laser, namespace, key, body, ttl_ms, expires_at_micros, expect) = self.snapshot();
-        let session = self.session.clone();
-        future_into_py(py, async move {
-            let kv = laser.kv(namespace).linked(session);
-            let mut request = kv.set(&key);
-            request = apply_body(request, body).map_err(to_pyerr)?;
-            if let Some(ttl_ms) = ttl_ms {
-                request = request.ttl(duration_ms(ttl_ms, "ttl_ms")?);
-            }
-            if let Some(epoch_micros) = expires_at_micros {
-                request = request.expires_at(epoch_micros);
-            }
-            request = match expect {
-                Some(Expect::Version(version)) => request.expect_version(version),
-                Some(Expect::Absent) => request.expect_absent(),
-                None => request,
-            };
-            request.send().await.map_err(to_pyerr)
-        })
-    }
-
-    /// Apply a compare-and-swap (needs `expect_version` / `expect_absent`).
-    /// Returns the entry's new version.
-    fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let (laser, namespace, key, body, ttl_ms, expires_at_micros, expect) = self.snapshot();
-        let session = self.session.clone();
-        future_into_py(py, async move {
-            let kv = laser.kv(namespace).linked(session);
-            let mut request = kv.set(&key);
-            request = apply_body(request, body).map_err(to_pyerr)?;
-            if let Some(ttl_ms) = ttl_ms {
-                request = request.ttl(duration_ms(ttl_ms, "ttl_ms")?);
-            }
-            if let Some(epoch_micros) = expires_at_micros {
-                request = request.expires_at(epoch_micros);
-            }
-            request = match expect {
-                Some(Expect::Version(version)) => request.expect_version(version),
-                Some(Expect::Absent) => request.expect_absent(),
-                None => request,
-            };
-            request.commit().await.map_err(to_pyerr)
+    /// Apply the unconditional write.
+    fn send<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
+        let write = self.clone();
+        awaitable(py, async move {
+            write.request()?.send().await.map_err(to_pyerr)
         })
     }
 }
 
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyKvCas {
+    /// Expire the entry `ttl_ms` milliseconds after the server's time of the write.
+    fn ttl(mut slf: PyRefMut<'_, Self>, ttl_ms: f64) -> PyRefMut<'_, Self> {
+        slf.write.ttl_ms = Some(ttl_ms);
+        slf
+    }
+
+    /// Expire the entry at an absolute epoch-microseconds timestamp.
+    fn expires_at(mut slf: PyRefMut<'_, Self>, epoch_micros: u64) -> PyRefMut<'_, Self> {
+        slf.write.expires_at_micros = Some(epoch_micros);
+        slf
+    }
+
+    /// Apply the compare-and-swap. Returns the entry's new version.
+    fn commit<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, u64>> {
+        let write = self.write.clone();
+        let expect = self.expect;
+        awaitable(py, async move {
+            let request = match expect {
+                Expect::Version(version) => write.request()?.expect_version(version),
+                Expect::Absent => write.request()?.expect_absent(),
+            };
+            request.commit().await.map_err(to_pyerr)
+        })
+    }
+
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Generator[typing.Any, None, builtins.int]",
+        imports = ("typing", "builtins")
+    ))]
+    fn __await__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.commit(py)?
+            .into_pyobject(py)?
+            .call_method0("__await__")
+    }
+}
+
 impl PyKvSet {
-    #[allow(clippy::type_complexity)]
-    fn snapshot(
-        &self,
-    ) -> (
-        Laser,
-        String,
-        Vec<u8>,
-        Body,
-        Option<f64>,
-        Option<u64>,
-        Option<Expect>,
-    ) {
-        (
-            self.laser.clone(),
-            self.namespace.clone(),
-            self.key.clone(),
-            self.body.clone(),
-            self.ttl_ms,
-            self.expires_at_micros,
-            self.expect,
-        )
+    // The Rust request this builder describes, value and expiry applied.
+    fn request(self) -> PyResult<laser_sdk::kv::KvSetRequest> {
+        let kv = self.laser.kv(self.namespace).linked(self.session);
+        let mut request = apply_body(kv.set(&self.key), self.body).map_err(to_pyerr)?;
+        if let Some(ttl_ms) = self.ttl_ms {
+            request = request.ttl(duration_ms(ttl_ms, "ttl_ms")?);
+        }
+        if let Some(epoch_micros) = self.expires_at_micros {
+            request = request.expires_at(epoch_micros);
+        }
+        Ok(request)
     }
 }
 
@@ -1329,8 +1690,8 @@ pub struct PyKvScan {
     range: Option<(Vec<u8>, Vec<u8>)>,
     key_contains: Option<String>,
     conversation: Option<String>,
-    limit: Option<usize>,
-    cursor: Option<Vec<u8>>,
+    page: u32,
+    results: Option<u32>,
 }
 
 #[gen_stub_pymethods]
@@ -1338,6 +1699,7 @@ pub struct PyKvScan {
 impl PyKvScan {
     fn prefix<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         prefix: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.prefix = Some(payload_bytes(prefix)?);
@@ -1346,7 +1708,9 @@ impl PyKvScan {
 
     fn range<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         start: &Bound<'_, PyAny>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         end: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.range = Some((payload_bytes(start)?, payload_bytes(end)?));
@@ -1368,21 +1732,21 @@ impl PyKvScan {
         slf
     }
 
-    fn limit(mut slf: PyRefMut<'_, Self>, n: usize) -> PyRefMut<'_, Self> {
-        slf.limit = Some(n);
+    /// The 1-based page to read. Zero reads the first page.
+    fn page(mut slf: PyRefMut<'_, Self>, page: u32) -> PyRefMut<'_, Self> {
+        slf.page = page;
         slf
     }
 
-    fn cursor<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        cursor: &Bound<'_, PyAny>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.cursor = Some(payload_bytes(cursor)?);
-        Ok(slf)
+    /// The entries per page, clamped to the scan cap. Zero reads the server's
+    /// default page size.
+    fn results(mut slf: PyRefMut<'_, Self>, results: u32) -> PyRefMut<'_, Self> {
+        slf.results = Some(results);
+        slf
     }
 
-    /// Fetch one page (entries plus the cursor to continue).
-    fn fetch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Fetch the chosen page with the totals of the whole scan.
+    fn fetch<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyKvPage>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
@@ -1390,9 +1754,9 @@ impl PyKvScan {
         let range = self.range.clone();
         let key_contains = self.key_contains.clone();
         let conversation = parse_conversation(self.conversation.clone())?;
-        let limit = self.limit;
-        let cursor = self.cursor.clone();
-        future_into_py(py, async move {
+        let page = self.page;
+        let results = self.results;
+        awaitable(py, async move {
             let kv = laser.kv(namespace).linked(session);
             let mut request = kv.scan();
             if let Some(prefix) = prefix {
@@ -1407,19 +1771,16 @@ impl PyKvScan {
             if let Some(conversation) = conversation {
                 request = request.conversation(conversation);
             }
-            if let Some(n) = limit {
-                request = request.limit(n);
+            if let Some(results) = results {
+                request = request.results(results);
             }
-            if let Some(cursor) = cursor {
-                request = request.cursor(cursor);
-            }
-            let page = request.fetch().await.map_err(to_pyerr)?;
+            let page = request.page(page).fetch().await.map_err(to_pyerr)?;
             Ok(PyKvPage::from(page))
         })
     }
 
-    /// Walk every matching entry across pages.
-    fn entries<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Walk every matching entry from the first page to the last.
+    fn entries<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Vec<PyKvEntry>>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
@@ -1427,8 +1788,8 @@ impl PyKvScan {
         let range = self.range.clone();
         let key_contains = self.key_contains.clone();
         let conversation = parse_conversation(self.conversation.clone())?;
-        let limit = self.limit;
-        future_into_py(py, async move {
+        let results = self.results;
+        awaitable(py, async move {
             let kv = laser.kv(namespace).linked(session);
             let mut request = kv.scan();
             if let Some(prefix) = prefix {
@@ -1443,8 +1804,8 @@ impl PyKvScan {
             if let Some(conversation) = conversation {
                 request = request.conversation(conversation);
             }
-            if let Some(n) = limit {
-                request = request.limit(n);
+            if let Some(results) = results {
+                request = request.results(results);
             }
             let entries = request.entries().await.map_err(to_pyerr)?;
             Ok(entries.into_iter().map(PyKvEntry::from).collect::<Vec<_>>())
@@ -1470,6 +1831,7 @@ pub struct PyKvDeleteMany {
 impl PyKvDeleteMany {
     fn prefix<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         prefix: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.prefix = Some(payload_bytes(prefix)?);
@@ -1478,7 +1840,9 @@ impl PyKvDeleteMany {
 
     fn range<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         start: &Bound<'_, PyAny>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         end: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.range = Some((payload_bytes(start)?, payload_bytes(end)?));
@@ -1501,7 +1865,7 @@ impl PyKvDeleteMany {
     }
 
     /// Apply the bulk delete. Returns the number of entries removed.
-    fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn send<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, usize>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let session = self.session.clone();
@@ -1509,7 +1873,7 @@ impl PyKvDeleteMany {
         let range = self.range.clone();
         let key_contains = self.key_contains.clone();
         let conversation = parse_conversation(self.conversation.clone())?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let kv = laser.kv(namespace).linked(session);
             let mut request = kv.delete_many();
             if let Some(prefix) = prefix {

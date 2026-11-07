@@ -3,6 +3,7 @@ import { test } from "node:test"
 import type { Capabilities } from "../../src/client/capabilities.js"
 import { managedCapabilitiesFrom } from "../../src/client/capabilities.js"
 import { INTERNAL_TRANSPORT } from "../../src/client/internals.js"
+import { InvalidError } from "../../src/client/errors.js"
 import { Laser } from "../../src/client/laser.js"
 import type { IggyClient } from "../../src/iggy/apache-iggy.js"
 import { decodeOne, expectMap } from "../../src/wire/cbor.js"
@@ -61,7 +62,17 @@ void test("given_a_default_stream_when_naming_resources_then_should_scope_once_a
   const { laser } = await scoped()
   assert.equal(laser.resourceNaming(), "stream")
   assert.equal(laser.resourceName("agent.keys"), "stream:acme/agent.keys")
-  assert.equal(laser.resourceName("stream:other/sessions"), "stream:other/sessions")
+  assert.equal(laser.resourceName("stream:acme/sessions"), "stream:acme/sessions")
+  assert.equal(laser.resourceName("stream:other/sessions"), "stream:acme/stream:other/sessions")
+  assert.equal(
+    laser.localResourceName(laser.resourceName("stream:other/sessions")),
+    "stream:other/sessions"
+  )
+  assert.equal(laser.withDefaultStream("other").resourceName("stream:other/x"), "stream:other/x")
+  assert.equal(
+    laser.withResourceNaming("bare").resourceName("stream:other/sessions"),
+    "stream:other/sessions"
+  )
   const bare = laser.withResourceNaming("bare")
   assert.equal(bare.resourceName("agent.keys"), "agent.keys")
   assert.equal(bare.withDefaultStream("fleet").resourceNaming(), "bare")
@@ -143,4 +154,25 @@ void test("given_scoped_graph_fork_and_schema_requests_when_sent_then_should_nam
     "schema"
   )
   assert.equal(bare.stream, undefined)
+})
+
+void test("given_a_default_stream_with_a_slash_when_a_managed_call_runs_then_should_refuse_it", async () => {
+  const { laser, sent } = await scoped()
+  const slashed = laser.withDefaultStream("tenants/acme")
+  await assert.rejects(
+    slashed.kv("profiles").get(new TextEncoder().encode("user-1")),
+    (error: unknown) => error instanceof InvalidError && error.message.includes("`/`")
+  )
+  assert.equal(sent.length, 0)
+  assert.equal(slashed.withResourceNaming("bare").resourceName("profiles"), "profiles")
+})
+
+void test("given_a_default_stream_with_a_slash_when_a_lease_is_acquired_then_should_refuse_it", async () => {
+  const { laser, sent } = await scoped()
+  const slashed = laser.withDefaultStream("tenants/acme")
+  await assert.rejects(
+    slashed.kv("locks").lease(new TextEncoder().encode("job-1"), "worker-1", 5_000),
+    (error: unknown) => error instanceof InvalidError && error.message.includes("`/`")
+  )
+  assert.equal(sent.length, 0)
 })

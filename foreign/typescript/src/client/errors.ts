@@ -1,5 +1,4 @@
 import type { MessageWithHeaders, SendMessagesConfirmation } from "../iggy/apache-iggy.js"
-import type { CheckpointError } from "../wire/checkpoint.js"
 import type { FaultReason, FilterError, FilterGroupIdentity } from "../wire/filter.js"
 import type { SessionError as WireSessionError } from "../wire/session.js"
 import type { CommandError as WireCommandError } from "../wire/result.js"
@@ -35,6 +34,7 @@ export type LaserErrorKind =
   | "integrity"
   | "rejected"
   | "budget-exceeded"
+  | "session-ended"
   | "policy-blocked"
   | "step-up-required"
   | "policy-deferred"
@@ -42,7 +42,8 @@ export type LaserErrorKind =
   | "fence-violation"
   | "quarantined"
   | "no-respond-topic"
-  | "checkpoint"
+  | "step-failed"
+  | "journal-truncated"
 
 export class LaserError extends Error {
   readonly kind: LaserErrorKind
@@ -60,10 +61,10 @@ export class ConfigError extends LaserError {
   }
 }
 
-export class NoStreamError extends LaserError {
-  constructor(message: string, options?: { cause?: unknown }) {
-    super(message, "no-stream", options)
-  }
+/** A convenience call needed a default stream and none was set. A
+ * configuration mistake, never retryable. */
+export class NoStreamError extends ConfigError {
+  override readonly kind: LaserErrorKind = "no-stream"
 }
 
 export class TimeoutError extends LaserError {
@@ -72,9 +73,15 @@ export class TimeoutError extends LaserError {
   }
 }
 
+/** A managed mutation's outcome is unknown. `operationId` is the identity
+ * it was sent under, when it had one: repeating the mutation under it returns
+ * the recorded outcome instead of applying the change a second time. */
 export class AmbiguousMutationError extends LaserError {
-  constructor(message: string, options?: { cause?: unknown }) {
+  readonly operationId: bigint | undefined
+
+  constructor(message: string, options?: { cause?: unknown; operationId?: bigint }) {
     super(message, "ambiguous-mutation", options)
+    this.operationId = options?.operationId
   }
 }
 
@@ -120,9 +127,11 @@ export class InvalidError extends LaserError {
 /** Why parsing or validating an id failed: a conversation, agent, group, or
  * message id. Each static constructor is one Rust `IdError` variant with the
  * same message. */
-export class IdError extends LaserError {
+export class IdError extends InvalidError {
+  override readonly kind: LaserErrorKind = "id"
+
   private constructor(message: string) {
-    super(message, "id")
+    super(message)
   }
 
   static empty(): IdError {
@@ -211,7 +220,11 @@ export class CodecError extends LaserError {
   }
 }
 
-export class TypedDecodeError extends LaserError {
+/** A typed read could not produce a value. It classifies as its source: a
+ * failed poll keeps the transport error's code and retry answer, and a record
+ * that does not decode is a codec failure. */
+export class TypedDecodeError extends CodecError {
+  override readonly kind: LaserErrorKind = "typed-decode"
   readonly position: { readonly partitionId: number; readonly offset: bigint } | undefined
   /** What went wrong: a codec failure for a positioned record, the transport error for a failed poll. */
   readonly source: LaserError
@@ -221,7 +234,7 @@ export class TypedDecodeError extends LaserError {
     position: { readonly partitionId: number; readonly offset: bigint } | undefined,
     source: LaserError
   ) {
-    super(message, "typed-decode", { cause: source })
+    super(message, "typed", "decode", { cause: source })
     this.position = position
     this.source = source
   }
@@ -331,43 +344,55 @@ export class AuthzExecutionError extends LaserError {
   }
 }
 
-/** The streaming server or the filter catalog refused a consumer-filter operation. */
+/** A consumer-filter failure. `detail` is the typed refusal of the streaming
+ * server or the filter catalog, absent for a failure the reader found itself.
+ * `reason` names the cause: the refusal's reason, the fault reason, `oversized_record`,
+ * or for a group setup failure its cause's reason or `setup_failed`. */
 export class FilterExecutionError extends LaserError {
+  readonly detail: FilterError | undefined
+  readonly reason: string
+
   constructor(
     message: string,
-    readonly detail: FilterError,
-    options?: { cause?: unknown }
+    detail: FilterError | undefined,
+    options?: { cause?: unknown; reason?: string }
   ) {
     super(message, "filter", options)
+    this.detail = detail
+    this.reason = options?.reason ?? detail?.reason ?? "unknown"
   }
 }
 
 /** A filtered read stopped in front of a record the filter could not
  * evaluate under the `stop` fault policy. The record and everything after it
- * stay unacknowledged. */
-export class FilterFaultError extends LaserError {
+ * stay unacknowledged. `reason` is the fault reason. */
+export class FilterFaultError extends FilterExecutionError {
+  declare readonly reason: FaultReason
+
   constructor(
     readonly partitionId: number,
     readonly offset: bigint,
-    readonly reason?: FaultReason
+    reason: FaultReason
   ) {
     super(
-      `filter fault on partition ${String(partitionId)} at offset ${offset.toString()}: ${reason ?? "malformed"}`,
-      "filter"
+      `filter fault on partition ${String(partitionId)} at offset ${offset.toString()}: ${reason}`,
+      undefined,
+      { reason }
     )
   }
 }
 
 /** A matching record alone exceeds the filtered reply cap, so no page can
  * carry it. The record and everything after it stay unacknowledged. */
-export class FilterOversizedRecordError extends LaserError {
+export class FilterOversizedRecordError extends FilterExecutionError {
   constructor(
     readonly partitionId: number,
     readonly offset: bigint
   ) {
     super(
       `the record at offset ${offset.toString()} on partition ${String(partitionId)} exceeds the filtered reply cap`,
-      "filter"
+      undefined,
+      { reason: "oversized_record" }
     )
   }
 }
@@ -375,10 +400,10 @@ export class FilterOversizedRecordError extends LaserError {
 /**
  * The consumer group exists, but its filter was not configured. The group
  * stays as it is, unbound unless it ran a policy before, and no reader joined
- * it. `cause` is the catalog refusal or the transport failure, and
- * `filterReason(error.cause)` the catalog's reason when there is one.
+ * it. `cause` is the catalog refusal or the transport failure, `reason` the
+ * catalog's reason when there is one, else `setup_failed`.
  */
-export class ConsumerGroupSetupError extends LaserError {
+export class ConsumerGroupSetupError extends FilterExecutionError {
   constructor(
     readonly groupId: number,
     readonly groupName: string,
@@ -387,31 +412,47 @@ export class ConsumerGroupSetupError extends LaserError {
   ) {
     super(
       `consumer group ${String(groupId)} (${groupName}) exists but its filter was not configured: ${cause instanceof Error ? cause.message : String(cause)}`,
-      "filter",
-      { cause }
+      undefined,
+      {
+        cause,
+        reason:
+          cause instanceof FilterExecutionError && cause.detail !== undefined
+            ? cause.detail.reason
+            : "setup_failed"
+      }
     )
   }
 }
 
-export class NoCapableAgentError extends LaserError {
+/** Capability routing could not address an agent. */
+export class RoutingError extends LaserError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, "routing", options)
+  }
+}
+
+/** No live agent advertises `skill`. Retry after the registry refreshes, or route elsewhere. */
+export class NoCapableAgentError extends RoutingError {
   constructor(readonly skill: string) {
-    super(`no live agent advertises capability \`${skill}\``, "routing")
+    super(`no live agent advertises capability \`${skill}\``)
   }
 }
 
-export class NoInboxError extends LaserError {
+/** The capable `agent` advertises no inbox topic in its live presence. */
+export class NoInboxError extends RoutingError {
   constructor(readonly agent: string) {
-    super(`no inbox advertised for agent \`${agent}\``, "routing")
+    super(`no inbox advertised for agent \`${agent}\``)
   }
 }
 
-export class RoutePrincipalMismatchError extends LaserError {
+/** The selected `agent` is not bound to the `expected` principal. Never retryable. */
+export class RoutePrincipalMismatchError extends RoutingError {
   constructor(
     readonly agent: string,
     readonly expected: number,
     readonly actual?: number
   ) {
-    super(`agent \`${agent}\` is not authenticated as principal ${expected.toString()}`, "routing")
+    super(`agent \`${agent}\` is not authenticated as principal ${expected.toString()}`)
   }
 }
 
@@ -439,10 +480,10 @@ export class HandlerError extends LaserError {
   }
 }
 
-export class HandlerConfigError extends LaserError {
-  constructor(message: string, options?: { cause?: unknown }) {
-    super(message, "handler-config", options)
-  }
+/** A deterministic handler wiring, startup, or configuration failure, or a
+ * programming error in the handler. Never retryable. */
+export class HandlerConfigError extends ConfigError {
+  override readonly kind: LaserErrorKind = "handler-config"
 }
 
 export class StateStoreError extends LaserError {
@@ -493,6 +534,41 @@ export class BudgetExceededError extends LaserError {
   }
 }
 
+/** `begin` named a session that already ended, or `resume` named one an
+ * agent or an operator canceled. `status` is `completed`, `failed`, or
+ * `canceled`. A completed or failed session reopens through `resume`. */
+/** Why a workflow step did not complete, the Rust `StepFailure`. */
+export type StepFailure = "timed_out" | "failed" | "not_consumed" | "unverified" | "no_completion"
+
+/** A workflow step did not complete. `reason` says how, and only a step that
+ * timed out is retryable. The completed steps' compensations have run. */
+export class StepFailedError extends LaserError {
+  constructor(
+    readonly run: string,
+    readonly step: string,
+    readonly reason: StepFailure
+  ) {
+    super(`workflow run ${run} step \`${step}\` failed: ${reason}`, "step-failed")
+  }
+}
+
+/** A workflow resume found the run's journal shortened by retention, so the
+ * steps the run completed cannot be known. Not retryable on the same run. */
+export class JournalTruncatedError extends LaserError {
+  constructor(readonly run: string) {
+    super(`workflow run ${run} journal no longer holds the run's first record`, "journal-truncated")
+  }
+}
+
+export class SessionEndedError extends LaserError {
+  constructor(
+    readonly session: string,
+    readonly status: string
+  ) {
+    super(`session ${session} already ended as ${status}`, "session-ended")
+  }
+}
+
 /**
  * A publish that gave up. `committed` lists the ranges confirmed before the
  * failure, never replay them. `unconfirmed` lists the records left without a
@@ -527,15 +603,15 @@ export function publishCause(error: unknown): unknown {
   return current
 }
 
-/** A fenced write lost the fence: the held token is below the live sequence,
- * so a newer holder owns the task. Never retryable by the loser. */
+/** A fenced write lost the fence: the `held` token is below the `current`
+ * sequence, so a newer holder owns the task. Never retryable by the loser. */
 export class FenceViolationError extends LaserError {
   constructor(
-    readonly stale: bigint,
+    readonly held: bigint,
     readonly current: bigint
   ) {
     super(
-      `fence violation: held ${stale.toString()}, current ${current.toString()}`,
+      `fence violation: held ${held.toString()}, current ${current.toString()}`,
       "fence-violation"
     )
   }
@@ -548,21 +624,13 @@ export class QuarantinedError extends LaserError {
   }
 }
 
-/** The agent was built without a `respondOn` topic. Not retryable. */
-export class NoRespondTopicError extends LaserError {
-  constructor(message = "the agent has no respondOn topic configured") {
-    super(message, "no-respond-topic")
-  }
-}
+/** The agent was built without a `respondOn` topic. A configuration
+ * mistake, never retryable. */
+export class NoRespondTopicError extends ConfigError {
+  override readonly kind: LaserErrorKind = "no-respond-topic"
 
-/** Iggy answered a destination or checkpoint operation with a typed failure. */
-export class CheckpointExecutionError extends LaserError {
-  constructor(
-    message: string,
-    readonly detail: CheckpointError,
-    options?: { cause?: unknown }
-  ) {
-    super(message, "checkpoint", options)
+  constructor(message = "the agent has no respondOn topic configured") {
+    super(message)
   }
 }
 

@@ -112,11 +112,12 @@ impl SnapshotStore for KvSnapshotStore {
 /// `agent.snapshots`), partitioned by conversation so one conversation's
 /// checkpoints stay ordered. Log-native: works on Apache Iggy.
 ///
-/// `latest` walks the topic backward from each partition's tail and stops at
-/// the first (newest) record for the conversation, so a hit costs the tail
-/// distance to the last checkpoint. A conversation with no snapshot walks the
-/// topic fully before answering `None`: keep the snapshots topic on retention
-/// (its history is checkpoints, not truth) so that walk stays bounded.
+/// `latest` walks the one partition the conversation's snapshots route to
+/// backward from its tail and stops at the first (newest) record for the
+/// conversation, so a hit costs the tail distance to the last checkpoint. A
+/// conversation with no snapshot walks that partition fully before answering
+/// `None`: keep the snapshots topic on retention (its history is checkpoints,
+/// not truth) so that walk stays bounded.
 #[cfg(feature = "agent")]
 pub struct TopicSnapshotStore {
     laser: crate::laser::Laser,
@@ -160,71 +161,64 @@ impl SnapshotStore for TopicSnapshotStore {
             // No topic yet means nothing was ever saved.
             return Ok(None);
         };
-        let mut newest: Option<((u64, u32, u64), FoldSnapshot)> = None;
-        for partition in 0..bounded_partitions(details.partitions_count) {
-            let tail = client
-                .poll_messages(
-                    &stream,
-                    &topic,
-                    partition,
-                    &consumer,
-                    &PollingStrategy::last(),
-                    PollOptions {
-                        count: 1,
-                        ..PollOptions::default()
-                    },
-                )
-                .await?;
-            let Some(last) = tail.messages.last() else {
-                continue;
-            };
-            let mut end = last.header.offset.saturating_add(1);
-            // Walk backward in windows: newest window first, and within a
-            // window the highest matching offset wins, so the scan stops at
-            // the conversation's most recent checkpoint.
-            while end > 0 {
-                let start = end.saturating_sub(u64::from(SNAPSHOT_SCAN_BATCH));
-                let window = drain_partition(
-                    &client,
-                    &stream,
-                    &topic,
-                    &consumer,
-                    DrainRange::until(partition, start, end - 1),
-                    SNAPSHOT_SCAN_BATCH,
-                )
-                .await?;
-                let found = window.messages.iter().rev().find_map(|message| {
-                    decode(&message.payload)
-                        .ok()
-                        .filter(|snapshot| {
-                            snapshot.conversation == conversation
-                                && snapshot.fold == self.fold
-                                && snapshot.stream == stream_name
-                        })
-                        .map(|snapshot| (message.header.timestamp, message.header.offset, snapshot))
-                });
-                if let Some((timestamp, offset, snapshot)) = found {
-                    let position = (timestamp, partition, offset);
-                    if newest.as_ref().is_none_or(|(best, _)| position > *best) {
-                        newest = Some((position, snapshot));
-                    }
-                    break;
-                }
-                end = start;
-            }
+        if bounded_partitions(details.partitions_count) == 0 {
+            return Ok(None);
         }
-        Ok(newest.map(|(_, snapshot)| snapshot))
+        // The server routes a message key to `xxhash32(key) % partitions`, so
+        // every snapshot `save` wrote for this conversation and fold sits here.
+        let partition =
+            iggy_common::calculate_32(snapshot_partition_key(conversation, &self.fold).as_bytes())
+                % details.partitions_count;
+        let tail = client
+            .poll_messages(
+                &stream,
+                &topic,
+                partition,
+                &consumer,
+                &PollingStrategy::last(),
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
+            )
+            .await?;
+        let Some(last) = tail.messages.last() else {
+            return Ok(None);
+        };
+        let mut end = last.header.offset.saturating_add(1);
+        // Walk backward in windows: newest window first, and within a window
+        // the highest matching offset wins, so the scan stops at the
+        // conversation's most recent checkpoint.
+        while end > 0 {
+            let start = end.saturating_sub(u64::from(SNAPSHOT_SCAN_BATCH));
+            let window = drain_partition(
+                &client,
+                &stream,
+                &topic,
+                &consumer,
+                DrainRange::until(partition, start, end - 1),
+                SNAPSHOT_SCAN_BATCH,
+            )
+            .await?;
+            let found = window.messages.iter().rev().find_map(|message| {
+                decode(&message.payload).ok().filter(|snapshot| {
+                    snapshot.conversation == conversation
+                        && snapshot.fold == self.fold
+                        && snapshot.stream == stream_name
+                })
+            });
+            if found.is_some() {
+                return Ok(found);
+            }
+            end = start;
+        }
+        Ok(None)
     }
 
     async fn save(&self, snapshot: &FoldSnapshot) -> Result<(), LaserError> {
         validate_store_identity(self.laser.stream_required()?, &self.fold, snapshot)?;
         let payload = encode(snapshot)?;
-        let partition_key = format!(
-            "{}:{}:{}",
-            snapshot.conversation,
-            snapshot.fold.len(),
-            snapshot.fold
-        );
+        let partition_key = snapshot_partition_key(snapshot.conversation, &snapshot.fold);
         self.laser
             .topic(&self.topic)
             .send(
@@ -262,6 +256,14 @@ fn snapshot_key(
     fold: &str,
 ) -> String {
     format!("{}:{stream}:{conversation}:{fold}", stream.len())
+}
+
+#[cfg(feature = "agent")]
+// The message key a topic snapshot is routed by. It pins one conversation and
+// fold to one partition, the only one `latest` reads.
+#[cfg(feature = "agent")]
+fn snapshot_partition_key(conversation: laser_wire::agent::ConversationId, fold: &str) -> String {
+    format!("{conversation}:{}:{fold}", fold.len())
 }
 
 #[cfg(feature = "agent")]

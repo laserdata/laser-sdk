@@ -1,7 +1,6 @@
 use crate::common::world::LaserWorld;
 use cucumber::{given, then, when};
 use laser_sdk::a2a::{A2aBridge, TaskState, enter_bridge};
-use laser_sdk::agui::AgUiEvent;
 use laser_sdk::mcp::McpBridge;
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{ConversationId as WireConversationId, CorrelationId, OPERATION_CHAT};
@@ -164,6 +163,59 @@ async fn reconstructed_count(world: &mut LaserWorld, count: u64) {
 
 #[when(regex = r#"^I stream chat chunks "([^"]+)" and "([^"]+)"$"#)]
 async fn stream_chat(world: &mut LaserWorld, first: String, second: String) {
+    stream_chat_chunks(world, vec![first, second]).await;
+}
+
+#[when(regex = r"^I stream (\d+) chat chunks$")]
+async fn stream_many_chat_chunks(world: &mut LaserWorld, count: usize) {
+    let chunks = (0..count).map(|index| format!("chunk {index} ")).collect();
+    stream_chat_chunks(world, chunks).await;
+}
+
+#[then("AG-UI renders the chat lifecycle in order")]
+async fn chat_lifecycle(world: &mut LaserWorld) {
+    assert_eq!(
+        world.agui_event_types,
+        [
+            "RUN_STARTED",
+            "TEXT_MESSAGE_START",
+            "TEXT_MESSAGE_CONTENT",
+            "TEXT_MESSAGE_CONTENT",
+            "TEXT_MESSAGE_END",
+            "RUN_FINISHED",
+        ]
+    );
+}
+
+#[then(regex = r"^AG-UI renders one run with (\d+) text contents from its opening chunk$")]
+async fn long_chat_lifecycle(world: &mut LaserWorld, count: usize) {
+    let types = &world.agui_event_types;
+    assert_eq!(
+        types.first().map(String::as_str),
+        Some("RUN_STARTED"),
+        "{types:?}"
+    );
+    assert_eq!(
+        types.get(1).map(String::as_str),
+        Some("TEXT_MESSAGE_START"),
+        "{types:?}"
+    );
+    assert_eq!(
+        types
+            .iter()
+            .filter(|kind| *kind == "TEXT_MESSAGE_CONTENT")
+            .count(),
+        count
+    );
+    assert_eq!(
+        &types[types.len().saturating_sub(2)..],
+        ["TEXT_MESSAGE_END", "RUN_FINISHED"]
+    );
+}
+
+// Streams `chunks` as one chat channel and keeps the AG-UI event types once
+// the rendered stream reaches its end.
+async fn stream_chat_chunks(world: &mut LaserWorld, chunks: Vec<String>) {
     let conversation = world.conversation();
     let mut stream = world
         .laser()
@@ -178,14 +230,12 @@ async fn stream_chat(world: &mut LaserWorld, first: String, second: String) {
             CorrelationId::from_u128(conversation.as_u128()),
             OPERATION_CHAT,
         );
-    stream
-        .write(first.into_bytes())
-        .await
-        .expect("first chunk writes");
-    stream
-        .write(second.into_bytes())
-        .await
-        .expect("second chunk writes");
+    for chunk in chunks {
+        stream
+            .write(chunk.into_bytes())
+            .await
+            .expect("chunk writes");
+    }
     stream.finish("stop", None).await.expect("terminal writes");
     for _ in 0..80 {
         let events = world
@@ -193,35 +243,22 @@ async fn stream_chat(world: &mut LaserWorld, first: String, second: String) {
             .agui_events(conversation, AgentTopic::Sessions)
             .await
             .expect("AG-UI events render");
-        if events.len() >= 4 {
-            world.agui_event_types = events
-                .iter()
-                .map(|event| match event {
-                    AgUiEvent::TextMessageStart { .. } => "TEXT_MESSAGE_START",
-                    AgUiEvent::TextMessageContent { .. } => "TEXT_MESSAGE_CONTENT",
-                    AgUiEvent::TextMessageEnd { .. } => "TEXT_MESSAGE_END",
-                    _ => "OTHER",
-                })
-                .map(str::to_owned)
-                .collect();
+        let types: Vec<String> = events
+            .iter()
+            .map(|event| {
+                serde_json::to_value(event).expect("an AG-UI event encodes")["type"]
+                    .as_str()
+                    .expect("an AG-UI event names its type")
+                    .to_owned()
+            })
+            .collect();
+        if types.iter().any(|kind| kind == "TEXT_MESSAGE_END") {
+            world.agui_event_types = types;
             return;
         }
         sleep(Duration::from_millis(25)).await;
     }
     panic!("chat events did not become visible");
-}
-
-#[then("AG-UI renders the chat lifecycle in order")]
-async fn chat_lifecycle(world: &mut LaserWorld) {
-    assert_eq!(
-        world.agui_event_types,
-        [
-            "TEXT_MESSAGE_START",
-            "TEXT_MESSAGE_CONTENT",
-            "TEXT_MESSAGE_CONTENT",
-            "TEXT_MESSAGE_END",
-        ]
-    );
 }
 
 // Answers every command with its own name and records what each command was:
@@ -262,20 +299,40 @@ fn agent_id(name: &str) -> laser_sdk::wire::agent::AgentId {
 #[given(regex = r#"^responders "([^"]+)" and "([^"]+)" answer every command with their own name$"#)]
 async fn responders(world: &mut LaserWorld, first: String, second: String) {
     for name in [first, second] {
-        let answered = Arc::new(Mutex::new(Vec::new()));
-        let mut handle = Agent::builder()
-            .id(name.parse().expect("a valid agent id"))
-            .listen_on(AgentTopic::Sessions)
-            .handler(Responder {
-                name: name.clone(),
-                answered: Arc::clone(&answered),
-            })
-            .build()
-            .spawn(world.laser().clone());
-        handle.ready().await.expect("the responder is ready");
-        world.responders.push(handle);
-        world.answered.insert(name, answered);
+        spawn_responder(world, name, None).await;
     }
+}
+
+#[given(regex = r#"^responder "([^"]+)" answers every command with its own name$"#)]
+async fn responder(world: &mut LaserWorld, name: String) {
+    spawn_responder(world, name, None).await;
+}
+
+// An input request reaches only an agent that lists its operation.
+#[given(regex = r#"^responder "([^"]+)" answers A2A tasks and input requests with its own name$"#)]
+async fn approving_responder(world: &mut LaserWorld, name: String) {
+    let operations = vec![
+        OPERATION_CHAT.to_owned(),
+        laser_sdk::wire::dispatch::OPERATION_INPUT_REQUEST.to_owned(),
+    ];
+    spawn_responder(world, name, Some(operations)).await;
+}
+
+async fn spawn_responder(world: &mut LaserWorld, name: String, operations: Option<Vec<String>>) {
+    let answered = Arc::new(Mutex::new(Vec::new()));
+    let mut handle = Agent::builder()
+        .id(name.parse().expect("a valid agent id"))
+        .listen_on(AgentTopic::Sessions)
+        .maybe_operations(operations)
+        .handler(Responder {
+            name: name.clone(),
+            answered: Arc::clone(&answered),
+        })
+        .build()
+        .spawn(world.laser().clone());
+    handle.ready().await.expect("the responder is ready");
+    world.responders.push(handle);
+    world.answered.insert(name, answered);
 }
 
 #[when(regex = r#"^I submit an A2A task to "([^"]+)"$"#)]
@@ -345,12 +402,54 @@ async fn task_completes_with(world: &mut LaserWorld, text: String) {
     for _ in 0..600 {
         let task = bridge.task(&id).await.expect("task lookup succeeds");
         if task.status.state == TaskState::Completed {
-            assert_eq!(task.artifacts[0].text, text);
+            assert_eq!(task.artifacts[0].parts[0].text, text);
             return;
         }
         sleep(Duration::from_millis(25)).await;
     }
     panic!("the addressed A2A task did not complete");
+}
+
+#[then("canceling the A2A task is refused")]
+async fn cancel_finished_task_is_refused(world: &mut LaserWorld) {
+    let bridge = A2aBridge::new(
+        world.laser().clone(),
+        agent_id("a2a-gateway"),
+        AgentTopic::Sessions,
+        AgentTopic::Sessions,
+    );
+    let id = world.bridge_task.clone().expect("a task was submitted");
+    assert!(matches!(
+        bridge.cancel(&id).await,
+        Err(LaserError::Rejected(_))
+    ));
+    let response = bridge
+        .handle_rpc(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "CancelTask", "params": {"id": id}}),
+        )
+        .await;
+    assert_eq!(response.error.map(|error| error.code), Some(-32002));
+}
+
+#[then("an A2A task that was never submitted is not found")]
+async fn unknown_task_is_not_found(world: &mut LaserWorld) {
+    let bridge = A2aBridge::new(
+        world.laser().clone(),
+        agent_id("a2a-gateway"),
+        AgentTopic::Sessions,
+        AgentTopic::Sessions,
+    );
+    let unknown = ConversationId::new().to_string();
+    assert!(matches!(
+        bridge.task(&unknown).await,
+        Err(LaserError::HandlerConfig(_))
+    ));
+    let response = bridge
+        .handle_rpc(
+            json!({"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": unknown}}),
+        )
+        .await;
+    assert_eq!(response.error.map(|error| error.code), Some(-32001));
 }
 
 #[then(regex = r#"^the MCP tool result is "([^"]+)"$"#)]
