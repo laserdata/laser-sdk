@@ -25,7 +25,8 @@ import {
   graphReturnIsNodes,
   graphNodeEntity,
   NodeId,
-  validateGraphName
+  validateGraphName,
+  validateGraphUpsert
 } from "../../src/wire/graph.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 
@@ -202,6 +203,25 @@ void test("given_the_graph_reply_fixture_when_decoded_then_should_preserve_nodes
   assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
 })
 
+void test("given_a_truncated_graph_reply_when_round_tripped_then_should_keep_the_flag", () => {
+  const truncated = encodeGraphReplyFrame({
+    kind: "ok",
+    result: { nodes: [], edges: [], paths: [], truncated: true }
+  })
+  const decoded = decodeGraphReply(decodeOne(truncated, "graph_reply"), "graph_reply")
+  if (decoded.kind !== "ok") throw new Error("wrong shape")
+  assert.equal(decoded.result.truncated, true)
+  const complete = decodeGraphReply(
+    decodeOne(
+      encodeGraphReplyFrame({ kind: "ok", result: { nodes: [], edges: [], paths: [] } }),
+      "graph_reply"
+    ),
+    "graph_reply"
+  )
+  if (complete.kind !== "ok") throw new Error("wrong shape")
+  assert.equal(complete.result.truncated, undefined)
+})
+
 void test("given_the_graph_upsert_fixture_when_decoded_then_should_re_encode_byte_identically", async () => {
   const bytes = await readFixture("graph_upsert.bin")
   const map = expectMap(decodeOne(bytes, "graph_upsert"), "graph_upsert")
@@ -252,7 +272,6 @@ void test("given_the_graph_query_fixture_when_decoded_then_should_preserve_the_t
   assert.deepEqual(query.traverse, [{ edgeType: "works_at", dir: "out", max: 2 }])
   assert.equal(query.return, "paths")
   assert.equal(query.limit, 100)
-  assert.equal(query.consistency, "eventual")
   assert.equal(query.asOf, 1500n)
   assert.deepEqual(Buffer.from(encodeGraphQueryFrame(query)), Buffer.from(bytes))
 })
@@ -268,12 +287,12 @@ void test("given_a_conversation_graph_query_when_decoded_then_should_preserve_th
 
 void test("given_a_whole_number_nearest_embedding_when_encoded_then_should_keep_float_major_types", () => {
   const bytes = encodeGraphQueryFrame({
+    v: 1,
     graph: "knowledge",
     start: { kind: "nearest", embedding: [1, 2], k: 5 },
     traverse: [],
     return: "nodes",
-    limit: 10,
-    consistency: "eventual"
+    limit: 10
   })
   const query = decodeGraphQuery(
     expectMap(decodeOne(bytes, "nearest_graph_query"), "nearest_graph_query"),
@@ -300,4 +319,32 @@ void test("given_an_edge_id_when_round_tripped_through_a_string_then_should_be_e
   const id = EdgeId.fromU128(987_654_321n)
   const parsed = EdgeId.parse(id.toString())
   assert.equal(parsed.equals(id), true)
+})
+
+void test("given_a_graph_upsert_when_validated_then_should_apply_the_rust_rules", () => {
+  const node = graphNodeEntity("service", "checkout")
+  const message = (conversation: string) => ({
+    kind: "message" as const,
+    stream: 1,
+    topic: 2,
+    partition: 0,
+    offset: 3n,
+    conversation
+  })
+  const upsert = (nodes: (typeof node)[]) => ({ graph: "kg", nodes, edges: [] })
+  assert.doesNotThrow(() => {
+    validateGraphUpsert(upsert([{ ...node, source: message("01KWM3K3XEP3NP5TN850J17YBP") }]))
+  })
+  for (const invalid of [
+    { ...upsert([node]), graph: "" },
+    upsert([{ ...node, source: message("01KWM3K3\0") }]),
+    upsert([{ ...node, labels: Array.from({ length: 17 }, () => "label") }]),
+    upsert([{ ...node, attrs: [["k".repeat(257), { kind: "str" as const, value: "v" }]] }]),
+    upsert([{ ...node, source: { kind: "memory" as const, id: "m".repeat(2049) } }]),
+    upsert(Array.from({ length: 10_001 }, () => node))
+  ]) {
+    assert.throws(() => {
+      validateGraphUpsert(invalid)
+    })
+  }
 })

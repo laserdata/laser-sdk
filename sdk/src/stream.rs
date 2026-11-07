@@ -117,7 +117,7 @@ impl Topic {
     /// `.record()`, then `.send()`). The raw payload path compiles to the same
     /// bytes as the low-level send, nothing is linked unless a typed form is
     /// used. Feature `streaming`.
-    pub fn publish(&self) -> PublishRequest<'_> {
+    pub fn publish(&self) -> PublishRequest<'static> {
         match &self.stream {
             Some(stream) => self.laser.publish_on(stream, &self.name),
             None => self.laser.publish(&self.name),
@@ -126,7 +126,7 @@ impl Topic {
 
     /// Open the fluent record-batch builder (add records, then `.send()`), the
     /// typed sibling of [`batch`](Self::batch). Feature `streaming`.
-    pub fn publish_batch(&self) -> BatchPublishRequest<'_> {
+    pub fn publish_batch(&self) -> BatchPublishRequest {
         match &self.stream {
             Some(stream) => self.laser.publish_batch_on(stream, &self.name),
             None => self.laser.publish_batch(&self.name),
@@ -143,8 +143,15 @@ impl Topic {
         partition_key: Option<&str>,
     ) -> Result<SendMessagesResponse, LaserError> {
         let stream = self.stream()?.to_owned();
+        let payload: Vec<u8> = payload.into();
+        #[cfg(feature = "agent")]
+        let payload = self
+            .laser
+            .govern_publish(&stream, &self.name, &payload, Some(&headers))
+            .await?
+            .unwrap_or(payload);
         self.laser
-            .send_with_headers_on(&stream, &self.name, payload.into(), headers, partition_key)
+            .send_with_headers_on(&stream, &self.name, payload, headers, partition_key)
             .await
     }
 
@@ -152,10 +159,14 @@ impl Topic {
     /// sharing the same partitioning. An empty batch is a cheap no-op.
     pub async fn batch(
         &self,
-        messages: Vec<IggyMessage>,
+        #[cfg_attr(not(feature = "agent"), allow(unused_mut))] mut messages: Vec<IggyMessage>,
         partition_key: Option<&str>,
     ) -> Result<SendMessagesResponse, LaserError> {
         let stream = self.stream()?.to_owned();
+        #[cfg(feature = "agent")]
+        self.laser
+            .govern_messages(&stream, &self.name, &mut messages)
+            .await?;
         self.laser
             .send_batch_on(&stream, &self.name, messages, partition_key)
             .await
@@ -164,8 +175,7 @@ impl Topic {
     /// A size-and-time batching publisher over this topic: `.batching()`,
     /// tune `.max_records`/`.max_bytes`/`.linger`/`.partition_key`, then
     /// `.build()`. Opt-in: the unbatched verbs compile to exactly the same
-    /// calls as before. Feature `agent` (the linger timer rides tokio).
-    #[cfg(feature = "agent")]
+    /// calls as before.
     pub fn batching(&self) -> Result<crate::batching::BatchingProducerBuilder, LaserError> {
         let stream = self.stream()?.to_owned();
         Ok(crate::batching::BatchingProducerBuilder::new(

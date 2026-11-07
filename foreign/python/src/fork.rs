@@ -1,4 +1,4 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::convert::{payload_bytes, ser_to_py};
 use crate::errors::to_pyerr;
@@ -20,9 +20,9 @@ impl PyLaser {
     }
 
     /// Every open fork for the authenticated user, as a list of dicts.
-    fn forks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn forks<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let forks = laser.forks().await.map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &forks))
         })
@@ -65,7 +65,7 @@ impl PyForkHandle {
         continuous: bool,
         parent: Option<String>,
         tables: Option<Vec<String>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         if severed && continuous {
             return Err(crate::errors::InvalidError::new_err(
                 "a fork is either severed or continuous, not both",
@@ -73,7 +73,7 @@ impl PyForkHandle {
         }
         let laser = self.laser.clone();
         let fork_id = self.id.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let handle = laser.fork(fork_id);
             let mut request = handle.create();
             if severed {
@@ -94,19 +94,19 @@ impl PyForkHandle {
     }
 
     /// Promote this fork onto the trunk, then squash it. Returns rows applied.
-    fn promote<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn promote<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, usize>> {
         let laser = self.laser.clone();
         let fork_id = self.id.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser.fork(fork_id).promote().await.map_err(to_pyerr)
         })
     }
 
     /// Squash this fork (discard speculative rows). Returns whether one existed.
-    fn squash<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn squash<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, bool>> {
         let laser = self.laser.clone();
         let fork_id = self.id.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser.fork(fork_id).squash().await.map_err(to_pyerr)
         })
     }
@@ -182,6 +182,7 @@ impl PyForkPut {
     /// Attach an opaque payload body (str, bytes, or bytearray).
     fn payload<'py>(
         mut slf: PyRefMut<'py, Self>,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
         payload: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.payload = Some(payload_bytes(payload)?);
@@ -201,7 +202,7 @@ impl PyForkPut {
     }
 
     /// Write the speculative row.
-    fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn send<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
         let fork_id = self.fork_id.clone();
         let table = self.table.clone();
@@ -213,7 +214,7 @@ impl PyForkPut {
         let payload = self.payload.clone();
         let embedding = self.embedding.clone();
         let tombstone = self.tombstone;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let handle = laser.fork(fork_id);
             let mut request = handle.put_row(table, partition_id, offset);
             if let Some((id, version)) = projection {

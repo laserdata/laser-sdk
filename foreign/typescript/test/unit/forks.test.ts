@@ -9,7 +9,7 @@ import {
   UnsupportedError
 } from "../../src/client/errors.js"
 import { ForkHandle } from "../../src/managed/forks.js"
-import { encodeNamed } from "../../src/wire/cbor.js"
+import { type CborMap, decodeOne, encodeNamed, encodeOne } from "../../src/wire/cbor.js"
 import {
   ForkCreateCommand,
   ForkDeleteCommand,
@@ -21,6 +21,8 @@ import {
   type ForkInfo,
   type ForkOutcome,
   type ForkReply,
+  decodeForkInfo,
+  encodeForkInfo,
   encodeForkReply
 } from "../../src/wire/fork.js"
 
@@ -71,7 +73,7 @@ const INFO: ForkInfo = {
   userId: 7,
   status: "open",
   createdAtMicros: 1n,
-  rowCount: 0
+  rowCount: 0n
 }
 
 void test("given_open_capabilities_when_create_is_sent_then_should_reject_before_the_transport", async () => {
@@ -137,4 +139,12 @@ void test("given_an_err_reply_when_promote_fails_then_should_wrap_it_as_a_fork_e
 void test("given_an_unexpected_fork_outcome_when_promoted_then_should_raise_a_protocol_error", async () => {
   const { fork: handle } = fork("f-1", [okFrame({ kind: "written" })])
   await assert.rejects(handle.promote(), ProtocolError)
+})
+
+void test("given_a_fork_with_more_rows_than_u32_holds_when_decoded_then_should_keep_the_exact_count", () => {
+  const rows = (1n << 40n) + 3n
+  const map = encodeForkInfo(INFO)
+  map.set("row_count", rows)
+  const decoded = decodeForkInfo(decodeOne(encodeOne(map), "fork info") as CborMap, "fork info")
+  assert.equal(decoded.rowCount, rows)
 })

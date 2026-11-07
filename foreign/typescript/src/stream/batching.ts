@@ -1,4 +1,5 @@
 import { type BytesLike, ownedBytes } from "../client/bytes.js"
+import { type CallOptions, abortable, cancellable, throwIfAborted } from "../client/call-options.js"
 import { InvalidError, PublishFailedError } from "../client/errors.js"
 import type { MessageWithHeaders } from "../iggy/apache-iggy.js"
 import type { HeaderValue } from "./header-value.js"
@@ -15,7 +16,8 @@ export const MIN_LINGER_MS = 1
 /** Appends one flushed batch under the handle's partitioning. */
 export type BatchSink = (
   records: readonly MessageWithHeaders[],
-  partitionKey: Uint8Array | undefined
+  partitionKey: Uint8Array | undefined,
+  options: CallOptions
 ) => Promise<unknown>
 
 /**
@@ -90,7 +92,8 @@ export class BatchingProducerBuilder {
  * timer.
  *
  * A failed linger flush never stops the timer. Its failure is kept and thrown
- * by the next `send()`, `flush()`, or `close()`. When several batches fail
+ * by the next `send()`, `flush()`, or `close()`, and so is the failure of a
+ * flush whose `send()` or `flush()` was aborted. When several batches fail
  * before the caller asks, the report is one `PublishFailedError` that lists
  * the records of all of them.
  */
@@ -136,13 +139,15 @@ export class BatchingProducer implements AsyncDisposable {
    * grows the queue. */
   async send(
     payload: BytesLike,
-    headers: ReadonlyMap<string, HeaderValue> = new Map()
+    headers: ReadonlyMap<string, HeaderValue> = new Map(),
+    options: CallOptions = {}
   ): Promise<void> {
     if (this.closed) throw new InvalidError("send() called after close()")
+    throwIfAborted(options.signal, "batching send")
     const bytes = ownedBytes(payload)
     const record = { payload: bytes, headers: new Map(headers) }
     // A flush in flight may still keep a failure, so the check waits for it.
-    await this.flushing
+    await abortable(this.flushing, options.signal, "batching send")
     const kept = this.failure
     if (kept !== undefined) {
       this.failure = undefined
@@ -151,37 +156,41 @@ export class BatchingProducer implements AsyncDisposable {
     this.queue.push(record)
     this.payloadBytes += bytes.byteLength
     if (this.queue.length >= this.maxRecords || this.payloadBytes >= this.maxBytes) {
-      await this.drain("send")
+      await abortable(this.drain("send", options.signal), options.signal, "batching send")
     }
   }
 
   /** Flushes everything queued as one batch append, then reports the failure
    * an earlier linger flush left, if any. A no-op on an empty queue. */
-  flush(): Promise<void> {
-    return this.drain("caller")
+  flush(options: CallOptions = {}): Promise<void> {
+    return cancellable(options.signal, "batching flush", () => this.drain("caller", options.signal))
   }
 
   // Drains run one at a time, so batches reach the log in queue order. A
   // sender hears its own inline flush. The timer keeps a failure. The caller
-  // hears everything kept so far together with its own flush.
-  private drain(trigger: "send" | "timer" | "caller"): Promise<void> {
+  // hears everything kept so far together with its own flush. A drain whose
+  // caller aborted sends no retry and keeps its failure like the timer.
+  private drain(trigger: "send" | "timer" | "caller", signal?: AbortSignal): Promise<void> {
     const next = this.flushing.then(async () => {
+      // Aborted before its turn, the drain leaves the queue to the next one.
+      throwIfAborted(signal, "batching flush")
       const batch = this.queue
       this.queue = []
       this.payloadBytes = 0
       let sent: { readonly error: unknown } | undefined
       if (batch.length > 0) {
         try {
-          await this.sink(batch, this.partitionKey)
+          await this.sink(batch, this.partitionKey, { signal })
         } catch (error) {
           sent = { error }
         }
       }
-      if (trigger === "send") {
+      const reportTo = signal?.aborted === true ? "timer" : trigger
+      if (reportTo === "send") {
         if (sent !== undefined) throw sent.error
         return
       }
-      if (trigger === "timer") {
+      if (reportTo === "timer") {
         if (sent !== undefined) {
           this.failure =
             this.failure === undefined

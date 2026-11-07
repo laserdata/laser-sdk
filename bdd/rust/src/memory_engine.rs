@@ -6,7 +6,8 @@
 // Python ports agree on it byte for byte.
 
 use laser_sdk::memory::{MemoryId, MemoryKind, MemoryScope};
-use std::collections::{HashMap, HashSet};
+use laser_sdk::types::ConversationId;
+use std::collections::HashMap;
 
 struct Entry {
     id: MemoryId,
@@ -19,7 +20,6 @@ struct Entry {
 pub struct MemoryEngine {
     owner: MemoryScope,
     items: Vec<Entry>,
-    forgotten: HashSet<MemoryId>,
     feedback: HashMap<MemoryId, f32>,
     counter: u128,
 }
@@ -37,8 +37,22 @@ impl MemoryEngine {
     /// body is stored once and returns the existing id. Without it, each call is
     /// a distinct item.
     pub fn remember(&mut self, kind: MemoryKind, body: &[u8], dedup: bool) -> MemoryId {
+        self.remember_in(kind, body, dedup, None)
+    }
+
+    /// [`remember`](Self::remember) in `conversation`, which is part of the
+    /// content-addressed id, so the same body in two conversations is two items.
+    pub fn remember_in(
+        &mut self,
+        kind: MemoryKind,
+        body: &[u8],
+        dedup: bool,
+        conversation: Option<ConversationId>,
+    ) -> MemoryId {
+        let mut owner = self.owner.clone();
+        owner.conversation = conversation;
         let id = if dedup {
-            let id = MemoryId::content(&self.owner, kind, body);
+            let id = MemoryId::content(&owner, kind, body);
             if self.items.iter().any(|entry| entry.id == id) {
                 return id;
             }
@@ -48,7 +62,7 @@ impl MemoryEngine {
             self.counter += 1;
             let mut seed = body.to_vec();
             seed.extend_from_slice(&self.counter.to_be_bytes());
-            MemoryId::content(&self.owner, kind, &seed)
+            MemoryId::content(&owner, kind, &seed)
         };
         self.items.push(Entry {
             id,
@@ -57,12 +71,9 @@ impl MemoryEngine {
         id
     }
 
-    /// The number of live (not forgotten) items.
+    /// The number of live items.
     pub fn len(&self) -> usize {
-        self.items
-            .iter()
-            .filter(|entry| !self.forgotten.contains(&entry.id))
-            .count()
+        self.items.len()
     }
 
     /// Whether the store holds no live items.
@@ -75,20 +86,17 @@ impl MemoryEngine {
         *self.feedback.entry(target).or_insert(0.0) += weight;
     }
 
-    /// Forget `id`, removing it from recall.
+    /// Forget `id`, removing it from recall. Remembering it again later
+    /// brings it back, as a write after a tombstone does.
     pub fn forget(&mut self, id: MemoryId) {
-        self.forgotten.insert(id);
+        self.items.retain(|entry| entry.id != id);
     }
 
     /// Recall up to `limit` items. With feedback present, items rank by weight
     /// (promoted first). Otherwise the most recent come first. Returns the bodies
     /// as text, the form the scenarios assert against.
     pub fn recall(&self, limit: usize) -> Vec<String> {
-        let mut live: Vec<&Entry> = self
-            .items
-            .iter()
-            .filter(|entry| !self.forgotten.contains(&entry.id))
-            .collect();
+        let mut live: Vec<&Entry> = self.items.iter().collect();
         if self.feedback.is_empty() {
             live.reverse();
         } else {
@@ -124,6 +132,31 @@ mod tests {
         let second = engine.remember(MemoryKind::Fact, b"the budget is 5000", true);
         assert_eq!(first, second, "dedup yields the same id");
         assert_eq!(engine.len(), 1);
+    }
+
+    #[test]
+    fn given_the_same_body_in_two_conversations_when_remembered_with_dedup_then_should_hold_two_items()
+     {
+        let mut engine = store();
+        let first = ConversationId::derive("first");
+        engine.remember_in(MemoryKind::Fact, b"x", true, Some(first));
+        engine.remember_in(
+            MemoryKind::Fact,
+            b"x",
+            true,
+            Some(ConversationId::derive("second")),
+        );
+        engine.remember_in(MemoryKind::Fact, b"x", true, Some(first));
+        assert_eq!(engine.len(), 2);
+    }
+
+    #[test]
+    fn given_a_forgotten_item_when_remembered_again_then_should_be_recalled() {
+        let mut engine = store();
+        let id = engine.remember(MemoryKind::Fact, b"x", true);
+        engine.forget(id);
+        engine.remember(MemoryKind::Fact, b"x", true);
+        assert_eq!(engine.recall(1), vec!["x"]);
     }
 
     #[test]

@@ -13,101 +13,6 @@ from dataclasses import dataclass, field
 MAX_PAGE_SIZE = 1000
 
 
-class DataStackModel:
-    """Deterministic destination revision and bounded query lifecycle model."""
-
-    def __init__(self):
-        self.global_revision = 0
-        self.destinations = {}
-        self.operation = None
-        self.error = None
-        self.query_rows = []
-        self.query_cursor = 0
-        self.query_cancelled = False
-        self.query_page = None
-
-    def register(self, name, expected_global_revision):
-        if not self._require_global(expected_global_revision):
-            return
-        self.global_revision += 1
-        self.destinations[name] = {
-            "definition_revision": 1,
-            "checkpoint_revision": 0,
-            "effective_state": "disabled",
-            "next_offset": 0,
-            "retained_offset": 0,
-        }
-        self.operation = {"id": f"operation-{self.global_revision}"}
-
-    def enable(self, name, expected_global_revision, expected_definition_revision):
-        if not self._require_global(expected_global_revision):
-            return
-        destination = self.destinations.get(name)
-        if destination is None:
-            self.error = {"kind": "not_found"}
-            return
-        if destination["definition_revision"] != expected_definition_revision:
-            self.error = {"kind": "conflict", "observed_revision": self.global_revision}
-            return
-        self.global_revision += 1
-        destination["definition_revision"] += 1
-        destination["checkpoint_revision"] += 1
-        destination["effective_state"] = "running"
-        self.operation = {"id": f"operation-{self.global_revision}"}
-
-    def record_gap(self, name, required_offset, retained_offset):
-        destination = self.destinations[name]
-        # A gap means the log no longer holds the offset the destination needs.
-        if retained_offset <= required_offset:
-            self.error = {"kind": "invalid"}
-            return
-        destination["retained_offset"] = retained_offset
-        self.global_revision += 1
-        destination["checkpoint_revision"] += 1
-        destination["effective_state"] = "blocked"
-
-    def accept_gap(self, name, next_offset, expected_checkpoint_revision):
-        destination = self.destinations[name]
-        if destination["checkpoint_revision"] != expected_checkpoint_revision:
-            self.error = {"kind": "conflict", "observed_revision": self.global_revision}
-            return
-        # Accepting a gap resumes where the log still has records.
-        if next_offset < destination["retained_offset"]:
-            self.error = {"kind": "invalid"}
-            return
-        self.global_revision += 1
-        destination["checkpoint_revision"] += 1
-        destination["effective_state"] = "running"
-        destination["next_offset"] = next_offset
-
-    def seed_query(self, rows):
-        self.query_rows = list(rows)
-        self.query_cursor = 0
-        self.query_cancelled = False
-
-    def read_page(self, limit):
-        if self.query_cancelled:
-            self.error = {"kind": "cancelled"}
-            return
-        start = self.query_cursor
-        end = min(start + limit, len(self.query_rows))
-        self.query_cursor = end
-        self.query_page = {
-            "rows": self.query_rows[start:end],
-            "cursor": end if end < len(self.query_rows) else None,
-        }
-
-    def cancel_query(self):
-        self.query_cancelled = True
-
-    def _require_global(self, expected):
-        if self.global_revision == expected:
-            self.error = None
-            return True
-        self.error = {"kind": "conflict", "observed_revision": self.global_revision}
-        return False
-
-
 def _as_number(text):
     try:
         return float(text)
@@ -301,10 +206,10 @@ def _crockford(value):
     return "".join(out)
 
 
-def memory_content_id(agent, kind_code, body):
+def memory_content_id(agent, kind_code, body, conversation=""):
     """The content-addressed memory id for an owner and body, byte-for-byte the
     Rust `MemoryId::content`. Stream, user, and application are unset in these
-    scenarios."""
+    scenarios, and `conversation` is the canonical conversation id or empty."""
     seed = bytearray()
     seed.append(0)  # empty stream segment
     if agent:
@@ -312,6 +217,8 @@ def memory_content_id(agent, kind_code, body):
     seed.append(0)
     seed.append(0)  # empty user segment
     seed.append(0)  # empty application segment
+    seed += conversation.encode()
+    seed.append(0)
     seed.append(kind_code)
     seed += body
     seed = bytes(seed)
@@ -326,33 +233,34 @@ class MemoryEngine:
 
     agent: str = "agent"
     items: list = field(default_factory=list)
-    forgotten: set = field(default_factory=set)
     feedback: dict = field(default_factory=dict)
     counter: int = 0
 
-    def remember(self, body, dedup):
+    def remember(self, body, dedup, conversation=""):
         if dedup:
-            mid = memory_content_id(self.agent, 1, body)
+            mid = memory_content_id(self.agent, 1, body, conversation)
             if any(item_id == mid for item_id, _ in self.items):
                 return mid
         else:
             self.counter += 1
             salted = body + self.counter.to_bytes(16, "big")
-            mid = memory_content_id(self.agent, 1, salted)
+            mid = memory_content_id(self.agent, 1, salted, conversation)
         self.items.append((mid, body))
         return mid
 
     def live_len(self):
-        return sum(1 for item_id, _ in self.items if item_id not in self.forgotten)
+        return len(self.items)
 
     def improve(self, target, weight):
         self.feedback[target] = self.feedback.get(target, 0.0) + weight
 
     def forget(self, mid):
-        self.forgotten.add(mid)
+        # Remembering it again later brings it back, as a write after a
+        # tombstone does.
+        self.items = [item for item in self.items if item[0] != mid]
 
     def recall(self, limit):
-        live = [item for item in self.items if item[0] not in self.forgotten]
+        live = list(self.items)
         live.reverse()
         if self.feedback:
             live.sort(key=lambda item: self.feedback.get(item[0], 0.0), reverse=True)

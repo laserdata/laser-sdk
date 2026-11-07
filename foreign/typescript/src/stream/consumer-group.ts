@@ -1,7 +1,15 @@
 import type { ResourceScope } from "../client/resource-scope.js"
+import {
+  type CallOptions,
+  abortable,
+  cancellable,
+  delay,
+  throwIfAborted
+} from "../client/call-options.js"
 import type { Capabilities } from "../client/capabilities.js"
 import { isStreamOrTopicNotFound, isUnavailable } from "../client/error-classify.js"
 import {
+  CancelledError,
   ConsumerGroupSetupError,
   FilterExecutionError,
   InvalidError,
@@ -14,6 +22,7 @@ import {
   FilteredReaderBuilder,
   Filters,
   nativeGroup,
+  policyAware,
   sameGroupIdentity,
   type FilterPreviewOptions,
   type FilterTransport,
@@ -30,7 +39,6 @@ import {
   type FilterPreview,
   type FilterRef,
   type FilterRevisionPage,
-  type FilterRevisionRef,
   type FilterSummary,
   type FilterTestResult,
   type GroupFilterSpec,
@@ -42,6 +50,7 @@ import {
   type ConsumerOptions,
   type PollFailures
 } from "./consumer.js"
+import { MAX_FILTERED_PAGE_BYTES } from "../wire/limits.js"
 import { joinSeeds, storeSeeds } from "./consumer-start.js"
 import type { Topic } from "./topic.js"
 
@@ -82,7 +91,7 @@ export interface CreateConsumerGroupOptions {
    * registered filter name rule and need not be unique.
    */
   readonly filterName?: string
-  /** Configure the group with a definition or one of its own revisions. */
+  /** Configure the group with this definition once it exists. */
   readonly policy?: GroupFilterSpec
   /**
    * The idempotency key of the policy configuration. Record it first to
@@ -153,7 +162,9 @@ export class ConsumerGroup {
    * `ConsumerGroupSetupError` whose cause has filter reason `conflict`, and
    * the group is left as it is.
    */
-  async create(options: CreateConsumerGroupOptions = {}): Promise<ConsumerGroupInfo> {
+  async create(options: CreateConsumerGroupOptions & CallOptions = {}): Promise<ConsumerGroupInfo> {
+    const signal = options.signal
+    throwIfAborted(signal, "consumer group create")
     if (this.target.kind !== "name") {
       throw new InvalidError(
         "a consumer group is created by name, address it with consumerGroup(name)"
@@ -176,17 +187,24 @@ export class ConsumerGroup {
         group: { stream: this.streamName, topic: this.topicName, group: this.target.name },
         policy
       })
-      await this.filters().requireCatalog()
+      await abortable(this.filters().requireCatalog(), signal, "consumer group create")
     }
-    await this.transport.ensureConsumerGroup(this.streamName, this.topicName, this.target.name)
-    const native = await this.native()
-    if (policy === undefined) return this.described(native)
+    await abortable(
+      this.transport.ensureConsumerGroup(this.streamName, this.topicName, this.target.name),
+      signal,
+      "consumer group create"
+    )
+    const native = await abortable(this.native(), signal, "consumer group create")
+    if (policy === undefined) return this.described(native, options)
     try {
-      const configured = await this.filters().configureGroup(
-        { stream: this.streamName, topic: this.topicName, group: native.name },
-        policy,
-        options.operationId,
-        native.identity
+      const configured = await cancellable(signal, "consumer group create", () =>
+        this.filters().configureGroup(
+          { stream: this.streamName, topic: this.topicName, group: native.name },
+          policy,
+          options.operationId,
+          native.identity,
+          signal === undefined ? {} : { signal }
+        )
       )
       requireSameGroup(native.identity, configured.binding.identity)
       this.remember(configured.catalogPosition)
@@ -197,18 +215,23 @@ export class ConsumerGroup {
         filter: configured.binding
       }
     } catch (cause) {
+      if (cause instanceof CancelledError) throw cause
       throw new ConsumerGroupSetupError(native.id, native.name, native.identity, cause)
     }
   }
 
   /** The group as the server knows it: its id, exact identity and active policy. */
-  async info(): Promise<ConsumerGroupInfo> {
-    return this.described(await this.native())
+  async info(options: CallOptions = {}): Promise<ConsumerGroupInfo> {
+    throwIfAborted(options.signal, "consumer group info")
+    return this.described(
+      await abortable(this.native(), options.signal, "consumer group info"),
+      options
+    )
   }
 
   /**
-   * The group's filter policy: configure it, inspect it, draft and pause
-   * revisions, release it, preview and sample-test it.
+   * The group's filter policy: configure it, inspect it, pause and resume
+   * it, release it, preview and sample-test it.
    */
   filter(): GroupFilter {
     return GroupFilter.create({
@@ -232,7 +255,9 @@ export class ConsumerGroup {
    * server is probed again, and a probe that still established nothing is a
    * retryable `TimeoutError`, never a native read.
    */
-  async consumer(options: ConsumerOptions = {}): Promise<Consumer> {
+  async consumer(options: ConsumerOptions & CallOptions = {}): Promise<Consumer> {
+    const signal = options.signal
+    throwIfAborted(signal, "group consumer")
     const context = this.context
     if (context === undefined) {
       throw new UnsupportedError(
@@ -240,37 +265,48 @@ export class ConsumerGroup {
         { surface: "filters" }
       )
     }
-    let capabilities = await context.capabilities()
+    let capabilities = await abortable(context.capabilities(), signal, "group consumer")
     if (capabilities.hello === "unknown" && context.refreshCapabilities !== undefined) {
-      capabilities = await context.refreshCapabilities()
+      capabilities = await abortable(context.refreshCapabilities(), signal, "group consumer")
     }
     if (!policyAware(capabilities)) {
       return this[INTERNAL_NATIVE_CONSUMER](options)
     }
     const resolved = resolveConsumerOptions(options, false)
     if (this.target.kind === "name" && resolved.createGroup) {
-      await this.transport.ensureConsumerGroup(this.streamName, this.topicName, this.target.name)
+      await abortable(
+        this.transport.ensureConsumerGroup(this.streamName, this.topicName, this.target.name),
+        signal,
+        "group consumer"
+      )
     }
-    const name = this.target.kind === "name" ? this.target.name : (await this.native()).name
-    const seeds = await joinSeeds(
-      this.transport,
-      this.streamName,
-      this.topicName,
-      name,
-      resolved.startAt
+    const name =
+      this.target.kind === "name"
+        ? this.target.name
+        : (await abortable(this.native(), signal, "group consumer")).name
+    const seeds = await abortable(
+      joinSeeds(this.transport, this.streamName, this.topicName, name, resolved.startAt),
+      signal,
+      "group consumer"
     )
     const builder = this.readerWith({ kind: "group" })
       .seedStart(name, seeds)
       .count(resolved.batchLength)
       .maxExamined(resolved.batchLength)
+      .maxReplyBytes(Math.min(resolved.maxBytes, MAX_FILTERED_PAGE_BYTES))
       .maxWait(resolved.maxWaitMs)
-    const reader = await withInitRetries(
-      resolved.initRetries,
-      (error) => isUnavailable(error) || error instanceof TimeoutError,
-      () => builder.build()
+    const reader = await abortableAcquire(
+      withInitRetries(
+        resolved.initRetries,
+        (error) => isUnavailable(error) || error instanceof TimeoutError,
+        () => builder.build(options),
+        signal
+      ),
+      signal,
+      (built) => built.close()
     )
     try {
-      await reader.storeOwnedSeeds()
+      await abortable(reader.storeOwnedSeeds(), signal, "group consumer")
     } catch (error) {
       await reader.close().catch(() => undefined)
       throw error
@@ -301,33 +337,45 @@ export class ConsumerGroup {
    * @internal
    */
   async [INTERNAL_NATIVE_CONSUMER](
-    options: ConsumerOptions = {},
+    options: ConsumerOptions & CallOptions = {},
     pollFailures: PollFailures = "retry"
   ): Promise<Consumer> {
+    const signal = options.signal
+    throwIfAborted(signal, "group consumer")
     const resolved = resolveConsumerOptions(options, false)
-    const name = this.target.kind === "name" ? this.target.name : (await this.native()).name
-    await withInitRetries(resolved.initRetries, isStreamOrTopicNotFound, async () => {
-      if (resolved.createGroup) {
-        await this.transport.joinConsumerGroup(this.streamName, this.topicName, name)
-        return
-      }
-      if (this.transport.joinExistingConsumerGroup === undefined) {
-        throw new UnsupportedError("this transport cannot join a group without creating it", {
-          surface: "stream"
-        })
-      }
-      await this.transport.joinExistingConsumerGroup(this.streamName, this.topicName, name)
-    })
+    const name =
+      this.target.kind === "name"
+        ? this.target.name
+        : (await abortable(this.native(), signal, "group consumer")).name
+    await abortableAcquire(
+      withInitRetries(
+        resolved.initRetries,
+        isStreamOrTopicNotFound,
+        async () => {
+          if (resolved.createGroup) {
+            await this.transport.joinConsumerGroup(this.streamName, this.topicName, name)
+            return
+          }
+          if (this.transport.joinExistingConsumerGroup === undefined) {
+            throw new UnsupportedError("this transport cannot join a group without creating it", {
+              surface: "stream"
+            })
+          }
+          await this.transport.joinExistingConsumerGroup(this.streamName, this.topicName, name)
+        },
+        signal
+      ),
+      signal,
+      () => this.transport.leaveConsumerGroup(this.streamName, this.topicName, name)
+    )
     let seeds: Map<number, bigint>
     try {
-      seeds = await joinSeeds(
-        this.transport,
-        this.streamName,
-        this.topicName,
-        name,
-        resolved.startAt
+      seeds = await abortable(
+        joinSeeds(this.transport, this.streamName, this.topicName, name, resolved.startAt),
+        signal,
+        "group consumer"
       )
-      await this.storeHeldSeeds(name, seeds)
+      await abortable(this.storeHeldSeeds(name, seeds), signal, "group consumer")
     } catch (error) {
       await this.transport
         .leaveConsumerGroup(this.streamName, this.topicName, name)
@@ -382,11 +430,7 @@ export class ConsumerGroup {
   private remember(position: CatalogPosition | undefined): void {
     if (position === undefined) return
     const known = this.configuredAt
-    if (
-      known?.partitionId !== position.partitionId ||
-      known.offset < position.offset ||
-      (position.operationId !== undefined && known.operationId !== position.operationId)
-    ) {
+    if (known === undefined || supersedesPosition(known, position)) {
       this.configuredAt = position
     }
   }
@@ -434,9 +478,13 @@ export class ConsumerGroup {
     )
   }
 
-  private async described(native: NativeGroup): Promise<ConsumerGroupInfo> {
-    const capabilities = await this.context?.capabilities()
-    const filter = capabilities?.filters.catalog === true ? await this.filter().get() : undefined
+  private async described(native: NativeGroup, options: CallOptions): Promise<ConsumerGroupInfo> {
+    const capabilities =
+      this.context === undefined
+        ? undefined
+        : await abortable(this.context.capabilities(), options.signal, "consumer group info")
+    const filter =
+      capabilities?.filters.catalog === true ? await this.filter().get(options) : undefined
     if (filter !== undefined) requireSameGroup(native.identity, filter.identity)
     return {
       id: native.id,
@@ -477,13 +525,17 @@ export class GroupFilter {
    * policy throws with reason `conflict`: create a new group for another
    * policy.
    */
-  configure(name: string, filter: ConsumerFilter): Promise<FilterBinding> {
-    return this.configureAs(undefined, { kind: "definition", name, filter })
+  configure(
+    name: string,
+    filter: ConsumerFilter,
+    options: CallOptions = {}
+  ): Promise<FilterBinding> {
+    return this.configureAs(undefined, { kind: "definition", name, filter }, options)
   }
 
-  /** `configure` with a definition or one of the group's own revisions. */
-  configureWith(policy: GroupFilterSpec): Promise<FilterBinding> {
-    return this.configureAs(undefined, policy)
+  /** `configure` with a policy spec. */
+  configureWith(policy: GroupFilterSpec, options: CallOptions = {}): Promise<FilterBinding> {
+    return this.configureAs(undefined, policy, options)
   }
 
   /**
@@ -493,60 +545,73 @@ export class GroupFilter {
    */
   async configureAs(
     operationId: bigint | undefined,
-    policy: GroupFilterSpec
+    policy: GroupFilterSpec,
+    options: CallOptions = {}
   ): Promise<FilterBinding> {
-    validateFilterMutation({ kind: "configure_group", group: await this.group.groupRef(), policy })
-    const native = await this.group.native()
-    const configured = await this.group
-      .filters()
-      .configureGroup(
-        { stream: this.group.streamName, topic: this.group.topicName, group: native.name },
-        policy,
-        operationId,
-        native.identity
-      )
+    const signal = options.signal
+    throwIfAborted(signal, "group filter configure")
+    const group = await abortable(this.group.groupRef(), signal, "group filter configure")
+    validateFilterMutation({ kind: "configure_group", group, policy })
+    const native = await abortable(this.group.native(), signal, "group filter configure")
+    const configured = await cancellable(signal, "group filter configure", () =>
+      this.group
+        .filters()
+        .configureGroup(
+          { stream: this.group.streamName, topic: this.group.topicName, group: native.name },
+          policy,
+          operationId,
+          native.identity,
+          options
+        )
+    )
     requireSameGroup(native.identity, configured.binding.identity)
     this.group.remember(configured.catalogPosition)
     return configured.binding
   }
 
   /** The active policy, `undefined` for an unbound group. */
-  async get(): Promise<FilterBinding | undefined> {
+  async get(options: CallOptions = {}): Promise<FilterBinding | undefined> {
+    const signal = options.signal
+    throwIfAborted(signal, "group filter get")
     // The catalog gate comes first, like Rust: without a managed backend the
     // answer is `unsupported`, whatever the native group looks like.
-    await this.group.filters().requireCatalog()
-    const native = await this.group.native()
+    await abortable(this.group.filters().requireCatalog(), signal, "group filter get")
+    const native = await abortable(this.group.native(), signal, "group filter get")
     try {
-      const binding = await this.group.filters().binding({
-        stream: this.group.streamName,
-        topic: this.group.topicName,
-        group: native.name
-      })
+      const binding = await abortable(
+        this.group.filters().binding({
+          stream: this.group.streamName,
+          topic: this.group.topicName,
+          group: native.name
+        }),
+        signal,
+        "group filter get"
+      )
       requireSameGroup(native.identity, binding.identity)
       return binding
     } catch (error) {
-      if (error instanceof FilterExecutionError && error.detail.reason === "not_found")
+      if (error instanceof FilterExecutionError && error.detail?.reason === "not_found")
         return undefined
       throw error
     }
   }
 
-  /** One page of the group's own filter revisions, newest first. */
-  async revisions(page?: number, pageSize?: number): Promise<FilterRevisionPage> {
-    const active = await this.active()
-    return this.group.filters().revisions(active.filterId, {
-      ...(page !== undefined ? { page } : {}),
-      ...(pageSize !== undefined ? { pageSize } : {})
-    })
-  }
-
-  /**
-   * Draft a revision of the group's own filter. Readers keep running the
-   * active revision. `expectedRevision` must still be the latest.
-   */
-  async revise(expectedRevision: number, filter: ConsumerFilter): Promise<FilterRevisionRef> {
-    const active = await this.active()
-    return this.group.filters().revise(active.filterId, expectedRevision, filter)
+  /** One page of the group's own filter revisions, newest first. `page`
+   * counts from 1 and `results` is the page length. */
+  async revisions(
+    page?: number,
+    results?: number,
+    options: CallOptions = {}
+  ): Promise<FilterRevisionPage> {
+    const active = await this.active(options)
+    return abortable(
+      this.group.filters().revisions(active.filterId, {
+        ...(page !== undefined ? { page } : {}),
+        ...(results !== undefined ? { results } : {})
+      }),
+      options.signal,
+      "group filter revisions"
+    )
   }
 
   /**
@@ -554,9 +619,15 @@ export class GroupFilter {
    * revision refuses new reads, while records already delivered can still be
    * acknowledged.
    */
-  async setRevisionEnabled(revision: number, enabled: boolean): Promise<void> {
-    const active = await this.active()
-    await this.group.filters().setRevisionEnabled(active.filterId, revision, enabled)
+  async setRevisionEnabled(
+    revision: number,
+    enabled: boolean,
+    options: CallOptions = {}
+  ): Promise<void> {
+    const active = await this.active(options)
+    await cancellable(options.signal, "group filter revision", () =>
+      this.group.filters().setRevisionEnabled(active.filterId, revision, enabled, options)
+    )
   }
 
   /**
@@ -564,10 +635,12 @@ export class GroupFilter {
    * name, state, latest revision and the owning group. `undefined` when the
    * group has no filter of its own.
    */
-  async summary(): Promise<FilterSummary | undefined> {
-    await this.group.filters().requireCatalog()
-    const native = await this.group.native()
-    return this.group.filters().owned(native.identity)
+  async summary(options: CallOptions = {}): Promise<FilterSummary | undefined> {
+    const signal = options.signal
+    throwIfAborted(signal, "group filter summary")
+    await abortable(this.group.filters().requireCatalog(), signal, "group filter summary")
+    const native = await abortable(this.group.native(), signal, "group filter summary")
+    return abortable(this.group.filters().owned(native.identity), signal, "group filter summary")
   }
 
   /**
@@ -576,10 +649,14 @@ export class GroupFilter {
    * poll. Nothing of the filter stays in the catalog. `false` when the group
    * has no filter of its own.
    */
-  async delete(): Promise<boolean> {
-    const own = await this.summary()
+  async delete(options: CallOptions = {}): Promise<boolean> {
+    const own = await this.summary(options)
     if (own === undefined) return false
-    this.group.remember(await this.group.filters().dropFilter(own.id))
+    this.group.remember(
+      await cancellable(options.signal, "group filter delete", () =>
+        this.group.filters().dropFilter(own.id, options)
+      )
+    )
     return true
   }
 
@@ -587,8 +664,11 @@ export class GroupFilter {
    * Release the group's policy. Its readers then receive every record. A
    * released group may only be configured with the digest it ran.
    */
-  async release(): Promise<FilterBinding> {
-    const released = await this.group.filters().releaseGroup(await this.active())
+  async release(options: CallOptions = {}): Promise<FilterBinding> {
+    const active = await this.active(options)
+    const released = await cancellable(options.signal, "group filter release", () =>
+      this.group.filters().releaseGroup(active, options)
+    )
     this.group.remember(released.catalogPosition)
     return released.binding
   }
@@ -597,17 +677,24 @@ export class GroupFilter {
    * Preview the active policy over the stored records of one partition. A
    * preview joins no group, stores no offset, and changes no consumer state.
    */
-  async preview(partitionId: number, options: FilterPreviewOptions = {}): Promise<FilterPreview> {
-    const active = await this.active()
-    return this.group
-      .filters()
-      .preview(
-        this.group.streamName,
-        this.group.topicName,
-        partitionId,
-        { kind: "revision", filterId: active.filterId, revision: active.revision },
-        options
-      )
+  async preview(
+    partitionId: number,
+    options: FilterPreviewOptions & CallOptions = {}
+  ): Promise<FilterPreview> {
+    const active = await this.active(options)
+    return abortable(
+      this.group
+        .filters()
+        .preview(
+          this.group.streamName,
+          this.group.topicName,
+          partitionId,
+          { kind: "revision", filterId: active.filterId, revision: active.revision },
+          options
+        ),
+      options.signal,
+      "group filter preview"
+    )
   }
 
   /**
@@ -616,20 +703,25 @@ export class GroupFilter {
    */
   async test(
     payload: Uint8Array | string,
-    headers: readonly FilterHeader[] = []
+    headers: readonly FilterHeader[] = [],
+    options: CallOptions = {}
   ): Promise<FilterTestResult> {
-    const active = await this.active()
-    return this.group
-      .filters()
-      .test(
-        { kind: "revision", filterId: active.filterId, revision: active.revision },
-        payload,
-        headers
-      )
+    const active = await this.active(options)
+    return abortable(
+      this.group
+        .filters()
+        .test(
+          { kind: "revision", filterId: active.filterId, revision: active.revision },
+          payload,
+          headers
+        ),
+      options.signal,
+      "group filter test"
+    )
   }
 
-  private async active(): Promise<FilterBinding> {
-    const binding = await this.get()
+  private async active(options: CallOptions): Promise<FilterBinding> {
+    const binding = await this.get(options)
     if (binding === undefined) {
       throw new FilterExecutionError("not_found: the consumer group has no filter policy", {
         code: { kind: "known", name: "NotFound" },
@@ -651,43 +743,53 @@ function requireSameGroup(expected: FilterGroupIdentity, actual: FilterGroupIden
   }
 }
 
-/**
- * Whether a group consumer reads through the group reader. A server that
- * advertises group-aware reads does. A server that serves consumer filters
- * without them must be upgraded, because its groups may be bound and a native
- * poll would read past their policies. A probe that established nothing is
- * not a server without filters. Only a server whose announcement, or refusal
- * to announce, positively lacks filters reads natively.
- */
-export function policyAware(capabilities: Capabilities): boolean {
-  if (capabilities.filters.groupPolicyReads) return true
-  if (capabilities.filters.native) {
-    throw new UnsupportedError(
-      "this server serves consumer filters but not group-aware reads, upgrade it before consuming groups through the Laser SDK",
-      { surface: "filters", feature: "group_policy_reads" }
-    )
-  }
-  if (capabilities.hello === "failed" || capabilities.hello === "unknown") {
-    throw new TimeoutError(
-      "the managed probe that decides whether this server resolves consumer group policies, reconnect and build the consumer again"
-    )
-  }
-  return false
-}
-
 // Builds a consumer with the configured init retries: the first attempt plus
 // up to `retries` more, `intervalMs` apart, for a failure `retryable` admits.
 async function withInitRetries<T>(
   initRetries: { readonly retries: number; readonly intervalMs: number },
   retryable: (error: unknown) => boolean,
-  attempt: () => Promise<T>
+  attempt: () => Promise<T>,
+  signal: AbortSignal | undefined
 ): Promise<T> {
   for (let tried = 0; ; tried += 1) {
     try {
       return await attempt()
     } catch (error) {
       if (tried >= initRetries.retries || !retryable(error)) throw error
-      await new Promise((resolve) => setTimeout(resolve, initRetries.intervalMs))
+      await delay(initRetries.intervalMs, signal, "group consumer")
     }
   }
+}
+
+// Waits for `acquiring` like `abortable`. What it acquires after an abort is
+// released, so an abandoned join leaves no membership behind.
+async function abortableAcquire<T>(
+  acquiring: Promise<T>,
+  signal: AbortSignal | undefined,
+  release: (acquired: T) => Promise<unknown>
+): Promise<T> {
+  try {
+    return await abortable(acquiring, signal, "group consumer")
+  } catch (error) {
+    if (error instanceof CancelledError) void acquiring.then(release).catch(() => undefined)
+    throw error
+  }
+}
+
+/**
+ * Whether `position` is a later catalog configuration than `known`, as Rust
+ * `supersedes`. Catalog revisions order outcomes across a recreated control
+ * log, where offsets start over. Without them, another proven operation,
+ * another partition or a later offset counts as later.
+ * @internal
+ */
+export function supersedesPosition(known: CatalogPosition, position: CatalogPosition): boolean {
+  if (known.revision !== undefined && position.revision !== undefined) {
+    return position.revision > known.revision
+  }
+  return (
+    known.partitionId !== position.partitionId ||
+    known.offset < position.offset ||
+    (position.operationId !== undefined && known.operationId !== position.operationId)
+  )
 }

@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { test } from "node:test"
-import { InvalidError } from "../../src/client/errors.js"
+import { CodecError, InvalidError } from "../../src/client/errors.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import {
   decodeControlEnvelope,
@@ -122,11 +122,7 @@ void test("given_the_rust_filter_fixtures_when_decoded_then_should_re_encode_byt
     encodeFilterMutationRequest
   )
   assert.equal(configure.mutation.kind, "configure_group")
-  if (configure.mutation.policy.kind === "definition") {
-    assert.equal(configure.mutation.policy.name, "safe-mode")
-  } else {
-    assert.fail("the configure fixture saves a named definition")
-  }
+  assert.equal(configure.mutation.policy.name, "safe-mode")
   const configureJson = decodeFilterMutationRequest(
     parseCanonicalJson(await readText("filter_mutation_configure_group.json")),
     "configure group"
@@ -165,6 +161,19 @@ void test("given_the_rust_filter_fixtures_when_decoded_then_should_re_encode_byt
     assert.equal(unfilteredPage.outcome.page.matched, unfilteredPage.outcome.page.examined)
   } else {
     assert.fail("the unfiltered fixture is a page")
+  }
+  const unevaluatedPage = await assertRoundTrip(
+    "filter_reply_page_unevaluated.bin",
+    decodeFilterReply,
+    encodeFilterReply
+  )
+  if (unevaluatedPage.kind === "ok" && unevaluatedPage.outcome.kind === "page") {
+    assert.deepEqual(unevaluatedPage.outcome.page.unevaluated, [
+      { offset: 1398n, reason: "malformed" },
+      { offset: 1401n, reason: "type_mismatch" }
+    ])
+  } else {
+    assert.fail("the unevaluated fixture is a page")
   }
   const wait = await assertRoundTrip(
     "filter_wait_request.bin",
@@ -253,6 +262,13 @@ void test("given_the_json_filter_fixture_when_digested_then_should_match_the_rus
 
   assert.equal(consumerFilterJson(filter), JSON.stringify(JSON.parse(text)))
   assert.deepEqual([...ConsumerFilter.digest(filter)], validation.digest)
+})
+
+void test("given_a_group_policy_naming_a_revision_when_decoded_then_should_be_refused", () => {
+  const revision = parseCanonicalJson(
+    `{"v":1,"operation_id":"7","mutation":{"configure_group":{"group":{"stream":"orbit","topic":"fleet","group":"desk"},"policy":{"revision":{"filter_id":4,"revision":2}}}}}`
+  )
+  assert.throws(() => decodeFilterMutationRequest(revision, "configure group"), CodecError)
 })
 
 void test("given_the_json_mutation_fixture_when_decoded_then_should_keep_the_operation_id_exact", async () => {
@@ -625,7 +641,10 @@ void test("given_a_summary_with_an_owner_when_encoded_then_should_round_trip_and
   for (const item of [{ ...summary, owner }, summary]) {
     const reply: FilterCatalogReply = {
       kind: "ok",
-      outcome: { kind: "filters", page: { items: [item], page: 0, pageSize: 20, total: 1 } }
+      outcome: {
+        kind: "filters",
+        page: { items: [item], page: 1, totalPages: 1, totalResults: 1 }
+      }
     }
     const encoded = encodeFilterCatalogReply(reply)
     const filters = expectMap(expectMap(encoded.get("ok"), "ok").get("filters"), "filters")
@@ -646,9 +665,9 @@ void test("given_a_list_request_with_an_owner_when_validated_then_should_accept_
     topicCreatedAtMicros: 20n,
     groupId: 3n
   }
-  const list = { v: 1, owner, page: 0, pageSize: 20 }
+  const list = { v: 1, owner, page: 1, results: 20 }
   validateListFilters(list)
-  assert.deepEqual([...encodeListFilters(list).keys()], ["v", "owner", "page", "page_size"])
+  assert.deepEqual([...encodeListFilters(list).keys()], ["v", "owner", "page", "results"])
   assert.throws(() => {
     validateListFilters({ ...list, owner: { ...owner, groupId: 0x1_0000_0000n } })
   }, new InvalidError("consumer group id exceeds the native offset-key range"))

@@ -5,11 +5,7 @@ export const AGDX_BACKEND_HELLO_CODE = AGDX_COMMAND_BASE + 1
 export const AGDX_SET_CLIENT_METADATA_CODE = AGDX_COMMAND_BASE + 2
 export const AGDX_GET_CLIENTS_METADATA_CODE = AGDX_COMMAND_BASE + 3
 export const AGDX_BATCH_CODE = AGDX_COMMAND_BASE + 20
-export const AGDX_CHECKPOINT_CODE = AGDX_COMMAND_BASE + 21
-export const AGDX_DESTINATION_GET_CODE = AGDX_COMMAND_BASE + 22
-export const AGDX_DESTINATION_LIST_CODE = AGDX_COMMAND_BASE + 23
-export const AGDX_QUERY_ROUTE_LIST_CODE = AGDX_COMMAND_BASE + 24
-export const AGDX_DESTINATION_HTTP_CODE = AGDX_COMMAND_BASE + 25
+// Codes 1_000_021 to 1_000_025 belonged to the retired lakehouse destinations and are never reused.
 
 export const AGDX_AUTHZ_BASE = AGDX_COMMAND_BASE + 100
 export const AGDX_AUTHZ_WHOAMI_CODE = AGDX_AUTHZ_BASE
@@ -24,9 +20,7 @@ export const AGDX_CONTROL_PUBLISH_CODE = AGDX_AUTHZ_BASE + 8
 
 export const AGDX_QUERY_BASE = AGDX_COMMAND_BASE + 200
 export const AGDX_QUERY_CODE = AGDX_QUERY_BASE
-export const AGDX_QUERY_PAGE_CODE = AGDX_QUERY_BASE + 1
-export const AGDX_QUERY_CANCEL_CODE = AGDX_QUERY_BASE + 2
-export const AGDX_QUERY_STATUS_CODE = AGDX_QUERY_BASE + 3
+// Codes 1_000_201 to 1_000_203 belonged to the retired query execution paging, cancellation and status operations and are never reused.
 export const AGDX_GET_PROJECTION_CODE = AGDX_QUERY_BASE + 10
 export const AGDX_LIST_PROJECTIONS_CODE = AGDX_QUERY_BASE + 11
 export const AGDX_GET_SCHEMA_CODE = AGDX_QUERY_BASE + 20
@@ -103,8 +97,6 @@ export const AGDX_WATCH_FILTER_CATALOG_CODE = AGDX_DELIVERY_BASE + 18
 export const AUTHZ_OP_VERSION = 1
 export const QUERY_OP_VERSION = 1
 export const CONTROL_OP_VERSION = 1
-export const CHECKPOINT_OP_VERSION = 1
-export const DESTINATION_HTTP_OP_VERSION = 1
 export const KV_OP_VERSION = 1
 // The fenced-lease holder-identity shape was finalized before publication.
 export const KV_LEASE_OP_VERSION = 1
@@ -119,7 +111,6 @@ export const AGENT_OP_VERSION = 1
 
 const IDEMPOTENT_MANAGED_REQUESTS = new Set([
   AGDX_BATCH_CODE,
-  AGDX_CHECKPOINT_CODE,
   AGDX_CONTROL_PUBLISH_CODE,
   AGDX_KV_SET_CODE,
   AGDX_KV_DELETE_CODE,
@@ -137,7 +128,8 @@ const IDEMPOTENT_MANAGED_REQUESTS = new Set([
   AGDX_FORK_DELETE_CODE,
   AGDX_FORK_PROMOTE_CODE,
   AGDX_FORK_PUT_CODE,
-  AGDX_GRAPH_UPSERT_CODE
+  AGDX_GRAPH_UPSERT_CODE,
+  AGDX_REGISTER_SCHEMA_CODE
 ])
 
 export function isIdempotentManagedRequest(code: number): boolean {

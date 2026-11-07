@@ -99,7 +99,7 @@ fn provenance_headers(criterion: &mut Criterion) {
                 .cost_usd(0.42)
                 .build(),
         )
-        .deadline(laser_sdk::iggy::prelude::IggyTimestamp::from(
+        .deadline_at(laser_sdk::iggy::prelude::IggyTimestamp::from(
             1_717_171_777_000_000_u64,
         ))
         .idempotency_key("job-123-attempt-2".to_owned())

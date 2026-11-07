@@ -1,13 +1,13 @@
 import { CodecError, InvalidError } from "../client/errors.js"
 import {
-  decodeProjectionInfo,
+  decodeProjectionPage,
   decodeSchemaInfo,
-  encodeProjectionInfo,
+  encodeProjectionPage,
   encodeSchemaInfo,
-  type ProjectionInfo,
+  type ProjectionPage,
   type SchemaInfo
 } from "./browse.js"
-import { type CborMap, expectMap, expectString, field } from "./cbor.js"
+import { type CborMap, expectMap, field } from "./cbor.js"
 import {
   type FilterCodec,
   type FilterGroupIdentity,
@@ -31,9 +31,6 @@ import {
   encodeQueryResult,
   parseConsistency,
   type Consistency,
-  decodeQueryExecutionStatus,
-  encodeQueryExecutionStatus,
-  type QueryExecutionStatus,
   type QueryResult
 } from "./query.js"
 import { decodeSourceRef, encodeSourceRef, type SourceRef } from "./graph.js"
@@ -43,53 +40,13 @@ import { decodeWireTopology, encodeWireTopology, type WireTopology } from "./top
 import {
   bigIntToBytes16,
   bytes16ToBigInt,
-  CheckpointRequestId,
   type ConversationId,
   crockfordDecode,
-  crockfordEncode,
-  DestinationId,
-  DestinationOperationId,
-  type QueryExecutionId
+  crockfordEncode
 } from "./ids.js"
-import {
-  decodeDestinationBlock,
-  decodeDestinationCheckpointStatus,
-  decodeCheckpointMutationResult,
-  decodePreparedAttemptSummary,
-  decodeRetentionGap,
-  encodeDestinationBlock,
-  encodeCheckpointMutationResult,
-  encodeDestinationCheckpointStatus,
-  encodePreparedAttemptSummary,
-  encodeRetentionGap,
-  type CheckpointReadConsistency,
-  type CheckpointMutationResult,
-  type DestinationBlock,
-  type DestinationCheckpointStatus,
-  type PreparedAttemptSummary,
-  type RetentionGap
-} from "./checkpoint.js"
-import {
-  decodeMaterializationDestination,
-  decodeQueryRoute,
-  encodeMaterializationDestination,
-  encodeQueryRoute,
-  type MaterializationDestination,
-  type QueryRoute
-} from "./destination.js"
-import {
-  decodeLogicalSchema,
-  decodeTypedValue,
-  encodeLogicalSchema,
-  encodeTypedValue,
-  type LogicalSchema,
-  type TypedValue
-} from "./schema.js"
 
 export const CAPABILITIES_PATH = "/agdx/capabilities"
 export const QUERY_PATH = "/agdx/query"
-export const DESTINATIONS_PATH = "/agdx/destinations"
-export const QUERY_ROUTES_PATH = "/agdx/query-routes"
 export const PROJECTIONS_PATH = "/agdx/projections"
 export const BINDINGS_PATH = "/agdx/bindings"
 export const SCHEMAS_PATH = "/agdx/schemas"
@@ -98,10 +55,6 @@ export const FORKS_PATH = "/agdx/forks"
 export const GRAPHS_PATH = "/agdx/graphs"
 export const CLIENTS_PATH = "/agdx/clients"
 export const SESSIONS_PATH = "/agdx/sessions"
-/** `?limit=`: page size. */
-export const PARAM_LIMIT = "limit"
-/** `?cursor=`: opaque continuation token from the prior page. */
-export const PARAM_CURSOR = "cursor"
 /** `?status=` on a session list: one session status. */
 export const PARAM_STATUS = "status"
 /** `?agent=` on a session list: sessions this agent took part in. */
@@ -114,13 +67,17 @@ export const PARAM_ROOT = "root"
 export const PARAM_LABEL_PREFIX = "label_prefix"
 /** `?surface=` on session links: one link surface. */
 export const PARAM_SURFACE = "surface"
-/** `?after=` on session changes: the last change sequence already seen. */
-export const PARAM_AFTER = "after"
-/** `?total=` on a session list: also count every match. */
-export const PARAM_TOTAL = "total"
-/** `?fixed_frontier=` on session events: pin the fold frontier of the first
- * page for a historical walk. */
-export const PARAM_FIXED_FRONTIER = "fixed_frontier"
+/** `?as_of=` on a session list or timeline page: the bound of a walk, the
+ * `as_of` its first page returned. */
+export const PARAM_AS_OF = "as_of"
+/** `?series=` on a session list or timeline page: the change series of the
+ * walk's `as_of`. */
+export const PARAM_SERIES = "series"
+/** `?page=`: the 1-based page of a list. Zero or none reads the first page. */
+export const PARAM_PAGE = "page"
+/** `?results=`: the items per page of a list. Zero or none leaves it to the
+ * server. */
+export const PARAM_RESULTS = "results"
 /** `?history_limit=` on session state: the most history rows to return. */
 export const PARAM_HISTORY_LIMIT = "history_limit"
 /** `?stream=` on the schema routes: the stream whose registry is addressed. */
@@ -160,15 +117,13 @@ export function schemaQueryParams(query: SchemaQuery): URLSearchParams {
 export interface FilterListQuery {
   readonly nameContains?: string
   readonly state?: FilterState
-  /** Only filters with a lower id, for stable paging. */
-  readonly beforeId?: number
   readonly ownerStreamId?: number
   readonly ownerStreamCreatedAtMicros?: bigint
   readonly ownerTopicId?: number
   readonly ownerTopicCreatedAtMicros?: bigint
   readonly ownerGroupId?: bigint
   readonly page?: number
-  readonly pageSize?: number
+  readonly results?: number
 }
 
 const FILTER_STATES: ReadonlySet<string> = new Set<FilterState>(["active", "archived", "dropped"])
@@ -218,14 +173,13 @@ export function filterListQueryParams(query: FilterListQuery): URLSearchParams {
   const params = new URLSearchParams()
   setParam(params, PARAM_NAME_CONTAINS, query.nameContains)
   setParam(params, "state", query.state)
-  setParam(params, "before_id", query.beforeId)
   setParam(params, "owner_stream_id", query.ownerStreamId)
   setParam(params, "owner_stream_created_at_micros", query.ownerStreamCreatedAtMicros?.toString())
   setParam(params, "owner_topic_id", query.ownerTopicId)
   setParam(params, "owner_topic_created_at_micros", query.ownerTopicCreatedAtMicros?.toString())
   setParam(params, "owner_group_id", query.ownerGroupId?.toString())
   setParam(params, "page", query.page)
-  setParam(params, "page_size", query.pageSize)
+  setParam(params, "results", query.results)
   return params
 }
 
@@ -238,47 +192,51 @@ export function decodeFilterListQuery(params: URLSearchParams): FilterListQuery 
       "state"
     )
   }
-  const beforeId = u32Param(params, "before_id")
   const ownerStreamId = u32Param(params, "owner_stream_id")
   const ownerStreamCreatedAtMicros = u64Param(params, "owner_stream_created_at_micros")
   const ownerTopicId = u32Param(params, "owner_topic_id")
   const ownerTopicCreatedAtMicros = u64Param(params, "owner_topic_created_at_micros")
   const ownerGroupId = u64Param(params, "owner_group_id")
   const page = u32Param(params, "page")
-  const pageSize = u32Param(params, "page_size")
+  const results = u32Param(params, "results")
   return {
     ...stringParam(params, PARAM_NAME_CONTAINS, "nameContains"),
     ...(state !== null ? { state: state as FilterState } : {}),
-    ...(beforeId !== undefined ? { beforeId } : {}),
     ...(ownerStreamId !== undefined ? { ownerStreamId } : {}),
     ...(ownerStreamCreatedAtMicros !== undefined ? { ownerStreamCreatedAtMicros } : {}),
     ...(ownerTopicId !== undefined ? { ownerTopicId } : {}),
     ...(ownerTopicCreatedAtMicros !== undefined ? { ownerTopicCreatedAtMicros } : {}),
     ...(ownerGroupId !== undefined ? { ownerGroupId } : {}),
     ...(page !== undefined ? { page } : {}),
-    ...(pageSize !== undefined ? { pageSize } : {})
+    ...(results !== undefined ? { results } : {})
   }
 }
 
 /** Filters for `GET /agdx/sessions/{stream}`. The stream is the path segment.
  * A `limit` of zero or none leaves the page size to the server. */
+/** Filters and page of `GET /agdx/sessions/{stream}`. A `page` of zero or none
+ * reads the first page, and `results` of zero or none leaves the page size to
+ * the server. */
 export interface SessionsQuery {
   readonly status?: string
   readonly root?: string
   readonly labelPrefix?: string
   readonly agent?: string
   readonly text?: string
-  readonly cursor?: string
-  readonly limit?: number
-  readonly wantTotal?: boolean
+  readonly page?: number
+  readonly results?: number
+  readonly asOf?: bigint
+  readonly series?: bigint
 }
 
-/** Query of `GET /agdx/sessions/{stream}/{id}/events`. A `limit` of zero or
- * none leaves the page size to the server. */
+/** Page of `GET /agdx/sessions/{stream}/{id}/events`. A `page` of zero or none
+ * reads the first page, `results` of zero or none leaves the page size to the
+ * server, and `asOf` with `series` bounds a walk. */
 export interface SessionEventsQuery {
-  readonly cursor?: string
-  readonly limit?: number
-  readonly fixedFrontier?: boolean
+  readonly page?: number
+  readonly results?: number
+  readonly asOf?: bigint
+  readonly series?: bigint
 }
 
 /** Query of `GET /agdx/sessions/{stream}/{id}/state`. A `historyLimit` of zero
@@ -292,12 +250,12 @@ export interface SessionLinksQuery {
   readonly surface?: string
 }
 
-/** Query of `GET /agdx/sessions/{stream}/changes`. A `limit` of zero or none
- * leaves the page size to the server. */
+/** Page of `GET /agdx/sessions/{stream}/changes`. A `page` of zero or none
+ * reads the first page, and `results` of zero or none leaves the page size to
+ * the server. */
 export interface SessionChangesQuery {
-  readonly after?: bigint
-  readonly limit?: number
-  readonly series?: bigint
+  readonly page?: number
+  readonly results?: number
 }
 
 export function sessionsQueryParams(query: SessionsQuery): URLSearchParams {
@@ -307,40 +265,53 @@ export function sessionsQueryParams(query: SessionsQuery): URLSearchParams {
   setParam(params, PARAM_LABEL_PREFIX, query.labelPrefix)
   setParam(params, PARAM_AGENT, query.agent)
   setParam(params, PARAM_TEXT, query.text)
-  setParam(params, PARAM_CURSOR, query.cursor)
-  setParam(params, PARAM_LIMIT, query.limit)
-  if (query.wantTotal === true) params.set(PARAM_TOTAL, "true")
+  setParam(params, PARAM_PAGE, query.page)
+  setParam(params, PARAM_RESULTS, query.results)
+  setParam(params, PARAM_AS_OF, query.asOf?.toString())
+  setParam(params, PARAM_SERIES, query.series?.toString())
   return params
 }
 
 export function decodeSessionsQuery(params: URLSearchParams): SessionsQuery {
-  const limit = u32Param(params, PARAM_LIMIT)
+  const page = u32Param(params, PARAM_PAGE)
+  const results = u32Param(params, PARAM_RESULTS)
   return {
     ...stringParam(params, PARAM_STATUS, "status"),
     ...stringParam(params, PARAM_ROOT, "root"),
     ...stringParam(params, PARAM_LABEL_PREFIX, "labelPrefix"),
     ...stringParam(params, PARAM_AGENT, "agent"),
     ...stringParam(params, PARAM_TEXT, "text"),
-    ...stringParam(params, PARAM_CURSOR, "cursor"),
-    ...(limit !== undefined ? { limit } : {}),
-    wantTotal: boolParam(params, PARAM_TOTAL)
+    ...(page !== undefined ? { page } : {}),
+    ...(results !== undefined ? { results } : {}),
+    ...boundParams(params)
+  }
+}
+
+function boundParams(params: URLSearchParams): { asOf?: bigint; series?: bigint } {
+  const asOf = u64Param(params, PARAM_AS_OF)
+  const series = u64Param(params, PARAM_SERIES)
+  return {
+    ...(asOf !== undefined ? { asOf } : {}),
+    ...(series !== undefined ? { series } : {})
   }
 }
 
 export function sessionEventsQueryParams(query: SessionEventsQuery): URLSearchParams {
   const params = new URLSearchParams()
-  setParam(params, PARAM_CURSOR, query.cursor)
-  setParam(params, PARAM_LIMIT, query.limit)
-  if (query.fixedFrontier === true) params.set(PARAM_FIXED_FRONTIER, "true")
+  setParam(params, PARAM_PAGE, query.page)
+  setParam(params, PARAM_RESULTS, query.results)
+  setParam(params, PARAM_AS_OF, query.asOf?.toString())
+  setParam(params, PARAM_SERIES, query.series?.toString())
   return params
 }
 
 export function decodeSessionEventsQuery(params: URLSearchParams): SessionEventsQuery {
-  const limit = u32Param(params, PARAM_LIMIT)
+  const page = u32Param(params, PARAM_PAGE)
+  const results = u32Param(params, PARAM_RESULTS)
   return {
-    ...stringParam(params, PARAM_CURSOR, "cursor"),
-    ...(limit !== undefined ? { limit } : {}),
-    fixedFrontier: boolParam(params, PARAM_FIXED_FRONTIER)
+    ...(page !== undefined ? { page } : {}),
+    ...(results !== undefined ? { results } : {}),
+    ...boundParams(params)
   }
 }
 
@@ -367,42 +338,20 @@ export function decodeSessionLinksQuery(params: URLSearchParams): SessionLinksQu
 
 export function sessionChangesQueryParams(query: SessionChangesQuery): URLSearchParams {
   const params = new URLSearchParams()
-  params.set(PARAM_AFTER, String(query.after ?? 0n))
-  setParam(params, PARAM_LIMIT, query.limit)
-  setParam(params, "series", query.series?.toString())
+  setParam(params, PARAM_PAGE, query.page)
+  setParam(params, PARAM_RESULTS, query.results)
   return params
 }
 
 export function decodeSessionChangesQuery(params: URLSearchParams): SessionChangesQuery {
-  const raw = params.get(PARAM_AFTER)
-  if (raw !== null && !/^\d+$/.test(raw)) {
-    throw new CodecError(
-      `query parameter ${PARAM_AFTER} must be an unsigned integer`,
-      "query",
-      PARAM_AFTER
-    )
-  }
-  const after = raw === null ? 0n : BigInt(raw)
-  if (after > 0xffff_ffff_ffff_ffffn) {
-    throw new CodecError(`query parameter ${PARAM_AFTER} must fit u64`, "query", PARAM_AFTER)
-  }
-  const limit = u32Param(params, PARAM_LIMIT)
-  const rawSeries = params.get("series")
-  if (rawSeries !== null && !/^\d+$/.test(rawSeries)) {
-    throw new CodecError("query parameter series must be an unsigned integer", "query", "series")
-  }
-  const series = rawSeries === null ? undefined : BigInt(rawSeries)
-  if (series !== undefined && series > 0xffff_ffff_ffff_ffffn) {
-    throw new CodecError("query parameter series must fit u64", "query", "series")
-  }
+  const page = u32Param(params, PARAM_PAGE)
+  const results = u32Param(params, PARAM_RESULTS)
   return {
-    after,
-    ...(limit !== undefined ? { limit } : {}),
-    ...(series !== undefined ? { series } : {})
+    ...(page !== undefined ? { page } : {}),
+    ...(results !== undefined ? { results } : {})
   }
 }
 
-/** The HTTP error body of a session read failure. */
 export function sessionErrorBody(error: SessionError): ErrorBody {
   return { code: sessionErrorResultCode(error), message: sessionErrorMessage(error) }
 }
@@ -438,12 +387,6 @@ function u64Param(params: URLSearchParams, key: string): bigint | undefined {
   return BigInt(raw)
 }
 
-function boolParam(params: URLSearchParams, key: string): boolean {
-  const raw = params.get(key)
-  if (raw === null || raw === "false") return false
-  if (raw === "true") return true
-  throw new CodecError(`query parameter ${key} must be true or false`, "query", key)
-}
 export const AUTHZ_WHOAMI_PATH = "/agdx/authz/whoami"
 export const AUTHZ_ROLES_PATH = "/agdx/authz/roles"
 export const FILTERS_PATH = "/agdx/filters"
@@ -469,19 +412,19 @@ export function filterBindingPath(stream: string, topic: string, group: string):
   return `${FILTER_BINDINGS_PATH}/${encodeURIComponent(stream)}/${encodeURIComponent(topic)}/${encodeURIComponent(group)}`
 }
 
-export const authzRolePath = (name: string): string => `${AUTHZ_ROLES_PATH}/${name}`
+export const authzRolePath = (name: string): string => `${AUTHZ_ROLES_PATH}/${pathSegment(name)}`
 export const authzUserRolesPath = (userId: number): string =>
   `/agdx/authz/users/${String(userId)}/roles`
-export const graphPath = (id: string): string => `${GRAPHS_PATH}/${id}`
-export const graphQueryPath = (name: string): string => `/agdx/graph/${name}/query`
+export const graphPath = (id: string): string => `${GRAPHS_PATH}/${pathSegment(id)}`
+export const graphQueryPath = (name: string): string => `/agdx/graph/${pathSegment(name)}/query`
 export const graphNeighborsPath = (name: string, node: string): string =>
-  `/agdx/graph/${name}/neighbors/${node}`
-export const projectionPath = (id: string): string => `${PROJECTIONS_PATH}/${id}`
+  `/agdx/graph/${pathSegment(name)}/neighbors/${pathSegment(node)}`
+export const projectionPath = (id: string): string => `${PROJECTIONS_PATH}/${pathSegment(id)}`
 export const schemaPath = (id: number): string => `${SCHEMAS_PATH}/${String(id)}`
 export const schemaDecodePath = (id: number): string => `${schemaPath(id)}/decode`
-export const kvNamespacePath = (namespace: string): string => `${KV_PATH}/${namespace}`
+export const kvNamespacePath = (namespace: string): string => `${KV_PATH}/${pathSegment(namespace)}`
 export const kvEntryPath = (namespace: string, key: string): string =>
-  `${kvNamespacePath(namespace)}/${key}`
+  `${kvNamespacePath(namespace)}/${pathSegment(key)}`
 export const kvCasPath = (namespace: string, key: string): string =>
   `${kvEntryPath(namespace, key)}/cas`
 export const forkPath = (id: string): string => `${FORKS_PATH}/${pathSegment(id)}`
@@ -506,58 +449,12 @@ export const sessionLinksPath = (stream: string, id: ConversationId): string =>
   `${sessionPath(stream, id)}/links`
 export const sessionSourcesPath = (stream: string, id: ConversationId): string =>
   `${sessionPath(stream, id)}/sources`
-export const destinationPath = (id: DestinationId): string =>
-  `${DESTINATIONS_PATH}/${id.toString()}`
-export const destinationEnablePath = (id: DestinationId): string => `${destinationPath(id)}/enable`
-export const destinationDisablePath = (id: DestinationId): string =>
-  `${destinationPath(id)}/disable`
-export const destinationStatusPath = (id: DestinationId): string => `${destinationPath(id)}/status`
-export const destinationCheckpointPath = (id: DestinationId): string =>
-  `${destinationPath(id)}/checkpoint`
-export const destinationRetentionGapPath = (id: DestinationId): string =>
-  `${destinationPath(id)}/retention-gap`
-export const destinationPreparedAttemptPath = (id: DestinationId): string =>
-  `${destinationPath(id)}/prepared-attempt`
-export const destinationTablePath = (id: DestinationId): string => `${destinationPath(id)}/table`
-export const destinationTableSchemaPath = (id: DestinationId): string =>
-  `${destinationTablePath(id)}/schema`
-export const destinationSnapshotsPath = (id: DestinationId): string =>
-  `${destinationTablePath(id)}/snapshots`
-export const destinationCurrentSnapshotPath = (id: DestinationId): string =>
-  `${destinationTablePath(id)}/current-snapshot`
-export const destinationSnapshotPath = (id: DestinationId, snapshotId: bigint): string =>
-  `${destinationSnapshotsPath(id)}/${snapshotId.toString()}`
-export const destinationFilesPath = (id: DestinationId): string =>
-  `${destinationTablePath(id)}/files`
-export const destinationMetricsPath = (id: DestinationId): string =>
-  `${destinationTablePath(id)}/metrics`
-export const queryExecutionPath = (id: QueryExecutionId): string => `${QUERY_PATH}/${id.toString()}`
-export const queryPagePath = (id: QueryExecutionId): string => `${queryExecutionPath(id)}/pages`
-export const queryCancelPath = (id: QueryExecutionId): string => `${queryExecutionPath(id)}/cancel`
-export const destinationOperationPath = (id: DestinationOperationId): string =>
-  `${DESTINATIONS_PATH}/operations/${id.toString()}`
-
 export interface QueryCapsView {
   readonly available: boolean
   readonly projections: boolean
   readonly schemas: boolean
   readonly consistency: Consistency
   readonly keyword: boolean
-  readonly cursorPaging: boolean
-  readonly cancellation: boolean
-  readonly executionStatus: boolean
-}
-
-export interface DestinationCapsView {
-  readonly available: boolean
-  readonly lifecycle: boolean
-  readonly checkpointStatus: boolean
-  readonly queryRoutes: boolean
-  readonly tableSchema: boolean
-  readonly snapshots: boolean
-  readonly files: boolean
-  readonly metrics: boolean
-  readonly strongestConsistency: "potentially_stale" | "linearizable"
 }
 
 export interface KvCapsView {
@@ -581,7 +478,6 @@ export interface FilterCapsView {
 export interface HttpCapabilities {
   readonly managed: boolean
   readonly query: QueryCapsView
-  readonly destinations: DestinationCapsView
   readonly kv: KvCapsView
   readonly graph: boolean
   readonly fork: boolean
@@ -598,234 +494,24 @@ export interface KvEntryView {
   readonly key: string
   readonly value: string
   readonly expiresAtMicros?: bigint
+  /** The entry's version, the value a compare-and-swap expects. */
+  readonly version: bigint
   readonly scope?: MemoryRowScope
   readonly source?: SourceRef
 }
 
+/** One KV scan page on the HTTP surface, in key order. `page` counts from 1. */
 export interface KvPageView {
-  readonly entries: readonly KvEntryView[]
-  readonly cursor?: string
+  readonly items: readonly KvEntryView[]
+  readonly page: number
+  readonly totalPages: number
+  readonly totalResults: number
 }
 
 export interface ErrorBody {
   readonly code: ResultCode
   readonly message: string
   readonly detail?: unknown
-}
-
-export interface DestinationView {
-  readonly destination: MaterializationDestination
-  readonly status: DestinationCheckpointStatus
-}
-
-export interface DestinationPageView {
-  readonly destinations: readonly DestinationView[]
-  readonly nextCursor?: string
-  readonly globalStateRevision: bigint
-  readonly consistency: CheckpointReadConsistency
-}
-
-export interface QueryRoutePageView {
-  readonly routes: readonly QueryRoute[]
-  readonly nextCursor?: string
-  readonly definitionRevision: bigint
-  readonly globalStateRevision: bigint
-  readonly consistency: CheckpointReadConsistency
-}
-
-export interface TableView {
-  readonly tableUuid: Uint8Array
-  readonly destinationId: DestinationId
-  readonly destinationGeneration: bigint
-  readonly namespace: readonly string[]
-  readonly table: string
-  readonly currentSnapshotId: bigint
-  readonly currentSchemaId: number
-  readonly currentPartitionSpecId: number
-  readonly metadataIdentity: string
-  readonly properties: ReadonlyMap<string, string>
-}
-
-export interface TableSchemaView {
-  readonly tableUuid: Uint8Array
-  readonly icebergSchemaId: number
-  readonly logicalSchema: LogicalSchema
-}
-
-export interface TableSnapshotView {
-  readonly snapshotId: bigint
-  readonly parentSnapshotId?: bigint
-  readonly sequenceNumber: bigint
-  readonly committedAtMicros: bigint
-  readonly schemaId: number
-  readonly partitionSpecId: number
-  readonly materializationBoundaryDigest: Uint8Array
-  readonly checkpointRevision: bigint
-  readonly summary: ReadonlyMap<string, string>
-}
-
-export interface SnapshotPageView {
-  readonly snapshots: readonly TableSnapshotView[]
-  readonly nextBeforeSnapshotId?: bigint
-}
-
-export interface TableFileView {
-  readonly objectIdentity: string
-  readonly fileSizeBytes: bigint
-  readonly rowCount: bigint
-  readonly partition: ReadonlyMap<string, TypedValue>
-  readonly lowerBounds: ReadonlyMap<number, TypedValue>
-  readonly upperBounds: ReadonlyMap<number, TypedValue>
-  readonly nullValueCounts: ReadonlyMap<number, bigint>
-}
-
-export interface TableFilePageView {
-  readonly files: readonly TableFileView[]
-  readonly nextCursor?: string
-}
-
-export interface TableMetricsView {
-  readonly snapshotId: bigint
-  readonly dataFileCount: bigint
-  readonly deleteFileCount: bigint
-  readonly totalRows: bigint
-  readonly totalBytes: bigint
-  readonly partitionCount: bigint
-}
-
-export type OperationState = "accepted" | "running" | "succeeded" | "failed" | "cancelled"
-
-export interface OperationErrorView {
-  readonly code: ResultCode
-  readonly message: string
-}
-
-export interface AcceptedOperationView {
-  readonly operationId: DestinationOperationId
-  readonly requestId: CheckpointRequestId
-  readonly state: OperationState
-  readonly submittedAtMicros: bigint
-  readonly completedAtMicros?: bigint
-  readonly error?: OperationErrorView
-  readonly result?: CheckpointMutationResult
-}
-
-export interface QueryExecutionView {
-  readonly status: QueryExecutionStatus
-  readonly result?: QueryResult
-}
-
-export interface DestinationIssueView {
-  readonly retentionGap?: RetentionGap
-  readonly preparedAttempt?: PreparedAttemptSummary
-  readonly block?: DestinationBlock
-  readonly globalStateRevision: bigint
-  readonly checkpointRevision: bigint
-  readonly consistency: CheckpointReadConsistency
-}
-
-export type DestinationHttpOperation =
-  | "list_destinations"
-  | "get_destination"
-  | "create_destination"
-  | "enable_destination"
-  | "disable_destination"
-  | "get_operation"
-  | "get_status"
-  | "get_checkpoint"
-  | "get_retention_gap"
-  | "get_prepared_attempt"
-  | "list_query_routes"
-  | "get_table"
-  | "get_table_schema"
-  | "get_current_snapshot"
-  | "list_snapshots"
-  | "get_snapshot"
-  | "list_files"
-  | "get_metrics"
-
-export interface DestinationHttpRequest {
-  readonly v: number
-  readonly operation: DestinationHttpOperation
-  readonly parameters: readonly string[]
-  readonly query: Uint8Array
-  readonly body: Uint8Array
-}
-
-export interface DestinationHttpReply {
-  readonly status: number
-  readonly body: Uint8Array
-}
-
-const DESTINATION_HTTP_OPERATIONS: ReadonlySet<string> = new Set<DestinationHttpOperation>([
-  "list_destinations",
-  "get_destination",
-  "create_destination",
-  "enable_destination",
-  "disable_destination",
-  "get_operation",
-  "get_status",
-  "get_checkpoint",
-  "get_retention_gap",
-  "get_prepared_attempt",
-  "list_query_routes",
-  "get_table",
-  "get_table_schema",
-  "get_current_snapshot",
-  "list_snapshots",
-  "get_snapshot",
-  "list_files",
-  "get_metrics"
-])
-
-export function encodeDestinationHttpRequest(value: DestinationHttpRequest): Map<string, unknown> {
-  return new Map<string, unknown>([
-    ["v", value.v],
-    ["operation", value.operation],
-    ["parameters", [...value.parameters]],
-    ["query", value.query.slice()],
-    ["body", value.body.slice()]
-  ])
-}
-
-export function decodeDestinationHttpRequest(
-  map: CborMap,
-  context = "DestinationHttpRequest"
-): DestinationHttpRequest {
-  const operation = field.requiredString(map, "operation", context)
-  if (!DESTINATION_HTTP_OPERATIONS.has(operation)) {
-    throw new CodecError(`${context}.operation is unknown`, context, "operation")
-  }
-  return {
-    v: field.requiredU32(map, "v", context),
-    operation: operation as DestinationHttpOperation,
-    parameters: field.requiredArray(map, "parameters", context, (item, index) =>
-      expectString(item, `${context}.parameters[${String(index)}]`)
-    ),
-    query: field.requiredBytes(map, "query", context).slice(),
-    body: field.requiredBytes(map, "body", context).slice()
-  }
-}
-
-export function encodeDestinationHttpReply(value: DestinationHttpReply): Map<string, unknown> {
-  return new Map<string, unknown>([
-    ["status", value.status],
-    ["body", value.body.slice()]
-  ])
-}
-
-export function decodeDestinationHttpReply(
-  map: CborMap,
-  context = "DestinationHttpReply"
-): DestinationHttpReply {
-  const status = field.requiredU32(map, "status", context)
-  if (status > 0xffff) {
-    throw new CodecError(`${context}.status exceeds u16`, context, "status")
-  }
-  return {
-    status,
-    body: field.requiredBytes(map, "body", context).slice()
-  }
 }
 
 function parseJson(text: string, context: string): unknown {
@@ -953,10 +639,13 @@ function decodeList<T>(
   )
 }
 
-export const decodeProjectionListJson = (text: string): ProjectionInfo[] =>
-  decodeList(text, "ProjectionInfo[]", decodeProjectionInfo)
-export const encodeProjectionListJson = (items: readonly ProjectionInfo[]): string =>
-  encodeJson(items.map(encodeProjectionInfo), "ProjectionInfo[]")
+export const decodeProjectionPageJson = (text: string): ProjectionPage =>
+  decodeProjectionPage(
+    expectMap(parseJson(text, "ProjectionPage"), "ProjectionPage"),
+    "ProjectionPage"
+  )
+export const encodeProjectionPageJson = (page: ProjectionPage): string =>
+  encodeJson(encodeProjectionPage(page), "ProjectionPage")
 export const decodeSchemaListJson = (text: string): SchemaInfo[] =>
   decodeList(text, "SchemaInfo[]", decodeSchemaInfo)
 export const encodeSchemaListJson = (items: readonly SchemaInfo[]): string =>
@@ -983,515 +672,6 @@ export function decodeQueryResultJson(text: string): QueryResult {
 export const encodeQueryResultJson = (result: QueryResult): string =>
   encodeJson(encodeQueryResult(result), "QueryResult")
 
-function fixedBytes(value: Uint8Array, length: number, context: string): Uint8Array {
-  if (value.length !== length) {
-    throw new CodecError(`${context} must contain ${String(length)} bytes`, context, "bytes")
-  }
-  return value
-}
-
-function enumWord<T extends string>(
-  map: CborMap,
-  key: string,
-  context: string,
-  values: readonly T[]
-): T {
-  const value = field.requiredString(map, key, context)
-  if (!values.includes(value as T)) {
-    throw new CodecError(`unknown ${key} \`${value}\``, context, key)
-  }
-  return value as T
-}
-
-function parseResultCode(value: string, context: string): ResultCode {
-  const code = resultCodeFromWord(value)
-  if (code === undefined) throw new CodecError(`unknown result code \`${value}\``, context, "code")
-  return code
-}
-
-function encodeResultCode(value: ResultCode, context: string): string {
-  if (value.kind === "unrecognized") {
-    throw new CodecError("unrecognized numeric result codes have no JSON spelling", context, "code")
-  }
-  const word = resultCodeWord(value)
-  if (word === undefined) throw new CodecError("result code has no JSON spelling", context, "code")
-  return word
-}
-
-function decodeStringMap(map: CborMap, context: string): Map<string, string> {
-  return new Map(
-    [...map].map(([key, value]) => {
-      const name = expectString(key, `${context} key`)
-      return [name, expectString(value, `${context}.${name}`)] as const
-    })
-  )
-}
-
-function encodeStringMap(value: ReadonlyMap<string, string>): Map<string, string> {
-  return new Map([...value].sort(([left], [right]) => left.localeCompare(right)))
-}
-
-function decodeTypedValueMap(map: CborMap, context: string): Map<string, TypedValue> {
-  return new Map(
-    [...map].map(([key, value]) => {
-      const name = expectString(key, `${context} key`)
-      return [name, decodeTypedValue(value, `${context}.${name}`)] as const
-    })
-  )
-}
-
-function encodeTypedValueMap(
-  value: ReadonlyMap<string, TypedValue>
-): Map<string, Map<string, unknown>> {
-  return new Map(
-    [...value]
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, item]) => [key, encodeTypedValue(item)])
-  )
-}
-
-function parseFieldId(key: string, context: string): number {
-  const value = Number(key)
-  if (!Number.isInteger(value) || value < 0 || value > 0xffff_ffff || String(value) !== key) {
-    throw new CodecError(`invalid field id \`${key}\``, context, "key")
-  }
-  return value
-}
-
-function decodeFieldValueMap(map: CborMap, context: string): Map<number, TypedValue> {
-  return new Map(
-    [...map].map(([key, value]) => {
-      const name = expectString(key, `${context} key`)
-      return [parseFieldId(name, context), decodeTypedValue(value, `${context}.${name}`)] as const
-    })
-  )
-}
-
-function encodeFieldValueMap(
-  value: ReadonlyMap<number, TypedValue>
-): Map<string, Map<string, unknown>> {
-  return new Map(
-    [...value]
-      .sort(([left], [right]) => left - right)
-      .map(([key, item]) => [String(key), encodeTypedValue(item)])
-  )
-}
-
-function decodeFieldCountMap(map: CborMap, context: string): Map<number, bigint> {
-  return new Map(
-    [...map].map(([key]) => {
-      const name = expectString(key, `${context} key`)
-      return [parseFieldId(name, context), field.requiredU64(map, name, context)] as const
-    })
-  )
-}
-
-function encodeFieldCountMap(value: ReadonlyMap<number, bigint>): Map<string, bigint> {
-  return new Map(
-    [...value].sort(([left], [right]) => left - right).map(([key, item]) => [String(key), item])
-  )
-}
-
-function decodeDestinationView(map: CborMap, context: string): DestinationView {
-  return {
-    destination: decodeMaterializationDestination(
-      field.requiredMap(map, "destination", context),
-      `${context}.destination`
-    ),
-    status: decodeDestinationCheckpointStatus(
-      field.requiredMap(map, "status", context),
-      `${context}.status`
-    )
-  }
-}
-
-function encodeDestinationView(value: DestinationView): Map<string, unknown> {
-  return new Map([
-    ["destination", encodeMaterializationDestination(value.destination)],
-    ["status", encodeDestinationCheckpointStatus(value.status)]
-  ])
-}
-
-export function decodeDestinationPageJson(text: string): DestinationPageView {
-  const context = "DestinationPageView"
-  const map = expectMap(parseJson(text, context), context)
-  const nextCursor = field.optionalString(map, "next_cursor", context)
-  return {
-    destinations: field.requiredArray(map, "destinations", context, (item, index) =>
-      decodeDestinationView(
-        expectMap(item, `${context}.destinations[${String(index)}]`),
-        `${context}.destinations[${String(index)}]`
-      )
-    ),
-    ...(nextCursor === undefined ? {} : { nextCursor }),
-    globalStateRevision: field.requiredU64(map, "global_state_revision", context),
-    consistency: enumWord(map, "consistency", context, ["linearizable", "potentially_stale"])
-  }
-}
-
-export function encodeDestinationPageJson(value: DestinationPageView): string {
-  const map = new Map<string, unknown>([
-    ["destinations", value.destinations.map(encodeDestinationView)]
-  ])
-  if (value.nextCursor !== undefined) map.set("next_cursor", value.nextCursor)
-  map.set("global_state_revision", value.globalStateRevision)
-  map.set("consistency", value.consistency)
-  return encodeJson(map, "DestinationPageView")
-}
-
-export function decodeQueryRoutePageJson(text: string): QueryRoutePageView {
-  const context = "QueryRoutePageView"
-  const map = expectMap(parseJson(text, context), context)
-  const nextCursor = field.optionalString(map, "next_cursor", context)
-  return {
-    routes: field.requiredArray(map, "routes", context, (item, index) =>
-      decodeQueryRoute(
-        expectMap(item, `${context}.routes[${String(index)}]`),
-        `${context}.routes[${String(index)}]`
-      )
-    ),
-    ...(nextCursor === undefined ? {} : { nextCursor }),
-    definitionRevision: field.requiredU64(map, "definition_revision", context),
-    globalStateRevision: field.requiredU64(map, "global_state_revision", context),
-    consistency: enumWord(map, "consistency", context, ["linearizable", "potentially_stale"])
-  }
-}
-
-export function encodeQueryRoutePageJson(value: QueryRoutePageView): string {
-  const map = new Map<string, unknown>([["routes", value.routes.map(encodeQueryRoute)]])
-  if (value.nextCursor !== undefined) map.set("next_cursor", value.nextCursor)
-  map.set("definition_revision", value.definitionRevision)
-  map.set("global_state_revision", value.globalStateRevision)
-  map.set("consistency", value.consistency)
-  return encodeJson(map, "QueryRoutePageView")
-}
-
-export function decodeTableViewJson(text: string): TableView {
-  const context = "TableView"
-  const map = expectMap(parseJson(text, context), context)
-  return {
-    tableUuid: fixedBytes(
-      field.requiredBytes(map, "table_uuid", context),
-      16,
-      `${context}.table_uuid`
-    ),
-    destinationId: DestinationId.fromBytes(field.requiredBytes(map, "destination_id", context)),
-    destinationGeneration: field.requiredU64(map, "destination_generation", context),
-    namespace: field.requiredArray(map, "namespace", context, (item, index) =>
-      expectString(item, `${context}.namespace[${String(index)}]`)
-    ),
-    table: field.requiredString(map, "table", context),
-    currentSnapshotId: field.requiredI64(map, "current_snapshot_id", context),
-    currentSchemaId: field.requiredI32(map, "current_schema_id", context),
-    currentPartitionSpecId: field.requiredI32(map, "current_partition_spec_id", context),
-    metadataIdentity: field.requiredString(map, "metadata_identity", context),
-    properties: decodeStringMap(
-      field.requiredMap(map, "properties", context),
-      `${context}.properties`
-    )
-  }
-}
-
-export function encodeTableViewJson(value: TableView): string {
-  return encodeJson(
-    new Map<string, unknown>([
-      ["table_uuid", value.tableUuid],
-      ["destination_id", value.destinationId.toBytes()],
-      ["destination_generation", value.destinationGeneration],
-      ["namespace", [...value.namespace]],
-      ["table", value.table],
-      ["current_snapshot_id", value.currentSnapshotId],
-      ["current_schema_id", value.currentSchemaId],
-      ["current_partition_spec_id", value.currentPartitionSpecId],
-      ["metadata_identity", value.metadataIdentity],
-      ["properties", encodeStringMap(value.properties)]
-    ]),
-    "TableView"
-  )
-}
-
-export function decodeTableSchemaJson(text: string): TableSchemaView {
-  const context = "TableSchemaView"
-  const map = expectMap(parseJson(text, context), context)
-  return {
-    tableUuid: fixedBytes(
-      field.requiredBytes(map, "table_uuid", context),
-      16,
-      `${context}.table_uuid`
-    ),
-    icebergSchemaId: field.requiredI32(map, "iceberg_schema_id", context),
-    logicalSchema: decodeLogicalSchema(
-      field.requiredMap(map, "logical_schema", context),
-      `${context}.logical_schema`
-    )
-  }
-}
-
-export function encodeTableSchemaJson(value: TableSchemaView): string {
-  return encodeJson(
-    new Map<string, unknown>([
-      ["table_uuid", value.tableUuid],
-      ["iceberg_schema_id", value.icebergSchemaId],
-      ["logical_schema", encodeLogicalSchema(value.logicalSchema)]
-    ]),
-    "TableSchemaView"
-  )
-}
-
-function decodeTableSnapshot(map: CborMap, context: string): TableSnapshotView {
-  const parentSnapshotId = field.optionalI64(map, "parent_snapshot_id", context)
-  return {
-    snapshotId: field.requiredI64(map, "snapshot_id", context),
-    ...(parentSnapshotId === undefined ? {} : { parentSnapshotId }),
-    sequenceNumber: field.requiredI64(map, "sequence_number", context),
-    committedAtMicros: field.requiredU64(map, "committed_at_micros", context),
-    schemaId: field.requiredI32(map, "schema_id", context),
-    partitionSpecId: field.requiredI32(map, "partition_spec_id", context),
-    materializationBoundaryDigest: fixedBytes(
-      field.requiredBytes(map, "materialization_boundary_digest", context),
-      32,
-      `${context}.materialization_boundary_digest`
-    ),
-    checkpointRevision: field.requiredU64(map, "checkpoint_revision", context),
-    summary: decodeStringMap(field.requiredMap(map, "summary", context), `${context}.summary`)
-  }
-}
-
-function encodeTableSnapshot(value: TableSnapshotView): Map<string, unknown> {
-  const map = new Map<string, unknown>([["snapshot_id", value.snapshotId]])
-  if (value.parentSnapshotId !== undefined) map.set("parent_snapshot_id", value.parentSnapshotId)
-  map.set("sequence_number", value.sequenceNumber)
-  map.set("committed_at_micros", value.committedAtMicros)
-  map.set("schema_id", value.schemaId)
-  map.set("partition_spec_id", value.partitionSpecId)
-  map.set("materialization_boundary_digest", value.materializationBoundaryDigest)
-  map.set("checkpoint_revision", value.checkpointRevision)
-  map.set("summary", encodeStringMap(value.summary))
-  return map
-}
-
-export function decodeSnapshotPageJson(text: string): SnapshotPageView {
-  const context = "SnapshotPageView"
-  const map = expectMap(parseJson(text, context), context)
-  const nextBeforeSnapshotId = field.optionalI64(map, "next_before_snapshot_id", context)
-  return {
-    snapshots: field.requiredArray(map, "snapshots", context, (item, index) =>
-      decodeTableSnapshot(
-        expectMap(item, `${context}.snapshots[${String(index)}]`),
-        `${context}.snapshots[${String(index)}]`
-      )
-    ),
-    ...(nextBeforeSnapshotId === undefined ? {} : { nextBeforeSnapshotId })
-  }
-}
-
-export function encodeSnapshotPageJson(value: SnapshotPageView): string {
-  const map = new Map<string, unknown>([["snapshots", value.snapshots.map(encodeTableSnapshot)]])
-  if (value.nextBeforeSnapshotId !== undefined) {
-    map.set("next_before_snapshot_id", value.nextBeforeSnapshotId)
-  }
-  return encodeJson(map, "SnapshotPageView")
-}
-
-function decodeTableFile(map: CborMap, context: string): TableFileView {
-  return {
-    objectIdentity: field.requiredString(map, "object_identity", context),
-    fileSizeBytes: field.requiredU64(map, "file_size_bytes", context),
-    rowCount: field.requiredU64(map, "row_count", context),
-    partition: decodeTypedValueMap(
-      field.requiredMap(map, "partition", context),
-      `${context}.partition`
-    ),
-    lowerBounds: decodeFieldValueMap(
-      field.requiredMap(map, "lower_bounds", context),
-      `${context}.lower_bounds`
-    ),
-    upperBounds: decodeFieldValueMap(
-      field.requiredMap(map, "upper_bounds", context),
-      `${context}.upper_bounds`
-    ),
-    nullValueCounts: decodeFieldCountMap(
-      field.requiredMap(map, "null_value_counts", context),
-      `${context}.null_value_counts`
-    )
-  }
-}
-
-function encodeTableFile(value: TableFileView): Map<string, unknown> {
-  return new Map<string, unknown>([
-    ["object_identity", value.objectIdentity],
-    ["file_size_bytes", value.fileSizeBytes],
-    ["row_count", value.rowCount],
-    ["partition", encodeTypedValueMap(value.partition)],
-    ["lower_bounds", encodeFieldValueMap(value.lowerBounds)],
-    ["upper_bounds", encodeFieldValueMap(value.upperBounds)],
-    ["null_value_counts", encodeFieldCountMap(value.nullValueCounts)]
-  ])
-}
-
-export function decodeTableFilePageJson(text: string): TableFilePageView {
-  const context = "TableFilePageView"
-  const map = expectMap(parseJson(text, context), context)
-  const nextCursor = field.optionalString(map, "next_cursor", context)
-  return {
-    files: field.requiredArray(map, "files", context, (item, index) =>
-      decodeTableFile(
-        expectMap(item, `${context}.files[${String(index)}]`),
-        `${context}.files[${String(index)}]`
-      )
-    ),
-    ...(nextCursor === undefined ? {} : { nextCursor })
-  }
-}
-
-export function encodeTableFilePageJson(value: TableFilePageView): string {
-  const map = new Map<string, unknown>([["files", value.files.map(encodeTableFile)]])
-  if (value.nextCursor !== undefined) map.set("next_cursor", value.nextCursor)
-  return encodeJson(map, "TableFilePageView")
-}
-
-export function decodeTableMetricsJson(text: string): TableMetricsView {
-  const context = "TableMetricsView"
-  const map = expectMap(parseJson(text, context), context)
-  return {
-    snapshotId: field.requiredI64(map, "snapshot_id", context),
-    dataFileCount: field.requiredU64(map, "data_file_count", context),
-    deleteFileCount: field.requiredU64(map, "delete_file_count", context),
-    totalRows: field.requiredU64(map, "total_rows", context),
-    totalBytes: field.requiredU64(map, "total_bytes", context),
-    partitionCount: field.requiredU64(map, "partition_count", context)
-  }
-}
-
-export function encodeTableMetricsJson(value: TableMetricsView): string {
-  return encodeJson(
-    new Map<string, unknown>([
-      ["snapshot_id", value.snapshotId],
-      ["data_file_count", value.dataFileCount],
-      ["delete_file_count", value.deleteFileCount],
-      ["total_rows", value.totalRows],
-      ["total_bytes", value.totalBytes],
-      ["partition_count", value.partitionCount]
-    ]),
-    "TableMetricsView"
-  )
-}
-
-export function decodeAcceptedOperationJson(text: string): AcceptedOperationView {
-  const context = "AcceptedOperationView"
-  const map = expectMap(parseJson(text, context), context)
-  const completedAtMicros = field.optionalU64(map, "completed_at_micros", context)
-  const error = field.optionalMap(map, "error", context)
-  const result = field.optionalMap(map, "result", context)
-  return {
-    operationId: DestinationOperationId.fromBytes(
-      field.requiredBytes(map, "operation_id", context)
-    ),
-    requestId: CheckpointRequestId.fromBytes(field.requiredBytes(map, "request_id", context)),
-    state: enumWord(map, "state", context, [
-      "accepted",
-      "running",
-      "succeeded",
-      "failed",
-      "cancelled"
-    ]),
-    submittedAtMicros: field.requiredU64(map, "submitted_at_micros", context),
-    ...(completedAtMicros === undefined ? {} : { completedAtMicros }),
-    ...(error === undefined
-      ? {}
-      : {
-          error: {
-            code: parseResultCode(field.requiredString(error, "code", context), `${context}.error`),
-            message: field.requiredString(error, "message", context)
-          }
-        }),
-    ...(result === undefined
-      ? {}
-      : { result: decodeCheckpointMutationResult(result, `${context}.result`) })
-  }
-}
-
-export function encodeAcceptedOperationJson(value: AcceptedOperationView): string {
-  const context = "AcceptedOperationView"
-  const map = new Map<string, unknown>([
-    ["operation_id", value.operationId.toBytes()],
-    ["request_id", value.requestId.toBytes()],
-    ["state", value.state],
-    ["submitted_at_micros", value.submittedAtMicros]
-  ])
-  if (value.completedAtMicros !== undefined) map.set("completed_at_micros", value.completedAtMicros)
-  if (value.error !== undefined) {
-    map.set(
-      "error",
-      new Map<string, unknown>([
-        ["code", encodeResultCode(value.error.code, `${context}.error`)],
-        ["message", value.error.message]
-      ])
-    )
-  }
-  if (value.result !== undefined) map.set("result", encodeCheckpointMutationResult(value.result))
-  return encodeJson(map, "AcceptedOperationView")
-}
-
-export function decodeQueryExecutionJson(text: string): QueryExecutionView {
-  const context = "QueryExecutionView"
-  const map = expectMap(parseJson(text, context), context)
-  const result = field.optionalMap(map, "result", context)
-  return {
-    status: decodeQueryExecutionStatus(
-      field.requiredMap(map, "status", context),
-      `${context}.status`
-    ),
-    ...(result === undefined ? {} : { result: decodeQueryResult(result, `${context}.result`) })
-  }
-}
-
-export function encodeQueryExecutionJson(value: QueryExecutionView): string {
-  const map = new Map<string, unknown>([["status", encodeQueryExecutionStatus(value.status)]])
-  if (value.result !== undefined) map.set("result", encodeQueryResult(value.result))
-  return encodeJson(map, "QueryExecutionView")
-}
-
-export function decodeDestinationIssueJson(text: string): DestinationIssueView {
-  const context = "DestinationIssueView"
-  const map = expectMap(parseJson(text, context), context)
-  const retentionGap = field.optionalMap(map, "retention_gap", context)
-  const preparedAttempt = field.optionalMap(map, "prepared_attempt", context)
-  const block = field.optionalMap(map, "block", context)
-  return {
-    ...(retentionGap === undefined
-      ? {}
-      : { retentionGap: decodeRetentionGap(retentionGap, `${context}.retention_gap`) }),
-    ...(preparedAttempt === undefined
-      ? {}
-      : {
-          preparedAttempt: decodePreparedAttemptSummary(
-            preparedAttempt,
-            `${context}.prepared_attempt`
-          )
-        }),
-    ...(block === undefined ? {} : { block: decodeDestinationBlock(block, `${context}.block`) }),
-    globalStateRevision: field.requiredU64(map, "global_state_revision", context),
-    checkpointRevision: field.requiredU64(map, "checkpoint_revision", context),
-    consistency: enumWord(map, "consistency", context, ["linearizable", "potentially_stale"])
-  }
-}
-
-export function encodeDestinationIssueJson(value: DestinationIssueView): string {
-  const map = new Map<string, unknown>()
-  if (value.retentionGap !== undefined) {
-    map.set("retention_gap", encodeRetentionGap(value.retentionGap))
-  }
-  if (value.preparedAttempt !== undefined) {
-    map.set("prepared_attempt", encodePreparedAttemptSummary(value.preparedAttempt))
-  }
-  if (value.block !== undefined) map.set("block", encodeDestinationBlock(value.block))
-  map.set("global_state_revision", value.globalStateRevision)
-  map.set("checkpoint_revision", value.checkpointRevision)
-  map.set("consistency", value.consistency)
-  return encodeJson(map, "DestinationIssueView")
-}
-
 function decodeQueryCaps(map: CborMap, context: string): QueryCapsView {
   return {
     available: field.requiredBoolean(map, "available", context),
@@ -1501,10 +681,7 @@ function decodeQueryCaps(map: CborMap, context: string): QueryCapsView {
       field.optionalString(map, "consistency", context) ?? "eventual",
       context
     ),
-    keyword: field.optionalBoolean(map, "keyword", context) ?? false,
-    cursorPaging: field.optionalBoolean(map, "cursor_paging", context) ?? false,
-    cancellation: field.optionalBoolean(map, "cancellation", context) ?? false,
-    executionStatus: field.optionalBoolean(map, "execution_status", context) ?? false
+    keyword: field.optionalBoolean(map, "keyword", context) ?? false
   }
 }
 
@@ -1514,47 +691,7 @@ function encodeQueryCaps(value: QueryCapsView): Map<string, unknown> {
     ["projections", value.projections],
     ["schemas", value.schemas],
     ["consistency", consistencyToWord(value.consistency)],
-    ["keyword", value.keyword],
-    ["cursor_paging", value.cursorPaging],
-    ["cancellation", value.cancellation],
-    ["execution_status", value.executionStatus]
-  ])
-}
-
-function decodeDestinationCaps(map: CborMap, context: string): DestinationCapsView {
-  const consistency =
-    field.optionalString(map, "strongest_consistency", context) ?? "potentially_stale"
-  if (consistency !== "potentially_stale" && consistency !== "linearizable") {
-    throw new CodecError(
-      `unknown checkpoint consistency \`${consistency}\``,
-      context,
-      "strongest_consistency"
-    )
-  }
-  return {
-    available: field.requiredBoolean(map, "available", context),
-    lifecycle: field.optionalBoolean(map, "lifecycle", context) ?? false,
-    checkpointStatus: field.optionalBoolean(map, "checkpoint_status", context) ?? false,
-    queryRoutes: field.optionalBoolean(map, "query_routes", context) ?? false,
-    tableSchema: field.optionalBoolean(map, "table_schema", context) ?? false,
-    snapshots: field.optionalBoolean(map, "snapshots", context) ?? false,
-    files: field.optionalBoolean(map, "files", context) ?? false,
-    metrics: field.optionalBoolean(map, "metrics", context) ?? false,
-    strongestConsistency: consistency
-  }
-}
-
-function encodeDestinationCaps(value: DestinationCapsView): Map<string, unknown> {
-  return new Map<string, unknown>([
-    ["available", value.available],
-    ["lifecycle", value.lifecycle],
-    ["checkpoint_status", value.checkpointStatus],
-    ["query_routes", value.queryRoutes],
-    ["table_schema", value.tableSchema],
-    ["snapshots", value.snapshots],
-    ["files", value.files],
-    ["metrics", value.metrics],
-    ["strongest_consistency", value.strongestConsistency]
+    ["keyword", value.keyword]
   ])
 }
 
@@ -1565,10 +702,6 @@ export function decodeCapabilitiesJson(text: string): HttpCapabilities {
   return {
     managed: field.requiredBoolean(map, "managed", context),
     query: decodeQueryCaps(field.requiredMap(map, "query", context), `${context}.query`),
-    destinations: decodeDestinationCaps(
-      field.requiredMap(map, "destinations", context),
-      `${context}.destinations`
-    ),
     kv: {
       available: field.requiredBoolean(
         field.requiredMap(map, "kv", context),
@@ -1611,7 +744,6 @@ export function encodeCapabilitiesJson(value: HttpCapabilities): string {
   const map = new Map<string, unknown>([
     ["managed", value.managed],
     ["query", encodeQueryCaps(value.query)],
-    ["destinations", encodeDestinationCaps(value.destinations)],
     [
       "kv",
       new Map([
@@ -1677,6 +809,7 @@ function decodeKvEntry(map: CborMap, context: string): KvEntryView {
     key: field.requiredString(map, "key", context),
     value: field.requiredString(map, "value", context),
     ...(expiresAtMicros !== undefined ? { expiresAtMicros } : {}),
+    version: field.requiredU64(map, "version", context),
     ...(scope !== undefined ? { scope: decodeMemoryRowScope(scope, `${context}.scope`) } : {}),
     ...(source !== undefined ? { source: decodeSourceRef(source, `${context}.source`) } : {})
   }
@@ -1686,7 +819,8 @@ function encodeKvEntry(value: KvEntryView): Map<string, unknown> {
   const map = new Map<string, unknown>([
     ["key", value.key],
     ["value", value.value],
-    ["expires_at_micros", value.expiresAtMicros ?? null]
+    ["expires_at_micros", value.expiresAtMicros ?? null],
+    ["version", value.version]
   ])
   if (value.scope !== undefined) map.set("scope", encodeMemoryRowScope(value.scope))
   if (value.source !== undefined) map.set("source", encodeSourceRef(value.source))
@@ -1696,23 +830,26 @@ function encodeKvEntry(value: KvEntryView): Map<string, unknown> {
 export function decodeKvPageJson(text: string): KvPageView {
   const context = "KvPageView"
   const map = expectMap(parseJson(text, context), context)
-  const cursor = field.optionalString(map, "cursor", context)
   return {
-    entries: field.requiredArray(map, "entries", context, (item, index) =>
+    items: field.requiredArray(map, "items", context, (item, index) =>
       decodeKvEntry(
-        expectMap(item, `${context}.entries[${String(index)}]`),
-        `${context}.entries[${String(index)}]`
+        expectMap(item, `${context}.items[${String(index)}]`),
+        `${context}.items[${String(index)}]`
       )
     ),
-    ...(cursor !== undefined ? { cursor } : {})
+    page: field.requiredU32(map, "page", context),
+    totalPages: field.requiredU32(map, "total_pages", context),
+    totalResults: field.requiredU32(map, "total_results", context)
   }
 }
 
 export function encodeKvPageJson(value: KvPageView): string {
   return encodeJson(
     new Map<string, unknown>([
-      ["entries", value.entries.map(encodeKvEntry)],
-      ["cursor", value.cursor ?? null]
+      ["items", value.items.map(encodeKvEntry)],
+      ["page", value.page],
+      ["total_pages", value.totalPages],
+      ["total_results", value.totalResults]
     ]),
     "KvPageView"
   )

@@ -1,4 +1,4 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::context::PyContextMessage;
 use crate::convert::{py_to_de, ser_to_py};
@@ -16,6 +16,16 @@ fn session_id(value: &str) -> PyResult<ConversationId> {
     ConversationId::from_str(value).map_err(|error| to_pyerr(error.into()))
 }
 
+fn walk_bound(as_of: Option<u64>, series: Option<u64>) -> PyResult<Option<(u64, u64)>> {
+    match (as_of, series) {
+        (Some(as_of), Some(series)) => Ok(Some((as_of, series))),
+        (None, None) => Ok(None),
+        _ => Err(InvalidError::new_err(
+            "as_of and series name one bound, set both or neither",
+        )),
+    }
+}
+
 fn word<T: serde::de::DeserializeOwned>(
     py: Python<'_>,
     value: Option<String>,
@@ -30,21 +40,23 @@ fn word<T: serde::de::DeserializeOwned>(
 impl PySessions {
     /// One session's summary from the deployment's session index, as a
     /// `SessionInfo` dict.
-    fn get<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Bound<'py, PyAny>> {
+    fn get<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let sessions = self.inner.clone();
         let id = session_id(id)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let info = sessions.get(id).await.map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &info))
         })
     }
 
-    /// A page of this stream's sessions, newest first, as a `SessionPage`
-    /// dict. `status` is a status word such as `active`, `root` a session id
-    /// whose tree to list, `label_prefix` the start of the label, `agent` an
-    /// agent id, `text` a label or id substring, and a `limit` of zero leaves
-    /// the page size to the server. `total=True` also counts every match.
-    #[pyo3(signature = (*, status=None, root=None, label_prefix=None, agent=None, text=None, cursor=None, limit=0, total=false))]
+    /// A page of this stream's sessions, newest created first, as a
+    /// `SessionPage` dict. `status` is a status word such as `active`, `root`
+    /// a session id whose tree to list, `label_prefix` the start of the label,
+    /// `agent` an agent id, and `text` a label or id substring. `page` is
+    /// 1-based and zero reads the first page, and `results` of zero leaves the
+    /// page size to the server. `as_of` and `series` from a walk's first page
+    /// keep sessions folded after it out of later pages.
+    #[pyo3(signature = (*, status=None, root=None, label_prefix=None, agent=None, text=None, page=0, results=0, as_of=None, series=None))]
     #[allow(clippy::too_many_arguments)]
     fn list<'py>(
         &self,
@@ -54,11 +66,15 @@ impl PySessions {
         label_prefix: Option<String>,
         agent: Option<String>,
         text: Option<String>,
-        cursor: Option<String>,
-        limit: u32,
-        total: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let mut request = self.inner.list().limit(limit);
+        page: u32,
+        results: u32,
+        as_of: Option<u64>,
+        series: Option<u64>,
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
+        let mut request = self.inner.list().page(page).results(results);
+        if let Some((as_of, series)) = walk_bound(as_of, series)? {
+            request = request.as_of(as_of, series);
+        }
         if let Some(root) = root {
             request = request.root(session_id(&root)?);
         }
@@ -78,38 +94,36 @@ impl PySessions {
         if let Some(text) = text {
             request = request.text(text);
         }
-        if let Some(cursor) = cursor {
-            request = request.cursor(cursor);
-        }
-        if total {
-            request = request.total();
-        }
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let page = request.fetch().await.map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &page))
         })
     }
 
     /// A page of one session's events in server append time order, as a
-    /// `SessionEventsPage` dict. `fixed_frontier=True` pins the fold frontier
-    /// of the first page for a historical walk.
-    #[pyo3(signature = (id, *, cursor=None, limit=0, fixed_frontier=false))]
+    /// `SessionEventsPage` dict. `page` is 1-based and zero reads the first
+    /// page, and `results` of zero leaves the page size to the server.
+    /// `as_of` and `series` from a walk's first page keep events folded after
+    /// it out of later pages.
+    #[pyo3(signature = (id, *, page=0, results=0, as_of=None, series=None))]
     fn events<'py>(
         &self,
         py: Python<'py>,
         id: &str,
-        cursor: Option<String>,
-        limit: u32,
-        fixed_frontier: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let mut request = self.inner.events(session_id(id)?).limit(limit);
-        if let Some(cursor) = cursor {
-            request = request.cursor(cursor);
+        page: u32,
+        results: u32,
+        as_of: Option<u64>,
+        series: Option<u64>,
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
+        let mut request = self
+            .inner
+            .events(session_id(id)?)
+            .page(page)
+            .results(results);
+        if let Some((as_of, series)) = walk_bound(as_of, series)? {
+            request = request.as_of(as_of, series);
         }
-        if fixed_frontier {
-            request = request.fixed_frontier();
-        }
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let page = request.fetch().await.map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &page))
         })
@@ -124,10 +138,10 @@ impl PySessions {
         py: Python<'py>,
         id: &str,
         history_limit: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let sessions = self.inner.clone();
         let id = session_id(id)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let view = sessions.state(id, history_limit).await.map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &view))
         })
@@ -142,11 +156,11 @@ impl PySessions {
         py: Python<'py>,
         id: &str,
         surface: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let sessions = self.inner.clone();
         let id = session_id(id)?;
         let surface = word(py, surface)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let view = sessions.links(id, surface).await.map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &view))
         })
@@ -154,33 +168,46 @@ impl PySessions {
 
     /// The source partitions that hold one session's records, as a
     /// `SessionSources` dict.
-    fn sources<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Bound<'py, PyAny>> {
+    fn sources<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let sessions = self.inner.clone();
         let id = session_id(id)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let sources = sessions.sources(id).await.map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &sources))
         })
     }
 
-    /// This stream's change rows after `after`, as a `SessionChanges` dict.
-    /// A `limit` of zero leaves the page size to the server.
-    #[pyo3(signature = (after=0, limit=0))]
-    fn changes<'py>(&self, py: Python<'py>, after: u64, limit: u32) -> PyResult<Bound<'py, PyAny>> {
+    /// One page of this stream's change feed in sequence order, as a
+    /// `SessionChanges` dict. Page `page` of size `results` holds the changes
+    /// with sequence `(page - 1) * results + 1` to `page * results`, so
+    /// appends and pruning never shift it. A `results` of zero leaves the page
+    /// size to the server, and the reply names the size it used.
+    #[pyo3(signature = (page=0, results=0))]
+    fn changes<'py>(
+        &self,
+        py: Python<'py>,
+        page: u32,
+        results: u32,
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let sessions = self.inner.clone();
-        future_into_py(py, async move {
-            let changes = sessions.changes(after, limit).await.map_err(to_pyerr)?;
+        awaitable(py, async move {
+            let changes = sessions.changes(page, results).await.map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &changes))
         })
     }
 
     /// Follow this stream's session changes from now, polling every
-    /// `poll_every_ms` milliseconds. Returns a `SessionWatch` that starts at
-    /// the change rows retained when this call returns. Await `next()` on it.
-    fn watch<'py>(&self, py: Python<'py>, poll_every_ms: f64) -> PyResult<Bound<'py, PyAny>> {
+    /// `poll_every_ms` milliseconds, which must be above zero. Returns a
+    /// `SessionWatch` that starts at the newest change when this call returns.
+    /// Await `next()` on it or iterate it with `async for`.
+    fn watch<'py>(
+        &self,
+        py: Python<'py>,
+        poll_every_ms: f64,
+    ) -> PyResult<Awaitable<'py, PySessionWatch>> {
         let poll_every = crate::convert::duration_ms(poll_every_ms, "poll_every_ms")?;
         let sessions = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let watch = sessions.watch(poll_every).await.map_err(to_pyerr)?;
             Ok(PySessionWatch {
                 inner: Arc::new(Mutex::new(watch)),
@@ -194,9 +221,9 @@ impl PySessions {
 impl PySession {
     /// This session's summary from the deployment's session index, as a
     /// `SessionInfo` dict.
-    fn status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn status<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let session = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let info = session.status().await.map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &info))
         })
@@ -208,9 +235,9 @@ impl PySession {
     /// answers from its index. On open Apache Iggy, or for a session the
     /// index does not know yet, the retained session lane is folded. A
     /// session without a budget is never over it.
-    fn over_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn over_budget<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, bool>> {
         let session = self.inner.clone();
-        future_into_py(
+        awaitable(
             py,
             async move { session.over_budget().await.map_err(to_pyerr) },
         )
@@ -223,10 +250,14 @@ impl PyLaser {
     /// Read the one record `at` names, a message source reference dict.
     /// Returns a `ContextMessage`, or None when the record is gone or the
     /// topic was recreated.
-    fn read_at<'py>(&self, py: Python<'py>, at: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn read_at<'py>(
+        &self,
+        py: Python<'py>,
+        at: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, Option<PyContextMessage>>> {
         let laser = self.inner.clone();
         let at: laser_sdk::wire::graph::SourceRef = py_to_de(at)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let record = laser.read_at(&at).await.map_err(to_pyerr)?;
             Ok(record.map(PyContextMessage::new))
         })
@@ -257,9 +288,28 @@ pub struct PySessionWatch {
 #[pymethods]
 impl PySessionWatch {
     /// The next change, as a `SessionChange`, waiting until one lands.
-    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PySessionChange>> {
         let watch = self.inner.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
+            let change = watch.lock().await.next().await.map_err(to_pyerr)?;
+            Ok(match change {
+                SessionChange::Changed(sessions) => PySessionChange::Changed {
+                    sessions: sessions.iter().map(ToString::to_string).collect(),
+                },
+                SessionChange::Resync => PySessionChange::Resync(),
+            })
+        })
+    }
+
+    /// `async for change in watch` yields each change as it lands. The watch
+    /// follows changes until the loop stops, and a failed read raises.
+    fn __aiter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PySessionChange>> {
+        let watch = self.inner.clone();
+        awaitable(py, async move {
             let change = watch.lock().await.next().await.map_err(to_pyerr)?;
             Ok(match change {
                 SessionChange::Changed(sessions) => PySessionChange::Changed {

@@ -1,13 +1,12 @@
-use laser_wire::checkpoint::CheckpointReadConsistency;
 use laser_wire::filter::FilterCodec;
 use laser_wire::query::Consistency;
+use std::time::Duration;
 
 pub use laser_wire::destination::BackendResourceId;
 pub use laser_wire::hello::{
     BackendDescriptor, BackendDesiredState, BackendImplementation, BackendLimits, BackendMode,
     BackendObservedState, BackendReadiness, BackendReadinessCode, BackendReadinessReason,
-    FilterAnnounce, MaintenanceCapabilities, MaterializationCapability, OpVersions,
-    QueryCapabilities, QueryPagingCapability, SchemaCapabilities, TimeTravelCapability,
+    FilterAnnounce, OpVersions, QueryCapabilities, SchemaCapabilities,
 };
 
 /// What the connected infrastructure serves beyond the open SDK surface. The open
@@ -33,8 +32,6 @@ pub struct Capabilities {
     /// The managed query surface (`Laser::query`) and the read-consistency it
     /// serves.
     pub query: QueryCaps,
-    /// Materialization destination declarations and managed checkpoint lifecycle.
-    pub destinations: DestinationCaps,
     /// The managed key-value surface (`Laser::kv`) and its conditional-write
     /// support.
     pub kv: KvCaps,
@@ -47,6 +44,7 @@ pub struct Capabilities {
     pub a2a_gateway: bool,
     /// Managed reads of agent sessions in one stream.
     pub sessions: bool,
+    pub materializations: bool,
     /// The deployment scopes every managed name to one stream, and each
     /// stream's change feed rides its own ops topic.
     pub stream_tenancy: bool,
@@ -94,27 +92,14 @@ pub struct QueryCaps {
     /// Whether `Laser::query` is served.
     pub available: bool,
     /// The strongest read-consistency level the surface honors. The ladder is
-    /// `Eventual < ReadYourWrites < Strong`, so a level implies every weaker one
-    /// (a `Strong` surface serves a read-your-writes query too). `Eventual` is
-    /// the default when a query surface is available.
+    /// `Eventual < ReadYourWrites`, so a level implies every weaker one.
+    /// `Eventual` is the default when a query surface is available.
     pub consistency: Consistency,
     /// Whether the surface serves lexical relevance search (`.text()` /
     /// `.text_in()`). Off means a `text` query is refused locally before
     /// sending, since an unaware server would silently drop the additive field
     /// and answer wider than asked.
     pub keyword: bool,
-    /// Whether an executing query can continue through opaque cursor pages.
-    pub cursor_paging: bool,
-    /// Whether query cancellation is served.
-    pub cancellation: bool,
-    /// Whether query execution status is served.
-    pub execution_status: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DestinationCaps {
-    pub available: bool,
-    pub consistency: CheckpointReadConsistency,
 }
 
 /// Server-side consumer filters.
@@ -136,9 +121,9 @@ pub struct FilterCaps {
     /// server that predates the announcement, which then evaluates as this
     /// build does.
     pub evaluation: Option<FilterAnnounce>,
-    /// The longest filtered wait the server holds, in milliseconds. Zero when
-    /// it serves none, so a filtered reader paces idle rounds itself.
-    pub max_wait_ms: u32,
+    /// The longest filtered wait the server holds. Zero when it serves none,
+    /// so a filtered reader paces idle rounds itself.
+    pub max_wait: Duration,
 }
 
 impl FilterCaps {
@@ -183,13 +168,6 @@ impl Capabilities {
             available: false,
             consistency: Consistency::Eventual,
             keyword: false,
-            cursor_paging: false,
-            cancellation: false,
-            execution_status: false,
-        },
-        destinations: DestinationCaps {
-            available: false,
-            consistency: CheckpointReadConsistency::PotentiallyStale,
         },
         kv: KvCaps {
             available: false,
@@ -201,6 +179,7 @@ impl Capabilities {
         forks: false,
         a2a_gateway: false,
         sessions: false,
+        materializations: false,
         stream_tenancy: false,
         watch: false,
         authz: false,
@@ -209,7 +188,7 @@ impl Capabilities {
             catalog: false,
             group_policy_reads: false,
             evaluation: None,
-            max_wait_ms: 0,
+            max_wait: Duration::ZERO,
         },
         versions: None,
         backends: Vec::new(),
@@ -296,26 +275,6 @@ impl Capabilities {
         self
     }
 
-    #[must_use]
-    pub fn with_query_execution(mut self, paging: bool, cancellation: bool, status: bool) -> Self {
-        self.query.cursor_paging = paging;
-        self.query.cancellation = cancellation;
-        self.query.execution_status = status;
-        self
-    }
-
-    #[must_use]
-    pub fn with_destinations(mut self, value: bool) -> Self {
-        self.destinations.available = value;
-        self
-    }
-
-    #[must_use]
-    pub fn with_destination_consistency(mut self, value: CheckpointReadConsistency) -> Self {
-        self.destinations.consistency = value;
-        self
-    }
-
     /// Returns a copy with the managed key-value surface available.
     #[must_use]
     pub fn with_kv(mut self, value: bool) -> Self {
@@ -388,7 +347,7 @@ impl Capabilities {
             catalog,
             group_policy_reads: native,
             evaluation: None,
-            max_wait_ms: 0,
+            max_wait: Duration::ZERO,
         };
         self
     }
@@ -420,28 +379,21 @@ impl Capabilities {
         self.kv.fenced_leases |= versions.has_feature(feature::KV_FENCED_LEASES);
         self.kv.cas_fenced |= self.kv.fenced_leases;
         self.sessions |= versions.has_feature(feature::SESSIONS);
+        self.materializations |= versions.has_feature(feature::MATERIALIZATIONS);
         self.stream_tenancy |= versions.has_feature(feature::STREAM_TENANCY);
         self.query.keyword |= versions.has_feature(feature::KEYWORD_SEARCH);
         self.watch |= versions.has_feature(feature::WATCH);
         self.authz |= versions.has_feature(feature::AUTHZ);
         self.filters.native |= versions.has_feature(feature::CONSUMER_FILTERS);
         self.filters.group_policy_reads |= versions.has_feature(feature::GROUP_POLICY_READS);
-        self.destinations.available |=
-            versions.checkpoint > 0 && versions.has_feature(feature::DESTINATIONS);
-        if self.destinations.available {
-            self.destinations.consistency = CheckpointReadConsistency::Linearizable;
-        }
-        if versions.has_feature(feature::STRONG_CONSISTENCY) {
-            self.query.consistency = self.query.consistency.max(Consistency::Strong);
-        } else if versions.has_feature(feature::READ_YOUR_WRITES) {
+        if versions.has_feature(feature::READ_YOUR_WRITES) {
             self.query.consistency = self.query.consistency.max(Consistency::ReadYourWrites);
         }
     }
 
     /// Whether the query surface serves read-consistency `level`. Because the
     /// levels form a ladder, this is `level <= self.query.consistency`: `Eventual`
-    /// is always served, and a `Strong` surface subsumes a read-your-writes query.
-    /// An unknown future level is treated as not served (fail-safe).
+    /// is always served. An unknown future level is treated as not served (fail-safe).
     pub fn serves_consistency(&self, level: Consistency) -> bool {
         level <= self.query.consistency
     }
@@ -512,14 +464,13 @@ mod tests {
     }
 
     #[test]
-    fn given_the_strong_bit_when_merged_then_should_raise_the_level_to_strong() {
+    fn given_the_retired_strong_bit_when_merged_then_should_not_raise_the_level() {
         let mut caps = Capabilities::OPEN;
         caps.merge_features(
             &OpVersions::new(1, 1, 1, 1).with_features(feature::STRONG_CONSISTENCY),
         );
-        assert_eq!(caps.query.consistency, Consistency::Strong);
-        // Strong subsumes the weaker level, structurally.
-        assert!(caps.serves_consistency(Consistency::ReadYourWrites));
+        assert_eq!(caps.query.consistency, Consistency::Eventual);
+        assert!(!caps.serves_consistency(Consistency::ReadYourWrites));
     }
 
     #[test]
@@ -547,27 +498,13 @@ mod tests {
     fn given_open_capabilities_when_checking_consistency_then_should_serve_only_eventual() {
         assert!(Capabilities::OPEN.serves_consistency(Consistency::Eventual));
         assert!(!Capabilities::OPEN.serves_consistency(Consistency::ReadYourWrites));
-        assert!(!Capabilities::OPEN.serves_consistency(Consistency::Strong));
     }
 
     #[test]
-    fn given_read_your_writes_only_when_checked_then_should_not_serve_strong() {
+    fn given_read_your_writes_when_checked_then_should_serve_both_levels() {
         let ryw = Capabilities::OPEN.with_query_consistency(Consistency::ReadYourWrites);
+        assert!(ryw.serves_consistency(Consistency::Eventual));
         assert!(ryw.serves_consistency(Consistency::ReadYourWrites));
-        assert!(
-            !ryw.serves_consistency(Consistency::Strong),
-            "read-your-writes must not imply strong"
-        );
-    }
-
-    #[test]
-    fn given_strong_when_checked_then_should_subsume_read_your_writes() {
-        let strong = Capabilities::OPEN.with_query_consistency(Consistency::Strong);
-        assert!(strong.serves_consistency(Consistency::Strong));
-        assert!(
-            strong.serves_consistency(Consistency::ReadYourWrites),
-            "strong must subsume read-your-writes"
-        );
     }
 
     #[test]
@@ -587,7 +524,7 @@ mod tests {
             ),
             BackendDescriptor::new(
                 laser_wire::destination::BackendResourceId::from_u128(2),
-                BackendMode::Lakehouse,
+                BackendMode::Operational,
                 "Warehouse",
                 BackendImplementation {
                     kind: "columnar".to_owned(),

@@ -3,7 +3,7 @@ import { decodeOne } from "../../src/wire/cbor.js"
 import { test } from "node:test"
 import { OPEN_CAPABILITIES, type Capabilities } from "../../src/client/capabilities.js"
 import { code, isUnsupported } from "../../src/client/error-classify.js"
-import { ProtocolError, SessionError } from "../../src/client/errors.js"
+import { InvalidError, ProtocolError, SessionError } from "../../src/client/errors.js"
 import { INTERNAL_TRANSPORT } from "../../src/client/internals.js"
 import { Laser } from "../../src/client/laser.js"
 import type { IggyClient, PolledMessage } from "../../src/iggy/apache-iggy.js"
@@ -26,7 +26,9 @@ import {
   SessionStateCommand
 } from "../../src/wire/commands.js"
 import { ConversationId as WireConversationId } from "../../src/wire/ids.js"
+import type { SessionChange } from "../../src/session-reads.js"
 import {
+  type SessionChangeRow,
   type SessionChangesView,
   type SessionReply,
   encodeSessionReply
@@ -60,9 +62,31 @@ function fakeLaser(
   return { laser, sent }
 }
 
-const changes = (view: SessionChangesView): SessionReply => ({
+const view = (
+  items: readonly SessionChangeRow[],
+  totalResults: bigint,
+  floor: bigint,
+  series = 77n,
+  page = 1
+): SessionChangesView => ({
+  items,
+  page,
+  totalPages: Number((totalResults + 9n) / 10n),
+  totalResults,
+  results: 10,
+  floor,
+  series
+})
+
+const row = (
+  seq: bigint,
+  sessions: readonly WireConversationId[],
+  truncated = false
+): SessionChangeRow => ({ seq, sessions, positions: [], truncated })
+
+const changes = (value: SessionChangesView): SessionReply => ({
   kind: "ok",
-  outcome: { kind: "changes", changes: view }
+  outcome: { kind: "changes", changes: value }
 })
 
 void test("given_a_deployment_without_sessions_when_reading_then_should_refuse_before_io", async () => {
@@ -91,14 +115,14 @@ void test("given_session_reads_when_sent_then_should_encode_the_wire_requests", 
       .root(id)
       .labelPrefix("ticket-")
       .text("check")
-      .cursor("c1")
-      .limit(5)
-      .total()
+      .page(2)
+      .results(5)
+      .asOf(4405n, 77n)
       .fetch()
   )
-  await settle(sessions.events(id).cursor("c2").limit(3).fixedFrontier().fetch())
+  await settle(sessions.events(id).page(3).results(20).asOf(4405n, 77n).fetch())
   await settle(sessions.state(id, 7))
-  await settle(sessions.changes(42n, 10))
+  await settle(sessions.changes(45, 100))
   assert.deepEqual(
     sent[0]?.payload,
     SessionListCommand.encode({
@@ -107,9 +131,10 @@ void test("given_session_reads_when_sent_then_should_encode_the_wire_requests", 
       root: wireId,
       labelPrefix: "ticket-",
       text: "check",
-      cursor: "c1",
-      limit: 5,
-      wantTotal: true
+      page: 2,
+      results: 5,
+      asOf: 4405n,
+      series: 77n
     })
   )
   assert.deepEqual(
@@ -117,9 +142,10 @@ void test("given_session_reads_when_sent_then_should_encode_the_wire_requests", 
     SessionEventsCommand.encode({
       stream: "agents",
       id: wireId,
-      cursor: "c2",
-      limit: 3,
-      fixedFrontier: true
+      page: 3,
+      results: 20,
+      asOf: 4405n,
+      series: 77n
     })
   )
   assert.deepEqual(
@@ -128,7 +154,7 @@ void test("given_session_reads_when_sent_then_should_encode_the_wire_requests", 
   )
   assert.deepEqual(
     sent[3]?.payload,
-    SessionChangesCommand.encode({ stream: "agents", after: 42n, limit: 10 })
+    SessionChangesCommand.encode({ stream: "agents", page: 45, results: 100 })
   )
   assert.deepEqual(
     sent.map((entry) => entry.code),
@@ -144,8 +170,8 @@ void test("given_session_reads_when_sent_then_should_encode_the_wire_requests", 
 void test("given_session_replies_when_decoded_then_should_return_the_outcome_or_a_typed_error", async () => {
   const { laser, sent } = fakeLaser([
     { kind: "err", error: { kind: "notRegistered", message: "agents" } },
-    changes({ rows: [], floor: 4n, resync: false, series: 0n }),
-    changes({ rows: [], floor: 0n, resync: false, series: 0n })
+    changes(view([], 4n, 5n)),
+    changes(view([], 0n, 1n))
   ])
   const sessions = Sessions.create(laser)
   await assert.rejects(sessions.get(ConversationId.new()), (error: unknown) => {
@@ -155,29 +181,20 @@ void test("given_session_replies_when_decoded_then_should_return_the_outcome_or_
     return true
   })
   assert.equal(sent[0]?.code, AGDX_SESSION_GET_CODE)
-  assert.equal((await sessions.changes(0n, 0)).floor, 4n)
+  const page = await sessions.changes(0, 0)
+  assert.deepEqual([page.totalResults, page.floor, page.results], [4n, 5n, 10])
   await assert.rejects(sessions.get(ConversationId.new()), ProtocolError)
 })
 
 void test("given_a_session_watch_when_changes_land_then_should_start_from_now_dedupe_and_resync", async () => {
   const first = WireConversationId.fromU128(1n)
   const second = WireConversationId.fromU128(2n)
-  const row = (seq: bigint, sessions: readonly WireConversationId[]) => ({
-    seq,
-    sessions,
-    positions: [],
-    truncated: false
-  })
+  const retained = [row(1n, [first]), row(2n, [first]), row(3n, [second])]
   const { laser, sent } = fakeLaser([
-    changes({ rows: [row(3n, [first])], floor: 0n, resync: false, series: 0n }),
-    changes({ rows: [], floor: 0n, resync: false, series: 0n }),
-    changes({
-      rows: [row(4n, [first, second]), row(5n, [first])],
-      floor: 0n,
-      resync: false,
-      series: 0n
-    }),
-    changes({ rows: [], floor: 9n, resync: true, series: 0n })
+    changes(view(retained, 3n, 1n)),
+    changes(view(retained, 3n, 1n)),
+    changes(view([...retained, row(4n, [first, second]), row(5n, [first])], 5n, 1n)),
+    changes(view([], 9n, 9n))
   ])
   const watch = await Sessions.create(laser).watch(1)
   const changed = await watch.next()
@@ -185,27 +202,65 @@ void test("given_a_session_watch_when_changes_land_then_should_start_from_now_de
     first.toString(),
     second.toString()
   ])
-  assert.deepEqual(await watch.next(), { kind: "resync" })
+  assert.deepEqual(await watch.next(), { kind: "resync" }, "retention pruned past the watch")
   assert.equal(sent.length, 4)
 })
 
-void test("given_a_truncated_change_when_watched_then_should_resync_and_resume_after_the_page_the_resync_covers", async () => {
-  const omitted = WireConversationId.fromU128(2n)
-  const incomplete = {
-    seq: 4n,
-    sessions: [WireConversationId.fromU128(1n)],
-    positions: [],
-    truncated: true
-  }
+void test("given_retained_change_rows_when_a_watch_starts_then_should_start_in_one_read_without_draining_them", async () => {
+  const retained = WireConversationId.fromU128(1n)
   const { laser, sent } = fakeLaser([
-    changes({ rows: [], floor: 0n, resync: false, series: 0n }),
-    changes({ rows: [incomplete], floor: 0n, resync: false, series: 0n }),
-    changes({
-      rows: [{ ...incomplete, seq: 5n, sessions: [omitted], truncated: false }],
-      floor: 0n,
-      resync: false,
-      series: 0n
-    })
+    changes(view([row(1n, [retained])], 4405n, 1n)),
+    changes(view([row(4406n, [retained])], 4406n, 1n, 77n, 441))
+  ])
+  const watch = await Sessions.create(laser).watch(1)
+  assert.equal(sent.length, 1, "the start is one read")
+  const start = decodeOne(sent[0]?.payload ?? new Uint8Array(), "SessionChanges")
+  assert.ok(start instanceof Map)
+  assert.deepEqual([Number(start.get("page")), Number(start.get("results"))], [1, 0])
+  const next = await watch.next()
+  assert.deepEqual(next.kind === "changed" ? next.sessions.map(String) : [], [retained.toString()])
+  const follow = decodeOne(sent[1]?.payload ?? new Uint8Array(), "SessionChanges")
+  assert.ok(follow instanceof Map)
+  assert.deepEqual(
+    [Number(follow.get("page")), Number(follow.get("results"))],
+    [441, 10],
+    "the watch reads the page that holds the change after the newest one"
+  )
+})
+
+void test("given_a_zero_poll_interval_when_watching_then_should_refuse_it_before_reading", async () => {
+  const { laser, sent } = fakeLaser([])
+  for (const pollEveryMs of [0, -1, Number.NaN]) {
+    await assert.rejects(Sessions.create(laser).watch(pollEveryMs), InvalidError)
+  }
+  assert.equal(sent.length, 0)
+})
+
+void test("given_a_watch_when_iterated_with_for_await_then_should_yield_each_change", async () => {
+  const changed = WireConversationId.fromU128(3n)
+  const { laser } = fakeLaser([
+    changes(view([], 0n, 1n)),
+    changes(view([row(1n, [changed])], 1n, 1n)),
+    changes(view([], 2n, 2n, 78n))
+  ])
+  const seen: SessionChange[] = []
+  for await (const change of await Sessions.create(laser).watch(1)) {
+    seen.push(change)
+    if (seen.length === 2) break
+  }
+  assert.deepEqual(
+    seen.map((change) => change.kind),
+    ["changed", "resync"]
+  )
+})
+
+void test("given_a_truncated_change_when_watched_then_should_resync_and_resume_after_it", async () => {
+  const omitted = WireConversationId.fromU128(2n)
+  const incomplete = row(4n, [WireConversationId.fromU128(1n)], true)
+  const { laser, sent } = fakeLaser([
+    changes(view([], 3n, 1n)),
+    changes(view([incomplete], 4n, 1n)),
+    changes(view([incomplete, row(5n, [omitted])], 5n, 1n))
   ])
   const watch = await Sessions.create(laser).watch(1)
   // The caller lists again after the resync, which covers the truncated row.
@@ -214,29 +269,20 @@ void test("given_a_truncated_change_when_watched_then_should_resync_and_resume_a
   assert.deepEqual(recovered.kind === "changed" ? recovered.sessions.map(String) : [], [
     omitted.toString()
   ])
-  const resumed = decodeOne(sent[2]?.payload ?? new Uint8Array(), "SessionChanges")
-  assert.ok(resumed instanceof Map)
-  assert.equal(Number(resumed.get("after")), 4, "the cursor moved past the covered page")
+  assert.equal(sent.length, 3)
 })
 
-void test("given_a_watch_when_the_node_reports_a_change_series_then_should_send_it_back", async () => {
-  const changed = WireConversationId.fromU128(9n)
+void test("given_a_watch_when_the_node_names_another_change_series_then_should_resync_and_follow_it", async () => {
   const { laser, sent } = fakeLaser([
-    changes({ rows: [], floor: 0n, resync: false, series: 77n }),
-    changes({
-      rows: [{ seq: 1n, sessions: [changed], positions: [], truncated: false }],
-      floor: 0n,
-      resync: false,
-      series: 77n
-    })
+    changes(view([], 2n, 1n, 77n)),
+    changes(view([], 7n, 1n, 78n)),
+    changes(view([row(8n, [WireConversationId.fromU128(9n)])], 8n, 1n, 78n))
   ])
   const watch = await Sessions.create(laser).watch(1)
-  await watch.next()
-  const first = decodeOne(sent[0]?.payload ?? new Uint8Array(), "SessionChanges")
-  const second = decodeOne(sent[1]?.payload ?? new Uint8Array(), "SessionChanges")
-  assert.ok(first instanceof Map && second instanceof Map)
-  assert.equal(first.has("series"), false, "a first read names no series")
-  assert.equal(Number(second.get("series")), 77)
+  assert.deepEqual(await watch.next(), { kind: "resync" })
+  const changed = await watch.next()
+  assert.equal(changed.kind, "changed")
+  assert.equal(sent.length, 3)
 })
 
 interface ReadIdentity {
@@ -422,14 +468,9 @@ void test("given_a_watch_on_a_node_that_has_not_folded_the_stream_when_it_answer
     ])
   )
   const { laser, sent } = fakeLaser([
-    changes({ rows: [], floor: 0n, resync: false, series: 0n }),
+    changes(view([], 0n, 1n)),
     stale,
-    changes({
-      rows: [{ seq: 1n, sessions: [changed], positions: [], truncated: false }],
-      floor: 0n,
-      resync: false,
-      series: 0n
-    })
+    changes(view([row(1n, [changed])], 1n, 1n))
   ])
   const watch = await Sessions.create(laser).watch(1)
   const next = await watch.next()

@@ -3,6 +3,7 @@ import { test } from "node:test"
 
 import {
   CancelledError,
+  FilterFaultError,
   InvalidError,
   TimeoutError,
   TransportError
@@ -17,7 +18,7 @@ function matched(offset: bigint): MatchedRecord {
     partitionId: 0,
     offset,
     frontier: 10n,
-    evaluated: false,
+    evaluation: { kind: "unfiltered" },
     message: withMessageJson({
       payload: new Uint8Array([Number(offset)]),
       id: { partitionId: 0, offset },
@@ -199,7 +200,7 @@ void test("given_a_group_poll_when_aborted_before_delivery_then_should_keep_the_
     "stream",
     "topic",
     { kind: "group", name: "workers" },
-    {},
+    { commitPolicy: { kind: "polling" } },
     reader
   )
   await assert.rejects(consumer.nextWithin(100, { signal: controller.signal }), CancelledError)
@@ -235,6 +236,48 @@ void test("given_an_automatic_group_consumer_when_shutdown_with_buffered_records
   await consumer.shutdown()
   assert.deepEqual(handled, [0n, 1n], "offset two was never delivered")
   await assert.rejects(consumer.nextWithin(100), InvalidError)
+})
+
+void test("given_a_fault_when_a_group_consumer_skips_it_then_should_pass_the_skip_to_its_reader_and_read_on", async () => {
+  const skipped: (readonly [number, bigint])[] = []
+  let rounds = 0
+  const reader = {
+    owns: () => true,
+    wake: () => undefined,
+    readRound: () => {
+      rounds += 1
+      return rounds === 1
+        ? Promise.reject(new FilterFaultError(0, 1n, "malformed"))
+        : Promise.resolve([matchedPage([matched(2n)]), false] as const)
+    },
+    skip: (partitionId: number, offset: bigint) => {
+      skipped.push([partitionId, offset])
+      return Promise.resolve()
+    },
+    close: () => Promise.resolve()
+  } as unknown as FilteredReader
+  const consumer = Consumer.create(
+    {} as LaserTransport,
+    "stream",
+    "topic",
+    { kind: "group", name: "workers" },
+    { commitPolicy: { kind: "disabled" } },
+    reader
+  )
+  await assert.rejects(consumer.nextWithin(100), FilterFaultError)
+  await consumer.skip(0, 1n)
+  assert.deepEqual(skipped, [[0, 1n]])
+  assert.equal((await consumer.nextWithin(100)).position.offset, 2n)
+  await consumer.shutdown()
+})
+
+void test("given_a_native_consumer_when_skipping_then_should_refuse_it", async () => {
+  const consumer = Consumer.create({} as LaserTransport, "stream", "topic", {
+    kind: "single",
+    name: "reader",
+    partitionId: 0
+  })
+  await assert.rejects(consumer.skip(0, 0n), InvalidError)
 })
 
 void test("given_a_group_consumer_when_asynchronously_disposed_then_should_leave_once", async () => {
@@ -404,6 +447,103 @@ void test("given_group_commit_policies_when_records_are_delivered_then_should_st
     assert.deepEqual(seen, flushes, policy.kind)
     await consumer.shutdown()
   }
+})
+
+void test("given_native_commit_policies_when_records_are_delivered_then_should_store_only_records_the_caller_moved_past", async () => {
+  const cases = [
+    { policy: { kind: "each" }, stores: [[], [0n], [0n, 1n], [0n, 1n, 2n]], final: [0n, 1n, 2n] },
+    { policy: { kind: "every", count: 2 }, stores: [[], [], [1n], [1n]], final: [1n, 2n] },
+    { policy: { kind: "all" }, stores: [[], [], [], [2n]], final: [2n] }
+  ] as const
+  for (const { policy, stores, final } of cases) {
+    const stored: bigint[] = []
+    let served = false
+    const transport = {
+      pollMessages: () => {
+        if (served) return Promise.resolve([])
+        served = true
+        return Promise.resolve(
+          [0n, 1n, 2n].map((offset) => ({
+            payload: new Uint8Array(),
+            partitionId: 0,
+            offset,
+            headers: new Map()
+          }))
+        )
+      },
+      storeOffset: (
+        _stream: string,
+        _topic: string,
+        _target: unknown,
+        _partition: number,
+        offset: bigint
+      ) => {
+        stored.push(offset)
+        return Promise.resolve()
+      }
+    } as unknown as LaserTransport
+    const consumer = Consumer.create(
+      transport,
+      "stream",
+      "topic",
+      { kind: "single", name: "reader", partitionId: 0 },
+      { commitPolicy: policy, maxWaitMs: 0 }
+    )
+    const seen: bigint[][] = []
+    for (let read = 0; read < 3; read += 1) {
+      await consumer.nextWithin(100)
+      seen.push([...stored])
+    }
+    await assert.rejects(consumer.nextWithin(5), TimeoutError)
+    seen.push([...stored])
+    assert.deepEqual(seen, stores, policy.kind)
+    await consumer.shutdown()
+    assert.deepEqual(stored, final, `${policy.kind} at shutdown`)
+  }
+})
+
+void test("given_an_interval_commit_policy_when_the_timer_fires_then_should_store_only_records_the_caller_moved_past", async () => {
+  const stored: bigint[] = []
+  let served = false
+  const transport = {
+    pollMessages: () => {
+      if (served) return Promise.resolve([])
+      served = true
+      return Promise.resolve(
+        [0n, 1n].map((offset) => ({
+          payload: new Uint8Array(),
+          partitionId: 0,
+          offset,
+          headers: new Map()
+        }))
+      )
+    },
+    storeOffset: (
+      _stream: string,
+      _topic: string,
+      _target: unknown,
+      _partition: number,
+      offset: bigint
+    ) => {
+      stored.push(offset)
+      return Promise.resolve()
+    }
+  } as unknown as LaserTransport
+  const consumer = Consumer.create(
+    transport,
+    "stream",
+    "topic",
+    { kind: "single", name: "reader", partitionId: 0 },
+    { commitPolicy: { kind: "interval", intervalMs: 5 }, maxWaitMs: 0 }
+  )
+  assert.equal((await consumer.nextWithin(100)).position.offset, 0n)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.deepEqual(stored, [], "the record the caller holds is not stored by the timer")
+  assert.equal((await consumer.nextWithin(100)).position.offset, 1n)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.deepEqual(stored, [0n], "the timer stores the record the caller moved past")
+  await consumer.shutdown()
+  assert.deepEqual(stored, [0n, 1n])
 })
 
 void test("given_a_native_group_consumer_when_shut_down_then_should_leave_the_group_it_joined", async () => {

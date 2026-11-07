@@ -1,4 +1,4 @@
-use crate::async_bridge::{Undelivered, future_into_py, future_into_py_returning};
+use crate::async_bridge::{Awaitable, Undelivered, awaitable, awaitable_returning};
 use crate::convert::{json_to_py, payload_bytes, py_to_de, py_to_typed_value, ser_to_py};
 use crate::errors::{ConfigError, InvalidError, to_pyerr};
 use crate::transport::PyConsumerMessage;
@@ -6,7 +6,7 @@ use laser_sdk::LaserError;
 use laser_sdk::filters::{
     Coerce, ConsumerFilter, ExecutionMode, FaultPolicy, FilterError, FilterErrorReason, FilterExpr,
     FilterHeader, FilteredReader, FilteredStart, HeaderScalar, MatchedPage, MatchedRecord,
-    RecordPolicy, TextMatch, TimestampFormat,
+    RecordEvaluation, RecordPolicy, TextMatch, TimestampFormat,
 };
 use laser_sdk::query::CmpOp;
 use laser_sdk::wire::filter::eval::{
@@ -98,6 +98,10 @@ impl PyFilterExpr {
         field: String,
         op: String,
         value: &Bound<'_, PyAny>,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['number', 'rfc3339', 'epoch_seconds', 'epoch_millis', 'epoch_micros']",
+            imports = ("typing",)
+        ))]
         coerce: String,
     ) -> PyResult<Self> {
         Ok(Self {
@@ -154,7 +158,15 @@ impl PyFilterExpr {
     /// `contains`, `glob`, or `regex`. A value of another type is a type
     /// mismatch, which follows the filter's mismatch policy.
     #[staticmethod]
-    fn text(field: String, kind: &str, pattern: String) -> PyResult<Self> {
+    fn text(
+        field: String,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['equals', 'prefix', 'suffix', 'contains', 'glob', 'regex']",
+            imports = ("typing",)
+        ))]
+        kind: &str,
+        pattern: String,
+    ) -> PyResult<Self> {
         Ok(Self {
             inner: FilterExpr::text(field, text_match(kind)?, pattern),
         })
@@ -162,7 +174,15 @@ impl PyFilterExpr {
 
     /// Match one text user header, keyed exactly, the way `text` matches a field.
     #[staticmethod]
-    fn header_text(key: String, kind: &str, pattern: String) -> PyResult<Self> {
+    fn header_text(
+        key: String,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['equals', 'prefix', 'suffix', 'contains', 'glob', 'regex']",
+            imports = ("typing",)
+        ))]
+        kind: &str,
+        pattern: String,
+    ) -> PyResult<Self> {
         Ok(Self {
             inner: FilterExpr::header_text(key, text_match(kind)?, pattern),
         })
@@ -297,7 +317,11 @@ impl PyConsumerFilter {
     /// `pass`, or `drop`.
     #[staticmethod]
     #[pyo3(signature = (expr, fault_policy="stop"))]
-    fn json(expr: PyFilterExpr, fault_policy: &str) -> PyResult<Self> {
+    fn json(
+        expr: PyFilterExpr,
+        #[gen_stub(override_type(type_repr = "typing.Literal['stop', 'pass', 'drop']", imports = ("typing",)))]
+        fault_policy: &str,
+    ) -> PyResult<Self> {
         Ok(ConsumerFilter::json(expr.inner)
             .with_fault_policy(fault(fault_policy)?)
             .into())
@@ -306,7 +330,11 @@ impl PyConsumerFilter {
     /// Decode a CBOR payload with bounded depth and size.
     #[staticmethod]
     #[pyo3(signature = (expr, fault_policy="stop"))]
-    fn cbor(expr: PyFilterExpr, fault_policy: &str) -> PyResult<Self> {
+    fn cbor(
+        expr: PyFilterExpr,
+        #[gen_stub(override_type(type_repr = "typing.Literal['stop', 'pass', 'drop']", imports = ("typing",)))]
+        fault_policy: &str,
+    ) -> PyResult<Self> {
         Ok(ConsumerFilter::cbor(expr.inner)
             .with_fault_policy(fault(fault_policy)?)
             .into())
@@ -315,7 +343,12 @@ impl PyConsumerFilter {
     /// Decode a raw Avro datum selected by its agdx.sid header.
     #[staticmethod]
     #[pyo3(signature = (expr, schema_refs, fault_policy="stop"))]
-    fn avro(expr: PyFilterExpr, schema_refs: Vec<u32>, fault_policy: &str) -> PyResult<Self> {
+    fn avro(
+        expr: PyFilterExpr,
+        schema_refs: Vec<u32>,
+        #[gen_stub(override_type(type_repr = "typing.Literal['stop', 'pass', 'drop']", imports = ("typing",)))]
+        fault_policy: &str,
+    ) -> PyResult<Self> {
         Ok(ConsumerFilter::avro(expr.inner, schema_refs)
             .with_fault_policy(fault(fault_policy)?)
             .into())
@@ -324,7 +357,12 @@ impl PyConsumerFilter {
     /// Decode a Protobuf message selected by its agdx.sid header.
     #[staticmethod]
     #[pyo3(signature = (expr, schema_refs, fault_policy="stop"))]
-    fn protobuf(expr: PyFilterExpr, schema_refs: Vec<u32>, fault_policy: &str) -> PyResult<Self> {
+    fn protobuf(
+        expr: PyFilterExpr,
+        schema_refs: Vec<u32>,
+        #[gen_stub(override_type(type_repr = "typing.Literal['stop', 'pass', 'drop']", imports = ("typing",)))]
+        fault_policy: &str,
+    ) -> PyResult<Self> {
         Ok(ConsumerFilter::protobuf(expr.inner, schema_refs)
             .with_fault_policy(fault(fault_policy)?)
             .into())
@@ -333,7 +371,11 @@ impl PyConsumerFilter {
     /// Never decode the payload. Only header predicates are allowed.
     #[staticmethod]
     #[pyo3(signature = (expr, fault_policy="stop"))]
-    fn headers_only(expr: PyFilterExpr, fault_policy: &str) -> PyResult<Self> {
+    fn headers_only(
+        expr: PyFilterExpr,
+        #[gen_stub(override_type(type_repr = "typing.Literal['stop', 'pass', 'drop']", imports = ("typing",)))]
+        fault_policy: &str,
+    ) -> PyResult<Self> {
         Ok(ConsumerFilter::headers_only(expr.inner)
             .with_fault_policy(fault(fault_policy)?)
             .into())
@@ -352,7 +394,11 @@ impl PyConsumerFilter {
     }
 
     /// A copy with the malformed-payload policy: stop, pass, or drop.
-    fn with_fault_policy(&self, fault_policy: &str) -> PyResult<Self> {
+    fn with_fault_policy(
+        &self,
+        #[gen_stub(override_type(type_repr = "typing.Literal['stop', 'pass', 'drop']", imports = ("typing",)))]
+        fault_policy: &str,
+    ) -> PyResult<Self> {
         Ok(self
             .inner
             .clone()
@@ -659,6 +705,34 @@ impl PyFilteredReader {
             returned_pages: Arc::new(SyncMutex::new(VecDeque::new())),
         }
     }
+
+    // The work `close` and an `async with` exit share.
+    fn closing(&self) -> impl Future<Output = PyResult<()>> + Send + 'static {
+        let (state, returned) = (self.state.clone(), self.returned.clone());
+        let (returned_pages, interrupt) = (self.returned_pages.clone(), self.interrupt.clone());
+        async move {
+            let taken = {
+                let mut state = take(&state, &interrupt).await;
+                if let Some(reader) = state.reader.as_mut() {
+                    reader.flush_completed().await.map_err(to_pyerr)?;
+                }
+                state.buffered.clear();
+                returned
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                returned_pages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                state.reader.take()
+            };
+            match taken {
+                Some(reader) => reader.close().await.map_err(to_pyerr),
+                None => Ok(()),
+            }
+        }
+    }
 }
 
 // A page shared by its record handles, with each record's message decoded once
@@ -675,10 +749,10 @@ impl PyFilteredReader {
     /// the way the Rust reader does, in a filtered wait the server holds or
     /// one idle interval on a server that holds none. `ack` and `close` end
     /// that wait, so they run meanwhile.
-    fn next_page<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn next_page<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyMatchedPage>> {
         let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let returned_pages = self.returned_pages.clone();
-        future_into_py_returning(
+        awaitable_returning(
             py,
             async move {
                 loop {
@@ -700,10 +774,13 @@ impl PyFilteredReader {
     }
 
     /// Read until a page matches or nothing is new. `None` when nothing is new.
-    fn try_next_page<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn try_next_page<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Awaitable<'py, Option<PyMatchedPage>>> {
         let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let returned_pages = self.returned_pages.clone();
-        future_into_py_returning(
+        awaitable_returning(
             py,
             async move {
                 loop {
@@ -723,11 +800,14 @@ impl PyFilteredReader {
 
     /// One bounded round without an idle wait. Returns (page, more).
     /// Read examined_in_round() for the count of source records examined.
-    fn read_round<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn read_round<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Awaitable<'py, (Option<PyMatchedPage>, bool)>> {
         let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let returned_pages = self.returned_pages.clone();
         let recover = give_back_page(self.returned_pages.clone());
-        future_into_py_returning(
+        awaitable_returning(
             py,
             async move {
                 let mut state = take(&state, &interrupt).await;
@@ -748,9 +828,9 @@ impl PyFilteredReader {
     /// `max_wait_ms` and what it announces, and the next round reads only the
     /// ready partitions. On a server that holds no filtered wait it sleeps one
     /// idle interval. Any other call on the reader ends the wait.
-    fn wait_for_records<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn wait_for_records<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
-        future_into_py(py, async move {
+        awaitable(py, async move {
             state.lock().await.wait_for_records(&interrupt).await
         })
     }
@@ -761,10 +841,10 @@ impl PyFilteredReader {
     }
 
     /// The next matching record.
-    fn next_record<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn next_record<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyMatchedRecord>> {
         let (state, returned) = (self.state.clone(), self.returned.clone());
         let returned_pages = self.returned_pages.clone();
-        future_into_py_returning(
+        awaitable_returning(
             py,
             next_record(state, self.interrupt.clone(), returned, returned_pages),
             give_back(self.returned.clone()),
@@ -776,10 +856,10 @@ impl PyFilteredReader {
         &self,
         py: Python<'py>,
         record: PyRef<'_, PyMatchedRecord>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let (page, index) = (record.page.clone(), record.index);
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut state = take(&state, &interrupt).await;
             state
                 .open()?
@@ -795,10 +875,10 @@ impl PyFilteredReader {
         &self,
         py: Python<'py>,
         record: PyRef<'_, PyMatchedRecord>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let (page, index) = (record.page.clone(), record.index);
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut state = take(&state, &interrupt).await;
             state
                 .open()?
@@ -814,28 +894,51 @@ impl PyFilteredReader {
         &self,
         py: Python<'py>,
         page: PyRef<'_, PyMatchedPage>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let page = page.page.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let mut state = take(&state, &interrupt).await;
             state.open()?.ack_page(&page.page).await.map_err(to_pyerr)
         })
     }
 
-    /// The partitions this reader reads now.
-    fn partitions<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Pass the record a `FilterFaultError` or a `FilterOversizedRecordError`
+    /// stopped `partition_id` at, and read on after it, the way a native
+    /// consumer seeks past a record. The skip is a fenced acknowledgment of
+    /// `offset` under the policy and the owner the stopped page was read
+    /// under, stored once every earlier record of the partition is handled.
+    /// Raises `InvalidError` when the partition is not stopped at `offset`.
+    fn skip<'py>(
+        &self,
+        py: Python<'py>,
+        partition_id: u32,
+        offset: u64,
+    ) -> PyResult<Awaitable<'py, ()>> {
         let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
-        future_into_py(py, async move {
+        awaitable(py, async move {
+            let mut state = take(&state, &interrupt).await;
+            state
+                .open()?
+                .skip(partition_id, offset)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// The partitions this reader reads now.
+    fn partitions<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Vec<u32>>> {
+        let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
+        awaitable(py, async move {
             Ok(take(&state, &interrupt).await.open()?.partitions())
         })
     }
 
     /// How long this reader waits, in milliseconds, when nothing is new on a
     /// server that holds no filtered wait.
-    fn idle_interval_ms<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn idle_interval_ms<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, f64>> {
         let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
-        future_into_py(py, async move {
+        awaitable(py, async move {
             Ok(take(&state, &interrupt)
                 .await
                 .open()?
@@ -852,39 +955,38 @@ impl PyFilteredReader {
         &self,
         py: Python<'py>,
         page: PyRef<'_, PyMatchedPage>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, bool>> {
         let (state, interrupt) = (self.state.clone(), self.interrupt.clone());
         let page = Arc::clone(&page.page);
-        future_into_py(py, async move {
+        awaitable(py, async move {
             Ok(take(&state, &interrupt).await.open()?.owns(&page.page))
         })
     }
 
     /// Store completed progress and leave the group. Closing twice is a no-op.
-    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let (state, returned) = (self.state.clone(), self.returned.clone());
-        let (returned_pages, interrupt) = (self.returned_pages.clone(), self.interrupt.clone());
-        future_into_py(py, async move {
-            let taken = {
-                let mut state = take(&state, &interrupt).await;
-                if let Some(reader) = state.reader.as_mut() {
-                    reader.flush_completed().await.map_err(to_pyerr)?;
-                }
-                state.buffered.clear();
-                returned
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clear();
-                returned_pages
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clear();
-                state.reader.take()
-            };
-            match taken {
-                Some(reader) => reader.close().await.map_err(to_pyerr),
-                None => Ok(()),
-            }
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
+        awaitable(py, self.closing())
+    }
+
+    /// Enter `async with`: yield the reader. Exiting the block closes it.
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Awaitable<'py, Py<Self>>> {
+        awaitable(py, async move { Ok(slf) })
+    }
+
+    /// Exit `async with`: `close`, then return `False` so an exception in the
+    /// body is not suppressed.
+    #[pyo3(signature = (_exc_type, _exc_value, _traceback))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, bool>> {
+        let closing = self.closing();
+        awaitable(py, async move {
+            closing.await?;
+            Ok(false)
         })
     }
 
@@ -892,10 +994,10 @@ impl PyFilteredReader {
         slf
     }
 
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, PyMatchedRecord>> {
         let (state, returned) = (self.state.clone(), self.returned.clone());
         let (returned_pages, interrupt) = (self.returned_pages.clone(), self.interrupt.clone());
-        future_into_py_returning(
+        awaitable_returning(
             py,
             async move {
                 if state.lock().await.reader.is_none() {
@@ -1156,11 +1258,39 @@ impl PyMatchedRecord {
         self.record().frontier
     }
 
-    /// False when a pass fault, foreign-codec, or type-mismatch policy
-    /// delivered the record without evaluation.
+    /// How the group's policy treated the record: `selected` when the filter
+    /// evaluated and selected it, `unevaluated` when a pass fault,
+    /// foreign-record, or mismatch policy delivered it without evaluating it,
+    /// and `unfiltered` when the group has no policy and receives every
+    /// record.
     #[getter]
-    fn evaluated(&self) -> bool {
-        self.record().evaluated
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Literal['selected', 'unevaluated', 'unfiltered']",
+        imports = ("typing",)
+    ))]
+    fn evaluation(&self) -> &'static str {
+        match self.record().evaluation {
+            RecordEvaluation::Selected => "selected",
+            RecordEvaluation::Unevaluated(_) => "unevaluated",
+            RecordEvaluation::Unfiltered => "unfiltered",
+        }
+    }
+
+    /// Why the record was not evaluated when `evaluation` is `unevaluated`:
+    /// `malformed`, `too_large` or `too_deep` under a pass fault policy,
+    /// `foreign_codec`, `missing_schema`, `schema_not_allowed` or
+    /// `schema_mismatch` under a pass foreign-record policy, and
+    /// `type_mismatch` under a pass mismatch policy. None otherwise.
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Optional[typing.Literal['missing_schema', 'schema_not_allowed', 'schema_mismatch', 'malformed', 'too_large', 'too_deep', 'foreign_codec', 'type_mismatch']]",
+        imports = ("typing",)
+    ))]
+    fn unevaluated_reason(&self) -> Option<String> {
+        match self.record().evaluation {
+            RecordEvaluation::Unevaluated(reason) => Some(reason.to_string()),
+            RecordEvaluation::Selected | RecordEvaluation::Unfiltered => None,
+        }
     }
 
     /// True when a header entry or block structure is malformed. Valid
@@ -1303,6 +1433,7 @@ pub(crate) fn text_predicate_validate(predicate: &Bound<'_, PyAny>) -> PyResult<
 pub(crate) fn applied_policy_filtered(
     py: Python<'_>,
     group_id: Option<u64>,
+    #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
     digest: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let digest = <[u8; Digest32::BYTES]>::try_from(payload_bytes(digest)?.as_slice())

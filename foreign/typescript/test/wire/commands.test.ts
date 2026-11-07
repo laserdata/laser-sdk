@@ -81,13 +81,12 @@ void test("given_the_command_registry_when_checked_then_should_pin_every_rust_co
     MANAGED_COMMANDS.map((command) => command.code),
     [
       1_000_100, 1_000_101, 1_000_102, 1_000_103, 1_000_104, 1_000_105, 1_000_106, 1_000_200,
-      1_000_201, 1_000_202, 1_000_203, 1_000_021, 1_000_022, 1_000_023, 1_000_024, 1_000_025,
       1_000_210, 1_000_211, 1_000_220, 1_000_221, 1_000_222, 1_000_223, 1_000_300, 1_000_301,
       1_000_302, 1_000_303, 1_000_304, 1_000_305, 1_000_400, 1_000_401, 1_000_402, 1_000_403,
       1_000_404, 1_000_710, 1_000_711, 1_000_712, 1_000_713, 1_000_714, 1_000_715, 1_000_716
     ]
   )
-  assert.equal(new Set(MANAGED_COMMANDS.map((command) => command.code)).size, 40)
+  assert.equal(new Set(MANAGED_COMMANDS.map((command) => command.code)).size, 32)
 })
 
 void test("given_typed_command_requests_when_encoded_then_should_delegate_to_the_exact_wire_codec", () => {
@@ -122,10 +121,10 @@ void test("given_typed_command_requests_when_encoded_then_should_delegate_to_the
     { namespace: "n", key: Uint8Array.of(1), value: Uint8Array.of(2) },
     encodeKvSet
   )
-  assertFramed(KvScanCommand, { namespace: "n", limit: 10 }, encodeKvScan)
+  assertFramed(KvScanCommand, { namespace: "n", page: 1, results: 10 }, encodeKvScan)
   assertFramed(KvDeleteCommand, { namespace: "n", key: Uint8Array.of(1) }, encodeKvDelete)
   assertFramed(KvDeleteManyCommand, { namespace: "n" }, encodeKvDeleteMany)
-  assertFramed(KvNamespacesCommand, undefined, encodeKvNamespaces)
+  assertFramed(KvNamespacesCommand, { stream: "acme" }, encodeKvNamespaces)
 
   assertFramed(
     ForkCreateCommand,
@@ -134,7 +133,7 @@ void test("given_typed_command_requests_when_encoded_then_should_delegate_to_the
   )
   assertFramed(ForkDeleteCommand, { forkId: "draft" }, encodeForkDelete)
   assertFramed(ForkPromoteCommand, { forkId: "draft" }, encodeForkPromote)
-  assertFramed(ForkListCommand, undefined, encodeForkList)
+  assertFramed(ForkListCommand, { stream: "acme" }, encodeForkList)
   assertFramed(
     ForkPutCommand,
     {

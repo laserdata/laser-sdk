@@ -10,17 +10,21 @@ import {
   WireId,
   type SessionRef
 } from "./ids.js"
-import { MAX_GRAPH_LABEL_BYTES, MAX_GRAPH_NAME_BYTES } from "./limits.js"
-import { validateBoundedText } from "./validate.js"
 import {
-  consistencyToWord,
-  decodeFilter,
-  encodeFilter,
-  parseConsistency,
-  type Consistency,
-  type Filter
-} from "./query.js"
+  MAX_GRAPH_LABEL_BYTES,
+  MAX_GRAPH_NAME_BYTES,
+  MAX_GRAPH_NODE_LABELS,
+  MAX_GRAPH_RESULT_ELEMENTS,
+  MAX_GRAPH_TRAVERSE_DEPTH,
+  MAX_METADATA_ENTRIES,
+  MAX_METADATA_KEY_BYTES,
+  MAX_SOURCE_REF_BYTES
+} from "./limits.js"
+import { validateBoundedText, validateStoredText } from "./validate.js"
+import { decodeFilter, encodeFilter, type Filter } from "./query.js"
 import { decodeValue, encodeValue, type Value } from "./value.js"
+
+const UTF8 = new TextEncoder()
 
 export class NodeId extends WireId<"NodeId"> {
   private constructor(value: bigint) {
@@ -188,6 +192,7 @@ export function decodeGraphStart(value: unknown, context: string): GraphStart {
 }
 
 export interface GraphQuery {
+  readonly v: number
   readonly graph: string
   readonly start: GraphStart
   readonly traverse: readonly Hop[]
@@ -195,8 +200,6 @@ export interface GraphQuery {
   readonly edgeFilter?: Filter
   readonly return: GraphReturn
   readonly limit: number
-  readonly fork?: string
-  readonly consistency: Consistency
   readonly asOf?: bigint
   readonly conversation?: string
   /** The stream the lens conversation belongs to, set alongside
@@ -206,7 +209,7 @@ export interface GraphQuery {
 
 export function encodeGraphQuery(query: GraphQuery): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", BigInt(GRAPH_OP_VERSION))
+  map.set("v", BigInt(query.v))
   map.set("graph", query.graph)
   map.set("start", encodeGraphStart(query.start))
   if (query.traverse.length > 0)
@@ -218,8 +221,6 @@ export function encodeGraphQuery(query: GraphQuery): Map<string, unknown> {
   if (query.edgeFilter !== undefined) map.set("edge_filter", encodeFilter(query.edgeFilter))
   if (!graphReturnIsNodes(query.return)) map.set("return_", query.return)
   map.set("limit", BigInt(query.limit))
-  if (query.fork !== undefined) map.set("fork", query.fork)
-  if (query.consistency !== "eventual") map.set("consistency", consistencyToWord(query.consistency))
   if (query.asOf !== undefined) map.set("as_of", query.asOf)
   if (query.conversation !== undefined) map.set("conversation", query.conversation)
   if (query.stream !== undefined) map.set("stream", query.stream)
@@ -227,16 +228,15 @@ export function encodeGraphQuery(query: GraphQuery): Map<string, unknown> {
 }
 
 export function decodeGraphQuery(map: CborMap, context: string): GraphQuery {
-  field.requiredU32(map, "v", context)
+  const v = field.requiredU32(map, "v", context)
   const nodeFilter = map.get("node_filter")
   const edgeFilter = map.get("edge_filter")
   const returnWord = field.optionalString(map, "return_", context)
-  const fork = field.optionalString(map, "fork", context)
-  const consistency = field.optionalString(map, "consistency", context)
   const asOf = field.optionalU64(map, "as_of", context)
   const conversation = field.optionalString(map, "conversation", context)
   const stream = field.optionalString(map, "stream", context)
   return {
+    v,
     graph: field.requiredString(map, "graph", context),
     start: decodeGraphStart(field.requiredMap(map, "start", context), `${context}.start`),
     traverse: field.optionalArray(map, "traverse", context, (item, index) =>
@@ -253,11 +253,48 @@ export function decodeGraphQuery(map: CborMap, context: string): GraphQuery {
       : {}),
     return: returnWord !== undefined ? parseGraphReturn(returnWord, context) : "nodes",
     limit: field.requiredU32(map, "limit", context),
-    ...(fork !== undefined ? { fork } : {}),
-    consistency: consistency !== undefined ? parseConsistency(consistency, context) : "eventual",
     ...(asOf !== undefined ? { asOf } : {}),
     ...(conversation !== undefined ? { conversation } : {}),
     ...(stream !== undefined ? { stream } : {})
+  }
+}
+
+/** Refuses a traversal the managed backend would refuse or silently narrow:
+ * a bad graph name, a hop step outside one to the depth ceiling, an expanded
+ * depth past the ceiling, or a limit that is not a whole number up to the
+ * element cap. */
+export function validateGraphQuery(query: GraphQuery): void {
+  validateGraphName(query.graph)
+  let depth = 0
+  for (const hop of query.traverse) {
+    if (!Number.isInteger(hop.max) || hop.max < 1 || hop.max > MAX_GRAPH_TRAVERSE_DEPTH) {
+      throw new InvalidError(
+        `graph hop max ${String(hop.max)} must be between 1 and ${String(MAX_GRAPH_TRAVERSE_DEPTH)}`
+      )
+    }
+    depth += hop.max
+  }
+  if (depth > MAX_GRAPH_TRAVERSE_DEPTH) {
+    throw new InvalidError(
+      `graph traversal depth ${String(depth)} exceeds cap ${String(MAX_GRAPH_TRAVERSE_DEPTH)}`
+    )
+  }
+  validateGraphLimit(query.limit)
+  if (query.start.kind === "nearest") validateU32("graph nearest k", query.start.k)
+}
+
+/** Refuses a result limit that is not a whole number up to the element cap. */
+export function validateGraphLimit(limit: number): void {
+  if (!Number.isInteger(limit) || limit < 0 || limit > MAX_GRAPH_RESULT_ELEMENTS) {
+    throw new InvalidError(
+      `graph result limit ${String(limit)} must be a whole number up to ${String(MAX_GRAPH_RESULT_ELEMENTS)}`
+    )
+  }
+}
+
+function validateU32(label: string, value: number): void {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffff_ffff) {
+    throw new InvalidError(`${label} ${String(value)} must be a 32-bit unsigned integer`)
   }
 }
 
@@ -631,6 +668,9 @@ export interface GraphResult {
   readonly nodes: readonly GraphNode[]
   readonly edges: readonly GraphEdge[]
   readonly paths: readonly Path[]
+  /** The traversal stopped at its element limit while more matched. A result
+   * that fits the limit exactly is not truncated. */
+  readonly truncated?: boolean
 }
 
 export function encodeGraphResult(result: GraphResult): Map<string, unknown> {
@@ -650,6 +690,7 @@ export function encodeGraphResult(result: GraphResult): Map<string, unknown> {
       "paths",
       result.paths.map((path) => encodePath(path))
     )
+  if (result.truncated === true) map.set("truncated", true)
   return map
 }
 
@@ -672,7 +713,8 @@ export function decodeGraphResult(map: CborMap, context: string): GraphResult {
         expectMap(item, `${context}.paths[${String(index)}]`),
         `${context}.paths[${String(index)}]`
       )
-    )
+    ),
+    ...(field.optionalBoolean(map, "truncated", context) === true ? { truncated: true } : {})
   }
 }
 
@@ -683,15 +725,71 @@ export interface GraphUpsert {
   readonly edges: readonly GraphEdge[]
 }
 
-/** The node labels and edge types of an upsert, 1 to `MAX_GRAPH_LABEL_BYTES`
- * bytes without a control character, as Rust `GraphUpsert::validate`. */
+/** Rust `GraphUpsert::validate`: the graph name, the element count, and each
+ * element's labels or type, attributes and source. */
 export function validateGraphUpsert(upsert: GraphUpsert): void {
+  validateGraphName(upsert.graph)
+  const elements = upsert.nodes.length + upsert.edges.length
+  if (elements > MAX_GRAPH_RESULT_ELEMENTS) {
+    throw new InvalidError(
+      `graph upsert carries ${String(elements)} elements, exceeds cap ${String(MAX_GRAPH_RESULT_ELEMENTS)}`
+    )
+  }
   for (const node of upsert.nodes) {
+    if (node.labels.length > MAX_GRAPH_NODE_LABELS) {
+      throw new InvalidError(
+        `graph node carries ${String(node.labels.length)} labels, exceeds cap ${String(MAX_GRAPH_NODE_LABELS)}`
+      )
+    }
     for (const label of node.labels)
       validateBoundedText("graph node label", label, MAX_GRAPH_LABEL_BYTES)
+    validateAttrs("graph node", node.attrs)
+    if (node.source !== undefined) validateSourceRef(node.source)
   }
-  for (const edge of upsert.edges)
+  for (const edge of upsert.edges) {
     validateBoundedText("graph edge type", edge.edgeType, MAX_GRAPH_LABEL_BYTES)
+    validateAttrs("graph edge", edge.attrs)
+    if (edge.source !== undefined) validateSourceRef(edge.source)
+  }
+}
+
+function validateAttrs(label: string, attrs: readonly GraphAttr[]): void {
+  if (attrs.length > MAX_METADATA_ENTRIES) {
+    throw new InvalidError(
+      `${label} carries ${String(attrs.length)} attributes, exceeds cap ${String(MAX_METADATA_ENTRIES)}`
+    )
+  }
+  for (const [key] of attrs) {
+    const bytes = UTF8.encode(key).byteLength
+    if (bytes > MAX_METADATA_KEY_BYTES) {
+      throw new InvalidError(
+        `${label} attribute name is ${String(bytes)}B, exceeds cap ${String(MAX_METADATA_KEY_BYTES)}B`
+      )
+    }
+  }
+}
+
+/** Rust `SourceRef::validate`: a bounded reference and a conversation without NUL. */
+function validateSourceRef(source: SourceRef): void {
+  let size: number
+  switch (source.kind) {
+    case "message":
+      if (source.conversation !== undefined)
+        validateStoredText("source conversation", source.conversation)
+      size = source.conversation === undefined ? 0 : UTF8.encode(source.conversation).byteLength
+      break
+    case "kv":
+      size = UTF8.encode(source.namespace).byteLength + UTF8.encode(source.key).byteLength
+      break
+    case "memory":
+      size = UTF8.encode(source.id).byteLength
+      break
+  }
+  if (size > MAX_SOURCE_REF_BYTES) {
+    throw new InvalidError(
+      `source reference is ${String(size)}B, exceeds cap ${String(MAX_SOURCE_REF_BYTES)}B`
+    )
+  }
 }
 
 export function encodeGraphUpsert(upsert: GraphUpsert): Map<string, unknown> {

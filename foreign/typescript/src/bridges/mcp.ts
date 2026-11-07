@@ -1,8 +1,10 @@
 import { startChild } from "../agent/contract.js"
-import { publicErrorMessage } from "../client/error-classify.js"
-import { CodecError, HandlerConfigError, InvalidError, TimeoutError } from "../client/errors.js"
+import { type CallOptions, abortable, cancellable, throwIfAborted } from "../client/call-options.js"
+import { code, publicErrorMessage } from "../client/error-classify.js"
+import { CodecError, InvalidError, TimeoutError } from "../client/errors.js"
 import { INTERNAL_REPLY_HUB } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
+import type { SigningKey } from "../signing.js"
 import { ConversationId, type AgentId } from "../types/ids.js"
 import {
   AgentKind,
@@ -16,13 +18,21 @@ import {
 import { ContentType } from "../wire/content.js"
 import { ConversationId as WireConversationId, CorrelationId, type RecordId } from "../wire/ids.js"
 import { SDK_VERSION } from "./a2a.js"
-import { bridgeHopMetadata, enterBridge } from "./hops.js"
+import { bridgeHopMetadata, callHops, enterBridge, inboundHops } from "./hops.js"
 
+/** The protocol version `initialize` answers when the client asks for one
+ * this bridge does not serve: the latest it does. */
 export const MCP_DEFAULT_PROTOCOL_VERSION = "2025-11-25"
-export const MCP_APP_ERROR_CODE = -32_000
+/** The MCP protocol versions this bridge serves, newest first. */
+export const MCP_SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = [
+  "2025-11-25",
+  "2025-06-18",
+  "2025-03-26"
+]
 
 export const McpMethod = {
   Initialize: "initialize",
+  Ping: "ping",
   ToolsList: "tools/list",
   ToolsCall: "tools/call",
   ResourcesList: "resources/list",
@@ -88,6 +98,32 @@ export interface McpRpcResponse {
   readonly error?: McpRpcError
 }
 
+// A request refused with its JSON-RPC error code and a fixed public message.
+class McpFault extends Error {
+  constructor(
+    readonly code: number,
+    readonly publicMessage: string
+  ) {
+    super(publicMessage)
+  }
+}
+
+const INVALID_REQUEST = -32_600
+const METHOD_NOT_FOUND = -32_601
+const INVALID_PARAMS = -32_602
+const INTERNAL_ERROR = -32_603
+const RESOURCE_NOT_FOUND = -32_002
+
+// The JSON-RPC error a failure answers with: a fault carries its own code, a
+// client mistake is invalid params, anything else an internal error.
+function rpcError(error: unknown): McpRpcError {
+  if (error instanceof McpFault) return { code: error.code, message: error.publicMessage }
+  const result = code(error)
+  if (result.kind === "known" && result.name === "InvalidArgument")
+    return { code: INVALID_PARAMS, message: "invalid params" }
+  return { code: INTERNAL_ERROR, message: publicErrorMessage(error) }
+}
+
 interface ResourceEntry {
   readonly resource: McpResource
   readonly text: string
@@ -103,13 +139,6 @@ interface PromptEntry {
 function toolSchema(value: unknown): Readonly<Record<string, unknown>> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new InvalidError("MCP tool input schema must be a JSON object")
-  }
-  return value as Readonly<Record<string, unknown>>
-}
-
-function jsonObject(value: unknown, context: string): Readonly<Record<string, unknown>> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new HandlerConfigError(`${context} must be a JSON object`)
   }
   return value as Readonly<Record<string, unknown>>
 }
@@ -167,6 +196,8 @@ export class McpBridge {
   private readonly prompts: PromptEntry[] = []
   private timeoutMs = 30_000
   private hops: readonly string[]
+  private signingKey: SigningKey | undefined
+  private target: AgentId | undefined
 
   constructor(
     private readonly laser: Laser,
@@ -180,6 +211,20 @@ export class McpBridge {
 
   withBridgeHops(previous: readonly string[]): this {
     this.hops = enterBridge(this.source.asStr(), previous)
+    return this
+  }
+
+  /** Sign every tool call with `key`, so an agent that verifies its input
+   * accepts the calls this bridge publishes. */
+  withSigningKey(key: SigningKey): this {
+    this.signingKey = key
+    return this
+  }
+
+  /** Address every call that names no target to `agent`. Its reply must then
+   * be signed by `agent` when the `Laser` verifies replies. */
+  withTarget(agent: AgentId): this {
+    this.target = agent
     return this
   }
 
@@ -230,9 +275,14 @@ export class McpBridge {
     return this
   }
 
+  /** `initialize`: the requested protocol version when this bridge serves it,
+   * else the latest it serves, and the capabilities it serves. */
   initialize(protocolVersion?: string): unknown {
     return {
-      protocolVersion: protocolVersion ?? MCP_DEFAULT_PROTOCOL_VERSION,
+      protocolVersion:
+        protocolVersion !== undefined && MCP_SUPPORTED_PROTOCOL_VERSIONS.includes(protocolVersion)
+          ? protocolVersion
+          : MCP_DEFAULT_PROTOCOL_VERSION,
       serverInfo: { name: this.serverName, version: SDK_VERSION },
       capabilities: {
         tools: {},
@@ -287,8 +337,22 @@ export class McpBridge {
   async callTool(
     name: string,
     paramsJson: unknown,
-    options: { readonly target?: AgentId } = {}
+    options: CallOptions & { readonly target?: AgentId } = {}
   ): Promise<McpToolResult> {
+    return this.callToolWithHops([], name, paramsJson, options)
+  }
+
+  /** `callTool` for work that already crossed other bridges: `previousHops`
+   * is its `bridge_hops`, and the call carries that path with this bridge
+   * appended. A path that already holds this bridge is refused before
+   * anything is published. */
+  async callToolWithHops(
+    previousHops: readonly string[],
+    name: string,
+    paramsJson: unknown,
+    options: CallOptions & { readonly target?: AgentId } = {}
+  ): Promise<McpToolResult> {
+    const hops = callHops(this.hops, previousHops)
     const conversation = ConversationId.new()
     return toolResultFromEnvelope(
       await this.sendToolCall(
@@ -296,7 +360,9 @@ export class McpBridge {
         name,
         paramsBytes(paramsJson),
         undefined,
-        options.target
+        options.target ?? this.target,
+        hops,
+        options
       )
     )
   }
@@ -307,37 +373,49 @@ export class McpBridge {
    * result and failed on a tool error. A wait error surfaces before a
    * lifecycle error. `target` addresses the call to one agent, as in
    * `callTool`. */
-  async callToolIn(
+  callToolIn(
     parent: ConversationId,
     root: ConversationId,
     name: string,
     paramsJson: unknown,
-    options: { readonly target?: AgentId } = {}
+    options: CallOptions & { readonly target?: AgentId } = {}
   ): Promise<McpToolResult> {
-    const conversation = ConversationId.new()
-    const child = await startChild(this.laser, this.source, this.source, conversation, parent, root)
-    let envelope: AgentEnvelope
-    try {
-      envelope = await this.sendToolCall(
+    // An abort releases the caller at once while a started child still ends failed.
+    return cancellable(options.signal, "MCP tool call", async () => {
+      const conversation = ConversationId.new()
+      const child = await startChild(
+        this.laser,
+        this.source,
+        this.source,
         conversation,
-        name,
-        paramsBytes(paramsJson),
-        {
-          parent: WireConversationId.parse(parent.toString()),
-          root: WireConversationId.parse(root.toString())
-        },
-        options.target
+        parent,
+        root
       )
-    } catch (error) {
-      await child
-        .fail(toolFailure(error instanceof Error ? error.message : String(error)))
-        .catch(() => undefined)
-      throw error
-    }
-    if (envelope.kind === AgentKind.Error)
-      await child.fail(toolFailure("the tool returned an error"))
-    else await child.end()
-    return toolResultFromEnvelope(envelope)
+      let envelope: AgentEnvelope
+      try {
+        envelope = await this.sendToolCall(
+          conversation,
+          name,
+          paramsBytes(paramsJson),
+          {
+            parent: WireConversationId.parse(parent.toString()),
+            root: WireConversationId.parse(root.toString())
+          },
+          options.target ?? this.target,
+          this.hops,
+          options
+        )
+      } catch (error) {
+        await child
+          .fail(toolFailure(error instanceof Error ? error.message : String(error)))
+          .catch(() => undefined)
+        throw error
+      }
+      if (envelope.kind === AgentKind.Error)
+        await child.fail(toolFailure("the tool returned an error"))
+      else await child.end()
+      return toolResultFromEnvelope(envelope)
+    })
   }
 
   private async sendToolCall(
@@ -346,11 +424,19 @@ export class McpBridge {
     paramsJson: Uint8Array,
     ancestry:
       { readonly parent: WireConversationId; readonly root: WireConversationId } | undefined,
-    target: AgentId | undefined
+    target: AgentId | undefined,
+    hops: readonly string[],
+    options: CallOptions
   ): Promise<AgentEnvelope> {
+    throwIfAborted(options.signal, "MCP tool call")
     const correlation = CorrelationId.parse(conversation.toString())
-    const hub = await this.laser[INTERNAL_REPLY_HUB](this.replyTopic, this.source)
-    const ticket = hub.subscribeStream(correlation.toString())
+    const hub = await abortable(
+      this.laser[INTERNAL_REPLY_HUB](this.replyTopic, this.source),
+      options.signal,
+      "MCP tool call"
+    )
+    // A targeted call is answered only by its target when replies are verified.
+    const ticket = hub.subscribeStream(correlation.toString(), target?.asStr())
     const started = performance.now()
     try {
       let command = this.laser
@@ -359,14 +445,15 @@ export class McpBridge {
         .withTool(name)
       if (ancestry !== undefined) command = command.withAncestry(ancestry.parent, ancestry.root)
       if (target !== undefined) command = command.withTarget(target)
+      if (this.signingKey !== undefined) command = command.signedBy(this.signingKey)
       await command
-        .withMetadata(METADATA_BRIDGE_HOPS, bridgeHopMetadata(this.hops))
+        .withMetadata(METADATA_BRIDGE_HOPS, bridgeHopMetadata(hops))
         .contentType(ContentType.Json)
-        .send()
+        .send(options)
       for (;;) {
         const remaining = this.timeoutMs - (performance.now() - started)
         if (remaining <= 0) throw new TimeoutError("the MCP tool reply")
-        const message = await ticket.next(remaining)
+        const message = await ticket.next(remaining, options.signal)
         const envelope = message.envelope
         if (
           envelope !== undefined &&
@@ -380,65 +467,82 @@ export class McpBridge {
     }
   }
 
-  async handleRpc(input: unknown): Promise<McpRpcResponse> {
+  /** Handle one JSON-RPC message. A notification, a message without an
+   * `id`, is never answered and resolves to `undefined`. */
+  async handleRpc(input: unknown, options: CallOptions = {}): Promise<McpRpcResponse | undefined> {
+    throwIfAborted(options.signal, "MCP request")
     let id: unknown = null
     try {
-      const request = jsonObject(input, "MCP JSON-RPC request")
+      if (typeof input !== "object" || input === null || Array.isArray(input))
+        throw new McpFault(INVALID_REQUEST, "invalid request")
+      const request = input as Readonly<Record<string, unknown>>
+      if (!("id" in request)) return undefined
       id = request["id"] ?? null
       const method = request["method"]
-      if (typeof method !== "string") throw new HandlerConfigError("MCP method must be a string")
-      const params = jsonObject(request["params"] ?? {}, "MCP params")
-      let result: unknown
-      switch (method) {
-        case McpMethod.Initialize: {
-          const version = params["protocolVersion"]
-          if (version !== undefined && typeof version !== "string") {
-            throw new HandlerConfigError("MCP protocolVersion must be a string")
-          }
-          result = this.initialize(version)
-          break
-        }
-        case McpMethod.ToolsList:
-          result = this.listTools()
-          break
-        case McpMethod.ResourcesList:
-          result = this.listResources()
-          break
-        case McpMethod.ResourcesRead:
-          result = this.readResource(this.requiredString(params, "uri"))
-          break
-        case McpMethod.PromptsList:
-          result = this.listPrompts()
-          break
-        case McpMethod.PromptsGet:
-          result = this.getPrompt(this.requiredString(params, "name"))
-          break
-        case McpMethod.ToolsCall:
-          result = toolResultJson(
-            await this.callTool(this.requiredString(params, "name"), jsonBytes(params))
-          )
-          break
-        default:
-          throw new HandlerConfigError(`unknown MCP method \`${method}\``)
-      }
-      return { jsonrpc: "2.0", id, result }
+      if (typeof method !== "string") throw new McpFault(INVALID_REQUEST, "invalid request")
+      const rawParams = request["params"] ?? {}
+      if (typeof rawParams !== "object" || Array.isArray(rawParams))
+        throw new McpFault(INVALID_PARAMS, "invalid params")
+      const params = rawParams as Readonly<Record<string, unknown>>
+      return { jsonrpc: "2.0", id, result: await this.dispatch(method, params, options) }
     } catch (error) {
-      return {
-        jsonrpc: "2.0",
-        id,
-        error: {
-          code: MCP_APP_ERROR_CODE,
-          message: publicErrorMessage(error)
-        }
-      }
+      // A caller that gave up gets the cancellation, never an answer.
+      throwIfAborted(options.signal, "MCP request")
+      return { jsonrpc: "2.0", id, error: rpcError(error) }
     }
   }
 
-  private requiredString(object: Readonly<Record<string, unknown>>, key: string): string {
-    const value = object[key]
-    if (typeof value !== "string") throw new HandlerConfigError(`MCP ${key} must be a string`)
-    return value
+  private async dispatch(
+    method: string,
+    params: Readonly<Record<string, unknown>>,
+    options: CallOptions
+  ): Promise<unknown> {
+    switch (method) {
+      case McpMethod.Initialize: {
+        const version = params["protocolVersion"]
+        if (version !== undefined && typeof version !== "string") {
+          throw new McpFault(INVALID_PARAMS, "invalid params")
+        }
+        return this.initialize(version)
+      }
+      case McpMethod.Ping:
+        return {}
+      case McpMethod.ToolsList:
+        return this.listTools()
+      case McpMethod.ResourcesList:
+        return this.listResources()
+      case McpMethod.ResourcesRead: {
+        const uri = requiredString(params, "uri")
+        if (!this.resources.some((entry) => entry.resource.uri === uri))
+          throw new McpFault(RESOURCE_NOT_FOUND, "resource not found")
+        return this.readResource(uri)
+      }
+      case McpMethod.PromptsList:
+        return this.listPrompts()
+      case McpMethod.PromptsGet: {
+        const name = requiredString(params, "name")
+        if (!this.prompts.some((entry) => entry.prompt.name === name))
+          throw new McpFault(INVALID_PARAMS, "unknown prompt")
+        return this.getPrompt(name)
+      }
+      case McpMethod.ToolsCall: {
+        const name = requiredString(params, "name")
+        // Only an advertised tool is published, so a guessed name costs no wait.
+        if (!this.tools.some((tool) => tool.name === name))
+          throw new McpFault(INVALID_PARAMS, "unknown tool")
+        const hops = inboundHops(params["_meta"])
+        return toolResultJson(await this.callToolWithHops(hops, name, jsonBytes(params), options))
+      }
+      default:
+        throw new McpFault(METHOD_NOT_FOUND, "method not found")
+    }
   }
+}
+
+function requiredString(object: Readonly<Record<string, unknown>>, key: string): string {
+  const value = object[key]
+  if (typeof value !== "string") throw new McpFault(INVALID_PARAMS, "invalid params")
+  return value
 }
 
 // MCP spells a content item's kind `type` on the wire.

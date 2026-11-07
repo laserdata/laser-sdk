@@ -14,12 +14,21 @@ def open_store(bench):
     bench.memory_ids = {}
 
 
+@when(
+    parsers.re(
+        r'^I remember "(?P<body>[^"]+)" with dedup in conversation "(?P<conversation>[^"]+)"$'
+    )
+)
+def remember_dedup_in(bench, body, conversation):
+    bench.memory_ids[body] = bench.memory_engine.remember(body.encode(), True, conversation)
+
+
 @when(parsers.parse('I remember "{body}" with dedup'))
 def remember_dedup(bench, body):
     bench.memory_ids[body] = bench.memory_engine.remember(body.encode(), True)
 
 
-@when(parsers.parse('I remember "{body}"'))
+@when(parsers.re(r'^I remember "(?P<body>[^"]+)"$'))
 def remember(bench, body):
     bench.memory_ids[body] = bench.memory_engine.remember(body.encode(), False)
 

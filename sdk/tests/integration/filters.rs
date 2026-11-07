@@ -4,7 +4,9 @@
 // what is missing.
 
 use crate::harness;
-use laser_sdk::filters::{ConsumerFilter, FilterExpr};
+use futures::StreamExt;
+use laser_sdk::capabilities::HelloOutcome;
+use laser_sdk::filters::{ConsumerFilter, FilterExpr, FilteredStart};
 use laser_sdk::prelude::full::{Capabilities, Laser, LaserError};
 use laser_sdk::prelude::{CommitPolicy, ConsumerStart, ProducerMessage, Routing};
 use laser_sdk::query::CmpOp;
@@ -196,11 +198,14 @@ async fn given_each_commit_policy_when_a_group_consumer_shuts_down_after_zero_th
 #[tokio::test]
 async fn given_a_server_without_consumer_filters_when_building_a_reader_then_should_refuse() {
     // A bring-your-own client probes on its first capabilities read, so the
-    // open-only set is pinned as an explicit override.
+    // set open Apache Iggy answers is pinned as an explicit override. A probe
+    // that established nothing is a retryable timeout instead.
+    let mut rejected = Capabilities::OPEN;
+    rejected.hello = HelloOutcome::Rejected;
     let open = Laser::from_client(harness::client().await)
         .with_default_stream("any")
-        .with_capabilities(Capabilities::OPEN);
-    assert_eq!(open.capabilities().await, Capabilities::OPEN);
+        .with_capabilities(rejected.clone());
+    assert_eq!(open.capabilities().await, rejected);
 
     let refused = open
         .topic(TOPIC)
@@ -211,4 +216,42 @@ async fn given_a_server_without_consumer_filters_when_building_a_reader_then_sho
         .await;
 
     assert!(refused.err().is_some_and(|error| error.is_unsupported()));
+}
+
+#[tokio::test]
+async fn given_an_unbound_group_reader_when_its_records_are_streamed_then_should_yield_and_acknowledge_each_record()
+ {
+    let laser = harness::connected_laser().await;
+    publish(&laser, &[SAFE_MODE, GROUND_STATION, DECOMMISSION]).await;
+    let group = laser.topic(TOPIC).consumer_group("stream-desk");
+    group.create().build().await.expect("a plain group");
+    let mut records = group
+        .reader()
+        .expect("the builder needs only a stream")
+        .start(FilteredStart::First)
+        .build()
+        .await
+        .expect("the reader builds")
+        .stream();
+
+    let mut offsets = Vec::new();
+    for _ in 0..3 {
+        let record = tokio::time::timeout(READ_TIMEOUT, records.next())
+            .await
+            .expect("a record within the timeout")
+            .expect("the stream continues")
+            .expect("a matching record");
+        records
+            .ack(&record)
+            .await
+            .expect("the record is acknowledged");
+        offsets.push(record.offset);
+    }
+    records.close().await.expect("the reader closes");
+
+    assert_eq!(
+        offsets,
+        vec![0, 1, 2],
+        "an unbound group yields every record"
+    );
 }

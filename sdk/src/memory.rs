@@ -167,20 +167,24 @@ impl MemoryId {
 
     /// A deterministic, content-addressed id: the same `owner`, `kind`, and
     /// `body` always produce the same id, so a deduped remember stores one item.
-    /// The owner is the durable scope (stream, agent, user, and application,
-    /// never the conversation), so the same fact in two conversations is one
-    /// durable memory and two users never share an id. The hash is the wire
-    /// crate's one canonical [`content_id`](laser_wire::hashing::content_id),
-    /// so every SDK reproduces it from the same byte segments.
+    /// The owner is the stream, agent, user, application, and conversation, so
+    /// the same fact in two conversations is two items and two users never
+    /// share an id. The hash is the wire crate's one canonical
+    /// [`content_id`](laser_wire::hashing::content_id), so every SDK reproduces
+    /// it from the same byte segments.
     pub fn content(owner: &MemoryScope, kind: MemoryKind, body: &[u8]) -> Self {
         let stream = owner.stream.as_deref().unwrap_or("").as_bytes();
         let agent = owner.agent.as_ref().map(AgentId::as_str).unwrap_or("");
         let user = owner.user.as_deref().unwrap_or("").as_bytes();
         let application = owner.app.as_deref().unwrap_or("").as_bytes();
+        let conversation = owner
+            .conversation
+            .map(|conversation| conversation.to_string())
+            .unwrap_or_default();
         let kind = [kind.code()];
         // Owner segments each end in a zero separator, then the kind byte and
         // the body, the order every SDK hashes.
-        let segments: [&[u8]; 10] = [
+        let segments: [&[u8]; 12] = [
             stream,
             &[0],
             agent.as_bytes(),
@@ -188,6 +192,8 @@ impl MemoryId {
             user,
             &[0],
             application,
+            &[0],
+            conversation.as_bytes(),
             &[0],
             &kind,
             body,
@@ -650,8 +656,10 @@ struct Projection {
     items: Vec<MemoryItem>,
     scopes: std::collections::HashMap<MemoryId, StoredMemoryScope>,
     // Tombstones and feedback keyed by target and the conversation they are
-    // limited to. `None` applies to the target in any conversation.
-    forgotten: HashSet<(MemoryId, Option<ConversationId>)>,
+    // limited to. `None` applies to the target in any conversation. A tombstone
+    // keeps the latest forget's append time, so it drops older writes from any
+    // partition and keeps later ones.
+    forgotten: std::collections::HashMap<(MemoryId, Option<ConversationId>), u64>,
     feedback: std::collections::HashMap<(MemoryId, Option<ConversationId>), f32>,
     // The named-item altitude's point state, folded from the same topic: the
     // latest body per prefixed key. A named record's id is not a ULID, so it
@@ -664,6 +672,9 @@ struct Projection {
 struct StoredMemoryScope {
     user: Option<String>,
     app: Option<String>,
+    // The server append time of the record, which orders a tombstone against
+    // items folded from other partitions.
+    timestamp_micros: u64,
 }
 
 impl Projection {
@@ -674,7 +685,16 @@ impl Projection {
     // is ignored. Pure, so it is unit-tested.
     #[cfg(test)]
     fn absorb(&mut self, payload: &[u8], provenance: Provenance) {
-        self.absorb_scoped(payload, provenance, StoredMemoryScope::default(), None);
+        self.absorb_at(payload, provenance, 0);
+    }
+
+    #[cfg(test)]
+    fn absorb_at(&mut self, payload: &[u8], provenance: Provenance, timestamp_micros: u64) {
+        let scope = StoredMemoryScope {
+            timestamp_micros,
+            ..StoredMemoryScope::default()
+        };
+        self.absorb_scoped(payload, provenance, scope, None);
     }
 
     fn absorb_scoped(
@@ -697,18 +717,25 @@ impl Projection {
                 conversation,
             } => {
                 // Drop the tombstoned item so its body is not pinned for the life of
-                // the projection. Keep the id so a tombstone that arrives before its
-                // item (a cross-partition reorder) still suppresses it on arrival.
+                // the projection. Keep the id and time so a tombstone that arrives
+                // before an older write (a cross-partition reorder) still suppresses
+                // it, while a write after the forget stays.
+                let at = scope.timestamp_micros;
+                let scopes = &self.scopes;
                 let before = self.items.len();
                 self.items.retain(|item| {
                     item.id != target
                         || conversation
                             .is_some_and(|scope| scope != item.provenance.conversation_id)
+                        || scopes
+                            .get(&item.id)
+                            .is_some_and(|stored| stored.timestamp_micros > at)
                 });
                 if self.items.len() != before {
                     self.scopes.remove(&target);
                 }
-                self.forgotten.insert((target, conversation));
+                let forgotten = self.forgotten.entry((target, conversation)).or_insert(at);
+                *forgotten = (*forgotten).max(at);
             }
             MemoryLogEntry::Feedback {
                 target,
@@ -724,7 +751,7 @@ impl Projection {
                 origin,
                 producer,
             } => {
-                if self.is_forgotten(id, provenance.conversation_id) {
+                if self.is_forgotten(id, provenance.conversation_id, scope.timestamp_micros) {
                     return;
                 }
                 // Dedup on fold: a content-addressed id appended twice (a deduped
@@ -748,8 +775,18 @@ impl Projection {
         }
     }
 
-    fn is_forgotten(&self, id: MemoryId, conversation: ConversationId) -> bool {
-        self.forgotten.contains(&(id, None)) || self.forgotten.contains(&(id, Some(conversation)))
+    // A write at or before a tombstone's time stays forgotten.
+    fn is_forgotten(
+        &self,
+        id: MemoryId,
+        conversation: ConversationId,
+        timestamp_micros: u64,
+    ) -> bool {
+        [(id, None), (id, Some(conversation))].iter().any(|key| {
+            self.forgotten
+                .get(key)
+                .is_some_and(|at| *at >= timestamp_micros)
+        })
     }
 
     fn feedback_for(&self, item: &MemoryItem) -> Option<f32> {
@@ -798,7 +835,13 @@ fn folded_memory_items(
                 .conversation
                 .is_none_or(|conversation| item.provenance.conversation_id == conversation)
         })
-        .filter(|item| !projection.is_forgotten(item.id, item.provenance.conversation_id))
+        .filter(|item| {
+            let written = projection
+                .scopes
+                .get(&item.id)
+                .map_or(0, |stored| stored.timestamp_micros);
+            !projection.is_forgotten(item.id, item.provenance.conversation_id, written)
+        })
         .filter(|item| {
             let stored = projection.scopes.get(&item.id);
             scope.user.as_ref().is_none_or(|expected| {
@@ -954,8 +997,21 @@ impl LogMemory {
             payload: &payload,
             signed: false,
             counters: crate::govern::ActionCounters::default(),
+            approval: None,
         };
         Ok(self.laser.govern(action).await?.unwrap_or(payload))
+    }
+
+    // A handle writes to one stream, so a scope naming another is refused
+    // rather than written where no recall of that stream reads.
+    fn check_stream(&self, scope: &MemoryScope) -> Result<(), LaserError> {
+        let stream = self.stream_name()?;
+        match scope.stream.as_deref() {
+            Some(requested) if requested != stream => Err(LaserError::Invalid(format!(
+                "memory scope names stream `{requested}`, but this memory writes to `{stream}`"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     // Publish an encoded entry to this memory's stream and topic, keyed by the
@@ -1040,6 +1096,7 @@ impl LogMemory {
         kind: MemoryKind,
         payload: Vec<u8>,
     ) -> Result<MemoryId, LaserError> {
+        self.check_stream(scope)?;
         let provenance = Self::provenance(scope, id.to_string());
         let body = self.govern_payload(&provenance, payload).await?;
         let entry = MemoryLogEntry::Item {
@@ -1143,7 +1200,9 @@ impl LogMemory {
     }
 
     // Drain the audit topic from the projection's saved offsets to the current tail,
-    // folding only the new messages. Reads incrementally, not from offset 0.
+    // folding only the new messages. Reads incrementally, not from offset 0. A
+    // partition that fills one drain is read again, so a handle any distance
+    // behind folds the whole retained history before it answers.
     //
     // The network polling runs WITHOUT the projection lock held, so a round-trip
     // never blocks a concurrent recall. The lock is taken only to snapshot the
@@ -1168,80 +1227,88 @@ impl LogMemory {
         let consumer = Consumer::new(Identifier::named("laser-log-memory")?);
         let namespace = self.resource_namespace();
 
-        let from = {
+        loop {
+            let from = {
+                let mut projection = self.projection.lock().await;
+                if projection.offsets.len() < partitions as usize {
+                    projection.offsets.resize(partitions as usize, 0);
+                }
+                projection.offsets.clone()
+            };
+
+            let mut drained: Vec<(u32, u64, Vec<IggyMessage>)> = Vec::new();
+            for partition in 0..partitions {
+                let batch = crate::poll::drain_partition(
+                    &self.laser.client(),
+                    &stream,
+                    &topic,
+                    &consumer,
+                    crate::poll::DrainRange::open(partition, from[partition as usize]),
+                    READ_BATCH,
+                )
+                .await?;
+                if !batch.messages.is_empty() {
+                    drained.push((partition, batch.next_offset, batch.messages));
+                }
+            }
+            if drained.is_empty() {
+                return Ok(());
+            }
+
+            let mut behind = false;
             let mut projection = self.projection.lock().await;
             if projection.offsets.len() < partitions as usize {
                 projection.offsets.resize(partitions as usize, 0);
             }
-            projection.offsets.clone()
-        };
-
-        let mut drained: Vec<(u32, u64, Vec<IggyMessage>)> = Vec::new();
-        for partition in 0..partitions {
-            let batch = crate::poll::drain_partition(
-                &self.laser.client(),
-                &stream,
-                &topic,
-                &consumer,
-                crate::poll::DrainRange::open(partition, from[partition as usize]),
-                READ_BATCH,
-            )
-            .await?;
-            if !batch.messages.is_empty() {
-                drained.push((partition, batch.next_offset, batch.messages));
-            }
-        }
-        if drained.is_empty() {
-            return Ok(());
-        }
-
-        let mut projection = self.projection.lock().await;
-        if projection.offsets.len() < partitions as usize {
-            projection.offsets.resize(partitions as usize, 0);
-        }
-        for (partition, next_offset, messages) in drained {
-            if projection.offsets[partition as usize] != from[partition as usize] {
-                continue; // a concurrent catch_up already folded this partition
-            }
-            for message in messages {
-                // One header decode serves provenance and the memory scope. A
-                // record whose headers do not decode is not a memory record.
-                let Ok(Some(headers)) = message.user_headers_map() else {
-                    continue;
-                };
-                let Ok(provenance) = crate::provenance::provenance_from_headers(&headers) else {
-                    continue;
-                };
-                let text = |name: &str| -> Option<String> {
-                    let key = HeaderKey::from_str(name).ok()?;
-                    headers.get(&key)?.as_str().ok().map(str::to_owned)
-                };
-                if text(laser_wire::headers::MEMORY_NAMESPACE).as_deref()
-                    != Some(namespace.as_str())
-                {
-                    continue;
+            for (partition, next_offset, messages) in drained {
+                if projection.offsets[partition as usize] != from[partition as usize] {
+                    continue; // a concurrent catch_up already folded this partition
                 }
-                let source = SourceRef::Message {
-                    generation: Some(details.created_at.as_micros()),
-                    stream: stream_id,
-                    topic: details.id,
-                    partition,
-                    offset: message.header.offset,
-                    conversation: Some(provenance.conversation_id.to_string()),
-                };
-                projection.absorb_scoped(
-                    &message.payload,
-                    provenance,
-                    StoredMemoryScope {
-                        user: text(laser_wire::headers::MEMORY_USER),
-                        app: text(laser_wire::headers::MEMORY_APP),
-                    },
-                    Some(source),
-                );
+                behind |= messages.len() >= crate::poll::MAX_DRAIN_MESSAGES;
+                for message in messages {
+                    // One header decode serves provenance and the memory scope. A
+                    // record whose headers do not decode is not a memory record.
+                    let Ok(Some(headers)) = message.user_headers_map() else {
+                        continue;
+                    };
+                    let Ok(provenance) = crate::provenance::provenance_from_headers(&headers)
+                    else {
+                        continue;
+                    };
+                    let text = |name: &str| -> Option<String> {
+                        let key = HeaderKey::from_str(name).ok()?;
+                        headers.get(&key)?.as_str().ok().map(str::to_owned)
+                    };
+                    if text(laser_wire::headers::MEMORY_NAMESPACE).as_deref()
+                        != Some(namespace.as_str())
+                    {
+                        continue;
+                    }
+                    let source = SourceRef::Message {
+                        generation: Some(details.created_at.as_micros()),
+                        stream: stream_id,
+                        topic: details.id,
+                        partition,
+                        offset: message.header.offset,
+                        conversation: Some(provenance.conversation_id.to_string()),
+                    };
+                    projection.absorb_scoped(
+                        &message.payload,
+                        provenance,
+                        StoredMemoryScope {
+                            user: text(laser_wire::headers::MEMORY_USER),
+                            app: text(laser_wire::headers::MEMORY_APP),
+                            timestamp_micros: message.header.timestamp,
+                        },
+                        Some(source),
+                    );
+                }
+                projection.offsets[partition as usize] = next_offset;
             }
-            projection.offsets[partition as usize] = next_offset;
+            if !behind {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     /// Recall by folding the topic in process: read every memory record for the
@@ -1277,9 +1344,11 @@ impl LogMemory {
     }
 
     /// Recall by reading the managed key-value read view. Scans the memory
-    /// namespace narrowed to the scope's conversation (the lens the fold stamps),
-    /// rebuilds each item from the stored scope, filters by agent/user/app, and
-    /// returns the most recent by server append time and source address. Backs the default [`recall`](Memory::recall).
+    /// namespace narrowed to the scope's conversation, user, agent, and app (the
+    /// lenses the fold stamps), rebuilds each item from the stored scope, and
+    /// returns the most recent by server append time and source address. Every
+    /// strategy except recent ranks by the folded feedback weight first. Backs
+    /// the default [`recall`](Memory::recall).
     #[cfg(feature = "kv")]
     async fn recall_kv(
         &self,
@@ -1295,15 +1364,22 @@ impl LogMemory {
         }
         let kv = self.laser.kv(self.resource_namespace());
         let lens_stream = self.resource_stream().map(str::to_owned);
-        recall_kv_pages(scope, query, |cursor| {
-            let mut scan = kv.scan();
+        let agent = query
+            .agent
+            .as_ref()
+            .or(scope.agent.as_ref())
+            .map(|agent| agent.as_str().to_owned());
+        recall_kv_pages(scope, query, |page| {
+            // The server narrows by the scope's lenses, and the rows are checked
+            // again here, so a server without them returns the same items.
+            let mut scan = kv
+                .scan()
+                .memory_lens(scope.user.clone(), agent.clone(), scope.app.clone())
+                .page(page);
             if let Some(conversation) = scope.conversation {
                 scan = scan
                     .conversation(conversation)
                     .lens_stream(lens_stream.clone());
-            }
-            if let Some(cursor) = cursor {
-                scan = scan.cursor(cursor);
             }
             async move { scan.fetch().await }
         })
@@ -1318,36 +1394,73 @@ async fn recall_kv_pages<F, Fut>(
     mut fetch: F,
 ) -> Result<Vec<MemoryItem>, LaserError>
 where
-    F: FnMut(Option<Vec<u8>>) -> Fut,
+    F: FnMut(u32) -> Fut,
     Fut: std::future::Future<Output = Result<laser_wire::kv::KvPage, LaserError>>,
 {
     if query.limit == 0 {
         return Ok(Vec::new());
     }
+    // Feedback ranks every strategy except recent, then arrival breaks ties.
+    let weighted = query.strategy != RecallStrategy::Recent;
     let mut selected = std::collections::BTreeMap::new();
-    let mut cursor = None;
+    let mut requested = 1;
     loop {
-        let page = fetch(cursor.clone()).await?;
-        for entry in page.entries {
+        let page = fetch(requested).await?;
+        if page.page != requested {
+            return Err(LaserError::Protocol(format!(
+                "memory scan asked for page {requested} and was answered page {}",
+                page.page
+            )));
+        }
+        let last = page.items.is_empty() || page.page >= page.total_pages;
+        for entry in page.items {
             let arrival = arrival_key(&entry);
+            let weight = entry
+                .scope
+                .as_ref()
+                .and_then(|stored| stored.weight)
+                .filter(|_| weighted);
             if let Some(item) = memory_item_from_entry(scope, query.agent.as_ref(), entry)
                 .filter(|item| memory_query_matches(query, &item.payload))
             {
-                selected.insert((arrival, item.id), item);
+                let rank = weight_order(weight.unwrap_or(0.0));
+                selected.insert((rank, arrival, item.id), (item, weight));
                 if selected.len() > query.limit {
                     selected.pop_first();
                 }
             }
         }
-        let Some(next) = page.cursor else { break };
-        if cursor.as_ref() == Some(&next) {
-            return Err(LaserError::Protocol(
-                "memory scan cursor did not advance".to_owned(),
-            ));
+        if last {
+            break;
         }
-        cursor = Some(next);
+        requested += 1;
     }
-    Ok(selected.into_values().rev().collect())
+    Ok(selected
+        .into_values()
+        .rev()
+        .enumerate()
+        .map(|(rank, (mut item, weight))| {
+            if let Some(score) = weight {
+                item.score = Some(score);
+                // Feedback is not a strategy the caller picked, so its signal
+                // reads `Auto` in every backend.
+                item.signals.push(RecallSignal {
+                    strategy: RecallStrategy::Auto,
+                    rank,
+                    score: Some(score),
+                });
+            }
+            item
+        })
+        .collect())
+}
+
+// The total order of `f32::total_cmp` as an integer, so a weight can key the
+// bounded selection.
+#[cfg(feature = "kv")]
+fn weight_order(weight: f32) -> i32 {
+    let bits = weight.to_bits() as i32;
+    bits ^ (((bits >> 31) as u32) >> 1) as i32
 }
 
 // Arrival order of a memory view row across partitions: the server append time,
@@ -1468,6 +1581,7 @@ impl Memory for LogMemory {
         // Append a feedback record. The fold (`Projection::absorb`) accumulates the
         // weight on its target and keeps it out of the recalled items, so recall
         // ranks by the accumulated feedback.
+        self.check_stream(scope)?;
         let id = MemoryId::new();
         let entry = MemoryLogEntry::Feedback {
             target: feedback.target,
@@ -1480,6 +1594,7 @@ impl Memory for LogMemory {
     }
 
     async fn forget(&self, scope: &MemoryScope, id: MemoryId) -> Result<(), LaserError> {
+        self.check_stream(scope)?;
         let entry = MemoryLogEntry::Forget {
             target: id,
             conversation: scope.conversation,
@@ -1627,22 +1742,27 @@ impl<M: Memory + Sync, S: Summarizer + Sync> Consolidator for DefaultConsolidato
                 .filter(|item| item.kind == MemoryKind::Message)
                 .collect();
             if !sessions.is_empty() {
+                // The summary id covers the turns it distills, so a pass over
+                // turns that already have their summary skips the summarizer.
                 for (conversation, turns) in by_conversation(&sessions) {
-                    let bodies = turns.iter().map(|item| item.payload.clone()).collect();
-                    let summary = summarizer.summarize(bodies).await?;
                     let mut summary_scope = scope.clone();
                     summary_scope.conversation = Some(conversation);
                     summary_scope.lifetime = Lifetime::Durable;
+                    let summary_id = MemoryId::content(
+                        &summary_scope,
+                        MemoryKind::Summary,
+                        &covered_ids(&turns),
+                    );
+                    if items.iter().any(|item| item.id == summary_id) {
+                        continue;
+                    }
+                    let bodies = turns.iter().map(|item| item.payload.clone()).collect();
+                    let summary = summarizer.summarize(bodies).await?;
                     self.memory
-                        .append(
-                            &summary_scope,
-                            MemoryId::new(),
-                            MemoryKind::Summary,
-                            summary,
-                        )
+                        .append(&summary_scope, summary_id, MemoryKind::Summary, summary)
                         .await?;
+                    report.summarized += turns.len();
                 }
-                report.summarized = sessions.len();
                 if self.prune_summarized {
                     let ids: Vec<MemoryId> = sessions.iter().map(|item| item.id).collect();
                     for id in ids {
@@ -1667,6 +1787,14 @@ impl<M: Memory + Sync, S: Summarizer + Sync> Consolidator for DefaultConsolidato
         }
         Ok(report)
     }
+}
+
+// The turns a summary covers as its content: each id as 16 big-endian bytes,
+// in ascending order, the bytes every SDK hashes.
+fn covered_ids(turns: &[&MemoryItem]) -> Vec<u8> {
+    let mut ids: Vec<u128> = turns.iter().map(|item| item.id.as_u128()).collect();
+    ids.sort_unstable();
+    ids.into_iter().flat_map(u128::to_be_bytes).collect()
 }
 
 // Group summarized turns by conversation, in the order each conversation
@@ -1821,6 +1949,7 @@ impl<E> VectorMemory<E> {
             payload: &payload,
             signed: false,
             counters: crate::govern::ActionCounters::default(),
+            approval: None,
         };
         match governance.laser.govern(action).await? {
             Some(modified) => match entry {
@@ -3662,6 +3791,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_a_second_pass_over_the_same_turns_when_consolidated_then_should_summarize_once()
+    {
+        let memory = LogMemoryStub::default();
+        let conversation: ConversationId = "01KWM3K3XEP3NP5TN850J17YBQ"
+            .parse()
+            .expect("valid conversation");
+        for (id, body) in [(2, b"turn two"), (1, b"turn one")] {
+            memory.push_item(
+                MemoryId::from_u128(id),
+                MemoryKind::Message,
+                body.to_vec(),
+                conversation,
+            );
+        }
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let consolidator = DefaultConsolidator::new(memory.clone(), 100)
+            .with_summarizer(CountingSummarizer(calls.clone()));
+        let scope = MemoryScope::default();
+        let first = Consolidator::consolidate(&consolidator, &scope)
+            .await
+            .expect("the first pass consolidates");
+        let second = Consolidator::consolidate(&consolidator, &scope)
+            .await
+            .expect("the second pass consolidates");
+        assert_eq!(first.summarized, 2);
+        assert_eq!(second.summarized, 0, "the turns already have their summary");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let summaries: Vec<String> = memory
+            .items
+            .lock()
+            .expect("stub lock")
+            .iter()
+            .filter(|item| item.kind == MemoryKind::Summary)
+            .map(|item| item.id.to_string())
+            .collect();
+        // The id every SDK derives from the covered turns.
+        assert_eq!(summaries, ["7F2QS1XVSXGDJJPKXJTE739WP7"]);
+    }
+
+    struct CountingSummarizer(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Summarizer for CountingSummarizer {
+        async fn summarize(&self, bodies: Vec<Vec<u8>>) -> Result<Vec<u8>, LaserError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(format!("summary of {}", bodies.len()).into_bytes())
+        }
+    }
+
+    #[tokio::test]
     async fn given_prune_summarized_when_consolidated_then_should_forget_the_turns() {
         let memory = LogMemoryStub::default();
         let scope = MemoryScope::default();
@@ -3694,8 +3872,18 @@ mod tests {
         }
 
         fn push_in(&self, kind: MemoryKind, payload: Vec<u8>, conversation: ConversationId) {
+            self.push_item(MemoryId::new(), kind, payload, conversation);
+        }
+
+        fn push_item(
+            &self,
+            id: MemoryId,
+            kind: MemoryKind,
+            payload: Vec<u8>,
+            conversation: ConversationId,
+        ) {
             let provenance = Provenance::builder().conversation_id(conversation).build();
-            let mut item = MemoryItem::plain(MemoryId::new(), payload, provenance);
+            let mut item = MemoryItem::plain(id, payload, provenance);
             item.kind = kind;
             self.items.lock().expect("stub lock").push(item);
         }
@@ -3742,7 +3930,7 @@ mod tests {
                 .lock()
                 .expect("stub lock")
                 .push((scope.clone(), kind, payload.clone()));
-            self.push_in(kind, payload, scope.conversation.unwrap_or_default());
+            self.push_item(id, kind, payload, scope.conversation.unwrap_or_default());
             Ok(id)
         }
 
@@ -3901,7 +4089,7 @@ mod tests {
         assert_eq!(projection.items.len(), 1, "tombstoned item reclaimed");
         assert_eq!(projection.items[0].id, id_b, "only the survivor remains");
         assert!(
-            projection.is_forgotten(id_a, conversation),
+            projection.is_forgotten(id_a, conversation, 0),
             "first item forgotten"
         );
 
@@ -3985,6 +4173,53 @@ mod tests {
             projection.items.is_empty(),
             "the owning conversation forgets it"
         );
+    }
+
+    #[test]
+    fn given_an_item_remembered_after_its_forget_when_absorbed_then_should_recall_it_again() {
+        let conversation = ConversationId::new();
+        let prov = || Provenance::builder().conversation_id(conversation).build();
+        let mut projection = Projection::default();
+        let id = MemoryId::new();
+        let forget = MemoryLogEntry::Forget {
+            target: id,
+            conversation: None,
+        }
+        .encode()
+        .expect("a forget entry encodes");
+        projection.absorb_at(&item_entry(id, b"before"), prov(), 100);
+        projection.absorb_at(&forget, prov(), 200);
+        projection.absorb_at(&item_entry(id, b"after"), prov(), 300);
+        let bodies: Vec<&[u8]> = projection
+            .items
+            .iter()
+            .map(|item| item.payload.as_slice())
+            .collect();
+        assert_eq!(bodies, [b"after".as_slice()]);
+    }
+
+    #[test]
+    fn given_partitions_folded_out_of_time_order_when_a_forget_lands_then_should_drop_only_older_writes()
+     {
+        let conversation = ConversationId::new();
+        let prov = || Provenance::builder().conversation_id(conversation).build();
+        let mut projection = Projection::default();
+        let newer = MemoryId::new();
+        let older = MemoryId::new();
+        let forget = |target| {
+            MemoryLogEntry::Forget {
+                target,
+                conversation: None,
+            }
+            .encode()
+            .expect("a forget entry encodes")
+        };
+        projection.absorb_at(&item_entry(newer, b"newer"), prov(), 300);
+        projection.absorb_at(&forget(newer), prov(), 200);
+        projection.absorb_at(&forget(older), prov(), 200);
+        projection.absorb_at(&item_entry(older, b"older"), prov(), 100);
+        let ids: Vec<MemoryId> = projection.items.iter().map(|item| item.id).collect();
+        assert_eq!(ids, [newer], "a forget never removes a later write");
     }
 
     // Deterministic stand-in for a real embedding model: a 3-dim count vector.
@@ -4218,24 +4453,38 @@ mod tests {
             .app("console".to_owned())
             .build();
         let user_only = MemoryScope::builder().user("alice".to_owned()).build();
+        let in_conversation = MemoryScope::builder()
+            .agent("agent".parse().expect("valid agent"))
+            .conversation(
+                "01KWM3K3XEP3NP5TN850J17YBQ"
+                    .parse()
+                    .expect("valid conversation"),
+            )
+            .build();
         let cases = [
             (
                 &agent_only,
                 MemoryKind::Fact,
-                "63FZWE3WTSCVXAY845QK4TMVWM",
-                0xc37f_f8e1_f359_66fa_af20_85bc_c9aa_6f94_u128,
+                "4NEP7F11MYT484GKAGSAS5079E",
+                0x9575_8ef0_869e_d110_484d_50ca_b250_1d2e_u128,
             ),
             (
                 &full_owner,
                 MemoryKind::Fact,
-                "28429K3B8MPSM8WHDQR474827P",
-                0x4820_9331_ad14_b668_8e45_b7c1_0e44_08f6,
+                "5B3SH6J7DVW950TXZG1D1CBJH4",
+                0xab1e_6269_1dbb_e24a_0d77_f00b_42c5_ca24,
             ),
             (
                 &user_only,
                 MemoryKind::Procedure,
-                "3E6HJGHKFDBMQ91TCJEHV28X40",
-                0x6e34_6508_cded_5d2e_90e9_9274_7624_7480,
+                "7XEM2ZBKE6GR79DVYHWKFC48BM",
+                0xfd75_05f5_cdc6_860e_96ef_d1e4_dec2_2174,
+            ),
+            (
+                &in_conversation,
+                MemoryKind::Fact,
+                "4GAH8VSNF79FNRKBW6NYVJ8GNN",
+                0x9054_51bc_d5e7_4beb_89af_86af_b724_42b5,
             ),
         ];
         for (owner, kind, rendered, value) in cases {
@@ -4267,6 +4516,53 @@ mod tests {
             owner("alice", "console").user
         );
         assert_ne!(alice, shifted);
+    }
+
+    #[test]
+    fn given_the_same_body_in_two_conversations_when_content_addressed_then_should_produce_distinct_ids()
+     {
+        let owner = |conversation: ConversationId| {
+            MemoryScope::builder()
+                .agent("agent".parse().expect("valid agent"))
+                .conversation(conversation)
+                .build()
+        };
+        let first = ConversationId::derive("first");
+        let second = ConversationId::derive("second");
+        assert_ne!(
+            MemoryId::content(&owner(first), MemoryKind::Fact, b"x"),
+            MemoryId::content(&owner(second), MemoryKind::Fact, b"x"),
+            "the conversation is part of the owner"
+        );
+        assert_eq!(
+            MemoryId::content(&owner(first), MemoryKind::Fact, b"x"),
+            MemoryId::content(&owner(first), MemoryKind::Fact, b"x")
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_scope_on_another_stream_when_writing_log_memory_then_should_refuse_it() {
+        let laser = Laser::from_client(IggyClient::default()).with_default_stream("acme");
+        let memory = LogMemory::in_namespace(laser, "notes");
+        let elsewhere = MemoryScope::builder().stream("fleet".to_owned()).build();
+        let error = memory
+            .append(
+                &elsewhere,
+                MemoryId::new(),
+                MemoryKind::Fact,
+                b"fact".to_vec(),
+            )
+            .await
+            .expect_err("a write for another stream is refused");
+        assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
+        let error = Memory::forget(&memory, &elsewhere, MemoryId::new())
+            .await
+            .expect_err("a forget for another stream is refused");
+        assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
+        let error = Memory::improve(&memory, &elsewhere, Feedback::new(MemoryId::new(), 1.0))
+            .await
+            .expect_err("feedback for another stream is refused");
+        assert!(matches!(error, LaserError::Invalid(_)), "{error:?}");
     }
 
     #[tokio::test]
@@ -4409,29 +4705,33 @@ mod tests {
         let query = MemoryQuery::builder().limit(2).build();
         let mut pages = std::collections::VecDeque::from([
             laser_wire::kv::KvPage {
-                entries: vec![
+                items: vec![
                     scoped_kv_entry(1, first, "reader", "diagnostics"),
                     scoped_kv_entry(2, first, "other", "diagnostics"),
                 ],
-                cursor: Some(vec![2]),
+                page: 1,
+                total_pages: 2,
+                total_results: 5,
             },
             laser_wire::kv::KvPage {
-                entries: vec![
+                items: vec![
                     scoped_kv_entry(3, second, "reader", "other"),
                     scoped_kv_entry(4, second, "reader", "diagnostics"),
                     scoped_kv_entry(5, first, "reader", "diagnostics"),
                 ],
-                cursor: None,
+                page: 2,
+                total_pages: 2,
+                total_results: 5,
             },
         ]);
         let mut requested = Vec::new();
-        let items = recall_kv_pages(&scope, &query, |cursor| {
-            requested.push(cursor);
+        let items = recall_kv_pages(&scope, &query, |page| {
+            requested.push(page);
             std::future::ready(Ok(pages.pop_front().expect("next page")))
         })
         .await
         .expect("recall");
-        assert_eq!(requested, [None, Some(vec![2])]);
+        assert_eq!(requested, [1, 2]);
         assert_eq!(
             items
                 .iter()
@@ -4466,8 +4766,10 @@ mod tests {
         let query = MemoryQuery::builder().limit(2).build();
         let items = recall_kv_pages(&scope, &query, |_| {
             std::future::ready(Ok(laser_wire::kv::KvPage {
-                entries: vec![stamped(9, 0, 10), stamped(1, 1, 30), stamped(5, 2, 20)],
-                cursor: None,
+                items: vec![stamped(9, 0, 10), stamped(1, 1, 30), stamped(5, 2, 20)],
+                page: 1,
+                total_pages: 1,
+                total_results: 3,
             }))
         })
         .await
@@ -4483,13 +4785,83 @@ mod tests {
 
     #[cfg(feature = "kv")]
     #[tokio::test]
-    async fn given_a_repeating_memory_scan_cursor_when_recalled_then_should_refuse_to_loop() {
+    async fn given_feedback_weights_on_view_rows_when_recalled_then_should_rank_by_weight_except_recent()
+     {
+        let conversation = ConversationId::new();
+        let row = |id: u128, timestamp: u64, weight: Option<f32>| {
+            let mut entry = scoped_kv_entry(id, conversation, "reader", "diagnostics");
+            let scope = entry.scope.as_mut().expect("memory scope");
+            scope.timestamp_micros = Some(timestamp);
+            scope.weight = weight;
+            entry
+        };
+        let page = || {
+            std::future::ready(Ok(laser_wire::kv::KvPage {
+                items: vec![
+                    row(1, 10, Some(3.0)),
+                    row(2, 20, Some(-1.0)),
+                    row(3, 30, None),
+                    row(4, 40, None),
+                ],
+                page: 1,
+                total_pages: 1,
+                total_results: 4,
+            }))
+        };
+        let scope = MemoryScope::default();
+        let ids = |items: Vec<MemoryItem>| {
+            items
+                .iter()
+                .map(|item| item.id.as_u128())
+                .collect::<Vec<_>>()
+        };
+        let ranked = recall_kv_pages(&scope, &MemoryQuery::builder().limit(3).build(), |_| page())
+            .await
+            .expect("ranked recall");
+        assert_eq!(ranked[0].score, Some(3.0));
+        assert_eq!(
+            ranked[0].signals,
+            [RecallSignal {
+                strategy: RecallStrategy::Auto,
+                rank: 0,
+                score: Some(3.0),
+            }]
+        );
+        assert_eq!(
+            ids(ranked),
+            [1, 4, 3],
+            "the demoted item falls out of the limit"
+        );
+        let recent = recall_kv_pages(
+            &scope,
+            &MemoryQuery::builder()
+                .limit(3)
+                .strategy(RecallStrategy::Recent)
+                .build(),
+            |_| page(),
+        )
+        .await
+        .expect("recent recall");
+        assert_eq!(ids(recent), [4, 3, 2], "recent recall ignores feedback");
+    }
+
+    #[cfg(feature = "kv")]
+    #[tokio::test]
+    async fn given_a_memory_scan_answered_with_another_page_when_recalled_then_should_refuse_to_loop()
+     {
         let scope = MemoryScope::default();
         let query = MemoryQuery::builder().build();
         let result = recall_kv_pages(&scope, &query, |_| {
             std::future::ready(Ok(laser_wire::kv::KvPage {
-                entries: Vec::new(),
-                cursor: Some(vec![1]),
+                items: vec![scoped_kv_entry(
+                    1,
+                    ConversationId::new(),
+                    "reader",
+                    "diagnostics",
+                )],
+                page: 1,
+                total_pages: 3,
+                total_results: 3,
             }))
         })
         .await;
@@ -4520,6 +4892,7 @@ mod tests {
                 StoredMemoryScope {
                     user: Some(user.to_owned()),
                     app: Some(app.to_owned()),
+                    timestamp_micros: 0,
                 },
                 None,
             );
@@ -4579,8 +4952,10 @@ mod tests {
             .limit(1)
             .build();
         let mut page = Some(laser_wire::kv::KvPage {
-            entries: vec![matching, unrelated],
-            cursor: None,
+            items: vec![matching, unrelated],
+            page: 1,
+            total_pages: 1,
+            total_results: 2,
         });
         let items = recall_kv_pages(&scope, &query, |_| {
             std::future::ready(Ok(page.take().expect("one page")))

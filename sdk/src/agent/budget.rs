@@ -1,13 +1,10 @@
+use crate::agent::session::LaneLifecycle;
 use crate::agent::{Session, Sessions};
-use crate::context::LastN;
 use crate::error::LaserError;
-use crate::provenance::AgentTopic;
 use crate::types::ConversationId;
 use laser_wire::agent::{
-    AgentEnvelope, AgentErrorBody, AgentErrorCode, AgentKind, Budget, OPERATION_SESSION,
-    SessionEnd, SessionStart, SessionStatus, TaskState,
+    AgentEnvelope, AgentErrorBody, AgentErrorCode, Budget, SessionEnd, SessionStatus, TaskState,
 };
-use laser_wire::framing::decode_named;
 use laser_wire::query::Value;
 use laser_wire::session::{SessionError, SessionInfo};
 use std::collections::{BTreeMap, HashMap};
@@ -36,9 +33,7 @@ impl Session {
         if self.laser.capabilities().await.sessions {
             match self.status().await {
                 Ok(info) => return Ok(BudgetBreach::of_info(&info)),
-                Err(LaserError::Session(
-                    SessionError::NotFound(_) | SessionError::NotRegistered(_),
-                )) => {}
+                Err(error) if index_unusable(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -59,16 +54,19 @@ impl Session {
     }
 
     async fn lane_budget_breach(&self) -> Result<Option<BudgetBreach>, LaserError> {
-        let records = self
-            .scope()
-            .fetch_with(vec![AgentTopic::Sessions], Box::new(LastN(usize::MAX)))
-            .await?;
+        let records = self.lane_records().await?;
         let mut usage = LaneUsage::default();
-        for envelope in records.iter().filter_map(|record| record.envelope.as_ref()) {
-            usage.add(envelope);
+        for record in &records {
+            if let Some(envelope) = &record.envelope {
+                usage.add(envelope, record.topic == laser_wire::topics::AGENT_SESSIONS);
+            }
+        }
+        if !usage.lifecycle.started && !records.is_empty() {
+            let session = self.conversation();
+            warn!(%session, "The retained lane of session {session} no longer holds its start record, so its budget is unknown and it reads as within budget");
         }
         Ok(BudgetBreach::of(
-            usage.budget,
+            usage.lifecycle.budget,
             usage.tokens,
             usage.cost_micros,
         ))
@@ -325,18 +323,18 @@ struct Ending {
     written: bool,
 }
 
-// The budget of the first start record on the lane and the usage summed
-// over every record, as the session index folds them.
+// The budget of the start record the session index applies and the usage
+// summed over every record, as the index folds them: the first start, or
+// the start that resumed the session after a completed or failed end.
 #[derive(Default)]
 struct LaneUsage {
-    started: bool,
-    budget: Option<Budget>,
+    lifecycle: LaneLifecycle,
     tokens: u64,
     cost_micros: u64,
 }
 
 impl LaneUsage {
-    fn add(&mut self, envelope: &AgentEnvelope) {
+    fn add(&mut self, envelope: &AgentEnvelope, on_lane: bool) {
         if let Some(usage) = envelope.usage {
             self.tokens = self
                 .tokens
@@ -346,15 +344,25 @@ impl LaneUsage {
                 .cost_micros
                 .saturating_add(usage.cost_micros.unwrap_or(0));
         }
-        if !self.started
-            && envelope.kind == AgentKind::Status
-            && envelope.operation.as_deref() == Some(OPERATION_SESSION)
-            && let Ok(start) = decode_named::<SessionStart>(&envelope.body)
-        {
-            self.started = true;
-            self.budget = start.budget;
+        if on_lane {
+            self.lifecycle.add(envelope);
         }
     }
+}
+
+// Whether a failed index read leaves the lane fold to answer: the index does
+// not know the session, is catching up, or is out of reach for now.
+fn index_unusable(error: &LaserError) -> bool {
+    matches!(
+        error,
+        LaserError::Session(
+            SessionError::NotFound(_)
+                | SessionError::NotRegistered(_)
+                | SessionError::Stale(_)
+                | SessionError::Unavailable(_)
+        )
+    ) || error.is_unavailable()
+        || error.is_stale()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -366,12 +374,35 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use laser_wire::result::{CommandError, ResultCode};
 
     fn budget(tokens: Option<u64>, cost_micros: Option<u64>) -> Option<Budget> {
         Some(Budget {
             tokens,
             cost_micros,
         })
+    }
+
+    #[test]
+    fn given_an_index_read_refused_as_unavailable_or_stale_when_checking_a_budget_then_should_fold_the_lane()
+     {
+        for error in [
+            LaserError::Session(SessionError::Unavailable("restarting".to_owned())),
+            LaserError::Session(SessionError::Stale("catching up".to_owned())),
+            LaserError::Session(SessionError::NotFound("unknown".to_owned())),
+            LaserError::Session(SessionError::NotRegistered("unregistered".to_owned())),
+            CommandError::new(ResultCode::Unavailable, "the index is out of reach").into(),
+            CommandError::new(ResultCode::Stale, "the index is catching up").into(),
+        ] {
+            assert!(index_unusable(&error), "{error:?} folds the lane");
+        }
+        for error in [
+            LaserError::Session(SessionError::Unauthorized("no grant".to_owned())),
+            LaserError::Invalid("bad request".to_owned()),
+            CommandError::new(ResultCode::Forbidden, "no grant").into(),
+        ] {
+            assert!(!index_unusable(&error), "{error:?} surfaces");
+        }
     }
 
     #[test]

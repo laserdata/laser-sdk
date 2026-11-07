@@ -14,13 +14,16 @@ pub mod a2a;
 pub mod agent;
 #[cfg(feature = "agui")]
 pub mod agui;
-#[cfg(feature = "agent")]
+#[cfg(feature = "streaming")]
 pub mod batching;
 #[cfg(feature = "agent")]
 pub mod blob;
 // The `bridge_hops` loop guard both protocol bridges stamp.
 #[cfg(any(feature = "a2a-bridge", feature = "mcp-bridge"))]
 mod bridge_hops;
+// The browser `Origin` guard both bridge HTTP routers share.
+#[cfg(any(feature = "a2a-http", feature = "mcp-http"))]
+mod bridge_origin;
 pub mod capabilities;
 #[cfg(feature = "streaming")]
 mod connect_options;
@@ -36,8 +39,6 @@ mod control;
 pub mod crash_context;
 #[cfg(feature = "streaming")]
 pub mod cursor;
-#[cfg(feature = "destinations")]
-pub mod destinations;
 #[cfg(any(feature = "a2a-bridge", feature = "mcp-bridge"))]
 pub mod edge_auth;
 pub mod error;
@@ -55,7 +56,6 @@ pub mod laser;
 #[cfg(any(
     feature = "filters",
     feature = "fork",
-    feature = "destinations",
     feature = "graph",
     feature = "kv",
     feature = "projections",
@@ -63,6 +63,8 @@ pub mod laser;
     feature = "rbac"
 ))]
 mod managed;
+#[cfg(feature = "projections")]
+pub mod materialize;
 #[cfg(feature = "streaming")]
 #[cfg(feature = "mcp-bridge")]
 pub mod mcp;

@@ -1,11 +1,11 @@
 use crate::agent::budget::BudgetGate;
 use crate::agent::clock::{Clock, SystemClock};
 use crate::agent::control::ControlBook;
-use crate::agent::ctx::AgentCtx;
+use crate::agent::ctx::{AgentCtx, ApprovalResume, ApprovalSlot};
 use crate::agent::pause::{Hold, PauseRuntime, Replay, SourceTopic};
 use crate::agent::session::{SessionConfig, Sessions};
 use crate::capabilities::HelloOutcome;
-use crate::error::LaserError;
+use crate::error::{LaserError, TransportError};
 use crate::laser::Laser;
 use crate::poll::{DrainRange, drain_partition};
 use crate::provenance::{AgentTopic, LlmUsage, Provenance};
@@ -81,6 +81,9 @@ const WARM_DEDUP_BATCH: u32 = 1000;
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_QUEUED_RECORDS: usize = 4_096;
 const DEFAULT_MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+/// The error detail key that carries the dead-letter reason code, on a failed
+/// session and on the error a dead-lettered command answers its source with.
+pub(crate) const DEAD_LETTER_REASON_DETAIL: &str = "dead_letter_reason";
 
 /// What you implement: one async `handle` per message. (`AgentHandler` is the `Send` variant the runtime drives.)
 #[trait_variant::make(AgentHandler: Send)]
@@ -89,9 +92,10 @@ pub trait LocalAgentHandler {
 }
 
 /// A cross-cutting hook wrapped around every handler dispatch, for auth, metrics,
-/// and tracing without a handler rewrite. `before_handle` runs once before the
-/// retry loop and may reject the message (a rejection dead-letters it without
-/// running the handler). `after_handle` runs after every attempt with its result
+/// and tracing without a handler rewrite. `before_handle` runs before the retry
+/// loop and may reject the message: a non-retryable error dead-letters it
+/// without running the handler, and a retryable one is retried under the
+/// handler's retry policy. `after_handle` runs after every attempt with its result
 /// and one-based attempt number, so a metrics sink counts retries and outcomes.
 /// Boxed-future (`#[async_trait]`) so it composes as `Arc<dyn AgentMiddleware>`,
 /// the same seam shape as [`Deduplicator`].
@@ -113,9 +117,11 @@ pub trait AgentMiddleware: Send + Sync {
 }
 
 /// Notified whenever the consumer produces a dead-letter capsule, with the
-/// capsule and the result of publishing it to the DLQ topic. A publish failure
-/// means the poison message is lost as its offset commits, so this is the seam an
-/// operator wires to alert on a lost message rather than grep logs. The `message`
+/// capsule and the result of publishing it to the DLQ topic. A publish that
+/// still fails after the consumer's in-place retries stops the consumer with
+/// the poison message uncommitted, so it is read again once the consumer runs
+/// again. This is the seam an operator wires to alert on that stop rather than
+/// grep logs. The `message`
 /// is present for a decoded poison message, absent when the provenance itself
 /// would not decode. Boxed-future (`#[async_trait]`) so it composes as
 /// `Arc<dyn DeadLetterSink>`.
@@ -165,6 +171,13 @@ impl AgentMessage {
             Some(envelope) => &envelope.body,
             None => &self.payload,
         }
+    }
+
+    // The delivered record decoded, `None` when it does not decode.
+    pub(crate) fn of_record(received: &ConsumerMessage) -> Option<Self> {
+        Self::from_consumer(received, laser_wire::agent::features::NONE)
+            .ok()
+            .map(|decoded| decoded.message)
     }
 
     // Decode a delivered record into an `AgentMessage`. On a decode failure
@@ -346,7 +359,7 @@ fn provenance_from_envelope(envelope: &AgentEnvelope) -> Provenance {
                 .correlation
                 .map(|correlation| correlation.to_string()),
         )
-        .maybe_deadline(envelope.deadline_micros.map(IggyTimestamp::from))
+        .maybe_deadline_at(envelope.deadline_micros.map(IggyTimestamp::from))
         .maybe_usage(envelope.usage.map(|usage| LlmUsage {
             input_tokens: Some(usage.input_tokens),
             output_tokens: Some(usage.output_tokens),
@@ -409,8 +422,8 @@ pub enum ConcurrencyPolicy {
     /// concurrently, but a single partition is still handled strictly in order,
     /// one at a time. Retry backoff is lane-local, so a poison message on one
     /// partition never stalls another. `max_partitions` bounds the number of
-    /// concurrent lanes (a message for a partition beyond the cap is handled
-    /// inline rather than dropped).
+    /// concurrent lanes: a message for a new partition at the cap closes the
+    /// lanes holding no record, or waits for one to drain.
     SerialPerPartition {
         /// The most concurrent lanes to run.
         max_partitions: usize,
@@ -535,6 +548,11 @@ impl ReliableConsumer {
     where
         H: AgentHandler + Sync + Send + 'static,
     {
+        if self.ack_on_pickup && self.respond_on.is_none() {
+            return Err(LaserError::Config(
+                "ack_on_pickup requires respond_on, the topic the pickup status is sent on",
+            ));
+        }
         let stream = laser.stream_required()?.to_owned();
         let engine = DeliveryEngine::resolve(laser).await?;
         let me = self.agent.as_ref().map(AgentId::wire_id);
@@ -1043,7 +1061,7 @@ pub(crate) const MAX_CONSECUTIVE_POLL_ERRORS: u32 = crate::retry::CONSUMER_FAILU
 fn recoverable(error: &LaserError, failures: u32) -> bool {
     let rejoin = matches!(
         error,
-        LaserError::Iggy(IggyError::ConsumerGroupMemberNotFound(..))
+        LaserError::Transport(TransportError(IggyError::ConsumerGroupMemberNotFound(..)))
     );
     (rejoin || error.is_retryable()) && failures < MAX_CONSECUTIVE_POLL_ERRORS
 }
@@ -1227,6 +1245,9 @@ enum LaneOutcome {
 struct Lane {
     sender: tokio::sync::mpsc::Sender<QueuedMessage>,
     task: tokio::task::JoinHandle<()>,
+    // Cloned into every record queued on the lane and dropped once its
+    // completion is reported, so a lane holding no clone is idle.
+    held: Arc<()>,
 }
 
 // The lanes still running after the polling loop ends, and their pending
@@ -1351,17 +1372,28 @@ where
                     worker.observe_assignment(consumer);
                     let partition = message.partition_id;
                     if !lanes.contains_key(&partition) && lanes.len() >= limits.max_partitions {
-                        // Over the lane cap: handle inline rather than drop
-                        // the record or spawn an unbounded number of lanes.
-                        // No lane holds this partition, so nothing queued
-                        // precedes the record.
-                        if let Err(error) = worker.consume(&message).await {
-                            break 'polling LaneOutcome::Fatal(error);
+                        // At the lane cap: close the lanes holding no record,
+                        // else wait for one to drain while committing what the
+                        // others complete. The record in hand is uncommitted,
+                        // so a stop meanwhile reads it again later.
+                        retire_idle(&mut lanes, &mut retiring);
+                        while lanes.len() >= limits.max_partitions {
+                            tokio::select! {
+                                () = &mut *stop => break 'polling LaneOutcome::Stopped,
+                                completion = commit_rx.recv() => {
+                                    match completion {
+                                        Some(Ok(handled)) => {
+                                            if let Err(error) = consumer.commit_handled(&handled).await {
+                                                break 'polling LaneOutcome::Failed(error);
+                                            }
+                                        }
+                                        Some(Err(error)) => break 'polling LaneOutcome::Fatal(error),
+                                        None => break 'polling LaneOutcome::Stopped,
+                                    }
+                                    retire_idle(&mut lanes, &mut retiring);
+                                }
+                            }
                         }
-                        if let Err(error) = consumer.commit_handled(&message).await {
-                            break 'polling LaneOutcome::Failed(error);
-                        }
-                        continue;
                     }
                     let lane = lanes.entry(partition).or_insert_with(|| {
                         spawn_lane(
@@ -1394,6 +1426,7 @@ where
                         message,
                         record_permit,
                         byte_permit,
+                        held: Arc::clone(&lane.held),
                     };
                     if lane.sender.send(queued).await.is_err() {
                         // The lane stopped after a failed dead-letter publish.
@@ -1402,7 +1435,7 @@ where
                     }
                 }
                 Some(Err(error)) => {
-                    if matches!(error, LaserError::Iggy(IggyError::ConsumerGroupMemberNotFound(..))) {
+                    if matches!(error, LaserError::Transport(TransportError(IggyError::ConsumerGroupMemberNotFound(..)))) {
                         drop_revoked(opener, consumer, &mut lanes, &mut retiring).await;
                     }
                     break LaneOutcome::Failed(error);
@@ -1444,7 +1477,11 @@ where
         async move { worker.consume(&message).await.map(|()| message) }
     };
     let task = tokio::spawn(run_lane(predecessor, queue, handle, commits, notify, stop));
-    Lane { sender, task }
+    Lane {
+        sender,
+        task,
+        held: Arc::new(()),
+    }
 }
 
 // A lane: one partition's records handled in order, each reported to the
@@ -1472,17 +1509,39 @@ async fn run_lane<F, Fut>(
             message,
             record_permit,
             byte_permit,
+            held,
         } = queued;
         let result = handle(message).await;
         drop(record_permit);
         drop(byte_permit);
         let failed = result.is_err();
         let _ = commits.send(result).await;
+        drop(held);
         notify.notify_one();
         if failed {
             break;
         }
     }
+}
+
+// Close every lane that holds no record, queued or in hand. A closed lane
+// ends at once, and a later lane of its partition waits for it.
+fn retire_idle(
+    lanes: &mut std::collections::HashMap<u32, Lane>,
+    retiring: &mut std::collections::HashMap<u32, tokio::task::JoinHandle<()>>,
+) {
+    let idle: Vec<u32> = lanes
+        .iter()
+        .filter(|(_, lane)| Arc::strong_count(&lane.held) == 1)
+        .map(|(partition, _)| *partition)
+        .collect();
+    for partition in idle {
+        if let Some(lane) = lanes.remove(&partition) {
+            drop(lane.sender);
+            retiring.insert(partition, lane.task);
+        }
+    }
+    retiring.retain(|_, task| !task.is_finished());
 }
 
 // The assignment probe. A lane of a partition this member no longer reads is
@@ -1558,6 +1617,7 @@ struct QueuedMessage {
     message: ConsumerMessage,
     record_permit: tokio::sync::OwnedSemaphorePermit,
     byte_permit: tokio::sync::OwnedSemaphorePermit,
+    held: Arc<()>,
 }
 
 /// The dedup key, principal-scoped so one producer cannot suppress or replay
@@ -1749,6 +1809,30 @@ impl<H> ReliableWorker<H> {
         }
     }
 
+    // Record who signed a reply, against the connection's reply verifier,
+    // so an approval gate accepts only its approver's signed decision.
+    #[cfg(feature = "sign")]
+    fn verify_reply(
+        &self,
+        message: &mut AgentMessage,
+        context: Option<&SignatureContext>,
+        observed_at_micros: u64,
+    ) {
+        let Some(registry) = self.laser.registry_verifier() else {
+            return;
+        };
+        message.verified_principal = message
+            .envelope
+            .as_ref()
+            .zip(context)
+            .and_then(|(envelope, context)| {
+                registry
+                    .verify_observed_at(envelope, context, observed_at_micros)
+                    .ok()
+            })
+            .map(|verified| verified.principal);
+    }
+
     fn log_position(&self, id: MessageId) -> LogPosition {
         LogPosition::new(self.stream_id, self.topic_id, id.partition_id, id.offset)
     }
@@ -1775,10 +1859,59 @@ impl<H> ReliableWorker<H> {
         // re-drop the capsule for the very deadline that killed the original.
         let mut provenance = message.provenance.clone();
         provenance.causal_parent = Some(message.id);
-        provenance.deadline = None;
+        provenance.deadline_at = None;
         let session = Some(message.provenance.conversation_id);
         self.publish_dead_letter(provenance, message.id, capsule, Some(message), session)
-            .await
+            .await?;
+        self.answer_dead_letter(message, reason, detail).await;
+        Ok(())
+    }
+
+    // A correlated command that was dead-lettered answers its source with an
+    // AGDX error on `respond_on`, so a contract or request reads the refusal
+    // at once instead of waiting out its deadline. Best effort: the dead
+    // letter is published, so a failed answer is logged and the record
+    // still commits.
+    async fn answer_dead_letter(
+        &self,
+        message: &AgentMessage,
+        reason: DeadLetterReason,
+        detail: &str,
+    ) {
+        let (Some(agent), Some(respond_on), Some(envelope)) =
+            (&self.agent, &self.respond_on, &message.envelope)
+        else {
+            return;
+        };
+        let Some(correlation) = envelope.correlation else {
+            return;
+        };
+        if envelope.kind != AgentKind::Command {
+            return;
+        }
+        let producer = self
+            .laser
+            .agdx(respond_on.clone(), agent.wire_id(), envelope.conversation);
+        let failure = match producer.fail(correlation, &dead_letter_error(reason, detail)) {
+            Ok(failure) => failure,
+            Err(error) => {
+                warn!(%error, source = %message.id, "Answering the dead-lettered command {correlation} failed: {error}");
+                return;
+            }
+        };
+        let mut failure = failure
+            .with_target(envelope.source.clone())
+            .with_ancestry(envelope.parent, envelope.root);
+        if let Some(record) = envelope.record {
+            failure = failure.with_cause(record, Some(self.log_position(message.id)));
+        }
+        #[cfg(feature = "sign")]
+        if let Some(signing_key) = &self.signing_key {
+            failure = failure.signed_by(signing_key);
+        }
+        if let Err(error) = failure.send().await {
+            warn!(%error, source = %message.id, "Answering the dead-lettered command {correlation} failed: {error}");
+        }
     }
 
     // Dead-letters a message whose provenance could not be decoded. The original
@@ -1822,7 +1955,8 @@ impl<H> ReliableWorker<H> {
         session: Option<ConversationId>,
     ) -> Result<(), LaserError> {
         let reason = capsule.reason;
-        let result = self.send_dead_letter(&provenance, &capsule).await;
+        let result =
+            publish_retrying(source, || self.send_dead_letter(&provenance, &capsule)).await;
         if let Err(error) = &result {
             error!(%error, source = %source, ?reason, "failed to publish the dead-letter capsule, leaving the source offset uncommitted");
         }
@@ -1868,7 +2002,7 @@ impl<H> ReliableWorker<H> {
             retryable: false,
             detail: Some(BTreeMap::from([
                 (
-                    "dead_letter_reason".to_owned(),
+                    DEAD_LETTER_REASON_DETAIL.to_owned(),
                     laser_wire::query::Value::Uint(u64::from(capsule.reason.code())),
                 ),
                 (
@@ -1924,12 +2058,21 @@ where
     // record must stay uncommitted.
     #[tracing::instrument(target = "laser", level = "debug", skip_all, fields(conversation = tracing::field::Empty, operation = "handle"))]
     async fn consume(&self, received: &ConsumerMessage) -> Result<(), LaserError> {
-        self.deliver(received, true).await
+        self.deliver(received, true, None).await.map(|_| ())
     }
 
     // Handle one record. A live record passes the pause check, a held record
-    // replayed after the resume does not.
-    async fn deliver(&self, received: &ConsumerMessage, live: bool) -> Result<(), LaserError> {
+    // replayed after the resume does not, and a record resumed on its
+    // approval skips every gate it already passed and decides its gate on
+    // `resume`. `true` when the record waits on an approval. One function
+    // rather than a nested one keeps the delivery future shallow.
+    async fn deliver(
+        &self,
+        received: &ConsumerMessage,
+        live: bool,
+        resume: Option<ApprovalResume>,
+    ) -> Result<bool, LaserError> {
+        let resumed = resume.is_some();
         let source = received.position;
         let decoded = match AgentMessage::from_consumer(received, self.understood_features) {
             Ok(decoded) => decoded,
@@ -1940,7 +2083,7 @@ where
                     .flatten();
                 self.dead_letter_undecodable(source, conversation, payload)
                     .await?;
-                return Ok(());
+                return Ok(false);
             }
         };
         #[cfg(feature = "sign")]
@@ -1971,21 +2114,36 @@ where
         // Tolerating one-message-loss in case (2) is by design: the operator
         // is supposed to fix the group-per-agent setup, not have the SDK
         // paper over it by handling unrelated agents' work.
-        if let (Some(target), Some(agent)) = (&message.provenance.target_agent_id, &self.agent)
+        if !resumed
+            && let (Some(target), Some(agent)) = (&message.provenance.target_agent_id, &self.agent)
             && target != agent
         {
             debug!(target = %target, agent = %agent, source = %message.id, "skipping message targeted at another agent");
-            return Ok(());
+            return Ok(false);
         }
 
         // Dispatch classification, shared with every SDK and the session fold.
         // Only work for an operation this handler serves reaches it. Replies,
         // status, events, control, and records for another agent are skipped
         // and still committed. The author is never a discriminator.
-        let dispatch = self.dispatch(&message);
+        let dispatch = if resumed {
+            Dispatch::Work
+        } else {
+            self.dispatch(&message)
+        };
         if dispatch != Dispatch::Work {
+            // An approval decision addressed to this agent resumes the
+            // session it parked.
+            if dispatch == Dispatch::Reply
+                && live
+                && let Some(pause) = self.pause.get()
+            {
+                #[cfg(feature = "sign")]
+                self.verify_reply(&mut message, signature_context.as_ref(), observed_at_micros);
+                pause.resume_approval(self, &message).await?;
+            }
             debug!(source = %message.id, dispatch = dispatch.as_str(), "skipping a record that is not work for this agent");
-            return Ok(());
+            return Ok(false);
         }
 
         // Mandatory signature verification on a verified (control or effect) topic.
@@ -2001,40 +2159,44 @@ where
                         .ok()
                 })
             });
-            let Some(verified) = verified else {
-                warn!(source = %message.id, "unsigned or unverified message on a verified topic, dead-lettering");
-                self.dead_letter(
-                    &message,
-                    DeadLetterReason::Rejected,
-                    0,
-                    "signature verification failed",
-                )
-                .await?;
-                return Ok(());
-            };
-            // A verified signature proves who authored the envelope, not that
-            // this is its first delivery. Any writer on the topic can replay the
-            // captured bytes, and they verify again, so a repeat record id is
-            // dropped here before the handler acts on it.
-            if let Some(record) = message
-                .envelope
-                .as_ref()
-                .and_then(|envelope| envelope.record)
-            {
-                let first_delivery = self
-                    .verified_records
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(&record.to_string());
-                if !first_delivery {
-                    warn!(source = %message.id, %record, "replayed signed record, dropping");
-                    return Ok(());
+            if resumed {
+                message.verified_principal = verified.map(|verified| verified.principal);
+            } else {
+                let Some(verified) = verified else {
+                    warn!(source = %message.id, "unsigned or unverified message on a verified topic, dead-lettering");
+                    self.dead_letter(
+                        &message,
+                        DeadLetterReason::Rejected,
+                        0,
+                        "signature verification failed",
+                    )
+                    .await?;
+                    return Ok(false);
+                };
+                // A verified signature proves who authored the envelope, not that
+                // this is its first delivery. Any writer on the topic can replay the
+                // captured bytes, and they verify again, so a repeat record id is
+                // dropped here before the handler acts on it.
+                if let Some(record) = message
+                    .envelope
+                    .as_ref()
+                    .and_then(|envelope| envelope.record)
+                {
+                    let first_delivery = self
+                        .verified_records
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(&record.to_string());
+                    if !first_delivery {
+                        warn!(source = %message.id, %record, "replayed signed record, dropping");
+                        return Ok(false);
+                    }
                 }
+                message.verified_principal = Some(verified.principal);
             }
-            message.verified_principal = Some(verified.principal);
         }
 
-        // The pause check (D7a), before the fence and dedup gates so a held
+        // The pause check, before the fence and dedup gates so a held
         // record keeps its slot for the resume. Work for a paused session is
         // parked on the session lane and committed. A resumed session handles
         // its held records first. The session gate stays held through the
@@ -2043,17 +2205,17 @@ where
             (Some(pause), true) => {
                 let gate = pause.gate(message.provenance.conversation_id).await;
                 if pause.hold(self, &message).await? == Hold::Commit {
-                    return Ok(());
+                    return Ok(false);
                 }
                 Some(gate)
             }
             _ => None,
         };
 
-        // The budget check (D9), on a deployment that indexes sessions: work
+        // The budget check, on a deployment that indexes sessions: work
         // for a session over its budget ends the session failed with reason
         // `budget`, once, and is committed without reaching the handler.
-        if let Some(agent) = &self.agent {
+        if !resumed && let Some(agent) = &self.agent {
             let session = message.provenance.conversation_id;
             let admitted = self
                 .budget
@@ -2071,7 +2233,7 @@ where
                 .await;
             if !admitted {
                 debug!(source = %message.id, "skipping work for a session over its budget");
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -2082,7 +2244,8 @@ where
         // idempotency slot the legitimate holder's retry needs. A malformed fence
         // already failed to decode (an error, never `.ok()`-ed to absent), so a
         // present token here is trustworthy.
-        if let Some(fence) = message.provenance.fence_token
+        if !resumed
+            && let Some(fence) = message.provenance.fence_token
             && !accept_fence(
                 &self.high_water_fence,
                 &self.fence_last_sweep,
@@ -2092,10 +2255,10 @@ where
             )
         {
             debug!(source = %message.id, fence, "stale-holder fence, dropping replay");
-            return Ok(());
+            return Ok(false);
         }
 
-        if let Some(key) = dedup_key(&message.provenance) {
+        if !resumed && let Some(key) = dedup_key(&message.provenance) {
             // Dedup marks the key seen before the handler runs: a duplicate arriving
             // while the original is still in the window is skipped even if the
             // original later dead-letters. This is the at-least-once + idempotent
@@ -2103,11 +2266,12 @@ where
             // principal-scoped (see `dedup_key`).
             if !self.dedup.observe(&key).await {
                 debug!(dedup_key = %key, source = %message.id, "skipping duplicate message");
-                return Ok(());
+                return Ok(false);
             }
         }
 
-        if let Some(deadline) = message.provenance.deadline
+        if !resumed
+            && let Some(deadline) = message.provenance.deadline_at
             && IggyTimestamp::now().as_micros() > deadline.as_micros()
         {
             warn!(source = %message.id, "message past its deadline, dead-lettering");
@@ -2118,14 +2282,15 @@ where
                 "message past its deadline",
             )
             .await?;
-            return Ok(());
+            return Ok(false);
         }
 
         // Ack-on-pickup: a `Working` status the instant an AGDX command is taken,
         // before the handler runs, so a contract caller distinguishes consumed
         // from expired-unconsumed. The command survived the deadline check above,
         // so it was consumed in time.
-        if self.ack_on_pickup
+        if !resumed
+            && self.ack_on_pickup
             && let (Some(agent), Some(respond_on), Some(envelope)) =
                 (&self.agent, &self.respond_on, &message.envelope)
             && envelope.kind == AgentKind::Command
@@ -2137,7 +2302,8 @@ where
             let ack = producer
                 .status(OPERATION_TASK)
                 .with_correlation(correlation)
-                .with_task_state(TaskState::Working);
+                .with_task_state(TaskState::Working)
+                .with_target(envelope.source.clone());
             #[cfg(feature = "sign")]
             let ack = match &self.signing_key {
                 Some(signing_key) => ack.signed_by(signing_key),
@@ -2151,7 +2317,15 @@ where
         // Picking up the first command of a submitted session marks the
         // session working and keeps it listed in this process's heartbeat
         // while the handler runs.
-        let _pickup = self.pick_up_submitted(&message).await;
+        let _pickup = if resumed {
+            None
+        } else {
+            self.pick_up_submitted(&message).await
+        };
+        let approval = match self.pause.get() {
+            Some(_) => ApprovalSlot::parking(&self.topic, resume),
+            None => ApprovalSlot::default(),
+        };
         let ctx = AgentCtx::new(
             &self.laser,
             &message,
@@ -2162,16 +2336,35 @@ where
             self.signing_key.clone(),
         )
         .with_request_at(self.log_position(message.id))
-        .with_sessions(self.sessions.clone(), Arc::clone(&self.control));
-        // Middleware `before_handle` runs once, in order, before the retry loop.
-        // A rejection there dead-letters the message without ever running the
-        // handler (the auth/gatekeeping use), so it is a non-retryable stop.
+        .with_sessions(self.sessions.clone(), Arc::clone(&self.control))
+        .with_approval(approval.clone());
+        // Middleware `before_handle` runs in order before the retry loop. A
+        // non-retryable rejection dead-letters the message without ever running
+        // the handler (the auth/gatekeeping use). A retryable one is retried
+        // under the retry policy, then dead-lettered as exhausted.
         for middleware in &self.middleware {
-            if let Err(error) = middleware.before_handle(&message).await {
-                warn!(%error, source = %message.id, "middleware rejected message before handling, dead-lettering");
-                self.dead_letter(&message, DeadLetterReason::Rejected, 0, &error.to_string())
+            let mut attempt = 0;
+            while let Err(error) = middleware.before_handle(&message).await {
+                if !error.is_retryable() {
+                    warn!(%error, source = %message.id, "middleware rejected message before handling, dead-lettering");
+                    self.dead_letter(&message, DeadLetterReason::Rejected, 0, &error.to_string())
+                        .await?;
+                    return Ok(false);
+                }
+                if attempt + 1 >= self.retry.max_attempts {
+                    error!(%error, source = %message.id, attempts = attempt + 1, "middleware failed every attempt before handling, dead-lettering");
+                    self.dead_letter(
+                        &message,
+                        DeadLetterReason::RetryExhausted,
+                        attempt + 1,
+                        &error.to_string(),
+                    )
                     .await?;
-                return Ok(());
+                    return Ok(false);
+                }
+                warn!(%error, source = %message.id, attempt = attempt + 1, "middleware failed before handling, retrying");
+                sleep(self.retry.delay_for(attempt)).await;
+                attempt += 1;
             }
         }
         let mut attempt = 0;
@@ -2198,10 +2391,18 @@ where
                     .after_handle(&message, &result, attempt + 1)
                     .await;
             }
+            // An approval gate interrupted the handler, whatever it returned:
+            // park the record instead of committing or retrying it.
+            if let Some(interrupt) = approval.take_interrupt() {
+                if let Some(pause) = self.pause.get() {
+                    pause.park_approval(&message, &interrupt).await?;
+                }
+                return Ok(true);
+            }
             match result {
                 Ok(()) => {
                     debug!(source = %message.id, "message handled");
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(error) => {
                     if !error.is_retryable() {
@@ -2213,7 +2414,7 @@ where
                             &error.to_string(),
                         )
                         .await?;
-                        return Ok(());
+                        return Ok(false);
                     }
                     if attempt + 1 >= self.retry.max_attempts {
                         error!(%error, source = %message.id, attempts = attempt + 1, "handler exhausted retries, dead-lettering");
@@ -2224,7 +2425,7 @@ where
                             &error.to_string(),
                         )
                         .await?;
-                        return Ok(());
+                        return Ok(false);
                     }
                     warn!(%error, source = %message.id, attempt = attempt + 1, "handler failed, retrying");
                     sleep(self.retry.delay_for(attempt)).await;
@@ -2243,7 +2444,15 @@ where
         &'a self,
         received: &'a ConsumerMessage,
     ) -> futures::future::BoxFuture<'a, Result<(), LaserError>> {
-        Box::pin(self.deliver(received, false))
+        Box::pin(async move { self.deliver(received, false, None).await.map(|_| ()) })
+    }
+
+    fn resume<'a>(
+        &'a self,
+        received: &'a ConsumerMessage,
+        resume: ApprovalResume,
+    ) -> futures::future::BoxFuture<'a, Result<bool, LaserError>> {
+        Box::pin(self.deliver(received, false, Some(resume)))
     }
 }
 
@@ -2329,6 +2538,47 @@ fn warm_dedup_key(
             .ok()?;
     }
     dedup_key(&decoded.provenance)
+}
+
+// Publish one dead letter, retrying a retryable failure in place on the
+// consumer backoff, so a brief outage neither loses the record nor stops the
+// consumer. The last failure is returned once the failure budget is spent.
+async fn publish_retrying<F, Fut>(source: MessageId, mut publish: F) -> Result<(), LaserError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), LaserError>>,
+{
+    let mut failures = 0;
+    loop {
+        match publish().await {
+            Err(error) if error.is_retryable() && failures + 1 < MAX_CONSECUTIVE_POLL_ERRORS => {
+                failures += 1;
+                warn!(%error, source = %source, attempt = failures, "Publishing the dead letter of {source} failed, retrying it: {error}");
+                sleep(backoff_for(failures)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+// The error a dead-lettered command answers its source with: the reason code
+// in the detail, so a contract can tell a command dropped unconsumed.
+fn dead_letter_error(reason: DeadLetterReason, detail: &str) -> AgentErrorBody {
+    AgentErrorBody {
+        code: match reason {
+            DeadLetterReason::DeadlineExceeded => AgentErrorCode::DeadlineExceeded,
+            DeadLetterReason::RetryExhausted => AgentErrorCode::Internal,
+            DeadLetterReason::Rejected
+            | DeadLetterReason::DecodeFailed
+            | DeadLetterReason::Unrecognized(_) => AgentErrorCode::InvalidRequest,
+        },
+        message: Some(detail.to_owned()),
+        retryable: reason == DeadLetterReason::RetryExhausted,
+        detail: Some(BTreeMap::from([(
+            DEAD_LETTER_REASON_DETAIL.to_owned(),
+            laser_wire::query::Value::Uint(u64::from(reason.code())),
+        )])),
+    }
 }
 
 /// The dedup seam: decides whether an idempotency key has been seen before. The
@@ -2486,6 +2736,7 @@ mod tests {
                     .acquire_owned()
                     .await
                     .expect("byte permit"),
+                held: Arc::new(()),
             };
             queue_sender.send(queued).await.expect("queue the record");
         }
@@ -2574,6 +2825,103 @@ mod tests {
         }
         assert_eq!(crate::retry::CONSUMER.ceiling(1), Duration::from_millis(50));
         assert_eq!(crate::retry::CONSUMER.ceiling(40), Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn given_a_lane_holding_a_record_and_an_idle_lane_when_retiring_then_should_close_only_the_idle_lane()
+     {
+        let mut lanes = std::collections::HashMap::new();
+        let mut retiring = std::collections::HashMap::new();
+        for partition in [0u32, 1] {
+            let (sender, mut queue) = tokio::sync::mpsc::channel::<QueuedMessage>(1);
+            let task = tokio::spawn(async move { while queue.recv().await.is_some() {} });
+            lanes.insert(
+                partition,
+                Lane {
+                    sender,
+                    task,
+                    held: Arc::new(()),
+                },
+            );
+        }
+        let in_hand = Arc::clone(&lanes[&0].held);
+
+        retire_idle(&mut lanes, &mut retiring);
+        assert_eq!(lanes.keys().copied().collect::<Vec<_>>(), vec![0]);
+
+        drop(in_hand);
+        retire_idle(&mut lanes, &mut retiring);
+        assert!(lanes.is_empty(), "a drained lane is closed too");
+    }
+
+    #[tokio::test]
+    async fn given_a_dead_letter_publish_failing_twice_when_published_then_should_land_on_the_third_attempt()
+     {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let outcome = publish_retrying(MessageId::new(0, 7), || {
+            let attempt = attempts.fetch_add(1, Ordering::AcqRel);
+            async move {
+                if attempt < 2 {
+                    Err(LaserError::Timeout("dead-letter publish"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(attempts.load(Ordering::Acquire), 3);
+    }
+
+    #[tokio::test]
+    async fn given_a_dead_letter_publish_that_keeps_failing_when_published_then_should_stop_after_the_failure_budget()
+     {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let outcome = publish_retrying(MessageId::new(0, 7), || {
+            attempts.fetch_add(1, Ordering::AcqRel);
+            async { Err(LaserError::Timeout("dead-letter publish")) }
+        })
+        .await;
+        assert!(
+            matches!(outcome, Err(LaserError::Timeout(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            MAX_CONSECUTIVE_POLL_ERRORS
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_non_retryable_dead_letter_failure_when_published_then_should_not_retry() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let outcome = publish_retrying(MessageId::new(0, 7), || {
+            attempts.fetch_add(1, Ordering::AcqRel);
+            async { Err(LaserError::Codec("dead-letter capsule".to_owned())) }
+        })
+        .await;
+        assert!(matches!(outcome, Err(LaserError::Codec(_))), "{outcome:?}");
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn given_a_command_dropped_past_its_deadline_when_answered_then_should_carry_the_reason_code() {
+        let error = dead_letter_error(
+            DeadLetterReason::DeadlineExceeded,
+            "message past its deadline",
+        );
+        assert_eq!(error.code, AgentErrorCode::DeadlineExceeded);
+        assert!(!error.retryable);
+        assert_eq!(
+            error
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get(DEAD_LETTER_REASON_DETAIL)),
+            Some(&laser_wire::query::Value::Uint(4))
+        );
+        let exhausted = dead_letter_error(DeadLetterReason::RetryExhausted, "kept failing");
+        assert_eq!(exhausted.code, AgentErrorCode::Internal);
+        assert!(exhausted.retryable);
     }
 
     #[test]

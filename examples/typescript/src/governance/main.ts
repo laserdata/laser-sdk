@@ -41,8 +41,8 @@ const ROLES: readonly Role[] = [
   {
     name: "agent-runner",
     grants: [
-      allow("agent", "read", resourcePatternAll()),
-      allow("agent", "write", resourcePatternAll())
+      allow("session", "read", resourcePatternAll()),
+      allow("session", "write", resourcePatternAll())
     ]
   },
   {
@@ -110,7 +110,9 @@ async function installRoles(laser: Laser, targetUser: number): Promise<void> {
     console.log("support-reader role was not visible after define")
   }
   const bindings = await laser.getBindings(targetUser)
-  console.log(`user ${String(targetUser)} is bound to: [${bindings.join(", ")}]`)
+  console.log(
+    `user ${String(targetUser)} is bound to: [${bindings.roles.join(", ")}] at binding revision ${String(bindings.revision)}`
+  )
 }
 
 function demonstrateIntersection(): void {
@@ -139,7 +141,7 @@ function demonstrateEdgeAuth(): void {
   console.log(`edge read authorized: ${String(read === undefined)}`)
 
   const write = authorizeEdge(readOnly, "mcp.laserdata", "tool:write")
-  const challenge = write === undefined ? "none" : (edgeDenialChallenge(write) ?? "none")
+  const challenge = write === undefined ? "none" : edgeDenialChallenge(write)
   console.log(`edge write step-up challenge: ${challenge}`)
 
   const rejected = authorizeEdge(foreign, "mcp.laserdata", "tool:write")

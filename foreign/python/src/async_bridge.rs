@@ -4,12 +4,65 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use pyo3_async_runtimes::TaskLocals;
+use pyo3_stub_gen::{ImportKind, PyStubType, TypeIdentifierRef, TypeInfo};
+use std::convert::Infallible;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
 /// Takes back a successful result its cancelled Python future never received.
 pub type Undelivered = Box<dyn FnOnce(Python<'_>, Py<PyAny>) + Send>;
+
+/// The awaitable a binding returns, rendered in the stub as
+/// `typing.Awaitable[T]` from the stub type of the value it resolves to.
+#[repr(transparent)]
+pub struct Awaitable<'py, T> {
+    future: Bound<'py, PyAny>,
+    resolves_to: PhantomData<fn() -> T>,
+}
+
+impl<'py, T> IntoPyObject<'py> for Awaitable<'py, T> {
+    type Target = PyAny;
+    type Output = Bound<'py, PyAny>;
+    type Error = Infallible;
+
+    fn into_pyobject(self, _py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(self.future)
+    }
+}
+
+impl<T: PyStubType> PyStubType for Awaitable<'_, T> {
+    fn type_output() -> TypeInfo {
+        let inner = T::type_output();
+        let mut import = inner.import.clone();
+        import.insert("typing".into());
+        let mut type_refs = inner.type_refs.clone();
+        if let Some(module) = inner.source_module.clone()
+            && module.get().is_some()
+        {
+            let bare = inner
+                .name
+                .split('[')
+                .next()
+                .and_then(|name| name.rsplit('.').next())
+                .unwrap_or(&inner.name);
+            type_refs.insert(
+                bare.to_owned(),
+                TypeIdentifierRef {
+                    module,
+                    import_kind: ImportKind::Module,
+                },
+            );
+        }
+        TypeInfo {
+            name: format!("typing.Awaitable[{}]", inner.name),
+            source_module: None,
+            import,
+            type_refs,
+        }
+    }
+}
 
 /// The event loop and context variables a Python hook falls back to when it
 /// runs outside any awaiting caller, such as on a worker lane the runtime
@@ -588,6 +641,38 @@ mod portable {
 }
 
 pub use portable::future_into_py_returning;
+
+/// Run `future` on the runtime and hand Python the awaitable that resolves to
+/// its value, typed in the stub by that value.
+pub fn awaitable<'py, F, T>(py: Python<'py>, future: F) -> PyResult<Awaitable<'py, T>>
+where
+    F: Future<Output = PyResult<T>> + Send + 'static,
+    T: for<'a> IntoPyObject<'a> + Send + 'static,
+    for<'a> <T as IntoPyObject<'a>>::Error: Into<PyErr>,
+{
+    future_into_py(py, future).map(|future| Awaitable {
+        future,
+        resolves_to: PhantomData,
+    })
+}
+
+/// [`awaitable`] for a read whose completed value a cancelled caller hands
+/// back through `undelivered`.
+pub fn awaitable_returning<'py, F, T>(
+    py: Python<'py>,
+    future: F,
+    undelivered: Undelivered,
+) -> PyResult<Awaitable<'py, T>>
+where
+    F: Future<Output = PyResult<T>> + Send + 'static,
+    T: for<'a> IntoPyObject<'a> + Send + 'static,
+    for<'a> <T as IntoPyObject<'a>>::Error: Into<PyErr>,
+{
+    future_into_py_returning(py, future, undelivered).map(|future| Awaitable {
+        future,
+        resolves_to: PhantomData,
+    })
+}
 
 #[cfg(test)]
 mod tests {

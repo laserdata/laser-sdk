@@ -2,6 +2,7 @@ import {
   type AgentEnvelope,
   type AgentId,
   AgentKind,
+  METADATA_RECORDED,
   METADATA_ROLE,
   OPERATION_CHAT,
   OPERATION_PROGRESS,
@@ -25,6 +26,9 @@ export const OPERATION_SESSION_PAUSE = "session_pause"
 export const OPERATION_SESSION_RESUME = "session_resume"
 export const OPERATION_SESSION_CANCEL = "session_cancel"
 export const OPERATION_FORCE_CANCEL = "force_cancel"
+/** The `command` operation that asks a person or a named approver for input.
+ * Only a handler that lists it among its operations receives it as work. */
+export const OPERATION_INPUT_REQUEST = "input_request"
 export const OPERATION_TEXT_COMPLETION = "text_completion"
 export const OPERATION_GENERATE_CONTENT = "generate_content"
 export const OPERATION_EXECUTE_TOOL = "execute_tool"
@@ -207,6 +211,16 @@ function isModel(operation: string): boolean {
   )
 }
 
+function isRecorded(envelope: AgentEnvelope): boolean {
+  const recorded = envelope.metadata?.get(METADATA_RECORDED)
+  return recorded?.kind === "bool" && recorded.value
+}
+
+// An input request reaches only an approver that opted in to it.
+function handles(handled: HandledOperations, operation: string): boolean {
+  return handled === "any" ? operation !== OPERATION_INPUT_REQUEST : handled.includes(operation)
+}
+
 function isUser(envelope: AgentEnvelope): boolean {
   const role = envelope.metadata?.get(METADATA_ROLE)
   return role?.kind === "str" && role.value === "user"
@@ -244,7 +258,8 @@ export function classify(
       const onControl = topic === AGENT_CONTROL
       if (control) return onControl ? "control" : "observational"
       if (onControl) return "foreign"
-      return handled === "any" || handled.includes(operation) ? "work" : "observational"
+      if (isRecorded(envelope)) return "observational"
+      return handles(handled, operation) ? "work" : "observational"
     }
   }
 }

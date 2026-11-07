@@ -131,3 +131,8 @@ def test_given_an_ack_context_when_constructed_then_should_preserve_owner_and_me
     assert context.metadata_op == 41
     with pytest.raises(OverflowError):
         ls.AckContext(owner_generation=-1, metadata_op=41)
+
+
+def test_given_a_group_filter_when_inspected_then_should_offer_no_revision_drafts():
+    assert not hasattr(ls.GroupFilter, "revise")
+    assert hasattr(ls.GroupFilter, "set_revision_enabled")

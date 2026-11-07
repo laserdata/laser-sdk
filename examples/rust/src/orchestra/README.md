@@ -12,9 +12,9 @@ Each agent opens its own connection and stays up for the whole run. The example 
 4. Workflow. `Laser::workflow` runs a journalled `triage`, then a `diagnose` panel under a `verify_with` check, then `remediate`. A `WorkflowBudget` caps the dispatches and the wall clock. Each step builds its task from the earlier steps' outputs. The run is a root session and each step is a child session of it.
 5. Quarantine. An operator quarantines `diag-alpha` with `Laser::quarantine`. Every fused registry folds that fact, so the next panel routes around the agent.
 6. Recovery. The operator reinstates the agent with `Laser::unquarantine`, and the panel is whole again.
-7. Expiry and recovery. A task with a one-second deadline goes to the slow agent and times out. The orchestrator sends it again to a healthy agent.
+7. Expiry and recovery. A task with a one-second deadline goes to the slow agent and times out. The task carries the deadline, so the slow agent stops at it instead of finishing late, and the orchestrator sends the task again to a healthy agent.
 
-Routing uses a fixed inbox (`InboxRoute::Fixed(AgentTopic::Sessions)`), so the example runs on Apache Iggy. Each task is addressed to its agent on `agent.sessions`. A managed deployment also records live presence. On Apache Iggy that step is skipped.
+Routing uses the default advertised inbox. A managed deployment resolves each agent's live presence. On Apache Iggy, which keeps no presence, routing resolves the inbox the agent's capability card names, `agent.sessions` here. Each task is addressed to its agent there.
 
 ## Run it
 

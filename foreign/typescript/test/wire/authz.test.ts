@@ -29,17 +29,9 @@ import {
 } from "../../src/wire/authz.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import {
-  type OperatorActorAssertion,
-  validateOperatorAssertion
-} from "../../src/wire/checkpoint.js"
-import { CheckpointRequestId, DestinationId } from "../../src/wire/ids.js"
-import {
   AGDX_AGENT_BASE,
   AGDX_BATCH_CODE,
-  AGDX_CHECKPOINT_CODE,
   AGDX_CONTROL_PUBLISH_CODE,
-  AGDX_DESTINATION_GET_CODE,
-  AGDX_DESTINATION_HTTP_CODE,
   AGDX_HELLO_CODE,
   AGDX_KV_CAS_FENCED_CODE,
   AGDX_KV_GET_CODE,
@@ -203,9 +195,8 @@ void test("given_a_command_code_when_classified_then_should_map_to_feature_and_a
   ]) {
     assert.deepEqual(featureAction(code), ["session", "read"])
   }
-  assert.deepEqual(featureAction(AGDX_DESTINATION_GET_CODE), ["destination", "read"])
-  assert.equal(featureAction(AGDX_CHECKPOINT_CODE), undefined)
-  assert.equal(featureAction(AGDX_DESTINATION_HTTP_CODE), undefined)
+  for (const retired of [1_000_021, 1_000_022, 1_000_025, 1_000_201, 1_000_203])
+    assert.equal(featureAction(retired), undefined)
   assert.equal(AGDX_CONTROL_PUBLISH_CODE, 1_000_108)
   assert.equal(featureAction(AGDX_CONTROL_PUBLISH_CODE), undefined)
 })
@@ -245,36 +236,6 @@ void test("given_feature_action_pairs_when_indexed_then_should_match_rust_and_fi
   assert.equal(actionIndex("kv_lease", "admin"), 58)
   assert.equal(actionIndex("kv_fence", "read"), 60)
   assert.equal(actionIndex("session", "read"), 70)
-})
-
-void test("given_an_operator_assertion_when_validated_then_should_check_version_ids_window_and_lengths", () => {
-  const valid: OperatorActorAssertion = {
-    claims: {
-      v: 1,
-      requestId: CheckpointRequestId.fromU128(1n),
-      deploymentId: 2,
-      cloudUserId: 3,
-      action: "record_repair",
-      destinationId: DestinationId.fromU128(4n),
-      destinationGeneration: 5n,
-      issuedAtMicros: 1_000n,
-      expiresAtMicros: 1_000n + 300_000_000n
-    },
-    keyId: new Uint8Array(8),
-    signature: new Uint8Array(64)
-  }
-  validateOperatorAssertion(valid)
-  const broken: readonly [OperatorActorAssertion, RegExp][] = [
-    [{ ...valid, claims: { ...valid.claims, v: 2 } }, /version/],
-    [{ ...valid, claims: { ...valid.claims, cloudUserId: 0 } }, /nonzero/],
-    [{ ...valid, claims: { ...valid.claims, expiresAtMicros: 1_000n + 300_000_001n } }, /window/],
-    [{ ...valid, signature: new Uint8Array(63) }, /signature/]
-  ]
-  for (const [assertion, message] of broken) {
-    assert.throws(() => {
-      validateOperatorAssertion(assertion)
-    }, message)
-  }
 })
 
 void test("given_a_tenancy_event_when_round_tripped_then_should_keep_it", () => {

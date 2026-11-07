@@ -1,3 +1,4 @@
+import { isStale, isUnavailable } from "../client/error-classify.js"
 import { BudgetExceededError, LaserError, SessionError } from "../client/errors.js"
 import type { Session, Sessions } from "../session.js"
 import { warn } from "../runtime/warn.js"
@@ -69,12 +70,68 @@ export function breachOfInfo(info: SessionInfo): BudgetBreach | undefined {
   return breachOf(info.budget, tokens, info.costMicros) ?? exceededBreach(0n, tokens)
 }
 
-/** The budget of the first start record on the lane against the usage summed
- * over every enveloped record, as the session index folds them.
+/** The lifecycle of one session as the session index folds its lane: the
+ * first terminal ends it, and a start after a completed or failed end resumes
+ * it with that start's budget.
  * @internal */
-export function laneBreach(envelopes: Iterable<AgentEnvelope>): BudgetBreach | undefined {
-  let started = false
-  let budget: Budget | undefined
+export class LaneLifecycle {
+  started = false
+  ended: "completed" | "failed" | "canceled" | undefined
+  budget: Budget | undefined
+
+  add(envelope: AgentEnvelope): void {
+    if (envelope.kind !== AgentKind.Status || envelope.operation !== OPERATION_SESSION) return
+    const state = envelope.taskState?.kind === "known" ? envelope.taskState.name : undefined
+    if (
+      state === "Completed" ||
+      state === "Failed" ||
+      state === "Rejected" ||
+      state === "Canceled"
+    ) {
+      this.ended ??=
+        state === "Completed" ? "completed" : state === "Canceled" ? "canceled" : "failed"
+      return
+    }
+    if (
+      state !== "Submitted" &&
+      state !== "Working" &&
+      state !== "InputRequired" &&
+      state !== "AuthRequired"
+    )
+      return
+    let budget: Budget | undefined
+    try {
+      budget = decodeSessionStart(
+        expectMap(decodeOne(envelope.body, "start"), "start"),
+        "start"
+      ).budget
+    } catch {
+      // A transition is a session status too, but not a start.
+      return
+    }
+    if (!this.started) {
+      this.started = true
+      this.budget = budget
+    } else if (this.ended === "completed" || this.ended === "failed") {
+      this.ended = undefined
+      this.budget = budget
+    }
+  }
+}
+
+/** The budget of the start record the session index applies against the usage
+ * summed over every enveloped record, as the index folds them, and whether
+ * the lane still holds a start record. `onLane` says which envelopes ride
+ * `agent.sessions`, where the lifecycle lives.
+ * @internal */
+export function laneBreach(
+  envelopes: Iterable<AgentEnvelope>,
+  onLane: (envelope: AgentEnvelope) => boolean = () => true
+): {
+  readonly breach: BudgetBreach | undefined
+  readonly started: boolean
+} {
+  const lifecycle = new LaneLifecycle()
   let tokens = 0n
   let costMicros = 0n
   for (const envelope of envelopes) {
@@ -82,23 +139,9 @@ export function laneBreach(envelopes: Iterable<AgentEnvelope>): BudgetBreach | u
       tokens += envelope.usage.inputTokens + envelope.usage.outputTokens
       costMicros += envelope.usage.costMicros ?? 0n
     }
-    if (
-      !started &&
-      envelope.kind === AgentKind.Status &&
-      envelope.operation === OPERATION_SESSION
-    ) {
-      try {
-        budget = decodeSessionStart(
-          expectMap(decodeOne(envelope.body, "start"), "start"),
-          "start"
-        ).budget
-        started = true
-      } catch {
-        // A transition or end record is not the start.
-      }
-    }
+    if (onLane(envelope)) lifecycle.add(envelope)
   }
-  return breachOf(budget, tokens, costMicros)
+  return { breach: breachOf(lifecycle.budget, tokens, costMicros), started: lifecycle.started }
 }
 
 /** The error body of a session ended for `breach`.
@@ -124,6 +167,19 @@ export function unknownToIndex(error: unknown): boolean {
   return (
     error instanceof SessionError &&
     (error.detail.kind === "notFound" || error.detail.kind === "notRegistered")
+  )
+}
+
+/** Whether a failed index read leaves the lane fold to answer: the index does
+ * not know the session, is catching up, or is out of reach for now.
+ * @internal */
+export function indexUnusable(error: unknown): boolean {
+  return (
+    unknownToIndex(error) ||
+    (error instanceof SessionError &&
+      (error.detail.kind === "stale" || error.detail.kind === "unavailable")) ||
+    isUnavailable(error) ||
+    isStale(error)
   )
 }
 

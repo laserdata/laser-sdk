@@ -2,10 +2,13 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import { OPEN_CAPABILITIES, type Capabilities } from "../../src/client/capabilities.js"
 import {
+  CancelledError,
   ConfigError,
   FilterExecutionError,
+  FilterFaultError,
   InvalidError,
   ProtocolError,
+  TimeoutError,
   TransportError,
   UnsupportedError
 } from "../../src/client/errors.js"
@@ -38,12 +41,14 @@ import {
   decodeFilteredWaitCancel,
   decodeFilteredWaitRequest,
   encodeFilterReply,
+  type FilteredAck,
   type FilteredPage,
   type FilteredPollRequest,
   type FilteredStart,
   type FilteredWaitCancel,
   type FilteredWaitRequest
 } from "../../src/wire/filter.js"
+import { MAX_FILTERED_WAIT_PARTITIONS } from "../../src/wire/limits.js"
 
 const SYNC_CONSUMER_GROUP_CODE = 606
 const INVALID_IDENTIFIER = 6
@@ -208,7 +213,11 @@ interface Coordinator {
   }[]
   readonly stored: FencedPosition[]
   readonly lookups: number[]
-  readonly acks: { readonly target: ManagedTarget; readonly offset: bigint }[]
+  readonly acks: {
+    readonly target: ManagedTarget
+    readonly offset: bigint
+    readonly request: FilteredAck
+  }[]
   readonly cancels: { readonly target: ManagedTarget; readonly request: FilteredWaitCancel }[]
 }
 
@@ -290,7 +299,7 @@ function coordinatorOf(spec: {
             metadataOp: ack.ackContext.metadataOp
           }
         }
-        acks.push({ target, offset: ack.offset })
+        acks.push({ target, offset: ack.offset, request: ack })
         const answered = spec.ack === undefined ? undefined : await spec.ack(ack.offset, target)
         if (answered !== undefined) return { reply: answered }
         if (spec.store !== undefined) await spec.store(position)
@@ -329,6 +338,16 @@ function coordinatorOf(spec: {
     close: () => Promise.resolve()
   }
   return { connection, polls, waits, stored, lookups, acks, cancels }
+}
+
+// An acknowledgment reply whose receipt reports `offset` as durable progress.
+function acknowledged(offset: bigint, of: typeof generation = generation): Uint8Array {
+  return encodeNamed(
+    encodeFilterReply({
+      kind: "ok",
+      outcome: { kind: "acknowledged", receipt: { partitionId: 0, offset, generation: of } }
+    })
+  )
 }
 
 function heldKey(target: ManagedTarget, waitId: bigint): string {
@@ -418,6 +437,26 @@ void test("given_a_server_without_group_reads_when_an_automatic_reader_is_built_
   assert.equal(joined, false)
 })
 
+void test("given_a_probe_that_established_nothing_or_no_filters_when_an_automatic_reader_is_built_then_should_classify_it_like_the_consumer", async () => {
+  const transport = baseTransport(() => Promise.reject(new Error("no command is needed")))
+  const automatic = (served: Capabilities) =>
+    FilteredReaderBuilder.create(
+      transport,
+      () => Promise.resolve(served),
+      new Filters(transport, () => Promise.resolve(served)),
+      { stream: "orbit", topic: "fleet_changes" },
+      { kind: "group", name: "anomaly-desk" },
+      { kind: "group" }
+    ).build()
+  await assert.rejects(automatic({ ...OPEN_CAPABILITIES, hello: "failed" }), TimeoutError)
+  await assert.rejects(automatic({ ...OPEN_CAPABILITIES, hello: "rejected" }), (error: unknown) => {
+    assert.ok(error instanceof UnsupportedError)
+    assert.equal(error.surface, "filters")
+    assert.equal(error.feature, undefined)
+    return true
+  })
+})
+
 void test("given_a_server_without_native_filters_when_a_bound_reader_is_built_then_should_reject_before_transport", async () => {
   let transportCalls = 0
   const unexpectedTransport = (): Promise<never> => {
@@ -491,7 +530,11 @@ void test("given_an_unfiltered_page_when_read_then_should_need_an_automatic_grou
   assert.equal(found?.policy.mode, "unfiltered")
   assert.equal(found.policy.digest, undefined)
   assert.equal(found.policy.policyGeneration, 2n)
-  assert.equal(found.records[0]?.evaluated, false, "an unbound group evaluates no filter")
+  assert.deepEqual(
+    found.records[0]?.evaluation,
+    { kind: "unfiltered" },
+    "an unbound group runs no filter, so no pass policy delivered the record"
+  )
   await assert.rejects(
     read("bound", unfiltered()),
     ProtocolError,
@@ -535,6 +578,52 @@ void test("given_an_over_budget_page_when_a_bounded_group_read_returns_then_shou
     await assert.rejects(filtered.readRound(), ProtocolError)
   } finally {
     await filtered.close()
+  }
+})
+
+void test("given_a_lone_record_over_the_requested_byte_cap_when_a_page_returns_then_should_accept_it_and_refuse_two", async () => {
+  for (const [offsets, accepted] of [
+    [[0n], true],
+    [[0n, 1n], false]
+  ] as const) {
+    const coordinator = coordinatorOf({
+      poll: () =>
+        Promise.resolve(
+          pageReply(groupPage({ offsets, examined: offsets.length, nextScanOffset: 2n }))
+        )
+    })
+    const transport = baseTransport(() => Promise.reject(new Error("unused")))
+    const filtered = FilteredReader.create({
+      transport,
+      filters: new Filters(transport, () => Promise.resolve(capabilities)),
+      coordinator: coordinator.connection,
+      request: {
+        v: FILTER_OP_VERSION,
+        source: { stream: "orbit", topic: "fleet_changes" },
+        partitionId: 0,
+        consumer: { kind: "group", name: "anomaly-desk" },
+        filter: { kind: "group" },
+        start: { kind: "first" },
+        count: 2,
+        maxExamined: 2,
+        maxReplyBytes: 64
+      },
+      start: { kind: "first" },
+      idleIntervalMs: 1,
+      guard: undefined,
+      membership: undefined,
+      partitionIds: [0]
+    })
+    try {
+      if (accepted) {
+        const [page] = await filtered.readRound()
+        assert.equal(page?.records.length, 1, "the record over the cap comes alone")
+      } else {
+        await assert.rejects(filtered.readRound(), ProtocolError)
+      }
+    } finally {
+      await filtered.close()
+    }
   }
 })
 
@@ -799,6 +888,72 @@ void test("given_a_checkpoint_inside_a_page_when_acknowledged_through_then_shoul
   await filtered.close()
 })
 
+void test("given_a_stored_checkpoint_when_an_earlier_record_is_acknowledged_through_then_should_send_nothing", async () => {
+  const coordinator = coordinatorOf({
+    poll: () => Promise.resolve(pageReply(page({ offsets: [3n, 7n, 9n], nextScanOffset: 20n })))
+  })
+  const filtered = reader(coordinator)
+  const found = await filtered.tryNextPage()
+  const [first, second] = found?.records ?? []
+  assert(first !== undefined && second !== undefined)
+  await filtered.ackThrough(second)
+  await filtered.ackThrough(first)
+  assert.deepEqual(
+    coordinator.acks.map((ack) => ack.offset),
+    [7n],
+    "7 is stored, so 3 needs no acknowledgment"
+  )
+  await filtered.close()
+})
+
+void test("given_a_receipt_above_the_target_when_acknowledged_then_should_cover_only_what_it_reports", async () => {
+  const coordinator = coordinatorOf({
+    poll: () => Promise.resolve(pageReply(page({ offsets: [3n, 7n, 11n], nextScanOffset: 20n }))),
+    ack: (offset) => Promise.resolve(offset < 15n ? acknowledged(15n) : undefined)
+  })
+  const filtered = reader(coordinator)
+  const found = await filtered.tryNextPage()
+  const [first, second, third] = found?.records ?? []
+  assert(first !== undefined && second !== undefined && third !== undefined)
+  await filtered.ackThrough(first)
+  await filtered.ackThrough(second)
+  assert.deepEqual(
+    coordinator.acks.map((ack) => ack.offset),
+    [3n],
+    "the durable offset 15 covers 7"
+  )
+  await filtered.ack(third)
+  assert.deepEqual(
+    coordinator.acks.map((ack) => ack.offset),
+    [3n, 19n],
+    "another consumer's progress marks no local record handled"
+  )
+  await filtered.close()
+})
+
+void test("given_a_receipt_below_the_target_or_for_another_generation_when_acknowledged_then_should_refuse_it", async () => {
+  for (const receipt of [
+    acknowledged(2n),
+    acknowledged(3n, { ...generation, partitionIncarnation: 18n })
+  ]) {
+    let refusals = 1
+    const coordinator = coordinatorOf({
+      poll: () => Promise.resolve(pageReply(page({ offsets: [3n, 7n], nextScanOffset: 20n }))),
+      ack: () => Promise.resolve(refusals-- > 0 ? receipt : undefined)
+    })
+    const filtered = reader(coordinator)
+    const first = (await filtered.tryNextPage())?.records[0]
+    assert(first !== undefined)
+    await assert.rejects(filtered.ackThrough(first), ProtocolError)
+    await filtered.close()
+    assert.deepEqual(
+      coordinator.acks.map((ack) => ack.offset),
+      [3n, 3n],
+      "the refused target stays pending and is sent again"
+    )
+  }
+})
+
 void test("given_a_group_page_when_acknowledged_then_should_store_under_the_numeric_group_it_named", async () => {
   const coordinator = coordinatorOf({
     poll: () => Promise.resolve(pageReply(groupPage({ offsets: [0n] }))),
@@ -837,6 +992,72 @@ void test("given_a_refused_store_when_the_next_ack_runs_then_should_store_the_sa
     [1n],
     "the unstored target is sent again, and a spread copy still acknowledges"
   )
+  await filtered.close()
+})
+
+void test("given_a_fault_page_when_skipped_then_should_send_one_fenced_ack_at_the_fault_once_earlier_records_are_handled_and_read_on_after_it", async () => {
+  // The fault page was read under another owner than the page before it.
+  const faultContext = { ownerGeneration: 5n, metadataOp: 9n }
+  const faulted = page({
+    nextScanOffset: 8n,
+    examined: 3,
+    stop: "fault",
+    fault: { offset: 8n, reason: "malformed" },
+    ackContext: faultContext,
+    records: body(0, 1000n, [], { incarnation: 17n, ...faultContext })
+  })
+  const served = [
+    page({ offsets: [4n], nextScanOffset: 5n }),
+    faulted,
+    page({ offsets: [9n], nextScanOffset: 10n })
+  ]
+  let polled = 0
+  const coordinator = coordinatorOf({
+    poll: () => {
+      const answer = served[Math.min(polled, served.length - 1)] ?? faulted
+      polled += 1
+      return Promise.resolve(pageReply(answer))
+    }
+  })
+  const filtered = reader(coordinator)
+  const earlier = (await filtered.tryNextPage())?.records[0]
+  assert(earlier !== undefined)
+  await assert.rejects(filtered.tryNextPage(), (error: unknown) => {
+    assert.ok(error instanceof FilterFaultError)
+    assert.deepEqual([error.partitionId, error.offset], [0, 8n])
+    return true
+  })
+
+  await assert.rejects(filtered.skip(0, 7n), InvalidError, "the partition is stopped at 8")
+  await filtered.skip(0, 8n)
+  assert.equal(coordinator.acks.length, 0, "record 4 is still open, so the skip waits for it")
+  await filtered.ack(earlier)
+  assert.deepEqual(
+    coordinator.acks.map((ack) => ack.request),
+    [
+      {
+        v: FILTER_OP_VERSION,
+        source: { stream: "orbit", topic: "fleet_changes" },
+        consumer: { kind: "consumer", name: "reader" },
+        partitionId: 0,
+        offset: 8n,
+        generation: faulted.generation,
+        ackContext: faultContext,
+        digest: faulted.policy.digest,
+        mode: faulted.policy.mode,
+        policyGeneration: faulted.policy.policyGeneration
+      }
+    ],
+    "one acknowledgment at the fault, under the fault page's fence"
+  )
+  const after = await filtered.tryNextPage()
+  assert.deepEqual(
+    after?.records.map((record) => record.offset),
+    [9n]
+  )
+  const resumed = coordinator.polls[2]?.request.start
+  assert.equal(resumed?.kind === "continue" ? resumed.continuation.nextScanOffset : undefined, 9n)
+  await assert.rejects(filtered.skip(0, 8n), InvalidError, "the block is gone")
   await filtered.close()
 })
 
@@ -1000,7 +1221,7 @@ for (const losses of [1, 2]) {
         await assert.rejects(
           filtered.tryNextPage(),
           (error: unknown) =>
-            error instanceof FilterExecutionError && error.detail.reason === "membership_stale"
+            error instanceof FilterExecutionError && error.detail?.reason === "membership_stale"
         )
       assert.equal(polls, 2)
       assert.deepEqual(coordinator.lookups, [0, 0], "a lost assignment drops the route")
@@ -1010,12 +1231,59 @@ for (const losses of [1, 2]) {
   })
 }
 
+void test("given_records_a_pass_policy_delivered_when_read_then_should_name_why_each_was_not_evaluated", async () => {
+  const reasons = [
+    { offset: 0n, reason: "type_mismatch" },
+    { offset: 2n, reason: "foreign_codec" }
+  ] as const
+  const coordinator = coordinatorOf({
+    poll: () =>
+      Promise.resolve(
+        pageReply(page({ offsets: [0n, 1n, 2n], nextScanOffset: 3n, unevaluated: reasons }))
+      )
+  })
+  const filtered = reader(coordinator)
+  const delivered = await filtered.tryNextPage()
+  assert.deepEqual(
+    delivered?.records.map((record) => record.evaluation),
+    [
+      { kind: "unevaluated", reason: "type_mismatch" },
+      { kind: "selected" },
+      { kind: "unevaluated", reason: "foreign_codec" }
+    ]
+  )
+  await filtered.close()
+  const contradictory = reader(
+    coordinatorOf({
+      poll: () =>
+        Promise.resolve(
+          pageReply(
+            page({
+              offsets: [0n],
+              unevaluated: [
+                { offset: 0n, reason: "type_mismatch" },
+                { offset: 0n, reason: "malformed" }
+              ]
+            })
+          )
+        )
+    })
+  )
+  await assert.rejects(
+    contradictory.tryNextPage(),
+    ProtocolError,
+    "a record is unevaluated for one reason"
+  )
+  await contradictory.close()
+})
+
 void test("given_unevaluated_records_when_guarded_then_should_require_a_reproducible_pass_fault", async () => {
   const passing = { ...filter, faultPolicy: "pass" as const }
-  for (const [definition, limit, accepted] of [
-    [filter, 4, false],
-    [passing, 4, true],
-    [passing, 1024, false]
+  for (const [definition, limit, reason, accepted] of [
+    [filter, 4, "too_large", false],
+    [passing, 4, "too_large", true],
+    [passing, 4, "malformed", false],
+    [passing, 1024, "too_large", false]
   ] as const) {
     const coordinator = coordinatorOf({
       poll: () =>
@@ -1028,15 +1296,20 @@ void test("given_unevaluated_records_when_guarded_then_should_require_a_reproduc
                 mode: "filtered",
                 policyGeneration: 0n
               },
-              unevaluated: [0n],
+              unevaluated: [{ offset: 0n, reason }],
               evaluationLimits: { maxPayloadBytes: limit, maxDepth: 64 }
             })
           )
         )
     })
     const filtered = reader(coordinator, { guarded: definition })
-    if (accepted) assert.equal((await filtered.tryNextPage())?.records.length, 1)
-    else await assert.rejects(filtered.tryNextPage())
+    if (accepted) {
+      const delivered = await filtered.tryNextPage()
+      assert.deepEqual(
+        delivered?.records.map((record) => record.evaluation),
+        [{ kind: "unevaluated", reason: "too_large" }]
+      )
+    } else await assert.rejects(filtered.tryNextPage())
     await filtered.close()
   }
 })
@@ -1140,6 +1413,43 @@ void test("given_an_idle_round_on_a_server_that_holds_waits_when_waiting_then_sh
     "only the ready partition is read"
   )
   held?.(readyReply([]))
+  await filtered.close()
+})
+
+void test("given_more_partitions_on_a_node_than_one_wait_names_when_waiting_then_should_wait_on_every_partition_in_capped_waits", async () => {
+  const partitionIds = Array.from(
+    { length: 2 * MAX_FILTERED_WAIT_PARTITIONS + 52 },
+    (_, partitionId) => partitionId
+  )
+  const last = partitionIds.length - 1
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: (request) =>
+      request.partitions.some((partition) => partition.partitionId === last)
+        ? Promise.resolve(readyReply([last]))
+        : new Promise<Uint8Array>(() => undefined)
+  })
+  const filtered = reader(coordinator, { partitionIds, maxWaitMs: 2_000 })
+  await filtered.readRound()
+  await filtered.waitForRecords()
+  assert.equal(coordinator.waits.length, 3, "one wait per slice of the node's partitions")
+  for (const wait of coordinator.waits)
+    assert.ok(wait.request.partitions.length <= MAX_FILTERED_WAIT_PARTITIONS)
+  assert.deepEqual(
+    coordinator.waits.flatMap((wait) =>
+      wait.request.partitions.map((partition) => partition.partitionId)
+    ),
+    partitionIds
+  )
+  assert.equal(new Set(coordinator.waits.map((wait) => wait.request.waitId)).size, 3)
+  const polled = coordinator.polls.length
+  await filtered.readRound()
+  assert.deepEqual(
+    coordinator.polls.slice(polled).map((poll) => poll.request.partitionId),
+    [last],
+    "only the ready partition past the first slice is read"
+  )
   await filtered.close()
 })
 
@@ -1714,6 +2024,32 @@ void test("given_a_held_wait_when_the_reader_closes_then_should_cancel_it_and_en
   await within(idle, 1_000)
 })
 
+void test("given_an_iterating_reader_when_closed_then_should_end_the_iteration_without_an_error", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(
+        pageReply(
+          request.start.kind === "first"
+            ? page({ partitionId: request.partitionId, offsets: [0n] })
+            : page({ partitionId: request.partitionId, nextScanOffset: 5n })
+        )
+      ),
+    wait: () => new Promise(() => undefined)
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 20_000, idleIntervalMs: 30_000 })
+  const seen: bigint[] = []
+  const iteration = (async () => {
+    for await (const record of filtered) seen.push(record.offset)
+  })()
+  await until(() => coordinator.waits.length === 1, 1_000)
+  await filtered.close()
+  await within(iteration, 1_000)
+  assert.deepEqual(seen, [0n])
+  const after: bigint[] = []
+  for await (const record of filtered) after.push(record.offset)
+  assert.deepEqual(after, [], "a closed reader yields nothing")
+})
+
 void test("given_a_held_wait_when_the_reader_is_woken_then_should_cancel_it", async () => {
   const coordinator = coordinatorOf({
     poll: (request) =>
@@ -1730,6 +2066,82 @@ void test("given_a_held_wait_when_the_reader_is_woken_then_should_cancel_it", as
   assert.deepEqual(coordinator.cancels[0]?.request.waitIds, [coordinator.waits[0]?.request.waitId])
   await filtered.close()
   assert.equal(coordinator.cancels.length, 1, "a cancelled wait is not cancelled again")
+})
+
+void test("given_a_held_wait_and_a_short_timeout_when_paging_then_should_return_by_the_timeout_and_cancel_the_wait", async (context) => {
+  // Timers count whole milliseconds, so the wait's bound can fire just before
+  // the page deadline by `performance.now()`. The skew makes that certain.
+  const now = performance.now.bind(performance)
+  let skewMs = 0
+  context.mock.method(performance, "now", () => now() - skewMs)
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: () => {
+      skewMs = 5
+      return new Promise(() => undefined)
+    }
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 20_000, idleIntervalMs: 30_000 })
+  const started = performance.now()
+  // The timeout leaves the first round time to reach the held wait on a loaded machine.
+  await assert.rejects(within(filtered.nextPage({ timeoutMs: 1_000 }), 5_000), TimeoutError)
+  assert.ok(performance.now() - started < 5_000, "the page call ends by its timeout")
+  assert.equal(coordinator.waits.length, 1, "the page call holds one wait")
+  await until(() => coordinator.cancels.length === 1, 1_000)
+  await filtered.close()
+})
+
+void test("given_an_aborted_signal_when_paging_then_should_reject_with_cancelled_before_reading", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: () => new Promise(() => undefined)
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 20_000 })
+  const controller = new AbortController()
+  controller.abort()
+  await assert.rejects(
+    within(filtered.nextPage({ signal: controller.signal }), 1_000),
+    CancelledError
+  )
+  assert.equal(coordinator.polls.length, 0)
+  await filtered.close()
+})
+
+void test("given_a_held_wait_when_the_signal_aborts_then_should_reject_with_cancelled_and_cancel_the_wait", async () => {
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      Promise.resolve(pageReply(page({ partitionId: request.partitionId, nextScanOffset: 5n }))),
+    wait: () => new Promise(() => undefined)
+  })
+  const filtered = reader(coordinator, { maxWaitMs: 20_000, idleIntervalMs: 30_000 })
+  const controller = new AbortController()
+  const paging = filtered.nextPage({ signal: controller.signal })
+  await until(() => coordinator.waits.length === 1, 1_000)
+  controller.abort()
+  await assert.rejects(within(paging, 1_000), CancelledError)
+  await until(() => coordinator.cancels.length === 1, 1_000)
+  await filtered.close()
+})
+
+void test("given_two_overlapping_page_calls_when_both_read_then_should_never_deliver_a_record_twice", async () => {
+  const coordinator = coordinatorOf({
+    poll: async (request) => {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      const at = request.start.kind === "continue" ? request.start.continuation.nextScanOffset : 0n
+      return pageReply(
+        page({ partitionId: request.partitionId, offsets: [at], nextScanOffset: at + 1n })
+      )
+    }
+  })
+  const filtered = reader(coordinator)
+  const pages = await within(Promise.all([filtered.nextPage(), filtered.nextPage()]), 2_000)
+  assert.deepEqual(
+    pages.flatMap((delivered) => delivered.records.map((record) => record.offset)),
+    [0n, 1n]
+  )
+  await filtered.close()
 })
 
 void test("given_a_cancel_that_fails_when_a_wait_ends_then_should_warn_and_keep_reading", async () => {

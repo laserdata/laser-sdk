@@ -4,6 +4,7 @@ import { test } from "node:test"
 import { UserStatus } from "apache-iggy"
 import { Laser } from "../../src/client/laser.js"
 import { CancelledError, TimeoutError } from "../../src/client/errors.js"
+import { parseConnectionString } from "../../src/iggy/apache-iggy.js"
 import type { Consumer, ConsumerMessage } from "../../src/stream/consumer.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
@@ -219,7 +220,7 @@ void test("given_a_fresh_consumer_when_reading_next_then_should_start_at_zero", 
   }
 })
 
-void test("given_default_polling_when_shutdown_after_offset_zero_then_should_resume_at_one", async () => {
+void test("given_the_default_policy_when_shutdown_after_offset_zero_then_should_resume_at_one", async () => {
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
@@ -233,6 +234,141 @@ void test("given_default_polling_when_shutdown_after_offset_zero_then_should_res
     await resumed.shutdown()
   } finally {
     await laser.close()
+  }
+})
+
+void test("given_each_commit_policy_when_the_consumer_stops_while_handling_a_record_then_should_deliver_it_again", async () => {
+  const laser = await Laser.connect(CONNECTION_STRING)
+  try {
+    const topic = await freshTopic(laser)
+    for (const value of ["zero", "one", "two"]) await topic.send(utf8(value))
+    const crashed = topic.consumer("crashed", 0, {
+      startAt: { kind: "first" },
+      commitPolicy: { kind: "each" }
+    })
+    assert.equal((await crashed.nextWithin(2_000)).position.offset, 0n)
+    assert.equal((await crashed.nextWithin(2_000)).position.offset, 1n)
+    assert.equal((await crashed.storedOffset(0))?.storedOffset, 0n)
+    const resumed = topic.consumer("crashed", 0, { commitPolicy: { kind: "each" } })
+    assert.equal(
+      decodeUtf8((await resumed.nextWithin(2_000)).payload),
+      "one",
+      "the record in hand at the crash comes again"
+    )
+    await resumed.shutdown()
+  } finally {
+    await laser.close()
+  }
+})
+
+void test("given_the_default_policy_when_the_consumer_stops_without_shutdown_while_holding_a_record_then_should_deliver_it_again", async () => {
+  const laser = await Laser.connect(CONNECTION_STRING)
+  try {
+    const topic = await freshTopic(laser)
+    for (const value of ["zero", "one", "two"]) await topic.send(utf8(value))
+    const crashed = topic.consumer("default-crashed", 0, { startAt: { kind: "first" } })
+    assert.equal((await crashed.nextWithin(2_000)).position.offset, 0n)
+    const resumed = topic.consumer("default-crashed", 0)
+    assert.equal(
+      (await resumed.nextWithin(2_000)).position.offset,
+      0n,
+      "nothing of the poll in hand was stored, so it comes again"
+    )
+    await resumed.shutdown()
+  } finally {
+    await laser.close()
+  }
+})
+
+void test("given_a_record_read_before_its_topic_was_recreated_when_committed_then_should_be_refused_instead_of_landing_on_the_new_topic", async () => {
+  const laser = await Laser.connect(CONNECTION_STRING)
+  const streamName = `laser-ts-test-${randomUUID()}`
+  try {
+    await laser.stream(streamName).ensure()
+    const topic = laser.stream(streamName).topic("events")
+    await topic.ensure(1)
+    for (const value of ["zero", "one"]) await topic.send(utf8(value))
+    const reader = topic.consumer("fenced", 0, {
+      startAt: { kind: "first" },
+      commitPolicy: { kind: "disabled" }
+    })
+    await reader.nextWithin(2_000)
+    const stale = await reader.nextWithin(2_000)
+    await laser.client.topic.delete({ streamId: streamName, topicId: "events", partitionsCount: 1 })
+    await topic.ensure(1)
+    for (const value of ["new-zero", "new-one", "new-two"]) await topic.send(utf8(value))
+    // A read of the new topic through the same client routes the partition
+    // under its new history.
+    const other = topic.consumer("other", 0, {
+      startAt: { kind: "first" },
+      commitPolicy: { kind: "disabled" }
+    })
+    assert.equal(decodeUtf8((await other.nextWithin(2_000)).payload), "new-zero")
+    await other.shutdown()
+    await assert.rejects(reader.commit(stale))
+    assert.equal(
+      await reader.storedOffset(0),
+      undefined,
+      "the commit of the older topic's record stores nothing on the new one"
+    )
+    await reader.shutdown()
+  } finally {
+    await laser
+      .stream(streamName)
+      .delete()
+      .catch(() => false)
+    await laser.close()
+  }
+})
+
+void test("given_a_partition_consumer_when_it_seeks_back_then_should_read_on_from_the_sought_offset", async () => {
+  const laser = await Laser.connect(CONNECTION_STRING)
+  try {
+    const topic = await freshTopic(laser)
+    for (const value of ["zero", "one", "two", "three"]) await topic.send(utf8(value))
+    const consumer = topic.consumer("seeker", 0, {
+      startAt: { kind: "first" },
+      commitPolicy: { kind: "disabled" }
+    })
+    for (const expected of [0n, 1n, 2n, 3n]) {
+      assert.equal((await consumer.nextWithin(2_000)).position.offset, expected)
+    }
+    await consumer.seek(0, { kind: "offset", value: 1n })
+    const sought = await consumer.nextWithin(2_000)
+    assert.equal(sought.position.offset, 1n)
+    assert.equal(decodeUtf8(sought.payload), "one")
+    await consumer.shutdown()
+  } finally {
+    await laser.close()
+  }
+})
+
+void test("given_a_password_with_a_colon_an_at_sign_and_a_question_mark_when_connecting_then_should_log_in_through_credentials_and_an_encoded_string", async () => {
+  const admin = await Laser.connect(CONNECTION_STRING)
+  const username = `secret-${randomUUID().slice(0, 8)}`
+  const password = `p:ss@w?rd%-${randomUUID().slice(0, 8)}`
+  try {
+    const created = await admin.client.user.create({
+      username,
+      password,
+      status: UserStatus.Active,
+      permissions: readerPermissions(true)
+    })
+    const { host, port } = parseConnectionString(CONNECTION_STRING, {})
+    const byCredentials = await Laser.builder()
+      .address(host, port)
+      .credentials(username, password)
+      .connect()
+    assert.equal((await byCredentials.client.client.getMe()).userId, created.id)
+    await byCredentials.close()
+    const byString = await Laser.connect(
+      `${encodeURIComponent(username)}:${encodeURIComponent(password)}@${host}:${String(port)}`
+    )
+    assert.equal((await byString.client.client.getMe()).userId, created.id)
+    await byString.close()
+  } finally {
+    await admin.client.user.delete({ userId: username }).catch(() => undefined)
+    await admin.close()
   }
 })
 

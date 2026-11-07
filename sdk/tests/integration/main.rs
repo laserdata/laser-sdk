@@ -8,6 +8,8 @@ mod agdx_consume;
 mod agdx_stream;
 #[cfg(feature = "agui")]
 mod agui;
+#[cfg(feature = "rbac")]
+mod authz_receipts;
 mod budget;
 mod context;
 mod contract;
@@ -28,6 +30,8 @@ mod managed_unsupported;
 mod mcp;
 mod memory;
 mod pause;
+#[cfg(all(feature = "agent", feature = "query"))]
+mod presence_pin;
 mod provenance;
 mod queue_pressure;
 mod reconnect;
@@ -36,6 +40,7 @@ mod replay;
 mod request;
 mod runtime;
 mod session;
+mod session_lane;
 mod shutdown;
 #[cfg(feature = "sign")]
 mod signing;

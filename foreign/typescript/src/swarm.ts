@@ -1,8 +1,8 @@
-import type { PolicyEvidence, Verdict } from "./govern.js"
+import type { PolicyEvidence } from "./govern.js"
 import { compareCodePoints } from "./runtime/compare.js"
 
 export class AgentActivity {
-  private readonly byVerdict = new Map<Verdict["kind"], bigint>()
+  private readonly byVerdict = new Map<PolicyEvidence["decision"], bigint>()
   decisions = 0n
   lastDecision: PolicyEvidence | undefined
 
@@ -20,7 +20,7 @@ export class AgentActivity {
     }
   }
 
-  count(verdict: Verdict["kind"]): bigint {
+  count(verdict: PolicyEvidence["decision"]): bigint {
     return this.byVerdict.get(verdict) ?? 0n
   }
 }

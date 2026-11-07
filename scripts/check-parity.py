@@ -55,6 +55,7 @@ REASONS = {
     "native-value": ("Python passes the native scalar, None, or list that serde reads and writes for this untagged Rust enum", True),
     "std-trait": ("The peer spells a Rust standard trait impl (FromStr, Display, From) as a function or static member", False),
     "serde-dict": ("Python passes the record as a dict that serde builds from the same Rust type, keyed by its serde field names", False),
+    "signature-type": ("TypeScript exports the parameter, option, or result shape a public signature names, where Rust passes the values or a generic bound directly", False),
 }
 
 # A serde derive on the Rust type, which fixes the dict keys a `serde-dict` peer carries.
@@ -105,6 +106,7 @@ PY_PROTOCOL = {"to_dict", "from_dict", "to_json", "from_json"}
 # members of that Rust type keywords of that call. A type row spelled `Class`
 # or `~Class` makes `Class` host the members.
 PY_PEERS = {
+    ("FilteredRecords", None): ("FilteredReader", "protocol"),
     ("SessionLayout", "per_agent_topic"): ("SessionLayout.PerAgentTopic", "constructor"),
     ("SessionLayout", "per_agent_partition"): ("SessionLayout.PerAgentPartition", "constructor"),
     ("LaserError", "ConsumerGroupSetup.name"): ("ConsumerGroupSetupError.group_name", "name-collision"),
@@ -188,6 +190,8 @@ PY_PEERS = {
     ("ContextAssemblerBuilder", None): ("Laser.assemble_context", "keywords"),
     ("ProjectionsRequest", None): ("Projections.list", "keywords"),
     ("ProjectionsRequest", "fetch"): ("Projections.list", "one-call"),
+    ("SchemasRequest", None): ("Schemas.list", "keywords"),
+    ("SchemasRequest", "fetch"): ("Schemas.list", "one-call"),
     ("RegisterSchemaRequest", None): ("Schemas.register", "keywords"),
     ("RegisterSchemaRequest", "send"): ("Schemas.register", "one-call"),
     ("ForkCreateRequest", None): ("ForkHandle.create", "keywords"),
@@ -237,6 +241,7 @@ PY_PEERS = {
     ("SessionConfig", "layout_kind"): ("SessionConfig.layout", "property"),
     ("SessionConfig", "sdk_info"): ("SessionConfig.sdk", "property"),
     ("SessionConfig", "idle_timeout_value"): ("SessionConfig.idle_timeout_ms", "property"),
+    ("Provenance", "deadline_at"): ("Provenance.deadline_at_micros", "property"),
     ("SessionConfig", "heartbeat_value"): ("SessionConfig.heartbeat_ms", "property"),
     ("TopicRetention", "expiry"): ("TopicRetention.expiry_ms", "property"),
     ("TopicRetention", "new"): ("new:TopicRetention(expiry_ms=, max_size=)", "keywords"),
@@ -255,6 +260,9 @@ PY_PEERS = {
     ("SessionPolicy", "conversation_for"): ("fn:session_policy_conversation_for", "free-function"),
     ("ChunkAssembler", "is_finished"): ("ChunkAssembler.finished", "property"),
     ("Laser", "bind_roles_expect_revision"): ("Laser.bind_roles(expect_revision=)", "overload"),
+    ("Laser", "bind_roles_as"): ("Laser.bind_roles(mutation_id=)", "overload"),
+    ("Laser", "define_role_as"): ("Laser.define_role(mutation_id=)", "overload"),
+    ("Laser", "delete_role_as"): ("Laser.delete_role(mutation_id=)", "overload"),
     ("A2aBridge", "submit_to"): ("A2aBridge.submit(target=)", "overload"),
     ("A2aBridge", "submit_in_to"): ("A2aBridge.submit_in(target=)", "overload"),
     ("A2aBridge", "with_task_binding"): ("new:A2aBridge(task_binding_key=, task_binding_ttl_ms=)", "keywords"),
@@ -267,6 +275,9 @@ PY_PEERS = {
     ("A2aCaller", "task"): ("A2aBridge.task(caller=)", "keywords"),
     ("A2aCaller", "cancel"): ("A2aBridge.cancel(caller=)", "keywords"),
     ("A2aCaller", "handle_rpc"): ("A2aBridge.handle_rpc(caller=)", "keywords"),
+    ("A2aCaller", "submit_with_hops"): ("A2aBridge.submit(previous_hops=, caller=)", "keywords"),
+    ("A2aBridge", "submit_with_hops"): ("A2aBridge.submit(previous_hops=)", "overload"),
+    ("McpBridge", "call_tool_with_hops"): ("McpBridge.call_tool(previous_hops=)", "overload"),
     ("McpBridge", "call_tool_to"): ("McpBridge.call_tool(target=)", "overload"),
     ("McpBridge", "call_tool_in_to"): ("McpBridge.call_tool_in(target=)", "overload"),
     ("Agdx", "request_input_from"): ("Agdx.request_input(target=)", "overload"),
@@ -297,6 +308,8 @@ PY_PEERS = {
     ("LaserError", "is_unsupported"): ("LaserError.unsupported", "property"),
     ("LaserError", "is_version_conflict"): ("LaserError.version_conflict", "property"),
     ("LaserError", "is_version_skew"): ("LaserError.version_skew", "property"),
+    ("TransportError", "as_iggy"): ("-", "rust-crate"),
+    ("TransportError", "iggy_error_code"): ("TransportError.iggy_error_code", "property"),
     ("PublishFailure", None): ("PublishFailedError", "error-class"),
     ("PublishFailure", "source"): ("PublishFailedError", "protocol"),
     ("ConsumerBuilder", "create_group"): ("ConsumerGroup.consumer(create_group=)", "keywords"),
@@ -318,7 +331,7 @@ PY_PEERS = {
     ("ProducerMessage", "header"): ("Producer.send(headers=)", "keywords"),
     ("Record", "metadata"): ("BatchPublishRequest.add_record(headers=)", "keywords"),
     ("RecordBuilder", "metadata"): ("BatchPublishRequest.add_record(headers=)", "keywords"),
-    ("CreateConsumerGroup", "policy"): ("ConsumerGroup.create(filter_id=, revision=)", "keywords"),
+    ("CreateConsumerGroup", "policy"): ("ConsumerGroup.create(filter=, filter_name=)", "keywords"),
     ("Topic", "iggy_consumer"): ("-", "rust-crate"),
     ("Topic", "iggy_consumer_group"): ("-", "rust-crate"),
     ("Topic", "iggy_producer"): ("-", "rust-crate"),
@@ -355,9 +368,6 @@ PY_PEERS = {
     ("Capabilities", "with_query"): ("Laser.with_capabilities(query=)", "keywords"),
     ("Capabilities", "with_query_consistency"): ("Laser.with_capabilities(query_consistency=)", "keywords"),
     ("Capabilities", "with_query_keyword"): ("Laser.with_capabilities(query_keyword=)", "keywords"),
-    ("Capabilities", "with_query_execution"): ("Laser.with_capabilities(query_execution=)", "keywords"),
-    ("Capabilities", "with_destinations"): ("Laser.with_capabilities(destinations=)", "keywords"),
-    ("Capabilities", "with_destination_consistency"): ("Laser.with_capabilities(destinations_consistency=)", "keywords"),
     ("Capabilities", "with_kv"): ("Laser.with_capabilities(kv=)", "keywords"),
     ("Capabilities", "with_kv_cas"): ("Laser.with_capabilities(kv_cas=)", "keywords"),
     ("Capabilities", "with_kv_fenced_leases"): ("Laser.with_capabilities(kv_fenced_leases=)", "keywords"),
@@ -374,15 +384,23 @@ PY_PEERS = {
     ("ProjectionsRequest", "for_topic"): ("Projections.list(topic=)", "keywords"),
     ("ProjectionsRequest", "for_topics"): ("Projections.list(topics=)", "keywords"),
     ("AgentTopic", "as_identifier"): ("-", "rust-crate"),
-    ("ProvenanceBuilder", "deadline"): ("new:Provenance(deadline_micros=)", "keywords"),
+    ("ProvenanceBuilder", "deadline_at"): ("new:Provenance(deadline_at_micros=)", "keywords"),
     ("KeyRecord", "operator"): ("new:KeyRecord(kind=)", "keywords"),
     ("KeyRecord", "valid_window"): ("new:KeyRecord(valid_from_micros=, valid_to_micros=)", "keywords"),
     ("KvKeyRegistry", "enroll_record"): ("KvKeyRegistry.enroll_record", None),
     ("KvKeyRegistry", "in_namespace"): ("new:KvKeyRegistry(namespace=)", "overload"),
     ("A2aBridge", "with_capabilities"): ("new:A2aBridge(capabilities=)", "keywords"),
     ("A2aBridge", "with_signing_key"): ("new:A2aBridge(signing_key=)", "keywords"),
+    ("A2aBridge", "with_target"): ("new:A2aBridge(target=)", "keywords"),
+    ("A2aBridge", "with_public_url"): ("new:A2aBridge(public_url=)", "keywords"),
+    ("A2aBridge", "with_description"): ("new:A2aBridge(description=)", "keywords"),
+    ("A2aBridge", "with_version"): ("new:A2aBridge(version=)", "keywords"),
     ("A2aBridge", "router"): ("-", "rust-crate"),
     ("McpBridge", "router"): ("-", "rust-crate"),
+    ("McpBridge", "with_allowed_origins"): ("-", "rust-crate"),
+    ("A2aBridge", "with_allowed_origins"): ("-", "rust-crate"),
+    ("McpBridge", "with_signing_key"): ("new:McpBridge(signing_key=)", "keywords"),
+    ("McpBridge", "with_target"): ("new:McpBridge(target=)", "keywords"),
     ("McpBridge", "with_memory_tools"): ("new:McpBridge(memory_tools=)", "keywords"),
     ("McpBridge", "with_timeout"): ("new:McpBridge(timeout_ms=)", "keywords"),
     ("McpBridge", "with_prompt"): ("new:McpBridge(prompts=)", "keywords"),
@@ -391,56 +409,30 @@ PY_PEERS = {
     ("CrashContext", "assemble"): ("new:CrashContext", "constructor"),
     ("Cursor", "batch"): ("Topic.replay(batch=)", "keywords"),
     ("Cursor", "from_offsets"): ("Topic.replay(from_offsets=)", "keywords"),
-    ("Destinations", "mutate_with_operator_assertion"): ("Destinations.mutate(operator_assertion=)", "overload"),
     ("KeyRecord", "revoked"): ("KeyRecord.revoke", "name-collision"),
 
-    ("PartitionCheckpoint", None): ("dict:Destinations.get", "serde-dict"),
-    ("SourceOffsetRange", None): ("dict:Destinations.prepare", "serde-dict"),
-    ("CheckpointOwnerLease", None): ("dict:Destinations.get", "serde-dict"),
-    ("CredentialGeneration", None): ("dict:Destinations.prepare", "serde-dict"),
-    ("AttemptObject", None): ("dict:Destinations.prepare", "serde-dict"),
-    ("AttemptColumnMetrics", None): ("dict:Destinations.prepare", "serde-dict"),
-    ("PreparedTableRequirements", None): ("dict:Destinations.prepare", "serde-dict"),
-    ("IcebergCommitRequirement", None): ("dict:Destinations.prepare", "serde-dict"),
-    ("PreparedAttempt", None): ("dict:Destinations.prepare", "serde-dict"),
-    ("PreparedAttemptSummary", None): ("dict:Destinations.get", "serde-dict"),
-    ("CompletedAttempt", None): ("dict:Destinations.complete", "serde-dict"),
-    ("RetentionGap", None): ("dict:Destinations.record_retention_gap", "serde-dict"),
-    ("DestinationBlock", None): ("dict:Destinations.record_block", "serde-dict"),
-    ("DestinationCheckpointStatus", None): ("dict:Destinations.get", "serde-dict"),
-    ("DestinationCheckpointView", None): ("dict:Destinations.get", "serde-dict"),
-    ("DestinationCheckpointPage", None): ("dict:Destinations.list", "serde-dict"),
-    ("DestinationListFilter", None): ("dict:Destinations.list", "serde-dict"),
-    ("QueryRoutePage", None): ("dict:Destinations.query_routes", "serde-dict"),
-    ("CheckpointRequestEnvelope", None): ("dict:Laser.execute_checkpoint", "serde-dict"),
-    ("PublicCheckpointMutation", None): ("dict:Destinations.mutate", "serde-dict"),
-    ("RepairRecord", None): ("dict:Destinations.record_repair", "serde-dict"),
-    ("CheckpointMutationResult", None): ("dict:Destinations.mutate", "serde-dict"),
-    ("CheckpointError", None): ("dict:CheckpointError.detail", "serde-dict"),
-    ("BackendBinding", None): ("dict:Destinations.register", "serde-dict"),
-    ("ProjectionRef", None): ("dict:Destinations.register", "serde-dict"),
-    ("PhysicalTable", None): ("dict:Destinations.register", "serde-dict"),
-    ("PartitionStart", None): ("dict:Destinations.register", "serde-dict"),
-    ("StartPolicy", None): ("dict:Destinations.register", "serde-dict"),
-    ("MaterializationDestination", None): ("dict:Destinations.register", "serde-dict"),
-    ("QueryRoute", None): ("dict:Destinations.register_query_route", "serde-dict"),
-    ("QueryRouteTarget", None): ("dict:Destinations.register_query_route", "serde-dict"),
-    ("SourceIncarnation", None): ("dict:Destinations.get", "serde-dict"),
-    ("SourceScope", None): ("dict:Destinations.register", "serde-dict"),
+    ("BackendBinding", None): ("dict:MaterializeRequest.backend", "serde-dict"),
     ("EdgeClaims", None): ("fn:authorize_edge", "keywords"),
     ("AuthzSubject", None): ("dict:Laser.authz_history", "serde-dict"),
     ("AuthzEventKind", None): ("dict:AuthzEvent.op", "serde-dict"),
     ("AuthzError", "Unauthorized"): ("key", "serde-dict"),
     ("AuthzError", "UnknownRole"): ("key", "serde-dict"),
     ("AuthzError", "InvalidName"): ("key", "serde-dict"),
+    ("AuthzError", "InvalidGrant"): ("key", "serde-dict"),
     ("AuthzError", "Conflict"): ("key", "serde-dict"),
     ("AuthzError", "Version"): ("key", "serde-dict"),
     ("AuthzError", "TenancyViolation"): ("key", "serde-dict"),
+    ("AuthzError", "MutationConflict"): ("key", "serde-dict"),
+    ("AuthzError", "ResourceLimit"): ("key", "serde-dict"),
     ("KvError", "InvalidKey"): ("key", "serde-dict"),
     ("KvError", "InvalidNamespace"): ("key", "serde-dict"),
     ("KvError", "TooLarge"): ("key", "serde-dict"),
     ("KvError", "Backend"): ("key", "serde-dict"),
     ("KvError", "Version"): ("key", "serde-dict"),
+    ("KvError", "LeaseHeld"): ("key", "serde-dict"),
+    ("KvError", "BarrierUnreachable"): ("key", "serde-dict"),
+    ("KvError", "Forbidden"): ("key", "serde-dict"),
+    ("KvError", "InvalidExpiry"): ("key", "serde-dict"),
     ("FilterError", "message"): ("key", "serde-dict"),
     ("ReliableConsumer", None): ("Laser.spawn_agent", "keywords"),
     ("ReliableConsumer", "builder"): ("Laser.spawn_agent", "keywords"),
@@ -493,6 +485,7 @@ PY_PEERS = {
     ("Task", None): ("dict:A2aBridge.submit", "serde-dict"),
     ("TaskStatus", None): ("dict:A2aBridge.submit", "serde-dict"),
     ("Artifact", None): ("dict:A2aBridge.submit", "serde-dict"),
+    ("Part", None): ("dict:A2aBridge.submit", "serde-dict"),
     ("JsonRpcResponse", None): ("dict:A2aBridge.handle_rpc", "serde-dict"),
     ("JsonRpcError", None): ("dict:A2aBridge.handle_rpc", "serde-dict"),
     ("McpRpcResponse", None): ("dict:McpBridge.handle_rpc", "serde-dict"),
@@ -515,7 +508,6 @@ PY_PEERS = {
     ("KvLease", None): ("dict:FencedLeaseClient.prepare_acquire", "serde-dict"),
     ("KvLeaseRenew", None): ("dict:FencedLeaseClient.prepare_renew", "serde-dict"),
     ("KvRelease", None): ("dict:FencedLeaseClient.prepare_release", "serde-dict"),
-    ("CheckpointRequestEnvelope", "with_operator_assertion"): ("fn:new_checkpoint_request_envelope(operator_assertion=)", "keywords"),
     ("ForkInfo", None): ("dict:ForkHandle.create", "serde-dict"),
     ("ForkError", None): ("dict:ForkError.detail", "serde-dict"),
     ("FoldSnapshot", None): ("dict:SnapshotStore.latest", "serde-dict"),
@@ -528,19 +520,20 @@ PY_PEERS = {
     ("GraphNode", None): ("dict:GraphHandle.upsert", "serde-dict"),
     ("GraphEdge", None): ("dict:GraphHandle.upsert", "serde-dict"),
     ("GraphResult", None): ("dict:GraphHandle.fetch", "serde-dict"),
+    ("GraphQuery", None): ("dict:GraphHandle.into_query", "serde-dict"),
+    ("GraphStart", None): ("dict:GraphHandle.into_query", "serde-dict"),
+    ("Hop", None): ("dict:GraphHandle.into_query", "serde-dict"),
     ("SourceRef", None): ("dict:GraphHandle.fetch", "serde-dict"),
     ("QueryError", "Unauthorized"): ("key", "serde-dict"),
     ("QueryError", "IndexNotFound"): ("key", "serde-dict"),
     ("QueryError", "ForkNotFound"): ("key", "serde-dict"),
+    ("QueryError", "SchemaNotFound"): ("key", "serde-dict"),
     ("QueryError", "Backend"): ("key", "serde-dict"),
+    ("QueryError", "Invalid"): ("key", "serde-dict"),
     ("QueryError", "TooLarge"): ("key", "serde-dict"),
     ("QueryError", "Version"): ("key", "serde-dict"),
-    ("QueryError", "Cancelled"): ("key", "serde-dict"),
     ("QueryError", "DeadlineExceeded"): ("key", "serde-dict"),
-    ("QueryError", "ExpiredSnapshot"): ("key", "serde-dict"),
     ("QueryError", "StaleGeneration"): ("key", "serde-dict"),
-    ("QueryError", "TargetUnavailable"): ("key", "serde-dict"),
-    ("QueryError", "ResourceLimit"): ("key", "serde-dict"),
     ("Filter", "Not"): ("Filter.negate", "constructor"),
     ("TypedRecords", "batch"): ("TypedTopic.records(batch=)", "keywords"),
     ("TypedRecords", "from_offsets"): ("TypedTopic.records(from_offsets=)", "keywords"),
@@ -549,9 +542,7 @@ PY_PEERS = {
     ("BackendLimits", None): ("dict:BackendDescriptor.limits", "serde-dict"),
     ("BackendReadiness", None): ("dict:BackendDescriptor.readiness", "serde-dict"),
     ("BackendReadinessReason", None): ("dict:BackendDescriptor.readiness", "serde-dict"),
-    ("MaintenanceCapabilities", None): ("dict:BackendDescriptor.maintenance", "serde-dict"),
-    ("MaterializationCapability", None): ("dict:BackendDescriptor.materialization", "serde-dict"),
-    ("QueryCapabilities", None): ("dict:BackendDescriptor.query", "serde-dict"),
+    ("QueryCapabilities", None): ("QueryCapabilities", None),
     ("SchemaCapabilities", None): ("dict:BackendDescriptor.schema", "serde-dict"),
     ("Codec", None): ("PublishRequest.encode_with(codec=)", "callback"),
     ("Decoder", None): ("KvEntry.decode_value_with(codec=)", "callback"),
@@ -568,7 +559,20 @@ PY_PEERS = {
     ("SourceSelector", None): ("dict:Bindings.remove", "serde-dict"),
     ("SchemaSource", None): ("dict:Schemas.register", "serde-dict"),
     ("SchemaDef", None): ("dict:Schemas.get", "serde-dict"),
+    ("BindingStatus", None): ("dict:Projections.status", "serde-dict"),
+    ("PartitionProgress", None): ("dict:Projections.status", "serde-dict"),
+    ("Hold", None): ("dict:Projections.status", "serde-dict"),
+    ("GapAcceptance", None): ("dict:Projections.status", "serde-dict"),
+    ("MaterializationWait", None): ("dict:Materialization.wait", "serde-dict"),
+    ("BindingStatus", "readiness"): ("fn:binding_status_readiness", "free-function"),
+    ("BindingStatus", "caught_up_to"): ("fn:binding_status_caught_up_to", "free-function"),
+    ("BindingStatus", "history_complete"): ("fn:binding_status_history_complete", "free-function"),
+    ("BindingStatus", "is_blocked"): ("fn:binding_status_is_blocked", "free-function"),
+    ("ProjectionHistory", None): ("dict:Projections.get", "serde-dict"),
+    ("ProjectionKey", None): ("dict:ProjectionBuilder.keyed", "serde-dict"),
     ("ProjectionInfo", None): ("dict:Projections.get", "serde-dict"),
+    ("ProjectionPage", None): ("dict:Projections.list", "serde-dict"),
+    ("SchemaPage", None): ("dict:Schemas.list", "serde-dict"),
     ("SchemaInfo", None): ("dict:Schemas.get", "serde-dict"),
     ("IndexSchema", "builder"): ("new:IndexSchemaBuilder", "constructor"),
     ("Projection", "builder"): ("new:ProjectionBuilder", "constructor"),
@@ -582,17 +586,14 @@ PY_PEERS = {
     ("QueryTarget", None): ("dict:Laser.execute_query", "serde-dict"),
     ("RawSql", None): ("dict:Laser.execute_query", "serde-dict"),
     ("Select", None): ("dict:Laser.execute_query", "serde-dict"),
-    ("SnapshotSelector", None): ("dict:Laser.execute_query", "serde-dict"),
     ("Sort", None): ("dict:Laser.execute_query", "serde-dict"),
     ("TextQuery", None): ("dict:Laser.execute_query", "serde-dict"),
     ("VectorQuery", None): ("dict:Laser.execute_query", "serde-dict"),
     ("Window", None): ("dict:Laser.execute_query", "serde-dict"),
     ("QueryContext", None): ("dict:QueryResult.context", "serde-dict"),
     ("QueryEngine", None): ("dict:QueryResult.context", "serde-dict"),
-    ("MaterializationBoundary", None): ("dict:QueryResult.context", "serde-dict"),
     ("QueryFrontier", None): ("dict:QueryResult.context", "serde-dict"),
     ("ResolvedQueryTarget", None): ("dict:QueryResult.context", "serde-dict"),
-    ("QueryExecutionStatus", None): ("dict:Laser.query_status", "serde-dict"),
     ("LogicalField", None): ("dict:QueryResult.fields", "serde-dict"),
     ("LogicalType", None): ("dict:QueryResult.fields", "serde-dict"),
     ("TypedValue", None): ("dict:Row.values", "serde-dict"),
@@ -640,6 +641,10 @@ PY_PEERS = {
     ("filters::Verdict", "Selected"): ("-", "plain-value"),
     ("filters::Verdict", "Rejected"): ("-", "plain-value"),
     ("filters::Verdict", "Fault"): ("-", "plain-value"),
+    ("RecordEvaluation", None): ("MatchedRecord.evaluation", "plain-value"),
+    ("RecordEvaluation", "Selected"): ("MatchedRecord.evaluation", "plain-value"),
+    ("RecordEvaluation", "Unevaluated"): ("MatchedRecord.unevaluated_reason", "plain-value"),
+    ("RecordEvaluation", "Unfiltered"): ("MatchedRecord.evaluation", "plain-value"),
     ("AppliedPolicy", None): ("dict:MatchedPage.policy", "serde-dict"),
     ("SourceGeneration", None): ("dict:MatchedPage.generation", "serde-dict"),
     ("FilterBinding", None): ("dict:GroupFilter.get", "serde-dict"),
@@ -647,7 +652,7 @@ PY_PEERS = {
     ("FilterGroupIdentity", None): ("dict:ConsumerGroupInfo.identity", "serde-dict"),
     ("FilterRevisionPage", None): ("dict:GroupFilter.revisions", "serde-dict"),
     ("FilterRevisionInfo", None): ("dict:GroupFilter.revisions", "serde-dict"),
-    ("FilterRevisionRef", None): ("dict:GroupFilter.revise", "serde-dict"),
+    ("FilterRevisionRef", None): ("dict:GroupFilter.configure", "serde-dict"),
     ("FilterPreview", None): ("dict:GroupFilter.preview", "serde-dict"),
     ("PreviewRecord", None): ("dict:GroupFilter.preview", "serde-dict"),
     ("FilterTestResult", None): ("dict:GroupFilter.test", "serde-dict"),
@@ -668,9 +673,8 @@ PY_PEERS = {
     ("FilterHeader", "key"): ("GroupFilter.test(headers=)", "keywords"),
     ("FilterHeader", "value"): ("GroupFilter.test(headers=)", "keywords"),
     ("HeaderScalar", None): ("-", "plain-value"),
-    ("GroupFilterSpec", None): ("ConsumerGroup.create(filter=, filter_id=, revision=)", "keywords"),
+    ("GroupFilterSpec", None): ("ConsumerGroup.create(filter=, filter_name=)", "keywords"),
     ("GroupFilterSpec", "Definition"): ("ConsumerGroup.create(filter=)", "keywords"),
-    ("GroupFilterSpec", "Revision"): ("ConsumerGroup.create(filter_id=, revision=)", "keywords"),
     ("FilterExpr", "Not"): ("FilterExpr.negate", "constructor"),
     ("CompiledFilter", "compile_with_schemas"): ("CompiledFilter.compile(schemas=)", "overload"),
     ("PathSegment", None): ("-", "plain-value"),
@@ -727,11 +731,13 @@ PY_PEERS = {
     ("BatchItem", None): ("dict:Laser.execute_batch", "serde-dict"),
     ("ArrowIpcMessageMetadata", None): ("dict:PublishRequest.arrow_ipc", "serde-dict"),
     ("MemoryRowScope", None): ("dict:KvEntry.scope", "serde-dict"),
-    ("OperatorActorAssertion", None): ("dict:Destinations.mutate", "serde-dict"),
-    ("OperatorActorClaims", None): ("dict:Destinations.mutate", "serde-dict"),
     ("HeaderValueRef", None): ("-", "plain-value"),
 }
 TS_PEERS = {
+    ("FilteredRecords", None): ("FilteredReader", "protocol"),
+    ("ConversationState", "load"): ("ConversationStateLoader.load", "free-function"),
+    ("ConversationState", "load_with"): ("ConversationStateLoader.loadWith", "free-function"),
+    ("GroupFilterSpec", "Definition"): ("GroupFilterSpec", "plain-value"),
     ("SessionLayout", "per_agent_topic"): ("-", "plain-value"),
     ("SessionLayout", "per_agent_partition"): ("-", "plain-value"),
     ("DisplayType", "as_str"): ("-", "plain-value"),
@@ -833,9 +839,6 @@ TS_PEERS = {
     ("Capabilities", "with_query"): ("{QueryCaps}.available", "keywords"),
     ("Capabilities", "with_query_consistency"): ("{QueryCaps}.consistency", "keywords"),
     ("Capabilities", "with_query_keyword"): ("{QueryCaps}.keyword", "keywords"),
-    ("Capabilities", "with_query_execution"): ("{QueryCaps}.cursorPaging", "keywords"),
-    ("Capabilities", "with_destinations"): ("{DestinationCaps}.available", "keywords"),
-    ("Capabilities", "with_destination_consistency"): ("{DestinationCaps}.consistency", "keywords"),
     ("Capabilities", "with_kv"): ("{KvCaps}.available", "keywords"),
     ("Capabilities", "with_kv_cas"): ("{KvCaps}.cas", "keywords"),
     ("Capabilities", "with_kv_fenced_leases"): ("{KvCaps}.fencedLeases", "keywords"),
@@ -848,10 +851,6 @@ TS_PEERS = {
     ("QueryRequest", "raw_sql_with"): ("QueryRequest.rawSql", "overload"),
     ("QueryRequest", "fetch_one_with"): ("QueryRequest.fetchOne", "overload"),
     ("QueryRequest", "fetch_typed_with"): ("QueryRequest.fetchTyped", "overload"),
-    ("QueryRows", None): ("QueryRequest.rows", "protocol"),
-    ("QueryRows", "next"): ("QueryRequest.rows", "protocol"),
-    ("TypedQueryRows", None): ("QueryRequest.rowsTyped", "protocol"),
-    ("TypedQueryRows", "next"): ("QueryRequest.rowsTyped", "protocol"),
     ("Filter", "all"): ("fn:filterAll", "free-function"),
     ("Filter", "any"): ("fn:filterAny", "free-function"),
     ("Filter", "negate"): ("fn:filterNegate", "free-function"),
@@ -869,6 +868,8 @@ TS_PEERS = {
     ("A2aBridge", "router"): ("-", "rust-crate"),
     ("A2aCallerPrincipal", None): ("-", "rust-crate"),
     ("McpBridge", "router"): ("-", "rust-crate"),
+    ("McpBridge", "with_allowed_origins"): ("-", "rust-crate"),
+    ("A2aBridge", "with_allowed_origins"): ("-", "rust-crate"),
     ("CrashContext", "assemble"): ("new:CrashContext", "constructor"),
     ("AgentEnvelope", "event"): ("fn:eventEnvelope", "free-function"),
     ("TaskState", "from_code"): ("fn:taskStateFromCode", "free-function"),
@@ -883,6 +884,8 @@ TS_PEERS = {
     ("MemoryKind", "code"): ("fn:memoryKindCode", "free-function"),
     ("ProducerMessageBuilder", "build"): ("new:ProducerMessage", "one-call"),
     ("LaserError", "iggy_error_code"): ("fn:iggyErrorCode", "error-function"),
+    ("TransportError", "as_iggy"): ("-", "rust-crate"),
+    ("TransportError", "iggy_error_code"): ("fn:iggyErrorCode", "error-function"),
     ("GraphNode", "entity"): ("fn:graphNodeEntity", "free-function"),
     ("GraphEdge", "relate"): ("fn:graphEdgeRelate", "free-function"),
     ("AgentEnvelope", "requiring"): ("fn:requiring", "free-function"),
@@ -890,7 +893,7 @@ TS_PEERS = {
     ("ResourcePattern", "all"): ("fn:resourcePatternAll", "free-function"),
     ("ResourcePattern", "literal"): ("fn:resourcePatternLiteral", "free-function"),
     ("ResourcePattern", "prefix"): ("fn:resourcePatternPrefix", "free-function"),
-    ("ProvenanceBuilder", "deadline"): ("Provenance.deadlineMicros", "keywords"),
+    ("ProvenanceBuilder", "deadline_at"): ("Provenance.deadlineAtMicros", "keywords"),
     ("IntentId", "new"): ("IntentId.new", None),
     ("MemoryId", "new"): ("MemoryId.new", None),
     ("filters::Verdict", None): ("FilterVerdict", "flat-namespace"),
@@ -901,10 +904,20 @@ TS_PEERS = {
     ("ScopedMemory", "consolidate_with"): ("ScopedMemory.consolidate", "overload"),
     ("MemoryHandle", "consolidate_with"): ("MemoryHandle.consolidate", "overload"),
     ("IndexField", "typed"): ("IndexField", "keywords"),
+    ("BindingStatus", "readiness"): ("fn:bindingStatusReadiness", "free-function"),
+    ("BindingStatus", "caught_up_to"): ("fn:bindingStatusCaughtUpTo", "free-function"),
+    ("BindingStatus", "history_complete"): ("fn:bindingStatusHistoryComplete", "free-function"),
+    ("BindingStatus", "is_blocked"): ("fn:bindingStatusIsBlocked", "free-function"),
+    ("InvalidRecordPolicy", "is_block"): ("fn:invalidRecordPolicyIsBlock", "free-function"),
+    ("OversizePolicy", "is_block"): ("fn:oversizePolicyIsBlock", "free-function"),
+    ("GapAcceptance", "covers"): ("fn:gapAcceptanceCovers", "free-function"),
+    ("ProjectionHistory", "is_append"): ("fn:projectionHistoryIsAppend", "free-function"),
     ("ProjectionKind", "from_code"): ("fn:projectionKindFromCode", "free-function"),
     ("Query", "operational"): ("fn:operationalQuery", "free-function"),
     ("Query", "builder"): ("new:QueryBuilder", "constructor"),
     ("QueryTarget", "operational"): ("fn:operationalTarget", "free-function"),
+    ("QueryTarget", "Operational"): ("fn:operationalTarget", "free-function"),
+    ("ResolvedQueryTarget", "Operational"): ("ResolvedQueryTarget", "free-function"),
     ("ResultCode", "from_code"): ("fn:resultCodeFromCode", "free-function"),
     ("ContentType", "code"): ("fn:contentTypeCode", "free-function"),
     ("ContentType", "is_raw"): ("fn:isRawContentType", "free-function"),
@@ -946,17 +959,20 @@ TS_PEERS = {
     ("AgentPresence", "validate"): ("fn:validateAgentPresence", "free-function"),
     ("LogPosition", "from_bytes"): ("fn:logPositionFromBytes", "free-function"),
     ("LogPosition", "to_bytes"): ("fn:logPositionToBytes", "free-function"),
-    ("OperatorActorAssertion", "validate"): ("fn:validateOperatorAssertion", "free-function"),
     ("snapshot::ConversationId", None): ("wire.ConversationId", None),
 }
 
 # Peer APIs with no Rust row of their own, each kept for a language reason.
 PY_ONLY = {
+    "QueryRow.keys": "protocol",
     "AmbiguousMutationRecovery.ttl_ms": "property",
+    "KvRevalidation.entry": "property",
     "KvStore": "native-binding",
     "Consumer.init": "lazy-init",
     "Producer.init": "lazy-init",
     "ConsumerMessage.header_kinds": "rust-crate",
+    "Message.header_kinds": "rust-crate",
+    "TypedRecord.header_kinds": "rust-crate",
     "encode_context_manifest": "native-binding",
     "decode_context_manifest": "native-binding",
     "encode_context_compaction": "native-binding",
@@ -992,6 +1008,9 @@ PY_ONLY = {
     "decode_session_reply": "native-binding",
 }
 TS_ONLY = {
+    "QueryValue": "signature-type",
+    "RoutingError": "error-class",
+    "FilterExecutionError.reason": "error-class",
     "Laser.withObserver": "telemetry",
     "LaserBuilder.observer": "telemetry",
     "LaserObserver": "telemetry",
@@ -1007,26 +1026,39 @@ TS_ONLY = {
     "MintUlid.fromU128": "std-trait",
     "parseIdempotencyKey": "std-trait",
     "KvStore": "callback",
+    "AgentDefinition": "signature-type",
+    "BytesLike": "signature-type",
+    "CallOptions": "signature-type",
+    "ConsolidateOptions.signal": "signature-type",
+    "CapabilitySurface": "signature-type",
+    "ClientOwnership": "signature-type",
+    "IggyClient": "signature-type",
+    "LaserErrorKind": "signature-type",
+    "MessageWithHeaders": "signature-type",
+    "ProducerSendOptions": "signature-type",
+    "RawSendOptions": "signature-type",
+    "ReaderTag": "signature-type",
+    "RegistryView": "signature-type",
+    "ReliableConsumerControl": "signature-type",
+    "TypedPollResult": "signature-type",
+    "UlidSource": "signature-type",
 }
 
 # The error class each LaserError variant raises, when it is not `<Variant>Error`.
 # Rust keeps a variant and its payload type in separate namespaces, so
 # `LaserError::Query(QueryError)` needs no second name. TypeScript exports the
 # payload type and the error class side by side, so the class takes an
-# `ExecutionError` suffix. No peer binds the Apache Iggy client error, so its
-# variant raises the transport error. A `~` class is a gap that names where
-# the variant is raised today.
-PY_ERROR_CLASSES = {"Iggy": "TransportError"}
+# `ExecutionError` suffix. A `~` class is a gap that names where the variant
+# is raised today.
+PY_ERROR_CLASSES = {}
 TS_ERROR_CLASSES = {
     "Command": "CommandExecutionError",
-    "Iggy": "TransportError",
     "Query": "QueryExecutionError",
     "Kv": "KvExecutionError",
     "Fork": "ForkExecutionError",
     "Graph": "GraphExecutionError",
     "Authz": "AuthzExecutionError",
     "Filter": "FilterExecutionError",
-    "Checkpoint": "CheckpointExecutionError",
     "FilterFault": "FilterFaultError",
     "FilterOversizedRecord": "FilterOversizedRecordError",
     "NoCapableAgent": "NoCapableAgentError",
@@ -1194,6 +1226,7 @@ def compare(rows, python, typescript):
         for variant in table:
             if ("LaserError", variant) not in by_key:
                 matrix.problems.append(f"{label} entry {variant} names no LaserError variant")
+    matrix.problems += error_tree_problems(python, typescript)
     for row in rows:
         for trait in row.traits:
             for member in (other for other in rows if other.owner == trait and other.member is not None):
@@ -1505,7 +1538,12 @@ class Lookup:
                 self.claims.add(target)
                 return True, not kws, None, None
             return False, False, None, None
-        cls, member = target.rsplit(".", 1)
+        # A computed member such as `[Symbol.asyncIterator]` holds a dot of its own.
+        if target.endswith("]") and ".[" in target:
+            cls, member = target.split(".[", 1)
+            member = f"[{member}"
+        else:
+            cls, member = target.rsplit(".", 1)
         if not self.has_type(cls):
             return False, False, None, None
         found = self.members(cls).get(member)
@@ -1617,6 +1655,12 @@ def resolve_cell(row, lookup, spelling, reason):
     found, accepted, params, info = lookup.resolve(spelling)
     if not found:
         return Cell(spelling, reason, gap=True, problem=f"{MISSING} {show_spelling(spelling)}")
+    if row.kind == "variant-field" and reason == "error-class":
+        cls, member = split_call(spelling)[0].rsplit(".", 1)
+        if lookup.members(cls)[member][0] == "LaserError":
+            # Every error carries the classifier flags, so a field of the same
+            # name is absent rather than matched.
+            return Cell(spelling, reason, gap=True, problem=f"{MISSING} {show_spelling(spelling)}, only the `LaserError` classifier of that name")
     if not accepted:
         return Cell(spelling, reason, gap=True, problem=f"{MISSING} {show_spelling(spelling)}, a keyword or option is absent")
     if reason == "free-function" and lookup.type_kind(row.owner.rsplit("::", 1)[-1]) == "class":
@@ -1823,6 +1867,39 @@ def variant_spelling(row, lookup, owner):
     return f"{owner}.{row.member}", None
 
 
+def error_tree_problems(python, typescript):
+    """Each Python error class sits under the same SDK parent as its
+    TypeScript peer, so `except ConfigError` and `instanceof ConfigError`
+    catch the same failures."""
+    to_typescript = {f"{variant}Error": name for variant, name in TS_ERROR_CLASSES.items()}
+    problems = []
+    for name, py_class in sorted(python.classes.items()):
+        parents = [base for base in py_class.bases if base in python.classes]
+        if not parents or not descends_from(python, name, "LaserError"):
+            continue
+        peer = to_typescript.get(name, name)
+        expected = to_typescript.get(parents[0], parents[0])
+        decl = typescript.decls.get(peer)
+        if decl is None or decl.kind != "class":
+            continue
+        if expected not in decl.bases:
+            problems.append(f"error tree: Python `{name}` extends `{parents[0]}` but TypeScript `{peer}` extends `{decl.base}`, expected `{expected}`")
+    return problems
+
+
+def descends_from(python, name, ancestor):
+    chain, seen = [name], set()
+    while chain:
+        current = chain.pop()
+        if current == ancestor:
+            return True
+        if current in seen or current not in python.classes:
+            continue
+        seen.add(current)
+        chain += python.classes[current].bases
+    return False
+
+
 def error_class(variant, lookup):
     return lookup.errors.get(variant, f"{variant}Error")
 
@@ -1920,15 +1997,17 @@ def python_only(python, claims):
 
 def typescript_only(typescript, claims):
     out = []
+    # A wire type the main entry point also exports so its signatures can name it.
+    wire_sources = {typescript.wire_aliases.get(name, name) for name in typescript.wire}
     for name in sorted(typescript.decls):
         decl = typescript.decls[name]
-        if name.startswith("wire."):
+        if name.startswith("wire.") or (name in wire_sources and name not in claims):
             continue
         if name not in claims:
             out.append(name)
             continue
         for member in sorted(decl.members):
-            if member in TS_PROTOCOL or f"{name}.{member}" in claims:
+            if member in TS_PROTOCOL or f"{name}.{member}" in claims or inherited_claim(typescript, decl, member, claims):
                 continue
             symbol = re.fullmatch(r"\[(\w+)\]", member)
             if symbol and symbol.group(1) not in typescript.decls:
@@ -1940,6 +2019,21 @@ def typescript_only(typescript, claims):
         if f"fn:{name}" not in claims:
             out.append(f"{name}()")
     return out
+
+
+def inherited_claim(typescript, decl, member, claims):
+    """A member a subclass declares again, such as a narrowed `kind`, answers
+    to the claim of the base class that declares it."""
+    chain, seen = list(decl.bases), set()
+    while chain:
+        base = chain.pop()
+        if base in seen or base not in typescript.decls:
+            continue
+        seen.add(base)
+        if f"{base}.{member}" in claims:
+            return True
+        chain += typescript.decls[base].bases
+    return False
 
 
 def item_rows(section, display, item, resolver, displays):

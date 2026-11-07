@@ -746,6 +746,10 @@ pub const METADATA_PROVIDER_NAME: &str = "gen_ai.provider.name";
 /// submitted session. The receiving agent marks the session working when it
 /// picks the command up.
 pub const METADATA_SUBMITTED: &str = "submitted";
+/// The metadata key that marks a command a session recorded for its own model
+/// or tool call. `classify` keeps such a record observational, so it never
+/// reaches a handler as new work.
+pub const METADATA_RECORDED: &str = "recorded";
 /// The metadata key for a call's duration in microseconds, measured by the
 /// application around the provider or tool call.
 pub const METADATA_DURATION_MICROS: &str = "duration_micros";
@@ -1257,6 +1261,10 @@ pub struct AgentCard {
     /// agent, the convention that makes cards liveness and not just discovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_micros: Option<u64>,
+    /// The topic the agent consumes its work on, the durable inbox a route
+    /// resolves to when no live presence advertises one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<String>,
 }
 
 impl AgentCard {
@@ -1264,6 +1272,7 @@ impl AgentCard {
     pub fn validate(&self) -> Result<(), ValidateError> {
         cap_str(self.name.as_deref(), "name")?;
         cap_str(self.version.as_deref(), "version")?;
+        cap_str(self.inbox.as_deref(), "inbox")?;
         if self.capabilities.len() > crate::limits::MAX_CARD_CAPABILITIES {
             return Err(ValidateError::TooLarge {
                 field: "capabilities",
@@ -1898,7 +1907,7 @@ pub enum ValidateError {
 // | last             | X       | X        | X     | O     | O      | X (always terminal) |
 // | finish_reason    | X       | O        | X     | O (with last) | X | X  |
 // | idempotency_key  | O       | O        | O     | X     | X      | X     |
-// | deadline_micros  | O       | X        | X     | O     | X      | X     |
+// | deadline_micros  | O       | X        | X     | O     | R quarantine|unquarantine, X otherwise | X |
 // | task_state       | X       | O        | X     | X     | R (task|session) | O |
 // | operation        | O       | O        | O     | R seq 0 (chat|reasoning|tool_args), X after | R (task|session|card|progress|quarantine|unquarantine) | O |
 // | tool             | O       | O        | O     | O     | X      | O     |
@@ -2008,9 +2017,17 @@ pub fn validate(envelope: &AgentEnvelope) -> Result<(), ValidateError> {
         forbid(envelope.idempotency_key.is_none(), "idempotency_key")?;
     }
 
-    // deadline_micros: commands and stream-opening chunks (the abandonment
-    // bound rides sequence 0, and a mid-stream deadline would be ambiguous).
-    if matches!(kind, Response | Event | Status | Error) {
+    // deadline_micros: commands, stream-opening chunks (the abandonment bound
+    // rides sequence 0, and a mid-stream deadline would be ambiguous), and
+    // registry facts, where it is the signed expiry that bounds a replay.
+    let registry_fact = kind == Status
+        && matches!(
+            envelope.operation.as_deref(),
+            Some(OPERATION_QUARANTINE | OPERATION_UNQUARANTINE)
+        );
+    if registry_fact {
+        require(envelope.deadline_micros.is_some(), "deadline_micros")?;
+    } else if matches!(kind, Response | Event | Status | Error) {
         forbid(envelope.deadline_micros.is_none(), "deadline_micros")?;
     }
     if kind == Chunk && envelope.deadline_micros.is_some() && envelope.sequence != Some(0) {
@@ -2856,6 +2873,32 @@ mod tests {
     }
 
     #[test]
+    fn given_registry_facts_when_validated_then_should_require_the_signed_deadline() {
+        let (record, conversation, source, _) = ids();
+        for operation in [OPERATION_QUARANTINE, OPERATION_UNQUARANTINE] {
+            let mut fact = AgentEnvelope::status(record, conversation, source.clone(), operation);
+            fact.body = b"worker".to_vec();
+            assert!(matches!(
+                validate(&fact),
+                Err(ValidateError::Missing {
+                    field: "deadline_micros",
+                    ..
+                })
+            ));
+            validate(&fact.with_deadline_micros(1)).expect("a fact with its deadline validates");
+        }
+        let card = AgentEnvelope::status(record, conversation, source, OPERATION_CARD)
+            .with_deadline_micros(1);
+        assert!(matches!(
+            validate(&card),
+            Err(ValidateError::Forbidden {
+                field: "deadline_micros",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn given_an_error_when_validated_then_last_should_be_forbidden() {
         let (record, conversation, source, correlation) = ids();
         let error =
@@ -2914,6 +2957,7 @@ mod tests {
                 descriptor("plan_rollout"),
             ],
             ttl_micros: Some(30_000_000),
+            inbox: Some("rollout-planner.work".to_owned()),
         };
         card.validate().expect("a well-formed card validates");
 
@@ -2927,11 +2971,18 @@ mod tests {
             })
         ));
 
-        let mut oversized = card;
+        let mut oversized = card.clone();
         oversized.name = Some("n".repeat(crate::limits::MAX_AGENT_STRING_BYTES + 1));
         assert!(matches!(
             oversized.validate(),
             Err(ValidateError::TooLarge { field: "name", .. })
+        ));
+
+        let mut long_inbox = card;
+        long_inbox.inbox = Some("i".repeat(crate::limits::MAX_AGENT_STRING_BYTES + 1));
+        assert!(matches!(
+            long_inbox.validate(),
+            Err(ValidateError::TooLarge { field: "inbox", .. })
         ));
     }
 

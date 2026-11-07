@@ -20,3 +20,18 @@ export function contentId(segments: readonly Uint8Array[]): bigint {
   const low = fnv1a(0xc7, segments)
   return (high << 64n) | low
 }
+
+export function materializationOperationId(setup: bigint, step: number): bigint {
+  const bytes = new Uint8Array(16)
+  let remaining = setup
+  for (let index = 0; index < 16; index++) {
+    bytes[index] = Number(remaining & 255n)
+    remaining >>= 8n
+  }
+  const id = contentId([
+    new TextEncoder().encode("laser.materialization"),
+    bytes,
+    new Uint8Array([step])
+  ])
+  return id === 0n ? 1n : id
+}

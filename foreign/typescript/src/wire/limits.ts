@@ -12,8 +12,6 @@ export const MAX_NAMESPACE_BYTES = 128
 export const MAX_SESSION_LABEL_BYTES = 256
 /** Max UTF-8 bytes of a session list's text filter. */
 export const MAX_SESSION_TEXT_QUERY_BYTES = 1024
-/** Max UTF-8 bytes of a session list's opaque page cursor. */
-export const MAX_SESSION_CURSOR_BYTES = 512
 /** Most session ids one heartbeat record lists. A process with more leases in
  * one stream splits them over several records. */
 export const MAX_HEARTBEAT_SESSIONS = 2048
@@ -27,6 +25,7 @@ export const MAX_LEASE_TTL_MICROS = 300_000_000
 export const MAX_FORK_ID_BYTES = 128
 
 export const MAX_ROLE_NAME_BYTES = 64
+export const MAX_AUTHZ_MUTATION_ID_BYTES = 64
 
 export const MAX_FRAME_BYTES = 64 * 1024 * 1024
 export const MAX_QUERY_REPLY_BYTES = MAX_FRAME_BYTES
@@ -38,7 +37,7 @@ export const MAX_INDEX_FIELD_BYTES = 255
 export const MAX_SCHEMA_NAME_BYTES = 255
 export const MAX_RAW_SQL_BYTES = 64 * 1024
 export const MAX_QUERY_PARAMETERS = 1024
-export const MAX_QUERY_CURSOR_BYTES = 512
+export const MAX_QUERY_OFFSET = 1_000_000
 export const MAX_QUERY_PREDICATES = 4096
 export const MAX_QUERY_FIELDS = 4096
 export const MAX_VECTOR_DIMENSIONS = 65_536
@@ -53,6 +52,8 @@ export const MAX_METADATA_VALUE_BYTES = 1024
 export const MAX_METADATA_TOTAL_BYTES = 8192
 export const MAX_BODY_REFERENCE_BYTES = 1024
 export const MAX_CARD_CAPABILITIES = 64
+export const REGISTRY_FACT_TTL_MICROS = 300_000_000
+export const MAX_REGISTRY_FACT_TTL_MICROS = 86_400_000_000
 export const MAX_CLIENT_METADATA = 64 * 1024
 
 export const MAX_MEMORY_BODY_BYTES = MAX_VALUE_BYTES

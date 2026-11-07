@@ -2,8 +2,10 @@ use crate::common::test_iggy::fresh_connected_laser;
 use crate::common::world::LaserWorld;
 use cucumber::{given, then, when};
 use laser_bdd::filter_fixtures::{feed, filter, record};
+use laser_sdk::LaserError;
 use laser_sdk::filters::{
-    FaultPolicy, FilterErrorReason, FilterHeader, FilteredStart, HeaderScalar, Verdict,
+    FaultPolicy, FilterErrorReason, FilterHeader, FilteredStart, HeaderScalar, RecordEvaluation,
+    Verdict,
 };
 use laser_sdk::iggy::prelude::{Consumer, ConsumerOffsetClient, Identifier};
 use laser_sdk::prelude::{CommitPolicy, ConsumerStart, ProducerMessage, Routing};
@@ -160,7 +162,7 @@ async fn list_filters(world: &mut LaserWorld) {
         .topic(TOPIC)
         .consumer_group("anomaly-desk")
         .filter()
-        .revisions(0, 10)
+        .revisions(1, 10)
         .await;
     world.last_result = Some(result.map(|_| ()).map_err(|error| {
         if error.is_unsupported() {
@@ -285,22 +287,23 @@ async fn unbound_reader(world: &mut LaserWorld) {
         .max_examined(100)
         .build()
         .await;
-    if !world
-        .laser()
-        .capabilities()
-        .await
-        .filters
-        .group_policy_reads
-    {
+    let filters = world.laser().capabilities().await.filters;
+    if !filters.group_policy_reads {
         let error = reader.err().expect("group-aware reads must be refused");
-        assert!(matches!(
-            error,
-            laser_sdk::LaserError::Unsupported {
-                surface: "filters",
-                feature: Some("group_policy_reads"),
-                ..
-            }
-        ));
+        // A server serving native filters without group reads needs an
+        // upgrade, a server without filters has no filtered read at all.
+        let feature = filters.native.then_some("group_policy_reads");
+        assert!(
+            matches!(
+                &error,
+                laser_sdk::LaserError::Unsupported {
+                    surface: "filters",
+                    feature: refused,
+                    ..
+                } if *refused == feature
+            ),
+            "{error}"
+        );
         world.last_result = Some(Err("unsupported".to_owned()));
         return;
     }
@@ -312,7 +315,11 @@ async fn unbound_reader(world: &mut LaserWorld) {
             .expect("page deadline")
             .expect("unbound page");
         assert_eq!(page.policy.mode, ExecutionMode::Unfiltered);
-        assert!(page.records.iter().all(|record| !record.evaluated));
+        assert!(
+            page.records
+                .iter()
+                .all(|record| record.evaluation == RecordEvaluation::Unfiltered)
+        );
         world.filtered_payloads.extend(
             page.records
                 .iter()
@@ -520,4 +527,87 @@ async fn reject_old_policy(world: &mut LaserWorld) {
         .collect();
     reader.ack_page(&current).await.expect("current policy");
     reader.close().await.expect("close");
+}
+
+#[when(regex = r#"^a "([^"]+)" record and a "([^"]+)" record follow the feed$"#)]
+async fn records_follow_feed(world: &mut LaserWorld, first: String, second: String) {
+    let producer = world
+        .laser()
+        .topic(TOPIC)
+        .producer()
+        .partitions(1)
+        .build()
+        .await
+        .expect("the producer initializes");
+    producer
+        .send_batch_with_routing(
+            [record(&first), record(&second)].map(|payload| ProducerMessage::new(payload.to_vec())),
+            Some(Routing::Partition(0)),
+        )
+        .await
+        .expect("the records publish");
+}
+
+#[when(regex = r#"^the anomaly desk skips the record its "([^"]+)" filter stops on$"#)]
+async fn skip_fault(world: &mut LaserWorld, name: String) {
+    let laser = world.laser().clone();
+    let group = laser.topic(TOPIC).consumer_group("fault-skip");
+    group
+        .create()
+        .filter(policy_name(&name), filter(&name))
+        .build()
+        .await
+        .expect("group policy configured");
+    let mut reader = group
+        .reader()
+        .expect("group source")
+        .start(FilteredStart::First)
+        .build()
+        .await
+        .expect("reader builds");
+    let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("a page arrives")
+        .expect("the read succeeds");
+    reader.ack_page(&page).await.expect("the page acknowledges");
+    let stopped = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("the fault arrives")
+        .expect_err("the broken record stops the read");
+    let LaserError::FilterFault {
+        partition_id,
+        offset,
+        ..
+    } = stopped
+    else {
+        panic!("expected a filter fault, got {stopped:?}");
+    };
+    assert_eq!(
+        offset,
+        feed().len() as u64,
+        "the broken record follows the feed"
+    );
+    reader
+        .skip(partition_id, offset)
+        .await
+        .expect("the fault is skipped");
+    let after = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("a page arrives")
+        .expect("the read after the skip succeeds");
+    world.filtered_payloads = after
+        .records
+        .iter()
+        .map(|matched| matched.message.payload.to_vec())
+        .collect();
+    reader
+        .ack_page(&after)
+        .await
+        .expect("the page acknowledges");
+    reader.close().await.expect("the reader closes");
+}
+
+#[then(regex = r#"^it receives the "([^"]+)" record after it$"#)]
+async fn receives_after(world: &mut LaserWorld, name: String) {
+    assert_eq!(world.filtered_payloads, vec![record(&name).to_vec()]);
 }

@@ -1,5 +1,6 @@
-use crate::async_bridge::{PyHook, future_into_py};
+use crate::async_bridge::{Awaitable, PyHook, awaitable};
 use crate::client::PyLaser;
+use crate::convert::duration_ms;
 use crate::errors::{InvalidError, to_pyerr};
 use async_trait::async_trait;
 use laser_sdk::LaserError;
@@ -26,7 +27,12 @@ impl PyLaser {
     /// evidence chain are fresh. Agents spawned from the governed handle
     /// inherit it.
     #[pyo3(signature = (governor, mode="enforce"))]
-    fn with_governor(&self, governor: &Bound<'_, PyAny>, mode: &str) -> PyResult<PyLaser> {
+    fn with_governor(
+        &self,
+        governor: &Bound<'_, PyAny>,
+        #[gen_stub(override_type(type_repr = "typing.Literal['observe', 'enforce']", imports = ("typing",)))]
+        mode: &str,
+    ) -> PyResult<PyLaser> {
         let mode = parse_mode(mode)?;
         Ok(PyLaser::from_inner(self.inner.with_governor(
             Arc::new(PyActionGovernor::new(governor)?),
@@ -40,6 +46,7 @@ impl PyLaser {
     fn with_governor_retention(
         &self,
         governor: &Bound<'_, PyAny>,
+        #[gen_stub(override_type(type_repr = "typing.Literal['observe', 'enforce']", imports = ("typing",)))]
         mode: &str,
         retention: PyGovernorRetention,
     ) -> PyResult<PyLaser> {
@@ -103,9 +110,8 @@ impl PyGovernorRetention {
 
 // An `ActionGovernor` backed by a Python object exposing `decide(action:
 // GovernedAction) -> ActionDecision`, or a plain callable, sync or async. A
-// raise or a non-decision return fails the governed action (fail closed),
-// mirroring the Rust trait's `Err` contract, so a broken governor never fails
-// open.
+// raise or a non-decision return is the Rust trait's `Err`: it fails the
+// governed action under enforce (fail closed) and is recorded under observe.
 pub(crate) struct PyActionGovernor {
     hook: PyHook,
 }
@@ -161,6 +167,7 @@ pub struct PyGovernedAction {
     payload: Vec<u8>,
     signed: bool,
     counters: ActionCounters,
+    approval: Option<laser_sdk::agent::ApprovalGrant>,
 }
 
 impl PyGovernedAction {
@@ -181,6 +188,7 @@ impl PyGovernedAction {
             payload: action.payload.to_vec(),
             signed: action.signed,
             counters: action.counters,
+            approval: action.approval.cloned(),
         }
     }
 
@@ -216,6 +224,7 @@ impl PyGovernedAction {
             payload: &self.payload,
             signed: self.signed,
             counters: self.counters,
+            approval: self.approval.as_ref(),
         })
     }
 }
@@ -315,6 +324,15 @@ impl PyGovernedAction {
             inner: self.counters,
         }
     }
+
+    /// The approval the effect carries, from `AgentCtx.approval_gate`. A
+    /// step-up in the grant's conversation proceeds on it.
+    #[getter]
+    fn approval(&self) -> Option<crate::agent_runtime::PyApprovalGrant> {
+        self.approval
+            .clone()
+            .map(|inner| crate::agent_runtime::PyApprovalGrant { inner })
+    }
 }
 
 /// Session counters at decision time. Shared by every clone of the governed
@@ -404,7 +422,13 @@ impl PyActionDecision {
     /// Replace the body before the effect (applied before claim-check and
     /// signing).
     #[staticmethod]
-    fn modify(body: Vec<u8>) -> Self {
+    fn modify(
+        #[gen_stub(override_type(
+            type_repr = "builtins.bytes",
+            imports = ("builtins",)
+        ))]
+        body: Vec<u8>,
+    ) -> Self {
         Self {
             inner: ActionDecision::modify(body),
         }
@@ -518,7 +542,13 @@ impl PyVerdict {
 
     /// Replace the body, then run the effect.
     #[staticmethod]
-    fn modify(body: Vec<u8>) -> Self {
+    fn modify(
+        #[gen_stub(override_type(
+            type_repr = "builtins.bytes",
+            imports = ("builtins",)
+        ))]
+        body: Vec<u8>,
+    ) -> Self {
         Self {
             inner: Verdict::Modify { body },
         }
@@ -628,7 +658,10 @@ pub struct PyPolicyEvidence {
 impl PyPolicyEvidence {
     /// Decode an evidence body (named-field CBOR).
     #[staticmethod]
-    fn decode(payload: Vec<u8>) -> PyResult<Self> {
+    fn decode(
+        #[gen_stub(override_type(type_repr = "builtins.bytes", imports = ("builtins",)))]
+        payload: Vec<u8>,
+    ) -> PyResult<Self> {
         Ok(Self {
             inner: PolicyEvidence::decode(&payload).map_err(to_pyerr)?,
         })
@@ -748,10 +781,17 @@ impl PyPolicyEvidence {
         &self.inner.receipt_digest
     }
 
-    /// The prior decision's `receipt_digest` in this conversation.
+    /// The prior decision's `receipt_digest` in this chain.
     #[getter]
     fn previous_digest(&self) -> Option<&str> {
         self.inner.previous_digest.as_deref()
+    }
+
+    /// The chain this record extends (ULID). Each governed handle starts its
+    /// own chain per conversation, so chains of several processes interleave.
+    #[getter]
+    fn chain_id(&self) -> &str {
+        &self.inner.chain_id
     }
 
     /// What happened to the effect (`effected` | `blocked` | `step_up` | `deferred`).
@@ -870,6 +910,18 @@ impl PyQuorumGovernor {
         Ok(slf)
     }
 
+    /// How long each voter may take, in milliseconds, 10 seconds unless set.
+    /// A voter that does not answer in time counts as an error: a mandatory
+    /// one blocks, any other abstains. Returns this governor.
+    fn voter_timeout(mut slf: PyRefMut<'_, Self>, timeout_ms: f64) -> PyResult<PyRefMut<'_, Self>> {
+        let timeout = duration_ms(timeout_ms, "quorum voter timeout")?;
+        let current = slf.inner.take().ok_or_else(|| {
+            InvalidError::new_err("this QuorumGovernor is unusable: a previous voter() call failed")
+        })?;
+        slf.inner = Some(current.voter_timeout(timeout));
+        Ok(slf)
+    }
+
     /// Decide `action` by fanning out to every voter concurrently and folding
     /// their verdicts under this governor's policy. Reuses the real
     /// `ActionGovernor` combinator rather than reimplementing it here, so a
@@ -878,13 +930,13 @@ impl PyQuorumGovernor {
         &self,
         py: Python<'py>,
         action: &PyGovernedAction,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyActionDecision>> {
         let governor = self
             .inner
             .clone()
             .expect("QuorumGovernor always holds a value between calls");
         let action = action.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let governed = action.to_governed_action().map_err(to_pyerr)?;
             governor
                 .decide(&governed)
@@ -950,10 +1002,10 @@ impl PySwappableGovernor {
         &self,
         py: Python<'py>,
         action: &PyGovernedAction,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, PyActionDecision>> {
         let governor = Arc::clone(&self.inner);
         let action = action.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let governed = action.to_governed_action().map_err(to_pyerr)?;
             governor
                 .decide(&governed)

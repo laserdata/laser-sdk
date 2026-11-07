@@ -67,7 +67,7 @@ fn given_a_typescript_signature_when_rust_verifies_then_should_authenticate_the_
         .try_into()
         .expect("secret seed is 32 bytes");
     let key = SigningKey::from_bytes(&secret);
-    let mut registry = KeyRegistry::new();
+    let registry = KeyRegistry::new();
     registry.enroll("typescript-agent", key.verifying_key());
     let signed = envelope().with_signature(Signature {
         scheme: SIGNATURE_SCHEME_ED25519,

@@ -126,7 +126,8 @@ async def test_given_no_catalog_when_reading_then_should_follow_the_group_read_c
         with pytest.raises(ls.UnsupportedError) as refused:
             await group.reader(count=1)
         assert refused.value.surface == "filters"
-        assert refused.value.feature == "group_policy_reads"
+        expected = "group_policy_reads" if capabilities.filters.native else None
+        assert refused.value.feature == expected
 
 
 async def test_given_no_catalog_when_a_group_is_created_with_a_filter_then_should_refuse(laser):
@@ -160,9 +161,6 @@ async def test_given_no_catalog_when_a_group_is_created_with_a_filter_then_shoul
     [
         {"filter": "definition"},
         {"filter_name": POLICY},
-        {"filter_name": POLICY, "filter_id": 1, "revision": 1},
-        {"filter": "definition", "filter_name": POLICY, "filter_id": 1, "revision": 1},
-        {"filter_id": 1},
     ],
 )
 async def test_given_an_incomplete_policy_when_configuring_a_group_then_should_refuse_it_locally(
@@ -181,7 +179,7 @@ async def test_given_an_incomplete_policy_when_configuring_a_group_then_should_r
     ):
         with pytest.raises(ls.InvalidError) as refused:
             await configure(**options)
-        assert "filter_name" in str(refused.value) or "filter_id" in str(refused.value)
+        assert "filter_name" in str(refused.value)
     with pytest.raises(ls.InvalidError):
         await group.filter().configure_with()
 
@@ -245,17 +243,25 @@ async def test_given_a_named_policy_when_summarized_then_should_report_the_name_
     assert await group.filter().summary() is None
 
 
-async def test_given_a_revision_policy_when_a_group_is_created_then_should_need_no_name(laser):
+async def test_given_a_released_group_when_configured_again_then_should_reuse_its_revision(
+    laser,
+):
     group = await bound_group(laser, "revision-desk")
     binding = await group.filter().get()
     await group.filter().release()
 
-    restored = await group.filter().configure_with(
-        filter_id=binding["filter_id"], revision=binding["revision"]
-    )
+    restored = await group.filter().configure_with(filter=safe_mode_filter(), filter_name=POLICY)
 
+    assert (restored["filter_id"], restored["revision"]) == (
+        binding["filter_id"],
+        binding["revision"],
+    )
     assert restored["digest"] == binding["digest"]
     assert (await group.filter().summary())["name"] == POLICY
+    with pytest.raises(TypeError):
+        await group.filter().configure_with(
+            filter_id=binding["filter_id"], revision=binding["revision"]
+        )
     assert await group.filter().delete() is True
 
 
@@ -394,18 +400,19 @@ async def test_given_an_unbound_group_id_when_read_then_should_preserve_arbitrar
         assert second.payload == payloads[1]
     finally:
         await resumed.shutdown()
-    if not (await laser.capabilities()).filters.group_policy_reads:
+    filters = (await laser.capabilities()).filters
+    if not filters.group_policy_reads:
         with pytest.raises(ls.UnsupportedError) as refused:
             await by_id.reader(start="first", count=2)
         assert refused.value.surface == "filters"
-        assert refused.value.feature == "group_policy_reads"
+        assert refused.value.feature == ("group_policy_reads" if filters.native else None)
         return
     filtered = await by_id.reader(start="first", count=2)
     try:
         page = await asyncio.wait_for(filtered.next_page(), READ_TIMEOUT)
         assert page.policy["mode"] == "unfiltered"
         assert [record.message.payload for record in page.records] == payloads
-        assert all(not record.evaluated for record in page.records)
+        assert all(record.evaluation == "unfiltered" for record in page.records)
     finally:
         await filtered.close()
 
@@ -694,6 +701,48 @@ async def test_given_a_malformed_record_when_reading_then_should_deliver_matches
     await filtered.close()
 
 
+async def test_given_a_malformed_record_when_skipped_then_should_read_on_after_it(laser):
+    await publish(laser, [SAFE_MODE, "not json", DECOMMISSION])
+    filtered = await reader(laser, "safe-mode-skip", start="first")
+    page = await asyncio.wait_for(filtered.next_page(), READ_TIMEOUT)
+    await filtered.ack_page(page)
+    with pytest.raises(ls.FilterError) as fault:
+        await filtered.next_page()
+    assert (fault.value.partition_id, fault.value.offset) == (0, 1)
+
+    with pytest.raises(ls.InvalidError):
+        await filtered.skip(0, 2)
+    await filtered.skip(0, 1)
+    page = await asyncio.wait_for(filtered.next_page(), READ_TIMEOUT)
+    assert offsets(page) == [2]
+    with pytest.raises(ls.InvalidError):
+        await filtered.skip(0, 1)
+    await filtered.close()
+
+
+async def test_given_a_malformed_record_when_the_group_consumer_skips_it_then_should_deliver_the_next_match(  # noqa: E501
+    laser,
+):
+    group = await bound_group(laser, "safe-mode-consumer-skip")
+    await publish(laser, [SAFE_MODE, "not json", DECOMMISSION])
+    consumer = group.consumer(polling="first", auto_commit="disabled")
+    try:
+        first = await asyncio.wait_for(consumer.next(), READ_TIMEOUT)
+        await consumer.commit(first)
+        with pytest.raises(ls.FilterError) as fault:
+            await asyncio.wait_for(consumer.next(), READ_TIMEOUT)
+        assert (fault.value.partition_id, fault.value.offset) == (0, 1)
+        await consumer.skip(0, 1)
+        stored = await consumer.stored_offset(0)
+        assert stored is not None
+        assert stored.stored_offset == 1, "the skip stores the fault's offset"
+        message = await asyncio.wait_for(consumer.next(), READ_TIMEOUT)
+        assert message.position.offset == 2
+        await consumer.commit(message)
+    finally:
+        await consumer.shutdown()
+
+
 async def test_given_a_local_guard_when_reading_then_should_agree_with_the_server(laser):
     await publish(laser, [GROUND_STATION, TELEMETRY])
     filtered = await reader(laser, "safe-mode-guarded", start="first", local_guard=True)
@@ -726,7 +775,7 @@ async def test_given_a_sample_when_tested_against_the_group_filter_then_should_e
     revisions = await group.filter().revisions()
 
     assert tested["explanation"]["verdict"] == "rejected"
-    assert revisions["total"] == 1
+    assert (revisions["page"], revisions["total_pages"], revisions["total_results"]) == (1, 1, 1)
     assert revisions["items"][0]["digest"] == safe_mode_filter().digest
 
 
@@ -991,7 +1040,12 @@ async def test_given_pass_faults_when_guarded_then_should_verify_server_bounds(l
     group = await bound_group(laser, "guarded-pass", definition)
     filtered = await group.reader(start="first", local_guard=True, count=2)
     page = await asyncio.wait_for(filtered.next_page(), READ_TIMEOUT)
-    assert [(record.offset, record.evaluated) for record in page.records] == [(0, False), (1, True)]
+    assert [
+        (record.offset, record.evaluation, record.unevaluated_reason) for record in page.records
+    ] == [
+        (0, "unevaluated", "malformed"),
+        (1, "selected", None),
+    ]
     await filtered.ack_page(page)
     await filtered.close()
 

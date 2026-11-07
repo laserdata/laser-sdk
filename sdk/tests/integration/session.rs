@@ -2,7 +2,9 @@ use crate::harness;
 use iggy::prelude::{
     Consumer, Identifier, MessageClient, PollOptions, PollingStrategy, TopicClient,
 };
-use laser_sdk::agent::{PendingControl, SessionConfig, derive_session_id};
+use laser_sdk::agent::{
+    PendingControl, SessionConfig, SessionLayout, TopicRetention, derive_session_id,
+};
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{
     AgentEnvelope, AgentId, AgentKind, CorrelationId, RecordId, SessionEnd, SessionStart, TaskState,
@@ -10,6 +12,7 @@ use laser_sdk::wire::agent::{
 use laser_sdk::wire::dispatch::DisplayType;
 use laser_sdk::wire::framing::decode_named;
 use laser_sdk::wire::session::SessionHeartbeat;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 fn agent() -> AgentId {
@@ -237,7 +240,10 @@ async fn given_model_and_tool_calls_when_recorded_then_should_write_correlated_r
         .assemble(Box::new(LastN(10)))
         .await
         .expect("assembling reads the lane");
-    assert_eq!(assembled.manifest.fragments.len(), 1);
+    assert!(
+        assembled.manifest.fragments.is_empty(),
+        "the start record never reaches a prompt"
+    );
     let call = session
         .model(
             ModelRequest::new("gpt-test", br#"{"prompt":"hi","api_key":"k"}"#.to_vec()),
@@ -612,6 +618,80 @@ async fn given_a_declared_topic_layout_when_contracting_then_should_complete_thr
         .expect("the contract runs");
     assert!(matches!(outcome, Contract::Completed(_)), "{outcome:?}");
     worker.shutdown().await.expect("the worker stops");
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_declared_topic_layout_when_reading_a_session_then_should_read_its_conversation_on_the_agent_topics()
+ {
+    let laser = harness::laser().await;
+    let worker: AgentId = "worker".parse().expect("worker is a valid agent id");
+    let sessions = laser.sessions_with(SessionConfig::new().layout(SessionLayout::PerAgentTopic(
+        BTreeMap::from([
+            (agent(), "planner.inbox".to_owned()),
+            (worker.clone(), "worker.inbox".to_owned()),
+        ]),
+    )));
+    sessions
+        .bootstrap(2, TopicRetention::expire_after(Duration::from_secs(3600)))
+        .await
+        .expect("bootstrap creates the agent topics");
+    let (session, lease) = sessions
+        .start()
+        .agent(laser_sdk::types::AgentId::new("planner").expect("valid agent id"))
+        .begin()
+        .await
+        .expect("the session starts");
+    let conversation = session.conversation();
+    let correlation = CorrelationId::from_u128(12);
+    laser
+        .agdx(AgentTopic::Sessions, agent(), conversation.into())
+        .command(correlation, b"work".to_vec())
+        .with_target(worker.clone())
+        .send()
+        .await
+        .expect("the command is sent");
+    laser
+        .agdx(AgentTopic::Sessions, worker, conversation.into())
+        .respond(correlation, b"done".to_vec())
+        .with_target(agent())
+        .send()
+        .await
+        .expect("the reply is sent");
+    let declared: Vec<AgentTopic<'static>> = ["worker.inbox", "planner.inbox"]
+        .into_iter()
+        .map(|name| {
+            let topic: &'static Identifier =
+                Box::leak(Box::new(Identifier::named(name).expect("topic id")));
+            AgentTopic::Custom(topic)
+        })
+        .collect();
+    harness::eventually(|| async {
+        let routed = laser
+            .context(conversation)
+            .fetch_with(declared.clone(), Box::new(LastN(10)))
+            .await
+            .ok()?;
+        (routed.len() == 2).then_some(())
+    })
+    .await;
+
+    let mut kinds: Vec<AgentKind> = session
+        .context_with(Box::new(LastN(10)))
+        .await
+        .expect("the lane reads")
+        .into_iter()
+        .filter_map(|turn| turn.message.envelope.map(|envelope| envelope.kind))
+        .filter(|kind| *kind != AgentKind::Status)
+        .collect();
+    kinds.sort_by_key(|kind| kind.to_string());
+    assert_eq!(
+        kinds,
+        [AgentKind::Command, AgentKind::Response],
+        "a lane read covers the conversation routed onto the declared topics"
+    );
+    session.end().await.expect("the session ends");
+    drop(lease);
 }
 
 #[tokio::test]

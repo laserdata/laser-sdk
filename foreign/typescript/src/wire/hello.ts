@@ -1,7 +1,7 @@
 import { CodecError, InvalidError } from "../client/errors.js"
 import { type CborMap, decodeOne, encodeNamed, expectMap, expectString, field } from "./cbor.js"
 import { BackendResourceId } from "./ids.js"
-import type { Consistency, SqlDialect } from "./query.js"
+import type { AggFunc, Consistency, SqlDialect } from "./query.js"
 import type { LogicalTypeKind } from "./schema.js"
 import { FILTER_EVALUATOR_VERSION, type FilterCodec, decodeFilterCodec } from "./filter.js"
 import { type WireTopology, decodeWireTopology, encodeWireTopology } from "./topology.js"
@@ -9,6 +9,7 @@ import { type WireTopology, decodeWireTopology, encodeWireTopology } from "./top
 export const feature = {
   KV_CAS: 1n << 0n,
   READ_YOUR_WRITES: 1n << 1n,
+  // Retired with linearizable query reads. No server sets it and the bit is never reused.
   STRONG_CONSISTENCY: 1n << 2n,
   KV_CAS_FENCED: 1n << 3n,
   // Retired with the run registry. No server sets it and the bit is never reused.
@@ -16,11 +17,13 @@ export const feature = {
   KEYWORD_SEARCH: 1n << 5n,
   WATCH: 1n << 6n,
   AUTHZ: 1n << 7n,
+  // Retired with lakehouse destinations. No server sets it and the bit is never reused.
   DESTINATIONS: 1n << 8n,
   KV_FENCED_LEASES: 1n << 9n,
   CONSUMER_FILTERS: 1n << 10n,
   GROUP_POLICY_READS: 1n << 11n,
   SESSIONS: 1n << 12n,
+  MATERIALIZATIONS: 1n << 14n,
   // The managed backend runs in stream tenancy: every managed name is scoped
   // to one stream, and the change feed and dead letters of each stream ride
   // their own ops topics.
@@ -34,7 +37,6 @@ export interface OpVersions {
   readonly fork: number
   readonly agent: number
   readonly graph: number
-  readonly checkpoint?: number
   readonly filter?: number
   readonly features: bigint
 }
@@ -44,7 +46,7 @@ export function newOpVersions(
   kv: number,
   fork: number
 ): OpVersions {
-  return { query, control, kv, fork, agent: 0, graph: 0, checkpoint: 0, filter: 0, features: 0n }
+  return { query, control, kv, fork, agent: 0, graph: 0, filter: 0, features: 0n }
 }
 export function opVersionsHasFeature(versions: OpVersions, bit: bigint): boolean {
   return (versions.features & bit) === bit
@@ -58,7 +60,6 @@ export function encodeOpVersions(value: OpVersions): Map<string, unknown> {
   ])
   if (value.agent !== 0) map.set("agent", value.agent)
   if (value.graph !== 0) map.set("graph", value.graph)
-  if ((value.checkpoint ?? 0) !== 0) map.set("checkpoint", value.checkpoint)
   if ((value.filter ?? 0) !== 0) map.set("filter", value.filter)
   if (value.features !== 0n) map.set("features", value.features)
   return map
@@ -71,7 +72,6 @@ export function decodeOpVersions(map: CborMap, context: string): OpVersions {
     fork: field.requiredU32(map, "fork", context),
     agent: field.optionalU32(map, "agent", context) ?? 0,
     graph: field.optionalU32(map, "graph", context) ?? 0,
-    checkpoint: field.optionalU32(map, "checkpoint", context) ?? 0,
     filter: field.optionalU32(map, "filter", context) ?? 0,
     features: field.optionalU64(map, "features", context) ?? 0n
   }
@@ -81,7 +81,7 @@ export interface HelloReply {
   readonly versions: OpVersions
 }
 export const BACKEND_DESCRIPTOR_VERSION = 1
-export type BackendMode = "operational" | "lakehouse"
+export type BackendMode = "operational"
 export type BackendDesiredState = "disabled" | "enabled"
 export type BackendObservedState = "disabled" | "starting" | "ready" | "degraded" | "unavailable"
 export type BackendReadinessCode =
@@ -94,6 +94,7 @@ export type BackendReadinessCode =
   | "query_runtime_unavailable"
   | "generation_mismatch"
   | "probe_failed"
+  | "query_identity_rejected"
 export interface BackendImplementation {
   readonly kind: string
   readonly version: string
@@ -107,33 +108,19 @@ export interface BackendReadiness {
   readonly reasons: readonly BackendReadinessReason[]
   readonly observedAtMicros: bigint
 }
-export interface MaterializationCapability {
-  readonly fileFormat: "parquet"
-  readonly tableFormat: "iceberg_v2"
-  readonly createTable: boolean
-  readonly append: boolean
-}
-export type TimeTravelCapability = "snapshot_id" | "timestamp_micros"
-export type QueryPagingCapability = "offset" | "cursor"
 export interface QueryCapabilities {
   readonly dialects: readonly SqlDialect[]
-  readonly timeTravel: readonly TimeTravelCapability[]
   readonly consistency: readonly Consistency[]
   readonly logicalTypes: readonly LogicalTypeKind[]
-  readonly paging: readonly QueryPagingCapability[]
-  readonly cancellation: boolean
-  readonly executionStatus: boolean
   readonly rawSql: boolean
+  readonly aggregates: readonly AggFunc[]
+  readonly vectorSearch: boolean
+  readonly textSearch: boolean
 }
 export interface SchemaCapabilities {
   readonly logicalSchema: boolean
   readonly arrowIpcStream: boolean
   readonly schemaEvolution: boolean
-}
-export interface MaintenanceCapabilities {
-  readonly expireSnapshots: boolean
-  readonly removeOrphanFiles: boolean
-  readonly compactDataFiles: boolean
 }
 export interface BackendLimits {
   readonly maxQueryRows: bigint
@@ -142,7 +129,7 @@ export interface BackendLimits {
   readonly maxQueryMicros: bigint
   readonly maxConcurrentQueries: number
   readonly maxSchemaFields: number
-  readonly maxMaterializationFileBytes: bigint
+  readonly maxPayloadBytes: bigint
 }
 export interface BackendDescriptor {
   readonly descriptorVersion: number
@@ -155,10 +142,8 @@ export interface BackendDescriptor {
   readonly desiredState: BackendDesiredState
   readonly observedState: BackendObservedState
   readonly readiness: BackendReadiness
-  readonly materialization: readonly MaterializationCapability[]
   readonly query?: QueryCapabilities
   readonly schema: SchemaCapabilities
-  readonly maintenance: MaintenanceCapabilities
   readonly limits: BackendLimits
 }
 export interface BackendAnnounce {
@@ -224,9 +209,7 @@ export function newBackendDescriptor(
     desiredState: "disabled",
     observedState: "disabled",
     readiness: backendReadinessNotReady("disabled"),
-    materialization: [],
     schema: { logicalSchema: false, arrowIpcStream: false, schemaEvolution: false },
-    maintenance: { expireSnapshots: false, removeOrphanFiles: false, compactDataFiles: false },
     limits: {
       maxQueryRows: 0n,
       maxQueryBytes: 0n,
@@ -234,7 +217,7 @@ export function newBackendDescriptor(
       maxQueryMicros: 0n,
       maxConcurrentQueries: 0,
       maxSchemaFields: 0,
-      maxMaterializationFileBytes: 0n
+      maxPayloadBytes: 0n
     }
   }
 }
@@ -243,10 +226,7 @@ export function backendReadinessNotReady(code: BackendReadinessCode): BackendRea
 }
 
 export function backendDescriptorHasCapability(backend: BackendDescriptor, tag: string): boolean {
-  return (
-    backend.materialization.some((item) => item.fileFormat === tag || item.tableFormat === tag) ||
-    backend.query?.dialects.includes(tag as SqlDialect) === true
-  )
+  return backend.query?.dialects.includes(tag as SqlDialect) === true
 }
 export function newBackendAnnounce(versions: OpVersions): BackendAnnounce {
   return { versions, ready: true, backends: [] }
@@ -314,19 +294,7 @@ export function encodeBackendDescriptor(value: BackendDescriptor): Map<string, u
     ["runtime_configuration_revision", value.runtimeConfigurationRevision],
     ["desired_state", value.desiredState],
     ["observed_state", value.observedState],
-    ["readiness", readiness],
-    [
-      "materialization",
-      value.materialization.map(
-        (item) =>
-          new Map<string, unknown>([
-            ["file_format", item.fileFormat],
-            ["table_format", item.tableFormat],
-            ["create_table", item.createTable],
-            ["append", item.append]
-          ])
-      )
-    ]
+    ["readiness", readiness]
   ])
   optional(
     map,
@@ -335,13 +303,14 @@ export function encodeBackendDescriptor(value: BackendDescriptor): Map<string, u
     (item) =>
       new Map<string, unknown>([
         ["dialects", [...item.dialects]],
-        ["time_travel", [...item.timeTravel]],
         ["consistency", [...item.consistency]],
         ["logical_types", [...item.logicalTypes]],
-        ["paging", [...item.paging]],
-        ["cancellation", item.cancellation],
-        ["execution_status", item.executionStatus],
-        ["raw_sql", item.rawSql]
+        ["raw_sql", item.rawSql],
+        ...(item.aggregates.length > 0
+          ? [["aggregates", [...item.aggregates]] as [string, unknown]]
+          : []),
+        ["vector_search", item.vectorSearch],
+        ["text_search", item.textSearch]
       ])
   )
   map.set(
@@ -353,14 +322,6 @@ export function encodeBackendDescriptor(value: BackendDescriptor): Map<string, u
     ])
   )
   map.set(
-    "maintenance",
-    new Map([
-      ["expire_snapshots", value.maintenance.expireSnapshots],
-      ["remove_orphan_files", value.maintenance.removeOrphanFiles],
-      ["compact_data_files", value.maintenance.compactDataFiles]
-    ])
-  )
-  map.set(
     "limits",
     new Map<string, unknown>([
       ["max_query_rows", value.limits.maxQueryRows],
@@ -369,7 +330,7 @@ export function encodeBackendDescriptor(value: BackendDescriptor): Map<string, u
       ["max_query_micros", value.limits.maxQueryMicros],
       ["max_concurrent_queries", value.limits.maxConcurrentQueries],
       ["max_schema_fields", value.limits.maxSchemaFields],
-      ["max_materialization_file_bytes", value.limits.maxMaterializationFileBytes]
+      ["max_payload_bytes", value.limits.maxPayloadBytes]
     ])
   )
   return map
@@ -381,12 +342,11 @@ export function decodeBackendDescriptor(value: unknown, context: string): Backen
   const readiness = field.requiredMap(map, "readiness", context)
   const query = field.optionalMap(map, "query", context)
   const schema = field.requiredMap(map, "schema", context)
-  const maintenance = field.requiredMap(map, "maintenance", context)
   const limits = field.requiredMap(map, "limits", context)
   return {
     descriptorVersion: field.requiredU32(map, "descriptor_version", context),
     resourceId: BackendResourceId.fromBytes(field.requiredBytes(map, "resource_id", context)),
-    mode: word(map, "mode", context, ["operational", "lakehouse"]),
+    mode: word(map, "mode", context, ["operational"]),
     label: field.requiredString(map, "label", context),
     implementation: {
       kind: field.requiredString(implementation, "kind", context),
@@ -417,38 +377,20 @@ export function decodeBackendDescriptor(value: unknown, context: string): Backen
             "catalog_unavailable",
             "query_runtime_unavailable",
             "generation_mismatch",
-            "probe_failed"
+            "probe_failed",
+            "query_identity_rejected"
           ]),
           ...(detail === undefined ? {} : { detail })
         }
       }),
       observedAtMicros: field.requiredU64(readiness, "observed_at_micros", context)
     },
-    materialization: field.requiredArray(map, "materialization", context, (item, index) => {
-      const capability = expectMap(item, `${context}.materialization[${String(index)}]`)
-      return {
-        fileFormat: word(capability, "file_format", context, ["parquet"]),
-        tableFormat: word(capability, "table_format", context, ["iceberg_v2"]),
-        createTable: field.requiredBoolean(capability, "create_table", context),
-        append: field.requiredBoolean(capability, "append", context)
-      }
-    }),
     ...(query === undefined
       ? {}
       : {
           query: {
-            dialects: words(query, "dialects", context, [
-              "data_fusion",
-              "postgres",
-              "my_sql",
-              "sqlite"
-            ]),
-            timeTravel: words(query, "time_travel", context, ["snapshot_id", "timestamp_micros"]),
-            consistency: words(query, "consistency", context, [
-              "eventual",
-              "read_your_writes",
-              "strong"
-            ]),
+            dialects: words(query, "dialects", context, ["postgres", "my_sql", "sqlite"]),
+            consistency: words(query, "consistency", context, ["eventual", "read_your_writes"]),
             logicalTypes: words(query, "logical_types", context, [
               "boolean",
               "int",
@@ -466,12 +408,24 @@ export function decodeBackendDescriptor(value: unknown, context: string): Backen
               "binary",
               "struct",
               "list",
-              "map"
+              "map",
+              "variant"
             ]),
-            paging: words(query, "paging", context, ["offset", "cursor"]),
-            cancellation: field.requiredBoolean(query, "cancellation", context),
-            executionStatus: field.requiredBoolean(query, "execution_status", context),
-            rawSql: field.requiredBoolean(query, "raw_sql", context)
+            rawSql: field.requiredBoolean(query, "raw_sql", context),
+            aggregates: query.has("aggregates")
+              ? words(query, "aggregates", context, [
+                  "count",
+                  "count_distinct",
+                  "sum",
+                  "avg",
+                  "min",
+                  "max",
+                  "percentile",
+                  "std_dev"
+                ])
+              : [],
+            vectorSearch: field.optionalBoolean(query, "vector_search", context) ?? false,
+            textSearch: field.optionalBoolean(query, "text_search", context) ?? false
           }
         }),
     schema: {
@@ -479,23 +433,14 @@ export function decodeBackendDescriptor(value: unknown, context: string): Backen
       arrowIpcStream: field.requiredBoolean(schema, "arrow_ipc_stream", context),
       schemaEvolution: field.requiredBoolean(schema, "schema_evolution", context)
     },
-    maintenance: {
-      expireSnapshots: field.requiredBoolean(maintenance, "expire_snapshots", context),
-      removeOrphanFiles: field.requiredBoolean(maintenance, "remove_orphan_files", context),
-      compactDataFiles: field.requiredBoolean(maintenance, "compact_data_files", context)
-    },
     limits: {
+      maxPayloadBytes: field.optionalU64(limits, "max_payload_bytes", context) ?? 0n,
       maxQueryRows: field.requiredU64(limits, "max_query_rows", context),
       maxQueryBytes: field.requiredU64(limits, "max_query_bytes", context),
       maxScanBytes: field.requiredU64(limits, "max_scan_bytes", context),
       maxQueryMicros: field.requiredU64(limits, "max_query_micros", context),
       maxConcurrentQueries: field.requiredU32(limits, "max_concurrent_queries", context),
-      maxSchemaFields: field.requiredU32(limits, "max_schema_fields", context),
-      maxMaterializationFileBytes: field.requiredU64(
-        limits,
-        "max_materialization_file_bytes",
-        context
-      )
+      maxSchemaFields: field.requiredU32(limits, "max_schema_fields", context)
     }
   }
 }

@@ -1,3 +1,4 @@
+import type { CallOptions } from "../client/call-options.js"
 import { CodecError, InvalidError, NoStreamError, ProtocolError } from "../client/errors.js"
 import { INTERNAL_GOVERN, INTERNAL_TRANSPORT } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
@@ -34,6 +35,7 @@ const READ_BATCH = 1000
 interface FoldedItem {
   readonly item: MemoryItem
   readonly scope: MemoryScope
+  readonly timestampMicros: bigint
 }
 
 // Where one memory record lands, and the identity the governor sees for it.
@@ -47,10 +49,11 @@ interface RecordTarget {
 export class LogMemory implements Memory {
   private readonly items = new Map<string, FoldedItem>()
   // Tombstones and feedback keyed by target and the conversation they are
-  // limited to, with an empty conversation for any. Feedback stays apart from
-  // the items so a weight folded before its item (a cross-partition reorder)
-  // still applies.
-  private readonly forgotten = new Set<string>()
+  // limited to, with an empty conversation for any. A tombstone keeps the
+  // latest forget's append time, so it drops older writes from any partition
+  // and keeps later ones. Feedback stays apart from the items so a weight
+  // folded before its item (a cross-partition reorder) still applies.
+  private readonly forgotten = new Map<string, bigint>()
   private readonly feedback = new Map<string, number>()
   private readonly named = new Map<string, Uint8Array>()
   private readonly offsets = new Map<number, bigint>()
@@ -76,16 +79,22 @@ export class LogMemory implements Memory {
     this.namespace = namespace ?? topic
   }
 
-  async remember(scope: MemoryScope, payload: Uint8Array): Promise<MemoryId> {
-    return this.append(scope, MemoryId.new(), MemoryKind.Fact, payload)
+  async remember(
+    scope: MemoryScope,
+    payload: Uint8Array,
+    options: CallOptions = {}
+  ): Promise<MemoryId> {
+    return this.append(scope, MemoryId.new(), MemoryKind.Fact, payload, options)
   }
 
   async append(
     scope: MemoryScope,
     id: MemoryId,
     kind: MemoryKind,
-    payload: Uint8Array
+    payload: Uint8Array,
+    options: CallOptions = {}
   ): Promise<MemoryId> {
+    this.checkStream(scope)
     const target = this.target(scope, id.toString())
     // The governor sees the item body, not the record frame around it.
     const body = await this.govern(target, payload.slice())
@@ -98,7 +107,8 @@ export class LogMemory implements Memory {
         memoryKind: kind,
         body,
         ...lineage(scope)
-      })
+      }),
+      options
     )
     return id
   }
@@ -109,17 +119,28 @@ export class LogMemory implements Memory {
   async recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]> {
     const limit = recallLimit(query)
     if (limit === 0 || (scope.stream !== undefined && scope.stream !== this.stream)) return []
-    const selected = new Map<string, { readonly arrival: ArrivalKey; readonly item: MemoryItem }>()
+    // Feedback ranks every strategy except recent, then arrival breaks ties.
+    const weighted = query.strategy !== RecallStrategy.Recent
+    const selected = new Map<string, Selected>()
     const agent = query.agent ?? scope.agent
-    let cursor: Uint8Array | undefined
+    let requested = 1
     for (;;) {
-      const scan = this.laser.kv(this.resourceNamespace()).scan()
+      // The server narrows by the scope's lenses, and the rows are checked again
+      // here, so a server without them returns the same items.
+      const scan = this.laser
+        .kv(this.resourceNamespace())
+        .scan()
+        .memoryLens(scope.user, agent?.asStr(), scope.app)
+        .page(requested)
       if (scope.conversation !== undefined) {
         scan.conversation(scope.conversation.toString()).lensStream(this.resourceStream())
       }
-      if (cursor !== undefined) scan.cursor(cursor)
       const page = await scan.fetch()
-      for (const entry of page.entries) {
+      if (page.page !== requested)
+        throw new ProtocolError(
+          `memory scan asked for page ${String(requested)} and was answered page ${String(page.page)}`
+        )
+      for (const entry of page.items) {
         const stored = entry.scope
         if (
           stored === undefined ||
@@ -136,25 +157,27 @@ export class LogMemory implements Memory {
             !item.provenance.conversationId.equals(scope.conversation))
         )
           continue
-        selected.set(item.id.toString(), { arrival: arrivalKey(entry, item.id), item })
+        const weight = weighted ? stored.weight : undefined
+        selected.set(item.id.toString(), { arrival: arrivalKey(entry, item.id), item, weight })
         if (selected.size > limit) {
-          const oldest = [...selected].sort(([, left], [, right]) =>
-            compareArrival(left.arrival, right.arrival)
-          )[0]
-          if (oldest !== undefined) selected.delete(oldest[0])
+          const lowest = [...selected].sort(([, left], [, right]) => compareRank(left, right))[0]
+          if (lowest !== undefined) selected.delete(lowest[0])
         }
       }
-      if (page.cursor === undefined) break
-      if (
-        page.cursor.length === cursor?.length &&
-        page.cursor.every((byte, index) => byte === cursor?.[index])
-      )
-        throw new ProtocolError("memory scan cursor did not advance")
-      cursor = page.cursor
+      if (page.items.length === 0 || page.page >= page.totalPages) break
+      requested += 1
     }
     return [...selected.values()]
-      .sort((left, right) => compareArrival(right.arrival, left.arrival))
-      .map(({ item }) => item)
+      .sort((left, right) => compareRank(right, left))
+      .map(({ item, weight }, rank) =>
+        weight === undefined
+          ? item
+          : {
+              ...item,
+              score: weight,
+              signals: [{ strategy: RecallStrategy.Auto, rank, score: weight }]
+            }
+      )
   }
 
   /** Recall by folding the memory topic in process, the opt-in path for a small
@@ -188,35 +211,56 @@ export class LogMemory implements Memory {
       )
   }
 
-  async improve(scope: MemoryScope, feedback: Feedback): Promise<MemoryId> {
+  async improve(
+    scope: MemoryScope,
+    feedback: Feedback,
+    options: CallOptions = {}
+  ): Promise<MemoryId> {
+    this.checkStream(scope)
     const id = MemoryId.new()
-    await this.publish(scope, id.toString(), {
-      kind: "feedback",
-      target: feedback.target.toString(),
-      weight: feedback.weight,
-      ...(scope.conversation !== undefined ? { conversation: scope.conversation.toString() } : {})
-    })
+    await this.publish(
+      scope,
+      id.toString(),
+      {
+        kind: "feedback",
+        target: feedback.target.toString(),
+        weight: feedback.weight,
+        ...(scope.conversation !== undefined ? { conversation: scope.conversation.toString() } : {})
+      },
+      options
+    )
     return id
   }
 
-  async forget(scope: MemoryScope, id: MemoryId): Promise<void> {
-    await this.publish(scope, id.toString(), {
-      kind: "forget",
-      target: id.toString(),
-      ...(scope.conversation !== undefined ? { conversation: scope.conversation.toString() } : {})
-    })
+  async forget(scope: MemoryScope, id: MemoryId, options: CallOptions = {}): Promise<void> {
+    this.checkStream(scope)
+    await this.publish(
+      scope,
+      id.toString(),
+      {
+        kind: "forget",
+        target: id.toString(),
+        ...(scope.conversation !== undefined ? { conversation: scope.conversation.toString() } : {})
+      },
+      options
+    )
   }
 
   /** Writes named point state: a keyed item on the topic, reflected in the
    * fold for read-your-writes. */
-  async setNamed(key: string, payload: Uint8Array): Promise<void> {
+  async setNamed(key: string, payload: Uint8Array, options: CallOptions = {}): Promise<void> {
     const id = this.namedKey(key)
-    await this.publish({}, id, {
-      kind: "item",
+    await this.publish(
+      {},
       id,
-      memoryKind: MemoryKind.Fact,
-      body: payload.slice()
-    })
+      {
+        kind: "item",
+        id,
+        memoryKind: MemoryKind.Fact,
+        body: payload.slice()
+      },
+      options
+    )
     this.named.set(id, payload.slice())
   }
 
@@ -234,29 +278,30 @@ export class LogMemory implements Memory {
 
   /** Merge-patches the named item (RFC 7386). A patch or a stored value that
    * is not JSON throws `CodecError`. */
-  async updateNamed(key: string, patch: Uint8Array): Promise<void> {
+  async updateNamed(key: string, patch: Uint8Array, options: CallOptions = {}): Promise<void> {
     const patchValue = parseJson(patch, "update patch is not JSON")
     const current = await this.fetchNamedFolded(key)
     const base = current === undefined ? null : parseJson(current, "stored value is not JSON")
     const merged = mergePatch(base, patchValue)
-    await this.setNamed(key, new TextEncoder().encode(JSON.stringify(merged)))
+    await this.setNamed(key, new TextEncoder().encode(JSON.stringify(merged)), options)
   }
 
   /** Deletes named point state with a keyed tombstone. */
-  async forgetNamed(key: string): Promise<void> {
+  async forgetNamed(key: string, options: CallOptions = {}): Promise<void> {
     const id = this.namedKey(key)
-    await this.publish({}, id, { kind: "forget", target: id })
+    await this.publish({}, id, { kind: "forget", target: id }, options)
     this.named.delete(id)
   }
 
   private async publish(
     scope: MemoryScope,
     idempotencyKey: string,
-    record: MemoryRecord
+    record: MemoryRecord,
+    options: CallOptions
   ): Promise<void> {
     const target = this.target(scope, idempotencyKey)
     const payload = await this.govern(target, encodeMemoryRecordFrame(record))
-    await this.send(target, scope, payload)
+    await this.send(target, scope, payload, options)
   }
 
   private target(scope: MemoryScope, idempotencyKey: string): RecordTarget {
@@ -280,7 +325,12 @@ export class LogMemory implements Memory {
     })
   }
 
-  private async send(target: RecordTarget, scope: MemoryScope, payload: Uint8Array): Promise<void> {
+  private async send(
+    target: RecordTarget,
+    scope: MemoryScope,
+    payload: Uint8Array,
+    options: CallOptions
+  ): Promise<void> {
     const headers = new Map(
       encodeProvenanceHeaders({
         conversationId: target.conversation,
@@ -296,7 +346,9 @@ export class LogMemory implements Memory {
       this.topic,
       payload,
       headers,
-      target.conversation.toString()
+      target.conversation.toString(),
+      undefined,
+      { signal: options.signal }
     )
   }
 
@@ -340,6 +392,7 @@ export class LogMemory implements Memory {
           record,
           provenance,
           message.headers,
+          message.timestampMicros ?? 0n,
           topicIds === undefined
             ? undefined
             : {
@@ -358,6 +411,7 @@ export class LogMemory implements Memory {
     record: MemoryRecord,
     provenance: Provenance,
     headers: ReadonlyMap<string, HeaderValue>,
+    timestampMicros: bigint,
     source?: SourceRef
   ): void {
     if (record.kind === "forget") {
@@ -365,11 +419,14 @@ export class LogMemory implements Memory {
       const conversation = canonicalConversation(record.conversation)
       const existing = this.items.get(target)
       if (
-        conversation === "" ||
-        existing?.item.provenance.conversationId.toString() === conversation
+        existing !== undefined &&
+        existing.timestampMicros <= timestampMicros &&
+        (conversation === "" || existing.item.provenance.conversationId.toString() === conversation)
       )
         this.items.delete(target)
-      this.forgotten.add(scopedKey(target, conversation))
+      const key = scopedKey(target, conversation)
+      if ((this.forgotten.get(key) ?? -1n) < timestampMicros)
+        this.forgotten.set(key, timestampMicros)
       if (conversation === "") this.named.delete(record.target)
       return
     }
@@ -385,7 +442,11 @@ export class LogMemory implements Memory {
       return
     }
     const key = id.toString()
-    if (this.isForgotten(key, provenance.conversationId.toString()) || this.items.has(key)) return
+    if (
+      this.isForgotten(key, provenance.conversationId.toString(), timestampMicros) ||
+      this.items.has(key)
+    )
+      return
     const user = headerString(headers, MEMORY_USER)
     const app = headerString(headers, MEMORY_APP)
     const scope: MemoryScope = {
@@ -415,12 +476,16 @@ export class LogMemory implements Memory {
               }
             })
       },
-      scope
+      scope,
+      timestampMicros
     })
   }
 
-  private isForgotten(id: string, conversation: string): boolean {
-    return this.forgotten.has(scopedKey(id, "")) || this.forgotten.has(scopedKey(id, conversation))
+  // A write at or before a tombstone's time stays forgotten.
+  private isForgotten(id: string, conversation: string, timestampMicros: bigint): boolean {
+    return [scopedKey(id, ""), scopedKey(id, conversation)].some(
+      (key) => (this.forgotten.get(key) ?? -1n) >= timestampMicros
+    )
   }
 
   private feedbackFor(item: MemoryItem): number | undefined {
@@ -443,6 +508,16 @@ export class LogMemory implements Memory {
 
   private namedKey(key: string): string {
     return `${this.namespace}/${key}`
+  }
+
+  // A handle writes to one stream, so a scope naming another is refused
+  // rather than written where no recall of that stream reads.
+  private checkStream(scope: MemoryScope): void {
+    if (scope.stream !== undefined && scope.stream !== this.requireStream()) {
+      throw new InvalidError(
+        `memory scope names stream \`${scope.stream}\`, but this memory writes to \`${this.requireStream()}\``
+      )
+    }
   }
 
   private requireStream(): string {
@@ -512,6 +587,12 @@ function parseKind(word: string): MemoryKind {
 // oldest.
 type ArrivalKey = readonly [bigint, number, number, bigint, bigint]
 
+interface Selected {
+  readonly arrival: ArrivalKey
+  readonly item: MemoryItem
+  readonly weight: number | undefined
+}
+
 function arrivalKey(entry: KvEntry, id: MemoryId): ArrivalKey {
   const source = entry.scope?.source
   const timestamp = entry.scope?.timestampMicros ?? 0n
@@ -527,6 +608,11 @@ function compareArrival(left: ArrivalKey, right: ArrivalKey): number {
     if (a !== b) return a < b ? -1 : 1
   }
   return 0
+}
+
+function compareRank(left: Selected, right: Selected): number {
+  const weight = (left.weight ?? 0) - (right.weight ?? 0)
+  return weight === 0 ? compareArrival(left.arrival, right.arrival) : Math.sign(weight)
 }
 
 function itemFromEntry(

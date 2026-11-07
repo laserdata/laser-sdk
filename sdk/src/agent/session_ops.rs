@@ -4,12 +4,12 @@ use crate::context::{ContextMessage, ContextPolicy};
 use crate::error::LaserError;
 use crate::provenance::AgentTopic;
 use crate::types::MintUlid;
-use iggy::prelude::{Identifier, StreamClient, TopicClient};
+use iggy::prelude::{Identifier, TopicClient};
 use laser_wire::agent::{
     AgentErrorBody, ContextManifest, CorrelationId, Fragment, METADATA_DURATION_MICROS,
-    METADATA_PROVIDER_NAME, METADATA_REQUEST_MODEL, METADATA_RESPONSE_MODEL, OPERATION_CHAT,
-    OPERATION_STATE_DELTA, OPERATION_STATE_SNAPSHOT, SessionRef, StateDelta, StateSnapshot,
-    TokenUsage, apply_json_patch, estimate_tokens,
+    METADATA_PROVIDER_NAME, METADATA_RECORDED, METADATA_REQUEST_MODEL, METADATA_RESPONSE_MODEL,
+    OPERATION_CHAT, OPERATION_STATE_DELTA, OPERATION_STATE_SNAPSHOT, SessionRef, StateDelta,
+    StateSnapshot, TokenUsage, apply_json_patch, estimate_tokens,
 };
 use laser_wire::content::ContentType;
 use laser_wire::dispatch::{OPERATION_CONTEXT_ASSEMBLED, OPERATION_EXECUTE_TOOL};
@@ -17,8 +17,10 @@ use laser_wire::framing::{decode_named, encode_named};
 use laser_wire::graph::{ProducerInfo, SourceRef};
 use laser_wire::query::Value;
 use laser_wire::session::SessionStateView;
+use laser_wire::validate::Validate;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 // Keys whose values the default redaction drops from tool arguments and
 // model request bodies before they are published.
@@ -118,11 +120,11 @@ pub struct AssembledContext {
 }
 
 impl AssembledContext {
-    /// The fragments' payloads as UTF-8, one per line.
+    /// The fragments' bodies as UTF-8, one per line.
     pub fn text(&self) -> String {
         self.fragments
             .iter()
-            .map(|fragment| String::from_utf8_lossy(&fragment.payload).into_owned())
+            .map(|fragment| String::from_utf8_lossy(fragment.body()).into_owned())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -244,30 +246,9 @@ impl SessionState {
         &self,
         patch: Vec<laser_wire::agent::PatchOperation>,
     ) -> Result<AgdxReceipt, LaserError> {
-        self.seed().await?;
-        let (delta, due) = {
-            let mut cursor = self.session.state.lock().expect("session state lock");
-            let base = cursor.document.clone().unwrap_or(serde_json::json!({}));
-            let next = apply_json_patch(&base, &patch)
-                .map_err(|error| LaserError::Invalid(error.to_string()))?;
-            let delta = StateDelta {
-                base_revision: cursor.revision,
-                patch,
-                op_id: ulid::Ulid::generate().to_string(),
-            };
-            cursor.revision += 1;
-            cursor.document = Some(next);
-            cursor.since_snapshot += 1;
-            (delta, cursor.since_snapshot >= SNAPSHOT_EVERY_DELTAS)
-        };
-        let receipt = self
-            .session
-            .write_event(OPERATION_STATE_DELTA, encode_named(&delta)?, None)
-            .await?;
-        if due {
-            self.snapshot().await?;
-        }
-        Ok(receipt)
+        let mut cursor = self.session.state.lock().await;
+        self.seed(&mut cursor).await?;
+        self.write_delta(&mut cursor, patch).await
     }
 
     /// Replace the whole document with `document`, a JSON object, as one
@@ -279,18 +260,11 @@ impl SessionState {
                 "a state document is a JSON object".to_owned(),
             ));
         };
-        self.seed().await?;
-        let current = self
-            .session
-            .state
-            .lock()
-            .expect("session state lock")
-            .document
-            .clone()
-            .unwrap_or(serde_json::json!({}));
+        let mut cursor = self.session.state.lock().await;
+        self.seed(&mut cursor).await?;
         let pointer = |key: &str| format!("/{}", key.replace('~', "~0").replace('/', "~1"));
         let mut operations = Vec::new();
-        if let serde_json::Value::Object(current) = &current {
+        if let Some(serde_json::Value::Object(current)) = &cursor.document {
             for key in current.keys().filter(|key| !next.contains_key(*key)) {
                 operations.push(serde_json::json!({"op": "remove", "path": pointer(key)}));
             }
@@ -301,49 +275,85 @@ impl SessionState {
         }
         let patch = serde_json::from_value(serde_json::Value::Array(operations))
             .map_err(|error| LaserError::Invalid(format!("state patch: {error}")))?;
-        self.patch(patch).await
+        self.write_delta(&mut cursor, patch).await
     }
 
     /// Write the whole document this handle holds as a snapshot.
     pub async fn snapshot(&self) -> Result<AgdxReceipt, LaserError> {
-        self.seed().await?;
-        let snapshot = {
-            let cursor = self.session.state.lock().expect("session state lock");
-            StateSnapshot {
-                base_revision: cursor.revision,
-                document: cursor.document.clone().unwrap_or(serde_json::json!({})),
+        let mut cursor = self.session.state.lock().await;
+        self.seed(&mut cursor).await?;
+        self.write_snapshot(&mut cursor).await
+    }
+
+    // Every write holds the cursor lock across its publish, so the writes of
+    // one handle and its clones land in revision order. A failed publish
+    // leaves the lane revision unknown, so the next write reseeds from the
+    // folded lane instead of naming a revision nothing was written at.
+    async fn write_delta(
+        &self,
+        cursor: &mut StateCursor,
+        patch: Vec<laser_wire::agent::PatchOperation>,
+    ) -> Result<AgdxReceipt, LaserError> {
+        let base = cursor
+            .document
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let next = apply_json_patch(&base, &patch)
+            .map_err(|error| LaserError::Invalid(error.to_string()))?;
+        let delta = StateDelta {
+            base_revision: cursor.revision,
+            patch,
+            op_id: ulid::Ulid::generate().to_string(),
+        };
+        let receipt = match self
+            .session
+            .write_event(OPERATION_STATE_DELTA, encode_named(&delta)?, None)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                cursor.document = None;
+                return Err(error);
             }
+        };
+        cursor.revision += 1;
+        cursor.document = Some(next);
+        cursor.since_snapshot += 1;
+        if cursor.since_snapshot >= SNAPSHOT_EVERY_DELTAS
+            && let Err(error) = self.write_snapshot(cursor).await
+        {
+            let session = self.session.conversation();
+            warn!(%session, %error, "Writing the automatic state snapshot of session {session} failed, the next write retries it");
+        }
+        Ok(receipt)
+    }
+
+    async fn write_snapshot(&self, cursor: &mut StateCursor) -> Result<AgdxReceipt, LaserError> {
+        let snapshot = StateSnapshot {
+            base_revision: cursor.revision,
+            document: cursor
+                .document
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({})),
         };
         let receipt = self
             .session
             .write_event(OPERATION_STATE_SNAPSHOT, encode_named(&snapshot)?, None)
             .await?;
-        let mut cursor = self.session.state.lock().expect("session state lock");
-        if cursor.revision == snapshot.base_revision {
-            cursor.since_snapshot = 0;
-        }
+        cursor.since_snapshot = 0;
         Ok(receipt)
     }
 
-    // A handle that has not written yet starts from the folded lane, so its
-    // first delta names the revision the lane is at.
-    async fn seed(&self) -> Result<(), LaserError> {
-        if self
-            .session
-            .state
-            .lock()
-            .expect("session state lock")
-            .document
-            .is_some()
-        {
+    // A handle that has not written yet, or whose last write failed, starts
+    // from the folded lane, so its next delta names the revision the lane is
+    // at.
+    async fn seed(&self, cursor: &mut StateCursor) -> Result<(), LaserError> {
+        if cursor.document.is_some() {
             return Ok(());
         }
         let view = self.current_view().await?;
-        let mut cursor = self.session.state.lock().expect("session state lock");
-        if cursor.document.is_none() {
-            cursor.revision = view.revision;
-            cursor.document = Some(view.document);
-        }
+        cursor.revision = view.revision;
+        cursor.document = Some(view.document);
         Ok(())
     }
 
@@ -370,31 +380,20 @@ impl SessionState {
     }
 
     pub(crate) async fn snapshot_if_changed(&self) -> Result<(), LaserError> {
-        let changed = self
-            .session
-            .state
-            .lock()
-            .expect("session state lock")
-            .since_snapshot
-            > 0;
-        if changed {
-            self.snapshot().await?;
+        let mut cursor = self.session.state.lock().await;
+        if cursor.since_snapshot > 0 {
+            self.seed(&mut cursor).await?;
+            self.write_snapshot(&mut cursor).await?;
         }
         Ok(())
     }
 
-    /// Fold the state from the retained session lane: the newest snapshot
-    /// plus the deltas after it. `complete` is false when the lane no longer
-    /// holds the records the document starts from.
+    /// Fold the state from the whole retained session lane: the newest
+    /// snapshot plus the deltas after it. `complete` is false when retention
+    /// removed the records the document starts from. A state record that
+    /// does not decode is skipped, as the session index skips it.
     pub async fn get(&self) -> Result<SessionStateView, LaserError> {
-        let records = self
-            .session
-            .scope()
-            .fetch_with(
-                vec![AgentTopic::Sessions],
-                Box::new(crate::context::LastN(usize::MAX)),
-            )
-            .await?;
+        let records = self.session.lane_records().await?;
         let mut document = serde_json::json!({});
         let mut revision = 0u64;
         let mut complete = false;
@@ -404,7 +403,12 @@ impl SessionState {
             };
             match envelope.operation.as_deref() {
                 Some(OPERATION_STATE_SNAPSHOT) => {
-                    let snapshot: StateSnapshot = decode_named(&envelope.body)?;
+                    let Ok(snapshot) = decode_named::<StateSnapshot>(&envelope.body) else {
+                        continue;
+                    };
+                    if snapshot.validate().is_err() {
+                        continue;
+                    }
                     // The first snapshot is the baseline. A later one counts
                     // only at the revision the fold has reached, so a stale
                     // snapshot from a second writer changes nothing.
@@ -416,7 +420,9 @@ impl SessionState {
                     complete = true;
                 }
                 Some(OPERATION_STATE_DELTA) => {
-                    let delta: StateDelta = decode_named(&envelope.body)?;
+                    let Ok(delta) = decode_named::<StateDelta>(&envelope.body) else {
+                        continue;
+                    };
                     if delta.base_revision == 0 && revision == 0 {
                         complete = true;
                     }
@@ -472,23 +478,12 @@ impl Session {
     }
 
     /// Whether an operator asked to cancel this session on `agent.control`,
-    /// by a cancel request or a forced cancel. Reads the retained control
-    /// records of this session, so it answers on open Apache Iggy too.
+    /// by a cancel request or a forced cancel addressed to this handle's
+    /// agent or to every agent, on the session's control route: the
+    /// `cancel_requested` flag of [`pending_control`](Self::pending_control).
+    /// It answers on open Apache Iggy too.
     pub async fn cancel_requested(&self) -> Result<bool, LaserError> {
-        let records = self
-            .scope()
-            .fetch_with(
-                vec![AgentTopic::Control],
-                Box::new(crate::context::LastN(usize::MAX)),
-            )
-            .await?;
-        Ok(records.iter().any(|record| {
-            record.envelope.as_ref().is_some_and(|envelope| {
-                envelope.operation.as_deref()
-                    == Some(laser_wire::dispatch::OPERATION_SESSION_CANCEL)
-                    || envelope.task_state == Some(laser_wire::agent::TaskState::Canceled)
-            })
-        }))
+        Ok(self.control_state().await?.flags.cancel_requested)
     }
 
     /// The pause and cancel requests operators sent this session on
@@ -515,13 +510,7 @@ impl Session {
             return Ok(state);
         }
         let me = self.agent.clone();
-        let mut records = self
-            .scope()
-            .fetch_with(
-                vec![AgentTopic::Control],
-                Box::new(crate::context::LastN(usize::MAX)),
-            )
-            .await?;
+        let mut records = self.control_records().await?;
         records.sort_by_key(|record| {
             (
                 record.timestamp_micros,
@@ -564,8 +553,12 @@ impl Session {
         }
     }
 
-    /// Assemble the model context under `policy` from the session lane and
-    /// describe it in a manifest. Nothing is written.
+    /// Assemble the model context under `policy` from the conversation
+    /// records of the session and describe it in a manifest. `policy` selects
+    /// from the user, agent, tool, and model response records only: lifecycle,
+    /// state, context bookkeeping, and the model requests the session
+    /// recorded never reach a prompt. Nothing is written, and a selection over
+    /// the manifest's fragment cap is refused before any write.
     pub async fn assemble(
         &self,
         policy: Box<dyn ContextPolicy>,
@@ -573,30 +566,29 @@ impl Session {
         let name = policy.name();
         let version = policy.version();
         let fragments = self
-            .scope()
-            .fetch_with(vec![AgentTopic::Sessions], policy)
+            .lane_context(Box::new(crate::agent::session::ConversationRecords(policy)))
             .await?;
-        let (stream_id, topic_id, generation) = self.lane_identity().await?;
+        let generations = self.topic_generations(&fragments).await?;
         let mut tokens = 0u64;
         let mut bytes = 0u64;
         let mut frontier: BTreeMap<(u32, u32), u64> = BTreeMap::new();
         let manifest_fragments = fragments
             .iter()
             .map(|message| {
-                let size = message.payload.len();
+                let size = message.body().len();
                 tokens += estimate_tokens(size);
                 bytes += size as u64;
                 let position = frontier
-                    .entry((topic_id, message.id.partition_id))
+                    .entry((message.topic_id, message.id.partition_id))
                     .or_insert(message.id.offset);
                 *position = (*position).max(message.id.offset);
                 Fragment::Message {
                     at: SourceRef::Message {
-                        stream: stream_id,
-                        topic: topic_id,
+                        stream: message.stream_id,
+                        topic: message.topic_id,
                         partition: message.id.partition_id,
                         offset: message.id.offset,
-                        generation: Some(generation),
+                        generation: generations.get(&message.topic).copied(),
                         conversation: Some(self.conversation().to_string()),
                     },
                     tokens: u32::try_from(estimate_tokens(size)).unwrap_or(u32::MAX),
@@ -604,26 +596,29 @@ impl Session {
                 }
             })
             .collect();
+        let manifest = ContextManifest {
+            policy: name,
+            policy_version: version,
+            fragments: manifest_fragments,
+            tokens,
+            bytes,
+            frontier: frontier
+                .into_iter()
+                .map(|((topic, partition), offset)| (topic, partition, offset))
+                .collect(),
+            correlation: None,
+        };
+        manifest.validate()?;
         Ok(AssembledContext {
             fragments,
-            manifest: ContextManifest {
-                policy: name,
-                policy_version: version,
-                fragments: manifest_fragments,
-                tokens,
-                bytes,
-                frontier: frontier
-                    .into_iter()
-                    .map(|((topic, partition), offset)| (topic, partition, offset))
-                    .collect(),
-                correlation: None,
-            },
+            manifest,
         })
     }
 
     /// Record a model request addressed to this agent, and the context it
     /// received when `assembled` is given. Finish the returned call when the
-    /// application's provider answers.
+    /// application's provider answers. The request is marked recorded, so the
+    /// agent's own runtime never takes it as new work.
     pub async fn model(
         &self,
         request: ModelRequest,
@@ -640,7 +635,9 @@ impl Session {
         })
     }
 
-    /// Record a tool call addressed to this agent, with `args` redacted.
+    /// Record a tool call addressed to this agent, with `args` redacted. The
+    /// call is marked recorded, so the agent's own runtime never takes it as
+    /// new work.
     pub async fn tool(
         &self,
         name: impl Into<String>,
@@ -657,6 +654,7 @@ impl Session {
             .with_operation(OPERATION_EXECUTE_TOOL)
             .with_tool(tool.clone())
             .with_target(agent)
+            .with_metadata(METADATA_RECORDED, Value::Bool(true))
             .content_type(ContentType::Json)
             .send()
             .await?;
@@ -708,7 +706,7 @@ impl Session {
     pub fn linked_graph(
         &self,
         name: impl Into<String>,
-    ) -> Result<crate::graph::GraphHandle<'_>, LaserError> {
+    ) -> Result<crate::graph::GraphHandle, LaserError> {
         let mut graph = self
             .laser
             .graph(name)
@@ -779,19 +777,28 @@ impl Session {
             .ok_or_else(|| LaserError::Invalid("this session handle has no agent".to_owned()))
     }
 
-    async fn lane_identity(&self) -> Result<(u32, u32, u64), LaserError> {
+    // The creation time of each topic the fragments were read from, the
+    // generation a fragment's source reference proves its numeric ids with.
+    async fn topic_generations(
+        &self,
+        fragments: &[ContextMessage],
+    ) -> Result<BTreeMap<String, u64>, LaserError> {
         let stream = Identifier::named(self.stream()?)?;
         let client = self.laser.client();
-        let stream_id = client
-            .get_stream(&stream)
-            .await?
-            .ok_or_else(|| LaserError::Invalid("the session stream does not exist".to_owned()))?
-            .id;
-        let topic = client
-            .get_topic(&stream, &AgentTopic::Sessions.as_identifier())
-            .await?
-            .ok_or_else(|| LaserError::Invalid("agent.sessions does not exist".to_owned()))?;
-        Ok((stream_id, topic.id, topic.created_at.as_micros()))
+        let mut generations = BTreeMap::new();
+        for message in fragments {
+            if generations.contains_key(&message.topic) {
+                continue;
+            }
+            let topic = client
+                .get_topic(&stream, &Identifier::named(&message.topic)?)
+                .await?
+                .ok_or_else(|| {
+                    LaserError::Invalid(format!("the topic `{}` does not exist", message.topic))
+                })?;
+            generations.insert(message.topic.clone(), topic.created_at.as_micros());
+        }
+        Ok(generations)
     }
 
     async fn write_model_request(
@@ -812,6 +819,7 @@ impl Session {
             .command(correlation, body)
             .with_operation(request.operation.clone())
             .with_target(agent)
+            .with_metadata(METADATA_RECORDED, Value::Bool(true))
             .with_metadata(METADATA_REQUEST_MODEL, Value::Str(request.model.clone()));
         if let Some(provider) = &request.provider {
             send = send.with_metadata(METADATA_PROVIDER_NAME, Value::Str(provider.clone()));
@@ -939,6 +947,9 @@ pub struct SubmitBuilder {
     namespace: Option<String>,
     budget: Option<laser_wire::agent::Budget>,
     tags: Vec<String>,
+    // The id of an unlabeled submission, minted once so `id` names the
+    // session `send` writes.
+    fresh: crate::types::ConversationId,
 }
 
 /// What a submission wrote: the session and the command's correlation.
@@ -986,20 +997,30 @@ impl SubmitBuilder {
         self
     }
 
-    /// Write the submitted status and the command.
-    pub async fn send(self) -> Result<Submitted, LaserError> {
-        let submitter = self.submitter.ok_or_else(|| {
-            LaserError::Invalid("a submission needs `.from(submitter)`".to_owned())
-        })?;
-        let stream = self.sessions.stream()?.to_owned();
-        let session = match &self.label {
+    /// The id of the session [`send`](Self::send) writes: the label's
+    /// derived id, or one fresh id minted for this submission.
+    pub fn id(&self) -> Result<crate::types::ConversationId, LaserError> {
+        Ok(match &self.label {
             Some(label) => crate::agent::derive_session_id(
-                &stream,
+                self.sessions.stream()?,
                 self.namespace.as_deref().unwrap_or_default(),
                 label,
             ),
-            None => crate::types::ConversationId::new(),
-        };
+            None => self.fresh,
+        })
+    }
+
+    /// Write the submitted status and the command. A labeled session that
+    /// ended completed or failed resumes, and one an agent or an operator
+    /// canceled is refused with [`LaserError::SessionEnded`]. When the
+    /// command cannot be published after the status was written, the session
+    /// is ended failed, so it never stays submitted with no work, and the
+    /// publish error is returned.
+    pub async fn send(self) -> Result<Submitted, LaserError> {
+        let session = self.id()?;
+        let submitter = self.submitter.ok_or_else(|| {
+            LaserError::Invalid("a submission needs `.from(submitter)`".to_owned())
+        })?;
         let start = laser_wire::agent::SessionStart {
             label: self.label,
             namespace: self.namespace,
@@ -1014,8 +1035,21 @@ impl SubmitBuilder {
             budget: self.budget,
             tags: self.tags,
         };
-        laser_wire::validate::Validate::validate(&start)?;
+        start.validate()?;
+        if self.sessions.config().idle_timeout_value().is_zero() {
+            return Err(LaserError::Invalid(
+                "a session idle timeout must be positive".to_owned(),
+            ));
+        }
         let handle = self.sessions.open(session).as_agent(submitter);
+        if start.label.is_some()
+            && handle.ended_as().await? == Some(laser_wire::agent::SessionStatus::Canceled)
+        {
+            return Err(LaserError::SessionEnded {
+                session: session.to_string(),
+                status: "canceled".to_owned(),
+            });
+        }
         let lane = handle.lane()?;
         lane.status(laser_wire::agent::OPERATION_SESSION)
             .with_task_state(laser_wire::agent::TaskState::Submitted)
@@ -1024,12 +1058,25 @@ impl SubmitBuilder {
             .send()
             .await?;
         let correlation = CorrelationId::mint();
-        lane.command(correlation, self.input)
+        let sent = lane
+            .command(correlation, self.input)
             .with_operation(self.operation)
             .with_target(self.agent)
             .with_metadata(laser_wire::agent::METADATA_SUBMITTED, Value::Bool(true))
             .send()
-            .await?;
+            .await;
+        if let Err(error) = sent {
+            let failure = AgentErrorBody {
+                code: laser_wire::agent::AgentErrorCode::Internal,
+                message: Some(format!("the submitted command was not published: {error}")),
+                retryable: true,
+                detail: None,
+            };
+            if let Err(ended) = handle.fail(failure).await {
+                warn!(%session, %ended, "Ending submitted session {session} after its command failed to publish also failed");
+            }
+            return Err(error);
+        }
         Ok(Submitted {
             session,
             correlation,
@@ -1175,6 +1222,7 @@ impl crate::agent::Sessions {
             namespace: None,
             budget: None,
             tags: Vec::new(),
+            fresh: crate::types::ConversationId::new(),
         }
     }
 

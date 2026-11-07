@@ -1,4 +1,9 @@
-import { MANAGED_MUTATION, MANAGED_MUTATION_DEADLINE_MS, jittered } from "../retry.js"
+import {
+  MANAGED_ATTEMPT_FIRST_MS,
+  MANAGED_MUTATION,
+  MANAGED_MUTATION_DEADLINE_MS,
+  jittered
+} from "../retry.js"
 import { JOIN_GROUP } from "apache-iggy/dist/wire/consumer-group/join-group.command.js"
 import { SYNC_GROUP } from "apache-iggy/dist/wire/consumer-group/sync-group.command.js"
 import { GET_STREAM } from "apache-iggy/dist/wire/stream/get-stream.command.js"
@@ -7,6 +12,7 @@ import {
   FETCH_MESSAGES,
   fetchSectionError
 } from "apache-iggy/dist/wire/message/fetch-messages.command.js"
+import { type CallOptions, delay, throwIfAborted } from "../client/call-options.js"
 import { connectOptions } from "../client/connect-options.js"
 import {
   publishOptions,
@@ -66,10 +72,12 @@ import {
   AGDX_AUTHZ_BIND_ROLES_CODE,
   AGDX_AUTHZ_DEFINE_ROLE_CODE,
   AGDX_AUTHZ_DELETE_ROLE_CODE,
+  AGDX_BATCH_CODE,
   AGDX_COMMAND_BASE,
   isBarrierRead,
   isIdempotentManagedRequest
 } from "../wire/codes.js"
+import { type BatchReply, decodeBatchReply } from "../wire/batch.js"
 import {
   type AppliedFrontier,
   MANAGED_REQUEST_VERSION,
@@ -101,6 +109,10 @@ export interface PolledMessage {
   readonly currentOffset?: bigint
   /** The user-header block exactly as stored, absent when the record has none. */
   readonly userHeaders?: Uint8Array
+  /** The partition incarnation and owner the record was read under, which a
+   * store of its offset is fenced to. Not enumerable, so a copy of the record
+   * leaves it behind. */
+  readonly context?: PartitionContext
 }
 
 /** The part of a user-header block that did not decode. */
@@ -108,7 +120,7 @@ export type HeaderFault = "structure" | "content_type" | "entry"
 
 export type IggyClient = SimpleClient
 export type ClientOwnership = "owned" | "borrowed"
-export type { SendMessagesConfirmation, SendMessagesResponse }
+export type { PartitionContext, SendMessagesConfirmation, SendMessagesResponse }
 
 /** Settings applied only when a topic is created. `maxTopicSize` is in bytes,
  * `UNLIMITED_TOPIC_SIZE` lifts the limit, and leaving it out keeps the server
@@ -143,8 +155,12 @@ const PUBLISH_BATCH_LENGTH = 1_000
 const NUMERIC_IDENTIFIER = 1
 const STRING_IDENTIFIER = 2
 // Server replies a later attempt can clear: a write the cluster did not
-// commit or admit, and a partition the node could not read or find yet.
-const TRANSIENT_SERVER_CODES: ReadonlySet<number> = new Set([57, 58, 3004, 3007, 10002])
+// commit or admit, and a partition the node could not read yet.
+const TRANSIENT_SERVER_CODES: ReadonlySet<number> = new Set([57, 58, 3004, 10002])
+const PARTITION_NOT_FOUND = 3007
+// A topic's cached partition count is read again once this old, so keyed and
+// balanced publishes reach partitions added since.
+const PARTITION_COUNT_MAX_AGE_MS = 5_000
 const DEFAULT_RECONNECT_INTERVAL_MS = 1_000
 // Apache Iggy's spelling of `reconnection_retries=unlimited`, u32::MAX.
 const UNLIMITED_RECONNECT_RETRIES = 4_294_967_295
@@ -207,7 +223,6 @@ const NOT_PRIMARY = 89
 const GET_PARTITION_ROUTE_CODE = 105
 // incarnation u64, metadata_op u64, view u32, partitions_count u32, primary_replica u8
 const PARTITION_ROUTE_BYTES = 25
-const PINNED_QUERIES = 1024
 const U64_MASK = (1n << 64n) - 1n
 
 interface GroupCursor {
@@ -221,6 +236,11 @@ interface GroupCursor {
 interface GroupPollState {
   readonly cursors: Map<string, GroupCursor>
   sessionGeneration: number
+}
+// A topic's partition count and when it was read.
+interface PartitionCount {
+  readonly count: number
+  readonly readAt: number
 }
 const GROUP_POLL_STATES = new WeakMap<RawClient, GroupPollState>()
 
@@ -267,11 +287,15 @@ export type ManagedTarget =
 
 /** A managed reply and the replica that sent it, absent when the metadata primary answered. */
 export interface ManagedAnswer {
+  /** The reply, opened from the positioned envelope a managed node may wrap it in. */
   readonly reply: Uint8Array
+  /** The applied frontier the positioned envelope carried. */
+  readonly frontier?: AppliedFrontier
   readonly replica?: number
 }
 
 export interface ManagedSendOptions {
+  readonly operationId?: bigint
   readonly retryAfterReconnect?: boolean
   /** The node the request goes to, when not the one its code picks. */
   readonly target?: ManagedTarget
@@ -281,6 +305,15 @@ export interface ManagedSendOptions {
   /** Overrides the mutation deadline, for tests.
    * @internal */
   readonly mutationDeadlineMs?: number
+  /** Marked once an attempt wrote the frame, so a later attempt's failure
+   * cannot hide that its outcome is unknown.
+   * @internal */
+  readonly written?: FrameWritten
+}
+
+/** Whether any attempt of one managed send wrote its frame to a connection. */
+export interface FrameWritten {
+  written: boolean
 }
 
 /** A consumer offset stored under the partition owner a filtered page was read under. */
@@ -317,6 +350,8 @@ export interface LaserTransport {
   storePosition?(position: FencedPosition): Promise<void>
   /** The highest mutation position seen per managed surface. */
   seenPositions?(): AppliedFrontier
+  /** Raises the seen positions to a frontier another connection observed. */
+  observePositions?(frontier: AppliedFrontier): void
   ensureStream(name: string): Promise<void>
   deleteStream(name: string): Promise<boolean>
   ensureTopic(
@@ -365,7 +400,8 @@ export interface LaserTransport {
     streamId: string,
     topicId: string,
     payloads: readonly Uint8Array[],
-    routing: Routing
+    routing: Routing,
+    options?: CallOptions
   ): Promise<SendMessagesResponse>
   /** Sends one message with exact headers and optional key or partition routing. */
   sendMessageWithHeaders(
@@ -374,27 +410,30 @@ export interface LaserTransport {
     payload: Uint8Array,
     headers: ReadonlyMap<string, HeaderValue>,
     partitionKey?: string | Uint8Array,
-    partitionId?: number
+    partitionId?: number,
+    options?: CallOptions
   ): Promise<SendMessagesResponse>
   /** Sends the records in requests of at most `batchLength` (1000 unless
    * set). A failure throws `PublishFailedError` with the confirmed requests
-   * and the records from the failed request on. */
+   * and the records from the failed request on. An aborted `signal` starts
+   * no new attempt and no retry wait. */
   sendMessagesWithHeaders(
     streamId: string,
     topicId: string,
     messages: readonly MessageWithHeaders[],
     partitionKey?: string | Uint8Array,
     partitionId?: number,
-    options?: Partial<PublishOptions> & {
-      readonly batchLength?: number
-      /** Background mode: resend at once, then every this many milliseconds, any failure but a lost confirmation. */
-      readonly fixedRetryIntervalMs?: number
-      readonly beforeSend?: () => Promise<{
-        readonly streamId: number
-        readonly topicId: number
-        readonly partitions: number
-      }>
-    }
+    options?: Partial<PublishOptions> &
+      CallOptions & {
+        readonly batchLength?: number
+        /** Background mode: resend at once, then every this many milliseconds, any failure but a lost confirmation. */
+        readonly fixedRetryIntervalMs?: number
+        readonly beforeSend?: () => Promise<{
+          readonly streamId: number
+          readonly topicId: number
+          readonly partitions: number
+        }>
+      }
   ): Promise<SendMessagesResponse>
   /**
    * One poll, held on the server as `wait` says. A one-shot read when absent.
@@ -434,12 +473,16 @@ export interface LaserTransport {
     signal?: AbortSignal,
     reader?: string
   ): Promise<readonly HeldPartition[]>
+  /** Stores a consumer offset. With the `context` a record was read under,
+   * the store is refused once the partition was recreated (87) or moved to
+   * another group member (5009), instead of landing on the newer history. */
   storeOffset(
     streamId: string,
     topicId: string,
     target: ConsumerTarget,
     partitionId: number,
-    offset: bigint
+    offset: bigint,
+    context?: PartitionContext
   ): Promise<void>
   getConsumerOffset?(
     streamId: string,
@@ -760,7 +803,7 @@ export function decodePolledHead(body: Uint8Array): PolledHead {
 export function decodePolledBody(body: Uint8Array): readonly PolledMessage[] {
   const malformed = (what: string): ProtocolError =>
     new ProtocolError(`the polled record body has a malformed ${what}`)
-  const { partitionId, currentOffset } = decodePolledHead(body)
+  const { partitionId, currentOffset, context } = decodePolledHead(body)
   const view = new DataView(body.buffer, body.byteOffset, body.byteLength)
   const messages: PolledMessage[] = []
   let position = POLLED_HEAD_BYTES
@@ -789,7 +832,7 @@ export function decodePolledBody(body: Uint8Array): readonly PolledMessage[] {
       const block = body.subarray(headersStart, frameEnd)
       const headers = decodeUserHeaders(block)
       const contentType = headers === "entry" ? decodeUserHeaders(block, true) : headers
-      messages.push({
+      const message: PolledMessage = {
         payload: body.subarray(payloadStart, headersStart),
         partitionId,
         offset: baseOffset + BigInt(offsetDelta),
@@ -806,7 +849,8 @@ export function decodePolledBody(body: Uint8Array): readonly PolledMessage[] {
               headersMalformed: typeof contentType === "string" ? contentType : headers
             }
           : { headers })
-      })
+      }
+      messages.push(Object.defineProperty(message, "context", { value: context }))
       position = frameEnd
     }
   }
@@ -992,25 +1036,37 @@ function stripScheme(value: string): string {
   return value
 }
 
-// `user:password` or a personal access token, both non-empty and verbatim.
-// Apache Iggy splits them on `:` and `@` without percent-decoding.
+// `user:password` or a personal access token, both non-empty and
+// percent-decoded, so a secret carries `:`, `@`, `?` and `%` as `%3A`, `%40`,
+// `%3F` and `%25`. A raw `@` or a second raw `:` would split them again.
 function parseCredentials(userinfo: string): ClientCredentials {
   if (userinfo.includes("@")) {
-    throw new ConfigError("connection string credentials cannot contain `@`")
+    throw new ConfigError("connection string credentials cannot contain a raw `@`, write it as %40")
   }
   const parts = userinfo.split(":")
   if (parts.length > 2) {
-    throw new ConfigError("connection string credentials cannot contain more than one `:`")
+    throw new ConfigError(
+      "connection string credentials cannot contain more than one raw `:`, write it as %3A"
+    )
   }
   const [first = "", password] = parts
   if (password === undefined) {
     if (first.length === 0) throw new ConfigError("connection string has an empty access token")
-    return { token: first }
+    return { token: decodeCredential(first) }
   }
   if (first.length === 0 || password.length === 0) {
     throw new ConfigError("connection string has an empty username or password")
   }
-  return { username: first, password }
+  return { username: decodeCredential(first), password: decodeCredential(password) }
+}
+
+// The error never echoes the credential.
+function decodeCredential(encoded: string): string {
+  try {
+    return decodeURIComponent(encoded)
+  } catch {
+    throw new ConfigError("connection string credentials have a malformed percent escape")
+  }
 }
 
 // `host` or `host:port`. A missing port becomes 8090. IPv6 literals are refused
@@ -1062,9 +1118,9 @@ function parseOptions(query: string): ReadonlyMap<string, string> {
 
 /**
  * Parses a connection string with the Rust grammar: an optional `iggy://` or
- * `iggy+tcp://` scheme, required verbatim credentials, `host[:port]`, and only
- * Apache Iggy's TCP options. The string carries a password, so errors never
- * echo it.
+ * `iggy+tcp://` scheme, required percent-decoded credentials, `host[:port]`,
+ * and only Apache Iggy's TCP options. The string carries a password, so errors
+ * never echo it.
  */
 export function parseConnectionString(
   connectionString: string,
@@ -1396,7 +1452,6 @@ export class Nodes {
   // Failed links so far, each one moves the caller to the next node.
   private moved = 0n
   // The node each recent query ran on, newest last.
-  private readonly queries: { readonly executionId: bigint; readonly replica: number }[] = []
 
   constructor(private readonly callerKey: bigint = callerKeyOf()) {}
 
@@ -1411,37 +1466,34 @@ export class Nodes {
     code: number,
     payload: Uint8Array,
     target: ManagedTarget,
-    deadline?: number
+    deadline?: number,
+    written: FrameWritten = { written: false }
   ): Promise<ManagedAnswer> {
     const buffer = toNodeBuffer(payload)
     switch (target.kind) {
       case "metadata_primary":
-        return {
-          reply: fromNodeBuffer(
-            await run(
-              (client) =>
-                deadline === undefined
-                  ? client.sendBinaryRequest(code, buffer)
-                  : sendWithin(client, code, buffer, { deadline }),
-              `managed command ${String(code)} failed`
-            )
+        return openAnswer(
+          await run(
+            (client) =>
+              deadline === undefined
+                ? client.sendBinaryRequest(code, buffer)
+                : sendWithin(client, code, buffer, { deadline }),
+            `managed command ${String(code)} failed`
           )
-        }
+        )
       case "replica":
-        return {
-          reply: fromNodeBuffer(
-            await run(
-              (client) =>
-                deadline === undefined
-                  ? client.sendBinaryRequestToReplica(code, buffer, target.replica)
-                  : sendWithin(client, code, buffer, { deadline, replica: target.replica }),
-              `managed command ${String(code)} to replica ${String(target.replica)} failed`
-            )
+        return openAnswer(
+          await run(
+            (client) =>
+              deadline === undefined
+                ? client.sendBinaryRequestToReplica(code, buffer, target.replica)
+                : sendWithin(client, code, buffer, { deadline, replica: target.replica }),
+            `managed command ${String(code)} to replica ${String(target.replica)} failed`
           ),
-          replica: target.replica
-        }
+          target.replica
+        )
       case "caller":
-        return this.sendToCaller(run, code, buffer, deadline)
+        return this.sendToCaller(run, code, buffer, deadline, written)
     }
   }
 
@@ -1475,26 +1527,12 @@ export class Nodes {
     this.roster = []
   }
 
-  /** Remembers the node a query ran on, so its pages, status and cancellation
-   * reach the plane that holds its state. */
-  pinQuery(executionId: bigint, replica: number): void {
-    const index = this.queries.findIndex((pinned) => pinned.executionId === executionId)
-    if (index >= 0) this.queries.splice(index, 1)
-    if (this.queries.length === PINNED_QUERIES) this.queries.shift()
-    this.queries.push({ executionId, replica })
-  }
-
-  /** The node of a pinned query, or the caller's node. */
-  queryTarget(executionId: bigint): ManagedTarget {
-    const pinned = this.queries.find((query) => query.executionId === executionId)
-    return pinned === undefined ? { kind: "caller" } : { kind: "replica", replica: pinned.replica }
-  }
-
   private async sendToCaller(
     run: Runner,
     code: number,
     buffer: Buffer,
-    deadline: number | undefined
+    deadline: number | undefined,
+    written: FrameWritten
   ): Promise<ManagedAnswer> {
     let rosterRead = false
     let failedLinks = 0
@@ -1508,13 +1546,16 @@ export class Nodes {
               : sendWithin(client, code, buffer, { deadline, replica }),
           `managed command ${String(code)} to replica ${String(replica)} failed`
         )
-        if (backendUnavailable(reply)) {
+        written.written = true
+        const answer = openAnswer(reply, replica)
+        if (backendUnavailable(answer.reply)) {
           this.failed(replica)
           failedLinks += 1
-          if (failedLinks < nodes) continue
+          if (walksOn(failedLinks, nodes, deadline)) continue
         }
-        return { reply: fromNodeBuffer(reply), replica }
+        return answer
       } catch (error) {
+        if (frameWritten(error)) written.written = true
         if (serverErrorCode(error) === INVALID_IDENTIFIER && !rosterRead) {
           rosterRead = true
           this.forgetRoster()
@@ -1523,7 +1564,7 @@ export class Nodes {
         if (!isTransientFailure(error)) throw error
         this.failed(replica)
         failedLinks += 1
-        if (failedLinks >= nodes) throw error
+        if (!walksOn(failedLinks, nodes, deadline)) throw error
       }
     }
   }
@@ -1532,6 +1573,13 @@ export class Nodes {
     const replica = pickNode(this.roster, this.callerKey, this.moved)
     return replica === undefined ? undefined : { replica, nodes: this.roster.length }
   }
+}
+
+// Whether a caller request whose link failed on `failedLinks` nodes moves to
+// the next one. An expired attempt deadline ends the walk, so the next attempt
+// starts on the next node with a fresh deadline, as Rust `walks_on`.
+function walksOn(failedLinks: number, nodes: number, deadline: number | undefined): boolean {
+  return failedLinks < nodes && (deadline === undefined || Date.now() < deadline)
 }
 
 // A raw command bounded by the caller's deadline instead of the client's
@@ -1548,7 +1596,12 @@ async function sendWithin(
   return response.length <= 1 ? Buffer.alloc(0) : response.data
 }
 
-function backendUnavailable(reply: Uint8Array): boolean {
+/**
+ * Whether an opened reply refuses as `BackendUnavailable`, as Rust
+ * `reply_error`. A recovering node's positioned refusal is opened first.
+ * @internal
+ */
+export function backendUnavailable(reply: Uint8Array): boolean {
   try {
     const value: unknown = decodeOne(reply, "CommandError")
     return (
@@ -1558,6 +1611,17 @@ function backendUnavailable(reply: Uint8Array): boolean {
     )
   } catch {
     return false
+  }
+}
+
+// A node's reply with its positioned envelope opened once, the frontier kept
+// beside the reply.
+function openAnswer(reply: Buffer, replica?: number): ManagedAnswer {
+  const opened = openPositioned(fromNodeBuffer(reply))
+  return {
+    reply: opened.reply,
+    ...(opened.frontier !== undefined ? { frontier: opened.frontier } : {}),
+    ...(replica !== undefined ? { replica } : {})
   }
 }
 
@@ -1631,6 +1695,123 @@ export function pendingReplyMessage(reply: Uint8Array): string | undefined {
   return typeof message === "string" ? message : code
 }
 
+/** What one attempt of a managed mutation came back with. @internal */
+export type MutationAttempt =
+  | { readonly kind: "answered"; readonly reply: Uint8Array }
+  | { readonly kind: "lost"; readonly message: string }
+  | { readonly kind: "refused"; readonly cause: unknown }
+
+/**
+ * What the attempts of one managed mutation know about its outcome, as Rust
+ * `MutationAttempts`. An attempt whose outcome is unknown makes every later
+ * refusal ambiguous too, because the earlier attempt may still apply.
+ * @internal
+ */
+export class MutationAttempts {
+  uncertain: string | undefined
+  // The unresolved items of a batch frame, by slot, empty for one mutation.
+  private readonly slots: (string | undefined)[] = []
+
+  /** `batch` when the request is the mixed-operation batch, which settles
+   * item by item. */
+  constructor(private readonly batch = false) {}
+
+  /** The reply that settles the mutation, `undefined` to send it again. Throws
+   * the error the caller gets. */
+  settle(attempt: MutationAttempt): Uint8Array | undefined {
+    switch (attempt.kind) {
+      case "answered": {
+        if (this.batch) {
+          const batch = batchReply(attempt.reply)
+          if (batch !== undefined) return this.settleBatch(attempt.reply, batch)
+        }
+        const pending = pendingReplyMessage(attempt.reply)
+        if (pending !== undefined) {
+          this.uncertain = pending
+          return undefined
+        }
+        const refusal = admissionRefusal(attempt.reply)
+        if (this.uncertain !== undefined && refusal !== undefined) {
+          throw this.ambiguous(this.uncertain, refusal)
+        }
+        return attempt.reply
+      }
+      case "lost":
+        this.uncertain = attempt.message
+        return undefined
+      case "refused":
+        if (this.uncertain !== undefined) {
+          const message =
+            attempt.cause instanceof Error ? attempt.cause.message : String(attempt.cause)
+          throw this.ambiguous(this.uncertain, message)
+        }
+        throw attempt.cause
+    }
+  }
+
+  // Settle a batch frame item by item, as Rust `settle_batch`. An item whose
+  // outcome is unknown leaves the whole frame unresolved, so the same frame is
+  // sent again and every item answers under its own derived identity: a
+  // mutation with its recorded outcome, a read with a fresh result. An item
+  // that was unknown and is then refused by admission may still apply.
+  private settleBatch(reply: Uint8Array, batch: BatchReply): Uint8Array | undefined {
+    const frameUncertain = this.uncertain
+    this.uncertain = undefined
+    this.slots.length = batch.results.length
+    const unresolved: number[] = []
+    for (const [index, slot] of batch.results.entries()) {
+      const earlier = this.slots[index] ?? frameUncertain
+      this.slots[index] = undefined
+      const pending = pendingReplyMessage(slot)
+      if (pending !== undefined) {
+        this.slots[index] = pending
+        unresolved.push(index)
+        continue
+      }
+      const refusal = admissionRefusal(slot)
+      if (earlier !== undefined && refusal !== undefined) {
+        throw this.ambiguous(`item ${String(index)}: ${earlier}`, refusal)
+      }
+    }
+    const first = unresolved[0]
+    if (first === undefined) return reply
+    this.uncertain = `items [${unresolved.join(", ")}] are unresolved: ${this.slots[first] ?? ""}`
+    return undefined
+  }
+
+  private ambiguous(earlier: string, refusal: string): AmbiguousMutationError {
+    return new AmbiguousMutationError(
+      `an earlier attempt's outcome is unknown (${earlier}), then the request was refused (${refusal})`
+    )
+  }
+}
+
+// The reply decoded as a batch frame, `undefined` for any other reply.
+function batchReply(reply: Uint8Array): BatchReply | undefined {
+  try {
+    return decodeBatchReply(expectMap(decodeOne(reply, "BatchReply"), "BatchReply"), "BatchReply")
+  } catch {
+    return undefined
+  }
+}
+
+// A refusal that names no outcome of the mutation, only why this attempt was
+// not admitted, as Rust `admission_refusal`.
+function admissionRefusal(reply: Uint8Array): string | undefined {
+  let value: unknown
+  try {
+    value = decodeOne(reply, "CommandError")
+  } catch {
+    return undefined
+  }
+  if (!(value instanceof Map)) return undefined
+  const code: unknown = value.get("code")
+  if (code !== "forbidden" && code !== "unauthenticated" && code !== "step_up_required")
+    return undefined
+  const message: unknown = value.get("message")
+  return `${code}: ${typeof message === "string" ? message : ""}`
+}
+
 export class ApacheIggyTransport implements LaserTransport {
   readonly kind = "apache-iggy" as const
   readonly publishRetriesManaged = true
@@ -1652,7 +1833,7 @@ export class ApacheIggyTransport implements LaserTransport {
       readonly create: boolean
     }
   >()
-  private readonly partitionCounts = new Map<string, number>()
+  private readonly partitionCounts = new Map<string, PartitionCount>()
   private readonly balancedCursors = new Map<string, number>()
   // Sends of the current client whose outcome is unknown. Each one blocks its
   // partition lane until a later send resolves it.
@@ -1727,12 +1908,19 @@ export class ApacheIggyTransport implements LaserTransport {
     operation: (client: SimpleClient) => Promise<Value>,
     message: string,
     retryAfterReconnect = true,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    deadline?: number
   ): Promise<Value> {
     if (this.closed) throw new TransportError("transport is closed", false)
+    if (deadline !== undefined && Date.now() >= deadline) {
+      throw new TransportError(`${message}: attempt deadline elapsed`, true)
+    }
     const stale = this.client
     if (this.disconnected.has(stale)) {
-      await this.reconnect(stale)
+      await this.reconnect(stale, deadline)
+      if (deadline !== undefined && Date.now() >= deadline) {
+        throw new TransportError(`${message}: attempt deadline elapsed`, true)
+      }
       try {
         return await operation(this.client)
       } catch (cause) {
@@ -1746,6 +1934,11 @@ export class ApacheIggyTransport implements LaserTransport {
       // read, says nothing about the link.
       if (signal?.aborted === true) {
         throw new CancelledError(`${message}: cancelled`, { cause: firstCause })
+      }
+      if (deadline !== undefined && Date.now() >= deadline) {
+        throw new TransportError(`${message}: attempt deadline elapsed`, true, {
+          cause: firstCause
+        })
       }
       // The client could not prove the outcome, or no node took the command.
       // Neither is cleared by another connection, and a resend could apply it
@@ -1772,7 +1965,10 @@ export class ApacheIggyTransport implements LaserTransport {
         throw new AmbiguousMutationError(`${message}: outcome is unknown`, { cause: firstCause })
       }
       try {
-        await this.reconnect(stale)
+        await this.reconnect(stale, deadline)
+        if (deadline !== undefined && Date.now() >= deadline) {
+          throw new TransportError(`${message}: attempt deadline elapsed`, true)
+        }
         return await operation(this.client)
       } catch (cause) {
         const actual = cause ?? firstCause
@@ -1894,9 +2090,11 @@ export class ApacheIggyTransport implements LaserTransport {
         target,
         options?.deadline
       )
-      return { ...answer, reply: this.takePositioned(answer.reply) }
+      return { ...answer, reply: this.takePositioned(answer) }
     }
-    const operationId = mintUlidValue()
+    const operationId = options?.operationId ?? mintUlidValue()
+    if (operationId <= 0n || operationId >= 1n << 128n)
+      throw new InvalidError("operation id must be a nonzero u128")
     const frame = encodeNamed(
       encodeManagedRequestEnvelope({
         v: MANAGED_REQUEST_VERSION,
@@ -1925,34 +2123,81 @@ export class ApacheIggyTransport implements LaserTransport {
   ): Promise<ManagedAnswer> {
     const deadlineMs = options?.mutationDeadlineMs ?? MANAGED_MUTATION_DEADLINE_MS
     const deadline = Date.now() + deadlineMs
+    const identity = operationId.toString(16).padStart(32, "0")
     let delay = MANAGED_MUTATION.baseMs
+    let bound = MANAGED_ATTEMPT_FIRST_MS
+    const attempts = new MutationAttempts(code === AGDX_BATCH_CODE)
     for (;;) {
-      let unknown: string
+      let attempt: MutationAttempt
+      let answer: ManagedAnswer | undefined
+      const attemptDeadline = Math.min(Date.now() + bound, deadline)
       try {
-        const answer = await this.nodes.send(this.runner(options), code, frame, target)
-        const reply = this.takePositioned(answer.reply)
-        const pending = pendingReplyMessage(reply)
-        if (pending === undefined) return { ...answer, reply }
-        unknown = pending
+        answer = await this.nodes.send(
+          this.runner({ ...options, deadline: attemptDeadline }),
+          code,
+          frame,
+          target,
+          attemptDeadline
+        )
+        attempt = { kind: "answered", reply: this.takePositioned(answer) }
       } catch (cause) {
-        if (!isTransientFailure(cause)) throw cause
-        unknown = cause instanceof Error ? cause.message : String(cause)
+        if (cause instanceof AmbiguousMutationError) {
+          throw new AmbiguousMutationError(`operation ${identity}: ${cause.message}`, {
+            cause,
+            operationId
+          })
+        }
+        attempt = isTransientFailure(cause)
+          ? { kind: "lost", message: cause instanceof Error ? cause.message : String(cause) }
+          : { kind: "refused", cause }
       }
+      let settled: Uint8Array | undefined
+      try {
+        settled = attempts.settle(attempt)
+      } catch (cause) {
+        if (cause instanceof AmbiguousMutationError) {
+          throw new AmbiguousMutationError(`operation ${identity}: ${cause.message}`, {
+            cause,
+            operationId
+          })
+        }
+        throw cause
+      }
+      if (settled !== undefined && answer !== undefined) return { ...answer, reply: settled }
+      const unknown = attempts.uncertain ?? ""
       const wait = jittered(delay)
       if (Date.now() + wait >= deadline) {
         throw new AmbiguousMutationError(
-          `operation ${operationId.toString(16).padStart(32, "0")} outcome is still unknown after ${String(deadlineMs / 1000)}s: ${unknown}`
+          `operation ${identity} outcome is still unknown after ${String(deadlineMs / 1000)}s: ${unknown}`,
+          { operationId }
         )
       }
       await new Promise((resolve) => setTimeout(resolve, wait))
       delay = Math.min(delay * 2, MANAGED_MUTATION.maxMs)
+      bound *= 2
     }
   }
 
   // Runs one operation on this connection, reconnecting it as `execute` does.
   private runner(options?: ManagedSendOptions): Runner {
-    return (operation, message) =>
-      this.execute(operation, message, options?.retryAfterReconnect ?? true)
+    return async (operation, message) => {
+      const pending = this.execute(
+        operation,
+        message,
+        options?.retryAfterReconnect ?? true,
+        undefined,
+        options?.deadline
+      )
+      if (options?.deadline === undefined) return pending
+      try {
+        return await publishWithin(pending, Math.max(0, options.deadline - Date.now()))
+      } catch (cause) {
+        if (cause instanceof TimeoutError) {
+          throw new TransportError(`${message}: attempt deadline elapsed`, true, { cause })
+        }
+        throw cause
+      }
+    }
   }
 
   /**
@@ -1978,18 +2223,23 @@ export class ApacheIggyTransport implements LaserTransport {
     )
   }
 
-  /** Opens a positioned reply and raises the seen frontier to its own. */
-  private takePositioned(reply: Uint8Array): Uint8Array {
-    const opened = openPositioned(reply)
-    if (opened.frontier !== undefined) {
-      this.seenFrontier = mergeFrontier(this.seenFrontier, opened.frontier)
+  /** The opened reply, after raising the seen frontier to its own. */
+  private takePositioned(answer: ManagedAnswer): Uint8Array {
+    if (answer.frontier !== undefined) {
+      this.seenFrontier = mergeFrontier(this.seenFrontier, answer.frontier)
     }
-    return opened.reply
+    return answer.reply
   }
 
   /** The highest mutation position this client has seen per surface. */
   seenPositions(): AppliedFrontier {
     return this.seenFrontier
+  }
+
+  /** Raises the seen positions to a frontier another connection observed, as
+   * a lease granted over the dedicated coordination connection. */
+  observePositions(frontier: AppliedFrontier): void {
+    this.seenFrontier = mergeFrontier(this.seenFrontier, frontier)
   }
 
   /** Sends an already framed managed command to the caller's node, as Rust
@@ -1999,8 +2249,15 @@ export class ApacheIggyTransport implements LaserTransport {
     payload: Uint8Array,
     options?: ManagedSendOptions
   ): Promise<Uint8Array> {
-    const answer = await this.nodes.send(this.runner(options), code, payload, { kind: "caller" })
-    return this.takePositioned(answer.reply)
+    const answer = await this.nodes.send(
+      this.runner(options),
+      code,
+      payload,
+      { kind: "caller" },
+      undefined,
+      options?.written
+    )
+    return this.takePositioned(answer)
   }
 
   async ensureStream(name: string): Promise<void> {
@@ -2096,7 +2353,10 @@ export class ApacheIggyTransport implements LaserTransport {
         return raced.partitionsCount
       }
     }, `failed to create topic \`${topicId}\` on stream \`${streamId}\``)
-    this.partitionCounts.set(this.topicKey(streamId, topicId), partitionCount)
+    this.partitionCounts.set(this.topicKey(streamId, topicId), {
+      count: partitionCount,
+      readAt: Date.now()
+    })
   }
 
   async findTopicPartitionCount(streamId: string, topicId: string): Promise<number | undefined> {
@@ -2105,7 +2365,10 @@ export class ApacheIggyTransport implements LaserTransport {
       `failed to read topic \`${topicId}\``
     )
     if (topic === null) return undefined
-    this.partitionCounts.set(this.topicKey(streamId, topicId), topic.partitionsCount)
+    this.partitionCounts.set(this.topicKey(streamId, topicId), {
+      count: topic.partitionsCount,
+      readAt: Date.now()
+    })
     return topic.partitionsCount
   }
 
@@ -2214,10 +2477,11 @@ export class ApacheIggyTransport implements LaserTransport {
 
   private async publish(
     operation: (client: SimpleClient) => Promise<SendMessagesResponse>,
-    options?: Partial<PublishOptions> & { readonly fixedRetryIntervalMs?: number }
+    options?: Partial<PublishOptions> & { readonly fixedRetryIntervalMs?: number } & CallOptions
   ): Promise<SendMessagesResponse> {
     const config = { ...this.publishConfig, ...options }
     const fixed = options?.fixedRetryIntervalMs
+    const signal = options?.signal
     for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
       let used = this.client
       try {
@@ -2230,6 +2494,7 @@ export class ApacheIggyTransport implements LaserTransport {
           const deadline = Date.now() + config.timeoutMs
           used = this.client
           if (this.closed) throw new TransportError("transport is closed", false)
+          throwIfAborted(signal, "publish")
           if (this.disconnected.has(used)) {
             // Half the attempt budget goes to recovery so the send that follows
             // always gets a real window. Spending it all here would leave a
@@ -2245,7 +2510,7 @@ export class ApacheIggyTransport implements LaserTransport {
           )
         })
       } catch (cause) {
-        if (cause instanceof SessionError) throw cause
+        if (cause instanceof SessionError || cause instanceof CancelledError) throw cause
         // A send that may have committed is never resent and keeps the
         // connection, as the Apache Iggy producer leaves it to its caller.
         const unproven = unprovenOutcome(cause)
@@ -2293,7 +2558,8 @@ export class ApacheIggyTransport implements LaserTransport {
           throw new TransportError("Iggy publish failed", retryable, { cause })
         }
         const wait = fixed === undefined ? retryDelayMs(config, attempt) : attempt === 0 ? 0 : fixed
-        await new Promise((resolve) => setTimeout(resolve, wait))
+        // An abort ends the wait and starts no new attempt. One already sent is not undone.
+        await delay(wait, signal, "publish")
       }
     }
     throw new TransportError("publish attempts exhausted", true)
@@ -2326,13 +2592,15 @@ export class ApacheIggyTransport implements LaserTransport {
     streamId: string,
     topicId: string,
     payloads: readonly Uint8Array[],
-    routing: Routing
+    routing: Routing,
+    options: CallOptions = {}
   ): Promise<SendMessagesResponse> {
     return this.sendRecords(
       streamId,
       topicId,
       payloads.map((payload) => ({ payload, headers: new Map() })),
-      routing
+      routing,
+      options
     )
   }
 
@@ -2342,14 +2610,16 @@ export class ApacheIggyTransport implements LaserTransport {
     payload: Uint8Array,
     headers: ReadonlyMap<string, HeaderValue>,
     partitionKey?: string | Uint8Array,
-    partitionId?: number
+    partitionId?: number,
+    options: CallOptions = {}
   ): Promise<SendMessagesResponse> {
     return this.sendMessagesWithHeaders(
       streamId,
       topicId,
       [{ payload, headers }],
       partitionKey,
-      partitionId
+      partitionId,
+      options
     )
   }
 
@@ -2359,16 +2629,17 @@ export class ApacheIggyTransport implements LaserTransport {
     messages: readonly MessageWithHeaders[],
     partitionKey?: string | Uint8Array,
     partitionId?: number,
-    options?: Partial<PublishOptions> & {
-      readonly batchLength?: number
-      /** Background mode: resend at once, then every this many milliseconds, any failure but a lost confirmation. */
-      readonly fixedRetryIntervalMs?: number
-      readonly beforeSend?: () => Promise<{
-        readonly streamId: number
-        readonly topicId: number
-        readonly partitions: number
-      }>
-    }
+    options?: Partial<PublishOptions> &
+      CallOptions & {
+        readonly batchLength?: number
+        /** Background mode: resend at once, then every this many milliseconds, any failure but a lost confirmation. */
+        readonly fixedRetryIntervalMs?: number
+        readonly beforeSend?: () => Promise<{
+          readonly streamId: number
+          readonly topicId: number
+          readonly partitions: number
+        }>
+      }
   ): Promise<SendMessagesResponse> {
     const routing: Routing =
       partitionId !== undefined
@@ -2394,16 +2665,17 @@ export class ApacheIggyTransport implements LaserTransport {
     topicId: string,
     messages: readonly MessageWithHeaders[],
     routing: Routing,
-    options?: Partial<PublishOptions> & {
-      readonly batchLength?: number
-      /** Background mode: resend at once, then every this many milliseconds, any failure but a lost confirmation. */
-      readonly fixedRetryIntervalMs?: number
-      readonly beforeSend?: () => Promise<{
-        readonly streamId: number
-        readonly topicId: number
-        readonly partitions: number
-      }>
-    }
+    options?: Partial<PublishOptions> &
+      CallOptions & {
+        readonly batchLength?: number
+        /** Background mode: resend at once, then every this many milliseconds, any failure but a lost confirmation. */
+        readonly fixedRetryIntervalMs?: number
+        readonly beforeSend?: () => Promise<{
+          readonly streamId: number
+          readonly topicId: number
+          readonly partitions: number
+        }>
+      }
   ): Promise<SendMessagesResponse> {
     if (messages.length === 0) return { confirmations: [] }
     if (routing.kind === "key" && (routing.key.byteLength === 0 || routing.key.byteLength > 255))
@@ -2439,6 +2711,7 @@ export class ApacheIggyTransport implements LaserTransport {
                   : await this.resolvePartition(streamId, topicId, routing, client)
           if (this.disconnected.has(client))
             throw new TransportError("publish connection was retired", true)
+          throwIfAborted(options?.signal, "publish")
           return client.message.send({
             streamId: source?.streamId ?? streamId,
             topicId: source?.topicId ?? topicId,
@@ -2451,8 +2724,11 @@ export class ApacheIggyTransport implements LaserTransport {
         try {
           response = await sendChunk()
         } catch (cause) {
-          if (!MISSING_RESOURCE_CODES.has(serverErrorCode(cause) ?? -1)) throw cause
-          // Rebuild the routing once, as a recreated stream or topic needs.
+          const code = serverErrorCode(cause) ?? -1
+          const missedRoute = code === PARTITION_NOT_FOUND && routing.kind !== "partition"
+          if (!MISSING_RESOURCE_CODES.has(code) && !missedRoute) throw cause
+          // Rebuild the routing once, as a recreated stream or topic or a
+          // topic with fewer partitions needs.
           this.partitionCounts.delete(this.topicKey(streamId, topicId))
           this.balancedCursors.delete(this.topicKey(streamId, topicId))
           if (routing.kind !== "partition") resolvedPartition = undefined
@@ -2577,7 +2853,8 @@ export class ApacheIggyTransport implements LaserTransport {
     topicId: string,
     target: ConsumerTarget,
     partitionId: number,
-    offset: bigint
+    offset: bigint,
+    context?: PartitionContext
   ): Promise<void> {
     await this.execute(
       (client) =>
@@ -2586,7 +2863,8 @@ export class ApacheIggyTransport implements LaserTransport {
           topicId,
           consumer: toIggyConsumer(target),
           partitionId,
-          offset
+          offset,
+          ...(context !== undefined ? { context } : {})
         }),
       `failed to store offset for topic \`${topicId}\``
     )
@@ -2911,13 +3189,14 @@ export class ApacheIggyTransport implements LaserTransport {
   ): Promise<number> {
     if (routing.kind === "partition") return routing.partition
     const key = this.topicKey(streamId, topicId)
-    let partitionCount = this.partitionCounts.get(key)
-    if (partitionCount === undefined) {
+    let cached = this.partitionCounts.get(key)
+    if (cached === undefined || Date.now() - cached.readAt >= PARTITION_COUNT_MAX_AGE_MS) {
       const topic = await client.topic.get({ streamId, topicId })
       if (topic === null) throw new TransportError(`topic ${topicId} does not exist`, false)
-      partitionCount = topic.partitionsCount
-      this.partitionCounts.set(key, partitionCount)
+      cached = { count: topic.partitionsCount, readAt: Date.now() }
+      this.partitionCounts.set(key, cached)
     }
+    const partitionCount = cached.count
     if (partitionCount <= 0) {
       throw new TransportError(
         `topic \`${topicId}\` on stream \`${streamId}\` has no partitions`,
@@ -3079,6 +3358,31 @@ function unprovenOutcome(error: unknown): Error | undefined {
     cause(error, VsrResponseTimeoutError) ??
     cause(error, LaneBlockedError)
   )
+}
+
+/**
+ * Whether a failed send wrote its frame and lost the reply: the client proved
+ * no outcome for it, as Rust `TransientNotCommitted` or `OperationUncertain`.
+ * @internal
+ */
+export function frameWritten(error: unknown): boolean {
+  return error instanceof AmbiguousMutationError || unprovenOutcome(error) !== undefined
+}
+
+/**
+ * Whether a failed send never wrote its frame: no link carried it.
+ * @internal
+ */
+export function frameNotWritten(error: unknown): boolean {
+  return cause(error, NotConnectedError) !== undefined
+}
+
+/**
+ * A refusal before any frame was written, as `frameNotWritten` reads it.
+ * @internal
+ */
+export function notWrittenError(message: string): TransportError {
+  return new TransportError(message, true, { cause: new NotConnectedError() })
 }
 
 /**

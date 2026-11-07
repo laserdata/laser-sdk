@@ -8,8 +8,6 @@ pub(crate) mod contract;
 pub(crate) mod control;
 mod ctx;
 mod laser;
-#[cfg(feature = "a2a-bridge")]
-pub(crate) use laser::ReplyLookup;
 pub(crate) mod lease;
 mod memory_handler;
 pub(crate) mod partitioning;
@@ -20,7 +18,7 @@ mod router;
 mod scope;
 mod session;
 mod session_reads;
-pub use laser_wire::limits::{MAX_SESSION_CURSOR_BYTES, MAX_SESSION_TEXT_QUERY_BYTES};
+pub use laser_wire::limits::MAX_SESSION_TEXT_QUERY_BYTES;
 pub use session_reads::{SessionChange, SessionEventsRequest, SessionListRequest, SessionWatch};
 pub(crate) mod session_ops;
 pub use session_ops::{
@@ -33,12 +31,16 @@ mod workflow;
 pub use crate::laser::Laser;
 pub(crate) use agdx::agdx_headers;
 pub use agdx::{
-    Agdx, AgdxReceipt, AgdxSend, AgdxStream, DEFAULT_CHUNK_FLUSH_BYTES, DEFAULT_CHUNK_LINGER_MS,
-    MAX_CHUNK_BODY_BYTES,
+    Agdx, AgdxReceipt, AgdxSend, AgdxStream, DEFAULT_CHUNK_ABANDON_MS, DEFAULT_CHUNK_FLUSH_BYTES,
+    DEFAULT_CHUNK_LINGER_MS, MAX_CHUNK_BODY_BYTES,
 };
 pub use assembler::{ChunkAssembler, FINISH_REASON_ABANDONED, FINISH_REASON_GAP, StreamEvent};
+#[doc(hidden)]
+pub use builder::Advertisement;
 pub use builder::{Agent, AgentHandle};
 pub use clock::{Clock, SystemClock, TestClock};
+#[cfg(feature = "a2a-bridge")]
+pub(crate) use consumer::decode_agent_record;
 pub(crate) use consumer::provenance_and_envelope;
 pub use consumer::{
     AgentHandler, AgentMessage, AgentMiddleware, ConcurrencyPolicy, DeadLetterSink, Deduplicator,
@@ -46,7 +48,9 @@ pub use consumer::{
 };
 pub use contract::{Contract, ContractBuilder, ScatterOutcome, ScatterReport};
 pub use control::PendingControl;
-pub use ctx::{AgentCtx, Gather, GatherPolicy};
+#[doc(hidden)]
+pub use ctx::ApprovalSlot;
+pub use ctx::{AgentCtx, ApprovalGrant, Gather, GatherPolicy};
 pub use laser::{ConsumerRef, ConsumptionStatus};
 pub use lease::SessionLease;
 pub use memory_handler::MemoryHandler;
@@ -71,5 +75,6 @@ pub use state::{
 #[cfg(feature = "kv")]
 pub use workflow::WORKFLOW_FENCE_NAMESPACE;
 pub use workflow::{
-    OnTimeout, StepContext, StepFn, StepHandle, Verifier, Workflow, WorkflowBudget, WorkflowOutcome,
+    OnTimeout, StepContext, StepFailure, StepFn, StepHandle, Verifier, Workflow, WorkflowBudget,
+    WorkflowOutcome,
 };

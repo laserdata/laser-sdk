@@ -25,6 +25,7 @@ const decoder = new TextDecoder()
 interface Stored {
   readonly payload: Uint8Array
   readonly headers: ReadonlyMap<string, HeaderValue>
+  readonly timestampMicros?: bigint
 }
 
 // An in-process memory topic: writes land on partition 0, polls read by offset.
@@ -99,6 +100,10 @@ function item(id: MemoryId, body: string): Stored {
     memoryKind: MemoryKind.Fact,
     body: encoder.encode(body)
   })
+}
+
+function at(stored: Stored, timestampMicros: bigint): Stored {
+  return { ...stored, timestampMicros }
 }
 
 function bodies(items: readonly MemoryItem[]): readonly string[] {
@@ -258,6 +263,57 @@ void test("given_scoped_tombstones_and_feedback_when_folded_then_should_touch_on
   assert.equal(kept[0]?.score, 2)
   await memory.forget({ conversation: owner }, id)
   assert.deepEqual(await memory.recallFolded({}, {}), [])
+})
+
+void test("given_an_item_remembered_after_its_forget_when_folded_then_should_recall_it_again", async () => {
+  const id = MemoryId.fromU128(7n)
+  const topic = new FakeTopic([
+    [
+      at(item(id, "before"), 100n),
+      at(record({ kind: "forget", target: id.toString() }), 200n),
+      at(item(id, "after"), 300n)
+    ]
+  ])
+  assert.deepEqual(bodies(await topic.memory().recallFolded({}, {})), ["after"])
+})
+
+void test("given_partitions_folded_out_of_time_order_when_a_forget_lands_then_should_drop_only_older_writes", async () => {
+  const newer = MemoryId.fromU128(1n)
+  const older = MemoryId.fromU128(2n)
+  const topic = new FakeTopic([
+    [at(item(newer, "newer"), 300n)],
+    [
+      at(record({ kind: "forget", target: newer.toString() }), 200n),
+      at(record({ kind: "forget", target: older.toString() }), 200n)
+    ],
+    [at(item(older, "older"), 100n)]
+  ])
+  assert.deepEqual(bodies(await topic.memory().recallFolded({}, {})), ["newer"])
+})
+
+void test("given_a_scope_on_another_stream_when_writing_log_memory_then_should_refuse_it", async () => {
+  const topic = new FakeTopic()
+  const memory = topic.memory()
+  const elsewhere = { stream: "fleet" }
+  await assert.rejects(
+    memory.append(elsewhere, MemoryId.new(), MemoryKind.Fact, encoder.encode("fact")),
+    InvalidError
+  )
+  await assert.rejects(memory.forget(elsewhere, MemoryId.new()), InvalidError)
+  await assert.rejects(
+    memory.improve(elsewhere, { target: MemoryId.new(), weight: 1 }),
+    InvalidError
+  )
+  const written = topic.partitions?.[0]
+  assert.ok(written !== undefined)
+  assert.deepEqual(written, [], "nothing reached the topic")
+  await memory.append(
+    { stream: "records" },
+    MemoryId.new(),
+    MemoryKind.Fact,
+    encoder.encode("fact")
+  )
+  assert.equal(written.length, 1, "the handle's own stream is accepted")
 })
 
 void test("given_a_named_key_over_the_memory_id_cap_when_written_then_should_refuse_it_before_sending", async () => {

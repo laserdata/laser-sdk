@@ -1,8 +1,8 @@
 # Producer statistics
 
-Rust, Python, and TypeScript producers report optional statistics through the AGDX client metadata extension. One observer connection per Laser connection carries the reports, so agent presence on the main connection is untouched. A telemetry error never fails a publish. Ordinary publishing against Apache Iggy is unchanged.
+Rust, Python, and TypeScript producers report statistics through the AGDX client metadata extension. On a managed host, one that answered the capability probe, reporting is on by default: every 10 seconds, over one extra authenticated observer connection per Laser connection, so agent presence on the main connection is untouched. Set `LASER_PRODUCER_TELEMETRY_INTERVAL_MS=0` to turn it off. A telemetry error never fails a publish. Against open Apache Iggy nothing reports and publishing is unchanged.
 
-## Enable it
+## Configure it
 
 Set the variables before creating producers.
 

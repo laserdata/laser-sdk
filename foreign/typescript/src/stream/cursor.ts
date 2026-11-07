@@ -14,6 +14,8 @@ interface CursorRecord extends Message {
   readonly partitionId: number
   readonly offset: bigint
   readonly timestampMicros?: bigint
+  /** The id the record was sent with. */
+  readonly messageId?: bigint
 }
 
 const DEFAULT_BATCH_SIZE = 1_000
@@ -32,22 +34,26 @@ export class Cursor {
     private readonly transport: LaserTransport,
     private readonly streamName: string,
     private readonly topicName: string,
-    private readonly partitionIds: readonly number[]
+    private partitionIds: readonly number[],
+    private readonly partitionCount?: () => Promise<number | undefined>
   ) {}
 
-  /** @internal */
+  /** @internal A cursor over `partitionIds`, or over the topic's partitions
+   * as `partitionCount` reports them at each poll, like Rust. */
   static create(
     transport: LaserTransport,
     streamName: string,
     topicName: string,
-    partitionIds: readonly number[]
+    partitionIds: readonly number[],
+    partitionCount?: () => Promise<number | undefined>
   ): Cursor {
-    return new Cursor(transport, streamName, topicName, partitionIds)
+    return new Cursor(transport, streamName, topicName, partitionIds, partitionCount)
   }
 
   /**
-   * The next offset to read on each partition. Empty before the first poll
-   * unless `fromOffsets` seeded it. Persist this to resume later with
+   * The next offset to read on each partition, past every record handed out
+   * so far. Empty before the first poll unless `fromOffsets` seeded it.
+   * Persist this after handling a record to resume right after it with
    * `fromOffsets`.
    */
   get offsets(): ReadonlyMap<number, bigint> {
@@ -111,15 +117,9 @@ export class Cursor {
   async pollRecords(
     options: { readonly signal?: AbortSignal } = {}
   ): Promise<readonly CursorRecord[]> {
-    checkCancellation(options.signal)
-    const results: CursorRecord[] = []
-    const nextOffsets = new Map(this.partitionOffsets)
-    for (const partitionId of this.partitionIds) {
-      const start = this.partitionOffsets.get(partitionId) ?? 0n
-      nextOffsets.set(partitionId, await this.drain(partitionId, start, results, options.signal))
-    }
+    const [records, nextOffsets] = await this.readBatch(options.signal)
     this.partitionOffsets = nextOffsets
-    return results.sort(byLogOrder)
+    return records
   }
 
   /**
@@ -136,10 +136,37 @@ export class Cursor {
     options: { readonly signal?: AbortSignal } = {}
   ): AsyncIterable<CursorRecord> {
     for (;;) {
-      const batch = await this.pollRecords(options)
-      if (batch.length === 0) return
-      yield* batch
+      const [batch, nextOffsets] = await this.readBatch(options.signal)
+      if (batch.length === 0) {
+        this.partitionOffsets = nextOffsets
+        return
+      }
+      for (const [index, record] of batch.entries()) {
+        if (index === batch.length - 1) this.partitionOffsets = nextOffsets
+        else this.partitionOffsets.set(record.partitionId, record.offset + 1n)
+        yield record
+      }
     }
+  }
+
+  // One drain of every partition and the offsets after it, leaving the
+  // cursor's own offsets as they were.
+  private async readBatch(
+    signal: AbortSignal | undefined
+  ): Promise<readonly [readonly CursorRecord[], Map<number, bigint>]> {
+    checkCancellation(signal)
+    if (this.partitionCount !== undefined) {
+      const count = await this.partitionCount()
+      if (count === undefined) return [[], new Map(this.partitionOffsets)]
+      this.partitionIds = Array.from({ length: count }, (_, index) => index)
+    }
+    const results: CursorRecord[] = []
+    const nextOffsets = new Map(this.partitionOffsets)
+    for (const partitionId of this.partitionIds) {
+      const start = this.partitionOffsets.get(partitionId) ?? 0n
+      nextOffsets.set(partitionId, await this.drain(partitionId, start, results, signal))
+    }
+    return [results.sort(byLogOrder), nextOffsets]
   }
 
   private async drain(

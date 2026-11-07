@@ -24,12 +24,7 @@ const SERVER_LOCKSTEP_COOLDOWN_EXEMPT = new Set(["apache-iggy"])
 // one exact version naming the advisory it fixes or was pulled in by, so the
 // next bump of that package waits again. Drop an entry once its version is
 // older than the cooldown.
-const ADVISORY_FIX_COOLDOWN_EXEMPT = new Map([
-  ["minimatch@11.0.3", "GHSA-g3hv-75wg-m249"],
-  ["@isaacs/nonrecursive-glob-match@1.0.3", "GHSA-g3hv-75wg-m249"],
-  ["glob@14.0.3", "GHSA-3g3m-2fjr-6pw4"],
-  ["path-scurry@3.0.0", "GHSA-3g3m-2fjr-6pw4"]
-])
+const ADVISORY_FIX_COOLDOWN_EXEMPT = new Map()
 
 function exemptFromCooldown({ name, version }) {
   return (

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { NoStreamError } from "../../src/client/errors.js"
+import { InvalidError, NoStreamError } from "../../src/client/errors.js"
 import { INTERNAL_TRANSPORT } from "../../src/client/internals.js"
 import type { Laser } from "../../src/client/laser.js"
-import type { PolledMessage } from "../../src/iggy/apache-iggy.js"
+import { type PolledMessage, xxHash32 } from "../../src/iggy/apache-iggy.js"
 import { KvSnapshotStore, TopicSnapshotStore, encodeSnapshot } from "../../src/snapshot.js"
 import type { ConsumerStart } from "../../src/stream/consumer-start.js"
 import { ConversationId } from "../../src/types/ids.js"
@@ -97,20 +97,23 @@ void test("given_no_snapshot_or_no_stream_when_the_latest_is_read_then_should_an
   await assert.rejects(storeOver([], null).store.latest(mine), NoStreamError)
 })
 
-void test("given_snapshots_on_two_partitions_when_read_then_should_use_server_time", async () => {
-  const partitions = [
-    [{ ...record(100n, mine, "older"), timestampMicros: 10n, partitionId: 0 }],
-    [{ ...record(2n, mine, "newer"), timestampMicros: 20n, partitionId: 1 }]
-  ]
+function keyedTopic(partitionCount: number, conversation: ConversationId) {
+  const key = new TextEncoder().encode(`${conversation.toString()}:7:planner`)
+  const home = xxHash32(key) % partitionCount
+  const read: number[] = []
   const transport = {
-    findTopicPartitionCount: () => Promise.resolve(2),
+    findTopicPartitionCount: () => Promise.resolve(partitionCount),
     pollMessages: (
       _stream: string,
       _topic: string,
       target: { readonly partitionId: number },
       strategy: ConsumerStart
     ) => {
-      const messages = partitions[target.partitionId] ?? []
+      read.push(target.partitionId)
+      const messages =
+        target.partitionId === home
+          ? [{ ...record(0n, conversation, "home"), partitionId: home }]
+          : [{ ...record(0n, other, "noise"), partitionId: target.partitionId }]
       return Promise.resolve(strategy.kind === "last" ? messages.slice(-1) : messages)
     }
   }
@@ -118,8 +121,31 @@ void test("given_snapshots_on_two_partitions_when_read_then_should_use_server_ti
     defaultStream: "orbit",
     [INTERNAL_TRANSPORT]: () => transport
   } as unknown as Laser
-  const latest = await new TopicSnapshotStore(laser, "planner").latest(mine)
-  assert.equal(new TextDecoder().decode(latest?.state), "newer")
+  return { store: new TopicSnapshotStore(laser, "planner"), home, read }
+}
+
+void test("given_a_topic_with_many_partitions_when_the_latest_is_read_then_should_read_only_the_partition_its_key_routes_to", async () => {
+  const hit = keyedTopic(8, mine)
+  assert.equal(new TextDecoder().decode((await hit.store.latest(mine))?.state), "home")
+  assert.deepEqual(new Set(hit.read), new Set([hit.home]), "a hit reads one partition")
+  const miss = keyedTopic(8, mine)
+  assert.equal(await miss.store.latest(ConversationId.new()), undefined)
+  assert.equal(new Set(miss.read).size, 1, "a miss reads one partition, not the topic")
+})
+
+void test("given_a_snapshot_for_another_fold_when_saved_then_should_refuse_it_as_invalid", async () => {
+  const laser = { defaultStream: "orbit" } as unknown as Laser
+  const snapshot = {
+    stream: "orbit",
+    streamId: 0,
+    streamCreatedAtMicros: 100n,
+    conversation: WireConversationId.parse(mine.toString()),
+    fold: "worker",
+    asOf: [],
+    state: new Uint8Array()
+  }
+  await assert.rejects(new TopicSnapshotStore(laser, "planner").save(snapshot), InvalidError)
+  await assert.rejects(new KvSnapshotStore(laser, "planner").save(snapshot), InvalidError)
 })
 
 void test("given_two_folds_in_one_conversation_when_saved_then_should_keep_both_snapshots", async () => {

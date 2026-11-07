@@ -140,20 +140,29 @@ void test("given_a_memory_owner_when_content_id_is_minted_then_should_match_the_
     [
       { agent: AgentId.new("agent") },
       MemoryKind.Fact,
-      "63FZWE3WTSCVXAY845QK4TMVWM",
-      0xc37ff8e1f35966faaf2085bcc9aa6f94n
+      "4NEP7F11MYT484GKAGSAS5079E",
+      0x95758ef0869ed110484d50cab2501d2en
     ],
     [
       { stream: "laser", agent: AgentId.new("agent"), user: "alice", app: "console" },
       MemoryKind.Fact,
-      "28429K3B8MPSM8WHDQR474827P",
-      0x48209331ad14b6688e45b7c10e4408f6n
+      "5B3SH6J7DVW950TXZG1D1CBJH4",
+      0xab1e62691dbbe24a0d77f00b42c5ca24n
     ],
     [
       { user: "alice" },
       MemoryKind.Procedure,
-      "3E6HJGHKFDBMQ91TCJEHV28X40",
-      0x6e346508cded5d2e90e9927476247480n
+      "7XEM2ZBKE6GR79DVYHWKFC48BM",
+      0xfd7505f5cdc6860e96efd1e4dec22174n
+    ],
+    [
+      {
+        agent: AgentId.new("agent"),
+        conversation: ConversationId.parse("01KWM3K3XEP3NP5TN850J17YBQ")
+      },
+      MemoryKind.Fact,
+      "4GAH8VSNF79FNRKBW6NYVJ8GNN",
+      0x905451bcd5e74beb89af86afb72442b5n
     ]
   ]
   for (const [owner, kind, rendered, value] of cases) {
@@ -174,10 +183,17 @@ void test("given_two_users_when_the_same_body_is_addressed_then_should_produce_d
   assert.equal(alice.equals(id(owner("bob", "console"))), false)
   assert.equal(alice.equals(id(owner("alice", "support"))), false)
   assert.equal(alice.equals(id(owner("alicecon", "sole"))), false)
-  assert.equal(
-    alice.equals(id({ ...owner("alice", "console"), conversation: ConversationId.derive("c") })),
-    true
-  )
+})
+
+void test("given_the_same_body_in_two_conversations_when_content_addressed_then_should_produce_distinct_ids", () => {
+  const owner = (conversation: ConversationId): MemoryScope => ({
+    agent: AgentId.new("agent"),
+    conversation
+  })
+  const id = (scope: MemoryScope) => MemoryId.content(scope, MemoryKind.Fact, encoder.encode("x"))
+  const first = ConversationId.derive("first")
+  assert.equal(id(owner(first)).equals(id(owner(ConversationId.derive("second")))), false)
+  assert.equal(id(owner(first)).equals(id(owner(first))), true)
 })
 
 void test("given_memory_kinds_when_classified_then_should_use_the_shared_taxonomy", () => {

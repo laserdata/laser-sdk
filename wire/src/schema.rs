@@ -32,6 +32,7 @@ pub const PROVENANCE_FIELDS: &[(u32, &str)] = &[
     (2_000_000_012, "__laser_original_payload"),
     (2_000_000_013, "__laser_original_content_type"),
     (2_000_000_014, "__laser_original_schema_id"),
+    (2_000_000_015, "__laser_original_headers"),
 ];
 
 pub const ORIGINAL_PAYLOAD_FIELD_ID: u32 = 2_000_000_012;
@@ -40,6 +41,8 @@ pub const ORIGINAL_CONTENT_TYPE_FIELD_ID: u32 = 2_000_000_013;
 pub const ORIGINAL_CONTENT_TYPE_FIELD_NAME: &str = "__laser_original_content_type";
 pub const ORIGINAL_SCHEMA_ID_FIELD_ID: u32 = 2_000_000_014;
 pub const ORIGINAL_SCHEMA_ID_FIELD_NAME: &str = "__laser_original_schema_id";
+pub const ORIGINAL_HEADERS_FIELD_ID: u32 = 2_000_000_015;
+pub const ORIGINAL_HEADERS_FIELD_NAME: &str = "__laser_original_headers";
 pub const PARTITION_ID_FIELD_NAME: &str = "__laser_partition_id";
 pub const OFFSET_FIELD_NAME: &str = "__laser_offset";
 
@@ -365,6 +368,7 @@ fn encode_logical_type(
             bytes.push(u8::from(*value_required));
             encode_logical_type(bytes, value)?;
         }
+        LogicalType::Variant => bytes.push(17),
     }
     Ok(())
 }
@@ -417,6 +421,8 @@ pub enum LogicalType {
         value_required: bool,
         value: Box<LogicalType>,
     },
+    /// Any canonical value, each carrying its own tag, for a field declared without a type.
+    Variant,
 }
 
 /// Non-parameterized logical type identity used in capability descriptors.
@@ -441,6 +447,7 @@ pub enum LogicalTypeKind {
     Struct,
     List,
     Map,
+    Variant,
 }
 
 impl LogicalType {
@@ -463,6 +470,7 @@ impl LogicalType {
             Self::Struct { .. } => LogicalTypeKind::Struct,
             Self::List { .. } => LogicalTypeKind::List,
             Self::Map { .. } => LogicalTypeKind::Map,
+            Self::Variant => LogicalTypeKind::Variant,
         }
     }
 }
@@ -799,6 +807,7 @@ impl TypedValue {
                     ..
                 },
             ) => validate_map(entries, key, value, *value_required),
+            (_, LogicalType::Variant) => Ok(()),
             _ => Err(InvalidError::new("typed value does not match logical type")),
         }
     }
@@ -1395,6 +1404,43 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn given_a_variant_field_when_validated_then_should_accept_every_canonical_value_and_refuse_a_map_key()
+     {
+        for value in [
+            TypedValue::Null,
+            TypedValue::Boolean(true),
+            TypedValue::Long(i64::MAX),
+            TypedValue::Double(2.5),
+            TypedValue::String("text".to_owned()),
+        ] {
+            value
+                .validate_against(&LogicalType::Variant, false)
+                .expect("a variant takes any tagged value");
+        }
+        assert!(
+            TypedValue::Double(f64::NAN)
+                .validate_against(&LogicalType::Variant, false)
+                .is_err()
+        );
+        assert!(
+            TypedValue::Null
+                .validate_against(&LogicalType::Variant, true)
+                .is_err()
+        );
+        assert!(!LogicalType::Variant.accepts_map_key());
+        assert_eq!(LogicalType::Variant.kind(), LogicalTypeKind::Variant);
+        let json = serde_json::to_string(&LogicalType::Variant).expect("type serializes");
+        assert_eq!(json, r#"{"kind":"variant"}"#);
+        let mut variant_fields = fields();
+        variant_fields[1].field_type = LogicalType::Variant;
+        let variant = LogicalSchema::new(LogicalSchemaId::from_u128(1), 1, variant_fields)
+            .expect("a variant schema is valid");
+        let map = LogicalSchema::new(LogicalSchemaId::from_u128(1), 1, fields())
+            .expect("the map schema is valid");
+        assert_ne!(variant.schema.fingerprint, map.schema.fingerprint);
     }
 
     #[test]

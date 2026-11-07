@@ -8,7 +8,6 @@
 // u8 dictionaries use.
 
 use crate::authz::AuthzError;
-use crate::checkpoint::CheckpointError;
 use crate::fork::ForkError;
 use crate::graph::GraphError;
 use crate::kv::KvError;
@@ -197,6 +196,25 @@ impl ResultCode {
         )
     }
 
+    /// Whether the request could not be served right now: the retryable codes
+    /// other than a lagging read model. The broad `is_unavailable` classifier
+    /// of every client reads this.
+    pub const fn is_unavailable(self) -> bool {
+        matches!(
+            self,
+            ResultCode::Unavailable
+                | ResultCode::TargetUnavailable
+                | ResultCode::BackendUnavailable
+        )
+    }
+
+    /// Whether the caller's credential or grant was refused: no credential or
+    /// an unverified one, or a missing grant. The fix is a credential or a
+    /// grant, never a retry.
+    pub const fn is_permission_denied(self) -> bool {
+        matches!(self, ResultCode::Forbidden | ResultCode::Unauthenticated)
+    }
+
     /// Whether the mutation was accepted and its outcome is still unknown. The
     /// caller repeats the exact request with the same operation identity.
     pub const fn is_pending(self) -> bool {
@@ -249,21 +267,20 @@ impl From<&QueryError> for ResultCode {
     fn from(error: &QueryError) -> Self {
         match error {
             QueryError::Unsupported(_) => ResultCode::Unsupported,
+            QueryError::Invalid(_) => ResultCode::InvalidArgument,
             // The per-source DSL check refused the query: the caller authenticated
             // but lacks the grant for the named resource, so forbidden not 401.
             QueryError::Unauthorized(_) => ResultCode::Forbidden,
-            QueryError::IndexNotFound(_) | QueryError::ForkNotFound(_) => ResultCode::NotFound,
+            QueryError::IndexNotFound(_)
+            | QueryError::ForkNotFound(_)
+            | QueryError::SchemaNotFound(_) => ResultCode::NotFound,
             QueryError::Backend(_) => ResultCode::Backend,
             QueryError::Unavailable(_) => ResultCode::Unavailable,
             QueryError::TooLarge { .. } => ResultCode::TooLarge,
             QueryError::Version { .. } => ResultCode::VersionSkew,
             QueryError::Stale { .. } => ResultCode::Stale,
-            QueryError::Cancelled { .. } => ResultCode::Cancelled,
             QueryError::DeadlineExceeded { .. } => ResultCode::DeadlineExceeded,
-            QueryError::ExpiredSnapshot { .. } => ResultCode::ExpiredSnapshot,
             QueryError::StaleGeneration { .. } => ResultCode::StaleGeneration,
-            QueryError::TargetUnavailable { .. } => ResultCode::TargetUnavailable,
-            QueryError::ResourceLimit { .. } => ResultCode::ResourceLimit,
         }
     }
 }
@@ -280,9 +297,13 @@ impl From<&KvError> for ResultCode {
             KvError::Version { .. } => ResultCode::VersionSkew,
             KvError::VersionConflict { .. } => ResultCode::Conflict,
             KvError::LeaseLost => ResultCode::Conflict,
+            KvError::LeaseHeld { .. } => ResultCode::Conflict,
+            KvError::BarrierUnreachable { .. } => ResultCode::StaleGeneration,
             KvError::NotFound => ResultCode::NotFound,
             KvError::NotLeader => ResultCode::Unavailable,
             KvError::Stale { .. } => ResultCode::Stale,
+            KvError::Forbidden(_) => ResultCode::Forbidden,
+            KvError::InvalidExpiry(_) => ResultCode::InvalidArgument,
         }
     }
 }
@@ -323,11 +344,12 @@ impl From<&AuthzError> for ResultCode {
             AuthzError::Unsupported(_) => ResultCode::Unsupported,
             AuthzError::Unauthorized => ResultCode::Forbidden,
             AuthzError::UnknownRole(_) => ResultCode::NotFound,
-            AuthzError::InvalidName(_) | AuthzError::TenancyViolation(_) => {
-                ResultCode::InvalidArgument
-            }
-            AuthzError::Conflict { .. } => ResultCode::Conflict,
+            AuthzError::InvalidName(_)
+            | AuthzError::InvalidGrant(_)
+            | AuthzError::TenancyViolation(_) => ResultCode::InvalidArgument,
+            AuthzError::Conflict { .. } | AuthzError::MutationConflict(_) => ResultCode::Conflict,
             AuthzError::Version { .. } => ResultCode::VersionSkew,
+            AuthzError::ResourceLimit(_) => ResultCode::ResourceLimit,
         }
     }
 }
@@ -342,19 +364,6 @@ impl From<&SessionError> for ResultCode {
             SessionError::Stale(_) => ResultCode::StaleGeneration,
             SessionError::Backend(_) => ResultCode::Backend,
             SessionError::Unavailable(_) => ResultCode::Unavailable,
-        }
-    }
-}
-
-impl From<&CheckpointError> for ResultCode {
-    fn from(error: &CheckpointError) -> Self {
-        match error {
-            CheckpointError::Invalid(_) => ResultCode::InvalidArgument,
-            CheckpointError::NotFound => ResultCode::NotFound,
-            CheckpointError::Conflict { .. } | CheckpointError::LeaseLost => ResultCode::Conflict,
-            CheckpointError::Unauthorized => ResultCode::Forbidden,
-            CheckpointError::Unavailable(_) => ResultCode::Unavailable,
-            CheckpointError::Version { .. } => ResultCode::VersionSkew,
         }
     }
 }
@@ -434,6 +443,88 @@ mod tests {
             ResultCode::from(&AuthzError::Unauthorized),
             ResultCode::Forbidden
         );
+    }
+
+    // One code per condition on every surface. A surface without its own
+    // variant for a condition answers the surface-neutral `CommandError`.
+    #[test]
+    fn given_one_condition_on_every_surface_when_classified_then_should_share_one_code() {
+        let text = || "x".to_owned();
+        let table: [(ResultCode, Vec<ResultCode>); 6] = [
+            (
+                ResultCode::InvalidArgument,
+                vec![
+                    ResultCode::from(&KvError::InvalidKey(text())),
+                    ResultCode::from(&KvError::InvalidNamespace(text())),
+                    ResultCode::from(&ForkError::InvalidFork(text())),
+                    ResultCode::from(&GraphError::InvalidName(text())),
+                    ResultCode::from(&AuthzError::InvalidName(text())),
+                    ResultCode::from(&AuthzError::InvalidGrant(text())),
+                    ResultCode::from(&SessionError::Invalid(text())),
+                    ResultCode::from(&QueryError::Invalid(text())),
+                ],
+            ),
+            (
+                ResultCode::Forbidden,
+                vec![
+                    ResultCode::from(&QueryError::Unauthorized(text())),
+                    ResultCode::from(&GraphError::Unauthorized(text())),
+                    ResultCode::from(&AuthzError::Unauthorized),
+                    ResultCode::from(&SessionError::Unauthorized(text())),
+                ],
+            ),
+            (
+                ResultCode::NotFound,
+                vec![
+                    ResultCode::from(&QueryError::IndexNotFound(text())),
+                    ResultCode::from(&KvError::NotFound),
+                    ResultCode::from(&ForkError::NotFound(text())),
+                    ResultCode::from(&GraphError::NotFound(text())),
+                    ResultCode::from(&AuthzError::UnknownRole(text())),
+                    ResultCode::from(&SessionError::NotFound(text())),
+                ],
+            ),
+            (
+                ResultCode::Unavailable,
+                vec![
+                    ResultCode::from(&QueryError::Unavailable(text())),
+                    ResultCode::from(&KvError::Unavailable(text())),
+                    ResultCode::from(&ForkError::Unavailable(text())),
+                    ResultCode::from(&GraphError::Unavailable(text())),
+                    ResultCode::from(&SessionError::Unavailable(text())),
+                ],
+            ),
+            (
+                ResultCode::Unsupported,
+                vec![
+                    ResultCode::from(&QueryError::Unsupported(text())),
+                    ResultCode::from(&KvError::Unsupported(text())),
+                    ResultCode::from(&ForkError::Unsupported(text())),
+                    ResultCode::from(&GraphError::Unsupported(text())),
+                    ResultCode::from(&AuthzError::Unsupported(text())),
+                    ResultCode::from(&SessionError::Unsupported(text())),
+                ],
+            ),
+            (
+                ResultCode::Backend,
+                vec![
+                    ResultCode::from(&QueryError::Backend(text())),
+                    ResultCode::from(&KvError::Backend(text())),
+                    ResultCode::from(&ForkError::Backend(text())),
+                    ResultCode::from(&GraphError::Backend(text())),
+                    ResultCode::from(&SessionError::Backend(text())),
+                ],
+            ),
+        ];
+        for (expected, codes) in table {
+            for (surface, code) in codes.into_iter().enumerate() {
+                assert_eq!(code, expected, "surface {surface} of {expected:?}");
+            }
+            assert!(
+                !expected.is_retryable() || expected == ResultCode::Unavailable,
+                "only unavailable is retryable among these"
+            );
+        }
     }
 
     // A transient outcome must be distinguishable from a fault without parsing

@@ -29,6 +29,13 @@ async fn remember_dedup(world: &mut LaserWorld, body: String) {
     world.memory_ids.insert(body, id);
 }
 
+#[when(regex = r#"^I remember "([^"]+)" with dedup in conversation "([^"]+)"$"#)]
+async fn remember_dedup_in(world: &mut LaserWorld, body: String, conversation: String) {
+    let conversation = conversation.parse().expect("a valid conversation id");
+    let id = engine(world).remember_in(MemoryKind::Fact, body.as_bytes(), true, Some(conversation));
+    world.memory_ids.insert(body, id);
+}
+
 #[when(regex = r#"^I remember "([^"]+)"$"#)]
 async fn remember(world: &mut LaserWorld, body: String) {
     let id = engine(world).remember(MemoryKind::Fact, body.as_bytes(), false);

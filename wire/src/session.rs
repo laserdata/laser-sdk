@@ -4,8 +4,8 @@ use crate::agent::{
 use crate::error::InvalidError;
 use crate::graph::SourceRef;
 use crate::limits::{
-    MAX_FILTER_SOURCE_NAME_BYTES, MAX_HEARTBEAT_SESSIONS, MAX_SESSION_CURSOR_BYTES,
-    MAX_SESSION_LABEL_BYTES, MAX_SESSION_TEXT_QUERY_BYTES,
+    MAX_FILTER_SOURCE_NAME_BYTES, MAX_HEARTBEAT_SESSIONS, MAX_SESSION_LABEL_BYTES,
+    MAX_SESSION_TEXT_QUERY_BYTES,
 };
 use crate::schema::Digest32;
 use crate::validate::Validate;
@@ -58,22 +58,34 @@ pub mod request {
         pub agent: Option<AgentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub text: Option<String>,
+        /// The 1-based page. Zero reads the first page.
+        pub page: u32,
+        /// The sessions per page. Zero leaves it to the server.
+        pub results: u32,
+        /// The bound of a walk: the `as_of` its first page returned. Later
+        /// pages pass it back so sessions folded after it stay out.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub cursor: Option<String>,
-        /// The page size. Zero leaves it to the server.
-        pub limit: u32,
-        pub want_total: bool,
+        pub as_of: Option<u64>,
+        /// The change series `as_of` belongs to, from the same first page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub series: Option<u64>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SessionEvents {
         pub stream: String,
         pub id: ConversationId,
+        /// The 1-based page. Zero reads the first page.
+        pub page: u32,
+        /// The events per page. Zero leaves it to the server.
+        pub results: u32,
+        /// The bound of a walk: the `as_of` its first page returned. Later
+        /// pages pass it back so events folded after it stay out.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub cursor: Option<String>,
-        /// The page size. Zero leaves it to the server.
-        pub limit: u32,
-        pub fixed_frontier: bool,
+        pub as_of: Option<u64>,
+        /// The change series `as_of` belongs to, from the same first page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub series: Option<u64>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,18 +113,16 @@ pub mod request {
         pub lane_only: bool,
     }
 
+    /// A page of the change feed. Page `p` of size `r` holds the changes with
+    /// sequence `(p - 1) * r + 1 ..= p * r`, so appends and pruning never
+    /// shift a page.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SessionChanges {
         pub stream: String,
-        pub after: u64,
-        /// The page size. Zero leaves it to the server.
-        pub limit: u32,
-        /// The change series `after` was read from. A different series answers a
-        /// resync with the current series and the newest sequence as `floor`, so
-        /// `Some(0)` with `after` zero is the one-call start of a follower. `None`
-        /// skips the series check and returns the retained rows after `after`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub series: Option<u64>,
+        /// The 1-based page. Zero reads the first page.
+        pub page: u32,
+        /// The changes per page. Zero leaves it to the server.
+        pub results: u32,
     }
 }
 
@@ -250,6 +260,9 @@ pub struct SessionInfo {
     pub idle: bool,
     pub over_budget: bool,
     pub pause_requested: bool,
+    /// The participants of the pause in force that have not acknowledged it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub awaiting: Vec<AgentId>,
     pub cancel_requested: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<u64>,
@@ -285,16 +298,23 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
-/// One page of session summaries.
+/// One page of session summaries, newest created first. `page` counts from 1.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPage {
     pub items: Vec<SessionInfo>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total: Option<u64>,
+    pub page: u32,
+    pub total_pages: u32,
+    pub total_results: u32,
+    /// The newest change the page covers. Pass it back with `series` for the
+    /// next page of the same walk.
+    pub as_of: u64,
+    /// The change series of the serving index.
+    pub series: u64,
+    /// The rows a substring search examined.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub searched: Option<u64>,
+    /// A substring search filled its scan window, so `total_results` counts
+    /// only the matches inside it.
     pub truncated: bool,
     /// The index is rebuilding on this node, so `items` and `total` can be incomplete.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -333,17 +353,23 @@ pub struct SessionEvent {
     pub summary: BTreeMap<String, serde_json::Value>,
 }
 
-/// One page of a session timeline.
+/// One page of a session timeline in server append time order. `page` counts
+/// from 1.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionEventsPage {
     pub items: Vec<SessionEvent>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
+    pub page: u32,
+    pub total_pages: u32,
+    pub total_results: u32,
+    /// The newest change the page covers. Pass it back with `series` for the
+    /// next page of the same walk.
+    pub as_of: u64,
+    /// The change series of the serving index.
+    pub series: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ranges: Vec<PayloadRange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frontier: Vec<SourceFrontier>,
-    pub fixed_frontier: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gaps: Vec<SourceGap>,
 }
@@ -427,19 +453,20 @@ impl SessionChangeOrigin {
     }
 }
 
-/// Change rows after a sequence. On a series mismatch `floor` is the newest
-/// sequence and `resync` is set. Otherwise `floor` is the oldest retained
-/// sequence, or the next one when none is retained, and `resync` is set when
-/// `after + 1 < floor`, even with rows present. On `resync` the reader adopts
-/// `series` and `floor` and lists sessions again.
+/// One page of the change feed in sequence order. `total_results` is the
+/// newest sequence, pruned changes included, and `floor` the oldest retained
+/// sequence, or the next one when none is retained. A follower whose `series`
+/// differs, or whose next sequence is below `floor`, lists sessions again.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionChanges {
-    pub rows: Vec<SessionChangeRow>,
+    pub items: Vec<SessionChangeRow>,
+    pub page: u32,
+    pub total_pages: u32,
+    pub total_results: u64,
+    /// The page size the server used, which fixes the sequence range of a page.
+    pub results: u32,
     pub floor: u64,
-    pub resync: bool,
-    /// The change series these sequence numbers belong to. Zero from an index
-    /// that does not name one.
-    #[serde(default, skip_serializing_if = "is_zero_series")]
+    /// The registration's change series.
     pub series: u64,
 }
 
@@ -509,7 +536,6 @@ impl Validate for request::SessionList {
         let bounded = [
             ("label prefix", &self.label_prefix, MAX_SESSION_LABEL_BYTES),
             ("text", &self.text, MAX_SESSION_TEXT_QUERY_BYTES),
-            ("cursor", &self.cursor, MAX_SESSION_CURSOR_BYTES),
         ];
         for (label, value, cap) in bounded {
             if let Some(value) = value
@@ -520,6 +546,11 @@ impl Validate for request::SessionList {
                     value.len()
                 )));
             }
+        }
+        if self.as_of.is_some() != self.series.is_some() {
+            return Err(InvalidError::new(
+                "session list as_of and series name one bound, set both or neither",
+            ));
         }
         Ok(())
     }
@@ -532,11 +563,6 @@ impl Validate for SessionHeartbeat {
         }
         Ok(())
     }
-}
-
-#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip predicate")]
-fn is_zero_series(series: &u64) -> bool {
-    *series == 0
 }
 
 #[cfg(test)]
@@ -552,27 +578,33 @@ mod tests {
             label_prefix: None,
             agent: None,
             text: None,
-            cursor: None,
-            limit: 0,
-            want_total: false,
+            page: 0,
+            results: 0,
+            as_of: None,
+            series: None,
         };
         list.validate().expect("a plain session list is valid");
+        request::SessionList {
+            as_of: Some(4405),
+            series: Some(77),
+            ..list.clone()
+        }
+        .validate()
+        .expect("a bound names its sequence and series");
         request::SessionList {
             stream: "s".repeat(MAX_FILTER_SOURCE_NAME_BYTES),
             label_prefix: Some("l".repeat(MAX_SESSION_LABEL_BYTES)),
             text: Some("t".repeat(MAX_SESSION_TEXT_QUERY_BYTES)),
-            cursor: Some("c".repeat(MAX_SESSION_CURSOR_BYTES)),
             ..list.clone()
         }
         .validate()
         .expect("every filter at its cap is valid");
         request::SessionList {
             text: Some(String::new()),
-            cursor: Some(String::new()),
             ..list.clone()
         }
         .validate()
-        .expect("an empty text and cursor are within their caps");
+        .expect("an empty text is within its cap");
         for invalid in [
             request::SessionList {
                 stream: String::new(),
@@ -591,7 +623,11 @@ mod tests {
                 ..list.clone()
             },
             request::SessionList {
-                cursor: Some("c".repeat(MAX_SESSION_CURSOR_BYTES + 1)),
+                as_of: Some(4405),
+                ..list.clone()
+            },
+            request::SessionList {
+                series: Some(77),
                 ..list.clone()
             },
         ] {

@@ -48,14 +48,17 @@ async def main() -> None:
         async def approver(ctx, message):
             await ctx.respond_input(ls.AgentTopic.Sessions, b"approved")
 
-        async def spawn(agent_id, handler):
-            handle = laser.spawn_agent(agent_id, ls.AgentTopic.Sessions, handler)
+        async def spawn(agent_id, handler, operations=None):
+            handle = laser.spawn_agent(
+                agent_id, ls.AgentTopic.Sessions, handler, operations=operations
+            )
             await handle.ready()
             return handle
 
         assistant = await spawn("assistant", worker)
         tool_runner = await spawn("tool-runner", worker)
-        approver_agent = await spawn("approver", approver)
+        # Input requests reach only an agent that serves them.
+        approver_agent = await spawn("approver", approver, operations=["input_request"])
 
         async with assistant, tool_runner, approver_agent:
             await run_flows(laser)
@@ -77,11 +80,11 @@ async def run_flows(laser) -> None:
     completed = None
     for _ in range(60):
         completed = await a2a.task(task["id"])
-        if completed["status"]["state"].lower() not in ("working", "submitted"):
+        if completed["status"]["state"] not in ("TASK_STATE_WORKING", "TASK_STATE_SUBMITTED"):
             break
         await asyncio.sleep(0.25)
     artifacts = completed.get("artifacts") or []
-    answer = artifacts[0]["text"] if artifacts and "text" in artifacts[0] else "(no artifact)"
+    answer = artifacts[0]["parts"][0]["text"] if artifacts else "(no artifact)"
     print(f"A2A task {completed['id']} -> {completed['status']['state']}: {answer}")
 
     # MCP: tools/call reaches a worker and renders the answer as a tool result.

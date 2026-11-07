@@ -1,17 +1,20 @@
+use crate::agent::clock::{Clock, SystemClock};
 use crate::agent::consumer::AgentMessage;
 use crate::agent::{ChunkAssembler, StreamEvent};
-use crate::context::ContextAssembler;
+use crate::context::{ContextAssembler, LastN};
 use crate::error::LaserError;
 use crate::govern::{ActionCounters, ActionKind, GovernedAction};
 use crate::laser::{Laser, ensure_stream, ensure_topic, ensure_topic_retained};
 use crate::provenance::{AgentTopic, Provenance};
-use crate::types::{AgentId, ConsumerGroupName, ConversationId, MessageId};
+use crate::types::{AgentId, ConsumerGroupName, ConversationId, MessageId, MintUlid};
 use iggy::prelude::*;
 use laser_wire::agent::{
-    AgentDeadLetter, AgentEnvelope, AgentKind, ChannelId, CorrelationId, LogPosition,
-    OPERATION_TASK, TaskState,
+    AgentDeadLetter, AgentEnvelope, AgentKind, ChannelId, CorrelationId, IdempotencyKey,
+    LogPosition, OPERATION_TASK, RecordId, TaskState, validate,
 };
 use laser_wire::dispatch::{Dispatch, HandledOperations, classify};
+use laser_wire::framing::{decode_named, encode_named};
+use laser_wire::headers::AGENT_VERSION;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::Duration;
@@ -153,6 +156,7 @@ impl Laser {
             payload: &payload,
             signed: false,
             counters: ActionCounters::default(),
+            approval: None,
         };
         if let Some(modified) = self.govern(action).await? {
             payload = modified;
@@ -253,25 +257,31 @@ impl Laser {
         let idempotency = HeaderKey::from_str(crate::provenance::keys::IDEMPOTENCY_KEY)
             .map_err(|_| LaserError::Invalid("idempotency header key".to_owned()))?;
         if let Some(existing) = headers.get(&idempotency) {
-            let redrive_key = format!(
-                "{}/redrive/{}-{}",
-                existing.as_str()?,
-                source.partition_id,
-                source.offset
-            );
+            let redrive_key = redrive_key(existing.as_str()?, source);
             headers.insert(
                 idempotency,
                 HeaderValue::from_str(&redrive_key)
                     .map_err(|_| LaserError::Invalid("redrive idempotency value".to_owned()))?,
             );
         }
+        // Dedup and routing of an AGDX record read the envelope body, so the
+        // copy re-keys the body too.
+        let payload = if headers.contains_key(&HeaderKey::from_str(AGENT_VERSION)?) {
+            bytes::Bytes::from(redriven_envelope(
+                &original.payload,
+                source,
+                IggyTimestamp::now().as_micros(),
+            )?)
+        } else {
+            original.payload.clone()
+        };
         // Re-key by the original conversation so the redriven copy lands on the
         // same partition and stays ordered with the rest of its conversation.
         let key = Provenance::try_from(&original)
             .ok()
             .map(|provenance| provenance.partition_key());
         let message = IggyMessage::builder()
-            .payload(original.payload)
+            .payload(payload)
             .user_headers(headers)
             .build()?;
         self.send_batch_on(&stream_name, &topic_name, vec![message], key.as_deref())
@@ -279,12 +289,14 @@ impl Laser {
             .map(|_| ())
     }
 
-    /// Reassemble a chunk stream from the log: read `conversation` on `topic`,
-    /// take the `chunk` envelopes for `channel` in `sequence` order, and replay
-    /// them through a [`ChunkAssembler`] into the ordered [`StreamEvent`]s. This
-    /// is the log-native form of resuming or replaying a token stream. Offset
-    /// replay does what SSE replay cannot, so a finished stream reconstructs
-    /// deterministically after the fact with no external transcript store.
+    /// Reassemble a chunk stream from the log: read every retained record of
+    /// `conversation` on `topic`, take the `chunk` envelopes for `channel` in
+    /// `sequence` order, and replay them through a [`ChunkAssembler`] into the
+    /// ordered [`StreamEvent`]s. This is the log-native form of resuming or
+    /// replaying a token stream. Offset replay does what SSE replay cannot, so
+    /// a finished stream reconstructs deterministically after the fact with no
+    /// external transcript store. A stream with no terminal past its opening
+    /// chunk's abandonment bound ends with a synthetic `abandoned` finish.
     pub async fn reassemble_channel(
         &self,
         conversation: ConversationId,
@@ -294,8 +306,9 @@ impl Laser {
         let messages = ContextAssembler::builder()
             .conversation_id(conversation)
             .topics(vec![topic])
+            .policy(Box::new(LastN(usize::MAX)))
             .build()
-            .assemble(self)
+            .replay(self)
             .await?;
         let mut chunks: Vec<_> = messages
             .iter()
@@ -308,10 +321,20 @@ impl Laser {
         // order, but a stream can be keyed onto several partitions, so ordering by
         // `sequence` reassembles deterministically regardless.
         chunks.sort_by_key(|envelope| envelope.sequence);
+        // The opening chunk's bound ends a stream its producer never finished.
+        let abandon_at = chunks
+            .first()
+            .filter(|envelope| envelope.sequence == Some(0))
+            .and_then(|envelope| envelope.deadline_micros);
         let mut assembler = ChunkAssembler::new();
         let mut events = Vec::new();
         for chunk in chunks {
             events.extend(assembler.feed(chunk));
+        }
+        if abandon_at.is_some_and(|deadline| SystemClock.now_micros() > deadline)
+            && let Some(abandoned) = assembler.abandon()
+        {
+            events.push(abandoned);
         }
         Ok(events)
     }
@@ -354,6 +377,37 @@ impl Laser {
         Ok(reader)
     }
 
+    // The next offset of every partition of the reply topic `requester` reads,
+    // the point a reply to a request sent now lands at or after.
+    pub(crate) async fn reply_positions(
+        &self,
+        reply_topic: AgentTopic<'_>,
+        requester: &laser_wire::agent::AgentId,
+    ) -> Result<Vec<u64>, LaserError> {
+        Ok(self
+            .agdx_reply_reader(reply_topic, Some(requester))
+            .await?
+            .offsets)
+    }
+
+    // A reply reader that starts at `positions` instead of the tail, so a
+    // reply that landed after an earlier send of the same request is found.
+    pub(crate) fn agdx_reply_reader_from(
+        &self,
+        reply_topic: AgentTopic<'_>,
+        requester: &laser_wire::agent::AgentId,
+        positions: Vec<u64>,
+    ) -> Result<AgentReplyReader, LaserError> {
+        let topic = self.reply_topic_for(&reply_topic, Some(requester))?;
+        let mut reader = AgentReplyReader::new(self.stream_required()?, topic)?;
+        reader.offsets = positions;
+        #[cfg(feature = "sign")]
+        {
+            reader.verifier = self.registry_verifier();
+        }
+        Ok(reader)
+    }
+
     /// Wait on a pre-seeded `reader` for the AGDX `response`/`error` carrying
     /// `correlation`, up to `timeout`. The reader is forward-advancing (offsets
     /// only move forward, seeded at the tail before the request was sent), so the
@@ -379,37 +433,6 @@ impl Laser {
                 ReplyScan::CaughtUp => sleep(Duration::from_millis(50)).await,
             }
         }
-    }
-
-    /// One forward pass over `reply_topic` for the AGDX `response`/`error`
-    /// carrying `correlation`: the answer if it has already landed, else `None`.
-    /// A point lookup (no waiting), for the stateless A2A `tasks/get`.
-    /// The scan is bounded: this lookup is reachable from an unauthenticated
-    /// bridge request and starts at the topic's head, so an ever-growing reply
-    /// topic would otherwise turn one request into an unbounded read.
-    #[cfg(feature = "a2a-bridge")]
-    pub(crate) async fn find_agdx_reply(
-        &self,
-        reply_topic: AgentTopic<'_>,
-        correlation: CorrelationId,
-    ) -> Result<ReplyLookup, LaserError> {
-        const MAX_LOOKUP_PASSES: usize = 32;
-        let mut reader =
-            AgentReplyReader::new(self.stream_required()?, reply_topic.as_identifier())?;
-        #[cfg(feature = "sign")]
-        {
-            reader.verifier = self.registry_verifier();
-        }
-        for _ in 0..MAX_LOOKUP_PASSES {
-            match reader.next_agdx_match(&self.client(), correlation).await? {
-                ReplyScan::Found(envelope) => return Ok(ReplyLookup::Found(envelope)),
-                ReplyScan::More => continue,
-                ReplyScan::CaughtUp => return Ok(ReplyLookup::NotFound),
-            }
-        }
-        // The bound ended the scan before the topic did, so the answer may
-        // still be further on. That is not proof the task is still working.
-        Ok(ReplyLookup::Incomplete)
     }
 
     /// A fresh child conversation of `parent`, carrying its parent/root ids for causality.
@@ -655,6 +678,9 @@ pub(crate) struct AgentReplyReader {
     /// cannot answer for the routed agent.
     #[cfg(feature = "sign")]
     pub(crate) expected_signer: Option<String>,
+    /// The author an AGDX reply must name, an input request's approver, so a
+    /// reply from any other agent cannot answer for it.
+    pub(crate) expected_source: Option<laser_wire::agent::AgentId>,
 }
 
 impl AgentReplyReader {
@@ -669,6 +695,7 @@ impl AgentReplyReader {
             verifier: None,
             #[cfg(feature = "sign")]
             expected_signer: None,
+            expected_source: None,
         })
     }
 
@@ -816,6 +843,10 @@ impl AgentReplyReader {
                     && envelope.correlation == Some(correlation)
                     && matches!(envelope.kind, AgentKind::Response | AgentKind::Error)
                     && self
+                        .expected_source
+                        .as_ref()
+                        .is_none_or(|expected| envelope.source == *expected)
+                    && self
                         .verified_principal(
                             &envelope,
                             decoded.signature_context.as_ref(),
@@ -854,6 +885,7 @@ impl AgentReplyReader {
         &mut self,
         client: &IggyClient,
         correlation: CorrelationId,
+        expected: &crate::agent::replies::ExpectedReply,
     ) -> Result<ContractPass, LaserError> {
         let correlation_key = correlation.to_string();
         let partitions = match self.partitions {
@@ -944,15 +976,23 @@ impl AgentReplyReader {
                     content_type: decoded.content_type,
                     verified_principal,
                 };
+                // A terminal answers only in the request's session and only when
+                // addressed to the requester.
                 match signal {
-                    ContractSignal::Working => pass.consumed = true,
+                    ContractSignal::Working => pass.consumed |= expected.acknowledges(&reply(None)),
                     ContractSignal::Completed(principal) => {
-                        pass.terminal = Some(ContractTerminal::Completed(reply(principal)));
-                        return Ok(pass);
+                        let message = reply(principal);
+                        if expected.accepts(&message) {
+                            pass.terminal = Some(ContractTerminal::Completed(message));
+                            return Ok(pass);
+                        }
                     }
                     ContractSignal::Failed(principal) => {
-                        pass.terminal = Some(ContractTerminal::Failed(reply(principal)));
-                        return Ok(pass);
+                        let message = reply(principal);
+                        if expected.accepts(&message) {
+                            pass.terminal = Some(ContractTerminal::Failed(message));
+                            return Ok(pass);
+                        }
                     }
                     ContractSignal::Ignore => {}
                 }
@@ -987,6 +1027,53 @@ enum ContractSignal {
     Ignore,
 }
 
+// The idempotency key a redriven copy carries: the original key re-keyed by
+// the source position, so the copy survives dedup while a second redrive of
+// the same capsule does not.
+fn redrive_key(key: &str, source: LogPosition) -> String {
+    format!("{key}/redrive/{}-{}", source.partition_id, source.offset)
+}
+
+// The AGDX envelope a redrive republishes for the dead-lettered `payload`: its
+// idempotency key re-keyed and its record id minted fresh. A signed envelope
+// is refused, its signature covers both fields, and so is one past its
+// deadline, which would only dead-letter again. A body that does not decode is
+// returned unchanged.
+fn redriven_envelope(
+    payload: &[u8],
+    source: LogPosition,
+    now_micros: u64,
+) -> Result<Vec<u8>, LaserError> {
+    // An undecodable body has no key to re-key and is replayed byte for byte.
+    let Ok(mut envelope) = decode_named::<AgentEnvelope>(payload) else {
+        return Ok(payload.to_vec());
+    };
+    if envelope.signature.is_some() {
+        return Err(LaserError::Invalid(
+            "a signed AGDX dead letter cannot be redriven, its signature covers the record id and idempotency key".to_owned(),
+        ));
+    }
+    if envelope
+        .deadline_micros
+        .is_some_and(|deadline| deadline <= now_micros)
+    {
+        return Err(LaserError::Invalid(
+            "the dead-lettered AGDX record is past its deadline".to_owned(),
+        ));
+    }
+    if envelope.record.is_some() {
+        envelope.record = Some(RecordId::mint());
+    }
+    if let Some(key) = &envelope.idempotency_key {
+        envelope.idempotency_key = Some(IdempotencyKey::from_str(&redrive_key(
+            key.as_str(),
+            source,
+        ))?);
+    }
+    validate(&envelope)?;
+    Ok(encode_named(&envelope)?)
+}
+
 /// Every record on a shared session topic carries `agdx.to`, `*` when the
 /// caller named no target, so a role group bound to the addressee filter on a
 /// deployment that serves group-aware reads still receives it. Open Apache
@@ -1005,14 +1092,71 @@ pub(crate) fn stamp_broadcast_addressee(
     Ok(())
 }
 
-/// What a bounded reply lookup established.
-#[cfg(feature = "a2a-bridge")]
-pub(crate) enum ReplyLookup {
-    Found(Box<AgentEnvelope>),
-    /// The whole reply topic was read and no answer carries the correlation.
-    NotFound,
-    /// The scan bound ended before the topic did.
-    Incomplete,
+#[cfg(test)]
+mod redrive_tests {
+    use super::*;
+
+    const SOURCE: LogPosition = LogPosition {
+        stream_id: 1,
+        topic_id: 2,
+        partition_id: 0,
+        offset: 7,
+    };
+
+    #[test]
+    fn given_an_agdx_dead_letter_when_redriven_then_should_rekey_the_envelope_body() {
+        let original = command(|envelope| envelope);
+        let before: AgentEnvelope = decode_named(&original).expect("the original decodes");
+        let copy: AgentEnvelope =
+            decode_named(&redriven_envelope(&original, SOURCE, 1).expect("redrives"))
+                .expect("the copy decodes");
+        assert_eq!(
+            copy.idempotency_key.as_ref().map(IdempotencyKey::as_str),
+            Some("attempt-1/redrive/0-7")
+        );
+        assert_ne!(copy.record, before.record);
+        assert_eq!(copy.body, before.body);
+    }
+
+    #[test]
+    fn given_an_undecodable_agdx_dead_letter_when_redriven_then_should_republish_its_bytes_unchanged()
+     {
+        let garbage = b"not cbor at all, definitely".to_vec();
+        let copy = redriven_envelope(&garbage, SOURCE, 1).expect("an undecodable body redrives");
+        assert_eq!(copy, garbage);
+    }
+
+    #[test]
+    fn given_a_signed_or_expired_agdx_dead_letter_when_redriven_then_should_refuse_it() {
+        let signed = command(|envelope| {
+            envelope.with_signature(laser_wire::agent::Signature {
+                scheme: laser_wire::agent::SIGNATURE_SCHEME_ED25519,
+                key_id: vec![1; 8],
+                bytes: vec![2; 64],
+                context: None,
+            })
+        });
+        let expired = command(|envelope| envelope.with_deadline_micros(5));
+        for payload in [signed, expired] {
+            assert!(matches!(
+                redriven_envelope(&payload, SOURCE, 10),
+                Err(LaserError::Invalid(_))
+            ));
+        }
+    }
+
+    // One AGDX command as the log stores it, refined by `refine`.
+    fn command(refine: impl FnOnce(AgentEnvelope) -> AgentEnvelope) -> Vec<u8> {
+        let envelope = AgentEnvelope::command(
+            RecordId::mint(),
+            ConversationId::new().into(),
+            "planner".parse().expect("a valid agent id"),
+            CorrelationId::mint(),
+            b"work".to_vec(),
+        )
+        .with_idempotency_key(IdempotencyKey::from_str("attempt-1").expect("a valid key"));
+        encode_named(&refine(envelope)).expect("the envelope encodes")
+    }
 }
 
 #[cfg(test)]

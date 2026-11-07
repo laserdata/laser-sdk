@@ -30,7 +30,6 @@ def with_fields(error, **fields):
         ("AmbiguousMutationError", "LaserError"),
         ("StateStoreError", "LaserError"),
         ("CommandError", "LaserError"),
-        ("CheckpointError", "LaserError"),
         ("FilterFaultError", "FilterError"),
         ("FilterOversizedRecordError", "FilterError"),
         ("ConsumerGroupSetupError", "FilterError"),
@@ -59,35 +58,37 @@ def test_given_a_rejection_when_classified_then_should_not_be_a_validation_error
 
 
 @pytest.mark.parametrize(
-    ("error", "code", "retryable", "flag"),
+    ("error", "code", "retryable", "flags"),
     [
-        (ls.LaserError("x"), "Backend", False, None),
-        (ls.InvalidError("x"), "InvalidArgument", False, None),
-        (ls.ConfigError("x"), "InvalidArgument", False, None),
-        (ls.NoStreamError("x"), "Unsupported", False, None),
-        (ls.TimeoutError("x"), "Backend", True, None),
-        (ls.HandlerError("x"), "Backend", True, None),
-        (ls.PolicyDeferredError("x"), "Backend", True, None),
-        (ls.SignatureError("x"), "Unauthenticated", False, None),
-        (ls.StepUpRequiredError("x"), "StepUpRequired", False, None),
-        (ls.UnsupportedError("x"), "Unsupported", False, "unsupported"),
-        (ls.AmbiguousMutationError("x"), "Backend", False, "ambiguous_mutation"),
-        (ls.FenceViolationError("x"), "Conflict", False, "fence_violation"),
-        (ls.BudgetExceededError("x"), "Backend", False, "budget_exceeded"),
-        (ls.QuarantinedError("x"), "Forbidden", False, "quarantined"),
-        (ls.NoCapableAgentError("x"), "NotFound", True, "no_capable_agent"),
-        (ls.RoutePrincipalMismatchError("x"), "Forbidden", False, "permission_denied"),
-        (ls.FilterOversizedRecordError("x"), "TooLarge", False, None),
+        (ls.LaserError("x"), "Backend", False, set()),
+        (ls.InvalidError("x"), "InvalidArgument", False, set()),
+        (ls.ConfigError("x"), "InvalidArgument", False, set()),
+        (ls.NoStreamError("x"), "InvalidArgument", False, set()),
+        (ls.TimeoutError("x"), "Backend", True, set()),
+        (ls.HandlerError("x"), "Backend", True, set()),
+        (ls.PolicyDeferredError("x"), "Backend", True, set()),
+        (ls.SignatureError("x"), "Unauthenticated", False, {"permission_denied"}),
+        (ls.StepUpRequiredError("x"), "StepUpRequired", False, set()),
+        (ls.UnsupportedError("x"), "Unsupported", False, {"unsupported"}),
+        (ls.AmbiguousMutationError("x"), "Backend", False, {"ambiguous_mutation"}),
+        (ls.FenceViolationError("x"), "Conflict", False, {"fence_violation"}),
+        (ls.BudgetExceededError("x"), "Backend", False, {"budget_exceeded"}),
+        (ls.QuarantinedError("x"), "Forbidden", False, {"permission_denied", "quarantined"}),
+        (ls.NoCapableAgentError("x"), "NotFound", True, {"not_found", "no_capable_agent"}),
+        (ls.RoutePrincipalMismatchError("x"), "Forbidden", False, {"permission_denied"}),
+        (ls.FilterOversizedRecordError("x"), "TooLarge", False, set()),
+        (ls.IdError("x"), "InvalidArgument", False, set()),
+        (ls.CancelledError("x"), "Cancelled", False, set()),
     ],
 )
 def test_given_an_error_raised_by_application_code_when_read_then_should_carry_class_defaults(
-    error, code, retryable, flag
+    error, code, retryable, flags
 ):
     assert error.code == code
     assert error.retryable is retryable
-    flags = ("unavailable", "not_found", "stale", "permission_denied", "not_leader")
-    for name in flags + ("unsupported", "fence_violation", "quarantined"):
-        assert getattr(error, name) is (name == flag)
+    names = ("unavailable", "not_found", "stale", "permission_denied", "not_leader")
+    for name in names + ("unsupported", "fence_violation", "quarantined", "no_capable_agent"):
+        assert getattr(error, name) is (name in flags), name
 
 
 def test_given_a_binding_validation_failure_when_raised_then_should_carry_code_and_retryable():
@@ -125,8 +126,37 @@ async def test_given_a_command_error_when_it_crosses_rust_then_should_preserve_c
 
 
 @pytest.mark.parametrize(
+    ("detail", "code"),
+    [
+        ({"MutationConflict": "taken"}, "Conflict"),
+        ({"ResourceLimit": "full"}, "ResourceLimit"),
+    ],
+)
+async def test_given_a_receipt_refusal_when_it_crosses_rust_then_should_keep_its_detail_and_code(
+    detail, code
+):
+    raised = with_fields(ls.AuthzError("refused"), detail=detail)
+    memory = ls.MemoryHandle.vector(raised_by(raised))
+    with pytest.raises(ls.AuthzError) as failure:
+        await memory.remember("value")
+    assert failure.value.detail == detail
+    assert failure.value.code == code
+    assert failure.value.retryable is False
+
+
+@pytest.mark.parametrize(
     ("raised", "expected", "fields"),
     [
+        (
+            with_fields(ls.AmbiguousMutationError("lost"), operation_id=7),
+            ls.AmbiguousMutationError,
+            {"operation_id": 7, "ambiguous_mutation": True, "retryable": False},
+        ),
+        (
+            ls.AmbiguousMutationError("lost"),
+            ls.AmbiguousMutationError,
+            {"operation_id": None},
+        ),
         (
             with_fields(ls.BudgetExceededError("over"), ceiling=10, spent=12),
             ls.BudgetExceededError,
@@ -163,6 +193,9 @@ async def test_given_a_command_error_when_it_crosses_rust_then_should_preserve_c
         (asyncio.CancelledError("stop"), ls.CancelledError, {"retryable": False}),
         (TimeoutError("slow"), ls.TimeoutError, {"retryable": True}),
         (RuntimeError("boom"), ls.HandlerError, {"retryable": True}),
+        (TypeError("bad"), ls.HandlerConfigError, {"retryable": False}),
+        (AttributeError("bad"), ls.HandlerConfigError, {"retryable": False}),
+        (NameError("bad"), ls.HandlerConfigError, {"retryable": False}),
     ],
 )
 async def test_given_a_callback_error_when_it_crosses_rust_then_should_keep_its_class_and_fields(
@@ -174,6 +207,19 @@ async def test_given_a_callback_error_when_it_crosses_rust_then_should_keep_its_
     assert type(failure.value) is expected
     for name, value in fields.items():
         assert getattr(failure.value, name) == value
+
+
+async def test_given_a_run_cancel_error_when_a_task_raises_it_then_should_fail_not_cancel_it():
+    async def run():
+        raise with_fields(ls.CancelledError("canceled"), run="run-1")
+
+    task = asyncio.ensure_future(run())
+    with pytest.raises(ls.CancelledError) as failure:
+        await asyncio.gather(task)
+    assert failure.value.run == "run-1"
+    assert not task.cancelled()
+    assert isinstance(task.exception(), ls.LaserError)
+    assert not issubclass(ls.CancelledError, asyncio.CancelledError)
 
 
 async def test_given_a_refused_memory_operation_when_raised_then_should_name_the_surface():

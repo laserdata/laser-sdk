@@ -1,4 +1,3 @@
-#[cfg(feature = "query")]
 use crate::agent::clock::{Clock, SystemClock};
 use crate::cursor::Cursor;
 use crate::error::LaserError;
@@ -8,6 +7,8 @@ use crate::laser::Laser;
 #[cfg(feature = "query")]
 use crate::nodes::Target;
 use crate::provenance::AgentTopic;
+#[cfg(feature = "query")]
+use crate::retry::PRESENCE_ATTEMPT;
 use crate::types::{AgentId, MintUlid, PrincipalId};
 use laser_wire::agent::{
     AgentCard, AgentEnvelope, AgentPresence, ConversationId, Health, OPERATION_CARD,
@@ -15,6 +16,7 @@ use laser_wire::agent::{
 };
 use laser_wire::content::ContentType;
 use laser_wire::framing::decode_named;
+use laser_wire::limits::{MAX_REGISTRY_FACT_TTL_MICROS, REGISTRY_FACT_TTL_MICROS};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -30,7 +32,6 @@ const APPLIED_FACT_CAPACITY: usize = 16_384;
 // never ages out, so the map is capped like the applied-fact set rather than
 // left to grow with every id a registry writer invents.
 const MAX_REGISTERED_CARDS: usize = 4_096;
-const APPLIED_FACT_TTL_MICROS: u64 = 86_400_000_000;
 
 /// The registry read model's persisted state, shared per stream on the connection
 /// so a fresh [`AgentRegistry`] resumes the fold instead of re-reading the whole
@@ -70,6 +71,8 @@ use laser_wire::codes::{
 };
 #[cfg(feature = "query")]
 use laser_wire::framing::encode_named;
+#[cfg(feature = "query")]
+use laser_wire::result::{CommandError, ResultCode};
 
 /// The shared page cap, so one client-metadata page can never pull an unbounded
 /// list. Mirrors the server clamp.
@@ -128,10 +131,10 @@ impl RegisteredCard {
 /// resolves to, gone on disconnect). Build it with [`Laser::agent_registry`],
 /// [`refresh`](Self::refresh) to fold new cards, [`refresh_presence`](Self::refresh_presence)
 /// to pull live presence, then resolve by capability and inbox.
-pub struct AgentRegistry<'a> {
+pub struct AgentRegistry {
     // Only the `query`-gated presence read uses this. The card fold rides `cursor`.
     #[cfg_attr(not(feature = "query"), allow(dead_code))]
-    laser: &'a Laser,
+    laser: Laser,
     cursor: Cursor,
     cards: HashMap<AgentId, RegisteredCard>,
     /// Live presence keyed by the agent id the connection claims. Seeded from the
@@ -161,7 +164,7 @@ pub struct AgentRegistry<'a> {
     verifier: Option<Arc<crate::sign::KeyRegistry>>,
 }
 
-impl<'a> AgentRegistry<'a> {
+impl AgentRegistry {
     /// Fold every card published since the last refresh into the registry,
     /// stamping `now_micros` as the observation time, and write the result back to
     /// the shared per-stream cache (evicting cards stale at `now_micros`, so the
@@ -187,16 +190,18 @@ impl<'a> AgentRegistry<'a> {
                 || operation == Some(OPERATION_UNQUARANTINE)
             {
                 // A quarantine fact evicts an agent from routing, so it is the one
-                // privileged write here. Three gates, in order. A fact whose signed
-                // `record` id was already folded is a verbatim replay and dropped
-                // (G1). An enrolled verifier must confirm an OPERATOR key valid at
-                // fold time (G2, so an enrolled agent cannot quarantine another).
+                // privileged write here. Four gates, in order. A fact whose signed
+                // `record` id was already folded is a verbatim replay and dropped.
+                // A fact appended after its signed deadline is a late replay and
+                // dropped. An enrolled verifier must confirm an OPERATOR key valid
+                // at fold time (so an enrolled agent cannot quarantine another).
                 // Without a verifier the registry topic's write access control is
                 // the gate. An authorized fact's id is remembered so its replay is
                 // caught even when it did not change state.
                 if envelope
                     .record
                     .is_some_and(|id| self.applied_facts.contains(&id))
+                    || !fact_live(&envelope, decoded.observed_at_micros)
                     || !self.fact_authorized(
                         &envelope,
                         decoded.signature_context.as_ref(),
@@ -226,7 +231,7 @@ impl<'a> AgentRegistry<'a> {
         // A card past its ttl is a dead agent. Drop it so the cached set is bounded
         // by live agents, not every agent ever seen. A ttl-less card never expires.
         self.cards.retain(|_, card| card.is_fresh(now_micros));
-        let cutoff = now_micros.saturating_sub(APPLIED_FACT_TTL_MICROS);
+        let cutoff = now_micros.saturating_sub(MAX_REGISTRY_FACT_TTL_MICROS);
         while self.applied_fact_order.len() > APPLIED_FACT_CAPACITY
             || self
                 .applied_fact_order
@@ -311,14 +316,20 @@ impl<'a> AgentRegistry<'a> {
         self.quarantined.contains(agent)
     }
 
-    /// The inbox topic `agent` advertised in its live presence, or `None` when it
-    /// advertised none (or [`refresh_presence`](Self::refresh_presence) has not
-    /// run). The destination an [`InboxRoute::Advertised`](crate::agent::InboxRoute::Advertised)
-    /// route resolves to, so routing never assumes a shared topic name.
+    /// The inbox topic `agent` advertised in its live presence, else the inbox
+    /// its card names, or `None` when neither does. The destination an
+    /// [`InboxRoute::Advertised`](crate::agent::InboxRoute::Advertised) route
+    /// resolves to, so routing never assumes a shared topic name. The card
+    /// inbox serves a server without live presence.
     pub fn inbox_for(&self, agent: &AgentId) -> Option<&str> {
         self.presence
             .get(agent)
             .and_then(|entry| entry.presence.inbox.as_deref())
+            .or_else(|| {
+                self.cards
+                    .get(agent)
+                    .and_then(|registered| registered.card.inbox.as_deref())
+            })
     }
 
     /// The inbox `agent` advertised, but only if the connection that advertised it
@@ -349,8 +360,9 @@ impl<'a> AgentRegistry<'a> {
     /// blob). A later connection claiming the same agent id wins, matching
     /// last-write presence. Returns the number of presences folded.
     ///
-    /// Served by Iggy, so it returns a transport error against a
-    /// Iggy server that lacks the command.
+    /// Apache Iggy keeps no connection metadata, so against it this folds
+    /// nothing and returns zero, and an advertised route resolves to the
+    /// card's inbox.
     #[cfg(feature = "query")]
     pub async fn refresh_presence(&mut self) -> Result<usize, LaserError> {
         let now = SystemClock.now_micros();
@@ -362,12 +374,28 @@ impl<'a> AgentRegistry<'a> {
         {
             return Ok(self.presence.len());
         }
-        let connections = self
+        // Apache Iggy keeps no connection metadata, so there is no live
+        // presence to read and routes resolve to the card inbox. A server not
+        // known to serve it that refuses the read is read the same way.
+        let hello = self.laser.capabilities().await.hello;
+        if hello == crate::capabilities::HelloOutcome::Rejected {
+            return Ok(0);
+        }
+        let connections = match self
             .laser
             .client_metadata()
             .with_metadata_only(true)
             .all()
-            .await?;
+            .await
+        {
+            Ok(connections) => connections,
+            Err(error) if hello != crate::capabilities::HelloOutcome::Answered => {
+                tracing::debug!(%error, "no live presence to read, routes resolve to card inboxes");
+                self.presence_read_at_micros = Some(now);
+                return Ok(0);
+            }
+            Err(error) => return Err(error),
+        };
         let mut fresh = HashMap::new();
         for connection in connections {
             if let Some(payload) = connection.metadata.as_deref() {
@@ -425,7 +453,7 @@ impl Laser {
     /// per-stream cache so it resumes the fold instead of re-reading the topic from
     /// offset 0. Each [`refresh`](AgentRegistry::refresh) folds only what is new and
     /// writes the result back to the cache.
-    pub fn agent_registry(&self) -> Result<AgentRegistry<'_>, LaserError> {
+    pub fn agent_registry(&self) -> Result<AgentRegistry, LaserError> {
         let cache = self.registry_cache()?;
         let (
             cards,
@@ -453,7 +481,7 @@ impl Laser {
             .reader(AgentTopic::Registry.topic_string())?
             .from_offsets(offsets);
         Ok(AgentRegistry {
-            laser: self,
+            laser: self.clone(),
             cursor,
             cards,
             presence,
@@ -523,6 +551,11 @@ impl Laser {
             ConversationId::mint(),
         )
         .status(operation)
+        .with_deadline_at_micros(
+            SystemClock
+                .now_micros()
+                .saturating_add(REGISTRY_FACT_TTL_MICROS),
+        )
         .body(agent.as_str().as_bytes().to_vec())
         .send()
         .await?;
@@ -570,6 +603,11 @@ impl Laser {
             ConversationId::mint(),
         )
         .status(operation)
+        .with_deadline_at_micros(
+            SystemClock
+                .now_micros()
+                .saturating_add(REGISTRY_FACT_TTL_MICROS),
+        )
         .body(agent.as_str().as_bytes().to_vec())
         .signed_by(key)
         .send()
@@ -586,26 +624,68 @@ impl Laser {
     ///
     /// Served by Iggy, so it returns a transport error against a
     /// Iggy server that lacks the command.
+    ///
+    /// The presence lives on the replica that received it. The first advertise
+    /// pins that replica, and every later advertise or clear goes there, so a
+    /// client whose managed requests moved to another node never leaves a
+    /// stale presence behind or advertises a second one elsewhere. While the
+    /// pinned replica does not answer within [`PRESENCE_ATTEMPT`], the call
+    /// fails as `Unavailable` and keeps the pin.
     #[cfg(feature = "query")]
     pub async fn advertise_presence(&self, presence: &AgentPresence) -> Result<(), LaserError> {
         let requested = AgentId::try_from(presence.agent.as_str())?;
         self.claim_presence(requested)?;
         let payload = encode_named(presence)
             .map_err(|error| LaserError::Codec(format!("encode presence: {error}")))?;
-        self.send_raw_with_response(AGDX_SET_CLIENT_METADATA_CODE, payload)
-            .await?;
+        let mut pin = self.presence_pin().lock().await;
+        let replica = self.send_presence(payload, *pin).await?;
+        *pin = replica.or(*pin);
         Ok(())
     }
 
     /// Withdraw this connection's advertised presence (an empty
     /// `AGDX_SET_CLIENT_METADATA` clears it). Disconnecting clears it too, this is
-    /// the explicit early withdrawal.
+    /// the explicit early withdrawal. The clear goes to the replica that holds
+    /// the presence, and while that replica does not answer the call fails as
+    /// `Unavailable` and keeps the pin, never reporting a presence cleared that
+    /// is still advertised.
     #[cfg(feature = "query")]
     pub async fn clear_presence(&self) -> Result<(), LaserError> {
-        self.send_raw_with_response(AGDX_SET_CLIENT_METADATA_CODE, Vec::new())
-            .await?;
+        let mut pin = self.presence_pin().lock().await;
+        self.send_presence(Vec::new(), *pin).await?;
+        *pin = None;
         self.release_presence();
         Ok(())
+    }
+
+    // One presence frame to the pinned replica, else the caller's node, naming
+    // the replica that answered. A pinned replica that does not answer within
+    // the attempt bound is reported unavailable, and the pin is the caller's.
+    #[cfg(feature = "query")]
+    async fn send_presence(
+        &self,
+        payload: Vec<u8>,
+        pinned: Option<u8>,
+    ) -> Result<Option<u8>, LaserError> {
+        let target = pinned.map_or(Target::Caller, Target::Replica);
+        let deadline = tokio::time::Instant::now() + PRESENCE_ATTEMPT;
+        match self
+            .send_managed_within(AGDX_SET_CLIENT_METADATA_CODE, payload, target, deadline)
+            .await
+        {
+            Ok((_, replica)) => Ok(replica),
+            Err(error) if pinned.is_some() && error.is_retryable() => {
+                Err(LaserError::Command(CommandError::new(
+                    ResultCode::Unavailable,
+                    format!(
+                        "replica {} holds this connection's presence and did not answer within {}s, the presence is kept there: {error}",
+                        pinned.unwrap_or_default(),
+                        PRESENCE_ATTEMPT.as_secs()
+                    ),
+                )))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Start a filtered, paginated discovery read of live connections and their
@@ -616,9 +696,9 @@ impl Laser {
     /// Served by Iggy, so it returns a transport error against a
     /// Iggy server that lacks the command.
     #[cfg(feature = "query")]
-    pub fn client_metadata(&self) -> ClientMetadataRequest<'_> {
+    pub fn client_metadata(&self) -> ClientMetadataRequest {
         ClientMetadataRequest {
-            laser: self,
+            laser: self.clone(),
             query: ClientMetadataQuery {
                 v: CLIENT_METADATA_OP_VERSION,
                 with_metadata_only: false,
@@ -641,13 +721,13 @@ pub struct ClientMetadataPage {
 
 /// Fluent builder for the client-metadata discovery read.
 #[cfg(feature = "query")]
-pub struct ClientMetadataRequest<'a> {
-    laser: &'a Laser,
+pub struct ClientMetadataRequest {
+    laser: Laser,
     query: ClientMetadataQuery,
 }
 
 #[cfg(feature = "query")]
-impl ClientMetadataRequest<'_> {
+impl ClientMetadataRequest {
     /// Only return connections that advertised metadata.
     pub fn with_metadata_only(mut self, value: bool) -> Self {
         self.query.with_metadata_only = value;
@@ -807,11 +887,54 @@ fn lift_quarantine(quarantined: &mut HashSet<AgentId>, envelope: &AgentEnvelope)
     quarantined.remove(&agent)
 }
 
+/// Whether a registry fact was appended inside its signed validity: before its
+/// deadline, with no more validity left than the applied-fact set remembers its
+/// id for, so a replay is caught by one guard or the other.
+fn fact_live(envelope: &AgentEnvelope, observed_at_micros: u64) -> bool {
+    envelope.deadline_micros.is_some_and(|deadline| {
+        observed_at_micros < deadline
+            && deadline - observed_at_micros <= MAX_REGISTRY_FACT_TTL_MICROS
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "query")]
+    use crate::capabilities::{Capabilities, HelloOutcome};
+    #[cfg(feature = "query")]
+    use crate::iggy::prelude::IggyClient;
     use laser_wire::agent::{CapabilityDescriptor, ConversationId, Health, RecordId};
     use laser_wire::framing::encode_named;
+
+    #[cfg(feature = "query")]
+    #[tokio::test]
+    async fn given_owned_registry_handles_when_spawned_then_should_run_on_their_own_tasks() {
+        let laser = Laser::from_client(IggyClient::default())
+            .with_default_stream("acme")
+            .with_capabilities(Capabilities {
+                hello: HelloOutcome::Rejected,
+                ..Capabilities::OPEN
+            });
+        let mut registry = laser
+            .agent_registry()
+            .expect("a default stream has a registry");
+        let presence = tokio::spawn(async move { registry.refresh_presence().await });
+        let metadata = tokio::spawn(laser.client_metadata().all());
+        assert_eq!(
+            presence
+                .await
+                .expect("the registry task joins")
+                .expect("a server without presence reads none"),
+            0
+        );
+        assert!(
+            metadata
+                .await
+                .expect("the metadata task joins")
+                .is_err_and(|error| matches!(error, LaserError::Transport(_)))
+        );
+    }
 
     fn descriptor(skill_id: &str) -> CapabilityDescriptor {
         CapabilityDescriptor {
@@ -832,6 +955,7 @@ mod tests {
             version: None,
             capabilities: skills.iter().map(|skill| descriptor(skill)).collect(),
             ttl_micros,
+            inbox: None,
         };
         let mut envelope = AgentEnvelope::status(
             RecordId::from_u128(1),
@@ -944,6 +1068,34 @@ mod tests {
     }
 
     #[test]
+    fn given_a_registry_fact_when_appended_against_its_deadline_then_should_be_live_only_before_it()
+    {
+        let mut fact = AgentEnvelope::status(
+            RecordId::from_u128(1),
+            ConversationId::from_u128(2),
+            "operator".parse().expect("valid agent id"),
+            OPERATION_UNQUARANTINE,
+        );
+        fact.body = b"worker".to_vec();
+        assert!(!fact_live(&fact, 100), "a fact without a deadline");
+        let fact = fact.with_deadline_micros(100 + REGISTRY_FACT_TTL_MICROS);
+        assert!(fact_live(&fact, 100), "the fact as its signer appended it");
+        assert!(
+            !fact_live(&fact, 100 + REGISTRY_FACT_TTL_MICROS),
+            "the same signed fact appended again once its deadline passed"
+        );
+        assert!(
+            !fact_live(&fact, 100 + MAX_REGISTRY_FACT_TTL_MICROS),
+            "a replay after the applied-fact set forgot the original"
+        );
+        let unbounded = fact.with_deadline_micros(101 + MAX_REGISTRY_FACT_TTL_MICROS);
+        assert!(
+            !fact_live(&unbounded, 100),
+            "a fact valid for longer than its replay guard remembers it"
+        );
+    }
+
+    #[test]
     fn given_advertised_health_when_checking_availability_then_should_skip_only_unavailable() {
         let with_health = |health| RegisteredCard {
             agent: "a".parse().expect("valid agent id"),
@@ -955,6 +1107,7 @@ mod tests {
                     ..descriptor("diagnose")
                 }],
                 ttl_micros: None,
+                inbox: None,
             },
             observed_at_micros: 0,
         };

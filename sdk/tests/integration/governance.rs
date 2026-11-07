@@ -1,8 +1,8 @@
 use crate::harness::{eventually, laser};
 use async_trait::async_trait;
 use laser_sdk::govern::{
-    ActionDecision, ActionGovernor, ActionKind, GovernedAction, GovernorMode,
-    POLICY_DECISION_OPERATION, PolicyEvidence,
+    ActionDecision, ActionGovernor, ActionKind, GOVERNOR_ERROR_DECISION, GovernedAction,
+    GovernorMode, POLICY_DECISION_OPERATION, PolicyEvidence,
 };
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{AgentEnvelope, METADATA_PURPOSE};
@@ -93,6 +93,43 @@ async fn given_observe_mode_when_a_block_decides_then_should_record_and_let_the_
     })
     .await;
     assert!(!landed.payload.is_empty());
+}
+
+#[tokio::test]
+async fn given_observe_mode_when_the_governor_fails_then_should_record_the_failure_and_let_the_action_through()
+ {
+    let laser = laser().await;
+    let observed = laser.with_governor(Arc::new(FailingGovernor), GovernorMode::Observe);
+    let enforced = laser.with_governor(Arc::new(FailingGovernor), GovernorMode::Enforce);
+    let provenance = Provenance::builder()
+        .conversation_id(ConversationId::new())
+        .build();
+
+    observed
+        .send_agent(AgentTopic::Sessions, "shadowed send", &provenance)
+        .await
+        .expect("observe mode proceeds when the governor fails");
+    let error = enforced
+        .send_agent(AgentTopic::Sessions, "enforced send", &provenance)
+        .await
+        .expect_err("enforce mode fails closed when the governor fails");
+    assert!(matches!(error, LaserError::Handler(_)), "{error:?}");
+
+    let evidence = eventually(|| async {
+        let all = audit_evidence(&laser).await;
+        all.into_iter()
+            .find(|record| record.decision == GOVERNOR_ERROR_DECISION)
+    })
+    .await;
+    assert_eq!(evidence.outcome, "effected");
+    assert_eq!(evidence.mode, "observe");
+    assert!(
+        evidence
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("policy engine offline")),
+        "{evidence:?}"
+    );
 }
 
 // A governor keyed on the advisory `purpose` metadata redacts the body: the
@@ -319,6 +356,8 @@ impl ActionGovernor for RedactMarketing {
 
 struct StepUpRequests;
 
+struct FailingGovernor;
+
 struct BlockFabricatedMemory;
 
 struct IdentityEmbedder;
@@ -342,6 +381,13 @@ impl ActionGovernor for BlockFabricatedMemory {
             return Ok(ActionDecision::block("fabricated memory marker"));
         }
         Ok(ActionDecision::allow())
+    }
+}
+
+#[async_trait]
+impl ActionGovernor for FailingGovernor {
+    async fn decide(&self, _action: &GovernedAction<'_>) -> Result<ActionDecision, LaserError> {
+        Err(LaserError::Handler("policy engine offline".to_owned()))
     }
 }
 

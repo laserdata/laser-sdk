@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 import laser_sdk as ls
+import pytest
 from pytest_bdd import given, parsers, scenarios, then, when
 
 SCENARIOS = Path(__file__).parent.parent / "scenarios"
@@ -42,7 +43,7 @@ def submit_and_cancel_a2a(world):
     replayed = canceled
     for _ in range(80):
         replayed = world.run(lambda: bridge.task(task["id"]))
-        if replayed["status"]["state"].casefold() == "canceled":
+        if replayed["status"]["state"] == "TASK_STATE_CANCELED":
             world.bridge_task_state = "Canceled"
             return
         world.run(lambda: asyncio.sleep(0.025))
@@ -75,7 +76,7 @@ def record_bound_cancel(world, caller):
     try:
         task = world.run(lambda: bridge.cancel(world.bound_task, caller=caller))
         state = task["status"]["state"]
-        state = "Canceled" if state.casefold() == "canceled" else state
+        state = "Canceled" if state == "TASK_STATE_CANCELED" else state
     except ls.HandlerConfigError:
         state = "refused"
     world.bound_outcomes.append(f"{caller or 'anonymous'}:{state}")
@@ -129,18 +130,28 @@ def reconstructed_count(world, count):
 
 @when(parsers.parse('I stream chat chunks "{first}" and "{second}"'))
 def stream_chat(world, first, second):
+    stream_chat_chunks(world, [first, second])
+
+
+@when(parsers.parse("I stream {count:d} chat chunks"))
+def stream_many_chat_chunks(world, count):
+    stream_chat_chunks(world, [f"chunk {index} " for index in range(count)])
+
+
+def stream_chat_chunks(world, chunks):
     stream = world.laser.agdx(ls.AgentTopic.Sessions, "assistant", world.conversation).stream(
         ls.mint_ulid(), "chat"
     )
-    world.run(lambda: stream.write(first.encode()))
-    world.run(lambda: stream.write(second.encode()))
+    for chunk in chunks:
+        world.run(lambda chunk=chunk: stream.write(chunk.encode()))
     world.run(lambda: stream.finish(finish_reason="stop"))
     for _ in range(80):
         events = world.run(
             lambda: world.laser.agui_events(world.conversation, ls.AgentTopic.Sessions)
         )
-        if len(events) >= 4:
-            world.agui_event_types = [event["type"] for event in events]
+        types = [event["type"] for event in events]
+        if "TEXT_MESSAGE_END" in types:
+            world.agui_event_types = types
             return
         world.run(lambda: asyncio.sleep(0.025))
     raise AssertionError("chat events did not become visible")
@@ -149,11 +160,21 @@ def stream_chat(world, first, second):
 @then("AG-UI renders the chat lifecycle in order")
 def chat_lifecycle(world):
     assert world.agui_event_types == [
+        "RUN_STARTED",
         "TEXT_MESSAGE_START",
         "TEXT_MESSAGE_CONTENT",
         "TEXT_MESSAGE_CONTENT",
         "TEXT_MESSAGE_END",
+        "RUN_FINISHED",
     ]
+
+
+@then(parsers.parse("AG-UI renders one run with {count:d} text contents from its opening chunk"))
+def long_chat_lifecycle(world, count):
+    types = world.agui_event_types
+    assert types[:2] == ["RUN_STARTED", "TEXT_MESSAGE_START"], types
+    assert types.count("TEXT_MESSAGE_CONTENT") == count
+    assert types[-2:] == ["TEXT_MESSAGE_END", "RUN_FINISHED"]
 
 
 @given(
@@ -162,31 +183,42 @@ def chat_lifecycle(world):
 def responders(world, first, second):
     world.responders = []
     world.answered = {}
-
-    def responder(name, answered):
-        async def handle(ctx, message):
-            envelope = message.envelope
-            if envelope is None or envelope["kind"] != "command":
-                return
-            if envelope.get("tool") is not None:
-                answered.append("tool")
-            elif envelope.get("operation") == "chat":
-                answered.append("task")
-            else:
-                answered.append("input")
-            await ctx.respond_input(ls.AgentTopic.Sessions, name.encode())
-
-        return handle
-
-    async def spawn(name):
-        answered = []
-        agent = world.laser.spawn_agent(name, ls.AgentTopic.Sessions, responder(name, answered))
-        await agent.ready()
-        world.answered[name] = answered
-        world.responders.append(agent)
-
     for name in (first, second):
-        world.run(lambda name=name: spawn(name))
+        world.run(lambda name=name: _spawn_responder(world, name, None))
+
+
+@given(parsers.parse('responder "{name}" answers every command with its own name'))
+def responder(world, name):
+    world.responders = []
+    world.answered = {}
+    world.run(lambda: _spawn_responder(world, name, None))
+
+
+# An input request reaches only an agent that lists its operation.
+@given(parsers.parse('responder "{name}" answers A2A tasks and input requests with its own name'))
+def approving_responder(world, name):
+    world.run(lambda: _spawn_responder(world, name, ["chat", "input_request"]))
+
+
+async def _spawn_responder(world, name, operations):
+    answered = []
+
+    async def handle(ctx, message):
+        envelope = message.envelope
+        if envelope is None or envelope["kind"] != "command":
+            return
+        if envelope.get("tool") is not None:
+            answered.append("tool")
+        elif envelope.get("operation") == "chat":
+            answered.append("task")
+        else:
+            answered.append("input")
+        await ctx.respond_input(ls.AgentTopic.Sessions, name.encode())
+
+    agent = world.laser.spawn_agent(name, ls.AgentTopic.Sessions, handle, operations=operations)
+    await agent.ready()
+    world.answered[name] = answered
+    world.responders.append(agent)
 
 
 @when(parsers.parse('I submit an A2A task to "{target}"'))
@@ -233,11 +265,42 @@ def task_completes_with(world, text):
     current = None
     for _ in range(600):
         current = world.run(lambda: bridge.task(world.bridge_task))
-        if current["status"]["state"].casefold() == "completed":
-            assert current["artifacts"][0]["text"] == text
+        if current["status"]["state"] == "TASK_STATE_COMPLETED":
+            assert current["artifacts"][0]["parts"][0]["text"] == text
             return
         world.run(lambda: asyncio.sleep(0.025))
     raise AssertionError(f"the addressed A2A task did not complete: {current!r}")
+
+
+@then("canceling the A2A task is refused")
+def cancel_finished_task_is_refused(world):
+    bridge = ls.A2aBridge(
+        world.laser, "a2a-gateway", ls.AgentTopic.Sessions, ls.AgentTopic.Sessions
+    )
+    with pytest.raises(ls.RejectedError):
+        world.run(lambda: bridge.cancel(world.bridge_task))
+    response = world.run(
+        lambda: bridge.handle_rpc(
+            {"jsonrpc": "2.0", "id": 1, "method": "CancelTask", "params": {"id": world.bridge_task}}
+        )
+    )
+    assert response["error"]["code"] == -32002
+
+
+@then("an A2A task that was never submitted is not found")
+def unknown_task_is_not_found(world):
+    bridge = ls.A2aBridge(
+        world.laser, "a2a-gateway", ls.AgentTopic.Sessions, ls.AgentTopic.Sessions
+    )
+    unknown = ls.new_conversation_id()
+    with pytest.raises(ls.HandlerConfigError):
+        world.run(lambda: bridge.task(unknown))
+    response = world.run(
+        lambda: bridge.handle_rpc(
+            {"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": unknown}}
+        )
+    )
+    assert response["error"]["code"] == -32001
 
 
 @then(parsers.parse('the MCP tool result is "{text}"'))

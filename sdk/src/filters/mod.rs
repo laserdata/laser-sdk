@@ -36,8 +36,14 @@ mod progress;
 #[cfg(feature = "streaming")]
 pub(crate) mod reader;
 #[cfg(feature = "streaming")]
+mod records;
+#[cfg(feature = "streaming")]
 pub use client::{DEFAULT_OUTCOME_WAIT, FilterPreviewBuilder};
 #[cfg(feature = "filters")]
 pub use laser_wire::filter::eval::{CompiledFilter, DecodeLimits, FilterRecord, HeaderRef};
 #[cfg(feature = "streaming")]
-pub use reader::{FilteredReader, FilteredReaderBuilder, MatchedPage, MatchedRecord};
+pub use reader::{
+    FilteredReader, FilteredReaderBuilder, MatchedPage, MatchedRecord, RecordEvaluation,
+};
+#[cfg(feature = "streaming")]
+pub use records::FilteredRecords;

@@ -1,4 +1,4 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::convert::{py_to_de, ser_to_py};
 use crate::errors::to_pyerr;
@@ -53,10 +53,10 @@ impl PyProjections {
         &self,
         py: Python<'py>,
         projection: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
         let projection: Projection = py_to_de(projection)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .projections()
                 .register(projection)
@@ -66,9 +66,9 @@ impl PyProjections {
     }
 
     /// Drop a projection by id. The managed host stops applying it. Existing rows stay.
-    fn drop<'py>(&self, py: Python<'py>, id: String) -> PyResult<Bound<'py, PyAny>> {
+    fn drop<'py>(&self, py: Python<'py>, id: String) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser.projections().drop(id).await.map_err(to_pyerr)
         })
     }
@@ -81,13 +81,13 @@ impl PyProjections {
         &self,
         py: Python<'py>,
         projection: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
         let mut projection: Projection = py_to_de(projection)?;
         // A graph projection is always `kind = Graph`, so the dict need not carry
         // the wire code: set it here from the entity schema the caller passed.
         projection.kind = ProjectionKind::Graph;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .projections()
                 .register_graph(projection)
@@ -98,17 +98,31 @@ impl PyProjections {
 
     /// Drop the graph projection registered under `id`. Materialized nodes and
     /// edges are left untouched.
-    fn drop_graph<'py>(&self, py: Python<'py>, id: String) -> PyResult<Bound<'py, PyAny>> {
+    fn drop_graph<'py>(&self, py: Python<'py>, id: String) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser.projections().drop_graph(id).await.map_err(to_pyerr)
         })
     }
 
-    /// Read one projection's details by id, or `None` when no projection has it.
-    fn get<'py>(&self, py: Python<'py>, id: String) -> PyResult<Bound<'py, PyAny>> {
+    /// Each binding's status dict for projection `id`, or None when no
+    /// projection has it.
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Awaitable[typing.Optional[list[dict[str, typing.Any]]]]",
+        imports = ("typing",)
+    ))]
+    fn status<'py>(&self, py: Python<'py>, id: String) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.laser.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
+            let statuses = laser.projections().status(id).await.map_err(to_pyerr)?;
+            Python::attach(|py| ser_to_py(py, &statuses))
+        })
+    }
+
+    /// Read one projection's details by id, or `None` when no projection has it.
+    fn get<'py>(&self, py: Python<'py>, id: String) -> PyResult<Awaitable<'py, Py<PyAny>>> {
+        let laser = self.laser.clone();
+        awaitable(py, async move {
             let info = laser.projections().get(id).await.map_err(to_pyerr)?;
             Python::attach(|py| match info {
                 Some(info) => ser_to_py(py, &info),
@@ -117,10 +131,18 @@ impl PyProjections {
         })
     }
 
-    /// List projections, narrowed by a bound `topic` or any of `topics`, a
-    /// `name_contains` substring, an `id_prefix`, or a `search` substring of
-    /// the id or the name. No filter lists every projection.
-    #[pyo3(signature = (*, topic=None, topics=None, name_contains=None, id_prefix=None, search=None))]
+    /// One page of the projections, narrowed by a bound `topic` or any of
+    /// `topics`, a `name_contains` substring, an `id_prefix`, or a `search`
+    /// substring of the id or the name. No filter lists every projection.
+    /// `page` is 1-based and `results` the projections per page, zero for the
+    /// server's default of 10, at most 100. The dict holds `items`, `page`,
+    /// `total_pages` and `total_results`.
+    #[pyo3(signature = (*, topic=None, topics=None, name_contains=None, id_prefix=None, search=None, page=0, results=0))]
+    #[allow(clippy::too_many_arguments)]
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Awaitable[dict[str, typing.Any]]",
+        imports = ("typing",)
+    ))]
     fn list<'py>(
         &self,
         py: Python<'py>,
@@ -129,10 +151,12 @@ impl PyProjections {
         name_contains: Option<String>,
         id_prefix: Option<String>,
         search: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+        page: u32,
+        results: u32,
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let mut request = laser.projections().list();
+        awaitable(py, async move {
+            let mut request = laser.projections().list().page(page).results(results);
             if let Some(topic) = topic {
                 request = request.for_topic(topic);
             }
@@ -172,10 +196,10 @@ impl PyBindings {
         &self,
         py: Python<'py>,
         binding: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
         let binding: ProjectionBinding = py_to_de(binding)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser.bindings().apply(binding).await.map_err(to_pyerr)
         })
     }
@@ -189,10 +213,10 @@ impl PyBindings {
         py: Python<'py>,
         source: &Bound<'_, PyAny>,
         projection_ref: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
         let source: SourceSelector = py_to_de(source)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser
                 .bindings()
                 .remove(source, projection_ref)
@@ -202,7 +226,10 @@ impl PyBindings {
     }
 }
 
-/// The writer-schema registry (Avro, Protobuf), built with `laser.schemas()`.
+/// The writer-schema registry (Avro, Protobuf), built with `laser.schemas()`:
+/// the default stream's registry, or the deployment-wide one without a default
+/// stream. Ids are unique within one registry, and a registry holds at most
+/// 1,024 schemas, tombstones included.
 #[gen_stub_pyclass]
 #[pyclass(name = "Schemas", frozen)]
 pub struct PySchemas {
@@ -222,10 +249,10 @@ impl PySchemas {
         source: &Bound<'_, PyAny>,
         name: Option<String>,
         version: Option<u32>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Awaitable<'py, u32>> {
         let laser = self.laser.clone();
         let source = py_to_de(source)?;
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let schemas = laser.schemas();
             let mut request = schemas.register(source);
             if let Some(name) = name {
@@ -240,18 +267,18 @@ impl PySchemas {
 
     /// Drop the writer schema at `id`. A tombstone: records stamped with it keep
     /// decoding and the id stays reserved.
-    fn drop<'py>(&self, py: Python<'py>, id: u32) -> PyResult<Bound<'py, PyAny>> {
+    fn drop<'py>(&self, py: Python<'py>, id: u32) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.laser.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             laser.schemas().drop(id).await.map_err(to_pyerr)
         })
     }
 
     /// Read the writer schema at `id` (active or tombstoned), or `None` when the
     /// id is free.
-    fn get<'py>(&self, py: Python<'py>, id: u32) -> PyResult<Bound<'py, PyAny>> {
+    fn get<'py>(&self, py: Python<'py>, id: u32) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.laser.clone();
-        future_into_py(py, async move {
+        awaitable(py, async move {
             let info = laser.schemas().get(id).await.map_err(to_pyerr)?;
             Python::attach(|py| match info {
                 Some(info) => ser_to_py(py, &info),
@@ -260,12 +287,29 @@ impl PySchemas {
         })
     }
 
-    /// List every known writer schema, active and tombstoned.
-    fn list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// One page of writer schemas, active and tombstoned, in id order: a dict
+    /// with `items`, `page`, `total_pages` and `total_results`. `page` 0 reads
+    /// the first page and `results` 0 leaves the page size to the server.
+    #[pyo3(signature = (*, name_contains=None, page=0, results=0))]
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Awaitable[dict[str, typing.Any]]",
+        imports = ("typing",)
+    ))]
+    fn list<'py>(
+        &self,
+        py: Python<'py>,
+        name_contains: Option<String>,
+        page: u32,
+        results: u32,
+    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let list = laser.schemas().list().await.map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &list))
+        awaitable(py, async move {
+            let mut request = laser.schemas().list().page(page).results(results);
+            if let Some(substring) = name_contains {
+                request = request.name_contains(substring);
+            }
+            let page = request.fetch().await.map_err(to_pyerr)?;
+            Python::attach(|py| ser_to_py(py, &page))
         })
     }
 }

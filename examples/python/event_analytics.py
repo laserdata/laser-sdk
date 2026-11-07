@@ -88,6 +88,7 @@ ROUTES = [
 # a random few seconds from here.
 BASE_US = 1_900_000_000_000_000
 ONE_MINUTE_US = 60_000_000
+ONE_MINUTE_MS = 60_000
 STEP_MAX_US = 30_000_000
 
 PUBLISH_CHUNK = 30
@@ -225,7 +226,7 @@ async def run_analytics(laser: ls.Laser) -> None:
     )
     print(f"events in the first 5 minutes: {scalar(first_window)}")
 
-    per_minute = await laser.query(INDEX).count().window(TS, ONE_MINUTE_US).fetch()
+    per_minute = await laser.query(INDEX).count().window(TS, ONE_MINUTE_MS).fetch()
     print("events per minute:")
     for row in per_minute.rows:
         bucket = per_minute.value_text(row, "window_start") or "?"

@@ -8,8 +8,7 @@ use iggy::prelude::{ConsumerGroupClient, ConsumerGroupDetails, Identifier, IggyE
 use laser_wire::filter::{
     CatalogPosition, ConsumerFilter, FilterBinding, FilterConsumer, FilterError, FilterErrorReason,
     FilterGroupIdentity, FilterGroupRef, FilterHeader, FilterMutation, FilterRef,
-    FilterRevisionPage, FilterRevisionRef, FilterSource, FilterSummary, FilterTestResult,
-    GroupFilterSpec,
+    FilterRevisionPage, FilterSource, FilterSummary, FilterTestResult, GroupFilterSpec,
 };
 use laser_wire::validate::Validate;
 use std::sync::{Arc, Mutex};
@@ -92,8 +91,8 @@ impl ConsumerGroup {
         }
     }
 
-    /// The group's filter policy: configure it, inspect it, draft and pause
-    /// revisions, release it, preview and sample-test it.
+    /// The group's filter policy: configure it, inspect it, pause and resume
+    /// it, release it, preview and sample-test it.
     pub fn filter(&self) -> GroupFilter {
         GroupFilter {
             group: self.clone(),
@@ -116,7 +115,7 @@ impl ConsumerGroup {
     /// # Errors
     ///
     /// [`LaserError::NoStream`] when the topic has no stream.
-    pub fn reader(&self) -> Result<FilteredReaderBuilder<'_>, LaserError> {
+    pub fn reader(&self) -> Result<FilteredReaderBuilder, LaserError> {
         self.reader_with(FilterRef::Group)
     }
 
@@ -151,9 +150,9 @@ impl ConsumerGroup {
     pub(crate) fn reader_with(
         &self,
         filter: FilterRef,
-    ) -> Result<FilteredReaderBuilder<'_>, LaserError> {
+    ) -> Result<FilteredReaderBuilder, LaserError> {
         Ok(FilteredReaderBuilder::new(
-            self.laser(),
+            self.laser().clone(),
             self.source()?,
             self.selector(),
             filter,
@@ -222,11 +221,7 @@ impl ConsumerGroup {
             .configured_at
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if configured_at.is_none_or(|known| {
-            position.operation_id.is_some() && known.operation_id != position.operation_id
-                || known.partition_id != position.partition_id
-                || known.offset < position.offset
-        }) {
+        if configured_at.is_none_or(|known| supersedes(&known, &position)) {
             *configured_at = Some(position);
         }
     }
@@ -297,7 +292,7 @@ impl CreateConsumerGroup {
         self
     }
 
-    /// Configure the group with a definition or one of its own revisions.
+    /// Configure the group with this policy once it exists.
     #[must_use]
     pub fn policy(mut self, policy: GroupFilterSpec) -> Self {
         self.policy = Some(policy);
@@ -395,8 +390,7 @@ impl GroupFilter {
         .await
     }
 
-    /// [`configure`](Self::configure) with a definition or one of the group's
-    /// own revisions.
+    /// [`configure`](Self::configure) with a policy spec.
     pub async fn configure_with(
         &self,
         policy: GroupFilterSpec,
@@ -460,33 +454,18 @@ impl GroupFilter {
         }
     }
 
-    /// One page of the group's own filter revisions, newest first.
+    /// One page of the group's own filter revisions, newest first. `page`
+    /// counts from 1 and `results` is the page length.
     pub async fn revisions(
         &self,
         page: u32,
-        page_size: u32,
+        results: u32,
     ) -> Result<FilterRevisionPage, LaserError> {
         let active = self.active().await?;
         self.group
             .laser()
             .filters()
-            .revisions(active.filter_id, page, page_size)
-            .await
-    }
-
-    /// Draft a revision of the group's own filter. Readers keep running the
-    /// active revision. A different digest requires a separate group.
-    /// `expected_revision` must still be the latest.
-    pub async fn revise(
-        &self,
-        expected_revision: u32,
-        filter: ConsumerFilter,
-    ) -> Result<FilterRevisionRef, LaserError> {
-        let active = self.active().await?;
-        self.group
-            .laser()
-            .filters()
-            .revise(active.filter_id, expected_revision, filter)
+            .revisions(active.filter_id, page, results)
             .await
     }
 
@@ -541,7 +520,7 @@ impl GroupFilter {
     /// Preview the active policy over the stored records of one partition. A
     /// preview joins no group, stores no offset, and changes no consumer
     /// state.
-    pub async fn preview(&self, partition_id: u32) -> Result<FilterPreviewBuilder<'_>, LaserError> {
+    pub async fn preview(&self, partition_id: u32) -> Result<FilterPreviewBuilder, LaserError> {
         let active = self.active().await?;
         let source = self.group.source()?;
         Ok(self.group.laser().filters().preview(
@@ -585,5 +564,44 @@ impl GroupFilter {
             )
             .into()
         })
+    }
+}
+
+/// Whether `position` is a later catalog configuration than `known`. Catalog revisions order
+/// outcomes across a recreated control log, where offsets start over. Without them, another
+/// proven operation, another partition or a later offset counts as later.
+fn supersedes(known: &CatalogPosition, position: &CatalogPosition) -> bool {
+    match (known.revision, position.revision) {
+        (Some(known), Some(revision)) => revision > known,
+        _ => {
+            position.operation_id.is_some() && known.operation_id != position.operation_id
+                || known.partition_id != position.partition_id
+                || known.offset < position.offset
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_catalog_replies_that_arrive_reversed_across_a_recreated_log_when_remembered_then_should_keep_the_later_revision()
+     {
+        let later = CatalogPosition {
+            partition_id: 0,
+            offset: 5,
+            operation_id: Some(2),
+            revision: Some(2),
+        };
+        let earlier = CatalogPosition {
+            partition_id: 0,
+            offset: 900,
+            operation_id: Some(1),
+            revision: Some(1),
+        };
+
+        assert!(!supersedes(&later, &earlier));
+        assert!(supersedes(&earlier, &later));
     }
 }

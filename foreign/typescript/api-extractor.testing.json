@@ -3,5 +3,11 @@
   "mainEntryPointFilePath": "<projectFolder>/dist/testing.d.ts",
   "apiReport": {
     "reportFileName": "laser-sdk-testing.api.md"
+  },
+  "messages": {
+    "extractorMessageReporting": {
+      "ae-forgotten-export": { "logLevel": "none", "addToApiReportFile": true },
+      "ae-missing-release-tag": { "logLevel": "none" }
+    }
   }
 }

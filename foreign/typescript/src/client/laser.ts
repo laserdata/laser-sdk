@@ -1,4 +1,6 @@
+import { Materialization, MaterializeRequest } from "../managed/materialize.js"
 import { millisToMicros } from "./duration.js"
+import { type CallOptions, abortable, cancellable, delay, throwIfAborted } from "./call-options.js"
 import { closeProducerStatistics } from "../stream/producer-statistics.js"
 import type { GroupContext } from "../stream/consumer-group.js"
 import { connectOptions, type ConnectOptions } from "./connect-options.js"
@@ -9,11 +11,15 @@ import {
   type IggyClient,
   type LaserTransport,
   type ManagedAnswer,
+  type ManagedSendOptions,
   type ManagedTarget,
   NEVER_EXPIRE,
   type SendMessagesResponse,
   serverErrorCode
 } from "../iggy/apache-iggy.js"
+import { PRESENCE_ATTEMPT_MS } from "../retry.js"
+import { isRetryable } from "./error-classify.js"
+import { Mutex } from "../runtime/mutex.js"
 import { createAgdx, type Agdx } from "../agent/agdx.js"
 import { replyTopicFor, resolveAgentTopic } from "../agent/partitioning.js"
 import { decodeAgentMessage, type AgentMessage } from "../agent/reliable-consumer.js"
@@ -21,6 +27,7 @@ import { type Dispatch, classify } from "../wire/dispatch.js"
 import type { AppliedFrontier } from "../wire/mutation.js"
 import { ReplyHub } from "../agent/replies.js"
 import { ContractBuilder, scatter, scatterReport, type ScatterReport } from "../agent/contract.js"
+import type { GatherPolicy } from "../agent/context.js"
 import { Workflow } from "../agent/workflow.js"
 import {
   aguiEvents,
@@ -67,11 +74,10 @@ import type { KeyRegistry, SigningKey } from "../signing.js"
 import type { Topic } from "../stream/topic.js"
 import { executeBatch } from "../managed/batch.js"
 import { ForkHandle } from "../managed/forks.js"
-import { Kv } from "../managed/kv.js"
+import { Kv, type LeaseCalls } from "../managed/kv.js"
 import { LeaseCoordinator } from "../managed/coordination.js"
 import { Bindings, Projections, Schemas } from "../managed/projections.js"
 import { QueryRequest, queryReplyWaitMs } from "../managed/query.js"
-import { Destinations } from "../managed/destinations.js"
 import {
   authzHistory,
   bindRoles,
@@ -87,25 +93,23 @@ import { Watch } from "../managed/watch.js"
 import {
   type AuthzHistoryReply,
   type AuthzSubject,
+  type BindingsReply,
   type Role,
   type WhoamiReply,
-  scopedResource,
-  splitScopedResource
+  splitScopedResource,
+  streamResource
 } from "../wire/authz.js"
 import type { BatchItem } from "../wire/batch.js"
 import {
   AGDX_HELLO_CODE,
   AGDX_CONTROL_PUBLISH_CODE,
+  AGDX_KV_LEASE_CODE,
+  AGDX_KV_LEASE_RENEW_CODE,
   AGDX_SET_CLIENT_METADATA_CODE,
   CONTROL_OP_VERSION,
   QUERY_OP_VERSION
 } from "../wire/codes.js"
-import {
-  QueryCancelCommand,
-  QueryCommand,
-  QueryPageCommand,
-  QueryStatusCommand
-} from "../wire/commands.js"
+import { QueryCommand } from "../wire/commands.js"
 import {
   encodeControlEnvelope,
   type ControlCommand,
@@ -114,10 +118,15 @@ import {
 import type { ForkInfo } from "../wire/fork.js"
 import { decodeBackendAnnounce } from "../wire/hello.js"
 import type { KvNamespaceInfo } from "../wire/kv.js"
-import type { Query, QueryExecutionStatus, QueryResult, QueryTarget } from "../wire/query.js"
-import type { CheckpointMutationResult, CheckpointRequestEnvelope } from "../wire/checkpoint.js"
-import type { DestinationId, QueryExecutionId } from "../wire/ids.js"
+import { REGISTRY_FACT_TTL_MICROS } from "../wire/limits.js"
+import {
+  describeQueryError,
+  type Query,
+  type QueryResult,
+  type QueryTarget
+} from "../wire/query.js"
 import { AgentId, ConversationId } from "../types/ids.js"
+import { redriveKey, redrivenEnvelope } from "../agent/redrive.js"
 import { ownedBytes, type BytesLike } from "./bytes.js"
 import {
   OPERATION_CARD,
@@ -136,7 +145,7 @@ import {
   type AgentPresence
 } from "../wire/agent.js"
 import { ContentType, contentTypeCode } from "../wire/content.js"
-import { CONTENT_TYPE } from "../wire/headers.js"
+import { AGENT_VERSION, CONTENT_TYPE } from "../wire/headers.js"
 import { IDEMPOTENCY_KEY, TARGET_AGENT_ID } from "../wire/headers.js"
 import type { HeaderValue } from "../stream/header-value.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
@@ -162,13 +171,16 @@ import type { LogPosition } from "../wire/ids.js"
 import type { AgentDeadLetter, PatchOp } from "../wire/agent.js"
 import type { ConsumerGroupName } from "../types/ids.js"
 import {
+  CommandExecutionError,
   ConfigError,
   NoStreamError,
   PresenceConflictError,
   QueryExecutionError,
   ProtocolError,
   InvalidError,
+  LaserError,
   TimeoutError,
+  TransportError,
   UnsupportedError
 } from "./errors.js"
 import { decodeManagedReply, executeManaged, type ManagedTransport } from "./managed.js"
@@ -188,6 +200,7 @@ import {
   type Capabilities,
   OPEN_CAPABILITIES,
   advertisedTopology,
+  capabilityReprobeDue,
   managedCapabilitiesFrom,
   mergeCapabilities,
   isReady,
@@ -389,13 +402,16 @@ export class LaserBuilder {
 
   /** Connects with the configured settings. A configuration conflict
    * rejects before any I/O, like every other failure of the connect. */
-  async connect(): Promise<Laser> {
+  async connect(options: CallOptions = {}): Promise<Laser> {
     const modes =
       Number(this.connectionStringValue !== undefined) +
       Number(this.addressValue !== undefined) +
       Number(this.clientValue !== undefined)
     if (modes > 1) {
       throw new ConfigError("connectionString(), address(), and client() are mutually exclusive")
+    }
+    if (modes === 0 && this.credentialsValue === undefined) {
+      throw new ConfigError("connectionString, address+credentials, or client is required")
     }
     if (this.credentialsValue !== undefined && this.addressValue === undefined) {
       throw new ConfigError("credentials() requires address()")
@@ -418,7 +434,7 @@ export class LaserBuilder {
     for (const [name, value] of topologyEntries) {
       if (value.length === 0) throw new ConfigError(`${name} must not be empty`)
     }
-    return this.connectWith({
+    const settings: LaserBuildOptions = {
       connectOptions: connectOptions(this.connectOptionsValue),
       publishOptions: publishOptions(this.publishOptionsValue),
       ...(this.connectionStringValue !== undefined
@@ -438,7 +454,8 @@ export class LaserBuilder {
       ...(this.verifierValue !== undefined ? { verifier: this.verifierValue } : {}),
       topology: this.topologyValue,
       topologyOverrides: this.topologyOverridesValue
-    })
+    }
+    return connectUnless(options.signal, () => this.connectWith(settings))
   }
 }
 
@@ -467,6 +484,11 @@ interface LaserSharedState {
   // connections of its own.
   readonly dialed: boolean
   advertisedAgent?: string
+  // The replica that holds this connection's advertised presence, pinned by
+  // the first advertise and released by a clear that reached it.
+  presenceReplica?: number
+  // Serializes advertise and clear, so one cannot overtake the other.
+  readonly presenceLock: Mutex
   capabilityProbeAtMs?: number
   announcedTopology: LaserTopology
   closing?: Promise<void>
@@ -493,6 +515,7 @@ function newSharedState(connectionString: string | undefined): LaserSharedState 
   return {
     registryCaches: new Map(),
     replyHubs: new Map(),
+    presenceLock: new Mutex(),
     leases: LeaseCoordinator.forConnection(connectionString),
     sessionLeases: new LeaseRegistry(),
     layouts: new Map(),
@@ -591,6 +614,22 @@ async function probeCapabilities(transport: ManagedTransport): Promise<Capabilit
   }
 }
 
+// A connection that opens after `signal` aborted is closed, so an abandoned
+// connect leaks no socket.
+async function connectUnless(
+  signal: AbortSignal | undefined,
+  open: () => Promise<Laser>
+): Promise<Laser> {
+  throwIfAborted(signal, "connect")
+  const opening = open()
+  try {
+    return await abortable(opening, signal, "connect")
+  } catch (error) {
+    if (signal?.aborted === true) void opening.then((laser) => laser.close()).catch(() => undefined)
+    throw error
+  }
+}
+
 /** Owns one Apache Iggy connection and addresses every stream available through it. */
 export class Laser implements AsyncDisposable {
   private constructor(
@@ -631,8 +670,10 @@ export class Laser implements AsyncDisposable {
 
   /** The name this handle sends for the managed resource `name`:
    * `stream:<default stream>/<name>` under `stream` naming with a default
-   * stream, else `name` unchanged. A name that already starts with `stream:`
-   * is returned unchanged. */
+   * stream, else `name` unchanged. A name already scoped to the default stream
+   * is returned unchanged, and a `stream:` name for any other stream is scoped
+   * like a local name. Re-scope with `withDefaultStream` or use `bare` naming
+   * to address another stream. */
   resourceName(name: string): string {
     return this.resourceNameIn(this.defaultStream, name)
   }
@@ -657,7 +698,20 @@ export class Laser implements AsyncDisposable {
    * @internal */
   resourceNameIn(stream: string | undefined, name: string): string {
     const scope = this.resourceScope(stream)
-    return scope !== undefined && name.length > 0 ? scopedResource(scope, name) : name
+    if (scope === undefined || name.length === 0) return name
+    return splitScopedResource(name)?.[0] === scope ? name : `${streamResource(scope)}/${name}`
+  }
+
+  // A handle that scopes its names to a default stream containing `/` would
+  // send names every server reads as belonging to the stream before the first
+  // slash, so its managed calls are refused.
+  private ensureScopable(commandCode: number): void {
+    const stream = this.resourceStream()
+    if (stream !== undefined && stream.includes("/") && commandCode !== AGDX_HELLO_CODE) {
+      throw new InvalidError(
+        `default stream \`${stream}\` contains \`/\`, so managed names cannot be scoped to it, use bare resource naming`
+      )
+    }
   }
 
   /** This handle's naming, for the managed handles it builds.
@@ -724,13 +778,16 @@ export class Laser implements AsyncDisposable {
           deadline
         )
       } else if (options.address !== undefined) {
-        // Credentials go in verbatim and the parser validates them, as in Rust.
+        // Percent-encoded, so the parser hands the exact secret to the login
+        // and a dedicated connection dialed from the same string gets it too.
         const { username, password } = options.credentials ?? { username: "", password: "" }
-        dialed = `iggy+tcp://${username}:${password}@${options.address.host}:${String(options.address.port)}`
+        dialed = `iggy+tcp://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${options.address.host}:${String(options.address.port)}`
+        transport = await ApacheIggyTransport.connect(dialed, options.publishOptions, deadline)
+      } else if (options.connectionString !== undefined) {
+        dialed = options.connectionString
         transport = await ApacheIggyTransport.connect(dialed, options.publishOptions, deadline)
       } else {
-        dialed = options.connectionString ?? LOCAL_CONNECTION_STRING
-        transport = await ApacheIggyTransport.connect(dialed, options.publishOptions, deadline)
+        throw new ConfigError("connectionString, address+credentials, or client is required")
       }
       const laser = new Laser(
         transport,
@@ -767,32 +824,29 @@ export class Laser implements AsyncDisposable {
    */
   static fromClient(
     client: IggyClient,
-    options: { readonly ownership?: ClientOwnership } = {}
+    options: CallOptions & { readonly ownership?: ClientOwnership } = {}
   ): Promise<Laser> {
-    return Laser.builder().client(client, options).capabilities(OPEN_CAPABILITIES).connect()
+    return Laser.builder().client(client, options).capabilities(OPEN_CAPABILITIES).connect(options)
   }
 
   /**
    * Connect using an Iggy connection string. Connecting gives up after 30 seconds, or `LASER_CONNECT_TIMEOUT_MS`, with a `TimeoutError` that says whether the server never accepted the connection or never answered the login. Use `Laser.builder().connectTimeout()` for another budget.
    */
-  static async connect(connectionString: string): Promise<Laser> {
-    const deadline = Date.now() + connectOptions().timeoutMs
-    const transport = await ApacheIggyTransport.connect(connectionString, undefined, deadline)
-    const laser = new Laser(transport, undefined, new AsyncOnce(), newSharedState(connectionString))
-    await laser.probeCapabilitiesBefore(deadline)
-    return laser
+  static connect(connectionString: string, options: CallOptions = {}): Promise<Laser> {
+    return connectUnless(options.signal, () => Laser.open(connectionString, undefined))
   }
 
-  static async connectWithStream(connectionString: string, stream: string): Promise<Laser> {
-    const deadline = Date.now() + connectOptions().timeoutMs
-    const transport = await ApacheIggyTransport.connect(connectionString, undefined, deadline)
-    const laser = new Laser(transport, stream, new AsyncOnce(), newSharedState(connectionString))
-    await laser.probeCapabilitiesBefore(deadline)
-    return laser
+  static connectWithStream(
+    connectionString: string,
+    stream: string,
+    options: CallOptions = {}
+  ): Promise<Laser> {
+    return connectUnless(options.signal, () => Laser.open(connectionString, stream))
   }
 
   static async connectEnv(
-    env: Readonly<Record<string, string | undefined>> = process.env
+    env: Readonly<Record<string, string | undefined>> = process.env,
+    options: CallOptions = {}
   ): Promise<Laser> {
     const connectionString = env["LASER_CONNECTION_STRING"]
     if (connectionString === undefined || connectionString.length === 0) {
@@ -800,12 +854,20 @@ export class Laser implements AsyncDisposable {
     }
     const stream = env["LASER_STREAM"]
     return stream === undefined || stream.length === 0
-      ? Laser.connect(connectionString)
-      : Laser.connectWithStream(connectionString, stream)
+      ? Laser.connect(connectionString, options)
+      : Laser.connectWithStream(connectionString, stream, options)
   }
 
-  static async local(): Promise<Laser> {
-    return Laser.connect(LOCAL_CONNECTION_STRING)
+  static local(options: CallOptions = {}): Promise<Laser> {
+    return Laser.connect(LOCAL_CONNECTION_STRING, options)
+  }
+
+  private static async open(connectionString: string, stream: string | undefined): Promise<Laser> {
+    const deadline = Date.now() + connectOptions().timeoutMs
+    const transport = await ApacheIggyTransport.connect(connectionString, undefined, deadline)
+    const laser = new Laser(transport, stream, new AsyncOnce(), newSharedState(connectionString))
+    await laser.probeCapabilitiesBefore(deadline)
+    return laser
   }
 
   /**
@@ -960,9 +1022,10 @@ export class Laser implements AsyncDisposable {
   private managedTransport(): ManagedTransport {
     return {
       sendManaged: (commandCode, payload, options) =>
-        this.observe("laser.managed", { operation: "managed", commandCode }, () =>
-          this.transport.sendManaged(commandCode, payload, options)
-        )
+        this.observe("laser.managed", { operation: "managed", commandCode }, () => {
+          this.ensureScopable(commandCode)
+          return this.transport.sendManaged(commandCode, payload, options)
+        })
     }
   }
 
@@ -971,41 +1034,22 @@ export class Laser implements AsyncDisposable {
     readonly sendManagedTo: (
       commandCode: number,
       payload: Uint8Array,
-      target: ManagedTarget
+      target: ManagedTarget,
+      options?: ManagedSendOptions
     ) => Promise<ManagedAnswer>
   } {
     return {
-      sendManagedTo: (commandCode, payload, target) =>
+      sendManagedTo: (commandCode, payload, target, options) =>
         this.observe("laser.managed", { operation: "managed", commandCode }, () => {
+          this.ensureScopable(commandCode)
           const transport = this.transport
           return transport.sendManagedTo === undefined
             ? transport
-                .sendManaged(commandCode, payload, { target })
+                .sendManaged(commandCode, payload, { ...options, target })
                 .then((reply): ManagedAnswer => ({ reply }))
-            : transport.sendManagedTo(commandCode, payload, target)
+            : transport.sendManagedTo(commandCode, payload, target, options)
         })
     }
-  }
-
-  // A query's pages, status, and cancellation reach the plane that ran it.
-  private pinningTransport(executionId: QueryExecutionId): ManagedTransport {
-    const answering = this.answeringTransport()
-    return {
-      sendManaged: async (commandCode, payload, options) => {
-        const answer = await answering.sendManagedTo(
-          commandCode,
-          payload,
-          options?.target ?? { kind: "caller" }
-        )
-        if (answer.replica !== undefined)
-          this.transport.nodes?.pinQuery(executionId.asU128(), answer.replica)
-        return answer.reply
-      }
-    }
-  }
-
-  private queryNode(executionId: QueryExecutionId): ManagedTarget {
-    return this.transport.nodes?.queryTarget(executionId.asU128()) ?? { kind: "caller" }
   }
 
   /**
@@ -1018,7 +1062,11 @@ export class Laser implements AsyncDisposable {
     return this.transport.seenPositions?.() ?? {}
   }
 
-  async capabilities(): Promise<Capabilities> {
+  capabilities(options: CallOptions = {}): Promise<Capabilities> {
+    return cancellable(options.signal, "capabilities", () => this.probedCapabilities())
+  }
+
+  private async probedCapabilities(): Promise<Capabilities> {
     if (this.capabilityOverride !== undefined) return this.capabilityOverride
     const probe = async (): Promise<Capabilities> => {
       const probed = mergeCapabilities(
@@ -1029,10 +1077,7 @@ export class Laser implements AsyncDisposable {
       return probed
     }
     let capabilities = await this.capabilitiesOnce.get(probe)
-    // A set without a managed backend is probed again once its last probe is
-    // a second old, or when it was never probed, as in Rust `reprobe_due`.
-    const probedAt = this.shared.capabilityProbeAtMs
-    if (!capabilities.managed && (probedAt === undefined || Date.now() - probedAt >= 1_000)) {
+    if (capabilityReprobeDue(capabilities, this.shared.capabilityProbeAtMs, Date.now())) {
       this.capabilitiesOnce.invalidate(capabilities)
       capabilities = await this.capabilitiesOnce.get(probe)
     }
@@ -1065,19 +1110,22 @@ export class Laser implements AsyncDisposable {
     await this.capabilities()
   }
 
-  async refreshCapabilities(): Promise<Capabilities> {
+  async refreshCapabilities(options: CallOptions = {}): Promise<Capabilities> {
+    throwIfAborted(options.signal, "capability refresh")
     if (this.capabilityOverride !== undefined) return this.capabilityOverride
     this.capabilitiesOnce.clear()
-    return this.capabilities()
+    return this.capabilities(options)
   }
 
-  async waitUntilReady(timeoutMs: number): Promise<Capabilities> {
+  async waitUntilReady(timeoutMs: number, options: CallOptions = {}): Promise<Capabilities> {
+    const signal = options.signal
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
       throw new InvalidError("timeoutMs must be finite and non-negative")
     }
     const deadline = Date.now() + timeoutMs
     for (;;) {
-      const capabilities = await this.refreshCapabilities()
+      throwIfAborted(signal, "readiness wait")
+      const capabilities = await this.refreshCapabilities(options)
       if (isReady(capabilities)) return capabilities
       if (capabilities.backends.length === 0) {
         throw new UnsupportedError("server has no managed backend descriptors", {
@@ -1089,7 +1137,7 @@ export class Laser implements AsyncDisposable {
           cause: capabilities.backends.flatMap((candidate) => candidate.readiness.reasons)
         })
       }
-      await new Promise((resolve) => setTimeout(resolve, 100))
+      await delay(100, signal, "readiness wait")
     }
   }
 
@@ -1130,8 +1178,8 @@ export class Laser implements AsyncDisposable {
   }
 
   /** @internal */
-  [INTERNAL_PUBLISH_CONTROL](command: ControlCommand): Promise<void> {
-    return this.publishControl(command)
+  [INTERNAL_PUBLISH_CONTROL](command: ControlCommand, options: CallOptions = {}): Promise<void> {
+    return this.publishControl(command, undefined, undefined, options)
   }
 
   /** @internal */
@@ -1187,7 +1235,7 @@ export class Laser implements AsyncDisposable {
           payload,
           signed: false
         }),
-      async (schemaId) => (await this.schemas().get(schemaId))?.schema,
+      async (schemaId, options) => (await this.schemas().get(schemaId, options))?.schema,
       (operation, attributes, effect) => this.observe(operation, attributes, effect),
       () => {
         this.shared.registryCaches.delete(name)
@@ -1202,7 +1250,21 @@ export class Laser implements AsyncDisposable {
           )
         }
       },
-      this.groupContext()
+      this.groupContext(),
+      (topic) => {
+        const scoped = this.withDefaultStream(name)
+        return MaterializeRequest.create(
+          {
+            scope: scoped.resourceScopeOf(),
+            capabilities: () => scoped.capabilities(),
+            publish: (command, stream, operationId, options) =>
+              scoped.publishControl(command, stream, operationId, options),
+            statusInfo: (id, options) => scoped.projections().statusInfo(id, options)
+          },
+          name,
+          topic
+        )
+      }
     )
   }
 
@@ -1229,7 +1291,7 @@ export class Laser implements AsyncDisposable {
       source,
       conversation,
       undefined,
-      (envelope, willSign) =>
+      (envelope, willSign, approval) =>
         this[INTERNAL_GOVERN]({
           kind: actionKind(envelope.kind),
           stream,
@@ -1244,7 +1306,8 @@ export class Laser implements AsyncDisposable {
           ...(envelope.tool !== undefined ? { tool: envelope.tool } : {}),
           ...metadataActionFields(envelope),
           payload: envelope.body,
-          signed: willSign
+          signed: willSign,
+          ...(approval !== undefined ? { approval } : {})
         }),
       this.verifier,
       () => this.shared.layouts.get(stream)
@@ -1268,9 +1331,12 @@ export class Laser implements AsyncDisposable {
   publishStateSnapshot(
     source: AgentId,
     conversation: ConversationId,
-    state: Readonly<Record<string, unknown>>
+    state: Readonly<Record<string, unknown>>,
+    options: CallOptions = {}
   ): Promise<void> {
-    return publishStateSnapshot(this, source, conversation, state)
+    return cancellable(options.signal, "state snapshot", () =>
+      publishStateSnapshot(this, source, conversation, state)
+    )
   }
 
   /** Apply `patch`, an RFC 6902 JSON Patch array, to the session state
@@ -1278,39 +1344,77 @@ export class Laser implements AsyncDisposable {
   publishStateDelta(
     source: AgentId,
     conversation: ConversationId,
-    patch: readonly PatchOp[]
+    patch: readonly PatchOp[],
+    options: CallOptions = {}
   ): Promise<void> {
-    return publishStateDelta(this, source, conversation, patch)
+    return cancellable(options.signal, "state delta", () =>
+      publishStateDelta(this, source, conversation, patch)
+    )
   }
 
   /** The session state document of `conversation`, `undefined` until a state
    * record exists. */
-  reconstructState(conversation: ConversationId): Promise<unknown> {
-    return reconstructState(this, conversation)
+  reconstructState(conversation: ConversationId, options: CallOptions = {}): Promise<unknown> {
+    return cancellable(options.signal, "state read", () => reconstructState(this, conversation))
   }
 
-  aguiEvents(conversation: ConversationId, topic: string): Promise<readonly AgUiEvent[]> {
-    return aguiEvents(this, conversation, topic)
+  aguiEvents(
+    conversation: ConversationId,
+    topic: string,
+    options: CallOptions = {}
+  ): Promise<readonly AgUiEvent[]> {
+    return cancellable(options.signal, "AG-UI rendering", () =>
+      aguiEvents(this, conversation, topic)
+    )
   }
 
+  /** Scatter a contract to every agent advertising the selector's skill,
+   * gather the branches under `policy` within `deadlineMs`, and return the
+   * reply body of each that completed. */
   scatter(
     source: AgentId,
     selector: CapabilitySelector,
     payload: BytesLike,
     inboxRoute: InboxRoute,
-    deadlineMs: number
+    policy: GatherPolicy,
+    deadlineMs: number,
+    options: CallOptions = {}
   ): Promise<readonly Uint8Array[]> {
-    return scatter(this, source, selector, payload, inboxRoute, deadlineMs)
+    return scatter(
+      this,
+      source,
+      selector,
+      payload,
+      inboxRoute,
+      policy,
+      deadlineMs,
+      undefined,
+      options
+    )
   }
 
+  /** Like `scatter`, but every finished branch's outcome, the branches the
+   * policy cancelled, and whether the policy was met. */
   scatterReport(
     source: AgentId,
     selector: CapabilitySelector,
     payload: BytesLike,
     inboxRoute: InboxRoute,
-    deadlineMs: number
+    policy: GatherPolicy,
+    deadlineMs: number,
+    options: CallOptions = {}
   ): Promise<ScatterReport> {
-    return scatterReport(this, source, selector, payload, inboxRoute, deadlineMs)
+    return scatterReport(
+      this,
+      source,
+      selector,
+      payload,
+      inboxRoute,
+      policy,
+      deadlineMs,
+      undefined,
+      options
+    )
   }
 
   context(conversation: ConversationId): ContextScope {
@@ -1364,8 +1468,25 @@ export class Laser implements AsyncDisposable {
    * by the first card or registry fact. The seven topics hold
    * `7 * partitions` partitions on the server, so keep `partitions` small on
    * small tiers. */
-  async bootstrap(partitions: number, retention: TopicRetention): Promise<void> {
+  async bootstrap(
+    partitions: number,
+    retention: TopicRetention,
+    options: CallOptions = {}
+  ): Promise<void> {
+    throwIfAborted(options.signal, "bootstrap")
     const stream = this.requireDefaultStream("bootstrap()")
+    await abortable(
+      this.bootstrapTopics(stream, partitions, retention),
+      options.signal,
+      "bootstrap"
+    )
+  }
+
+  private async bootstrapTopics(
+    stream: string,
+    partitions: number,
+    retention: TopicRetention
+  ): Promise<void> {
     await this.observe(
       "laser.bootstrap",
       { operation: "bootstrap", stream, partitions },
@@ -1423,16 +1544,21 @@ export class Laser implements AsyncDisposable {
     topic: string,
     payload: BytesLike,
     provenance: Provenance,
-    options: { readonly contentType?: ContentType } = {}
+    options: CallOptions & { readonly contentType?: ContentType } = {}
   ): Promise<void> {
-    await this.sendAgentWithKind(topic, payload, provenance, options, ActionKind.Send)
+    throwIfAborted(options.signal, "agent send")
+    await abortable(
+      this.sendAgentWithKind(topic, payload, provenance, options, ActionKind.Send),
+      options.signal,
+      "agent send"
+    )
   }
 
   private async sendAgentWithKind(
     topic: string,
     payload: BytesLike,
     provenance: Provenance,
-    options: { readonly contentType?: ContentType },
+    options: CallOptions & { readonly contentType?: ContentType },
     kind: ActionKind
   ): Promise<SendMessagesResponse> {
     const stream = this.requireDefaultStream("sendAgent()")
@@ -1477,7 +1603,9 @@ export class Laser implements AsyncDisposable {
           this.agentTopicFor(stream, topic, provenance),
           governedPayload,
           headers,
-          provenancePartitionKey(provenance)
+          provenancePartitionKey(provenance),
+          undefined,
+          { signal: options.signal }
         )
       }
     )
@@ -1522,7 +1650,11 @@ export class Laser implements AsyncDisposable {
    * generation the reference recorded and that the returned record sits at the
    * named offset. `undefined` when the record is gone or the topic was
    * recreated. Only a message reference names a log record. */
-  async readAt(at: SourceRef): Promise<ContextMessage | undefined> {
+  readAt(at: SourceRef, options: CallOptions = {}): Promise<ContextMessage | undefined> {
+    return cancellable(options.signal, "record read", () => this.readRecordAt(at))
+  }
+
+  private async readRecordAt(at: SourceRef): Promise<ContextMessage | undefined> {
     if (at.kind !== "message") {
       throw new InvalidError("only a message reference names a log record")
     }
@@ -1572,12 +1704,17 @@ export class Laser implements AsyncDisposable {
   async reassembleChannel(
     conversation: ConversationId,
     topic: string,
-    channel: ChannelId
+    channel: ChannelId,
+    options: CallOptions = {}
   ): Promise<readonly StreamEvent[]> {
-    const cursor = (await this.topic(topic).replay()).batch(1_000)
+    const signal = options.signal
+    throwIfAborted(signal, "channel reassembly")
+    const cursor = (
+      await abortable(this.topic(topic).replay(), signal, "channel reassembly")
+    ).batch(1_000)
     const envelopes: AgentEnvelope[] = []
     for (;;) {
-      const records = await cursor.pollRecords()
+      const records = await cursor.pollRecords(signal === undefined ? {} : { signal })
       if (records.length === 0) break
       for (const record of records) {
         const decoded = decodeAgentMessage(record)
@@ -1597,11 +1734,27 @@ export class Laser implements AsyncDisposable {
       const b = right.sequence ?? 0n
       return a < b ? -1 : a > b ? 1 : 0
     })
+    // The opening chunk's bound ends a stream its producer never finished.
+    const opening = envelopes[0]
+    const abandonAt = opening?.sequence === 0n ? opening.deadlineMicros : undefined
     const assembler = new ChunkAssembler()
-    return envelopes.flatMap((envelope) => assembler.feed(envelope))
+    const events = envelopes.flatMap((envelope) => assembler.feed(envelope))
+    if (abandonAt !== undefined && BigInt(Date.now()) * 1_000n > abandonAt) {
+      const abandoned = assembler.abandon()
+      if (abandoned !== undefined) events.push(abandoned)
+    }
+    return events
   }
 
-  async consumed(target: ConsumerRef, at: LogPosition): Promise<ConsumptionStatus> {
+  consumed(
+    target: ConsumerRef,
+    at: LogPosition,
+    options: CallOptions = {}
+  ): Promise<ConsumptionStatus> {
+    return cancellable(options.signal, "consumption check", () => this.consumedAt(target, at))
+  }
+
+  private async consumedAt(target: ConsumerRef, at: LogPosition): Promise<ConsumptionStatus> {
     if (
       this.transport.resolveStreamTopicNames === undefined ||
       this.transport.getConsumerOffset === undefined
@@ -1669,7 +1822,11 @@ export class Laser implements AsyncDisposable {
     return target !== undefined && target !== me ? "foreign" : "work"
   }
 
-  async redriveDeadLetter(capsule: AgentDeadLetter): Promise<void> {
+  redriveDeadLetter(capsule: AgentDeadLetter, options: CallOptions = {}): Promise<void> {
+    return cancellable(options.signal, "dead-letter redrive", () => this.redrive(capsule, options))
+  }
+
+  private async redrive(capsule: AgentDeadLetter, options: CallOptions): Promise<void> {
     if (this.transport.resolveStreamTopicNames === undefined) {
       throw new UnsupportedError("the active Iggy transport cannot resolve dead-letter sources", {
         surface: "stream"
@@ -1679,6 +1836,14 @@ export class Laser implements AsyncDisposable {
     const names = await this.transport.resolveStreamTopicNames(source.streamId, source.topicId)
     if (names === undefined) {
       throw new InvalidError("dead-letter source stream or topic no longer exists")
+    }
+    // Any writer of the dead-letter topic can forge a capsule, so the redrive
+    // stays inside this connection's default stream.
+    const expected = this.requireDefaultStream("redriveDeadLetter()")
+    if (names.stream !== expected) {
+      throw new InvalidError(
+        `dead-letter capsule names stream \`${names.stream}\`, outside this connection's stream \`${expected}\``
+      )
     }
     const records = await this.transport.pollMessages(
       names.stream,
@@ -1699,18 +1864,28 @@ export class Laser implements AsyncDisposable {
     if (idempotency?.kind === "string") {
       headers.set(IDEMPOTENCY_KEY, {
         kind: "string",
-        value: `${idempotency.value}/redrive/${String(source.partitionId)}-${source.offset.toString()}`
+        value: redriveKey(idempotency.value, source.partitionId, source.offset)
       })
     }
+    const payload = headers.has(AGENT_VERSION)
+      ? redrivenEnvelope(
+          original.payload,
+          source.partitionId,
+          source.offset,
+          BigInt(Date.now()) * 1000n
+        )
+      : original.payload
     const decoded = decodeAgentMessage(original)
     const partitionKey =
       decoded.kind === "message" ? provenancePartitionKey(decoded.message.provenance) : undefined
     await this.transport.sendMessageWithHeaders(
       names.stream,
       names.topic,
-      original.payload,
+      payload,
       headers,
-      partitionKey
+      partitionKey,
+      undefined,
+      { signal: options.signal }
     )
   }
 
@@ -1720,11 +1895,13 @@ export class Laser implements AsyncDisposable {
     payload: BytesLike,
     provenance: Provenance,
     timeoutMs: number,
-    signal?: AbortSignal
+    options: CallOptions = {}
   ): Promise<AgentMessage> {
+    const signal = options.signal
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
       throw new InvalidError("request() timeout must be a non-negative finite number")
     }
+    throwIfAborted(signal, "request")
     const correlationId = provenance.correlationId ?? ConversationId.new().toString()
     const correlated = { ...provenance, correlationId }
     const listenTopic = this.replyTopicFor(replyTopic, correlated.agent)
@@ -1732,18 +1909,16 @@ export class Laser implements AsyncDisposable {
       this.defaultStream === undefined
         ? requestTopic
         : this.agentTopicFor(this.defaultStream, requestTopic, correlated)
-    const hub = await this.replyHub(listenTopic)
+    const hub = await abortable(this.replyHub(listenTopic), signal, "request")
     const ticket = hub.subscribe(correlationId, correlated.targetAgentId?.asStr(), true, {
       session: correlated.conversationId,
       ...(correlated.agent !== undefined ? { requester: correlated.agent.asStr() } : {})
     })
     try {
-      const sent = await this.sendAgentWithKind(
-        requestTopic,
-        payload,
-        correlated,
-        {},
-        ActionKind.Request
+      const sent = await abortable(
+        this.sendAgentWithKind(requestTopic, payload, correlated, { signal }, ActionKind.Request),
+        signal,
+        "request"
       )
       const confirmation = sent.confirmations[0]
       if (confirmation === undefined)
@@ -1764,25 +1939,81 @@ export class Laser implements AsyncDisposable {
     return ClientMetadataRequest.create(this.transport)
   }
 
-  async advertisePresence(presence: AgentPresence): Promise<void> {
+  /**
+   * Advertises this connection's live presence. The presence lives on the
+   * replica that received it: the first advertise pins that replica, and every
+   * later advertise or clear goes there, so a client whose managed requests
+   * moved to another node never leaves a stale presence behind or advertises a
+   * second one elsewhere. While the pinned replica does not answer within
+   * `PRESENCE_ATTEMPT_MS`, the call fails as unavailable and keeps the pin.
+   */
+  advertisePresence(presence: AgentPresence, options: CallOptions = {}): Promise<void> {
+    return cancellable(options.signal, "presence advertise", () =>
+      this.advertiseOwnPresence(presence)
+    )
+  }
+
+  private async advertiseOwnPresence(presence: AgentPresence): Promise<void> {
     const requested = AgentId.new(presence.agent).asStr()
     const advertised = this.shared.advertisedAgent
     if (advertised !== undefined && advertised !== requested) {
       throw new PresenceConflictError(advertised, requested)
     }
     this.shared.advertisedAgent = requested
-    await this.managedTransport().sendManaged(
-      AGDX_SET_CLIENT_METADATA_CODE,
-      encodePresence(presence)
-    )
+    await this.shared.presenceLock.runExclusive(async () => {
+      const replica = await this.sendPresence(encodePresence(presence))
+      if (replica !== undefined) this.shared.presenceReplica = replica
+    })
   }
 
-  async clearPresence(): Promise<void> {
-    await this.managedTransport().sendManaged(AGDX_SET_CLIENT_METADATA_CODE, new Uint8Array())
-    delete this.shared.advertisedAgent
+  /**
+   * Withdraws this connection's advertised presence. The clear goes to the
+   * replica that holds the presence, and while that replica does not answer
+   * the call fails as unavailable and keeps the pin, never reporting a
+   * presence cleared that is still advertised.
+   */
+  clearPresence(options: CallOptions = {}): Promise<void> {
+    return cancellable(options.signal, "presence clear", () => this.clearOwnPresence())
   }
 
-  async agentRegistry(): Promise<AgentRegistry> {
+  private async clearOwnPresence(): Promise<void> {
+    await this.shared.presenceLock.runExclusive(async () => {
+      await this.sendPresence(new Uint8Array())
+      delete this.shared.presenceReplica
+      delete this.shared.advertisedAgent
+    })
+  }
+
+  // One presence frame to the pinned replica, else the caller's node, naming
+  // the replica that answered. A pinned replica that does not answer within the
+  // attempt bound is reported unavailable, and the pin is the caller's.
+  private async sendPresence(payload: Uint8Array): Promise<number | undefined> {
+    const pinned = this.shared.presenceReplica
+    const target: ManagedTarget =
+      pinned === undefined ? { kind: "caller" } : { kind: "replica", replica: pinned }
+    try {
+      const answer = await this.answeringTransport().sendManagedTo(
+        AGDX_SET_CLIENT_METADATA_CODE,
+        payload,
+        target,
+        { deadline: Date.now() + PRESENCE_ATTEMPT_MS }
+      )
+      return answer.replica
+    } catch (error) {
+      if (pinned === undefined || !(error instanceof LaserError) || !isRetryable(error)) throw error
+      throw new TransportError(
+        `replica ${String(pinned)} holds this connection's presence and did not answer within ${String(PRESENCE_ATTEMPT_MS / 1000)}s, the presence is kept there`,
+        true,
+        { cause: error }
+      )
+    }
+  }
+
+  agentRegistry(options: CallOptions = {}): Promise<AgentRegistry> {
+    return cancellable(options.signal, "agent registry", () => this.openAgentRegistry())
+  }
+
+  private async openAgentRegistry(): Promise<AgentRegistry> {
     const stream = this.requireDefaultStream("agentRegistry()")
     await this.topic(AgentTopic.Registry).ensure(1)
     let cache = this.shared.registryCaches.get(stream)
@@ -1796,49 +2027,79 @@ export class Laser implements AsyncDisposable {
       cache,
       () => this.clientMetadata(),
       undefined,
-      this.verifier
+      this.verifier,
+      async () => {
+        const hello = (await this.capabilities()).hello
+        return hello === "answered" ? "yes" : hello === "rejected" ? "no" : "unknown"
+      }
     )
   }
 
-  async publishCard(source: AgentId, card: AgentCard): Promise<void> {
+  async publishCard(source: AgentId, card: AgentCard, options: CallOptions = {}): Promise<void> {
+    const signal = options.signal
+    throwIfAborted(signal, "card publish")
     validateAgentCard(card)
     const body = encodeNamed(encodeAgentCard(card))
-    await this.topic(AgentTopic.Registry).ensure(1)
-    await this.agdx(AgentTopic.Registry, source, ConversationId.new())
-      .status(OPERATION_CARD)
-      .body(body)
-      .contentType(ContentType.Cbor)
-      .send()
+    await abortable(this.topic(AgentTopic.Registry).ensure(1), signal, "card publish")
+    await abortable(
+      this.agdx(AgentTopic.Registry, source, ConversationId.new())
+        .status(OPERATION_CARD)
+        .body(body)
+        .contentType(ContentType.Cbor)
+        .send({ signal }),
+      signal,
+      "card publish"
+    )
   }
 
-  async quarantine(operator: AgentId, agent: AgentId): Promise<void> {
-    await this.publishRegistryFact(OPERATION_QUARANTINE, operator, agent)
+  quarantine(operator: AgentId, agent: AgentId, options: CallOptions = {}): Promise<void> {
+    return cancellable(options.signal, "quarantine", () =>
+      this.publishRegistryFact(OPERATION_QUARANTINE, operator, agent, undefined, options)
+    )
   }
 
-  async unquarantine(operator: AgentId, agent: AgentId): Promise<void> {
-    await this.publishRegistryFact(OPERATION_UNQUARANTINE, operator, agent)
+  unquarantine(operator: AgentId, agent: AgentId, options: CallOptions = {}): Promise<void> {
+    return cancellable(options.signal, "unquarantine", () =>
+      this.publishRegistryFact(OPERATION_UNQUARANTINE, operator, agent, undefined, options)
+    )
   }
 
-  async quarantineSigned(operator: AgentId, agent: AgentId, key: SigningKey): Promise<void> {
-    await this.publishRegistryFact(OPERATION_QUARANTINE, operator, agent, key)
+  quarantineSigned(
+    operator: AgentId,
+    agent: AgentId,
+    key: SigningKey,
+    options: CallOptions = {}
+  ): Promise<void> {
+    return cancellable(options.signal, "quarantine", () =>
+      this.publishRegistryFact(OPERATION_QUARANTINE, operator, agent, key, options)
+    )
   }
 
-  async unquarantineSigned(operator: AgentId, agent: AgentId, key: SigningKey): Promise<void> {
-    await this.publishRegistryFact(OPERATION_UNQUARANTINE, operator, agent, key)
+  unquarantineSigned(
+    operator: AgentId,
+    agent: AgentId,
+    key: SigningKey,
+    options: CallOptions = {}
+  ): Promise<void> {
+    return cancellable(options.signal, "unquarantine", () =>
+      this.publishRegistryFact(OPERATION_UNQUARANTINE, operator, agent, key, options)
+    )
   }
 
   private async publishRegistryFact(
     operation: string,
     operator: AgentId,
     agent: AgentId,
-    key?: SigningKey
+    key: SigningKey | undefined,
+    options: CallOptions
   ): Promise<void> {
     await this.topic(AgentTopic.Registry).ensure(1)
     let fact = this.agdx(AgentTopic.Registry, operator, ConversationId.new())
       .status(operation)
+      .withDeadlineAtMicros(BigInt(Date.now()) * 1000n + BigInt(REGISTRY_FACT_TTL_MICROS))
       .body(new TextEncoder().encode(agent.asStr()))
     if (key !== undefined) fact = fact.signedBy(key)
-    await fact.send()
+    await fact.send(options)
   }
 
   private requireDefaultStream(operation: string): string {
@@ -1870,31 +2131,15 @@ export class Laser implements AsyncDisposable {
     return this.queryTarget({ kind: "operational", index })
   }
 
-  /** Start a query against an explicit operational or lakehouse target. An
-   * operational index is sent as `resourceName` names it. */
+  /** Start a query against an explicit target. An operational index is sent
+   * as `resourceName` names it. */
   queryTarget(target: QueryTarget): QueryRequest {
     const scope = this.resourceScopeOf()
     return QueryRequest.create(
-      target.kind === "operational" ? { ...target, index: scope.name(target.index) } : target,
-      (query) => this.executeQuery(query),
-      (executionId) => this.queryStatus(executionId),
-      (executionId) => this.cancelQuery(executionId),
+      { ...target, index: scope.name(target.index) },
+      (query, options) => this.executeQuery(query, options),
       scope
     )
-  }
-
-  queryLakehouse(destinationId: DestinationId, destinationGeneration: bigint): QueryRequest {
-    return this.queryTarget({ kind: "lakehouse", destinationId, destinationGeneration })
-  }
-
-  destinations(): Destinations {
-    return Destinations.create(this.managedTransport(), () => this.capabilities())
-  }
-
-  /** Sends one checkpoint request envelope, the deep form behind every
-   * `destinations()` mutation. */
-  executeCheckpoint(request: CheckpointRequestEnvelope): Promise<CheckpointMutationResult> {
-    return this.destinations().executeCheckpoint(request)
   }
 
   // What a consumer group needs to reach its filter policy and read through
@@ -1942,21 +2187,46 @@ export class Laser implements AsyncDisposable {
       this.managedTransport(),
       () => this.capabilities(),
       namespace,
-      this.shared.leases,
+      this.scopedLeases(),
       this.resourceScopeOf()
     )
+  }
+
+  // The shared lease coordinator behind this handle's own scope check, as
+  // every other managed call of the handle runs behind it.
+  private scopedLeases(): LeaseCalls {
+    const leases = this.shared.leases
+    return {
+      acquire: (request, options) => {
+        this.ensureScopable(AGDX_KV_LEASE_CODE)
+        return leases.acquire(request, options)
+      },
+      renew: (request, deadlineMs, options) => {
+        this.ensureScopable(AGDX_KV_LEASE_RENEW_CODE)
+        return leases.renew(request, deadlineMs, options)
+      }
+    }
   }
 
   /** Every KV namespace that holds at least one entry for this caller. A
    * handle that scopes its resources to a stream lists only that stream's
    * namespaces, under the names the caller gave them. */
-  async kvNamespaces(): Promise<readonly KvNamespaceInfo[]> {
-    return Kv.namespaces(this.managedTransport(), () => this.capabilities(), this.resourceScopeOf())
+  kvNamespaces(options: CallOptions = {}): Promise<readonly KvNamespaceInfo[]> {
+    return Kv.namespaces(
+      this.managedTransport(),
+      () => this.capabilities(),
+      this.resourceScopeOf(),
+      options
+    )
   }
 
-  async executeBatch(ops: readonly BatchItem[]): Promise<readonly Uint8Array[]> {
-    const capabilities = await this.capabilities()
-    return executeBatch(this.managedTransport(), capabilities, ops)
+  executeBatch(
+    ops: readonly BatchItem[],
+    options: CallOptions = {}
+  ): Promise<readonly Uint8Array[]> {
+    return cancellable(options.signal, "batch", async () =>
+      executeBatch(this.managedTransport(), await this.capabilities(), ops, options)
+    )
   }
 
   /** A handle to one fork by id. The id is sent as `resourceName` names it. */
@@ -1972,26 +2242,31 @@ export class Laser implements AsyncDisposable {
   /** Every open fork for the authenticated user. A handle that scopes its
    * resources to a stream lists only that stream's forks, under the ids the
    * caller gave them. */
-  async forks(): Promise<readonly ForkInfo[]> {
+  forks(options: CallOptions = {}): Promise<readonly ForkInfo[]> {
     return ForkHandle.forks(
       this.managedTransport(),
       () => this.capabilities(),
-      this.resourceScopeOf()
+      this.resourceScopeOf(),
+      options
     )
+  }
+
+  materialization(projectionId: string): Materialization {
+    return Materialization.create((options) => this.projections().status(projectionId, options))
   }
 
   projections(): Projections {
     return Projections.create(
       this.managedTransport(),
       () => this.capabilities(),
-      (command, stream) => this.publishControl(command, stream),
+      (command, stream, options) => this.publishControl(command, stream, undefined, options),
       this.resourceScopeOf()
     )
   }
 
   bindings(): Bindings {
     return Bindings.create(
-      (command, stream) => this.publishControl(command, stream),
+      (command, stream, options) => this.publishControl(command, stream, undefined, options),
       this.resourceScopeOf()
     )
   }
@@ -2000,7 +2275,7 @@ export class Laser implements AsyncDisposable {
     return Schemas.create(
       this.managedTransport(),
       () => this.capabilities(),
-      (command, stream) => this.publishControl(command, stream),
+      (command, stream, options) => this.publishControl(command, stream, undefined, options),
       this.resourceScopeOf()
     )
   }
@@ -2016,7 +2291,7 @@ export class Laser implements AsyncDisposable {
           stream !== undefined && (await this.capabilities()).streamTenancy
             ? streamOpsTopic(stream, CHANGES_TOPIC)
             : this.changesTopic
-        return this.stream(this.opsStream).topic(topic).replay()
+        return this.stream(this.opsStream).topic(topic)
       },
       this.resourceScopeOf()
     )
@@ -2032,75 +2307,149 @@ export class Laser implements AsyncDisposable {
     )
   }
 
-  async whoami(): Promise<WhoamiReply> {
-    return whoami(this.managedTransport(), await this.capabilities())
+  whoami(options: CallOptions = {}): Promise<WhoamiReply> {
+    return cancellable(options.signal, "whoami", async () =>
+      whoami(this.managedTransport(), await this.capabilities(), options)
+    )
   }
 
-  async listRoles(options?: {
-    readonly namePrefix?: string
-    readonly search?: string
-  }): Promise<readonly Role[]> {
-    return listRoles(this.managedTransport(), await this.capabilities(), options)
+  listRoles(
+    options: CallOptions & { readonly namePrefix?: string; readonly search?: string } = {}
+  ): Promise<readonly Role[]> {
+    return cancellable(options.signal, "role list", async () =>
+      listRoles(this.managedTransport(), await this.capabilities(), options)
+    )
   }
 
-  async getRole(name: string): Promise<Role | undefined> {
-    return getRole(this.managedTransport(), await this.capabilities(), name)
+  getRole(name: string, options: CallOptions = {}): Promise<Role | undefined> {
+    return cancellable(options.signal, "role read", async () =>
+      getRole(this.managedTransport(), await this.capabilities(), name, options)
+    )
   }
 
-  async getBindings(userId: number): Promise<readonly string[]> {
-    return getBindings(this.managedTransport(), await this.capabilities(), userId)
+  getBindings(userId: number, options: CallOptions = {}): Promise<BindingsReply> {
+    return cancellable(options.signal, "binding read", async () =>
+      getBindings(this.managedTransport(), await this.capabilities(), userId, options)
+    )
   }
 
-  async defineRole(role: Role): Promise<void> {
-    return defineRole(this.managedTransport(), await this.capabilities(), role)
+  defineRole(role: Role, options: CallOptions = {}): Promise<void> {
+    return cancellable(options.signal, "role define", async () =>
+      defineRole(this.managedTransport(), await this.capabilities(), role, undefined, options)
+    )
   }
 
-  async deleteRole(name: string): Promise<void> {
-    return deleteRole(this.managedTransport(), await this.capabilities(), name)
+  /** `defineRole` under a caller-chosen `mutationId`, the receipt identity of
+   * the request. The server keeps the outcome of an applied mutation under
+   * the account that sent it, so a repeat with the same id and content after
+   * a lost reply returns the original outcome without a second effect, and the
+   * same id with other content is a conflict. */
+  defineRoleAs(role: Role, mutationId: string, options: CallOptions = {}): Promise<void> {
+    return cancellable(options.signal, "role define", async () =>
+      defineRole(this.managedTransport(), await this.capabilities(), role, mutationId, options)
+    )
   }
 
-  async bindRoles(
+  deleteRole(name: string, options: CallOptions = {}): Promise<void> {
+    return cancellable(options.signal, "role delete", async () =>
+      deleteRole(this.managedTransport(), await this.capabilities(), name, undefined, options)
+    )
+  }
+
+  /** `deleteRole` under a caller-chosen `mutationId`, with the receipt
+   * semantics of `defineRoleAs`. */
+  deleteRoleAs(name: string, mutationId: string, options: CallOptions = {}): Promise<void> {
+    return cancellable(options.signal, "role delete", async () =>
+      deleteRole(this.managedTransport(), await this.capabilities(), name, mutationId, options)
+    )
+  }
+
+  bindRoles(
     userId: number,
     roles: readonly string[],
-    expectRevision?: bigint
-  ): Promise<void> {
-    return bindRoles(
-      this.managedTransport(),
-      await this.capabilities(),
-      userId,
-      roles,
-      expectRevision
+    expectRevision?: bigint,
+    options: CallOptions = {}
+  ): Promise<BindingsReply> {
+    return cancellable(options.signal, "role bind", async () =>
+      bindRoles(
+        this.managedTransport(),
+        await this.capabilities(),
+        userId,
+        roles,
+        expectRevision,
+        undefined,
+        options
+      )
     )
   }
 
-  async authzHistory(
+  /** `bindRoles`, with an optional expected binding revision, under a
+   * caller-chosen `mutationId`, with the receipt semantics of `defineRoleAs`.
+   * An administrator that revokes its own administration keeps that request's
+   * receipt, so its exact repeat after a lost reply returns the original
+   * success and the binding revision moves once. */
+  bindRolesAs(
+    userId: number,
+    roles: readonly string[],
+    mutationId: string,
+    expectRevision?: bigint,
+    options: CallOptions = {}
+  ): Promise<BindingsReply> {
+    return cancellable(options.signal, "role bind", async () =>
+      bindRoles(
+        this.managedTransport(),
+        await this.capabilities(),
+        userId,
+        roles,
+        expectRevision,
+        mutationId,
+        options
+      )
+    )
+  }
+
+  authzHistory(
     subject: AuthzSubject,
     limit: number,
-    afterRevision?: bigint
+    afterRevision?: bigint,
+    options: CallOptions = {}
   ): Promise<AuthzHistoryReply> {
-    return authzHistory(
-      this.managedTransport(),
-      await this.capabilities(),
-      subject,
-      limit,
-      afterRevision
+    return cancellable(options.signal, "authorization history", async () =>
+      authzHistory(
+        this.managedTransport(),
+        await this.capabilities(),
+        subject,
+        limit,
+        afterRevision,
+        options
+      )
     )
   }
 
-  private async publishControl(command: ControlCommand, stream?: string): Promise<void> {
-    const capabilities = await this.capabilities()
+  private async publishControl(
+    command: ControlCommand,
+    stream?: string,
+    operationId?: bigint,
+    options: CallOptions = {}
+  ): Promise<void> {
+    const signal = options.signal
+    throwIfAborted(signal, "control publish")
+    const capabilities = await abortable(this.capabilities(), signal, "control publish")
     if (!capabilities.managed) {
       throw new UnsupportedError("control commands require a managed backend", {
         surface: "control"
       })
     }
+    // The same refusal a server of another control version answers.
     if (
       capabilities.versions !== undefined &&
       capabilities.versions.control !== CONTROL_OP_VERSION
     ) {
-      throw new InvalidError(
-        `control wire version must be ${String(CONTROL_OP_VERSION)}, got ${String(capabilities.versions.control)}`
-      )
+      const message = `control wire version must be ${String(CONTROL_OP_VERSION)}, got ${String(capabilities.versions.control)}`
+      throw new CommandExecutionError(message, {
+        code: { kind: "known", name: "VersionSkew" },
+        message
+      })
     }
     validateControlCommand(command)
     const envelope = {
@@ -2110,7 +2459,15 @@ export class Laser implements AsyncDisposable {
       ...(stream !== undefined ? { stream } : {})
     }
     const payload = encodeNamed(encodeControlEnvelope(envelope))
-    const reply = await this.managedTransport().sendManaged(AGDX_CONTROL_PUBLISH_CODE, payload)
+    const reply = await abortable(
+      this.managedTransport().sendManaged(
+        AGDX_CONTROL_PUBLISH_CODE,
+        payload,
+        operationId === undefined ? undefined : { operationId }
+      ),
+      signal,
+      "control publish"
+    )
     decodeManagedReply((bytes) => {
       const value = decodeOne(bytes, "control reply")
       if (
@@ -2127,8 +2484,25 @@ export class Laser implements AsyncDisposable {
    * callers want `query(index)...fetch()` instead. Needs the managed backend
    * of Laser Stack or LaserData Cloud, otherwise it fails with
    * `UnsupportedError`. */
-  async executeQuery(query: Query): Promise<QueryResult> {
-    const capabilities = await this.capabilities()
+  async executeQuery(query: Query, options: CallOptions = {}): Promise<QueryResult> {
+    const signal = options.signal
+    throwIfAborted(signal, "query")
+    const capabilities = await abortable(this.capabilities(), signal, "query")
+    const rawSql = query.rawSql
+    if (
+      rawSql !== undefined &&
+      !capabilities.backends.some(
+        (backend) =>
+          backend.desiredState === "enabled" &&
+          backend.query?.rawSql === true &&
+          backend.query.dialects.includes(rawSql.dialect)
+      )
+    ) {
+      throw new UnsupportedError("raw SQL dialect is not served by an enabled backend", {
+        surface: "query"
+      })
+    }
+
     if (query.text !== undefined && !capabilities.query.keyword) {
       throw new UnsupportedError("keyword query is not served by this deployment", {
         surface: "query",
@@ -2142,10 +2516,13 @@ export class Laser implements AsyncDisposable {
       )
     }
     const reply = await sendQueryUntil(query.deadlineMicros, () =>
-      executeManaged(this.pinningTransport(query.executionId), capabilities, QueryCommand, {
-        v: QUERY_OP_VERSION,
-        query
-      })
+      executeManaged(
+        this.managedTransport(),
+        capabilities,
+        QueryCommand,
+        { v: QUERY_OP_VERSION, query },
+        { signal }
+      )
     )
     if (reply.kind === "ok") {
       if (reply.result.context.executionId.asU128() !== query.executionId.asU128()) {
@@ -2153,94 +2530,7 @@ export class Laser implements AsyncDisposable {
       }
       return reply.result
     }
-    throw new QueryExecutionError(`query failed: ${reply.error.kind}`, reply.error)
-  }
-
-  /** Retrieves the next cursor page of an executing query. Needs the
-   * `cursorPaging` capability. */
-  async queryPage(
-    executionId: QueryExecutionId,
-    cursor: string,
-    deadlineMicros: bigint
-  ): Promise<QueryResult> {
-    const capabilities = await this.capabilities()
-    if (!capabilities.query.cursorPaging) {
-      throw new UnsupportedError("query cursor paging is not advertised by this deployment", {
-        surface: "query",
-        feature: "cursor_paging"
-      })
-    }
-    const reply = await sendQueryUntil(deadlineMicros, () =>
-      executeManaged(
-        this.managedTransport(),
-        capabilities,
-        QueryPageCommand,
-        {
-          v: QUERY_OP_VERSION,
-          executionId,
-          cursor,
-          deadlineMicros
-        },
-        { target: this.queryNode(executionId) }
-      )
-    )
-    if (reply.kind === "ok") {
-      if (reply.result.context.executionId.asU128() !== executionId.asU128()) {
-        throw new ProtocolError("query reply execution id does not match the request")
-      }
-      return reply.result
-    }
-    throw new QueryExecutionError(`query page failed: ${reply.error.kind}`, reply.error)
-  }
-
-  /** Reads the current state of an executing or recently completed query. */
-  async queryStatus(executionId: QueryExecutionId): Promise<QueryExecutionStatus> {
-    const capabilities = await this.capabilities()
-    if (!capabilities.query.executionStatus) {
-      throw new UnsupportedError("query execution status is not served by this deployment", {
-        surface: "query",
-        feature: "execution_status"
-      })
-    }
-    const reply = await executeManaged(
-      this.managedTransport(),
-      capabilities,
-      QueryStatusCommand,
-      { v: QUERY_OP_VERSION, executionId },
-      { target: this.queryNode(executionId) }
-    )
-    if (reply.kind === "ok") {
-      if (reply.status.executionId.asU128() !== executionId.asU128()) {
-        throw new ProtocolError("query status execution id does not match the request")
-      }
-      return reply.status
-    }
-    throw new QueryExecutionError(`query status failed: ${reply.error.kind}`, reply.error)
-  }
-
-  /** Cancels an executing query by its unguessable identity. */
-  async cancelQuery(executionId: QueryExecutionId): Promise<QueryExecutionStatus> {
-    const capabilities = await this.capabilities()
-    if (!capabilities.query.cancellation) {
-      throw new UnsupportedError("query cancellation is not served by this deployment", {
-        surface: "query",
-        feature: "cancellation"
-      })
-    }
-    const reply = await executeManaged(
-      this.managedTransport(),
-      capabilities,
-      QueryCancelCommand,
-      { v: QUERY_OP_VERSION, executionId },
-      { target: this.queryNode(executionId) }
-    )
-    if (reply.kind === "ok") {
-      if (reply.status.executionId.asU128() !== executionId.asU128()) {
-        throw new ProtocolError("query status execution id does not match the request")
-      }
-      return reply.status
-    }
-    throw new QueryExecutionError(`query cancellation failed: ${reply.error.kind}`, reply.error)
+    throw new QueryExecutionError(describeQueryError(reply.error), reply.error)
   }
 
   /** Closes owned transport resources. Safe to call more than once. */
@@ -2266,9 +2556,9 @@ export class Laser implements AsyncDisposable {
   /**
    * Closes the connection when this is the root `Laser` from `connect*()` or
    * `builder()`. A view from `withDefaultStream` or another `with*` method only
-   * borrows the connection, so disposing it is a no-op. Rust and Python close
-   * when the last handle is dropped, which JavaScript cannot observe, so the
-   * root owns the connection here.
+   * borrows the connection, so disposing it is a no-op, as with Python `async with`.
+   * Rust closes when the last handle is dropped, which JavaScript cannot
+   * observe, so the root owns the connection here.
    */
   [Symbol.asyncDispose](): Promise<void> {
     return this.ownsClosure ? this.close() : Promise.resolve()

@@ -51,16 +51,8 @@ pub const AGDX_GET_CLIENTS_METADATA_CODE: u32 = AGDX_COMMAND_BASE + 3;
 /// decoded client-side as the typed unsupported, so no capability bit is
 /// needed.
 pub const AGDX_BATCH_CODE: u32 = AGDX_COMMAND_BASE + 20;
-/// Managed command code: submit one public checkpoint mutation to the managed backend.
-pub const AGDX_CHECKPOINT_CODE: u32 = AGDX_COMMAND_BASE + 21;
-/// Fork-native command code: read one destination and its checkpoint status.
-pub const AGDX_DESTINATION_GET_CODE: u32 = AGDX_COMMAND_BASE + 22;
-/// Fork-native command code: list destinations and their checkpoint status.
-pub const AGDX_DESTINATION_LIST_CODE: u32 = AGDX_COMMAND_BASE + 23;
-/// Fork-native command code: list explicit query-route declarations.
-pub const AGDX_QUERY_ROUTE_LIST_CODE: u32 = AGDX_COMMAND_BASE + 24;
-/// Internal carriage for the closed destination HTTP operation set.
-pub const AGDX_DESTINATION_HTTP_CODE: u32 = AGDX_COMMAND_BASE + 25;
+// Codes 1_000_021 to 1_000_025 belonged to the retired lakehouse destinations
+// and are never reused.
 
 // Authorization and system-management band (1_000_100..=1_000_199). Handled by
 // the streaming server itself. Reads +0..+3, writes +4..+6, history +7.
@@ -96,12 +88,8 @@ pub const AGDX_QUERY_BASE: u32 = AGDX_COMMAND_BASE + 200;
 // `QueryReply`, off the log over the managed command channel.
 /// Managed command code: execute a query.
 pub const AGDX_QUERY_CODE: u32 = AGDX_QUERY_BASE;
-/// Managed command code: retrieve the next page of an executing query.
-pub const AGDX_QUERY_PAGE_CODE: u32 = AGDX_QUERY_BASE + 1;
-/// Managed command code: cancel an executing query.
-pub const AGDX_QUERY_CANCEL_CODE: u32 = AGDX_QUERY_BASE + 2;
-/// Managed command code: read query execution status.
-pub const AGDX_QUERY_STATUS_CODE: u32 = AGDX_QUERY_BASE + 3;
+// Codes 1_000_201 to 1_000_203 belonged to the retired query execution paging,
+// cancellation and status operations and are never reused.
 // Browse the projection registry (read-only). Get one projection by id (request
 // `GetProjection`) or list them all (request `ListProjections`), reply a CBOR
 // `BrowseReply`.
@@ -113,7 +101,7 @@ pub const AGDX_LIST_PROJECTIONS_CODE: u32 = AGDX_QUERY_BASE + 11;
 pub const AGDX_GET_SCHEMA_CODE: u32 = AGDX_QUERY_BASE + 20;
 /// Managed command code: list registered schemas.
 pub const AGDX_LIST_SCHEMAS_CODE: u32 = AGDX_QUERY_BASE + 21;
-/// Managed command code: advisory next free schema id.
+/// Managed command code: register a writer schema and answer its allocated id.
 pub const AGDX_REGISTER_SCHEMA_CODE: u32 = AGDX_QUERY_BASE + 22;
 /// Managed command code: decode one payload under a registered schema id.
 pub const AGDX_DECODE_RECORD_CODE: u32 = AGDX_QUERY_BASE + 23;
@@ -152,7 +140,7 @@ pub const AGDX_KV_PATCH_CODE: u32 = AGDX_KV_BASE + 9;
 /// Managed command code: acquire a revocable lease on a key (the formal `LEASE`
 /// primitive). Carries the stable holder identity and an optional delegated
 /// subject at [`KV_LEASE_OP_VERSION`]. Served only by a deployment advertising
-/// the `KV_FENCED_LEASES` feature bit; a backend that cannot serve it returns a
+/// the `KV_FENCED_LEASES` feature bit. A backend that cannot serve it returns a
 /// clean unsupported error.
 pub const AGDX_KV_LEASE_CODE: u32 = AGDX_KV_BASE + 10;
 /// Managed command code: release a held lease early (the formal `RELEASE`
@@ -163,7 +151,7 @@ pub const AGDX_KV_RELEASE_CODE: u32 = AGDX_KV_BASE + 11;
 /// backend transaction that also requires a live lease at the request's
 /// coordination namespace and key plus a fence sequence equal to the presented
 /// token (the at-most-one effective-writer gate). Rides
-/// [`KV_LEASE_OP_VERSION`]; served only under the `KV_FENCED_LEASES` feature
+/// [`KV_LEASE_OP_VERSION`] and is served only under the `KV_FENCED_LEASES` feature
 /// bit, which subsumes the older fence-only `kv_cas_fenced` flag.
 pub const AGDX_KV_CAS_FENCED_CODE: u32 = AGDX_KV_BASE + 12;
 /// Managed command code: copy the value at one key to another key (possibly in
@@ -175,7 +163,7 @@ pub const AGDX_KV_COPY_CODE: u32 = AGDX_KV_BASE + 13;
 pub const AGDX_KV_MOVE_CODE: u32 = AGDX_KV_BASE + 14;
 /// Managed command code: extend a held lease without changing its token (the
 /// formal `RENEW` primitive). Requires the same holder and subject, a live
-/// lease, and the current fence token; never bumps the fence. Rides
+/// lease, and the current fence token, and never bumps the fence. Rides
 /// [`KV_LEASE_OP_VERSION`] under the `KV_FENCED_LEASES` feature bit.
 pub const AGDX_KV_LEASE_RENEW_CODE: u32 = AGDX_KV_BASE + 15;
 
@@ -317,10 +305,6 @@ pub const CHANGE_OP_VERSION: u32 = 1;
 /// Wire version of the client-metadata discovery request and reply
 /// ([`crate::clients`]).
 pub const CLIENT_METADATA_OP_VERSION: u32 = 1;
-/// Wire version of public checkpoint mutation requests and status replies.
-pub const CHECKPOINT_OP_VERSION: u32 = 1;
-/// Server-to-backend destination HTTP carriage version.
-pub const DESTINATION_HTTP_OP_VERSION: u32 = 1;
 /// Wire version of the agent presence body ([`crate::agent::AgentPresence`]) an
 /// agent advertises in its connection metadata. Carried in the body's own `v`
 /// field, not out-of-band, because presence rides the opaque connection-metadata
@@ -380,7 +364,7 @@ pub const fn is_idempotent_managed_request(code: u32) -> bool {
             | AGDX_FORK_PROMOTE_CODE
             | AGDX_FORK_PUT_CODE
             | AGDX_GRAPH_UPSERT_CODE
-            | AGDX_CHECKPOINT_CODE
             | AGDX_CONTROL_PUBLISH_CODE
+            | AGDX_REGISTER_SCHEMA_CODE
     )
 }

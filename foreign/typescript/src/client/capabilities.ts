@@ -8,7 +8,6 @@ import type {
   FilterAnnounce,
   OpVersions
 } from "../wire/hello.js"
-import type { CheckpointReadConsistency } from "../wire/checkpoint.js"
 import type { BackendResourceId } from "../wire/ids.js"
 import type { Consistency } from "../wire/query.js"
 import type { WireTopology } from "../wire/topology.js"
@@ -17,14 +16,6 @@ export interface QueryCaps {
   readonly available: boolean
   readonly consistency: Consistency
   readonly keyword: boolean
-  readonly cursorPaging: boolean
-  readonly cancellation: boolean
-  readonly executionStatus: boolean
-}
-
-export interface DestinationCaps {
-  readonly available: boolean
-  readonly consistency: CheckpointReadConsistency
 }
 
 export interface KvCaps {
@@ -69,12 +60,12 @@ export type HelloOutcome = "unknown" | "answered" | "rejected" | "failed"
 export interface Capabilities {
   readonly managed: boolean
   readonly query: QueryCaps
-  readonly destinations: DestinationCaps
   readonly kv: KvCaps
   readonly graph: boolean
   readonly forks: boolean
   readonly a2aGateway: boolean
   readonly sessions: boolean
+  readonly materializations: boolean
   /** The deployment scopes every managed name to one stream, and each
    * stream's change feed rides its own ops topic. */
   readonly streamTenancy: boolean
@@ -89,7 +80,6 @@ export interface Capabilities {
 export type CapabilitySurface =
   | "managed"
   | "query"
-  | "destinations"
   | "kv"
   | "kvCas"
   | "kvCasFenced"
@@ -107,17 +97,14 @@ export const OPEN_CAPABILITIES: Capabilities = Object.freeze({
   query: Object.freeze({
     available: false,
     consistency: "eventual",
-    keyword: false,
-    cursorPaging: false,
-    cancellation: false,
-    executionStatus: false
+    keyword: false
   }),
-  destinations: Object.freeze({ available: false, consistency: "potentially_stale" }),
   kv: Object.freeze({ available: false, cas: false, casFenced: false, fencedLeases: false }),
   graph: false,
   forks: false,
   a2aGateway: false,
   sessions: false,
+  materializations: false,
   streamTenancy: false,
   watch: false,
   authz: false,
@@ -126,10 +113,12 @@ export const OPEN_CAPABILITIES: Capabilities = Object.freeze({
   hello: "unknown"
 })
 
+// How long an unsettled capability set is trusted before it is probed again.
+const CAPABILITY_REPROBE_INTERVAL_MS = 1_000
+
 const CONSISTENCY_RANK: Readonly<Record<Consistency, number>> = {
   eventual: 0,
-  read_your_writes: 1,
-  strong: 2
+  read_your_writes: 1
 }
 
 // The announcement each answered set came from, so a merge onto the builder's
@@ -160,38 +149,23 @@ export function mergeCapabilities(configured: Capabilities, announced: Capabilit
 }
 
 /** True when the connected infrastructure advertised nothing beyond the open
- * SDK, field for field equal to `OPEN_CAPABILITIES`, like Rust
+ * SDK: every field but the probe outcome equals `OPEN_CAPABILITIES`, like Rust
  * `Capabilities::is_open_only`. */
 export function isOpenOnly(capabilities: Capabilities): boolean {
-  const open = OPEN_CAPABILITIES
-  const { query, destinations, kv, filters } = capabilities
-  return (
-    capabilities.managed === open.managed &&
-    query.available === open.query.available &&
-    query.consistency === open.query.consistency &&
-    query.keyword === open.query.keyword &&
-    query.cursorPaging === open.query.cursorPaging &&
-    query.cancellation === open.query.cancellation &&
-    query.executionStatus === open.query.executionStatus &&
-    destinations.available === open.destinations.available &&
-    destinations.consistency === open.destinations.consistency &&
-    kv.available === open.kv.available &&
-    kv.cas === open.kv.cas &&
-    kv.casFenced === open.kv.casFenced &&
-    kv.fencedLeases === open.kv.fencedLeases &&
-    capabilities.graph === open.graph &&
-    capabilities.forks === open.forks &&
-    capabilities.a2aGateway === open.a2aGateway &&
-    capabilities.watch === open.watch &&
-    capabilities.authz === open.authz &&
-    filters.native === open.filters.native &&
-    filters.catalog === open.filters.catalog &&
-    filters.groupPolicyReads === open.filters.groupPolicyReads &&
-    filters.evaluation === undefined &&
-    filters.maxWaitMs === open.filters.maxWaitMs &&
-    capabilities.versions === undefined &&
-    capabilities.backends.length === 0
-  )
+  return sameCapability({ ...capabilities, hello: OPEN_CAPABILITIES.hello }, OPEN_CAPABILITIES)
+}
+
+// Structural equality over the plain records a capability set is made of. An
+// absent field and an undefined one are the same.
+function sameCapability(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true
+  if (typeof left !== "object" || typeof right !== "object" || left === null || right === null)
+    return false
+  if (Array.isArray(left) !== Array.isArray(right)) return false
+  const leftRecord = left as Readonly<Record<string, unknown>>
+  const rightRecord = right as Readonly<Record<string, unknown>>
+  const keys = new Set([...Object.keys(leftRecord), ...Object.keys(rightRecord)])
+  return [...keys].every((key) => sameCapability(leftRecord[key], rightRecord[key]))
 }
 
 /** Whether the server evaluates a filter built for `evaluatorVersion` with
@@ -236,6 +210,18 @@ export function readinessReasons(
   return backend(capabilities, resourceId)?.readiness.reasons
 }
 
+/** Whether a set probed at `probedAtMs` is probed again at `nowMs`: one without a managed backend, or with an enabled backend that is not ready, once it is a second old, as Rust `reprobe_due`. */
+export function capabilityReprobeDue(
+  capabilities: Capabilities,
+  probedAtMs: number | undefined,
+  nowMs: number
+): boolean {
+  const unsettled = !capabilities.managed || unreadyBackends(capabilities).length > 0
+  return (
+    unsettled && (probedAtMs === undefined || nowMs - probedAtMs >= CAPABILITY_REPROBE_INTERVAL_MS)
+  )
+}
+
 export function isReady(capabilities: Capabilities): boolean {
   const enabled = enabledBackends(capabilities)
   return (
@@ -251,33 +237,29 @@ export function requireCapability(capabilities: Capabilities, surface: Capabilit
       ? capabilities.managed
       : surface === "query"
         ? capabilities.query.available
-        : surface === "destinations"
-          ? capabilities.destinations.available
-          : surface === "kv"
-            ? capabilities.kv.available
-            : surface === "kvCas"
-              ? capabilities.kv.available && capabilities.kv.cas
-              : surface === "kvCasFenced"
-                ? capabilities.kv.available && capabilities.kv.casFenced
-                : surface === "kvFencedLeases"
-                  ? capabilities.kv.available && capabilities.kv.fencedLeases
-                  : surface === "graph"
-                    ? capabilities.graph
-                    : surface === "forks"
-                      ? capabilities.forks
-                      : surface === "sessions"
-                        ? capabilities.sessions
-                        : surface === "watch"
-                          ? capabilities.watch
-                          : surface === "filters"
-                            ? capabilities.filters.native
-                            : surface === "filterCatalog"
-                              ? capabilities.filters.catalog
-                              : capabilities.authz
+        : surface === "kv"
+          ? capabilities.kv.available
+          : surface === "kvCas"
+            ? capabilities.kv.available && capabilities.kv.cas
+            : surface === "kvCasFenced"
+              ? capabilities.kv.available && capabilities.kv.casFenced
+              : surface === "kvFencedLeases"
+                ? capabilities.kv.available && capabilities.kv.fencedLeases
+                : surface === "graph"
+                  ? capabilities.graph
+                  : surface === "forks"
+                    ? capabilities.forks
+                    : surface === "sessions"
+                      ? capabilities.sessions
+                      : surface === "watch"
+                        ? capabilities.watch
+                        : surface === "filters"
+                          ? capabilities.filters.native
+                          : surface === "filterCatalog"
+                            ? capabilities.filters.catalog
+                            : capabilities.authz
   if (!available) {
-    throw new UnsupportedError(`${surface} is not served by this deployment`, {
-      cause: { surface }
-    })
+    throw new UnsupportedError(`${surface} is not served by this deployment`, { surface })
   }
 }
 
@@ -316,12 +298,8 @@ function foldAnnouncement(capabilities: Capabilities, announce: BackendAnnounce)
     hello: "answered"
   }
   if (announce.ready === false) return answered
-  const destinations =
-    capabilities.destinations.available ||
-    ((versions.checkpoint ?? 0) > 0 && has(feature.DESTINATIONS))
   let consistency = capabilities.query.consistency
-  if (has(feature.STRONG_CONSISTENCY)) consistency = "strong"
-  else if (has(feature.READ_YOUR_WRITES))
+  if (has(feature.READ_YOUR_WRITES))
     consistency = strongerConsistency(consistency, "read_your_writes")
   let query = {
     ...capabilities.query,
@@ -332,13 +310,9 @@ function foldAnnouncement(capabilities: Capabilities, announce: BackendAnnounce)
     if (served === undefined) continue
     query = {
       ...query,
-      available: query.available || versions.query > 0,
-      cursorPaging: query.cursorPaging || served.paging.includes("cursor"),
-      cancellation: query.cancellation || served.cancellation,
-      executionStatus: query.executionStatus || served.executionStatus
+      available: query.available || versions.query > 0
     }
-    if (served.consistency.includes("strong")) consistency = "strong"
-    else if (served.consistency.includes("read_your_writes"))
+    if (served.consistency.includes("read_your_writes"))
       consistency = strongerConsistency(consistency, "read_your_writes")
   }
   const fencedLeases = capabilities.kv.fencedLeases || has(feature.KV_FENCED_LEASES)
@@ -346,10 +320,6 @@ function foldAnnouncement(capabilities: Capabilities, announce: BackendAnnounce)
     ...answered,
     managed: true,
     query: { ...query, consistency },
-    destinations: {
-      available: destinations,
-      consistency: destinations ? "linearizable" : capabilities.destinations.consistency
-    },
     kv: {
       available: capabilities.kv.available || versions.kv > 0,
       cas: capabilities.kv.cas || has(feature.KV_CAS),
@@ -359,6 +329,7 @@ function foldAnnouncement(capabilities: Capabilities, announce: BackendAnnounce)
     graph: capabilities.graph || versions.graph > 0,
     forks: capabilities.forks || versions.fork > 0,
     sessions: capabilities.sessions || has(feature.SESSIONS),
+    materializations: capabilities.materializations || has(feature.MATERIALIZATIONS),
     streamTenancy: capabilities.streamTenancy || has(feature.STREAM_TENANCY),
     watch: capabilities.watch || has(feature.WATCH),
     filters: {

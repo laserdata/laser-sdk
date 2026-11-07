@@ -6,6 +6,7 @@ import {
   CompiledFilter,
   ConsumerFilter,
   FilterExpr,
+  FilterFaultError,
   UnsupportedError,
   type FilterHeader,
 } from "@laserdata/laser-sdk";
@@ -309,13 +310,14 @@ When(
       .topic(TOPIC)
       .consumerGroup("unbound-readers");
     await group.create();
-    if (!(await this.requireLaser().capabilities()).filters.groupPolicyReads) {
+    const filters = (await this.requireLaser().capabilities()).filters;
+    if (!filters.groupPolicyReads) {
       await assert.rejects(
         group.reader().count(2).maxExamined(2).build(),
         (error: unknown) => {
           assert.ok(error instanceof UnsupportedError);
           assert.equal(error.surface, "filters");
-          assert.equal(error.feature, "group_policy_reads");
+          assert.equal(error.feature, filters.native ? "group_policy_reads" : undefined);
           this.error = error;
           return true;
         },
@@ -329,7 +331,7 @@ When(
       assert.equal(page.policy.mode, "unfiltered");
       assert.equal(page.examined, page.records.length);
       assert.ok(page.records.length <= 2);
-      assert.ok(page.records.every((record) => !record.evaluated));
+      assert.ok(page.records.every((record) => record.evaluation.kind === "unfiltered"));
       delivered.push(...page.records.map((record) => record.message.payload));
       await reader.ackPage(page);
     }
@@ -340,7 +342,8 @@ When(
 Then(
   "the advanced reader follows the group-aware read capability",
   async function (this: LaserWorld) {
-    if ((await this.requireLaser().capabilities()).filters.groupPolicyReads) {
+    const filters = (await this.requireLaser().capabilities()).filters;
+    if (filters.groupPolicyReads) {
       assert.deepEqual(
         this.filtered.map((record) => [...record]),
         FEED.map((name) => [...named(RECORDS, name)]),
@@ -348,7 +351,7 @@ Then(
     } else {
       assert.ok(this.error instanceof UnsupportedError);
       assert.equal(this.error.surface, "filters");
-      assert.equal(this.error.feature, "group_policy_reads");
+      assert.equal(this.error.feature, filters.native ? "group_policy_reads" : undefined);
     }
   },
 );
@@ -460,3 +463,54 @@ When("the anomaly desk rejects a page after releasing its policy", async functio
   this.filtered = current.records.map((record) => record.message.payload);
   await reader.ackPage(current);
 });
+
+When(
+  /^a "([^"]+)" record and a "([^"]+)" record follow the feed$/,
+  async function (this: LaserWorld, first: string, second: string) {
+    const topic = this.requireLaser().topic(TOPIC);
+    for (const name of [first, second])
+      await topic.send(named(RECORDS, name), { partition: 0 });
+  },
+);
+
+When(
+  /^the anomaly desk skips the record its "([^"]+)" filter stops on$/,
+  async function (this: LaserWorld, name: string) {
+    const group = this.requireLaser().topic(TOPIC).consumerGroup("fault-skip");
+    await group.create({
+      filter: named(FILTERS, name)(),
+      filterName: policyName(name),
+    });
+    await using reader = await group.reader().start({ kind: "first" }).build();
+    await reader.ackPage(await reader.nextPage({ timeoutMs: READ_TIMEOUT_MS }));
+    const stopped: unknown = await reader
+      .nextPage({ timeoutMs: READ_TIMEOUT_MS })
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    assert.ok(
+      stopped instanceof FilterFaultError,
+      "the broken record stops the read",
+    );
+    assert.equal(
+      stopped.offset,
+      BigInt(FEED.length),
+      "the broken record follows the feed",
+    );
+    await reader.skip(stopped.partitionId, stopped.offset);
+    const after = await reader.nextPage({ timeoutMs: READ_TIMEOUT_MS });
+    await reader.ackPage(after);
+    this.filtered = after.records.map((record) => record.message.payload);
+  },
+);
+
+Then(
+  /^it receives the "([^"]+)" record after it$/,
+  function (this: LaserWorld, name: string) {
+    assert.deepEqual(
+      this.filtered.map((payload) => Buffer.from(payload).toString("utf8")),
+      [Buffer.from(named(RECORDS, name)).toString("utf8")],
+    );
+  },
+);

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 
-// R2: a handler that records when it starts and when it finishes, so a shutdown
+// A handler that records when it starts and when it finishes, so a shutdown
 // can be issued mid-flight and the finish observed.
 struct SlowHandler {
     started: Arc<AtomicBool>,
@@ -71,7 +71,7 @@ async fn given_a_message_in_flight_when_shut_down_then_should_drain_before_retur
     );
 }
 
-// R14: a dead-letter sink that records every capsule it is handed.
+// A dead-letter sink that records every capsule it is handed.
 struct RecordingSink {
     capsules: Arc<std::sync::Mutex<Vec<AgentDeadLetter>>>,
 }
@@ -163,7 +163,7 @@ async fn given_a_rejected_message_when_dead_lettered_then_should_notify_the_sink
     handle.shutdown().await.expect("shutdown");
 }
 
-// R1: a handler that blocks on a "slow" payload while flagging in-flight, and
+// A handler that blocks on a "slow" payload while flagging in-flight, and
 // counts "fast" payloads handled during that window. Under serial-per-partition
 // a fast message on another partition is handled while the slow one blocks its
 // own lane. Under strict serial nothing would run until the slow one returns.

@@ -2,8 +2,9 @@ use crate::convert::{py_to_de, ser_to_py};
 use crate::errors::InvalidError;
 use laser_sdk::wire::content::ContentType;
 use laser_sdk::wire::control::{
-    FieldType, IndexField, IndexSchema, IndexSchemaBuilder, Projection, ProjectionBinding,
-    ProjectionBindingBuilder, ProjectionBuilder, ProjectionKind, SchemaDef, SourceSelector,
+    FieldType, IndexField, IndexSchema, IndexSchemaBuilder, InvalidRecordPolicy, OversizePolicy,
+    Projection, ProjectionBinding, ProjectionBindingBuilder, ProjectionBuilder, ProjectionKind,
+    SchemaDef, SourceSelector,
 };
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
@@ -122,8 +123,24 @@ impl PyProjectionBuilder {
         Ok(slf)
     }
 
-    /// Make this a graph projection extracting the nodes and edges of the
-    /// entity schema dict.
+    /// Keep the current row of each key, deleted by a record carrying `delete_header` when one is named.
+    #[pyo3(signature = (key, delete_header=None))]
+    fn keyed<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        key: &Bound<'_, PyAny>,
+        delete_header: Option<String>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let key = py_to_de(key)?;
+        slf.apply(|builder| builder.keyed(key, delete_header.as_deref()))?;
+        Ok(slf)
+    }
+
+    fn record(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
+        slf.apply(ProjectionBuilder::record)?;
+        Ok(slf)
+    }
+
+    /// Make this a graph projection from an entity schema dict.
     fn graph<'py>(
         mut slf: PyRefMut<'py, Self>,
         schema: &Bound<'_, PyAny>,
@@ -297,11 +314,20 @@ impl PyProjectionBindingBuilder {
         Ok(slf)
     }
 
-    /// Let the managed backend skip a record it proved the destination or the
-    /// extraction rejects, instead of holding the partition. Every skip is an ordered
-    /// control record, and the skipped record goes to the dead-letter topic.
-    fn skip_rejected(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
-        slf.apply(ProjectionBindingBuilder::skip_rejected)?;
+    fn invalid_records<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        policy: &str,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let policy = InvalidRecordPolicy::from_str(policy)
+            .map_err(|error| InvalidError::new_err(error.to_string()))?;
+        slf.apply(|builder| builder.invalid_records(policy))?;
+        Ok(slf)
+    }
+
+    fn oversize<'py>(mut slf: PyRefMut<'py, Self>, policy: &str) -> PyResult<PyRefMut<'py, Self>> {
+        let policy = OversizePolicy::from_str(policy)
+            .map_err(|error| InvalidError::new_err(error.to_string()))?;
+        slf.apply(|builder| builder.oversize(policy))?;
         Ok(slf)
     }
 

@@ -1,9 +1,8 @@
 // Wire caps, enforced client-side so an oversized op fails fast instead of
 // round-tripping, and server-side so a hostile client cannot inflate state.
 
-/// Hard ceiling on rows in a single query reply. A `limit` above it is
-/// rejected with `QueryError::TooLarge`, and a `0` limit defaults to a full
-/// page. Callers page through larger result sets with `offset`.
+/// Hard ceiling on rows in a single query reply. A query `limit` must be in
+/// `1..=MAX_PAGE_SIZE`. Callers page through larger result sets with `offset`.
 pub const MAX_PAGE_SIZE: usize = 1000;
 /// Page size a streaming reader pulls when the caller has not set an explicit
 /// limit. Large enough to amortize round-trips, small enough that an
@@ -54,8 +53,6 @@ pub const MAX_NAMESPACE_BYTES: usize = 128;
 pub const MAX_SESSION_LABEL_BYTES: usize = 256;
 /// Maximum UTF-8 bytes of a session list's text filter.
 pub const MAX_SESSION_TEXT_QUERY_BYTES: usize = 1024;
-/// Maximum UTF-8 bytes of a session list's opaque page cursor.
-pub const MAX_SESSION_CURSOR_BYTES: usize = 512;
 /// Most session ids one heartbeat record lists. A process with more leases in
 /// one stream splits them over several records.
 pub const MAX_HEARTBEAT_SESSIONS: usize = 2048;
@@ -76,11 +73,8 @@ pub const MAX_HOLDER_ID_BYTES: usize = 128;
 pub const MIN_LEASE_TTL_MICROS: u64 = 1_000_000;
 /// Longest lease (and renewal) lifetime a request may ask for, in
 /// microseconds. A lease is a bounded-TTL lock whose whole purpose is that a
-/// dead holder's ownership expires; an unbounded request would let one crashed
-/// holder park a key for hours. The ceiling matches
-/// [`crate::authz::MAX_OPERATOR_ASSERTION_TTL_MICROS`]: the same "how long
-/// may one unattended grant outlive the process that asked for it" question.
-/// The store may still grant less (`granted_ttl_micros`), so this bounds the
+/// dead holder's ownership expires. An unbounded request would let one crashed
+/// holder park a key for hours. The store may still grant less (`granted_ttl_micros`), so this bounds the
 /// *request*, and a holder needing longer renews.
 pub const MAX_LEASE_TTL_MICROS: u64 = 5 * 60 * 1_000_000;
 
@@ -98,6 +92,8 @@ pub const MAX_FORK_ID_BYTES: usize = 128;
 // same way. 64 matches the common RBAC-identifier norm.
 /// Maximum role name length, in bytes.
 pub const MAX_ROLE_NAME_BYTES: usize = 64;
+/// Maximum authorization mutation id length, in bytes.
+pub const MAX_AUTHZ_MUTATION_ID_BYTES: usize = 64;
 
 /// Ceiling on one `[len: u32 LE][bytes]` frame on the managed-command sockets,
 /// enforced by both the server and LaserData Cloud. A reply above it is replaced by
@@ -132,8 +128,9 @@ pub const MAX_SCHEMA_NAME_BYTES: usize = 255;
 pub const MAX_RAW_SQL_BYTES: usize = 64 * 1024;
 /// Maximum number of positional raw SQL parameters.
 pub const MAX_QUERY_PARAMETERS: usize = 1024;
-/// Maximum UTF-8 bytes in an opaque query page cursor.
-pub const MAX_QUERY_CURSOR_BYTES: usize = 512;
+/// Largest query page `offset`. Deeper rows are reached by narrowing the
+/// filter, for example by a time range.
+pub const MAX_QUERY_OFFSET: u64 = 1_000_000;
 /// Maximum predicate nodes in one structured filter tree.
 pub const MAX_QUERY_PREDICATES: usize = 4096;
 /// Maximum selected, grouped, sorted, or exact-match fields in one query.
@@ -169,6 +166,13 @@ pub const MAX_METADATA_TOTAL_BYTES: usize = 8192;
 pub const MAX_BODY_REFERENCE_BYTES: usize = 1024;
 /// Max capability entries on an [`AgentCard`](crate::agent::AgentCard).
 pub const MAX_CARD_CAPABILITIES: usize = 64;
+/// How long a quarantine or unquarantine fact stays valid after its signer
+/// stamps `deadline_micros`, the five minutes of clock skew Kerberos tolerates.
+pub const REGISTRY_FACT_TTL_MICROS: u64 = 5 * 60 * 1_000_000;
+/// The longest validity a registry reader accepts on a fact, and how long it
+/// remembers an applied fact's record id, so a fact cannot outlive its replay
+/// guard.
+pub const MAX_REGISTRY_FACT_TTL_MICROS: u64 = 24 * 60 * 60 * 1_000_000;
 /// Ceiling on a connection's advertised metadata (`AGDX_SET_CLIENT_METADATA`).
 /// The metadata is an opaque byte payload any client may set, not agent-only: an
 /// agent advertises its card under the AGDX schema, a regular app sets whatever

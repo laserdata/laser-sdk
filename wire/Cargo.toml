@@ -1,6 +1,6 @@
 [package]
 name = "laser-wire"
-description = "LaserData SDK over Apache Iggy: typed streaming, operational and lakehouse query, materialization destinations, key-value state, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
+description = "LaserData SDK over Apache Iggy: typed streaming, operational query, materialization, key-value state, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
 categories = ["encoding", "api-bindings", "wasm"]
 keywords = ["iggy", "laserdata", "wire", "cbor", "wasm"]
 readme = "README.md"
@@ -36,13 +36,12 @@ codecs = ["cbor", "dep:rmp-serde"]
 # the BDD reference engine share this implementation, including CBOR and
 # registered Avro/Protobuf payload decoders. This optional evaluator is outside
 # the dependency-minimal portable contract feature set.
-filter-eval = [
-    "dep:apache-avro",
-    "dep:ciborium",
-    "dep:prost-reflect",
-    "dep:ouroboros",
-    "serde_json/float_roundtrip",
-]
+filter-eval = ["dep:ciborium", "schema-decode", "serde_json/float_roundtrip"]
+# The one writer-schema lowering: compile a registered Avro or Protobuf writer
+# schema and decode a body into the JSON model consumer filters, the SDK
+# codecs, the typed handle and the managed projector all share. Native-only
+# like `filter-eval`, outside the portable contract feature set.
+schema-decode = ["dep:apache-avro", "dep:ouroboros", "dep:prost-reflect"]
 # The golden corpus embedded via include_bytes! plus assertion helpers.
 fixtures = ["codecs"]
 # The fluent `Query::builder()` (bon-derived). Non-default so a type-only
@@ -87,6 +86,11 @@ required-features = ["fixtures"]
 name = "filter_eval_corpus"
 path = "tests/filter_eval_corpus.rs"
 required-features = ["filter-eval"]
+
+[[test]]
+name = "writer_schema_corpus"
+path = "tests/writer_schema_corpus.rs"
+required-features = ["schema-decode"]
 
 [[test]]
 name = "wire_fixtures"

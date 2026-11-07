@@ -224,8 +224,8 @@ async function routeAlerts(laser: Laser, stream: string): Promise<void> {
   }
 }
 
-// Draft a stricter revision on the desk's own filter, run the variant in its
-// own group, pause and resume it, then release and delete both policies.
+// List the desk's own revision, run a stricter variant in its own group,
+// pause and resume it, then release and delete both policies.
 async function manageRevisions(
   laser: Laser,
   stream: string,
@@ -233,13 +233,10 @@ async function manageRevisions(
   binding: FilterBinding,
   expected: number
 ): Promise<void> {
-  phase("draft a stricter revision: readers keep running the active one")
-  const draft = await desk
-    .filter()
-    .revise(binding.revision, ConsumerFilter.json(safeModeTransition()))
-  const revisions = await desk.filter().revisions(0, 10)
+  phase("a group runs one policy: its own filter lists the revision it runs")
+  const revisions = await desk.filter().revisions(1, 10)
   console.log(
-    `  revision ${String(draft.revision)} drafted, the group lists ${String(revisions.total)} revisions and still runs revision ${String(binding.revision)}`
+    `  the group lists ${String(revisions.totalResults)} revision(s) and runs revision ${String(binding.revision)}`
   )
 
   phase("A/B: the transitions-only variant runs in its own group")
@@ -265,7 +262,7 @@ async function manageRevisions(
       await reader.tryNextPage()
       throw new Error("a disabled revision kept reading")
     } catch (error) {
-      if (!(error instanceof FilterExecutionError) || error.detail.reason !== "revision_disabled")
+      if (!(error instanceof FilterExecutionError) || error.detail?.reason !== "revision_disabled")
         throw error
       console.log("  paused: the server refuses new reads with revision_disabled")
     }
@@ -285,7 +282,7 @@ async function manageRevisions(
       .configure("safe-mode-transitions", ConsumerFilter.json(safeModeTransition()))
     throw new Error("a running policy was replaced")
   } catch (error) {
-    if (!(error instanceof FilterExecutionError) || error.detail.reason !== "conflict") throw error
+    if (!(error instanceof FilterExecutionError) || error.detail?.reason !== "conflict") throw error
     console.log("  refused with conflict: create a new group for another policy")
   }
 

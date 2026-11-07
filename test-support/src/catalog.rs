@@ -75,88 +75,56 @@ impl CatalogState {
                         "the group incarnation changed before configuration",
                     ));
                 }
-                let (filter_id, revision, digest) = match policy {
-                    GroupFilterSpec::Definition { name, filter } => {
-                        let digest = filter.digest();
-                        if let Some(existing) = self.bindings.get(&identity) {
-                            if existing.digest == digest {
-                                let existing = existing.clone();
-                                if let Some(owned) = self.owned.get_mut(&existing.filter_id) {
-                                    owned.name = name;
-                                }
-                                return Ok(FilterMutationResult::Bound(existing));
+                let GroupFilterSpec::Definition { name, filter } = policy;
+                let (filter_id, revision, digest) = {
+                    let digest = filter.digest();
+                    if let Some(existing) = self.bindings.get(&identity) {
+                        if existing.digest == digest {
+                            let existing = existing.clone();
+                            if let Some(owned) = self.owned.get_mut(&existing.filter_id) {
+                                owned.name = name;
                             }
-                            return Err(FilterError::new(
-                                FilterErrorReason::Conflict,
-                                "the group already runs another policy",
-                            ));
+                            return Ok(FilterMutationResult::Bound(existing));
                         }
-                        let filter_id = match self.owners.get(&identity) {
-                            Some(filter_id) => *filter_id,
-                            None => {
-                                self.next_filter_id += 1;
-                                self.owners.insert(identity, self.next_filter_id);
-                                self.next_filter_id
-                            }
-                        };
-                        self.owned.insert(
-                            filter_id,
-                            OwnedFilter {
-                                name,
-                                owner: FilterOwner {
-                                    identity,
-                                    group: group.clone(),
-                                },
-                            },
-                        );
-                        let revisions = self.filters.entry(filter_id).or_default();
-                        let revision = match revisions.iter().find(|info| info.digest == digest) {
-                            Some(info) => info.revision,
-                            None => {
-                                let revision = revisions.len() as u32 + 1;
-                                revisions.push(FilterRevisionInfo {
-                                    enabled: true,
-                                    revision,
-                                    digest: digest.clone(),
-                                    filter,
-                                    created_at_micros: 1,
-                                });
-                                revision
-                            }
-                        };
-                        (filter_id, revision, digest)
+                        return Err(FilterError::new(
+                            FilterErrorReason::Conflict,
+                            "the group already runs another policy",
+                        ));
                     }
-                    GroupFilterSpec::Revision {
+                    let filter_id = match self.owners.get(&identity) {
+                        Some(filter_id) => *filter_id,
+                        None => {
+                            self.next_filter_id += 1;
+                            self.owners.insert(identity, self.next_filter_id);
+                            self.next_filter_id
+                        }
+                    };
+                    self.owned.insert(
                         filter_id,
-                        revision,
-                    } => {
-                        if self.owners.get(&identity) != Some(&filter_id) {
-                            return Err(FilterError::new(
-                                FilterErrorReason::Conflict,
-                                "not the group's own filter",
-                            ));
+                        OwnedFilter {
+                            name,
+                            owner: FilterOwner {
+                                identity,
+                                group: group.clone(),
+                            },
+                        },
+                    );
+                    let revisions = self.filters.entry(filter_id).or_default();
+                    let revision = match revisions.iter().find(|info| info.digest == digest) {
+                        Some(info) => info.revision,
+                        None => {
+                            let revision = revisions.len() as u32 + 1;
+                            revisions.push(FilterRevisionInfo {
+                                enabled: true,
+                                revision,
+                                digest: digest.clone(),
+                                filter,
+                                created_at_micros: 1,
+                            });
+                            revision
                         }
-                        let digest = self
-                            .filters
-                            .get(&filter_id)
-                            .and_then(|revisions| {
-                                revisions.iter().find(|info| info.revision == revision)
-                            })
-                            .map(|info| info.digest.clone())
-                            .ok_or_else(|| {
-                                FilterError::new(FilterErrorReason::NotFound, "no such revision")
-                            })?;
-                        if let Some(existing) = self.bindings.get(&identity) {
-                            if existing.digest == digest {
-                                return Ok(FilterMutationResult::Bound(existing.clone()));
-                            }
-                            return Err(FilterError::new(
-                                FilterErrorReason::Conflict,
-                                "the group already runs another policy",
-                            ));
-                        }
-                        (filter_id, revision, digest)
-                    }
+                    };
+                    (filter_id, revision, digest)
                 };
                 let binding = FilterBinding {
                     group,
@@ -347,6 +315,7 @@ impl CatalogState {
                             partition_id: 1,
                             offset: self.offset,
                             operation_id: Some(operation_id),
+                            revision: None,
                         }),
                     },
                 )))
@@ -391,12 +360,11 @@ impl CatalogState {
                 let mut items: Vec<FilterSummary> = self
                     .owned
                     .iter()
-                    .filter(|(filter_id, owned)| {
+                    .filter(|(_, owned)| {
                         let owner_matches = request
                             .owner
                             .is_none_or(|owner| (owned.owner.identity == owner) != mismatched);
                         owner_matches
-                            && request.before_id.is_none_or(|before| **filter_id < before)
                             && request
                                 .name_contains
                                 .as_deref()
@@ -424,17 +392,12 @@ impl CatalogState {
                     })
                     .collect();
                 items.sort_by_key(|summary| std::cmp::Reverse(summary.id));
-                let total = items.len() as u32;
-                let items = items
-                    .into_iter()
-                    .skip((request.page as usize).saturating_mul(request.page_size as usize))
-                    .take(request.page_size as usize)
-                    .collect();
+                let page = Page::of(items, request.page, request.results);
                 FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Filters(FilterPage {
-                    items,
-                    page: request.page,
-                    page_size: request.page_size,
-                    total,
+                    items: page.items,
+                    page: page.number,
+                    total_pages: page.total_pages,
+                    total_results: page.total_results,
                 })))
             }
             AGDX_LIST_FILTER_REVISIONS_CODE => {
@@ -445,14 +408,14 @@ impl CatalogState {
                     .cloned()
                     .unwrap_or_default();
                 items.reverse();
-                let total = items.len() as u32;
+                let page = Page::of(items, request.page, request.results);
                 FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Revisions(
                     FilterRevisionPage {
                         filter_id: request.filter_id,
-                        items,
-                        page: request.page,
-                        page_size: request.page_size,
-                        total,
+                        items: page.items,
+                        page: page.number,
+                        total_pages: page.total_pages,
+                        total_results: page.total_results,
                     },
                 )))
             }
@@ -473,13 +436,13 @@ impl CatalogState {
                     })
                     .cloned()
                     .collect();
-                let total = items.len() as u32;
+                let page = Page::of(items, request.page, request.results);
                 FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Bindings(
                     FilterBindingPage {
-                        items,
-                        page: request.page,
-                        page_size: request.page_size,
-                        total,
+                        items: page.items,
+                        page: page.number,
+                        total_pages: page.total_pages,
+                        total_results: page.total_results,
                     },
                 )))
             }
@@ -490,6 +453,32 @@ impl CatalogState {
             _ => return None,
         };
         encode_named(&reply).ok()
+    }
+}
+
+// One offset page of a stable list, `number` counting from 1 as the catalog does.
+struct Page<T> {
+    items: Vec<T>,
+    number: u32,
+    total_pages: u32,
+    total_results: u32,
+}
+
+impl<T> Page<T> {
+    fn of(items: Vec<T>, page: u32, results: u32) -> Self {
+        let number = page.max(1);
+        let total_results = u32::try_from(items.len()).unwrap_or(u32::MAX);
+        let skip = ((number - 1) as usize).saturating_mul(results as usize);
+        Self {
+            items: items
+                .into_iter()
+                .skip(skip)
+                .take(results as usize)
+                .collect(),
+            number,
+            total_pages: total_results.div_ceil(results.max(1)),
+            total_results,
+        }
     }
 }
 

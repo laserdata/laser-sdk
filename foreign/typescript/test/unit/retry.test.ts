@@ -7,12 +7,14 @@ import {
   CONSUMER_FAILURE_BUDGET,
   CONTROL_DISCOVERY_MAX_MS,
   CREATE_RACE_ATTEMPTS,
+  PRESENCE_ATTEMPT_MS,
   FILTER_MUTATION_ATTEMPTS,
   FILTER_MUTATION_BACKOFF_MS,
   FILTER_OUTCOME_WAIT_MS,
   JITTER_HIGH,
   JITTER_LOW,
   MANAGED_MUTATION,
+  MANAGED_ATTEMPT_FIRST_MS,
   MANAGED_MUTATION_DEADLINE_MS,
   QUERY_DEADLINE_MS,
   QUERY_REPLY_GRACE_MS,
@@ -22,10 +24,12 @@ import {
 
 interface RetryTable {
   readonly jitter: { readonly low: number; readonly high: number }
+  readonly presence: { readonly attempt_ms: number }
   readonly managed_mutation: {
     readonly base_ms: number
     readonly max_ms: number
     readonly deadline_ms: number
+    readonly attempt_first_ms: number
   }
   readonly consumer: {
     readonly base_ms: number
@@ -54,6 +58,7 @@ void test("given_the_shared_retry_table_when_compared_then_should_match_every_ty
     maxMs: TABLE.managed_mutation.max_ms
   })
   assert.equal(MANAGED_MUTATION_DEADLINE_MS, TABLE.managed_mutation.deadline_ms)
+  assert.equal(MANAGED_ATTEMPT_FIRST_MS, TABLE.managed_mutation.attempt_first_ms)
   assert.deepEqual(CONSUMER, { baseMs: TABLE.consumer.base_ms, maxMs: TABLE.consumer.max_ms })
   assert.equal(CONSUMER_FAILURE_BUDGET, TABLE.consumer.failure_budget)
   assert.equal(CONTROL_DISCOVERY_MAX_MS, TABLE.control_discovery.max_ms)
@@ -63,6 +68,7 @@ void test("given_the_shared_retry_table_when_compared_then_should_match_every_ty
   assert.equal(QUERY_DEADLINE_MS, TABLE.query.deadline_ms)
   assert.equal(QUERY_REPLY_GRACE_MS, TABLE.query.reply_grace_ms)
   assert.equal(CREATE_RACE_ATTEMPTS, TABLE.create_race.attempts)
+  assert.equal(PRESENCE_ATTEMPT_MS, TABLE.presence.attempt_ms)
 })
 
 void test("given_consecutive_failures_when_backing_off_then_should_double_up_to_the_cap", () => {

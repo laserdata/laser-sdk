@@ -10,6 +10,7 @@ import {
   cardAvailableFor,
   cardIsFresh,
   cardServes,
+  factLive,
   liftQuarantine,
   newRegistryCache,
   type PresenceEntry,
@@ -20,6 +21,7 @@ import type {
   PolledMessage,
   SendMessagesResponse
 } from "../../src/iggy/apache-iggy.js"
+import { KeyRecord, KeyRegistry, SigningKey } from "../../src/signing.js"
 import { Cursor } from "../../src/stream/cursor.js"
 import { AgentId as SdkAgentId, PrincipalId } from "../../src/types/ids.js"
 import {
@@ -33,6 +35,7 @@ import {
   newAgentPresence,
   parseAgentId,
   statusEnvelope,
+  withSignature,
   type AgentCard,
   type AgentEnvelope,
   type CapabilityDescriptor
@@ -46,6 +49,13 @@ import {
 import { AGENT_OP_VERSION } from "../../src/wire/codes.js"
 import { AGENT_VERSION } from "../../src/wire/headers.js"
 import { ConversationId, RecordId } from "../../src/wire/ids.js"
+import {
+  MAX_REGISTRY_FACT_TTL_MICROS as MAX_FACT_TTL,
+  REGISTRY_FACT_TTL_MICROS as FACT_TTL
+} from "../../src/wire/limits.js"
+
+const REGISTRY_FACT_TTL_MICROS = BigInt(FACT_TTL)
+const MAX_REGISTRY_FACT_TTL_MICROS = BigInt(MAX_FACT_TTL)
 
 class RegistryTransport implements LaserTransport {
   readonly kind = "apache-iggy" as const
@@ -126,12 +136,31 @@ class RegistryTransport implements LaserTransport {
   }
 }
 
-function polled(envelope: AgentEnvelope, offset: bigint): PolledMessage {
+function polled(envelope: AgentEnvelope, offset: bigint, timestampMicros = 100n): PolledMessage {
   return {
     payload: encodeNamed(encodeAgentEnvelope(envelope)),
     partitionId: 0,
     offset,
+    timestampMicros,
     headers: new Map([[AGENT_VERSION, { kind: "uint32", value: AGENT_OP_VERSION }]])
+  }
+}
+
+function registryFact(
+  record: bigint,
+  operation: string,
+  agent: string,
+  deadlineMicros: bigint
+): AgentEnvelope {
+  return {
+    ...statusEnvelope(
+      RecordId.fromU128(record),
+      ConversationId.fromU128(record + 1n),
+      parseAgentId("operator"),
+      operation
+    ),
+    body: new TextEncoder().encode(agent),
+    deadlineMicros
   }
 }
 
@@ -321,15 +350,12 @@ void test("given_invalid_client_metadata_page_numbers_when_set_then_should_rejec
 
 void test("given_registry_records_when_refreshed_then_should_cache_offsets_and_exclude_quarantine", async () => {
   const transport = new RegistryTransport()
-  const quarantine = {
-    ...statusEnvelope(
-      RecordId.fromU128(3n),
-      ConversationId.fromU128(4n),
-      parseAgentId("operator"),
-      OPERATION_QUARANTINE
-    ),
-    body: new TextEncoder().encode("planner")
-  }
+  const quarantine = registryFact(
+    3n,
+    OPERATION_QUARANTINE,
+    "planner",
+    100n + REGISTRY_FACT_TTL_MICROS
+  )
   transport.pollPages.push([polled(cardEnvelope("planner", ["plan"]), 0n), polled(quarantine, 1n)])
   const cache = newRegistryCache()
   const registry = AgentRegistry.create(
@@ -353,6 +379,92 @@ void test("given_registry_records_when_refreshed_then_should_cache_offsets_and_e
   )
   assert.equal(resumed.isQuarantined(SdkAgentId.new("planner")), true)
   assert.equal(resumed.lookup(SdkAgentId.new("planner"))?.agent.asStr(), "planner")
+})
+
+void test("given_an_old_unquarantine_replayed_after_the_replay_window_when_refreshed_then_should_keep_the_quarantine", async () => {
+  const transport = new RegistryTransport()
+  const lift = registryFact(5n, OPERATION_UNQUARANTINE, "worker", 1_000n + REGISTRY_FACT_TTL_MICROS)
+  const quarantine = registryFact(
+    7n,
+    OPERATION_QUARANTINE,
+    "worker",
+    2_000n + REGISTRY_FACT_TTL_MICROS
+  )
+  transport.pollPages.push([polled(lift, 0n, 1_000n), polled(quarantine, 1n, 2_000n)])
+  let now = 3_000n
+  const registry = AgentRegistry.create(
+    Cursor.create(transport, "stream", "agent.registry", [0]),
+    newRegistryCache(),
+    () => ClientMetadataRequest.create(transport),
+    () => now
+  )
+  await registry.refresh()
+  assert.equal(registry.isQuarantined(SdkAgentId.new("worker")), true)
+
+  now = 3_000n + MAX_REGISTRY_FACT_TTL_MICROS
+  await registry.refresh()
+  transport.pollPages.push([polled(lift, 2n, now)])
+  await registry.refresh()
+  assert.equal(
+    registry.isQuarantined(SdkAgentId.new("worker")),
+    true,
+    "the quarantined agent re-appended its own old unquarantine"
+  )
+})
+
+void test("given_a_registry_fact_when_appended_against_its_deadline_then_should_be_live_only_before_it", () => {
+  const fact = registryFact(1n, OPERATION_UNQUARANTINE, "worker", 100n + REGISTRY_FACT_TTL_MICROS)
+  assert.equal(factLive(fact, 100n), true)
+  assert.equal(
+    factLive(
+      statusEnvelope(
+        RecordId.fromU128(1n),
+        ConversationId.fromU128(2n),
+        parseAgentId("operator"),
+        OPERATION_UNQUARANTINE
+      ),
+      100n
+    ),
+    false
+  )
+  assert.equal(factLive(fact, undefined), false)
+  assert.equal(factLive(fact, 100n + REGISTRY_FACT_TTL_MICROS), false)
+  assert.equal(factLive(fact, 100n + MAX_REGISTRY_FACT_TTL_MICROS), false)
+  assert.equal(
+    factLive({ ...fact, deadlineMicros: 101n + MAX_REGISTRY_FACT_TTL_MICROS }, 100n),
+    false
+  )
+})
+
+void test("given_a_verifier_shared_with_the_registry_when_its_operator_key_is_revoked_then_should_refuse_later_facts", async () => {
+  const operator = SigningKey.fromBytes(new Uint8Array(32).fill(31))
+  const verifier = new KeyRegistry()
+  verifier.enrollOperator("operator", operator.verifyingKey())
+  const signedFact = (record: bigint, agent: string): AgentEnvelope => {
+    const fact = registryFact(
+      record,
+      OPERATION_QUARANTINE,
+      agent,
+      1_000n + REGISTRY_FACT_TTL_MICROS
+    )
+    return withSignature(fact, operator.signWithContext(fact, { agentVersion: AGENT_OP_VERSION }))
+  }
+  const transport = new RegistryTransport()
+  transport.pollPages.push([polled(signedFact(11n, "first"), 0n, 1_000n)])
+  const registry = AgentRegistry.create(
+    Cursor.create(transport, "stream", "agent.registry", [0]),
+    newRegistryCache(),
+    () => ClientMetadataRequest.create(transport),
+    () => 2_000n,
+    verifier
+  )
+  await registry.refresh()
+  assert.equal(registry.isQuarantined(SdkAgentId.new("first")), true)
+
+  verifier.enrollRecord(KeyRecord.operator("operator", operator.verifyingKey()).revoke())
+  transport.pollPages.push([polled(signedFact(13n, "second"), 1n, 1_500n)])
+  await registry.refresh()
+  assert.equal(registry.isQuarantined(SdkAgentId.new("second")), false)
 })
 
 void test("given_live_presence_when_refreshed_within_ttl_then_should_reuse_the_cached_page", async () => {
@@ -463,4 +575,33 @@ void test("given_presence_on_two_nodes_when_listing_all_then_should_page_each_no
     { replica: 1 },
     { replica: 1, after: 5 }
   ])
+})
+
+void test("given_an_over_cap_card_on_the_registry_topic_when_folded_then_should_reject_it", () => {
+  const cards = new Map<string, RegisteredCard>()
+  const envelope = statusEnvelope(
+    RecordId.fromU128(1n),
+    ConversationId.fromU128(2n),
+    parseAgentId("crowded"),
+    OPERATION_CARD
+  )
+  const crowded: AgentCard = {
+    capabilities: Array.from({ length: 65 }, (_, index) => descriptor(`skill-${String(index)}`))
+  }
+  assert.equal(
+    applyCard(cards, { ...envelope, body: encodeNamed(encodeAgentCard(crowded)) }, 100n),
+    false
+  )
+  assert.equal(cards.size, 0)
+})
+
+void test("given_a_full_card_map_when_a_new_agent_folds_then_should_evict_the_least_recently_observed", () => {
+  const cards = new Map<string, RegisteredCard>()
+  for (let index = 0; index < 4_096; index += 1) {
+    applyCard(cards, cardEnvelope(`agent-${String(index)}`, ["plan"]), BigInt(index + 1))
+  }
+  assert.equal(applyCard(cards, cardEnvelope("newcomer", ["plan"]), 10_000n), true)
+  assert.equal(cards.size, 4_096)
+  assert.equal(cards.has("agent-0"), false)
+  assert.equal(cards.has("newcomer"), true)
 })

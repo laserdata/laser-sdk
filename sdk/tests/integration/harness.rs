@@ -98,6 +98,11 @@ pub async fn laser() -> Laser {
     laser
 }
 
+/// The shared server's root connection string.
+pub async fn connection_string() -> String {
+    iggy().await.connection_string()
+}
+
 /// A `Laser` connected through a connection string, on a data stream unique to
 /// this test. The connect-time probe runs, and dedicated data connections can
 /// open with the same credentials.

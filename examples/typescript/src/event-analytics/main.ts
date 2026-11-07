@@ -69,6 +69,7 @@ const ROUTES = [
 ] as const
 const BASE_MICROS = 1_900_000_000_000_000
 const ONE_MINUTE_MICROS = 60_000_000n
+const ONE_MINUTE_MS = 60_000
 const LIVE_TIMEOUT_MS = 15_000
 const LIVE_GROUP = "event-analytics-live"
 
@@ -142,7 +143,8 @@ async function registerProjection(
   laser: Laser,
   topic: string,
   index: string,
-  inlinePayloadDefault = false
+  inlinePayloadDefault = false,
+  invalidRecords: InvalidRecordPolicy = "block"
 ): Promise<void> {
   const id = parseProjectionId(`${index}.v1`)
   const projection: Projection = {
@@ -150,6 +152,7 @@ async function registerProjection(
     name: index,
     version: 1,
     kind: { kind: "row" },
+    history: { kind: "append" },
     contentType: ContentType.Json,
     extraction: {
       fields: COLUMNS.map((name) => ({
@@ -166,7 +169,8 @@ async function registerProjection(
     defaultProjection: id,
     index,
     notify: true,
-    skipRejected: false
+    invalidRecords,
+    oversize: "block"
   }
   await laser.projections().register(projection)
   await laser.bindings().apply(binding)
@@ -197,7 +201,8 @@ async function guardedIngest(laser: Laser, sample: ClickEvent): Promise<void> {
     .send()
   console.log(`allocated writer-schema id ${String(schemaId)} for the ClickEvent guard`)
   await laser.topic(GUARDED_TOPIC).ensure(PARTITIONS)
-  await registerProjection(laser, GUARDED_TOPIC, GUARDED_INDEX, true)
+  // The malformed event is dead-lettered so the valid ones keep materializing.
+  await registerProjection(laser, GUARDED_TOPIC, GUARDED_INDEX, true, "dead_letter")
   await waitForSchema(laser, schemaId)
   const guarded = await laser.topic(GUARDED_TOPIC).schema(schemaId, decodeEventValue)
   await guarded.publish(sample)
@@ -270,7 +275,7 @@ async function runAnalytics(laser: Laser): Promise<void> {
     .fetch()
   console.log(`events in the first 5 minutes: ${scalar(firstWindow)}`)
 
-  const perMinute = await laser.query(INDEX).count().window(TS, ONE_MINUTE_MICROS).fetch()
+  const perMinute = await laser.query(INDEX).count().window(TS, ONE_MINUTE_MS).fetch()
   console.log("events per minute")
   printTable([
     ["window start", "count"],

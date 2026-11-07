@@ -10,15 +10,18 @@ use crate::types::MessageId;
 use bytes::Bytes;
 use futures::Stream;
 use futures::future::{Either, ready};
+use iggy::clients::producer_config::BackpressureMode;
+use iggy::clients::producer_error_callback::{ErrorCallback, ErrorCtx};
 use iggy::prelude::{
-    AutoCommit, BackgroundConfig, Client, CommitAfter, CommitEvery, ConsumerGroupClient,
-    ConsumerOffsetClient, DEFAULT_POLL_MAX_BYTES, DirectConfig, Identifier, IggyClient,
-    IggyConsumer, IggyConsumerBuilder, IggyError, IggyExpiry, IggyMessage, IggyProducer,
-    IggyTimestamp, MAX_DEFERRED_POLL_WAIT_US, MIN_DEFERRED_POLL_MAX_BYTES, MaxTopicSize,
-    MessageClient, Partitioning, PollOptions, PollingStrategy, ReadError, ReceivedMessage,
-    SendMessagesResponse,
+    AutoCommit, BackgroundConfig, Checkpoint, Client, CommitAfter, CommitEvery,
+    ConsumerGroupClient, ConsumerOffsetClient, DEFAULT_POLL_MAX_BYTES, DirectConfig, Identifier,
+    IggyByteSize, IggyClient, IggyConsumer, IggyConsumerBuilder, IggyDuration, IggyError,
+    IggyExpiry, IggyMessage, IggyProducer, IggyTimestamp, MAX_DEFERRED_POLL_WAIT_US,
+    MIN_DEFERRED_POLL_MAX_BYTES, MaxTopicSize, MessageClient, Partitioning, PollOptions,
+    PollingStrategy, ReadError, ReceivedMessage, SendMessagesResponse, Sharding,
 };
 use laser_wire::filter::FilterRef;
+use laser_wire::limits::MAX_FILTERED_PAGE_BYTES;
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -99,34 +102,39 @@ impl ConsumerStart {
     }
 }
 
-/// Server offset storage policy for a live consumer.
+/// Server offset storage policy for a live consumer. Every policy but
+/// `Disabled` and the polling forms stores only handled records: a record
+/// counts as handled once the caller asks for the next one or shuts the
+/// consumer down, so a crash delivers the record in hand again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CommitPolicy {
     /// Never store offsets automatically. Call [`Consumer::commit`] after a
     /// record has been handled successfully.
     Disabled,
-    /// Store offsets on a fixed interval.
+    /// Store the handled records on a fixed interval.
     Interval(Duration),
     /// Commit the current polled batch on the server before delivery. A crash
     /// can skip records the application has not processed. A policy-aware
     /// group consumer stores the delivered prefix when it polls again and at
     /// shutdown instead, so a crash redelivers the current batch and never
     /// skips it.
-    #[default]
     Polling,
     /// Store on an interval or commit the current batch during polling.
     IntervalOrPolling(Duration),
-    /// Store after consuming all records returned by a poll.
+    /// Store once the last record of a poll is handled, and the handled
+    /// prefix at shutdown. The default: one store per poll and a crash
+    /// delivers the unhandled rest of the poll again, on every server.
+    #[default]
     All,
-    /// Store on an interval or after consuming a full poll result.
+    /// Store on an interval or once the last record of a poll is handled.
     IntervalOrAll(Duration),
-    /// Store after every yielded record.
+    /// Store every handled record.
     Each,
-    /// Store on an interval or after every yielded record.
+    /// Store on an interval or every handled record.
     IntervalOrEach(Duration),
-    /// Store after every `n` yielded records.
+    /// Store after every `n` handled records.
     Every(u32),
-    /// Store on an interval or after every `n` yielded records.
+    /// Store on an interval or after every `n` handled records.
     IntervalOrEvery(Duration, u32),
 }
 
@@ -279,10 +287,13 @@ impl ProducerBuilder {
         self
     }
 
+    /// Resends after a failed publish and the first delay between them. `None`
+    /// keeps the connection's publish setting, and `Some(0)` disables resends.
     #[must_use]
     pub fn retries(mut self, retries: Option<u32>, interval: Option<Duration>) -> Self {
-        self.retries = retries;
-        self.retry_interval = interval;
+        let publish = self.topic.laser.publish_options();
+        self.retries = Some(retries.unwrap_or(publish.max_retries));
+        self.retry_interval = Some(interval.unwrap_or(publish.retry_backoff));
         self
     }
 
@@ -407,7 +418,9 @@ impl ProducerBuilder {
     /// `linger` are ignored once this is set, `config` carries their
     /// equivalents plus sharding and backpressure. Call
     /// [`Producer::shutdown`] before dropping the built producer, or
-    /// buffered-but-unsent messages are lost.
+    /// buffered-but-unsent messages are lost. Without an `error_callback` of
+    /// your own, [`Producer::flush`] and [`Producer::shutdown`] return the
+    /// failed background writes.
     #[must_use]
     pub fn background(mut self, config: BackgroundConfig) -> Self {
         self.background = Some(config);
@@ -439,9 +452,14 @@ impl ProducerBuilder {
             publish_options.retry_backoff = interval;
         }
         publish_options.validate()?;
+        let failure = Arc::new(std::sync::Mutex::new(None));
+        let partitioning = self.routing.into_partitioning()?;
+        let recipe = self.background.map(|config| {
+            BackgroundRecipe::new(self.topic.clone(), config, partitioning.clone(), &failure)
+        });
         let mut builder = self.topic.iggy_producer()?;
-        builder = match self.background {
-            Some(config) => builder.background(config),
+        builder = match &recipe {
+            Some(recipe) => builder.background(recipe.config()),
             None => builder.direct(
                 DirectConfig::builder()
                     .batch_length(self.batch_length)
@@ -449,7 +467,7 @@ impl ProducerBuilder {
                     .build(),
             ),
         };
-        builder = builder.partitioning(self.routing.into_partitioning()?);
+        builder = builder.partitioning(partitioning);
         builder = if self.create_stream {
             builder.create_stream_if_not_exists()
         } else {
@@ -503,7 +521,13 @@ impl ProducerBuilder {
         );
         Ok(Producer {
             statistics,
-            inner: Arc::new(producer),
+            inner: Arc::new(ProducerSlot {
+                stream: producer.stream().to_string(),
+                topic: producer.topic().to_string(),
+                producer: tokio::sync::RwLock::new(Some(producer)),
+                recipe,
+                failure,
+            }),
             laser: self.topic.laser.clone(),
             publish_options,
             batch_length: if self.batch_length == 0 {
@@ -517,10 +541,11 @@ impl ProducerBuilder {
 }
 
 #[derive(Clone)]
-/// A cloneable, initialized streaming producer.
+/// A cloneable, initialized streaming producer. Every clone sends through the
+/// same producer, and `flush` and `shutdown` on any clone act for all of them.
 pub struct Producer {
     statistics: super::producer_statistics::ProducerRecorder,
-    inner: Arc<IggyProducer>,
+    inner: Arc<ProducerSlot>,
     laser: crate::laser::Laser,
     publish_options: crate::laser::PublishOptions,
     batch_length: usize,
@@ -623,9 +648,13 @@ impl Producer {
 
     async fn send_iggy(
         &self,
-        messages: Vec<IggyMessage>,
+        #[cfg_attr(not(feature = "agent"), allow(unused_mut))] mut messages: Vec<IggyMessage>,
         routing: Option<Arc<Partitioning>>,
     ) -> Result<SendMessagesResponse, LaserError> {
+        #[cfg(feature = "agent")]
+        self.laser
+            .govern_messages(&self.inner.stream, &self.inner.topic, &mut messages)
+            .await?;
         let observation = self.statistics.begin(
             messages.len() as u64,
             messages
@@ -643,8 +672,15 @@ impl Producer {
         mut messages: Vec<IggyMessage>,
         routing: Option<Arc<Partitioning>>,
     ) -> Result<SendMessagesResponse, LaserError> {
+        // Held for the whole send, so `flush` and `shutdown` wait for it.
+        let slot = self.inner.producer.read().await;
+        let Some(producer) = slot.as_ref() else {
+            return Err(LaserError::Invalid(
+                "the producer is shut down, build a new one with Topic::producer".to_owned(),
+            ));
+        };
         if self.background {
-            return Ok(self.inner.send_with_partitioning(messages, routing).await?);
+            return Ok(producer.send_with_partitioning(messages, routing).await?);
         }
         crate::laser::prepare_publish_messages(&mut messages);
         let mut confirmations = Vec::new();
@@ -658,8 +694,7 @@ impl Producer {
                             self.laser.publish_generation(),
                             std::sync::atomic::Ordering::Release,
                         );
-                        Ok(self
-                            .inner
+                        Ok(producer
                             .send_with_partitioning(
                                 chunk.iter().map(crate::laser::clone_iggy_message).collect(),
                                 routing.clone(),
@@ -679,10 +714,7 @@ impl Producer {
                         &messages[index * self.batch_length..],
                         std::mem::take(&mut confirmations),
                         chunk.len(),
-                        (
-                            &self.inner.stream().to_string(),
-                            &self.inner.topic().to_string(),
-                        ),
+                        (&self.inner.stream, &self.inner.topic),
                     )
                 })?;
             confirmations.extend(response.confirmations);
@@ -690,21 +722,213 @@ impl Producer {
         Ok(SendMessagesResponse { confirmations })
     }
 
-    /// Flushes buffered `background`-mode messages and stops the worker. A
-    /// `direct`-mode producer has nothing to flush, so this is a cheap
-    /// no-op for it. Requires this to be the last live handle to the
-    /// producer, since Apache Iggy's shutdown takes ownership. Fails if
-    /// other clones of this `Producer` are still alive.
-    pub async fn shutdown(self) -> Result<(), LaserError> {
-        match Arc::try_unwrap(self.inner) {
-            Ok(producer) => {
-                producer.shutdown().await;
-                Ok(())
-            }
-            Err(_) => Err(LaserError::Invalid(
-                "producer still has other live handles, drop them before shutdown".to_owned(),
-            )),
+    /// Waits until every record a `background`-mode send queued is written,
+    /// after the sends already in flight. A `direct`-mode producer has nothing
+    /// to flush. Returns the background write failures that reached no error
+    /// callback of your own since the last flush, as one
+    /// [`LaserError::PublishFailed`] that lists the records of every failed
+    /// write.
+    pub async fn flush(&self) -> Result<(), LaserError> {
+        let mut slot = self.inner.producer.write().await;
+        if slot.is_none() {
+            return Err(LaserError::Invalid(
+                "the producer is shut down, build a new one with Topic::producer".to_owned(),
+            ));
         }
+        if let Some(recipe) = &self.inner.recipe {
+            // Apache Iggy drains a background producer only on shutdown, so
+            // the drained one is replaced by a fresh one with the same settings.
+            if let Some(drained) = slot.replace(recipe.producer()?) {
+                drain(drained).await;
+            }
+        }
+        drop(slot);
+        self.inner.take_failure()
+    }
+
+    /// Flushes buffered `background`-mode records and stops the producer for
+    /// every clone, after the sends already in flight. Later sends fail, and a
+    /// second shutdown returns at once. Returns the background write failures
+    /// `flush` would.
+    pub async fn shutdown(&self) -> Result<(), LaserError> {
+        let producer = self.inner.producer.write().await.take();
+        if let Some(producer) = producer {
+            drain(producer).await;
+        }
+        self.inner.take_failure()
+    }
+}
+
+// The one producer every clone shares. A send holds the read side for its
+// whole call, and `flush` and `shutdown` take the write side.
+struct ProducerSlot {
+    producer: tokio::sync::RwLock<Option<IggyProducer>>,
+    stream: String,
+    topic: String,
+    recipe: Option<BackgroundRecipe>,
+    failure: Arc<std::sync::Mutex<Option<LaserError>>>,
+}
+
+impl ProducerSlot {
+    fn take_failure(&self) -> Result<(), LaserError> {
+        match self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            Some(failure) => Err(failure),
+            None => Ok(()),
+        }
+    }
+}
+
+// What a flush needs to build the background producer again: the topic, the
+// partitioning, and every setting of the caller's `BackgroundConfig`, with
+// its sharding shared.
+struct BackgroundRecipe {
+    topic: Topic,
+    partitioning: Partitioning,
+    num_shards: usize,
+    linger_time: IggyDuration,
+    error_callback: Arc<Box<dyn ErrorCallback + Send + Sync>>,
+    sharding: Arc<Box<dyn Sharding + Send + Sync>>,
+    batch_size: usize,
+    batch_length: usize,
+    failure_mode: BackpressureMode,
+    max_buffer_size: IggyByteSize,
+    max_in_flight: usize,
+}
+
+impl BackgroundRecipe {
+    // Apache Iggy's default callback logs a failed write and drops it, so
+    // without a callback of the caller's own the failure is kept for `flush`
+    // and `shutdown` instead.
+    fn new(
+        topic: Topic,
+        config: BackgroundConfig,
+        partitioning: Partitioning,
+        failure: &Arc<std::sync::Mutex<Option<LaserError>>>,
+    ) -> Self {
+        let BackgroundConfig {
+            num_shards,
+            linger_time,
+            error_callback,
+            sharding,
+            batch_size,
+            batch_length,
+            failure_mode,
+            max_buffer_size,
+            max_in_flight,
+        } = config;
+        let error_callback: Arc<Box<dyn ErrorCallback + Send + Sync>> =
+            if format!("{error_callback:?}") == "LogErrorCallback" {
+                Arc::new(Box::new(KeptFailure(Arc::clone(failure))))
+            } else {
+                error_callback
+            };
+        Self {
+            topic,
+            partitioning,
+            num_shards,
+            linger_time,
+            error_callback,
+            sharding: Arc::new(sharding),
+            batch_size,
+            batch_length,
+            failure_mode,
+            max_buffer_size,
+            max_in_flight,
+        }
+    }
+
+    fn config(&self) -> BackgroundConfig {
+        BackgroundConfig {
+            num_shards: self.num_shards,
+            linger_time: self.linger_time,
+            error_callback: Arc::clone(&self.error_callback),
+            sharding: Box::new(SharedSharding(Arc::clone(&self.sharding))),
+            batch_size: self.batch_size,
+            batch_length: self.batch_length,
+            failure_mode: self.failure_mode.clone(),
+            max_buffer_size: self.max_buffer_size,
+            max_in_flight: self.max_in_flight,
+        }
+    }
+
+    // The topic exists by now, so the rebuilt producer creates nothing.
+    fn producer(&self) -> Result<IggyProducer, LaserError> {
+        Ok(self
+            .topic
+            .iggy_producer()?
+            .background(self.config())
+            .partitioning(self.partitioning.clone())
+            .do_not_create_stream_if_not_exists()
+            .do_not_create_topic_if_not_exists()
+            .build())
+    }
+}
+
+// Keeps the background write failures for `flush` and `shutdown`: the first
+// one, with the records and confirmations of every later one added to it.
+#[derive(Debug)]
+struct KeptFailure(Arc<std::sync::Mutex<Option<LaserError>>>);
+
+impl ErrorCallback for KeptFailure {
+    fn call(&self, context: ErrorCtx) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let kept = Arc::clone(&self.0);
+        Box::pin(async move {
+            let failure = crate::laser::publish_failure(
+                LaserError::from(IggyError::ProducerSendFailed {
+                    cause: context.cause,
+                    failed: context.messages,
+                    uncertain: 0,
+                    committed: context.committed,
+                    stream_name: context.stream_name.into(),
+                    topic_name: context.topic_name.into(),
+                }),
+                &[],
+                Vec::new(),
+                0,
+                ("", ""),
+            );
+            let mut kept = kept
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match (kept.as_mut(), failure) {
+                (Some(LaserError::PublishFailed(earlier)), LaserError::PublishFailed(later)) => {
+                    let later = *later;
+                    earlier.committed.extend(later.committed);
+                    earlier.unconfirmed.extend(later.unconfirmed);
+                }
+                (Some(_), _) => {}
+                (None, failure) => *kept = Some(failure),
+            }
+        })
+    }
+}
+
+// One sharding strategy shared by every producer a flush builds.
+#[derive(Debug)]
+struct SharedSharding(Arc<Box<dyn Sharding + Send + Sync>>);
+
+impl Sharding for SharedSharding {
+    fn pick_shard(
+        &self,
+        num_shards: usize,
+        messages: &[IggyMessage],
+        stream: &Identifier,
+        topic: &Identifier,
+    ) -> usize {
+        self.0.pick_shard(num_shards, messages, stream, topic)
+    }
+}
+
+// Drains on a task of its own, so a cancelled flush or shutdown never drops
+// the buffered records.
+async fn drain(producer: IggyProducer) {
+    if let Err(error) = tokio::spawn(producer.shutdown()).await {
+        tracing::warn!(target: "laser", %error, "Draining a background producer failed.");
     }
 }
 
@@ -766,7 +990,7 @@ impl ConsumerBuilder {
             min_count: DEFAULT_MIN_COUNT,
             max_bytes: DEFAULT_POLL_MAX_BYTES,
             start: ConsumerStart::Next,
-            commit: CommitPolicy::Polling,
+            commit: CommitPolicy::default(),
             create_group: true,
             polling_retry_interval: DEFAULT_RETRY_INTERVAL,
             init_retries: None,
@@ -813,7 +1037,9 @@ impl ConsumerBuilder {
     }
 
     /// Most record bytes one poll returns. Default 1 MiB. A record larger
-    /// than the cap comes alone, so a poll always makes progress. Native only.
+    /// than the cap comes alone, so a poll always makes progress. A
+    /// policy-aware group consumer caps its filtered pages with it, up to
+    /// [`MAX_FILTERED_PAGE_BYTES`].
     #[must_use]
     pub const fn max_bytes(mut self, max_bytes: u32) -> Self {
         self.max_bytes = max_bytes;
@@ -929,6 +1155,7 @@ impl ConsumerBuilder {
                 .seeded(self.start)
                 .count(self.batch_length)
                 .max_examined(self.batch_length)
+                .max_reply_bytes(self.max_bytes.min(MAX_FILTERED_PAGE_BYTES))
                 .idle_interval(DEFAULT_IDLE_INTERVAL)
                 .max_wait(self.max_wait)
                 .retry_interval(polling_retry_interval)
@@ -976,6 +1203,7 @@ impl ConsumerBuilder {
                 },
             )))),
             manual_commit: self.commit == CommitPolicy::Disabled,
+            commits_on_read: false,
             allow_replay: self.allow_replay,
             shutdown_target: None,
             group_reads: std::sync::Mutex::new(GroupReads::default()),
@@ -1085,6 +1313,10 @@ impl ConsumerBuilder {
             yielded_zero: BTreeSet::new(),
             inner: Some(ConsumerInner::Native(Box::new(consumer))),
             manual_commit,
+            commits_on_read: matches!(
+                self.commit,
+                CommitPolicy::Polling | CommitPolicy::IntervalOrPolling(_)
+            ),
             allow_replay: self.allow_replay,
             shutdown_target,
             group_reads: std::sync::Mutex::new(GroupReads::default()),
@@ -1471,6 +1703,10 @@ pub struct ConsumerMessage {
     // The delivery handle a policy-aware group consumer commits by. Absent
     // on a native record.
     pub(crate) delivery: Option<Delivery>,
+    // The position a native consumer commits by, fenced to the partition
+    // history and reader that delivered the record. Absent on a record read
+    // through another path.
+    pub(crate) checkpoint: Option<Checkpoint>,
 }
 
 impl ConsumerMessage {
@@ -1506,18 +1742,23 @@ impl ConsumerMessage {
             user_headers: message.user_headers,
             headers_malformed,
             delivery,
+            checkpoint: None,
         }
     }
 }
 
 impl From<ReceivedMessage> for ConsumerMessage {
     fn from(received: ReceivedMessage) -> Self {
-        Self::of(
-            received.message,
-            received.partition_id,
-            received.current_offset,
-            None,
-        )
+        let checkpoint = received.checkpoint();
+        Self {
+            checkpoint: Some(checkpoint),
+            ..Self::of(
+                received.message,
+                received.partition_id,
+                received.current_offset,
+                None,
+            )
+        }
     }
 }
 
@@ -1526,6 +1767,9 @@ pub struct Consumer {
     yielded_zero: BTreeSet<u32>,
     inner: Option<ConsumerInner>,
     manual_commit: bool,
+    // Native only: whether the server stores each batch as it reads it, which
+    // leaves no checkpoint for a commit to fence.
+    commits_on_read: bool,
     // Native only: whether a stored offset may move back.
     allow_replay: bool,
     shutdown_target: Option<ConsumerGroupTarget>,
@@ -1761,6 +2005,12 @@ impl GroupEngine {
         Ok(())
     }
 
+    async fn skip(&mut self, partition_id: u32, offset: u64) -> Result<(), LaserError> {
+        let skipped = self.reader.skip(partition_id, offset).await;
+        self.sync_stored();
+        skipped
+    }
+
     // Acknowledge the deliveries handled since the last read, in the order
     // they were handled. A failed acknowledgment stays queued with the ones
     // after it, so the next attempt resends it. A partition this member lost
@@ -1874,7 +2124,13 @@ impl Consumer {
 
     /// Store a handled record's offset on the server. A policy-aware group
     /// consumer stores the contiguous prefix of its partition through this
-    /// record, so earlier records yielded out of order cannot be skipped.
+    /// record, so earlier records yielded out of order cannot be skipped. A
+    /// native consumer stores it under the partition history and reader that
+    /// delivered the record: a record read before the topic was recreated,
+    /// the partition moved to another member, or a [`seek`](Self::seek) of
+    /// its partition stores nothing, and one this consumer did not deliver is
+    /// refused with [`LaserError::Invalid`]. Under the polling policies the
+    /// server already stored the record's batch when it read it.
     pub async fn commit(&self, message: &ConsumerMessage) -> Result<(), LaserError> {
         match self.inner.as_ref() {
             Some(ConsumerInner::Group(engine)) => {
@@ -1889,10 +2145,55 @@ impl Consumer {
                     .interrupt();
                 engine.lock().await.commit(delivery).await
             }
-            _ => {
+            _ if self.commits_on_read => {
                 self.store_offset(message.position.offset, Some(message.partition_id))
                     .await
             }
+            _ => {
+                let consumer = self.native()?;
+                let undelivered = || {
+                    LaserError::Invalid("the record was not delivered by this consumer".to_owned())
+                };
+                let checkpoint = message.checkpoint.ok_or_else(undelivered)?;
+                consumer
+                    .commit(checkpoint)
+                    .await
+                    .map_err(|error| match error {
+                        IggyError::InvalidCommand => undelivered(),
+                        other => other.into(),
+                    })
+            }
+        }
+    }
+
+    /// Pass the record a [`LaserError::FilterFault`] or a
+    /// [`LaserError::FilterOversizedRecord`] stopped `partition_id` at, and
+    /// read on after it, as [`FilteredReader::skip`] does. Policy-aware group
+    /// consumers only: a native consumer runs no filter, so nothing stops it
+    /// there, and [`store_offset`](Self::store_offset) moves it.
+    ///
+    /// # Errors
+    ///
+    /// [`LaserError::Invalid`] when the partition is not stopped at `offset`
+    /// or the consumer is native.
+    pub async fn skip(&self, partition_id: u32, offset: u64) -> Result<(), LaserError> {
+        match self.inner.as_ref() {
+            Some(ConsumerInner::Group(engine)) => {
+                self.group_reads
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .interrupt();
+                engine.lock().await.skip(partition_id, offset).await
+            }
+            Some(ConsumerInner::Native(_) | ConsumerInner::Recovering(_)) => {
+                Err(LaserError::Invalid(
+                    "a native consumer runs no filter, so no fault stops it. Store an offset instead"
+                        .to_owned(),
+                ))
+            }
+            None => Err(LaserError::Invalid(
+                "consumer has been shut down".to_owned(),
+            )),
         }
     }
 
@@ -1962,6 +2263,27 @@ impl Consumer {
     /// Native only, like [`store_offset`](Self::store_offset).
     pub async fn delete_offset(&self, partition: Option<u32>) -> Result<(), LaserError> {
         self.native()?.delete_offset(partition).await?;
+        Ok(())
+    }
+
+    /// Read `partition` next from `start`, again from an earlier record or
+    /// past a later one. The rest of the partition's polled batch is dropped,
+    /// and a record delivered before the seek commits nothing. Under the
+    /// polling policies a seek to an offset above zero first stores the
+    /// offset before it, so a restart resumes there. Every other seek stores
+    /// nothing. Native only, like [`store_offset`](Self::store_offset), and a
+    /// group member seeks only a partition it holds.
+    pub async fn seek(&mut self, partition: u32, start: ConsumerStart) -> Result<(), LaserError> {
+        let consumer = match self.inner.as_mut() {
+            Some(ConsumerInner::Native(consumer)) => consumer,
+            other => return Err(not_native(other.map(|inner| &*inner))),
+        };
+        consumer.seek(partition, start.into_polling()).await?;
+        self.returned_native
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|message| message.partition_id != partition);
+        self.yielded_zero.remove(&partition);
         Ok(())
     }
 
@@ -2099,17 +2421,7 @@ impl Consumer {
     fn native(&self) -> Result<&IggyConsumer, LaserError> {
         match self.inner.as_ref() {
             Some(ConsumerInner::Native(consumer)) => Ok(consumer),
-            Some(ConsumerInner::Recovering(_)) => Err(LaserError::Invalid(
-                "the consumer is resuming a partition a read error stopped, read its next record first"
-                    .to_owned(),
-            )),
-            Some(ConsumerInner::Group(_)) => Err(LaserError::Invalid(
-                "explicit offsets bypass the group's acknowledgment contract, commit a delivered record instead"
-                    .to_owned(),
-            )),
-            None => Err(LaserError::Invalid(
-                "consumer has been shut down".to_owned(),
-            )),
+            other => Err(not_native(other)),
         }
     }
 }
@@ -2203,9 +2515,26 @@ impl Stream for Consumer {
     }
 }
 
+// Why a call that needs the native reader cannot reach it.
+fn not_native(inner: Option<&ConsumerInner>) -> LaserError {
+    LaserError::Invalid(
+        match inner {
+            Some(ConsumerInner::Recovering(_)) => {
+                "the consumer is resuming a partition a read error stopped, read its next record first"
+            }
+            Some(ConsumerInner::Group(_)) => {
+                "explicit offsets bypass the group's acknowledgment contract, commit a delivered record instead"
+            }
+            Some(ConsumerInner::Native(_)) | None => "consumer has been shut down",
+        }
+        .to_owned(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::TransportError;
     use crate::stream::MAX_REPLICATION_FACTOR;
     use iggy::prelude::NonZeroIggyDuration;
     use std::num::NonZeroU32;
@@ -2213,6 +2542,19 @@ mod tests {
     fn producer_builder() -> ProducerBuilder {
         let laser = crate::laser::Laser::from_client(iggy::prelude::IggyClient::default());
         laser.stream("fleet").topic("readings").producer()
+    }
+
+    #[test]
+    fn given_no_retry_settings_when_a_producer_is_configured_then_should_inherit_the_connection_publish_settings()
+     {
+        let laser = crate::laser::Laser::from_client(iggy::prelude::IggyClient::default());
+        let publish = laser.publish_options();
+        let inherited = producer_builder().retries(None, None);
+        assert_eq!(inherited.retries, Some(publish.max_retries));
+        assert_eq!(inherited.retry_interval, Some(publish.retry_backoff));
+        let disabled = producer_builder().retries(Some(0), None);
+        assert_eq!(disabled.retries, Some(0), "zero disables resends");
+        assert_eq!(disabled.retry_interval, Some(publish.retry_backoff));
     }
 
     #[tokio::test]
@@ -2456,6 +2798,36 @@ mod tests {
     }
 
     #[test]
+    fn given_a_consumer_without_a_commit_policy_when_configured_then_should_store_once_a_poll_is_handled()
+     {
+        let laser = crate::laser::Laser::from_client(iggy::prelude::IggyClient::default());
+        let topic = laser.stream("fleet").topic("readings");
+        assert_eq!(CommitPolicy::default(), CommitPolicy::All);
+        assert_eq!(topic.consumer("reader", 0).commit, CommitPolicy::All);
+        assert_eq!(
+            topic.consumer_group("workers").consumer().commit,
+            CommitPolicy::All
+        );
+    }
+
+    #[test]
+    fn given_a_native_delivery_when_converted_then_should_keep_the_checkpoint_its_commit_is_fenced_by()
+     {
+        let message = IggyMessage::builder()
+            .payload(Bytes::from_static(b"body"))
+            .build()
+            .expect("a valid message");
+        let received =
+            ReceivedMessage::new(message, 9, 2, iggy::prelude::PartitionContext::default());
+        let checkpoint = received.checkpoint();
+
+        let converted = ConsumerMessage::from(received);
+
+        assert_eq!(converted.checkpoint, Some(checkpoint));
+        assert_eq!(converted.position, MessageId::new(2, 0));
+    }
+
+    #[test]
     fn given_zero_frequency_when_building_commit_policy_then_should_reject_it() {
         let error = iggy::prelude::CommitPolicy::try_from(CommitPolicy::Every(0))
             .expect_err("zero cannot be a commit frequency");
@@ -2667,7 +3039,12 @@ mod tests {
         let reported = recover_read(&mut target, error).await;
 
         assert!(
-            matches!(reported, Some(LaserError::Iggy(IggyError::Unauthorized))),
+            matches!(
+                reported,
+                Some(LaserError::Transport(TransportError(
+                    IggyError::Unauthorized
+                )))
+            ),
             "{reported:?}"
         );
         assert!(target.abandoned.is_empty());
@@ -2710,7 +3087,9 @@ mod tests {
         assert!(
             matches!(
                 reported,
-                Some(LaserError::Iggy(IggyError::InvalidMessagePayloadLength))
+                Some(LaserError::Transport(TransportError(
+                    IggyError::InvalidMessagePayloadLength
+                )))
             ),
             "{reported:?}"
         );
@@ -2725,7 +3104,12 @@ mod tests {
         let reported = recover_read(&mut target, error).await;
 
         assert!(
-            matches!(reported, Some(LaserError::Iggy(IggyError::InvalidCommand))),
+            matches!(
+                reported,
+                Some(LaserError::Transport(TransportError(
+                    IggyError::InvalidCommand
+                )))
+            ),
             "{reported:?}"
         );
     }
@@ -2740,7 +3124,9 @@ mod tests {
         assert!(
             matches!(
                 reported,
-                Some(LaserError::Iggy(IggyError::TransientNotAccepted))
+                Some(LaserError::Transport(TransportError(
+                    IggyError::TransientNotAccepted
+                )))
             ),
             "{reported:?}"
         );
@@ -2753,7 +3139,7 @@ mod tests {
         let error = Routing::key(Vec::new())
             .into_partitioning()
             .expect_err("an empty partition key should be rejected");
-        assert!(matches!(error, LaserError::Iggy(_)));
+        assert!(matches!(error, LaserError::Transport(TransportError(_))));
     }
 
     #[test]
@@ -2785,6 +3171,116 @@ mod tests {
             .expect("the producer message should lower to Iggy");
 
         assert_eq!(message.payload.as_ptr(), payload.as_ptr());
+    }
+
+    #[tokio::test]
+    async fn given_two_failed_background_writes_when_kept_then_should_report_the_first_cause_with_every_record()
+     {
+        let kept = Arc::new(std::sync::Mutex::new(None));
+        let callback = KeptFailure(Arc::clone(&kept));
+        callback
+            .call(failed_write(IggyError::Unauthorized, 2))
+            .await;
+        callback
+            .call(failed_write(IggyError::InvalidFormat, 3))
+            .await;
+
+        let slot = ProducerSlot {
+            producer: tokio::sync::RwLock::new(None),
+            stream: "fleet".to_owned(),
+            topic: "readings".to_owned(),
+            recipe: None,
+            failure: kept,
+        };
+        let failure = slot.take_failure().expect_err("the failures are kept");
+        let LaserError::PublishFailed(failure) = failure else {
+            panic!("a failed publish, got {failure:?}");
+        };
+        assert_eq!(
+            (failure.stream.as_str(), failure.topic.as_str()),
+            ("fleet", "readings")
+        );
+        assert_eq!(
+            failure.unconfirmed.len(),
+            5,
+            "every failed record is listed"
+        );
+        assert_eq!(
+            failure.source.iggy_error_code(),
+            Some(IggyError::Unauthorized.as_code()),
+            "the first cause is kept"
+        );
+        assert!(
+            slot.take_failure().is_ok(),
+            "a reported failure is not reported again"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_background_config_when_a_write_fails_then_should_keep_it_only_without_a_callback_of_its_own()
+     {
+        let laser = crate::laser::Laser::from_client(iggy::prelude::IggyClient::default());
+        let topic = laser.stream("fleet").topic("readings");
+        let kept = Arc::new(std::sync::Mutex::new(None));
+        let default = BackgroundRecipe::new(
+            topic.clone(),
+            BackgroundConfig::builder().build(),
+            Partitioning::balanced(),
+            &kept,
+        );
+        default
+            .config()
+            .error_callback
+            .call(failed_write(IggyError::Disconnected, 1))
+            .await;
+        assert!(
+            kept.lock().expect("kept").take().is_some(),
+            "the default callback would drop it"
+        );
+
+        let received = Arc::new(std::sync::Mutex::new(None));
+        let own = BackgroundRecipe::new(
+            topic,
+            BackgroundConfig::builder()
+                .error_callback(Arc::new(Box::new(KeptFailure(Arc::clone(&received)))))
+                .build(),
+            Partitioning::balanced(),
+            &kept,
+        );
+        own.config()
+            .error_callback
+            .call(failed_write(IggyError::Disconnected, 1))
+            .await;
+        assert!(
+            received.lock().expect("received").is_some(),
+            "the caller's callback receives it"
+        );
+        assert!(
+            kept.lock().expect("kept").is_none(),
+            "a failure the caller's callback took is not kept"
+        );
+    }
+
+    fn failed_write(cause: IggyError, records: usize) -> ErrorCtx {
+        ErrorCtx {
+            cause: Box::new(cause),
+            stream: Arc::new(Identifier::named("fleet").expect("a stream name")),
+            stream_name: "fleet".to_owned(),
+            topic: Arc::new(Identifier::named("readings").expect("a topic name")),
+            topic_name: "readings".to_owned(),
+            partitioning: None,
+            messages: Arc::new(
+                (0..records)
+                    .map(|_| {
+                        IggyMessage::builder()
+                            .payload(Bytes::from_static(b"reading"))
+                            .build()
+                            .expect("a message")
+                    })
+                    .collect(),
+            ),
+            committed: Arc::new(Vec::new()),
+        }
     }
 
     fn read_error(

@@ -228,26 +228,19 @@ async fn route_alerts(laser: &Laser, stream: &str) -> Result<(), LaserError> {
     paged
 }
 
-// Draft a stricter revision on the desk's own filter, run the variant in its
-// own group, pause and resume it, then release and delete both policies.
+// List the desk's own revision, run a stricter variant in its own group,
+// pause and resume it, then release and delete both policies.
 async fn manage_revisions(
     laser: &Laser,
     desk: &ConsumerGroup,
     binding: &FilterBinding,
     expected: usize,
 ) -> Result<(), LaserError> {
-    phase("draft a stricter revision: readers keep running the active one");
-    let draft = desk
-        .filter()
-        .revise(
-            binding.revision,
-            ConsumerFilter::json(safe_mode_transition()),
-        )
-        .await?;
-    let revisions = desk.filter().revisions(0, 10).await?;
+    phase("a group runs one policy: its own filter lists the revision it runs");
+    let revisions = desk.filter().revisions(1, 10).await?;
     println!(
-        "  revision {} drafted, the group lists {} revisions and still runs revision {}",
-        draft.revision, revisions.total, binding.revision
+        "  the group lists {} revision(s) and runs revision {}",
+        revisions.total_results, binding.revision
     );
 
     phase("A/B: the transitions-only variant runs in its own group");

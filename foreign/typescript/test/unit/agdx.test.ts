@@ -1,10 +1,20 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { createAgdx, MAX_CHUNK_BODY_BYTES, type Agdx } from "../../src/agent/agdx.js"
-import { InvalidError, RejectedError } from "../../src/client/errors.js"
+import { InvalidError, PolicyDeferredError, RejectedError } from "../../src/client/errors.js"
+import { INTERNAL_TRANSPORT, INTERNAL_VERIFIER } from "../../src/client/internals.js"
+import { Laser } from "../../src/client/laser.js"
+import {
+  AgentCtx,
+  ApprovalSlot,
+  approvalCorrelation,
+  isApprovalCorrelation
+} from "../../src/agent/context.js"
+import { AgentTopic } from "../../src/provenance/agent-topic.js"
 import { KeyRegistry, SigningKey } from "../../src/signing.js"
 import type {
   ConsumerTarget,
+  IggyClient,
   LaserTransport,
   MessageWithHeaders,
   PolledMessage,
@@ -183,7 +193,7 @@ void test("given_a_refined_command_when_sent_then_should_stamp_typed_headers_and
     .command(correlation, new TextEncoder().encode("request"))
     .withTarget(AgentId.new("target-agent"))
     .withIdempotencyKey(parseIdempotencyKey("attempt-1"))
-    .withDeadlineMicros(1_717_171_777_000_000n)
+    .withDeadlineAtMicros(1_717_171_777_000_000n)
     .withOperation("chat")
     .withMetadata("priority", { kind: "str", value: "high" })
     .contentType(ContentType.Json)
@@ -249,6 +259,81 @@ void test("given_a_buffered_chunk_stream_when_finished_then_should_append_chunks
   await assert.rejects(stream.write(new Uint8Array()), InvalidError)
 })
 
+void test("given_a_chunk_publish_failure_when_writing_then_should_keep_the_sequence_for_the_retry", async () => {
+  const transport = new FakeTransport()
+  let failures = 1
+  const send = transport.sendMessagesWithHeaders.bind(transport)
+  transport.sendMessagesWithHeaders = (stream, topic, messages, partitionKey) => {
+    if (failures > 0) {
+      failures -= 1
+      return Promise.reject(new Error("link down"))
+    }
+    return send(stream, topic, messages, partitionKey)
+  }
+  const stream = newAgdx(transport).stream(CorrelationId.fromU128(9n), "chat")
+  await assert.rejects(stream.write(new TextEncoder().encode("t")))
+  await stream.write(new TextEncoder().encode("t"))
+  await stream.finish("stop")
+  const sequences = transport.batches.map((batch) => {
+    const message = batch.messages[0]
+    assert.ok(message !== undefined)
+    return envelopeOf(message).sequence
+  })
+  assert.deepEqual(sequences, [0n, 1n])
+  const opening = transport.batches[0]?.messages[0]
+  assert.ok(opening !== undefined)
+  assert.ok(envelopeOf(opening).deadlineMicros !== undefined, "the opening chunk is bounded")
+})
+
+void test("given_an_absolute_deadline_when_set_on_a_chunk_stream_then_should_carry_it_unchanged", async () => {
+  const transport = new FakeTransport()
+  const stream = newAgdx(transport)
+    .stream(CorrelationId.fromU128(8n), "chat")
+    .withDeadlineAtMicros(1_717_171_777_000_000n)
+  await stream.write(new TextEncoder().encode("t"))
+  const opening = transport.batches[0]?.messages[0]
+  assert.ok(opening !== undefined)
+  assert.equal(envelopeOf(opening).deadlineMicros, 1_717_171_777_000_000n)
+})
+
+void test("given_an_unfinished_stream_longer_than_fifty_chunks_when_reassembled_past_its_bound_then_should_end_it_abandoned", async () => {
+  const transport = new FakeTransport()
+  const stream = newAgdx(transport)
+    .stream(CorrelationId.fromU128(10n), "chat")
+    .withDeadlineAtMicros(1n)
+  for (let index = 0; index < 61; index += 1) {
+    await stream.write(new TextEncoder().encode(`t${String(index)}`))
+  }
+  const records: PolledMessage[] = transport.batches
+    .flatMap((batch) => batch.messages)
+    .map((message, offset) => ({
+      partitionId: 0,
+      offset: BigInt(offset),
+      payload: message.payload,
+      headers: message.headers,
+      timestampMicros: BigInt(offset + 1)
+    }))
+  const client = { clientProvider: () => Promise.resolve({}) } as unknown as IggyClient
+  const laser = (await Laser.fromClient(client)).withDefaultStream("agents")
+  const log = laser[INTERNAL_TRANSPORT]()
+  log.getTopicPartitionCount = () => Promise.resolve(1)
+  log.findTopicPartitionCount = () => Promise.resolve(1)
+  log.pollMessages = (_stream, _topic, _target, strategy, count) =>
+    Promise.resolve(
+      strategy.kind === "offset"
+        ? records.slice(Number(strategy.value), Number(strategy.value) + count)
+        : []
+    )
+  const conversation = SdkConversationId.parse(
+    WireConversationId.fromU128(0x0190_3c1f_aa00_0000_0000_0000_0000_0002n).toString()
+  )
+
+  const events = await laser.reassembleChannel(conversation, AgentTopic.Sessions, stream.channel)
+
+  assert.equal(events.filter((event) => event.kind === "body").length, 61)
+  assert.deepEqual(events.at(-1), { kind: "finished", finishReason: "abandoned", synthetic: true })
+})
+
 void test("given_an_oversized_chunk_when_written_then_should_reject_before_transport", async () => {
   const transport = new FakeTransport()
   const stream = newAgdx(transport).stream(CorrelationId.fromU128(7n), "chat")
@@ -300,6 +385,7 @@ void test("given_a_correlated_input_response_when_requested_then_should_return_t
   transport.onSend = (messages) => {
     const command = messages[0]
     assert.ok(command !== undefined)
+    if (envelopeOf(command).kind !== AgentKind.Command) return
     const correlation = envelopeOf(command).correlation
     assert.ok(correlation !== undefined)
     const reply = responseEnvelope(
@@ -330,6 +416,7 @@ void test("given_a_correlated_input_error_when_requested_then_should_surface_the
   transport.onSend = (messages) => {
     const command = messages[0]
     assert.ok(command !== undefined)
+    if (envelopeOf(command).kind !== AgentKind.Command) return
     const correlation = envelopeOf(command).correlation
     assert.ok(correlation !== undefined)
     const reply = errorEnvelope(
@@ -364,6 +451,7 @@ void test("given_a_target_when_requesting_input_then_should_address_the_prompt_t
   transport.onSend = (messages) => {
     const command = messages[0]
     assert.ok(command !== undefined)
+    if (envelopeOf(command).kind !== AgentKind.Command) return
     const envelope = envelopeOf(command)
     targets.push(envelope.target)
     assert.ok(envelope.correlation !== undefined)
@@ -388,6 +476,138 @@ void test("given_a_target_when_requesting_input_then_should_address_the_prompt_t
   assert.deepEqual(targets, ["approver", undefined])
 })
 
+void test("given_an_input_request_when_sent_then_should_announce_input_required_before_the_input_request_command", async () => {
+  const transport = new FakeTransport()
+  transport.onSend = (messages) => {
+    const sent = messages[0]
+    assert.ok(sent !== undefined)
+    const envelope = envelopeOf(sent)
+    if (envelope.kind !== AgentKind.Command || envelope.correlation === undefined) return
+    transport.replies.push({
+      payload: encodeNamed(
+        encodeAgentEnvelope(
+          responseEnvelope(
+            RecordId.fromU128(103n),
+            WireConversationId.fromU128(2n),
+            parseAgentId("approver"),
+            envelope.correlation,
+            new TextEncoder().encode("approved")
+          )
+        )
+      ),
+      partitionId: 0,
+      offset: 0n,
+      headers: new Map([[AGENT_VERSION, { kind: "uint32", value: 1 }]])
+    })
+  }
+  await newAgdx(transport).requestInput(
+    "agent.sessions",
+    new TextEncoder().encode("approve?"),
+    1_000
+  )
+  const [status, command] = transport.batches.map((batch) => {
+    const message = batch.messages[0]
+    assert.ok(message !== undefined)
+    return envelopeOf(message)
+  })
+  assert.ok(status !== undefined && command !== undefined)
+  assert.equal(status.kind, AgentKind.Status)
+  assert.equal(status.operation, "task")
+  assert.deepEqual(status.taskState, { kind: "known", name: "InputRequired" })
+  assert.equal(command.kind, AgentKind.Command)
+  assert.equal(command.operation, "input_request")
+  assert.ok(status.correlation?.equals(command.correlation ?? CorrelationId.fromU128(0n)))
+})
+
+void test("given_a_named_approver_when_another_agent_answers_first_then_should_wait_for_the_approver", async () => {
+  const transport = new FakeTransport()
+  transport.onSend = (messages) => {
+    const sent = messages[0]
+    assert.ok(sent !== undefined)
+    const envelope = envelopeOf(sent)
+    if (envelope.kind !== AgentKind.Command || envelope.correlation === undefined) return
+    for (const [record, author, body] of [
+      [104n, "mallory", "forged"],
+      [105n, "approver", "approved"]
+    ] as const) {
+      transport.replies.push({
+        payload: encodeNamed(
+          encodeAgentEnvelope(
+            responseEnvelope(
+              RecordId.fromU128(record),
+              WireConversationId.fromU128(2n),
+              parseAgentId(author),
+              envelope.correlation,
+              new TextEncoder().encode(body)
+            )
+          )
+        ),
+        partitionId: 0,
+        offset: record,
+        headers: new Map([[AGENT_VERSION, { kind: "uint32", value: 1 }]])
+      })
+    }
+  }
+  const body = await newAgdx(transport).requestInput(
+    "agent.sessions",
+    new TextEncoder().encode("approve?"),
+    1_000,
+    { target: AgentId.new("approver") }
+  )
+  assert.equal(new TextDecoder().decode(body), "approved")
+})
+
+void test("given_full_reply_batches_before_the_answer_when_requesting_input_then_should_read_on_without_sleeping", async (t) => {
+  const transport = new FakeTransport()
+  const backlog: PolledMessage[] = []
+  const headers = new Map([[AGENT_VERSION, { kind: "uint32", value: 1 } as const]])
+  transport.onSend = (messages) => {
+    const sent = messages[0]
+    assert.ok(sent !== undefined)
+    const envelope = envelopeOf(sent)
+    if (envelope.kind !== AgentKind.Command || envelope.correlation === undefined) return
+    for (let offset = 0n; offset <= 1_000n; offset += 1n) {
+      const answer = offset === 1_000n
+      backlog.push({
+        payload: encodeNamed(
+          encodeAgentEnvelope(
+            responseEnvelope(
+              RecordId.fromU128(200n + offset),
+              WireConversationId.fromU128(2n),
+              parseAgentId("human"),
+              answer ? envelope.correlation : CorrelationId.fromU128(999n),
+              new TextEncoder().encode(answer ? "approved" : "token")
+            )
+          )
+        ),
+        partitionId: 0,
+        offset,
+        headers
+      })
+    }
+  }
+  const poll: LaserTransport["pollMessages"] = (_stream, _topic, _target, strategy, count) =>
+    Promise.resolve(
+      strategy.kind === "offset"
+        ? backlog.slice(Number(strategy.value), Number(strategy.value) + count)
+        : []
+    )
+  Object.assign(transport, { pollMessages: poll })
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+
+  const answer = newAgdx(transport)
+    .requestInput("agent.sessions", new TextEncoder().encode("approve?"), 60_000)
+    .then((body) => new TextDecoder().decode(body))
+  const slept = (async () => {
+    for (let turn = 0; turn < 50; turn += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    return "slept between full batches"
+  })()
+
+  assert.equal(await Promise.race([answer, slept]), "approved")
+})
+
 void test("given_a_failure_with_a_changed_content_type_when_sent_then_should_refuse_it", async () => {
   const transport = new FakeTransport()
   const agdx = newAgdx(transport)
@@ -403,4 +623,80 @@ void test("given_a_failure_with_a_changed_content_type_when_sent_then_should_ref
     .withTaskState({ kind: "known", name: "Failed" })
     .send()
   assert.equal(transport.batches.length, 1)
+})
+
+void test("given_a_parking_gate_when_it_runs_first_then_should_publish_the_prompt_once_and_interrupt", async () => {
+  const sent: string[] = []
+  const recorder = (label: string) => {
+    const send: Record<string, unknown> = {
+      withCorrelation: () => send,
+      withTaskState: () => send,
+      withOperation: () => send,
+      withTarget: () => send,
+      withDeadlineAtMicros: () => send,
+      send: () => {
+        sent.push(label)
+        return Promise.resolve(undefined)
+      },
+      sendReceipt: () => {
+        sent.push(label)
+        return Promise.resolve({ partitionId: 0, offset: 7n })
+      }
+    }
+    return send
+  }
+  const laser = {
+    agdx: () => ({ status: () => recorder("status"), command: () => recorder("prompt") }),
+    [INTERNAL_VERIFIER]: () => undefined
+  } as unknown as Laser
+  const message = {
+    provenance: { conversationId: SdkConversationId.new() },
+    payload: new Uint8Array(),
+    id: { partitionId: 0, offset: 3n }
+  }
+  const at = { streamId: 1, topicId: 2, partitionId: 0, offset: 3n }
+  const slot = new ApprovalSlot("agent.sessions", undefined)
+  const context = AgentCtx.create(laser, message, {
+    agent: AgentId.new("gatekeeper"),
+    requestAt: at,
+    approval: slot
+  })
+  const approver = AgentId.new("approver")
+  await assert.rejects(
+    context.approvalGate(approver, "agent.sessions", new TextEncoder().encode("ok?"), 1_000),
+    PolicyDeferredError
+  )
+  assert.deepEqual(sent, ["status", "prompt"])
+  assert.equal(slot.interrupt?.prompt?.at.offset, 7n)
+
+  const correlation = approvalCorrelation(at)
+  assert.ok(isApprovalCorrelation(correlation))
+  const reply = (author: string) => ({
+    ...message,
+    envelope: responseEnvelope(
+      RecordId.fromU128(9n),
+      WireConversationId.fromU128(2n),
+      parseAgentId(author),
+      correlation,
+      new TextEncoder().encode("approved")
+    )
+  })
+  const forged = new ApprovalSlot("agent.sessions", { kind: "decided", reply: reply("mallory") })
+  await assert.rejects(
+    AgentCtx.create(laser, message, {
+      agent: AgentId.new("gatekeeper"),
+      requestAt: at,
+      approval: forged
+    }).approvalGate(approver, "agent.sessions", new Uint8Array(), 1_000),
+    PolicyDeferredError
+  )
+  assert.equal(forged.interrupt?.prompt, undefined, "a forged reply keeps the record parked")
+  const decided = new ApprovalSlot("agent.sessions", { kind: "decided", reply: reply("approver") })
+  const grant = await AgentCtx.create(laser, message, {
+    agent: AgentId.new("gatekeeper"),
+    requestAt: at,
+    approval: decided
+  }).approvalGate(approver, "agent.sessions", new Uint8Array(), 1_000)
+  assert.equal(new TextDecoder().decode(grant.decision), "approved")
+  assert.deepEqual(sent, ["status", "prompt"], "a replay publishes nothing")
 })

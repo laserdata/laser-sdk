@@ -16,21 +16,23 @@ bdd/
 │   ├── agent.feature                  the AGDX agent envelope + conversation threading
 │   ├── agent_must_understand.feature  the must-understand feature-bit rejection rule
 │   ├── bridges.feature                A2A, MCP, and AG-UI keep the AGDX lifecycle, streaming, and state
-│   ├── capabilities.feature           negotiation + the Unsupported boundary
+│   ├── capabilities.feature           negotiation + the Unsupported boundary on every managed surface
 │   ├── capabilities_injected.feature  the read-consistency pre-gate under injected caps
 │   ├── clients.feature                live connections listed from every node of the cluster
 │   ├── consistency.feature            managed reads carry the client's highest seen position
 │   ├── context_window.feature         the bounded context read window per partition
-│   ├── data_stack.feature              schemas, typed query, destinations, checkpoints, and Arrow
 │   ├── filters.feature                consumer-filter evaluation rules (shared evaluator)
 │   ├── filters_live.feature           server-side filtered reads + the catalog Unsupported boundary
 │   ├── governance.feature             action governance at the effect boundary
 │   ├── graph.feature                  knowledge graph traversal semantics (reference engine)
 │   ├── kv_cas.feature                 compare-and-swap semantics (reference engine)
+│   ├── kv_leases.feature              fenced leases on the managed store: renew, release, takeover read, stale holder fenced out
 │   ├── managed_sessions.feature       the managed session index: layouts, child rollup, links, state history, liveness, change feed, reads, budget enforcement
 │   ├── memory.feature                 agentic memory recall semantics (reference engine)
 │   ├── provenance.feature             provenance + causality round-trip
 │   ├── query.feature                  the query DSL semantics (reference engine)
+│   ├── query_managed.feature          2,000 materialized records read through each SDK's query builder: filter totals, ordering, groups, offset walk
+│   ├── schema_registry.feature        writer schema registries per stream on the managed backend: ids from 1 in every stream, reads and listings of one registry
 │   ├── session.feature                sessions on the lane over open Apache Iggy: lifecycle and the terminal latch, state, model and tool records, submit, control, layouts, heartbeats
 │   └── streaming.feature              typed publish on the log
 ├── rust/                              Rust reference runner (cucumber-rs)
@@ -40,7 +42,7 @@ bdd/
 └── README.md
 ```
 
-Streaming, provenance, agent, bridge, session, and context window scenarios run against open Apache Iggy. Managed query, key-value, graph, and memory semantics use deterministic transport-free reference engines. The production query client uses the managed `AGDX_QUERY` command and does not use a request topic.
+Streaming, provenance, agent, bridge, session, and context window scenarios run against open Apache Iggy. Managed query, key-value, graph, and memory semantics use deterministic transport-free reference engines, and `kv_leases.feature`, `query_managed.feature` and `schema_registry.feature` prove leases, queries and per-stream schema registries on the managed backend itself. The production query client uses the managed `AGDX_QUERY` command and does not use a request topic.
 
 ## What is NOT here, and why
 

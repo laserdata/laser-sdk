@@ -1,6 +1,8 @@
 use crate::agent::Laser;
-pub use crate::bridge_hops::enter_bridge;
-use crate::bridge_hops::hops_metadata;
+pub use crate::bridge_hops::{BRIDGE_HOPS_META_KEY, enter_bridge};
+use crate::bridge_hops::{call_hops, hops_metadata, inbound_hops};
+#[cfg(feature = "mcp-http")]
+use crate::bridge_origin::origin_allowed;
 use crate::error::LaserError;
 use crate::provenance::AgentTopic;
 use crate::types::ConversationId;
@@ -10,11 +12,16 @@ use axum::Router;
 #[cfg(feature = "mcp-http")]
 use axum::extract::State;
 #[cfg(feature = "mcp-http")]
+use axum::http::{HeaderMap, StatusCode};
+#[cfg(feature = "mcp-http")]
+use axum::response::{IntoResponse, Response};
+#[cfg(feature = "mcp-http")]
 use axum::routing::post;
 use laser_wire::agent::{
     self as agdx, AgentEnvelope, AgentId, CorrelationId, METADATA_BRIDGE_HOPS,
 };
 use laser_wire::content::ContentType;
+use laser_wire::result::ResultCode;
 use serde::{Deserialize, Serialize};
 use serde_json::to_value;
 use serde_json::{Value as JsonValue, json};
@@ -25,17 +32,30 @@ use std::time::Duration;
 use strum::{Display, EnumString};
 
 const JSONRPC_VERSION: &str = "2.0";
-const APP_ERROR_CODE: i32 = -32000;
-// Echoed when the client sends no protocolVersion (an MCP server otherwise
-// echoes the client's requested version on initialize).
+const INVALID_REQUEST: i32 = -32600;
+const METHOD_NOT_FOUND: i32 = -32601;
+const INVALID_PARAMS: i32 = -32602;
+const INTERNAL_ERROR: i32 = -32603;
+const RESOURCE_NOT_FOUND: i32 = -32002;
+// Answered on initialize when the client asks for a version this bridge does
+// not serve: the latest it does.
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "mcp-http")]
+const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+
+/// The MCP protocol versions this bridge serves, newest first. Every one
+/// carries Streamable HTTP and the tool, resource and prompt shapes the bridge
+/// answers with.
+pub const MCP_SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
 
 /// MCP JSON-RPC methods the bridge serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString)]
 pub enum McpMethod {
     #[strum(serialize = "initialize")]
     Initialize,
+    #[strum(serialize = "ping")]
+    Ping,
     #[strum(serialize = "tools/list")]
     ToolsList,
     #[strum(serialize = "tools/call")]
@@ -184,6 +204,48 @@ pub struct McpBridge {
     // The `bridge_hops` path stamped on every tool call, ending in this
     // bridge's own id.
     hops: Vec<String>,
+    // The agent every call that names no target is addressed to.
+    target: Option<AgentId>,
+    #[cfg(feature = "sign")]
+    signing_key: Option<crate::sign::SigningKey>,
+    // The browser origins the HTTP router accepts besides same-origin pages
+    // on an IP literal or `localhost` host.
+    #[cfg(feature = "mcp-http")]
+    allowed_origins: Vec<String>,
+}
+
+// A request refused with its JSON-RPC error code and a fixed public message.
+enum McpFault {
+    InvalidRequest,
+    MethodNotFound,
+    InvalidParams(&'static str),
+    ResourceNotFound,
+    Laser(LaserError),
+}
+
+impl McpFault {
+    fn rpc_error(&self) -> McpRpcError {
+        let (code, message) = match self {
+            Self::InvalidRequest => (INVALID_REQUEST, "invalid request"),
+            Self::MethodNotFound => (METHOD_NOT_FOUND, "method not found"),
+            Self::InvalidParams(message) => (INVALID_PARAMS, *message),
+            Self::ResourceNotFound => (RESOURCE_NOT_FOUND, "resource not found"),
+            Self::Laser(error) if error.code() == ResultCode::InvalidArgument => {
+                (INVALID_PARAMS, "invalid params")
+            }
+            Self::Laser(error) => (INTERNAL_ERROR, crate::error::public_error_message(error)),
+        };
+        McpRpcError {
+            code,
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl From<LaserError> for McpFault {
+    fn from(error: LaserError) -> Self {
+        Self::Laser(error)
+    }
 }
 
 // A resource plus the text `resources/read` returns for it.
@@ -224,7 +286,43 @@ impl McpBridge {
             prompts: Vec::new(),
             timeout: DEFAULT_CALL_TIMEOUT,
             hops,
+            target: None,
+            #[cfg(feature = "sign")]
+            signing_key: None,
+            #[cfg(feature = "mcp-http")]
+            allowed_origins: Vec::new(),
         }
+    }
+
+    /// Sign every tool call with `key`, so an agent that verifies its input
+    /// accepts the calls this bridge publishes. Requires the `sign` feature.
+    #[cfg(feature = "sign")]
+    #[must_use]
+    pub fn with_signing_key(mut self, key: crate::sign::SigningKey) -> Self {
+        self.signing_key = Some(key);
+        self
+    }
+
+    /// Address every call that names no target to `agent`, the agent this
+    /// bridge fronts. Its reply must then be signed by `agent` when the
+    /// `Laser` verifies replies.
+    #[must_use]
+    pub fn with_target(mut self, agent: impl Into<AgentId>) -> Self {
+        self.target = Some(agent.into());
+        self
+    }
+
+    /// The browser origins the HTTP router accepts, each as the exact
+    /// `Origin` header value (`https://app.example.com`). A request without an
+    /// `Origin` header, a non-browser client, is always accepted, and so is a
+    /// same-origin page on an IP literal or `localhost` host. Any other browser
+    /// request is refused with 403, the DNS rebinding guard MCP Streamable
+    /// HTTP requires. Requires the `mcp-http` feature.
+    #[cfg(feature = "mcp-http")]
+    #[must_use]
+    pub fn with_allowed_origins(mut self, origins: Vec<String>) -> Self {
+        self.allowed_origins = origins;
+        self
     }
 
     /// Continue the loop-guard path of a call that already crossed other
@@ -339,9 +437,13 @@ impl McpBridge {
         self
     }
 
-    /// `initialize`: echo the client's protocol version and advertise the
-    /// capabilities the bridge actually serves.
+    /// `initialize`: the client's protocol version when this bridge serves it
+    /// ([`MCP_SUPPORTED_PROTOCOL_VERSIONS`]), else the latest it serves, and
+    /// the capabilities the bridge actually serves.
     pub fn initialize(&self, protocol_version: Option<&str>) -> JsonValue {
+        let protocol_version = protocol_version
+            .filter(|version| MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(version))
+            .unwrap_or(DEFAULT_PROTOCOL_VERSION);
         let mut capabilities = serde_json::Map::new();
         capabilities.insert("tools".to_owned(), json!({}));
         if !self.resources.is_empty() {
@@ -351,7 +453,7 @@ impl McpBridge {
             capabilities.insert("prompts".to_owned(), json!({}));
         }
         json!({
-            "protocolVersion": protocol_version.unwrap_or(DEFAULT_PROTOCOL_VERSION),
+            "protocolVersion": protocol_version,
             "serverInfo": { "name": self.server_name, "version": env!("CARGO_PKG_VERSION") },
             "capabilities": capabilities,
         })
@@ -404,11 +506,17 @@ impl McpBridge {
                 |(role, text)| json!({ "role": role, "content": { "type": "text", "text": text } }),
             )
             .collect();
-        Ok(json!({ "description": entry.prompt.description, "messages": messages }))
+        let mut rendered = serde_json::Map::new();
+        if let Some(description) = &entry.prompt.description {
+            rendered.insert("description".to_owned(), json!(description));
+        }
+        rendered.insert("messages".to_owned(), JsonValue::Array(messages));
+        Ok(JsonValue::Object(rendered))
     }
 
     /// `tools/call`: map onto an AGDX `command`, await the correlated terminal,
-    /// render the MCP tool result. The command is addressed to every agent
+    /// render the MCP tool result. The command is addressed to the
+    /// [`with_target`](Self::with_target) agent, else to every agent
     /// (`agdx.to = *`), so on a shared session topic every listening agent
     /// receives it. Use [`call_tool_to`](Self::call_tool_to) to address one
     /// agent.
@@ -417,7 +525,25 @@ impl McpBridge {
         name: &str,
         params_json: Vec<u8>,
     ) -> Result<McpToolResult, LaserError> {
-        self.call_tool_addressed(None, name, params_json).await
+        self.call_tool_addressed(None, &self.hops, name, params_json)
+            .await
+    }
+
+    /// [`call_tool`](Self::call_tool) for work that already crossed other
+    /// bridges: `previous` is its `bridge_hops`, and the call carries that path
+    /// with this bridge appended. A path that already holds this bridge is
+    /// refused before anything is published. `target` addresses one agent,
+    /// as in [`call_tool_to`](Self::call_tool_to).
+    pub async fn call_tool_with_hops(
+        &self,
+        previous: &[String],
+        target: Option<AgentId>,
+        name: &str,
+        params_json: Vec<u8>,
+    ) -> Result<McpToolResult, LaserError> {
+        let hops = call_hops(&self.hops, previous)?;
+        self.call_tool_addressed(target, &hops, name, params_json)
+            .await
     }
 
     /// [`call_tool`](Self::call_tool) addressed to `target`, so only that
@@ -429,7 +555,7 @@ impl McpBridge {
         params_json: Vec<u8>,
     ) -> Result<McpToolResult, LaserError> {
         let target = target.into();
-        self.call_tool_addressed(Some(target), name, params_json)
+        self.call_tool_addressed(Some(target), &self.hops, name, params_json)
             .await
     }
 
@@ -466,12 +592,13 @@ impl McpBridge {
     async fn call_tool_addressed(
         &self,
         target: Option<AgentId>,
+        hops: &[String],
         name: &str,
         params_json: Vec<u8>,
     ) -> Result<McpToolResult, LaserError> {
         let conversation = ConversationId::new();
         let envelope = self
-            .send_tool_call(conversation, target, None, name, params_json)
+            .send_tool_call(conversation, target, None, hops, name, params_json)
             .await?;
         Ok(tool_result_from_envelope(&envelope))
     }
@@ -499,6 +626,7 @@ impl McpBridge {
                 conversation,
                 target,
                 Some((parent, root)),
+                &self.hops,
                 name,
                 params_json,
             )
@@ -523,14 +651,22 @@ impl McpBridge {
         conversation: ConversationId,
         target: Option<AgentId>,
         ancestry: Option<(ConversationId, ConversationId)>,
+        hops: &[String],
         name: &str,
         params_json: Vec<u8>,
     ) -> Result<AgentEnvelope, LaserError> {
+        let target = target.or_else(|| self.target.clone());
         let correlation = CorrelationId::from_u128(conversation.as_u128());
+        #[allow(unused_mut)]
         let mut reader = self
             .laser
             .agdx_reply_reader(self.reply_topic.clone(), Some(&self.source))
             .await?;
+        // A targeted call is answered only by its target when replies are verified.
+        #[cfg(feature = "sign")]
+        {
+            reader.expected_signer = target.as_ref().map(ToString::to_string);
+        }
         let producer = self.laser.agdx(
             self.tool_topic.clone(),
             self.source.clone(),
@@ -539,7 +675,7 @@ impl McpBridge {
         let mut command = producer
             .command(correlation, params_json)
             .with_tool(name.to_owned())
-            .with_metadata(METADATA_BRIDGE_HOPS, hops_metadata(&self.hops))
+            .with_metadata(METADATA_BRIDGE_HOPS, hops_metadata(hops))
             .content_type(ContentType::Json);
         if let Some((parent, root)) = ancestry {
             command = command.with_ancestry(Some(parent.into()), Some(root.into()));
@@ -547,45 +683,51 @@ impl McpBridge {
         if let Some(target) = target {
             command = command.with_target(target);
         }
+        #[cfg(feature = "sign")]
+        if let Some(key) = &self.signing_key {
+            command = command.signed_by(key);
+        }
         command.send().await?;
         self.laser
             .await_agdx_reply(&mut reader, correlation, self.timeout)
             .await
     }
 
-    pub async fn handle_rpc(&self, request: JsonValue) -> McpRpcResponse {
+    /// Handle one JSON-RPC message. A notification, a message without an
+    /// `id`, is never answered and returns `None`.
+    pub async fn handle_rpc(&self, request: JsonValue) -> Option<McpRpcResponse> {
+        if request.is_object() && request.get("id").is_none() {
+            return None;
+        }
         let id = request.get("id").cloned().unwrap_or(JsonValue::Null);
-        match self.dispatch_rpc(&request).await {
+        Some(match self.dispatch_rpc(&request).await {
             Ok(result) => McpRpcResponse {
                 jsonrpc: JSONRPC_VERSION,
                 id,
                 result: Some(result),
                 error: None,
             },
-            Err(error) => {
-                tracing::warn!(error = %error, "MCP request failed");
+            Err(fault) => {
+                if let McpFault::Laser(error) = &fault {
+                    tracing::warn!(error = %error, "MCP request failed");
+                }
                 McpRpcResponse {
                     jsonrpc: JSONRPC_VERSION,
                     id,
                     result: None,
-                    error: Some(McpRpcError {
-                        code: APP_ERROR_CODE,
-                        message: crate::error::public_error_message(&error).to_owned(),
-                    }),
+                    error: Some(fault.rpc_error()),
                 }
             }
-        }
+        })
     }
 
-    async fn dispatch_rpc(&self, request: &JsonValue) -> Result<JsonValue, LaserError> {
+    async fn dispatch_rpc(&self, request: &JsonValue) -> Result<JsonValue, McpFault> {
         // Serde also reads a struct from an array, so the object check comes first.
         if !request.is_object() {
-            return Err(LaserError::HandlerConfig(
-                "MCP JSON-RPC request must be an object".to_owned(),
-            ));
+            return Err(McpFault::InvalidRequest);
         }
-        let McpRpcRequest { method, params, .. } = McpRpcRequest::deserialize(request)
-            .map_err(|_| LaserError::HandlerConfig("MCP method must be a string".to_owned()))?;
+        let McpRpcRequest { method, params, .. } =
+            McpRpcRequest::deserialize(request).map_err(|_| McpFault::InvalidRequest)?;
         let value = if params.is_null() {
             JsonValue::Object(Default::default())
         } else {
@@ -593,42 +735,80 @@ impl McpBridge {
         };
         let params = value
             .as_object()
-            .ok_or_else(|| LaserError::HandlerConfig("MCP params must be an object".to_owned()))?;
+            .ok_or(McpFault::InvalidParams("invalid params"))?;
         let required = |key| {
             params
                 .get(key)
                 .and_then(JsonValue::as_str)
-                .ok_or_else(|| LaserError::HandlerConfig(format!("MCP {key} must be a string")))
+                .ok_or(McpFault::InvalidParams("invalid params"))
         };
         match McpMethod::from_str(&method) {
             Ok(McpMethod::Initialize) => {
                 let version = params
                     .get("protocolVersion")
                     .map(|value| {
-                        value.as_str().ok_or_else(|| {
-                            LaserError::HandlerConfig(
-                                "MCP protocolVersion must be a string".to_owned(),
-                            )
-                        })
+                        value
+                            .as_str()
+                            .ok_or(McpFault::InvalidParams("invalid params"))
                     })
                     .transpose()?;
                 Ok(self.initialize(version))
             }
+            Ok(McpMethod::Ping) => Ok(json!({})),
             Ok(McpMethod::ToolsList) => Ok(self.list_tools()),
             Ok(McpMethod::ResourcesList) => Ok(self.list_resources()),
-            Ok(McpMethod::ResourcesRead) => self.read_resource(required("uri")?),
+            Ok(McpMethod::ResourcesRead) => {
+                let uri = required("uri")?;
+                if !self.resources.iter().any(|entry| entry.resource.uri == uri) {
+                    return Err(McpFault::ResourceNotFound);
+                }
+                Ok(self.read_resource(uri)?)
+            }
             Ok(McpMethod::PromptsList) => Ok(self.list_prompts()),
-            Ok(McpMethod::PromptsGet) => self.get_prompt(required("name")?),
+            Ok(McpMethod::PromptsGet) => {
+                let name = required("name")?;
+                if !self.prompts.iter().any(|entry| entry.prompt.name == name) {
+                    return Err(McpFault::InvalidParams("unknown prompt"));
+                }
+                Ok(self.get_prompt(name)?)
+            }
             Ok(McpMethod::ToolsCall) => {
                 let name = required("name")?;
+                // Only an advertised tool is published, so a guessed name costs no wait.
+                if !self.tools.iter().any(|tool| tool.name == name) {
+                    return Err(McpFault::InvalidParams("unknown tool"));
+                }
+                let previous = inbound_hops(params.get("_meta"))?;
                 let body = serde_json::to_vec(&value)
                     .map_err(|error| LaserError::Codec(error.to_string()))?;
-                let result = self.call_tool(name, body).await?;
-                to_value(result).map_err(|error| LaserError::Codec(error.to_string()))
+                let result = self
+                    .call_tool_with_hops(&previous, None, name, body)
+                    .await?;
+                to_value(result)
+                    .map_err(|error| McpFault::Laser(LaserError::Codec(error.to_string())))
             }
-            Err(_) => Err(LaserError::HandlerConfig(format!(
-                "unknown MCP method `{method}`"
-            ))),
+            Err(_) => Err(McpFault::MethodNotFound),
+        }
+    }
+
+    // The Streamable HTTP answer to one POST: 403 for a browser origin the
+    // guard refuses, 400 for an unsupported protocol version header, 202 with
+    // no body for a notification, else the JSON-RPC response.
+    #[cfg(feature = "mcp-http")]
+    async fn http_reply(&self, headers: &HeaderMap, request: JsonValue) -> Response {
+        if !origin_allowed(headers, &self.allowed_origins) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        if let Some(version) = headers.get(PROTOCOL_VERSION_HEADER)
+            && !version
+                .to_str()
+                .is_ok_and(|version| MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&version))
+        {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        match self.handle_rpc(request).await {
+            Some(response) => axum::Json(response).into_response(),
+            None => StatusCode::ACCEPTED.into_response(),
         }
     }
 
@@ -671,9 +851,10 @@ pub struct McpRpcError {
 #[cfg(feature = "mcp-http")]
 async fn handle_mcp(
     State(bridge): State<Arc<McpBridge>>,
+    headers: HeaderMap,
     axum::Json(request): axum::Json<JsonValue>,
-) -> axum::Json<McpRpcResponse> {
-    axum::Json(bridge.handle_rpc(request).await)
+) -> Response {
+    bridge.http_reply(&headers, request).await
 }
 
 #[cfg(test)]
@@ -727,7 +908,8 @@ mod tests {
         let bridge = bridge();
         let response = bridge
             .handle_rpc(json!({"id": "init", "method": "initialize"}))
-            .await;
+            .await
+            .expect("a request is answered");
         assert_eq!(response.id, "init");
         assert!(response.error.is_none());
         assert_eq!(
@@ -735,34 +917,230 @@ mod tests {
             DEFAULT_PROTOCOL_VERSION
         );
         let response = bridge
-            .handle_rpc(json!({"method": "tools/list", "params": null}))
-            .await;
+            .handle_rpc(json!({"id": null, "method": "tools/list", "params": null}))
+            .await
+            .expect("a request is answered");
         assert_eq!(response.id, JsonValue::Null);
         assert_eq!(response.result, Some(json!({"tools": []})));
+        assert!(
+            bridge
+                .handle_rpc(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .await
+                .is_none(),
+            "a notification is never answered"
+        );
     }
 
     #[tokio::test]
     async fn given_malformed_rpc_requests_when_dispatched_then_should_echo_ids_and_return_public_errors()
      {
-        for request in [
-            json!(null),
-            json!([]),
-            json!([7, "tools/list", null]),
-            json!({"id": 7}),
-            json!({"id": 7, "method": "unknown"}),
-            json!({"id": 7, "method": "initialize", "params": {"protocolVersion": null}}),
-            json!({"id": 7, "method": "tools/list", "params": []}),
-            json!({"id": 7, "method": "resources/read"}),
-            json!({"id": 7, "method": "prompts/get", "params": {"name": 12}}),
-            json!({"id": 7, "method": "tools/call", "params": {"name": false}}),
+        for (request, code, message) in [
+            (json!(null), -32600, "invalid request"),
+            (json!([]), -32600, "invalid request"),
+            (json!([7, "tools/list", null]), -32600, "invalid request"),
+            (json!({"id": 7}), -32600, "invalid request"),
+            (
+                json!({"id": 7, "method": "unknown"}),
+                -32601,
+                "method not found",
+            ),
+            (
+                json!({"id": 7, "method": "initialize", "params": {"protocolVersion": null}}),
+                -32602,
+                "invalid params",
+            ),
+            (
+                json!({"id": 7, "method": "tools/list", "params": []}),
+                -32602,
+                "invalid params",
+            ),
+            (
+                json!({"id": 7, "method": "resources/read"}),
+                -32602,
+                "invalid params",
+            ),
+            (
+                json!({"id": 7, "method": "prompts/get", "params": {"name": 12}}),
+                -32602,
+                "invalid params",
+            ),
+            (
+                json!({"id": 7, "method": "tools/call", "params": {"name": false}}),
+                -32602,
+                "invalid params",
+            ),
         ] {
             let expected = request.get("id").cloned().unwrap_or(JsonValue::Null);
-            let response = bridge().handle_rpc(request).await;
+            let response = bridge()
+                .handle_rpc(request)
+                .await
+                .expect("a malformed request is answered");
             assert_eq!(response.id, expected);
             assert!(response.result.is_none());
             let error = response.error.expect("malformed request returns an error");
-            assert_eq!(error.code, -32000);
-            assert_eq!(error.message, "invalid request");
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[tokio::test]
+    async fn given_protocol_details_when_dispatched_then_should_follow_the_mcp_schema() {
+        let bridge = bridge()
+            .with_prompt(
+                McpPrompt {
+                    name: "greet".to_owned(),
+                    title: None,
+                    description: None,
+                    arguments: Vec::new(),
+                },
+                vec![("user".to_owned(), "hello".to_owned())],
+            )
+            .with_tool("search", None, json!({"type": "object"}))
+            .expect("an object schema");
+        let reply = |request| async {
+            bridge
+                .handle_rpc(request)
+                .await
+                .expect("a request is answered")
+        };
+        let ping = reply(json!({"id": 1, "method": "ping"})).await;
+        assert_eq!(ping.result, Some(json!({})), "ping answers an empty result");
+        let prompt = reply(json!({"id": 2, "method": "prompts/get", "params": {"name": "greet"}}))
+            .await
+            .result
+            .expect("the prompt renders");
+        assert!(
+            prompt.get("description").is_none(),
+            "a missing description is omitted, never null"
+        );
+        let init = reply(json!({"id": 3, "method": "initialize",
+            "params": {"protocolVersion": "1999-01-01"}}))
+        .await
+        .result
+        .expect("initialize succeeds");
+        assert_eq!(init["protocolVersion"], DEFAULT_PROTOCOL_VERSION);
+        let codes = [
+            (json!({"id": 4, "method": "unknown"}), -32601),
+            (
+                json!({"id": 5, "method": "tools/call", "params": {"name": "nope"}}),
+                -32602,
+            ),
+            (
+                json!({"id": 6, "method": "prompts/get", "params": {"name": "nope"}}),
+                -32602,
+            ),
+            (
+                json!({"id": 7, "method": "resources/read", "params": {"uri": "file:///nope"}}),
+                -32002,
+            ),
+            (
+                json!({"id": 8, "method": "tools/call", "params": {"name": "search",
+                    "_meta": {crate::bridge_hops::BRIDGE_HOPS_META_KEY: ["a2a-edge", "mcp-edge"]}}}),
+                -32602,
+            ),
+        ];
+        for (request, code) in codes {
+            let error = reply(request).await.error.expect("the request is refused");
+            assert_eq!(error.code, code);
+        }
+    }
+
+    #[cfg(feature = "mcp-http")]
+    #[tokio::test]
+    async fn given_streamable_http_posts_when_answered_then_should_guard_origin_version_and_notifications()
+     {
+        let bridge = bridge().with_allowed_origins(vec!["https://app.example.com".to_owned()]);
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut headers = HeaderMap::new();
+            for (name, value) in pairs {
+                headers.insert(*name, value.parse().expect("a valid header value"));
+            }
+            headers
+        };
+        let ping = || json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+        let status = |response: Response| response.status();
+        assert_eq!(
+            status(
+                bridge
+                    .http_reply(&headers(&[("origin", "https://evil.example")]), ping())
+                    .await
+            ),
+            StatusCode::FORBIDDEN,
+            "a DNS rebinding page is refused"
+        );
+        assert_eq!(
+            status(
+                bridge
+                    .http_reply(&headers(&[("origin", "https://app.example.com")]), ping())
+                    .await
+            ),
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(bridge.http_reply(&headers(&[]), ping()).await),
+            StatusCode::OK,
+            "a client without an Origin header is not a browser page"
+        );
+        assert_eq!(
+            status(
+                bridge
+                    .http_reply(&headers(&[("mcp-protocol-version", "1999-01-01")]), ping())
+                    .await
+            ),
+            StatusCode::BAD_REQUEST
+        );
+        let accepted = bridge
+            .http_reply(
+                &headers(&[("mcp-protocol-version", "2025-11-25")]),
+                json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            )
+            .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(accepted.into_body(), 1024)
+            .await
+            .expect("the body reads");
+        assert!(body.is_empty(), "202 carries no body");
+    }
+
+    #[cfg(feature = "mcp-http")]
+    #[tokio::test]
+    async fn given_same_origin_posts_when_answered_then_should_allow_only_hosts_a_rebinding_cannot_reach()
+     {
+        let bridge = bridge();
+        let headers = |host: &str, origin: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", host.parse().expect("a valid host header"));
+            headers.insert("origin", origin.parse().expect("a valid origin header"));
+            headers
+        };
+        let ping = || json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+        for (host, origin) in [
+            ("127.0.0.1:8080", "http://127.0.0.1:8080"),
+            ("[::1]:8080", "http://[::1]:8080"),
+            ("localhost:8080", "http://localhost:8080"),
+        ] {
+            assert_eq!(
+                bridge
+                    .http_reply(&headers(host, origin), ping())
+                    .await
+                    .status(),
+                StatusCode::OK,
+                "a page the bridge itself serves on {host}"
+            );
+        }
+        for (host, origin) in [
+            ("evil.example:8080", "http://evil.example:8080"),
+            ("127.0.0.1:8080", "http://127.0.0.1:9090"),
+            ("127.0.0.1:8080", "null"),
+        ] {
+            assert_eq!(
+                bridge
+                    .http_reply(&headers(host, origin), ping())
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN,
+                "{origin} on {host}"
+            );
         }
     }
 

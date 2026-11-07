@@ -30,6 +30,14 @@ pub fn content_id(segments: &[&[u8]]) -> u128 {
     (u128::from(fnv1a(0x4d, segments)) << 64) | u128::from(fnv1a(0xc7, segments))
 }
 
+/// The operation id of one step of a materialization setup, derived from the
+/// setup's own identity, so a repeated setup repeats every step under the same
+/// identity and never applies one twice.
+pub fn materialization_operation_id(setup: u128, step: u8) -> u128 {
+    let id = content_id(&[b"laser.materialization", &setup.to_le_bytes(), &[step]]);
+    id.max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,6 +52,25 @@ mod tests {
     #[test]
     fn given_different_segments_when_hashed_then_should_differ() {
         assert_ne!(content_id(&[b"a"]), content_id(&[b"b"]));
+    }
+
+    #[test]
+    fn given_a_setup_identity_when_its_steps_are_derived_then_should_match_the_golden_ids() {
+        let setup = 0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128;
+        assert_eq!(
+            materialization_operation_id(setup, 1),
+            235_494_386_156_137_362_547_501_458_209_079_933_319,
+            "pin the derived register step"
+        );
+        assert_eq!(
+            materialization_operation_id(setup, 2),
+            235_494_325_308_908_527_519_489_171_275_872_844_602,
+            "pin the derived bind step"
+        );
+        assert_ne!(
+            materialization_operation_id(setup, 1),
+            materialization_operation_id(setup + 1, 1)
+        );
     }
 
     #[test]
