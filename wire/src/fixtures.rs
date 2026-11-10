@@ -184,6 +184,7 @@ corpus!(
     "filter_reply_page_unfiltered.bin",
     "filter_validation.json",
     "fork_create.bin",
+    "fork_create_points.bin",
     "fork_info.json",
     "fork_put.bin",
     "fork_reply_created.bin",

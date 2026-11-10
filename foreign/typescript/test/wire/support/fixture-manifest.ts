@@ -174,6 +174,7 @@ export const FIXTURE_MANIFEST: Readonly<Record<string, FixtureStatus>> = {
   "fold_snapshot.bin": "covered",
   json_patch: "covered",
   "fork_create.bin": "covered",
+  "fork_create_points.bin": "covered",
   "fork_info.json": "covered",
   "fork_put.bin": "covered",
   "fork_reply_created.bin": "covered",

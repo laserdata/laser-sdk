@@ -5902,6 +5902,7 @@ interface ForkCreate {
     readonly kind: ForkKind;
     // (undocumented)
     readonly parent?: string;
+    readonly points?: readonly ForkPoint[];
     // (undocumented)
     readonly tables: readonly string[];
     readonly v?: number;
@@ -6032,6 +6033,17 @@ type ForkOutcome = {
 
 // @public (undocumented)
 const forkPath: (id: string) => string;
+
+// @public
+interface ForkPoint {
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    readonly sourceIncarnation?: bigint;
+    // (undocumented)
+    readonly table: string;
+}
 
 // @public (undocumented)
 interface ForkPromote {
@@ -14787,6 +14799,7 @@ declare namespace wire {
         ForkStatus,
         ForkInfo,
         ForkCreate,
+        ForkPoint,
         ForkDelete,
         ForkPromote,
         ForkList,

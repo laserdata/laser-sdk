@@ -8,7 +8,7 @@ const packageRoot = fileURLToPath(new URL("..", import.meta.url))
 const workspace = await mkdtemp(path.join(tmpdir(), "laser-sdk-pack-"))
 const npmEnvironment = {
   ...process.env,
-  npm_config_cache: path.join(workspace, "npm-cache")
+  npm_config_cache: process.env.npm_config_cache ?? path.join(workspace, "npm-cache")
 }
 
 function run(command, args, cwd) {

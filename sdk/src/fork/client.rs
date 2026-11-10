@@ -246,6 +246,7 @@ impl ForkCreateRequest {
             parent: self.parent,
             kind: self.kind,
             tables: self.tables,
+            points: None,
         };
         match self
             .laser
