@@ -103,6 +103,18 @@ pub struct NamedFields<'a> {
 impl<'a> NamedFields<'a> {
     /// Scan the fields of `payload`.
     pub fn decode(payload: &'a [u8]) -> Result<Self, DecodeError> {
+        Self::decode_within(payload, usize::MAX)
+    }
+
+    /// [`Self::decode`], refusing a map of more than `max_fields` fields
+    /// before it scans past them, so a server can bound the work one request
+    /// costs before it authorizes it.
+    pub fn decode_within(payload: &'a [u8], max_fields: usize) -> Result<Self, DecodeError> {
+        let too_many = || {
+            DecodeError::Decode(format!(
+                "a named-field map holds more than {max_fields} fields"
+            ))
+        };
         let mut cursor = Cursor {
             bytes: payload,
             at: 0,
@@ -116,12 +128,21 @@ impl<'a> NamedFields<'a> {
         let mut fields: Vec<(&'a str, &'a [u8])> = Vec::new();
         match argument {
             Argument::Value(count) => {
+                if usize::try_from(count)
+                    .ok()
+                    .is_none_or(|count| count > max_fields)
+                {
+                    return Err(too_many());
+                }
                 for _ in 0..count {
                     fields.push(cursor.entry()?);
                 }
             }
             Argument::Indefinite => {
                 while !cursor.at_break()? {
+                    if fields.len() == max_fields {
+                        return Err(too_many());
+                    }
                     fields.push(cursor.entry()?);
                 }
                 cursor.at += 1;
@@ -133,10 +154,14 @@ impl<'a> NamedFields<'a> {
                 payload.len() - cursor.at
             )));
         }
-        for (index, (key, _)) in fields.iter().enumerate() {
-            if fields[..index].iter().any(|(earlier, _)| earlier == key) {
-                return Err(DecodeError::Decode(format!("duplicate field `{key}`")));
-            }
+        // Sorted, so a map of many fields costs one sort, not a pass per field.
+        let mut keys: Vec<&str> = fields.iter().map(|(key, _)| *key).collect();
+        keys.sort_unstable();
+        if let Some(pair) = keys.windows(2).find(|pair| pair[0] == pair[1]) {
+            return Err(DecodeError::Decode(format!(
+                "duplicate field `{}`",
+                pair[0]
+            )));
         }
         Ok(Self { fields })
     }
@@ -357,6 +382,7 @@ pub fn frame_decode(buf: &[u8]) -> Result<Option<(&[u8], usize)>, DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn given_a_payload_when_framed_then_should_round_trip() {
@@ -439,6 +465,27 @@ mod tests {
         value: Vec<u8>,
     }
 
+    fn distinct_fields(count: u32) -> Vec<u8> {
+        let mut payload = vec![0xba];
+        payload.extend_from_slice(&count.to_be_bytes());
+        for index in 0..count {
+            payload.extend(text(&format!("f{index}")));
+            payload.push(0xf6);
+        }
+        payload
+    }
+
+    fn fastest_scan(payload: &[u8]) -> Duration {
+        (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                NamedFields::decode(payload).expect("distinct fields scan");
+                started.elapsed()
+            })
+            .min()
+            .unwrap_or_default()
+    }
+
     fn text(value: &str) -> Vec<u8> {
         let mut bytes = vec![0x60 | value.len() as u8];
         bytes.extend_from_slice(value.as_bytes());
@@ -510,6 +557,54 @@ mod tests {
         assert_eq!(fields.value::<u32>("c").expect("tagged"), Some(2));
         assert_eq!(fields.text("d").expect("null reads as absent"), None);
         assert_eq!(fields.value::<Option<u32>>("d").expect("null"), Some(None));
+    }
+
+    #[test]
+    fn given_a_named_map_with_many_distinct_fields_when_scanned_then_should_check_them_in_linearithmic_time()
+     {
+        // Eight times the fields cost about ten times the work when linearithmic and 64 when quadratic.
+        let small = fastest_scan(&distinct_fields(10_000));
+        let large_payload = distinct_fields(80_000);
+        let large = fastest_scan(&large_payload);
+
+        assert!(
+            large < small.max(Duration::from_micros(100)) * 32,
+            "80,000 fields took {large:?}, 10,000 took {small:?}"
+        );
+        let fields = NamedFields::decode(&large_payload).expect("distinct fields scan");
+        assert_eq!(fields.get("f79999"), Some(&[0xf6_u8][..]));
+        let mut repeated = large_payload;
+        repeated.extend(text("f7"));
+        repeated.push(0xf6);
+        repeated[1..5].copy_from_slice(&80_001_u32.to_be_bytes());
+        assert!(matches!(
+            NamedFields::decode(&repeated),
+            Err(DecodeError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn given_a_named_map_over_the_field_bound_when_scanned_within_it_then_should_refuse_it() {
+        for indefinite in [false, true] {
+            let mut payload = if indefinite { vec![0xbf] } else { vec![0xa3] };
+            for key in ["a", "b", "c"] {
+                payload.extend(text(key));
+                payload.push(0x01);
+            }
+            if indefinite {
+                payload.push(0xff);
+            }
+
+            assert!(
+                matches!(
+                    NamedFields::decode_within(&payload, 2),
+                    Err(DecodeError::Decode(_))
+                ),
+                "indefinite: {indefinite}"
+            );
+            let within = NamedFields::decode_within(&payload, 3).expect("three fields fit");
+            assert_eq!(within.get("c"), Some(&[0x01_u8][..]));
+        }
     }
 
     #[test]

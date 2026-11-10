@@ -49,7 +49,7 @@ use laser_wire::filter::{
     GroupPolicyUnbound, RecordFault, RecordPolicy, SourceGeneration, StopReason,
 };
 use laser_wire::fork::{
-    ForkCreate, ForkInfo, ForkKind, ForkOutcome, ForkPut, ForkReply, ForkStatus,
+    ForkCreate, ForkInfo, ForkKind, ForkOutcome, ForkPoint, ForkPut, ForkReply, ForkStatus,
 };
 use laser_wire::forward::{Caller, ForwardedCommand, ForwardedQuery, ForwardedScope};
 use laser_wire::framing::{decode_named, encode_named};
@@ -1770,6 +1770,31 @@ fn given_fork_frames_when_encoded_then_should_match_golden_fixtures() {
             parent: Some("trunk".to_owned()),
             kind: ForkKind::Severed,
             tables: vec!["readings_rows".to_owned()],
+            points: None,
+        },
+    );
+    assert_frame(
+        "fork_create_points.bin",
+        &ForkCreate {
+            v: FORK_OP_VERSION,
+            fork_id: "agent-run-7".to_owned(),
+            parent: Some("trunk".to_owned()),
+            kind: ForkKind::Severed,
+            tables: vec!["readings_rows".to_owned()],
+            points: Some(vec![
+                ForkPoint {
+                    table: "readings_rows".to_owned(),
+                    partition_id: 0,
+                    offset: 41,
+                    source_incarnation: None,
+                },
+                ForkPoint {
+                    table: "readings_rows".to_owned(),
+                    partition_id: 1,
+                    offset: 7,
+                    source_incarnation: Some(1_794_000_000_000_000),
+                },
+            ]),
         },
     );
     assert_frame(

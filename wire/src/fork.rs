@@ -78,6 +78,23 @@ pub struct ForkCreate {
     pub kind: ForkKind,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<String>,
+    /// The trunk positions a severed fork is frozen at, stamped by the server
+    /// that logs the request so every replica folds the same fork. Clients
+    /// leave it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub points: Option<Vec<ForkPoint>>,
+}
+
+/// One trunk position a severed fork is frozen at: the last materialized
+/// offset of one partition of one table.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkPoint {
+    pub table: String,
+    pub partition_id: u32,
+    pub offset: u64,
+    /// The creation time of the source topic incarnation the offset belongs to, set by the server that logs the create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_incarnation: Option<u64>,
 }
 
 /// Wire form of the `AGDX_FORK_DELETE` (squash) request.
@@ -260,11 +277,42 @@ mod tests {
             parent: None,
             kind: ForkKind::Severed,
             tables: vec!["readings".to_owned()],
+            points: None,
         };
         let bytes = encode_named(&request).expect("serializes");
         let back: ForkCreate = decode_named(&bytes).expect("deserializes");
         assert_eq!(back.fork_id, "agent-run-7");
         assert_eq!(back.kind, ForkKind::Severed);
+        assert_eq!(back.points, None);
+    }
+
+    #[test]
+    fn given_fork_create_with_points_when_round_tripped_then_should_preserve_them() {
+        let points = vec![
+            ForkPoint {
+                table: "readings".to_owned(),
+                partition_id: 2,
+                offset: 41,
+                source_incarnation: Some(1_700_000_000_000_000),
+            },
+            ForkPoint {
+                table: "readings".to_owned(),
+                partition_id: 3,
+                offset: 7,
+                source_incarnation: None,
+            },
+        ];
+        let request = ForkCreate {
+            v: FORK_OP_VERSION,
+            fork_id: "agent-run-8".to_owned(),
+            parent: None,
+            kind: ForkKind::Severed,
+            tables: Vec::new(),
+            points: Some(points.clone()),
+        };
+        let bytes = encode_named(&request).expect("serializes");
+        let back: ForkCreate = decode_named(&bytes).expect("deserializes");
+        assert_eq!(back.points, Some(points));
     }
 
     #[test]

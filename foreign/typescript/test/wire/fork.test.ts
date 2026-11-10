@@ -36,6 +36,35 @@ void test("given_the_fork_create_fixture_when_decoded_then_should_preserve_kind"
   assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
 })
 
+void test("given_the_stamped_fork_create_fixture_when_decoded_then_should_preserve_points_and_bytes", async () => {
+  const bytes = await readFixture("fork_create_points.bin")
+  const map = expectMap(decodeOne(bytes, "fork_create_points"), "fork_create_points")
+  const create = decodeForkCreate(map, "fork_create_points")
+  assert.deepEqual(create.points, [
+    { table: "readings_rows", partitionId: 0, offset: 41n },
+    {
+      table: "readings_rows",
+      partitionId: 1,
+      offset: 7n,
+      sourceIncarnation: 1_794_000_000_000_000n
+    }
+  ])
+  const reencoded = encodeNamed(encodeForkCreate(create))
+  assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
+})
+
+void test("given_a_fork_create_with_points_when_round_tripped_then_should_preserve_them", () => {
+  const points = [
+    { table: "readings", partitionId: 2, offset: 41n },
+    { table: "readings", partitionId: 3, offset: 7n, sourceIncarnation: 1_794_000_000_000_000n }
+  ]
+  const encoded = encodeNamed(
+    encodeForkCreate({ forkId: "agent-run-8", kind: "severed", tables: [], points })
+  )
+  const map = expectMap(decodeOne(encoded, "fork_create"), "fork_create")
+  assert.deepEqual(decodeForkCreate(map, "fork_create").points, points)
+})
+
 void test("given_the_fork_put_fixture_when_decoded_then_should_preserve_fields_metadata_and_embedding", async () => {
   const bytes = await readFixture("fork_put.bin")
   const map = expectMap(decodeOne(bytes, "fork_put"), "fork_put")

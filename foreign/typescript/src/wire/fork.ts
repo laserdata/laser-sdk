@@ -65,6 +65,17 @@ export interface ForkCreate {
   readonly parent?: string
   readonly kind: ForkKind
   readonly tables: readonly string[]
+  /** The trunk positions a severed fork is frozen at, stamped by the server that logs the request. Clients leave it unset. */
+  readonly points?: readonly ForkPoint[]
+}
+
+/** One trunk position a severed fork is frozen at: the last materialized offset of one partition of one table. */
+export interface ForkPoint {
+  readonly table: string
+  readonly partitionId: number
+  readonly offset: bigint
+  /** Creation time of the source topic incarnation the offset belongs to, set by the server that logs the request. */
+  readonly sourceIncarnation?: bigint
 }
 
 export function encodeForkCreate(create: ForkCreate): Map<string, unknown> {
@@ -74,6 +85,22 @@ export function encodeForkCreate(create: ForkCreate): Map<string, unknown> {
   if (create.parent !== undefined) map.set("parent", create.parent)
   map.set("kind", create.kind)
   if (create.tables.length > 0) map.set("tables", [...create.tables])
+  if (create.points !== undefined) {
+    map.set(
+      "points",
+      create.points.map((point) => {
+        const entry = new Map<string, unknown>([
+          ["table", point.table],
+          ["partition_id", point.partitionId],
+          ["offset", point.offset]
+        ])
+        if (point.sourceIncarnation !== undefined) {
+          entry.set("source_incarnation", point.sourceIncarnation)
+        }
+        return entry
+      })
+    )
+  }
   return map
 }
 
@@ -89,7 +116,22 @@ export function decodeForkCreate(map: CborMap, context: string): ForkCreate {
     kind,
     tables: field.optionalArray(map, "tables", context, (item, index) =>
       expectString(item, `${context}.tables[${String(index)}]`)
-    )
+    ),
+    ...(map.has("points")
+      ? {
+          points: field.optionalArray(map, "points", context, (item, index) => {
+            const pointContext = `${context}.points[${String(index)}]`
+            const point = expectMap(item, pointContext)
+            const sourceIncarnation = field.optionalU64(point, "source_incarnation", pointContext)
+            return {
+              table: field.requiredString(point, "table", pointContext),
+              partitionId: field.requiredU32(point, "partition_id", pointContext),
+              offset: field.requiredU64(point, "offset", pointContext),
+              ...(sourceIncarnation !== undefined ? { sourceIncarnation } : {})
+            }
+          })
+        }
+      : {})
   }
 }
 

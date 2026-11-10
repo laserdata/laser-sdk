@@ -2047,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "laser-examples"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -2065,7 +2065,7 @@ dependencies = [
 
 [[package]]
 name = "laser-sdk"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "apache-avro",
  "async-trait",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "laser-test-support"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "iggy",
  "iggy_binary_protocol",
@@ -2114,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "laser-wire"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "apache-avro",
  "bon",
