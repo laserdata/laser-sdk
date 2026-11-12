@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { CancelledError, InvalidError } from "../../src/client/errors.js"
+import { CancelledError, InvalidError, TransportError } from "../../src/client/errors.js"
 import type { LaserTransport, PolledMessage } from "../../src/iggy/apache-iggy.js"
 import { Json } from "../../src/stream/codecs.js"
 import { Cursor, heldRead, readThrough } from "../../src/stream/cursor.js"
@@ -442,6 +442,48 @@ void test("given_a_range_read_cut_short_by_the_byte_cap_when_read_through_an_off
     [2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n]
   )
   assert.deepEqual(counts, [8, 5, 2], "each read asks only for what is left of the range")
+})
+
+void test("given_one_primary_refusing_its_fetch_when_holding_reads_then_should_fail_at_once_and_cancel_the_other_fetches", async () => {
+  let cancelled = 0
+  const transport = {
+    pollMessages() {
+      return Promise.reject(new Error("a held read goes through the fetch of its primary"))
+    },
+    primaryGroups(_stream, _topic, partitions) {
+      return Promise.resolve([
+        partitions.filter((partition) => partition % 2 === 0),
+        partitions.filter((partition) => partition % 2 === 1)
+      ])
+    },
+    fetchHeld(_stream, _topic, offsets, _count, _wait, signal) {
+      if (offsets.has(1)) return Promise.reject(new TransportError("the route went stale", true))
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            cancelled += 1
+            reject(new CancelledError("the other fetch is cancelled"))
+          },
+          { once: true }
+        )
+      })
+    }
+  } satisfies Pick<LaserTransport, "pollMessages" | "primaryGroups" | "fetchHeld">
+  const offsets = new Map(Array.from({ length: 4 }, (_, partition) => [partition, 0n] as const))
+  const outcome = await Promise.race([
+    heldRead(transport as unknown as LaserTransport, "test", "replies", offsets, 200, {
+      maxWaitMs: 5_000,
+      minCount: 1,
+      maxBytes: 1_048_576
+    }).then(
+      () => "answered",
+      (error: unknown) => error
+    ),
+    new Promise<string>((resolve) => setTimeout(resolve, 500, "still holding"))
+  ])
+  assert.ok(outcome instanceof TransportError, `the held read ended as ${String(outcome)}`)
+  assert.equal(cancelled, 1, "the fetch of the other primary stops holding")
 })
 
 void test("given_partitions_grouped_by_primary_when_holding_reads_then_should_hold_one_fetch_per_primary_and_no_read_per_partition", async () => {

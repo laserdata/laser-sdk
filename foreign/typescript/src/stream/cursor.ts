@@ -256,7 +256,8 @@ export async function readThrough(
  * parks at most 64 such reads, so a fetch per primary keeps a topic of any
  * partition count from queueing behind them. The other reads are cancelled
  * once one answers with records. They store no offset, so nothing is lost.
- * `undefined` when every read ended empty.
+ * A read that fails ends the others at once, so its partitions are not left
+ * unread while the other reads hold. `undefined` when every read ended empty.
  * @internal
  */
 export async function heldRead(
@@ -314,18 +315,6 @@ export async function heldRead(
           )
     return await new Promise((resolve, reject) => {
       let open = reads.length
-      let failure: unknown
-      const settle = (): void => {
-        open -= 1
-        if (open > 0) return
-        if (failure === undefined) resolve(undefined)
-        else
-          reject(
-            failure instanceof Error
-              ? failure
-              : new TransportError("a held read failed", true, { cause: failure })
-          )
-      }
       if (open === 0) resolve(undefined)
       for (const read of reads) {
         read().then(
@@ -338,11 +327,15 @@ export async function heldRead(
                 break
               }
             }
-            settle()
+            open -= 1
+            if (open === 0) resolve(undefined)
           },
           (error: unknown) => {
-            failure ??= error
-            settle()
+            reject(
+              error instanceof Error
+                ? error
+                : new TransportError("a held read failed", true, { cause: error })
+            )
           }
         )
       }
