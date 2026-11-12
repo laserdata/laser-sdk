@@ -449,10 +449,29 @@ mod tests {
         let encoded = encode_named(&value).expect("encodes");
         assert_eq!(&framed[..4], &(encoded.len() as u32).to_le_bytes());
         assert_eq!(&framed[4..], &encoded);
+        assert_eq!(
+            encode_named_framed(&value, 16, encoded.len()).expect("exact cap frames"),
+            framed
+        );
         assert!(matches!(
             encode_named_framed(&value, 16, encoded.len() - 1),
             Err(DecodeError::Frame(_))
         ));
+    }
+
+    #[test]
+    fn given_a_payload_at_the_frame_cap_when_framed_then_should_round_trip_and_refuse_one_byte_more()
+     {
+        let over = vec![7u8; MAX_FRAME_BYTES + 1];
+        let payload = &over[..MAX_FRAME_BYTES];
+        let framed = frame_encode(payload).expect("a payload at the cap frames");
+        assert_eq!(&framed[..4], &(MAX_FRAME_BYTES as u32).to_le_bytes());
+        let (decoded, consumed) = frame_decode(&framed)
+            .expect("a frame at the cap decodes")
+            .expect("whole frame present");
+        assert!(decoded == payload, "the payload round trips");
+        assert_eq!(consumed, framed.len());
+        assert!(matches!(frame_encode(&over), Err(DecodeError::Frame(_))));
     }
 
     #[derive(serde::Serialize)]
@@ -557,6 +576,100 @@ mod tests {
         assert_eq!(fields.value::<u32>("c").expect("tagged"), Some(2));
         assert_eq!(fields.text("d").expect("null reads as absent"), None);
         assert_eq!(fields.value::<Option<u32>>("d").expect("null"), Some(None));
+    }
+
+    #[test]
+    fn given_heads_with_one_two_and_eight_byte_arguments_when_scanned_then_should_find_each_value()
+    {
+        // {"a": 24 bytes, "b": 256 bytes, "c": 1 as a 64-bit integer}
+        let mut payload = vec![0xa3];
+        payload.extend(text("a"));
+        let one = payload.len();
+        payload.extend([0x58, 24]);
+        payload.extend([7; 24]);
+        let one_end = payload.len();
+        payload.extend(text("b"));
+        let two = payload.len();
+        payload.extend([0x59, 0x01, 0x00]);
+        payload.extend([7; 256]);
+        let two_end = payload.len();
+        payload.extend(text("c"));
+        let eight = payload.len();
+        payload.extend([0x1b, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let fields = NamedFields::decode(&payload).expect("scans");
+        assert_eq!(fields.get("a"), Some(&payload[one..one_end]));
+        assert_eq!(fields.get("b"), Some(&payload[two..two_end]));
+        assert_eq!(fields.get("c"), Some(&payload[eight..]));
+    }
+
+    #[test]
+    fn given_arrays_nested_to_the_scan_bound_when_scanned_then_should_accept_them_and_refuse_one_more()
+     {
+        let bound = MAX_SCAN_DEPTH as usize;
+        for (levels, accepted) in [(bound, true), (bound + 1, false)] {
+            let mut payload = vec![0xa1];
+            payload.extend(text("a"));
+            payload.extend(std::iter::repeat_n(0x81, levels));
+            payload.push(0x01);
+            assert_eq!(
+                NamedFields::decode(&payload).is_ok(),
+                accepted,
+                "levels: {levels}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_nesting_past_the_scan_bound_in_any_container_when_scanned_then_should_refuse_it() {
+        let levels = MAX_SCAN_DEPTH as usize + 1;
+        let nested = |open: &[u8], close: &[u8]| {
+            let mut payload = vec![0xa1];
+            payload.extend(text("a"));
+            for _ in 0..levels {
+                payload.extend_from_slice(open);
+            }
+            payload.push(0x01);
+            for _ in 0..levels {
+                payload.extend_from_slice(close);
+            }
+            payload
+        };
+        for (case, payload) in [
+            ("map keys", nested(&[0xa1], &[0x01])),
+            ("map values", nested(&[0xa1, 0x01], &[])),
+            ("indefinite arrays", nested(&[0x9f], &[0xff])),
+            ("tags", nested(&[0xc1], &[])),
+        ] {
+            assert!(
+                matches!(NamedFields::decode(&payload), Err(DecodeError::Decode(_))),
+                "{case} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_nested_indefinite_map_when_scanned_then_should_accept_only_whole_pairs() {
+        let field = |value: &[u8]| {
+            let mut payload = vec![0xa1];
+            payload.extend(text("a"));
+            payload.extend_from_slice(value);
+            payload
+        };
+        assert!(
+            matches!(
+                NamedFields::decode(&field(&[0xbf, 0x01, 0xff])),
+                Err(DecodeError::Decode(_))
+            ),
+            "a key without a value must be refused"
+        );
+        for (case, value) in [
+            ("one pair", &[0xbf, 0x01, 0x02, 0xff][..]),
+            ("an odd array", &[0x9f, 0x01, 0xff][..]),
+        ] {
+            let payload = field(value);
+            let fields = NamedFields::decode(&payload).expect(case);
+            assert_eq!(fields.get("a"), Some(value), "{case}");
+        }
     }
 
     #[test]
