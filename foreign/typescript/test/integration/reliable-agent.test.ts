@@ -589,9 +589,26 @@ void test("given_ack_on_pickup_when_an_agdx_command_arrives_then_should_emit_wor
   }
 })
 
-void test("given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_before_commit", async () => {
+void test("given_a_refused_dlq_publish_when_the_worker_stops_then_should_redeliver_before_commit", async (context) => {
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  const transport = laser[INTERNAL_TRANSPORT]()
+  const send = transport.sendMessageWithHeaders.bind(transport)
+  let refuseDlq = true
+  context.mock.method(transport, "sendMessageWithHeaders", (...args: Parameters<typeof send>) => {
+    const [streamId, topicId, payload, headers] = args
+    if (refuseDlq && topicId === AgentTopic.Dlq)
+      return Promise.reject(
+        new PublishFailedError(
+          streamId,
+          topicId,
+          [],
+          [{ payload, headers }],
+          new TransportError("injected DLQ refusal", false)
+        )
+      )
+    return send(...args)
+  })
   try {
     await laser.stream(stream).ensure()
     await laser.topic(AgentTopic.Sessions).ensure()
@@ -630,6 +647,7 @@ void test("given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_be
         error instanceof PublishFailedError && error.publishCause() instanceof TransportError
     )
 
+    refuseDlq = false
     await laser.topic(AgentTopic.Dlq).ensure()
     const dlq = await laser.topic(AgentTopic.Dlq).replay()
     let durableSinkCalls = 0
@@ -1672,9 +1690,26 @@ void test("given_a_connected_runtime_when_records_are_handled_then_should_commit
   }
 })
 
-void test("given_a_failed_dead_letter_in_a_lane_when_the_worker_stops_then_should_not_commit_the_queued_successor", async () => {
+void test("given_a_failed_dead_letter_in_a_lane_when_the_worker_stops_then_should_not_commit_the_queued_successor", async (context) => {
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  const transport = laser[INTERNAL_TRANSPORT]()
+  const send = transport.sendMessageWithHeaders.bind(transport)
+  let refuseDlq = true
+  context.mock.method(transport, "sendMessageWithHeaders", (...args: Parameters<typeof send>) => {
+    const [streamId, topicId, payload, headers] = args
+    if (refuseDlq && topicId === AgentTopic.Dlq)
+      return Promise.reject(
+        new PublishFailedError(
+          streamId,
+          topicId,
+          [],
+          [{ payload, headers }],
+          new TransportError("injected DLQ refusal", false)
+        )
+      )
+    return send(...args)
+  })
   try {
     await laser.stream(stream).ensure()
     await laser.topic(AgentTopic.Sessions).ensure(4)
@@ -1709,6 +1744,7 @@ void test("given_a_failed_dead_letter_in_a_lane_when_the_worker_stops_then_shoul
     await assert.rejects(first.join(), PublishFailedError)
     assert.deepEqual(handled, [], "the lane stops before its queued successor")
 
+    refuseDlq = false
     await laser.topic(AgentTopic.Dlq).ensure(4)
     const restarted = await Laser.connectWithStream(CONNECTION_STRING, stream)
     try {

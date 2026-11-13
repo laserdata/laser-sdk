@@ -3,9 +3,11 @@ use bytes::Bytes;
 use laser_sdk::agent::StepContext;
 use laser_sdk::agent::{Clock, SystemClock};
 use laser_sdk::prelude::full::*;
-use laser_sdk::wire::agent::{AgentCard, CapabilityDescriptor};
+use laser_sdk::wire::agent::{AgentCard, AgentEnvelope, AgentKind, CapabilityDescriptor};
+use laser_sdk::wire::framing::decode_named;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 // A worker that tags its reply with its role and echoes the input, so a step's
 // output reflects both its own work and what the prior step produced.
@@ -582,9 +584,9 @@ async fn given_a_verifier_that_never_answers_when_the_step_runs_then_should_fail
         .verify_with(HeldVerifier {
             entered: Arc::clone(&entered),
         })
-        .deadline(std::time::Duration::from_secs(3))
+        .deadline(Duration::from_secs(3))
         .run();
-    let error = tokio::time::timeout(std::time::Duration::from_secs(20), run)
+    let error = tokio::time::timeout(Duration::from_secs(20), run)
         .await
         .expect("the step deadline bounds a verifier that never answers")
         .expect_err("the unverified step fails the run");
@@ -598,4 +600,163 @@ async fn given_a_verifier_that_never_answers_when_the_step_runs_then_should_fail
         "{error:?}"
     );
     checker.shutdown().await.expect("checker shuts down");
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_step_command_that_expired_unconsumed_when_a_fresh_process_resumes_the_run_then_should_run_the_resent_step()
+ {
+    let first_process = harness::laser().await;
+    let worker_id: AgentId = "expiry-worker".parse().expect("worker id is valid");
+    let run = ConversationId::new();
+    let stopped = first_process
+        .workflow("expiryflow")
+        .run_id(run)
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
+        .step(
+            "work",
+            Router::to(worker_id.clone()),
+            |_ctx: &StepContext<'_>| b"go".to_vec(),
+        )
+        .deadline(Duration::from_secs(1))
+        .run()
+        .await
+        .expect_err("no worker reads the first send");
+    assert!(
+        matches!(&stopped, LaserError::StepFailed { reason, .. } if *reason == StepFailure::TimedOut),
+        "{stopped:?}"
+    );
+
+    // A fresh process resumes the run and sends the step again before its
+    // worker starts, so the worker reads the expired copy first.
+    let resuming_process = harness::reconnect(&first_process).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resumed = resuming_process
+        .workflow("expiryflow")
+        .run_id(run)
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
+        .step(
+            "work",
+            Router::to(worker_id.clone()),
+            |_ctx: &StepContext<'_>| b"go".to_vec(),
+        )
+        .deadline(Duration::from_secs(20))
+        .run();
+    let worker_started = async {
+        harness::eventually(|| {
+            let laser = first_process.clone();
+            async move {
+                (envelopes_on_log(&laser, AgentKind::Command, "expiry-worker").await == 2)
+                    .then_some(())
+            }
+        })
+        .await;
+        Agent::builder()
+            .id(worker_id.clone())
+            .listen_on(AgentTopic::Sessions)
+            .respond_on(AgentTopic::Sessions)
+            .ack_on_pickup(true)
+            .handler(Counter {
+                calls: calls.clone(),
+            })
+            .build()
+            .spawn(harness::reconnect(&first_process).await)
+    };
+    let (outcome, worker) = tokio::join!(resumed, worker_started);
+    let outcome = outcome.expect("the resent step completes");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "only the resent copy runs");
+    assert_eq!(
+        outcome.outputs.get("work").map(Vec::as_slice),
+        Some(b"counted".as_slice())
+    );
+    worker.shutdown().await.expect("worker shuts down");
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_an_expired_step_command_answered_before_the_resume_when_a_fresh_process_resumes_the_run_then_should_run_the_resent_step()
+ {
+    let first_process = harness::laser().await;
+    let worker_id: AgentId = "answered-worker".parse().expect("worker id is valid");
+    let run = ConversationId::new();
+    let stopped = first_process
+        .workflow("answeredflow")
+        .run_id(run)
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
+        .step(
+            "work",
+            Router::to(worker_id.clone()),
+            |_ctx: &StepContext<'_>| b"go".to_vec(),
+        )
+        .deadline(Duration::from_secs(1))
+        .run()
+        .await
+        .expect_err("no worker reads the first send");
+    assert!(
+        matches!(&stopped, LaserError::StepFailed { reason, .. } if *reason == StepFailure::TimedOut),
+        "{stopped:?}"
+    );
+
+    // The worker starts in its own process, drops the expired copy, and
+    // answers that it was not consumed before the run resumes.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker = Agent::builder()
+        .id(worker_id.clone())
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
+        .ack_on_pickup(true)
+        .handler(Counter {
+            calls: calls.clone(),
+        })
+        .build()
+        .spawn(harness::reconnect(&first_process).await);
+    harness::eventually(|| {
+        let laser = first_process.clone();
+        async move {
+            (envelopes_on_log(&laser, AgentKind::Error, "answeredflow").await == 1).then_some(())
+        }
+    })
+    .await;
+
+    let resumed = harness::reconnect(&first_process)
+        .await
+        .workflow("answeredflow")
+        .run_id(run)
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
+        .step("work", Router::to(worker_id), |_ctx: &StepContext<'_>| {
+            b"go".to_vec()
+        })
+        .deadline(Duration::from_secs(20))
+        .run()
+        .await
+        .expect("the resent step completes");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "only the resent copy runs");
+    assert_eq!(
+        resumed.outputs.get("work").map(Vec::as_slice),
+        Some(b"counted".as_slice())
+    );
+    worker.shutdown().await.expect("worker shuts down");
+}
+
+// How many AGDX envelopes of `kind` addressed to `target` the sessions topic
+// holds.
+async fn envelopes_on_log(laser: &Laser, kind: AgentKind, target: &str) -> usize {
+    let sessions = laser.topic(AgentTopic::Sessions.topic_string());
+    let mut cursor = sessions.replay().expect("the sessions topic replays");
+    cursor
+        .poll()
+        .await
+        .expect("the sessions topic drains")
+        .iter()
+        .filter_map(|message| decode_named::<AgentEnvelope>(&message.payload).ok())
+        .filter(|envelope| {
+            envelope.kind == kind
+                && envelope
+                    .target
+                    .as_ref()
+                    .is_some_and(|addressee| addressee.as_str() == target)
+        })
+        .count()
 }

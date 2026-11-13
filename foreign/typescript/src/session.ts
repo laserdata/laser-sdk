@@ -1291,7 +1291,9 @@ export class Session {
   }
 
   /** End the session as completed. State changed since the last snapshot is
-   * snapshotted first, so a reader can start from the final document. */
+   * snapshotted first, so a reader can start from the final document, unless
+   * another writer changed the document since this handle's last write, in
+   * which case the session ends without writing state. */
   async end(options: CallOptions = {}): Promise<void> {
     await this.state().snapshotIfChanged(options)
     await this.terminate("Completed", {}, options)

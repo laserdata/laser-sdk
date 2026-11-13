@@ -121,6 +121,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98.0
+      # The cluster tests build the laser-test-support binaries in the root workspace.
+      # Only main saves caches, so pull request and tag copies never evict the ones every run restores.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            foreign/python -> target
+            . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build the extension and install test dependencies
         run: uv sync --locked --extra testing
       - name: Verify the stub is current
@@ -154,7 +162,11 @@ jobs:
         if: needs.flags.outputs.server_tests == 'run'
         run: uv run pytest -q ../../bdd/python
 
-  # abi3 wheels: one wheel per platform covers Python 3.10+.
+  # abi3 wheels: one wheel per platform covers Python 3.10+. Each leg then
+  # installs its wheel into a clean interpreter on the oldest supported Python
+  # and the current one, from outside the checkout, imports it and touches the
+  # public surface. Source-workspace tests cannot prove what an installed
+  # artifact ships.
   wheels:
     name: wheels-${{ matrix.platform.target }}
     needs: [flags]
@@ -182,6 +194,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      # Host-built legs reuse cached dependencies. The manylinux legs build inside a container.
+      - uses: dtolnay/rust-toolchain@master
+        if: matrix.platform.manylinux == ''
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.platform.manylinux == ''
+        with:
+          workspaces: foreign/python -> target
+          key: ${{ matrix.platform.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -196,6 +219,24 @@ jobs:
         with:
           name: wheels-${{ matrix.platform.target }}-${{ matrix.platform.runner }}
           path: foreign/python/dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install the wheel and smoke the public surface on Python 3.10
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -m pip install --no-index --find-links "${GITHUB_WORKSPACE}/foreign/python/dist" laser-sdk
+          python "${GITHUB_WORKSPACE}/scripts/ci/wheel-smoke.py"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install the wheel and smoke the public surface on Python 3.13
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -m pip install --no-index --find-links "${GITHUB_WORKSPACE}/foreign/python/dist" laser-sdk
+          python "${GITHUB_WORKSPACE}/scripts/ci/wheel-smoke.py"
 
   sdist:
     needs: [flags]
@@ -213,58 +254,6 @@ jobs:
         with:
           name: sdist
           path: foreign/python/dist
-
-  # The artifact gate: install every built wheel into a clean interpreter with
-  # no repository checkout, on the oldest supported Python and the current one,
-  # then import it and touch the public surface. Source-workspace tests cannot
-  # prove what an installed artifact ships.
-  wheel-install:
-    name: wheel-install-${{ matrix.platform.target }}-py${{ matrix.python }}
-    needs: [wheels]
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.10", "3.13"]
-        platform:
-          - { runner: ubuntu-latest, target: x86_64 }
-          - { runner: ubuntu-24.04-arm, target: aarch64 }
-          - { runner: macos-15, target: universal2-apple-darwin }
-          - { runner: windows-latest, target: x64 }
-    defaults:
-      run:
-        working-directory: ${{ github.workspace }}
-    steps:
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: wheels-${{ matrix.platform.target }}-${{ matrix.platform.runner }}
-          path: dist
-      - name: Install the wheel and smoke the public surface
-        shell: bash
-        run: |
-          python -m pip install --no-index --find-links dist laser-sdk
-          python - << 'EOF'
-          import importlib.metadata
-          import pathlib
-
-          import laser_sdk as ls
-
-          version = importlib.metadata.version("laser-sdk")
-          print(f"installed laser-sdk {version}")
-          package = pathlib.Path(ls.__file__).parent
-          stub = package / "__init__.pyi"
-          assert stub.is_file(), "the typing stub must ship inside the wheel"
-          assert (package / "py.typed").is_file(), "the PEP 561 marker must ship inside the wheel"
-          key = ls.SigningKey(bytes(range(32)))
-          registry = ls.KeyRegistry()
-          registry.enroll("smoke", key.verifying_key)
-          provenance = ls.Provenance(agent="smoke")
-          assert provenance.conversation_id
-          print("public surface smoke passed")
-          EOF
 
   # Build the source distribution in a directory with no repository parents, so
   # a vendoring or path-dependency defect fails here rather than on a user.
@@ -297,7 +286,7 @@ jobs:
   # Publish to PyPI on a py-v* tag, using the laserdata account's trusted publisher.
   publish:
     if: startsWith(github.ref, 'refs/tags/py-v')
-    needs: [test, wheels, sdist, wheel-install, sdist-install]
+    needs: [test, wheels, sdist, sdist-install]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -324,7 +313,6 @@ jobs:
       - test
       - wheels
       - sdist
-      - wheel-install
       - sdist-install
     runs-on: ubuntu-latest
     steps:

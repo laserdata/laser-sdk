@@ -26,6 +26,7 @@ const DIGEST_DOMAIN: &[u8] = b"agdx.consumer-filter.v1\0";
 /// unknown, `not` keeps unknown, and an unknown root selects nothing. A decode
 /// fault is separate from truth and follows the filter's [`FaultPolicy`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FilterExpr {
     All(Vec<FilterExpr>),
@@ -52,6 +53,7 @@ pub enum FilterExpr {
 /// compare, so `"2026-09-21T18:04:12Z"` orders as an instant and `"12.50"` as a
 /// number. The coercion is part of the expression and its digest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct CoercedPredicate {
     pub pred: Predicate,
     pub coerce: Coerce,
@@ -60,6 +62,7 @@ pub struct CoercedPredicate {
 /// An explicit value coercion. A value that does not parse under it compares
 /// as unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Coerce {
     /// Compare as an instant in microseconds.
@@ -70,6 +73,7 @@ pub enum Coerce {
 
 /// A comparison against one user header, keyed exactly (`agdx.ct` is one key).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct HeaderPredicate {
     pub key: String,
     pub op: CmpOp,
@@ -92,6 +96,7 @@ pub struct HeaderPredicate {
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum FilterCodec {
@@ -134,6 +139,7 @@ pub enum FilterCodec {
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum RecordPolicy {
@@ -165,6 +171,7 @@ impl RecordPolicy {
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum FaultPolicy {
@@ -181,6 +188,7 @@ pub enum FaultPolicy {
 /// One consumer filter: the expression plus everything that changes what it
 /// selects. Its [`digest`](Self::digest) identifies these semantics.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ConsumerFilter {
     pub v: u32,
     pub evaluator_version: u32,

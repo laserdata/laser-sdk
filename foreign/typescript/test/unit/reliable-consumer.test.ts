@@ -9,13 +9,17 @@ import {
   DEFAULT_RETRY_POLICY,
   provenanceAndEnvelope,
   provenanceFromEnvelope,
+  positionKey,
+  refills,
   retryBackoff,
   retryDelayMs,
   ReliableConsumer,
   SlidingWindow,
+  WarmDedupPolicy,
   type FenceEntry,
   type FenceSweepState,
-  type ReceivedAgentMessage
+  type ReceivedAgentMessage,
+  type WarmSeed
 } from "../../src/agent/reliable-consumer.js"
 import { isRetryable } from "../../src/client/error-classify.js"
 import {
@@ -26,7 +30,7 @@ import {
   RejectedError,
   TransportError
 } from "../../src/client/errors.js"
-import { CancelledError } from "../../src/client/errors.js"
+import { CancelledError, InvalidError } from "../../src/client/errors.js"
 import {
   INTERNAL_COMMIT_HANDLED,
   INTERNAL_NATIVE_CONSUMER,
@@ -434,4 +438,36 @@ void test("given_an_enveloped_child_record_when_decoded_then_should_carry_its_pa
   const provenance = provenanceFromEnvelope(envelope)
   assert.equal(provenance.parentConversationId?.toString(), parent.toString())
   assert.equal(provenance.rootConversationId?.toString(), root.toString())
+})
+
+void test("given_each_warm_dedup_policy_when_deciding_refills_then_should_leave_out_only_what_it_names", () => {
+  const seed = (offset: bigint, deadlineMicros?: bigint): WarmSeed => ({
+    key: `key-${offset.toString()}`,
+    partitionId: 0,
+    offset,
+    appendedAtMicros: 1n,
+    ...(deadlineMicros !== undefined ? { deadlineMicros } : {})
+  })
+  const now = 1_000n
+  const seeds = [seed(1n), seed(2n, 500n), seed(3n, 600n), seed(4n, 2_000n)]
+  const deadLetters = new Set([positionKey(0, 2n)])
+  const decide = (policy: WarmDedupPolicy, expired?: ReadonlySet<string>): boolean[] =>
+    seeds.map((one) => refills(policy, one, expired, now))
+
+  assert.deepEqual(decide(WarmDedupPolicy.DeadLetters, deadLetters), [true, false, true, true])
+  assert.deepEqual(decide(WarmDedupPolicy.DeadLetters), [true, false, false, true])
+  assert.deepEqual(decide(WarmDedupPolicy.Unexpired, deadLetters), [true, false, false, true])
+  assert.deepEqual(decide(WarmDedupPolicy.All), [true, true, true, true])
+})
+
+void test("given_an_unknown_warm_dedup_policy_when_constructing_then_should_reject_it", () => {
+  assert.throws(
+    () =>
+      new ReliableConsumer({
+        group: ConsumerGroupName.forAgent(AgentId.new("worker")),
+        topic: "commands",
+        warmDedupPolicy: "dead-letters" as WarmDedupPolicy
+      }),
+    InvalidError
+  )
 })

@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
@@ -43,6 +44,7 @@ pub enum ForkKind {
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
@@ -55,6 +57,7 @@ pub enum ForkStatus {
 
 /// A fork's metadata, returned by `create` and `list`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ForkInfo {
     pub fork_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,6 +72,7 @@ pub struct ForkInfo {
 /// Wire form of the `AGDX_FORK_CREATE` request. Wire-stability-bound, built
 /// through the SDK's fork handle in application code.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ForkCreate {
     pub v: u32,
     pub fork_id: String,
@@ -88,6 +92,7 @@ pub struct ForkCreate {
 /// One trunk position a severed fork is frozen at: the last materialized
 /// offset of one partition of one table.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ForkPoint {
     pub table: String,
     pub partition_id: u32,
@@ -99,6 +104,7 @@ pub struct ForkPoint {
 
 /// Wire form of the `AGDX_FORK_DELETE` (squash) request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ForkDelete {
     pub v: u32,
     pub fork_id: String,
@@ -106,6 +112,7 @@ pub struct ForkDelete {
 
 /// Wire form of the `AGDX_FORK_PROMOTE` request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ForkPromote {
     pub v: u32,
     pub fork_id: String,
@@ -113,6 +120,7 @@ pub struct ForkPromote {
 
 /// Wire form of the `AGDX_FORK_LIST` request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ForkList {
     pub v: u32,
     /// The stream whose resources the listing covers. Required in stream
@@ -125,6 +133,7 @@ pub struct ForkList {
 /// Wire form of the `AGDX_FORK_PUT` request. Wire-stability-bound, built through
 /// the SDK's fork handle in application code.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ForkPut {
     pub v: u32,
     pub fork_id: String,
@@ -139,6 +148,10 @@ pub struct ForkPut {
     pub fields: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::opt_bytes_schema")
+    )]
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -153,6 +166,7 @@ pub struct ForkPut {
 
 /// The result of a fork op: `Ok` with the outcome, or `Err` with a failure.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum ForkReply {
     Ok(ForkOutcome),
@@ -161,6 +175,7 @@ pub enum ForkReply {
 
 /// The successful outcome of a fork command, shaped per op.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum ForkOutcome {
     Created(ForkInfo),
@@ -172,6 +187,7 @@ pub enum ForkOutcome {
 
 /// Why a fork operation failed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum ForkError {
     #[error("forks not supported: {0}")]

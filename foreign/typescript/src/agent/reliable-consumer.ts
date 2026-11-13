@@ -41,7 +41,7 @@ import {
   INTERNAL_VERIFIER
 } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
-import type { LaserTransport } from "../iggy/apache-iggy.js"
+import type { ConsumerTarget, LaserTransport, PolledMessage } from "../iggy/apache-iggy.js"
 import type { HeaderValue } from "../stream/header-value.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
 import type { Provenance } from "../provenance/provenance.js"
@@ -54,6 +54,7 @@ import {
   AgentKind,
   OPERATION_TASK,
   TaskStateName,
+  decodeAgentDeadLetter,
   encodeAgentDeadLetter,
   METADATA_SUBMITTED,
   deadLetterReasonCode,
@@ -65,7 +66,7 @@ import {
   type AgentId as WireAgentId,
   type DeadLetterReasonName
 } from "../wire/agent.js"
-import { encodeNamed } from "../wire/cbor.js"
+import { decodeOne, encodeNamed, expectMap } from "../wire/cbor.js"
 import {
   ADDRESSEE_FILTER_NAME,
   type Dispatch,
@@ -75,7 +76,7 @@ import {
 } from "../wire/dispatch.js"
 import { CONVERSATION_ID } from "../wire/headers.js"
 import { type LogPosition, crockfordEncode } from "../wire/ids.js"
-import { AGENT_CONTROL, AGENT_SESSIONS } from "../wire/topics.js"
+import { AGENT_CONTROL, AGENT_DLQ, AGENT_SESSIONS } from "../wire/topics.js"
 import type { Consumer, ConsumerMessage } from "../stream/consumer.js"
 import { policyAware } from "../managed/filters.js"
 import { readThrough } from "../stream/cursor.js"
@@ -115,6 +116,11 @@ const VERIFIED_RECORD_WINDOW = 16_384
 const ANONYMOUS_AGENT = "anonymous"
 // How long the server holds a read that finds nothing new, as Rust.
 const DEFAULT_MAX_WAIT_MS = 5_000
+// Records one warmer poll asks for.
+const WARM_DEDUP_BATCH = 1_000
+// A dead letter can carry the clock of another node than its source record,
+// so the warm-up reads dead letters from this long before the oldest record.
+const DEAD_LETTER_CLOCK_MARGIN_MICROS = 60_000_000n
 
 /** The error detail key that carries the dead-letter reason code, on a failed
  * session and on the error a dead-lettered command answers its source with.
@@ -156,6 +162,20 @@ export type ConcurrencyPolicy =
 
 export const SERIAL_CONCURRENCY: ConcurrencyPolicy = { kind: "serial" }
 
+/** Which committed records refill the duplicate window when a consumer starts
+ * with warm dedup. A record without a deadline always refills its key.
+ * `dead_letters` leaves out a copy that a `DeadlineExceeded` dead letter names,
+ * and acts as `unexpired` when the dead letters cannot all be read.
+ * `unexpired` leaves out every copy whose deadline passed before the start,
+ * without reading dead letters. `all` refills every key, including copies
+ * dropped past their deadline, so a resend after an expiry is skipped. */
+export const WarmDedupPolicy = {
+  DeadLetters: "dead_letters",
+  Unexpired: "unexpired",
+  All: "all"
+} as const
+export type WarmDedupPolicy = (typeof WarmDedupPolicy)[keyof typeof WarmDedupPolicy]
+
 export interface Deduplicator {
   observe(key: string): Promise<boolean>
 }
@@ -179,6 +199,11 @@ export class SlidingWindow implements Deduplicator {
     this.order.push(key)
     return Promise.resolve(true)
   }
+}
+
+/** @internal */
+export function isWarmDedupPolicy(value: string): value is WarmDedupPolicy {
+  return (Object.values(WarmDedupPolicy) as string[]).includes(value)
 }
 
 export function dedupKey(provenance: Provenance): string | undefined {
@@ -266,6 +291,9 @@ export interface ReliableConsumerOptions {
   readonly ackOnPickup?: boolean
   readonly deduplicator?: Deduplicator
   readonly warmDedup?: boolean
+  /** Which committed records refill the window when `warmDedup` is on.
+   * Defaults to `dead_letters`. */
+  readonly warmDedupPolicy?: WarmDedupPolicy
   readonly middleware?: readonly AgentMiddleware[]
   readonly onDeadLetter?: DeadLetterSink
   /** The command operations the handler serves. Unset serves every operation.
@@ -683,8 +711,8 @@ class ReliableWorker {
     ) {
       return
     }
-    const key = dedupKey(message.provenance)
-    if (key !== undefined && !(await this.options.deduplicator.observe(key))) return
+    // The deadline gate comes before dedup like the fence gate: an expired copy
+    // never ran, so it must not consume the idempotency slot its resend needs.
     if (
       message.provenance.deadlineAtMicros !== undefined &&
       this.options.clock.nowMicros() > message.provenance.deadlineAtMicros
@@ -692,6 +720,8 @@ class ReliableWorker {
       await this.deadLetter(message, "DeadlineExceeded", 0, "message past its deadline")
       return
     }
+    const key = dedupKey(message.provenance)
+    if (key !== undefined && !(await this.options.deduplicator.observe(key))) return
     if (this.cancelled()) return
     await this.ackOnPickup(message)
     // Picking up the first command of a submitted session marks the session
@@ -1094,6 +1124,9 @@ export class ReliableConsumer {
     const grace = options.shutdownGraceMs ?? 30_000
     if (!Number.isFinite(grace) || grace < 0)
       throw new InvalidError("shutdownGraceMs must be a non-negative finite number")
+    if (!isWarmDedupPolicy(options.warmDedupPolicy ?? WarmDedupPolicy.DeadLetters)) {
+      throw new InvalidError('warmDedupPolicy must be "dead_letters", "unexpired" or "all"')
+    }
     if (options.ackOnPickup === true && options.respondOn === undefined) {
       throw new ConfigError(
         "ackOnPickup requires respondOn, the topic the pickup status is sent on"
@@ -1501,6 +1534,9 @@ export class ReliableConsumer {
     if (failure !== undefined) throw failure
   }
 
+  // Pre-fill the dedup window from the records the group already committed,
+  // never past its stored offset, so a restart recognizes duplicates of work
+  // it handled. The policy decides which of those records refill the window.
   private async warmDedup(laser: Laser, deduplicator: Deduplicator, depth: number): Promise<void> {
     const transport = laserTransport(laser)
     if (transport.getConsumerOffset === undefined) {
@@ -1508,11 +1544,13 @@ export class ReliableConsumer {
     }
     const stream = laser.defaultStream
     if (stream === undefined) throw new NoStreamError("warm dedup requires a stream")
-    const partitions = await transport.getTopicPartitionCount(stream, this.options.topic)
+    const topic = this.options.topic
+    const partitions = await transport.getTopicPartitionCount(stream, topic)
+    const seeds: WarmSeed[] = []
     for (let partitionId = 0; partitionId < partitions; partitionId += 1) {
       const offset = await transport.getConsumerOffset(
         stream,
-        this.options.topic,
+        topic,
         { kind: "group", name: this.options.group.asStr() },
         partitionId
       )
@@ -1522,18 +1560,201 @@ export class ReliableConsumer {
       const messages = await readThrough(
         transport,
         stream,
-        this.options.topic,
+        topic,
         { kind: "single", partitionId },
         start,
         offset.storedOffset
       )
       for (const received of messages) {
-        const decoded = decodeAgentMessage(received)
-        if (decoded.kind !== "message") continue
-        const key = dedupKey(decoded.message.provenance)
-        if (key !== undefined) await deduplicator.observe(key)
+        const seed = this.warmSeed(received)
+        if (seed !== undefined) seeds.push(seed)
       }
     }
+    const policy = this.options.warmDedupPolicy ?? WarmDedupPolicy.DeadLetters
+    let oldest: bigint | undefined
+    for (const seed of seeds) {
+      if (seed.deadlineMicros === undefined) continue
+      if (oldest === undefined || seed.appendedAtMicros < oldest) oldest = seed.appendedAtMicros
+    }
+    let expired: ReadonlySet<string> | undefined
+    if (policy === WarmDedupPolicy.DeadLetters && oldest !== undefined) {
+      const since =
+        oldest > DEAD_LETTER_CLOCK_MARGIN_MICROS ? oldest - DEAD_LETTER_CLOCK_MARGIN_MICROS : 0n
+      try {
+        const source = await transport.resolveStreamTopicIds?.(stream, topic)
+        expired =
+          source === undefined
+            ? undefined
+            : await expiredCopies(transport, stream, source, since, depth)
+        if (expired === undefined) {
+          warn(
+            `The dead letters since ${since.toString()} could not all be read, so the warm-up of ${topic} leaves out every copy whose deadline has passed.`
+          )
+        }
+      } catch (error) {
+        warn(
+          `Reading the dead letters failed, so the warm-up of ${topic} leaves out every copy whose deadline has passed: ${handlerError(error).message}`
+        )
+      }
+    }
+    const now = (this.options.clock ?? new SystemClock()).nowMicros()
+    for (const seed of seeds) {
+      if (refills(policy, seed, expired, now)) await deduplicator.observe(seed.key)
+    }
+  }
+
+  // The key a committed record can refill the window with: decoded under the
+  // understood features, addressed to this agent or to every agent, and
+  // verified when a verifier is set, as the live gates require.
+  private warmSeed(received: PolledMessage): WarmSeed | undefined {
+    const decoded = decodeAgentMessage(received, this.options.understoodFeatures ?? 0n)
+    if (decoded.kind !== "message") return undefined
+    const { message } = decoded
+    const target = message.provenance.targetAgentId
+    const agent = this.options.agent
+    if (target !== undefined && agent !== undefined && !target.equals(agent)) return undefined
+    const verifier = this.options.verifier
+    if (verifier !== undefined) {
+      if (
+        message.envelope === undefined ||
+        decoded.signatureContext === undefined ||
+        decoded.observedAtMicros === undefined
+      ) {
+        return undefined
+      }
+      try {
+        verifier.verifyObservedAt(
+          message.envelope,
+          decoded.signatureContext,
+          decoded.observedAtMicros
+        )
+      } catch {
+        return undefined
+      }
+    }
+    const key = dedupKey(message.provenance)
+    if (key === undefined) return undefined
+    const deadline = message.provenance.deadlineAtMicros
+    return {
+      key,
+      partitionId: received.partitionId,
+      offset: received.offset,
+      appendedAtMicros: received.timestampMicros ?? 0n,
+      ...(deadline !== undefined ? { deadlineMicros: deadline } : {})
+    }
+  }
+}
+
+/** One committed record whose key can refill the dedup window.
+ * @internal */
+export interface WarmSeed {
+  readonly key: string
+  readonly partitionId: number
+  readonly offset: bigint
+  readonly appendedAtMicros: bigint
+  readonly deadlineMicros?: bigint
+}
+
+/** Whether a committed record refills the dedup window under `policy`. The
+ * deadline gate drops only a copy whose deadline has passed, so a copy without
+ * one always refills. `expired` holds the positions dead letters name,
+ * `undefined` when they could not all be read.
+ * @internal */
+export function refills(
+  policy: WarmDedupPolicy,
+  seed: WarmSeed,
+  expired: ReadonlySet<string> | undefined,
+  nowMicros: bigint
+): boolean {
+  const deadline = seed.deadlineMicros
+  if (deadline === undefined || policy === WarmDedupPolicy.All) return true
+  if (policy === WarmDedupPolicy.DeadLetters && expired !== undefined) {
+    return !expired.has(positionKey(seed.partitionId, seed.offset))
+  }
+  return nowMicros <= deadline
+}
+
+/** @internal */
+export function positionKey(partitionId: number, offset: bigint): string {
+  return `${String(partitionId)}:${offset.toString()}`
+}
+
+// The partition and offset of every copy of `source` that a dead letter shows
+// was dropped past its deadline, read from the dead letters published since
+// `sinceMicros`. `undefined` when a dead-letter partition holds more than
+// `limit` of them, or retention removed some of them.
+async function expiredCopies(
+  transport: LaserTransport,
+  stream: string,
+  source: { readonly streamId: number; readonly topicId: number },
+  sinceMicros: bigint,
+  limit: number
+): Promise<ReadonlySet<string> | undefined> {
+  const expired = new Set<string>()
+  // No dead-letter topic means no dead letter was published, and a copy whose
+  // dead letter failed to publish was never committed.
+  const partitions = await transport.findTopicPartitionCount(stream, AGENT_DLQ)
+  if (partitions === undefined) return expired
+  for (let partitionId = 0; partitionId < partitions; partitionId += 1) {
+    const target: ConsumerTarget = { kind: "single", partitionId }
+    const [oldest] = await transport.pollMessages(
+      stream,
+      AGENT_DLQ,
+      target,
+      { kind: "first" },
+      1,
+      false
+    )
+    if (oldest === undefined) continue
+    if (oldest.offset > 0n && (oldest.timestampMicros ?? 0n) > sinceMicros) return undefined
+    const [start] = await transport.pollMessages(
+      stream,
+      AGENT_DLQ,
+      target,
+      { kind: "timestampMicros", value: sinceMicros },
+      1,
+      false
+    )
+    if (start === undefined) continue
+    let next = start.offset
+    let read = 0
+    for (;;) {
+      const batch = await transport.pollMessages(
+        stream,
+        AGENT_DLQ,
+        target,
+        { kind: "offset", value: next },
+        WARM_DEDUP_BATCH,
+        false
+      )
+      const fresh = batch.filter((message) => message.offset >= next)
+      const last = fresh.at(-1)
+      if (last === undefined) break
+      read += fresh.length
+      if (read > limit) return undefined
+      for (const message of fresh) {
+        const letter = deadLetterOf(message.payload)
+        if (
+          letter?.reason.kind === "known" &&
+          letter.reason.name === "DeadlineExceeded" &&
+          letter.source.streamId === source.streamId &&
+          letter.source.topicId === source.topicId
+        ) {
+          expired.add(positionKey(letter.source.partitionId, letter.source.offset))
+        }
+      }
+      next = last.offset + 1n
+    }
+  }
+  return expired
+}
+
+function deadLetterOf(payload: Uint8Array): AgentDeadLetter | undefined {
+  const context = "dead letter"
+  try {
+    return decodeAgentDeadLetter(expectMap(decodeOne(payload, context), context), context)
+  } catch {
+    return undefined
   }
 }
 

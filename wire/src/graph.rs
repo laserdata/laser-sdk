@@ -45,6 +45,7 @@ impl EdgeId {
 
 /// Which way a hop follows edges from the current frontier.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeDir {
     /// Outgoing edges (from -> to). The default.
@@ -58,6 +59,7 @@ pub enum EdgeDir {
 
 /// What a graph query returns.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum GraphReturn {
     /// The reachable nodes. The default.
@@ -75,6 +77,7 @@ pub enum GraphReturn {
 /// hops at this step. The expanded hops of a traversal, each `max` summed,
 /// stay within [`MAX_GRAPH_TRAVERSE_DEPTH`](crate::limits::MAX_GRAPH_TRAVERSE_DEPTH).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Hop {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_type: Option<String>,
@@ -93,6 +96,7 @@ impl EdgeDir {
 /// Where a traversal starts: explicit node ids, the nodes matching a predicate,
 /// or the nodes nearest an embedding (vector-seeded traversal).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum GraphStart {
     Ids(Vec<NodeId>),
     Match(Filter),
@@ -103,6 +107,7 @@ pub enum GraphStart {
 /// to return. Reuses the query [`Filter`] predicate language, so there is one
 /// filter grammar across query and graph.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GraphQuery {
     pub v: u32,
     pub graph: String,
@@ -145,6 +150,7 @@ impl GraphReturn {
 /// A one-hop neighbor read: the cheap, common traversal. `depth` follows the same
 /// hop repeatedly.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GraphNeighbors {
     pub v: u32,
     pub graph: String,
@@ -182,6 +188,7 @@ pub struct GraphNeighbors {
 /// upsert. The complete history is the source log, which the projector can
 /// replay. Absent on the wire when unknown.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum SourceRef {
     /// A record on the message log, by numeric stream id, topic id, partition, and
     /// offset. Ids, not names: the pointer is route-ready and survives a rename.
@@ -208,6 +215,7 @@ pub enum SourceRef {
 
 /// The component that produced a memory or graph fact.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ProducerInfo {
     pub name: String,
     pub version: String,
@@ -215,6 +223,7 @@ pub struct ProducerInfo {
 
 /// One node: its id, labels, attributes, optional embedding, and optional source.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GraphNode {
     pub id: NodeId,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -255,6 +264,7 @@ impl GraphNode {
 /// One edge: its id, endpoints, type, weight, attributes, and an optional
 /// valid-time window for bitemporal facts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GraphEdge {
     pub id: EdgeId,
     pub from: NodeId,
@@ -330,6 +340,7 @@ impl GraphEdge {
 
 /// One path through the graph: parallel node and edge id sequences.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Path {
     pub nodes: Vec<NodeId>,
     pub edges: Vec<EdgeId>,
@@ -338,6 +349,7 @@ pub struct Path {
 /// The data a graph traversal returns. Which fields are populated depends on the
 /// query's [`GraphReturn`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GraphResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<GraphNode>,
@@ -358,6 +370,7 @@ fn is_false(value: &bool) -> bool {
 /// Upsert nodes and edges into a graph. The projector path: idempotent on
 /// content-addressed ids, so re-applying the same extraction is a no-op.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GraphUpsert {
     pub v: u32,
     pub graph: String,
@@ -372,6 +385,7 @@ pub struct GraphUpsert {
 /// The result of a graph operation: `Ok` with the traversal data, or `Err` with
 /// a structured failure.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum GraphReply {
     Ok(GraphResult),
@@ -380,6 +394,7 @@ pub enum GraphReply {
 
 /// Why a graph operation failed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum GraphError {
     #[error("graph not supported: {0}")]

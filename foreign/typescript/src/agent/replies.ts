@@ -10,10 +10,18 @@ import {
 import { NOOP_OBSERVER, type LaserObserver } from "../observe.js"
 import type { KeyRegistry } from "../signing.js"
 import { Cursor, heldRead } from "../stream/cursor.js"
-import { AgentKind, OPERATION_TASK, type AgentEnvelope } from "../wire/agent.js"
-import type { CorrelationId } from "../wire/ids.js"
+import {
+  AgentKind,
+  OPERATION_TASK,
+  type AgentEnvelope,
+  deadLetterReasonCode,
+  decodeAgentErrorBody
+} from "../wire/agent.js"
+import { decodeOne, expectMap } from "../wire/cbor.js"
+import type { CorrelationId, RecordId } from "../wire/ids.js"
 import type { ConversationId, MessageId } from "../types/ids.js"
 import {
+  DEAD_LETTER_REASON_DETAIL,
   decodeAgentMessage,
   type AgentMessage,
   type DecodedAgentMessage
@@ -100,11 +108,13 @@ interface StreamWaiter {
 
 /** What a record must carry to answer one request: the request's session, a
  * reply kind, and, when the request named its sender, that sender as the
- * addressee.
+ * addressee. A request that names its command record is not answered by an
+ * earlier copy of it that expired unconsumed.
  * @internal */
 export interface ExpectedReply {
   readonly session: ConversationId
   readonly requester?: string
+  readonly command?: RecordId
 }
 
 function accepts(expected: ExpectedReply, message: AgentMessage): boolean {
@@ -113,11 +123,40 @@ function accepts(expected: ExpectedReply, message: AgentMessage): boolean {
   let addressee: string | undefined
   if (envelope !== undefined) {
     if (envelope.kind !== AgentKind.Response && envelope.kind !== AgentKind.Error) return false
+    if (
+      expected.command !== undefined &&
+      envelope.cause !== undefined &&
+      !envelope.cause.equals(expected.command) &&
+      droppedUnconsumed(envelope)
+    ) {
+      return false
+    }
     addressee = envelope.target
   } else {
     addressee = message.provenance.targetAgentId?.asStr()
   }
   return expected.requester === undefined || expected.requester === addressee
+}
+
+/** Whether the target answered that its consumer dropped the command past its
+ * deadline, before any handler ran.
+ * @internal */
+export function droppedUnconsumed(envelope: AgentEnvelope): boolean {
+  if (envelope.kind !== AgentKind.Error) return false
+  try {
+    const context = "AGDX error body"
+    const reason = decodeAgentErrorBody(
+      expectMap(decodeOne(envelope.body, context), context),
+      context
+    ).detail?.get(DEAD_LETTER_REASON_DETAIL)
+    return (
+      reason !== undefined &&
+      (reason.kind === "int" || reason.kind === "uint") &&
+      reason.value === BigInt(deadLetterReasonCode({ kind: "known", name: "DeadlineExceeded" }))
+    )
+  } catch {
+    return false
+  }
 }
 
 // A pickup acknowledgment for the request: a `Working` task status in the

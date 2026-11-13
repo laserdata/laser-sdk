@@ -22,6 +22,7 @@ const GLOB_ESCAPE: char = '\\';
 /// text: a missing value is unknown, and a value of another type is a type
 /// mismatch, which follows the filter's mismatch policy.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct TextPredicate {
     /// A payload field path, or a header key for [`FilterExpr::HeaderText`](crate::filter::FilterExpr::HeaderText).
     pub field: String,
@@ -45,6 +46,7 @@ pub struct TextPredicate {
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum TextMatch {

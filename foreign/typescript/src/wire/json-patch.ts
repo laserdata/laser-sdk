@@ -139,8 +139,11 @@ function removeValue(
   return { document, value }
 }
 
-function equalJson(left: unknown, right: unknown): boolean {
+/** @internal */
+export function equalJson(left: unknown, right: unknown): boolean {
   if (Object.is(left, right)) return true
+  // Negative zero travels as the integer zero, so the two are one number.
+  if (typeof left === "number" && typeof right === "number") return left === right
   if (Array.isArray(left) && Array.isArray(right)) {
     return (
       left.length === right.length && left.every((value, index) => equalJson(value, right[index]))

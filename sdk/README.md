@@ -21,9 +21,9 @@ The [`laser-wire`](https://crates.io/crates/laser-wire) crate defines encoded me
 
 ```toml
 [dependencies]
-laser-sdk = "0.9.2" # typed streaming plus provenance
+laser-sdk = "0.9.3" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "0.9.2", features = ["agent", "managed"] }
+laser-sdk = { version = "0.9.3", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -64,7 +64,7 @@ while let Some(record) = records.next().await {
 # Ok(()) }
 ```
 
-This example uses only the default `streaming` and `provenance` features and runs against Apache Iggy. One connection addresses every stream on the server. `Laser::connect_with_stream` only pins a default stream so `laser.topic(name)` can be used as a shortcut. It does not limit the connection to that stream. `Laser::connect_env()` reads `LASER_CONNECTION_STRING` and the optional `LASER_STREAM`, and `Laser::local()` targets local Apache Iggy. A connection string is `user:password@host[:port]` or `token@host[:port]`, optionally prefixed with `iggy://` or `iggy+tcp://`, and the port defaults to 8090. Credentials are required and percent-decoded, so a `:`, `@`, `?` or `%` inside one is written `%3A`, `%40`, `%3F` or `%25`. `LaserBuilder::address(..).credentials(user, password)` takes both parts as given, any character included. Other schemes, unknown or repeated options, and malformed credentials, escapes or ports return `LaserError::Config` before dialing.
+This example uses only the default `streaming` and `provenance` features and runs against Apache Iggy. One connection addresses every stream on the server. `Laser::connect_with_stream` only pins a default stream so `laser.topic(name)` can be used as a shortcut. It does not limit the connection to that stream. `Laser::connect_env()` reads `LASER_CONNECTION_STRING` and the optional `LASER_STREAM`, and `Laser::local()` targets local Apache Iggy. A connection string is `user:password@host[:port]` or `token@host[:port]`, optionally prefixed with `iggy://` or `iggy+tcp://`, and the port defaults to 8090. An IPv6 address goes in brackets, as in `token@[::1]:8090`. Credentials are required and percent-decoded, so a `:`, `@`, `?` or `%` inside one is written `%3A`, `%40`, `%3F` or `%25`. `LaserBuilder::address(..).credentials(user, password)` takes both parts as given, any character included. Other schemes, unknown or repeated options, and malformed credentials, escapes or ports return `LaserError::Config` before dialing.
 
 `Topic::ensure(partitions, replication_factor)` creates the topic when absent. `None` takes the server's default replication factor, `Some(factor)` stores each partition on that many nodes, 1 to `MAX_REPLICATION_FACTOR` (32) and at most the cluster's node count. `ProducerBuilder::replication_factor(factor)` does the same for a topic the producer creates. An out-of-range factor fails with `LaserError::Invalid` before anything is sent, and the server's refusal of a factor above the node count surfaces as `LaserError::Transport`. Reads and writes go to each partition's primary, which always stores it. See [client behavior](../docs/client-behavior.md#publication-and-reads).
 
@@ -292,10 +292,10 @@ Choose the read API that provides the behavior your application needs.
 | live consumer | `topic.consumer(..)` / `topic.consumer_group(..).consumer()` | a Laser async `Stream` over Apache Iggy with batching, polling, replay, retries, groups, automatic or explicit server offset commits, and `next_within(timeout)` for a bounded single-record wait. A group consumer always resumes after the group's stored offset, and `start_at` only seeds partitions the group never stored ([client behavior](../docs/client-behavior.md#consumers-and-polling)) |
 | replay | `topic.replay()` | a resumable `Cursor` by explicit offsets: bounded, restartable, nothing consumed (`topic.json::<T>().records(reader_name)` is the same rung, typed) |
 | change feed | `laser.watch()` | lightweight advancement records, so feed-poll-then-query replaces repeated blind queries |
-| reliable consumer | `Agent::builder` / `ReliableConsumer` | consumer-group delivery plus dedup, retry, deadline, and dead-lettering |
+| reliable consumer | `Agent::builder` / `ReliableConsumer` | consumer-group delivery plus dedup, retry, deadline, and dead-lettering. `warm_dedup(true)` refills the dedup window after a restart from the records the group committed, and `warm_dedup_policy(WarmDedupPolicy::..)` decides which, by default leaving out copies dead-lettered past their deadline ([client behavior](../docs/client-behavior.md#dispatch-and-replies)) |
 | query | `laser.query(index)` | the materialized read model: filters, aggregates, vector recall, consistency levels |
 
-Use `topic.send(..)` for raw publication. Use `publish()` and `publish_batch()` for typed builders. Use `topic.producer()` for a persistent producer with batching, retries, topology discovery, and routing. `topic.batching()` adds governed batches that flush by size or time. `contract(..)` sends a directed task, and `workflow(name)` runs steps in dependency order. Apache Iggy builders and the client remain available for detailed configuration.
+Use `topic.send(..)` for raw publication. Use `publish()` and `publish_batch()` for typed builders. Use `topic.producer()` for a persistent producer with batching, retries, topology discovery, and routing. `topic.batching()` adds governed batches that flush by size or time. `contract(..)` sends a directed task, and `workflow(name)` runs steps in dependency order and resumes a stopped run under its `run_id` ([recovery](../docs/client-behavior.md#workflows-and-child-sessions)). Apache Iggy builders and the client remain available for detailed configuration.
 
 ## Consumer filters
 

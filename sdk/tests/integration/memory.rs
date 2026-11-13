@@ -339,6 +339,47 @@ async fn given_a_configured_memory_topic_when_remembering_then_should_recall_it_
 
 #[tokio::test]
 #[serial_test::serial(integration)]
+async fn given_a_missing_memory_topic_when_remembering_then_should_create_it_and_read_back() {
+    let laser = harness::laser().await;
+    let memory = laser
+        .memory_on_topic("new.memory", None)
+        .expect("a memory handle on another topic");
+    assert!(
+        memory
+            .fetch_folded("host:123")
+            .await
+            .expect("an absent memory topic reads as empty")
+            .is_none()
+    );
+    let stream = Identifier::named(laser.default_stream().expect("the test stream is selected"))
+        .expect("the stream name is valid");
+    assert!(
+        laser
+            .client()
+            .get_topic(
+                &stream,
+                &Identifier::named("new.memory").expect("the topic name is valid")
+            )
+            .await
+            .expect("the topic lookup succeeds")
+            .is_none(),
+        "a read must not create the topic"
+    );
+    memory
+        .set("host:123", br#"{"log_level":"info"}"#.to_vec())
+        .await
+        .expect("a memory write creates its topic");
+    assert_eq!(
+        memory
+            .fetch_folded("host:123")
+            .await
+            .expect("the memory read succeeds"),
+        Some(br#"{"log_level":"info"}"#.to_vec())
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
 async fn given_named_point_state_when_set_then_should_ride_the_stream_and_read_back() {
     // The named-item altitude is memory too: set publishes an event to the memory
     // topic (not a direct key-value write), and a fresh handle folds it back.

@@ -32,7 +32,7 @@ These changes require explicit user authorization unless the current session alr
 
 ## Verification order
 
-`.github/workflows/ci-rust.yml` defines `lint`, `lint-detached`, `build`, `wire-feature-matrix`, `feature-matrix`, `wasm`, `deny`, `test`, `fuzz`, and `bdd`. Python publication also tests installed wheels and source packages through `ci-python.yml`. TypeScript publication tests its npm archive through `ci-typescript.yml`. Managed execution belongs to Laser Stack `scripts/smoke`, which accepts a local SDK archive.
+`.github/workflows/ci-rust.yml` defines `lint`, `lint-detached`, `build`, `wire-feature-matrix`, `feature-matrix`, `wasm`, `deny`, `test`, `test-integration`, `fuzz`, and `bdd`. `test` runs every cargo test outside the Iggy integration binary. `test-integration` runs that binary under the same two feature sets, split by module into the shards `scripts/ci/integration-shard.sh` lists, each on its own runner. Its last shard skips the modules the others name, so a new module runs there. Rust caches save only on `main`. Python publication also tests installed wheels and source packages through `ci-python.yml`. Each wheel job installs its wheel on Python 3.10 and 3.13 and runs `scripts/ci/wheel-smoke.py`. TypeScript publication tests its npm archive through `ci-typescript.yml`. Managed execution belongs to Laser Stack `scripts/smoke`, which accepts a local SDK archive.
 
 `bdd/rust` and `fuzz` are outside the main workspace. `--workspace` does not include them. `lint-detached` and `just lint` run formatting, dependency, and clippy checks for those projects.
 
@@ -120,7 +120,8 @@ wire/                   the laser-wire crate: the wire CONTRACT, data + pure fun
                         envelope parent/root, the session bodies SessionStart /
                         SessionTransition / SessionEnd, SessionStatus, SessionRef, Budget,
                         SdkInfo, ContextManifest / Fragment / ContextCompaction /
-                        ContextRetrieval, StateDelta / StateSnapshot + apply_json_patch,
+                        ContextRetrieval, StateDelta / StateSnapshot + apply_json_patch +
+                        equal_json (numbers by value),
                         estimate_tokens (bytes / 4 rounded up), validate() (the per-kind
                         validity matrix + caps)
     session.rs          session read requests (stream first), SessionReply / SessionOutcome
@@ -332,11 +333,12 @@ sdk/src/
                       high-water gate, opt-in ack_on_pickup (Working status, requires respond_on),
                       AgentMessage::body(), ConcurrencyPolicy (Serial | SerialPerPartition lanes,
                       idle lanes retired at the cap), graceful drain, AgentMiddleware +
-                      DeadLetterSink seams
+                      DeadLetterSink seams, warm dedup refilled under WarmDedupPolicy
+                      (dead_letters default, unexpired, all)
     memory_handler.rs MemoryHandler<H>: wraps an AgentHandler so a successfully handled message is
                       remembered under its conversation, auto_remember selects the MemoryKind
     builder.rs        Agent::builder + AgentHandle (ready/shutdown=graceful drain/join/abort), capabilities +
-                      ack_on_pickup + inbox_route + max_wait + signing_key + retry/verifier/dedup_window/shutdown_grace/concurrency/
+                      ack_on_pickup + inbox_route + max_wait + signing_key + retry/verifier/dedup_window/warm_dedup/warm_dedup_policy/shutdown_grace/concurrency/
                       middleware/on_dead_letter, self-advertises card (inbox, ttl refreshed each heartbeat,
                       withdrawn on stop) + presence on spawn through Advertisement
     ctx.rs            AgentCtx handed to a handler: respond/reply_on/send/request/respond_input,
@@ -468,7 +470,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-This inventory describes the `0.9.2` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.9.3` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
 Capabilities identify managed support such as queries, key-value, forks, graphs, and an A2A gateway, plus native consumer filters served by the streaming server. Every capability flag maps to a hello feature bit or an op version. Memory combines query and graph operations and has no separate managed command group.
 
@@ -502,7 +504,7 @@ The `rbac` API requires `authz` and lives in `sdk/src/rbac/`. It exposes `Laser:
 
 `laser-wire` defines the envelope, IDs, dictionaries, validity matrix, operation names, card body, `BodyRef`, reference data, `agdx.av`, and `OpVersions.agent`. SDK methods expose these through `Laser::agdx` and `Agdx`. `AgdxStream` writes chunks. `Agdx::request_input` publishes an `input-required` status and an `input_request` command, and `AgentCtx::respond_input` answers it with a response record. `ChunkAssembler` handles order, duplicates, gaps, late records, terminal records, and abandonment.
 
-The reliable consumer publishes `AgentDeadLetter` for decode failures, expired deadlines, permanent rejection, and exhausted retries. It includes `DeadLetterReason`, attempts, the full `LogPosition`, and original payload. It retains provenance, clears the deadline, and sets `agdx.ct = cbor`. A correlated command it dead-letters is answered on `respond_on` with an AGDX error carrying the reason code, which a contract reads as `Failed`, or as `NotConsumed` for an expired command.
+The reliable consumer publishes `AgentDeadLetter` for decode failures, expired deadlines, permanent rejection, and exhausted retries. It includes `DeadLetterReason`, attempts, the full `LogPosition`, and original payload. It retains provenance, clears the deadline, and sets `agdx.ct = cbor`. A correlated command it dead-letters is answered on `respond_on` with an AGDX error carrying the reason code, which a contract reads as `Failed`, or as `NotConsumed` for an expired command. The deadline check runs before duplicate suppression, and a contract ignores the expiry answer to another copy of its request, so a resend under the same idempotency key still runs.
 
 `Laser::redrive_dead_letter` republishes with a source-position-based idempotency key. `AgentMessage.envelope` and `ContextMessage.envelope` expose the decoded `AgentEnvelope`. For these records, routing, duplicate suppression, and deadline handling use envelope fields.
 

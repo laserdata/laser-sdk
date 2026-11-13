@@ -504,6 +504,7 @@ impl Laser {
     pub async fn publish_card(&self, source: AgentId, card: &AgentCard) -> Result<(), LaserError> {
         let body = laser_wire::framing::encode_named(card)
             .map_err(|error| LaserError::Codec(format!("encode card: {error}")))?;
+        self.ensure_registry().await?;
         self.agdx(
             AgentTopic::Registry,
             source.wire_id(),
@@ -545,6 +546,7 @@ impl Laser {
         operator: AgentId,
         agent: &AgentId,
     ) -> Result<(), LaserError> {
+        self.ensure_registry().await?;
         self.agdx(
             AgentTopic::Registry,
             operator.wire_id(),
@@ -597,6 +599,7 @@ impl Laser {
         agent: &AgentId,
         key: &crate::sign::SigningKey,
     ) -> Result<(), LaserError> {
+        self.ensure_registry().await?;
         self.agdx(
             AgentTopic::Registry,
             operator.wire_id(),
@@ -613,6 +616,13 @@ impl Laser {
         .send()
         .await?;
         Ok(())
+    }
+
+    // The first registry write creates the registry topic, with one partition.
+    async fn ensure_registry(&self) -> Result<(), LaserError> {
+        self.topic(AgentTopic::Registry.topic_string())
+            .ensure(1, None)
+            .await
     }
 
     /// Advertise this connection's live presence (`AGDX_SET_CLIENT_METADATA`): the

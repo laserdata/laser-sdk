@@ -4,7 +4,7 @@ import laser_sdk as ls
 import pytest
 
 
-async def _silent_server():
+async def _silent_server(host="127.0.0.1"):
     """Accept connections and read forever, like a server that never answers login."""
 
     writers = []
@@ -17,7 +17,7 @@ async def _silent_server():
         finally:
             writer.close()
 
-    return await asyncio.start_server(hold, "127.0.0.1", 0), writers
+    return await asyncio.start_server(hold, host, 0), writers
 
 
 @pytest.mark.parametrize(("tls", "stage"), [(False, "login"), (True, "accept")])
@@ -72,7 +72,9 @@ async def test_given_an_unreachable_server_when_connecting_then_should_use_the_e
         "iggy:iggy@127.0.0.1:8090?tls=true&tls=false",
         "iggy:iggy@127.0.0.1:8090?tls=false&tls_ca_file=/ca.crt",
         "iggy:iggy@127.0.0.1:0",
-        "iggy:iggy@[::1]:8090",
+        "iggy:iggy@[localhost]:8090",
+        "iggy:iggy@[::1",
+        "iggy:iggy@::1:8090",
     ],
 )
 async def test_given_an_unsupported_connection_string_when_connecting_then_should_raise_config(
@@ -80,6 +82,30 @@ async def test_given_an_unsupported_connection_string_when_connecting_then_shoul
 ):
     with pytest.raises(ls.ConfigError):
         await ls.Laser.connect(connection_string, connect_timeout_ms=300)
+
+
+@pytest.mark.parametrize("bracketed", [True, False])
+async def test_given_a_bracketed_ipv6_address_when_connecting_then_should_dial_it(bracketed):
+    try:
+        server, writers = await _silent_server("::1")
+    except OSError:
+        pytest.skip("IPv6 loopback is unavailable")
+    port = server.sockets[0].getsockname()[1]
+    try:
+        with pytest.raises(ls.TimeoutError, match="login"):
+            if bracketed:
+                await ls.Laser.connect(f"iggy:iggy@[::1]:{port}", connect_timeout_ms=300)
+            else:
+                await ls.Laser.connect(
+                    address=f"[::1]:{port}", credentials=("iggy", "iggy"), connect_timeout_ms=300
+                )
+        assert writers
+    finally:
+        server.close()
+        await server.wait_closed()
+        for writer in writers:
+            writer.close()
+            await writer.wait_closed()
 
 
 async def test_given_an_address_without_a_port_when_connecting_then_should_dial_8090(monkeypatch):

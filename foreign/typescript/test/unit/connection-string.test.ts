@@ -93,11 +93,30 @@ void test("given_a_connection_string_without_a_scheme_when_parsed_then_should_pr
   assert.deepEqual(parsed.reconnection, { intervalMs: 1_000, maxRetries: undefined })
 })
 
-void test("given_an_ipv6_authority_or_a_path_when_parsed_then_should_refuse_it", () => {
+void test("given_a_bracketed_ipv6_address_when_parsed_then_should_dial_it_without_brackets", () => {
+  const parsed = parseConnectionString("iggy://user:password@[2001:db8::7]:9080", {})
+  assert.equal(parsed.host, "2001:db8::7")
+  assert.equal(parsed.port, 9080)
+  const portless = parseConnectionString("token@[::ffff:192.0.2.1]?nodelay=true", {})
+  assert.equal(portless.host, "::ffff:192.0.2.1")
+  assert.equal(portless.port, 8090)
+})
+
+void test("given_a_malformed_ipv6_address_or_a_path_when_parsed_then_should_refuse_it", () => {
   for (const value of [
-    "iggy://user:password@[2001:db8::7]:9080",
     "iggy://user:password@host/path",
-    "iggy://user:password@host#frag"
+    "iggy://user:password@host#frag",
+    "iggy://user:password@[::1",
+    "iggy://user:password@[::1]x:8090",
+    "iggy://user:password@[::1]:",
+    "iggy://user:password@[::1]:0",
+    "iggy://user:password@[::1]:65536",
+    "iggy://user:password@[]:8090",
+    "iggy://user:password@[localhost]:8090",
+    "iggy://user:password@[gggg::1]:8090",
+    "iggy://user:password@::1:8090",
+    "iggy://user:password@2001:db8::1:8090",
+    "iggy://user:password@[::1]:8090/path"
   ]) {
     assert.throws(() => parseConnectionString(value, {}), ConfigError, value)
   }

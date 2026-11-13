@@ -70,6 +70,23 @@ void test("given_credentials_with_a_colon_an_at_sign_and_a_question_mark_when_co
   })
 })
 
+void test("given_an_ipv6_host_when_connected_through_an_address_then_should_dial_it", async (context) => {
+  const dialed: string[] = []
+  context.mock.method(ApacheIggyTransport, "connect", (connectionString: string) => {
+    dialed.push(connectionString)
+    return Promise.reject(new ConfigError("not dialed in a unit test"))
+  })
+  await assert.rejects(
+    Laser.builder().address("2001:db8::7", 9080).credentials("user", "password").connect(),
+    ConfigError
+  )
+  const [connectionString] = dialed
+  assert.ok(connectionString !== undefined)
+  const parsed = parseConnectionString(connectionString, {})
+  assert.equal(parsed.host, "2001:db8::7")
+  assert.equal(parsed.port, 9080)
+})
+
 void test("given_a_borrowed_injected_client_when_closed_then_should_leave_the_client_open", async () => {
   let destroys = 0
   const laser = (await Laser.fromClient(fakeClient(() => destroys++))).withDefaultStream("events")

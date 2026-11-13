@@ -55,6 +55,10 @@ builders = ["dep:bon"]
 # (no executor dependency) and wasm-safe. Pulls serde_urlencoded for the typed
 # query strings.
 http-client = ["cbor", "dep:serde_urlencoded"]
+# JSON Schema for every wire type, so a tool catalog (for example an MCP
+# server) describes requests from the same types the server decodes.
+# Native and wasm-safe, outside the portable contract feature set.
+schemars = ["dep:schemars"]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 bson = { workspace = true, optional = true }
@@ -70,6 +74,7 @@ ouroboros = { workspace = true, optional = true }
 prost-reflect = { workspace = true, optional = true }
 regex = { workspace = true }
 rmp-serde = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_urlencoded = { workspace = true, optional = true }

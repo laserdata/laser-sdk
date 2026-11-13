@@ -25,3 +25,8 @@ Feature: The AGDX agent envelope on the log
     When I publish an AGDX command "ping" via the typed producer
     And I assemble the conversation
     Then the AGDX command body is "ping"
+
+  Scenario: A second advertising agent on one connection reports the presence conflict as it starts
+    Given agent "first-worker" advertising the skill "first" is ready on this connection
+    When agent "second-worker" advertising the skill "second" starts on the same connection
+    Then waiting for the second agent to be ready fails with a presence conflict

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// and run-registry change records are candidate extensions of the same shape,
 /// not implied.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ChangeRecord {
     pub v: u32,
     /// The materialized index the batch advanced.

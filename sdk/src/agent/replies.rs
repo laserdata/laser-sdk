@@ -1,10 +1,14 @@
-use crate::agent::consumer::{AgentMessage, decode_agent_record};
+use crate::agent::consumer::{AgentMessage, DEAD_LETTER_REASON_DETAIL, decode_agent_record};
 use crate::error::LaserError;
 use crate::poll::{TopicFollower, bounded_partitions};
 use crate::types::MessageId;
 use dashmap::DashMap;
 use iggy::prelude::*;
-use laser_wire::agent::{AgentKind, OPERATION_TASK, TaskState};
+use laser_wire::agent::{
+    AgentErrorBody, AgentKind, DeadLetterReason, OPERATION_TASK, RecordId, TaskState,
+};
+use laser_wire::framing::decode_named;
+use laser_wire::query::Value;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -67,10 +71,12 @@ struct ReplyWaiterState {
 
 // What a record must carry to answer one request: the request's session, a
 // reply kind, and, when the request named its sender, that sender as the
-// addressee.
+// addressee. A request that names its command record is not answered by an
+// earlier copy of it that expired unconsumed.
 pub(crate) struct ExpectedReply {
     pub(crate) session: crate::types::ConversationId,
     pub(crate) requester: Option<String>,
+    pub(crate) command: Option<RecordId>,
 }
 
 impl ExpectedReply {
@@ -81,6 +87,13 @@ impl ExpectedReply {
         let addressee = match &message.envelope {
             Some(envelope) => {
                 if !matches!(envelope.kind, AgentKind::Response | AgentKind::Error) {
+                    return false;
+                }
+                if let (Some(command), Some(cause)) = (self.command, envelope.cause)
+                    && cause != command
+                    && envelope.kind == AgentKind::Error
+                    && dropped_unconsumed(message)
+                {
                     return false;
                 }
                 envelope
@@ -109,6 +122,23 @@ impl ExpectedReply {
                     && envelope.task_state == Some(TaskState::Working)
             })
     }
+}
+
+// Whether the target answered that its consumer dropped the command past its
+// deadline, before any handler ran.
+pub(crate) fn dropped_unconsumed(reply: &AgentMessage) -> bool {
+    let Some(envelope) = &reply.envelope else {
+        return false;
+    };
+    decode_named::<AgentErrorBody>(&envelope.body)
+        .ok()
+        .and_then(|body| body.detail)
+        .and_then(|detail| match detail.get(DEAD_LETTER_REASON_DETAIL) {
+            Some(Value::Uint(code)) => Some(*code),
+            Some(Value::Int(code)) => u64::try_from(*code).ok(),
+            _ => None,
+        })
+        .is_some_and(|code| code == u64::from(DeadLetterReason::DeadlineExceeded.code()))
 }
 
 impl ReplyHubInner {

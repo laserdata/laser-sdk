@@ -1,8 +1,9 @@
 import assert from "node:assert/strict"
 import { createServer, type Server } from "node:net"
 import { test } from "node:test"
+import { setTimeout as sleep } from "node:timers/promises"
 import { connectOptions } from "../../src/client/connect-options.js"
-import { ConfigError, TimeoutError } from "../../src/client/errors.js"
+import { CancelledError, ConfigError, TimeoutError } from "../../src/client/errors.js"
 import { Laser } from "../../src/client/laser.js"
 import { OPEN_CAPABILITIES } from "../../src/client/capabilities.js"
 import type { IggyClient } from "../../src/iggy/apache-iggy.js"
@@ -189,4 +190,33 @@ void test("given_an_unmanaged_set_polled_faster_than_a_second_when_a_second_pass
   await Promise.all([laser.capabilities(), laser.capabilities(), laser.capabilities()])
   assert.equal(probes, 3 * perProbe)
   await laser.close()
+})
+
+void test("given_a_connect_sweeping_a_refusing_server_when_aborted_then_should_stop_dialing_at_once", async () => {
+  let dials = 0
+  const server = createServer((socket) => {
+    dials += 1
+    socket.destroy()
+  })
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  const address = server.address()
+  if (address === null || typeof address === "string") throw new Error("no TCP address")
+  const controller = new AbortController()
+  try {
+    const connecting = Laser.builder()
+      .connectionString(`iggy:iggy@127.0.0.1:${String(address.port)}?reconnection_interval=20ms`)
+      .connectTimeout(10_000)
+      .connect({ signal: controller.signal })
+    for (let wait = 0; wait < 200 && dials === 0; wait += 1) await sleep(10)
+    assert.ok(dials > 0)
+    controller.abort()
+    await assert.rejects(connecting, CancelledError)
+    // A dial already on its way may still land.
+    await sleep(50)
+    const afterAbort = dials
+    await sleep(500)
+    assert.equal(dials, afterAbort, "the aborted connect kept dialing")
+  } finally {
+    server.close()
+  }
 })

@@ -111,6 +111,69 @@ void test(
   }
 )
 
+void test(
+  "given_failed_agent_startup_when_waiting_again_and_shutting_down_then_should_raise_the_same_cause",
+  { timeout: 1000 },
+  async () => {
+    const handle = builder()
+      .build()
+      .spawn({} as Laser)
+    await assert.rejects(handle.ready(), NoStreamError)
+    await assert.rejects(handle.ready(), NoStreamError)
+    await assert.rejects(handle.shutdown(), NoStreamError)
+  }
+)
+
+void test(
+  "given_an_agent_shut_down_before_it_becomes_ready_when_waiting_for_ready_then_should_report_the_stop",
+  { timeout: 1000 },
+  async (t) => {
+    // The run never reports ready and ends cleanly once shutdown is asked.
+    t.mock.method(
+      ReliableConsumer.prototype,
+      "run",
+      async (_laser: Laser, _handler: AgentHandler, control: ReliableConsumerControl) => {
+        await new Promise<void>((resolve) => {
+          control.signal?.addEventListener(
+            "abort",
+            () => {
+              resolve()
+            },
+            { once: true }
+          )
+        })
+      }
+    )
+    const handle = builder()
+      .build()
+      .spawn({} as Laser)
+    await handle.shutdown()
+    await assert.rejects(handle.ready(), stoppedBeforeReady)
+    await assert.rejects(handle.ready(), stoppedBeforeReady)
+  }
+)
+
+void test(
+  "given_a_wait_that_reported_a_clean_stop_when_shutting_down_then_should_report_the_stop_again",
+  { timeout: 1000 },
+  async (t) => {
+    t.mock.method(ReliableConsumer.prototype, "run", () => Promise.resolve())
+    const handle = builder()
+      .build()
+      .spawn({} as Laser)
+    await assert.rejects(handle.ready(), stoppedBeforeReady)
+    await assert.rejects(handle.shutdown(), stoppedBeforeReady)
+  }
+)
+
+// The error and wording Rust and Python report for a run that ended without
+// an error before the agent became ready.
+function stoppedBeforeReady(error: unknown): boolean {
+  return (
+    error instanceof HandlerConfigError && error.message === "agent stopped before it became ready"
+  )
+}
+
 // The consumer reports ready and parks until shutdown, then drains for `settleMs`.
 function parkedRun(t: TestContext, settleMs = 0): void {
   t.mock.method(

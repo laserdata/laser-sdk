@@ -87,6 +87,17 @@ impl std::str::FromStr for FieldPath {
     }
 }
 
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for FieldPath {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "FieldPath".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "description": "A field path such as `order.total`", "type": "string" })
+    }
+}
+
 impl Serialize for FieldPath {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(self)

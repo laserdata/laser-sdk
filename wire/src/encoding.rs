@@ -10,7 +10,9 @@
 // accepts both shapes explicitly: a byte string via `visit_bytes` (the binary
 // band, with no reliance on a CBOR library's leniency about routing a byte
 // string through the sequence path) and an array of `u8` via `visit_seq` (the
-// JSON surface). Any other type fails, so wrong-typed data is rejected.
+// JSON surface). A human-readable format also accepts text as its UTF-8 bytes,
+// so a JSON caller can write a key as `"user-1"`. Any other type fails, so
+// wrong-typed data is rejected, and a binary format never takes text.
 
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserializer, Serialize, Serializer};
@@ -56,7 +58,37 @@ impl<'de> Visitor<'de> for ByteVecVisitor {
     }
 }
 
-/// `Vec<u8>` as a CBOR byte string (or a JSON array of bytes on the HTTP view).
+struct ByteTextVisitor;
+
+impl<'de> Visitor<'de> for ByteTextVisitor {
+    type Value = Vec<u8>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("UTF-8 text or an array of bytes")
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(v.as_bytes().to_vec())
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(v.into_bytes())
+    }
+
+    fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+        ByteVecVisitor.visit_bytes(v)
+    }
+
+    fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+        ByteVecVisitor.visit_byte_buf(v)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+        ByteVecVisitor.visit_seq(seq)
+    }
+}
+
+/// `Vec<u8>` as a CBOR byte string, or on the JSON view an array of bytes, also read from UTF-8 text.
 pub(crate) mod bin_bytes {
     use super::*;
 
@@ -65,7 +97,11 @@ pub(crate) mod bin_bytes {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        deserializer.deserialize_any(ByteVecVisitor)
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(ByteTextVisitor)
+        } else {
+            deserializer.deserialize_any(ByteVecVisitor)
+        }
     }
 }
 
@@ -201,8 +237,16 @@ pub(crate) mod opt_u128_text {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     #[derive(Deserialize, Serialize)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
     #[serde(transparent)]
-    struct OperationId(#[serde(with = "super::u128_text")] u128);
+    struct OperationId(
+        #[cfg_attr(
+            feature = "schemars",
+            schemars(schema_with = "crate::encoding::u128_schema")
+        )]
+        #[serde(with = "super::u128_text")]
+        u128,
+    );
 
     pub fn serialize<S: Serializer>(
         value: &Option<u128>,
@@ -219,15 +263,100 @@ pub(crate) mod opt_u128_text {
     }
 }
 
+/// JSON Schema of a byte field: UTF-8 text or an array of byte values.
+#[cfg(feature = "schemars")]
+pub(crate) fn bytes_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "description": "Bytes, written as UTF-8 text or as an array of byte values",
+        "anyOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } }
+        ]
+    })
+}
+
+/// JSON Schema of an optional byte field.
+#[cfg(feature = "schemars")]
+pub(crate) fn opt_bytes_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let bytes = bytes_schema(generator);
+    schemars::json_schema!({ "anyOf": [bytes, { "type": "null" }] })
+}
+
+/// JSON Schema of a list of byte fields.
+#[cfg(feature = "schemars")]
+pub(crate) fn vec_bytes_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let bytes = bytes_schema(generator);
+    schemars::json_schema!({ "type": "array", "items": bytes })
+}
+
+/// JSON Schema of a fixed-length byte field, an array of `length` byte values.
+#[cfg(feature = "schemars")]
+pub(crate) fn fixed_bytes_schema(
+    _: &mut schemars::SchemaGenerator,
+    length: usize,
+) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "items": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "minItems": length,
+        "maxItems": length
+    })
+}
+
+/// JSON Schema of an RFC 6902 JSON Patch.
+#[cfg(feature = "schemars")]
+pub(crate) fn json_patch_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "description": "RFC 6902 JSON Patch operations",
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "op": { "enum": ["add", "remove", "replace", "move", "copy", "test"] },
+                "path": { "type": "string" },
+                "from": { "type": "string" },
+                "value": {}
+            },
+            "required": ["op", "path"]
+        }
+    })
+}
+
+/// JSON Schema of a `u128` carried as decimal text.
+#[cfg(feature = "schemars")]
+pub(crate) fn u128_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "description": "Unsigned 128-bit integer as decimal text",
+        "type": "string",
+        "pattern": "^[0-9]+$"
+    })
+}
+
+/// JSON Schema of an optional `u128` carried as decimal text.
+#[cfg(feature = "schemars")]
+pub(crate) fn opt_u128_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let text = u128_schema(generator);
+    schemars::json_schema!({ "anyOf": [text, { "type": "null" }] })
+}
+
 #[cfg(all(test, feature = "cbor"))]
 mod tests {
     use crate::framing::{decode_named, encode_named};
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
     struct WithBytes {
+        #[cfg_attr(
+            feature = "schemars",
+            schemars(schema_with = "crate::encoding::bytes_schema")
+        )]
         #[serde(with = "super::bin_bytes")]
         payload: Vec<u8>,
+        #[cfg_attr(
+            feature = "schemars",
+            schemars(schema_with = "crate::encoding::opt_bytes_schema")
+        )]
         #[serde(default, with = "super::opt_bin_bytes")]
         opt: Option<Vec<u8>>,
     }
@@ -255,6 +384,37 @@ mod tests {
         assert!(json.contains("[255,0,16]"), "bytes render as a JSON array");
         let back: WithBytes = serde_json::from_str(&json).expect("json decodes");
         assert_eq!(back, value);
+    }
+
+    #[test]
+    fn given_text_for_a_byte_field_when_decoded_from_json_then_should_take_its_utf8_bytes() {
+        let back: WithBytes =
+            serde_json::from_str(r#"{"payload":"user-1","opt":"x"}"#).expect("json decodes");
+        assert_eq!(back.payload, b"user-1".to_vec());
+        assert_eq!(back.opt, Some(b"x".to_vec()));
+    }
+
+    #[cfg(feature = "schemars")]
+    #[test]
+    fn given_a_kv_request_when_its_schema_is_built_then_should_take_text_or_bytes_for_the_key() {
+        let schema = serde_json::to_value(schemars::schema_for!(crate::kv::KvGet)).expect("schema");
+        let key = &schema["properties"]["key"];
+        assert_eq!(key["anyOf"][0]["type"], "string", "{schema}");
+        assert_eq!(key["anyOf"][1]["type"], "array", "{schema}");
+        let request: crate::kv::KvGet = serde_json::from_value(
+            serde_json::json!({"v": 1, "namespace": "state", "key": "user-1"}),
+        )
+        .expect("a text key decodes");
+        assert_eq!(request.key, b"user-1".to_vec());
+    }
+
+    #[cfg(feature = "schemars")]
+    #[test]
+    fn given_a_wire_id_when_its_schema_is_built_then_should_be_26_character_text() {
+        let schema = serde_json::to_value(schemars::schema_for!(crate::agent::ConversationId))
+            .expect("schema");
+        assert_eq!(schema["type"], "string");
+        assert_eq!(schema["minLength"], 26);
     }
 
     #[test]
@@ -287,6 +447,7 @@ mod tests {
         // A non-bytes, non-array value (here a string) must fail rather than
         // silently coerce.
         #[derive(Serialize)]
+        #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
         struct AsString {
             payload: &'static str,
             opt: Option<Vec<u8>>,

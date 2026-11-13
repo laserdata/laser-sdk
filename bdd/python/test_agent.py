@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import laser_sdk as ls
-from pytest_bdd import parsers, scenarios, then, when
+from pytest_bdd import given, parsers, scenarios, then, when
 
 # Background and the shared command / assemble / payload steps live in conftest.py.
 SCENARIOS = Path(__file__).parent.parent / "scenarios"
@@ -69,3 +69,35 @@ def receiver_rejects(world):
 @then("the receiver understands it")
 def receiver_understands(world):
     assert world.agent_event_understood is True
+
+
+async def _idle(_ctx, _message):
+    return None
+
+
+@given(parsers.parse('agent "{name}" advertising the skill "{skill}" is ready on this connection'))
+def advertising_agent_ready(world, name, skill):
+    async def spawn():
+        # The agent runs on the scenario's loop, so it is spawned inside it.
+        worker = world.laser.spawn_agent(name, ls.AgentTopic.Sessions, _idle, capabilities=[skill])
+        await worker.ready()
+        return worker
+
+    world.first_worker = world.run(spawn)
+
+
+@when(parsers.parse('agent "{name}" advertising the skill "{skill}" starts on the same connection'))
+def second_advertising_agent(world, name, skill):
+    async def spawn():
+        return world.laser.spawn_agent(name, ls.AgentTopic.Sessions, _idle, capabilities=[skill])
+
+    world.second_worker = world.run(spawn)
+
+
+@then("waiting for the second agent to be ready fails with a presence conflict")
+def second_ready_conflict(world):
+    try:
+        world.capture(lambda: world.second_worker.ready())
+        assert isinstance(world.error, ls.PresenceConflictError), repr(world.error)
+    finally:
+        world.run(lambda: world.first_worker.shutdown())

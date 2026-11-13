@@ -44,7 +44,7 @@ pub(crate) use consumer::decode_agent_record;
 pub(crate) use consumer::provenance_and_envelope;
 pub use consumer::{
     AgentHandler, AgentMessage, AgentMiddleware, ConcurrencyPolicy, DeadLetterSink, Deduplicator,
-    LocalAgentHandler, ReliableConsumer, RetryPolicy, SlidingWindow,
+    LocalAgentHandler, ReliableConsumer, RetryPolicy, SlidingWindow, WarmDedupPolicy,
 };
 pub use contract::{Contract, ContractBuilder, ScatterOutcome, ScatterReport};
 pub use control::PendingControl;

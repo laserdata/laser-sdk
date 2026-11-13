@@ -1,6 +1,6 @@
 import { type BytesLike, ownedBytes } from "./client/bytes.js"
 import { type CallOptions, abortable, cancellable, throwIfAborted } from "./client/call-options.js"
-import { InvalidError } from "./client/errors.js"
+import { InvalidError, SessionError } from "./client/errors.js"
 import type { AgdxReceipt } from "./agent/agdx.js"
 import { type ContextMessage, contextMessageBody } from "./context.js"
 import { warn } from "./runtime/warn.js"
@@ -21,7 +21,7 @@ import {
 import { decodeOne, encodeNamed, expectMap } from "./wire/cbor.js"
 import { OPERATION_EXECUTE_TOOL } from "./wire/dispatch.js"
 import type { CorrelationId } from "./wire/ids.js"
-import { applyJsonPatch } from "./wire/json-patch.js"
+import { applyJsonPatch, equalJson } from "./wire/json-patch.js"
 import type { SessionStateView } from "./wire/session.js"
 
 // Keys whose values the default redaction drops from tool arguments and model
@@ -254,10 +254,16 @@ export class SessionState {
     })
   }
 
-  /** Write the whole document this handle holds as a snapshot. */
+  /** Write the whole document this handle holds as a snapshot. Fails with
+   * the stale session error, writing nothing, when the session's document is
+   * no longer the one this handle holds, so a handle whose earlier write did
+   * not apply never overwrites a later change. */
   snapshot(options: CallOptions = {}): Promise<AgdxReceipt> {
     return this.exclusive(options, async () => {
-      await this.seed(options)
+      if (!(await this.holdsCurrent(options))) {
+        const message = "the session state changed since this handle's last write"
+        throw new SessionError(`stale session generation: ${message}`, { kind: "stale", message })
+      }
       return this.writeSnapshot(options)
     })
   }
@@ -306,7 +312,7 @@ export class SessionState {
     this.cursor.sinceSnapshot += 1
     if (this.cursor.sinceSnapshot >= SNAPSHOT_EVERY_DELTAS) {
       try {
-        await this.writeSnapshot(options)
+        if (await this.holdsCurrent(options)) await this.writeSnapshot(options)
       } catch (error) {
         warn(
           `Writing the automatic state snapshot of session ${this.session.conversation.toString()} failed, the next write retries it: ${String(error)}`
@@ -361,13 +367,36 @@ export class SessionState {
     return this.cursor.document !== undefined
   }
 
-  /** @internal */
+  /** A stale handle ends its session without writing state, as a stale delta
+   * leaves the document to the writer that won.
+   * @internal */
   snapshotIfChanged(options: CallOptions = {}): Promise<void> {
     return this.exclusive(options, async () => {
       if (this.cursor.sinceSnapshot === 0) return
-      await this.seed(options)
-      await this.writeSnapshot(options)
+      if (await this.holdsCurrent(options)) await this.writeSnapshot(options)
     })
+  }
+
+  // Whether the session's current document is the one this handle holds. A
+  // delta written against a stale base never applied, yet the handle counted
+  // it, so its revision can name the revision the session reached through
+  // another writer with a document nobody applied. An unseeded handle is
+  // seeded and holds the current document by construction. A stale handle
+  // reseeds on its next write.
+  private async holdsCurrent(options: CallOptions): Promise<boolean> {
+    if (!this.seeded()) {
+      await this.seed(options)
+      return true
+    }
+    const view = await this.currentView(options)
+    if (
+      view.revision === this.cursor.revision &&
+      equalJson(view.document ?? {}, this.cursor.document)
+    ) {
+      return true
+    }
+    this.cursor.document = undefined
+    return false
   }
 
   /** Fold the state from the whole retained session lane: the newest snapshot
@@ -394,9 +423,13 @@ export class SessionState {
         )
         if (snapshot === undefined) continue
         // The first snapshot is the baseline. A later one counts only at the
-        // revision the fold has reached, so a stale snapshot from a second
-        // writer changes nothing.
-        if (complete && snapshot.baseRevision !== revision) continue
+        // revision the fold has reached and with the document it holds, so a
+        // stale snapshot from a second writer changes nothing.
+        if (
+          complete &&
+          (snapshot.baseRevision !== revision || !equalJson(snapshot.document, document))
+        )
+          continue
         document = snapshot.document
         revision = snapshot.baseRevision
         complete = true

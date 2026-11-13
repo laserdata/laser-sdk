@@ -1,6 +1,8 @@
 #![cfg(feature = "cbor")]
 
-use laser_wire::agent::{ContextManifest, Fragment, StateDelta, StateSnapshot, apply_json_patch};
+use laser_wire::agent::{
+    ContextManifest, Fragment, StateDelta, StateSnapshot, apply_json_patch, equal_json,
+};
 use laser_wire::framing::decode_named;
 use laser_wire::schema::Digest32;
 use laser_wire::validate::Validate;
@@ -84,4 +86,54 @@ fn state_json_rejects_integers_that_typescript_cannot_represent_exactly() {
     }))
     .expect("patch shape");
     assert!(delta.validate().is_err());
+}
+
+#[test]
+fn given_a_whole_float_in_the_document_when_a_patch_tests_it_as_an_integer_then_should_apply() {
+    let document = serde_json::json!({"progress": 1.0});
+    let patch = |value: u64| -> Vec<json_patch::PatchOperation> {
+        serde_json::from_value(serde_json::json!([
+            {"op": "test", "path": "/progress", "value": value},
+            {"op": "add", "path": "/done", "value": true}
+        ]))
+        .expect("patch shape")
+    };
+    assert_eq!(
+        apply_json_patch(&document, &patch(1)).expect("the same number passes the test"),
+        serde_json::json!({"progress": 1.0, "done": true})
+    );
+    assert!(apply_json_patch(&document, &patch(2)).is_err());
+}
+
+#[test]
+fn given_a_whole_number_written_as_a_float_and_as_an_integer_when_compared_then_should_be_equal() {
+    assert!(equal_json(
+        &serde_json::json!({"progress": 1.0, "items": [0.0, {"depth": -2.0}]}),
+        &serde_json::json!({"items": [0, {"depth": -2}], "progress": 1}),
+    ));
+    assert!(equal_json(&serde_json::json!(-0.0), &serde_json::json!(0)));
+    assert!(equal_json(
+        &serde_json::json!(9_007_199_254_740_991.0),
+        &serde_json::json!(9_007_199_254_740_991_u64),
+    ));
+}
+
+#[test]
+fn given_documents_that_differ_when_compared_then_should_be_unequal() {
+    let document = serde_json::json!({"progress": 1, "items": [1, {"depth": 2}]});
+    for other in [
+        serde_json::json!({"progress": 1.5, "items": [1, {"depth": 2}]}),
+        serde_json::json!({"progress": 1, "items": [1, {"depth": 3}]}),
+        serde_json::json!({"progress": 1, "items": [1, {"depth": 2}, 3]}),
+        serde_json::json!({"progress": 1, "items": [1, {"depth": 2}], "done": true}),
+        serde_json::json!({"progress": "1", "items": [1, {"depth": 2}]}),
+        serde_json::json!({"progress": -1, "items": [1, {"depth": 2}]}),
+    ] {
+        assert!(!equal_json(&document, &other), "{other}");
+    }
+    // 2^53 as a float is not the integer one above it.
+    assert!(!equal_json(
+        &serde_json::json!(9_007_199_254_740_992.0),
+        &serde_json::json!(9_007_199_254_740_993_u64),
+    ));
 }

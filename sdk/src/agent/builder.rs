@@ -1,6 +1,6 @@
 use crate::agent::consumer::{
     AgentHandler, AgentMiddleware, ConcurrencyPolicy, DeadLetterSink, Deduplicator,
-    ReliableConsumer, RetryPolicy,
+    ReliableConsumer, RetryPolicy, WarmDedupPolicy,
 };
 use crate::agent::router::InboxRoute;
 use crate::error::LaserError;
@@ -69,8 +69,14 @@ pub struct Agent<H> {
     pub max_queued_records: Option<usize>,
     /// Override the total payload and header bytes buffered across partition lanes.
     pub max_queued_bytes: Option<usize>,
+    /// Refill the dedup window from the records the group already committed
+    /// when the agent starts. Off by default.
     #[builder(default)]
     pub warm_dedup: bool,
+    /// Which committed records refill the window when `warm_dedup` is on.
+    /// Defaults to [`WarmDedupPolicy::DeadLetters`].
+    #[builder(default)]
+    pub warm_dedup_policy: WarmDedupPolicy,
     /// Cross-cutting hooks wrapped around each handler dispatch, in order, for
     /// auth, metrics, and tracing without touching the handler.
     #[builder(default)]
@@ -192,6 +198,7 @@ where
         let ack_on_pickup = self.ack_on_pickup;
         let max_wait = self.max_wait;
         let warm_dedup = self.warm_dedup;
+        let warm_dedup_policy = self.warm_dedup_policy;
         let deduplicator = self.deduplicator;
         let shutdown_grace = self.shutdown_grace;
         let concurrency = self.concurrency;
@@ -251,6 +258,7 @@ where
                     .maybe_max_queued_records(max_queued_records)
                     .maybe_max_queued_bytes(max_queued_bytes)
                     .warm_dedup(warm_dedup)
+                    .warm_dedup_policy(warm_dedup_policy)
                     .maybe_deduplicator(deduplicator)
                     .maybe_dedup_window(dedup_window)
                     .maybe_retry(retry)
@@ -419,7 +427,9 @@ pub struct AgentHandle {
 
 impl AgentHandle {
     /// Wait until the agent has joined its group and is polling, so a publish after
-    /// this is delivered rather than racing the join. Idempotent.
+    /// this is delivered rather than racing the join. Idempotent. When the
+    /// runtime stopped before it became ready, the first call returns the error
+    /// it stopped with and every later call reports that it stopped.
     pub async fn ready(&mut self) -> Result<(), LaserError> {
         if let Some(ready) = self.ready.take()
             && ready.await.is_err()
@@ -432,6 +442,9 @@ impl AgentHandle {
                     Ok(Ok(())) => {}
                 }
             }
+        }
+        // Only a failed wait takes the task, `shutdown` and `join` consume the handle.
+        if self.task.is_none() {
             return Err(LaserError::HandlerConfig(
                 "agent stopped before it became ready".to_owned(),
             ));
@@ -633,6 +646,46 @@ mod tests {
             handle.shutdown().await,
             Err(LaserError::HandlerConfig(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn given_a_failed_ready_when_waiting_again_then_should_report_the_stop() {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        let mut handle = Agent::builder()
+            .id("planner".parse().expect("valid agent id"))
+            .listen_on(AgentTopic::Sessions)
+            .handler(IgnoreHandler)
+            .build()
+            .spawn(laser);
+        assert!(matches!(handle.ready().await, Err(LaserError::NoStream)));
+        assert!(matches!(
+            handle.ready().await,
+            Err(LaserError::HandlerConfig(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn given_a_run_that_ends_cleanly_before_ready_when_waiting_for_ready_then_should_report_the_stop()
+     {
+        let (shutdown, _stop) = oneshot::channel();
+        let (never_ready, ready) = oneshot::channel();
+        drop(never_ready);
+        let mut handle = AgentHandle {
+            shutdown: Some(shutdown),
+            task: Some(tokio::spawn(async { Ok(()) })),
+            ready: Some(ready),
+            consolidation: None,
+        };
+        let stopped = |outcome: &Result<(), LaserError>| {
+            matches!(outcome, Err(LaserError::HandlerConfig(message))
+                if message == "agent stopped before it became ready")
+        };
+        let first = handle.ready().await;
+        assert!(stopped(&first), "{first:?}");
+        let again = handle.ready().await;
+        assert!(stopped(&again), "{again:?}");
+        let shutdown = handle.shutdown().await;
+        assert!(stopped(&shutdown), "{shutdown:?}");
     }
 
     #[tokio::test]

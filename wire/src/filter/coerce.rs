@@ -19,6 +19,7 @@ const MAX_DECIMAL_DIGITS: usize = 512;
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum TimestampFormat {

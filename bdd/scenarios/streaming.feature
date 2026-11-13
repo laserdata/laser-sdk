@@ -23,3 +23,7 @@ Feature: Streaming core
     And I publish a JSON event to topic "readings"
     And I publish a JSON event to topic "alerts"
     Then the publish succeeds
+
+  Scenario: Publish a batch to a missing topic without bootstrap
+    When I publish a batch of 3 JSON events to topic "created-by-publish"
+    Then all 3 events are published

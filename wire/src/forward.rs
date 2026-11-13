@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// client asked. A record the backend or the streaming server issues on its own
 /// carries none.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Caller {
     /// The authenticated user. The root user is id zero.
     pub user_id: u32,
@@ -24,6 +25,7 @@ pub struct Caller {
 
 /// Trusted stream identity stamped by the server before forwarding a session request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ForwardedScope {
     pub stream_id: u32,
     pub stream: String,
@@ -33,6 +35,7 @@ pub struct ForwardedScope {
 /// A forwarded managed query. Carries the authenticated identity the SDK cannot
 /// set itself, plus the opaque request the SDK sent. CBOR-encoded, named fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ForwardedQuery {
     /// Authenticated identity. Audit today, per-user stream scoping later.
     /// Trusted: set by the server, not the client.
@@ -43,6 +46,10 @@ pub struct ForwardedQuery {
     /// `gen_ai.conversation.id` echoed for the audit log, never used to route.
     pub correlation: Option<String>,
     /// Opaque CBOR `QueryEnvelope` from the SDK, not decoded in transit.
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub query_envelope: Vec<u8>,
     /// The caller's effective capability grants, stamped by the server. Empty
@@ -65,6 +72,7 @@ pub struct ForwardedQuery {
 /// `command_code` and the backend dispatches on it. `payload` is the opaque
 /// CBOR request the SDK sent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ForwardedCommand {
     /// The client that asked, stamped by the server, so the SDK cannot set it.
     /// The backend records it and authorizes with `grants`. Absent on a request
@@ -92,6 +100,10 @@ pub struct ForwardedCommand {
     /// dispatches on it.
     pub command_code: u32,
     /// Opaque CBOR request the SDK sent, not decoded in transit.
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub payload: Vec<u8>,
     /// The caller's effective capability grants, stamped by the server. Empty
@@ -265,6 +277,7 @@ mod tests {
     #[test]
     fn given_a_caller_with_an_empty_agent_when_decoded_then_should_be_refused() {
         #[derive(serde::Serialize)]
+        #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
         struct Unchecked<'a> {
             user_id: u32,
             agent: &'a str,

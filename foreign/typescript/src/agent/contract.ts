@@ -6,7 +6,7 @@ import { INTERNAL_REPLY_HUB, INTERNAL_VERIFIER } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import type { AgdxSend } from "./agdx.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
-import { ConversationId, type AgentId } from "../types/ids.js"
+import { ConversationId, MintUlid, type AgentId } from "../types/ids.js"
 import {
   type IdempotencyKey,
   AgentKind,
@@ -15,21 +15,15 @@ import {
   METADATA_SUBMITTED,
   OPERATION_SESSION,
   TaskStateName,
-  deadLetterReasonCode,
-  decodeAgentErrorBody,
   encodeSessionStart,
   taskStateFromCode
 } from "../wire/agent.js"
-import { decodeOne, encodeNamed, expectMap } from "../wire/cbor.js"
+import { encodeNamed } from "../wire/cbor.js"
 import { ContentType } from "../wire/content.js"
 import type { Session } from "../session.js"
 import { FENCE } from "../wire/headers.js"
-import { ConversationId as WireConversationId, CorrelationId } from "../wire/ids.js"
-import {
-  DEAD_LETTER_REASON_DETAIL,
-  agentMessageBody,
-  type AgentMessage
-} from "./reliable-consumer.js"
+import { ConversationId as WireConversationId, CorrelationId, RecordId } from "../wire/ids.js"
+import { agentMessageBody, type AgentMessage } from "./reliable-consumer.js"
 import {
   type Branch,
   type BranchResult,
@@ -39,7 +33,7 @@ import {
   gatherSatisfied,
   validateGatherPolicy
 } from "./context.js"
-import type { ExpectedReply, ReplyStreamTicket } from "./replies.js"
+import { type ExpectedReply, type ReplyStreamTicket, droppedUnconsumed } from "./replies.js"
 import {
   ADVERTISED_INBOX_ROUTE,
   requiredPrincipal,
@@ -358,7 +352,13 @@ export class ContractBuilder {
     )
     const conversation = this.conversationId ?? ConversationId.new()
     const correlation = this.correlationId ?? CorrelationId.parse(ConversationId.new().toString())
-    const expected: ExpectedReply = { session: conversation, requester: source.asStr() }
+    // Minted here so an earlier copy's expiry answer never settles this send.
+    const record = MintUlid.mint(RecordId)
+    const expected: ExpectedReply = {
+      session: conversation,
+      requester: source.asStr(),
+      command: record
+    }
     const hub = await this.laser[INTERNAL_REPLY_HUB](this.replyTopic, source)
     const ticket = hub.subscribeStream(correlation.toString(), resolved.expectedSigner, expected)
     try {
@@ -398,7 +398,9 @@ export class ContractBuilder {
         if (landed !== undefined) {
           outcome = terminal(landed)
         } else {
-          await this.command(source, resolved, conversation, correlation).send(options)
+          await this.command(source, resolved, conversation, correlation)
+            .withRecord(record)
+            .send(options)
           outcome = await this.watch(ticket, resolved.expectedSigner, options.signal)
         }
       } catch (error) {
@@ -481,26 +483,7 @@ export class ContractBuilder {
 function terminal(reply: AgentMessage): Contract {
   const envelope = reply.envelope
   if (envelope?.kind !== AgentKind.Error) return { kind: "completed", reply }
-  return droppedUnconsumed(envelope.body) ? { kind: "notConsumed" } : { kind: "failed", reply }
-}
-
-// Whether the target answered that its consumer dropped the command past its
-// deadline, before any handler ran.
-function droppedUnconsumed(body: Uint8Array): boolean {
-  try {
-    const context = "AGDX error body"
-    const reason = decodeAgentErrorBody(
-      expectMap(decodeOne(body, context), context),
-      context
-    ).detail?.get(DEAD_LETTER_REASON_DETAIL)
-    return (
-      reason !== undefined &&
-      (reason.kind === "int" || reason.kind === "uint") &&
-      reason.value === BigInt(deadLetterReasonCode({ kind: "known", name: "DeadlineExceeded" }))
-    )
-  } catch {
-    return false
-  }
+  return droppedUnconsumed(envelope) ? { kind: "notConsumed" } : { kind: "failed", reply }
 }
 
 /** Scatter a contract to every agent advertising the selector's skill and

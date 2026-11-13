@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -41,6 +42,7 @@ pub enum Effect {
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -122,6 +124,7 @@ pub fn split_scoped_resource(name: &str) -> Option<(&str, &str)> {
 /// How a deployment scopes its managed resources, as its replicated
 /// authorization state records it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Tenancy {
     /// One deployment-wide namespace. Every grant pattern is accepted.
@@ -199,6 +202,7 @@ fn prefix_stream(prefix: &str) -> Option<&str> {
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -229,6 +233,7 @@ pub enum Action {
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -244,6 +249,7 @@ pub enum ResourceKind {
 
 /// A resource selector on a grant: literal, prefixed, or the whole feature.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ResourcePattern {
     #[serde(default)]
     pub kind: ResourceKind,
@@ -288,6 +294,7 @@ impl ResourcePattern {
 /// One capability grant: an effect on a `feature:action`, optionally scoped to a
 /// resource pattern.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Grant {
     pub effect: Effect,
     pub feature: Feature,
@@ -299,6 +306,7 @@ pub struct Grant {
 /// A named set of grants, bound to users. A user's effective capability is the
 /// union of the grants of every bound role, minus any matching deny.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Role {
     pub name: String,
     pub grants: Vec<Grant>,
@@ -306,6 +314,7 @@ pub struct Role {
 
 /// The roles bound to one user (by the server-stamped `user_id`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RoleBinding {
     pub user_id: u32,
     pub roles: Vec<String>,
@@ -490,12 +499,14 @@ pub fn delegated_allow(
 
 /// Request the caller's own effective capabilities.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct WhoamiReq {
     pub v: u32,
 }
 
 /// The caller's bound roles and their flattened grants.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct WhoamiReply {
     pub v: u32,
     pub roles: Vec<String>,
@@ -505,6 +516,7 @@ pub struct WhoamiReply {
 /// Request to list roles, optionally filtered. Absent filters list every role,
 /// the same bounded-registry browse as `ListProjections`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ListRolesReq {
     pub v: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -515,6 +527,7 @@ pub struct ListRolesReq {
 
 /// Every matching role with its full grant set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ListRolesReply {
     pub v: u32,
     pub roles: Vec<Role>,
@@ -522,6 +535,7 @@ pub struct ListRolesReply {
 
 /// Request one role by name.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GetRoleReq {
     pub v: u32,
     pub name: String,
@@ -529,6 +543,7 @@ pub struct GetRoleReq {
 
 /// Request one user's bound role names.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GetBindingsReq {
     pub v: u32,
     pub user_id: u32,
@@ -536,6 +551,7 @@ pub struct GetBindingsReq {
 
 /// One user's bound role names and the binding revision they were read at.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct BindingsReply {
     pub v: u32,
     pub roles: Vec<String>,
@@ -547,6 +563,7 @@ pub struct BindingsReply {
 
 /// Define or replace a role (upsert, carries the full grant set).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct DefineRoleReq {
     pub v: u32,
     pub role: Role,
@@ -556,6 +573,7 @@ pub struct DefineRoleReq {
 
 /// Delete a role by name.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct DeleteRoleReq {
     pub v: u32,
     pub name: String,
@@ -565,6 +583,7 @@ pub struct DeleteRoleReq {
 
 /// Bind roles to a user (replace the user's whole role set).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct BindRolesReq {
     pub v: u32,
     pub user_id: u32,
@@ -582,6 +601,7 @@ pub struct BindRolesReq {
 
 /// Which authorization subject an [`AuthzHistoryReq`] reads the change log of.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AuthzSubject {
     /// One role by name.
@@ -598,6 +618,7 @@ pub enum AuthzSubject {
 /// Read the authorization change history for a subject, paged by revision. The
 /// audit surface the first compliance conversation opens: who granted what, when.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AuthzHistoryReq {
     pub v: u32,
     pub subject: AuthzSubject,
@@ -608,6 +629,7 @@ pub struct AuthzHistoryReq {
 
 /// What an [`AuthzEvent`] recorded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AuthzEventKind {
     /// A role was defined or replaced.
@@ -622,6 +644,7 @@ pub enum AuthzEventKind {
 
 /// One recorded authorization change: its revision, who made it, when, and what.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AuthzEvent {
     pub revision: u64,
     pub actor: String,
@@ -635,6 +658,7 @@ pub struct AuthzEvent {
 
 /// A page of authorization change history.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AuthzHistoryReply {
     pub v: u32,
     pub events: Vec<AuthzEvent>,
@@ -644,6 +668,7 @@ pub struct AuthzHistoryReply {
 
 /// Reply to any authorization command, shaped per request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum AuthzReply {
     /// A mutating command applied (`define_role`, `delete_role`, `bind_roles`).
@@ -663,6 +688,7 @@ pub enum AuthzReply {
 
 /// An authorization command failure.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum AuthzError {
     #[error("authz not supported: {0}")]

@@ -9,7 +9,7 @@ use laser_wire::agent::{
     AgentErrorBody, ContextManifest, CorrelationId, Fragment, METADATA_DURATION_MICROS,
     METADATA_PROVIDER_NAME, METADATA_RECORDED, METADATA_REQUEST_MODEL, METADATA_RESPONSE_MODEL,
     OPERATION_CHAT, OPERATION_STATE_DELTA, OPERATION_STATE_SNAPSHOT, SessionRef, StateDelta,
-    StateSnapshot, TokenUsage, apply_json_patch, estimate_tokens,
+    StateSnapshot, TokenUsage, apply_json_patch, equal_json, estimate_tokens,
 };
 use laser_wire::content::ContentType;
 use laser_wire::dispatch::{OPERATION_CONTEXT_ASSEMBLED, OPERATION_EXECUTE_TOOL};
@@ -278,10 +278,19 @@ impl SessionState {
         self.write_delta(&mut cursor, patch).await
     }
 
-    /// Write the whole document this handle holds as a snapshot.
+    /// Write the whole document this handle holds as a snapshot. Fails with
+    /// the stale session error, writing nothing, when the session's document
+    /// is no longer the one this handle holds, so a handle whose earlier
+    /// write did not apply never overwrites a later change.
     pub async fn snapshot(&self) -> Result<AgdxReceipt, LaserError> {
         let mut cursor = self.session.state.lock().await;
-        self.seed(&mut cursor).await?;
+        if !self.holds_current(&mut cursor).await? {
+            return Err(LaserError::Session(
+                laser_wire::session::SessionError::Stale(
+                    "the session state changed since this handle's last write".to_owned(),
+                ),
+            ));
+        }
         self.write_snapshot(&mut cursor).await
     }
 
@@ -319,11 +328,16 @@ impl SessionState {
         cursor.revision += 1;
         cursor.document = Some(next);
         cursor.since_snapshot += 1;
-        if cursor.since_snapshot >= SNAPSHOT_EVERY_DELTAS
-            && let Err(error) = self.write_snapshot(cursor).await
-        {
-            let session = self.session.conversation();
-            warn!(%session, %error, "Writing the automatic state snapshot of session {session} failed, the next write retries it");
+        if cursor.since_snapshot >= SNAPSHOT_EVERY_DELTAS {
+            let written = match self.holds_current(cursor).await {
+                Ok(true) => self.write_snapshot(cursor).await.map(|_| ()),
+                Ok(false) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = written {
+                let session = self.session.conversation();
+                warn!(%session, %error, "Writing the automatic state snapshot of session {session} failed, the next write retries it");
+            }
         }
         Ok(receipt)
     }
@@ -379,13 +393,38 @@ impl SessionState {
         }
     }
 
+    // A stale handle ends its session without writing state, as a stale
+    // delta leaves the document to the writer that won.
     pub(crate) async fn snapshot_if_changed(&self) -> Result<(), LaserError> {
         let mut cursor = self.session.state.lock().await;
-        if cursor.since_snapshot > 0 {
-            self.seed(&mut cursor).await?;
+        if cursor.since_snapshot > 0 && self.holds_current(&mut cursor).await? {
             self.write_snapshot(&mut cursor).await?;
         }
         Ok(())
+    }
+
+    // Whether the session's current document is the one this handle holds.
+    // A delta written against a stale base never applied, yet the handle
+    // counted it, so its revision can name the revision the session reached
+    // through another writer with a document nobody applied. An unseeded
+    // handle is seeded and holds the current document by construction. A
+    // stale handle reseeds on its next write.
+    async fn holds_current(&self, cursor: &mut StateCursor) -> Result<bool, LaserError> {
+        if cursor.document.is_none() {
+            self.seed(cursor).await?;
+            return Ok(true);
+        }
+        let view = self.current_view().await?;
+        if view.revision == cursor.revision
+            && cursor
+                .document
+                .as_ref()
+                .is_some_and(|document| equal_json(document, &view.document))
+        {
+            return Ok(true);
+        }
+        cursor.document = None;
+        Ok(false)
     }
 
     /// Fold the state from the whole retained session lane: the newest
@@ -410,9 +449,13 @@ impl SessionState {
                         continue;
                     }
                     // The first snapshot is the baseline. A later one counts
-                    // only at the revision the fold has reached, so a stale
-                    // snapshot from a second writer changes nothing.
-                    if complete && snapshot.base_revision != revision {
+                    // only at the revision the fold has reached and with the
+                    // document it holds, so a stale snapshot from a second
+                    // writer changes nothing.
+                    if complete
+                        && (snapshot.base_revision != revision
+                            || !equal_json(&snapshot.document, &document))
+                    {
                         continue;
                     }
                     document = snapshot.document;

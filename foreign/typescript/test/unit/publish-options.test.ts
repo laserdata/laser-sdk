@@ -20,6 +20,8 @@ async function transport(send: Send, maxRetries = 2, destroy = () => undefined) 
   const client = {
     clientProvider: () => Promise.resolve({}),
     message: { send },
+    stream: { ensure: () => Promise.resolve() },
+    topic: { get: () => Promise.resolve({ partitionsCount: 1 }) },
     destroy: () => {
       destroy()
       return Promise.resolve()
@@ -171,6 +173,51 @@ void test("given_a_missing_topic_when_publishing_then_should_rebuild_the_routing
     partition: 0
   })
   assert.equal(recreated, 2)
+})
+
+void test("given_a_topic_that_does_not_exist_when_publishing_by_key_then_should_create_it_with_server_defaults", async () => {
+  let sends = 0
+  let streams = 0
+  const creates: unknown[] = []
+  let created = false
+  const client = {
+    clientProvider: () => Promise.resolve({}),
+    stream: {
+      ensure: () => {
+        streams += 1
+        return Promise.resolve()
+      }
+    },
+    topic: {
+      get: () => Promise.resolve(created ? { partitionsCount: 1 } : null),
+      create: (settings: unknown) => {
+        creates.push(settings)
+        created = true
+        return Promise.resolve({ partitionsCount: 1 })
+      }
+    },
+    message: {
+      send: () => {
+        sends += 1
+        return Promise.resolve({ confirmations: [] })
+      }
+    },
+    destroy: () => Promise.resolve()
+  } as unknown as IggyClient
+  const transport = await ApacheIggyTransport.fromClient(client, "owned", {
+    timeoutMs: 20,
+    maxRetries: 2,
+    retryBackoffMs: 1
+  })
+  await transport.sendMessages("stream", "absent", [new Uint8Array([1])], {
+    kind: "key",
+    key: new Uint8Array([7])
+  })
+  assert.equal(streams, 1)
+  assert.deepEqual(creates, [
+    { streamId: "stream", name: "absent", partitionCount: 1, compressionAlgorithm: 1 }
+  ])
+  assert.equal(sends, 1)
 })
 
 void test("given_a_stalled_publish_with_no_retries_when_timed_out_then_should_close_and_reject", async () => {

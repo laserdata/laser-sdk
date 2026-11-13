@@ -1,14 +1,14 @@
 use crate::agent::clock::{Clock, SystemClock};
-use crate::agent::consumer::{AgentMessage, DEAD_LETTER_REASON_DETAIL};
+use crate::agent::consumer::AgentMessage;
 use crate::agent::ctx::{Branches, GatherPolicy, gather_branches};
 use crate::agent::laser::ContractTerminal;
-use crate::agent::replies::{ExpectedReply, ReplyTicket};
+use crate::agent::replies::{ExpectedReply, ReplyTicket, dropped_unconsumed};
 use crate::agent::router::{CapabilitySelector, InboxRoute, Router};
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::provenance::AgentTopic;
 use crate::types::{AgentId, MintUlid};
-use laser_wire::agent::{AgentKind, ConversationId, CorrelationId, IdempotencyKey};
+use laser_wire::agent::{AgentKind, ConversationId, CorrelationId, IdempotencyKey, RecordId};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -381,9 +381,12 @@ impl ContractBuilder {
         let deadline = self.deadline;
         let conversation = self.conversation.unwrap_or_else(ConversationId::mint);
         let correlation = self.correlation.unwrap_or_else(CorrelationId::mint);
+        // Minted here so an earlier copy's expiry answer never settles this send.
+        let command = RecordId::mint();
         let expected = ExpectedReply {
             session: conversation.into(),
             requester: Some(source.as_str().to_owned()),
+            command: Some(command),
         };
         // Under a verifier the reply signer must be the route's authenticated
         // principal when one was required, otherwise the resolved target's
@@ -407,6 +410,7 @@ impl ContractBuilder {
             ExpectedReply {
                 session: expected.session,
                 requester: expected.requester.clone(),
+                command: expected.command,
             },
             expected_signer.clone(),
         );
@@ -462,6 +466,7 @@ impl ContractBuilder {
                     conversation,
                     correlation,
                     CommandOptions {
+                        record: command,
                         payload: self.payload,
                         fence: self.fence,
                         parent: self.parent,
@@ -524,6 +529,7 @@ impl ContractBuilder {
 
 // What the command carries besides its address.
 struct CommandOptions {
+    record: RecordId,
     payload: Vec<u8>,
     fence: Option<u64>,
     parent: Option<(ConversationId, ConversationId)>,
@@ -588,6 +594,7 @@ async fn send_command(
     let producer = laser.agdx(AgentTopic::Custom(inbox), source.wire_id(), conversation);
     let mut command = producer
         .command(correlation, options.payload)
+        .with_record(options.record)
         .with_target(target.wire_id())
         .with_deadline_at_micros(
             SystemClock
@@ -699,25 +706,6 @@ fn terminal(reply: AgentMessage) -> Contract {
         Some(AgentKind::Error) => Contract::Failed(reply),
         _ => Contract::Completed(reply),
     }
-}
-
-// Whether the target answered that its consumer dropped the command past its
-// deadline, before any handler ran.
-fn dropped_unconsumed(reply: &AgentMessage) -> bool {
-    let Some(envelope) = &reply.envelope else {
-        return false;
-    };
-    laser_wire::framing::decode_named::<laser_wire::agent::AgentErrorBody>(&envelope.body)
-        .ok()
-        .and_then(|body| body.detail)
-        .and_then(|detail| match detail.get(DEAD_LETTER_REASON_DETAIL) {
-            Some(laser_wire::query::Value::Uint(code)) => Some(*code),
-            Some(laser_wire::query::Value::Int(code)) => u64::try_from(*code).ok(),
-            _ => None,
-        })
-        .is_some_and(|code| {
-            code == u64::from(laser_wire::agent::DeadLetterReason::DeadlineExceeded.code())
-        })
 }
 
 #[cfg(test)]

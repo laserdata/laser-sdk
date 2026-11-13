@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// record's headers so recall reconstructs a memory item and narrows by scope.
 /// Absent on a generic key-value entry, which carries no scope.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct MemoryRowScope {
     /// The item kind word, from the record body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43,9 +44,18 @@ pub struct MemoryRowScope {
 /// key and value are owned `Vec<u8>`, so the public API never leaks the `bytes`
 /// crate, and they ride the wire as CBOR byte strings, byte-exact.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvEntry {
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub value: Vec<u8>,
     /// Absolute expiry in epoch microseconds, or `None` for no expiry. Expired
@@ -92,6 +102,7 @@ impl KvEntry {
 /// `total_results` counts every live match of the scan, so a caller reads any
 /// page directly.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvPage {
     pub items: Vec<KvEntry>,
     pub page: u32,
@@ -113,9 +124,14 @@ pub struct KvPage {
 /// ignores the field, so a client must not send it unless the bit is
 /// advertised. Absent keeps today's immediate local read, byte-identical.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvGet {
     pub v: u32,
     pub namespace: String,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,13 +142,22 @@ pub struct KvGet {
 
 /// Request to write `value` at `key` in `namespace`, with an optional expiry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvSet {
     pub v: u32,
     pub namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<crate::agent::SessionRef>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub value: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,6 +174,7 @@ pub struct KvSet {
 /// of compare-and-swap: lock-free optimistic concurrency for callers contending
 /// on one key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum CasExpect {
     /// Apply only if the key currently holds this exact [`KvEntry::version`].
     Match(u64),
@@ -161,13 +187,22 @@ pub enum CasExpect {
 /// [`KvError::VersionConflict`]. The swap half of optimistic concurrency, paired
 /// with [`KvEntry::version`] as the compare token.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvCas {
     pub v: u32,
     pub namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<crate::agent::SessionRef>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub value: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,14 +225,23 @@ pub struct KvCas {
 /// [`crate::codes::KV_LEASE_OP_VERSION`]. Required fence fields have no decode
 /// defaults and any other `v` fails [`crate::validate::Validate`] fail-closed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvCasFenced {
     pub v: u32,
     pub namespace: String,
     /// The session this write is linked to, as on [`KvCas`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<crate::agent::SessionRef>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub value: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,6 +258,10 @@ pub struct KvCasFenced {
     /// writer can present a fence without being able to mutate it.
     pub fence_namespace: String,
     /// The lease key whose live row and fence sequence gate this write.
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub fence_key: Vec<u8>,
     /// The fencing token: the fence-sequence value the holder was granted.
@@ -225,11 +273,16 @@ pub struct KvCasFenced {
 /// the delete applies only when the live version matches (a conditional delete),
 /// returning [`KvError::VersionConflict`] otherwise.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvDelete {
     pub v: u32,
     pub namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<crate::agent::SessionRef>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,9 +293,14 @@ pub struct KvDelete {
 /// to check a precondition before transferring a large value (the formal
 /// `EXISTS` primitive).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvExists {
     pub v: u32,
     pub namespace: String,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
 }
@@ -251,9 +309,14 @@ pub struct KvExists {
 /// its value. `expires_at_micros` of `None` clears the expiry (the formal
 /// `EXPIRE` primitive).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvExpire {
     pub v: u32,
     pub namespace: String,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -271,13 +334,22 @@ pub struct KvExpire {
 /// names the format). With `if_match` set, the patch applies only at that version
 /// (the formal `PATCH` primitive).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvPatch {
     pub v: u32,
     pub namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<crate::agent::SessionRef>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub patch: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -289,14 +361,23 @@ pub struct KvPatch {
 /// on success, `NotFound` when the source is absent. The destination is
 /// overwritten (a guarded copy composes `exists` + `cas` instead).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvCopy {
     pub v: u32,
     pub namespace: String,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     /// The destination namespace. Absent means the source `namespace`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_namespace: Option<String>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub to_key: Vec<u8>,
 }
@@ -304,14 +385,23 @@ pub struct KvCopy {
 /// Request to move the value at `key` to `to_key`: copy plus delete of the
 /// source, one backend transaction, the same outcomes as [`KvCopy`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvMove {
     pub v: u32,
     pub namespace: String,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     /// The destination namespace. Absent means the source `namespace`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_namespace: Option<String>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub to_key: Vec<u8>,
 }
@@ -323,9 +413,14 @@ pub struct KvMove {
 /// conflicts: renewal is [`KvLeaseRenew`], never re-acquisition. The request
 /// uses [`crate::codes::KV_LEASE_OP_VERSION`] and requires holder identity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvLease {
     pub v: u32,
     pub namespace: String,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     /// Requested maximum lifetime, within
@@ -355,9 +450,14 @@ pub struct KvLease {
 /// the fence. An expired or re-acquired lease answers
 /// [`KvError::LeaseLost`], so a deposed holder learns immediately.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvLeaseRenew {
     pub v: u32,
     pub namespace: String,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     pub holder_id: String,
@@ -379,9 +479,14 @@ pub struct KvLeaseRenew {
 /// the idempotent [`KvOutcome::Released`]`(false)`. A stale fence is
 /// [`KvError::LeaseLost`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvRelease {
     pub v: u32,
     pub namespace: String,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     pub lease_token: u64,
@@ -391,6 +496,7 @@ pub struct KvRelease {
 /// One key's metadata without its value: version, expiry, and value size. The
 /// reply to [`KvExists`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvMetadata {
     pub version: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -400,6 +506,7 @@ pub struct KvMetadata {
 
 /// Request to list every namespace that holds at least one entry for the caller.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvNamespaces {
     pub v: u32,
     /// The stream whose resources the listing covers. Required in stream
@@ -411,6 +518,7 @@ pub struct KvNamespaces {
 
 /// One namespace summary in a `Namespaces` reply.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvNamespaceInfo {
     pub namespace: String,
     pub entries: usize,
@@ -422,21 +530,34 @@ pub struct KvNamespaceInfo {
 /// keeps only keys that are valid UTF-8 and contain the substring (binary keys
 /// are skipped). All bounds compose.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvScan {
     pub v: u32,
     pub namespace: String,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::opt_bytes_schema")
+    )]
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         with = "crate::encoding::opt_bin_bytes"
     )]
     pub prefix: Option<Vec<u8>>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::opt_bytes_schema")
+    )]
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         with = "crate::encoding::opt_bin_bytes"
     )]
     pub start: Option<Vec<u8>>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::opt_bytes_schema")
+    )]
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -481,21 +602,34 @@ pub struct KvScan {
 /// clears the whole namespace. No `page`/`results`, and expiry is ignored (a
 /// matching expired entry is removed too).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvDeleteMany {
     pub v: u32,
     pub namespace: String,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::opt_bytes_schema")
+    )]
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         with = "crate::encoding::opt_bin_bytes"
     )]
     pub prefix: Option<Vec<u8>>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::opt_bytes_schema")
+    )]
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         with = "crate::encoding::opt_bin_bytes"
     )]
     pub start: Option<Vec<u8>>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::opt_bytes_schema")
+    )]
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -516,6 +650,7 @@ pub struct KvDeleteMany {
 /// The result of a key-value operation: `Ok` with the operation's outcome, or
 /// `Err` with a structured failure.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum KvReply {
     Ok(KvOutcome),
@@ -524,6 +659,7 @@ pub enum KvReply {
 
 /// The successful outcome of a KV command, shaped per op.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum KvOutcome {
     /// `get`: the live entry, or `None` when absent or expired.
@@ -576,6 +712,7 @@ pub enum KvOutcome {
 
 /// Why a key-value operation failed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum KvError {
     #[error("kv not supported: {0}")]
@@ -982,9 +1119,14 @@ mod tests {
         // made those fields required, so an old payload must fail decode
         // rather than fill in defaults.
         #[derive(Serialize)]
+        #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
         struct LegacyLease<'a> {
             v: u32,
             namespace: &'a str,
+            #[cfg_attr(
+                feature = "schemars",
+                schemars(schema_with = "crate::encoding::bytes_schema")
+            )]
             #[serde(with = "crate::encoding::bin_bytes")]
             key: &'a [u8],
             lease_ttl_micros: u64,
@@ -1002,9 +1144,14 @@ mod tests {
         );
 
         #[derive(Serialize)]
+        #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
         struct LegacyRelease<'a> {
             v: u32,
             namespace: &'a str,
+            #[cfg_attr(
+                feature = "schemars",
+                schemars(schema_with = "crate::encoding::bytes_schema")
+            )]
             #[serde(with = "crate::encoding::bin_bytes")]
             key: &'a [u8],
             lease_token: u64,
@@ -1022,14 +1169,27 @@ mod tests {
         );
 
         #[derive(Serialize)]
+        #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
         struct LegacyCasFenced<'a> {
             v: u32,
             namespace: &'a str,
+            #[cfg_attr(
+                feature = "schemars",
+                schemars(schema_with = "crate::encoding::bytes_schema")
+            )]
             #[serde(with = "crate::encoding::bin_bytes")]
             key: &'a [u8],
+            #[cfg_attr(
+                feature = "schemars",
+                schemars(schema_with = "crate::encoding::bytes_schema")
+            )]
             #[serde(with = "crate::encoding::bin_bytes")]
             value: &'a [u8],
             expect: CasExpect,
+            #[cfg_attr(
+                feature = "schemars",
+                schemars(schema_with = "crate::encoding::bytes_schema")
+            )]
             #[serde(with = "crate::encoding::bin_bytes")]
             fence_key: &'a [u8],
             fence_token: u64,

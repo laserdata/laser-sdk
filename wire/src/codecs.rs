@@ -172,6 +172,7 @@ mod tests {
     use super::*;
 
     #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
     struct Body {
         id: u32,
         name: String,

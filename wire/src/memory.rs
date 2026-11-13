@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// byte-identical to the SDK's own record. Runtime-free and portable, like the
 /// rest of the wire contract.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum MemoryRecord {
     /// A remembered item: its id, kind word, and body.
     Item {

@@ -4,6 +4,7 @@ import decimal
 import json
 import time
 import uuid
+from urllib.parse import unquote, urlsplit
 
 import laser_sdk as ls
 import pytest
@@ -23,6 +24,23 @@ async def test_given_an_absent_stream_when_a_producer_starts_then_should_require
         assert len(response.confirmations) == 1
     finally:
         await laser.close()
+
+
+async def test_given_a_missing_topic_or_stream_when_published_then_should_create_it(laser):
+    published = await laser.topic("new-topic").publish().payload(b"created").send()
+    assert len(published.confirmations) == 1
+    absent = laser.stream(f"{laser.default_stream}-absent")
+    try:
+        sent = await absent.topic("events").send(b"created")
+        assert len(sent.confirmations) == 1
+        memory = laser.memory_on_topic("new.memory")
+        assert await memory.fetch_folded("host:123") is None
+        with pytest.raises(ls.TransportError, match="was not found"):
+            await laser.topic("new.memory").producer(create_topic=False).init()
+        await memory.set("host:123", b"created")
+        assert await memory.fetch_folded("host:123") == b"created"
+    finally:
+        await absent.delete()
 
 
 @pytest.mark.parametrize("factor", [0, ls.MAX_REPLICATION_FACTOR + 1])
@@ -436,7 +454,10 @@ async def test_given_percent_encoded_credentials_when_connecting_then_should_log
     iggy_endpoint,
 ):
     _, address = iggy_endpoint.rsplit("@", 1)
-    laser = await ls.Laser.connect(f"%69ggy:%69%67gy@{address}")
+    parsed = urlsplit(iggy_endpoint if "://" in iggy_endpoint else f"iggy://{iggy_endpoint}")
+    username = "".join(f"%{byte:02X}" for byte in unquote(parsed.username).encode())
+    password = "".join(f"%{byte:02X}" for byte in unquote(parsed.password).encode())
+    laser = await ls.Laser.connect(f"{username}:{password}@{address}")
     try:
         await laser.stream(f"t-{uuid.uuid4().hex[:12]}").ensure()
     finally:

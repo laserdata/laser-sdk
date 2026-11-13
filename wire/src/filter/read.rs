@@ -18,6 +18,7 @@ use std::fmt;
 
 /// The stream and topic a filtered read or preview addresses, by name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterSource {
     pub stream: String,
     pub topic: String,
@@ -47,6 +48,36 @@ impl FilterConsumer {
     }
 }
 
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for FilterConsumer {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "FilterConsumer".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "enum": ["consumer", "group"] },
+                        "name": { "type": "string" }
+                    },
+                    "required": ["kind", "name"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "const": "group_id" },
+                        "id": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["kind", "id"]
+                }
+            ]
+        })
+    }
+}
+
 impl Serialize for FilterConsumer {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut state = serializer.serialize_struct("FilterConsumer", 2)?;
@@ -71,6 +102,7 @@ impl Serialize for FilterConsumer {
 impl<'de> Deserialize<'de> for FilterConsumer {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
+        #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
         #[serde(tag = "kind", rename_all = "snake_case")]
         enum Selector {
             Consumer { name: String },
@@ -87,6 +119,7 @@ impl<'de> Deserialize<'de> for FilterConsumer {
 
 /// Which filter a read executes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FilterRef {
     /// The full filter in the request. Needs no catalog. A consumer group
@@ -105,6 +138,7 @@ pub enum FilterRef {
 
 /// Where a filtered read starts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FilteredStart {
     /// After the consumer's stored offset.
@@ -124,6 +158,7 @@ pub enum FilteredStart {
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, strum::Display,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum ExecutionMode {
@@ -160,6 +195,7 @@ fn validate_policy_identity(
 /// history is rejected rather than applied to new records. The partition is
 /// named by its incarnation, the value its route reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SourceGeneration {
     pub stream_id: u32,
     pub stream_created_at_micros: u64,
@@ -173,6 +209,7 @@ pub struct SourceGeneration {
 /// offset with it and the page's partition incarnation, so the store is refused
 /// once the partition was recreated or its consumer group assignment moved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AckContext {
     /// The consumer group owner generation, zero for an independent consumer.
     pub owner_generation: u64,
@@ -182,6 +219,7 @@ pub struct AckContext {
 
 /// The resume point a page hands to the next request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Continuation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<u64>,
@@ -204,6 +242,7 @@ pub struct Continuation {
 /// `wait_id` names the wait on its connection so a [`FilteredWaitCancel`] can
 /// end it early.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilteredWaitRequest {
     pub v: u32,
     pub source: FilterSource,
@@ -216,6 +255,7 @@ pub struct FilteredWaitRequest {
 /// End the filtered waits this connection holds under `wait_ids`. Each
 /// cancelled wait answers at once with no ready partition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilteredWaitCancel {
     pub v: u32,
     pub wait_ids: Vec<u64>,
@@ -224,12 +264,14 @@ pub struct FilteredWaitCancel {
 /// The waits a [`FilteredWaitCancel`] ended. A wait that had already answered
 /// or was never held is left out.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilteredWaitCancelled {
     pub cancelled: Vec<u64>,
 }
 
 /// One partition of a filtered wait and the offset its next read starts at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilteredWaitPartition {
     pub partition_id: u32,
     pub offset: u64,
@@ -238,12 +280,14 @@ pub struct FilteredWaitPartition {
 /// The partitions that hold a record at or after their offset. Empty when the
 /// wait ended first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilteredWaitResult {
     pub ready: Vec<u32>,
 }
 
 /// Read one bounded page of matching records from one partition.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilteredPollRequest {
     pub v: u32,
     pub source: FilterSource,
@@ -269,6 +313,7 @@ pub struct FilteredPollRequest {
 
 /// Why a page stopped scanning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum StopReason {
@@ -286,6 +331,7 @@ pub enum StopReason {
 
 /// Why a record could not be evaluated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum FaultReason {
@@ -323,6 +369,7 @@ impl FaultReason {
 
 /// One record the filter could not evaluate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RecordFault {
     pub offset: u64,
     pub reason: FaultReason,
@@ -330,6 +377,7 @@ pub struct RecordFault {
 
 /// Decoder limits applied by the server to unevaluated records in a page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterDecodeLimits {
     pub max_payload_bytes: u32,
     pub max_depth: u32,
@@ -337,6 +385,7 @@ pub struct FilterDecodeLimits {
 
 /// The filter a page actually executed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AppliedPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<u64>,
@@ -411,6 +460,7 @@ impl Validate for AppliedPolicy {
 /// `ack_context`, only after every returned record at or below it is fully
 /// handled.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilteredPage {
     pub v: u32,
     pub partition_id: u32,
@@ -435,6 +485,10 @@ pub struct FilteredPage {
     pub unevaluated: Vec<RecordFault>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation_limits: Option<Box<FilterDecodeLimits>>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub records: Vec<u8>,
 }
@@ -461,6 +515,7 @@ impl FilteredPage {
 /// offset only while the source still has the generation the page was read
 /// from, and only while the consumer still owns the partition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilteredAck {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<u64>,
@@ -484,6 +539,7 @@ pub struct FilteredAck {
 
 /// A stored acknowledgment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AckReceipt {
     pub partition_id: u32,
     pub offset: u64,
@@ -493,6 +549,7 @@ pub struct AckReceipt {
 /// Preview a filter over stored records of one partition. Observational: it
 /// joins no group, stores no offset, and changes no consumer state.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterPreviewRequest {
     pub v: u32,
     pub source: FilterSource,
@@ -509,6 +566,7 @@ pub struct FilterPreviewRequest {
 
 /// How the filter judged one previewed record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Verdict {
@@ -519,6 +577,7 @@ pub enum Verdict {
 
 /// One previewed record: identity, verdict, and a bounded text view.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct PreviewRecord {
     pub offset: u64,
     pub timestamp_micros: u64,
@@ -535,6 +594,7 @@ pub struct PreviewRecord {
 
 /// A preview of one partition range.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterPreview {
     pub v: u32,
     pub partition_id: u32,
@@ -554,6 +614,7 @@ pub struct FilterPreview {
 /// A typed user header value, as the evaluator reads it. Iggy integer kinds up
 /// to 64 bits map to `int` or `uint`. 128-bit integers arrive as `raw` bytes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum HeaderScalar {
     Bool(bool),
@@ -561,11 +622,19 @@ pub enum HeaderScalar {
     Uint(u64),
     Float(f64),
     String(String),
-    Raw(#[serde(with = "crate::encoding::bin_bytes")] Vec<u8>),
+    Raw(
+        #[cfg_attr(
+            feature = "schemars",
+            schemars(schema_with = "crate::encoding::bytes_schema")
+        )]
+        #[serde(with = "crate::encoding::bin_bytes")]
+        Vec<u8>,
+    ),
 }
 
 /// One user header of a record.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterHeader {
     pub key: String,
     pub value: HeaderScalar,
@@ -574,10 +643,15 @@ pub struct FilterHeader {
 /// Evaluate a filter against one supplied record. Nothing is read from a
 /// stream and nothing is stored.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterTestRequest {
     pub v: u32,
     /// `inline` or `revision`. `bound` is rejected.
     pub filter: FilterRef,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub payload: Vec<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -586,6 +660,7 @@ pub struct FilterTestRequest {
 
 /// Three-valued comparison truth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Truth {
@@ -597,6 +672,7 @@ pub enum Truth {
 /// One node of an explanation tree: what it tested and how it resolved.
 /// `truth` is absent when the payload could not be decoded for this node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ExplainNode {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -607,6 +683,7 @@ pub struct ExplainNode {
 
 /// Why a record was or was not selected.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterExplanation {
     pub verdict: Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -616,6 +693,7 @@ pub struct FilterExplanation {
 
 /// The result of a sample test.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterTestResult {
     pub v: u32,
     pub policy: AppliedPolicy,
@@ -624,6 +702,7 @@ pub struct FilterTestResult {
 
 /// A filter that validated and compiled.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterValidation {
     pub v: u32,
     pub digest: Digest32,
@@ -636,6 +715,7 @@ pub struct FilterValidation {
 /// The typed cause of a consumer-filter failure. Each maps to one shared
 /// [`ResultCode`], so a generic client can still classify it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
@@ -700,6 +780,7 @@ impl FilterErrorReason {
 
 /// A consumer-filter failure.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[error("{reason}: {message}")]
 pub struct FilterError {
     pub code: ResultCode,
@@ -734,6 +815,7 @@ impl FilterError {
 
 /// A successful reply of a server-native consumer-filter command.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FilterOutcome {
     Page(FilteredPage),
@@ -747,6 +829,7 @@ pub enum FilterOutcome {
 
 /// The reply to every server-native consumer-filter command.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 // Keep successful pages inline without another allocation on every read.
 #[allow(clippy::large_enum_variant)]

@@ -18,6 +18,7 @@ wire_id!(
 
 /// The resource against which a query is authorized and resolved.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum QueryTarget {
@@ -34,6 +35,7 @@ impl QueryTarget {
 
 /// SQL grammar accepted by the selected query backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SqlDialect {
@@ -44,6 +46,7 @@ pub enum SqlDialect {
 
 /// One exact-match constraint: the indexed `field` must equal `value`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KeyMatch {
     pub field: String,
     pub value: TypedValue,
@@ -62,6 +65,7 @@ impl KeyMatch {
 /// A query against a materialized index. Build it fluently via the SDK's
 /// `Laser::query`, or directly through [`Query::builder`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "builders", derive(bon::Builder))]
 pub struct Query {
     pub execution_id: QueryExecutionId,
@@ -163,6 +167,7 @@ impl Query {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct QueryPageRequest {
     pub limit: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -469,6 +474,7 @@ fn is_false(value: &bool) -> bool {
 // capability check is `want <= served`. A new variant must be appended to keep
 // the order meaningful.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Consistency {
@@ -541,6 +547,7 @@ impl ConsistencyGate {
 /// comparison leaf. Externally tagged on the wire:
 /// `{"all":[{"pred":{...}}]}`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Filter {
     All(Vec<Filter>),
@@ -577,6 +584,7 @@ impl Filter {
 
 /// A filter leaf: a field, a comparison op, and a value.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Predicate {
     pub field: String,
     pub op: CmpOp,
@@ -586,6 +594,7 @@ pub struct Predicate {
 /// Raw-SQL escape hatch scoped to [`Query::target`]. The server validates both
 /// the parsed statement and the resulting scan plan against that target.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RawSql {
     pub dialect: SqlDialect,
     pub sql: String,
@@ -606,6 +615,7 @@ pub struct RawSql {
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum CmpOp {
@@ -622,6 +632,7 @@ pub enum CmpOp {
 
 /// An order-by clause: a field and a direction.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Sort {
     pub field: String,
     #[serde(default)]
@@ -642,6 +653,7 @@ pub struct Sort {
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Dir {
@@ -656,6 +668,7 @@ pub enum Dir {
 /// `KEYWORD_SEARCH`: a backend without a lexical index answers unsupported,
 /// never a contains approximation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct TextQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
@@ -664,6 +677,7 @@ pub struct TextQuery {
 
 /// A nearest-neighbour search: the query embedding and how many rows to return.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct VectorQuery {
     pub field: String,
     pub embedding: Vec<f32>,
@@ -674,6 +688,7 @@ pub struct VectorQuery {
 /// can return several aggregates grouped by the same keys. An optional `window`
 /// adds a time-bucket key.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Aggregate {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_by: Vec<String>,
@@ -686,6 +701,7 @@ pub struct Aggregate {
 /// is the fraction for `Percentile` (e.g. 0.95). `alias` names the output field
 /// in each result row.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AggCall {
     pub func: AggFunc,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -709,6 +725,7 @@ pub struct AggCall {
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum AggFunc {
@@ -724,6 +741,7 @@ pub enum AggFunc {
 
 /// A tumbling window of `every_micros` over the timestamp `field`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Window {
     pub field: String,
     pub every_micros: u64,
@@ -731,6 +749,7 @@ pub struct Window {
 
 /// Which columns and payload a query returns.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Select {
     // Empty selects every indexed field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -750,6 +769,7 @@ pub struct Select {
 /// `i64::MAX` falls through to `Uint` before `Float` (never a lossy `f64`).
 /// `Null` is a unit variant matching a bare `null`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum Value {
     Str(String),
@@ -901,6 +921,7 @@ impl std::str::FromStr for Value {
 
 /// A typed page. Each row is positionally aligned with `fields`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct QueryResult {
     pub fields: Vec<LogicalField>,
     pub rows: Vec<Row>,
@@ -911,6 +932,7 @@ pub struct QueryResult {
 
 /// One typed query row. Values are ordered exactly like [`QueryResult::fields`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Row {
     pub values: Vec<TypedValue>,
     /// Backend-native relevance for vector or lexical search. Vector backends
@@ -1011,6 +1033,7 @@ impl QueryResult {
 
 /// Target and execution evidence returned with every page.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct QueryContext {
     pub execution_id: QueryExecutionId,
     pub engine: QueryEngine,
@@ -1032,6 +1055,7 @@ pub struct QueryContext {
 
 /// One source partition's applied position in the store that served a query.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct QueryFrontier {
     pub stream: String,
     pub topic: String,
@@ -1046,6 +1070,7 @@ pub struct QueryFrontier {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct QueryEngine {
     pub name: String,
     pub version: String,
@@ -1054,6 +1079,7 @@ pub struct QueryEngine {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ResolvedQueryTarget {
@@ -1074,6 +1100,7 @@ pub enum ResolvedQueryTarget {
 /// caller that never asked cannot misread a page-bounded number as a count:
 /// there is no number.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Page {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
@@ -1120,6 +1147,7 @@ impl Validate for Page {
 /// Internal on-wire envelope: a versioned wrapper around `Query`. Workers and
 /// clients use it, app code does not.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub struct QueryEnvelope {
     pub v: u32,
@@ -1150,6 +1178,7 @@ impl Validate for QueryEnvelope {
 
 /// A query reply: `Ok(QueryResult)` or `Err(QueryError)`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum QueryReply {
     Ok(Box<QueryResult>),
@@ -1158,6 +1187,7 @@ pub enum QueryReply {
 
 /// Why a query failed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum QueryError {
     #[error("query not supported: {0}")]
@@ -1216,6 +1246,7 @@ pub enum QueryError {
 
 /// Stable machine-readable classification for [`QueryError`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum QueryErrorCode {

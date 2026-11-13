@@ -36,6 +36,17 @@ impl SnapshotOffset {
     }
 }
 
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for SnapshotOffset {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SnapshotOffset".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <(u32, u64, u32, u64)>::json_schema(generator)
+    }
+}
+
 impl Serialize for SnapshotOffset {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -69,6 +80,7 @@ impl<'de> Deserialize<'de> for SnapshotOffset {
 
 /// A fold state and the exact source positions included in it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FoldSnapshot {
     pub stream: String,
     pub stream_id: u32,
@@ -78,6 +90,10 @@ pub struct FoldSnapshot {
     /// Sorted by topic ID, topic creation time, and partition ID.
     pub as_of: Vec<SnapshotOffset>,
     /// The application chooses the codec for these bytes.
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub state: Vec<u8>,
 }

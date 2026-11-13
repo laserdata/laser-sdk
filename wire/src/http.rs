@@ -228,6 +228,7 @@ pub fn fork_rows_path(id: &str) -> String {
 /// match), and it answers truthfully even when the managed backend is disabled (200
 /// with `managed: false`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub struct Capabilities {
     /// Connected to a managed backend at all (the root: with no backend every managed
@@ -281,6 +282,7 @@ pub struct Capabilities {
 /// The managed query surface on the HTTP capabilities reply: whether it is
 /// served, its registry browse views, and the consistency it honors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct QueryCapsView {
     /// Whether `POST /agdx/query` is served.
     pub available: bool,
@@ -303,6 +305,7 @@ pub struct QueryCapsView {
 /// by the streaming server itself and holds with the managed backend off. The
 /// catalog (saved filters and group bindings) needs the backend.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterCapsView {
     /// Filtered reads, fenced acknowledgments, sample tests, and validation.
     #[serde(default)]
@@ -370,6 +373,7 @@ impl FilterCapsView {
 
 /// The managed key-value surface on the HTTP capabilities reply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvCapsView {
     /// Whether the get/set/scan routes are served.
     pub available: bool,
@@ -554,6 +558,7 @@ impl Capabilities {
 /// base64, because keys and values are arbitrary bytes that JSON strings
 /// cannot carry raw.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvEntryView {
     pub key: String,
     pub value: String,
@@ -577,6 +582,7 @@ pub struct KvEntryView {
 
 /// One KV scan page on the HTTP surface, in key order. `page` counts from 1.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvPageView {
     pub items: Vec<KvEntryView>,
     pub page: u32,
@@ -586,6 +592,7 @@ pub struct KvPageView {
 
 /// `DELETE /agdx/kv/{namespace}` reply: the number of entries removed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct DeletedManyView {
     pub deleted: usize,
 }
@@ -595,6 +602,7 @@ pub struct DeletedManyView {
 /// carry raw bytes), or `None` when the connection advertised none. The console
 /// decodes and interprets it per producer kind (an agent card or an app blob).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ClientMetadataView {
     pub client_id: u32,
     pub user_id: Option<u32>,
@@ -608,6 +616,7 @@ pub struct ClientMetadataView {
 /// One page of the `GET /agdx/clients` discovery read. `next_cursor` is the
 /// `after` query parameter for the next page, or `None` on the last page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ClientMetadataListView {
     pub clients: Vec<ClientMetadataView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -618,6 +627,7 @@ pub struct ClientMetadataListView {
 /// window, all optional. Shared by the server handler and the typed client so the
 /// query string cannot drift between them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ClientsQuery {
     /// Only return connections that advertised metadata.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
@@ -635,6 +645,7 @@ pub struct ClientsQuery {
 
 /// `POST /agdx/forks/{id}/promote` reply: the number of rows applied.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct PromotedView {
     pub rows: usize,
 }
@@ -643,6 +654,7 @@ pub struct PromotedView {
 /// attributes rendered as strings (e.g. the entity `value`) for a browser or
 /// wasm client that has no access to the typed `Value`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GraphNodeView {
     pub id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -657,6 +669,7 @@ pub struct GraphNodeView {
 /// One graph edge on the HTTP surface: endpoint ids as strings, the type, and the
 /// weight.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GraphEdgeView {
     pub id: String,
     pub from: String,
@@ -677,6 +690,7 @@ pub struct GraphEdgeView {
 /// `POST /agdx/graph/{name}/query` reply: the reachable nodes, traversed edges,
 /// and (for a `paths` return) the reconstructed paths as id sequences.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GraphResultView {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<GraphNodeView>,
@@ -689,6 +703,7 @@ pub struct GraphResultView {
 /// One path in a `GraphResultView`: parallel node and edge id sequences, ids as
 /// Crockford-base32 strings (the JSON view of [`crate::graph::Path`]).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct PathView {
     pub nodes: Vec<String>,
     pub edges: Vec<String>,
@@ -698,6 +713,7 @@ pub struct PathView {
 /// backend allocates it and the reply carries it back as
 /// `{"SchemaRegistered":id}`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RegisterSchemaBody {
     pub source: crate::control::SchemaSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -713,12 +729,14 @@ pub struct RegisterSchemaBody {
 /// `POST /agdx/schemas/{id}/decode` body: the record payload as URL-safe
 /// unpadded base64.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct DecodeRecordBody {
     pub payload: String,
 }
 
 /// `POST /agdx/forks` body.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ForkCreateBody {
     pub fork_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -732,6 +750,7 @@ pub struct ForkCreateBody {
 /// `PUT /agdx/forks/{id}/rows` body. `payload_b64` is URL-safe unpadded base64,
 /// like every binary body on this surface.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ForkPutBody {
     pub table: String,
     pub partition_id: u32,
@@ -757,6 +776,7 @@ pub struct ForkPutBody {
 /// `projection_ref` present removes only that one projection from the binding,
 /// leaving the rest. Mirrors `ControlCommand::RemoveBinding`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RemoveBindingBody {
     pub stream: String,
     pub topic: String,
@@ -773,6 +793,7 @@ pub struct RemoveBindingBody {
 /// carries optional structured context (e.g. the conflicting version on a CAS
 /// miss) as free-form JSON.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ErrorBody {
     pub code: ResultCode,
     pub message: String,
@@ -918,6 +939,7 @@ pub const ON_BEHALF_OF_HEADER: &str = "agdx-on-behalf-of";
 /// `PARAM_*` consts verbatim, so the client serializer and the server parser
 /// share one spelling.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ProjectionListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
@@ -945,6 +967,7 @@ pub struct ProjectionListQuery {
 /// schema's optional name, the same spelling as the projection list, so the two
 /// list surfaces share one filter vocabulary.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SchemaListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_contains: Option<String>,
@@ -963,6 +986,7 @@ pub struct SchemaListQuery {
 /// `?stream=` on `GET /agdx/kv` and `GET /agdx/forks`: the stream whose
 /// namespaces or forks are listed, required in stream tenancy.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct StreamQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<String>,
@@ -972,6 +996,7 @@ pub struct StreamQuery {
 /// `POST /agdx/schemas/{id}/decode`: the stream whose registry holds the id.
 /// Absent addresses the deployment-wide registry.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SchemaQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<String>,
@@ -983,6 +1008,7 @@ pub struct SchemaQuery {
 /// once. The value is the decimal text of a non-zero `u128`, the same text the
 /// filter routes use. A write without it gets a fresh id per request.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct OperationQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
@@ -1019,6 +1045,7 @@ pub struct InvalidOperationId;
 
 /// `GET /agdx/filters` query parameters.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_contains: Option<String>,
@@ -1087,6 +1114,7 @@ impl From<FilterGroupIdentity> for FilterListQuery {
 
 /// `GET /agdx/filters/{id}/revisions` query parameters.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterRevisionListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<u32>,
@@ -1096,6 +1124,7 @@ pub struct FilterRevisionListQuery {
 
 /// `GET /agdx/filter-bindings` query parameters.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterBindingListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter_id: Option<u32>,
@@ -1112,6 +1141,7 @@ pub struct FilterBindingListQuery {
 /// `POST /agdx/filters/test` body. The sample payload is given either as
 /// base64url bytes or as UTF-8 text, never both.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterTestBody {
     pub filter: crate::filter::FilterRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1126,6 +1156,7 @@ pub struct FilterTestBody {
 /// (`prefix`/`start`/`end`/`key_contains`) are base64url, like every binary
 /// value on this surface.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvScanQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
@@ -1151,6 +1182,7 @@ pub struct KvScanQuery {
 
 /// `PUT /agdx/kv/{namespace}/{key}` query: an optional absolute expiry.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvPutQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_micros: Option<u64>,
@@ -1162,6 +1194,7 @@ pub struct KvPutQuery {
 /// (omitted for the backend ceiling). One struct shared by the typed client and
 /// the server route, so the two cannot drift.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GraphNeighborsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
@@ -1186,6 +1219,7 @@ pub struct GraphNeighborsQuery {
 /// or none leaves the page size to the server, and `as_of` with `series`
 /// bounds a walk.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -1211,6 +1245,7 @@ pub struct SessionsQuery {
 /// none reads the first page, `results` of zero or none leaves the page size
 /// to the server, and `as_of` with `series` bounds a walk.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionEventsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<u32>,
@@ -1225,6 +1260,7 @@ pub struct SessionEventsQuery {
 /// Query of `GET /agdx/sessions/{stream}/{id}/state`. A `history_limit` of
 /// zero or none leaves the history size to the server.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionStateQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_limit: Option<u32>,
@@ -1232,6 +1268,7 @@ pub struct SessionStateQuery {
 
 /// Query of `GET /agdx/sessions/{stream}/{id}/links`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionLinksQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<String>,
@@ -1241,6 +1278,7 @@ pub struct SessionLinksQuery {
 /// reads the first page, and `results` of zero or none leaves the page size
 /// to the server.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionChangesQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<u32>,
@@ -1253,6 +1291,7 @@ pub struct SessionChangesQuery {
 /// version) or `expect_absent` (create-if-absent) is set, mirroring the binary
 /// `CasExpect`. The value rides the raw request body.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct KvCasQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_version: Option<u64>,
@@ -1265,6 +1304,7 @@ pub struct KvCasQuery {
 /// `PUT /agdx/kv/{namespace}/{key}/cas` reply on success: the new version the
 /// committed write took.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct CasCommittedView {
     pub version: u64,
 }

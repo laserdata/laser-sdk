@@ -495,6 +495,7 @@ impl Laser {
                     .agent
                     .as_ref()
                     .map(|agent| agent.as_str().to_owned()),
+                command: None,
             },
             provenance
                 .target_agent_id

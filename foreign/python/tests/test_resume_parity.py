@@ -361,6 +361,7 @@ async def test_given_recalled_items_when_rendered_then_should_preserve_order_and
 async def test_given_an_arrow_record_when_a_fingerprint_is_set_then_should_stamp_exact_bytes(laser):
     fingerprint = bytes(range(32))
     topic = laser.topic("fingerprint-records")
+    await topic.ensure(1)
     await (
         topic.publish_batch()
         .add_record(b"raw payload", content_type="arrow", logical_schema_fingerprint=fingerprint)
@@ -513,3 +514,10 @@ async def test_given_an_explicit_memory_id_when_appended_then_should_keep_the_id
     assert items[0].kind == "entity"
     assert items[0].text() == "typed"
     assert await memory.recall(strategy="recent", **{**scope, "stream": "another-fleet"}) == []
+
+
+async def test_given_an_async_operation_without_a_value_when_awaited_then_should_return_none():
+    memory = ls.MemoryHandle.vector(lambda _: [1.0])
+    identity = await memory.remember(b"temporary")
+    assert await memory.forget(identity) is None
+    assert await memory.recall() == []

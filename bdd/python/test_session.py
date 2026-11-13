@@ -201,6 +201,62 @@ def state_set(world, key, value):
     world.run(lambda: state.set(key, json.loads(value)))
 
 
+@when(parsers.re(r"the session state is replaced with (?P<document>.+)$"))
+def state_replace(world, document):
+    state = world.session.state()
+    world.run(lambda: state.replace(json.loads(document)))
+
+
+@when(parsers.parse('agent "{name}" opens a second handle on the session'))
+def open_second_handle(world, name):
+    world.second_handle = _sessions(world).open(world.session.conversation).as_agent(name)
+
+
+@when(parsers.re(r'the second handle\'s state sets "(?P<key>[^"]+)" to (?P<value>.+)$'))
+def second_state_set(world, key, value):
+    state = world.second_handle.state()
+    world.run(lambda: state.set(key, json.loads(value)))
+
+
+@when(parsers.re(r"the second handle's state is replaced with (?P<document>.+)$"))
+def second_state_replace(world, document):
+    state = world.second_handle.state()
+    world.run(lambda: state.replace(json.loads(document)))
+
+
+@when("the second handle ends the session")
+def second_handle_ends(world):
+    world.run(lambda: world.second_handle.end())
+
+
+@when("the second handle writes a state snapshot")
+def second_handle_snapshot(world):
+    state = world.second_handle.state()
+    try:
+        world.run(lambda: state.snapshot())
+        world.error = None
+    except ls.LaserError as error:
+        world.error = error
+
+
+@then("the second handle's snapshot is refused as a stale session")
+def second_snapshot_stale(world):
+    assert isinstance(world.error, ls.SessionError), world.error
+    assert "stale" in str(world.error), world.error
+
+
+@then(parsers.re(r"the folded session state is (?P<document>.+) at revision (?P<revision>\d+)$"))
+def folded_document(world, document, revision):
+    state = world.session.state()
+
+    def read():
+        view = world.run(lambda: state.get())
+        return view if view["revision"] == int(revision) else None
+
+    view = _eventually(world, read, "the folded state")
+    assert view["document"] == json.loads(document)
+
+
 @then(
     parsers.re(
         r'the folded session state has "(?P<first>[^"]+)" (?P<first_value>\S+) and '
