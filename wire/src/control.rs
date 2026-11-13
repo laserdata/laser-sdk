@@ -28,6 +28,7 @@ pub const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/sch
 /// writer schema is not registered. Explicit headers always win over
 /// schema-extracted values for the same field name.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct IndexField {
     pub name: String,
     pub pointer: String,
@@ -76,6 +77,7 @@ impl IndexField {
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
@@ -88,6 +90,7 @@ pub enum FieldType {
 
 /// The indexed fields (and optional vector field) a projection extracts.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct IndexSchema {
     pub fields: Vec<IndexField>,
     // Optional JSON pointer to a vector field (`[f32]`) inside the payload.
@@ -165,6 +168,7 @@ impl IndexSchemaBuilder {
 /// `schema_id`, which selects a codec's writer schema rather than a
 /// materialization rule.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(transparent)]
 pub struct ProjectionId(String);
 
@@ -220,6 +224,7 @@ impl From<String> for ProjectionId {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProjectionHistory {
     #[default]
@@ -239,6 +244,7 @@ impl ProjectionHistory {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProjectionKey {
     Header { name: String },
@@ -250,6 +256,7 @@ pub enum ProjectionKey {
 /// so a future kind flows through an old reader as
 /// [`Unrecognized`](Self::Unrecognized) rather than failing the listing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(from = "u8", into = "u8")]
 pub enum ProjectionKind {
     /// Materialize queryable rows (the default).
@@ -309,6 +316,7 @@ impl From<ProjectionKind> for u8 {
 /// projection for discovery and as the extraction contract. Graph data is written
 /// via the graph upsert op. Applying this plan to a bound source is managed-side.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct EntitySchema {
     pub nodes: Vec<NodeExtract>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -318,6 +326,7 @@ pub struct EntitySchema {
 /// One node-extraction rule: the node's label and the pointer to its canonical
 /// value (which content-addresses its id, so the same entity converges).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct NodeExtract {
     pub label: String,
     pub value_pointer: String,
@@ -328,6 +337,7 @@ pub struct NodeExtract {
 /// One edge-extraction rule: the edge type, the pointers to its endpoint values,
 /// and optional pointers to the bitemporal valid-time window.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct EdgeExtract {
     pub edge_type: String,
     pub from_pointer: String,
@@ -363,6 +373,7 @@ pub struct EdgeExtract {
 /// are queryable. Everything else rides through as part of the inlined body
 /// (when on) or is reachable only by Iggy replay (when off).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Projection {
     /// Stable id used on the wire as `agdx.ref`.
     pub id: ProjectionId,
@@ -591,6 +602,7 @@ impl ProjectionBuilder {
 /// for cheap storage and fast replay) whose derived index must survive forever.
 /// Set the binding to [`RetentionPolicy::Keep`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum RetentionPolicy {
@@ -625,6 +637,7 @@ pub enum RetentionPolicy {
 /// optional default, and one operational index. The index uses the replica-local
 /// backend unless an exact backend resource generation is bound.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ProjectionBinding {
     pub source: SourceSelector,
     /// Projections allowed to fire on messages from this source. A record
@@ -685,6 +698,7 @@ pub struct ProjectionBinding {
     strum::Display,
     strum::EnumString,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
@@ -720,6 +734,7 @@ impl InvalidRecordPolicy {
     strum::Display,
     strum::EnumString,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
@@ -878,6 +893,7 @@ impl ProjectionBindingBuilder {
 /// prefix, glob, or multi-stream selectors. Today the model is
 /// one-topic-per-binding to keep routing simple.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SourceSelector {
     pub stream: String,
     pub topic: String,
@@ -900,6 +916,7 @@ impl SourceSelector {
 /// are permanent: registering an occupied id with a different definition is
 /// rejected managed-side, and dropping tombstones the definition.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SchemaDef {
     pub id: u32,
     pub source: SchemaSource,
@@ -921,6 +938,7 @@ pub struct SchemaDef {
 /// the lowest free id is taken. The id an explicit [`SchemaDef`] names is never
 /// renumbered, so the two stay distinct commands.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SchemaAllocation {
     pub source: SchemaSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -960,6 +978,7 @@ impl SchemaDef {
 /// server's unknown source kind: an unrecognized `kind` decodes to
 /// [`SchemaSource::Unknown`] instead of failing the whole reply.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SchemaSource {
@@ -968,6 +987,10 @@ pub enum SchemaSource {
     /// A Protobuf `FileDescriptorSet` (one or more compiled `.proto` files)
     /// plus the fully-qualified message type to decode, e.g. `"fleet.Reading"`.
     Protobuf {
+        #[cfg_attr(
+            feature = "schemars",
+            schemars(schema_with = "crate::encoding::bytes_schema")
+        )]
         #[serde(with = "crate::encoding::bin_bytes")]
         descriptor_set: Vec<u8>,
         message_type: String,
@@ -990,6 +1013,7 @@ pub enum SchemaSource {
 /// driving LaserData Cloud) publishes these to register projections,
 /// bindings, and schemas.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum ControlCommand {
     RegisterProjection(Projection),
     DropProjection(String),
@@ -1051,6 +1075,7 @@ pub enum ControlCommand {
 
 /// The first offset one source partition incarnation still retains.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SourceRetention {
     pub source: SourceSelector,
     pub partition_id: u32,
@@ -1063,6 +1088,7 @@ pub struct SourceRetention {
 
 /// One record a binding skips, on one topic incarnation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RecordSkip {
     pub source: SourceSelector,
     pub partition_id: u32,
@@ -1100,6 +1126,7 @@ impl RecordSkip {
 
 /// The exact missing range an operator accepted for one source partition.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GapAcceptance {
     pub source: SourceSelector,
     pub partition_id: u32,
@@ -1124,6 +1151,7 @@ impl GapAcceptance {
 
 /// The topics a session-source registration covers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum SessionTopics {
     All,
     Named(Vec<String>),
@@ -1131,6 +1159,7 @@ pub enum SessionTopics {
 
 /// Versioned wrapper around a [`ControlCommand`], CBOR-named on the wire.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ControlEnvelope {
     pub v: u32,
     pub timestamp_micros: u64,
@@ -1152,6 +1181,7 @@ pub struct ControlEnvelope {
 
 /// Who appended a control record and for which resource generation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ControlStamp {
     /// The deployment whose backend appended the record. Zero for a
     /// standalone backend without a deployment identity.
@@ -1175,6 +1205,7 @@ pub struct ControlStamp {
 /// One incarnation of a stream: a deleted and recreated stream has a new
 /// creation time even when it reuses its name and id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ControlStreamGeneration {
     pub stream_id: u32,
     pub created_at_micros: u64,

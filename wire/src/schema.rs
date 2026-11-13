@@ -68,6 +68,17 @@ impl LogicalSchemaId {
     }
 }
 
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for LogicalSchemaId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "LogicalSchemaId".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        crate::encoding::fixed_bytes_schema(generator, 16)
+    }
+}
+
 impl Serialize for LogicalSchemaId {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_bytes(&self.to_bytes())
@@ -118,7 +129,15 @@ impl<'de> Deserialize<'de> for LogicalSchemaId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SchemaFingerprint(#[serde(with = "crate::encoding::bin_bytes")] pub Vec<u8>);
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct SchemaFingerprint(
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub Vec<u8>,
+);
 
 impl SchemaFingerprint {
     pub const BYTES: usize = 32;
@@ -133,7 +152,15 @@ impl SchemaFingerprint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Digest32(#[serde(with = "crate::encoding::bin_bytes")] pub Vec<u8>);
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct Digest32(
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub Vec<u8>,
+);
 
 impl Digest32 {
     pub const BYTES: usize = 32;
@@ -174,6 +201,7 @@ impl Validate for SchemaFingerprint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct LogicalSchemaRef {
     pub id: LogicalSchemaId,
     pub version: u32,
@@ -193,6 +221,7 @@ impl Validate for LogicalSchemaRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct LogicalSchema {
     pub schema: LogicalSchemaRef,
     pub fields: Vec<LogicalField>,
@@ -374,6 +403,7 @@ fn encode_logical_type(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct LogicalField {
     pub id: u32,
     pub name: String,
@@ -384,6 +414,7 @@ pub struct LogicalField {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum LogicalType {
@@ -427,6 +458,7 @@ pub enum LogicalType {
 
 /// Non-parameterized logical type identity used in capability descriptors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum LogicalTypeKind {
@@ -496,7 +528,12 @@ impl LogicalType {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct DecimalValue {
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub unscaled: Vec<u8>,
     pub precision: u8,
@@ -510,7 +547,15 @@ impl DecimalValue {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UuidValue(#[serde(with = "crate::encoding::bin_bytes")] pub Vec<u8>);
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct UuidValue(
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub Vec<u8>,
+);
 
 impl UuidValue {
     pub const BYTES: usize = 16;
@@ -581,9 +626,18 @@ fn decode_hex(byte: u8) -> Result<u8, InvalidError> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BinaryValue(#[serde(with = "crate::encoding::bin_bytes")] pub Vec<u8>);
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct BinaryValue(
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub Vec<u8>,
+);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum TypedValue {
@@ -823,12 +877,14 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FieldValue {
     pub field_id: u32,
     pub value: TypedValue,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct MapEntry {
     pub key: TypedValue,
     pub value: TypedValue,

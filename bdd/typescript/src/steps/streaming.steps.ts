@@ -39,7 +39,6 @@ When(
   /^I publish a JSON event to topic "([^"]+)"$/,
   async function (this: LaserWorld, topic: string) {
     const target = this.requireLaser().topic(topic);
-    await target.ensure(1);
     await target.json(new Json(decodeEvent)).publish({ id: this.published });
     this.published += 1;
     this.lastTopic = topic;
@@ -51,7 +50,6 @@ When(
   async function (this: LaserWorld, countText: string, topic: string) {
     const count = Number(countText);
     const target = this.requireLaser().topic(topic);
-    await target.ensure(1);
     await target
       .json(new Json(decodeEvent))
       .publishBatch(Array.from({ length: count }, (_, id) => ({ id })));

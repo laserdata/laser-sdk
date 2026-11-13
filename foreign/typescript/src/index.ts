@@ -522,7 +522,12 @@ export { agentCtx, agentMessage } from "./testing.js"
 export type { ConsumerRef, ConsumptionStatus, ResourceNaming } from "./client/laser.js"
 export { ChunkAssembler, FINISH_REASON_ABANDONED, FINISH_REASON_GAP } from "./agent/assembler.js"
 export type { StreamEvent } from "./agent/assembler.js"
-export { ReliableConsumer, SlidingWindow, retryBackoff } from "./agent/reliable-consumer.js"
+export {
+  ReliableConsumer,
+  SlidingWindow,
+  WarmDedupPolicy,
+  retryBackoff
+} from "./agent/reliable-consumer.js"
 export type {
   AgentHandler,
   AgentMiddleware,

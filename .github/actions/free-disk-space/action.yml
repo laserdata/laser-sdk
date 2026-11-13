@@ -1,15 +1,28 @@
 name: Free up disk space
-# GitHub-hosted ubuntu runners ship ~14 GB free, and a dev-profile build of the
-# full test workspace plus container images can fill
+# GitHub-hosted ubuntu runners used to ship ~14 GB free, and a dev-profile build of
+# the full test workspace plus container images can fill
 # it ("No space left on device"). Strip the preinstalled toolchains we never
-# use before building.
+# use before building, unless the runner already has room. The cleanup takes
+# several minutes, mostly deleting files.
 description: Remove preinstalled toolchains and images to free runner disk
+inputs:
+  minimum-free-gb:
+    description: Skip the cleanup when the root filesystem already has this many GB free
+    default: "50"
 runs:
   using: composite
   steps:
     - name: Remove unused preinstalled software
       shell: bash
+      env:
+        MINIMUM_FREE_GB: ${{ inputs.minimum-free-gb }}
       run: |
+        df -h /
+        free_gb="$(df --output=avail --block-size=1G / | tail -n 1 | tr -d ' ')"
+        if (( free_gb >= MINIMUM_FREE_GB )); then
+          echo "${free_gb} GB free, at least ${MINIMUM_FREE_GB} GB wanted, cleanup skipped"
+          exit 0
+        fi
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
         sudo rm -rf /usr/local/share/boost /usr/share/swift
         sudo rm -rf /usr/local/.ghcup /usr/local/share/powershell /usr/local/lib/node_modules

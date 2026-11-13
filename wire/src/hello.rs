@@ -75,6 +75,7 @@ pub mod feature {
 /// feature bits it advertises. A pinned wire shape, mirrored by the HTTP
 /// capabilities `versions` block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub struct OpVersions {
     pub query: u32,
@@ -170,6 +171,7 @@ impl OpVersions {
 /// servers answer the probe with an empty body, which a client treats as "no
 /// versions advertised", never an error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub struct HelloReply {
     pub versions: OpVersions,
@@ -186,6 +188,7 @@ pub const BACKEND_DESCRIPTOR_VERSION: u32 = 1;
 
 /// One observed backend resource and its structured, secret-free capabilities.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub struct BackendDescriptor {
     pub descriptor_version: u32,
@@ -315,6 +318,7 @@ impl Validate for BackendDescriptor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BackendMode {
@@ -322,12 +326,14 @@ pub enum BackendMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct BackendImplementation {
     pub kind: String,
     pub version: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BackendDesiredState {
@@ -336,6 +342,7 @@ pub enum BackendDesiredState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BackendObservedState {
@@ -347,6 +354,7 @@ pub enum BackendObservedState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct BackendReadiness {
     pub ready: bool,
     pub reasons: Vec<BackendReadinessReason>,
@@ -401,6 +409,7 @@ impl Validate for BackendReadiness {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct BackendReadinessReason {
     pub code: BackendReadinessCode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -408,6 +417,7 @@ pub struct BackendReadinessReason {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BackendReadinessCode {
@@ -425,6 +435,7 @@ pub enum BackendReadinessCode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct QueryCapabilities {
     pub dialects: Vec<SqlDialect>,
     pub consistency: Vec<Consistency>,
@@ -491,6 +502,7 @@ fn validate_descriptor_text(label: &str, value: &str) -> Result<(), InvalidError
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SchemaCapabilities {
     pub logical_schema: bool,
     pub arrow_ipc_stream: bool,
@@ -498,6 +510,7 @@ pub struct SchemaCapabilities {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct BackendLimits {
     pub max_query_rows: u64,
     pub max_query_bytes: u64,
@@ -528,6 +541,7 @@ const fn backend_is_ready(ready: &bool) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub struct BackendAnnounce {
     pub versions: OpVersions,
@@ -560,6 +574,7 @@ pub struct BackendAnnounce {
 /// list, so a version gap fails before the first page instead of filtering
 /// differently.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterAnnounce {
     pub evaluator_version: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

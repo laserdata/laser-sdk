@@ -6,10 +6,11 @@ use laser_sdk::govern::{ActionDecision, ActionGovernor, GovernedAction, Governor
 use laser_sdk::prelude::full::*;
 use laser_sdk::types::MintUlid;
 use laser_sdk::wire::agent::{
-    AgentEnvelope, AgentId, AgentKind, Budget, CorrelationId, OPERATION_STATE_DELTA, RecordId,
-    TaskState, TokenUsage,
+    AgentEnvelope, AgentId, AgentKind, Budget, CorrelationId, OPERATION_STATE_DELTA,
+    OPERATION_STATE_SNAPSHOT, RecordId, StateSnapshot, TaskState, TokenUsage,
 };
 use laser_sdk::wire::dispatch::OPERATION_INVOKE_AGENT;
+use laser_sdk::wire::framing::encode_named;
 use laser_sdk::wire::limits::MAX_MANIFEST_FRAGMENTS;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -392,6 +393,94 @@ async fn given_an_undecodable_state_record_when_the_state_is_read_then_should_sk
 
 #[tokio::test]
 #[serial_test::serial(integration)]
+async fn given_a_snapshot_at_the_reached_revision_with_another_document_when_the_state_is_read_then_should_keep_the_folded_document()
+ {
+    let laser = harness::laser().await;
+    let (session, lease) = laser
+        .sessions()
+        .start()
+        .agent(agent("writer"))
+        .begin()
+        .await
+        .expect("the session starts");
+    session
+        .state()
+        .set("progress", serde_json::json!(1.0))
+        .await
+        .expect("the first write lands");
+    // The same document from a client that writes whole numbers as integers.
+    session
+        .append(state_snapshot(
+            session.conversation(),
+            1,
+            serde_json::json!({"progress": 1}),
+        ))
+        .await
+        .expect("the equal snapshot appends");
+    // A writer whose own delta never applied names the reached revision.
+    session
+        .append(state_snapshot(
+            session.conversation(),
+            1,
+            serde_json::json!({"progress": 9}),
+        ))
+        .await
+        .expect("the stale snapshot appends");
+    let reader = laser
+        .sessions()
+        .open(session.conversation())
+        .as_agent(agent("writer"));
+    reader
+        .state()
+        .set("b", serde_json::json!(2))
+        .await
+        .expect("a write after the snapshots seeds and lands");
+    await_state_deltas(&laser, session.conversation(), 2).await;
+    let view = reader.state().get().await.expect("the state folds");
+    assert_eq!(view.document, serde_json::json!({"progress": 1, "b": 2}));
+    assert_eq!(view.revision, 2);
+    drop(lease);
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_whole_float_checkpointed_as_an_integer_when_the_writer_snapshots_then_should_write_it()
+ {
+    let laser = harness::laser().await;
+    let (session, lease) = laser
+        .sessions()
+        .start()
+        .agent(agent("writer"))
+        .begin()
+        .await
+        .expect("the session starts");
+    let state = session.state();
+    state
+        .set("progress", serde_json::json!(1.0))
+        .await
+        .expect("the first write lands");
+    session
+        .append(state_snapshot(
+            session.conversation(),
+            1,
+            serde_json::json!({"progress": 1}),
+        ))
+        .await
+        .expect("the checkpoint appends");
+    harness::eventually(|| async {
+        let view = state.get().await.ok()?;
+        (view.document == serde_json::json!({"progress": 1})).then_some(())
+    })
+    .await;
+    state
+        .snapshot()
+        .await
+        .expect("the writer still holds the current document");
+    drop(lease);
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
 async fn given_concurrent_state_writes_when_sent_then_should_publish_one_at_a_time_in_revision_order()
  {
     let laser = harness::laser().await;
@@ -531,6 +620,26 @@ async fn await_state_deltas(laser: &Laser, conversation: ConversationId, count: 
         (deltas >= count).then_some(())
     })
     .await;
+}
+
+// A state snapshot record as another writer on the session lane appends it.
+fn state_snapshot(
+    conversation: ConversationId,
+    base_revision: u64,
+    document: serde_json::Value,
+) -> AgentEnvelope {
+    let mut envelope = AgentEnvelope::event(
+        RecordId::mint(),
+        conversation.into(),
+        agent("writer"),
+        encode_named(&StateSnapshot {
+            base_revision,
+            document,
+        })
+        .expect("the snapshot encodes"),
+    );
+    envelope.operation = Some(OPERATION_STATE_SNAPSHOT.to_owned());
+    envelope
 }
 
 fn agent(name: &str) -> AgentId {

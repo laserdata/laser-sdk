@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 
 /// The resource surface used to narrow a session link read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LinkSurface {
     Memory,
@@ -26,6 +27,7 @@ pub enum LinkSurface {
 
 /// The relationship a session has with a linked resource.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LinkRelation {
     Wrote,
@@ -38,12 +40,14 @@ pub mod request {
     use super::*;
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
     pub struct SessionGet {
         pub stream: String,
         pub id: ConversationId,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
     pub struct SessionList {
         pub stream: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,6 +76,7 @@ pub mod request {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
     pub struct SessionEvents {
         pub stream: String,
         pub id: ConversationId,
@@ -89,6 +94,7 @@ pub mod request {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
     pub struct SessionState {
         pub stream: String,
         pub id: ConversationId,
@@ -97,6 +103,7 @@ pub mod request {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
     pub struct SessionLinks {
         pub stream: String,
         pub id: ConversationId,
@@ -105,6 +112,7 @@ pub mod request {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
     pub struct SessionSources {
         pub stream: String,
         pub id: ConversationId,
@@ -117,6 +125,7 @@ pub mod request {
     /// sequence `(p - 1) * r + 1 ..= p * r`, so appends and pruning never
     /// shift a page.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
     pub struct SessionChanges {
         pub stream: String,
         /// The 1-based page. Zero reads the first page.
@@ -130,6 +139,7 @@ pub mod request {
 /// never compared across topics. `topic_generation` is the topic creation time
 /// in microseconds, so a recreated topic with a reused id is a different source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SourceFrontier {
     pub topic_id: u32,
     pub topic_generation: u64,
@@ -147,6 +157,7 @@ pub struct SourceFrontier {
 
 /// Why part of a session timeline is missing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum GapReason {
     /// The source expired these offsets before the index folded them.
@@ -163,6 +174,7 @@ pub enum GapReason {
 
 /// A missing inclusive offset range on one source partition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SourceGap {
     pub topic_id: u32,
     pub topic_generation: u64,
@@ -176,6 +188,7 @@ pub struct SourceGap {
 /// of a timeline page. A range is a hint for bounded polls, not a promise that
 /// every offset in it belongs to the session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct PayloadRange {
     pub topic_id: u32,
     pub topic_generation: u64,
@@ -186,13 +199,14 @@ pub struct PayloadRange {
 
 /// What the fold did with one state record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StateOutcome {
     /// The patch or snapshot changed the document.
     Applied,
     /// A patch operation failed, so the whole patch was rejected.
     Rejected,
-    /// The base revision did not match the applied revision.
+    /// The base revision did not match the applied revision, or a snapshot at it held another document.
     Stale,
     /// The operation id was already applied.
     Duplicate,
@@ -202,6 +216,7 @@ pub enum StateOutcome {
 
 /// One entry in the state history of a session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct StateChange {
     /// The document revision after this record.
     pub revision: u64,
@@ -220,6 +235,7 @@ pub struct StateChange {
 
 /// Conditions that make a session summary partial.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionFlags {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub label_truncated: bool,
@@ -243,6 +259,7 @@ pub struct SessionFlags {
 
 /// The summary of one session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionInfo {
     pub stream: String,
     pub id: ConversationId,
@@ -300,6 +317,7 @@ fn is_zero(value: &u64) -> bool {
 
 /// One page of session summaries, newest created first. `page` counts from 1.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionPage {
     pub items: Vec<SessionInfo>,
     pub page: u32,
@@ -324,6 +342,7 @@ pub struct SessionPage {
 /// One indexed record on a session timeline. The summary never holds prompt
 /// text or tool argument values.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionEvent {
     pub at: SourceRef,
     pub session: ConversationId,
@@ -356,6 +375,7 @@ pub struct SessionEvent {
 /// One page of a session timeline in server append time order. `page` counts
 /// from 1.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionEventsPage {
     pub items: Vec<SessionEvent>,
     pub page: u32,
@@ -376,6 +396,7 @@ pub struct SessionEventsPage {
 
 /// The folded state document of a session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionStateView {
     pub revision: u64,
     pub document: serde_json::Value,
@@ -388,6 +409,7 @@ pub struct SessionStateView {
 
 /// One resource a session wrote, recalled, or touched.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionLink {
     pub surface: LinkSurface,
     pub resource: String,
@@ -399,6 +421,7 @@ pub struct SessionLink {
 
 /// The resources linked to one session.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionLinksView {
     pub links: Vec<SessionLink>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -408,6 +431,7 @@ pub struct SessionLinksView {
 
 /// The source partitions that hold records of one session.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionSources {
     pub sources: Vec<SourceFrontier>,
     /// Registered lane topic ID, creation generation, and partition count.
@@ -417,6 +441,7 @@ pub struct SessionSources {
 
 /// One committed change batch in a stream.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionChangeRow {
     pub seq: u64,
     pub sessions: Vec<ConversationId>,
@@ -433,6 +458,7 @@ pub struct SessionChangeRow {
 
 /// What made the sessions of one change row change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionChangeOrigin {
     /// Records folded from the session sources.
@@ -458,6 +484,7 @@ impl SessionChangeOrigin {
 /// sequence, or the next one when none is retained. A follower whose `series`
 /// differs, or whose next sequence is below `floor`, lists sessions again.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionChanges {
     pub items: Vec<SessionChangeRow>,
     pub page: u32,
@@ -473,6 +500,7 @@ pub struct SessionChanges {
 /// The reply to every session read: `Ok` with the outcome, or `Err` with a
 /// failure.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum SessionReply {
     Ok(SessionOutcome),
@@ -481,6 +509,7 @@ pub enum SessionReply {
 
 /// The successful outcome of a session read, shaped per request.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum SessionOutcome {
     Info(Box<SessionInfo>),
@@ -494,6 +523,7 @@ pub enum SessionOutcome {
 
 /// Why a session read failed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum SessionError {
     #[error("sessions not supported: {0}")]
@@ -520,6 +550,7 @@ pub enum SessionError {
 /// one stream that the process holds leases on. A process with sessions in
 /// several streams writes one heartbeat per stream.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionHeartbeat {
     pub process: String,
     pub stream: String,

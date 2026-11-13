@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// by `client_id`, applies the filters, skips past `after_client_id`, and returns
 /// up to `limit` entries plus a cursor when more remain.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ClientMetadataQuery {
     pub v: u32,
     /// Only return connections that advertised metadata. The common case for
@@ -34,6 +35,7 @@ fn is_false(value: &bool) -> bool {
 /// Cloud). The metadata is opaque: an agent advertises its card, a regular app
 /// sets any blob the consumer interprets.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ClientMetadata {
     pub client_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43,6 +45,10 @@ pub struct ClientMetadata {
     pub transport: u8,
     pub address: String,
     pub consumer_groups_count: u32,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::opt_bytes_schema")
+    )]
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -56,6 +62,7 @@ pub struct ClientMetadata {
 /// more connections remain, so the caller pages by passing it as the next
 /// `after_client_id`. `None` means the last page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ClientMetadataList {
     pub clients: Vec<ClientMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,6 +70,7 @@ pub struct ClientMetadataList {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ProducerPresence {
     pub producer_presence_version: u32,
     pub observed_at_millis: u64,
@@ -71,6 +79,7 @@ pub struct ProducerPresence {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ProducerStatistics {
     pub instance_id: String,
     pub stream: String,
@@ -88,6 +97,7 @@ pub struct ProducerStatistics {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ProducerLatency {
     pub samples: u64,
     pub p50_micros: Option<u64>,

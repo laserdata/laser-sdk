@@ -143,6 +143,8 @@ export const NEVER_EXPIRE = 18_446_744_073_709_551_615n
 
 const TOPIC_NAME_ALREADY_EXISTS = 2013
 const NOT_FOUND_METADATA_CODES = new Set([1009, 1010, 2010, 2011])
+const STREAM_NAME_NOT_FOUND = 1010
+const TOPIC_NAME_NOT_FOUND = 2011
 // A missing resource, stream, or topic on publish: the cached routing may
 // predate a deleted and recreated stream or topic.
 const MISSING_RESOURCE_CODES = new Set([20, 1009, 1010, 2010, 2011])
@@ -1069,17 +1071,32 @@ function decodeCredential(encoded: string): string {
   }
 }
 
-// `host` or `host:port`. A missing port becomes 8090. IPv6 literals are refused
-// because Apache Iggy's connection string cannot carry them.
+// `host`, `host:port`, `[ipv6]` or `[ipv6]:port`. A missing port becomes 8090.
+// The host of an IPv6 address is dialed without its brackets.
 function parseAddress(address: string): { readonly host: string; readonly port: number } {
-  if (/[[\]/#]/.test(address)) {
-    throw new ConfigError(
-      "connection string address must be host or host:port, IPv6 literals and paths are not supported"
+  const malformed = (): ConfigError =>
+    new ConfigError(
+      "connection string address must be host, host:port, [ipv6] or [ipv6]:port, without a path"
     )
+  if (/[/#]/.test(address)) throw malformed()
+  let host: string
+  let portText: string | undefined
+  if (address.startsWith("[")) {
+    const closing = address.indexOf("]")
+    if (closing < 0) throw malformed()
+    host = address.slice(1, closing)
+    if (isIP(host) !== 6) {
+      throw new ConfigError("connection string brackets must hold an IPv6 address")
+    }
+    const rest = address.slice(closing + 1)
+    if (rest.length > 0 && !rest.startsWith(":")) throw malformed()
+    portText = rest.length === 0 ? undefined : rest.slice(1)
+  } else {
+    if (/[[\]]/.test(address)) throw malformed()
+    const separator = address.indexOf(":")
+    host = separator < 0 ? address : address.slice(0, separator)
+    portText = separator < 0 ? undefined : address.slice(separator + 1)
   }
-  const separator = address.indexOf(":")
-  const host = separator < 0 ? address : address.slice(0, separator)
-  const portText = separator < 0 ? undefined : address.slice(separator + 1)
   if (host.length === 0) throw new ConfigError("connection string missing host")
   if (portText === undefined) return { host, port: DEFAULT_TCP_PORT }
   const port = Number(portText)
@@ -1330,6 +1347,14 @@ function transportUp(raw: RawClient | undefined): boolean {
   return !(socket instanceof TLSSocket) || Object.keys(socket.getPeerCertificate()).length > 0
 }
 
+// A stream or topic a lookup found missing, carrying Apache Iggy's code for it
+// so it classifies like the server's own refusal.
+function missingResource(message: string, errorCode: number): TransportError {
+  return new TransportError(message, false, {
+    cause: Object.assign(new Error(message), { errorCode })
+  })
+}
+
 // A failure a later attempt can clear: no server reply, or a server reply the
 // cluster marks transient.
 function retryableFailure(error: unknown): boolean {
@@ -1355,14 +1380,16 @@ function serverResponseError(error: unknown): Error | undefined {
 
 async function connectWithRetry(
   parsed: ParsedConnectionString,
-  deadline: number
+  deadline: number,
+  signal?: AbortSignal
 ): Promise<ConnectedClient> {
   let lastError: unknown
   for (;;) {
     try {
-      return await connectSimpleClient(parsed, deadline)
+      return await connectSimpleClient(parsed, deadline, signal)
     } catch (error) {
-      if (error instanceof ConfigError || error instanceof TimeoutError) throw error
+      if (error instanceof ConfigError || error instanceof TimeoutError || signal?.aborted === true)
+        throw error
       lastError = error
       // The client spends a bounded retry budget on its own dials. An unlimited
       // one outlasts its 30-second call, so only the connect budget ends it.
@@ -1374,9 +1401,11 @@ async function connectWithRetry(
       }
       const remaining = deadline - Date.now()
       if (remaining <= 0) throw new TimeoutError(ACCEPT_STAGE, { cause: error })
-      await new Promise((resolve) =>
-        setTimeout(resolve, Math.min(parsed.reconnection.intervalMs, remaining))
-      )
+      await sleep(
+        Math.min(parsed.reconnection.intervalMs, remaining),
+        undefined,
+        signal === undefined ? {} : { signal }
+      ).catch(() => undefined)
     }
   }
   const responseError = serverResponseError(lastError)
@@ -1879,11 +1908,12 @@ export class ApacheIggyTransport implements LaserTransport {
   static async connect(
     connectionString: string,
     options?: Partial<PublishOptions>,
-    deadline = Date.now() + connectOptions().timeoutMs
+    deadline = Date.now() + connectOptions().timeoutMs,
+    signal?: AbortSignal
   ): Promise<ApacheIggyTransport> {
     const config = publishOptions(options)
     const parsed = parseConnectionString(connectionString)
-    const connected = await connectWithRetry(parsed, deadline)
+    const connected = await connectWithRetry(parsed, deadline, signal)
     return new ApacheIggyTransport(connected.client, parsed, "owned", config)
   }
 
@@ -2430,9 +2460,9 @@ export class ApacheIggyTransport implements LaserTransport {
   async getTopicPartitionCount(streamId: string, topicId: string): Promise<number> {
     const partitions = await this.findTopicPartitionCount(streamId, topicId)
     if (partitions === undefined) {
-      throw new TransportError(
+      throw missingResource(
         `topic \`${topicId}\` on stream \`${streamId}\` does not exist`,
-        false
+        TOPIC_NAME_NOT_FOUND
       )
     }
     return partitions
@@ -2448,12 +2478,12 @@ export class ApacheIggyTransport implements LaserTransport {
       `failed to resolve topic \`${topicId}\``
     )
     if (stream === null) {
-      throw new TransportError(`stream \`${streamId}\` does not exist`, false)
+      throw missingResource(`stream \`${streamId}\` does not exist`, STREAM_NAME_NOT_FOUND)
     }
     if (topic === null) {
-      throw new TransportError(
+      throw missingResource(
         `topic \`${topicId}\` on stream \`${streamId}\` does not exist`,
-        false
+        TOPIC_NAME_NOT_FOUND
       )
     }
     return { streamId: stream.id, topicId: topic.id }
@@ -2727,6 +2757,10 @@ export class ApacheIggyTransport implements LaserTransport {
           const code = serverErrorCode(cause) ?? -1
           const missedRoute = code === PARTITION_NOT_FOUND && routing.kind !== "partition"
           if (!MISSING_RESOURCE_CODES.has(code) && !missedRoute) throw cause
+          if (MISSING_RESOURCE_CODES.has(code) && options?.beforeSend === undefined) {
+            await this.ensureStream(streamId)
+            await this.createTopicIfAbsent(streamId, topicId, 1, {})
+          }
           // Rebuild the routing once, as a recreated stream or topic or a
           // topic with fewer partitions needs.
           this.partitionCounts.delete(this.topicKey(streamId, topicId))
@@ -3192,7 +3226,12 @@ export class ApacheIggyTransport implements LaserTransport {
     let cached = this.partitionCounts.get(key)
     if (cached === undefined || Date.now() - cached.readAt >= PARTITION_COUNT_MAX_AGE_MS) {
       const topic = await client.topic.get({ streamId, topicId })
-      if (topic === null) throw new TransportError(`topic ${topicId} does not exist`, false)
+      if (topic === null) {
+        throw missingResource(
+          `topic \`${topicId}\` on stream \`${streamId}\` does not exist`,
+          TOPIC_NAME_NOT_FOUND
+        )
+      }
       cached = { count: topic.partitionsCount, readAt: Date.now() }
       this.partitionCounts.set(key, cached)
     }

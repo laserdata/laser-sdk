@@ -15,6 +15,7 @@ pub const MAX_ARROW_DECIMAL_BITS: u16 = 128;
 /// Validated facts about one self-contained Arrow IPC stream carried by one
 /// Iggy message. The raw IPC stream remains the message body.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ArrowIpcMessageMetadata {
     pub contract_version: u32,
     pub schema_fingerprint: SchemaFingerprint,
@@ -66,6 +67,7 @@ impl Validate for ArrowIpcMessageMetadata {
 /// Frozen producer-side Arrow input policy. One message contains one complete
 /// stream with its schema, dictionaries, and record batches.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ArrowIpcPolicy {
     pub contract_version: u32,
     pub stream_format_only: bool,
@@ -127,6 +129,7 @@ impl Validate for ArrowIpcPolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ArrowTimestampUnit {
@@ -135,6 +138,7 @@ pub enum ArrowTimestampUnit {
 
 /// Stable reason returned when an Arrow stream cannot enter the logical schema gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ArrowIpcRejectionCode {

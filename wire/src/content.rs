@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]

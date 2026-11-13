@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// picture of one materialized view: its extraction schema, expected content
 /// type, indexed fields, and where it applies.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ProjectionInfo {
     pub projection: Projection,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -21,6 +22,7 @@ pub struct ProjectionInfo {
 
 /// One binding's materialization as the answering node sees it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct BindingStatus {
     #[serde(default, skip_serializing_if = "ProjectionHistory::is_append")]
     pub history: ProjectionHistory,
@@ -54,6 +56,7 @@ pub struct BindingStatus {
 
 /// Whether a binding's destination table exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum RealizationState {
@@ -67,6 +70,7 @@ pub enum RealizationState {
 
 /// Why the destination table could not be created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum FailureClass {
@@ -90,6 +94,7 @@ pub enum FailureClass {
 
 /// What keeps a binding from visible progress when no record holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum StallReason {
@@ -107,6 +112,7 @@ pub enum StallReason {
 
 /// One source partition's progress into a binding's destination.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct PartitionProgress {
     pub partition_id: u32,
     /// The last offset the source partition holds.
@@ -124,6 +130,7 @@ pub struct PartitionProgress {
 
 /// Why a partition does not advance.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Hold {
     pub partition_id: u32,
     pub offset: u64,
@@ -133,6 +140,7 @@ pub struct Hold {
 
 /// What holds a partition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum HoldCause {
@@ -150,6 +158,7 @@ pub enum HoldCause {
 
 /// How far a materialization setup has come, weakest first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum MaterializationReadiness {
@@ -243,6 +252,7 @@ impl FailureClass {
 /// permanent). Wire mirrors stay constructible (wire-stability-bound, not
 /// API-stability-bound).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SchemaInfo {
     pub schema: SchemaDef,
     #[serde(default)]
@@ -251,6 +261,7 @@ pub struct SchemaInfo {
 
 /// Request to read one projection's details by id.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GetProjection {
     pub v: u32,
     pub id: String,
@@ -267,6 +278,7 @@ pub struct GetProjection {
 /// keeps projections of the named kinds. The filters compose (AND). The reply is one
 /// page of the matches in id order.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ListProjections {
     pub v: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -294,6 +306,7 @@ pub struct ListProjections {
 
 /// One page of a projection listing. `page` counts from 1.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ProjectionPage {
     pub items: Vec<ProjectionInfo>,
     pub page: u32,
@@ -303,6 +316,7 @@ pub struct ProjectionPage {
 
 /// Request to read one registered writer schema by id.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GetSchema {
     pub v: u32,
     pub id: u32,
@@ -318,6 +332,7 @@ pub struct GetSchema {
 /// HTTP query, so the server pushes it down rather than the client paging the
 /// whole set.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ListSchemas {
     pub v: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -336,6 +351,7 @@ pub struct ListSchemas {
 
 /// One page of a writer-schema listing, ordered by id. `page` counts from 1.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SchemaPage {
     pub items: Vec<SchemaInfo>,
     pub page: u32,
@@ -349,6 +365,7 @@ pub struct SchemaPage {
 /// `ControlCommand::RegisterSchema`, the durable log form that carries the
 /// allocated id.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RegisterSchema {
     pub v: u32,
     pub source: SchemaSource,
@@ -367,9 +384,14 @@ pub struct RegisterSchema {
 /// convenience for consoles and tools that hold a schema-first (Avro/Protobuf)
 /// payload and want its JSON form without re-implementing the codecs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct DecodeRecord {
     pub v: u32,
     pub id: u32,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub payload: Vec<u8>,
     /// The stream the record was read from: `id` resolves in its registry,
@@ -381,6 +403,7 @@ pub struct DecodeRecord {
 
 /// Reply to a registry browse: `Ok` with the result, or `Err`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum BrowseReply {
     Ok(BrowseOutcome),
@@ -389,6 +412,7 @@ pub enum BrowseReply {
 
 /// The result of a registry browse, shaped per request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum BrowseOutcome {
     /// `list_projections`: one page of the matching projections.

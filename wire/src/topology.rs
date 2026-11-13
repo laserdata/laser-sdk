@@ -44,6 +44,7 @@ fn default_graph_mutations_topic() -> String {
 /// announcement from an older peer missing a newer field still decodes to
 /// that field's real default name, not an empty one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct WireTopology {
     #[serde(default = "default_ops_stream")]
     pub ops_stream: String,

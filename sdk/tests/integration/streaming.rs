@@ -433,6 +433,45 @@ async fn given_a_bootstrapped_stream_when_deleted_then_should_remove_it_once() {
 }
 
 #[tokio::test]
+async fn given_a_missing_topic_or_stream_when_published_then_should_create_it_and_commit() {
+    let laser = harness::laser().await;
+    let response = laser
+        .topic("new-topic")
+        .publish()
+        .payload(b"created".to_vec())
+        .send()
+        .await
+        .expect("a publish creates its missing topic");
+    assert_eq!(response.confirmations.len(), 1);
+    let absent = format!(
+        "{}_absent",
+        laser
+            .default_stream()
+            .expect("the test laser names its stream")
+    );
+    let response = laser
+        .stream(&absent)
+        .topic("events")
+        .send(b"created".to_vec(), BTreeMap::new(), None)
+        .await
+        .expect("a send creates its missing stream and topic");
+    assert_eq!(response.confirmations.len(), 1);
+    assert!(
+        laser
+            .client()
+            .get_stream(&Identifier::named(&absent).expect("the stream name is valid"))
+            .await
+            .expect("the stream lookup succeeds")
+            .is_some()
+    );
+    laser
+        .stream(&absent)
+        .delete()
+        .await
+        .expect("the created stream is removed");
+}
+
+#[tokio::test]
 async fn given_a_closed_laser_when_used_then_should_refuse_further_requests() {
     let laser = harness::laser().await;
     let clone = laser.clone();

@@ -10,6 +10,7 @@ pub const MANAGED_REQUEST_VERSION: u32 = 1;
 /// within one `topic_generation`: a generation mismatch is fail-closed
 /// ([`crate::kv::KvError::Stale`]), never an implicit reset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct MutationPosition {
     pub topic_generation: u64,
     pub partition: u32,
@@ -17,9 +18,14 @@ pub struct MutationPosition {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ManagedRequestEnvelope {
     pub v: u32,
     pub operation_id: u128,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub payload: Vec<u8>,
 }
@@ -38,6 +44,7 @@ impl ManagedRequestEnvelope {
 
 /// A managed surface with its own mutation log and fold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PositionSurface {
     Kv,
@@ -103,10 +110,15 @@ impl PositionSurface {
 /// writes without waiting for the whole log. A node that does not get there
 /// within its wait bound answers `Stale`, never older state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ManagedReadEnvelope {
     pub v: u32,
     /// The read request the client would otherwise send on its own.
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub read: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +135,7 @@ pub struct ManagedReadEnvelope {
 /// How far a node's session fold has applied one partition of a session
 /// source. Positions compare only within one stream and topic generation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct SessionPosition {
     pub stream_id: u32,
@@ -140,6 +153,7 @@ pub struct SessionPosition {
 /// `None` for a surface whose fold has applied nothing yet. `sessions` covers
 /// the stream of a session read and is empty for every other reply.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AppliedFrontier {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -160,11 +174,16 @@ pub struct AppliedFrontier {
 /// [`ManagedReadEnvelope::min_position`]. Unknown fields are refused, so no
 /// surface reply is ever taken for this frame.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ManagedReplyEnvelope {
     pub v: u32,
     #[serde(default)]
     pub frontier: AppliedFrontier,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub reply: Vec<u8>,
 }
@@ -179,6 +198,7 @@ fn is_false(value: &bool) -> bool {
 /// append and fold share one request schema instead of maintaining a second
 /// mutation representation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct MutationCommandEnvelope {
     pub v: u32,
     pub operation_id: u128,
@@ -188,6 +208,10 @@ pub struct MutationCommandEnvelope {
     /// Trusted stream identity carried through durable replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<crate::forward::ForwardedScope>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub payload: Vec<u8>,
     /// The client that asked for the command, stamped before the command

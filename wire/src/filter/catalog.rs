@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
     strum::EnumString,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum FilterState {
@@ -36,6 +37,7 @@ pub enum FilterState {
 /// own metadata. A recreated stream, topic, or group with the same names gets
 /// a different identity, so it never inherits an old binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterGroupIdentity {
     pub stream_id: u32,
     pub stream_created_at_micros: u64,
@@ -46,6 +48,7 @@ pub struct FilterGroupIdentity {
 
 /// A consumer group by name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterGroupRef {
     pub stream: String,
     pub topic: String,
@@ -57,6 +60,7 @@ pub struct FilterGroupRef {
 /// the group name stays current. Stream and topic names can change, so a
 /// reader resolves them live from the identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterOwner {
     pub identity: FilterGroupIdentity,
     pub group: FilterGroupRef,
@@ -64,6 +68,7 @@ pub struct FilterOwner {
 
 /// One immutable revision of a saved filter.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterRevisionInfo {
     #[serde(default = "revision_enabled")]
     pub enabled: bool,
@@ -79,6 +84,7 @@ const fn revision_enabled() -> bool {
 
 /// A saved filter as a list row.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterSummary {
     pub id: u32,
     pub name: String,
@@ -99,6 +105,7 @@ pub struct FilterSummary {
 
 /// A saved filter with its latest revision and bindings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterDetail {
     pub summary: FilterSummary,
     pub latest: FilterRevisionInfo,
@@ -109,6 +116,7 @@ pub struct FilterDetail {
 /// revision to every filtered read of the group, and rejects a reader that
 /// brings a different filter.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterBinding {
     pub group: FilterGroupRef,
     pub identity: FilterGroupIdentity,
@@ -129,11 +137,16 @@ pub struct FilterBinding {
 /// answers, which gives the application that configured the group a
 /// read-your-writes guarantee through any node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct CatalogPosition {
     pub partition_id: u32,
     pub offset: u64,
     /// The durable operation whose outcome proves this position was folded.
     /// Keeps read-your-writes valid when the control log is recreated.
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::opt_u128_schema")
+    )]
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -153,6 +166,7 @@ pub struct CatalogPosition {
 /// owning group with it. A group's binding never moves to another digest, so
 /// no revision of its own filter can be configured instead.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum GroupFilterSpec {
     Definition {
@@ -165,6 +179,7 @@ pub enum GroupFilterSpec {
 /// receive every record. `policy_generation` fences a later binding against
 /// acknowledgments of pages delivered unfiltered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GroupPolicyUnbound {
     pub identity: FilterGroupIdentity,
     pub policy_generation: u64,
@@ -172,6 +187,7 @@ pub struct GroupPolicyUnbound {
 
 /// One catalog change.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FilterMutation {
     /// Pause or resume new reads without changing the revision's policy.
@@ -229,8 +245,13 @@ pub enum FilterMutation {
 /// A catalog mutation with the caller's idempotency key. A retry with the same
 /// `operation_id` returns the outcome of the first attempt.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterMutationRequest {
     pub v: u32,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::u128_schema")
+    )]
     #[serde(with = "crate::encoding::u128_text")]
     pub operation_id: u128,
     pub mutation: FilterMutation,
@@ -239,6 +260,7 @@ pub struct FilterMutationRequest {
 /// Operational limits captured when the managed backend accepts a catalog command.
 /// Zero disables a limit. Older commands keep the original defaults on replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterCatalogLimits {
     pub max_definitions: u32,
     pub max_tombstones: u32,
@@ -274,7 +296,12 @@ const fn default_max_catalog_bytes() -> u64 {
 /// deterministic, so every replica, and every replay of the log, records the
 /// same outcome.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterCatalogCommand {
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::u128_schema")
+    )]
     #[serde(with = "crate::encoding::u128_text")]
     pub operation_id: u128,
     pub mutation: FilterMutation,
@@ -294,6 +321,7 @@ pub struct FilterCatalogCommand {
 
 /// A saved revision, by identity and digest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterRevisionRef {
     pub filter_id: u32,
     pub revision: u32,
@@ -302,6 +330,7 @@ pub struct FilterRevisionRef {
 
 /// What an applied mutation produced.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FilterMutationResult {
     /// The revision now accepts or refuses new reads.
@@ -329,6 +358,7 @@ pub enum FilterMutationResult {
 /// Where a mutation stands. `pending` means it entered the control log but has
 /// not been applied yet: read its outcome later by operation id.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FilterMutationStatus {
     Pending,
@@ -338,8 +368,13 @@ pub enum FilterMutationStatus {
 
 /// The authoritative outcome of one mutation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterMutationOutcome {
     pub v: u32,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::u128_schema")
+    )]
     #[serde(with = "crate::encoding::u128_text")]
     pub operation_id: u128,
     pub status: FilterMutationStatus,
@@ -350,6 +385,7 @@ pub struct FilterMutationOutcome {
 
 /// Read one saved filter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GetFilter {
     pub v: u32,
     pub filter_id: u32,
@@ -358,6 +394,7 @@ pub struct GetFilter {
 /// List saved filters, newest first by id. `page` counts from 1, and 0 reads
 /// the first page too. `results` is the page length.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ListFilters {
     pub v: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -374,6 +411,7 @@ pub struct ListFilters {
 
 /// A page of saved filters. `page` counts from 1.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterPage {
     pub items: Vec<FilterSummary>,
     pub page: u32,
@@ -384,6 +422,7 @@ pub struct FilterPage {
 /// List one filter's revisions, newest first. `page` counts from 1, and 0
 /// reads the first page too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ListFilterRevisions {
     pub v: u32,
     pub filter_id: u32,
@@ -394,6 +433,7 @@ pub struct ListFilterRevisions {
 
 /// A page of revisions. `page` counts from 1.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterRevisionPage {
     pub filter_id: u32,
     pub items: Vec<FilterRevisionInfo>,
@@ -405,6 +445,7 @@ pub struct FilterRevisionPage {
 /// Read one consumer group's binding. The streaming server stamps `identity`
 /// from the names before it forwards the request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GetFilterBinding {
     pub v: u32,
     pub group: FilterGroupRef,
@@ -415,6 +456,7 @@ pub struct GetFilterBinding {
 /// List bindings, optionally narrowed to one filter or one source. `page`
 /// counts from 1, and 0 reads the first page too.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ListFilterBindings {
     pub v: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,6 +472,7 @@ pub struct ListFilterBindings {
 
 /// A page of bindings. `page` counts from 1.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterBindingPage {
     pub items: Vec<FilterBinding>,
     pub page: u32,
@@ -439,14 +482,20 @@ pub struct FilterBindingPage {
 
 /// Read a mutation's outcome by its operation id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GetFilterOperation {
     pub v: u32,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::u128_schema")
+    )]
     #[serde(with = "crate::encoding::u128_text")]
     pub operation_id: u128,
 }
 
 /// The policy a filtered read resolves: a saved revision, or a group binding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FilterPolicyRef {
     Revision { filter_id: u32, revision: u32 },
@@ -455,6 +504,7 @@ pub enum FilterPolicyRef {
 
 /// Internal: the streaming server resolves a read's execution policy.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ResolveFilterPolicy {
     #[serde(default)]
     pub allow_disabled: bool,
@@ -477,6 +527,7 @@ pub struct ResolveFilterPolicy {
 /// Internal: wait until the catalog version differs from `since`, or the wait
 /// elapses. A zero wait confirms the current version before a cached read.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct WatchFilterCatalog {
     pub v: u32,
     pub since: u64,
@@ -486,6 +537,7 @@ pub struct WatchFilterCatalog {
 /// Internal: an opaque catalog version. It changes on each control-log fold
 /// and starts with a random token on each backend process to fence old caches.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FilterCatalogVersion {
     pub v: u32,
     pub version: u64,
@@ -493,6 +545,7 @@ pub struct FilterCatalogVersion {
 
 /// An execution policy: exactly one revision, with its lifecycle state.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ResolvedFilterPolicy {
     pub filter_id: u32,
     pub revision: u32,
@@ -506,6 +559,7 @@ pub struct ResolvedFilterPolicy {
 
 /// A successful catalog reply.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FilterCatalogOutcome {
     Filter(FilterDetail),
@@ -522,6 +576,7 @@ pub enum FilterCatalogOutcome {
 
 /// The reply to every catalog command.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FilterCatalogReply {
     Ok(Box<FilterCatalogOutcome>),

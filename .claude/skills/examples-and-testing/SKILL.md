@@ -48,7 +48,7 @@ The helpers call `laser.projections().register(..)` and `laser.bindings().apply(
 - `runtime.rs` tests graceful drain, dead-letter callbacks, middleware, and `ConcurrencyPolicy::SerialPerPartition`. It requires a real server. Unit tests cover the error classifier and local testing helpers.
 - `streaming.rs` tests the Laser producer and consumer APIs against Iggy. It covers batches, routing, exact headers, delivery, commits, group rejoin, uncommitted replay, and standalone reads.
 - For a handler unit test without a server, `laser_sdk::testing` (`agent` feature) ships `agent_message` + `agent_ctx` so `handle(&message, &ctx)` runs directly. That is the offline path, and `runtime.rs` here is the live-server path.
-- Gated by the zero-dep `integration` feature so `cargo test --workspace` stays unit-only. Run it with `just test-it`. The suite uses the released Iggy binary.
+- Gated by the zero-dep `integration` feature so `cargo test --workspace` stays unit-only. Run it with `just test-it`. The suite uses the released Iggy binary. CI runs it in the module shards `scripts/ci/integration-shard.sh` lists. A new module runs in the last shard, and moving a slow module into a named shard is an edit to that script.
 - Managed query, KV, and fork execution belongs to Laser Stack or LaserData Cloud. Original Apache Iggy returns `Unsupported`. Reference files cover wire bytes, and `laser_bdd::query_engine` covers query behavior through `bdd/scenarios/query.feature`. Do not add a query worker or request-topic fallback to these tests.
 
 ## Cross-SDK BDD conformance (`bdd/`)

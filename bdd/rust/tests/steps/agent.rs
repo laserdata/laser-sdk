@@ -1,9 +1,9 @@
 use crate::common::world::LaserWorld;
-use cucumber::{then, when};
+use cucumber::{given, then, when};
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{
-    AgentEnvelope, AgentId, AgentKind, ConversationId as WireConversationId, CorrelationId,
-    RecordId, features,
+    AgentEnvelope, AgentId, AgentKind, CapabilityDescriptor, ConversationId as WireConversationId,
+    CorrelationId, RecordId, features,
 };
 use laser_sdk::wire::framing::{decode_named, encode_named};
 use std::time::Duration;
@@ -245,4 +245,57 @@ async fn receiver_understands(world: &mut LaserWorld) {
         Some(false),
         "an unmarked envelope must leave no requirement unmet"
     );
+}
+
+#[given(regex = r#"^agent "([^"]+)" advertising the skill "([^"]+)" is ready on this connection$"#)]
+async fn advertising_agent_ready(world: &mut LaserWorld, name: String, skill: String) {
+    let mut worker = spawn_advertising(world, &name, &skill);
+    worker
+        .ready()
+        .await
+        .expect("the first advertising agent is ready");
+    world.worker = Some(worker);
+}
+
+#[when(
+    regex = r#"^agent "([^"]+)" advertising the skill "([^"]+)" starts on the same connection$"#
+)]
+async fn second_advertising_agent(world: &mut LaserWorld, name: String, skill: String) {
+    world.second_worker = Some(spawn_advertising(world, &name, &skill));
+}
+
+#[then("waiting for the second agent to be ready fails with a presence conflict")]
+async fn second_ready_conflict(world: &mut LaserWorld) {
+    let mut second = world.second_worker.take().expect("a second agent started");
+    let outcome = second.ready().await;
+    let _ = second.shutdown().await;
+    if let Some(first) = world.worker.take() {
+        first.shutdown().await.expect("the first agent stops");
+    }
+    assert!(
+        matches!(outcome, Err(LaserError::PresenceConflict { .. })),
+        "{outcome:?}"
+    );
+}
+
+// Handles nothing: the presence scenario only starts and stops agents.
+struct Idle;
+
+impl AgentHandler for Idle {
+    async fn handle(&self, _message: &AgentMessage, _ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
+        Ok(())
+    }
+}
+
+fn spawn_advertising(world: &LaserWorld, name: &str, skill: &str) -> laser_sdk::agent::AgentHandle {
+    Agent::builder()
+        .id(name.parse().expect("a valid agent id"))
+        .listen_on(AgentTopic::Sessions)
+        .capabilities(vec![CapabilityDescriptor {
+            skill_id: skill.to_owned(),
+            ..CapabilityDescriptor::default()
+        }])
+        .handler(Idle)
+        .build()
+        .spawn(world.laser().clone())
 }

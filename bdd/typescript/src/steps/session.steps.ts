@@ -17,6 +17,7 @@ import {
   RecordId,
   SessionConfig,
   SessionEndedError,
+  SessionError,
   TopicRetention,
   deriveSessionId,
   eventEnvelope,
@@ -24,6 +25,7 @@ import {
   type ActionGovernor,
   type AgentHandle,
   type AssembledContext,
+  type Session,
   type SessionLease,
   type SessionTurn,
   type Sessions,
@@ -292,6 +294,87 @@ When(
     await this.requireSession()
       .state()
       .set(key, JSON.parse(value) as unknown);
+  },
+);
+
+When(
+  /^the session state is replaced with (.+)$/,
+  async function (this: LaserWorld, document: string) {
+    await this.requireSession()
+      .state()
+      .replace(JSON.parse(document) as Record<string, unknown>);
+  },
+);
+
+When(
+  /^agent "([^"]+)" opens a second handle on the session$/,
+  function (this: LaserWorld, name: string) {
+    native(this).second = sessionsOf(this)
+      .open(this.requireSession().conversation)
+      .asAgent(AgentId.new(name));
+  },
+);
+
+When(
+  /^the second handle's state sets "([^"]+)" to (.+)$/,
+  async function (this: LaserWorld, key: string, value: string) {
+    await secondHandle(this)
+      .state()
+      .set(key, JSON.parse(value) as unknown);
+  },
+);
+
+When(
+  /^the second handle's state is replaced with (.+)$/,
+  async function (this: LaserWorld, document: string) {
+    await secondHandle(this)
+      .state()
+      .replace(JSON.parse(document) as Record<string, unknown>);
+  },
+);
+
+When("the second handle ends the session", async function (this: LaserWorld) {
+  await secondHandle(this).end();
+});
+
+When(
+  "the second handle writes a state snapshot",
+  async function (this: LaserWorld) {
+    try {
+      await secondHandle(this).state().snapshot();
+      native(this).secondSnapshot = "written";
+    } catch (error) {
+      native(this).secondSnapshot = error;
+    }
+  },
+);
+
+Then(
+  "the second handle's snapshot is refused as a stale session",
+  function (this: LaserWorld) {
+    const outcome = native(this).secondSnapshot;
+    assert.ok(outcome instanceof SessionError, String(outcome));
+    assert.equal(outcome.detail.kind, "stale");
+  },
+);
+
+Then(
+  /^the folded session state is (.+) at revision (\d+)$/,
+  async function (this: LaserWorld, document: string, revision: string) {
+    const state = this.requireSession().state();
+    const view = await eventual(
+      async () => {
+        const view = await state.get();
+        return view.revision === BigInt(revision) ? view : undefined;
+      },
+      "the folded session state",
+      10_000,
+    );
+    // The fold builds null-prototype objects, so compare the JSON values.
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(view.document)),
+      JSON.parse(document),
+    );
   },
 );
 
@@ -599,6 +682,8 @@ interface Native {
   secondStream?: string;
   leases: Map<string, SessionLease>;
   labels: Map<string, readonly [string, ConversationId]>;
+  second?: Session;
+  secondSnapshot?: unknown;
 }
 
 const scenarios = new WeakMap<LaserWorld, Native>();
@@ -627,6 +712,13 @@ After(async function (this: LaserWorld) {
   for (const agent of state.agents) await agent.shutdown();
   state.agents = [];
 });
+
+// The second handle a scenario opened on the session.
+function secondHandle(world: LaserWorld): Session {
+  const second = native(world).second;
+  if (second === undefined) throw new Error("scenario has no second handle");
+  return second;
+}
 
 // The session factory of the scenario: the configured one, or the default.
 function sessionsOf(world: LaserWorld): Sessions {

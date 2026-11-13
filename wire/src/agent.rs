@@ -101,6 +101,22 @@ macro_rules! wire_id {
             }
         }
 
+        #[cfg(feature = "schemars")]
+        impl schemars::JsonSchema for $name {
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                stringify!($name).into()
+            }
+
+            fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                schemars::json_schema!({
+                    "description": "A 128-bit id as 26-character Crockford base32 text",
+                    "type": "string",
+                    "minLength": 26,
+                    "maxLength": 26
+                })
+            }
+        }
+
         impl serde::Serialize for $name {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 if serializer.is_human_readable() {
@@ -276,6 +292,17 @@ impl LogPosition {
 // The locator rides the payload as one opaque CBOR byte string, not a named-field
 // map, so the slot is binding-neutral (an Iggy packing here, another binding's
 // packing elsewhere) and pins smaller than the four labelled fields would.
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for LogPosition {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "LogPosition".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        crate::encoding::fixed_bytes_schema(generator, LOG_POSITION_BYTES)
+    }
+}
+
 impl Serialize for LogPosition {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_bytes(&self.to_bytes())
@@ -331,6 +358,7 @@ impl<'de> Deserialize<'de> for LogPosition {
 /// `job-123-attempt-2`, so consoles and dead-letter capsules stay debuggable.
 /// The reliable consumer's dedup store hashes it internally.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(try_from = "String", into = "String")]
 pub struct IdempotencyKey(String);
 
@@ -394,6 +422,7 @@ impl fmt::Display for IdempotencyKey {
 /// [`MAX_AGENT_STRING_BYTES`](crate::limits::MAX_AGENT_STRING_BYTES), and free
 /// of ASCII control characters. Every other character is allowed.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(try_from = "String", into = "String")]
 pub struct AgentId(String);
 
@@ -470,6 +499,7 @@ impl fmt::Display for AgentId {
     strum::Display,
     strum::EnumString,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum AgentKind {
@@ -501,6 +531,7 @@ pub enum AgentKind {
 // Display too and the derive panics on it). Every pure unit-word vocabulary
 // (`AgentRunState`, `ForkKind`, `ContentType`, ...) derives strum instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(from = "u8", into = "u8")]
 pub enum TaskState {
     Submitted,
@@ -617,6 +648,7 @@ impl FromStr for TaskState {
 
 /// The session lifecycle exposed by managed reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Submitted,
@@ -631,6 +663,7 @@ pub enum SessionStatus {
 
 /// One session addressed within a stream by name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionRef {
     pub stream: String,
     pub session: ConversationId,
@@ -638,6 +671,7 @@ pub struct SessionRef {
 
 /// The SDK that created a session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SdkInfo {
     pub language: String,
     pub version: String,
@@ -645,6 +679,7 @@ pub struct SdkInfo {
 
 /// The optional token and cost ceiling requested for a session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Budget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<u64>,
@@ -654,6 +689,7 @@ pub struct Budget {
 
 /// The first status body of a session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionStart {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -675,6 +711,7 @@ pub struct SessionStart {
 
 /// A session status update that can acknowledge a control record.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionTransition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<AgentId>,
@@ -687,6 +724,7 @@ pub struct SessionTransition {
 /// written. An empty set names no agent, and every agent that receives work
 /// for the session while it is paused acknowledges when it holds that work.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionPauseRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<AgentId>,
@@ -698,6 +736,7 @@ pub struct SessionPauseRequest {
 /// the record after the resume. The source address with its topic generation,
 /// the agent, and the pause request position together identify one parking.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionParking {
     pub source: crate::graph::SourceRef,
     pub role: AgentId,
@@ -723,6 +762,7 @@ impl crate::validate::Validate for SessionParking {
 
 /// The body of a terminal session status.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SessionEnd {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -756,6 +796,7 @@ pub const METADATA_DURATION_MICROS: &str = "duration_micros";
 
 /// The inputs and source positions used to assemble one model context.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ContextManifest {
     pub policy: String,
     pub policy_version: String,
@@ -769,6 +810,7 @@ pub struct ContextManifest {
 
 /// One input in the context that a model received.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum Fragment {
     Message {
         at: crate::graph::SourceRef,
@@ -809,6 +851,7 @@ pub enum Fragment {
 
 /// A summary that replaces a range of context records.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ContextCompaction {
     pub summary_at: crate::graph::SourceRef,
     pub covered: Vec<(u32, u32, u64, u64)>,
@@ -817,6 +860,7 @@ pub struct ContextCompaction {
 
 /// The items selected by one context retrieval.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ContextRetrieval {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
@@ -828,14 +872,20 @@ pub use json_patch::PatchOperation;
 
 /// One revision-guarded RFC 6902 state patch.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct StateDelta {
     pub base_revision: u64,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::json_patch_schema")
+    )]
     pub patch: Vec<json_patch::PatchOperation>,
     pub op_id: String,
 }
 
-/// A complete state document at the applied revision it replaces.
+/// The complete state document at its base revision.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct StateSnapshot {
     pub base_revision: u64,
     pub document: serde_json::Value,
@@ -951,12 +1001,74 @@ pub fn apply_json_patch(
         serde_json::to_value(patch).map_err(|error| InvalidError::new(error.to_string()))?;
     validate_portable_json(&patch_value)?;
     let mut result = document.clone();
-    json_patch::patch(&mut result, patch).map_err(|error| InvalidError::new(error.to_string()))?;
+    for (index, operation) in patch.iter().enumerate() {
+        // RFC 6902 tests a number by value, the patch crate by its type.
+        if let json_patch::PatchOperation::Test(test) = operation {
+            let kind = match result.pointer(test.path.as_str()) {
+                Some(target) if equal_json(target, &test.value) => continue,
+                Some(_) => "value did not match",
+                None => "path is invalid",
+            };
+            return Err(InvalidError::new(format!(
+                "operation '/{index}' failed at path '{}': {kind}",
+                test.path
+            )));
+        }
+        json_patch::patch(&mut result, std::slice::from_ref(operation)).map_err(|mut error| {
+            error.operation = index;
+            InvalidError::new(error.to_string())
+        })?;
+    }
     crate::validate::Validate::validate(&StateSnapshot {
         base_revision: 0,
         document: result.clone(),
     })?;
     Ok(result)
+}
+
+/// Whether two state documents hold the same JSON, with numbers compared by value.
+pub fn equal_json(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    match (left, right) {
+        (serde_json::Value::Number(left), serde_json::Value::Number(right)) => {
+            equal_json_number(left, right)
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| equal_json(left, right))
+        }
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right.get(key).is_some_and(|other| equal_json(value, other))
+                })
+        }
+        _ => left == right,
+    }
+}
+
+// A whole float is an exact integer, so a float meets an integer on the integer side.
+fn equal_json_number(left: &serde_json::Number, right: &serde_json::Number) -> bool {
+    let integer = |number: &serde_json::Number| {
+        number
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| number.as_u64().map(i128::from))
+    };
+    let whole = |number: &serde_json::Number| {
+        number
+            .as_f64()
+            .filter(|float| float.fract() == 0.0)
+            .map(|float| float as i128)
+    };
+    match (integer(left), integer(right)) {
+        (Some(left), Some(right)) => left == right,
+        (Some(integer), None) => whole(right) == Some(integer),
+        (None, Some(integer)) => whole(left) == Some(integer),
+        (None, None) => left.as_f64() == right.as_f64(),
+    }
 }
 
 impl crate::validate::Validate for SessionStart {
@@ -996,6 +1108,7 @@ impl crate::validate::Validate for SessionStart {
 /// Advisory analytics input. It is agent-written, so budgets enforce where the
 /// LLM call executes, never on this field.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -1013,6 +1126,7 @@ pub struct TokenUsage {
 /// Why an agent operation failed, as a pinned u8 dictionary (the
 /// [`TaskState`] pattern: unknown codes decode and pass through).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(from = "u8", into = "u8")]
 pub enum AgentErrorCode {
     InvalidRequest,
@@ -1072,6 +1186,7 @@ impl From<AgentErrorCode> for u8 {
 /// enums of the other surfaces. The `code` is the machine discriminator, the
 /// optional `message` is human detail.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AgentErrorBody {
     pub code: AgentErrorCode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1084,6 +1199,7 @@ pub struct AgentErrorBody {
 
 /// Why a message was dead-lettered, as a pinned u8 dictionary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(from = "u8", into = "u8")]
 pub enum DeadLetterReason {
     RetryExhausted,
@@ -1140,12 +1256,17 @@ impl From<DeadLetterReason> for u8 {
 /// dead-letter capsules stay operator-facing JSON on a different topic, for a
 /// different audience.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AgentDeadLetter {
     pub source: LogPosition,
     pub reason: DeadLetterReason,
     pub attempts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub payload: Vec<u8>,
 }
@@ -1153,6 +1274,7 @@ pub struct AgentDeadLetter {
 /// An advertised skill's health, a pinned u8 dictionary (the [`TaskState`]
 /// pattern: unknown codes pass through as [`Unrecognized`](Self::Unrecognized)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(from = "u8", into = "u8")]
 pub enum Health {
     Healthy,
@@ -1205,6 +1327,7 @@ impl From<Health> for u8 {
 /// content-type name from a newer peer as a schema id. The tag makes the two
 /// unambiguous and forward-safe.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ContentRef {
     ContentType(crate::content::ContentType),
@@ -1215,6 +1338,7 @@ pub enum ContentRef {
 /// shape, advisory cost and latency classes, concurrency, health, and load.
 /// Mirrors the SDK A2A `AgentSkill` so the bridge maps one to the other.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct CapabilityDescriptor {
     /// The skill identifier, capped like every vocabulary string.
     pub skill_id: String,
@@ -1245,6 +1369,7 @@ pub struct CapabilityDescriptor {
 /// what discovery needs. Anything richer is application data in `metadata` or a
 /// follow-up body, never new card fields by convention.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AgentCard {
     /// Human-readable display label (a viewer shows the base32 id without
     /// it). Capped like every vocabulary string.
@@ -1305,6 +1430,7 @@ impl AgentCard {
 /// The metadata channel stays opaque: a non-agent client advertises whatever blob
 /// its own consumers interpret, and only an AGDX agent advertises this shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AgentPresence {
     /// The presence body version, carried in-band (the metadata bytes have no
     /// out-of-band version header).
@@ -1355,6 +1481,7 @@ impl AgentPresence {
 /// body is still a `body`, just one whose bytes are a `BodyRef` instead of the
 /// content itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct BodyRef {
     /// Where the bytes live: a URI, object key, or KV key. Bounded by
     /// [`MAX_BODY_REFERENCE_BYTES`](crate::limits::MAX_BODY_REFERENCE_BYTES).
@@ -1362,6 +1489,10 @@ pub struct BodyRef {
     /// The externalized content's size in bytes.
     pub size_bytes: u64,
     /// SHA-256 of the externalized content, exactly 32 bytes as a CBOR byte string.
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub sha256: Vec<u8>,
     /// Encryption scheme code, dormant like [`Signature::scheme`]. Absent means
@@ -1426,15 +1557,24 @@ impl BodyRef {
 /// bytes, [`validate`](Self::validate) enforces the registered per-scheme
 /// lengths, and unknown schemes pass through.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Signature {
     /// The signing scheme code ([`SIGNATURE_SCHEME_ED25519`] = 1). Codes are
     /// permanent, and unknown codes pass through like every open dictionary.
     pub scheme: u8,
     /// Which of the agent's registered keys signed (8 bytes for Ed25519).
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key_id: Vec<u8>,
     /// The signature over the canonical envelope encoding (signature field
     /// absent), domain-separated (64 bytes for Ed25519).
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub bytes: Vec<u8>,
     /// Out-of-band interpretation attributes the signature also covers, so an
@@ -1452,6 +1592,7 @@ pub struct Signature {
 /// these would let an intermediary reinterpret a signed record. Folded into the
 /// preimage here, a change invalidates the signature.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SignatureContext {
     /// The `agdx.ct` content-type code the body is encoded with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1517,6 +1658,7 @@ impl Signature {
 /// metadata (A2A `metadata`, MCP `_meta`) never maps into it. It tunnels whole
 /// inside `body`, keeping bridge round trips byte-identical.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AgentEnvelope {
     pub kind: AgentKind,
     /// Producer-assigned record identity, required on every kind except
@@ -1602,6 +1744,10 @@ pub struct AgentEnvelope {
     pub must_understand: u64,
     /// The content, codec per the `agdx.ct` header. Default-empty and skipped
     /// when empty. The validity matrix says which kinds require it.
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",

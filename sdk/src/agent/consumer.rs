@@ -74,6 +74,9 @@ const FENCE_SWEEP_INTERVAL_MICROS: u64 = 1_000_000;
 const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(5);
 // Records one warmer poll asks for. The drain reads on until the stored offset.
 const WARM_DEDUP_BATCH: u32 = 1000;
+// A dead letter can carry the clock of another node than its source record,
+// so the warm-up reads dead letters from this long before the oldest record.
+const DEAD_LETTER_CLOCK_MARGIN_MICROS: u64 = 60_000_000;
 
 // How long a graceful shutdown waits for the in-flight message (its handler and
 // any retry backoff) to finish before dropping the consumer. `abort` is the
@@ -430,6 +433,23 @@ pub enum ConcurrencyPolicy {
     },
 }
 
+/// Which committed records refill the duplicate window when a consumer starts
+/// with warm dedup. A record without a deadline always refills its key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, strum::Display, strum::EnumString)]
+#[strum(serialize_all = "snake_case")]
+pub enum WarmDedupPolicy {
+    /// Leave out a copy that a `DeadlineExceeded` dead letter names. When the
+    /// dead letters cannot all be read, act as [`Unexpired`](Self::Unexpired).
+    #[default]
+    DeadLetters,
+    /// Leave out every copy whose deadline passed before the start, without
+    /// reading dead letters.
+    Unexpired,
+    /// Refill every key, including copies dropped past their deadline, so a
+    /// resend after an expiry is skipped.
+    All,
+}
+
 /// The reliable consumer (consumer-group delivery + dedup + retry + DLQ). Most callers use `Agent::builder`, not this directly.
 #[derive(bon::Builder)]
 pub struct ReliableConsumer {
@@ -484,6 +504,10 @@ pub struct ReliableConsumer {
     // (the at-least-once + idempotent-handler default tolerates the replay).
     #[builder(default)]
     pub warm_dedup: bool,
+    /// Which committed records refill the window when `warm_dedup` is on.
+    /// Defaults to [`WarmDedupPolicy::DeadLetters`].
+    #[builder(default)]
+    pub warm_dedup_policy: WarmDedupPolicy,
     /// Cross-cutting hooks wrapped around each handler dispatch, in order, for
     /// auth, metrics, and tracing without touching the handler.
     #[builder(default)]
@@ -575,9 +599,6 @@ impl ReliableConsumer {
             .deduplicator
             .take()
             .unwrap_or_else(|| Box::new(SlidingWindow::new(self.dedup_window)));
-        if self.warm_dedup {
-            warm_dedup_window(laser, &self, deduplicator.as_ref()).await?;
-        }
         // Resolve the subscribed stream and topic to their numeric ids once, so
         // every dead-letter capsule can carry a complete `LogPosition` for the
         // poison message without a server round-trip per failure. The consumer has
@@ -614,6 +635,9 @@ impl ReliableConsumer {
             }),
             _ => None,
         };
+        if self.warm_dedup {
+            warm_dedup_window(laser, &self, deduplicator.as_ref(), source).await?;
+        }
         let (stream_id, topic_id) = (stream_id.unwrap_or_default(), topic_id.unwrap_or_default());
         let sessions = laser.sessions_with(self.sessions.clone().unwrap_or_default());
 
@@ -2258,18 +2282,8 @@ where
             return Ok(false);
         }
 
-        if !resumed && let Some(key) = dedup_key(&message.provenance) {
-            // Dedup marks the key seen before the handler runs: a duplicate arriving
-            // while the original is still in the window is skipped even if the
-            // original later dead-letters. This is the at-least-once + idempotent
-            // model, and a durable `Deduplicator` is the drop-in upgrade. The key is
-            // principal-scoped (see `dedup_key`).
-            if !self.dedup.observe(&key).await {
-                debug!(dedup_key = %key, source = %message.id, "skipping duplicate message");
-                return Ok(false);
-            }
-        }
-
+        // Deadline gate, ordered BEFORE dedup like the fence gate: an expired copy
+        // never ran, so it must not consume the idempotency slot its resend needs.
         if !resumed
             && let Some(deadline) = message.provenance.deadline_at
             && IggyTimestamp::now().as_micros() > deadline.as_micros()
@@ -2283,6 +2297,18 @@ where
             )
             .await?;
             return Ok(false);
+        }
+
+        if !resumed && let Some(key) = dedup_key(&message.provenance) {
+            // Dedup marks the key seen before the handler runs: a duplicate arriving
+            // while the original is still in the window is skipped even if the
+            // original later dead-letters. This is the at-least-once + idempotent
+            // model, and a durable `Deduplicator` is the drop-in upgrade. The key is
+            // principal-scoped (see `dedup_key`).
+            if !self.dedup.observe(&key).await {
+                debug!(dedup_key = %key, source = %message.id, "skipping duplicate message");
+                return Ok(false);
+            }
         }
 
         // Ack-on-pickup: a `Working` status the instant an AGDX command is taken,
@@ -2460,11 +2486,13 @@ where
 // recognizes duplicates of messages it processed before the restart. Reads only
 // up to the group's stored (already-consumed) offset and at most `depth` per
 // partition: reading past the stored offset would pre-mark un-consumed messages
-// and cause them to be skipped (data loss).
+// and cause them to be skipped (data loss). The policy decides which of those
+// committed records refill the window.
 async fn warm_dedup_window(
     laser: &Laser,
     settings: &ReliableConsumer,
     dedup: &dyn Deduplicator,
+    source: Option<SourceTopic>,
 ) -> Result<(), LaserError> {
     let stream = Identifier::named(laser.stream_required()?)?;
     let topic_id = Identifier::named(&settings.topic)?;
@@ -2475,6 +2503,7 @@ async fn warm_dedup_window(
         iggy::prelude::Consumer::group(Identifier::named(settings.group.as_str())?);
     let reader = iggy::prelude::Consumer::new(Identifier::named("laser-dedup-warmer")?);
     let depth = u64::try_from(settings.dedup_window).unwrap_or(u64::MAX);
+    let mut seeds = Vec::new();
     for partition in 0..crate::poll::bounded_partitions(details.partitions_count) {
         let Some(offset) = laser
             .client()
@@ -2498,29 +2527,73 @@ async fn warm_dedup_window(
             if batch.messages.is_empty() {
                 break;
             }
-            for message in batch.messages {
-                if let Some(key) = warm_dedup_key(
-                    &message,
+            seeds.extend(batch.messages.iter().filter_map(|message| {
+                warm_seed(
+                    message,
+                    partition,
                     settings.agent.as_ref(),
                     settings.understood_features,
                     #[cfg(feature = "sign")]
                     settings.verifier.as_deref(),
-                ) {
-                    dedup.observe(&key).await;
+                )
+            }));
+            from = batch.next_offset;
+        }
+    }
+    let oldest_with_deadline = seeds
+        .iter()
+        .filter(|seed| seed.deadline_micros.is_some())
+        .map(|seed| seed.appended_at_micros)
+        .min();
+    let expired = match (settings.warm_dedup_policy, oldest_with_deadline, source) {
+        (WarmDedupPolicy::DeadLetters, Some(oldest), Some(source)) => {
+            let since = oldest.saturating_sub(DEAD_LETTER_CLOCK_MARGIN_MICROS);
+            let topic = &settings.topic;
+            match expired_copies(laser, source, &reader, since, settings.dedup_window).await {
+                Ok(Some(expired)) => Some(expired),
+                Ok(None) => {
+                    warn!(%topic, "The dead letters since {since} could not all be read, so the warm-up of {topic} leaves out every copy whose deadline has passed.");
+                    None
+                }
+                Err(error) => {
+                    warn!(%topic, %error, "Reading the dead letters failed, so the warm-up of {topic} leaves out every copy whose deadline has passed: {error}");
+                    None
                 }
             }
-            from = batch.next_offset;
+        }
+        _ => None,
+    };
+    let now_micros = IggyTimestamp::now().as_micros();
+    for seed in &seeds {
+        if refills(
+            settings.warm_dedup_policy,
+            seed,
+            expired.as_ref(),
+            now_micros,
+        ) {
+            dedup.observe(&seed.key).await;
         }
     }
     Ok(())
 }
 
-fn warm_dedup_key(
+// One committed record whose key can refill the dedup window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WarmSeed {
+    key: String,
+    partition: u32,
+    offset: u64,
+    appended_at_micros: u64,
+    deadline_micros: Option<u64>,
+}
+
+fn warm_seed(
     message: &IggyMessage,
+    partition: u32,
     agent: Option<&AgentId>,
     understood_features: u64,
     #[cfg(feature = "sign")] verifier: Option<&crate::sign::KeyRegistry>,
-) -> Option<String> {
+) -> Option<WarmSeed> {
     let decoded = decode_agent_record(message, understood_features).ok()?;
     if let (Some(target), Some(agent)) = (&decoded.provenance.target_agent_id, agent)
         && target != agent
@@ -2537,7 +2610,126 @@ fn warm_dedup_key(
             )
             .ok()?;
     }
-    dedup_key(&decoded.provenance)
+    Some(WarmSeed {
+        key: dedup_key(&decoded.provenance)?,
+        partition,
+        offset: message.header.offset,
+        appended_at_micros: message.header.timestamp,
+        deadline_micros: decoded
+            .provenance
+            .deadline_at
+            .map(|deadline| deadline.as_micros()),
+    })
+}
+
+// Whether a committed record refills the dedup window under `policy`. The
+// deadline gate drops only a copy whose deadline has passed, so a copy
+// without one always refills. `expired` holds the positions dead letters
+// name, `None` when they could not all be read.
+fn refills(
+    policy: WarmDedupPolicy,
+    seed: &WarmSeed,
+    expired: Option<&HashSet<(u32, u64)>>,
+    now_micros: u64,
+) -> bool {
+    let Some(deadline) = seed.deadline_micros else {
+        return true;
+    };
+    match (policy, expired) {
+        (WarmDedupPolicy::All, _) => true,
+        (WarmDedupPolicy::DeadLetters, Some(expired)) => {
+            !expired.contains(&(seed.partition, seed.offset))
+        }
+        (WarmDedupPolicy::DeadLetters | WarmDedupPolicy::Unexpired, _) => now_micros <= deadline,
+    }
+}
+
+// The partition and offset of every copy of `source` that a dead letter shows
+// was dropped past its deadline, read from the dead letters published since
+// `since_micros`. `None` when a dead-letter partition holds more than `limit`
+// of them, or retention removed some of them.
+async fn expired_copies(
+    laser: &Laser,
+    source: SourceTopic,
+    reader: &iggy::prelude::Consumer,
+    since_micros: u64,
+    limit: usize,
+) -> Result<Option<HashSet<(u32, u64)>>, LaserError> {
+    let client = laser.client();
+    let stream = Identifier::named(laser.stream_required()?)?;
+    let topic = Identifier::named(&AgentTopic::Dlq.topic_string())?;
+    let mut expired = HashSet::new();
+    // No dead-letter topic means no dead letter was published, and a copy
+    // whose dead letter failed to publish was never committed.
+    let Some(details) = client.get_topic(&stream, &topic).await? else {
+        return Ok(Some(expired));
+    };
+    let one_record = PollOptions {
+        count: 1,
+        ..PollOptions::default()
+    };
+    for partition in 0..crate::poll::bounded_partitions(details.partitions_count) {
+        let oldest = client
+            .poll_messages(
+                &stream,
+                &topic,
+                partition,
+                reader,
+                &PollingStrategy::first(),
+                one_record,
+            )
+            .await?;
+        let Some(oldest) = oldest.messages.first() else {
+            continue;
+        };
+        if oldest.header.offset > 0 && oldest.header.timestamp > since_micros {
+            return Ok(None);
+        }
+        let start = client
+            .poll_messages(
+                &stream,
+                &topic,
+                partition,
+                reader,
+                &PollingStrategy::timestamp(IggyTimestamp::from(since_micros)),
+                one_record,
+            )
+            .await?;
+        let Some(start) = start.messages.first() else {
+            continue;
+        };
+        let mut from = start.header.offset;
+        let mut read = 0;
+        loop {
+            let batch = drain_partition(
+                &client,
+                &stream,
+                &topic,
+                reader,
+                DrainRange::open(partition, from),
+                WARM_DEDUP_BATCH,
+            )
+            .await?;
+            if batch.messages.is_empty() {
+                break;
+            }
+            read += batch.messages.len();
+            if read > limit {
+                return Ok(None);
+            }
+            for message in &batch.messages {
+                if let Ok(letter) = decode_named::<AgentDeadLetter>(&message.payload)
+                    && letter.reason == DeadLetterReason::DeadlineExceeded
+                    && letter.source.stream_id == source.stream_id
+                    && letter.source.topic_id == source.topic_id
+                {
+                    expired.insert((letter.source.partition_id, letter.source.offset));
+                }
+            }
+            from = batch.next_offset;
+        }
+    }
+    Ok(Some(expired))
 }
 
 // Publish one dead letter, retrying a retryable failure in place on the
@@ -2952,18 +3144,26 @@ mod tests {
         let other: AgentId = "other".parse().expect("other parses");
 
         assert_eq!(
-            warm_dedup_key(
+            warm_seed(
                 &message,
+                4,
                 Some(&worker),
                 features::NONE,
                 #[cfg(feature = "sign")]
                 None,
             ),
-            Some(format!("author{DEDUP_SCOPE_SEP}attempt-1"))
+            Some(WarmSeed {
+                key: format!("author{DEDUP_SCOPE_SEP}attempt-1"),
+                partition: 4,
+                offset: message.header.offset,
+                appended_at_micros: message.header.timestamp,
+                deadline_micros: None,
+            })
         );
         assert!(
-            warm_dedup_key(
+            warm_seed(
                 &message,
+                4,
                 Some(&other),
                 features::NONE,
                 #[cfg(feature = "sign")]
@@ -2971,6 +3171,56 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn given_each_warm_dedup_policy_when_deciding_refills_then_should_leave_out_only_what_it_names()
+    {
+        let seed = |offset, deadline_micros| WarmSeed {
+            key: format!("key-{offset}"),
+            partition: 0,
+            offset,
+            appended_at_micros: 1,
+            deadline_micros,
+        };
+        let now = 1_000;
+        let without_deadline = seed(1, None);
+        let dropped = seed(2, Some(500));
+        let ran_and_passed = seed(3, Some(600));
+        let still_ahead = seed(4, Some(2_000));
+        let dead_letters = HashSet::from([(0, 2)]);
+        let decide = |policy, expired: Option<&HashSet<(u32, u64)>>| {
+            [&without_deadline, &dropped, &ran_and_passed, &still_ahead]
+                .map(|seed| refills(policy, seed, expired, now))
+        };
+
+        assert_eq!(
+            decide(WarmDedupPolicy::DeadLetters, Some(&dead_letters)),
+            [true, false, true, true]
+        );
+        assert_eq!(
+            decide(WarmDedupPolicy::DeadLetters, None),
+            [true, false, false, true]
+        );
+        assert_eq!(
+            decide(WarmDedupPolicy::Unexpired, Some(&dead_letters)),
+            [true, false, false, true]
+        );
+        assert_eq!(decide(WarmDedupPolicy::All, None), [true, true, true, true]);
+    }
+
+    #[test]
+    fn given_a_policy_name_when_parsed_then_should_round_trip_in_snake_case() {
+        for (name, policy) in [
+            ("dead_letters", WarmDedupPolicy::DeadLetters),
+            ("unexpired", WarmDedupPolicy::Unexpired),
+            ("all", WarmDedupPolicy::All),
+        ] {
+            assert_eq!(name.parse::<WarmDedupPolicy>(), Ok(policy));
+            assert_eq!(policy.to_string(), name);
+        }
+        assert!("dead-letters".parse::<WarmDedupPolicy>().is_err());
+        assert_eq!(WarmDedupPolicy::default(), WarmDedupPolicy::DeadLetters);
     }
 
     #[test]

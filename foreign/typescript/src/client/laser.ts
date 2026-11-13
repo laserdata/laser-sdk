@@ -287,11 +287,16 @@ export class LaserBuilder {
   private topologyOverridesValue: TopologyOverrides = NO_TOPOLOGY_OVERRIDES
 
   private constructor(
-    private readonly connectWith: (options: LaserBuildOptions) => Promise<Laser>
+    private readonly connectWith: (
+      options: LaserBuildOptions,
+      signal: AbortSignal | undefined
+    ) => Promise<Laser>
   ) {}
 
   /** @internal */
-  static create(connectWith: (options: LaserBuildOptions) => Promise<Laser>): LaserBuilder {
+  static create(
+    connectWith: (options: LaserBuildOptions, signal: AbortSignal | undefined) => Promise<Laser>
+  ): LaserBuilder {
     return new LaserBuilder(connectWith)
   }
 
@@ -455,7 +460,7 @@ export class LaserBuilder {
       topology: this.topologyValue,
       topologyOverrides: this.topologyOverridesValue
     }
-    return connectUnless(options.signal, () => this.connectWith(settings))
+    return connectUnless(options.signal, (signal) => this.connectWith(settings, signal))
   }
 }
 
@@ -618,10 +623,11 @@ async function probeCapabilities(transport: ManagedTransport): Promise<Capabilit
 // connect leaks no socket.
 async function connectUnless(
   signal: AbortSignal | undefined,
-  open: () => Promise<Laser>
+  open: (signal: AbortSignal | undefined) => Promise<Laser>
 ): Promise<Laser> {
   throwIfAborted(signal, "connect")
-  const opening = open()
+  // The signal also ends the dial sweep, so an aborted connect dials no more.
+  const opening = open(signal)
   try {
     return await abortable(opening, signal, "connect")
   } catch (error) {
@@ -766,7 +772,7 @@ export class Laser implements AsyncDisposable {
   }
 
   static builder(): LaserBuilder {
-    return LaserBuilder.create(async (options) => {
+    return LaserBuilder.create(async (options, signal) => {
       const deadline = Date.now() + options.connectOptions.timeoutMs
       let transport: ApacheIggyTransport
       let dialed: string | undefined
@@ -781,11 +787,24 @@ export class Laser implements AsyncDisposable {
         // Percent-encoded, so the parser hands the exact secret to the login
         // and a dedicated connection dialed from the same string gets it too.
         const { username, password } = options.credentials ?? { username: "", password: "" }
-        dialed = `iggy+tcp://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${options.address.host}:${String(options.address.port)}`
-        transport = await ApacheIggyTransport.connect(dialed, options.publishOptions, deadline)
+        const { host, port } = options.address
+        // Only an IPv6 address holds a colon, and its authority is bracketed.
+        const authority = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host
+        dialed = `iggy+tcp://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${authority}:${String(port)}`
+        transport = await ApacheIggyTransport.connect(
+          dialed,
+          options.publishOptions,
+          deadline,
+          signal
+        )
       } else if (options.connectionString !== undefined) {
         dialed = options.connectionString
-        transport = await ApacheIggyTransport.connect(dialed, options.publishOptions, deadline)
+        transport = await ApacheIggyTransport.connect(
+          dialed,
+          options.publishOptions,
+          deadline,
+          signal
+        )
       } else {
         throw new ConfigError("connectionString, address+credentials, or client is required")
       }
@@ -833,7 +852,9 @@ export class Laser implements AsyncDisposable {
    * Connect using an Iggy connection string. Connecting gives up after 30 seconds, or `LASER_CONNECT_TIMEOUT_MS`, with a `TimeoutError` that says whether the server never accepted the connection or never answered the login. Use `Laser.builder().connectTimeout()` for another budget.
    */
   static connect(connectionString: string, options: CallOptions = {}): Promise<Laser> {
-    return connectUnless(options.signal, () => Laser.open(connectionString, undefined))
+    return connectUnless(options.signal, (signal) =>
+      Laser.open(connectionString, undefined, signal)
+    )
   }
 
   static connectWithStream(
@@ -841,7 +862,7 @@ export class Laser implements AsyncDisposable {
     stream: string,
     options: CallOptions = {}
   ): Promise<Laser> {
-    return connectUnless(options.signal, () => Laser.open(connectionString, stream))
+    return connectUnless(options.signal, (signal) => Laser.open(connectionString, stream, signal))
   }
 
   static async connectEnv(
@@ -862,9 +883,18 @@ export class Laser implements AsyncDisposable {
     return Laser.connect(LOCAL_CONNECTION_STRING, options)
   }
 
-  private static async open(connectionString: string, stream: string | undefined): Promise<Laser> {
+  private static async open(
+    connectionString: string,
+    stream: string | undefined,
+    signal: AbortSignal | undefined
+  ): Promise<Laser> {
     const deadline = Date.now() + connectOptions().timeoutMs
-    const transport = await ApacheIggyTransport.connect(connectionString, undefined, deadline)
+    const transport = await ApacheIggyTransport.connect(
+      connectionString,
+      undefined,
+      deadline,
+      signal
+    )
     const laser = new Laser(transport, stream, new AsyncOnce(), newSharedState(connectionString))
     await laser.probeCapabilitiesBefore(deadline)
     return laser

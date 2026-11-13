@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 /// from a surface's typed error via the `From` impls below. The typed error
 /// keeps the detail, this is the shared classification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ResultCode {
@@ -243,6 +244,7 @@ impl ResultCode {
 /// client that fails to decode the surface's typed reply tries `CommandError`
 /// next, turning the wrong-surface reply into a typed [`ResultCode`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct CommandError {
     pub code: ResultCode,
     pub message: String,

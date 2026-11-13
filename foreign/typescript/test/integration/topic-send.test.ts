@@ -84,3 +84,25 @@ void test("given_a_send_with_conflicting_routing_options_when_called_then_should
     await laser.close()
   }
 })
+
+void test("given_a_missing_topic_or_stream_when_published_then_should_create_it_and_commit", async () => {
+  const streamName = `laser-ts-test-${randomUUID()}`
+  const laser = await Laser.connectWithStream(CONNECTION_STRING, streamName)
+  const payload = new TextEncoder().encode("created")
+  try {
+    const sent = await laser.topic("events").publish().payload(payload).send()
+    assert.equal(sent.confirmations.length, 1)
+    assert.notEqual(await laser.client.stream.get({ streamId: streamName }), null)
+    const memory = laser.memoryOnTopic("new.memory")
+    assert.equal(await memory.fetchFolded("host:123"), undefined)
+    assert.equal(
+      await laser.client.topic.get({ streamId: streamName, topicId: "new.memory" }),
+      null
+    )
+    await memory.set("host:123", payload)
+    assert.deepEqual(await memory.fetchFolded("host:123"), payload)
+  } finally {
+    await laser.stream(streamName).delete()
+    await laser.close()
+  }
+})

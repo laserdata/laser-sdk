@@ -12,12 +12,14 @@ import { AGENT_SESSIONS } from "../wire/topics.js"
 import type { Consolidator } from "../memory/types.js"
 import {
   ReliableConsumer,
+  isWarmDedupPolicy,
   type AgentHandler,
   type AgentMiddleware,
   type ConcurrencyPolicy,
   type DeadLetterSink,
   type Deduplicator,
-  type RetryPolicy
+  type RetryPolicy,
+  type WarmDedupPolicy
 } from "./reliable-consumer.js"
 import type { InboxRoute } from "./router.js"
 import { longTimeout } from "./timer.js"
@@ -45,6 +47,8 @@ export interface AgentDefinition {
   readonly maxQueuedBytes?: number
   readonly understoodFeatures: bigint
   readonly warmDedup: boolean
+  /** Which committed records refill the window when `warmDedup` is on. Defaults to `dead_letters`. */
+  readonly warmDedupPolicy?: WarmDedupPolicy
   readonly middleware: readonly AgentMiddleware[]
   readonly onDeadLetter?: DeadLetterSink
   /** The command operations the handler serves. Unset serves every operation. */
@@ -94,6 +98,10 @@ export class AgentHandle implements AsyncDisposable {
   private readonly hardStopController = new AbortController()
   private hardStopped = false
   private readySettled = false
+  // The error a run that ended cleanly before readiness reports, and whether
+  // a wait already reported it, so a later stop or join reports it again.
+  private stoppedBeforeReady: HandlerConfigError | undefined
+  private stopReported = false
   private readonly readyPromise: Promise<void>
   private readonly resolveReady: () => void
   private readonly rejectReady: (error: unknown) => void
@@ -132,8 +140,16 @@ export class AgentHandle implements AsyncDisposable {
     return new AgentHandle(definition, laser)
   }
 
-  ready(options: CallOptions = {}): Promise<void> {
-    return abortable(this.readyPromise, options.signal, "agent ready")
+  /** Waits until the agent reads its topic. Rejects with the error the run
+   * stopped with when it stopped first, or with `HandlerConfigError` (agent
+   * stopped before it became ready) when it ended without an error first. */
+  async ready(options: CallOptions = {}): Promise<void> {
+    try {
+      await abortable(this.readyPromise, options.signal, "agent ready")
+    } catch (error) {
+      if (error === this.stoppedBeforeReady) this.stopReported = true
+      throw error
+    }
   }
 
   /** Stops intake, drains active handlers, and joins background work. */
@@ -154,6 +170,7 @@ export class AgentHandle implements AsyncDisposable {
       throw new TimeoutError("agent shutdown drain")
     }
     if (outcome.kind === "error") throw outcome.error
+    if (this.stopReported && this.stoppedBeforeReady !== undefined) throw this.stoppedBeforeReady
     await this.consolidationTask
   }
 
@@ -167,6 +184,7 @@ export class AgentHandle implements AsyncDisposable {
     this.consolidationController.abort("agent stopped")
     await this.consolidationTask
     if (outcome.kind === "error") throw outcome.error
+    if (this.stopReported && this.stoppedBeforeReady !== undefined) throw this.stoppedBeforeReady
   }
 
   abort(): void {
@@ -281,6 +299,9 @@ export class AgentHandle implements AsyncDisposable {
         ...(definition.retry !== undefined ? { retry: definition.retry } : {}),
         ...(definition.deduplicator !== undefined ? { deduplicator: definition.deduplicator } : {}),
         warmDedup: definition.warmDedup,
+        ...(definition.warmDedupPolicy !== undefined
+          ? { warmDedupPolicy: definition.warmDedupPolicy }
+          : {}),
         middleware: definition.middleware,
         ackOnPickup: definition.ackOnPickup,
         ...(definition.verifier !== undefined ? { verifier: definition.verifier } : {}),
@@ -300,7 +321,11 @@ export class AgentHandle implements AsyncDisposable {
         clearInterval(refresh)
         if (card !== undefined && !this.hardStopped) await withdraw(scoped, definition.id, card)
       }
-      if (!this.readySettled) this.resolveReady()
+      if (!this.readySettled) {
+        this.readySettled = true
+        this.stoppedBeforeReady = new HandlerConfigError("agent stopped before it became ready")
+        this.rejectReady(this.stoppedBeforeReady)
+      }
       return { kind: "ok" }
     } catch (error) {
       if (!this.readySettled) {
@@ -326,6 +351,7 @@ export class AgentBuilder {
   private queuedBytes: number | undefined
   private understood = 0n
   private shouldWarmDedup = false
+  private warmPolicy: WarmDedupPolicy | undefined
   private readonly middlewareList: AgentMiddleware[] = []
   private sink: DeadLetterSink | undefined
   private servedOperations: readonly string[] | undefined
@@ -408,6 +434,13 @@ export class AgentBuilder {
 
   warmDedup(value = true): this {
     this.shouldWarmDedup = value
+    return this
+  }
+
+  /** Which committed records refill the window when warm dedup is on.
+   * Defaults to `dead_letters`. */
+  warmDedupPolicy(policy: WarmDedupPolicy): this {
+    this.warmPolicy = policy
     return this
   }
 
@@ -517,6 +550,7 @@ export class AgentBuilder {
       ...(this.queuedBytes !== undefined ? { maxQueuedBytes: this.queuedBytes } : {}),
       understoodFeatures: this.understood,
       warmDedup: this.shouldWarmDedup,
+      ...(this.warmPolicy !== undefined ? { warmDedupPolicy: this.warmPolicy } : {}),
       middleware: [...this.middlewareList],
       ...(this.sink !== undefined ? { onDeadLetter: this.sink } : {}),
       ...(this.servedOperations !== undefined ? { operations: this.servedOperations } : {}),
@@ -590,6 +624,9 @@ function validateDefinition(definition: AgentDefinition): void {
     (!Number.isSafeInteger(definition.dedupWindow) || definition.dedupWindow < 1)
   ) {
     throw new HandlerConfigError("dedupWindow must be a positive safe integer")
+  }
+  if (definition.warmDedupPolicy !== undefined && !isWarmDedupPolicy(definition.warmDedupPolicy)) {
+    throw new HandlerConfigError('warmDedupPolicy must be "dead_letters", "unexpired" or "all"')
   }
   if (
     definition.retry !== undefined &&

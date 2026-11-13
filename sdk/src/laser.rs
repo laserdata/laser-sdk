@@ -13,6 +13,7 @@ use laser_wire::codes::AGDX_BATCH_CODE;
 use laser_wire::framing::decode_named;
 use laser_wire::validate::Validate;
 use std::collections::BTreeMap;
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 #[cfg(feature = "kv")]
 use std::sync::atomic::AtomicBool;
@@ -2658,17 +2659,35 @@ fn percent_encode(value: &str) -> String {
         .collect()
 }
 
-// `host` or `host:port`. A missing port becomes 8090. IPv6 literals are refused
-// because Apache Iggy's connection string cannot carry them.
+// `host`, `host:port`, `[ipv6]` or `[ipv6]:port`. A missing port becomes 8090.
 fn with_default_port(address: &str) -> Result<String, LaserError> {
-    if address.contains(['[', ']', '/', '#']) {
-        return Err(LaserError::Config(
-            "connection string address must be host or host:port, IPv6 literals and paths are not supported",
-        ));
+    let malformed = || {
+        LaserError::Config(
+            "connection string address must be host, host:port, [ipv6] or [ipv6]:port, without a path",
+        )
+    };
+    if address.contains(['/', '#']) {
+        return Err(malformed());
     }
-    let (host, port) = match address.split_once(':') {
-        Some((host, port)) => (host, Some(port)),
-        None => (address, None),
+    let (host, port) = match address.strip_prefix('[') {
+        Some(bracketed) => {
+            let (literal, rest) = bracketed.split_once(']').ok_or_else(malformed)?;
+            if literal.parse::<Ipv6Addr>().is_err() {
+                return Err(LaserError::Config(
+                    "connection string brackets must hold an IPv6 address",
+                ));
+            }
+            let port = match rest {
+                "" => None,
+                rest => Some(rest.strip_prefix(':').ok_or_else(malformed)?),
+            };
+            (&address[..literal.len() + 2], port)
+        }
+        None if address.contains(['[', ']']) => return Err(malformed()),
+        None => match address.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (address, None),
+        },
     };
     if host.is_empty() {
         return Err(LaserError::Config("connection string missing host"));
@@ -3549,9 +3568,52 @@ mod connection_string_tests {
             "iggy:iggy@host:",
             "iggy:iggy@host:+1",
             "iggy:iggy@host:80:81",
-            "iggy:iggy@[::1]:8090",
             "iggy:iggy@host:8090/path",
             "iggy:iggy@:8090",
+        ] {
+            assert!(
+                matches!(
+                    normalize_connection_string(value),
+                    Err(LaserError::Config(_))
+                ),
+                "{value} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_bracketed_ipv6_address_when_normalized_then_should_keep_it_and_default_its_port() {
+        assert_eq!(
+            normalize_connection_string("iggy:iggy@[::1]:8090").expect("a bracketed IPv6 address"),
+            "iggy://iggy:iggy@[::1]:8090",
+        );
+        assert_eq!(
+            normalize_connection_string("iggy+tcp://token@[2001:db8::1]?nodelay=true")
+                .expect("a portless IPv6 address"),
+            "iggy+tcp://token@[2001:db8::1]:8090?nodelay=true",
+        );
+        let config = tcp_client_config(
+            &normalize_connection_string("iggy:iggy@[::ffff:192.0.2.1]:9090")
+                .expect("a mapped IPv6 address"),
+        )
+        .expect("a TCP client config");
+        assert_eq!(config.server_address, "[::ffff:192.0.2.1]:9090");
+    }
+
+    #[test]
+    fn given_a_malformed_ipv6_address_when_normalized_then_should_fail_as_config() {
+        for value in [
+            "iggy:iggy@[::1",
+            "iggy:iggy@[::1]x:8090",
+            "iggy:iggy@[::1]:",
+            "iggy:iggy@[::1]:0",
+            "iggy:iggy@[::1]:65536",
+            "iggy:iggy@[]:8090",
+            "iggy:iggy@[localhost]:8090",
+            "iggy:iggy@[gggg::1]:8090",
+            "iggy:iggy@::1:8090",
+            "iggy:iggy@2001:db8::1:8090",
+            "iggy:iggy@[::1]:8090/path",
         ] {
             assert!(
                 matches!(

@@ -88,6 +88,13 @@ async def reader(laser, name, **options):
     return await group.reader(**options)
 
 
+async def read_nonempty(filtered, method):
+    async with asyncio.timeout(READ_TIMEOUT):
+        while (result := await getattr(filtered, method)()) is None:
+            await asyncio.sleep(0.001)
+        return result
+
+
 def offsets(page):
     return [record.offset for record in page.records]
 
@@ -692,11 +699,10 @@ async def test_given_a_malformed_record_when_reading_then_should_deliver_matches
     page = await asyncio.wait_for(filtered.next_page(), READ_TIMEOUT)
     assert offsets(page) == [0]
     await filtered.ack_page(page)
-    with pytest.raises(ls.FilterError) as fault:
+    with pytest.raises(ls.FilterFaultError) as fault:
         await filtered.next_page()
 
-    assert fault.value.reason == "fault"
-    assert fault.value.fault_reason == "malformed"
+    assert fault.value.reason == "malformed"
     assert (fault.value.partition_id, fault.value.offset) == (0, 1)
     await filtered.close()
 
@@ -828,7 +834,7 @@ async def test_given_a_completed_read_when_cancelled_before_delivery_then_should
             await asyncio.sleep(0)
         for callback, args in callbacks:
             callback(*args)
-        result = await asyncio.wait_for(getattr(filtered, method)(), READ_TIMEOUT)
+        result = await read_nonempty(filtered, method)
         if method == "next_record":
             assert result.offset == 0
             await filtered.ack(result)
@@ -863,7 +869,7 @@ async def test_given_a_delivered_read_when_cancelled_before_resuming_then_should
         pending.cancel()
         with pytest.raises(asyncio.CancelledError):
             await pending
-        result = await asyncio.wait_for(getattr(filtered, method)(), READ_TIMEOUT)
+        result = await read_nonempty(filtered, method)
         if method == "next_record":
             assert result.offset == 0, "the delivered record was given back"
             await filtered.ack(result)
@@ -933,7 +939,7 @@ async def test_given_a_read_when_cancelled_before_start_then_should_not_consume_
         with pytest.raises(asyncio.CancelledError):
             await pending
         await asyncio.sleep(0.05)
-        result = await asyncio.wait_for(getattr(filtered, method)(), READ_TIMEOUT)
+        result = await read_nonempty(filtered, method)
         if method == "next_record":
             assert result.offset == 0
             await filtered.ack(result)

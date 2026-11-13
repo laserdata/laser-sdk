@@ -986,7 +986,9 @@ impl Session {
     }
 
     /// End the session as completed. State changed since the last snapshot is
-    /// snapshotted first, so a reader can start from the final document.
+    /// snapshotted first, so a reader can start from the final document,
+    /// unless another writer changed the document since this handle's last
+    /// write, in which case the session ends without writing state.
     pub async fn end(&self) -> Result<(), LaserError> {
         self.state().snapshot_if_changed().await?;
         self.terminate(TaskState::Completed, SessionEnd::default())

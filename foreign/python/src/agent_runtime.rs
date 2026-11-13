@@ -12,7 +12,7 @@ use laser_sdk::agent::{
     Advertisement, AgentCtx, AgentHandler, AgentMessage, AgentMiddleware, CapabilitySelector,
     ConcurrencyPolicy, Contract, DeadLetterSink, Deduplicator, Gather, GatherPolicy, InboxRoute,
     ReliableConsumer, RetryPolicy, RouteCandidate, RoutePolicy, RouteScorer, Router, ScatterReport,
-    SlidingWindow,
+    SlidingWindow, WarmDedupPolicy,
 };
 use laser_sdk::context::{Chain, ContextAssembler, ContextPolicy, LastN, RoleFilter, TokenBudget};
 use laser_sdk::laser::Laser;
@@ -536,7 +536,8 @@ impl PyLaser {
     /// `agent_id=None` opens an unscoped reliable consumer and requires `consumer_group`. It cannot advertise capabilities.
     /// `operations` lists the command operations the handler serves. Omit it to serve every operation.
     /// `sessions` is a `Sessions` factory whose config the runtime applies: the lens `ctx.session()` opens and whether a dead letter fails its session.
-    #[pyo3(signature = (agent_id, listen_on, handler, *, consumer_group=None, respond_on=None, fixed_inbox=None, max_wait_ms=None, warm_dedup=false, dedup=None, dedup_window=None, consolidate_every_ms=None, consolidator=None, capabilities=None, ack_on_pickup=false, health=None, max_partitions=None, max_queued_records=None, max_queued_bytes=None, understood_features=0, shutdown_grace_ms=None, dead_letter=None, middleware=None, retry_max_attempts=None, retry_base_delay_ms=None, governor=None, governor_mode="enforce", governor_retention=None, signing_key=None, verifier=None, operations=None, sessions=None))]
+    /// `warm_dedup=True` refills the dedup window at start from the records the group already committed. `warm_dedup_policy` decides which: `"dead_letters"` (default) leaves out a copy a dead letter shows was dropped past its deadline, `"unexpired"` leaves out every copy whose deadline has passed, `"all"` refills every key.
+    #[pyo3(signature = (agent_id, listen_on, handler, *, consumer_group=None, respond_on=None, fixed_inbox=None, max_wait_ms=None, warm_dedup=false, warm_dedup_policy="dead_letters", dedup=None, dedup_window=None, consolidate_every_ms=None, consolidator=None, capabilities=None, ack_on_pickup=false, health=None, max_partitions=None, max_queued_records=None, max_queued_bytes=None, understood_features=0, shutdown_grace_ms=None, dead_letter=None, middleware=None, retry_max_attempts=None, retry_base_delay_ms=None, governor=None, governor_mode="enforce", governor_retention=None, signing_key=None, verifier=None, operations=None, sessions=None))]
     #[allow(clippy::too_many_arguments)]
     fn spawn_agent(
         &self,
@@ -549,6 +550,8 @@ impl PyLaser {
         fixed_inbox: Option<String>,
         max_wait_ms: Option<f64>,
         warm_dedup: bool,
+        #[gen_stub(override_type(type_repr = "typing.Literal['dead_letters', 'unexpired', 'all']", imports = ("typing",)))]
+        warm_dedup_policy: &str,
         dedup: Option<&Bound<'_, PyAny>>,
         dedup_window: Option<usize>,
         consolidate_every_ms: Option<f64>,
@@ -575,6 +578,11 @@ impl PyLaser {
         sessions: Option<&crate::session::PySessions>,
     ) -> PyResult<PyAgentHandle> {
         let sessions = sessions.map(|sessions| sessions.inner.config().clone());
+        let warm_dedup_policy = WarmDedupPolicy::from_str(warm_dedup_policy).map_err(|_| {
+            InvalidError::new_err(format!(
+                "warm_dedup_policy must be \"dead_letters\", \"unexpired\" or \"all\", got \"{warm_dedup_policy}\""
+            ))
+        })?;
         let agent = agent_id
             .map(AgentId::new)
             .transpose()
@@ -772,6 +780,7 @@ impl PyLaser {
                 .understood_features(understood_features)
                 .maybe_retry(retry)
                 .warm_dedup(warm_dedup)
+                .warm_dedup_policy(warm_dedup_policy)
                 .maybe_deduplicator(deduplicator)
                 .maybe_on_dead_letter(dead_letter_sink)
                 .middleware(middleware)
@@ -806,8 +815,9 @@ impl PyLaser {
         }));
         Ok(PyAgentHandle {
             shutdown: Mutex::new(Some(shutdown_tx)),
-            join: Mutex::new(Some(join)),
+            join: Arc::new(Mutex::new(Some(join))),
             ready: Mutex::new(Some(ready_rx)),
+            stopped: Arc::new(Mutex::new(None)),
             consolidation,
         })
     }
@@ -1522,10 +1532,16 @@ pub fn agent_ctx(
 #[pyclass(name = "AgentHandle")]
 pub struct PyAgentHandle {
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
-    join: Mutex<Option<JoinHandle<Result<(), LaserError>>>>,
+    join: AgentTask,
     ready: Mutex<Option<oneshot::Receiver<()>>>,
+    // Why the agent stopped before it became ready, once a wait raised it, so
+    // every later wait, stop, and join raises it again.
+    stopped: StoppedBeforeReady,
     consolidation: Option<tokio::task::AbortHandle>,
 }
+
+type AgentTask = Arc<Mutex<Option<JoinHandle<Result<(), LaserError>>>>>;
+type StoppedBeforeReady = Arc<Mutex<Option<PyErr>>>;
 
 // Dropping the handle without `shutdown()` or `abort()` would otherwise strand
 // the consumer task: it keeps polling, handling, and acking with its stop signal
@@ -1562,19 +1578,17 @@ impl Drop for PyAgentHandle {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyAgentHandle {
-    /// Wait until the agent has joined its group and is polling.
+    /// Wait until the agent has joined its group and is polling. An agent that
+    /// stopped before it became ready raises the error it stopped with, such as
+    /// `PresenceConflictError`, here and on every later wait, stop, or join.
     fn ready<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let receiver = self.ready.lock().expect("ready lock").take();
-        awaitable(py, async move {
-            if let Some(receiver) = receiver {
-                receiver.await.map_err(|_| {
-                    to_pyerr(LaserError::HandlerConfig(
-                        "agent stopped before ready".to_owned(),
-                    ))
-                })?;
-            }
-            Ok(())
-        })
+        let join = Arc::clone(&self.join);
+        let stopped = Arc::clone(&self.stopped);
+        awaitable(
+            py,
+            async move { wait_ready(receiver, &join, &stopped).await },
+        )
     }
 
     /// Signal the agent to stop, wait for it, and surface any consumer error.
@@ -1586,13 +1600,14 @@ impl PyAgentHandle {
             let _ = sender.send(());
         }
         let join = self.join.lock().expect("join lock").take();
+        let stopped = Arc::clone(&self.stopped);
         awaitable(py, async move {
             match join {
                 Some(join) => match join.await {
                     Ok(result) => result.map_err(to_pyerr),
                     Err(error) => Err(to_pyerr(LaserError::HandlerConfig(error.to_string()))),
                 },
-                None => Ok(()),
+                None => stopped_error(&stopped).map_or(Ok(()), Err),
             }
         })
     }
@@ -1601,13 +1616,14 @@ impl PyAgentHandle {
     fn join<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
         let consolidation = self.consolidation.clone();
         let join = self.join.lock().expect("join lock").take();
+        let stopped = Arc::clone(&self.stopped);
         awaitable(py, async move {
             let result = match join {
                 Some(join) => match join.await {
                     Ok(result) => result.map_err(to_pyerr),
                     Err(error) => Err(to_pyerr(LaserError::HandlerConfig(error.to_string()))),
                 },
-                None => Ok(()),
+                None => stopped_error(&stopped).map_or(Ok(()), Err),
             };
             if let Some(task) = consolidation {
                 task.abort();
@@ -1631,16 +1647,14 @@ impl PyAgentHandle {
         slf: Py<Self>,
         py: Python<'py>,
     ) -> PyResult<Awaitable<'py, Py<PyAgentHandle>>> {
-        let receiver = slf.borrow(py).ready.lock().expect("ready lock").take();
+        let (receiver, join, stopped) = {
+            let this = slf.borrow(py);
+            let receiver = this.ready.lock().expect("ready lock").take();
+            (receiver, Arc::clone(&this.join), Arc::clone(&this.stopped))
+        };
         let handle = slf.clone_ref(py);
         awaitable(py, async move {
-            if let Some(receiver) = receiver {
-                receiver.await.map_err(|_| {
-                    to_pyerr(LaserError::HandlerConfig(
-                        "agent stopped before ready".to_owned(),
-                    ))
-                })?;
-            }
+            wait_ready(receiver, &join, &stopped).await?;
             Ok(handle)
         })
     }
@@ -1662,18 +1676,72 @@ impl PyAgentHandle {
             let _ = sender.send(());
         }
         let join = self.join.lock().expect("join lock").take();
+        let stopped = Arc::clone(&self.stopped);
         awaitable(py, async move {
-            if let Some(join) = join {
-                match join.await {
+            match join {
+                Some(join) => match join.await {
                     Ok(result) => result.map_err(to_pyerr)?,
                     Err(error) => {
                         return Err(to_pyerr(LaserError::HandlerConfig(error.to_string())));
+                    }
+                },
+                None => {
+                    if let Some(error) = stopped_error(&stopped) {
+                        return Err(error);
                     }
                 }
             }
             Ok(false)
         })
     }
+}
+
+// Wait for readiness. A closed ready channel means the agent stopped first:
+// the first wait awaits its task and keeps the error it stopped with, so the
+// typed cause is raised here and by every later call.
+async fn wait_ready(
+    receiver: Option<oneshot::Receiver<()>>,
+    join: &AgentTask,
+    stopped: &StoppedBeforeReady,
+) -> PyResult<()> {
+    let Some(receiver) = receiver else {
+        return stopped_error(stopped).map_or(Ok(()), Err);
+    };
+    if receiver.await.is_ok() {
+        return Ok(());
+    }
+    let task = join
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let error = match task {
+        Some(task) => match task.await {
+            Ok(Err(error)) => to_pyerr(error),
+            Err(error) => to_pyerr(LaserError::HandlerConfig(error.to_string())),
+            Ok(Ok(())) => to_pyerr(LaserError::HandlerConfig(
+                "agent stopped before it became ready".to_owned(),
+            )),
+        },
+        None => to_pyerr(LaserError::HandlerConfig(
+            "agent stopped before it became ready".to_owned(),
+        )),
+    };
+    let kept = Python::attach(|py| error.clone_ref(py));
+    *stopped
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(kept);
+    Err(error)
+}
+
+// The error the agent stopped with before it became ready, when a wait
+// already raised it.
+fn stopped_error(stopped: &StoppedBeforeReady) -> Option<PyErr> {
+    let stopped = stopped
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    stopped
+        .as_ref()
+        .map(|error| Python::attach(|py| error.clone_ref(py)))
 }
 
 // One contract call's options, validated up front so a bad argument raises

@@ -2,7 +2,11 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import { createAgdx } from "../../src/agent/agdx.js"
 import { Agent } from "../../src/agent/builder.js"
-import { ReliableConsumer } from "../../src/agent/reliable-consumer.js"
+import {
+  ReliableConsumer,
+  type AgentHandler,
+  type ReliableConsumerControl
+} from "../../src/agent/reliable-consumer.js"
 import {
   declaredAgentTopic,
   replyTopicFor,
@@ -299,10 +303,20 @@ void test("given_a_declared_topic_layout_when_a_plain_agent_record_is_sent_then_
 
 void test("given_a_declared_agent_of_a_topic_layout_when_spawned_on_the_lane_then_should_read_its_own_topic", async (t) => {
   const read: string[] = []
-  t.mock.method(ReliableConsumer.prototype, "run", function (this: ReliableConsumer) {
-    read.push((this as unknown as { readonly options: { readonly topic: string } }).options.topic)
-    return Promise.resolve()
-  })
+  t.mock.method(
+    ReliableConsumer.prototype,
+    "run",
+    function (
+      this: ReliableConsumer,
+      _laser: Laser,
+      _handler: AgentHandler,
+      control: ReliableConsumerControl
+    ) {
+      read.push((this as unknown as { readonly options: { readonly topic: string } }).options.topic)
+      control.ready?.()
+      return Promise.resolve()
+    }
+  )
   const client = {
     clientProvider: () => Promise.resolve({ protocol: "vsr" }),
     destroy: () => Promise.resolve()

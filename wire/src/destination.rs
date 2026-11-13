@@ -9,6 +9,7 @@ wire_id!(
 );
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct BackendBinding {
     pub resource_id: BackendResourceId,
     pub generation: u64,

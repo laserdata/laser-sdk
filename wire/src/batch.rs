@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// transaction). A nested batch (an item whose code is the batch code) is
 /// rejected.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct BatchRequest {
     /// Op version, [`BATCH_OP_VERSION`](crate::codes::BATCH_OP_VERSION).
     pub v: u32,
@@ -20,11 +21,16 @@ pub struct BatchRequest {
 /// One managed request inside a [`BatchRequest`]: the command code it would
 /// have been sent under on its own, and its encoded request bytes verbatim.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct BatchItem {
     /// The managed command code (e.g. `AGDX_KV_GET_CODE`).
     pub code: u32,
     /// The op's own encoded request frame, exactly what a standalone send
     /// would carry.
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::bytes_schema")
+    )]
     #[serde(with = "crate::encoding::bin_bytes")]
     pub payload: Vec<u8>,
 }
@@ -34,8 +40,13 @@ pub struct BatchItem {
 /// reply for an item that failed, so the caller decodes each slot with the
 /// item's own reply type).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct BatchReply {
     /// Per-op reply frames, index-aligned with the request's `ops`.
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(schema_with = "crate::encoding::vec_bytes_schema")
+    )]
     #[serde(with = "crate::encoding::vec_bin_bytes")]
     pub results: Vec<Vec<u8>>,
 }

@@ -6,7 +6,7 @@ import { type LeaseRegistry, SessionLease } from "../../src/agent/lease.js"
 import { HandlerError, InvalidError } from "../../src/client/errors.js"
 import type { Laser } from "../../src/client/laser.js"
 import { INTERNAL_LAYOUTS, INTERNAL_TRANSPORT } from "../../src/client/internals.js"
-import { Checkpoint } from "../../src/context.js"
+import { Checkpoint, type ContextMessage } from "../../src/context.js"
 import type { LaserTransport, MessageWithHeaders } from "../../src/iggy/apache-iggy.js"
 import { MemoryId, MemoryKind } from "../../src/memory/types.js"
 import { AgentTopic } from "../../src/provenance/agent-topic.js"
@@ -501,9 +501,16 @@ void test("given_secret_keys_at_any_depth_when_redacted_then_should_drop_only_th
   })
 })
 
-void test("given_state_deltas_when_written_then_should_chain_revisions_and_snapshot_every_64_and_on_end", async () => {
+void test("given_state_deltas_when_written_then_should_chain_revisions_and_snapshot_every_64_and_on_end", async (t) => {
   const { laser, sent } = fakeLaser()
   const session = Sessions.create(laser).open(ConversationId.new()).asAgent(planner)
+  // The lane holds what this test wrote, so the check before a snapshot folds
+  // the state a server would hold.
+  t.mock.method(session, "laneRecords", () =>
+    Promise.resolve(
+      sent.map((entry) => ({ envelope: entry.envelope }) as unknown as ContextMessage)
+    )
+  )
   const state = session.state()
   await assert.rejects(state.patch([{ op: "remove", path: "/missing" }]), InvalidError)
   assert.equal(sent.length, 0)
@@ -701,6 +708,58 @@ void test("given_a_stale_snapshot_after_the_baseline_when_folded_then_should_cha
   assert.equal(view.revision, 5n)
   assert.equal(view.complete, true)
   assert.deepEqual(JSON.parse(JSON.stringify(view.document)), { count: 5 })
+})
+
+void test("given_a_snapshot_at_the_reached_revision_with_another_document_when_folded_then_should_keep_the_folded_document", async () => {
+  const snapshot = (baseRevision: bigint, document: unknown) => ({
+    envelope: {
+      operation: OPERATION_STATE_SNAPSHOT,
+      body: encodeNamed(encodeStateSnapshot({ baseRevision, document }))
+    }
+  })
+  const records = [
+    {
+      envelope: {
+        operation: OPERATION_STATE_DELTA,
+        body: encodeNamed(
+          encodeStateDelta({
+            baseRevision: 0n,
+            patch: [{ op: "add", path: "/count", value: 1 }],
+            opId: "op-1"
+          })
+        )
+      }
+    },
+    snapshot(1n, { count: 1 }),
+    // A writer whose own delta never applied names the reached revision.
+    snapshot(1n, { count: 9 })
+  ]
+  const session = {
+    laneRecords: () => Promise.resolve(records)
+  } as unknown as Session
+  const view = await SessionState.create(session, {
+    revision: 0n,
+    document: undefined,
+    sinceSnapshot: 0,
+    tail: Promise.resolve()
+  }).get()
+  assert.equal(view.revision, 1n)
+  assert.deepEqual(JSON.parse(JSON.stringify(view.document)), { count: 1 })
+})
+
+void test("given_a_negative_zero_in_the_state_when_the_writer_snapshots_then_should_write_it", async (t) => {
+  const { laser, sent } = fakeLaser()
+  const session = Sessions.create(laser).open(ConversationId.new()).asAgent(planner)
+  t.mock.method(session, "laneRecords", () =>
+    Promise.resolve(
+      sent.map((entry) => ({ envelope: entry.envelope }) as unknown as ContextMessage)
+    )
+  )
+  const state = session.state()
+  // The wire carries negative zero as the integer zero.
+  await state.set("balance", -0)
+  await state.snapshot()
+  assert.equal(nth(sent, sent.length - 1).envelope.operation, OPERATION_STATE_SNAPSHOT)
 })
 
 void test("given_a_delta_writing_a_constructor_member_when_folded_then_should_apply_it_and_keep_folding", async () => {

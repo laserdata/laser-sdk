@@ -3,6 +3,7 @@ import { test } from "node:test"
 import { Agent, type AgentBuilder } from "../../src/agent/builder.js"
 import {
   ReliableConsumer,
+  WarmDedupPolicy,
   type AgentHandler,
   type ReliableConsumerControl
 } from "../../src/agent/reliable-consumer.js"
@@ -113,5 +114,49 @@ void test(
       .spawn({} as Laser)
     await handle.join()
     assert.deepEqual(operations, ["summarize"])
+  }
+)
+
+void test(
+  "given_a_warm_dedup_policy_when_spawning_then_should_hand_it_to_the_reliable_consumer",
+  { timeout: 1000 },
+  async (t) => {
+    const policies: (WarmDedupPolicy | undefined)[] = []
+    t.mock.method(
+      ReliableConsumer.prototype,
+      "run",
+      function (
+        this: ReliableConsumer,
+        _laser: Laser,
+        _handler: AgentHandler,
+        control: ReliableConsumerControl
+      ) {
+        policies.push(
+          (this as unknown as { options: { warmDedupPolicy?: WarmDedupPolicy } }).options
+            .warmDedupPolicy
+        )
+        control.ready?.()
+        return Promise.resolve()
+      }
+    )
+    await builder()
+      .warmDedup()
+      .build()
+      .spawn({} as Laser)
+      .join()
+    await builder()
+      .warmDedup()
+      .warmDedupPolicy(WarmDedupPolicy.Unexpired)
+      .build()
+      .spawn({} as Laser)
+      .join()
+    assert.deepEqual(policies, [undefined, WarmDedupPolicy.Unexpired])
+    assert.throws(
+      () =>
+        builder()
+          .warmDedupPolicy("dead-letters" as WarmDedupPolicy)
+          .build(),
+      HandlerConfigError
+    )
   }
 )

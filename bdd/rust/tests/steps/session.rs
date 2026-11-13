@@ -317,6 +317,83 @@ async fn state_set(world: &mut LaserWorld, key: String, value: String) {
         .expect("the state delta is written");
 }
 
+#[when(regex = r#"^the session state is replaced with (.+)$"#)]
+async fn state_replace(world: &mut LaserWorld, document: String) {
+    let document: serde_json::Value = serde_json::from_str(&document).expect("a JSON document");
+    world
+        .session()
+        .state()
+        .replace(document)
+        .await
+        .expect("the state replace is written");
+}
+
+#[when(regex = r#"^agent "([^"]+)" opens a second handle on the session$"#)]
+async fn open_second_handle(world: &mut LaserWorld, name: String) {
+    let session = world.session().conversation();
+    world.native.second = Some(sessions(world).open(session).as_agent(agent(&name)));
+}
+
+#[when(regex = r#"^the second handle's state sets "([^"]+)" to (.+)$"#)]
+async fn second_state_set(world: &mut LaserWorld, key: String, value: String) {
+    let value: serde_json::Value = serde_json::from_str(&value).expect("a JSON value");
+    second_handle(world)
+        .state()
+        .set(&key, value)
+        .await
+        .expect("the state delta is written");
+}
+
+#[when(regex = r#"^the second handle's state is replaced with (.+)$"#)]
+async fn second_state_replace(world: &mut LaserWorld, document: String) {
+    let document: serde_json::Value = serde_json::from_str(&document).expect("a JSON document");
+    second_handle(world)
+        .state()
+        .replace(document)
+        .await
+        .expect("the state replace is written");
+}
+
+#[when("the second handle ends the session")]
+async fn second_handle_ends(world: &mut LaserWorld) {
+    second_handle(world)
+        .end()
+        .await
+        .expect("the second handle ends the session");
+}
+
+#[when("the second handle writes a state snapshot")]
+async fn second_handle_snapshot(world: &mut LaserWorld) {
+    let outcome = second_handle(world).state().snapshot().await.map(|_| ());
+    world.native.second_snapshot = Some(outcome);
+}
+
+#[then("the second handle's snapshot is refused as a stale session")]
+async fn second_snapshot_stale(world: &mut LaserWorld) {
+    let outcome = world.native.second_snapshot.as_ref();
+    assert!(
+        matches!(
+            outcome,
+            Some(Err(LaserError::Session(
+                laser_sdk::wire::session::SessionError::Stale(_)
+            )))
+        ),
+        "{outcome:?}"
+    );
+}
+
+#[then(regex = r#"^the folded session state is (.+) at revision (\d+)$"#)]
+async fn folded_document(world: &mut LaserWorld, document: String, revision: u64) {
+    let expected: serde_json::Value = serde_json::from_str(&document).expect("a JSON document");
+    let state = world.session().state();
+    let view = eventually(async || {
+        let view = state.get().await.ok()?;
+        (view.revision == revision).then_some(view)
+    })
+    .await;
+    assert_eq!(view.document, expected);
+}
+
 #[then(
     regex = r#"^the folded session state has "([^"]+)" (\S+) and "([^"]+)" (\S+) at revision (\d+)$"#
 )]
@@ -626,6 +703,17 @@ pub struct Native {
     second_stream: Option<String>,
     leases: BTreeMap<String, (String, ConversationId, SessionLease)>,
     labels: BTreeMap<String, (String, ConversationId)>,
+    second: Option<Session>,
+    second_snapshot: Option<Result<(), LaserError>>,
+}
+
+// The second handle a scenario opened on the session.
+fn second_handle(world: &LaserWorld) -> &Session {
+    world
+        .native
+        .second
+        .as_ref()
+        .expect("a second handle is open")
 }
 
 // The session factory of the scenario: the configured one, or the default.

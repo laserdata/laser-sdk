@@ -45,6 +45,8 @@ pub struct LaserWorld {
     pub other_session: Option<ConversationId>,
     /// The worker agent of the submit scenario.
     pub worker: Option<laser_sdk::agent::AgentHandle>,
+    /// The agent started second on one connection in the presence scenario.
+    pub second_worker: Option<laser_sdk::agent::AgentHandle>,
     /// The partitions a routed command and its reply landed on.
     pub routed: Option<(Option<u32>, Option<u32>)>,
     /// The session a routed command and its reply rode.
@@ -143,6 +145,8 @@ pub struct LaserWorld {
     pub input_decision: Option<String>,
     /// The managed-session scenarios: their streams, sessions, and reads.
     pub managed: crate::steps::managed_sessions::Managed,
+    /// The warm dedup scenarios: their worker and what it handled.
+    pub warm: crate::steps::warm_dedup::Warm,
 }
 
 impl fmt::Debug for LaserWorld {

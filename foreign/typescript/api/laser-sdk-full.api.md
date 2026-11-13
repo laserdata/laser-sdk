@@ -601,6 +601,7 @@ export class AgentBuilder {
     verifier(verifier: KeyRegistry): this;
     // (undocumented)
     warmDedup(value?: boolean): this;
+    warmDedupPolicy(policy: WarmDedupPolicy): this;
 }
 
 // @public (undocumented)
@@ -747,6 +748,7 @@ export interface AgentDefinition {
     readonly verifier?: KeyRegistry;
     // (undocumented)
     readonly warmDedup: boolean;
+    readonly warmDedupPolicy?: WarmDedupPolicy;
 }
 
 // @public (undocumented)
@@ -846,7 +848,6 @@ export class AgentHandle implements AsyncDisposable {
     abort(): void;
     // (undocumented)
     join(options?: CallOptions): Promise<void>;
-    // (undocumented)
     ready(options?: CallOptions): Promise<void>;
     shutdown(): Promise<void>;
 }
@@ -11295,6 +11296,7 @@ export interface ReliableConsumerOptions {
     readonly verifier?: KeyRegistry;
     // (undocumented)
     readonly warmDedup?: boolean;
+    readonly warmDedupPolicy?: WarmDedupPolicy;
 }
 
 // @public (undocumented)
@@ -13895,6 +13897,16 @@ export const VoteChoice: {
 
 // @public (undocumented)
 export type VoteChoice = (typeof VoteChoice)[keyof typeof VoteChoice];
+
+// @public
+export const WarmDedupPolicy: {
+    readonly DeadLetters: "dead_letters";
+    readonly Unexpired: "unexpired";
+    readonly All: "all";
+};
+
+// @public (undocumented)
+export type WarmDedupPolicy = (typeof WarmDedupPolicy)[keyof typeof WarmDedupPolicy];
 
 // @public (undocumented)
 export class Watch {

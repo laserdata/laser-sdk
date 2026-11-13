@@ -318,6 +318,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Agent.max_queued_records` | `Laser.spawn_agent(max_queued_records=)` | `AgentBuilder.maxQueuedRecords` | keywords |
 | `Agent.max_queued_bytes` | `Laser.spawn_agent(max_queued_bytes=)` | `AgentBuilder.maxQueuedBytes` | keywords |
 | `Agent.warm_dedup` | `Laser.spawn_agent(warm_dedup=)` | `AgentBuilder.warmDedup` | keywords |
+| `Agent.warm_dedup_policy` | `Laser.spawn_agent(warm_dedup_policy=)` | `AgentBuilder.warmDedupPolicy` | keywords |
 | `Agent.middleware` | `Laser.spawn_agent(middleware=)` | `AgentBuilder.middleware` | keywords |
 | `Agent.on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `AgentBuilder.onDeadLetter` | keywords |
 | `Agent.operations` | `Laser.spawn_agent(operations=)` | `AgentBuilder.operations` | keywords |
@@ -380,6 +381,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AgentBuilder::maybe_understood_features` | `Laser.spawn_agent(understood_features=)` | `AgentBuilder.understoodFeatures` | keywords |
 | `AgentBuilder::maybe_verifier` | `Laser.spawn_agent(verifier=)` | `AgentBuilder.verifier` | keywords |
 | `AgentBuilder::maybe_warm_dedup` | `Laser.spawn_agent(warm_dedup=)` | `AgentBuilder.warmDedup` | keywords |
+| `AgentBuilder::maybe_warm_dedup_policy` | `Laser.spawn_agent(warm_dedup_policy=)` | `AgentBuilder.warmDedupPolicy` | keywords |
 | `AgentBuilder::middleware` | `Laser.spawn_agent(middleware=)` | `AgentBuilder.middleware` | keywords |
 | `AgentBuilder::on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `AgentBuilder.onDeadLetter` | keywords |
 | `AgentBuilder::operations` | `Laser.spawn_agent(operations=)` | `AgentBuilder.operations` | keywords |
@@ -391,6 +393,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AgentBuilder::understood_features` | `Laser.spawn_agent(understood_features=)` | `AgentBuilder.understoodFeatures` | keywords |
 | `AgentBuilder::verifier` | `Laser.spawn_agent(verifier=)` | `AgentBuilder.verifier` | keywords |
 | `AgentBuilder::warm_dedup` | `Laser.spawn_agent(warm_dedup=)` | `AgentBuilder.warmDedup` | keywords |
+| `AgentBuilder::warm_dedup_policy` | `Laser.spawn_agent(warm_dedup_policy=)` | `AgentBuilder.warmDedupPolicy` | keywords |
 | `AgentCtx` | `AgentCtx` | `AgentCtx` |  |
 | `AgentCtx::approval_gate` | `AgentCtx.approval_gate` | `AgentCtx.approvalGate` |  |
 | `AgentCtx::fan_out` | `AgentCtx.fan_out` | `AgentCtx.fanOut` |  |
@@ -764,6 +767,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ReliableConsumer.ack_on_pickup` | `Laser.spawn_agent(ack_on_pickup=)` | `ReliableConsumerOptions.ackOnPickup` | keywords |
 | `ReliableConsumer.deduplicator` | `Laser.spawn_agent(dedup=)` | `ReliableConsumerOptions.deduplicator` | keywords |
 | `ReliableConsumer.warm_dedup` | `Laser.spawn_agent(warm_dedup=)` | `ReliableConsumerOptions.warmDedup` | keywords |
+| `ReliableConsumer.warm_dedup_policy` | `Laser.spawn_agent(warm_dedup_policy=)` | `ReliableConsumerOptions.warmDedupPolicy` | keywords |
 | `ReliableConsumer.middleware` | `Laser.spawn_agent(middleware=)` | `ReliableConsumerOptions.middleware` | keywords |
 | `ReliableConsumer.on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `ReliableConsumerOptions.onDeadLetter` | keywords |
 | `ReliableConsumer.operations` | `Laser.spawn_agent(operations=)` | `ReliableConsumerOptions.operations` | keywords |
@@ -804,6 +808,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ReliableConsumerBuilder::maybe_understood_features` | `Laser.spawn_agent(understood_features=)` | `ReliableConsumerOptions.understoodFeatures` | keywords |
 | `ReliableConsumerBuilder::maybe_verifier` | `Laser.spawn_agent(verifier=)` | `ReliableConsumerOptions.verifier` | keywords |
 | `ReliableConsumerBuilder::maybe_warm_dedup` | `Laser.spawn_agent(warm_dedup=)` | `ReliableConsumerOptions.warmDedup` | keywords |
+| `ReliableConsumerBuilder::maybe_warm_dedup_policy` | `Laser.spawn_agent(warm_dedup_policy=)` | `ReliableConsumerOptions.warmDedupPolicy` | keywords |
 | `ReliableConsumerBuilder::middleware` | `Laser.spawn_agent(middleware=)` | `ReliableConsumerOptions.middleware` | keywords |
 | `ReliableConsumerBuilder::on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `ReliableConsumerOptions.onDeadLetter` | keywords |
 | `ReliableConsumerBuilder::operations` | `Laser.spawn_agent(operations=)` | `ReliableConsumerOptions.operations` | keywords |
@@ -816,6 +821,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ReliableConsumerBuilder::understood_features` | `Laser.spawn_agent(understood_features=)` | `ReliableConsumerOptions.understoodFeatures` | keywords |
 | `ReliableConsumerBuilder::verifier` | `Laser.spawn_agent(verifier=)` | `ReliableConsumerOptions.verifier` | keywords |
 | `ReliableConsumerBuilder::warm_dedup` | `Laser.spawn_agent(warm_dedup=)` | `ReliableConsumerOptions.warmDedup` | keywords |
+| `ReliableConsumerBuilder::warm_dedup_policy` | `Laser.spawn_agent(warm_dedup_policy=)` | `ReliableConsumerOptions.warmDedupPolicy` | keywords |
 | `ReplayBound` | `ContextScope.state` | `ReplayBound` | keywords |
 | `ReplayBound::FromOffsets` | `ContextScope.state(from_offsets=)` | `ReplayBound` | keywords, plain-value |
 | `ReplayBound::Last` | `ContextScope.state(last_n=)` | `ReplayBound` | keywords, plain-value |
@@ -1204,6 +1210,10 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Verifier` | `Workflow.step(verify=)` | `Verifier` | callback |
 | `Verifier::verify` | `Workflow.step(verify=)` | `Verifier` | callback |
 | `agent::WORKFLOW_FENCE_NAMESPACE` | `const:WORKFLOW_FENCE_NAMESPACE` | `const:WORKFLOW_FENCE_NAMESPACE` |  |
+| `WarmDedupPolicy` | omitted | `WarmDedupPolicy` | plain-value |
+| `WarmDedupPolicy::DeadLetters` | omitted | `WarmDedupPolicy.DeadLetters` | plain-value |
+| `WarmDedupPolicy::Unexpired` | omitted | `WarmDedupPolicy.Unexpired` | plain-value |
+| `WarmDedupPolicy::All` | omitted | `WarmDedupPolicy.All` | plain-value |
 | `Workflow` | `Workflow` | `Workflow` |  |
 | `Workflow::budget` | `Workflow.budget` | `Workflow.budget` |  |
 | `Workflow::inbox_route` | `Laser.workflow(fixed_inbox=)` | `Workflow.inboxRoute` | keywords |

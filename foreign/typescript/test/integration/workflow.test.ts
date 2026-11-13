@@ -2,12 +2,13 @@ import assert from "node:assert/strict"
 import { randomUUID } from "node:crypto"
 import { test } from "node:test"
 import { Agent, type AgentHandle } from "../../src/agent/builder.js"
+import { decodeAgentMessage } from "../../src/agent/reliable-consumer.js"
 import { WorkflowBudget } from "../../src/agent/workflow.js"
 import { BudgetExceededError, CancelledError, StepFailedError } from "../../src/client/errors.js"
 import { Laser } from "../../src/client/laser.js"
 import { AgentTopic } from "../../src/provenance/agent-topic.js"
 import { AgentId, ConversationId } from "../../src/types/ids.js"
-import { decodeSessionStart } from "../../src/wire/agent.js"
+import { AgentKind, decodeSessionStart } from "../../src/wire/agent.js"
 import { decodeOne, expectMap } from "../../src/wire/cbor.js"
 import { routeTo } from "../../src/agent/router.js"
 import { TopicRetention } from "../../src/session.js"
@@ -223,3 +224,137 @@ void test("given_a_cancel_request_on_the_control_topic_when_a_workflow_runs_then
     await laser.close()
   }
 })
+
+void test("given_a_step_command_that_expired_unconsumed_when_a_fresh_process_resumes_the_run_then_should_run_the_resent_step", async () => {
+  const stream = `laser-ts-test-${randomUUID()}`
+  const firstProcess = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  const resumingProcess = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  const workerProcess = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  let handle: AgentHandle | undefined
+  try {
+    await firstProcess.bootstrap(4, TopicRetention.expireAfter(86_400_000))
+    const worker = AgentId.new("expiry-worker")
+    const run = ConversationId.new()
+    await assert.rejects(
+      firstProcess
+        .workflow("expiryflow")
+        .runId(run)
+        .inboxRoute(fixedCommands)
+        .step("work", routeTo(worker), () => textEncoder.encode("go"))
+        .deadline(1_000)
+        .run(),
+      (error: unknown) => error instanceof StepFailedError && error.reason === "timed_out"
+    )
+
+    // A fresh process resumes the run and sends the step again before its
+    // worker starts, so the worker reads the expired copy first.
+    const resumed = resumingProcess
+      .workflow("expiryflow")
+      .runId(run)
+      .inboxRoute(fixedCommands)
+      .step("work", routeTo(worker), () => textEncoder.encode("go"))
+      .deadline(20_000)
+      .run()
+    await eventually(async () =>
+      (await envelopesOnLog(firstProcess, AgentKind.Command, "expiry-worker")) === 2
+        ? true
+        : undefined
+    )
+    let calls = 0
+    handle = Agent.builder()
+      .id(worker)
+      .listenOn(AgentTopic.Sessions)
+      .respondOn(AgentTopic.Sessions)
+      .ackOnPickup()
+      .handler({
+        handle(_message, context): Promise<void> {
+          calls += 1
+          return context.respond(textEncoder.encode("counted"))
+        }
+      })
+      .build()
+      .spawn(workerProcess)
+    const outcome = await resumed
+
+    assert.equal(calls, 1)
+    assert.equal(textDecoder.decode(outcome.outputs.get("work")), "counted")
+  } finally {
+    if (handle !== undefined) await handle.shutdown()
+    await workerProcess.close()
+    await resumingProcess.close()
+    await firstProcess.close()
+  }
+})
+
+void test("given_an_expired_step_command_answered_before_the_resume_when_a_fresh_process_resumes_the_run_then_should_run_the_resent_step", async () => {
+  const stream = `laser-ts-test-${randomUUID()}`
+  const firstProcess = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  const workerProcess = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  const resumingProcess = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  let handle: AgentHandle | undefined
+  try {
+    await firstProcess.bootstrap(4, TopicRetention.expireAfter(86_400_000))
+    const worker = AgentId.new("answered-worker")
+    const run = ConversationId.new()
+    await assert.rejects(
+      firstProcess
+        .workflow("answeredflow")
+        .runId(run)
+        .inboxRoute(fixedCommands)
+        .step("work", routeTo(worker), () => textEncoder.encode("go"))
+        .deadline(1_000)
+        .run(),
+      (error: unknown) => error instanceof StepFailedError && error.reason === "timed_out"
+    )
+
+    // The worker starts in its own process, drops the expired copy, and
+    // answers that it was not consumed before the run resumes.
+    let calls = 0
+    handle = Agent.builder()
+      .id(worker)
+      .listenOn(AgentTopic.Sessions)
+      .respondOn(AgentTopic.Sessions)
+      .ackOnPickup()
+      .handler({
+        handle(_message, context): Promise<void> {
+          calls += 1
+          return context.respond(textEncoder.encode("counted"))
+        }
+      })
+      .build()
+      .spawn(workerProcess)
+    await eventually(async () =>
+      (await envelopesOnLog(firstProcess, AgentKind.Error, "answeredflow")) === 1 ? true : undefined
+    )
+
+    const resumed = await resumingProcess
+      .workflow("answeredflow")
+      .runId(run)
+      .inboxRoute(fixedCommands)
+      .step("work", routeTo(worker), () => textEncoder.encode("go"))
+      .deadline(20_000)
+      .run()
+
+    assert.equal(calls, 1)
+    assert.equal(textDecoder.decode(resumed.outputs.get("work")), "counted")
+  } finally {
+    if (handle !== undefined) await handle.shutdown()
+    await resumingProcess.close()
+    await workerProcess.close()
+    await firstProcess.close()
+  }
+})
+
+// How many AGDX envelopes of `kind` addressed to `target` the sessions topic
+// holds.
+async function envelopesOnLog(laser: Laser, kind: AgentKind, target: string): Promise<number> {
+  const records = await (await laser.topic(AgentTopic.Sessions).replay()).pollRecords()
+  return records.filter((record) => {
+    const decoded = decodeAgentMessage(record)
+    return (
+      decoded.kind === "message" &&
+      decoded.message.envelope?.kind === kind &&
+      decoded.message.envelope.target === target
+    )
+  }).length
+}

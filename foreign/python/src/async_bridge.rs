@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use pyo3_async_runtimes::TaskLocals;
 use pyo3_stub_gen::{ImportKind, PyStubType, TypeIdentifierRef, TypeInfo};
+use std::any::TypeId;
 use std::convert::Infallible;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -650,7 +651,11 @@ where
     T: for<'a> IntoPyObject<'a> + Send + 'static,
     for<'a> <T as IntoPyObject<'a>>::Error: Into<PyErr>,
 {
-    future_into_py(py, future).map(|future| Awaitable {
+    future_into_py(py, async move {
+        let value = future.await?;
+        Python::attach(|py| resolved_value(py, value))
+    })
+    .map(|future| Awaitable {
         future,
         resolves_to: PhantomData,
     })
@@ -668,10 +673,32 @@ where
     T: for<'a> IntoPyObject<'a> + Send + 'static,
     for<'a> <T as IntoPyObject<'a>>::Error: Into<PyErr>,
 {
-    future_into_py_returning(py, future, undelivered).map(|future| Awaitable {
+    future_into_py_returning(
+        py,
+        async move {
+            let value = future.await?;
+            Python::attach(|py| resolved_value(py, value))
+        },
+        undelivered,
+    )
+    .map(|future| Awaitable {
         future,
         resolves_to: PhantomData,
     })
+}
+
+fn resolved_value<T>(py: Python<'_>, value: T) -> PyResult<Py<PyAny>>
+where
+    T: for<'a> IntoPyObject<'a> + 'static,
+    for<'a> <T as IntoPyObject<'a>>::Error: Into<PyErr>,
+{
+    if TypeId::of::<T>() == TypeId::of::<()>() {
+        return Ok(py.None());
+    }
+    value
+        .into_pyobject(py)
+        .map(|value| value.into_any().unbind())
+        .map_err(Into::into)
 }
 
 #[cfg(test)]

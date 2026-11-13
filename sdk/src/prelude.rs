@@ -74,8 +74,8 @@ pub mod full {
         CapabilitySelector, ChunkAssembler, ConcurrencyPolicy, ContractBuilder, DeadLetterSink,
         Deduplicator, Gather, GatherPolicy, InboxRoute, RegisteredCard, RetryPolicy,
         RouteCandidate, RouteScorer, ScatterOutcome, ScatterReport, SessionPolicy, SlidingWindow,
-        StepContext, StepFailure, StepFn, StepHandle, StreamEvent, Verifier, WorkflowBudget,
-        WorkflowOutcome,
+        StepContext, StepFailure, StepFn, StepHandle, StreamEvent, Verifier, WarmDedupPolicy,
+        WorkflowBudget, WorkflowOutcome,
     };
     #[cfg(feature = "agui")]
     pub use crate::agui::AgUiEvent;

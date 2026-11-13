@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { Given, Then, When } from "@cucumber/cucumber";
+import { After, Given, Then, When } from "@cucumber/cucumber";
 import {
+  Agent,
   AgentId,
   AgentTopic,
   CorrelationId,
@@ -11,8 +12,10 @@ import {
   code,
   eventEnvelope,
   isUnavailable,
+  PresenceConflictError,
   requiring,
   unmetRequirements,
+  type AgentHandle,
 } from "@laserdata/laser-sdk";
 import { wire } from "@laserdata/laser-sdk/full";
 import { eventual } from "../support/eventual.js";
@@ -232,3 +235,68 @@ async function sendCommand(
       ...extra,
     });
 }
+
+/** The agents of the presence scenario: the first one ready, the second
+ * started on the same connection. */
+interface Presence {
+  first?: AgentHandle;
+  second?: AgentHandle;
+}
+
+const presences = new WeakMap<LaserWorld, Presence>();
+
+function presence(world: LaserWorld): Presence {
+  let state = presences.get(world);
+  if (state === undefined) {
+    state = {};
+    presences.set(world, state);
+  }
+  return state;
+}
+
+function spawnAdvertising(
+  world: LaserWorld,
+  name: string,
+  skill: string,
+): AgentHandle {
+  return Agent.builder()
+    .id(AgentId.new(name))
+    .listenOn(AgentTopic.Sessions)
+    .capabilities([{ skillId: skill }])
+    .handler({ handle: () => Promise.resolve() })
+    .build()
+    .spawn(world.requireLaser());
+}
+
+After(async function (this: LaserWorld) {
+  const state = presences.get(this);
+  if (state === undefined) return;
+  await state.second?.shutdown().catch(() => undefined);
+  await state.first?.shutdown();
+  presences.delete(this);
+});
+
+Given(
+  /^agent "([^"]+)" advertising the skill "([^"]+)" is ready on this connection$/,
+  async function (this: LaserWorld, name: string, skill: string) {
+    const first = spawnAdvertising(this, name, skill);
+    presence(this).first = first;
+    await first.ready();
+  },
+);
+
+When(
+  /^agent "([^"]+)" advertising the skill "([^"]+)" starts on the same connection$/,
+  function (this: LaserWorld, name: string, skill: string) {
+    presence(this).second = spawnAdvertising(this, name, skill);
+  },
+);
+
+Then(
+  "waiting for the second agent to be ready fails with a presence conflict",
+  async function (this: LaserWorld) {
+    const second = presence(this).second;
+    assert.ok(second !== undefined, "a second agent started");
+    await assert.rejects(second.ready(), PresenceConflictError);
+  },
+);

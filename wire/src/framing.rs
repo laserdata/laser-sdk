@@ -412,6 +412,7 @@ mod tests {
     #[test]
     fn given_named_encoding_when_round_tripped_then_should_preserve_fields() {
         #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
         struct Body {
             id: u32,
             name: String,
@@ -475,11 +476,16 @@ mod tests {
     }
 
     #[derive(serde::Serialize)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
     struct Keyed {
         v: u32,
         namespace: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<String>,
+        #[cfg_attr(
+            feature = "schemars",
+            schemars(schema_with = "crate::encoding::bytes_schema")
+        )]
         #[serde(with = "crate::encoding::bin_bytes")]
         value: Vec<u8>,
     }
