@@ -217,6 +217,7 @@ impl LeaseRegistry {
                 process: self.process.clone(),
                 stream: stream.to_owned(),
                 sessions: chunk.iter().copied().map(Into::into).collect(),
+                stream_generation: Some(generation),
             })?;
             producer
                 .status(OPERATION_PROGRESS)

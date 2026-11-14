@@ -22,7 +22,7 @@ Choose where to run:
 - In the [Laser Stack](https://github.com/laserdata/laser-stack) checkout, run `./scripts/up`. Copy the printed `LASER_CONNECTION_STRING` export.
 - Start Apache Iggy for streaming. Set `LASER_CONNECTION_STRING` to its connection string.
 
-The repository examples read `LASER_CONNECTION_STRING`. Export it once or set it for one command:
+The repository examples read `LASER_CONNECTION_STRING`. Keep the connection string there, read it inside the program, and never print or log it. Export it once or set it for one command:
 
 ```sh
 export LASER_CONNECTION_STRING='<connection string>'
@@ -332,7 +332,7 @@ Laser Stack runs Laser Streams and the managed backend. Laser Streams owns the d
 
 ### TLS
 
-Connections to `*.laserdata.cloud` and `*.laserdata.com` automatically use the public LaserData CA bundled with the SDK. `LASER_TLS_CERT=<path>` enables TLS with an explicit CA for any host or overrides the bundled CA. `LASER_NO_TLS=1` disables automatic TLS setup. Other hosts keep the TLS settings from their connection string when neither variable is set.
+Connections to `*.laserdata.cloud` and `*.laserdata.com` automatically use the public LaserData CA bundled with the SDK. `LASER_TLS_CERT=<path>` enables TLS with an explicit CA for any host or overrides the bundled CA. `LASER_NO_TLS=1` disables automatic TLS setup. Other hosts keep the TLS settings from their connection string when neither variable is set. Rust and Python connect over TCP (`iggy+tcp://`), QUIC (`iggy+quic://`) or WebSocket (`iggy+ws://`), and TypeScript over TCP. QUIC verifies certificates only against the operating system trust store: a LaserData Cloud host needs the LaserData root CA installed there, and other hosts keep Apache Iggy's default `validate_certificate=false`, so set `validate_certificate=true` outside local development. [Client behavior](docs/client-behavior.md#connections) has the transport table and the TLS rules per transport.
 
 ## Consumer groups and offsets
 

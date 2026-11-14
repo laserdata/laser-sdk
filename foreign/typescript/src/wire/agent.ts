@@ -424,11 +424,15 @@ export interface StateDelta {
   readonly baseRevision: bigint
   readonly patch: readonly PatchOp[]
   readonly opId: string
+  /** The `opId` of the delta that produced `baseRevision`, when the writer knows it. */
+  readonly baseOpId?: string
 }
 
 export interface StateSnapshot {
   readonly baseRevision: bigint
   readonly document: unknown
+  /** The `opId` of the delta that produced `baseRevision`, when the writer knows it. */
+  readonly baseOpId?: string
 }
 
 function jsonBytes(value: unknown): number {
@@ -555,20 +559,24 @@ function decodePatchOp(value: unknown, context: string): PatchOp {
 
 export function encodeStateDelta(delta: StateDelta): Map<string, unknown> {
   validateStateDelta(delta)
-  return new Map<string, unknown>([
+  const map = new Map<string, unknown>([
     ["base_revision", delta.baseRevision],
     ["patch", delta.patch.map(encodePatchOp)],
     ["op_id", delta.opId]
   ])
+  if (delta.baseOpId !== undefined) map.set("base_op_id", delta.baseOpId)
+  return map
 }
 
 export function decodeStateDelta(map: CborMap, context: string): StateDelta {
+  const baseOpId = field.optionalString(map, "base_op_id", context)
   const delta = {
     baseRevision: field.requiredU64(map, "base_revision", context),
     patch: field.requiredArray(map, "patch", context, (item, index) =>
       decodePatchOp(item, `${context}.patch[${String(index)}]`)
     ),
-    opId: field.requiredString(map, "op_id", context)
+    opId: field.requiredString(map, "op_id", context),
+    ...(baseOpId !== undefined ? { baseOpId } : {})
   }
   validateStateDelta(delta)
   return delta
@@ -576,16 +584,20 @@ export function decodeStateDelta(map: CborMap, context: string): StateDelta {
 
 export function encodeStateSnapshot(snapshot: StateSnapshot): Map<string, unknown> {
   validateStateSnapshot(snapshot)
-  return new Map<string, unknown>([
+  const map = new Map<string, unknown>([
     ["base_revision", snapshot.baseRevision],
     ["document", jsonToCbor(snapshot.document)]
   ])
+  if (snapshot.baseOpId !== undefined) map.set("base_op_id", snapshot.baseOpId)
+  return map
 }
 
 export function decodeStateSnapshot(map: CborMap, context: string): StateSnapshot {
+  const baseOpId = field.optionalString(map, "base_op_id", context)
   const snapshot = {
     baseRevision: field.requiredU64(map, "base_revision", context),
-    document: cborToJson(map.get("document"), context)
+    document: cborToJson(map.get("document"), context),
+    ...(baseOpId !== undefined ? { baseOpId } : {})
   }
   validateStateSnapshot(snapshot)
   return snapshot

@@ -616,7 +616,7 @@ mod tests {
         assert_eq!(expanded.len(), 2);
         assert_eq!(expanded[0].name, "stream_direct-rate-1000");
         assert_eq!(expanded[1].offered_rate, Some(2_000));
-        assert!(expanded[1].offered_rates.is_empty());
+        assert_eq!(expanded[1].offered_rates, Vec::<u64>::new());
     }
 
     #[test]

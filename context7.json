@@ -1,0 +1,36 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "Laser SDK",
+  "description": "Laser SDK: agent memory, durable workflows, sessions and messaging on Apache Iggy, with matching Rust, Python and TypeScript clients.",
+  "folders": [
+    "docs",
+    "sdk",
+    "wire",
+    "foreign/python",
+    "foreign/typescript",
+    "examples"
+  ],
+  "excludeFolders": [
+    "target",
+    "node_modules",
+    "bench",
+    "fuzz",
+    "bdd",
+    "wire/fixtures",
+    "foreign/typescript/api",
+    "foreign/typescript/test",
+    "foreign/python/tests",
+    "sdk/tests"
+  ],
+  "excludeFiles": [
+    "parity.md",
+    "CHANGELOG.md"
+  ],
+  "rules": [
+    "Never print or log the connection string or its password. Read it from LASER_CONNECTION_STRING inside the program.",
+    "Connect with a connection string from the LASER_CONNECTION_STRING environment variable through connect_env() in Python, connectEnv() in TypeScript or connect_env() in Rust. A LaserData API key is not a connection string.",
+    "Python installs with pip install laser-sdk and imports laser_sdk. TypeScript installs @laserdata/laser-sdk. Rust adds laser-sdk.",
+    "Use the SDK's own workflow, memory and session APIs for durable results. A local list, dict or plain function is not durable.",
+    "A LaserData Cloud deployment admits a Laser SDK connection only from an address its access rules allow over TCP."
+  ]
+}

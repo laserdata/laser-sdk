@@ -451,7 +451,7 @@ fn parse_feature_action(feature: &str, action: &str) -> PyResult<(Feature, Actio
 
 /// A named set of grants.
 #[gen_stub_pyclass]
-#[pyclass(name = "Role", frozen, skip_from_py_object)]
+#[pyclass(name = "Role", frozen)]
 #[derive(Clone)]
 pub struct PyRole {
     #[pyo3(get)]
@@ -522,7 +522,7 @@ impl From<BindingsReply> for PyBindingsReply {
 /// `{"roles_bound": {"user_id": id, "roles": [...]}}`, or
 /// `{"tenancy_set": "deployment" | "stream"}`.
 #[gen_stub_pyclass]
-#[pyclass(name = "AuthzEvent", frozen, skip_from_py_object)]
+#[pyclass(name = "AuthzEvent", frozen)]
 #[derive(Clone)]
 pub struct PyAuthzEvent {
     #[pyo3(get)]
@@ -562,7 +562,7 @@ impl From<AuthzEvent> for PyAuthzEvent {
 /// A page of authorization change history. Pass `next_after_revision` as
 /// `after_revision` to read the next page.
 #[gen_stub_pyclass]
-#[pyclass(name = "AuthzHistoryReply", frozen, skip_from_py_object)]
+#[pyclass(name = "AuthzHistoryReply", frozen)]
 #[derive(Clone)]
 pub struct PyAuthzHistoryReply {
     /// The authorization operation version of the reply.
@@ -588,7 +588,7 @@ impl From<AuthzHistoryReply> for PyAuthzHistoryReply {
 /// hard reject of a token minted for another server, or `step_up`, a token
 /// that lacks the required scope.
 #[gen_stub_pyclass]
-#[pyclass(name = "EdgeDenial", frozen, eq, skip_from_py_object)]
+#[pyclass(name = "EdgeDenial", frozen, eq)]
 #[derive(Clone, PartialEq)]
 pub struct PyEdgeDenial {
     inner: EdgeDenial,

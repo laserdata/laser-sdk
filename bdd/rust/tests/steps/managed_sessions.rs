@@ -1,6 +1,7 @@
 use crate::common::test_iggy::fresh_connected_laser;
 use crate::common::world::LaserWorld;
 use cucumber::{given, then, when};
+use iggy::prelude::{Identifier, StreamClient};
 use laser_sdk::a2a::A2aBridge;
 use laser_sdk::agent::{
     AgentHandle, SessionChange, SessionConfig, SessionLayout, SessionLease, SessionWatch, Sessions,
@@ -12,8 +13,12 @@ use laser_sdk::wire::agent::{
     AgentEnvelope, AgentKind, Budget, CorrelationId, RecordId, SessionEnd, SessionStatus,
     TaskState, TokenUsage,
 };
+use laser_sdk::wire::framing::decode_named;
 use laser_sdk::wire::graph::SourceRef;
-use laser_sdk::wire::session::{LinkRelation, LinkSurface, SessionInfo, StateOutcome};
+use laser_sdk::wire::session::{
+    LinkRelation, LinkSurface, SessionHeartbeat, SessionInfo, StateOutcome,
+};
+use laser_sdk::wire::topics::AGENT_HEARTBEATS;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1686,23 +1691,45 @@ async fn old_lane_stays_stale(world: &mut LaserWorld) {
     );
 }
 
-#[then("the old lease publishes no heartbeat into the recreated stream")]
+// A send the server processes after the recreation still lands, since the
+// replacement reuses the numeric ids. A reader ignores it by its generation.
+#[then("no heartbeat of the old lease counts in the recreated stream")]
 async fn old_generation_never_heartbeats(world: &mut LaserWorld) {
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let mut cursor = world
-        .managed
-        .laser()
-        .topic(laser_sdk::wire::topics::AGENT_HEARTBEATS)
+    let laser = world.managed.laser();
+    let stream = Identifier::named(laser.default_stream().expect("a managed stream"))
+        .expect("a stream identifier");
+    let generation = laser
+        .client()
+        .get_stream(&stream)
+        .await
+        .expect("read the recreated stream")
+        .expect("the recreated stream")
+        .created_at
+        .as_micros();
+    let mut cursor = laser
+        .topic(AGENT_HEARTBEATS)
         .replay()
         .expect("a heartbeat reader");
-    assert!(
-        cursor
+    loop {
+        let batch = cursor
             .poll()
             .await
-            .expect("read the recreated heartbeat topic")
-            .is_empty(),
-        "an old-generation lease must publish no new-generation heartbeat"
-    );
+            .expect("read the recreated heartbeat topic");
+        if batch.is_empty() {
+            break;
+        }
+        for message in batch {
+            let envelope: AgentEnvelope =
+                decode_named(&message.payload).expect("a heartbeat envelope");
+            let heartbeat: SessionHeartbeat =
+                decode_named(&envelope.body).expect("a heartbeat body");
+            assert!(
+                !heartbeat.counts_for(generation),
+                "a heartbeat of the deleted stream counts in its replacement: {heartbeat:?}"
+            );
+        }
+    }
     world.managed.lease = None;
     world.session_lease = None;
 }

@@ -240,7 +240,7 @@ impl PyWatchedChange {
 
 /// One change-feed record: a materialized index advanced past an offset window.
 #[gen_stub_pyclass]
-#[pyclass(name = "ChangeRecord", frozen, get_all, skip_from_py_object)]
+#[pyclass(name = "ChangeRecord", frozen, get_all)]
 #[derive(Clone)]
 pub struct PyChangeRecord {
     /// The change-feed record version.

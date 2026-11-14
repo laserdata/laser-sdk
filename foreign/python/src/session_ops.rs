@@ -360,7 +360,8 @@ impl PySessionState {
 
     /// Fold the state from the retained session lane, as a `SessionStateView`
     /// dict. `complete` is false when the lane no longer holds the records the
-    /// document starts from.
+    /// document starts from, and `head_op_id` names the delta that produced
+    /// `revision` when the lane records it.
     fn get<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Py<PyAny>>> {
         let state = self.inner.clone();
         awaitable(py, async move {

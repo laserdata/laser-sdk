@@ -21,6 +21,19 @@ async def _bootstrap(laser):
     return laser.sessions()
 
 
+async def _heartbeat_bodies(laser):
+    # Every heartbeat body on the default stream, in log order. Python has no
+    # typed heartbeat, so a body decodes to a dict through the CBOR codec.
+    cursor = laser.topic(ls.AgentTopic.Heartbeats).replay()
+    bodies = []
+    while True:
+        batch = await cursor.poll()
+        if not batch:
+            return bodies
+        for message in batch:
+            bodies.append(bytes(ls.Cbor.decode(bytes(message.payload))["body"]))
+
+
 async def _statuses(laser, session_id):
     turns = await laser.sessions().open(session_id).context_with(ls.LastN(20))
     return [
@@ -141,3 +154,38 @@ async def test_given_a_zero_idle_timeout_when_beginning_then_should_raise_invali
     sessions = await _bootstrap(laser)
     with pytest.raises(ls.InvalidError):
         await sessions.start().agent("planner").idle_timeout(0).begin()
+
+
+async def test_given_a_heartbeat_of_a_deleted_stream_when_read_then_should_name_another_generation(
+    laser,
+):
+    await _bootstrap(laser)
+    _, lease = await laser.sessions(heartbeat_ms=50).start().agent("planner").begin()
+
+    async def first():
+        bodies = await _heartbeat_bodies(laser)
+        return bodies[-1] if bodies else None
+
+    late = await _eventually(first, "a heartbeat of the first stream")
+    lease.release()
+    await asyncio.sleep(0.2)
+    assert await laser.stream(laser.default_stream).delete()
+    await _bootstrap(laser)
+    # The server appends a send it processes after the stream was created
+    # again, since the replacement reuses the numeric ids.
+    await laser.agdx(ls.AgentTopic.Heartbeats, "planner", ls.mint_ulid()).status(
+        "progress", body=late, content_type="cbor"
+    )
+    _, fresh = await laser.sessions(heartbeat_ms=50).start().agent("planner").begin()
+
+    async def replacement():
+        beats = [ls.Cbor.decode(body) for body in await _heartbeat_bodies(laser)]
+        return beats if len(beats) > 1 else None
+
+    beats = await _eventually(replacement, "a heartbeat of the replacement's own lease")
+    fresh.release()
+    generation = beats[-1].get("stream_generation")
+    assert isinstance(generation, int), beats[-1]
+    assert ls.Cbor.decode(late).get("stream_generation") != generation, (
+        "a heartbeat of the deleted stream names the replacement's generation"
+    )

@@ -89,7 +89,7 @@ impl PyStream {
 /// One topic: where records live. Publish to it, replay it, ensure it. Build
 /// with `Laser.topic` (default stream) or `Stream.topic`.
 #[gen_stub_pyclass]
-#[pyclass(name = "Topic", skip_from_py_object)]
+#[pyclass(name = "Topic")]
 #[derive(Clone)]
 pub struct PyTopic {
     laser: Laser,

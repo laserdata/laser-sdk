@@ -149,7 +149,7 @@ impl ActionGovernor for PyActionGovernor {
 /// fields (`purpose`, `data_classification`) are claims unless the envelope is
 /// signed.
 #[gen_stub_pyclass]
-#[pyclass(name = "GovernedAction", skip_from_py_object)]
+#[pyclass(name = "GovernedAction")]
 #[derive(Clone)]
 pub struct PyGovernedAction {
     kind: String,
@@ -338,7 +338,7 @@ impl PyGovernedAction {
 /// Session counters at decision time. Shared by every clone of the governed
 /// `Laser`, so a policy can bound a whole session, not one handle.
 #[gen_stub_pyclass]
-#[pyclass(name = "ActionCounters", frozen, eq, skip_from_py_object)]
+#[pyclass(name = "ActionCounters", frozen, eq)]
 #[derive(Clone, Copy, PartialEq)]
 pub struct PyActionCounters {
     inner: ActionCounters,

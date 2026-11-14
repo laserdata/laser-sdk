@@ -266,7 +266,7 @@ impl PyLaser {
 
 /// What a session watch reports.
 #[gen_stub_pyclass_complex_enum]
-#[pyclass(name = "SessionChange", frozen, eq, skip_from_py_object)]
+#[pyclass(name = "SessionChange", frozen, eq)]
 #[derive(Clone, PartialEq)]
 pub enum PySessionChange {
     /// These sessions changed, each named once.

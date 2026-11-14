@@ -1098,6 +1098,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `SessionStateView.history` | dict key | `SessionStateView.history` | serde-dict, keywords |
 | `SessionStateView.frontier` | dict key | `SessionStateView.frontier` | serde-dict, keywords |
 | `SessionStateView.complete` | dict key | `SessionStateView.complete` | serde-dict, keywords |
+| `SessionStateView.head_op_id` | dict key | `SessionStateView.headOpId` | serde-dict, keywords |
 | `SessionTurn` | `SessionTurn` | `SessionTurn` |  |
 | `SessionTurn.display` | `SessionTurn.display` | `SessionTurn.display` | keywords |
 | `SessionTurn.message` | `SessionTurn.message` | `SessionTurn.message` | keywords |

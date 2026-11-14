@@ -206,7 +206,8 @@ pub enum StateOutcome {
     Applied,
     /// A patch operation failed, so the whole patch was rejected.
     Rejected,
-    /// The base revision did not match the applied revision, or a snapshot at it held another document.
+    /// The base revision did not match the applied revision, the base operation id did not match
+    /// the delta that produced it, or a snapshot at it held another document.
     Stale,
     /// The operation id was already applied.
     Duplicate,
@@ -405,6 +406,9 @@ pub struct SessionStateView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontier: Option<SourceFrontier>,
     pub complete: bool,
+    /// The `op_id` of the delta that produced `revision`, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_op_id: Option<String>,
 }
 
 /// One resource a session wrote, recalled, or touched.
@@ -555,6 +559,20 @@ pub struct SessionHeartbeat {
     pub process: String,
     pub stream: String,
     pub sessions: Vec<ConversationId>,
+    /// The creation time, in epoch microseconds, of the stream the leases
+    /// were taken on. `None` when the writer does not know it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_generation: Option<u64>,
+}
+
+impl SessionHeartbeat {
+    /// Whether a reader counts this heartbeat for the stream it read it from,
+    /// created at `stream_generation`. A stream deleted and created again
+    /// keeps its name, so a heartbeat that names another generation is ignored.
+    pub fn counts_for(&self, stream_generation: u64) -> bool {
+        self.stream_generation
+            .is_none_or(|generation| generation == stream_generation)
+    }
 }
 
 impl Validate for request::SessionList {
@@ -664,5 +682,25 @@ mod tests {
         ] {
             assert!(invalid.validate().is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn given_a_heartbeat_when_checked_against_a_stream_generation_then_should_count_unless_it_names_another()
+     {
+        let heartbeat = |stream_generation| SessionHeartbeat {
+            process: "worker".to_owned(),
+            stream: "agents".to_owned(),
+            sessions: Vec::new(),
+            stream_generation,
+        };
+        assert!(
+            heartbeat(None).counts_for(7),
+            "a heartbeat that names no generation counts"
+        );
+        assert!(heartbeat(Some(7)).counts_for(7));
+        assert!(
+            !heartbeat(Some(6)).counts_for(7),
+            "a heartbeat of another stream generation is ignored"
+        );
     }
 }

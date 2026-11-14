@@ -540,8 +540,7 @@ fn print_recovery_summary(summary: &serde_json::Value) {
     let catch_up = summary
         .get("catch_up_records_per_second")
         .and_then(serde_json::Value::as_f64)
-        .map(|value| format!("  catch-up {value:.0} records/s"))
-        .unwrap_or_default();
+        .map_or_default(|value| format!("  catch-up {value:.0} records/s"));
     println!(
         "    Recovery   {}  {} records  convergence {}{}",
         driver.bright_cyan().bold(),

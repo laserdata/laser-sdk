@@ -54,11 +54,13 @@ export function defaultRedact(value: unknown): unknown {
 }
 
 // The state one session handle has written: the revision it expects next, the
-// document after its own deltas, how many deltas since the last snapshot, and
-// the write in flight, which the next write waits for.
+// delta that produced it, the document after its own deltas, how many deltas
+// since the last snapshot, and the write in flight, which the next write waits
+// for.
 /** @internal */
 export interface StateCursor {
   revision: bigint
+  head: string | undefined
   document: unknown
   sinceSnapshot: number
   tail: Promise<void>
@@ -290,10 +292,12 @@ export class SessionState {
   // written at.
   private async writeDelta(patch: readonly PatchOp[], options: CallOptions): Promise<AgdxReceipt> {
     const next = applyJsonPatch(this.cursor.document ?? {}, patch)
+    const head = this.cursor.head
     const delta = {
       baseRevision: this.cursor.revision,
       patch,
-      opId: this.session.mintOpId()
+      opId: this.session.mintOpId(),
+      ...(head !== undefined ? { baseOpId: head } : {})
     }
     let receipt: AgdxReceipt
     try {
@@ -305,9 +309,11 @@ export class SessionState {
       )
     } catch (error) {
       this.cursor.document = undefined
+      this.cursor.head = undefined
       throw error
     }
     this.cursor.revision += 1n
+    this.cursor.head = delta.opId
     this.cursor.document = next
     this.cursor.sinceSnapshot += 1
     if (this.cursor.sinceSnapshot >= SNAPSHOT_EVERY_DELTAS) {
@@ -328,7 +334,8 @@ export class SessionState {
       encodeNamed(
         encodeStateSnapshot({
           baseRevision: this.cursor.revision,
-          document: this.cursor.document ?? {}
+          document: this.cursor.document ?? {},
+          ...(this.cursor.head !== undefined ? { baseOpId: this.cursor.head } : {})
         })
       ),
       undefined,
@@ -344,6 +351,7 @@ export class SessionState {
     if (this.seeded()) return
     const view = await this.currentView(options)
     this.cursor.revision = view.revision
+    this.cursor.head = view.headOpId
     this.cursor.document = view.document ?? {}
   }
 
@@ -380,22 +388,27 @@ export class SessionState {
   // Whether the session's current document is the one this handle holds. A
   // delta written against a stale base never applied, yet the handle counted
   // it, so its revision can name the revision the session reached through
-  // another writer with a document nobody applied. An unseeded handle is
-  // seeded and holds the current document by construction. A stale handle
-  // reseeds on its next write.
+  // another writer with a document nobody applied. When both name the delta
+  // behind the revision it must match, since a stale delta can leave an equal
+  // document. An unseeded handle is seeded and holds the current document by
+  // construction. A stale handle reseeds on its next write.
   private async holdsCurrent(options: CallOptions): Promise<boolean> {
     if (!this.seeded()) {
       await this.seed(options)
       return true
     }
     const view = await this.currentView(options)
+    const held = this.cursor.head
+    const sameHead = held === undefined || view.headOpId === undefined || held === view.headOpId
     if (
       view.revision === this.cursor.revision &&
+      sameHead &&
       equalJson(view.document ?? {}, this.cursor.document)
     ) {
       return true
     }
     this.cursor.document = undefined
+    this.cursor.head = undefined
     return false
   }
 
@@ -412,6 +425,7 @@ export class SessionState {
     )
     let document: unknown = {}
     let revision = 0n
+    let head: string | undefined
     let complete = false
     for (const record of records) {
       const envelope = record.envelope
@@ -422,14 +436,16 @@ export class SessionState {
           decodeStateSnapshot(expectMap(decodeOne(envelope.body, context), context), context)
         )
         if (snapshot === undefined) continue
-        // The first snapshot is the baseline. A later one counts only at the
-        // revision the fold has reached and with the document it holds, so a
-        // stale snapshot from a second writer changes nothing.
-        if (
-          complete &&
-          (snapshot.baseRevision !== revision || !equalJson(snapshot.document, document))
-        )
-          continue
+        // The first snapshot is the baseline and carries the head. A later one
+        // counts only at the revision the fold has reached and with the
+        // document it holds, so a stale snapshot from a second writer changes
+        // nothing, and it keeps the fold's head.
+        if (complete) {
+          if (snapshot.baseRevision !== revision || !equalJson(snapshot.document, document))
+            continue
+        } else {
+          head = snapshot.baseOpId
+        }
         document = snapshot.document
         revision = snapshot.baseRevision
         complete = true
@@ -439,16 +455,26 @@ export class SessionState {
         )
         if (delta === undefined) continue
         if (delta.baseRevision === 0n && revision === 0n) complete = true
-        if (delta.baseRevision !== revision) continue
+        // A writer that lost a race names a reached revision, not the delta that reached it.
+        const staleParent =
+          delta.baseOpId !== undefined && head !== undefined && delta.baseOpId !== head
+        if (delta.baseRevision !== revision || staleParent) continue
         try {
           document = applyJsonPatch(document, delta.patch)
           revision += 1n
+          head = delta.opId
         } catch {
           // A delta that does not apply leaves the document unchanged.
         }
       }
     }
-    return { revision, document, history: [], complete }
+    return {
+      revision,
+      document,
+      history: [],
+      complete,
+      ...(head !== undefined ? { headOpId: head } : {})
+    }
   }
 }
 

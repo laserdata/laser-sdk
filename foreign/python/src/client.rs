@@ -212,7 +212,11 @@ impl PyLaser {
 impl PyLaser {
     /// Connect with a connection string or a bare `user:password@host:port`
     /// endpoint, or over TCP with `address` (`host:port`) and `credentials`
-    /// (`(username, password)`). Pinning `stream` only enables the
+    /// (`(username, password)`). The scheme selects the transport: none,
+    /// `iggy://` or `iggy+tcp://` for TCP, `iggy+quic://` for QUIC and
+    /// `iggy+ws://` for WebSocket, and `iggy+http://` raises `ConfigError`.
+    /// Keep the connection string in `LASER_CONNECTION_STRING` and never print
+    /// or log it. Pinning `stream` only enables the
     /// default-stream shortcuts. `capabilities` seeds the capability set
     /// (default `Capabilities.OPEN`), and `governor` with `governor_mode` (and
     /// optionally `governor_retention`) enrolls a pre-effect policy hook like
@@ -632,7 +636,7 @@ impl PyLaser {
 /// Consumer-filter evaluator version, codecs, and filtered wait advertised by
 /// the server.
 #[gen_stub_pyclass]
-#[pyclass(name = "FilterAnnounce", frozen, skip_from_py_object)]
+#[pyclass(name = "FilterAnnounce", frozen)]
 #[derive(Clone)]
 pub struct PyFilterAnnounce {
     #[pyo3(get)]
@@ -736,7 +740,7 @@ pub struct PyCapabilities {
 
 /// The managed query surface and the strongest read consistency it serves.
 #[gen_stub_pyclass]
-#[pyclass(name = "QueryCaps", frozen, get_all, skip_from_py_object)]
+#[pyclass(name = "QueryCaps", frozen, get_all)]
 #[derive(Clone)]
 pub struct PyQueryCaps {
     /// Whether `Laser.query` is served.
@@ -764,7 +768,7 @@ impl From<laser_sdk::capabilities::QueryCaps> for PyQueryCaps {
 
 /// The managed key-value surface and its conditional-write support.
 #[gen_stub_pyclass]
-#[pyclass(name = "KvCaps", frozen, get_all, skip_from_py_object)]
+#[pyclass(name = "KvCaps", frozen, get_all)]
 #[derive(Clone)]
 pub struct PyKvCaps {
     /// Whether the managed key-value store is served.
@@ -791,7 +795,7 @@ impl From<laser_sdk::capabilities::KvCaps> for PyKvCaps {
 
 /// Server-side consumer filters.
 #[gen_stub_pyclass]
-#[pyclass(name = "FilterCaps", frozen, skip_from_py_object)]
+#[pyclass(name = "FilterCaps", frozen)]
 #[derive(Clone)]
 pub struct PyFilterCaps {
     /// Filtered reads, previews, sample tests, and validation, served by the
@@ -960,7 +964,7 @@ fn consistency_level(level: &str) -> PyResult<laser_sdk::query::Consistency> {
 
 /// The managed operation versions advertised by the connected server.
 #[gen_stub_pyclass]
-#[pyclass(name = "OpVersions", frozen, get_all, skip_from_py_object)]
+#[pyclass(name = "OpVersions", frozen, get_all)]
 #[derive(Clone)]
 pub struct PyOpVersions {
     pub query: u32,
@@ -1076,7 +1080,7 @@ impl PyOpVersions {
 
 /// One structured, versioned backend observation from the connected server.
 #[gen_stub_pyclass]
-#[pyclass(name = "BackendDescriptor", frozen, skip_from_py_object)]
+#[pyclass(name = "BackendDescriptor", frozen)]
 #[derive(Clone)]
 pub struct PyBackendDescriptor {
     #[pyo3(get)]

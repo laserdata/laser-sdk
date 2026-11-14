@@ -7,13 +7,16 @@ use bytes::Bytes;
 use dashmap::DashMap;
 #[cfg(feature = "streaming")]
 use iggy::prelude::*;
-use iggy_common::{ConnectionString, MAX_REPLICATION_FACTOR, TcpConnectionStringOptions};
+use iggy_common::{
+    ConnectionString, MAX_REPLICATION_FACTOR, QuicConnectionStringOptions,
+    TcpConnectionStringOptions, WebSocketConnectionStringOptions,
+};
 use laser_wire::batch::BatchReply;
 use laser_wire::codes::AGDX_BATCH_CODE;
 use laser_wire::framing::decode_named;
 use laser_wire::validate::Validate;
 use std::collections::BTreeMap;
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 #[cfg(feature = "kv")]
 use std::sync::atomic::AtomicBool;
@@ -386,7 +389,7 @@ impl Laser {
     /// Connect using an Iggy connection string. The connection string is the
     /// only thing required. For a `*.laserdata.cloud` or `*.laserdata.com`
     /// host with no `tls_ca_file=` already set, TLS is auto-attached with
-    /// LaserData's public root CA, bundled in the SDK itself. Set `LASER_TLS_CERT=<path>` to enable TLS with an explicit CA for any host or to override the bundled CA. Disable automatic TLS with `LASER_NO_TLS=1`. Other hosts keep their Apache Iggy TLS settings when neither variable is set. Connection strings use the bare `user:password@host[:port]` form because `Laser::connect` supplies the TCP scheme, and the port defaults to 8090.
+    /// LaserData's public root CA, bundled in the SDK itself. Set `LASER_TLS_CERT=<path>` to enable TLS with an explicit CA for any host or to override the bundled CA. Disable automatic TLS with `LASER_NO_TLS=1`. Other hosts keep their Apache Iggy TLS settings when neither variable is set. A bare `user:password@host[:port]` connects over TCP on port 8090, and the scheme selects another transport: `iggy+quic://` (port 8080) or `iggy+ws://` (port 8092). `iggy+http://` is refused because HTTP has no binary request path. Keep the connection string in `LASER_CONNECTION_STRING` and never print or log it.
     ///
     /// Connecting gives up after 30 seconds, or `LASER_CONNECT_TIMEOUT_MS`, with a [`LaserError::Timeout`] that says whether the server never accepted the connection or never answered the login. Set another budget with [`LaserBuilder::connect_timeout`].
     ///
@@ -1869,7 +1872,7 @@ impl ConnectionConfig {
 }
 
 impl LaserBuilder {
-    /// Budget for the initial connect: TCP dial, TLS handshake, login, and the managed capability probe. An expired budget returns [`LaserError::Timeout`] naming the stage that stalled. Default: 30 seconds, or `LASER_CONNECT_TIMEOUT_MS`.
+    /// Budget for the initial connect: the dial over TCP, QUIC or WebSocket, the TLS handshake, login, and the managed capability probe. An expired budget returns [`LaserError::Timeout`] naming the stage that stalled. Default: 30 seconds, or `LASER_CONNECT_TIMEOUT_MS`.
     pub fn connect_timeout(mut self, value: Duration) -> Self {
         self.connect_timeout = Some(value);
         self
@@ -1893,10 +1896,11 @@ impl LaserBuilder {
         self
     }
 
-    /// Connect using an Iggy TCP connection string: `user:password@host[:port]`,
-    /// `token@host[:port]`, optionally prefixed with `iggy://` or `iggy+tcp://`.
-    /// The port defaults to 8090. Other transports are refused. The most
-    /// ergonomic option.
+    /// Connect using an Iggy connection string: `user:password@host[:port]` or
+    /// `token@host[:port]`, optionally prefixed with `iggy://` or `iggy+tcp://`
+    /// for TCP (port 8090), `iggy+quic://` for QUIC (port 8080) or `iggy+ws://`
+    /// for WebSocket (port 8092). `iggy+http://` is refused. The most ergonomic
+    /// option.
     pub fn connection_string(mut self, value: impl Into<String>) -> Self {
         if matches!(
             self.connection,
@@ -2097,8 +2101,14 @@ impl LaserBuilder {
             ConnectionConfig::Client(client) => (client, None),
             connection => {
                 let normalized = connection.connection_string()?;
-                let client = tcp_client(&normalized)?;
-                connect_before(&client, connect_deadline).await?;
+                let client = transport_client(&normalized)?;
+                let verified_quic = split_scheme(&normalized)?.0 == Transport::Quic
+                    && query_of(&normalized).is_some_and(|query| {
+                        query
+                            .split('&')
+                            .any(|pair| pair == "validate_certificate=true")
+                    });
+                connect_before(&client, connect_deadline, verified_quic).await?;
                 (client, Some(normalized))
             }
         };
@@ -2471,12 +2481,14 @@ mod announcement_tests {
     }
 }
 
-// Apache Iggy's TCP port. A connection string or address may omit it.
+// Apache Iggy's default ports. A connection string or address may omit the port.
 const DEFAULT_TCP_PORT: u16 = 8090;
+const DEFAULT_QUIC_PORT: u16 = 8080;
+const DEFAULT_WEBSOCKET_PORT: u16 = 8092;
 
-// The query parameters Apache Iggy's TCP transport reads. Any other key is
+// The query parameters each Apache Iggy transport reads. Any other key is
 // refused, so a misspelled option fails at connect instead of being ignored.
-const CONNECTION_OPTIONS: [&str; 8] = [
+const TCP_OPTIONS: [&str; 10] = [
     "tls",
     "tls_domain",
     "tls_ca_file",
@@ -2485,7 +2497,92 @@ const CONNECTION_OPTIONS: [&str; 8] = [
     "reestablish_after",
     "heartbeat_interval",
     "nodelay",
+    "max_pending_operations",
+    "max_pending_operation_bytes",
 ];
+const QUIC_OPTIONS: [&str; 15] = [
+    "validate_certificate",
+    "reconnection_max_retries",
+    "reconnection_interval",
+    "reconnection_reestablish_after",
+    "heartbeat_interval",
+    "response_buffer_size",
+    "max_concurrent_bidi_streams",
+    "datagram_send_buffer_size",
+    "initial_mtu",
+    "send_window",
+    "receive_window",
+    "keep_alive_interval",
+    "max_idle_timeout",
+    "max_pending_operations",
+    "max_pending_operation_bytes",
+];
+const WEBSOCKET_OPTIONS: [&str; 16] = [
+    "tls",
+    "tls_domain",
+    "tls_ca_file",
+    "tls_validate_certificate",
+    "reconnection_retries",
+    "reconnection_interval",
+    "reestablish_after",
+    "heartbeat_interval",
+    "read_buffer_size",
+    "write_buffer_size",
+    "max_write_buffer_size",
+    "max_message_size",
+    "max_frame_size",
+    "accept_unmasked_frames",
+    "max_pending_operations",
+    "max_pending_operation_bytes",
+];
+const BOOLEAN_OPTIONS: [&str; 5] = [
+    "tls",
+    "nodelay",
+    "validate_certificate",
+    "tls_validate_certificate",
+    "accept_unmasked_frames",
+];
+
+// The binary transports a connection string selects. HTTP has no binary
+// request path, so the managed surfaces cannot ride it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transport {
+    Tcp,
+    Quic,
+    WebSocket,
+}
+
+impl Transport {
+    fn default_port(self) -> u16 {
+        match self {
+            Self::Tcp => DEFAULT_TCP_PORT,
+            Self::Quic => DEFAULT_QUIC_PORT,
+            Self::WebSocket => DEFAULT_WEBSOCKET_PORT,
+        }
+    }
+
+    fn options(self) -> &'static [&'static str] {
+        match self {
+            Self::Tcp => &TCP_OPTIONS,
+            Self::Quic => &QUIC_OPTIONS,
+            Self::WebSocket => &WEBSOCKET_OPTIONS,
+        }
+    }
+
+    fn unknown_option(self) -> LaserError {
+        LaserError::Config(match self {
+            Self::Tcp => {
+                "connection string has an unknown option: TCP supports tls, tls_domain, tls_ca_file, reconnection_retries, reconnection_interval, reestablish_after, heartbeat_interval, nodelay, max_pending_operations, max_pending_operation_bytes"
+            }
+            Self::Quic => {
+                "connection string has an unknown option: QUIC supports validate_certificate, reconnection_max_retries, reconnection_interval, reconnection_reestablish_after, heartbeat_interval, response_buffer_size, max_concurrent_bidi_streams, datagram_send_buffer_size, initial_mtu, send_window, receive_window, keep_alive_interval, max_idle_timeout, max_pending_operations, max_pending_operation_bytes"
+            }
+            Self::WebSocket => {
+                "connection string has an unknown option: WebSocket supports tls, tls_domain, tls_ca_file, tls_validate_certificate, reconnection_retries, reconnection_interval, reestablish_after, heartbeat_interval, read_buffer_size, write_buffer_size, max_write_buffer_size, max_message_size, max_frame_size, accept_unmasked_frames, max_pending_operations, max_pending_operation_bytes"
+            }
+        })
+    }
+}
 
 // The login a connection string's userinfo names, percent-decoded.
 enum Userinfo {
@@ -2504,23 +2601,29 @@ impl From<Userinfo> for Credentials {
     }
 }
 
-/// Validate and normalize a connection string. The scheme is optional and
-/// must be `iggy://` or `iggy+tcp://`, so a raw `user:pass@host:port` from a
-/// LaserData Cloud bootstrap endpoint works as-is. Credentials are required,
-/// either `user:password@` or `token@`, and are percent-decoded, so a `:`,
-/// `@`, `?` or `%` inside one is written `%3A`, `%40`, `%3F` or `%25`. A missing port
-/// defaults to 8090, the Apache Iggy TCP port. Only Apache Iggy's TCP options
-/// are accepted, each at most once. `tls_ca_file=` without `tls=` turns TLS on,
-/// and `tls=false` next to `tls_ca_file=` is refused. Then, for a LaserData
-/// Cloud host that does not already name a `tls_ca_file=`, attach `tls=true`
-/// plus LaserData's bundled public CA so a bare connection string is enough.
-/// `LASER_TLS_CERT=<path>` enables TLS with that CA for any host or overrides
-/// the bundled CA. `LASER_NO_TLS=1` and an explicit `tls=false` disable
-/// automatic TLS setup. The connection string's own `tls_ca_file=` remains
-/// authoritative.
+/// Validate and normalize a connection string. The scheme selects the
+/// transport: `iggy://` or `iggy+tcp://` for TCP, `iggy+quic://` for QUIC and
+/// `iggy+ws://` for WebSocket. Without one the string is TCP, so a raw
+/// `user:pass@host:port` from a LaserData Cloud bootstrap endpoint works
+/// as-is. Credentials are required, either `user:password@` or `token@`, and
+/// are percent-decoded, so a `:`, `@`, `?` or `%` inside one is written `%3A`,
+/// `%40`, `%3F` or `%25`. A missing port defaults to Apache Iggy's port for
+/// the transport: 8090, 8080 or 8092. Only the options Apache Iggy reads for
+/// the transport are accepted, each at most once. `tls_ca_file=` without
+/// `tls=` turns TLS on, and `tls=false` next to `tls_ca_file=` is refused.
+/// Then, for a LaserData Cloud host that does not already name a
+/// `tls_ca_file=`, attach `tls=true` plus LaserData's bundled public CA so a
+/// bare connection string is enough. `LASER_TLS_CERT=<path>` enables TLS with
+/// that CA for any host or overrides the bundled CA. `LASER_NO_TLS=1` and an
+/// explicit `tls=false` disable automatic TLS setup. The connection string's
+/// own `tls_ca_file=` remains authoritative. A WebSocket with TLS verifies the
+/// server unless `tls_validate_certificate=false` says otherwise. QUIC always
+/// encrypts and takes no CA file, so a LaserData Cloud host turns
+/// `validate_certificate=true` on against the operating system trust store,
+/// whatever `LASER_NO_TLS` says, and `LASER_TLS_CERT` is refused for QUIC.
 fn normalize_connection_string(value: &str) -> Result<String, LaserError> {
     let trimmed = value.trim();
-    let (scheme, rest) = split_scheme(trimmed)?;
+    let (transport, scheme, rest) = split_scheme(trimmed)?;
     let authority = authority_start(rest);
     if authority == 0 {
         return Err(LaserError::Config(
@@ -2533,61 +2636,118 @@ fn normalize_connection_string(value: &str) -> Result<String, LaserError> {
         Some((address, query)) => (address, Some(query)),
         None => (&rest[authority..], None),
     };
-    let address = with_default_port(address)?;
+    let address = with_default_port(address, transport.default_port())?;
     let mut normalized = format!("{scheme}{userinfo}@{address}");
     if let Some(query) = query {
-        let options = validate_options(query)?;
+        let options = validate_options(query, transport)?;
         normalized = format!("{normalized}?{query}");
         if options.contains(&"tls_ca_file") && !options.contains(&"tls") {
             normalized.push_str("&tls=true");
         }
     }
-    resolve_tls(normalized).map(with_tls_domain)
+    match transport {
+        Transport::Tcp => resolve_tls(normalized).map(with_tls_domain),
+        Transport::WebSocket => resolve_tls(normalized)
+            .map(with_tls_domain)
+            .map(with_certificate_validation),
+        Transport::Quic => resolve_quic_verification(normalized),
+    }
 }
 
-/// A TCP client for a normalized connection string, logging in by itself
-/// after every reconnect.
-pub(crate) fn tcp_client(normalized: &str) -> Result<IggyClient, LaserError> {
-    let client = TcpClient::create(Arc::new(tcp_client_config(normalized)?))?;
-    Ok(IggyClientBuilder::new()
-        .with_client(ClientWrapper::Tcp(client))
-        .build()?)
+/// A client for a normalized connection string over the transport its scheme
+/// names, logging in by itself after every reconnect.
+pub(crate) fn transport_client(normalized: &str) -> Result<IggyClient, LaserError> {
+    let (transport, _, _) = split_scheme(normalized)?;
+    let client = match transport {
+        Transport::Tcp => {
+            ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config(normalized)?))?)
+        }
+        Transport::Quic => ClientWrapper::Quic(QuicClient::create(Arc::new(quic_client_config(
+            normalized,
+        )?))?),
+        Transport::WebSocket => ClientWrapper::WebSocket(WebSocketClient::create(Arc::new(
+            websocket_client_config(normalized)?,
+        ))?),
+    };
+    Ok(IggyClientBuilder::new().with_client(client).build()?)
+}
+
+fn tcp_client_config(normalized: &str) -> Result<TcpClientConfig, LaserError> {
+    let (credentials, placeholder) = placeholder_login(normalized)?;
+    let mut config: TcpClientConfig =
+        ConnectionString::<TcpConnectionStringOptions>::new(&placeholder)?.into();
+    config.auto_login = AutoLogin::Enabled(credentials.into());
+    Ok(config)
+}
+
+// Apache Iggy's QUIC parser names `localhost` as the server and binds the
+// client to 127.0.0.1, which reaches only a server on this machine, so the
+// connection string's host names the server and a remote host gets the
+// unspecified address of its family.
+fn quic_client_config(normalized: &str) -> Result<QuicClientConfig, LaserError> {
+    let (credentials, placeholder) = placeholder_login(normalized)?;
+    let mut config: QuicClientConfig =
+        ConnectionString::<QuicConnectionStringOptions>::new(&placeholder)?.into();
+    let host = host_of(normalized);
+    config.server_name = host.to_owned();
+    match host.parse::<IpAddr>() {
+        Ok(address) if address.is_loopback() => {}
+        Ok(IpAddr::V6(_)) => config.client_address = "[::]:0".to_owned(),
+        Ok(IpAddr::V4(_)) => config.client_address = "0.0.0.0:0".to_owned(),
+        Err(_) if host.eq_ignore_ascii_case("localhost") => {}
+        Err(_) => config.client_address = "0.0.0.0:0".to_owned(),
+    }
+    config.auto_login = AutoLogin::Enabled(credentials.into());
+    Ok(config)
+}
+
+fn websocket_client_config(normalized: &str) -> Result<WebSocketClientConfig, LaserError> {
+    let (credentials, placeholder) = placeholder_login(normalized)?;
+    let mut config: WebSocketClientConfig =
+        ConnectionString::<WebSocketConnectionStringOptions>::new(&placeholder)?.into();
+    config.auto_login = AutoLogin::Enabled(credentials.into());
+    Ok(config)
 }
 
 // Apache Iggy's parser splits userinfo on `:` and `@` without decoding it, so
 // it reads the address and options next to a placeholder login, and the
 // decoded credentials replace that login.
-fn tcp_client_config(normalized: &str) -> Result<TcpClientConfig, LaserError> {
-    let (scheme, rest) = split_scheme(normalized)?;
+fn placeholder_login(normalized: &str) -> Result<(Userinfo, String), LaserError> {
+    let (_, scheme, rest) = split_scheme(normalized)?;
     let authority = authority_start(rest);
     let Some(userinfo) = authority.checked_sub(1).map(|end| &rest[..end]) else {
         return Err(LaserError::Config(
             "connection string missing credentials: use user:password@host or token@host",
         ));
     };
-    let credentials = decode_userinfo(userinfo)?;
-    let mut config: TcpClientConfig = ConnectionString::<TcpConnectionStringOptions>::new(
-        &format!("{scheme}laser@{}", &rest[authority..]),
-    )?
-    .into();
-    config.auto_login = AutoLogin::Enabled(credentials.into());
-    Ok(config)
+    Ok((
+        decode_userinfo(userinfo)?,
+        format!("{scheme}laser@{}", &rest[authority..]),
+    ))
 }
 
-// Split off the scheme. A string with no scheme gets `iggy://`. A `://` after
-// the userinfo has begun belongs to a password, not to a scheme.
-fn split_scheme(value: &str) -> Result<(&'static str, &str), LaserError> {
-    if let Some(rest) = value.strip_prefix("iggy://") {
-        return Ok(("iggy://", rest));
-    }
-    if let Some(rest) = value.strip_prefix("iggy+tcp://") {
-        return Ok(("iggy+tcp://", rest));
+// Split off the scheme and the transport it names. A string with no scheme
+// gets `iggy://`, TCP. A `://` after the userinfo has begun belongs to a
+// password, not to a scheme.
+fn split_scheme(value: &str) -> Result<(Transport, &'static str, &str), LaserError> {
+    for (scheme, transport) in [
+        ("iggy://", Transport::Tcp),
+        ("iggy+tcp://", Transport::Tcp),
+        ("iggy+quic://", Transport::Quic),
+        ("iggy+ws://", Transport::WebSocket),
+    ] {
+        if let Some(rest) = value.strip_prefix(scheme) {
+            return Ok((transport, scheme, rest));
+        }
     }
     match value.split_once("://") {
-        Some((scheme, _)) if !scheme.contains([':', '@']) => Err(LaserError::Config(
-            "unsupported connection string scheme: use iggy:// or iggy+tcp://",
+        Some(("iggy+http", _)) => Err(LaserError::Config(
+            "iggy+http:// is not supported: HTTP has no binary request path for Laser features, use iggy+tcp://, iggy+quic:// or iggy+ws://",
         )),
-        _ => Ok(("iggy://", value)),
+        Some((scheme, _)) if !scheme.contains([':', '@']) => Err(LaserError::Config(
+            "unsupported connection string scheme: use iggy:// or iggy+tcp:// for TCP, iggy+quic:// for QUIC, or iggy+ws:// for WebSocket",
+        )),
+        _ => Ok((Transport::Tcp, "iggy://", value)),
     }
 }
 
@@ -2659,8 +2819,9 @@ fn percent_encode(value: &str) -> String {
         .collect()
 }
 
-// `host`, `host:port`, `[ipv6]` or `[ipv6]:port`. A missing port becomes 8090.
-fn with_default_port(address: &str) -> Result<String, LaserError> {
+// `host`, `host:port`, `[ipv6]` or `[ipv6]:port`. A missing port becomes the
+// transport's default.
+fn with_default_port(address: &str, default_port: u16) -> Result<String, LaserError> {
     let malformed = || {
         LaserError::Config(
             "connection string address must be host, host:port, [ipv6] or [ipv6]:port, without a path",
@@ -2693,7 +2854,7 @@ fn with_default_port(address: &str) -> Result<String, LaserError> {
         return Err(LaserError::Config("connection string missing host"));
     }
     match port {
-        None => Ok(format!("{host}:{DEFAULT_TCP_PORT}")),
+        None => Ok(format!("{host}:{default_port}")),
         Some(port) => match port.parse::<u16>() {
             Ok(number) if number > 0 && !port.starts_with('+') => Ok(format!("{host}:{number}")),
             _ => Err(LaserError::Config(
@@ -2703,11 +2864,13 @@ fn with_default_port(address: &str) -> Result<String, LaserError> {
     }
 }
 
-// Every option is `key=value`, names one of Apache Iggy's TCP options, and
-// appears once. Boolean options take `true` or `false` only. Returns the keys.
-fn validate_options(query: &str) -> Result<Vec<&str>, LaserError> {
+// Every option is `key=value`, names one of the options Apache Iggy reads for
+// the transport, and appears once. Boolean options take `true` or `false`
+// only. Returns the keys.
+fn validate_options(query: &str, transport: Transport) -> Result<Vec<&str>, LaserError> {
     let mut keys = Vec::new();
     let mut tls_off = false;
+    let mut unverified = false;
     for pair in query.split('&') {
         let mut parts = pair.split('=');
         let (Some(key), Some(value), None) = (parts.next(), parts.next(), parts.next()) else {
@@ -2715,25 +2878,29 @@ fn validate_options(query: &str) -> Result<Vec<&str>, LaserError> {
                 "connection string option must be key=value",
             ));
         };
-        if !CONNECTION_OPTIONS.contains(&key) {
-            return Err(LaserError::Config(
-                "connection string has an unknown option: supported are tls, tls_domain, tls_ca_file, reconnection_retries, reconnection_interval, reestablish_after, heartbeat_interval, nodelay",
-            ));
+        if !transport.options().contains(&key) {
+            return Err(transport.unknown_option());
         }
         if keys.contains(&key) {
             return Err(LaserError::Config("connection string repeats an option"));
         }
-        if matches!(key, "tls" | "nodelay") && !matches!(value, "true" | "false") {
+        if BOOLEAN_OPTIONS.contains(&key) && !matches!(value, "true" | "false") {
             return Err(LaserError::Config(
-                "connection string tls and nodelay take true or false",
+                "connection string tls, nodelay, validate_certificate, tls_validate_certificate and accept_unmasked_frames take true or false",
             ));
         }
         tls_off |= key == "tls" && value == "false";
+        unverified |= key == "tls_validate_certificate" && value == "false";
         keys.push(key);
     }
     if tls_off && keys.contains(&"tls_ca_file") {
         return Err(LaserError::Config(
             "connection string sets tls=false together with tls_ca_file",
+        ));
+    }
+    if unverified && keys.contains(&"tls_ca_file") {
+        return Err(LaserError::Config(
+            "connection string sets tls_validate_certificate=false together with tls_ca_file",
         ));
     }
     Ok(keys)
@@ -2825,6 +2992,53 @@ fn with_tls_domain(connection_string: String) -> String {
     format!("{connection_string}&tls_domain={domain}")
 }
 
+// Apache Iggy's WebSocket parser skips certificate verification unless told
+// otherwise, while its TCP client verifies, so a WebSocket with TLS verifies
+// too unless the connection string turns it off.
+fn with_certificate_validation(connection_string: String) -> String {
+    let tls = query_of(&connection_string)
+        .is_some_and(|query| query.split('&').any(|pair| pair == "tls=true"));
+    if !tls || has_query_param(&connection_string, "tls_validate_certificate") {
+        return connection_string;
+    }
+    format!("{connection_string}&tls_validate_certificate=true")
+}
+
+// QUIC always encrypts. Apache Iggy's QUIC client verifies the server only
+// against the operating system trust store and reads no CA file, so a
+// LaserData Cloud host turns verification on whatever `LASER_NO_TLS` says,
+// and a CA named by `LASER_TLS_CERT` is refused rather than silently unused.
+// Only the string's own `validate_certificate` decides otherwise.
+fn resolve_quic_verification(connection_string: String) -> Result<String, LaserError> {
+    let custom_cert = std::env::var("LASER_TLS_CERT").is_ok_and(|path| !path.is_empty());
+    resolve_quic_verification_with(connection_string, custom_cert)
+}
+
+fn resolve_quic_verification_with(
+    connection_string: String,
+    custom_cert: bool,
+) -> Result<String, LaserError> {
+    if has_query_param(&connection_string, "validate_certificate") {
+        return Ok(connection_string);
+    }
+    if custom_cert {
+        return Err(LaserError::Config(
+            "LASER_TLS_CERT cannot apply to QUIC: Apache Iggy's QUIC client verifies servers against the operating system trust store only, so add the CA there and set validate_certificate=true, or use iggy+tcp:// or iggy+ws://",
+        ));
+    }
+    if !is_laserdata_host(host_of(&connection_string)) {
+        return Ok(connection_string);
+    }
+    let separator = if query_of(&connection_string).is_some() {
+        '&'
+    } else {
+        '?'
+    };
+    Ok(format!(
+        "{connection_string}{separator}validate_certificate=true"
+    ))
+}
+
 // An opt-out flag is read by value. Bare presence is not enough:
 // `LASER_NO_TLS=0` and `LASER_NO_TLS=false` must not disable TLS.
 fn flag_value_enabled(value: &str) -> bool {
@@ -2857,8 +3071,11 @@ fn resolve_tls_with(
 ) -> Result<String, LaserError> {
     if no_tls
         || has_query_param(&connection_string, "tls_ca_file")
-        || query_of(&connection_string)
-            .is_some_and(|query| query.split('&').any(|pair| pair == "tls=false"))
+        || query_of(&connection_string).is_some_and(|query| {
+            query
+                .split('&')
+                .any(|pair| pair == "tls=false" || pair == "tls_validate_certificate=false")
+        })
     {
         return Ok(connection_string);
     }
@@ -3427,10 +3644,11 @@ mod builder_conflict_tests {
 mod connection_string_tests {
     use super::{
         ConnectionConfig, LaserError, PROD_CERT, flag_value_enabled, has_query_param, host_of,
-        install_cert, is_laserdata_host, normalize_connection_string, resolve_tls,
-        resolve_tls_with, tcp_client_config,
+        install_cert, is_laserdata_host, normalize_connection_string, quic_client_config,
+        resolve_quic_verification_with, resolve_tls, resolve_tls_with, tcp_client_config,
+        websocket_client_config,
     };
-    use iggy::prelude::{AutoLogin, Credentials, TcpClientConfig};
+    use iggy::prelude::{AutoLogin, Credentials};
     use iggy_common::login_user::LoginUser;
     use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 
@@ -3448,14 +3666,14 @@ mod connection_string_tests {
         let config = tcp_client_config(&normalized).expect("a TCP client config");
         assert_eq!(config.server_address, "127.0.0.1:8090");
         assert_eq!(
-            login_of(&config),
+            login_of(&config.auto_login),
             Login::Password("agent:one".to_owned(), "pa:ss@w?rd%/#".to_owned())
         );
         let redialed = tcp_client_config(
             &normalize_connection_string(&normalized).expect("the stored string normalizes again"),
         )
         .expect("a second connection's config");
-        assert_eq!(login_of(&redialed), login_of(&config));
+        assert_eq!(login_of(&redialed.auto_login), login_of(&config.auto_login));
     }
 
     #[test]
@@ -3466,13 +3684,16 @@ mod connection_string_tests {
                 .expect("percent-encoded credentials normalize");
         let config = tcp_client_config(&normalized).expect("a TCP client config");
         assert_eq!(
-            login_of(&config),
+            login_of(&config.auto_login),
             Login::Password("ag@ent".to_owned(), "pa:ss@w?rd%".to_owned())
         );
         let token = normalize_connection_string("tok%3Aen%40one@host")
             .and_then(|normalized| tcp_client_config(&normalized))
             .expect("a percent-encoded token normalizes");
-        assert_eq!(login_of(&token), Login::Token("tok:en@one".to_owned()));
+        assert_eq!(
+            login_of(&token.auto_login),
+            Login::Token("tok:en@one".to_owned())
+        );
     }
 
     #[test]
@@ -3626,12 +3847,117 @@ mod connection_string_tests {
     }
 
     #[test]
-    fn given_another_transport_scheme_when_normalized_then_should_fail_as_config() {
+    fn given_http_or_an_unknown_scheme_when_normalized_then_should_fail_as_config_naming_the_binary_transports()
+     {
+        let Err(LaserError::Config(http)) =
+            normalize_connection_string("iggy+http://iggy:iggy@host:3000")
+        else {
+            panic!("HTTP must be refused");
+        };
+        assert!(http.contains("HTTP has no binary request path"), "{http}");
         for value in [
-            "iggy+quic://iggy:iggy@host:8080",
-            "iggy+ws://iggy:iggy@host:8092",
-            "iggy+http://iggy:iggy@host:3000",
             "tcp://iggy:iggy@host:8090",
+            "iggy+udp://iggy:iggy@host:8080",
+            "IGGY+QUIC://iggy:iggy@host:8080",
+        ] {
+            let Err(LaserError::Config(message)) = normalize_connection_string(value) else {
+                panic!("{value} must be refused");
+            };
+            assert!(message.contains("iggy+quic://"), "{message}");
+            assert!(message.contains("iggy+ws://"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_refused_or_failed_connection_when_reported_then_should_never_echo_the_secret()
+    {
+        let secret = "sup3rs3cr3t";
+        let leaked = |error: &LaserError| {
+            let text = format!("{error} {error:?}");
+            text.contains(secret).then_some(text)
+        };
+        for value in [
+            format!("iggy+http://user:{secret}@host"),
+            format!("iggy+udp://user:{secret}@host"),
+            format!("iggy+quic://user:{secret}@host?tls=true"),
+            format!("iggy+ws://{secret}@host?tls=yes"),
+            format!("iggy+tcp://user:{secret}@host:99999"),
+            format!("iggy+tcp://user:{secret}%zz@host"),
+            format!("user:{secret}@host?foo=bar"),
+        ] {
+            let error = normalize_connection_string(&value).expect_err("a refused string");
+            assert_eq!(leaked(&error), None);
+        }
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a closed port")
+            .port();
+        for value in [
+            format!("iggy+tcp://user:{secret}@127.0.0.1:{closed}"),
+            format!("iggy+quic://user:{secret}@127.0.0.1:{closed}"),
+            format!("iggy+quic://{secret}@127.0.0.1:{closed}?initial_mtu=many"),
+            format!("iggy+ws://user:{secret}@127.0.0.1:{closed}"),
+        ] {
+            let error = super::Laser::builder()
+                .connection_string(value)
+                .connect_timeout(std::time::Duration::from_millis(300))
+                .build()
+                .await
+                .err()
+                .expect("nothing listens");
+            assert_eq!(leaked(&error), None);
+        }
+    }
+
+    #[test]
+    fn given_quic_and_websocket_schemes_when_normalized_then_should_keep_the_scheme_and_default_their_ports()
+     {
+        for (value, expected) in [
+            (
+                "iggy+quic://iggy:iggy@127.0.0.1",
+                "iggy+quic://iggy:iggy@127.0.0.1:8080",
+            ),
+            (
+                "iggy+quic://iggy:iggy@[::1]?initial_mtu=1400",
+                "iggy+quic://iggy:iggy@[::1]:8080?initial_mtu=1400",
+            ),
+            (
+                "iggy+ws://iggy:iggy@127.0.0.1",
+                "iggy+ws://iggy:iggy@127.0.0.1:8092",
+            ),
+            (
+                "iggy+ws://token@host:8070?tls=true&tls_ca_file=/ca.crt",
+                "iggy+ws://token@host:8070?tls=true&tls_ca_file=/ca.crt&tls_domain=host&tls_validate_certificate=true",
+            ),
+            (
+                "iggy+ws://iggy:iggy@host?tls_ca_file=/ca.crt",
+                "iggy+ws://iggy:iggy@host:8092?tls_ca_file=/ca.crt&tls=true&tls_domain=host&tls_validate_certificate=true",
+            ),
+        ] {
+            let normalized = normalize_connection_string(value).expect("a supported transport");
+            assert_eq!(normalized, expected);
+            assert_eq!(
+                normalize_connection_string(&normalized).expect("a normalized string"),
+                normalized,
+                "a second connection dials the same string"
+            );
+        }
+    }
+
+    #[test]
+    fn given_an_option_another_transport_reads_when_normalized_then_should_fail_as_config() {
+        for value in [
+            "iggy+tcp://iggy:iggy@host?validate_certificate=true",
+            "iggy+tcp://iggy:iggy@host?tls_validate_certificate=true",
+            "iggy+quic://iggy:iggy@host?tls=true",
+            "iggy+quic://iggy:iggy@host?tls_ca_file=/ca.crt",
+            "iggy+quic://iggy:iggy@host?nodelay=true",
+            "iggy+quic://iggy:iggy@host?reconnection_retries=3",
+            "iggy+quic://iggy:iggy@host?validate_certificate=yes",
+            "iggy+ws://iggy:iggy@host?nodelay=true",
+            "iggy+ws://iggy:iggy@host?validate_certificate=true",
+            "iggy+ws://iggy:iggy@host?accept_unmasked_frames=1",
+            "iggy+ws://iggy:iggy@host?tls=true&tls_validate_certificate=false&tls_ca_file=/ca.crt",
         ] {
             assert!(
                 matches!(
@@ -3640,6 +3966,158 @@ mod connection_string_tests {
                 ),
                 "{value} must be refused"
             );
+        }
+    }
+
+    #[test]
+    fn given_a_quic_connection_string_when_configured_then_should_name_the_host_and_reach_it() {
+        let remote = quic_client_config(
+            &normalize_connection_string("iggy+quic://ag%40ent:pa%3Ass@edge.example.com")
+                .expect("a remote QUIC string"),
+        )
+        .expect("a QUIC client config");
+        assert_eq!(remote.server_address, "edge.example.com:8080");
+        assert_eq!(remote.server_name, "edge.example.com");
+        assert_eq!(remote.client_address, "0.0.0.0:0");
+        assert!(!remote.validate_certificate);
+        assert_eq!(
+            login_of(&remote.auto_login),
+            Login::Password("ag@ent".to_owned(), "pa:ss".to_owned())
+        );
+        let local = quic_client_config(
+            &normalize_connection_string(
+                "iggy+quic://token@127.0.0.1:9080?validate_certificate=true",
+            )
+            .expect("a local QUIC string"),
+        )
+        .expect("a QUIC client config");
+        assert_eq!(local.client_address, "127.0.0.1:0");
+        assert_eq!(local.server_name, "127.0.0.1");
+        assert!(local.validate_certificate);
+        assert_eq!(
+            login_of(&local.auto_login),
+            Login::Token("token".to_owned())
+        );
+        let ipv6 = quic_client_config(
+            &normalize_connection_string("iggy+quic://iggy:iggy@[2001:db8::1]")
+                .expect("an IPv6 QUIC string"),
+        )
+        .expect("a QUIC client config");
+        assert_eq!(ipv6.client_address, "[::]:0");
+        assert_eq!(ipv6.server_name, "2001:db8::1");
+    }
+
+    #[test]
+    fn given_a_websocket_connection_string_with_tls_when_configured_then_should_verify_the_named_host()
+     {
+        let config = websocket_client_config(
+            &normalize_connection_string(
+                "iggy+ws://ag%40ent:pa%3Ass@10.0.0.7:8070?tls_ca_file=/ca.pem&tls_domain=edge.example.com",
+            )
+            .expect("a WebSocket string with TLS"),
+        )
+        .expect("a WebSocket client config");
+        assert_eq!(config.server_address, "10.0.0.7:8070");
+        assert!(config.tls_enabled);
+        assert!(config.tls_validate_certificate);
+        assert_eq!(config.tls_domain, "edge.example.com");
+        assert_eq!(config.tls_ca_file.as_deref(), Some("/ca.pem"));
+        assert_eq!(
+            login_of(&config.auto_login),
+            Login::Password("ag@ent".to_owned(), "pa:ss".to_owned())
+        );
+        let unverified = websocket_client_config(
+            &normalize_connection_string(
+                "iggy+ws://iggy:iggy@host?tls=true&tls_validate_certificate=false",
+            )
+            .expect("an explicit opt-out"),
+        )
+        .expect("a WebSocket client config");
+        assert!(unverified.tls_enabled);
+        assert!(!unverified.tls_validate_certificate);
+        let plain = websocket_client_config(
+            &normalize_connection_string("iggy+ws://iggy:iggy@127.0.0.1").expect("a plain string"),
+        )
+        .expect("a WebSocket client config");
+        assert!(!plain.tls_enabled);
+    }
+
+    #[test]
+    fn given_a_laserdata_cloud_host_when_reached_over_websocket_then_should_verify_it_with_the_bundled_ca()
+     {
+        let resolved = resolve_tls_with(
+            "iggy+ws://u:p@d.laserdata.cloud:8070".to_owned(),
+            false,
+            Some(std::path::PathBuf::from("/bundled.crt")),
+        )
+        .expect("TLS resolves");
+        assert_eq!(
+            super::with_certificate_validation(super::with_tls_domain(resolved)),
+            "iggy+ws://u:p@d.laserdata.cloud:8070?tls=true&tls_ca_file=/bundled.crt&tls_domain=d.laserdata.cloud&tls_validate_certificate=true"
+        );
+        assert_eq!(
+            resolve_tls_with(
+                "iggy+ws://u:p@d.laserdata.cloud:8070?tls=true&tls_validate_certificate=false"
+                    .to_owned(),
+                false,
+                Some(std::path::PathBuf::from("/bundled.crt")),
+            )
+            .expect("an explicit opt-out"),
+            "iggy+ws://u:p@d.laserdata.cloud:8070?tls=true&tls_validate_certificate=false",
+        );
+    }
+
+    #[test]
+    fn given_a_quic_connection_string_when_verification_resolves_then_should_verify_a_laserdata_cloud_host_and_refuse_a_ca_file()
+     {
+        assert_eq!(
+            resolve_quic_verification_with(
+                "iggy+quic://u:p@d.laserdata.cloud:8080".to_owned(),
+                false
+            )
+            .expect("a Cloud host"),
+            "iggy+quic://u:p@d.laserdata.cloud:8080?validate_certificate=true"
+        );
+        assert_eq!(
+            resolve_quic_verification_with(
+                "iggy+quic://u:p@d.laserdata.cloud:8080?initial_mtu=1400".to_owned(),
+                false
+            )
+            .expect("a Cloud host with options"),
+            "iggy+quic://u:p@d.laserdata.cloud:8080?initial_mtu=1400&validate_certificate=true"
+        );
+        let local = "iggy+quic://u:p@127.0.0.1:8080".to_owned();
+        assert_eq!(
+            resolve_quic_verification_with(local.clone(), false).expect("a local host"),
+            local
+        );
+        assert!(matches!(
+            resolve_quic_verification_with(local, true),
+            Err(LaserError::Config(_))
+        ));
+        let explicit =
+            "iggy+quic://u:p@d.laserdata.cloud:8080?validate_certificate=false".to_owned();
+        assert_eq!(
+            resolve_quic_verification_with(explicit.clone(), true).expect("an explicit choice"),
+            explicit
+        );
+    }
+
+    #[test]
+    fn given_a_laserdata_cloud_host_over_quic_when_normalized_then_should_keep_certificate_validation_on()
+     {
+        for value in [
+            "iggy+quic://u:p@d.laserdata.cloud",
+            "iggy+quic://token@edge.laserdata.com:8080?initial_mtu=1400",
+        ] {
+            let normalized = normalize_connection_string(value).expect("a Cloud QUIC string");
+            assert!(
+                normalized.ends_with("validate_certificate=true"),
+                "{normalized}"
+            );
+            let config = quic_client_config(&normalized).expect("a QUIC client config");
+            assert!(config.validate_certificate);
+            assert_ne!(config.client_address, "127.0.0.1:0");
         }
     }
 
@@ -3937,14 +4415,14 @@ mod connection_string_tests {
 
     // A secret has no accessor outside `secrecy`, so it is read the way the
     // HTTP login serializes it.
-    fn login_of(config: &TcpClientConfig) -> Login {
+    fn login_of(auto_login: &AutoLogin) -> Login {
         let secret = |value: serde_json::Value, field: &str| {
             value[field]
                 .as_str()
                 .expect("the login serializes its secret")
                 .to_owned()
         };
-        match &config.auto_login {
+        match auto_login {
             AutoLogin::Enabled(Credentials::UsernamePassword(username, password)) => {
                 let login = LoginUser {
                     username: username.clone(),

@@ -1200,12 +1200,41 @@ def old_lane_stays_stale(world):
     _assert_stale_lane(world, lambda: managed.retained_state.set("after", 3))
 
 
-@then("the old lease publishes no heartbeat into the recreated stream")
+def _stream_created_at(world):
+    # The creation time of the scenario's stream, in epoch microseconds.
+    result = subprocess.run(
+        [
+            "node",
+            str(SCENARIOS.parent / "session-lane-admin.mjs"),
+            world.endpoint,
+            world.session.stream,
+            "stream created at",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    return int(result.stdout.strip())
+
+
+# A send the server processes after the recreation still lands, since the
+# replacement reuses the numeric ids. A reader ignores it by its generation.
+@then("no heartbeat of the old lease counts in the recreated stream")
 def old_generation_never_heartbeats(world):
     managed = _managed(world)
     world.run(lambda: asyncio.sleep(3))
+    generation = _stream_created_at(world)
     cursor = managed.laser.topic(ls.AgentTopic.Heartbeats).replay()
-    assert not world.run(lambda: cursor.poll()), "an old lease must not heartbeat into a new stream"
+    while batch := world.run(lambda: cursor.poll()):
+        for message in batch:
+            envelope = ls.Cbor.decode(bytes(message.payload))
+            heartbeat = ls.Cbor.decode(bytes(envelope["body"]))
+            # No stream generation counts, like a heartbeat of this generation.
+            assert heartbeat.get("stream_generation", generation) != generation, (
+                "a heartbeat of the deleted stream counts in its replacement"
+            )
     managed.lease.release()
     managed.lease = None
 

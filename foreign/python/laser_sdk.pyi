@@ -4820,7 +4820,11 @@ class Laser:
         r"""
         Connect with a connection string or a bare `user:password@host:port`
         endpoint, or over TCP with `address` (`host:port`) and `credentials`
-        (`(username, password)`). Pinning `stream` only enables the
+        (`(username, password)`). The scheme selects the transport: none,
+        `iggy://` or `iggy+tcp://` for TCP, `iggy+quic://` for QUIC and
+        `iggy+ws://` for WebSocket, and `iggy+http://` raises `ConfigError`.
+        Keep the connection string in `LASER_CONNECTION_STRING` and never print
+        or log it. Pinning `stream` only enables the
         default-stream shortcuts. `capabilities` seeds the capability set
         (default `Capabilities.OPEN`), and `governor` with `governor_mode` (and
         optionally `governor_retention`) enrolls a pre-effect policy hook like
@@ -8153,7 +8157,8 @@ class SessionState:
         r"""
         Fold the state from the retained session lane, as a `SessionStateView`
         dict. `complete` is false when the lane no longer holds the records the
-        document starts from.
+        document starts from, and `head_op_id` names the delta that produced
+        `revision` when the lane records it.
         """
 
 @typing.final

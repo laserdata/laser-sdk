@@ -239,8 +239,18 @@ void test("given_context_and_state_fixtures_when_decoded_then_should_match_rust_
   )
   const delta = await roundTrip("state_delta.bin", decodeStateDelta, encodeStateDelta)
   assert.equal(delta.opId, "patch-4")
+  assert.equal(delta.baseOpId, undefined)
+  const chained = await roundTrip("state_delta_base_op.bin", decodeStateDelta, encodeStateDelta)
+  assert.equal(chained.baseOpId, "patch-3")
   const snapshot = await roundTrip("state_snapshot.bin", decodeStateSnapshot, encodeStateSnapshot)
   assert.equal(snapshot.baseRevision, 4n)
+  assert.equal(snapshot.baseOpId, undefined)
+  const headed = await roundTrip(
+    "state_snapshot_base_op.bin",
+    decodeStateSnapshot,
+    encodeStateSnapshot
+  )
+  assert.equal(headed.baseOpId, "patch-4")
 })
 
 void test("given_invalid_context_digest_or_patch_op_when_encoded_then_should_reject", async () => {

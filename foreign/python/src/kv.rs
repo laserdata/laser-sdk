@@ -118,7 +118,7 @@ pub struct PyKv {
 
 /// The durable managed-mutation position used as a barrier for takeover reads.
 #[gen_stub_pyclass]
-#[pyclass(name = "MutationPosition", frozen, skip_from_py_object)]
+#[pyclass(name = "MutationPosition", frozen)]
 #[derive(Clone)]
 pub struct PyMutationPosition {
     #[pyo3(get)]
@@ -132,7 +132,7 @@ pub struct PyMutationPosition {
 /// The mutation positions seen per managed surface, `None` for a surface
 /// with no position yet.
 #[gen_stub_pyclass]
-#[pyclass(name = "AppliedFrontier", frozen, skip_from_py_object)]
+#[pyclass(name = "AppliedFrontier", frozen)]
 #[derive(Clone)]
 pub struct PyAppliedFrontier {
     #[pyo3(get)]
@@ -160,7 +160,7 @@ impl From<laser_sdk::wire::mutation::AppliedFrontier> for PyAppliedFrontier {
 /// How far a node's session fold has applied one partition of a session
 /// source.
 #[gen_stub_pyclass]
-#[pyclass(name = "SessionPosition", frozen, skip_from_py_object)]
+#[pyclass(name = "SessionPosition", frozen)]
 #[derive(Clone)]
 pub struct PySessionPosition {
     #[pyo3(get)]
@@ -1306,7 +1306,7 @@ impl PyKvCasFenced {
 
 /// One stored entry: key, value, version, and optional expiry.
 #[gen_stub_pyclass]
-#[pyclass(name = "KvEntry", frozen, skip_from_py_object)]
+#[pyclass(name = "KvEntry", frozen)]
 #[derive(Clone)]
 pub struct PyKvEntry {
     pub key: Vec<u8>,
@@ -1391,7 +1391,7 @@ impl PyKvEntry {
 
 /// One key's metadata without its value: version, expiry, and value size.
 #[gen_stub_pyclass]
-#[pyclass(name = "KvMetadata", frozen, skip_from_py_object)]
+#[pyclass(name = "KvMetadata", frozen)]
 #[derive(Clone)]
 pub struct PyKvMetadata {
     #[pyo3(get)]
@@ -1510,7 +1510,7 @@ impl PyKvPage {
 
 /// Fluent builder for a KV set. A precondition turns it into a `KvCasRequest`.
 #[gen_stub_pyclass]
-#[pyclass(name = "KvSetRequest", skip_from_py_object)]
+#[pyclass(name = "KvSetRequest")]
 #[derive(Clone)]
 pub struct PyKvSet {
     laser: Laser,

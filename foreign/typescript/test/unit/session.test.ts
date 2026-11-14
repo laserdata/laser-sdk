@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs"
 import { test } from "node:test"
 import { createAgdx } from "../../src/agent/agdx.js"
 import { type LeaseRegistry, SessionLease } from "../../src/agent/lease.js"
-import { HandlerError, InvalidError } from "../../src/client/errors.js"
+import { HandlerError, InvalidError, SessionError } from "../../src/client/errors.js"
 import type { Laser } from "../../src/client/laser.js"
 import { INTERNAL_LAYOUTS, INTERNAL_TRANSPORT } from "../../src/client/internals.js"
 import { Checkpoint, type ContextMessage } from "../../src/context.js"
@@ -39,6 +39,7 @@ import {
   decodeContextCompaction,
   decodeContextRetrieval,
   decodeSessionEnd,
+  type StateDelta,
   decodeStateDelta,
   encodeStateDelta,
   encodeStateSnapshot
@@ -701,6 +702,7 @@ void test("given_a_stale_snapshot_after_the_baseline_when_folded_then_should_cha
   } as unknown as Session
   const view = await SessionState.create(session, {
     revision: 0n,
+    head: undefined,
     document: undefined,
     sinceSnapshot: 0,
     tail: Promise.resolve()
@@ -739,12 +741,67 @@ void test("given_a_snapshot_at_the_reached_revision_with_another_document_when_f
   } as unknown as Session
   const view = await SessionState.create(session, {
     revision: 0n,
+    head: undefined,
     document: undefined,
     sinceSnapshot: 0,
     tail: Promise.resolve()
   }).get()
   assert.equal(view.revision, 1n)
   assert.deepEqual(JSON.parse(JSON.stringify(view.document)), { count: 1 })
+})
+
+void test("given_a_handle_whose_delta_was_stale_when_it_writes_again_then_should_leave_the_winners_document", async (t) => {
+  const { laser, sent } = fakeLaser()
+  const id = ConversationId.new()
+  const lane = () =>
+    Promise.resolve(
+      sent.map((entry) => ({ envelope: entry.envelope }) as unknown as ContextMessage)
+    )
+  const first = Sessions.create(laser).open(id).asAgent(planner)
+  const second = Sessions.create(laser).open(id).asAgent(AgentId.new("reviewer"))
+  t.mock.method(first, "laneRecords", lane)
+  t.mock.method(second, "laneRecords", lane)
+  await second.state().set("note", "joined")
+  await first.state().replace({ status: "escalated" })
+  await second.state().replace({ status: "closed" })
+  await second.state().set("owner", "reviewer")
+  const deltas = sent.map((entry) =>
+    decodeStateDelta(expectMap(decodeOne(entry.envelope.body, "delta"), "delta"), "delta")
+  )
+  const view = await first.state().get()
+  assert.deepEqual(JSON.parse(JSON.stringify(view.document)), { status: "escalated" })
+  assert.equal(view.revision, 2n)
+  assert.equal(view.headOpId, nth(deltas, 1).opId)
+  assert.equal(nth(deltas, 1).baseOpId, nth(deltas, 0).opId, "a seeded handle names the head")
+  assert.equal(nth(deltas, 3).baseOpId, nth(deltas, 2).opId, "a handle names its last delta")
+  await assert.rejects(second.state().snapshot(), SessionError)
+})
+
+void test("given_deltas_without_a_base_op_id_when_folded_then_should_apply_them_by_revision", async () => {
+  const view = await foldLane([
+    stateSnapshot(2n, { n: 2 }, undefined),
+    // The baseline names no head, so a known parent is not checked.
+    stateDelta(2n, "unknown", "three", [{ op: "add", path: "/n", value: 3 }]),
+    stateDelta(3n, undefined, "four", [{ op: "add", path: "/n", value: 4 }]),
+    stateDelta(4n, "four", "five", [{ op: "add", path: "/n", value: 5 }]),
+    stateDelta(5n, "four", "late", [{ op: "add", path: "/n", value: 0 }])
+  ])
+  assert.deepEqual(JSON.parse(JSON.stringify(view.document)), { n: 5 })
+  assert.equal(view.revision, 5n)
+  assert.equal(view.headOpId, "five")
+})
+
+void test("given_a_baseline_snapshot_and_a_checkpoint_when_folded_then_should_take_the_head_from_the_baseline_only", async () => {
+  const view = await foldLane([
+    stateSnapshot(3n, { n: 3 }, "three"),
+    stateDelta(3n, "two", "stale", [{ op: "add", path: "/stale", value: true }]),
+    stateDelta(3n, "three", "four", [{ op: "add", path: "/n", value: 4 }]),
+    stateSnapshot(4n, { n: 4 }, "other"),
+    stateDelta(4n, "four", "five", [{ op: "add", path: "/n", value: 5 }])
+  ])
+  assert.deepEqual(JSON.parse(JSON.stringify(view.document)), { n: 5 })
+  assert.equal(view.revision, 5n)
+  assert.equal(view.headOpId, "five")
 })
 
 void test("given_a_negative_zero_in_the_state_when_the_writer_snapshots_then_should_write_it", async (t) => {
@@ -781,6 +838,7 @@ void test("given_a_delta_writing_a_constructor_member_when_folded_then_should_ap
   } as unknown as Session
   const view = await SessionState.create(session, {
     revision: 0n,
+    head: undefined,
     document: undefined,
     sinceSnapshot: 0,
     tail: Promise.resolve()
@@ -821,6 +879,7 @@ void test("given_a_lane_fold_and_a_managed_view_when_seeding_then_should_trust_t
     } as unknown as Session
     await SessionState.create(session, {
       revision: 0n,
+      head: undefined,
       document: undefined,
       sinceSnapshot: 0,
       tail: Promise.resolve()
@@ -843,3 +902,54 @@ void test("given_a_lane_fold_and_a_managed_view_when_seeding_then_should_trust_t
     "a failed view read keeps the fold"
   )
 })
+
+function foldLane(records: readonly unknown[]): ReturnType<SessionState["get"]> {
+  const session = { laneRecords: () => Promise.resolve(records) } as unknown as Session
+  return SessionState.create(session, {
+    revision: 0n,
+    head: undefined,
+    document: undefined,
+    sinceSnapshot: 0,
+    tail: Promise.resolve()
+  }).get()
+}
+
+function stateDelta(
+  baseRevision: bigint,
+  baseOpId: string | undefined,
+  opId: string,
+  patch: StateDelta["patch"]
+): { readonly envelope: Pick<AgentEnvelope, "operation" | "body"> } {
+  return {
+    envelope: {
+      operation: OPERATION_STATE_DELTA,
+      body: encodeNamed(
+        encodeStateDelta({
+          baseRevision,
+          patch,
+          opId,
+          ...(baseOpId !== undefined ? { baseOpId } : {})
+        })
+      )
+    }
+  }
+}
+
+function stateSnapshot(
+  baseRevision: bigint,
+  document: unknown,
+  baseOpId: string | undefined
+): { readonly envelope: Pick<AgentEnvelope, "operation" | "body"> } {
+  return {
+    envelope: {
+      operation: OPERATION_STATE_SNAPSHOT,
+      body: encodeNamed(
+        encodeStateSnapshot({
+          baseRevision,
+          document,
+          ...(baseOpId !== undefined ? { baseOpId } : {})
+        })
+      )
+    }
+  }
+}

@@ -7,9 +7,12 @@ use tokio::time::Instant;
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCEPT_STAGE: &str = "the Iggy server to accept the connection";
+// A QUIC client that verifies the server retries a refused certificate like
+// an unreachable server, so the stage names that cause too.
+const VERIFIED_QUIC_ACCEPT_STAGE: &str = "the Iggy server to accept the QUIC connection: QUIC may be off on the server, or its certificate is not in the operating system trust store, so install the LaserData root CA there or connect over TCP or WebSocket";
 const LOGIN_STAGE: &str = "the Iggy login reply";
 
-/// Budget for the initial connect: TCP dial, TLS handshake, login, and the managed capability probe.
+/// Budget for the initial connect: the dial over TCP, QUIC or WebSocket, TLS handshake, login, and the managed capability probe.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ConnectOptions {
     pub(crate) timeout: Duration,
@@ -48,10 +51,11 @@ impl ConnectOptions {
     }
 }
 
-/// Connect `client` before `deadline`. The Iggy client retries a failed dial by itself, and the deadline stops those retries.
+/// Connect `client` before `deadline`. The Iggy client retries a failed dial by itself, and the deadline stops those retries. `verified_quic` names the certificate cause when the server never accepts.
 pub(crate) async fn connect_before(
     client: &IggyClient,
     deadline: Instant,
+    verified_quic: bool,
 ) -> Result<(), LaserError> {
     let mut events = client.subscribe_events().await;
     match tokio::time::timeout_at(deadline, client.connect()).await {
@@ -63,10 +67,10 @@ pub(crate) async fn connect_before(
             while let Ok(event) = events.try_recv() {
                 accepted |= event == DiagnosticEvent::Connected;
             }
-            Err(LaserError::Timeout(if accepted {
-                LOGIN_STAGE
-            } else {
-                ACCEPT_STAGE
+            Err(LaserError::Timeout(match (accepted, verified_quic) {
+                (true, _) => LOGIN_STAGE,
+                (false, true) => VERIFIED_QUIC_ACCEPT_STAGE,
+                (false, false) => ACCEPT_STAGE,
             }))
         }
     }
@@ -117,7 +121,7 @@ mod tests {
                 .build()
                 .expect("build the client");
         let started = Instant::now();
-        let result = connect_before(&client, started + Duration::from_millis(300)).await;
+        let result = connect_before(&client, started + Duration::from_millis(300), false).await;
         assert!(matches!(result, Err(LaserError::Timeout(LOGIN_STAGE))));
         assert!(started.elapsed() < Duration::from_secs(5));
         server.abort();
@@ -137,7 +141,7 @@ mod tests {
                 .build()
                 .expect("build the client");
         let started = Instant::now();
-        let result = connect_before(&client, started + Duration::from_millis(300)).await;
+        let result = connect_before(&client, started + Duration::from_millis(300), false).await;
         assert!(matches!(result, Err(LaserError::Timeout(ACCEPT_STAGE))));
         assert!(started.elapsed() < Duration::from_secs(5));
     }

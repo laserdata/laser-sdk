@@ -41,12 +41,7 @@ pub(crate) fn positive_duration_ms(value: f64, field: &'static str) -> PyResult<
 
 /// One committed partition range reported by Apache Iggy after a send.
 #[gen_stub_pyclass]
-#[pyclass(
-    name = "SendMessagesConfirmationResponse",
-    frozen,
-    get_all,
-    skip_from_py_object
-)]
+#[pyclass(name = "SendMessagesConfirmationResponse", frozen, get_all)]
 #[derive(Clone)]
 pub struct PySendMessagesConfirmation {
     pub stream_id: u32,
@@ -68,7 +63,7 @@ impl From<SendMessagesConfirmationResponse> for PySendMessagesConfirmation {
 
 /// Commit confirmations returned by a successful Apache Iggy send.
 #[gen_stub_pyclass]
-#[pyclass(name = "SendMessagesResponse", frozen, skip_from_py_object)]
+#[pyclass(name = "SendMessagesResponse", frozen)]
 #[derive(Clone)]
 pub struct PySendMessagesResponse {
     #[pyo3(get)]
@@ -1721,7 +1716,7 @@ impl PyConsumer {
 /// A consumer's offset as the server stores it, read by
 /// `Consumer.stored_offset`.
 #[gen_stub_pyclass]
-#[pyclass(name = "StoredOffset", frozen, get_all, skip_from_py_object)]
+#[pyclass(name = "StoredOffset", frozen, get_all)]
 #[derive(Clone)]
 pub struct PyStoredOffset {
     /// The offset the server stored for the consumer.

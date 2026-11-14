@@ -7736,6 +7736,7 @@ export interface SessionStateView {
     readonly document: unknown;
     // (undocumented)
     readonly frontier?: SourceFrontier;
+    readonly headOpId?: string;
     // (undocumented)
     readonly history: readonly StateChange[];
     // (undocumented)

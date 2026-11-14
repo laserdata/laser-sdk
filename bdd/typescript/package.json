@@ -17,6 +17,6 @@
     "typescript": "7.0.2"
   },
   "overrides": {
-    "@cucumber/query": "16.1.1"
+    "@cucumber/query": "16.2.0"
   }
 }

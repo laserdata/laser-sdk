@@ -23,7 +23,8 @@ import {
   encodeSessionList,
   encodeSessionReply,
   encodeSessionSources,
-  encodeSessionState
+  encodeSessionState,
+  sessionHeartbeatCountsFor
 } from "../../src/wire/session.js"
 
 const FIXTURES_DIR = path.resolve(process.cwd(), "../../wire/fixtures")
@@ -89,6 +90,7 @@ void test("given_session_read_replies_when_decoded_then_should_match_rust_bytes"
     "page_rebuilding",
     "events",
     "state",
+    "state_head",
     "links",
     "sources",
     "changes",
@@ -121,6 +123,10 @@ void test("given_session_read_replies_when_decoded_then_should_match_rust_bytes"
   assert.ok(state?.kind === "ok" && state.outcome.kind === "state")
   assert.equal(JSON.stringify(state.outcome.state.document), JSON.stringify({ tasks: ["triage"] }))
   assert.equal(state.outcome.state.history[0]?.outcome, "applied")
+  assert.equal(state.outcome.state.headOpId, undefined)
+  const head = replies.get("state_head")
+  assert.ok(head?.kind === "ok" && head.outcome.kind === "state")
+  assert.equal(head.outcome.state.headOpId, "op-2")
   const sources = replies.get("sources")
   assert.ok(sources?.kind === "ok" && sources.outcome.kind === "sources")
   assert.deepEqual(sources.outcome.sources.lane, [2, 100n, 4])
@@ -143,4 +149,25 @@ void test("given_a_session_heartbeat_when_round_tripped_then_should_match_rust_b
   )
   const tooMany = Array.from({ length: MAX_HEARTBEAT_SESSIONS + 1 }, () => get.id)
   assert.throws(() => encodeSessionHeartbeat({ ...beat, sessions: tooMany }))
+})
+
+void test("given_a_session_heartbeat_naming_its_stream_generation_when_round_tripped_then_should_match_rust_bytes", async () => {
+  const beat = await roundTrip(
+    "session_heartbeat_generation.bin",
+    decodeSessionHeartbeat,
+    encodeSessionHeartbeat
+  )
+  assert.equal(beat.streamGeneration, 1_778_000_000_000_000n)
+})
+
+void test("given_a_session_heartbeat_when_checked_against_a_stream_generation_then_should_count_unless_it_names_another", async () => {
+  const unknown = await roundTrip(
+    "session_heartbeat.bin",
+    decodeSessionHeartbeat,
+    encodeSessionHeartbeat
+  )
+  assert.equal(unknown.streamGeneration, undefined)
+  assert.ok(sessionHeartbeatCountsFor(unknown, 7n))
+  assert.ok(sessionHeartbeatCountsFor({ ...unknown, streamGeneration: 7n }, 7n))
+  assert.ok(!sessionHeartbeatCountsFor({ ...unknown, streamGeneration: 6n }, 7n))
 })

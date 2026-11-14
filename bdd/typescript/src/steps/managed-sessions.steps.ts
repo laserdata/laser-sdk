@@ -1351,6 +1351,25 @@ async function laneRecordCount(world: LaserWorld): Promise<bigint> {
   return BigInt(stdout.trim());
 }
 
+// The creation time of the scenario's stream, in epoch microseconds.
+async function streamCreatedAt(world: LaserWorld): Promise<bigint> {
+  const helper = fileURLToPath(
+    new URL("../../../session-lane-admin.mjs", import.meta.url),
+  );
+  const { stdout } = await promisify(execFile)(
+    "node",
+    [
+      helper,
+      world.endpoint,
+      world.requireSession().stream(),
+      "stream created at",
+      "1",
+    ],
+    { timeout: 60_000 },
+  );
+  return BigInt(stdout.trim());
+}
+
 const staleLaneError = (error: unknown): boolean =>
   error instanceof SessionError && error.detail.kind === "stale";
 
@@ -1559,16 +1578,38 @@ Then(
   },
 );
 
+// A send the server processes after the recreation still lands, since the
+// replacement reuses the numeric ids. A reader ignores it by its generation.
 Then(
-  "the old lease publishes no heartbeat into the recreated stream",
+  "no heartbeat of the old lease counts in the recreated stream",
   async function (this: LaserWorld) {
     await new Promise((resolve) => setTimeout(resolve, 3000));
+    const generation = await streamCreatedAt(this);
     const cursor = await laserOf(this).topic(AgentTopic.Heartbeats).replay();
-    assert.deepEqual(
-      await cursor.poll(),
-      [],
-      "an old lease must not publish a new-generation heartbeat",
-    );
+    for (;;) {
+      const batch = await cursor.poll();
+      if (batch.length === 0) break;
+      for (const message of batch) {
+        const envelope = wire.decodeAgentEnvelope(
+          wire.expectMap(
+            wire.decodeOne(message.payload, "heartbeat"),
+            "heartbeat",
+          ),
+          "heartbeat",
+        );
+        const heartbeat = wire.decodeSessionHeartbeat(
+          wire.expectMap(
+            wire.decodeOne(envelope.body, "heartbeat"),
+            "heartbeat",
+          ),
+          "heartbeat",
+        );
+        assert.ok(
+          !wire.sessionHeartbeatCountsFor(heartbeat, generation),
+          "a heartbeat of the deleted stream counts in its replacement",
+        );
+      }
+    }
     managed(this).lease?.release();
     delete managed(this).lease;
     this.sessionLease?.release();

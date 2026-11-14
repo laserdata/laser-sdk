@@ -15,18 +15,24 @@ import { SessionConfig, TopicRetention, deriveSessionId, type Session } from "..
 import { AgentId, ConversationId } from "../../src/types/ids.js"
 import {
   AgentKind,
+  OPERATION_PROGRESS,
   type TaskState,
   commandEnvelope,
   decodeSessionEnd,
   decodeSessionStart
 } from "../../src/wire/agent.js"
 import { decodeOne, expectMap } from "../../src/wire/cbor.js"
+import { ContentType } from "../../src/wire/content.js"
 import {
   ConversationId as WireConversationId,
   CorrelationId,
   RecordId
 } from "../../src/wire/ids.js"
-import { type SessionHeartbeat, decodeSessionHeartbeat } from "../../src/wire/session.js"
+import {
+  type SessionHeartbeat,
+  decodeSessionHeartbeat,
+  sessionHeartbeatCountsFor
+} from "../../src/wire/session.js"
 
 function nth<Item>(items: readonly Item[], index: number): Item {
   const item = items.at(index)
@@ -60,6 +66,21 @@ function decoded<Value>(
   decode: (map: ReturnType<typeof expectMap>, context: string) => Value
 ): Value {
   return decode(expectMap(decodeOne(body, "body"), "body"), "body")
+}
+
+// Every heartbeat body on the default stream, in log order.
+async function heartbeatBodies(laser: Laser): Promise<Uint8Array[]> {
+  const cursor = (await laser.topic(AgentTopic.Heartbeats).replay()).batch(100)
+  const bodies: Uint8Array[] = []
+  for (;;) {
+    const records = await cursor.pollRecords()
+    if (records.length === 0) return bodies
+    for (const record of records) {
+      const message = decodeAgentMessage(record)
+      if (message.kind === "message" && message.message.envelope !== undefined)
+        bodies.push(message.message.envelope.body)
+    }
+  }
 }
 
 async function lifecycle(
@@ -193,6 +214,47 @@ void test("given_a_held_lease_when_the_interval_passes_then_should_list_the_sess
     assert.ok(heartbeat.sessions.some((id) => id.toString() === session.conversation.toString()))
     assert.equal(heartbeat.stream, laser.defaultStream)
     lease.release()
+  } finally {
+    await laser.close()
+  }
+})
+
+void test("given_a_heartbeat_of_a_deleted_stream_when_it_lands_in_the_replacement_then_should_not_count", async () => {
+  const laser = await connect()
+  try {
+    const stream = laser.defaultStream
+    assert.ok(stream !== undefined)
+    const { lease } = await laser
+      .sessions(new SessionConfig().heartbeat(50))
+      .start()
+      .agent(planner)
+      .begin()
+    const late = await eventually(async () => (await heartbeatBodies(laser)).at(-1))
+    lease.release()
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.ok(await laser.stream(stream).delete())
+    await laser.bootstrap(4, ONE_DAY)
+    const replacement = await laser[INTERNAL_TRANSPORT]().findSnapshotStream?.(stream)
+    assert.ok(replacement !== undefined)
+    // The server appends a send it processes after the stream was created
+    // again, since the replacement reuses the numeric ids.
+    await laser
+      .agdx(AgentTopic.Heartbeats, planner, ConversationId.derive("late-heartbeat"))
+      .status(OPERATION_PROGRESS)
+      .body(late)
+      .contentType(ContentType.Cbor)
+      .send()
+    const landed = (await heartbeatBodies(laser)).map((body) =>
+      decoded(body, decodeSessionHeartbeat)
+    )
+    assert.ok(landed.length > 0, "the late heartbeat is in the replacement")
+    assert.deepEqual(
+      landed.filter((heartbeat) =>
+        sessionHeartbeatCountsFor(heartbeat, replacement.createdAtMicros)
+      ),
+      [],
+      "a heartbeat of the deleted stream counted in its replacement"
+    )
   } finally {
     await laser.close()
   }

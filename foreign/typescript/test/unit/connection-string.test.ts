@@ -138,10 +138,15 @@ void test("given_an_out_of_range_port_when_parsed_then_should_refuse_it", () => 
   assert.equal(parseConnectionString("iggy://user:password@host:65535", {}).port, 65_535)
 })
 
-void test("given_a_scheme_other_than_iggy_tcp_when_parsed_then_should_refuse_it", () => {
-  for (const value of ["iggy+quic://u:p@host", "iggy+http://u:p@host", "http://u:p@host"]) {
-    assert.throws(() => parseConnectionString(value, {}), ConfigError, value)
+void test("given_a_scheme_other_than_iggy_tcp_when_parsed_then_should_refuse_it_naming_the_tcp_transport", () => {
+  for (const value of ["iggy+quic://u:p@host", "iggy+ws://u:p@host"]) {
+    assert.throws(() => parseConnectionString(value, {}), /connects over TCP, plain or TLS/, value)
   }
+  assert.throws(
+    () => parseConnectionString("iggy+http://u:p@host", {}),
+    /HTTP has no binary request path/
+  )
+  assert.throws(() => parseConnectionString("http://u:p@host", {}), ConfigError)
   assert.equal(parseConnectionString("iggy+tcp://u:p@host", {}).host, "host")
 })
 
@@ -288,6 +293,52 @@ void test("given_an_invalid_port_when_parsed_then_should_not_echo_the_credential
       return true
     }
   )
+})
+
+void test("given_a_refused_or_failed_connection_when_reported_then_should_never_echo_the_secret", async () => {
+  const secret = "sup3rs3cr3t"
+  const leaks = (error: unknown): string | undefined => {
+    for (let cause = error; cause instanceof Error; cause = cause.cause) {
+      for (const text of [cause.message, String(cause), cause.stack ?? ""]) {
+        if (text.includes(secret)) return text
+      }
+    }
+    return undefined
+  }
+  for (const value of [
+    `iggy+quic://user:${secret}@host`,
+    `iggy+ws://${secret}@host`,
+    `iggy+http://user:${secret}@host`,
+    `iggy://user:${secret}@host?unknown=1`,
+    `iggy://user:${secret}@host?tls_ca_file=/missing/ca.pem`
+  ]) {
+    assert.throws(
+      () => parseConnectionString(value, {}),
+      (error: unknown) => leaks(error) === undefined || assert.fail(String(leaks(error)))
+    )
+  }
+  const server = createServer((socket) => socket.destroy())
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolve)
+  })
+  const address = server.address()
+  assert(address !== null && typeof address === "object")
+  try {
+    await assert.rejects(
+      ApacheIggyTransport.connect(
+        `iggy://user:${secret}@127.0.0.1:${String(address.port)}?reconnection_retries=0`
+      ),
+      (error: unknown) => leaks(error) === undefined || assert.fail(String(leaks(error)))
+    )
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => {
+        if (error === undefined) resolve()
+        else reject(error)
+      })
+    })
+  }
 })
 
 void test("given_a_negated_no_tls_flag_when_parsed_then_should_still_enable_tls", () => {

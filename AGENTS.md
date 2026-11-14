@@ -65,7 +65,7 @@ just parity-check          # 14. Rust, Python, TypeScript surfaces match docs/pa
 
 Run `--all-features --doc` as a required gate. `clippy --all-targets` does not compile documentation examples. A default-feature `cargo test --workspace` can omit examples behind optional features such as `kv` and `query`. The doctest gate requires no Iggy server or Docker. CI runs it too.
 
-VSR is native to Iggy. Laser SDK does not expose a transport feature or alternate framing option. Rust, Python, and TypeScript use the same Iggy transport. Integration and BDD suites run the versioned Iggy binary. Managed reads use the non-replicated extension path, and the three managed-authorization writes use dedicated replicated operations.
+VSR is native to Iggy. Laser SDK does not expose a transport feature or alternate framing option. The connection string scheme selects the Iggy transport: Rust and Python dial TCP, QUIC or WebSocket, TypeScript dials TCP through `apache-iggy`, and HTTP is refused in every client ([client behavior](docs/client-behavior.md#connections)). Integration and BDD suites run the versioned Iggy binary. Managed reads use the non-replicated extension path, and the three managed-authorization writes use dedicated replicated operations.
 
 The wire crate must compile for `wasm32-unknown-unknown` with `cbor,codecs,fixtures,builders,http-client`. Exclude `bson` from this target. Its portable dependency graph must exclude iggy, tokio, bytes, ulid, dashmap, tracing, and getrandom, as specified in `deny-wire.toml`. Include `builders` and `http-client` in both portability gates. CI enforces these requirements even when local tools are unavailable.
 
@@ -180,7 +180,12 @@ sdk/src/
                       managed name scoped to `stream:<default stream>/<name>` unless Bare,
                       producer cache, send_raw_with_response (the raw managed-command
                       transport, Vec<u8> in/out, converts to/from iggy's own `Bytes` only at
-                      the client call, never in the SDK's own signatures). `resolve_tls`
+                      the client call, never in the SDK's own signatures). `split_scheme`
+                      picks the transport (`iggy://`/`iggy+tcp://` TCP, `iggy+quic://`,
+                      `iggy+ws://`, HTTP refused), `validate_options` takes exactly
+                      that transport's Apache Iggy options, and `transport_client` dials
+                      it. A WebSocket with TLS verifies by default, and a QUIC Cloud host
+                      gets `validate_certificate=true`. `resolve_tls`
                       auto-attaches TLS + the bundled public CA (`certs/laserdata.crt`,
                       `include_bytes!`) for a `*.laserdata.cloud`/`*.laserdata.com` host with no
                       `tls_ca_file=` query parameter already set. The bundled CA is cached in a
@@ -326,7 +331,8 @@ sdk/src/
     partitioning.rs   send-boundary partition routing from the declared SessionLayout: a command
                       by its addressee, a reply by its requester, everything else by session
     lease.rs          SessionLease + the per-connection lease registry and heartbeat task: one
-                      status(progress) per stream per interval on agent.heartbeats
+                      status(progress) per stream per interval on agent.heartbeats, naming
+                      the stream generation a reader checks
     consumer.rs       reliable consumer: Deduplicator seam, commit-after-handle, retry -> DLQ
                       (a failed DLQ publish retried in place, then the consumer stops uncommitted),
                       the AGDX error answer to a dead-lettered correlated command, fence
@@ -470,7 +476,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-This inventory describes the `0.9.3` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.10.0` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
 Capabilities identify managed support such as queries, key-value, forks, graphs, and an A2A gateway, plus native consumer filters served by the streaming server. Every capability flag maps to a hello feature bit or an op version. Memory combines query and graph operations and has no separate managed command group.
 

@@ -22,7 +22,7 @@ Repo-wide rules (verification order, idiomatic-traits, no `cargo install`, no em
 
 Laser SDK uses an append-only log for source records. Projections, queries, key-value state, and forks provide views over that data. AGDX defines the shared exchange contract.
 
-The workspace publishes `laser-wire`, the Rust `laser-sdk`, Python bindings, and a native TypeScript client, all at version `0.9.3`. The three clients expose streaming, managed, and agent surfaces. The [cross-SDK parity matrix](../../../docs/parity.md) maps Rust types, fields, error payloads, constants, and callable APIs to their Python and TypeScript forms, and reports unresolved mappings and peer-only APIs. Update it in the same change as any public API. Rust defines the codes, envelopes, dictionaries, limits, and reference files. Python calls the Rust implementation. TypeScript uses the same encoded files and behavior scenarios. The SDKs do not call language models.
+The workspace publishes `laser-wire`, the Rust `laser-sdk`, Python bindings, and a native TypeScript client, all at version `0.10.0`. The three clients expose streaming, managed, and agent surfaces. The [cross-SDK parity matrix](../../../docs/parity.md) maps Rust types, fields, error payloads, constants, and callable APIs to their Python and TypeScript forms, and reports unresolved mappings and peer-only APIs. Update it in the same change as any public API. Rust defines the codes, envelopes, dictionaries, limits, and reference files. Python calls the Rust implementation. TypeScript uses the same encoded files and behavior scenarios. The SDKs do not call language models.
 
 `laser_sdk::prelude::*` imports the common accessors and types. `laser_sdk::prelude::full::*` also imports bridge, projection, and memory types. Examples and integration tests use `full`. Application code can use the smaller prelude with explicit imports. `ReliableConsumer` is the public consumer, and `ReliableWorker` is its private message adapter.
 
@@ -40,7 +40,7 @@ The `streaming` feature provides `publish()`, `publish_batch()`, `send(payload, 
 
 Use `iggy_producer()`, `iggy_consumer()`, `iggy_consumer_group()`, `Laser::client()`, and `laser_sdk::iggy` for direct Iggy access. Examples include `native-streaming`, `event-analytics`, and `fleet-tape`. Default features are `streaming` and `provenance`. Agent and managed features are optional.
 
-Every client uses standard Iggy transport. Managed reads use the non-replicated extension, and the three authorization writes use dedicated replicated operations. Managed calls return `LaserError::Unsupported` without a supporting backend. `BlobStore::put`, `BlobStore::get`, and one-shot managed calls use `Vec<u8>`. Conversion to Iggy `Bytes` occurs at the client-call boundary. `sdk/src/blob.rs` and `send_raw_with_response` define those paths.
+Every client uses standard Iggy transport, picked by the connection string scheme: Rust and Python speak TCP, QUIC and WebSocket, TypeScript TCP, and HTTP is refused ([client behavior](../../../docs/client-behavior.md#connections)). Managed reads use the non-replicated extension, and the three authorization writes use dedicated replicated operations. Managed calls return `LaserError::Unsupported` without a supporting backend. `BlobStore::put`, `BlobStore::get`, and one-shot managed calls use `Vec<u8>`. Conversion to Iggy `Bytes` occurs at the client-call boundary. `sdk/src/blob.rs` and `send_raw_with_response` define those paths.
 
 ## Which skill to load
 

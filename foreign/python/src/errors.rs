@@ -448,7 +448,7 @@ static TIMEOUT_ERROR: OnceLock<Py<PyType>> = OnceLock::new();
 /// One record a failed publish left without a confirmation. It keeps the
 /// message id the attempts used, and it may already be on the server.
 #[gen_stub_pyclass]
-#[pyclass(name = "IggyMessage", frozen, skip_from_py_object)]
+#[pyclass(name = "IggyMessage", frozen)]
 pub struct PyUnconfirmedMessage {
     message_id: u128,
     payload: bytes::Bytes,

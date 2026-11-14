@@ -68,9 +68,7 @@ pub struct EnvironmentReport {
 /// The number of Tokio workers actually serving this benchmark process.
 #[must_use]
 pub fn runtime_worker_threads() -> usize {
-    tokio::runtime::Handle::try_current()
-        .map(|handle| handle.metrics().num_workers())
-        .unwrap_or_default()
+    tokio::runtime::Handle::try_current().map_or_default(|handle| handle.metrics().num_workers())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

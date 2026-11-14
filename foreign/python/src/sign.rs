@@ -63,7 +63,7 @@ fn key_kind_word(kind: KeyKind) -> &'static str {
 /// A verified signer: the enrolled principal and the kind of key it holds
 /// (`agent` or `operator`).
 #[gen_stub_pyclass]
-#[pyclass(name = "VerifiedPrincipal", frozen, skip_from_py_object)]
+#[pyclass(name = "VerifiedPrincipal", frozen)]
 pub struct PyVerifiedPrincipal {
     inner: VerifiedPrincipal,
 }
@@ -207,7 +207,7 @@ impl PyKeyRegistry {
 
 /// A lifecycle-aware verifying key enrolled in a managed key registry.
 #[gen_stub_pyclass]
-#[pyclass(name = "KeyRecord", frozen, skip_from_py_object)]
+#[pyclass(name = "KeyRecord", frozen)]
 #[derive(Clone)]
 pub struct PyKeyRecord {
     inner: KeyRecord,

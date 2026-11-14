@@ -24,7 +24,7 @@ pub struct PyConsumerGroup {
 /// A consumer group as the server knows it, returned by `ConsumerGroup.create`
 /// and `ConsumerGroup.info`.
 #[gen_stub_pyclass]
-#[pyclass(name = "ConsumerGroupInfo", frozen, eq, skip_from_py_object)]
+#[pyclass(name = "ConsumerGroupInfo", frozen, eq)]
 #[derive(Clone, PartialEq, Eq)]
 pub struct PyConsumerGroupInfo {
     info: ConsumerGroupInfo,

@@ -76,6 +76,7 @@ fn state_json_rejects_integers_that_typescript_cannot_represent_exactly() {
     let snapshot = StateSnapshot {
         base_revision: 0,
         document: document.clone(),
+        base_op_id: None,
     };
     assert!(snapshot.validate().is_err());
     assert!(apply_json_patch(&document, &[]).is_err());

@@ -6,10 +6,11 @@ use crate::provenance::AgentTopic;
 use crate::types::MintUlid;
 use iggy::prelude::{Identifier, TopicClient};
 use laser_wire::agent::{
-    AgentErrorBody, ContextManifest, CorrelationId, Fragment, METADATA_DURATION_MICROS,
-    METADATA_PROVIDER_NAME, METADATA_RECORDED, METADATA_REQUEST_MODEL, METADATA_RESPONSE_MODEL,
-    OPERATION_CHAT, OPERATION_STATE_DELTA, OPERATION_STATE_SNAPSHOT, SessionRef, StateDelta,
-    StateSnapshot, TokenUsage, apply_json_patch, equal_json, estimate_tokens,
+    AgentEnvelope, AgentErrorBody, ContextManifest, CorrelationId, Fragment,
+    METADATA_DURATION_MICROS, METADATA_PROVIDER_NAME, METADATA_RECORDED, METADATA_REQUEST_MODEL,
+    METADATA_RESPONSE_MODEL, OPERATION_CHAT, OPERATION_STATE_DELTA, OPERATION_STATE_SNAPSHOT,
+    SessionRef, StateDelta, StateSnapshot, TokenUsage, apply_json_patch, equal_json,
+    estimate_tokens,
 };
 use laser_wire::content::ContentType;
 use laser_wire::dispatch::{OPERATION_CONTEXT_ASSEMBLED, OPERATION_EXECUTE_TOOL};
@@ -55,11 +56,13 @@ pub fn default_redact(value: &mut serde_json::Value) {
     }
 }
 
-// The state this handle has written: the revision it expects next, the
-// document after its own deltas, and how many deltas since the last snapshot.
+// The state this handle has written: the revision it expects next, the delta
+// that produced it, the document after its own deltas, and how many deltas
+// since the last snapshot.
 #[derive(Default)]
 pub(crate) struct StateCursor {
     revision: u64,
+    head: Option<String>,
     document: Option<serde_json::Value>,
     since_snapshot: u32,
 }
@@ -313,6 +316,7 @@ impl SessionState {
             base_revision: cursor.revision,
             patch,
             op_id: ulid::Ulid::generate().to_string(),
+            base_op_id: cursor.head.clone(),
         };
         let receipt = match self
             .session
@@ -322,10 +326,12 @@ impl SessionState {
             Ok(receipt) => receipt,
             Err(error) => {
                 cursor.document = None;
+                cursor.head = None;
                 return Err(error);
             }
         };
         cursor.revision += 1;
+        cursor.head = Some(delta.op_id);
         cursor.document = Some(next);
         cursor.since_snapshot += 1;
         if cursor.since_snapshot >= SNAPSHOT_EVERY_DELTAS {
@@ -349,6 +355,7 @@ impl SessionState {
                 .document
                 .clone()
                 .unwrap_or_else(|| serde_json::json!({})),
+            base_op_id: cursor.head.clone(),
         };
         let receipt = self
             .session
@@ -367,6 +374,7 @@ impl SessionState {
         }
         let view = self.current_view().await?;
         cursor.revision = view.revision;
+        cursor.head = view.head_op_id;
         cursor.document = Some(view.document);
         Ok(())
     }
@@ -406,16 +414,23 @@ impl SessionState {
     // Whether the session's current document is the one this handle holds.
     // A delta written against a stale base never applied, yet the handle
     // counted it, so its revision can name the revision the session reached
-    // through another writer with a document nobody applied. An unseeded
-    // handle is seeded and holds the current document by construction. A
-    // stale handle reseeds on its next write.
+    // through another writer with a document nobody applied. When both name
+    // the delta behind the revision it must match, since a stale delta can
+    // leave an equal document. An unseeded handle is seeded and holds the
+    // current document by construction. A stale handle reseeds on its next
+    // write.
     async fn holds_current(&self, cursor: &mut StateCursor) -> Result<bool, LaserError> {
         if cursor.document.is_none() {
             self.seed(cursor).await?;
             return Ok(true);
         }
         let view = self.current_view().await?;
+        let same_head = match (&cursor.head, &view.head_op_id) {
+            (Some(held), Some(head)) => held == head,
+            _ => true,
+        };
         if view.revision == cursor.revision
+            && same_head
             && cursor
                 .document
                 .as_ref()
@@ -424,6 +439,7 @@ impl SessionState {
             return Ok(true);
         }
         cursor.document = None;
+        cursor.head = None;
         Ok(false)
     }
 
@@ -433,60 +449,9 @@ impl SessionState {
     /// does not decode is skipped, as the session index skips it.
     pub async fn get(&self) -> Result<SessionStateView, LaserError> {
         let records = self.session.lane_records().await?;
-        let mut document = serde_json::json!({});
-        let mut revision = 0u64;
-        let mut complete = false;
-        for record in records {
-            let Some(envelope) = record.envelope else {
-                continue;
-            };
-            match envelope.operation.as_deref() {
-                Some(OPERATION_STATE_SNAPSHOT) => {
-                    let Ok(snapshot) = decode_named::<StateSnapshot>(&envelope.body) else {
-                        continue;
-                    };
-                    if snapshot.validate().is_err() {
-                        continue;
-                    }
-                    // The first snapshot is the baseline. A later one counts
-                    // only at the revision the fold has reached and with the
-                    // document it holds, so a stale snapshot from a second
-                    // writer changes nothing.
-                    if complete
-                        && (snapshot.base_revision != revision
-                            || !equal_json(&snapshot.document, &document))
-                    {
-                        continue;
-                    }
-                    document = snapshot.document;
-                    revision = snapshot.base_revision;
-                    complete = true;
-                }
-                Some(OPERATION_STATE_DELTA) => {
-                    let Ok(delta) = decode_named::<StateDelta>(&envelope.body) else {
-                        continue;
-                    };
-                    if delta.base_revision == 0 && revision == 0 {
-                        complete = true;
-                    }
-                    if delta.base_revision != revision {
-                        continue;
-                    }
-                    if let Ok(next) = apply_json_patch(&document, &delta.patch) {
-                        document = next;
-                        revision += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(SessionStateView {
-            revision,
-            document,
-            history: Vec::new(),
-            frontier: None,
-            complete,
-        })
+        Ok(fold_state(
+            records.iter().filter_map(|record| record.envelope.as_ref()),
+        ))
     }
 }
 
@@ -955,6 +920,73 @@ impl Session {
     }
 }
 
+// The lane fold `SessionState::get` runs over the session's state records in
+// lane order.
+fn fold_state<'a>(envelopes: impl Iterator<Item = &'a AgentEnvelope>) -> SessionStateView {
+    let mut document = serde_json::json!({});
+    let mut revision = 0u64;
+    let mut head: Option<String> = None;
+    let mut complete = false;
+    for envelope in envelopes {
+        match envelope.operation.as_deref() {
+            Some(OPERATION_STATE_SNAPSHOT) => {
+                let Ok(snapshot) = decode_named::<StateSnapshot>(&envelope.body) else {
+                    continue;
+                };
+                if snapshot.validate().is_err() {
+                    continue;
+                }
+                // The first snapshot is the baseline and carries the head. A
+                // later one counts only at the revision the fold has reached
+                // and with the document it holds, so a stale snapshot from a
+                // second writer changes nothing, and it keeps the fold's head.
+                if complete {
+                    if snapshot.base_revision != revision
+                        || !equal_json(&snapshot.document, &document)
+                    {
+                        continue;
+                    }
+                } else {
+                    head = snapshot.base_op_id;
+                }
+                document = snapshot.document;
+                revision = snapshot.base_revision;
+                complete = true;
+            }
+            Some(OPERATION_STATE_DELTA) => {
+                let Ok(delta) = decode_named::<StateDelta>(&envelope.body) else {
+                    continue;
+                };
+                if delta.base_revision == 0 && revision == 0 {
+                    complete = true;
+                }
+                // A writer that lost a race names a reached revision, not the delta that reached it.
+                let stale_parent = matches!(
+                    (&delta.base_op_id, &head),
+                    (Some(parent), Some(head)) if parent != head
+                );
+                if delta.base_revision != revision || stale_parent {
+                    continue;
+                }
+                if let Ok(next) = apply_json_patch(&document, &delta.patch) {
+                    document = next;
+                    revision += 1;
+                    head = Some(delta.op_id);
+                }
+            }
+            _ => {}
+        }
+    }
+    SessionStateView {
+        revision,
+        document,
+        history: Vec::new(),
+        frontier: None,
+        complete,
+        head_op_id: head,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,6 +1005,148 @@ mod tests {
         assert_eq!(args["nested"]["api_key"], "[redacted]");
         assert_eq!(args["nested"]["keep"], 1);
         assert_eq!(args["list"][0]["password"], "[redacted]");
+    }
+
+    #[test]
+    fn given_a_handle_whose_delta_was_stale_when_its_next_delta_folds_then_should_mark_it_stale() {
+        let lane = [
+            delta(
+                0,
+                None,
+                "joined",
+                r#"[{"op":"add","path":"/note","value":"joined"}]"#,
+            ),
+            delta(
+                1,
+                Some("joined"),
+                "escalated",
+                r#"[{"op":"remove","path":"/note"},{"op":"add","path":"/status","value":"escalated"}]"#,
+            ),
+            delta(
+                1,
+                Some("joined"),
+                "closed",
+                r#"[{"op":"remove","path":"/note"},{"op":"add","path":"/status","value":"closed"}]"#,
+            ),
+            // The losing handle counted its stale delta, so it names the
+            // revision the winner reached with a document nobody applied.
+            delta(
+                2,
+                Some("closed"),
+                "owner",
+                r#"[{"op":"add","path":"/owner","value":"reviewer"}]"#,
+            ),
+        ];
+        let view = fold_state(lane.iter());
+        assert_eq!(view.document, serde_json::json!({"status": "escalated"}));
+        assert_eq!(view.revision, 2);
+        assert_eq!(view.head_op_id.as_deref(), Some("escalated"));
+    }
+
+    #[test]
+    fn given_deltas_without_a_base_op_id_when_folded_then_should_apply_them_by_revision() {
+        let lane = [
+            snapshot(2, serde_json::json!({"n": 2}), None),
+            // The baseline names no head, so a known parent is not checked.
+            delta(
+                2,
+                Some("unknown"),
+                "three",
+                r#"[{"op":"add","path":"/n","value":3}]"#,
+            ),
+            delta(3, None, "four", r#"[{"op":"add","path":"/n","value":4}]"#),
+            delta(
+                4,
+                Some("four"),
+                "five",
+                r#"[{"op":"add","path":"/n","value":5}]"#,
+            ),
+            delta(
+                5,
+                Some("four"),
+                "late",
+                r#"[{"op":"add","path":"/n","value":0}]"#,
+            ),
+        ];
+        let view = fold_state(lane.iter());
+        assert_eq!(view.document, serde_json::json!({"n": 5}));
+        assert_eq!(view.revision, 5);
+        assert_eq!(view.head_op_id.as_deref(), Some("five"));
+    }
+
+    #[test]
+    fn given_a_baseline_snapshot_and_a_checkpoint_when_folded_then_should_take_the_head_from_the_baseline_only()
+     {
+        let lane = [
+            snapshot(3, serde_json::json!({"n": 3}), Some("three")),
+            delta(
+                3,
+                Some("two"),
+                "stale",
+                r#"[{"op":"add","path":"/stale","value":true}]"#,
+            ),
+            delta(
+                3,
+                Some("three"),
+                "four",
+                r#"[{"op":"add","path":"/n","value":4}]"#,
+            ),
+            snapshot(4, serde_json::json!({"n": 4}), Some("other")),
+            delta(
+                4,
+                Some("four"),
+                "five",
+                r#"[{"op":"add","path":"/n","value":5}]"#,
+            ),
+        ];
+        let view = fold_state(lane.iter());
+        assert_eq!(view.document, serde_json::json!({"n": 5}));
+        assert_eq!(view.revision, 5);
+        assert_eq!(view.head_op_id.as_deref(), Some("five"));
+    }
+
+    fn delta(
+        base_revision: u64,
+        base_op_id: Option<&str>,
+        op_id: &str,
+        patch: &str,
+    ) -> AgentEnvelope {
+        state_record(
+            OPERATION_STATE_DELTA,
+            encode_named(&StateDelta {
+                base_revision,
+                patch: serde_json::from_str(patch).expect("the patch decodes"),
+                op_id: op_id.to_owned(),
+                base_op_id: base_op_id.map(str::to_owned),
+            })
+            .expect("the delta encodes"),
+        )
+    }
+
+    fn snapshot(
+        base_revision: u64,
+        document: serde_json::Value,
+        base_op_id: Option<&str>,
+    ) -> AgentEnvelope {
+        state_record(
+            OPERATION_STATE_SNAPSHOT,
+            encode_named(&StateSnapshot {
+                base_revision,
+                document,
+                base_op_id: base_op_id.map(str::to_owned),
+            })
+            .expect("the snapshot encodes"),
+        )
+    }
+
+    fn state_record(operation: &str, body: Vec<u8>) -> AgentEnvelope {
+        AgentEnvelope::event(
+            laser_wire::agent::RecordId::from_u128(1),
+            laser_wire::agent::ConversationId::from_u128(2),
+            "writer".parse().expect("a valid agent id"),
+            body,
+        )
+        .with_operation(operation)
     }
 }
 

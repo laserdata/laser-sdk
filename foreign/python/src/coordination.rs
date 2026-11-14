@@ -222,7 +222,7 @@ impl PyPreparedMutation {
 /// the same `PreparedMutation`), or `reconcile_target_precondition` (read the
 /// target and reconcile through the fenced CAS precondition).
 #[gen_stub_pyclass]
-#[pyclass(name = "AmbiguousMutationRecovery", frozen, eq, skip_from_py_object)]
+#[pyclass(name = "AmbiguousMutationRecovery", frozen, eq)]
 #[derive(Clone, PartialEq)]
 pub struct PyAmbiguousMutationRecovery {
     inner: AmbiguousMutationRecovery,
