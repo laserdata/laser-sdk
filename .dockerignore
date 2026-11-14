@@ -1,0 +1,15 @@
+.git
+**/target
+**/node_modules
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/local_data
+foreign/python/dist
+foreign/typescript/dist
+foreign/typescript/dist-test
+foreign/typescript/coverage
+foreign/typescript/artifacts
+foreign/typescript/*.tgz
+bdd/typescript/dist
+examples/typescript/dist

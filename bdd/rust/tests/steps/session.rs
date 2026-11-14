@@ -751,7 +751,7 @@ impl ActionGovernor for RefuseSessionStatus {
         if session_status
             && self
                 .remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                     left.checked_sub(1)
                 })
                 .is_ok()
@@ -761,7 +761,7 @@ impl ActionGovernor for RefuseSessionStatus {
         if action.operation == Some(laser_sdk::wire::agent::OPERATION_STATE_SNAPSHOT)
             && self
                 .snapshots
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                     left.checked_sub(1)
                 })
                 .is_ok()

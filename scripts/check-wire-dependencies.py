@@ -29,8 +29,9 @@ def main() -> None:
             archive.extractall(directory, filter="data")
         subprocess.run([
             "cargo", "deny", "--manifest-path", str(Path(directory) / name / "Cargo.toml"),
+            "--config", str(ROOT / "deny-wire.toml"),
             "--target", "wasm32-unknown-unknown", "--no-default-features",
-            "--features", FEATURES, "check", "--config", str(ROOT / "deny-wire.toml"), "bans",
+            "--features", FEATURES, "check", "bans",
         ], cwd=ROOT, check=True)
 
 

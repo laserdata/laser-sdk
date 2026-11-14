@@ -4,7 +4,7 @@
 services:
   rust-bdd:
     build:
-      context: ../..
+      context: ..
       dockerfile: bdd/rust/Dockerfile
 
   typescript-bdd:

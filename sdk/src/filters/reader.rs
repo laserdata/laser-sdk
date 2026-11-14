@@ -9,7 +9,7 @@ use crate::iggy::prelude::{
     Client, IggyClient, IggyError, IggyMessage, PolledMessages, PollingStrategy, StreamClient,
     TopicClient,
 };
-use crate::laser::{Laser, tcp_client};
+use crate::laser::{Laser, transport_client};
 use crate::nodes::{Answered, Target, is_route_stale, partition_primary};
 use crate::retry::{MANAGED_MUTATION, MANAGED_MUTATION_DEADLINE};
 use crate::stream::ConsumerStart;
@@ -524,7 +524,7 @@ impl FilteredReaderBuilder {
         // shared client is the only one there is.
         let coordinator = match self.laser.connection_string() {
             Some(connection_string) => {
-                let client = tcp_client(connection_string)?;
+                let client = transport_client(connection_string)?;
                 client.connect().await?;
                 Arc::new(client)
             }

@@ -7,8 +7,8 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/laserdata/laser-sdk"
-rust-version = "1.98.0"
-version = "0.9.3"
+rust-version = "1.100.0"
+version = "0.10.0"
 
 [workspace.dependencies]
 apache-avro = { version = "0.22.0" }
@@ -19,7 +19,6 @@ bon = { version = "3.10.3" }
 bson = { version = "3.1.0", features = ["serde"] }
 bytes = { version = "1.12.1" }
 ciborium = { version = "0.2.2" }
-colored = { version = "3.1.1" }
 dashmap = { version = "6.2.1" }
 ed25519-dalek = { version = "3.0.0" }
 futures = { version = "0.3.34" }
@@ -28,20 +27,20 @@ iggy = { version = "0.12.0" }
 iggy_binary_protocol = { version = "0.12.0" }
 iggy_common = { version = "0.12.0" }
 json-patch = { version = "5.0.0" }
-jsonschema = { version = "0.60.2", default-features = false }
+jsonschema = { version = "0.61.2", default-features = false }
 laser-sdk = { path = "sdk" }
 laser-test-support = { path = "test-support" }
-laser-wire = { path = "wire", version = "0.9.3" }
+laser-wire = { path = "wire", version = "0.10.0" }
 memchr = { version = "2.8.3" }
 ouroboros = { version = "0.18.5" }
-prost = { version = "0.14.4" }
+prost = { version = "0.14.6" }
 prost-reflect = { version = "0.16.5" }
 protox = { version = "0.10.0" }
+rcgen = { version = "0.14.10" }
 regex = { version = "1.13.1" }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 rmp-serde = { version = "1.3.1" }
 schemars = "1.2"
-secrecy = { version = "0.10.3" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 serde_urlencoded = { version = "0.7.1" }

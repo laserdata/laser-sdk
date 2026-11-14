@@ -1,6 +1,6 @@
 # Connect timeout and cleanup
 
-Rust, Python, and TypeScript give the initial connect a 30-second budget. The budget covers the TCP dial, the TLS handshake, the login, and the managed capability probe. The Iggy client retries a failed dial by itself. The budget stops those retries.
+Rust, Python, and TypeScript give the initial connect a 30-second budget. The budget covers the dial over TCP, QUIC or WebSocket, the TLS handshake, the login, and the managed capability probe. The Iggy client retries a failed dial by itself. The budget stops those retries.
 
 | Configuration | Rust builder | Python `Laser.connect` | TypeScript builder | Environment variable | Default |
 | --- | --- | --- | --- | --- | --- |

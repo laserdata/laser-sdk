@@ -429,11 +429,18 @@ void test("given_a_checkpoint_of_another_stream_or_topic_generation_when_read_th
 
 function cursor(): {
   revision: bigint
+  head: string | undefined
   document: unknown
   sinceSnapshot: number
   tail: Promise<void>
 } {
-  return { revision: 0n, document: undefined, sinceSnapshot: 0, tail: Promise.resolve() }
+  return {
+    revision: 0n,
+    head: undefined,
+    document: undefined,
+    sinceSnapshot: 0,
+    tail: Promise.resolve()
+  }
 }
 
 function delta(baseRevision: bigint, key: string, value: number): AgentEnvelope {

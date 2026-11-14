@@ -46,6 +46,7 @@ mod shutdown;
 mod signing;
 mod state;
 mod streaming;
+mod transports;
 #[cfg(feature = "query")]
 mod typed_topics;
 mod warm_dedup;

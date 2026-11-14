@@ -236,11 +236,11 @@ Feature: Managed sessions on a deployment that indexes them
       | stream generation |
 
   @lane_identity
-  Scenario: A lease from a deleted stream never heartbeats into its replacement
+  Scenario: A heartbeat of a deleted stream's lease never counts in its replacement
     Given a managed session stream whose agents heartbeat every 1 second
     When agent "planner" starts the session "old-lease"
     And the session source changes its stream generation
-    Then the old lease publishes no heartbeat into the recreated stream
+    Then no heartbeat of the old lease counts in the recreated stream
     When the session source is explicitly removed and registered again
     Then a fresh session can write lifecycle and state on the recovered lane
 

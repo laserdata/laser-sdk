@@ -164,7 +164,9 @@ def test_given_invalid_snapshot_bytes_when_decoded_then_should_raise_a_typed_err
         ("context_compaction.bin", ls.decode_context_compaction, ls.encode_context_compaction),
         ("context_retrieval.bin", ls.decode_context_retrieval, ls.encode_context_retrieval),
         ("state_delta.bin", ls.decode_state_delta, ls.encode_state_delta),
+        ("state_delta_base_op.bin", ls.decode_state_delta, ls.encode_state_delta),
         ("state_snapshot.bin", ls.decode_state_snapshot, ls.encode_state_snapshot),
+        ("state_snapshot_base_op.bin", ls.decode_state_snapshot, ls.encode_state_snapshot),
     ],
 )
 def test_given_context_or_state_fixture_when_reencoded_then_should_keep_exact_bytes(
@@ -172,6 +174,17 @@ def test_given_context_or_state_fixture_when_reencoded_then_should_keep_exact_by
 ):
     payload = FIXTURES.joinpath(name).read_bytes()
     assert encode(decode(payload)) == payload
+
+
+def test_given_state_fixtures_when_decoded_then_should_carry_the_base_op_id_only_when_set():
+    delta = ls.decode_state_delta(FIXTURES.joinpath("state_delta.bin").read_bytes())
+    assert "base_op_id" not in delta
+    chained = ls.decode_state_delta(FIXTURES.joinpath("state_delta_base_op.bin").read_bytes())
+    assert chained["base_op_id"] == "patch-3"
+    snapshot = ls.decode_state_snapshot(FIXTURES.joinpath("state_snapshot.bin").read_bytes())
+    assert "base_op_id" not in snapshot
+    headed = ls.decode_state_snapshot(FIXTURES.joinpath("state_snapshot_base_op.bin").read_bytes())
+    assert headed["base_op_id"] == "patch-4"
 
 
 def test_given_oversize_context_or_state_when_encoded_then_should_reject():
@@ -262,7 +275,18 @@ def test_given_session_read_request_when_reencoded_then_should_match_rust_and_ty
 
 @pytest.mark.parametrize(
     "name",
-    ["info", "page", "page_rebuilding", "events", "state", "links", "sources", "changes", "error"],
+    [
+        "info",
+        "page",
+        "page_rebuilding",
+        "events",
+        "state",
+        "state_head",
+        "links",
+        "sources",
+        "changes",
+        "error",
+    ],
 )
 def test_given_session_read_reply_when_reencoded_then_should_match_rust_and_typescript(name):
     payload = FIXTURES.joinpath(f"session_reply_{name}.bin").read_bytes()
@@ -272,6 +296,9 @@ def test_given_session_read_reply_when_reencoded_then_should_match_rust_and_type
         assert reply == {"Err": {"NotRegistered": "agents"}}
     if name == "state":
         assert reply["Ok"]["State"]["document"] == {"tasks": ["triage"]}
+        assert "head_op_id" not in reply["Ok"]["State"]
+    if name == "state_head":
+        assert reply["Ok"]["State"]["head_op_id"] == "op-2"
     if name == "page":
         assert "rebuilding" not in reply["Ok"]["Page"]
     if name == "page_rebuilding":

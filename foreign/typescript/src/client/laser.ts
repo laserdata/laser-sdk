@@ -849,7 +849,7 @@ export class Laser implements AsyncDisposable {
   }
 
   /**
-   * Connect using an Iggy connection string. Connecting gives up after 30 seconds, or `LASER_CONNECT_TIMEOUT_MS`, with a `TimeoutError` that says whether the server never accepted the connection or never answered the login. Use `Laser.builder().connectTimeout()` for another budget.
+   * Connect using an Iggy connection string over TCP, plain or TLS. The scheme is optional and may be `iggy://` or `iggy+tcp://`, other transports fail with `ConfigError`. Keep the connection string in `LASER_CONNECTION_STRING` and never print or log it. Connecting gives up after 30 seconds, or `LASER_CONNECT_TIMEOUT_MS`, with a `TimeoutError` that says whether the server never accepted the connection or never answered the login. Use `Laser.builder().connectTimeout()` for another budget.
    */
   static connect(connectionString: string, options: CallOptions = {}): Promise<Laser> {
     return connectUnless(options.signal, (signal) =>

@@ -38,7 +38,8 @@ def _data_root():
 
 
 class IggyTestServer:
-    def __init__(self):
+    def __init__(self, environment=None):
+        self._environment = dict(environment or {})
         self._temporary = None
         self._log = None
         self._process = None
@@ -80,6 +81,7 @@ class IggyTestServer:
                 "IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT": "1s",
             }
         )
+        env.update(self._environment)
         self._process = subprocess.Popen(
             [binary],
             env=env,
@@ -132,6 +134,16 @@ def _free_port():
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         return listener.getsockname()[1]
+
+
+def free_udp_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def free_tcp_port():
+    return _free_port()
 
 
 class IggyTestCluster:

@@ -224,7 +224,8 @@ export class LeaseRegistry {
           stream,
           sessions: sessions
             .slice(start, start + MAX_HEARTBEAT_SESSIONS)
-            .map((session) => WireConversationId.parse(session.toString()))
+            .map((session) => WireConversationId.parse(session.toString())),
+          streamGeneration: generation
         })
       )
       await producer.status(OPERATION_PROGRESS).body(body).contentType(ContentType.Cbor).send()

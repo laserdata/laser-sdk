@@ -77,6 +77,15 @@ Feature: Agent sessions over the log
     Then the second handle's snapshot is refused as a stale session
     And the folded session state is {"status": "escalated"} at revision 2
 
+  Scenario: A stale handle's next delta leaves the newer state document in place
+    When agent "planner" starts the session "contested"
+    And agent "reviewer" opens a second handle on the session
+    And the second handle's state sets "note" to "joined"
+    And the session state is replaced with {"status": "escalated"}
+    And the second handle's state is replaced with {"status": "closed"}
+    And the second handle's state sets "owner" to "reviewer"
+    Then the folded session state is {"status": "escalated"} at revision 2
+
   Scenario: A submitted session is picked up and completed by its agent
     Given agent "worker" ends every session it handles
     When "client" submits a session to agent "worker"

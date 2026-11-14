@@ -64,8 +64,9 @@ async def test_given_an_unreachable_server_when_connecting_then_should_use_the_e
 @pytest.mark.parametrize(
     "connection_string",
     [
-        "iggy+quic://iggy:iggy@127.0.0.1:8080",
-        "iggy+ws://iggy:iggy@127.0.0.1:8092",
+        "iggy+http://iggy:iggy@127.0.0.1:3000",
+        "iggy+quic://iggy:iggy@127.0.0.1:8080?tls=true",
+        "iggy+ws://iggy:iggy@127.0.0.1:8092?nodelay=true",
         "127.0.0.1:8090",
         "user:@127.0.0.1:8090",
         "iggy:iggy@127.0.0.1:8090?unknown=1",

@@ -152,7 +152,7 @@ mod tests {
         oracle.observe(corrupt);
         let summary = oracle.finish();
         assert_eq!(summary.missing, [2]);
-        assert!(summary.unexpected.is_empty());
+        assert_eq!(summary.unexpected, Vec::<u64>::new());
         assert_eq!(summary.duplicates, [0]);
         assert_eq!(summary.checksum_failures, [1]);
         assert_eq!(summary.ordering_violations, [0]);
@@ -186,9 +186,9 @@ mod tests {
 
         let summary = oracle.finish();
         assert_eq!(summary.late_arrivals, [7, 7]);
-        assert!(summary.duplicates.is_empty());
+        assert_eq!(summary.duplicates, Vec::<u64>::new());
         assert_eq!(summary.checksum_failures, [7]);
-        assert!(summary.ordering_violations.is_empty());
+        assert_eq!(summary.ordering_violations, Vec::<u64>::new());
         assert!(!summary.valid(policy));
     }
 }

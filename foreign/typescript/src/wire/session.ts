@@ -312,6 +312,19 @@ export interface SessionHeartbeat {
   readonly process: string
   readonly stream: string
   readonly sessions: readonly ConversationId[]
+  /** The creation time, in epoch microseconds, of the stream the leases were
+   * taken on. Absent when the writer does not know it. */
+  readonly streamGeneration?: bigint
+}
+
+/** Whether a reader counts `heartbeat` for the stream it read it from,
+ * created at `streamGeneration`. A stream deleted and created again keeps its
+ * name, so a heartbeat that names another generation is ignored. */
+export function sessionHeartbeatCountsFor(
+  heartbeat: SessionHeartbeat,
+  streamGeneration: bigint
+): boolean {
+  return heartbeat.streamGeneration === undefined || heartbeat.streamGeneration === streamGeneration
 }
 
 function validateSessionHeartbeat(heartbeat: SessionHeartbeat): void {
@@ -321,14 +334,17 @@ function validateSessionHeartbeat(heartbeat: SessionHeartbeat): void {
 
 export function encodeSessionHeartbeat(heartbeat: SessionHeartbeat): Map<string, unknown> {
   validateSessionHeartbeat(heartbeat)
-  return new Map<string, unknown>([
+  const map = new Map<string, unknown>([
     ["process", heartbeat.process],
     ["stream", heartbeat.stream],
     ["sessions", heartbeat.sessions.map((id) => id.toBytes())]
   ])
+  encodeU64Option(map, "stream_generation", heartbeat.streamGeneration)
+  return map
 }
 
 export function decodeSessionHeartbeat(map: CborMap, context: string): SessionHeartbeat {
+  const streamGeneration = field.optionalU64(map, "stream_generation", context)
   const heartbeat = {
     process: field.requiredString(map, "process", context),
     stream: field.requiredString(map, "stream", context),
@@ -336,7 +352,8 @@ export function decodeSessionHeartbeat(map: CborMap, context: string): SessionHe
       if (!(item instanceof Uint8Array))
         throw new CodecError(`sessions ${String(index)} must be bytes`, context, "sessions")
       return ConversationId.fromBytes(item)
-    })
+    }),
+    ...(streamGeneration !== undefined ? { streamGeneration } : {})
   }
   validateSessionHeartbeat(heartbeat)
   return heartbeat
@@ -495,6 +512,8 @@ export interface SessionStateView {
   readonly history: readonly StateChange[]
   readonly frontier?: SourceFrontier
   readonly complete: boolean
+  /** The `opId` of the delta that produced `revision`, when known. */
+  readonly headOpId?: string
 }
 
 export interface SessionLink {
@@ -1022,11 +1041,13 @@ function encodeStateView(state: SessionStateView): Map<string, unknown> {
   setList(map, "history", state.history, encodeStateChange)
   if (state.frontier !== undefined) map.set("frontier", encodeSourceFrontier(state.frontier))
   map.set("complete", state.complete)
+  if (state.headOpId !== undefined) map.set("head_op_id", state.headOpId)
   return map
 }
 
 function decodeStateView(map: CborMap, context: string): SessionStateView {
   const frontier = field.optionalMap(map, "frontier", context)
+  const headOpId = field.optionalString(map, "head_op_id", context)
   return {
     revision: field.requiredU64(map, "revision", context),
     document: cborToJson(map.get("document"), `${context}.document`),
@@ -1034,7 +1055,8 @@ function decodeStateView(map: CborMap, context: string): SessionStateView {
     ...(frontier !== undefined
       ? { frontier: decodeSourceFrontier(frontier, `${context}.frontier`) }
       : {}),
-    complete: field.requiredBoolean(map, "complete", context)
+    complete: field.requiredBoolean(map, "complete", context),
+    ...(headOpId !== undefined ? { headOpId } : {})
   }
 }
 

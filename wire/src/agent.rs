@@ -881,6 +881,9 @@ pub struct StateDelta {
     )]
     pub patch: Vec<json_patch::PatchOperation>,
     pub op_id: String,
+    /// The `op_id` of the delta that produced `base_revision`, when the writer knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_op_id: Option<String>,
 }
 
 /// The complete state document at its base revision.
@@ -889,6 +892,9 @@ pub struct StateDelta {
 pub struct StateSnapshot {
     pub base_revision: u64,
     pub document: serde_json::Value,
+    /// The `op_id` of the delta that produced `base_revision`, when the writer knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_op_id: Option<String>,
 }
 
 impl crate::validate::Validate for ContextManifest {
@@ -1022,6 +1028,7 @@ pub fn apply_json_patch(
     crate::validate::Validate::validate(&StateSnapshot {
         base_revision: 0,
         document: result.clone(),
+        base_op_id: None,
     })?;
     Ok(result)
 }

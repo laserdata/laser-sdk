@@ -12255,7 +12255,11 @@ interface SessionHeartbeat {
     readonly sessions: readonly WireConversationId[];
     // (undocumented)
     readonly stream: string;
+    readonly streamGeneration?: bigint;
 }
+
+// @public
+function sessionHeartbeatCountsFor(heartbeat: SessionHeartbeat, streamGeneration: bigint): boolean;
 
 // @public (undocumented)
 export interface SessionInfo {
@@ -12700,6 +12704,7 @@ export interface SessionStateView {
     readonly document: unknown;
     // (undocumented)
     readonly frontier?: SourceFrontier;
+    readonly headOpId?: string;
     // (undocumented)
     readonly history: readonly StateChange[];
     // (undocumented)
@@ -12962,6 +12967,7 @@ export interface StateChange {
 
 // @public (undocumented)
 interface StateDelta {
+    readonly baseOpId?: string;
     // (undocumented)
     readonly baseRevision: bigint;
     // (undocumented)
@@ -12975,6 +12981,7 @@ export type StateOutcome = "applied" | "rejected" | "stale" | "duplicate" | "unr
 
 // @public (undocumented)
 interface StateSnapshot {
+    readonly baseOpId?: string;
     // (undocumented)
     readonly baseRevision: bigint;
     // (undocumented)
@@ -15435,6 +15442,7 @@ declare namespace wire {
         decodeSessionSources,
         encodeSessionChanges,
         decodeSessionChanges,
+        sessionHeartbeatCountsFor,
         encodeSessionHeartbeat,
         decodeSessionHeartbeat,
         sessionErrorResultCode,

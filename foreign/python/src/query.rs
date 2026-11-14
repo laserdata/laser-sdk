@@ -62,7 +62,7 @@ impl PyLaser {
 
 /// One typed query row. Values are positionally aligned with `QueryResult.fields`.
 #[gen_stub_pyclass]
-#[pyclass(name = "Row", frozen, skip_from_py_object)]
+#[pyclass(name = "Row", frozen)]
 #[derive(Clone)]
 pub struct PyRow {
     inner: Row,
@@ -102,7 +102,7 @@ impl PyRow {
 /// value by field name or position with `row["name"]` or `row[0]`, like
 /// `sqlite3.Row`.
 #[gen_stub_pyclass]
-#[pyclass(name = "QueryRow", frozen, skip_from_py_object)]
+#[pyclass(name = "QueryRow", frozen)]
 #[derive(Clone)]
 pub struct PyQueryRow {
     inner: QueryRow,
@@ -361,7 +361,7 @@ impl PyQueryResult {
 /// Pagination info for a query result. `has_more` is exact and free. `total`
 /// is present only when the query asked for it with `with_total()`.
 #[gen_stub_pyclass]
-#[pyclass(name = "Page", frozen, skip_from_py_object)]
+#[pyclass(name = "Page", frozen)]
 #[derive(Clone)]
 pub struct PyPage {
     inner: laser_sdk::query::Page,

@@ -92,7 +92,7 @@ fn build_provenance(
 /// The agentic message spine: conversation, causality, routing, usage. Stamped on
 /// every agent message as headers.
 #[gen_stub_pyclass]
-#[pyclass(name = "Provenance", skip_from_py_object)]
+#[pyclass(name = "Provenance")]
 #[derive(Clone)]
 pub struct PyProvenance {
     pub(crate) inner: Provenance,

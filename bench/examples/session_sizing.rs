@@ -271,8 +271,7 @@ async fn completed(sessions: &Sessions) -> u64 {
         .results(1)
         .fetch()
         .await
-        .map(|page| u64::from(page.total_results))
-        .unwrap_or_default()
+        .map_or_default(|page| u64::from(page.total_results))
 }
 
 // Each session: its start, `per_session - 2` notes, and its end, published

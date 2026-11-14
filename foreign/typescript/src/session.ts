@@ -1202,7 +1202,13 @@ export class Session {
     return new Session(laser, config, conversation, {
       laneGuard: new LaneGuard(),
       terminal: {},
-      state: { revision: 0n, document: undefined, sinceSnapshot: 0, tail: Promise.resolve() },
+      state: {
+        revision: 0n,
+        head: undefined,
+        document: undefined,
+        sinceSnapshot: 0,
+        tail: Promise.resolve()
+      },
       redactor: defaultRedact
     })
   }

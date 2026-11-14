@@ -1026,13 +1026,25 @@ function parseReconnectRetries(value: string | undefined): number | undefined {
 }
 
 // The scheme is optional. A `://` after the userinfo has begun belongs to a
-// password, not to a scheme.
+// password, not to a scheme. `apache-iggy` dials TCP only, so QUIC and
+// WebSocket stay with the Rust and Python clients.
 function stripScheme(value: string): string {
   for (const scheme of ["iggy://", "iggy+tcp://"]) {
     if (value.startsWith(scheme)) return value.slice(scheme.length)
   }
   const separator = value.indexOf("://")
   if (separator >= 0 && !/[:@]/.test(value.slice(0, separator))) {
+    const scheme = value.slice(0, separator)
+    if (scheme === "iggy+quic" || scheme === "iggy+ws") {
+      throw new ConfigError(
+        "the TypeScript client connects over TCP, plain or TLS: use iggy:// or iggy+tcp://, QUIC and WebSocket are served by the Rust and Python clients"
+      )
+    }
+    if (scheme === "iggy+http") {
+      throw new ConfigError(
+        "iggy+http:// is not supported: HTTP has no binary request path for Laser features, use iggy:// or iggy+tcp://"
+      )
+    }
     throw new ConfigError("unsupported connection string scheme: use iggy:// or iggy+tcp://")
   }
   return value

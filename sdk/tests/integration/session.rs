@@ -1,22 +1,44 @@
 use crate::harness;
 use iggy::prelude::{
-    Consumer, Identifier, MessageClient, PollOptions, PollingStrategy, TopicClient,
+    Consumer, Identifier, MessageClient, PollOptions, PollingStrategy, StreamClient, TopicClient,
 };
 use laser_sdk::agent::{
     PendingControl, SessionConfig, SessionLayout, TopicRetention, derive_session_id,
 };
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{
-    AgentEnvelope, AgentId, AgentKind, CorrelationId, RecordId, SessionEnd, SessionStart, TaskState,
+    AgentEnvelope, AgentId, AgentKind, CorrelationId, OPERATION_PROGRESS, RecordId, SessionEnd,
+    SessionStart, TaskState,
 };
 use laser_sdk::wire::dispatch::DisplayType;
 use laser_sdk::wire::framing::decode_named;
 use laser_sdk::wire::session::SessionHeartbeat;
+use laser_sdk::wire::topics::AGENT_HEARTBEATS;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 fn agent() -> AgentId {
     "planner".parse().expect("planner is a valid agent id")
+}
+
+// Every heartbeat body on the default stream, in log order.
+async fn heartbeat_bodies(laser: &Laser) -> Vec<Vec<u8>> {
+    let mut cursor = laser
+        .topic(AGENT_HEARTBEATS)
+        .replay()
+        .expect("a heartbeat reader");
+    let mut bodies = Vec::new();
+    loop {
+        let batch = cursor.poll().await.expect("the heartbeats read");
+        if batch.is_empty() {
+            return bodies;
+        }
+        for message in batch {
+            let envelope: AgentEnvelope =
+                decode_named(&message.payload).expect("a heartbeat envelope");
+            bodies.push(envelope.body);
+        }
+    }
 }
 
 async fn lifecycle(laser: &Laser, session: ConversationId) -> Vec<(TaskState, Vec<u8>)> {
@@ -193,6 +215,72 @@ async fn given_a_held_lease_when_the_interval_passes_then_should_list_the_sessio
     assert!(heartbeat.sessions.contains(&session.conversation().into()));
     assert_eq!(heartbeat.stream, laser.default_stream().expect("stream"));
     drop(lease);
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_heartbeat_of_a_deleted_stream_when_it_lands_in_the_replacement_then_should_not_count()
+ {
+    let laser = harness::laser().await;
+    let stream = laser.default_stream().expect("stream").to_owned();
+    let sessions = laser.sessions_with(SessionConfig::new().heartbeat(Duration::from_millis(50)));
+    let (_session, lease) = sessions
+        .start()
+        .agent(agent())
+        .begin()
+        .await
+        .expect("the session starts");
+    let late = harness::eventually(|| async { heartbeat_bodies(&laser).await.pop() }).await;
+    drop(lease);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        laser
+            .stream(&stream)
+            .delete()
+            .await
+            .expect("the stream deletes")
+    );
+    laser
+        .bootstrap(4, TopicRetention::expire_after(Duration::from_secs(86_400)))
+        .await
+        .expect("the replacement bootstraps");
+    let generation = laser
+        .client()
+        .get_stream(&Identifier::named(&stream).expect("id"))
+        .await
+        .expect("the replacement reads")
+        .expect("the replacement exists")
+        .created_at
+        .as_micros();
+    // The server appends a send it processes after the stream was created
+    // again, since the replacement reuses the numeric ids.
+    laser
+        .agdx(
+            AgentTopic::Heartbeats,
+            agent(),
+            ConversationId::derive("late-heartbeat").into(),
+        )
+        .status(OPERATION_PROGRESS)
+        .body(late)
+        .content_type(ContentType::Cbor)
+        .send()
+        .await
+        .expect("the late heartbeat lands");
+    let landed: Vec<SessionHeartbeat> = heartbeat_bodies(&laser)
+        .await
+        .iter()
+        .map(|body| decode_named(body).expect("a heartbeat body"))
+        .collect();
+    assert!(
+        !landed.is_empty(),
+        "the late heartbeat is in the replacement"
+    );
+    assert!(
+        landed
+            .iter()
+            .all(|heartbeat| !heartbeat.counts_for(generation)),
+        "a heartbeat of the deleted stream counted in its replacement: {landed:?}"
+    );
 }
 
 #[tokio::test]

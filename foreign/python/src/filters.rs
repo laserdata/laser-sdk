@@ -229,7 +229,7 @@ impl PyFilterExpr {
 /// `.` and array indexes as `[n]`, such as `after.ground_stations[0]`. Build
 /// it with `FieldPath.parse`.
 #[gen_stub_pyclass]
-#[pyclass(name = "FieldPath", frozen, eq, skip_from_py_object)]
+#[pyclass(name = "FieldPath", frozen, eq)]
 #[derive(Clone, PartialEq, Eq)]
 pub struct PyFieldPath {
     inner: FieldPath,

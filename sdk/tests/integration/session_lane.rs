@@ -7,10 +7,10 @@ use laser_sdk::prelude::full::*;
 use laser_sdk::types::MintUlid;
 use laser_sdk::wire::agent::{
     AgentEnvelope, AgentId, AgentKind, Budget, CorrelationId, OPERATION_STATE_DELTA,
-    OPERATION_STATE_SNAPSHOT, RecordId, StateSnapshot, TaskState, TokenUsage,
+    OPERATION_STATE_SNAPSHOT, RecordId, StateDelta, StateSnapshot, TaskState, TokenUsage,
 };
 use laser_sdk::wire::dispatch::OPERATION_INVOKE_AGENT;
-use laser_sdk::wire::framing::encode_named;
+use laser_sdk::wire::framing::{decode_named, encode_named};
 use laser_sdk::wire::limits::MAX_MANIFEST_FRAGMENTS;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -444,6 +444,63 @@ async fn given_a_snapshot_at_the_reached_revision_with_another_document_when_the
 
 #[tokio::test]
 #[serial_test::serial(integration)]
+async fn given_a_handle_whose_delta_was_stale_when_it_writes_again_then_should_leave_the_winners_document()
+ {
+    let laser = harness::laser().await;
+    let (session, lease) = laser
+        .sessions()
+        .start()
+        .agent(agent("planner"))
+        .begin()
+        .await
+        .expect("the session starts");
+    let conversation = session.conversation();
+    let second = laser
+        .sessions()
+        .open(conversation)
+        .as_agent(agent("reviewer"));
+    second
+        .state()
+        .set("note", serde_json::json!("joined"))
+        .await
+        .expect("the second handle's first write lands");
+    await_state_deltas(&laser, conversation, 1).await;
+    session
+        .state()
+        .replace(serde_json::json!({"status": "escalated"}))
+        .await
+        .expect("the first handle's replace lands");
+    await_state_deltas(&laser, conversation, 2).await;
+    second
+        .state()
+        .replace(serde_json::json!({"status": "closed"}))
+        .await
+        .expect("the stale replace appends");
+    second
+        .state()
+        .set("owner", serde_json::json!("reviewer"))
+        .await
+        .expect("the delta after the stale one appends");
+    let deltas = await_state_deltas(&laser, conversation, 4).await;
+    let view = session.state().get().await.expect("the state folds");
+    assert_eq!(view.document, serde_json::json!({"status": "escalated"}));
+    assert_eq!(view.revision, 2);
+    assert_eq!(view.head_op_id.as_deref(), Some(deltas[1].op_id.as_str()));
+    assert_eq!(
+        deltas[1].base_op_id.as_deref(),
+        Some(deltas[0].op_id.as_str()),
+        "a seeded handle names the delta that produced the revision it read"
+    );
+    assert_eq!(
+        deltas[3].base_op_id.as_deref(),
+        Some(deltas[2].op_id.as_str()),
+        "a handle names its own last delta, applied or not"
+    );
+    drop(lease);
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
 async fn given_a_whole_float_checkpointed_as_an_integer_when_the_writer_snapshots_then_should_write_it()
  {
     let laser = harness::laser().await;
@@ -599,27 +656,32 @@ impl AgentHandler for Recording {
     }
 }
 
-// Wait until `count` state delta records of `conversation` are readable.
-async fn await_state_deltas(laser: &Laser, conversation: ConversationId, count: usize) {
+// Wait until `count` state delta records of `conversation` are readable and
+// return the ones that decode, in lane order.
+async fn await_state_deltas(
+    laser: &Laser,
+    conversation: ConversationId,
+    count: usize,
+) -> Vec<StateDelta> {
     harness::eventually(|| async {
         let records = laser
             .context(conversation)
             .fetch_with(vec![AgentTopic::Sessions], Box::new(LastN(100)))
             .await
             .ok()?;
-        let deltas = records
+        let deltas: Vec<_> = records
             .iter()
-            .filter(|record| {
-                record
-                    .envelope
-                    .as_ref()
-                    .and_then(|envelope| envelope.operation.as_deref())
-                    == Some(OPERATION_STATE_DELTA)
-            })
-            .count();
-        (deltas >= count).then_some(())
+            .filter_map(|record| record.envelope.as_ref())
+            .filter(|envelope| envelope.operation.as_deref() == Some(OPERATION_STATE_DELTA))
+            .collect();
+        (deltas.len() >= count).then(|| {
+            deltas
+                .into_iter()
+                .filter_map(|envelope| decode_named(&envelope.body).ok())
+                .collect()
+        })
     })
-    .await;
+    .await
 }
 
 // A state snapshot record as another writer on the session lane appends it.
@@ -635,6 +697,7 @@ fn state_snapshot(
         encode_named(&StateSnapshot {
             base_revision,
             document,
+            base_op_id: None,
         })
         .expect("the snapshot encodes"),
     );

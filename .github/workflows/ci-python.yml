@@ -120,7 +120,7 @@ jobs:
           enable-cache: true
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.98.0
+          toolchain: 1.100.0
       # The cluster tests build the laser-test-support binaries in the root workspace.
       # Only main saves caches, so pull request and tag copies never evict the ones every run restores.
       - uses: Swatinem/rust-cache@v2
@@ -198,7 +198,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         if: matrix.platform.manylinux == ''
         with:
-          toolchain: 1.98.0
+          toolchain: 1.100.0
       - uses: Swatinem/rust-cache@v2
         if: matrix.platform.manylinux == ''
         with:
@@ -269,7 +269,7 @@ jobs:
           python-version: "3.10"
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.98.0
+          toolchain: 1.100.0
       - uses: actions/download-artifact@v4
         with:
           name: sdist

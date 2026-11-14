@@ -5,7 +5,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pyme
 /// A message's position on the log: its partition and offset. Prints as
 /// `<partition_id>:<offset>`.
 #[gen_stub_pyclass]
-#[pyclass(name = "MessageId", frozen, eq, hash, skip_from_py_object)]
+#[pyclass(name = "MessageId", frozen, eq, hash)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PyMessageId {
     pub(crate) inner: MessageId,

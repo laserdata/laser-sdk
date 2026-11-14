@@ -1,6 +1,6 @@
 {
   "name": "@laserdata/laser-sdk",
-  "version": "0.9.3",
+  "version": "0.10.0",
   "description": "LaserData SDK over Apache Iggy: typed streaming, operational query, materialization, key-value state, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX).",
   "type": "module",
   "main": "./dist/index.js",
@@ -94,7 +94,7 @@
     "@typescript/native": "npm:typescript@^7.0.2",
     "c8": "^12.0.0",
     "eslint": "10.14.0",
-    "globals": "17.13.0",
+    "globals": "17.14.0",
     "prettier": "3.9.10",
     "typescript": "^6.0.3",
     "typescript-eslint": "8.72.1"

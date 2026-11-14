@@ -2699,8 +2699,18 @@ mod agent_fixtures {
             "state_delta.bin",
             &StateDelta {
                 base_revision: 3,
+                patch: vec![operation.clone()],
+                op_id: "patch-4".to_owned(),
+                base_op_id: None,
+            },
+        );
+        assert_frame(
+            "state_delta_base_op.bin",
+            &StateDelta {
+                base_revision: 3,
                 patch: vec![operation],
                 op_id: "patch-4".to_owned(),
+                base_op_id: Some("patch-3".to_owned()),
             },
         );
         assert_frame(
@@ -2708,6 +2718,15 @@ mod agent_fixtures {
             &StateSnapshot {
                 base_revision: 4,
                 document: serde_json::json!({"ready": true}),
+                base_op_id: None,
+            },
+        );
+        assert_frame(
+            "state_snapshot_base_op.bin",
+            &StateSnapshot {
+                base_revision: 4,
+                document: serde_json::json!({"ready": true}),
+                base_op_id: Some("patch-4".to_owned()),
             },
         );
     }
@@ -3677,6 +3696,13 @@ fn given_session_read_replies_when_encoded_then_should_match_golden_fixtures() {
         &SessionReply::Ok(SessionOutcome::State(canonical_session_state_view())),
     );
     assert_frame(
+        "session_reply_state_head.bin",
+        &SessionReply::Ok(SessionOutcome::State(SessionStateView {
+            head_op_id: Some("op-2".to_owned()),
+            ..canonical_session_state_view()
+        })),
+    );
+    assert_frame(
         "session_reply_links.bin",
         &SessionReply::Ok(SessionOutcome::Links(canonical_session_links_view())),
     );
@@ -3719,6 +3745,16 @@ fn given_session_read_replies_when_encoded_then_should_match_golden_fixtures() {
             process: "01KWM3K3XEP3NP5TN850J17YBR".to_owned(),
             stream: "agents".to_owned(),
             sessions: vec![id, ConversationId::from_u128(3)],
+            stream_generation: None,
+        },
+    );
+    assert_frame(
+        "session_heartbeat_generation.bin",
+        &SessionHeartbeat {
+            process: "01KWM3K3XEP3NP5TN850J17YBR".to_owned(),
+            stream: "agents".to_owned(),
+            sessions: vec![id, ConversationId::from_u128(3)],
+            stream_generation: Some(1_778_000_000_000_000),
         },
     );
     assert_frame(
@@ -3767,6 +3803,13 @@ fn given_session_http_payloads_when_encoded_then_should_match_golden_fixtures() 
     );
     assert_json("session_http_events.json", &canonical_session_events_page());
     assert_json("session_http_state.json", &canonical_session_state_view());
+    assert_json(
+        "session_http_state_head.json",
+        &SessionStateView {
+            head_op_id: Some("op-2".to_owned()),
+            ..canonical_session_state_view()
+        },
+    );
     assert_json("session_http_links.json", &canonical_session_links_view());
     assert_json("session_http_sources.json", &canonical_session_sources());
     assert_json(
@@ -4028,6 +4071,7 @@ fn canonical_session_state_view() -> SessionStateView {
         }],
         frontier: Some(canonical_session_frontier()),
         complete: true,
+        head_op_id: None,
     }
 }
 

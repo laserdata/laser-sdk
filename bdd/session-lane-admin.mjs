@@ -3,6 +3,7 @@ import {
   TopicRetention,
   isUnavailable,
 } from "../foreign/typescript/dist/index.js";
+import { INTERNAL_TRANSPORT } from "../foreign/typescript/dist/client/internals.js";
 
 const [endpoint, stream, change, countText, username] = process.argv.slice(2);
 const count = Number(countText);
@@ -28,6 +29,15 @@ try {
       if (topic === null)
         throw new Error("the current session lane is missing");
       process.stdout.write(topic.messagesCount.toString());
+      break;
+    }
+    case "stream created at": {
+      // The Python and TypeScript clients expose no stream creation time.
+      const details =
+        await laser[INTERNAL_TRANSPORT]().findSnapshotStream?.(stream);
+      if (details === undefined)
+        throw new Error("the session stream is missing");
+      process.stdout.write(details.createdAtMicros.toString());
       break;
     }
     case "writer credentials": {
