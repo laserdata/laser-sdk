@@ -42,13 +42,27 @@ jobs:
     defaults:
       run:
         working-directory: ${{ github.workspace }}
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
     outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      pr_run: ${{ steps.plan.outputs.pr_run }}
       run_ci: ${{ steps.decide.outputs.run_ci }}
       server_tests: ${{ steps.decide.outputs.server_tests }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Plan a label release
+        id: plan
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_FILE: ci-python.yml
+        run: ${{ github.workspace }}/scripts/ci/release-plan.sh
       - name: Decide the server-backed test mode
         id: decide
         env:
@@ -58,6 +72,7 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          RELEASE: ${{ steps.plan.outputs.release }}
         run: |
           run_ci=run
           mode=run
@@ -86,6 +101,11 @@ jobs:
           fi
           echo "python CI: ${run_ci}"
           echo "server-backed suites: ${mode}"
+          if [[ "${RELEASE}" == "yes" ]]; then
+            # The pull request run already tested this exact tree.
+            run_ci=skip
+            mode=skip
+          fi
           echo "run_ci=${run_ci}" >> "${GITHUB_OUTPUT}"
           echo "server_tests=${mode}" >> "${GITHUB_OUTPUT}"
 
@@ -284,24 +304,76 @@ jobs:
           python -c "import laser_sdk; print('sdist import passed')"
 
   # Publish to PyPI on a py-v* tag, using the laserdata account's trusted publisher.
+  # A merged pull request labelled `release` publishes the wheels and sdist
+  # that its own run built and tested, see flags.
   publish:
-    if: startsWith(github.ref, 'refs/tags/py-v')
-    needs: [test, wheels, sdist, sdist-install]
+    if: >-
+      always() &&
+      ((startsWith(github.ref, 'refs/tags/py-v') &&
+      needs.test.result == 'success' &&
+      needs.wheels.result == 'success' &&
+      needs.sdist.result == 'success' &&
+      needs.sdist-install.result == 'success') ||
+      needs.flags.outputs.release == 'yes')
+    needs: [flags, test, wheels, sdist, sdist-install]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
+      actions: read
+      contents: write
       id-token: write
     steps:
       - uses: actions/download-artifact@v4
+        if: needs.flags.outputs.release != 'yes'
         with:
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        if: needs.flags.outputs.release == 'yes'
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+          run-id: ${{ needs.flags.outputs.pr_run }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        if: needs.flags.outputs.release == 'yes'
+        with:
+          name: sdist
+          path: dist
+          run-id: ${{ needs.flags.outputs.pr_run }}
+          github-token: ${{ github.token }}
+      - name: Check the planned version
+        if: needs.flags.outputs.release == 'yes'
+        working-directory: ${{ github.workspace }}
+        env:
+          RELEASE_VERSION: ${{ needs.flags.outputs.version }}
+        run: |
+          if ! ls dist | grep --fixed-strings --quiet "laser_sdk-${RELEASE_VERSION}"; then
+            echo "the downloaded distributions are not version ${RELEASE_VERSION}" >&2
+            ls dist >&2
+            exit 1
+          fi
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
           # PEP 740 provenance: the trusted publisher signs digital attestations
           # for every distribution, so an installer can verify origin.
           attestations: true
+      - name: Tag the label release
+        if: needs.flags.outputs.release == 'yes'
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.flags.outputs.version }}
+        run: |
+          tag="py-v${RELEASE_VERSION}"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            echo "${tag} already exists"
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f "ref=refs/tags/${tag}" -f "sha=${GITHUB_SHA}" >/dev/null
+            echo "tagged ${tag}"
+          fi
 
   # One aggregate gate so branch protection requires a single check. Excludes
   # publish (tag-only). Fails if any of the test/build jobs did not succeed.

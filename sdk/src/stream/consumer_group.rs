@@ -1,7 +1,7 @@
 use crate::error::LaserError;
 use crate::filters::FilterPreviewBuilder;
 use crate::filters::reader::{FilteredReaderBuilder, SourceIncarnation};
-use crate::laser::Laser;
+use crate::laser::{Laser, is_missing_resource};
 use crate::stream::Topic;
 use crate::stream::transport::ConsumerBuilder;
 use iggy::prelude::{ConsumerGroupClient, ConsumerGroupDetails, Identifier, IggyError};
@@ -147,6 +147,25 @@ impl ConsumerGroup {
         })
     }
 
+    /// Delete the group with its stored offsets. Returns `false` when the
+    /// group, its topic or its stream did not exist. A recreated group is
+    /// another identity and inherits no policy.
+    pub async fn delete(&self) -> Result<bool, LaserError> {
+        let stream = Identifier::named(self.topic.stream()?)?;
+        let topic = Identifier::named(self.topic.name())?;
+        let group = self.identifier()?;
+        match self
+            .laser()
+            .client()
+            .delete_consumer_group(&stream, &topic, &group)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(error) if is_missing_group(&error) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub(crate) fn reader_with(
         &self,
         filter: FilterRef,
@@ -241,16 +260,20 @@ impl ConsumerGroup {
         })
     }
 
-    async fn native(&self) -> Result<ConsumerGroupDetails, LaserError> {
-        let stream = Identifier::named(self.topic.stream()?)?;
-        let topic = Identifier::named(self.topic.name())?;
-        let group = match &self.target {
+    fn identifier(&self) -> Result<Identifier, LaserError> {
+        Ok(match &self.target {
             GroupTarget::Name(name) => Identifier::named(name)?,
             GroupTarget::Id(id) => Identifier::numeric(
                 u32::try_from(*id)
                     .map_err(|_| LaserError::Config("consumer group id exceeds 32 bits"))?,
             )?,
-        };
+        })
+    }
+
+    async fn native(&self) -> Result<ConsumerGroupDetails, LaserError> {
+        let stream = Identifier::named(self.topic.stream()?)?;
+        let topic = Identifier::named(self.topic.name())?;
+        let group = self.identifier()?;
         self.laser()
             .client()
             .get_consumer_group(&stream, &topic, &group)
@@ -579,6 +602,14 @@ fn supersedes(known: &CatalogPosition, position: &CatalogPosition) -> bool {
                 || known.offset < position.offset
         }
     }
+}
+
+fn is_missing_group(error: &IggyError) -> bool {
+    is_missing_resource(error)
+        || matches!(
+            error,
+            IggyError::ConsumerGroupIdNotFound(..) | IggyError::ConsumerGroupNameNotFound(..)
+        )
 }
 
 #[cfg(test)]

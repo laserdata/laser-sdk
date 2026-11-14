@@ -64,7 +64,19 @@ TypeScript runs one publish attempt per connection at a time. The Apache Iggy cl
 
 A supplied TypeScript client has no connection recipe. After a connection failure, its owner must replace it. The SDK closes a socket that times out even when the client belongs to the caller. Its pending response prevents safe reuse.
 
-Retries keep message IDs, payloads, headers, and the selected routing. Rust and TypeScript retry batches in chunks of 1000 records and never resend an earlier confirmed chunk. Delivery remains at-least-once, so a record can arrive more than once. A lost acknowledgement can cause a duplicate even when the message ID stays the same. Effects must be idempotent, which means that repeating them does not change the result. An agent reply deadline, such as incident-desk's `DESK_TIMEOUT`, is separate from the publish timeout.
+Retries keep message IDs, payloads, headers, and the selected routing. Rust and TypeScript retry batches in chunks of 1000 records and never resend an earlier confirmed chunk. Without an idempotent producer, delivery remains at-least-once, so a record can arrive more than once. A lost acknowledgement can cause a duplicate even when the message ID stays the same. Effects must be idempotent, which means that repeating them does not change the result. An agent reply deadline, such as incident-desk's `DESK_TIMEOUT`, is separate from the publish timeout.
+
+## Idempotent producers
+
+An idempotent producer writes each batch once per partition, also when a lost reply makes the producer send the batch again. The option is off by default. Turn it on with Rust `ProducerBuilder::idempotent()`, Python `Topic.producer(idempotent=True)`, or TypeScript `ProducerOptions.idempotent`.
+
+The producer takes a producer id, a number that identifies its batches. Rust and Python take the id from the Apache Iggy client, which builds it from the session number. TypeScript draws a random id from the same 63-bit range. Each batch carries the producer id, an epoch, and the sequence number of its first record. The sequence counts records per partition. The producer sends the batches of one partition one at a time, also in background mode, so the sequence order is the send order.
+
+The partition keeps the last five batches of each producer. When a batch arrives again, the partition does not write it, and the reply gives the offset of the first write. A resend after a lost reply, a timeout, or a reconnect keeps the producer section and the message IDs of the first attempt. The retry count and delay of the producer apply. If retries are zero, the producer does not resend.
+
+A partition forgets a producer after one day without a write, or when it must make room for other producers. If a partition does not know the producer, the producer starts a new epoch at sequence 0 and sends the batch again. If an earlier send of that batch had no reply, the send fails instead, because that earlier send can have landed. After a batch fails for good, the next batch starts a new epoch, so it never follows a gap. If a newer epoch of the same producer wrote to the partition, the server answers Apache Iggy error code 93, and the producer refuses every later send.
+
+The server must support producer sections. A server without this support refuses the batch with an error. All three SDKs read records that an idempotent producer wrote. A reader on an older Apache Iggy client can refuse such batches. The producer id lives in the producer. A new producer, or a restarted process, gets a new id, so the protection covers resends of one producer only. Keep the business idempotency keys that the rest of this page describes.
 
 ## Longer outages
 

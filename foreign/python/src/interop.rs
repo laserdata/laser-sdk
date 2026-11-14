@@ -179,8 +179,11 @@ impl PyA2aBridge {
     /// `task_binding_key` (32 bytes) with `task_binding_ttl_ms` binds every
     /// task id to the caller that submitted it, as Rust `with_task_binding`.
     /// Task methods then need `caller`, the authenticated principal.
+    ///
+    /// `allowed_origins` lists the browser origins `serve` accepts on the
+    /// JSON-RPC endpoint, each as the exact `Origin` header value.
     #[new]
-    #[pyo3(signature = (laser, source, request_topic, reply_topic, *, capabilities=None, signing_key=None, task_binding_key=None, task_binding_ttl_ms=None, target=None, public_url=None, description=None, version=None))]
+    #[pyo3(signature = (laser, source, request_topic, reply_topic, *, capabilities=None, signing_key=None, task_binding_key=None, task_binding_ttl_ms=None, target=None, public_url=None, description=None, version=None, allowed_origins=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         laser: PyRef<'_, PyLaser>,
@@ -196,6 +199,7 @@ impl PyA2aBridge {
         public_url: Option<String>,
         description: Option<String>,
         version: Option<String>,
+        allowed_origins: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let mut bridge = A2aBridge::new(
             laser.inner.clone(),
@@ -226,6 +230,9 @@ impl PyA2aBridge {
         if let Some(version) = version {
             bridge = bridge.with_version(version);
         }
+        if let Some(origins) = allowed_origins {
+            bridge = bridge.with_allowed_origins(origins);
+        }
         match (task_binding_key, task_binding_ttl_ms) {
             (None, None) => {}
             (Some(key), Some(ttl_ms)) => {
@@ -250,6 +257,36 @@ impl PyA2aBridge {
             inner: Held::new(bridge),
             source,
         })
+    }
+
+    /// Serve the bridge over HTTP on `host` and `port`, port 0 picking a free
+    /// one. `POST /` is the JSON-RPC endpoint and `GET
+    /// /.well-known/agent-card.json` the Agent Card, signed with the bridge's
+    /// key when it has one and answered with 404 until `public_url` is set. A
+    /// request without an `Origin` header, a non-browser client, passes the
+    /// endpoint, and so does a browser origin in `allowed_origins` or a
+    /// same-origin page on an IP literal or `localhost` host. Every other
+    /// browser request gets 403. The card is public and served to any origin.
+    /// `caller` takes the request headers as a dict with lowercase names and
+    /// returns the authenticated principal, or None for none. It may be async.
+    /// A hook that raises or returns anything else refuses the request with
+    /// 401.
+    #[pyo3(signature = (host="127.0.0.1".to_owned(), port=0, *, caller=None))]
+    fn serve<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        port: u16,
+        #[gen_stub(override_type(type_repr = "typing.Optional[typing.Callable[[dict[str, str]], typing.Union[typing.Optional[str], typing.Awaitable[typing.Optional[str]]]]]", imports = ("typing",)))]
+        caller: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Awaitable<'py, crate::bridge_http::PyBridgeServer>> {
+        let caller = caller
+            .map(|caller| {
+                crate::async_bridge::PyHook::new(caller, "__call__", "an A2A caller hook")
+            })
+            .transpose()?;
+        let router = crate::bridge_http::with_caller(self.inner.get().router(), caller);
+        crate::bridge_http::serve(py, router, host, port)
     }
 
     /// Handle one A2A JSON-RPC request. `caller` is the authenticated
@@ -449,9 +486,11 @@ impl PyMcpBridge {
     /// agent with a verifier accepts them. `target` addresses every call that
     /// names no target to that agent, whose reply must then be signed by it
     /// when the laser verifies replies. Every tool call carries the
-    /// `bridge_hops` loop-guard path, starting at `source`.
+    /// `bridge_hops` loop-guard path, starting at `source`. `allowed_origins`
+    /// lists the browser origins `serve` accepts, each as the exact `Origin`
+    /// header value.
     #[new]
-    #[pyo3(signature = (laser, source, tool_topic, reply_topic, server_name, *, tools=None, resources=None, prompts=None, timeout_ms=None, memory_tools=false, signing_key=None, target=None))]
+    #[pyo3(signature = (laser, source, tool_topic, reply_topic, server_name, *, tools=None, resources=None, prompts=None, timeout_ms=None, memory_tools=false, signing_key=None, target=None, allowed_origins=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         laser: PyRef<'_, PyLaser>,
@@ -466,6 +505,7 @@ impl PyMcpBridge {
         memory_tools: bool,
         signing_key: Option<PyRef<'_, crate::sign::PySigningKey>>,
         target: Option<String>,
+        allowed_origins: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let tools: Vec<ToolSpec> = tools.map(py_to_de).transpose()?.unwrap_or_default();
         let resources: Vec<ResourceSpec> = resources.map(py_to_de).transpose()?.unwrap_or_default();
@@ -506,10 +546,30 @@ impl PyMcpBridge {
         if let Some(target) = target_agent(target)? {
             bridge = bridge.with_target(target);
         }
+        if let Some(origins) = allowed_origins {
+            bridge = bridge.with_allowed_origins(origins);
+        }
         Ok(Self {
             inner: Held::new(bridge),
             source,
         })
+    }
+
+    /// Serve the bridge over MCP Streamable HTTP on `host` and `port`, port 0
+    /// picking a free one. `POST /` takes one JSON-RPC message and answers it,
+    /// or answers 202 with no body for a notification. An unsupported
+    /// `MCP-Protocol-Version` header gets 400. A request without an `Origin`
+    /// header, a non-browser client, passes, and so does a browser origin in
+    /// `allowed_origins` or a same-origin page on an IP literal or `localhost`
+    /// host. Every other browser request gets 403.
+    #[pyo3(signature = (host="127.0.0.1".to_owned(), port=0))]
+    fn serve<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        port: u16,
+    ) -> PyResult<Awaitable<'py, crate::bridge_http::PyBridgeServer>> {
+        crate::bridge_http::serve(py, self.inner.get().router(), host, port)
     }
 
     /// Handle one MCP JSON-RPC message. A notification, a message without an

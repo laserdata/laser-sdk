@@ -51,6 +51,7 @@ import {
   type PollFailures
 } from "./consumer.js"
 import { MAX_FILTERED_PAGE_BYTES } from "../wire/limits.js"
+import { adminOperation } from "./admin.js"
 import { joinSeeds, storeSeeds } from "./consumer-start.js"
 import type { Topic } from "./topic.js"
 
@@ -226,6 +227,25 @@ export class ConsumerGroup {
     return this.described(
       await abortable(this.native(), options.signal, "consumer group info"),
       options
+    )
+  }
+
+  /**
+   * Deletes the group with its stored offsets. Resolves `false` when the
+   * group, its topic or its stream did not exist. A recreated group is
+   * another identity and inherits no policy.
+   */
+  async delete(options: CallOptions = {}): Promise<boolean> {
+    throwIfAborted(options.signal, "consumer group delete")
+    const remove = adminOperation(
+      this.transport.deleteConsumerGroup?.bind(this.transport),
+      "consumer group delete"
+    )
+    const group = this.target.kind === "name" ? this.target.name : Number(this.target.id)
+    return abortable(
+      remove(this.streamName, this.topicName, group),
+      options.signal,
+      "consumer group delete"
     )
   }
 

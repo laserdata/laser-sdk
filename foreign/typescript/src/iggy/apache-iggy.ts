@@ -8,12 +8,30 @@ import { JOIN_GROUP } from "apache-iggy/dist/wire/consumer-group/join-group.comm
 import { SYNC_GROUP } from "apache-iggy/dist/wire/consumer-group/sync-group.command.js"
 import { GET_STREAM } from "apache-iggy/dist/wire/stream/get-stream.command.js"
 import { GET_TOPIC } from "apache-iggy/dist/wire/topic/get-topic.command.js"
+import { GET_STREAMS } from "apache-iggy/dist/wire/stream/get-streams.command.js"
+import { deserializeToStream } from "apache-iggy/dist/wire/stream/stream.utils.js"
+import { GET_TOPICS } from "apache-iggy/dist/wire/topic/get-topics.command.js"
+import {
+  type BaseTopic,
+  deserializeBaseTopic,
+  deserializePartition
+} from "apache-iggy/dist/wire/topic/topic.utils.js"
 import {
   FETCH_MESSAGES,
   fetchSectionError
 } from "apache-iggy/dist/wire/message/fetch-messages.command.js"
+import { serializeHeaders } from "apache-iggy/dist/wire/message/header.utils.js"
+import {
+  encodeMessagesBatch,
+  resolveMessageId
+} from "apache-iggy/dist/wire/message/message.utils.js"
+import { serializePartitioning } from "apache-iggy/dist/wire/message/partitioning.utils.js"
+import { SEND_MESSAGES } from "apache-iggy/dist/wire/message/send-messages.command.js"
+import { frameChecksum } from "apache-iggy/dist/wire/message/iggy-header.utils.js"
+import { serializeIdentifier } from "apache-iggy/dist/wire/identifier.utils.js"
 import { type CallOptions, delay, throwIfAborted } from "../client/call-options.js"
 import { connectOptions } from "../client/connect-options.js"
+import type { ConnectionEvent } from "../client/connection-events.js"
 import {
   publishOptions,
   publishWithin,
@@ -45,6 +63,7 @@ import type {
   SendMessagesConfirmation,
   SendMessagesResponse
 } from "apache-iggy"
+import { randomBytes } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { Socket, isIP } from "node:net"
 import { setTimeout as sleep } from "node:timers/promises"
@@ -62,6 +81,7 @@ import {
   UnsupportedError
 } from "../client/errors.js"
 import { LASERDATA_ROOT_CA } from "../client/laserdata-ca.js"
+import type { ConsumerGroupSummary, PartitionInfo, StreamInfo, TopicInfo } from "../stream/admin.js"
 import type { ConsumerStart } from "../stream/consumer-start.js"
 import type { HeaderValue } from "../stream/header-value.js"
 import type { Routing } from "../stream/routing.js"
@@ -142,13 +162,15 @@ export const UNLIMITED_TOPIC_SIZE = 18_446_744_073_709_551_615n
 export const NEVER_EXPIRE = 18_446_744_073_709_551_615n
 
 const TOPIC_NAME_ALREADY_EXISTS = 2013
-const NOT_FOUND_METADATA_CODES = new Set([1009, 1010, 2010, 2011])
+// A missing resource, stream, or topic, the set the Rust client reads as absent.
+// On publish, the cached routing may predate a deleted and recreated stream or topic.
+const MISSING_RESOURCE_CODES = new Set([20, 1009, 1010, 2010, 2011])
+const MISSING_GROUP_CODES = new Set([...MISSING_RESOURCE_CODES, 5000, 5003])
 const STREAM_NAME_NOT_FOUND = 1010
 const TOPIC_NAME_NOT_FOUND = 2011
-// A missing resource, stream, or topic on publish: the cached routing may
-// predate a deleted and recreated stream or topic.
-const MISSING_RESOURCE_CODES = new Set([20, 1009, 1010, 2010, 2011])
 const UNAUTHENTICATED = 40
+// The deadline Apache Iggy's own send gives each call.
+const IGGY_SEND_TIMEOUT_MS = 30_000
 // `InvalidJsonResponse` and `InvalidBytesResponse`: the batch committed and only
 // its confirmation was lost.
 const LOST_CONFIRMATION_CODES: ReadonlySet<number> = new Set([302, 303])
@@ -200,6 +222,9 @@ export function toNodeBuffer(bytes: Uint8Array): Buffer {
 export interface MessageWithHeaders {
   readonly payload: Uint8Array
   readonly headers: ReadonlyMap<string, HeaderValue>
+  /** An exact user-header block sent in place of `headers`, such as an
+   * encrypted one. */
+  readonly userHeaders?: Uint8Array
   /** The message id. A record without one, or with `0n`, gets a fresh id
    * before its first attempt, and every retry and a resend from a failure
    * report keep it, so the server deduplicates them. */
@@ -356,6 +381,30 @@ export interface LaserTransport {
   observePositions?(frontier: AppliedFrontier): void
   ensureStream(name: string): Promise<void>
   deleteStream(name: string): Promise<boolean>
+  listStreams?(): Promise<readonly StreamInfo[]>
+  /** Runs one server administration call on the raw client. A mutation is not repeated after a reconnect. */
+  administer?<Value>(
+    operation: (client: SimpleClient) => Promise<Value>,
+    message: string,
+    idempotent: boolean
+  ): Promise<Value>
+  findStream?(name: string): Promise<StreamInfo | undefined>
+  listTopics?(streamId: string): Promise<readonly TopicInfo[]>
+  findTopic?(
+    streamId: string,
+    topicId: string
+  ): Promise<
+    { readonly topic: TopicInfo; readonly partitions: readonly PartitionInfo[] } | undefined
+  >
+  deleteTopic?(streamId: string, topicId: string): Promise<boolean>
+  /** Drops the routing this transport cached for every topic of the stream. */
+  forgetStream?(name: string): void
+  /** Drops the routing this transport cached for the topic. */
+  forgetTopic?(streamId: string, topicId: string): void
+  addPartitions?(streamId: string, topicId: string, count: number): Promise<void>
+  deletePartitions?(streamId: string, topicId: string, count: number): Promise<void>
+  listConsumerGroups?(streamId: string, topicId: string): Promise<readonly ConsumerGroupSummary[]>
+  deleteConsumerGroup?(streamId: string, topicId: string, group: string | number): Promise<boolean>
   ensureTopic(
     streamId: string,
     topicId: string,
@@ -430,6 +479,9 @@ export interface LaserTransport {
         readonly batchLength?: number
         /** Background mode: resend at once, then every this many milliseconds, any failure but a lost confirmation. */
         readonly fixedRetryIntervalMs?: number
+        /** Sends each batch with the producer section of its partition, so a resend is written once.
+         * @internal */
+        readonly idempotence?: ProducerSequences
         readonly beforeSend?: () => Promise<{
           readonly streamId: number
           readonly topicId: number
@@ -532,6 +584,8 @@ export interface LaserTransport {
   publishTimeoutMs?(): number
   /** The publish timeout, retry count, and backoff this connection uses. */
   publishOptions?(): PublishOptions
+  /** Registers `listener` for the connection events from now on, and returns what removes it. */
+  watchConnection?(listener: (event: ConnectionEvent) => void): () => void
   close(): Promise<void>
 }
 
@@ -761,6 +815,44 @@ export function validateReplicationFactor(factor: number): void {
     throw new InvalidError(`replication factor must be 1..=${String(MAX_REPLICATION_FACTOR)}`)
 }
 
+export function validateCount(count: number): void {
+  if (!Number.isInteger(count) || count < 1)
+    throw new InvalidError("count must be greater than zero")
+}
+
+// One delete call, a missing target reads as `false`.
+async function absentAsFalse(
+  deletion: Promise<unknown>,
+  missing: ReadonlySet<number>
+): Promise<boolean> {
+  try {
+    await deletion
+    return true
+  } catch (error) {
+    if (missing.has(serverErrorCode(error) ?? -1)) return false
+    throw error
+  }
+}
+
+function topicInfo(topic: BaseTopic, createdAtMicros: bigint): TopicInfo {
+  const factor = topic.options["replication_factor"] ?? topic.derivedOptions["replication_factor"]
+  return {
+    id: topic.id,
+    name: topic.name,
+    partitionsCount: topic.partitionsCount,
+    ...(typeof factor === "number" ? { replicationFactor: factor } : {}),
+    ...(topic.messageExpiry === 0n || topic.messageExpiry === NEVER_EXPIRE
+      ? {}
+      : { messageExpiryMs: Number(topic.messageExpiry) / 1000 }),
+    ...(topic.maxTopicSize === 0n || topic.maxTopicSize === UNLIMITED_TOPIC_SIZE
+      ? {}
+      : { maxSizeBytes: topic.maxTopicSize }),
+    sizeBytes: topic.sizeBytes,
+    messagesCount: topic.messagesCount,
+    createdAtMicros
+  }
+}
+
 export function serverErrorCode(error: unknown): number | undefined {
   let current = error
   for (let depth = 0; depth < 8; depth += 1) {
@@ -832,8 +924,6 @@ export function decodePolledBody(body: Uint8Array): readonly PolledMessage[] {
       const frameEnd = headersStart + headersLength
       if (frameEnd > batchEnd) throw malformed("message frame")
       const block = body.subarray(headersStart, frameEnd)
-      const headers = decodeUserHeaders(block)
-      const contentType = headers === "entry" ? decodeUserHeaders(block, true) : headers
       const message: PolledMessage = {
         payload: body.subarray(payloadStart, headersStart),
         partitionId,
@@ -845,18 +935,243 @@ export function decodePolledBody(body: Uint8Array): readonly PolledMessage[] {
         originTimestampMicros: originTimestamp + BigInt(view.getUint32(position + 28, true)),
         currentOffset,
         ...(block.byteLength > 0 ? { userHeaders: block } : {}),
-        ...(typeof headers === "string"
-          ? {
-              headers: typeof contentType === "string" ? new Map() : contentType,
-              headersMalformed: typeof contentType === "string" ? contentType : headers
-            }
-          : { headers })
+        ...decodeHeaderBlock(block)
       }
       messages.push(Object.defineProperty(message, "context", { value: context }))
       position = frameEnd
     }
   }
   return messages
+}
+
+/** The typed headers of a user-header block, with what did not decode. A
+ * block whose entries do not all decode keeps a valid content type. */
+export function decodeHeaderBlock(block: Uint8Array): {
+  readonly headers: ReadonlyMap<string, HeaderValue>
+  readonly headersMalformed?: HeaderFault
+} {
+  const headers = decodeUserHeaders(block)
+  if (typeof headers !== "string") return { headers }
+  const contentType = headers === "entry" ? decodeUserHeaders(block, true) : headers
+  return {
+    headers: typeof contentType === "string" ? new Map() : contentType,
+    headersMalformed: typeof contentType === "string" ? contentType : headers
+  }
+}
+
+/** The Apache Iggy user-header block of `headers`, as a send encodes it. */
+export function encodeHeaderBlock(headers: ReadonlyMap<string, HeaderValue>): Uint8Array {
+  return new Uint8Array(serializeHeaders(headerEntries(headers)))
+}
+
+function headerEntries(headers: ReadonlyMap<string, HeaderValue>) {
+  return [...headers].map(([key, value]) => ({
+    key: HeaderKeyFactory.String(key),
+    value: toIggyHeaderValue(value)
+  }))
+}
+
+// Sends an encoded send request under the guard of the Apache Iggy client's
+// own send: one held operation, its send deadline, and the session lineage the
+// call started with, so no part of it runs under a later session.
+async function sendRaw(client: SimpleClient, request: Buffer): Promise<SendMessagesResponse> {
+  const link = await client.clientProvider()
+  const release = link.hold?.()
+  try {
+    const call = {
+      deadline: Date.now() + IGGY_SEND_TIMEOUT_MS,
+      ...(link.lineage === undefined ? {} : { lineage: link.lineage })
+    }
+    return SEND_MESSAGES.deserialize(await link.sendCommand(SEND_MESSAGES.code, request, call))
+  } finally {
+    release?.()
+  }
+}
+
+const BATCH_HEADER_SIZE = 256
+const FRAME_HEADER_SIZE = 48
+const MESSAGE_COUNT_OFFSET = 48
+const CHECKSUM_OFFSET = 40
+const PRODUCER_OFFSET = 52
+const PRODUCER_ID_OFFSET = 56
+const PRODUCER_EPOCH_OFFSET = 64
+const PRODUCER_SEQUENCE_OFFSET = 68
+const PRODUCER_RESERVED_OFFSET = 72
+const PRODUCER_ID_MAX = (1n << 63n) - 1n
+const EPOCH_MAX = 0x7fff
+const SEQUENCE_SPAN = 0x8000_0000
+
+/** A newer epoch of the producer wrote to the partition. */
+export const PRODUCER_EPOCH_FENCED = 93
+/** The partition holds no state for the producer. */
+export const PRODUCER_UNKNOWN = 94
+/** Sends of one batch under a new epoch after the partition forgot the producer. */
+export const PRODUCER_RESENDS = 3
+
+/** The producer section of one batch: the producer id, its epoch, and the
+ * sequence of the first record. */
+export interface BatchProducer {
+  readonly producerId: bigint
+  readonly epoch: number
+  readonly baseSequence: number
+}
+
+interface PartitionSequence {
+  producerId: bigint
+  epoch: number
+  next: number
+  lane: Promise<void>
+}
+
+// A producer id the size of a positive i64. Apache Iggy builds its ids from
+// the session number, which this client does not expose, so the id is drawn
+// at random from the same range.
+function randomProducerId(): bigint {
+  const id = randomBytes(8).readBigUInt64LE(0) & PRODUCER_ID_MAX
+  return id === 0n ? 1n : id
+}
+
+/** The idempotent state of one producer: its id and epoch, and the next
+ * sequence of each partition. A partition writes a batch of one producer
+ * once, so a resend with the same section answers the first write.
+ * @internal */
+export class ProducerSequences {
+  private producerId: bigint | undefined
+  private epoch = 0
+  private fenced = false
+  private readonly partitions = new Map<number, PartitionSequence>()
+
+  /** Runs `send` alone among the batches of `partition`, so the sequence
+   * order is the send order. */
+  async exclusive<T>(partition: number, send: () => Promise<T>): Promise<T> {
+    const sequence = this.partition(partition)
+    const previous = sequence.lane
+    let release = (): void => undefined
+    sequence.lane = new Promise((resolve) => {
+      release = resolve
+    })
+    await previous
+    try {
+      return await send()
+    } finally {
+      release()
+    }
+  }
+
+  /** The section of the next batch of `partition`. A new id or epoch starts
+   * the partition again at sequence 0. */
+  section(partition: number): BatchProducer {
+    if (this.fenced) {
+      throw new TransportError("a newer copy of this idempotent producer took over", false, {
+        cause: Object.assign(new Error("producer epoch fenced"), {
+          errorCode: PRODUCER_EPOCH_FENCED
+        })
+      })
+    }
+    const producerId = (this.producerId ??= randomProducerId())
+    const sequence = this.partition(partition)
+    if (sequence.producerId !== producerId || sequence.epoch !== this.epoch) {
+      sequence.producerId = producerId
+      sequence.epoch = this.epoch
+      sequence.next = 0
+    }
+    return { producerId, epoch: this.epoch, baseSequence: sequence.next }
+  }
+
+  /** Records the written batch of `count` records that `section` started. */
+  advance(partition: number, section: BatchProducer, count: number): void {
+    const sequence = this.partition(partition)
+    if (sequence.producerId === section.producerId && sequence.epoch === section.epoch)
+      sequence.next = (section.baseSequence + count) % SEQUENCE_SPAN
+  }
+
+  /** Moves past the epoch of `section`, so the next batch never follows a
+   * hole. The last epoch moves to a new producer id. */
+  nextEpoch(section: BatchProducer): void {
+    if (section.producerId !== this.producerId || section.epoch !== this.epoch) return
+    if (this.epoch === EPOCH_MAX) {
+      this.producerId = randomProducerId()
+      this.epoch = 0
+    } else {
+      this.epoch += 1
+    }
+  }
+
+  /** A newer copy of this producer wrote to a partition, so this one stops. */
+  fence(): void {
+    this.fenced = true
+  }
+
+  private partition(partition: number): PartitionSequence {
+    let sequence = this.partitions.get(partition)
+    if (sequence === undefined) {
+      sequence = { producerId: 0n, epoch: -1, next: 0, lane: Promise.resolve() }
+      this.partitions.set(partition, sequence)
+    }
+    return sequence
+  }
+}
+
+/** Writes the producer section into an encoded batch and checksums the batch
+ * again, as Apache Iggy hashes the section after the message count. */
+export function stampProducer(batch: Buffer, producer: BatchProducer): Buffer {
+  batch.fill(0, PRODUCER_OFFSET, PRODUCER_RESERVED_OFFSET)
+  batch.writeUInt8(1, PRODUCER_OFFSET)
+  batch.writeBigUInt64LE(producer.producerId, PRODUCER_ID_OFFSET)
+  batch.writeUInt16LE(producer.epoch, PRODUCER_EPOCH_OFFSET)
+  batch.writeUInt32LE(producer.baseSequence, PRODUCER_SEQUENCE_OFFSET)
+  const count = batch.readUInt32LE(MESSAGE_COUNT_OFFSET)
+  const checksums: Buffer[] = []
+  for (let at = BATCH_HEADER_SIZE, index = 0; index < count; index += 1) {
+    checksums.push(batch.subarray(at, at + 8))
+    at += FRAME_HEADER_SIZE + batch.readUInt32LE(at + 32) + batch.readUInt32LE(at + 36)
+  }
+  // The frame checksum hashes everything past its first eight bytes.
+  const hashed = Buffer.concat([
+    Buffer.alloc(8),
+    batch.subarray(0, CHECKSUM_OFFSET),
+    batch.subarray(MESSAGE_COUNT_OFFSET, PRODUCER_OFFSET + 1),
+    batch.subarray(PRODUCER_ID_OFFSET, PRODUCER_EPOCH_OFFSET + 2),
+    batch.subarray(PRODUCER_SEQUENCE_OFFSET, PRODUCER_RESERVED_OFFSET),
+    ...checksums
+  ])
+  batch.writeBigUInt64LE(frameChecksum(hashed), CHECKSUM_OFFSET)
+  return batch
+}
+
+interface RawRecord {
+  readonly id: bigint
+  readonly payload: Buffer
+  readonly userHeaders: Buffer
+}
+
+// A send request whose records carry exact user-header blocks or a producer
+// section, which the Apache Iggy client's own send cannot take.
+function encodeRawSend(
+  streamId: string | number,
+  topicId: string | number,
+  partition: number,
+  records: readonly RawRecord[],
+  producer?: BatchProducer
+): Buffer {
+  const stream = serializeIdentifier(streamId)
+  const topic = serializeIdentifier(topicId)
+  const partitioning = serializePartitioning(Partitioning.PartitionId(partition))
+  const count = Buffer.alloc(4)
+  count.writeUInt32LE(records.length)
+  const metadata = Buffer.alloc(4)
+  metadata.writeUInt32LE(stream.length + topic.length + partitioning.length + count.length)
+  const sentAt = BigInt(Date.now()) * US_PER_MS
+  const batch = encodeMessagesBatch(
+    records.map((record) => ({
+      id: resolveMessageId(record.id),
+      payload: record.payload,
+      userHeaders: record.userHeaders,
+      originTimestamp: sentAt
+    }))
+  )
+  if (producer !== undefined) stampProducer(batch, producer)
+  return Buffer.concat([metadata, stream, topic, partitioning, count, batch])
 }
 
 // The typed user headers as the server reads them for a filter: string keys
@@ -1361,6 +1676,14 @@ function transportUp(raw: RawClient | undefined): boolean {
 
 // A stream or topic a lookup found missing, carrying Apache Iggy's code for it
 // so it classifies like the server's own refusal.
+/** The stream-or-topic-not-found failure for a topic the server does not hold. */
+export function missingTopic(streamId: string, topicId: string): TransportError {
+  return missingResource(
+    `topic \`${topicId}\` on stream \`${streamId}\` does not exist`,
+    TOPIC_NAME_NOT_FOUND
+  )
+}
+
 function missingResource(message: string, errorCode: number): TransportError {
   return new TransportError(message, false, {
     cause: Object.assign(new Error(message), { errorCode })
@@ -1882,6 +2205,8 @@ export class ApacheIggyTransport implements LaserTransport {
   // Ends a redial that `close` overtakes, so a closed transport keeps no client.
   private readonly lifetime = new AbortController()
   private closed = false
+  private readonly connectionListeners = new Set<(event: ConnectionEvent) => void>()
+  private sessionLost = false
 
   private constructor(
     private client: SimpleClient,
@@ -1889,7 +2214,47 @@ export class ApacheIggyTransport implements LaserTransport {
     private readonly ownership: ClientOwnership,
     private readonly publishConfig: PublishOptions,
     readonly nodes: Nodes = new Nodes()
-  ) {}
+  ) {
+    void this.observeConnection(client)
+  }
+
+  watchConnection(listener: (event: ConnectionEvent) => void): () => void {
+    this.connectionListeners.add(listener)
+    return () => {
+      this.connectionListeners.delete(listener)
+    }
+  }
+
+  private announce(...events: readonly ConnectionEvent[]): void {
+    for (const event of events)
+      for (const listener of [...this.connectionListeners]) listener(event)
+  }
+
+  // The client resumes a lost session by itself and moves between nodes on a
+  // leader change. Only the end of a signed-in session is a disconnect, and the
+  // first heartbeat after it proves the session is back.
+  private async observeConnection(client: SimpleClient): Promise<void> {
+    const raw = await client.clientProvider().catch(() => undefined)
+    if (typeof raw?.on !== "function") return
+    raw.on("sessionReset", (signedIn) => {
+      if (signedIn === true && this.client === client) this.loseSession()
+    })
+    raw.on("heartbeat", () => {
+      if (this.client === client && raw.isAuthenticated) this.restoreSession()
+    })
+  }
+
+  private loseSession(): void {
+    if (this.sessionLost || this.closed) return
+    this.sessionLost = true
+    this.announce("disconnected")
+  }
+
+  private restoreSession(): void {
+    if (!this.sessionLost || this.closed) return
+    this.sessionLost = false
+    this.announce("connected", "signed_in")
+  }
 
   async replicaIds(): Promise<readonly number[]> {
     const metadata = await this.runner()(
@@ -1966,12 +2331,16 @@ export class ApacheIggyTransport implements LaserTransport {
       try {
         return await operation(this.client)
       } catch (cause) {
+        if (cause instanceof InvalidError) throw cause
         throw new TransportError(message, retryableFailure(cause), { cause })
       }
     }
     try {
       return await operation(stale)
     } catch (firstCause) {
+      // An argument the operation refused before it sent anything says
+      // nothing about the link.
+      if (firstCause instanceof InvalidError) throw firstCause
       // A call its caller cancelled, such as the losing reads of a raced held
       // read, says nothing about the link.
       if (signal?.aborted === true) {
@@ -1996,6 +2365,7 @@ export class ApacheIggyTransport implements LaserTransport {
       }
       if (!this.disconnected.has(stale) && serverResponseError(firstCause) === undefined) {
         this.disconnected.add(stale)
+        if (this.client === stale) this.loseSession()
       }
       if (!this.disconnected.has(stale)) {
         if (!retryAfterReconnect && serverResponseError(firstCause) === undefined) {
@@ -2070,6 +2440,8 @@ export class ApacheIggyTransport implements LaserTransport {
           }
           this.client = connected.client
           this.uncertainSends.clear()
+          void this.observeConnection(connected.client)
+          this.restoreSession()
           return
         } catch (error) {
           lastError = error
@@ -2310,20 +2682,207 @@ export class ApacheIggyTransport implements LaserTransport {
   }
 
   async deleteStream(name: string): Promise<boolean> {
-    const deleted = await this.execute(async (client) => {
-      if ((await client.stream.get({ streamId: name })) === null) return false
-      try {
-        await client.stream.delete({ streamId: name })
-      } catch (cause) {
-        if ((await client.stream.get({ streamId: name })) !== null) throw cause
-      }
-      return true
-    }, `failed to delete stream \`${name}\``)
+    const deleted = await this.execute(
+      (client) => absentAsFalse(client.stream.delete({ streamId: name }), MISSING_RESOURCE_CODES),
+      `failed to delete stream \`${name}\``
+    )
+    this.forgetStream(name)
     const prefix = `${name}\0`
-    for (const cache of [this.partitionCounts, this.balancedCursors, this.consumerGroups]) {
+    for (const key of this.consumerGroups.keys())
+      if (key.startsWith(prefix)) this.consumerGroups.delete(key)
+    return deleted
+  }
+
+  forgetStream(name: string): void {
+    const prefix = `${name}\0`
+    for (const cache of [this.partitionCounts, this.balancedCursors]) {
       for (const key of cache.keys()) if (key.startsWith(prefix)) cache.delete(key)
     }
+  }
+
+  administer<Value>(
+    operation: (client: SimpleClient) => Promise<Value>,
+    message: string,
+    idempotent: boolean
+  ): Promise<Value> {
+    return this.execute(operation, message, idempotent)
+  }
+
+  async listStreams(): Promise<readonly StreamInfo[]> {
+    const data = await this.rawList(
+      GET_STREAMS.code,
+      GET_STREAMS.serialize(),
+      "failed to list streams"
+    )
+    const streams: StreamInfo[] = []
+    for (let pos = 0; pos < data.length;) {
+      const { bytesRead, data: stream } = deserializeToStream(data, pos)
+      streams.push({
+        id: stream.id,
+        name: stream.name,
+        topicsCount: stream.topicsCount,
+        sizeBytes: stream.sizeBytes,
+        messagesCount: stream.messagesCount,
+        createdAtMicros: data.readBigUInt64LE(pos + 4)
+      })
+      pos += bytesRead
+    }
+    return streams
+  }
+
+  async findStream(name: string): Promise<StreamInfo | undefined> {
+    const data = await this.rawMetadata(
+      GET_STREAM.code,
+      GET_STREAM.serialize({ streamId: name }),
+      `failed to read stream \`${name}\``
+    )
+    if (data === undefined) return undefined
+    const { data: stream } = deserializeToStream(data, 0)
+    return {
+      id: stream.id,
+      name: stream.name,
+      topicsCount: stream.topicsCount,
+      sizeBytes: stream.sizeBytes,
+      messagesCount: stream.messagesCount,
+      createdAtMicros: data.readBigUInt64LE(4)
+    }
+  }
+
+  async listTopics(streamId: string): Promise<readonly TopicInfo[]> {
+    const data = await this.rawList(
+      GET_TOPICS.code,
+      GET_TOPICS.serialize({ streamId }),
+      `failed to list topics of stream \`${streamId}\``
+    )
+    const count = data.length === 0 ? 0 : data.readUInt32LE(0)
+    const topics: TopicInfo[] = []
+    let pos = 4
+    for (let index = 0; index < count; index += 1) {
+      const { bytesRead, data: topic } = deserializeBaseTopic(data, pos)
+      topics.push(topicInfo(topic, data.readBigUInt64LE(pos + 4)))
+      pos += bytesRead
+    }
+    // The server lists a missing stream as empty.
+    if (count === 0 && (await this.findStream(streamId)) === undefined) {
+      throw missingResource(`stream \`${streamId}\` does not exist`, STREAM_NAME_NOT_FOUND)
+    }
+    return topics
+  }
+
+  async findTopic(
+    streamId: string,
+    topicId: string
+  ): Promise<
+    { readonly topic: TopicInfo; readonly partitions: readonly PartitionInfo[] } | undefined
+  > {
+    const data = await this.rawMetadata(
+      GET_TOPIC.code,
+      GET_TOPIC.serialize({ streamId, topicId }),
+      `failed to read topic \`${topicId}\``
+    )
+    if (data === undefined) return undefined
+    const { bytesRead, data: topic } = deserializeBaseTopic(data, 0)
+    const partitions: PartitionInfo[] = []
+    let pos = bytesRead
+    for (let index = 0; index < topic.partitionsCount; index += 1) {
+      const { bytesRead: read, data: partition } = deserializePartition(data, pos)
+      partitions.push({
+        id: partition.id,
+        segmentsCount: partition.segmentsCount,
+        currentOffset: partition.currentOffset,
+        sizeBytes: partition.sizeBytes,
+        messagesCount: partition.messagesCount,
+        createdAtMicros: data.readBigUInt64LE(pos + 4)
+      })
+      pos += read
+    }
+    return { topic: topicInfo(topic, data.readBigUInt64LE(4)), partitions }
+  }
+
+  async deleteTopic(streamId: string, topicId: string): Promise<boolean> {
+    // The server reads no partition count from a topic delete.
+    const deleted = await this.execute(
+      (client) =>
+        absentAsFalse(
+          client.topic.delete({ streamId, topicId, partitionsCount: 0 }),
+          MISSING_RESOURCE_CODES
+        ),
+      `failed to delete topic \`${topicId}\` on stream \`${streamId}\``
+    )
+    this.forgetTopic(streamId, topicId)
+    const prefix = `${this.topicKey(streamId, topicId)}\0`
+    for (const key of this.consumerGroups.keys())
+      if (key.startsWith(prefix)) this.consumerGroups.delete(key)
     return deleted
+  }
+
+  async addPartitions(streamId: string, topicId: string, count: number): Promise<void> {
+    validateCount(count)
+    await this.execute(
+      (client) => client.partition.create({ streamId, topicId, partitionCount: count }),
+      `failed to add partitions to topic \`${topicId}\``
+    )
+    this.forgetTopic(streamId, topicId)
+  }
+
+  async deletePartitions(streamId: string, topicId: string, count: number): Promise<void> {
+    validateCount(count)
+    await this.execute(
+      (client) => client.partition.delete({ streamId, topicId, partitionCount: count }),
+      `failed to delete partitions of topic \`${topicId}\``
+    )
+    this.forgetTopic(streamId, topicId)
+  }
+
+  async listConsumerGroups(
+    streamId: string,
+    topicId: string
+  ): Promise<readonly ConsumerGroupSummary[]> {
+    const groups = await this.execute(
+      (client) => client.group.list({ streamId, topicId }),
+      `failed to list consumer groups of topic \`${topicId}\``
+    )
+    // The server lists a missing topic as empty.
+    if (groups.length === 0 && (await this.findTopic(streamId, topicId)) === undefined) {
+      throw missingTopic(streamId, topicId)
+    }
+    return groups.map((group) => ({
+      id: group.id,
+      name: group.name,
+      partitionsCount: group.partitionsCount,
+      membersCount: group.membersCount
+    }))
+  }
+
+  async deleteConsumerGroup(
+    streamId: string,
+    topicId: string,
+    group: string | number
+  ): Promise<boolean> {
+    const deleted = await this.execute(
+      (client) =>
+        absentAsFalse(
+          client.group.delete({ streamId, topicId, groupId: group }),
+          MISSING_GROUP_CODES
+        ),
+      `failed to delete consumer group \`${String(group)}\``
+    )
+    this.consumerGroups.delete(`${this.topicKey(streamId, topicId)}\0${String(group)}`)
+    return deleted
+  }
+
+  forgetTopic(streamId: string, topicId: string): void {
+    const key = this.topicKey(streamId, topicId)
+    this.partitionCounts.delete(key)
+    this.balancedCursors.delete(key)
+  }
+
+  private async rawList(code: number, payload: Buffer, message: string): Promise<Buffer> {
+    return this.execute(async (client) => {
+      const raw = await client.clientProvider()
+      const response = await raw.sendCommand(code, payload)
+      return response.length === 0 ? Buffer.alloc(0) : response.data
+    }, message)
   }
 
   async ensureConsumerGroup(streamId: string, topicId: string, name: string): Promise<void> {
@@ -2463,7 +3022,7 @@ export class ApacheIggyTransport implements LaserTransport {
         if (response.data.length < 16) throw new ProtocolError("metadata reply is too short")
         return response.data
       } catch (error) {
-        if (NOT_FOUND_METADATA_CODES.has(serverErrorCode(error) ?? -1)) return undefined
+        if (MISSING_RESOURCE_CODES.has(serverErrorCode(error) ?? -1)) return undefined
         throw error
       }
     }, message)
@@ -2519,7 +3078,10 @@ export class ApacheIggyTransport implements LaserTransport {
 
   private async publish(
     operation: (client: SimpleClient) => Promise<SendMessagesResponse>,
-    options?: Partial<PublishOptions> & { readonly fixedRetryIntervalMs?: number } & CallOptions
+    options?: Partial<PublishOptions> & {
+      readonly fixedRetryIntervalMs?: number
+      readonly idempotent?: { uncertain: boolean }
+    } & CallOptions
   ): Promise<SendMessagesResponse> {
     const config = { ...this.publishConfig, ...options }
     const fixed = options?.fixedRetryIntervalMs
@@ -2553,9 +3115,29 @@ export class ApacheIggyTransport implements LaserTransport {
         })
       } catch (cause) {
         if (cause instanceof SessionError || cause instanceof CancelledError) throw cause
+        const idempotent = options?.idempotent
         // A send that may have committed is never resent and keeps the
-        // connection, as the Apache Iggy producer leaves it to its caller.
+        // connection, as the Apache Iggy producer leaves it to its caller. An
+        // idempotent send is resent with the same producer section, which the
+        // partition writes once.
         const unproven = unprovenOutcome(cause)
+        if (
+          idempotent !== undefined &&
+          attempt < config.maxRetries &&
+          (unproven instanceof OperationUncertainError ||
+            unproven instanceof OperationNotRetainedError)
+        ) {
+          idempotent.uncertain = true
+          if (unproven instanceof OperationUncertainError && unproven.operationId !== undefined) {
+            try {
+              await this.client.abandonOperation(unproven.operationId)
+            } catch {
+              // Not retained means already released.
+            }
+          }
+          await delay(retryDelayMs(config, attempt), signal, "publish")
+          continue
+        }
         if (
           unproven instanceof OperationUncertainError ||
           unproven instanceof OperationNotRetainedError
@@ -2565,6 +3147,8 @@ export class ApacheIggyTransport implements LaserTransport {
           throw new TransportError("Iggy publish failed", false, { cause })
         }
         const response = serverResponseError(cause)
+        // A send without a reply can have landed.
+        if (idempotent !== undefined && response === undefined) idempotent.uncertain = true
         const code = serverErrorCode(cause)
         const transient = code !== undefined && TRANSIENT_SERVER_CODES.has(code)
         // An expired session on a connection that logged in once means the
@@ -2676,6 +3260,9 @@ export class ApacheIggyTransport implements LaserTransport {
         readonly batchLength?: number
         /** Background mode: resend at once, then every this many milliseconds, any failure but a lost confirmation. */
         readonly fixedRetryIntervalMs?: number
+        /** Sends each batch with the producer section of its partition, so a resend is written once.
+         * @internal */
+        readonly idempotence?: ProducerSequences
         readonly beforeSend?: () => Promise<{
           readonly streamId: number
           readonly topicId: number
@@ -2712,6 +3299,9 @@ export class ApacheIggyTransport implements LaserTransport {
         readonly batchLength?: number
         /** Background mode: resend at once, then every this many milliseconds, any failure but a lost confirmation. */
         readonly fixedRetryIntervalMs?: number
+        /** Sends each batch with the producer section of its partition, so a resend is written once.
+         * @internal */
+        readonly idempotence?: ProducerSequences
         readonly beforeSend?: () => Promise<{
           readonly streamId: number
           readonly topicId: number
@@ -2727,40 +3317,70 @@ export class ApacheIggyTransport implements LaserTransport {
     const confirmations: SendMessagesConfirmation[] = []
     let resolvedPartition: number | undefined
     for (let start = 0; start < records.length; start += batchLength) {
-      const prepared = records.slice(start, start + batchLength).map((record) => ({
+      const chunk = records.slice(start, start + batchLength)
+      const prepared = chunk.map((record) => ({
         id: record.id ?? mintUlidValue(),
         payload: toNodeBuffer(record.payload),
-        headers: [...record.headers].map(([key, value]) => ({
-          key: HeaderKeyFactory.String(key),
-          value: toIggyHeaderValue(value)
-        }))
+        headers: headerEntries(record.headers)
       }))
+      const idempotence = options?.idempotence
+      const raw =
+        idempotence !== undefined || chunk.some((record) => record.userHeaders !== undefined)
+          ? chunk.map((record, index) => ({
+              id: prepared[index]?.id ?? mintUlidValue(),
+              payload: toNodeBuffer(record.payload),
+              userHeaders:
+                record.userHeaders === undefined
+                  ? serializeHeaders(prepared[index]?.headers)
+                  : toNodeBuffer(record.userHeaders)
+            }))
+          : undefined
       const sendChunk = (): Promise<SendMessagesResponse> =>
-        this.publish(async (client) => {
-          const source = await options?.beforeSend?.()
-          const partition =
-            source === undefined
-              ? (resolvedPartition ??= await this.resolvePartition(
-                  streamId,
-                  topicId,
-                  routing,
-                  client
-                ))
-              : routing.kind === "partition"
-                ? routing.partition
-                : routing.kind === "key"
-                  ? xxHash32(routing.key) % source.partitions
-                  : await this.resolvePartition(streamId, topicId, routing, client)
-          if (this.disconnected.has(client))
-            throw new TransportError("publish connection was retired", true)
-          throwIfAborted(options?.signal, "publish")
-          return client.message.send({
-            streamId: source?.streamId ?? streamId,
-            topicId: source?.topicId ?? topicId,
-            messages: prepared,
-            partition: Partitioning.PartitionId(partition)
-          })
-        }, options)
+        idempotence !== undefined && raw !== undefined
+          ? (async () => {
+              const partition = (resolvedPartition ??= await this.execute(
+                (client) => this.resolvePartition(streamId, topicId, routing, client),
+                `failed to route topic \`${topicId}\``
+              ))
+              return idempotence.exclusive(partition, () =>
+                this.sendIdempotent(streamId, topicId, partition, raw, idempotence, options)
+              )
+            })()
+          : this.publish(async (client) => {
+              const source = await options?.beforeSend?.()
+              const partition =
+                source === undefined
+                  ? (resolvedPartition ??= await this.resolvePartition(
+                      streamId,
+                      topicId,
+                      routing,
+                      client
+                    ))
+                  : routing.kind === "partition"
+                    ? routing.partition
+                    : routing.kind === "key"
+                      ? xxHash32(routing.key) % source.partitions
+                      : await this.resolvePartition(streamId, topicId, routing, client)
+              if (this.disconnected.has(client))
+                throw new TransportError("publish connection was retired", true)
+              throwIfAborted(options?.signal, "publish")
+              if (raw !== undefined)
+                return sendRaw(
+                  client,
+                  encodeRawSend(
+                    source?.streamId ?? streamId,
+                    source?.topicId ?? topicId,
+                    partition,
+                    raw
+                  )
+                )
+              return client.message.send({
+                streamId: source?.streamId ?? streamId,
+                topicId: source?.topicId ?? topicId,
+                messages: prepared,
+                partition: Partitioning.PartitionId(partition)
+              })
+            }, options)
       try {
         let response: SendMessagesResponse
         try {
@@ -2786,6 +3406,49 @@ export class ApacheIggyTransport implements LaserTransport {
       }
     }
     return { confirmations }
+  }
+
+  // Sends one chunk to `partition` with the producer section of its next
+  // sequence. Every resend after a lost reply carries the same section, so the
+  // partition writes the chunk once. When the partition no longer holds the
+  // producer, the chunk starts a new epoch at sequence 0, but not after an
+  // uncertain send, which can have landed before the partition dropped it.
+  private async sendIdempotent(
+    streamId: string,
+    topicId: string,
+    partition: number,
+    records: readonly RawRecord[],
+    sequences: ProducerSequences,
+    options?: Partial<PublishOptions> & { readonly fixedRetryIntervalMs?: number } & CallOptions
+  ): Promise<SendMessagesResponse> {
+    const idempotent = { uncertain: false }
+    let section = sequences.section(partition)
+    for (let resends = 0; ; resends += 1) {
+      const producer = section
+      try {
+        const response = await this.publish(
+          async (client) => {
+            if (this.disconnected.has(client))
+              throw new TransportError("publish connection was retired", true)
+            throwIfAborted(options?.signal, "publish")
+            return sendRaw(client, encodeRawSend(streamId, topicId, partition, records, producer))
+          },
+          { ...options, idempotent }
+        )
+        sequences.advance(partition, producer, records.length)
+        return response
+      } catch (error) {
+        const code = serverErrorCode(error)
+        if (code === PRODUCER_UNKNOWN && !idempotent.uncertain && resends < PRODUCER_RESENDS) {
+          sequences.nextEpoch(producer)
+          section = sequences.section(partition)
+          continue
+        }
+        if (code === PRODUCER_EPOCH_FENCED) sequences.fence()
+        sequences.nextEpoch(producer)
+        throw error
+      }
+    }
   }
 
   async pollMessages(
@@ -3217,10 +3880,16 @@ export class ApacheIggyTransport implements LaserTransport {
   }
 
   async close(): Promise<void> {
+    const first = !this.closed
     this.closed = true
     this.lifetime.abort()
     this.consumerGroups.clear()
-    if (this.ownership === "owned") await this.client.destroy()
+    try {
+      if (this.ownership === "owned") await this.client.destroy()
+    } finally {
+      if (first) this.announce("shutdown")
+      this.connectionListeners.clear()
+    }
   }
 
   private topicKey(streamId: string, topicId: string): string {

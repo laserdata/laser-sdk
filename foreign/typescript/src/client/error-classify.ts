@@ -263,6 +263,36 @@ export function iggyErrorCode(error: unknown): number | undefined {
     if (typeof current !== "object" || current === null) return undefined
     const errorCode = (current as { readonly errorCode?: unknown }).errorCode
     if (typeof errorCode === "number") return errorCode
+    const named = UNCODED_IGGY_ERRORS.get((current as { readonly name?: unknown }).name)
+    if (named !== undefined) return named
+    current = "cause" in current ? (current as { readonly cause?: unknown }).cause : undefined
+  }
+  return undefined
+}
+
+// The Apache Iggy Node client raises these without an `errorCode`. Rust names
+// them `OperationUncertain` (14006) and `OperationNotRetained` (14008).
+const UNCODED_IGGY_ERRORS = new Map<unknown, number>([
+  ["OperationUncertainError", 14006],
+  ["OperationNotRetainedError", 14008]
+])
+
+/** The request a transport failure left with an unknown outcome, read like
+ * `iggyErrorCode`. Settle it with `Laser.resolveOperation` or
+ * `Laser.abandonOperation`. */
+export function uncertainOperation(error: unknown): bigint | undefined {
+  let current = classified(error)
+  if (
+    current instanceof LaserError &&
+    !(current instanceof TransportError) &&
+    !(current instanceof ProtocolError)
+  ) {
+    return undefined
+  }
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (typeof current !== "object" || current === null) return undefined
+    const operationId = (current as { readonly operationId?: unknown }).operationId
+    if (typeof operationId === "bigint") return operationId
     current = "cause" in current ? (current as { readonly cause?: unknown }).cause : undefined
   }
   return undefined

@@ -32,6 +32,101 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | serde-dict | Python passes the record as a dict that serde builds from the same Rust type, keyed by its serde field names |
 | signature-type | TypeScript exports the parameter, option, or result shape a public signature names, where Rust passes the values or a generic bound directly |
 
+## Capabilities
+
+Rust hands out the raw Apache Iggy client through `Laser::client` and TypeScript through `Laser.client`. Python has no raw client. So every operation that the raw client reaches needs a first-class Laser API in all three clients. A MISSING cell is a gap, and the check fails until the API ships or the user signs off on the gap in writing. A signed-off cell quotes that sign-off.
+
+The check reads the raw operations from the client sources. Rust has 74 operations in iggy_common and iggy 0.12.0. TypeScript has 61 operations in apache-iggy 0.11.0. Each operation belongs to exactly one capability below or to a retired call, and an operation in neither fails the check.
+
+| Capability | Raw Apache Iggy call (Rust / TypeScript) | Rust | Python | TypeScript |
+| --- | --- | --- | --- | --- |
+| Connect and sign in with a password or a personal access token, with the transport options of the connection string (`connection.connect`) | `builder`, `builder_from_connection_string`, `connect`, `create`, `from_connection_string`, `heartbeat_interval`, `login_user`, `login_with_personal_access_token`, `new` / `session.login`, `session.loginWithToken` | `Laser::connect` | `Laser.connect` | `Laser.connect` |
+| Sign out and close the connection (`connection.close`) | `logout_user`, `disconnect`, `shutdown` / `session.logout`, `destroy` | `Laser::close` | `Laser.close` | `Laser.close` |
+| Watch the connection get connected, disconnected, signed in, signed out, and shut down (`connection.events`) | `subscribe_events` / none | `Laser::connection_events` | `Laser.connection_events` | `Laser.connectionEvents` |
+| Prove the outcome of a request the client could not confirm, or give the request up (`operation.settle`) | `resolve_operation`, `abandon_operation` / `resolveOperation`, `abandonOperation` | `Laser::resolve_operation + Laser::abandon_operation + TransportError::uncertain_operation` | `Laser.resolve_operation + Laser.abandon_operation + TransportError.uncertain_operation` | `Laser.resolveOperation + Laser.abandonOperation + fn:uncertainOperation` |
+| Send a command by its code with a raw payload, to the connected node or to one replica (`command.raw`) | `client`, `send_binary_request`, `send_binary_request_to_replica`, `send_binary_request_to_replica_with_deadline`, `send_binary_request_with_deadline` / `sendBinaryRequest`, `sendBinaryRequestToReplica`, `clientProvider` | `Laser::send_command + Laser::send_command_to_replica` | `Laser.send_command + Laser.send_command_to_replica` | `Laser.sendCommand + Laser.sendCommandToReplica` |
+| List the streams (`stream.list`) | `get_streams` / `stream.list` | `Laser::streams` | `Laser.streams` | `Laser.streams` |
+| Read one stream or check that it exists (`stream.get`) | `get_stream` / `stream.get` | `Stream::get + Stream::exists` | `Stream.get + Stream.exists` | `Stream.get + Stream.exists` |
+| Create a stream (`stream.create`) | `create_stream` / `stream.create`, `stream.ensure` | `Stream::ensure` | `Stream.ensure` | `Stream.ensure` |
+| Rename a stream (`stream.update`) | `update_stream` / `stream.update` | `Stream::rename` | `Stream.rename` | `Stream.rename` |
+| Delete a stream (`stream.delete`) | `delete_stream` / `stream.delete` | `Stream::delete` | `Stream.delete` | `Stream.delete` |
+| List the topics of a stream (`topic.list`) | `get_topics` / `topic.list` | `Stream::topics` | `Stream.topics` | `Stream.topics` |
+| Read one topic with its partitions, or check that it exists (`topic.get`) | `get_topic` / `topic.get` | `Topic::get + Topic::exists + Topic::partitions` | `Topic.get + Topic.exists + Topic.partitions` | `Topic.get + Topic.exists + Topic.partitions` |
+| Create a topic (`topic.create`) | `create_topic` / `topic.create`, `topic.ensure` | `Topic::ensure` | `Topic.ensure` | `Topic.ensure` |
+| Change the settings of a topic (`topic.update`) | `update_topic` / `topic.update` | `Topic::update` | `Topic.update` | `Topic.update` |
+| Delete a topic (`topic.delete`) | `delete_topic` / `topic.delete` | `Topic::delete` | `Topic.delete` | `Topic.delete` |
+| Add partitions to a topic (`partition.create`) | `create_partitions` / `partition.create` | `Topic::add_partitions` | `Topic.add_partitions` | `Topic.addPartitions` |
+| Remove partitions from a topic (`partition.delete`) | `delete_partitions` / `partition.delete` | `Topic::delete_partitions` | `Topic.delete_partitions` | `Topic.deletePartitions` |
+| Delete the oldest segments of a partition (`segment.delete`) | `delete_segments` / `segment.delete` | `Topic::delete_segments` | `Topic.delete_segments` | `Topic.deleteSegments` |
+| List the consumer groups of a topic (`consumer_group.list`) | `get_consumer_groups` / `group.list` | `Topic::consumer_groups` | `Topic.consumer_groups` | `Topic.consumerGroups` |
+| Read one consumer group (`consumer_group.get`) | `get_consumer_group` / `group.get` | `ConsumerGroup::info` | `ConsumerGroup.info` | `ConsumerGroup.info` |
+| Create a consumer group (`consumer_group.create`) | `create_consumer_group` / `group.create`, `group.ensure` | `ConsumerGroup::create` | `ConsumerGroup.create` | `ConsumerGroup.create` |
+| Delete a consumer group (`consumer_group.delete`) | `delete_consumer_group` / `group.delete` | `ConsumerGroup::delete` | `ConsumerGroup.delete` | `ConsumerGroup.delete` |
+| Join and leave a consumer group, and follow its partition assignment, to read its partitions (`consumer_group.join`) | `consumer_group`, `join_consumer_group`, `leave_consumer_group`, `refresh_consumer_group_assignments`, `sync_consumer_group` / `group.join`, `group.leave`, `group.ensureAndJoin`, `consumerGroup` | `ConsumerGroup::consumer` | `ConsumerGroup.consumer` | `ConsumerGroup.consumer` |
+| Read a stored consumer offset (`consumer_offset.get`) | `get_consumer_offset` / `offset.get` | `Consumer::stored_offset` | `Consumer.stored_offset` | `Consumer.storedOffset` |
+| Store a consumer offset (`consumer_offset.store`) | `store_consumer_offset` / `offset.store` | `Consumer::store_offset` | `Consumer.store_offset` | `Consumer.storeOffset` |
+| Store the offset of a delivered record, fenced to the partition history and the reader that delivered it (`consumer_offset.commit`) | `store_consumer_position` / `offset.storePosition` | `Consumer::commit` | `Consumer.commit` | `Consumer.commit` |
+| Delete a stored consumer offset (`consumer_offset.delete`) | `delete_consumer_offset`, `delete_consumer_position` / `offset.delete`, `offset.deletePosition` | `Consumer::delete_offset` | `Consumer.delete_offset` | `Consumer.deleteOffset` |
+| Send messages (`message.send`) | `producer`, `send_messages` / `message.send` | `Topic::send` | `Topic.send` | `Topic.send` |
+| Poll messages, one partition or every partition of a standalone consumer (`message.poll`) | `consumer`, `poll_messages`, `poll_messages_raw`, `reader` / `message.poll`, `message.reader`, `consumer` | `Topic::consumer` | `Topic.consumer` | `Topic.consumer` |
+| Send and read user headers (`message.headers`) | none / none | `PublishRequest::header` | `PublishRequest.header` | `PublishRequest.header` |
+| Write each batch of a producer once per partition, also when a lost reply makes the producer send it again (`producer.idempotent`) | `send_producer_messages`, `next_producer_id` / none | `ProducerBuilder::idempotent` | `Topic.producer(idempotent=)` | `ProducerOptions.idempotent` |
+| Batch and route sends in the background, ordered or balanced over shards (`producer.batching`) | none / none | `ProducerBuilder::background` | `Topic.producer(background=)` | `ProducerOptions.background` |
+| Pick the background shard with caller code (`producer.sharding`) | none / none | `ProducerBuilder::sharding` | `Topic.producer(sharding=)` | `ProducerOptions.sharding` |
+| Encrypt payloads on the client (`producer.encryption`) | none / none | `ProducerBuilder::encryption` | `Topic.producer(encryption=)` | `ProducerOptions.encryption` |
+| Decrypt payloads on the client (`consumer.encryption`) | none / none | `ConsumerBuilder::encryption` | `Topic.consumer(encryption=)` | `ConsumerOptions.encryption` |
+| Read the committed and unconfirmed messages of a failed publish (`publish.failure`) | none / none | `LaserError::PublishFailed` | `PublishFailedError` | `PublishFailedError` |
+| Read the Apache Iggy error code of a transport failure (`error.code`) | none / none | `TransportError::iggy_error_code` | `TransportError.iggy_error_code` | `fn:iggyErrorCode` |
+| Name the well-known agent topics (`agent.topic_names`) | none / none | `AgentTopic::topic_string` | `AgentTopic` | `AgentTopic` |
+| Answer A2A and MCP JSON-RPC requests (`bridge.rpc`) | none / none | `A2aBridge::handle_rpc` | `A2aBridge.handle_rpc` | `A2aBridge.handleRpc` |
+| Serve a bridge over HTTP with a browser origin guard (`bridge.http`) | none / none | `A2aBridge::router` | `A2aBridge.serve` | `A2aBridge.serve` |
+| List the users (`user.list`) | `get_users` / `user.list` | `Laser::users` | `Laser.users` | `Laser.users` |
+| Read one user with its permissions, or check that it exists (`user.get`) | `get_user` / `user.get` | `User::get + User::exists` | `User.get + User.exists` | `User.get + User.exists` |
+| Create a user (`user.create`) | `create_user` / `user.create` | `User::create` | `User.create` | `User.create` |
+| Rename a user or change its status (`user.update`) | `update_user` / `user.update` | `User::update` | `User.update` | `User.update` |
+| Replace the permissions of a user (`user.permissions`) | `update_permissions` / `user.updatePermissions` | `User::set_permissions` | `User.set_permissions` | `User.setPermissions` |
+| Change the password of a user (`user.password`) | `change_password` / `user.changePassword` | `User::change_password` | `User.change_password` | `User.changePassword` |
+| Delete a user (`user.delete`) | `delete_user` / `user.delete` | `User::delete` | `User.delete` | `User.delete` |
+| List the personal access tokens of the signed-in user (`token.list`) | `get_personal_access_tokens` / `token.list` | `Laser::personal_access_tokens` | `Laser.personal_access_tokens` | `Laser.personalAccessTokens` |
+| Create a personal access token (`token.create`) | `create_personal_access_token` / `token.create` | `PersonalAccessToken::create` | `PersonalAccessToken.create` | `PersonalAccessToken.create` |
+| Delete a personal access token (`token.delete`) | `delete_personal_access_token` / `token.delete` | `PersonalAccessToken::delete` | `PersonalAccessToken.delete` | `PersonalAccessToken.delete` |
+| Ping the server (`system.ping`) | `ping` / `system.ping` | `Laser::ping` | `Laser.ping` | `Laser.ping` |
+| Read the server statistics (`system.stats`) | `get_stats` / `system.getStats` | `Laser::stats` | `Laser.stats` | `Laser.stats` |
+| Read this connection as the server sees it (`system.me`) | `get_me` / `client.getMe` | `Laser::me` | `Laser.me` | `Laser.me` |
+| List the connected clients (`system.clients`) | `get_clients` / `client.list` | `Laser::clients` | `Laser.clients` | `Laser.clients` |
+| Read one connected client (`system.client`) | `get_client` / `client.get` | `Laser::client_info` | `Laser.client_info` | `Laser.clientInfo` |
+| Read the cluster nodes and their roles (`system.cluster`) | `get_cluster_metadata` / `cluster.getClusterMetadata` | `Laser::cluster` | `Laser.cluster` | `Laser.cluster` |
+| Download a server diagnostics snapshot (`system.snapshot`) | `snapshot` / `system.snapshot` | `Laser::snapshot` | `Laser.snapshot` | `Laser.snapshot` |
+| Describe the server options (`system.options`) | `describe_options` / `system.describeOptions` | `Laser::describe_options` | `Laser.describe_options` | `Laser.describeOptions` |
+| Read the server metadata change feed (`system.metadata_changes`) | `get_metadata_changes` / `system.getMetadataChanges` | `Laser::metadata_changes` | `Laser.metadata_changes` | `Laser.metadataChanges` |
+
+An omitted row that reaches the raw client, or a method that does more than convert a value, names the capabilities a caller reaches through it. The check fails when such a row names none.
+
+| Omitted Rust item | Capabilities |
+| --- | --- |
+| `AgentTopic::as_identifier` | `agent.topic_names` |
+| `BalancedSharding` | `producer.batching` |
+| `DirectConfig` | `producer.batching` |
+| `HeaderKey` | `message.headers` |
+| `HeaderValue` | `message.headers` |
+| `Headers` | `message.headers` |
+| `IggyConsumer` | `message.poll`, `consumer` |
+| `IggyConsumerBuilder` | `message.poll`, `consumer` |
+| `IggyMessage` | `message.send`, `publish.failure` |
+| `IggyProducer` | `message.send`, `producer` |
+| `IggyProducerBuilder` | `message.send`, `producer` |
+| `Laser::client` | `connection`, `operation`, `command`, `stream`, `topic`, `partition`, `segment`, `consumer_group`, `consumer_offset`, `message`, `producer.idempotent`, `user`, `token`, `system` |
+| `Laser::from_client` | `connection.connect` |
+| `LaserBuilder::client` | `connection.connect` |
+| `OrderedSharding` | `producer.batching` |
+| `SendMessagesConfirmationResponse` | `publish.failure` |
+| `SendMessagesResponse` | `message.send` |
+| `Sharding` | `producer` |
+| `Topic::iggy_consumer` | `message.poll`, `consumer_offset`, `consumer` |
+| `Topic::iggy_consumer_group` | `consumer_group`, `consumer_offset`, `consumer` |
+| `Topic::iggy_producer` | `message.send`, `message.headers`, `producer` |
+| `TransportError::as_iggy` | `error.code` |
+
 ## laser_sdk
 
 | Rust | Python | TypeScript | Notes |
@@ -137,6 +232,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `LaserError::is_version_skew` | `LaserError.version_skew` | `fn:isVersionSkew` | property, error-function |
 | `LaserError::publish_cause` | `PublishFailedError` | `fn:publishCause` | protocol, error-function |
 | `LaserError::rejected` | `new RejectedError()` | `new RejectedError()` | constructor |
+| `LaserError::uncertain_operation` | `LaserError.uncertain_operation` | `fn:uncertainOperation` | property, error-function |
 | `LaserError::unsupported` | `new UnsupportedError()` | `new UnsupportedError()` | constructor |
 | `LaserError::unsupported_feature` | `new UnsupportedError()` | `new UnsupportedError()` | constructor |
 
@@ -152,7 +248,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `A2aBridge::card` | `A2aBridge.card` | `A2aBridge.card` |  |
 | `A2aBridge::handle_rpc` | `A2aBridge.handle_rpc` | `A2aBridge.handleRpc` |  |
 | `A2aBridge::new` | `new A2aBridge()` | `new A2aBridge()` | constructor |
-| `A2aBridge::router` | omitted | omitted | rust-crate |
+| `A2aBridge::router` | `A2aBridge.serve` | `A2aBridge.serve` | one-call |
 | `A2aBridge::signed_card` | `A2aBridge.signed_card` | `A2aBridge.signedCard` |  |
 | `A2aBridge::submit` | `A2aBridge.submit` | `A2aBridge.submit` |  |
 | `A2aBridge::submit_in` | `A2aBridge.submit_in` | `A2aBridge.submitIn` |  |
@@ -160,7 +256,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `A2aBridge::submit_to` | `A2aBridge.submit(target=)` | `A2aBridge.submit(target=)` | overload |
 | `A2aBridge::submit_with_hops` | `A2aBridge.submit(previous_hops=)` | `A2aBridge.submitWithHops` | overload |
 | `A2aBridge::task` | `A2aBridge.task` | `A2aBridge.task` |  |
-| `A2aBridge::with_allowed_origins` | omitted | omitted | rust-crate |
+| `A2aBridge::with_allowed_origins` | `new A2aBridge(allowed_origins=)` | `A2aBridge.withAllowedOrigins` | keywords |
 | `A2aBridge::with_bridge_hops` | `A2aBridge.with_bridge_hops` | `A2aBridge.withBridgeHops` |  |
 | `A2aBridge::with_capabilities` | `new A2aBridge(capabilities=)` | `A2aBridge.withCapabilities` | keywords |
 | `A2aBridge::with_description` | `new A2aBridge(description=)` | `A2aBridge.withDescription` | keywords |
@@ -178,7 +274,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `A2aCaller::submit_to` | `A2aBridge.submit(target=, caller=)` | `A2aCaller.submit(target=)` | keywords, overload |
 | `A2aCaller::submit_with_hops` | `A2aBridge.submit(previous_hops=, caller=)` | `A2aCaller.submitWithHops` | keywords |
 | `A2aCaller::task` | `A2aBridge.task(caller=)` | `A2aCaller.task` | keywords |
-| `A2aCallerPrincipal` | omitted | omitted | plain-value, rust-crate |
+| `A2aCallerPrincipal` | omitted | `A2aCallerHook` | plain-value, callback |
 | `A2aMethod` | omitted | `A2aMethod` | plain-value |
 | `A2aMethod::MessageSend` | omitted | `A2aMethod.MessageSend` | plain-value |
 | `A2aMethod::MessageStream` | omitted | `A2aMethod.MessageStream` | plain-value |
@@ -600,6 +696,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `InboxRoute::Fixed` | `Laser.spawn_agent(fixed_inbox=)` | `InboxRoute` | keywords, plain-value |
 | `InboxRoute::resolve` | `fn:inbox_route_resolve` | `fn:resolveInboxRoute` | free-function |
 | `Laser` | `Laser` | `Laser` |  |
+| `Laser::abandon_operation` | `Laser.abandon_operation` | `Laser.abandonOperation` |  |
 | `Laser::advertise_presence` | `Laser.advertise_presence` | `Laser.advertisePresence` |  |
 | `Laser::agdx` | `Laser.agdx` | `Laser.agdx` |  |
 | `Laser::agent` | `Laser.agent` | `Laser.agent` |  |
@@ -616,11 +713,15 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Laser::changes_topic` | `Laser.changes_topic` | `Laser.changesTopic` | property |
 | `Laser::clear_presence` | `Laser.clear_presence` | `Laser.clearPresence` |  |
 | `Laser::client` | omitted | `Laser.client` | rust-crate, property |
+| `Laser::client_info` | `Laser.client_info` | `Laser.clientInfo` |  |
 | `Laser::client_metadata` | `Laser.client_metadata` | `Laser.clientMetadata` |  |
+| `Laser::clients` | `Laser.clients` | `Laser.clients` |  |
 | `Laser::close` | `Laser.close` | `Laser.close` |  |
+| `Laser::cluster` | `Laser.cluster` | `Laser.cluster` |  |
 | `Laser::connect` | `Laser.connect` | `Laser.connect` |  |
 | `Laser::connect_env` | `Laser.connect_env` | `Laser.connectEnv` |  |
 | `Laser::connect_with_stream` | `Laser.connect_with_stream` | `Laser.connectWithStream` |  |
+| `Laser::connection_events` | `Laser.connection_events` | `Laser.connectionEvents` |  |
 | `Laser::consumed` | `Laser.consumed` | `Laser.consumed` |  |
 | `Laser::context` | `Laser.context` | `Laser.context` |  |
 | `Laser::contract` | `Laser.contract` | `Laser.contract` |  |
@@ -630,6 +731,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Laser::define_role_as` | `Laser.define_role(mutation_id=)` | `Laser.defineRoleAs` | overload |
 | `Laser::delete_role` | `Laser.delete_role` | `Laser.deleteRole` |  |
 | `Laser::delete_role_as` | `Laser.delete_role(mutation_id=)` | `Laser.deleteRoleAs` | overload |
+| `Laser::describe_options` | `Laser.describe_options` | `Laser.describeOptions` |  |
 | `Laser::dlq_topic` | `Laser.dlq_topic` | `Laser.dlqTopic` | property |
 | `Laser::execute_batch` | `Laser.execute_batch` | `Laser.executeBatch` |  |
 | `Laser::execute_query` | `Laser.execute_query` | `Laser.executeQuery` |  |
@@ -644,12 +746,17 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Laser::list_roles` | `Laser.list_roles` | `Laser.listRoles` |  |
 | `Laser::local` | `Laser.local` | `Laser.local` |  |
 | `Laser::materialization` | `Laser.materialization` | `Laser.materialization` |  |
+| `Laser::me` | `Laser.me` | `Laser.me` |  |
 | `Laser::memory` | `Laser.memory` | `Laser.memory` |  |
 | `Laser::memory_custom` | `Laser.memory_custom` | `Laser.memoryCustom` |  |
 | `Laser::memory_on_topic` | `Laser.memory_on_topic` | `Laser.memoryOnTopic` |  |
 | `Laser::memory_topic` | `Laser.memory_topic` | `Laser.memoryTopic` |  |
 | `Laser::memory_with` | `Laser.memory_with` | `Laser.memoryWith` |  |
+| `Laser::metadata_changes` | `Laser.metadata_changes` | `Laser.metadataChanges` |  |
 | `Laser::ops_stream` | `Laser.ops_stream` | `Laser.opsStream` | property |
+| `Laser::personal_access_token` | `Laser.personal_access_token` | `Laser.personalAccessToken` |  |
+| `Laser::personal_access_tokens` | `Laser.personal_access_tokens` | `Laser.personalAccessTokens` |  |
+| `Laser::ping` | `Laser.ping` | `Laser.ping` |  |
 | `Laser::projections` | `Laser.projections` | `Laser.projections` |  |
 | `Laser::publish_card` | `Laser.publish_card` | `Laser.publishCard` |  |
 | `Laser::publish_state_delta` | `Laser.publish_state_delta` | `Laser.publishStateDelta` |  |
@@ -664,6 +771,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Laser::redrive_dead_letter` | `Laser.redrive_dead_letter` | `Laser.redriveDeadLetter` |  |
 | `Laser::refresh_capabilities` | `Laser.refresh_capabilities` | `Laser.refreshCapabilities` |  |
 | `Laser::request` | `Laser.request` | `Laser.request` |  |
+| `Laser::resolve_operation` | `Laser.resolve_operation` | `Laser.resolveOperation` |  |
 | `Laser::resource_name` | `Laser.resource_name` | `Laser.resourceName` |  |
 | `Laser::resource_naming` | `Laser.resource_naming` | `Laser.resourceNaming` | property |
 | `Laser::scatter` | `Laser.scatter` | `Laser.scatter` | keywords |
@@ -671,13 +779,20 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Laser::schemas` | `Laser.schemas` | `Laser.schemas` |  |
 | `Laser::seen_positions` | `Laser.seen_positions` | `Laser.seenPositions` |  |
 | `Laser::send_agent` | `Laser.send_agent` | `Laser.sendAgent` |  |
+| `Laser::send_command` | `Laser.send_command` | `Laser.sendCommand` |  |
+| `Laser::send_command_to_replica` | `Laser.send_command_to_replica` | `Laser.sendCommandToReplica` |  |
 | `Laser::sessions` | `Laser.sessions` | `Laser.sessions` |  |
 | `Laser::sessions_with` | `Laser.sessions(stream=)` | `Laser.sessions(config=)` | overload |
+| `Laser::snapshot` | `Laser.snapshot` | `Laser.snapshot` |  |
 | `Laser::spawn_subconversation` | `Laser.spawn_subconversation` | `Laser.spawnSubconversation` |  |
+| `Laser::stats` | `Laser.stats` | `Laser.stats` |  |
 | `Laser::stream` | `Laser.stream` | `Laser.stream` |  |
+| `Laser::streams` | `Laser.streams` | `Laser.streams` |  |
 | `Laser::topic` | `Laser.topic` | `Laser.topic` |  |
 | `Laser::unquarantine` | `Laser.unquarantine` | `Laser.unquarantine` |  |
 | `Laser::unquarantine_signed` | `Laser.unquarantine_signed` | `Laser.unquarantineSigned` |  |
+| `Laser::user` | `Laser.user` | `Laser.user` |  |
+| `Laser::users` | `Laser.users` | `Laser.users` |  |
 | `Laser::wait_until_ready` | `Laser.wait_until_ready` | `Laser.waitUntilReady` |  |
 | `Laser::watch` | `Laser.watch` | `Laser.watch` |  |
 | `Laser::whoami` | `Laser.whoami` | `Laser.whoami` |  |
@@ -1450,6 +1565,19 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `SchemaCapabilities.arrow_ipc_stream` | dict key | `SchemaCapabilities.arrowIpcStream` | serde-dict, keywords |
 | `SchemaCapabilities.schema_evolution` | dict key | `SchemaCapabilities.schemaEvolution` | serde-dict, keywords |
 
+## connection
+
+| Rust | Python | TypeScript | Notes |
+| --- | --- | --- | --- |
+| `ConnectionEvent` | omitted | `ConnectionEvent` | plain-value |
+| `ConnectionEvent::Connected` | omitted | `ConnectionEvent` | plain-value |
+| `ConnectionEvent::Disconnected` | omitted | `ConnectionEvent` | plain-value |
+| `ConnectionEvent::SignedIn` | omitted | `ConnectionEvent` | plain-value |
+| `ConnectionEvent::SignedOut` | omitted | `ConnectionEvent` | plain-value |
+| `ConnectionEvent::Shutdown` | omitted | `ConnectionEvent` | plain-value |
+| `ConnectionEvents` | `ConnectionEvents` | `ConnectionEvents` |  |
+| `ConnectionEvents::next` | `ConnectionEvents.__anext__` | `ConnectionEvents.[Symbol.asyncIterator]` | protocol |
+
 ## context
 
 | Rust | Python | TypeScript | Notes |
@@ -1599,6 +1727,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `TransportError` | `TransportError` | `TransportError` |  |
 | `TransportError::as_iggy` | omitted | omitted | rust-crate |
 | `TransportError::iggy_error_code` | `TransportError.iggy_error_code` | `fn:iggyErrorCode` | property, error-function |
+| `TransportError::uncertain_operation` | `TransportError.uncertain_operation` | `fn:uncertainOperation` | property, error-function |
 
 ## filters
 
@@ -2688,8 +2817,8 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `McpBridge::list_tools` | `McpBridge.list_tools` | `McpBridge.listTools` |  |
 | `McpBridge::new` | `new McpBridge()` | `new McpBridge()` | constructor |
 | `McpBridge::read_resource` | `McpBridge.read_resource` | `McpBridge.readResource` |  |
-| `McpBridge::router` | omitted | omitted | rust-crate |
-| `McpBridge::with_allowed_origins` | omitted | omitted | rust-crate |
+| `McpBridge::router` | `McpBridge.serve` | `McpBridge.serve` | one-call |
+| `McpBridge::with_allowed_origins` | `new McpBridge(allowed_origins=)` | `McpBridge.withAllowedOrigins` | keywords |
 | `McpBridge::with_bridge_hops` | `McpBridge.with_bridge_hops` | `McpBridge.withBridgeHops` |  |
 | `McpBridge::with_memory_tools` | `new McpBridge(memory_tools=)` | `McpBridge.withMemoryTools` | keywords |
 | `McpBridge::with_prompt` | `new McpBridge(prompts=)` | `McpBridge.withPrompt` | keywords |
@@ -4023,6 +4152,260 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `CompiledSchema::validate` | `CompiledSchema.validate` | `CompiledSchema.validate` |  |
 | `CompiledSchema::validate_value` | `CompiledSchema.validate_value` | `CompiledSchema.validateValue` |  |
 
+## server
+
+| Rust | Python | TypeScript | Notes |
+| --- | --- | --- | --- |
+| `CacheMetrics` | `CacheMetrics` | `CacheMetrics` |  |
+| `CacheMetrics.stream_id` | `CacheMetrics.stream_id` | `CacheMetrics.streamId` | keywords |
+| `CacheMetrics.topic_id` | `CacheMetrics.topic_id` | `CacheMetrics.topicId` | keywords |
+| `CacheMetrics.partition_id` | `CacheMetrics.partition_id` | `CacheMetrics.partitionId` | keywords |
+| `CacheMetrics.hits` | `CacheMetrics.hits` | `CacheMetrics.hits` | keywords |
+| `CacheMetrics.misses` | `CacheMetrics.misses` | `CacheMetrics.misses` | keywords |
+| `CacheMetrics.hit_ratio` | `CacheMetrics.hit_ratio` | `CacheMetrics.hitRatio` | keywords |
+| `ClientConsumerGroup` | `ClientConsumerGroup` | `ClientConsumerGroup` |  |
+| `ClientConsumerGroup.stream_id` | `ClientConsumerGroup.stream_id` | `ClientConsumerGroup.streamId` | keywords |
+| `ClientConsumerGroup.topic_id` | `ClientConsumerGroup.topic_id` | `ClientConsumerGroup.topicId` | keywords |
+| `ClientConsumerGroup.group_id` | `ClientConsumerGroup.group_id` | `ClientConsumerGroup.groupId` | keywords |
+| `ClientInfo` | `ClientInfo` | `ClientInfo` |  |
+| `ClientInfo.client_id` | `ClientInfo.client_id` | `ClientInfo.clientId` | keywords |
+| `ClientInfo.user_id` | `ClientInfo.user_id` | `ClientInfo.userId` | keywords |
+| `ClientInfo.address` | `ClientInfo.address` | `ClientInfo.address` | keywords |
+| `ClientInfo.transport` | `ClientInfo.transport` | `ClientInfo.transport` | keywords |
+| `ClientInfo.consumer_groups_count` | `ClientInfo.consumer_groups_count` | `ClientInfo.consumerGroupsCount` | keywords |
+| `ClientInfo.consumer_groups` | `ClientInfo.consumer_groups` | `ClientInfo.consumerGroups` | keywords |
+| `ClusterInfo` | `ClusterInfo` | `ClusterInfo` |  |
+| `ClusterInfo.name` | `ClusterInfo.name` | `ClusterInfo.name` | keywords |
+| `ClusterInfo.nodes` | `ClusterInfo.nodes` | `ClusterInfo.nodes` | keywords |
+| `ClusterNode` | `ClusterNode` | `ClusterNode` |  |
+| `ClusterNode.replica_id` | `ClusterNode.replica_id` | `ClusterNode.replicaId` | keywords |
+| `ClusterNode.name` | `ClusterNode.name` | `ClusterNode.name` | keywords |
+| `ClusterNode.ip` | `ClusterNode.ip` | `ClusterNode.ip` | keywords |
+| `ClusterNode.tcp_port` | `ClusterNode.tcp_port` | `ClusterNode.tcpPort` | keywords |
+| `ClusterNode.quic_port` | `ClusterNode.quic_port` | `ClusterNode.quicPort` | keywords |
+| `ClusterNode.http_port` | `ClusterNode.http_port` | `ClusterNode.httpPort` | keywords |
+| `ClusterNode.websocket_port` | `ClusterNode.websocket_port` | `ClusterNode.websocketPort` | keywords |
+| `ClusterNode.role` | `ClusterNode.role` | `ClusterNode.role` | keywords |
+| `ClusterNode.status` | `ClusterNode.status` | `ClusterNode.status` | keywords |
+| `ClusterNodeRole` | omitted | `ClusterNodeRole` | plain-value |
+| `ClusterNodeRole::Leader` | omitted | `ClusterNodeRole` | plain-value |
+| `ClusterNodeRole::Follower` | omitted | `ClusterNodeRole` | plain-value |
+| `ClusterNodeStatus` | omitted | `ClusterNodeStatus` | plain-value |
+| `ClusterNodeStatus::Healthy` | omitted | `ClusterNodeStatus` | plain-value |
+| `ClusterNodeStatus::Starting` | omitted | `ClusterNodeStatus` | plain-value |
+| `ClusterNodeStatus::Stopping` | omitted | `ClusterNodeStatus` | plain-value |
+| `ClusterNodeStatus::Unreachable` | omitted | `ClusterNodeStatus` | plain-value |
+| `ClusterNodeStatus::Maintenance` | omitted | `ClusterNodeStatus` | plain-value |
+| `ClusterNodeStatus::Unknown` | omitted | `ClusterNodeStatus` | plain-value |
+| `CreateUserOptions` | `User.create` | `CreateUserOptions` | keywords |
+| `CreateUserOptions.status` | `User.create(status=)` | `CreateUserOptions.status` | keywords |
+| `CreateUserOptions.permissions` | `User.create(permissions=)` | `CreateUserOptions.permissions` | keywords |
+| `GlobalPermissions` | dict via `User.set_permissions` | `GlobalPermissions` | serde-dict |
+| `GlobalPermissions.manage_servers` | dict key | `GlobalPermissions.manageServers` | serde-dict, keywords |
+| `GlobalPermissions.read_servers` | dict key | `GlobalPermissions.readServers` | serde-dict, keywords |
+| `GlobalPermissions.manage_users` | dict key | `GlobalPermissions.manageUsers` | serde-dict, keywords |
+| `GlobalPermissions.read_users` | dict key | `GlobalPermissions.readUsers` | serde-dict, keywords |
+| `GlobalPermissions.manage_streams` | dict key | `GlobalPermissions.manageStreams` | serde-dict, keywords |
+| `GlobalPermissions.read_streams` | dict key | `GlobalPermissions.readStreams` | serde-dict, keywords |
+| `GlobalPermissions.manage_topics` | dict key | `GlobalPermissions.manageTopics` | serde-dict, keywords |
+| `GlobalPermissions.read_topics` | dict key | `GlobalPermissions.readTopics` | serde-dict, keywords |
+| `GlobalPermissions.poll_messages` | dict key | `GlobalPermissions.pollMessages` | serde-dict, keywords |
+| `GlobalPermissions.send_messages` | dict key | `GlobalPermissions.sendMessages` | serde-dict, keywords |
+| `MetadataChangeGroup` | omitted | `MetadataChangeGroup` | plain-value |
+| `MetadataChangeGroup::Streams` | omitted | `MetadataChangeGroup` | plain-value |
+| `MetadataChangeGroup::Topics` | omitted | `MetadataChangeGroup` | plain-value |
+| `MetadataChangeGroup::Partitions` | omitted | `MetadataChangeGroup` | plain-value |
+| `MetadataChangeGroup::ConsumerGroups` | omitted | `MetadataChangeGroup` | plain-value |
+| `MetadataChangeGroup::ConsumerGroupMembers` | omitted | `MetadataChangeGroup` | plain-value |
+| `MetadataChangeGroup::Users` | omitted | `MetadataChangeGroup` | plain-value |
+| `MetadataChangeGroup::PersonalAccessTokens` | omitted | `MetadataChangeGroup` | plain-value |
+| `MetadataChangeGroup::Sessions` | omitted | `MetadataChangeGroup` | plain-value |
+| `MetadataChangeKind` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::StreamCreated` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::StreamUpdated` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::StreamDeleted` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::TopicCreated` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::TopicUpdated` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::TopicDeleted` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::PartitionsChanged` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::ConsumerGroupCreated` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::ConsumerGroupDeleted` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::ConsumerGroupMemberJoined` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::ConsumerGroupMemberLeft` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::ConsumerGroupPartitionHandedOver` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::UserCreated` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::UserUpdated` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::UserDeleted` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::UserPasswordChanged` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::UserPermissionsUpdated` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::PersonalAccessTokenCreated` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::PersonalAccessTokenDeleted` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::SessionRegistered` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangeKind::SessionClosed` | omitted | `MetadataChangeKind` | plain-value |
+| `MetadataChangePhase` | omitted | `MetadataChangePhase` | plain-value |
+| `MetadataChangePhase::Changes` | omitted | `MetadataChangePhase` | plain-value |
+| `MetadataChangePhase::Current` | omitted | `MetadataChangePhase` | plain-value |
+| `MetadataChangeReason` | omitted | `MetadataChangeReason` | plain-value |
+| `MetadataChangeReason::Left` | omitted | `MetadataChangeReason` | plain-value |
+| `MetadataChangeReason::SessionEnded` | omitted | `MetadataChangeReason` | plain-value |
+| `MetadataChangeReason::Deleted` | omitted | `MetadataChangeReason` | plain-value |
+| `MetadataChangeReason::Expired` | omitted | `MetadataChangeReason` | plain-value |
+| `MetadataChangeReason::Logout` | omitted | `MetadataChangeReason` | plain-value |
+| `MetadataChangeReason::Revoked` | omitted | `MetadataChangeReason` | plain-value |
+| `MetadataChangeReason::Updated` | omitted | `MetadataChangeReason` | plain-value |
+| `MetadataChangeReason::ResourceDeleted` | omitted | `MetadataChangeReason` | plain-value |
+| `MetadataChangeRecord` | `MetadataChangeRecord` | `MetadataChangeRecord` |  |
+| `MetadataChangeRecord.op` | `MetadataChangeRecord.op` | `MetadataChangeRecord.op` | keywords |
+| `MetadataChangeRecord.ordinal` | `MetadataChangeRecord.ordinal` | `MetadataChangeRecord.ordinal` | keywords |
+| `MetadataChangeRecord.timestamp_micros` | `MetadataChangeRecord.timestamp_micros` | `MetadataChangeRecord.timestampMicros` | keywords |
+| `MetadataChangeRecord.actor_user_id` | `MetadataChangeRecord.actor_user_id` | `MetadataChangeRecord.actorUserId` | keywords |
+| `MetadataChangeRecord.kind` | `MetadataChangeRecord.kind` | `MetadataChangeRecord.kind` | keywords |
+| `MetadataChangeRecord.subject` | `MetadataChangeRecord.subject` | `MetadataChangeRecord.subject` | keywords |
+| `MetadataChangeStart` | `MetadataChangeStart` | `MetadataChangeStart` |  |
+| `MetadataChangeStart::Earliest` | `MetadataChangeStart.earliest` | `MetadataChangeStart` | plain-value |
+| `MetadataChangeStart::Latest` | `MetadataChangeStart.latest` | `MetadataChangeStart` | plain-value |
+| `MetadataChangeStart::After` | `MetadataChangeStart.after` | `MetadataChangeStart` | plain-value |
+| `MetadataChangeStart::Current` | `MetadataChangeStart.current` | `MetadataChangeStart` | plain-value |
+| `MetadataChangeStatus` | omitted | `MetadataChangeStatus` | plain-value |
+| `MetadataChangeStatus::Ok` | omitted | `MetadataChangeStatus` | plain-value |
+| `MetadataChangeStatus::Behind` | omitted | `MetadataChangeStatus` | plain-value |
+| `MetadataChangeStatus::Expired` | omitted | `MetadataChangeStatus` | plain-value |
+| `MetadataChangeStatus::Reset` | omitted | `MetadataChangeStatus` | plain-value |
+| `MetadataChanges` | `MetadataChanges` | `MetadataChanges` |  |
+| `MetadataChanges.status` | `MetadataChanges.status` | `MetadataChanges.status` | keywords |
+| `MetadataChanges.phase` | `MetadataChanges.phase` | `MetadataChanges.phase` | keywords |
+| `MetadataChanges.head_op` | `MetadataChanges.head_op` | `MetadataChanges.headOp` | keywords |
+| `MetadataChanges.oldest_op` | `MetadataChanges.oldest_op` | `MetadataChanges.oldestOp` | keywords |
+| `MetadataChanges.retained_since_micros` | `MetadataChanges.retained_since_micros` | `MetadataChanges.retainedSinceMicros` | keywords |
+| `MetadataChanges.next` | `MetadataChanges.next` | `MetadataChanges.next` | keywords |
+| `MetadataChanges.has_more` | `MetadataChanges.has_more` | `MetadataChanges.hasMore` | keywords |
+| `MetadataChanges.records` | `MetadataChanges.records` | `MetadataChanges.records` | keywords |
+| `MetadataChanges.items` | `MetadataChanges.items` | `MetadataChanges.items` | keywords |
+| `MetadataChanges.page_token` | `MetadataChanges.page_token` | `MetadataChanges.pageToken` | keywords |
+| `MetadataChangesQuery` | `Laser.metadata_changes` | `MetadataChangesQuery` | keywords |
+| `MetadataChangesQuery.start` | `Laser.metadata_changes(start=)` | `MetadataChangesQuery.start` | keywords |
+| `MetadataChangesQuery.groups` | `Laser.metadata_changes(groups=)` | `MetadataChangesQuery.groups` | keywords |
+| `MetadataChangesQuery.since_micros` | `Laser.metadata_changes(since_micros=)` | `MetadataChangesQuery.sinceMicros` | keywords |
+| `MetadataChangesQuery.until_micros` | `Laser.metadata_changes(until_micros=)` | `MetadataChangesQuery.untilMicros` | keywords |
+| `MetadataChangesQuery.limit` | `Laser.metadata_changes(limit=)` | `MetadataChangesQuery.limit` | keywords |
+| `MetadataItem` | `MetadataItem` | `MetadataItem` |  |
+| `MetadataItem.group` | `MetadataItem.group` | `MetadataItem.group` | keywords |
+| `MetadataItem.subject` | `MetadataItem.subject` | `MetadataItem.subject` | keywords |
+| `MetadataSubject` | `MetadataSubject` | `MetadataSubject` |  |
+| `MetadataSubject.stream_id` | `MetadataSubject.stream_id` | `MetadataSubject.streamId` | keywords |
+| `MetadataSubject.stream_created_op` | `MetadataSubject.stream_created_op` | `MetadataSubject.streamCreatedOp` | keywords |
+| `MetadataSubject.topic_id` | `MetadataSubject.topic_id` | `MetadataSubject.topicId` | keywords |
+| `MetadataSubject.topic_created_op` | `MetadataSubject.topic_created_op` | `MetadataSubject.topicCreatedOp` | keywords |
+| `MetadataSubject.group_id` | `MetadataSubject.group_id` | `MetadataSubject.groupId` | keywords |
+| `MetadataSubject.member_id` | `MetadataSubject.member_id` | `MetadataSubject.memberId` | keywords |
+| `MetadataSubject.partition_id` | `MetadataSubject.partition_id` | `MetadataSubject.partitionId` | keywords |
+| `MetadataSubject.user_id` | `MetadataSubject.user_id` | `MetadataSubject.userId` | keywords |
+| `MetadataSubject.user_created_at_micros` | `MetadataSubject.user_created_at_micros` | `MetadataSubject.userCreatedAtMicros` | keywords |
+| `MetadataSubject.client_id` | `MetadataSubject.client_id` | `MetadataSubject.clientId` | keywords |
+| `MetadataSubject.session` | `MetadataSubject.session` | `MetadataSubject.session` | keywords |
+| `MetadataSubject.name` | `MetadataSubject.name` | `MetadataSubject.name` | keywords |
+| `MetadataSubject.username` | `MetadataSubject.username` | `MetadataSubject.username` | keywords |
+| `MetadataSubject.created_at_micros` | `MetadataSubject.created_at_micros` | `MetadataSubject.createdAtMicros` | keywords |
+| `MetadataSubject.partitions_count` | `MetadataSubject.partitions_count` | `MetadataSubject.partitionsCount` | keywords |
+| `MetadataSubject.partition_ids` | `MetadataSubject.partition_ids` | `MetadataSubject.partitionIds` | keywords |
+| `MetadataSubject.removed_partition_ids` | `MetadataSubject.removed_partition_ids` | `MetadataSubject.removedPartitionIds` | keywords |
+| `MetadataSubject.consumer_groups_count` | `MetadataSubject.consumer_groups_count` | `MetadataSubject.consumerGroupsCount` | keywords |
+| `MetadataSubject.members_count` | `MetadataSubject.members_count` | `MetadataSubject.membersCount` | keywords |
+| `MetadataSubject.requested_op` | `MetadataSubject.requested_op` | `MetadataSubject.requestedOp` | keywords |
+| `MetadataSubject.status` | `MetadataSubject.status` | `MetadataSubject.status` | keywords |
+| `MetadataSubject.permissions` | `MetadataSubject.permissions` | `MetadataSubject.permissions` | keywords |
+| `MetadataSubject.expires_at_micros` | `MetadataSubject.expires_at_micros` | `MetadataSubject.expiresAtMicros` | keywords |
+| `MetadataSubject.reason` | `MetadataSubject.reason` | `MetadataSubject.reason` | keywords |
+| `OptionInfo` | `OptionInfo` | `OptionInfo` |  |
+| `OptionInfo.key` | `OptionInfo.key` | `OptionInfo.key` | keywords |
+| `OptionInfo.kind` | `OptionInfo.kind` | `OptionInfo.kind` | keywords |
+| `OptionInfo.updatable` | `OptionInfo.updatable` | `OptionInfo.updatable` | keywords |
+| `OptionInfo.resettable` | `OptionInfo.resettable` | `OptionInfo.resettable` | keywords |
+| `OptionInfo.secret` | `OptionInfo.secret` | `OptionInfo.secret` | keywords |
+| `OptionInfo.read_only` | `OptionInfo.read_only` | `OptionInfo.readOnly` | keywords |
+| `OptionInfo.critical` | `OptionInfo.critical` | `OptionInfo.critical` | keywords |
+| `OptionInfo.default_value` | `OptionInfo.default_value` | `OptionInfo.defaultValue` | keywords |
+| `OptionInfo.description` | `OptionInfo.description` | `OptionInfo.description` | keywords |
+| `OptionsScope` | omitted | `OptionsScope` | plain-value |
+| `OptionsScope::Topic` | omitted | `OptionsScope` | plain-value |
+| `OptionsScope::Stream` | omitted | `OptionsScope` | plain-value |
+| `OptionsScope::User` | omitted | `OptionsScope` | plain-value |
+| `Permissions` | dict via `User.set_permissions` | `Permissions` | serde-dict |
+| `Permissions.global` | dict key | `Permissions.global` | serde-dict, keywords |
+| `Permissions.streams` | dict key | `Permissions.streams` | serde-dict, keywords |
+| `PersonalAccessToken` | `PersonalAccessToken` | `PersonalAccessToken` |  |
+| `PersonalAccessToken::create` | `PersonalAccessToken.create` | `PersonalAccessToken.create` |  |
+| `PersonalAccessToken::delete` | `PersonalAccessToken.delete` | `PersonalAccessToken.delete` |  |
+| `PersonalAccessToken::name` | `PersonalAccessToken.name` | `PersonalAccessToken.name` | property |
+| `PersonalAccessTokenInfo` | `PersonalAccessTokenInfo` | `PersonalAccessTokenInfo` |  |
+| `PersonalAccessTokenInfo.name` | `PersonalAccessTokenInfo.name` | `PersonalAccessTokenInfo.name` | keywords |
+| `PersonalAccessTokenInfo.expires_at_micros` | `PersonalAccessTokenInfo.expires_at_micros` | `PersonalAccessTokenInfo.expiresAtMicros` | keywords |
+| `ServerStats` | `ServerStats` | `ServerStats` |  |
+| `ServerStats.process_id` | `ServerStats.process_id` | `ServerStats.processId` | keywords |
+| `ServerStats.cpu_usage` | `ServerStats.cpu_usage` | `ServerStats.cpuUsage` | keywords |
+| `ServerStats.total_cpu_usage` | `ServerStats.total_cpu_usage` | `ServerStats.totalCpuUsage` | keywords |
+| `ServerStats.memory_usage_bytes` | `ServerStats.memory_usage_bytes` | `ServerStats.memoryUsageBytes` | keywords |
+| `ServerStats.total_memory_bytes` | `ServerStats.total_memory_bytes` | `ServerStats.totalMemoryBytes` | keywords |
+| `ServerStats.available_memory_bytes` | `ServerStats.available_memory_bytes` | `ServerStats.availableMemoryBytes` | keywords |
+| `ServerStats.run_time_micros` | `ServerStats.run_time_micros` | `ServerStats.runTimeMicros` | keywords |
+| `ServerStats.start_time_micros` | `ServerStats.start_time_micros` | `ServerStats.startTimeMicros` | keywords |
+| `ServerStats.read_bytes` | `ServerStats.read_bytes` | `ServerStats.readBytes` | keywords |
+| `ServerStats.written_bytes` | `ServerStats.written_bytes` | `ServerStats.writtenBytes` | keywords |
+| `ServerStats.messages_size_bytes` | `ServerStats.messages_size_bytes` | `ServerStats.messagesSizeBytes` | keywords |
+| `ServerStats.streams_count` | `ServerStats.streams_count` | `ServerStats.streamsCount` | keywords |
+| `ServerStats.topics_count` | `ServerStats.topics_count` | `ServerStats.topicsCount` | keywords |
+| `ServerStats.partitions_count` | `ServerStats.partitions_count` | `ServerStats.partitionsCount` | keywords |
+| `ServerStats.segments_count` | `ServerStats.segments_count` | `ServerStats.segmentsCount` | keywords |
+| `ServerStats.messages_count` | `ServerStats.messages_count` | `ServerStats.messagesCount` | keywords |
+| `ServerStats.clients_count` | `ServerStats.clients_count` | `ServerStats.clientsCount` | keywords |
+| `ServerStats.consumer_groups_count` | `ServerStats.consumer_groups_count` | `ServerStats.consumerGroupsCount` | keywords |
+| `ServerStats.hostname` | `ServerStats.hostname` | `ServerStats.hostname` | keywords |
+| `ServerStats.os_name` | `ServerStats.os_name` | `ServerStats.osName` | keywords |
+| `ServerStats.os_version` | `ServerStats.os_version` | `ServerStats.osVersion` | keywords |
+| `ServerStats.kernel_version` | `ServerStats.kernel_version` | `ServerStats.kernelVersion` | keywords |
+| `ServerStats.server_version` | `ServerStats.server_version` | `ServerStats.serverVersion` | keywords |
+| `ServerStats.threads_count` | `ServerStats.threads_count` | `ServerStats.threadsCount` | keywords |
+| `ServerStats.free_disk_space_bytes` | `ServerStats.free_disk_space_bytes` | `ServerStats.freeDiskSpaceBytes` | keywords |
+| `ServerStats.total_disk_space_bytes` | `ServerStats.total_disk_space_bytes` | `ServerStats.totalDiskSpaceBytes` | keywords |
+| `ServerStats.open_files_count` | `ServerStats.open_files_count` | `ServerStats.openFilesCount` | keywords |
+| `ServerStats.open_files_limit` | `ServerStats.open_files_limit` | `ServerStats.openFilesLimit` | keywords |
+| `ServerStats.cache_metrics` | `ServerStats.cache_metrics` | `ServerStats.cacheMetrics` | keywords |
+| `StreamPermissions` | dict via `User.set_permissions` | `StreamPermissions` | serde-dict |
+| `StreamPermissions.manage_stream` | dict key | `StreamPermissions.manageStream` | serde-dict, keywords |
+| `StreamPermissions.read_stream` | dict key | `StreamPermissions.readStream` | serde-dict, keywords |
+| `StreamPermissions.manage_topics` | dict key | `StreamPermissions.manageTopics` | serde-dict, keywords |
+| `StreamPermissions.read_topics` | dict key | `StreamPermissions.readTopics` | serde-dict, keywords |
+| `StreamPermissions.poll_messages` | dict key | `StreamPermissions.pollMessages` | serde-dict, keywords |
+| `StreamPermissions.send_messages` | dict key | `StreamPermissions.sendMessages` | serde-dict, keywords |
+| `StreamPermissions.topics` | dict key | `StreamPermissions.topics` | serde-dict, keywords |
+| `TopicPermissions` | dict via `User.set_permissions` | `TopicPermissions` | serde-dict |
+| `TopicPermissions.manage_topic` | dict key | `TopicPermissions.manageTopic` | serde-dict, keywords |
+| `TopicPermissions.read_topic` | dict key | `TopicPermissions.readTopic` | serde-dict, keywords |
+| `TopicPermissions.poll_messages` | dict key | `TopicPermissions.pollMessages` | serde-dict, keywords |
+| `TopicPermissions.send_messages` | dict key | `TopicPermissions.sendMessages` | serde-dict, keywords |
+| `UnknownUserStatus` | omitted | omitted | plain-value, converted-error |
+| `UpdateUserOptions` | `User.update` | `UpdateUserOptions` | keywords |
+| `UpdateUserOptions.username` | `User.update(username=)` | `UpdateUserOptions.username` | keywords |
+| `UpdateUserOptions.status` | `User.update(status=)` | `UpdateUserOptions.status` | keywords |
+| `User` | `User` | `User` |  |
+| `User::change_password` | `User.change_password` | `User.changePassword` |  |
+| `User::create` | `User.create` | `User.create` |  |
+| `User::delete` | `User.delete` | `User.delete` |  |
+| `User::exists` | `User.exists` | `User.exists` |  |
+| `User::get` | `User.get` | `User.get` |  |
+| `User::name` | `User.name` | `User.name` | property |
+| `User::set_permissions` | `User.set_permissions` | `User.setPermissions` |  |
+| `User::update` | `User.update` | `User.update` |  |
+| `UserInfo` | `UserInfo` | `UserInfo` |  |
+| `UserInfo.id` | `UserInfo.id` | `UserInfo.id` | keywords |
+| `UserInfo.username` | `UserInfo.username` | `UserInfo.username` | keywords |
+| `UserInfo.status` | `UserInfo.status` | `UserInfo.status` | keywords |
+| `UserInfo.created_at_micros` | `UserInfo.created_at_micros` | `UserInfo.createdAtMicros` | keywords |
+| `UserInfo.permissions` | `UserInfo.permissions` | `UserInfo.permissions` | keywords |
+| `UserStatus` | omitted | `UserStatus` | plain-value |
+| `UserStatus::Active` | omitted | `UserStatus` | plain-value |
+| `UserStatus::Inactive` | omitted | `UserStatus` | plain-value |
+
 ## sign
 
 | Rust | Python | TypeScript | Notes |
@@ -4306,6 +4689,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ConsumerBuilder::build` | `Topic.consumer` | `Topic.consumer` | one-call |
 | `ConsumerBuilder::commit_policy` | `Topic.consumer(auto_commit=, commit_interval_ms=, commit_every=)` | `ConsumerOptions.commitPolicy` | keywords |
 | `ConsumerBuilder::create_group` | `ConsumerGroup.consumer(create_group=)` | `ConsumerOptions.createGroup` | keywords |
+| `ConsumerBuilder::encryption` | `Topic.consumer(encryption=)` | `ConsumerOptions.encryption` | keywords |
 | `ConsumerBuilder::init_retries` | `Topic.consumer(init_retries=)` | `ConsumerOptions.initRetries` | keywords |
 | `ConsumerBuilder::max_bytes` | `Topic.consumer(max_bytes=)` | `ConsumerOptions.maxBytes` | keywords |
 | `ConsumerBuilder::max_wait` | `Topic.consumer(max_wait_ms=)` | `ConsumerOptions.maxWaitMs` | keywords |
@@ -4315,6 +4699,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ConsumerGroup` | `ConsumerGroup` | `ConsumerGroup` |  |
 | `ConsumerGroup::consumer` | `ConsumerGroup.consumer` | `ConsumerGroup.consumer` |  |
 | `ConsumerGroup::create` | `ConsumerGroup.create` | `ConsumerGroup.create` |  |
+| `ConsumerGroup::delete` | `ConsumerGroup.delete` | `ConsumerGroup.delete` |  |
 | `ConsumerGroup::filter` | `ConsumerGroup.filter` | `ConsumerGroup.filter` |  |
 | `ConsumerGroup::id` | `ConsumerGroup.id` | `ConsumerGroup.id` | property |
 | `ConsumerGroup::info` | `ConsumerGroup.info` | `ConsumerGroup.info` |  |
@@ -4326,6 +4711,11 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ConsumerGroupInfo.name` | `ConsumerGroupInfo.name` | `ConsumerGroupInfo.name` | keywords |
 | `ConsumerGroupInfo.identity` | `ConsumerGroupInfo.identity` | `ConsumerGroupInfo.identity` | keywords |
 | `ConsumerGroupInfo.filter` | `ConsumerGroupInfo.filter` | `ConsumerGroupInfo.filter` | keywords |
+| `ConsumerGroupSummary` | `ConsumerGroupSummary` | `ConsumerGroupSummary` |  |
+| `ConsumerGroupSummary.id` | `ConsumerGroupSummary.id` | `ConsumerGroupSummary.id` | keywords |
+| `ConsumerGroupSummary.name` | `ConsumerGroupSummary.name` | `ConsumerGroupSummary.name` | keywords |
+| `ConsumerGroupSummary.partitions_count` | `ConsumerGroupSummary.partitions_count` | `ConsumerGroupSummary.partitionsCount` | keywords |
+| `ConsumerGroupSummary.members_count` | `ConsumerGroupSummary.members_count` | `ConsumerGroupSummary.membersCount` | keywords |
 | `ConsumerMessage` | `ConsumerMessage` | `ConsumerMessage` |  |
 | `ConsumerMessage.payload` | `ConsumerMessage.payload` | `ConsumerMessage.payload` | keywords |
 | `ConsumerMessage.headers` | `ConsumerMessage.headers` | `ConsumerMessage.headers` | keywords |
@@ -4372,6 +4762,10 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Decoder` | `KvEntry.decode_value_with(codec=)` | `Decoder` | callback |
 | `Decoder::decode` | `KvEntry.decode_value_with(codec=)` | `Decoder.decode` | callback, keywords |
 | `DirectConfig` | omitted | omitted | rust-crate |
+| `Encryption` | `Encryption` | `Encryption` |  |
+| `Encryption::aes256_gcm` | `Encryption.aes256_gcm` | `Encryption.aes256Gcm` |  |
+| `Encryption::decrypt` | `Encryption.decrypt` | `Encryption.decrypt` |  |
+| `Encryption::encrypt` | `Encryption.encrypt` | `Encryption.encrypt` |  |
 | `FilterOwner` | dict via `GroupFilter.summary` | `FilterOwner` | serde-dict |
 | `FilterOwner.identity` | dict key | `FilterOwner.identity` | serde-dict, keywords |
 | `FilterOwner.group` | dict key | `FilterOwner.group` | serde-dict, keywords |
@@ -4412,6 +4806,13 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `stream::MAX_REPLICATION_FACTOR` | `const:MAX_REPLICATION_FACTOR` | `const:MAX_REPLICATION_FACTOR` |  |
 | `Msgpack` | `Msgpack` | `Msgpack` |  |
 | `OrderedSharding` | omitted | omitted | rust-crate |
+| `PartitionInfo` | `PartitionInfo` | `PartitionInfo` |  |
+| `PartitionInfo.id` | `PartitionInfo.id` | `PartitionInfo.id` | keywords |
+| `PartitionInfo.segments_count` | `PartitionInfo.segments_count` | `PartitionInfo.segmentsCount` | keywords |
+| `PartitionInfo.current_offset` | `PartitionInfo.current_offset` | `PartitionInfo.currentOffset` | keywords |
+| `PartitionInfo.size_bytes` | `PartitionInfo.size_bytes` | `PartitionInfo.sizeBytes` | keywords |
+| `PartitionInfo.messages_count` | `PartitionInfo.messages_count` | `PartitionInfo.messagesCount` | keywords |
+| `PartitionInfo.created_at_micros` | `PartitionInfo.created_at_micros` | `PartitionInfo.createdAtMicros` | keywords |
 | `Producer` | `Producer` | `Producer` |  |
 | `Producer::flush` | `Producer.flush` | `Producer.flush` |  |
 | `Producer::send` | `Producer.send` | `Producer.send` |  |
@@ -4428,7 +4829,9 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ProducerBuilder::build` | `Topic.producer` | `Topic.producer` | one-call |
 | `ProducerBuilder::create_stream` | `Topic.producer(create_stream=)` | `ProducerOptions.createStream` | keywords |
 | `ProducerBuilder::create_topic` | `Topic.producer(create_topic=)` | `ProducerOptions.createTopic` | keywords |
+| `ProducerBuilder::encryption` | `Topic.producer(encryption=)` | `ProducerOptions.encryption` | keywords |
 | `ProducerBuilder::expire_after` | `Topic.producer(expire_after_ms=)` | `ProducerOptions.expireAfterMs` | keywords |
+| `ProducerBuilder::idempotent` | `Topic.producer(idempotent=)` | `ProducerOptions.idempotent` | keywords |
 | `ProducerBuilder::linger` | `Topic.producer(linger_ms=)` | `ProducerOptions.lingerMs` | keywords |
 | `ProducerBuilder::max_topic_bytes` | `Topic.producer(max_topic_bytes=)` | `ProducerOptions.maxTopicBytes` | keywords |
 | `ProducerBuilder::never_expire` | `Topic.producer(never_expire=)` | `ProducerOptions.neverExpire` | keywords |
@@ -4437,6 +4840,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ProducerBuilder::retries` | `Topic.producer(retries=)` | `ProducerOptions.retries` | keywords |
 | `ProducerBuilder::retry_backoff` | `Topic.producer(retry_interval_ms=)` | `ProducerOptions.retryBackoffMs` | keywords |
 | `ProducerBuilder::routing` | `Topic.producer(key=, partition=)` | `ProducerOptions.routing` | keywords |
+| `ProducerBuilder::sharding` | `Topic.producer(sharding=)` | `ProducerOptions.sharding` | keywords |
 | `ProducerBuilder::unlimited_topic_size` | `Topic.producer(unlimited_topic_size=)` | `ProducerOptions.unlimitedTopicSize` | keywords |
 | `ProducerMessage` | `Producer.send` | `ProducerMessage` | keywords |
 | `ProducerMessage::builder` | `Producer.send` | `new ProducerMessage()` | keywords, constructor |
@@ -4495,6 +4899,11 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Routing::key` | `Topic.producer(key=)` | `Routing.key` | keywords |
 | `SendMessagesConfirmationResponse` | `SendMessagesConfirmationResponse` | omitted | rust-crate |
 | `SendMessagesResponse` | `SendMessagesResponse` | omitted | rust-crate |
+| `ShardRequest` | `ShardRequest` | `ShardRequest` |  |
+| `ShardRequest.shards` | `ShardRequest.shards` | `ShardRequest.shards` | keywords |
+| `ShardRequest.stream` | `ShardRequest.stream` | `ShardRequest.stream` | keywords |
+| `ShardRequest.topic` | `ShardRequest.topic` | `ShardRequest.topic` | keywords |
+| `ShardRequest.records` | `ShardRequest.records` | `ShardRequest.records` | keywords |
 | `Sharding` | omitted | omitted | rust-crate |
 | `StoredOffset` | `StoredOffset` | `StoredOffset` |  |
 | `StoredOffset.stored_offset` | `StoredOffset.stored_offset` | `StoredOffset.storedOffset` | keywords |
@@ -4502,17 +4911,35 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Stream` | `Stream` | `Stream` |  |
 | `Stream::delete` | `Stream.delete` | `Stream.delete` |  |
 | `Stream::ensure` | `Stream.ensure` | `Stream.ensure` |  |
+| `Stream::exists` | `Stream.exists` | `Stream.exists` |  |
+| `Stream::get` | `Stream.get` | `Stream.get` |  |
 | `Stream::name` | `Stream.name` | `Stream.name` | property |
+| `Stream::rename` | `Stream.rename` | `Stream.rename` |  |
 | `Stream::topic` | `Stream.topic` | `Stream.topic` |  |
+| `Stream::topics` | `Stream.topics` | `Stream.topics` |  |
+| `StreamInfo` | `StreamInfo` | `StreamInfo` |  |
+| `StreamInfo.id` | `StreamInfo.id` | `StreamInfo.id` | keywords |
+| `StreamInfo.name` | `StreamInfo.name` | `StreamInfo.name` | keywords |
+| `StreamInfo.topics_count` | `StreamInfo.topics_count` | `StreamInfo.topicsCount` | keywords |
+| `StreamInfo.size_bytes` | `StreamInfo.size_bytes` | `StreamInfo.sizeBytes` | keywords |
+| `StreamInfo.messages_count` | `StreamInfo.messages_count` | `StreamInfo.messagesCount` | keywords |
+| `StreamInfo.created_at_micros` | `StreamInfo.created_at_micros` | `StreamInfo.createdAtMicros` | keywords |
 | `Topic` | `Topic` | `Topic` |  |
+| `Topic::add_partitions` | `Topic.add_partitions` | `Topic.addPartitions` |  |
 | `Topic::batch` | `Topic.batch` | `Topic.batch` |  |
 | `Topic::batching` | `Topic.batching` | `Topic.batching` |  |
 | `Topic::cbor` | `Topic.cbor` | `Topic.cbor` |  |
 | `Topic::consumer` | `Topic.consumer` | `Topic.consumer` |  |
 | `Topic::consumer_group` | `Topic.consumer_group` | `Topic.consumerGroup` |  |
 | `Topic::consumer_group_id` | `Topic.consumer_group_id` | `Topic.consumerGroupId` |  |
+| `Topic::consumer_groups` | `Topic.consumer_groups` | `Topic.consumerGroups` |  |
+| `Topic::delete` | `Topic.delete` | `Topic.delete` |  |
+| `Topic::delete_partitions` | `Topic.delete_partitions` | `Topic.deletePartitions` |  |
+| `Topic::delete_segments` | `Topic.delete_segments` | `Topic.deleteSegments` |  |
 | `Topic::ensure` | `Topic.ensure` | `Topic.ensure` |  |
 | `Topic::ensure_consumer_group` | `Topic.ensure_consumer_group` | `Topic.ensureConsumerGroup` |  |
+| `Topic::exists` | `Topic.exists` | `Topic.exists` |  |
+| `Topic::get` | `Topic.get` | `Topic.get` |  |
 | `Topic::iggy_consumer` | omitted | omitted | rust-crate |
 | `Topic::iggy_consumer_group` | omitted | omitted | rust-crate |
 | `Topic::iggy_producer` | omitted | omitted | rust-crate |
@@ -4520,12 +4947,30 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Topic::materialization` | `Topic.materialization` | `Topic.materialization` |  |
 | `Topic::materialize` | `Topic.materialize` | `Topic.materialize` |  |
 | `Topic::name` | `Topic.name` | `Topic.name` | property |
+| `Topic::partitions` | `Topic.partitions` | `Topic.partitions` |  |
 | `Topic::producer` | `Topic.producer` | `Topic.producer` |  |
 | `Topic::publish` | `Topic.publish` | `Topic.publish` |  |
 | `Topic::publish_batch` | `Topic.publish_batch` | `Topic.publishBatch` |  |
 | `Topic::replay` | `Topic.replay` | `Topic.replay` |  |
 | `Topic::schema` | `Topic.schema` | `Topic.schema` |  |
 | `Topic::send` | `Topic.send` | `Topic.send` |  |
+| `Topic::update` | `Topic.update` | `Topic.update` |  |
+| `TopicInfo` | `TopicInfo` | `TopicInfo` |  |
+| `TopicInfo.id` | `TopicInfo.id` | `TopicInfo.id` | keywords |
+| `TopicInfo.name` | `TopicInfo.name` | `TopicInfo.name` | keywords |
+| `TopicInfo.partitions_count` | `TopicInfo.partitions_count` | `TopicInfo.partitionsCount` | keywords |
+| `TopicInfo.replication_factor` | `TopicInfo.replication_factor` | `TopicInfo.replicationFactor` | keywords |
+| `TopicInfo.message_expiry` | `TopicInfo.message_expiry_ms` | `TopicInfo.messageExpiryMs` | keywords |
+| `TopicInfo.max_size_bytes` | `TopicInfo.max_size_bytes` | `TopicInfo.maxSizeBytes` | keywords |
+| `TopicInfo.size_bytes` | `TopicInfo.size_bytes` | `TopicInfo.sizeBytes` | keywords |
+| `TopicInfo.messages_count` | `TopicInfo.messages_count` | `TopicInfo.messagesCount` | keywords |
+| `TopicInfo.created_at_micros` | `TopicInfo.created_at_micros` | `TopicInfo.createdAtMicros` | keywords |
+| `UpdateTopicOptions` | `Topic.update` | `UpdateTopicOptions` | keywords |
+| `UpdateTopicOptions.name` | `Topic.update(name=)` | `UpdateTopicOptions.name` | keywords |
+| `UpdateTopicOptions.expire_after` | `Topic.update(expire_after_ms=)` | `UpdateTopicOptions.expireAfterMs` | keywords |
+| `UpdateTopicOptions.never_expire` | `Topic.update(never_expire=)` | `UpdateTopicOptions.neverExpire` | keywords |
+| `UpdateTopicOptions.max_topic_bytes` | `Topic.update(max_topic_bytes=)` | `UpdateTopicOptions.maxTopicBytes` | keywords |
+| `UpdateTopicOptions.unlimited_topic_size` | `Topic.update(unlimited_topic_size=)` | `UpdateTopicOptions.unlimitedTopicSize` | keywords |
 
 ## swarm
 
@@ -4642,6 +5087,7 @@ These Python and TypeScript APIs have no Rust row for a language reason.
 | Client | API | Note |
 | --- | --- | --- |
 | Python | `AmbiguousMutationRecovery.ttl_ms` | property |
+| Python | `BridgeServer` | one-call |
 | Python | `Consumer.init` | lazy-init |
 | Python | `ConsumerMessage.header_kinds` | rust-crate |
 | Python | `KvRevalidation.entry` | property |
@@ -4684,6 +5130,7 @@ These Python and TypeScript APIs have no Rust row for a language reason.
 | Python | `encode_state_delta()` | native-binding |
 | Python | `encode_state_snapshot()` | native-binding |
 | TypeScript | `AgentDefinition` | signature-type |
+| TypeScript | `BridgeServer` | one-call |
 | TypeScript | `BytesLike` | signature-type |
 | TypeScript | `CallOptions` | signature-type |
 | TypeScript | `CapabilitySurface` | signature-type |

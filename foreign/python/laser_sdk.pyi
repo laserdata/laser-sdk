@@ -86,6 +86,7 @@ __all__ = [
     "BatchingProducer",
     "Bindings",
     "BindingsReply",
+    "BridgeServer",
     "Bson",
     "Budget",
     "CAUSAL_PARENT",
@@ -96,21 +97,28 @@ __all__ = [
     "CONVERSATION_ID",
     "CORRELATION_ID",
     "COST_USD",
+    "CacheMetrics",
     "Capabilities",
     "Cbor",
     "Chain",
     "ChangeRecord",
     "Checkpoint",
     "ChunkAssembler",
+    "ClientConsumerGroup",
+    "ClientInfo",
     "ClientMetadataPage",
     "Clock",
+    "ClusterInfo",
+    "ClusterNode",
     "CompiledFilter",
     "CompiledSchema",
+    "ConnectionEvents",
     "ConsolidationReport",
     "Consumer",
     "ConsumerFilter",
     "ConsumerGroup",
     "ConsumerGroupInfo",
+    "ConsumerGroupSummary",
     "ConsumerMessage",
     "ConsumerRef",
     "ConsumptionStatus",
@@ -146,6 +154,7 @@ __all__ = [
     "Decision",
     "DedicatedKvTransport",
     "EdgeDenial",
+    "Encryption",
     "FENCE",
     "FIELD_MESSAGE_TYPE",
     "FIELD_TS",
@@ -252,6 +261,11 @@ __all__ = [
     "MemoryItem",
     "Message",
     "MessageId",
+    "MetadataChangeRecord",
+    "MetadataChangeStart",
+    "MetadataChanges",
+    "MetadataItem",
+    "MetadataSubject",
     "ModelCall",
     "ModelRequest",
     "ModelResponse",
@@ -261,12 +275,16 @@ __all__ = [
     "OPS_STREAM_DEFAULT",
     "ObservedVote",
     "OpVersions",
+    "OptionInfo",
     "PARENT_CONVERSATION_ID",
     "POLICY_DECISION_OPERATION",
     "PROJECTION_REF",
     "Page",
     "ParkedRecords",
+    "PartitionInfo",
     "PendingControl",
+    "PersonalAccessToken",
+    "PersonalAccessTokenInfo",
     "PolicyEvidence",
     "PolicyRef",
     "PreparedMutation",
@@ -306,6 +324,7 @@ __all__ = [
     "Selection",
     "SendMessagesConfirmationResponse",
     "SendMessagesResponse",
+    "ServerStats",
     "Session",
     "SessionBootstrap",
     "SessionBuilder",
@@ -319,11 +338,13 @@ __all__ = [
     "SessionTurn",
     "SessionWatch",
     "Sessions",
+    "ShardRequest",
     "SigningKey",
     "SnapshotStore",
     "StateStore",
     "StoredOffset",
     "Stream",
+    "StreamInfo",
     "SubmitBuilder",
     "Submitted",
     "SwappableGovernor",
@@ -335,6 +356,7 @@ __all__ = [
     "TokenBudget",
     "ToolCall",
     "Topic",
+    "TopicInfo",
     "TopicRetention",
     "TopicSnapshotStore",
     "TypedQueryRows",
@@ -344,6 +366,8 @@ __all__ = [
     "USAGE_INPUT_TOKENS",
     "USAGE_OUTPUT_TOKENS",
     "UUID_VALUE_BYTES",
+    "User",
+    "UserInfo",
     "VECTOR_FIELD",
     "VectorMemory",
     "Verdict",
@@ -660,7 +684,7 @@ class A2aBridge:
     An A2A bridge: drive an agent as an A2A task source (`SendMessage` ->
     `GetTask` / `CancelTask`).
     """
-    def __new__(cls, laser: Laser, source: builtins.str, request_topic: builtins.str, reply_topic: builtins.str, *, capabilities: typing.Optional[typing.Sequence[typing.Any]] = None, signing_key: typing.Optional[SigningKey] = None, task_binding_key: typing.Optional[builtins.bytes] = None, task_binding_ttl_ms: typing.Optional[builtins.float] = None, target: typing.Optional[builtins.str] = None, public_url: typing.Optional[builtins.str] = None, description: typing.Optional[builtins.str] = None, version: typing.Optional[builtins.str] = None) -> A2aBridge:
+    def __new__(cls, laser: Laser, source: builtins.str, request_topic: builtins.str, reply_topic: builtins.str, *, capabilities: typing.Optional[typing.Sequence[typing.Any]] = None, signing_key: typing.Optional[SigningKey] = None, task_binding_key: typing.Optional[builtins.bytes] = None, task_binding_ttl_ms: typing.Optional[builtins.float] = None, target: typing.Optional[builtins.str] = None, public_url: typing.Optional[builtins.str] = None, description: typing.Optional[builtins.str] = None, version: typing.Optional[builtins.str] = None, allowed_origins: typing.Optional[typing.Sequence[builtins.str]] = None) -> A2aBridge:
         r"""
         An A2A bridge mapping JSON-RPC methods onto agent topics over `laser`,
         publishing as `source`. Use it to drive an agent as an A2A task source
@@ -677,6 +701,24 @@ class A2aBridge:
         `task_binding_key` (32 bytes) with `task_binding_ttl_ms` binds every
         task id to the caller that submitted it, as Rust `with_task_binding`.
         Task methods then need `caller`, the authenticated principal.
+
+        `allowed_origins` lists the browser origins `serve` accepts on the
+        JSON-RPC endpoint, each as the exact `Origin` header value.
+        """
+    def serve(self, host: builtins.str = '127.0.0.1', port: builtins.int = 0, *, caller: typing.Optional[typing.Callable[[dict[str, str]], typing.Union[typing.Optional[str], typing.Awaitable[typing.Optional[str]]]]] = None) -> typing.Awaitable[BridgeServer]:
+        r"""
+        Serve the bridge over HTTP on `host` and `port`, port 0 picking a free
+        one. `POST /` is the JSON-RPC endpoint and `GET
+        /.well-known/agent-card.json` the Agent Card, signed with the bridge's
+        key when it has one and answered with 404 until `public_url` is set. A
+        request without an `Origin` header, a non-browser client, passes the
+        endpoint, and so does a browser origin in `allowed_origins` or a
+        same-origin page on an IP literal or `localhost` host. Every other
+        browser request gets 403. The card is public and served to any origin.
+        `caller` takes the request headers as a dict with lowercase names and
+        returns the authenticated principal, or None for none. It may be async.
+        A hook that raises or returns anything else refuses the request with
+        401.
         """
     def handle_rpc(self, request: typing.Any, *, caller: typing.Optional[builtins.str] = None) -> typing.Awaitable[typing.Any]:
         r"""
@@ -1718,6 +1760,29 @@ class BindingsReply:
     def revision(self) -> builtins.int: ...
 
 @typing.final
+class BridgeServer:
+    r"""
+    A running bridge HTTP server from `A2aBridge.serve` or `McpBridge.serve`.
+    `port` is the bound port, the one the system picked when `serve` asked
+    for port 0. `close` stops accepting connections and waits for the requests
+    in flight.
+    """
+    @property
+    def host(self) -> builtins.str: ...
+    @property
+    def port(self) -> builtins.int: ...
+    @property
+    def url(self) -> builtins.str:
+        r"""
+        The `http://host:port` base URL of the JSON-RPC endpoint.
+        """
+    def close(self) -> typing.Awaitable[None]:
+        r"""
+        Stop the server. A second call does nothing.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class Bson:
     r"""
     The built-in BSON codec. The top-level value must be a dict.
@@ -1761,6 +1826,24 @@ class Budget:
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
     def __new__(cls, *, tokens: typing.Optional[builtins.int] = None, cost_micros: typing.Optional[builtins.int] = None) -> Budget: ...
     def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class CacheMetrics:
+    r"""
+    The cache use of one partition, by native ids.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def partition_id(self) -> builtins.int: ...
+    @property
+    def hits(self) -> builtins.int: ...
+    @property
+    def misses(self) -> builtins.int: ...
+    @property
+    def hit_ratio(self) -> builtins.float: ...
 
 @typing.final
 class Capabilities:
@@ -2036,6 +2119,43 @@ class ChunkAssembler:
         """
 
 @typing.final
+class ClientConsumerGroup:
+    r"""
+    One consumer group a connected client is a member of, by native ids.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def group_id(self) -> builtins.int: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class ClientInfo:
+    r"""
+    One connected client as the server reports it. `Laser.me`, `Laser.clients`,
+    and `Laser.client_info` return it. `consumer_groups` is empty in a listing.
+    """
+    @property
+    def client_id(self) -> builtins.int: ...
+    @property
+    def user_id(self) -> typing.Optional[builtins.int]:
+        r"""
+        The signed-in user, `None` before the client signs in.
+        """
+    @property
+    def address(self) -> builtins.str: ...
+    @property
+    def transport(self) -> builtins.str: ...
+    @property
+    def consumer_groups_count(self) -> builtins.int: ...
+    @property
+    def consumer_groups(self) -> builtins.list[ClientConsumerGroup]: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class ClientMetadataPage:
     r"""
     One page of live connections plus the cursor to fetch the next, returned
@@ -2062,6 +2182,46 @@ class Clock:
         r"""
         The current time, epoch microseconds.
         """
+
+@typing.final
+class ClusterInfo:
+    r"""
+    The cluster as `Laser.cluster` reports it. A single server reports one
+    node.
+    """
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def nodes(self) -> builtins.list[ClusterNode]: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class ClusterNode:
+    r"""
+    One node of the cluster. A port is 0 when the node does not serve that
+    transport. `role` is `leader` or `follower`, and `status` is `healthy`,
+    `starting`, `stopping`, `unreachable`, `maintenance`, or `unknown`.
+    """
+    @property
+    def replica_id(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def ip(self) -> builtins.str: ...
+    @property
+    def tcp_port(self) -> builtins.int: ...
+    @property
+    def quic_port(self) -> builtins.int: ...
+    @property
+    def http_port(self) -> builtins.int: ...
+    @property
+    def websocket_port(self) -> builtins.int: ...
+    @property
+    def role(self) -> builtins.str: ...
+    @property
+    def status(self) -> builtins.str: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
 
 @typing.final
 class CompiledFilter:
@@ -2198,6 +2358,14 @@ class CompiledSchema:
         managed backend extracts indexed fields from. Raises `CodecError` when the
         payload does not decode.
         """
+
+@typing.final
+class ConnectionEvents:
+    r"""
+    `Laser.connection_events`.
+    """
+    def __aiter__(self) -> ConnectionEvents: ...
+    def __anext__(self) -> typing.Awaitable[typing.Literal['connected', 'disconnected', 'signed_in', 'signed_out', 'shutdown']]: ...
 
 @typing.final
 class ConsolidationReport:
@@ -2470,12 +2638,18 @@ class ConsumerGroup:
         r"""
         The group as the server knows it.
         """
+    def delete(self) -> typing.Awaitable[builtins.bool]:
+        r"""
+        Delete the group with its stored offsets. Returns `False` when the
+        group, its topic or its stream did not exist. A recreated group is
+        another identity and inherits no policy.
+        """
     def filter(self) -> GroupFilter:
         r"""
         The group's filter policy: configure it, inspect it, pause and resume
         it, release it, preview and sample-test it.
         """
-    def consumer(self, *, batch_length: builtins.int = 1000, max_wait_ms: builtins.float = 5000.0, min_count: builtins.int = 1, max_bytes: builtins.int = 1048576, polling: typing.Literal['first', 'last', 'next', 'offset', 'timestamp'] = "next", offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: typing.Literal['disabled', 'interval', 'polling', 'all', 'each', 'every'] = "all", commit_interval_ms: builtins.float = 0.0, commit_every: typing.Optional[builtins.int] = None, create_group: builtins.bool = True, polling_retry_interval_ms: builtins.float = 1000.0, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.float = 1000.0, allow_replay: builtins.bool = False) -> Consumer:
+    def consumer(self, *, batch_length: builtins.int = 1000, max_wait_ms: builtins.float = 5000.0, min_count: builtins.int = 1, max_bytes: builtins.int = 1048576, polling: typing.Literal['first', 'last', 'next', 'offset', 'timestamp'] = "next", offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: typing.Literal['disabled', 'interval', 'polling', 'all', 'each', 'every'] = "all", commit_interval_ms: builtins.float = 0.0, commit_every: typing.Optional[builtins.int] = None, create_group: builtins.bool = True, polling_retry_interval_ms: builtins.float = 1000.0, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.float = 1000.0, allow_replay: builtins.bool = False, encryption: typing.Optional[Encryption] = None) -> Consumer:
         r"""
         Build a live, load-balanced consumer of this group with server-backed
         offsets. On a server that resolves group policies the consumer runs
@@ -2495,7 +2669,8 @@ class ConsumerGroup:
         only seeds a partition the group never stored, before its first read
         (the native consumer only those it holds when it joins), and a refused
         seed, such as an offset past a partition's end, fails `init` or the
-        first `next` with the Iggy error.
+        first `next` with the Iggy error. `encryption=Encryption.aes256_gcm(key)`
+        decrypts every record as `Topic.consumer` does.
         """
     def reader(self, *, start: typing.Optional[typing.Any] = None, count: typing.Optional[builtins.int] = None, max_examined: typing.Optional[builtins.int] = None, max_reply_bytes: typing.Optional[builtins.int] = None, max_unacked_pages: typing.Optional[builtins.int] = None, local_guard: builtins.bool = False, idle_interval_ms: typing.Optional[builtins.float] = None, max_wait_ms: typing.Optional[builtins.float] = None, partitions: typing.Optional[typing.Sequence[builtins.int]] = None) -> typing.Awaitable[FilteredReader]:
         r"""
@@ -2543,6 +2718,26 @@ class ConsumerGroupInfo:
         The active policy binding as a dict, `None` for an unbound group whose
         readers receive every record.
         """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class ConsumerGroupSummary:
+    r"""
+    One consumer group of a topic as the topic listing reports it.
+    `Topic.consumer_groups` returns it.
+    """
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        The native numeric group id.
+        """
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def partitions_count(self) -> builtins.int: ...
+    @property
+    def members_count(self) -> builtins.int: ...
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
     def __repr__(self) -> builtins.str: ...
 
@@ -3054,6 +3249,33 @@ class EdgeDenial:
     def step_up(required_scope: builtins.str) -> EdgeDenial:
         r"""
         The token lacks `required_scope`.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class Encryption:
+    r"""
+    Client-side encryption in Apache Iggy's AES-256-GCM format: a random
+    12-byte nonce, the ciphertext, then the 16-byte tag. Pass it as
+    `encryption=` to `Topic.producer` to encrypt the payload and the
+    user-header block of every record, and to a consumer with the same key to
+    decrypt them. The Rust and TypeScript clients and Apache Iggy's own
+    encryptor read the same records.
+    """
+    @staticmethod
+    def aes256_gcm(key: bytes) -> Encryption:
+        r"""
+        AES-256-GCM with a 32-byte key. Any other length raises `InvalidError`.
+        """
+    def encrypt(self, plaintext: typing.Any) -> bytes:
+        r"""
+        Encrypt `plaintext` (bytes, bytearray, or str) with a fresh nonce.
+        """
+    def decrypt(self, ciphertext: typing.Any) -> bytes:
+        r"""
+        Decrypt what `encrypt` returned. A ciphertext that is short, altered,
+        or sealed with another key raises `TransportError` with Apache Iggy
+        error code 72.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -4933,6 +5155,15 @@ class Laser:
         r"""
         The name `name` is sent as under this handle's naming.
         """
+    def connection_events(self) -> ConnectionEvents:
+        r"""
+        Watch this connection get connected, disconnected, signed in, signed
+        out, and shut down, from now on. `async for event in
+        laser.connection_events()` yields each event as `"connected"`,
+        `"disconnected"`, `"signed_in"`, `"signed_out"`, or `"shutdown"`, and
+        stops after `"shutdown"`. A leader change that moves the client to
+        another node is not a disconnect.
+        """
     def context(self, conversation_id: builtins.str) -> ContextScope:
         r"""
         The context accessor: one conversation's working record on the log.
@@ -5201,6 +5432,96 @@ class Laser:
         Execute a raw query (a dict mirroring the wire `Query`) and return one
         result page. `query(..)` builds the same request fluently.
         """
+    def users(self) -> typing.Awaitable[builtins.list[UserInfo]]:
+        r"""
+        Every user of the server, without permissions. Needs the read users
+        permission.
+        """
+    def user(self, name: builtins.str) -> User:
+        r"""
+        The user accessor. Free and synchronous, IO happens at the verbs.
+        """
+    def personal_access_tokens(self) -> typing.Awaitable[builtins.list[PersonalAccessTokenInfo]]:
+        r"""
+        Every personal access token of the signed-in user.
+        """
+    def personal_access_token(self, name: builtins.str) -> PersonalAccessToken:
+        r"""
+        The personal access token accessor for the signed-in user. Free and
+        synchronous, IO happens at the verbs.
+        """
+    def ping(self) -> typing.Awaitable[None]:
+        r"""
+        Ping the server.
+        """
+    def stats(self) -> typing.Awaitable[ServerStats]:
+        r"""
+        The server statistics. Needs the read servers permission.
+        """
+    def me(self) -> typing.Awaitable[ClientInfo]:
+        r"""
+        This connection as the server sees it.
+        """
+    def clients(self) -> typing.Awaitable[builtins.list[ClientInfo]]:
+        r"""
+        Every client connected to the server. Needs the read servers
+        permission.
+        """
+    def cluster(self) -> typing.Awaitable[ClusterInfo]:
+        r"""
+        The cluster name and its nodes with their roles and states.
+        """
+    def snapshot(self) -> typing.Awaitable[builtins.bytes]:
+        r"""
+        A server diagnostics snapshot as the bytes of a ZIP archive, with every
+        section the server collects: file system overview, process list,
+        resource use, server logs, and server configuration. Needs the manage
+        servers permission.
+        """
+    def client_info(self, client_id: builtins.int) -> typing.Awaitable[typing.Optional[ClientInfo]]:
+        r"""
+        One connected client with its consumer groups, `None` when no client
+        has `client_id`. Needs the read servers permission.
+        """
+    def resolve_operation(self, operation: builtins.int, timeout_ms: builtins.float) -> typing.Awaitable[None]:
+        r"""
+        Prove the outcome of the request `operation` that a failure's
+        `uncertain_operation` names, waiting at most `timeout_ms`. Resolves
+        when the request committed and raises a committed refusal's own error.
+        Either outcome frees the requests the operation blocked.
+        """
+    def abandon_operation(self, operation: builtins.int) -> typing.Awaitable[None]:
+        r"""
+        Give up the request `operation` that a failure's
+        `uncertain_operation` names, and free the requests it blocked. Its
+        outcome stays unknown.
+        """
+    def send_command(self, code: builtins.int, payload: builtins.bytes) -> typing.Awaitable[builtins.bytes]:
+        r"""
+        Send the command `code` with a raw payload and return the raw reply.
+        The server checks the permissions of the command. The sign-in,
+        sign-out, and session commands are refused before anything is sent.
+        """
+    def send_command_to_replica(self, code: builtins.int, payload: builtins.bytes, replica: builtins.int) -> typing.Awaitable[builtins.bytes]:
+        r"""
+        Send the command `code` with a raw payload to the replica `replica`,
+        as `cluster()` numbers it, and return that replica's own reply. Only a
+        command that a node answers from its own state goes to a replica.
+        """
+    def describe_options(self, scope: typing.Literal['topic', 'stream', 'user']) -> typing.Awaitable[builtins.list[OptionInfo]]:
+        r"""
+        Every option the server accepts for `scope`, `topic`, `stream`, or
+        `user`, with its type, rules, default, and description.
+        """
+    def metadata_changes(self, start: typing.Optional[MetadataChangeStart] = None, *, groups: typing.Optional[typing.Sequence[typing.Literal['streams', 'topics', 'partitions', 'consumer_groups', 'consumer_group_members', 'users', 'personal_access_tokens', 'sessions']]] = None, since_micros: typing.Optional[builtins.int] = None, until_micros: typing.Optional[builtins.int] = None, limit: builtins.int = 100) -> typing.Awaitable[MetadataChanges]:
+        r"""
+        One page of the server's metadata changes, or of its current state.
+        `start` is a `MetadataChangeStart`, the earliest record by default.
+        `groups` names the record families to read, every group when empty.
+        `since_micros` and `until_micros` keep records stamped inside the
+        inclusive range with the earliest and after starts. `limit` is 1 to
+        1000. Needs the manage servers permission.
+        """
     def sessions(self, *, stream: typing.Optional[builtins.str] = None, layout: typing.Optional[SessionLayout] = None, idle_timeout_ms: typing.Optional[builtins.float] = None, heartbeat_ms: typing.Optional[builtins.float] = None, register_source: typing.Optional[builtins.bool] = None, fail_on_dead_letter: typing.Optional[builtins.bool] = None, memory_namespace: typing.Optional[builtins.str] = None, context_turns: typing.Optional[builtins.int] = None, context_tokens: typing.Optional[builtins.int] = None, sdk: typing.Optional[tuple[builtins.str, builtins.str]] = None) -> Sessions:
         r"""
         The session accessor. `stream` puts the sessions on another stream,
@@ -5229,6 +5550,10 @@ class Laser:
         Raises the typed no-stream error at the verbs when the client was
         connected without a default stream. `json(cls)`, `cbor(cls)`, and
         `schema(schema_id, cls)` open the typed handle over it.
+        """
+    def streams(self) -> typing.Awaitable[builtins.list[StreamInfo]]:
+        r"""
+        Every stream this connection's user can read.
         """
     def watch(self, *, index: typing.Optional[builtins.str] = None, from_offsets: typing.Optional[typing.Sequence[builtins.int]] = None, from_end: builtins.bool = False) -> typing.Awaitable[WatchReader]:
         r"""
@@ -5577,7 +5902,7 @@ class McpBridge:
     An MCP bridge: serve tools / resources / prompts over the log and route
     `tools/call` to an agent.
     """
-    def __new__(cls, laser: Laser, source: builtins.str, tool_topic: builtins.str, reply_topic: builtins.str, server_name: builtins.str, *, tools: typing.Optional[typing.Any] = None, resources: typing.Optional[typing.Any] = None, prompts: typing.Optional[typing.Any] = None, timeout_ms: typing.Optional[builtins.float] = None, memory_tools: builtins.bool = False, signing_key: typing.Optional[SigningKey] = None, target: typing.Optional[builtins.str] = None) -> McpBridge:
+    def __new__(cls, laser: Laser, source: builtins.str, tool_topic: builtins.str, reply_topic: builtins.str, server_name: builtins.str, *, tools: typing.Optional[typing.Any] = None, resources: typing.Optional[typing.Any] = None, prompts: typing.Optional[typing.Any] = None, timeout_ms: typing.Optional[builtins.float] = None, memory_tools: builtins.bool = False, signing_key: typing.Optional[SigningKey] = None, target: typing.Optional[builtins.str] = None, allowed_origins: typing.Optional[typing.Sequence[builtins.str]] = None) -> McpBridge:
         r"""
         An MCP bridge over `laser` serving tools / resources / prompts over the
         log, publishing tool calls as `source`. `tools` / `resources` /
@@ -5589,7 +5914,19 @@ class McpBridge:
         agent with a verifier accepts them. `target` addresses every call that
         names no target to that agent, whose reply must then be signed by it
         when the laser verifies replies. Every tool call carries the
-        `bridge_hops` loop-guard path, starting at `source`.
+        `bridge_hops` loop-guard path, starting at `source`. `allowed_origins`
+        lists the browser origins `serve` accepts, each as the exact `Origin`
+        header value.
+        """
+    def serve(self, host: builtins.str = '127.0.0.1', port: builtins.int = 0) -> typing.Awaitable[BridgeServer]:
+        r"""
+        Serve the bridge over MCP Streamable HTTP on `host` and `port`, port 0
+        picking a free one. `POST /` takes one JSON-RPC message and answers it,
+        or answers 202 with no body for a notification. An unsupported
+        `MCP-Protocol-Version` header gets 400. A request without an `Origin`
+        header, a non-browser client, passes, and so does a browser origin in
+        `allowed_origins` or a same-origin page on an IP literal or `localhost`
+        host. Every other browser request gets 403.
         """
     def handle_rpc(self, request: typing.Any) -> typing.Awaitable[typing.Any]:
         r"""
@@ -5898,6 +6235,185 @@ class MessageId:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class MetadataChangeRecord:
+    r"""
+    One committed metadata change. `kind` is a change kind word such as
+    `stream_created`, `None` for a kind this client does not know, and its
+    subject is then empty. `actor_user_id` is `None` for a change the server
+    made itself.
+    """
+    @property
+    def op(self) -> builtins.int: ...
+    @property
+    def ordinal(self) -> builtins.int: ...
+    @property
+    def timestamp_micros(self) -> builtins.int: ...
+    @property
+    def actor_user_id(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def kind(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def subject(self) -> MetadataSubject: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataChangeStart:
+    r"""
+    Where `Laser.metadata_changes` starts. `after` takes the `next` cursor of
+    an earlier page. `current` pages through the current state, starting a
+    scan without a token and continuing it with the `page_token` of the page
+    before.
+    """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    @staticmethod
+    def earliest() -> MetadataChangeStart:
+        r"""
+        The oldest record the requested groups still hold completely.
+        """
+    @staticmethod
+    def latest() -> MetadataChangeStart:
+        r"""
+        No records, only a cursor at the newest record.
+        """
+    @staticmethod
+    def after(cursor: builtins.str) -> MetadataChangeStart:
+        r"""
+        The records after `cursor`.
+        """
+    @staticmethod
+    def current(page_token: typing.Optional[builtins.str] = None) -> MetadataChangeStart:
+        r"""
+        A page of the current state, the first without `page_token`.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataChanges:
+    r"""
+    One page of metadata changes, or of the current state. `status` is `ok`,
+    `behind` (the node has not applied the start yet, ask again), `expired`
+    (the node no longer holds every record after the start), or `reset` (the
+    start belongs to another history). After `expired` or `reset`, read the
+    current state again. `phase` is `changes` or `current`. Pass `next` to
+    `MetadataChangeStart.after` to read on, and `page_token` to
+    `MetadataChangeStart.current` to continue a current state scan.
+    """
+    @property
+    def status(self) -> builtins.str: ...
+    @property
+    def phase(self) -> builtins.str: ...
+    @property
+    def head_op(self) -> builtins.int: ...
+    @property
+    def oldest_op(self) -> builtins.int: ...
+    @property
+    def retained_since_micros(self) -> builtins.int: ...
+    @property
+    def next(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def has_more(self) -> builtins.bool: ...
+    @property
+    def records(self) -> builtins.list[MetadataChangeRecord]: ...
+    @property
+    def items(self) -> builtins.list[MetadataItem]: ...
+    @property
+    def page_token(self) -> typing.Optional[builtins.str]: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataItem:
+    r"""
+    One resource of the current state. `group` is a group word such as
+    `streams`, `None` for a group this client does not know, and its subject
+    is then empty.
+    """
+    @property
+    def group(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def subject(self) -> MetadataSubject: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataSubject:
+    r"""
+    What one change record or current state item is about. Each kind fills
+    the fields that name its resource and what changed, and leaves the rest
+    `None` or empty. Ids are native ids. A `*_created_op` or
+    `user_created_at_micros` tells a recreated resource apart from an older one
+    with the same id. Resource options are not carried.
+    """
+    @property
+    def stream_id(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def stream_created_op(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def topic_id(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def topic_created_op(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def group_id(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def member_id(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def partition_id(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def user_id(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def user_created_at_micros(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def client_id(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def session(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def name(self) -> typing.Optional[builtins.str]:
+        r"""
+        The stream, topic, consumer group, or personal access token name.
+        """
+    @property
+    def username(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def created_at_micros(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def partitions_count(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def partition_ids(self) -> builtins.list[builtins.int]: ...
+    @property
+    def removed_partition_ids(self) -> builtins.list[builtins.int]: ...
+    @property
+    def consumer_groups_count(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def members_count(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def requested_op(self) -> typing.Optional[builtins.int]:
+        r"""
+        The op of the request a deferred delete answers.
+        """
+    @property
+    def status(self) -> typing.Optional[typing.Literal['active', 'inactive']]:
+        r"""
+        `active` or `inactive` for a user.
+        """
+    @property
+    def permissions(self) -> dict[str, typing.Any] | None:
+        r"""
+        The user's grants as a dict, shaped as `User.set_permissions` takes
+        them.
+        """
+    @property
+    def expires_at_micros(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def reason(self) -> typing.Optional[typing.Literal['left', 'session_ended', 'deleted', 'expired', 'logout', 'revoked', 'updated', 'resource_deleted']]:
+        r"""
+        Why a member left, a token was deleted, a session closed, or a user's
+        permissions changed.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class ModelCall:
     r"""
     A model call in flight. Finish it with `complete` or `fail`.
@@ -6064,6 +6580,38 @@ class OpVersions:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class OptionInfo:
+    r"""
+    One option the server accepts for a scope. `kind` names the value type,
+    such as `uint64`, `bool`, or `string`. `default_value` is the default in
+    its text form, `None` when the option has no default. Integers are decimal,
+    floats are the `0x` hex of their bits, and raw bytes are base64.
+    `updatable` and `resettable` say what an update may do, `secret` options
+    are never returned, `read_only` options are never accepted, and a node
+    that does not know a `critical` option must not serve the resource.
+    """
+    @property
+    def key(self) -> builtins.str: ...
+    @property
+    def kind(self) -> builtins.str: ...
+    @property
+    def updatable(self) -> builtins.bool: ...
+    @property
+    def resettable(self) -> builtins.bool: ...
+    @property
+    def secret(self) -> builtins.bool: ...
+    @property
+    def read_only(self) -> builtins.bool: ...
+    @property
+    def critical(self) -> builtins.bool: ...
+    @property
+    def default_value(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def description(self) -> builtins.str: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class Page:
     r"""
     Pagination info for a query result. `has_more` is exact and free. `total`
@@ -6116,6 +6664,30 @@ class ParkedRecords:
         """
 
 @typing.final
+class PartitionInfo:
+    r"""
+    One partition of a topic as the server reports it. `Topic.partitions`
+    returns it.
+    """
+    @property
+    def id(self) -> builtins.int: ...
+    @property
+    def segments_count(self) -> builtins.int: ...
+    @property
+    def current_offset(self) -> builtins.int:
+        r"""
+        The offset of the newest message, 0 for an empty partition.
+        """
+    @property
+    def size_bytes(self) -> builtins.int: ...
+    @property
+    def messages_count(self) -> builtins.int: ...
+    @property
+    def created_at_micros(self) -> builtins.int: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class PendingControl:
     r"""
     The operator requests recorded for one session.
@@ -6136,6 +6708,45 @@ class PendingControl:
         A control request arrived on another partition of `agent.control` than
         the session's control route. It was never applied.
         """
+
+@typing.final
+class PersonalAccessToken:
+    r"""
+    One personal access token of the signed-in user, addressed by name. Build
+    it with `Laser.personal_access_token`. A connection string that carries the
+    token value in place of a username and password signs in with it.
+    """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        This token's name.
+        """
+    def create(self, expiry_ms: typing.Optional[builtins.float] = None) -> typing.Awaitable[builtins.str]:
+        r"""
+        Create this token and return its value. The server shows the value
+        only once. `expiry_ms` sets how long the token works, and `None` means
+        it never expires.
+        """
+    def delete(self) -> typing.Awaitable[builtins.bool]:
+        r"""
+        Delete this token. Returns `False` when the token did not exist.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class PersonalAccessTokenInfo:
+    r"""
+    One personal access token as `Laser.personal_access_tokens` lists it.
+    """
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def expires_at_micros(self) -> typing.Optional[builtins.int]:
+        r"""
+        When the token stops working, `None` for a token that never expires.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class PolicyEvidence:
@@ -7617,6 +8228,72 @@ class SendMessagesResponse:
     def confirmations(self) -> builtins.list[SendMessagesConfirmationResponse]: ...
 
 @typing.final
+class ServerStats:
+    r"""
+    The server statistics that `Laser.stats` returns. Sizes are in bytes and
+    times in microseconds.
+    """
+    @property
+    def process_id(self) -> builtins.int: ...
+    @property
+    def cpu_usage(self) -> builtins.float: ...
+    @property
+    def total_cpu_usage(self) -> builtins.float: ...
+    @property
+    def memory_usage_bytes(self) -> builtins.int: ...
+    @property
+    def total_memory_bytes(self) -> builtins.int: ...
+    @property
+    def available_memory_bytes(self) -> builtins.int: ...
+    @property
+    def run_time_micros(self) -> builtins.int: ...
+    @property
+    def start_time_micros(self) -> builtins.int: ...
+    @property
+    def read_bytes(self) -> builtins.int: ...
+    @property
+    def written_bytes(self) -> builtins.int: ...
+    @property
+    def messages_size_bytes(self) -> builtins.int: ...
+    @property
+    def streams_count(self) -> builtins.int: ...
+    @property
+    def topics_count(self) -> builtins.int: ...
+    @property
+    def partitions_count(self) -> builtins.int: ...
+    @property
+    def segments_count(self) -> builtins.int: ...
+    @property
+    def messages_count(self) -> builtins.int: ...
+    @property
+    def clients_count(self) -> builtins.int: ...
+    @property
+    def consumer_groups_count(self) -> builtins.int: ...
+    @property
+    def hostname(self) -> builtins.str: ...
+    @property
+    def os_name(self) -> builtins.str: ...
+    @property
+    def os_version(self) -> builtins.str: ...
+    @property
+    def kernel_version(self) -> builtins.str: ...
+    @property
+    def server_version(self) -> builtins.str: ...
+    @property
+    def threads_count(self) -> builtins.int: ...
+    @property
+    def free_disk_space_bytes(self) -> builtins.int: ...
+    @property
+    def total_disk_space_bytes(self) -> builtins.int: ...
+    @property
+    def open_files_count(self) -> builtins.int: ...
+    @property
+    def open_files_limit(self) -> builtins.int: ...
+    @property
+    def cache_metrics(self) -> builtins.list[CacheMetrics]: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class Session:
     r"""
     One session. A cheap handle: copies share the terminal latch. Build it with
@@ -8308,6 +8985,28 @@ class Sessions:
         """
 
 @typing.final
+class ShardRequest:
+    r"""
+    What a producer's own `sharding` callable sees for one background send:
+    the shard count, the target, and how many records the send carries.
+    """
+    @property
+    def shards(self) -> builtins.int:
+        r"""
+        The background shard count, at least one.
+        """
+    @property
+    def stream(self) -> builtins.str: ...
+    @property
+    def topic(self) -> builtins.str: ...
+    @property
+    def records(self) -> builtins.int:
+        r"""
+        The records of this send.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class SigningKey:
     r"""
     An Ed25519 signing key created from a 32-byte secret seed.
@@ -8425,6 +9124,48 @@ class Stream:
         r"""
         Delete this stream with every topic and message in it. Returns `False` when the stream did not exist.
         """
+    def get(self) -> typing.Awaitable[typing.Optional[StreamInfo]]:
+        r"""
+        This stream as the server reports it, `None` when it does not exist.
+        """
+    def exists(self) -> typing.Awaitable[builtins.bool]:
+        r"""
+        Whether this stream exists.
+        """
+    def topics(self) -> typing.Awaitable[builtins.list[TopicInfo]]:
+        r"""
+        Every topic of this stream. A missing stream raises an error
+        with `stream_or_topic_not_found` set.
+        """
+    def rename(self, name: builtins.str) -> typing.Awaitable[None]:
+        r"""
+        Rename this stream. After the rename, address the stream by its new
+        name.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class StreamInfo:
+    r"""
+    One stream as the server reports it. `Laser.streams` and `Stream.get`
+    return it.
+    """
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        The native numeric stream id.
+        """
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def topics_count(self) -> builtins.int: ...
+    @property
+    def size_bytes(self) -> builtins.int: ...
+    @property
+    def messages_count(self) -> builtins.int: ...
+    @property
+    def created_at_micros(self) -> builtins.int: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
@@ -8729,7 +9470,7 @@ class Topic:
         r"""
         Start a batch publish that flushes 1..N records in a single Iggy send.
         """
-    def producer(self, *, batch_length: builtins.int = 1000, linger_ms: builtins.float = 0.0, retries: typing.Optional[builtins.int] = None, retry_interval_ms: typing.Optional[builtins.float] = None, key: typing.Optional[typing.Any] = None, partition: typing.Optional[builtins.int] = None, create_stream: builtins.bool = False, create_topic: builtins.bool = True, partitions: builtins.int = 1, replication_factor: typing.Optional[builtins.int] = None, expire_after_ms: typing.Optional[builtins.float] = None, never_expire: builtins.bool = False, max_topic_bytes: typing.Optional[builtins.int] = None, unlimited_topic_size: builtins.bool = False, background: typing.Optional[typing.Any] = None) -> Producer:
+    def producer(self, *, batch_length: builtins.int = 1000, linger_ms: builtins.float = 0.0, retries: typing.Optional[builtins.int] = None, retry_interval_ms: typing.Optional[builtins.float] = None, key: typing.Optional[typing.Any] = None, partition: typing.Optional[builtins.int] = None, create_stream: builtins.bool = False, create_topic: builtins.bool = True, partitions: builtins.int = 1, replication_factor: typing.Optional[builtins.int] = None, expire_after_ms: typing.Optional[builtins.float] = None, never_expire: builtins.bool = False, max_topic_bytes: typing.Optional[builtins.int] = None, unlimited_topic_size: builtins.bool = False, background: typing.Optional[typing.Any] = None, sharding: typing.Callable[[ShardRequest], int] | None = None, encryption: typing.Optional[Encryption] = None, idempotent: builtins.bool = False) -> Producer:
         r"""
         Build a Laser direct producer. This is the full streaming hot path
         below the typed publish API: tune batching/linger/retries,
@@ -8746,8 +9487,18 @@ class Topic:
         `replication_factor` stores each partition of a topic this producer
         creates on that many nodes, 1 to `MAX_REPLICATION_FACTOR` and at most
         the cluster's node count, else the server default.
+        `sharding(request: ShardRequest) -> int` picks the background shard of
+        each send in place of the `BackgroundConfig` sharding, and needs
+        background mode. It returns an index below `request.shards`. An
+        exception, or an index out of range, fails the send before anything is
+        queued. `encryption=Encryption.aes256_gcm(key)` encrypts the payload and
+        the user-header block of every record. A publish failure lists its
+        records as sent, before encryption. `idempotent=True` writes each batch
+        once per partition, also when a lost reply makes the producer send it
+        again: the producer takes a producer id, and a resend keeps the id, the
+        sequence, and the message ids of the first attempt.
         """
-    def consumer(self, name: builtins.str, *, partition: builtins.int, batch_length: builtins.int = 1000, max_wait_ms: builtins.float = 5000.0, min_count: builtins.int = 1, max_bytes: builtins.int = 1048576, polling: typing.Literal['first', 'last', 'next', 'offset', 'timestamp'] = "next", offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: typing.Literal['disabled', 'interval', 'polling', 'all', 'each', 'every'] = "all", commit_interval_ms: builtins.float = 0.0, commit_every: typing.Optional[builtins.int] = None, polling_retry_interval_ms: builtins.float = 1000.0, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.float = 1000.0, allow_replay: builtins.bool = False) -> Consumer:
+    def consumer(self, name: builtins.str, *, partition: builtins.int, batch_length: builtins.int = 1000, max_wait_ms: builtins.float = 5000.0, min_count: builtins.int = 1, max_bytes: builtins.int = 1048576, polling: typing.Literal['first', 'last', 'next', 'offset', 'timestamp'] = "next", offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: typing.Literal['disabled', 'interval', 'polling', 'all', 'each', 'every'] = "all", commit_interval_ms: builtins.float = 0.0, commit_every: typing.Optional[builtins.int] = None, polling_retry_interval_ms: builtins.float = 1000.0, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.float = 1000.0, allow_replay: builtins.bool = False, encryption: typing.Optional[Encryption] = None) -> Consumer:
         r"""
         Build a Laser reader for one partition. It is an async iterator
         and supports the same polling, batching, replay, retry, and commit modes
@@ -8758,7 +9509,11 @@ class Topic:
         commit-after-handle delivery. The server holds a
         poll that finds fewer than `min_count` new records for up to
         `max_wait_ms` (0 to 600000, 0 answers at once), and `max_bytes` caps
-        the record bytes of one reply.
+        the record bytes of one reply. `encryption=Encryption.aes256_gcm(key)`
+        decrypts the payload and the user-header block of every record. A
+        record that does not decrypt raises `TransportError` once, with Apache
+        Iggy error code 72, and is read past. It refuses `auto_commit="polling"`,
+        because the server would store a poll before it is decrypted.
         """
     def consumer_group(self, group: builtins.str) -> ConsumerGroup:
         r"""
@@ -8790,6 +9545,91 @@ class Topic:
         Idempotently create the consumer group `name` on this topic without
         joining it.
         """
+    def get(self) -> typing.Awaitable[typing.Optional[TopicInfo]]:
+        r"""
+        This topic as the server reports it, `None` when the topic or its
+        stream does not exist.
+        """
+    def exists(self) -> typing.Awaitable[builtins.bool]:
+        r"""
+        Whether this topic exists.
+        """
+    def delete(self) -> typing.Awaitable[builtins.bool]:
+        r"""
+        Delete this topic with every message in it. Returns `False` when the
+        topic or its stream did not exist.
+        """
+    def partitions(self) -> typing.Awaitable[builtins.list[PartitionInfo]]:
+        r"""
+        Every partition of this topic. A missing topic raises an error
+        with `stream_or_topic_not_found` set.
+        """
+    def add_partitions(self, count: builtins.int) -> typing.Awaitable[None]:
+        r"""
+        Add `count` partitions after the existing ones. A topic created with a
+        fixed partition layout refuses the change.
+        """
+    def delete_partitions(self, count: builtins.int) -> typing.Awaitable[None]:
+        r"""
+        Delete the last `count` partitions with their messages. A topic created
+        with a fixed partition layout refuses the change.
+        """
+    def update(self, *, name: typing.Optional[builtins.str] = None, expire_after_ms: typing.Optional[builtins.float] = None, never_expire: builtins.bool = False, max_topic_bytes: typing.Optional[builtins.int] = None, unlimited_topic_size: builtins.bool = False) -> typing.Awaitable[None]:
+        r"""
+        Change the name, retention, or size cap of this topic. A keyword left
+        unset keeps its value. Pass `expire_after_ms` or `never_expire`, and
+        `max_topic_bytes` or `unlimited_topic_size`. After a rename, address
+        the topic by its new name.
+        """
+    def delete_segments(self, partition_id: builtins.int, count: builtins.int) -> typing.Awaitable[None]:
+        r"""
+        Delete the oldest `count` segments of one partition with their
+        messages. The open segment stays.
+        """
+    def consumer_groups(self) -> typing.Awaitable[builtins.list[ConsumerGroupSummary]]:
+        r"""
+        Every consumer group of this topic. A missing topic raises an error
+        with `stream_or_topic_not_found` set.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class TopicInfo:
+    r"""
+    One topic as the server reports it. `Stream.topics` and `Topic.get`
+    return it.
+    """
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        The native numeric topic id.
+        """
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def partitions_count(self) -> builtins.int: ...
+    @property
+    def replication_factor(self) -> typing.Optional[builtins.int]:
+        r"""
+        How many nodes store each partition, `None` when the server reports no factor.
+        """
+    @property
+    def message_expiry_ms(self) -> typing.Optional[builtins.float]:
+        r"""
+        How long a message is kept in milliseconds, `None` when messages never expire.
+        """
+    @property
+    def max_size_bytes(self) -> typing.Optional[builtins.int]:
+        r"""
+        The retained size cap in bytes, `None` when the topic is unlimited.
+        """
+    @property
+    def size_bytes(self) -> builtins.int: ...
+    @property
+    def messages_count(self) -> builtins.int: ...
+    @property
+    def created_at_micros(self) -> builtins.int: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
@@ -8966,6 +9806,84 @@ class TypedTopic:
         The untyped handle underneath, for the verbs the typed form does not
         wrap: raw sends, batches, replay, and the producer and consumer builders.
         """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class User:
+    r"""
+    One user of the server, addressed by name. Build it with `Laser.user`.
+    Each verb needs the matching user permission on this connection.
+    Permissions are dicts with a `global` dict of grant flags and a `streams`
+    dict keyed by native stream id, each with its own `topics` dict keyed by
+    native topic id. A grant flag left out is `False`.
+    """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        This user's name.
+        """
+    def get(self) -> typing.Awaitable[typing.Optional[UserInfo]]:
+        r"""
+        This user with its permissions, `None` when it does not exist.
+        """
+    def exists(self) -> typing.Awaitable[builtins.bool]:
+        r"""
+        Whether this user exists.
+        """
+    def create(self, password: builtins.str, *, status: typing.Literal['active', 'inactive'] = "active", permissions: dict[str, typing.Any] | None = None) -> typing.Awaitable[UserInfo]:
+        r"""
+        Create this user with `password`. A user starts `active` without
+        grants. An existing user of the same name fails the call.
+        """
+    def update(self, *, username: typing.Optional[builtins.str] = None, status: typing.Literal['active', 'inactive'] | None = None) -> typing.Awaitable[None]:
+        r"""
+        Rename this user or change its status. A keyword left `None` keeps its
+        value. A deactivated user can no longer sign in. After a rename,
+        address the user by its new name.
+        """
+    def set_permissions(self, permissions: dict[str, typing.Any] | None) -> typing.Awaitable[None]:
+        r"""
+        Replace every permission of this user. `None` removes every grant.
+        """
+    def change_password(self, current_password: builtins.str, new_password: builtins.str) -> typing.Awaitable[None]:
+        r"""
+        Change this user's password. The server checks `current_password`
+        first.
+        """
+    def delete(self) -> typing.Awaitable[builtins.bool]:
+        r"""
+        Delete this user. Returns `False` when the user did not exist.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class UserInfo:
+    r"""
+    One user as the server reports it. `Laser.users`, `User.get`, and
+    `User.create` return it. `permissions` is `None` in a listing and for a
+    user without grants.
+    """
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        The native numeric user id.
+        """
+    @property
+    def username(self) -> builtins.str: ...
+    @property
+    def status(self) -> typing.Literal['active', 'inactive']:
+        r"""
+        `active` or `inactive`.
+        """
+    @property
+    def created_at_micros(self) -> builtins.int: ...
+    @property
+    def permissions(self) -> dict[str, typing.Any] | None:
+        r"""
+        The grants as a dict, `None` in a listing and for a user without
+        grants.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
@@ -10092,6 +11010,7 @@ class LaserError(builtins.Exception):
     code: builtins.str
     retryable: builtins.bool
     iggy_error_code: builtins.int | None
+    uncertain_operation: builtins.int | None
     filter_reason: builtins.str | None
     unavailable: builtins.bool
     unsupported: builtins.bool

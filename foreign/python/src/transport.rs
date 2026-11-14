@@ -3,6 +3,7 @@ use crate::async_bridge::{
 };
 use crate::convert::{duration_ms, payload_bytes};
 use crate::errors::{InvalidError, to_pyerr};
+use crate::sharding::PySharding;
 use iggy::clients::producer_config::BackpressureMode;
 use iggy::clients::producer_error_callback::{ErrorCallback, ErrorCtx};
 use iggy::prelude::{
@@ -12,8 +13,8 @@ use iggy::prelude::{
 };
 use laser_sdk::error::LaserError;
 use laser_sdk::stream::{
-    CommitPolicy, Consumer, ConsumerBuilder, ConsumerMessage, ConsumerStart, Headers, Producer,
-    ProducerMessage, Routing, StoredOffset, Topic,
+    CommitPolicy, Consumer, ConsumerBuilder, ConsumerMessage, ConsumerStart, Encryption, Headers,
+    Producer, ProducerMessage, Routing, StoredOffset, Topic,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
@@ -178,6 +179,7 @@ pub(crate) struct ConsumerConfig<'a> {
     pub init_retries: Option<u32>,
     pub init_retry_interval_ms: f64,
     pub allow_replay: bool,
+    pub encryption: Option<Encryption>,
 }
 
 /// Apply the Python keyword options to a Laser consumer builder. The consumer
@@ -248,6 +250,9 @@ pub(crate) fn configure_consumer(
     }
     if config.allow_replay {
         builder = builder.allow_replay();
+    }
+    if let Some(encryption) = config.encryption {
+        builder = builder.encryption(encryption);
     }
     Ok(PyConsumer::new(name, builder))
 }
@@ -469,6 +474,9 @@ pub(crate) struct ProducerSettings {
     pub expiry: IggyExpiry,
     pub max_topic_size: iggy::prelude::MaxTopicSize,
     pub background: Option<BackgroundSettings>,
+    pub sharding: Option<PySharding>,
+    pub encryption: Option<Encryption>,
+    pub idempotent: bool,
 }
 
 impl ProducerSettings {
@@ -501,10 +509,19 @@ impl ProducerSettings {
             IggyExpiry::NeverExpire => builder.never_expire(),
             IggyExpiry::ExpireDuration(expiry) => builder.expire_after(expiry.get_duration()),
         };
-        let builder = match self.background {
+        let mut builder = match self.background {
             Some(background) => builder.background(background.config()),
             None => builder,
         };
+        if let Some(sharding) = self.sharding {
+            builder = builder.sharding(sharding.picker());
+        }
+        if let Some(encryption) = self.encryption {
+            builder = builder.encryption(encryption);
+        }
+        if self.idempotent {
+            builder = builder.idempotent();
+        }
         builder.build().await
     }
 }
@@ -1806,6 +1823,9 @@ mod tests {
                 expiry: IggyExpiry::ServerDefault,
                 max_topic_size: MaxTopicSize::ServerDefault,
                 background: None,
+                sharding: None,
+                encryption: None,
+                idempotent: false,
             };
             let result = settings
                 .build(laser.stream("fleet").topic("readings"))

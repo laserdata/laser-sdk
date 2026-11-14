@@ -4,6 +4,7 @@ import { type CallOptions, abortable, cancellable, delay, throwIfAborted } from 
 import { closeProducerStatistics } from "../stream/producer-statistics.js"
 import type { GroupContext } from "../stream/consumer-group.js"
 import { connectOptions, type ConnectOptions } from "./connect-options.js"
+import { ConnectionEvents } from "./connection-events.js"
 import { publishOptions, type PublishOptions } from "./publish-options.js"
 import {
   ApacheIggyTransport,
@@ -47,6 +48,21 @@ import {
   type RegistryCache
 } from "../agent/registry.js"
 import { AsyncOnce } from "../runtime/async-once.js"
+import { type StreamInfo, adminOperation } from "../stream/admin.js"
+import {
+  type ClientInfo,
+  type ClusterInfo,
+  type MetadataChanges,
+  type MetadataChangesQuery,
+  type OptionInfo,
+  type OptionsScope,
+  PersonalAccessToken,
+  type PersonalAccessTokenInfo,
+  type ServerStats,
+  User,
+  type UserInfo,
+  serverVerbs
+} from "./server.js"
 import { Stream } from "../stream/stream.js"
 import { ContextScope } from "../context-scope.js"
 import {
@@ -1267,10 +1283,14 @@ export class Laser implements AsyncDisposable {
         }),
       async (schemaId, options) => (await this.schemas().get(schemaId, options))?.schema,
       (operation, attributes, effect) => this.observe(operation, attributes, effect),
-      () => {
-        this.shared.registryCaches.delete(name)
+      (topic) => {
+        if (topic === undefined || topic === AgentTopic.Registry)
+          this.shared.registryCaches.delete(name)
         for (const [key, hub] of this.shared.replyHubs) {
-          if (!key.startsWith(`${name}\u001f`)) continue
+          if (
+            topic === undefined ? !key.startsWith(`${name}\u001f`) : key !== `${name}\u001f${topic}`
+          )
+            continue
           this.shared.replyHubs.delete(key)
           void hub.then(
             (value) => {
@@ -1296,6 +1316,116 @@ export class Laser implements AsyncDisposable {
         )
       }
     )
+  }
+
+  /** Every user of the server, without permissions. Needs the read users permission. */
+  async users(options: CallOptions = {}): Promise<readonly UserInfo[]> {
+    return serverVerbs.users(this.transport, options)
+  }
+
+  /** The user accessor. Free and synchronous, IO happens at the verbs. */
+  user(name: string): User {
+    return User.create(this.transport, name)
+  }
+
+  /** Every personal access token of the signed-in user. */
+  async personalAccessTokens(
+    options: CallOptions = {}
+  ): Promise<readonly PersonalAccessTokenInfo[]> {
+    return serverVerbs.tokens(this.transport, options)
+  }
+
+  /** The personal access token accessor for the signed-in user. Free and synchronous, IO happens at the verbs. */
+  personalAccessToken(name: string): PersonalAccessToken {
+    return PersonalAccessToken.create(this.transport, name)
+  }
+
+  /** Pings the server. */
+  async ping(options: CallOptions = {}): Promise<void> {
+    return serverVerbs.ping(this.transport, options)
+  }
+
+  /** The server statistics. Needs the read servers permission. */
+  async stats(options: CallOptions = {}): Promise<ServerStats> {
+    return serverVerbs.stats(this.transport, options)
+  }
+
+  /** This connection as the server sees it. */
+  async me(options: CallOptions = {}): Promise<ClientInfo> {
+    return serverVerbs.me(this.transport, options)
+  }
+
+  /** Every client connected to the server. Needs the read servers permission. */
+  async clients(options: CallOptions = {}): Promise<readonly ClientInfo[]> {
+    return serverVerbs.clients(this.transport, options)
+  }
+
+  /** The cluster name and its nodes with their roles and states. */
+  async cluster(options: CallOptions = {}): Promise<ClusterInfo> {
+    return serverVerbs.cluster(this.transport, options)
+  }
+
+  /** A server diagnostics snapshot as the bytes of a ZIP archive, with every section the server collects: file system overview, process list, resource use, server logs, and server configuration. Needs the manage servers permission. */
+  async snapshot(options: CallOptions = {}): Promise<Uint8Array> {
+    return serverVerbs.snapshot(this.transport, options)
+  }
+
+  /** One connected client with its consumer groups. Resolves `undefined` when no client has `clientId`. Needs the read servers permission. */
+  async clientInfo(clientId: number, options: CallOptions = {}): Promise<ClientInfo | undefined> {
+    return serverVerbs.client(this.transport, clientId, options)
+  }
+
+  /** Proves the outcome of the request `operation` that `uncertainOperation(error)` names, waiting at most `timeoutMs`. Resolves when the request committed and rejects with a committed refusal's own error. Either outcome frees the requests the operation blocked. */
+  async resolveOperation(
+    operation: bigint,
+    timeoutMs: number,
+    options: CallOptions = {}
+  ): Promise<void> {
+    return serverVerbs.resolveOperation(this.transport, operation, timeoutMs, options)
+  }
+
+  /** Gives up the request `operation` that `uncertainOperation(error)` names, and frees the requests it blocked. Its outcome stays unknown. */
+  async abandonOperation(operation: bigint, options: CallOptions = {}): Promise<void> {
+    return serverVerbs.abandonOperation(this.transport, operation, options)
+  }
+
+  /** Sends the command `code` with a raw payload and resolves the raw reply. The server checks the permissions of the command. The sign-in, sign-out, and session commands are refused before anything is sent. */
+  async sendCommand(
+    code: number,
+    payload: Uint8Array,
+    options: CallOptions = {}
+  ): Promise<Uint8Array> {
+    return serverVerbs.sendCommand(this.transport, code, payload, undefined, options)
+  }
+
+  /** Sends the command `code` with a raw payload to the replica `replica`, as `cluster()` numbers it, and resolves that replica's own reply. Only a command that a node answers from its own state goes to a replica. */
+  async sendCommandToReplica(
+    code: number,
+    payload: Uint8Array,
+    replica: number,
+    options: CallOptions = {}
+  ): Promise<Uint8Array> {
+    return serverVerbs.sendCommand(this.transport, code, payload, replica, options)
+  }
+
+  /** Every option the server accepts for `scope`, with its type, rules, default, and description. */
+  async describeOptions(
+    scope: OptionsScope,
+    options: CallOptions = {}
+  ): Promise<readonly OptionInfo[]> {
+    return serverVerbs.describeOptions(this.transport, scope, options)
+  }
+
+  /** One page of the server's metadata changes, or of its current state. Needs the manage servers permission. */
+  async metadataChanges(query: MetadataChangesQuery & CallOptions = {}): Promise<MetadataChanges> {
+    return serverVerbs.metadataChanges(this.transport, query, query)
+  }
+
+  /** Every stream this connection's user can read. */
+  async streams(options: CallOptions = {}): Promise<readonly StreamInfo[]> {
+    const list = adminOperation(this.transport.listStreams?.bind(this.transport), "stream listing")
+    throwIfAborted(options.signal, "stream listing")
+    return abortable(list(), options.signal, "stream listing")
   }
 
   topic(name: string): Topic {
@@ -2561,6 +2691,14 @@ export class Laser implements AsyncDisposable {
       return reply.result
     }
     throw new QueryExecutionError(describeQueryError(reply.error), reply.error)
+  }
+
+  /** Watch this connection get connected, disconnected, signed in, signed out,
+   * and shut down, from now on, with `for await`. The iteration ends after
+   * `shutdown` or when `options.signal` aborts. A leader change that moves the
+   * client to another node is not a disconnect. */
+  connectionEvents(options?: CallOptions): ConnectionEvents {
+    return ConnectionEvents.create(this.transport.watchConnection?.bind(this.transport), options)
   }
 
   /** Closes owned transport resources. Safe to call more than once. */

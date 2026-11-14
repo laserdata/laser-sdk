@@ -25,16 +25,22 @@ pub use laser_wire::limits::MAX_INDEX_ENTRIES_PER_RECORD;
 /// The highest replication factor a topic takes, as Apache Iggy defines it.
 pub const MAX_REPLICATION_FACTOR: u32 = iggy_common::MAX_REPLICATION_FACTOR;
 
+mod admin;
 mod consumer_group;
+mod encryption;
 pub(crate) mod producer_statistics;
 mod publish;
 mod record;
+mod sharding;
 pub(crate) mod transport;
 
+pub use admin::{ConsumerGroupSummary, PartitionInfo, StreamInfo, TopicInfo, UpdateTopicOptions};
 pub(crate) use consumer_group::GroupTarget;
 pub use consumer_group::{ConsumerGroup, ConsumerGroupInfo, CreateConsumerGroup, GroupFilter};
+pub use encryption::Encryption;
 pub use publish::{BatchPublishRequest, PublishRequest};
 pub use record::{Record, RecordBuilder};
+pub use sharding::ShardRequest;
 pub use transport::{
     CommitPolicy, Consumer, ConsumerBuilder, ConsumerMessage, ConsumerStart, Headers, Producer,
     ProducerBuilder, ProducerMessage, Routing, StoredOffset,

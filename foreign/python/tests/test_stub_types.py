@@ -7,7 +7,14 @@ import pytest
 PACKAGE = pathlib.Path(__file__).resolve().parents[1]
 STUB = PACKAGE / "laser_sdk.pyi"
 SOURCES = PACKAGE / "src"
-INTEGER_SEQUENCES = {"schema_refs", "partitions", "offsets", "from_offsets"}
+INTEGER_SEQUENCES = {
+    "schema_refs",
+    "partitions",
+    "offsets",
+    "from_offsets",
+    "partition_ids",
+    "removed_partition_ids",
+}
 POLLING = ("first", "last", "next", "offset", "timestamp")
 AUTO_COMMIT = ("disabled", "interval", "polling", "all", "each", "every")
 CONSISTENCY = ("eventual", "read_your_writes")
@@ -173,3 +180,12 @@ def test_given_a_literal_vocabulary_when_used_at_runtime_then_should_accept_exac
 
 def test_given_a_topic_consumer_when_typed_then_should_require_the_partition():
     assert keyword_default("Topic", "consumer", "partition") is None
+
+
+def test_given_connection_events_when_typed_then_should_iterate_the_shared_event_words():
+    assert returns("Laser", "connection_events") == "ConnectionEvents"
+    assert returns("ConnectionEvents", "__anext__") == (
+        "typing.Awaitable["
+        + literal(("connected", "disconnected", "signed_in", "signed_out", "shutdown"))
+        + "]"
+    )

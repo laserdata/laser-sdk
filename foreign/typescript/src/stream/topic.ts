@@ -1,7 +1,9 @@
-import type {
-  LaserTransport,
-  MessageWithHeaders,
-  SendMessagesResponse
+import {
+  type LaserTransport,
+  type MessageWithHeaders,
+  type SendMessagesResponse,
+  missingTopic,
+  validateCount
 } from "../iggy/apache-iggy.js"
 import type { Materialization, MaterializeRequest } from "../managed/materialize.js"
 import type { HeaderValue } from "./header-value.js"
@@ -22,6 +24,16 @@ import {
   type Provenance
 } from "../provenance/provenance.js"
 import type { Codec } from "./codecs.js"
+import {
+  type ConsumerGroupSummary,
+  type PartitionInfo,
+  type TopicInfo,
+  type UpdateTopicOptions,
+  adminOperation
+} from "./admin.js"
+import { administer } from "../client/server.js"
+import { millis, millisToMicros } from "../client/duration.js"
+import { deleteSegments, updateTopic } from "../iggy/server-admin.js"
 import { ConsumerGroup, type GroupContext } from "./consumer-group.js"
 import { Consumer, type ConsumerOptions } from "./consumer.js"
 import { Cursor } from "./cursor.js"
@@ -67,7 +79,8 @@ export class Topic {
     private readonly resolveSchema?: ResolveSchema,
     private readonly observe?: ObserveEffect,
     private readonly groups?: GroupContext,
-    private readonly materializeRequest?: () => MaterializeRequest
+    private readonly materializeRequest?: () => MaterializeRequest,
+    private readonly forget?: () => void
   ) {
     this.streamName = streamName
   }
@@ -81,7 +94,8 @@ export class Topic {
     resolveSchema?: ResolveSchema,
     observe?: ObserveEffect,
     groups?: GroupContext,
-    materializeRequest?: () => MaterializeRequest
+    materializeRequest?: () => MaterializeRequest,
+    forget?: () => void
   ): Topic {
     return new Topic(
       transport,
@@ -91,7 +105,8 @@ export class Topic {
       resolveSchema,
       observe,
       groups,
-      materializeRequest
+      materializeRequest,
+      forget
     )
   }
 
@@ -163,6 +178,120 @@ export class Topic {
     await this.observed("ensure", { group: name }, async () => {
       await this.consumerGroup(name).create(options)
     })
+  }
+
+  /** This topic as the server reports it. Resolves `undefined` when the topic or its stream does not exist. */
+  async get(options: CallOptions = {}): Promise<TopicInfo | undefined> {
+    return (await this.details(options))?.topic
+  }
+
+  /** Whether this topic exists. */
+  async exists(options: CallOptions = {}): Promise<boolean> {
+    return (await this.details(options)) !== undefined
+  }
+
+  /** Deletes this topic with every message in it. Resolves `false` when the topic or its stream did not exist. */
+  async delete(options: CallOptions = {}): Promise<boolean> {
+    const remove = adminOperation(this.transport.deleteTopic?.bind(this.transport), "topic delete")
+    // An abandoned delete that lands still clears what the client cached for the topic.
+    return cancellable(options.signal, "topic delete", async () => {
+      const deleted = await this.observed("delete", {}, () => remove(this.streamName, this.name))
+      this.forget?.()
+      return deleted
+    })
+  }
+
+  /** Every partition of this topic. A missing topic fails with an error `isStreamOrTopicNotFound` recognizes. */
+  async partitions(options: CallOptions = {}): Promise<readonly PartitionInfo[]> {
+    const details = await this.details(options)
+    if (details === undefined) throw missingTopic(this.streamName, this.name)
+    return details.partitions
+  }
+
+  /** Adds `count` partitions after the existing ones. A topic created with a fixed partition layout refuses the change. */
+  async addPartitions(count: number, options: CallOptions = {}): Promise<void> {
+    const add = adminOperation(this.transport.addPartitions?.bind(this.transport), "partition add")
+    throwIfAborted(options.signal, "partition add")
+    await this.observed("partitions", { add: count }, () =>
+      abortable(
+        add(this.streamName, this.name, count).then(() => this.forget?.()),
+        options.signal,
+        "partition add"
+      )
+    )
+  }
+
+  /** Deletes the last `count` partitions with their messages. A topic created with a fixed partition layout refuses the change. */
+  async deletePartitions(count: number, options: CallOptions = {}): Promise<void> {
+    const remove = adminOperation(
+      this.transport.deletePartitions?.bind(this.transport),
+      "partition delete"
+    )
+    throwIfAborted(options.signal, "partition delete")
+    await this.observed("partitions", { delete: count }, () =>
+      abortable(
+        remove(this.streamName, this.name, count).then(() => this.forget?.()),
+        options.signal,
+        "partition delete"
+      )
+    )
+  }
+
+  /** Changes the name, retention, or size cap of this topic. A field left out keeps its value. Pass `expireAfterMs` or `neverExpire`, and `maxTopicBytes` or `unlimitedTopicSize`. After a rename, address the topic by its new name. */
+  async update(options: UpdateTopicOptions & CallOptions = {}): Promise<void> {
+    if (options.expireAfterMs !== undefined && options.neverExpire === true)
+      throw new InvalidError("set expireAfterMs or neverExpire, not both")
+    if (options.maxTopicBytes !== undefined && options.unlimitedTopicSize === true)
+      throw new InvalidError("set maxTopicBytes or unlimitedTopicSize, not both")
+    const settings = {
+      ...(options.name === undefined ? {} : { name: options.name }),
+      ...(options.expireAfterMs === undefined
+        ? {}
+        : { expiryMicros: millisToMicros(millis(options.expireAfterMs, "expireAfterMs")) }),
+      ...(options.neverExpire === undefined ? {} : { neverExpire: options.neverExpire }),
+      ...(options.maxTopicBytes === undefined ? {} : { maxTopicBytes: options.maxTopicBytes }),
+      ...(options.unlimitedTopicSize === undefined
+        ? {}
+        : { unlimitedTopicSize: options.unlimitedTopicSize })
+    }
+    // An abandoned update that lands still clears what the client cached for the topic.
+    return administer(this.transport, "topic update", false, options, async (client) => {
+      await updateTopic(client, this.streamName, this.name, settings)
+      this.transport.forgetTopic?.(this.streamName, this.name)
+      this.forget?.()
+    })
+  }
+
+  /** Deletes the oldest `count` segments of one partition with their messages. The open segment stays. */
+  async deleteSegments(
+    partitionId: number,
+    count: number,
+    options: CallOptions = {}
+  ): Promise<void> {
+    validateCount(count)
+    return administer(this.transport, "segment delete", false, options, (client) =>
+      deleteSegments(client, this.streamName, this.name, partitionId, count)
+    )
+  }
+
+  /** Every consumer group of this topic. A missing topic fails with an error `isStreamOrTopicNotFound` recognizes. */
+  async consumerGroups(options: CallOptions = {}): Promise<readonly ConsumerGroupSummary[]> {
+    const list = adminOperation(
+      this.transport.listConsumerGroups?.bind(this.transport),
+      "consumer group listing"
+    )
+    throwIfAborted(options.signal, "consumer group listing")
+    return abortable(list(this.streamName, this.name), options.signal, "consumer group listing")
+  }
+
+  private async details(
+    options: CallOptions
+  ): Promise<
+    { readonly topic: TopicInfo; readonly partitions: readonly PartitionInfo[] } | undefined
+  > {
+    const find = adminOperation(this.transport.findTopic?.bind(this.transport), "topic lookup")
+    throwIfAborted(options.signal, "topic lookup")
+    return abortable(find(this.streamName, this.name), options.signal, "topic lookup")
   }
 
   async send(

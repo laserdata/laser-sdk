@@ -41,13 +41,27 @@ jobs:
   # the full pipeline after the pinned server exists.
   flags:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
     outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      pr_run: ${{ steps.plan.outputs.pr_run }}
       run_ci: ${{ steps.decide.outputs.run_ci }}
       server_tests: ${{ steps.decide.outputs.server_tests }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Plan a label release
+        id: plan
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_FILE: ci-rust.yml
+        run: ${{ github.workspace }}/scripts/ci/release-plan.sh
       - name: Decide the server-backed test mode
         id: decide
         env:
@@ -57,6 +71,7 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          RELEASE: ${{ steps.plan.outputs.release }}
         run: |
           run_ci=run
           mode=run
@@ -87,6 +102,11 @@ jobs:
           fi
           echo "rust CI: ${run_ci}"
           echo "server-backed suites: ${mode}"
+          if [[ "${RELEASE}" == "yes" ]]; then
+            # The pull request run already tested this exact tree.
+            run_ci=skip
+            mode=skip
+          fi
           echo "run_ci=${run_ci}" >> "${GITHUB_OUTPUT}"
           echo "server_tests=${mode}" >> "${GITHUB_OUTPUT}"
 
@@ -553,17 +573,23 @@ jobs:
 
   publish-sdk:
     name: publish-sdk
+    # A `rust-v*` tag publishes after the full pipeline. A merged pull request
+    # labelled `release` publishes the tree its own run tested, see flags.
     if: >-
       always() &&
-      startsWith(github.ref, 'refs/tags/rust-v') &&
-      needs.ci-rust-complete.result == 'success'
+      ((startsWith(github.ref, 'refs/tags/rust-v') &&
+      needs.ci-rust-complete.result == 'success') ||
+      needs.flags.outputs.release == 'yes')
     needs:
+      - flags
       - ci-rust-complete
     runs-on: ubuntu-latest
     environment: crates
     permissions:
-      contents: read
+      contents: write
       id-token: write
+    env:
+      RELEASE_VERSION: ${{ needs.flags.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -584,10 +610,17 @@ jobs:
             printf '%s\n' "${versions[@]}" >&2
             exit 1
           fi
-          expected_tag="rust-v${versions[0]}"
-          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
-            echo "tag ${GITHUB_REF_NAME} does not match ${expected_tag}" >&2
-            exit 1
+          if [[ -n "${RELEASE_VERSION}" ]]; then
+            if [[ "${versions[0]}" != "${RELEASE_VERSION}" ]]; then
+              echo "planned ${RELEASE_VERSION} does not match ${versions[0]}" >&2
+              exit 1
+            fi
+          else
+            expected_tag="rust-v${versions[0]}"
+            if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+              echo "tag ${GITHUB_REF_NAME} does not match ${expected_tag}" >&2
+              exit 1
+            fi
           fi
 
       - name: Authenticate with crates.io
@@ -598,7 +631,7 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
         run: |
-          version="${GITHUB_REF_NAME#rust-v}"
+          version="${RELEASE_VERSION:-${GITHUB_REF_NAME#rust-v}}"
           index_url="https://index.crates.io/la/se/laser-wire"
           if curl --fail --silent "${index_url}" |
             grep --fixed-strings "\"vers\":\"${version}\"" >/dev/null; then
@@ -609,7 +642,7 @@ jobs:
 
       - name: Wait for laser-wire index entry
         run: |
-          version="${GITHUB_REF_NAME#rust-v}"
+          version="${RELEASE_VERSION:-${GITHUB_REF_NAME#rust-v}}"
           index_url="https://index.crates.io/la/se/laser-wire"
           for attempt in $(seq 1 60); do
             if curl --fail --silent "${index_url}" |
@@ -627,7 +660,7 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
         run: |
-          version="${GITHUB_REF_NAME#rust-v}"
+          version="${RELEASE_VERSION:-${GITHUB_REF_NAME#rust-v}}"
           index_url="https://index.crates.io/la/se/laser-sdk"
           if curl --fail --silent "${index_url}" |
             grep --fixed-strings "\"vers\":\"${version}\"" >/dev/null; then
@@ -635,3 +668,17 @@ jobs:
             exit 0
           fi
           cargo publish -p laser-sdk --locked
+
+      - name: Tag the label release
+        if: needs.flags.outputs.release == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for tag in "wire-v${RELEASE_VERSION}" "rust-v${RELEASE_VERSION}"; do
+            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+              echo "${tag} already exists"
+              continue
+            fi
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f "ref=refs/tags/${tag}" -f "sha=${GITHUB_SHA}" >/dev/null
+            echo "tagged ${tag}"
+          done

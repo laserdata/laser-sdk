@@ -24,6 +24,12 @@ export class A2aBridge {
     card(): AgentCard;
     // (undocumented)
     handleRpc(input: unknown, options?: CallOptions): Promise<JsonRpcResponse>;
+    serve(options?: CallOptions & {
+        readonly host?: string;
+        readonly port?: number;
+    } & {
+        readonly caller?: A2aCallerHook;
+    }): Promise<BridgeServer>;
     // (undocumented)
     signedCard(key: SigningKey): AgentCard;
     submit(paramsJson: unknown, options?: CallOptions & {
@@ -36,6 +42,7 @@ export class A2aBridge {
         readonly target?: AgentId;
     }): Promise<Task>;
     task(id: string, options?: CallOptions): Promise<Task>;
+    withAllowedOrigins(origins: readonly string[]): this;
     // (undocumented)
     withBridgeHops(previous: readonly string[]): this;
     // (undocumented)
@@ -63,6 +70,9 @@ export class A2aCaller {
     }): Promise<Task>;
     task(id: string, options?: CallOptions): Promise<Task>;
 }
+
+// @public
+export type A2aCallerHook = (headers: Readonly<Record<string, string>>) => string | undefined | Promise<string | undefined>;
 
 // @public (undocumented)
 export const A2aMethod: {
@@ -1287,6 +1297,16 @@ export interface BlobStore {
 export const BRIDGE_HOPS_META_KEY = "laserdata.com/bridge_hops";
 
 // @public
+export class BridgeServer {
+    close(): Promise<void>;
+    // (undocumented)
+    readonly host: string;
+    // (undocumented)
+    readonly port: number;
+    get url(): string;
+}
+
+// @public
 export class Bson<T = unknown> implements Codec<T> {
     constructor(decodeValue?: (value: unknown) => T);
     // (undocumented)
@@ -1316,6 +1336,22 @@ export class BudgetExceededError extends LaserError {
 
 // @public (undocumented)
 export type BytesLike = Uint8Array | ArrayBuffer | ArrayBufferView;
+
+// @public
+export interface CacheMetrics {
+    // (undocumented)
+    readonly hitRatio: number;
+    // (undocumented)
+    readonly hits: bigint;
+    // (undocumented)
+    readonly misses: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly streamId: number;
+    // (undocumented)
+    readonly topicId: number;
+}
 
 // @public
 export interface CallOptions {
@@ -1514,6 +1550,31 @@ export class ChunkAssembler {
 // @public (undocumented)
 export function chunkEnvelope(conversation: WireConversationId, source: WireAgentId, correlation: CorrelationId, channel: ChannelId, sequence: bigint, body: Uint8Array): AgentEnvelope;
 
+// @public
+export interface ClientConsumerGroup {
+    // (undocumented)
+    readonly groupId: number;
+    // (undocumented)
+    readonly streamId: number;
+    // (undocumented)
+    readonly topicId: number;
+}
+
+// @public
+export interface ClientInfo {
+    // (undocumented)
+    readonly address: string;
+    // (undocumented)
+    readonly clientId: number;
+    // (undocumented)
+    readonly consumerGroups: readonly ClientConsumerGroup[];
+    // (undocumented)
+    readonly consumerGroupsCount: number;
+    // (undocumented)
+    readonly transport: string;
+    readonly userId?: number;
+}
+
 // @public (undocumented)
 export interface ClientMetadata {
     // (undocumented)
@@ -1562,6 +1623,42 @@ export interface Clock {
     // (undocumented)
     nowMicros(): bigint;
 }
+
+// @public
+export interface ClusterInfo {
+    // (undocumented)
+    readonly name: string;
+    // (undocumented)
+    readonly nodes: readonly ClusterNode[];
+}
+
+// @public
+export interface ClusterNode {
+    // (undocumented)
+    readonly httpPort: number;
+    // (undocumented)
+    readonly ip: string;
+    // (undocumented)
+    readonly name: string;
+    // (undocumented)
+    readonly quicPort: number;
+    // (undocumented)
+    readonly replicaId: number;
+    // (undocumented)
+    readonly role: ClusterNodeRole;
+    // (undocumented)
+    readonly status: ClusterNodeStatus;
+    // (undocumented)
+    readonly tcpPort: number;
+    // (undocumented)
+    readonly websocketPort: number;
+}
+
+// @public
+export type ClusterNodeRole = "leader" | "follower";
+
+// @public
+export type ClusterNodeStatus = "healthy" | "starting" | "stopping" | "unreachable" | "maintenance" | "unknown";
 
 // @public (undocumented)
 export type CmpOp = "eq" | "ne" | "lt" | "lte" | "gt" | "gte" | "in" | "contains" | "prefix";
@@ -1711,6 +1808,15 @@ export class ConfigError extends LaserError {
     });
 }
 
+// @public
+export type ConnectionEvent = "connected" | "disconnected" | "signed_in" | "signed_out" | "shutdown";
+
+// @public
+export class ConnectionEvents implements AsyncIterable<ConnectionEvent> {
+    // (undocumented)
+    [Symbol.asyncIterator](): AsyncIterator<ConnectionEvent>;
+}
+
 // @public (undocumented)
 export type Consistency = "eventual" | "read_your_writes";
 
@@ -1801,6 +1907,7 @@ export const ConsumerFilter: {
 export class ConsumerGroup {
     consumer(options?: ConsumerOptions & CallOptions): Promise<Consumer>;
     create(options?: CreateConsumerGroupOptions & CallOptions): Promise<ConsumerGroupInfo>;
+    delete(options?: CallOptions): Promise<boolean>;
     filter(): GroupFilter;
     get id(): bigint | undefined;
     info(options?: CallOptions): Promise<ConsumerGroupInfo>;
@@ -1841,6 +1948,17 @@ export class ConsumerGroupSetupError extends FilterExecutionError {
 }
 
 // @public
+export interface ConsumerGroupSummary {
+    readonly id: number;
+    // (undocumented)
+    readonly membersCount: number;
+    // (undocumented)
+    readonly name: string;
+    // (undocumented)
+    readonly partitionsCount: number;
+}
+
+// @public
 export interface ConsumerMessage extends Message {
     readonly checksum: bigint;
     readonly currentOffset: bigint;
@@ -1861,6 +1979,7 @@ export interface ConsumerOptions {
     readonly batchLength?: number;
     readonly commitPolicy?: CommitPolicy;
     readonly createGroup?: boolean;
+    readonly encryption?: Encryption;
     readonly initRetries?: {
         readonly retries: number;
         readonly intervalMs: number;
@@ -2159,6 +2278,14 @@ export interface CreateConsumerGroupOptions {
     readonly policy?: GroupFilterSpec;
 }
 
+// @public
+export interface CreateUserOptions {
+    // (undocumented)
+    readonly permissions?: Permissions;
+    // (undocumented)
+    readonly status?: UserStatus;
+}
+
 // @public (undocumented)
 export class Cursor {
     batch(size: number): this;
@@ -2436,6 +2563,13 @@ export function encodePolicyEvidence(evidence: PolicyEvidence): Uint8Array;
 
 // @public
 export function encodeSnapshot(snapshot: FoldSnapshot): Uint8Array;
+
+// @public
+export class Encryption {
+    static aes256Gcm(key: BytesLike): Encryption;
+    decrypt(ciphertext: BytesLike): Uint8Array;
+    encrypt(plaintext: BytesLike): Uint8Array;
+}
 
 // @public (undocumented)
 export function enterBridge(bridge: string, previous?: readonly string[]): readonly string[];
@@ -3200,6 +3334,30 @@ export type GatherPolicy =
 
 // @public
 export function gatherReplies(gather: Gather): readonly AgentMessage[];
+
+// @public
+export interface GlobalPermissions {
+    // (undocumented)
+    readonly manageServers?: boolean;
+    // (undocumented)
+    readonly manageStreams?: boolean;
+    // (undocumented)
+    readonly manageTopics?: boolean;
+    // (undocumented)
+    readonly manageUsers?: boolean;
+    // (undocumented)
+    readonly pollMessages?: boolean;
+    // (undocumented)
+    readonly readServers?: boolean;
+    // (undocumented)
+    readonly readStreams?: boolean;
+    // (undocumented)
+    readonly readTopics?: boolean;
+    // (undocumented)
+    readonly readUsers?: boolean;
+    // (undocumented)
+    readonly sendMessages?: boolean;
+}
 
 // @public (undocumented)
 export interface GovernedAction {
@@ -4386,6 +4544,7 @@ export class KvStore implements StateStore {
 // @public
 export class Laser implements AsyncDisposable {
     [Symbol.asyncDispose](): Promise<void>;
+    abandonOperation(operation: bigint, options?: CallOptions): Promise<void>;
     advertisePresence(presence: AgentPresence, options?: CallOptions): Promise<void>;
     // (undocumented)
     agdx(topic: string, source: AgentId, conversation: ConversationId): Agdx;
@@ -4412,12 +4571,16 @@ export class Laser implements AsyncDisposable {
     clearPresence(options?: CallOptions): Promise<void>;
     // (undocumented)
     get client(): IggyClient;
+    clientInfo(clientId: number, options?: CallOptions): Promise<ClientInfo | undefined>;
     // (undocumented)
     clientMetadata(): ClientMetadataRequest;
+    clients(options?: CallOptions): Promise<readonly ClientInfo[]>;
     close(): Promise<void>;
+    cluster(options?: CallOptions): Promise<ClusterInfo>;
     static connect(connectionString: string, options?: CallOptions): Promise<Laser>;
     // (undocumented)
     static connectEnv(env?: Readonly<Record<string, string | undefined>>, options?: CallOptions): Promise<Laser>;
+    connectionEvents(options?: CallOptions): ConnectionEvents;
     // (undocumented)
     static connectWithStream(connectionString: string, stream: string, options?: CallOptions): Promise<Laser>;
     // (undocumented)
@@ -4436,6 +4599,7 @@ export class Laser implements AsyncDisposable {
     // (undocumented)
     deleteRole(name: string, options?: CallOptions): Promise<void>;
     deleteRoleAs(name: string, mutationId: string, options?: CallOptions): Promise<void>;
+    describeOptions(scope: OptionsScope, options?: CallOptions): Promise<readonly OptionInfo[]>;
     // (undocumented)
     get dlqTopic(): string;
     // (undocumented)
@@ -4463,6 +4627,7 @@ export class Laser implements AsyncDisposable {
     static local(options?: CallOptions): Promise<Laser>;
     // (undocumented)
     materialization(projectionId: string): Materialization;
+    me(options?: CallOptions): Promise<ClientInfo>;
     // (undocumented)
     memory(namespace: string): MemoryHandle;
     // (undocumented)
@@ -4470,8 +4635,12 @@ export class Laser implements AsyncDisposable {
     memoryOnTopic(topic: string, stream?: string): MemoryHandle;
     memoryTopic(topic: string): MemoryTopicBuilder;
     memoryWith(namespace: string, backend: MemoryBackend, embedder?: Embedder): MemoryHandle;
+    metadataChanges(query?: MetadataChangesQuery & CallOptions): Promise<MetadataChanges>;
     // (undocumented)
     get opsStream(): string;
+    personalAccessToken(name: string): PersonalAccessToken;
+    personalAccessTokens(options?: CallOptions): Promise<readonly PersonalAccessTokenInfo[]>;
+    ping(options?: CallOptions): Promise<void>;
     // (undocumented)
     projections(): Projections;
     // (undocumented)
@@ -4494,6 +4663,7 @@ export class Laser implements AsyncDisposable {
     refreshCapabilities(options?: CallOptions): Promise<Capabilities>;
     // (undocumented)
     request(requestTopic: string, replyTopic: string, payload: BytesLike, provenance: Provenance, timeoutMs: number, options?: CallOptions): Promise<AgentMessage>;
+    resolveOperation(operation: bigint, timeoutMs: number, options?: CallOptions): Promise<void>;
     resourceName(name: string): string;
     resourceNaming(): ResourceNaming;
     scatter(source: AgentId, selector: CapabilitySelector, payload: BytesLike, inboxRoute: InboxRoute, policy: GatherPolicy, deadlineMs: number, options?: CallOptions): Promise<readonly Uint8Array[]>;
@@ -4505,17 +4675,24 @@ export class Laser implements AsyncDisposable {
     sendAgent(topic: string, payload: BytesLike, provenance: Provenance, options?: CallOptions & {
         readonly contentType?: ContentType;
     }): Promise<void>;
+    sendCommand(code: number, payload: Uint8Array, options?: CallOptions): Promise<Uint8Array>;
+    sendCommandToReplica(code: number, payload: Uint8Array, replica: number, options?: CallOptions): Promise<Uint8Array>;
     sessions(config?: SessionConfig): Sessions;
+    snapshot(options?: CallOptions): Promise<Uint8Array>;
     // (undocumented)
     spawnSubconversation(parent: Provenance, author: AgentId): Provenance;
+    stats(options?: CallOptions): Promise<ServerStats>;
     // (undocumented)
     stream(name: string): Stream;
+    streams(options?: CallOptions): Promise<readonly StreamInfo[]>;
     // (undocumented)
     topic(name: string): Topic;
     // (undocumented)
     unquarantine(operator: AgentId, agent: AgentId, options?: CallOptions): Promise<void>;
     // (undocumented)
     unquarantineSigned(operator: AgentId, agent: AgentId, key: SigningKey, options?: CallOptions): Promise<void>;
+    user(name: string): User;
+    users(options?: CallOptions): Promise<readonly UserInfo[]>;
     // (undocumented)
     waitUntilReady(timeoutMs: number, options?: CallOptions): Promise<Capabilities>;
     // (undocumented)
@@ -4929,6 +5106,11 @@ export class McpBridge {
     listTools(): unknown;
     // (undocumented)
     readResource(uri: string): unknown;
+    serve(options?: CallOptions & {
+        readonly host?: string;
+        readonly port?: number;
+    }): Promise<BridgeServer>;
+    withAllowedOrigins(origins: readonly string[]): this;
     // (undocumented)
     withBridgeHops(previous: readonly string[]): this;
     // (undocumented)
@@ -5282,6 +5464,140 @@ export interface MessageWithHeaders {
     readonly id?: bigint;
     // (undocumented)
     readonly payload: Uint8Array;
+    readonly userHeaders?: Uint8Array;
+}
+
+// @public
+export type MetadataChangeGroup = "streams" | "topics" | "partitions" | "consumer_groups" | "consumer_group_members" | "users" | "personal_access_tokens" | "sessions";
+
+// @public
+export type MetadataChangeKind = "stream_created" | "stream_updated" | "stream_deleted" | "topic_created" | "topic_updated" | "topic_deleted" | "partitions_changed" | "consumer_group_created" | "consumer_group_deleted" | "consumer_group_member_joined" | "consumer_group_member_left" | "consumer_group_partition_handed_over" | "user_created" | "user_updated" | "user_deleted" | "user_password_changed" | "user_permissions_updated" | "personal_access_token_created" | "personal_access_token_deleted" | "session_registered" | "session_closed";
+
+// @public
+export type MetadataChangePhase = "changes" | "current";
+
+// @public
+export type MetadataChangeReason = "left" | "session_ended" | "deleted" | "expired" | "logout" | "revoked" | "updated" | "resource_deleted";
+
+// @public
+export interface MetadataChangeRecord {
+    // (undocumented)
+    readonly actorUserId?: number;
+    // (undocumented)
+    readonly kind?: MetadataChangeKind;
+    // (undocumented)
+    readonly op: bigint;
+    readonly ordinal: number;
+    // (undocumented)
+    readonly subject: MetadataSubject;
+    // (undocumented)
+    readonly timestampMicros: bigint;
+}
+
+// @public
+export interface MetadataChanges {
+    readonly hasMore: boolean;
+    readonly headOp: bigint;
+    // (undocumented)
+    readonly items: readonly MetadataItem[];
+    readonly next?: string;
+    readonly oldestOp: bigint;
+    readonly pageToken?: string;
+    // (undocumented)
+    readonly phase: MetadataChangePhase;
+    // (undocumented)
+    readonly records: readonly MetadataChangeRecord[];
+    readonly retainedSinceMicros: bigint;
+    // (undocumented)
+    readonly status: MetadataChangeStatus;
+}
+
+// @public
+export interface MetadataChangesQuery {
+    // (undocumented)
+    readonly groups?: readonly MetadataChangeGroup[];
+    // (undocumented)
+    readonly limit?: number;
+    // (undocumented)
+    readonly sinceMicros?: bigint;
+    // (undocumented)
+    readonly start?: MetadataChangeStart;
+    // (undocumented)
+    readonly untilMicros?: bigint;
+}
+
+// @public
+export type MetadataChangeStart = {
+    readonly mode: "earliest";
+} | {
+    readonly mode: "latest";
+} | {
+    readonly mode: "after";
+    readonly cursor: string;
+} | {
+    readonly mode: "current";
+    readonly pageToken?: string;
+};
+
+// @public
+export type MetadataChangeStatus = "ok" | "behind" | "expired" | "reset";
+
+// @public
+export interface MetadataItem {
+    // (undocumented)
+    readonly group?: MetadataChangeGroup;
+    // (undocumented)
+    readonly subject: MetadataSubject;
+}
+
+// @public
+export interface MetadataSubject {
+    // (undocumented)
+    readonly clientId?: bigint;
+    // (undocumented)
+    readonly consumerGroupsCount?: number;
+    // (undocumented)
+    readonly createdAtMicros?: bigint;
+    // (undocumented)
+    readonly expiresAtMicros?: bigint;
+    // (undocumented)
+    readonly groupId?: number;
+    // (undocumented)
+    readonly memberId?: number;
+    // (undocumented)
+    readonly membersCount?: number;
+    readonly name?: string;
+    // (undocumented)
+    readonly partitionId?: number;
+    // (undocumented)
+    readonly partitionIds: readonly number[];
+    // (undocumented)
+    readonly partitionsCount?: number;
+    // (undocumented)
+    readonly permissions?: Permissions;
+    // (undocumented)
+    readonly reason?: MetadataChangeReason;
+    // (undocumented)
+    readonly removedPartitionIds: readonly number[];
+    readonly requestedOp?: bigint;
+    // (undocumented)
+    readonly session?: bigint;
+    // (undocumented)
+    readonly status?: UserStatus;
+    // (undocumented)
+    readonly streamCreatedOp?: bigint;
+    // (undocumented)
+    readonly streamId?: number;
+    // (undocumented)
+    readonly topicCreatedOp?: bigint;
+    // (undocumented)
+    readonly topicId?: number;
+    // (undocumented)
+    readonly userCreatedAtMicros?: bigint;
+    // (undocumented)
+    readonly userId?: number;
+    // (undocumented)
+    readonly username?: string;
 }
 
 // @public
@@ -5438,6 +5754,26 @@ export function operationalTarget(index: string): QueryTarget;
 // @public (undocumented)
 export const OPS_STREAM_DEFAULT = "_agdx";
 
+// @public
+export interface OptionInfo {
+    readonly critical: boolean;
+    // (undocumented)
+    readonly defaultValue?: string;
+    // (undocumented)
+    readonly description: string;
+    // (undocumented)
+    readonly key: string;
+    // (undocumented)
+    readonly kind: string;
+    readonly readOnly: boolean;
+    readonly resettable: boolean;
+    readonly secret: boolean;
+    readonly updatable: boolean;
+}
+
+// @public
+export type OptionsScope = "topic" | "stream" | "user";
+
 // @public (undocumented)
 export interface OpVersions {
     // (undocumented)
@@ -5506,6 +5842,21 @@ export interface Part {
     readonly text: string;
 }
 
+// @public
+export interface PartitionInfo {
+    // (undocumented)
+    readonly createdAtMicros: bigint;
+    readonly currentOffset: bigint;
+    // (undocumented)
+    readonly id: number;
+    // (undocumented)
+    readonly messagesCount: bigint;
+    // (undocumented)
+    readonly segmentsCount: number;
+    // (undocumented)
+    readonly sizeBytes: bigint;
+}
+
 // @public (undocumented)
 export interface PartitionProgress {
     // (undocumented)
@@ -5568,6 +5919,31 @@ export interface PendingControl {
     readonly cancelRequested: boolean;
     readonly controlConflict: boolean;
     readonly pauseRequested: boolean;
+}
+
+// @public
+export interface Permissions {
+    // (undocumented)
+    readonly global?: GlobalPermissions;
+    // (undocumented)
+    readonly streams?: ReadonlyMap<number, StreamPermissions>;
+}
+
+// @public
+export class PersonalAccessToken {
+    create(options?: CallOptions & {
+        readonly expiryMs?: number;
+    }): Promise<string>;
+    delete(options?: CallOptions): Promise<boolean>;
+    // (undocumented)
+    readonly name: string;
+}
+
+// @public
+export interface PersonalAccessTokenInfo {
+    readonly expiresAtMicros?: bigint;
+    // (undocumented)
+    readonly name: string;
 }
 
 // @public (undocumented)
@@ -5761,7 +6137,9 @@ export interface ProducerOptions {
     readonly batchLength?: number;
     readonly createStream?: boolean;
     readonly createTopic?: boolean;
+    readonly encryption?: Encryption;
     readonly expireAfterMs?: number;
+    readonly idempotent?: boolean;
     readonly lingerMs?: number;
     readonly maxTopicBytes?: bigint;
     readonly neverExpire?: boolean;
@@ -5771,6 +6149,7 @@ export interface ProducerOptions {
     readonly retryBackoffMs?: number;
     // (undocumented)
     readonly routing?: Routing;
+    readonly sharding?: (request: ShardRequest) => number;
     readonly unlimitedTopicSize?: boolean;
 }
 
@@ -7256,6 +7635,68 @@ export { SendMessagesConfirmation }
 
 export { SendMessagesResponse }
 
+// @public
+export interface ServerStats {
+    // (undocumented)
+    readonly availableMemoryBytes: bigint;
+    // (undocumented)
+    readonly cacheMetrics: readonly CacheMetrics[];
+    // (undocumented)
+    readonly clientsCount: number;
+    // (undocumented)
+    readonly consumerGroupsCount: number;
+    // (undocumented)
+    readonly cpuUsage: number;
+    // (undocumented)
+    readonly freeDiskSpaceBytes: bigint;
+    // (undocumented)
+    readonly hostname: string;
+    // (undocumented)
+    readonly kernelVersion: string;
+    // (undocumented)
+    readonly memoryUsageBytes: bigint;
+    // (undocumented)
+    readonly messagesCount: bigint;
+    // (undocumented)
+    readonly messagesSizeBytes: bigint;
+    // (undocumented)
+    readonly openFilesCount: bigint;
+    // (undocumented)
+    readonly openFilesLimit: bigint;
+    // (undocumented)
+    readonly osName: string;
+    // (undocumented)
+    readonly osVersion: string;
+    // (undocumented)
+    readonly partitionsCount: number;
+    // (undocumented)
+    readonly processId: number;
+    // (undocumented)
+    readonly readBytes: bigint;
+    // (undocumented)
+    readonly runTimeMicros: bigint;
+    // (undocumented)
+    readonly segmentsCount: number;
+    // (undocumented)
+    readonly serverVersion: string;
+    // (undocumented)
+    readonly startTimeMicros: bigint;
+    // (undocumented)
+    readonly streamsCount: number;
+    // (undocumented)
+    readonly threadsCount: number;
+    // (undocumented)
+    readonly topicsCount: number;
+    // (undocumented)
+    readonly totalCpuUsage: number;
+    // (undocumented)
+    readonly totalDiskSpaceBytes: bigint;
+    // (undocumented)
+    readonly totalMemoryBytes: bigint;
+    // (undocumented)
+    readonly writtenBytes: bigint;
+}
+
 // @public (undocumented)
 export function servesConsistency(capabilities: Capabilities, level: Consistency): boolean;
 
@@ -7764,6 +8205,16 @@ export class SessionWatch implements AsyncIterable<SessionChange> {
     next(options?: CallOptions): Promise<SessionChange>;
 }
 
+// @public
+export interface ShardRequest {
+    readonly records: number;
+    readonly shards: number;
+    // (undocumented)
+    readonly stream: string;
+    // (undocumented)
+    readonly topic: string;
+}
+
 // @public (undocumented)
 export interface Signature {
     // (undocumented)
@@ -8052,10 +8503,14 @@ export class Stream {
     delete(options?: CallOptions): Promise<boolean>;
     // (undocumented)
     ensure(options?: CallOptions): Promise<void>;
+    exists(options?: CallOptions): Promise<boolean>;
+    get(options?: CallOptions): Promise<StreamInfo | undefined>;
     // (undocumented)
     readonly name: string;
+    rename(name: string, options?: CallOptions): Promise<void>;
     // (undocumented)
     topic(name: string): Topic;
+    topics(options?: CallOptions): Promise<readonly TopicInfo[]>;
 }
 
 // @public (undocumented)
@@ -8072,6 +8527,39 @@ export type StreamEvent = {
     readonly kind: "failed";
     readonly body: Uint8Array;
 };
+
+// @public
+export interface StreamInfo {
+    // (undocumented)
+    readonly createdAtMicros: bigint;
+    readonly id: number;
+    // (undocumented)
+    readonly messagesCount: bigint;
+    // (undocumented)
+    readonly name: string;
+    // (undocumented)
+    readonly sizeBytes: bigint;
+    // (undocumented)
+    readonly topicsCount: number;
+}
+
+// @public
+export interface StreamPermissions {
+    // (undocumented)
+    readonly manageStream?: boolean;
+    // (undocumented)
+    readonly manageTopics?: boolean;
+    // (undocumented)
+    readonly pollMessages?: boolean;
+    // (undocumented)
+    readonly readStream?: boolean;
+    // (undocumented)
+    readonly readTopics?: boolean;
+    // (undocumented)
+    readonly sendMessages?: boolean;
+    // (undocumented)
+    readonly topics?: ReadonlyMap<number, TopicPermissions>;
+}
 
 // @public
 export class SubmitBuilder {
@@ -8279,6 +8767,7 @@ export function toolResultFromEnvelope(envelope: AgentEnvelope): McpToolResult;
 
 // @public (undocumented)
 export class Topic {
+    addPartitions(count: number, options?: CallOptions): Promise<void>;
     batch(messages: readonly (BytesLike | MessageWithHeaders)[], options?: RawSendOptions & CallOptions): Promise<SendMessagesResponse>;
     batching(): BatchingProducerBuilder;
     // (undocumented)
@@ -8289,8 +8778,14 @@ export class Topic {
     consumer(name: string, partitionId: number, options?: ConsumerOptions): Consumer;
     consumerGroup(name: string): ConsumerGroup;
     consumerGroupId(id: bigint | number): ConsumerGroup;
+    consumerGroups(options?: CallOptions): Promise<readonly ConsumerGroupSummary[]>;
+    delete(options?: CallOptions): Promise<boolean>;
+    deletePartitions(count: number, options?: CallOptions): Promise<void>;
+    deleteSegments(partitionId: number, count: number, options?: CallOptions): Promise<void>;
     ensure(partitions?: number, replicationFactor?: number, options?: CallOptions): Promise<void>;
     ensureConsumerGroup(name: string, options?: CallOptions): Promise<void>;
+    exists(options?: CallOptions): Promise<boolean>;
+    get(options?: CallOptions): Promise<TopicInfo | undefined>;
     // (undocumented)
     json<T>(codec: Codec<T>): TypedTopic<T>;
     materialization(projectionId: string): Materialization;
@@ -8298,6 +8793,7 @@ export class Topic {
     materialize(): MaterializeRequest;
     // (undocumented)
     readonly name: string;
+    partitions(options?: CallOptions): Promise<readonly PartitionInfo[]>;
     // (undocumented)
     producer(options?: ProducerOptions): Producer;
     // (undocumented)
@@ -8309,6 +8805,37 @@ export class Topic {
     schema<T>(schemaId: number, codecOrDecoder: Codec<T> | ((value: unknown) => T), options?: CallOptions): Promise<TypedTopic<T>>;
     // (undocumented)
     send(payload: BytesLike, options?: RawSendOptions & CallOptions): Promise<SendMessagesResponse>;
+    update(options?: UpdateTopicOptions & CallOptions): Promise<void>;
+}
+
+// @public
+export interface TopicInfo {
+    // (undocumented)
+    readonly createdAtMicros: bigint;
+    readonly id: number;
+    readonly maxSizeBytes?: bigint;
+    readonly messageExpiryMs?: number;
+    // (undocumented)
+    readonly messagesCount: bigint;
+    // (undocumented)
+    readonly name: string;
+    // (undocumented)
+    readonly partitionsCount: number;
+    readonly replicationFactor?: number;
+    // (undocumented)
+    readonly sizeBytes: bigint;
+}
+
+// @public
+export interface TopicPermissions {
+    // (undocumented)
+    readonly manageTopic?: boolean;
+    // (undocumented)
+    readonly pollMessages?: boolean;
+    // (undocumented)
+    readonly readTopic?: boolean;
+    // (undocumented)
+    readonly sendMessages?: boolean;
 }
 
 // @public
@@ -8475,6 +9002,9 @@ export interface UlidSource {
     nowMilliseconds(): number;
 }
 
+// @public
+export function uncertainOperation(error: unknown): bigint | undefined;
+
 // @public (undocumented)
 export function unmetRequirements(envelope: AgentEnvelope, understood: bigint): bigint;
 
@@ -8493,6 +9023,53 @@ export class UnsupportedError extends LaserError {
     // (undocumented)
     readonly surface: string | undefined;
 }
+
+// @public
+export interface UpdateTopicOptions {
+    readonly expireAfterMs?: number;
+    readonly maxTopicBytes?: bigint;
+    // (undocumented)
+    readonly name?: string;
+    readonly neverExpire?: boolean;
+    readonly unlimitedTopicSize?: boolean;
+}
+
+// @public
+export interface UpdateUserOptions {
+    // (undocumented)
+    readonly status?: UserStatus;
+    // (undocumented)
+    readonly username?: string;
+}
+
+// @public
+export class User {
+    changePassword(currentPassword: string, newPassword: string, options?: CallOptions): Promise<void>;
+    create(password: string, options?: CreateUserOptions & CallOptions): Promise<UserInfo>;
+    delete(options?: CallOptions): Promise<boolean>;
+    exists(options?: CallOptions): Promise<boolean>;
+    get(options?: CallOptions): Promise<UserInfo | undefined>;
+    // (undocumented)
+    readonly name: string;
+    setPermissions(permissions?: Permissions, options?: CallOptions): Promise<void>;
+    update(options?: UpdateUserOptions & CallOptions): Promise<void>;
+}
+
+// @public
+export interface UserInfo {
+    // (undocumented)
+    readonly createdAtMicros: bigint;
+    readonly id: number;
+    // (undocumented)
+    readonly permissions?: Permissions;
+    // (undocumented)
+    readonly status: UserStatus;
+    // (undocumented)
+    readonly username: string;
+}
+
+// @public
+export type UserStatus = "active" | "inactive";
 
 // @public (undocumented)
 export const UuidValue: {

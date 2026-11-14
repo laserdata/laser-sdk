@@ -1,3 +1,4 @@
+use crate::admin::{PyConsumerGroupSummary, PyPartitionInfo, PyStreamInfo, PyTopicInfo};
 use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::consumer_group::PyConsumerGroup;
@@ -39,6 +40,15 @@ impl PyLaser {
     fn topic(&self, name: String) -> PyTopic {
         PyTopic::new(self.inner.clone(), None, name)
     }
+
+    /// Every stream this connection's user can read.
+    fn streams<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Vec<PyStreamInfo>>> {
+        let laser = self.inner.clone();
+        awaitable(py, async move {
+            let streams = laser.streams().await.map_err(to_pyerr)?;
+            Ok(streams.into_iter().map(PyStreamInfo::from).collect())
+        })
+    }
 }
 
 /// One Apache Iggy stream: the layer grouping topics. Build with `Laser.stream`.
@@ -79,6 +89,44 @@ impl PyStream {
         awaitable(py, async move {
             laser.stream(&name).delete().await.map_err(to_pyerr)
         })
+    }
+
+    /// This stream as the server reports it, `None` when it does not exist.
+    fn get<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Option<PyStreamInfo>>> {
+        let handle = self.laser.stream(&*self.name);
+        awaitable(py, async move {
+            Ok(handle
+                .get()
+                .await
+                .map_err(to_pyerr)?
+                .map(PyStreamInfo::from))
+        })
+    }
+
+    /// Whether this stream exists.
+    fn exists<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, bool>> {
+        let handle = self.laser.stream(&*self.name);
+        awaitable(py, async move { handle.exists().await.map_err(to_pyerr) })
+    }
+
+    /// Every topic of this stream. A missing stream raises an error
+    /// with `stream_or_topic_not_found` set.
+    fn topics<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Vec<PyTopicInfo>>> {
+        let handle = self.laser.stream(&*self.name);
+        awaitable(py, async move {
+            let topics = handle.topics().await.map_err(to_pyerr)?;
+            Ok(topics.into_iter().map(PyTopicInfo::from).collect())
+        })
+    }
+
+    /// Rename this stream. After the rename, address the stream by its new
+    /// name.
+    fn rename<'py>(&self, py: Python<'py>, name: String) -> PyResult<Awaitable<'py, ()>> {
+        let handle = self.laser.stream(&*self.name);
+        awaitable(
+            py,
+            async move { handle.rename(name).await.map_err(to_pyerr) },
+        )
     }
 
     fn __repr__(&self) -> String {
@@ -315,7 +363,17 @@ impl PyTopic {
     /// `replication_factor` stores each partition of a topic this producer
     /// creates on that many nodes, 1 to `MAX_REPLICATION_FACTOR` and at most
     /// the cluster's node count, else the server default.
-    #[pyo3(signature = (*, batch_length=1000, linger_ms=0.0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=false, create_topic=true, partitions=1, replication_factor=None, expire_after_ms=None, never_expire=false, max_topic_bytes=None, unlimited_topic_size=false, background=None))]
+    /// `sharding(request: ShardRequest) -> int` picks the background shard of
+    /// each send in place of the `BackgroundConfig` sharding, and needs
+    /// background mode. It returns an index below `request.shards`. An
+    /// exception, or an index out of range, fails the send before anything is
+    /// queued. `encryption=Encryption.aes256_gcm(key)` encrypts the payload and
+    /// the user-header block of every record. A publish failure lists its
+    /// records as sent, before encryption. `idempotent=True` writes each batch
+    /// once per partition, also when a lost reply makes the producer send it
+    /// again: the producer takes a producer id, and a resend keeps the id, the
+    /// sequence, and the message ids of the first attempt.
+    #[pyo3(signature = (*, batch_length=1000, linger_ms=0.0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=false, create_topic=true, partitions=1, replication_factor=None, expire_after_ms=None, never_expire=false, max_topic_bytes=None, unlimited_topic_size=false, background=None, sharding=None, encryption=None, idempotent=false))]
     #[allow(clippy::too_many_arguments)]
     fn producer(
         &self,
@@ -334,6 +392,13 @@ impl PyTopic {
         max_topic_bytes: Option<u64>,
         unlimited_topic_size: bool,
         background: Option<&Bound<'_, PyAny>>,
+        #[gen_stub(override_type(
+            type_repr = "typing.Callable[[ShardRequest], int] | None",
+            imports = ("typing",)
+        ))]
+        sharding: Option<&Bound<'_, PyAny>>,
+        encryption: Option<PyRef<'_, crate::encryption::PyEncryption>>,
+        idempotent: bool,
     ) -> PyResult<PyProducer> {
         let max_topic_size = match (max_topic_bytes, unlimited_topic_size) {
             (Some(_), true) => {
@@ -409,6 +474,12 @@ impl PyTopic {
                         .then(crate::transport::BackgroundSettings::default),
                 },
             },
+            sharding: sharding
+                .filter(|value| !value.is_none())
+                .map(crate::sharding::PySharding::new)
+                .transpose()?,
+            encryption: encryption.map(|encryption| encryption.inner.clone()),
+            idempotent,
         };
         Ok(PyProducer::new(
             self.laser.stream(stream.clone()).topic(&*self.name),
@@ -426,8 +497,12 @@ impl PyTopic {
     /// commit-after-handle delivery. The server holds a
     /// poll that finds fewer than `min_count` new records for up to
     /// `max_wait_ms` (0 to 600000, 0 answers at once), and `max_bytes` caps
-    /// the record bytes of one reply.
-    #[pyo3(signature = (name, *, partition, batch_length=1000, max_wait_ms=5000.0, min_count=1, max_bytes=1048576, polling="next", offset=None, timestamp_micros=None, auto_commit="all", commit_interval_ms=0.0, commit_every=None, polling_retry_interval_ms=1000.0, init_retries=None, init_retry_interval_ms=1000.0, allow_replay=false))]
+    /// the record bytes of one reply. `encryption=Encryption.aes256_gcm(key)`
+    /// decrypts the payload and the user-header block of every record. A
+    /// record that does not decrypt raises `TransportError` once, with Apache
+    /// Iggy error code 72, and is read past. It refuses `auto_commit="polling"`,
+    /// because the server would store a poll before it is decrypted.
+    #[pyo3(signature = (name, *, partition, batch_length=1000, max_wait_ms=5000.0, min_count=1, max_bytes=1048576, polling="next", offset=None, timestamp_micros=None, auto_commit="all", commit_interval_ms=0.0, commit_every=None, polling_retry_interval_ms=1000.0, init_retries=None, init_retry_interval_ms=1000.0, allow_replay=false, encryption=None))]
     #[allow(clippy::too_many_arguments)]
     fn consumer(
         &self,
@@ -455,6 +530,7 @@ impl PyTopic {
         init_retries: Option<u32>,
         init_retry_interval_ms: f64,
         allow_replay: bool,
+        encryption: Option<PyRef<'_, crate::encryption::PyEncryption>>,
     ) -> PyResult<PyConsumer> {
         let handle = match &self.stream {
             Some(stream) => self.laser.stream(stream.clone()).topic(&*self.name),
@@ -479,6 +555,7 @@ impl PyTopic {
                 init_retries,
                 init_retry_interval_ms,
                 allow_replay,
+                encryption: encryption.map(|encryption| encryption.inner.clone()),
             },
             false,
         )
@@ -562,6 +639,119 @@ impl PyTopic {
                 None => laser.topic(&*topic),
             };
             handle.ensure_consumer_group(&name).await.map_err(to_pyerr)
+        })
+    }
+
+    /// This topic as the server reports it, `None` when the topic or its
+    /// stream does not exist.
+    fn get<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Option<PyTopicInfo>>> {
+        let handle = self.handle();
+        awaitable(py, async move {
+            Ok(handle.get().await.map_err(to_pyerr)?.map(PyTopicInfo::from))
+        })
+    }
+
+    /// Whether this topic exists.
+    fn exists<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, bool>> {
+        let handle = self.handle();
+        awaitable(py, async move { handle.exists().await.map_err(to_pyerr) })
+    }
+
+    /// Delete this topic with every message in it. Returns `False` when the
+    /// topic or its stream did not exist.
+    fn delete<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, bool>> {
+        let handle = self.handle();
+        awaitable(py, async move { handle.delete().await.map_err(to_pyerr) })
+    }
+
+    /// Every partition of this topic. A missing topic raises an error
+    /// with `stream_or_topic_not_found` set.
+    fn partitions<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, Vec<PyPartitionInfo>>> {
+        let handle = self.handle();
+        awaitable(py, async move {
+            let partitions = handle.partitions().await.map_err(to_pyerr)?;
+            Ok(partitions.into_iter().map(PyPartitionInfo::from).collect())
+        })
+    }
+
+    /// Add `count` partitions after the existing ones. A topic created with a
+    /// fixed partition layout refuses the change.
+    fn add_partitions<'py>(&self, py: Python<'py>, count: u32) -> PyResult<Awaitable<'py, ()>> {
+        let handle = self.handle();
+        awaitable(py, async move {
+            handle.add_partitions(count).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Delete the last `count` partitions with their messages. A topic created
+    /// with a fixed partition layout refuses the change.
+    fn delete_partitions<'py>(&self, py: Python<'py>, count: u32) -> PyResult<Awaitable<'py, ()>> {
+        let handle = self.handle();
+        awaitable(py, async move {
+            handle.delete_partitions(count).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Change the name, retention, or size cap of this topic. A keyword left
+    /// unset keeps its value. Pass `expire_after_ms` or `never_expire`, and
+    /// `max_topic_bytes` or `unlimited_topic_size`. After a rename, address
+    /// the topic by its new name.
+    #[pyo3(signature = (*, name=None, expire_after_ms=None, never_expire=false, max_topic_bytes=None, unlimited_topic_size=false))]
+    fn update<'py>(
+        &self,
+        py: Python<'py>,
+        name: Option<String>,
+        expire_after_ms: Option<f64>,
+        never_expire: bool,
+        max_topic_bytes: Option<u64>,
+        unlimited_topic_size: bool,
+    ) -> PyResult<Awaitable<'py, ()>> {
+        let options = laser_sdk::stream::UpdateTopicOptions {
+            name,
+            expire_after: expire_after_ms
+                .map(|expiry| crate::convert::duration_ms(expiry, "expire_after_ms"))
+                .transpose()?,
+            never_expire,
+            max_topic_bytes,
+            unlimited_topic_size,
+        };
+        let handle = self.handle();
+        awaitable(
+            py,
+            async move { handle.update(options).await.map_err(to_pyerr) },
+        )
+    }
+
+    /// Delete the oldest `count` segments of one partition with their
+    /// messages. The open segment stays.
+    fn delete_segments<'py>(
+        &self,
+        py: Python<'py>,
+        partition_id: u32,
+        count: u32,
+    ) -> PyResult<Awaitable<'py, ()>> {
+        let handle = self.handle();
+        awaitable(py, async move {
+            handle
+                .delete_segments(partition_id, count)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Every consumer group of this topic. A missing topic raises an error
+    /// with `stream_or_topic_not_found` set.
+    fn consumer_groups<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Awaitable<'py, Vec<PyConsumerGroupSummary>>> {
+        let handle = self.handle();
+        awaitable(py, async move {
+            let groups = handle.consumer_groups().await.map_err(to_pyerr)?;
+            Ok(groups
+                .into_iter()
+                .map(PyConsumerGroupSummary::from)
+                .collect())
         })
     }
 

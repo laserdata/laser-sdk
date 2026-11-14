@@ -38,6 +38,8 @@ These changes require explicit user authorization unless the current session alr
 
 A `rust-v*` tag publishes both crates after the full gate. A `wire-v*` tag publishes only `laser-wire` after tests that need no server. This lets a changed contract publish before the matching server.
 
+A merged pull request with the `release` label publishes every package without a tag and without running the tests again. Its push to `main` runs `scripts/ci/release-plan.sh` in each workflow. The plan publishes only when the commit on `main` holds the same tree that the pull request tested, every non-publish job of that workflow succeeded on the pull request, the pull request carries neither `[wire-break]` nor `[skip-server]`, and the workspace, Python, and TypeScript versions are equal. Otherwise the push run fails. Rust then publishes `laser-wire` and `laser-sdk` from source, Python publishes the wheels and source distribution from the pull request run, and TypeScript publishes the npm package from the pull request run. Each workflow then creates its tags (`wire-v`, `rust-v`, `py-v`, `ts-v`). Tags created by the workflow token start no workflow. A release pull request must be up to date with `main` before it merges, and the `crates`, `pypi`, and `npm` environments must allow deployments from `main`. The tag path stays available for a manual release.
+
 `[wire-break]` in a pull request or push description marks a breaking wire change. `[skip-server]` marks a compatible change whose pinned server in `scripts/resolve-test-iggy-server.sh` is not published yet. Either one skips only tests that need the published server artifact. Server-free tests still run. Run the full pipeline on the unchanged revision after the pinned server is published. Rust, Python, and TypeScript package release tags always run their full pipelines. The wire-only tag remains server-free.
 
 GitHub Actions use readable upstream version tags. Never replace Action tags with commit hashes or add a workflow that enforces hashed Action references.
@@ -61,7 +63,7 @@ just python-docs           # 13. Python README snippets compile
 just parity-check          # 14. Rust, Python, TypeScript surfaces match docs/parity.md
 ```
 
-`just parity-check` runs `scripts/check-parity.py`. It reads public Rust types, re-exports, fields, enum variants, error payloads, constants, methods, trait methods, `bon` builder controls, and standalone functions, then checks the Python stub and TypeScript API reports. It also checks parameters and APIs present only in a peer. It fails when `docs/parity.md` is stale, when a public Rust type is neither covered nor excluded with a reason, or when a row says MISSING. After a public change in any SDK, regenerate the matrix with `python3 scripts/check-parity.py --write`. The Rust, Python, and TypeScript CI workflows run it. A listed row proves the API exists, not that it behaves the same, so behavior still needs tests.
+`just parity-check` runs `scripts/check-parity.py`. It reads public Rust types, re-exports, fields, enum variants, error payloads, constants, methods, trait methods, `bon` builder controls, and standalone functions, then checks the Python stub and TypeScript API reports. It also checks parameters and APIs present only in a peer. It fails when `docs/parity.md` is stale, when a public Rust type is neither covered nor excluded with a reason, or when a row says MISSING. Its capability section lists every operation the raw Apache Iggy client reaches (Rust `Laser::client`, TypeScript `Laser.client`, none in Python) with the first-class API that serves it in each client. The check derives those operations from the client sources at the pinned versions: the methods of the Rust `Client` trait of `iggy_common` and of every trait it extends, the public inherent methods of the Rust `IggyClient` type of the `iggy` crate, both from the cargo registry sources of the versions Cargo.lock pins, and every public instance method, function property, and command group command of the `apache-iggy` client class and the base classes it extends, from the declarations of the version package.json pins. Each operation must belong to exactly one capability row or one retired call, so a new client call without a row fails the check. `scripts/iggy-client-operations.json` keeps the derived lists for a job that lacks one of the sources, and the check fails when that file is stale or its version differs from the pin. A capability without that API fails the check until the API ships or the user signs off in writing in `CAPABILITY_SIGNOFFS`. An omitted row that reaches the raw client, or a method that is not a conversion, a constructor, or a plain-value accessor, must name its capabilities in `OMISSION_CAPABILITIES`. This holds for a method with no arguments too, so an omission reason never hides a lost capability. A raw call belongs to the retired list only when the Iggy server's binary protocol retired its command code, and the row cites that code. A retired call needs no API. After a public change in any SDK, regenerate the matrix with `python3 scripts/check-parity.py --write`. The Rust, Python, and TypeScript CI workflows run it. A listed row proves the API exists, not that it behaves the same, so behavior still needs tests.
 
 Run `--all-features --doc` as a required gate. `clippy --all-targets` does not compile documentation examples. A default-feature `cargo test --workspace` can omit examples behind optional features such as `kv` and `query`. The doctest gate requires no Iggy server or Docker. CI runs it too.
 
@@ -202,8 +204,14 @@ sdk/src/
   poll.rs             shared partition drain helper (context + cursor paths, reads until
                       empty or past the current offset) and TopicFollower, the held-read
                       follower over the upstream PartitionReader (reply hub, control follower)
+  server.rs           server administration under Iggy's own permission checks: Laser::users/user
+                      (User get/exists/create/update/set_permissions/change_password/delete,
+                      UserInfo, UserStatus, Permissions), personal_access_tokens/personal_access_token,
+                      ping, stats (ServerStats), me/clients/client_info (ClientInfo), cluster
+                      (ClusterInfo), snapshot (ZIP bytes), describe_options (OptionInfo),
+                      metadata_changes (MetadataChangesQuery -> MetadataChanges)
   stream.rs           the Log accessors: Laser::stream(name) -> Stream (real Iggy stream,
-                      ensure/topic) and Laser::topic(name) -> Topic (default-stream shortcut,
+                      ensure/delete/get/exists/topics/topic), Laser::streams() and Laser::topic(name) -> Topic (default-stream shortcut,
                       publish()/publish_batch() fluent, send/batch raw (impl Into<Vec<u8>>,
                       matching PublishRequest/BatchPublishRequest), all returning Iggy's
                       SendMessagesResponse commit positions, replay() -> Cursor,
@@ -212,7 +220,13 @@ sdk/src/
                       Iggy provides the VSR transport. Standard Iggy commands and managed reads use the
                       non-replicated extension path, and authorization writes use dedicated
                       replicated operations
-  stream/             publish.rs (publish builders) and record.rs (Record lowering, Vec<u8>
+  stream/             admin.rs (StreamInfo/TopicInfo/PartitionInfo/ConsumerGroupSummary, Laser::streams,
+                      Stream::get/exists/topics/rename, Topic::get/exists/delete/update/partitions/
+                      add_partitions/delete_partitions/delete_segments/consumer_groups,
+                      UpdateTopicOptions, get/exists read a missing stream or topic as
+                      None or false, topics/partitions/consumer_groups fail as stream or
+                      topic not found),
+                      publish.rs (publish builders) and record.rs (Record lowering, Vec<u8>
                       payload, one-shot/typed publish, not the hot loop), transport.rs is the
                       Laser-native direct Producer plus live futures::Stream Consumer/
                       ConsumerMessage path - ProducerMessage/ConsumerMessage keep `bytes::Bytes`
@@ -222,7 +236,9 @@ sdk/src/
                       (default All), explicit commit-after-success fenced by the delivery's
                       checkpoint, seek, producer commit confirmations, consumer
                       offsets, and next_within(timeout) for
-                      a bounded single-record wait
+                      a bounded single-record wait, encryption.rs (Encryption, Iggy's
+                      AES-256-GCM format for producer and consumer encryption) and
+                      sharding.rs (ShardRequest, the caller's background shard picker)
   batching.rs         Topic::batching() -> BatchingProducerBuilder, build() gives the BatchingProducer:
                       the governed size-and-time batcher
                       (max_records / max_bytes / linger), part of `streaming`
@@ -405,6 +421,8 @@ foreign/python/         the Python SDK (outside the workspace): PyO3 bindings ov
                         the Laser Producer/Consumer/ConsumerMessage surface with direct batching,
                         partitioning, group polling, auto/manual commits, offset control, and
                         next_within. batching.rs binds Topic.batching() -> BatchingProducer.
+                        admin.rs binds StreamInfo, TopicInfo, PartitionInfo, and
+                        ConsumerGroupSummary.
                         registry.rs binds the agent registry (AgentRegistry, publish_card,
                         quarantine_signed, presence, client_metadata) and Laser.agent(id) ->
                         AgentScope. context.rs binds ContextScope (fetch_with, state,
@@ -476,7 +494,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-This inventory describes the `0.10.0` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.10.1` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
 Capabilities identify managed support such as queries, key-value, forks, graphs, and an A2A gateway, plus native consumer filters served by the streaming server. Every capability flag maps to a hello feature bit or an op version. Memory combines query and graph operations and has no separate managed command group.
 
