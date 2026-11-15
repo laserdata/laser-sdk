@@ -1,10 +1,23 @@
 # LaserData - Laser SDK examples - TypeScript
 
-The TypeScript examples cover the Rust and Python catalog: nine tiny primitive examples plus the nine non-benchmark deep-dive scenarios. The deep-dive scenarios are shorter than their Rust counterparts and exercise the same primitives. Each example uses the public `@laserdata/laser-sdk` package, the shared connection helper in `src/common.ts`, deterministic input, bounded waits, and the same managed capability gates as the other languages.
+The TypeScript examples cover the Rust and Python catalog: two standalone programs, nine tiny primitive examples, and the nine non-benchmark deep-dive scenarios. The deep-dive scenarios are shorter than their Rust counterparts and exercise the same primitives. Each primitive and deep-dive example uses the public `@laserdata/laser-sdk` package, the shared connection helper in `src/common.ts`, deterministic input, bounded waits, and the same managed capability gates as the other languages.
+
+## Standalone programs
+
+Each imports only `@laserdata/laser-sdk`, reads `LASER_CONNECTION_STRING` through `Laser.connectEnv()`, works on a scratch stream that it deletes at the end, and prints its result as JSON, so it runs when copied alone into any project.
+
+| Example | What it shows | Needs Cloud? |
+| --- | --- | --- |
+| [`workflow`](src/workflow/README.md) | Three local workflow steps, journaled and resumable, with the run's status, completed steps, and outputs | no |
+| [`memory-correction`](src/memory-correction/README.md) | Remember two facts for a user, correct one with `supersede` in a later conversation, recall the current facts ranked by the question | no |
+
+```sh
+LASER_CONNECTION_STRING='<connection string>' npm run example:workflow
+```
 
 Run the commands below from `examples/typescript`.
 
-**Consumer filters: 98.5% less payload transfer in the CDC example.** The reader receives 4 of 240 records from the shared feed, with original bytes and offsets. The example also covers typed records, one-byte numeric headers, previews, and saved group policies. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+**Consumer filters: 98.5% less payload transfer in the CDC example.** The reader receives 4 of 240 records from the shared feed, with original bytes and offsets. The example also covers typed records, one-byte numeric headers, previews, and saved group policies. See the [Consumer Filters guide](https://docs.laserdata.com/laser-sdk/consumer-filters).
 
 ## Setup
 
@@ -72,15 +85,15 @@ One tiny, single-primitive example each, most under 100 lines including imports.
 
 | Example | Primitive | What it shows | Needs Cloud? | Docs |
 | --- | --- | --- | --- | --- |
-| [`log`](src/log/README.md) | Log | Ensure a topic, publish two JSON records, replay them back through one typed reader | no | [`/laser-sdk/log`](https://docs.laserdata.cloud/laser-sdk/log) |
-| [`query`](src/query/README.md) | Views | Declare a view over a topic, publish host readings, query the maintained view | yes | [`/laser-sdk/views`](https://docs.laserdata.cloud/laser-sdk/views) |
-| [`watch`](src/watch/README.md) | Change feed | React to an advancement record instead of re-querying blind | yes | [`/laser-sdk/change-feed`](https://docs.laserdata.cloud/laser-sdk/change-feed) |
-| [`kv`](src/kv/README.md) | State | Set/get keyed JSON with a TTL, change it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row | yes | [`/laser-sdk/state`](https://docs.laserdata.cloud/laser-sdk/state) |
-| [`cdc`](src/cdc/README.md) | Consumer filters | Read four safe-mode events out of a 240-record feed of typed records, sample-test and preview filters, route binary alerts on a header, then bind groups to saved filters and manage their revisions | yes | [`/laser-sdk/consumer-filters`](https://docs.laserdata.cloud/laser-sdk/consumer-filters) |
-| [`graph`](src/graph/README.md) | Graph | Link entities and traverse one relation out of a node | yes | [`/laser-sdk/graph`](https://docs.laserdata.cloud/laser-sdk/graph) |
-| [`recall`](src/recall/README.md) | Memory | All four durable verbs: remember, recall recent, improve, forget | no | [`/laser-sdk/memory`](https://docs.laserdata.cloud/laser-sdk/memory) |
-| [`context`](src/context/README.md) | Context | Assemble one conversation under a `LastN` + `TokenBudget` policy chain | no | [`/laser-sdk/context`](https://docs.laserdata.cloud/laser-sdk/context) |
-| [`agent`](src/agent/README.md) | Fabric | Spawn a handler agent and send it a deadline-bounded contract | no | [`/laser-sdk/fabric`](https://docs.laserdata.cloud/laser-sdk/fabric) |
+| [`log`](src/log/README.md) | Log | Ensure a topic, publish two JSON records, replay them back through one typed reader | no | [`/laser-sdk/log`](https://docs.laserdata.com/laser-sdk/log) |
+| [`query`](src/query/README.md) | Views | Declare a view over a topic, publish host readings, query the maintained view | yes | [`/laser-sdk/views`](https://docs.laserdata.com/laser-sdk/views) |
+| [`watch`](src/watch/README.md) | Change feed | React to an advancement record instead of re-querying blind | yes | [`/laser-sdk/change-feed`](https://docs.laserdata.com/laser-sdk/change-feed) |
+| [`kv`](src/kv/README.md) | State | Set/get keyed JSON with a TTL, change it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row | yes | [`/laser-sdk/state`](https://docs.laserdata.com/laser-sdk/state) |
+| [`cdc`](src/cdc/README.md) | Consumer filters | Read four safe-mode events out of a 240-record feed of typed records, sample-test and preview filters, route binary alerts on a header, then bind groups to saved filters and manage their revisions | yes | [`/laser-sdk/consumer-filters`](https://docs.laserdata.com/laser-sdk/consumer-filters) |
+| [`graph`](src/graph/README.md) | Graph | Link entities and traverse one relation out of a node | yes | [`/laser-sdk/graph`](https://docs.laserdata.com/laser-sdk/graph) |
+| [`recall`](src/recall/README.md) | Memory | All four durable verbs: remember, recall recent, improve, forget | no | [`/laser-sdk/memory`](https://docs.laserdata.com/laser-sdk/memory) |
+| [`context`](src/context/README.md) | Context | Assemble one conversation under a `LastN` + `TokenBudget` policy chain | no | [`/laser-sdk/context`](https://docs.laserdata.com/laser-sdk/context) |
+| [`agent`](src/agent/README.md) | Fabric | Spawn a handler agent and send it a deadline-bounded contract | no | [`/laser-sdk/fabric`](https://docs.laserdata.com/laser-sdk/fabric) |
 
 ## Deep-dive scenarios
 

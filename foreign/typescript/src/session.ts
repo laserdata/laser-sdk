@@ -13,6 +13,7 @@ import { warn } from "./runtime/warn.js"
 import { type BytesLike, ownedBytes } from "./client/bytes.js"
 import {
   InvalidError,
+  MISSING_TOPIC_HINT,
   NoStreamError,
   SessionEndedError,
   SessionError,
@@ -169,16 +170,21 @@ export const DEFAULT_SESSION_MEMORY_NAMESPACE = "agent.session"
 export const DEFAULT_SESSION_CONTEXT_TURNS = 50
 export const DEFAULT_SESSION_CONTEXT_TOKENS = 4000
 
+/** The `agent.sessions` expiry `bootstrap` uses when given no retention: one day.
+ * @internal */
+export const DEFAULT_BOOTSTRAP_RETENTION_MS = 86_400_000
+
 const MIN_LEASE_INTERVAL_MS = 10
+const MISSING_STREAM = "the session stream does not exist"
+const MISSING_LANE = "agent.sessions does not exist"
 const SHARED_LAYOUT: SessionLayout = { kind: "shared" }
 const U64_MAX = 0xffff_ffff_ffff_ffffn
 const U32_MAX = 0xffff_ffffn
 
-/** How long `agent.sessions` keeps records. Bootstrap needs one, because the
- * session topic holds every session's lane and there is no safe default. The
- * expiry is in milliseconds, and leaving it out never expires. The size bound
- * is in bytes, and leaving it out keeps the server default. A policy that
- * never expires and has no size bound is refused. */
+/** How long `agent.sessions` keeps records, one day when `bootstrap` is given
+ * none. The expiry is in milliseconds, and leaving it out never expires. The
+ * size bound is in bytes, and leaving it out keeps the server default. A
+ * policy that never expires and has no size bound is refused. */
 export class TopicRetention {
   private constructor(
     private readonly expiryMs: number | undefined,
@@ -405,8 +411,8 @@ class LaneGuard {
     const stream = requireStream(laser)
     const details = await transport.findSnapshotStream(stream)
     const topic = await transport.findSnapshotTopic(stream, AgentTopic.Sessions)
-    if (details === undefined) throw staleLane("the session stream does not exist")
-    if (topic === undefined) throw staleLane("agent.sessions does not exist")
+    if (details === undefined) throw staleLane(`${MISSING_STREAM}: ${MISSING_TOPIC_HINT}`)
+    if (topic === undefined) throw staleLane(`${MISSING_LANE}: ${MISSING_TOPIC_HINT}`)
     const current: LaneIdentity = {
       streamId: details.id,
       streamGeneration: details.createdAtMicros,
@@ -457,6 +463,15 @@ class LaneGuard {
   }
 }
 
+/** Whether `error` is the lane guard's refusal of a session stream or an
+ * `agent.sessions` topic that does not exist yet.
+ * @internal */
+export function isMissingLane(error: unknown): boolean {
+  if (!(error instanceof SessionError) || error.detail.kind !== "stale") return false
+  const message = error.detail.message
+  return [MISSING_STREAM, MISSING_LANE].some((fact) => message.startsWith(fact))
+}
+
 function staleLane(message: string): SessionError {
   return new SessionError(`stale session generation: ${message}`, { kind: "stale", message })
 }
@@ -505,10 +520,11 @@ export class Sessions {
    * serves sessions and `SessionConfig.registerSource` is on, register the
    * stream as a session source. A refused registration is reported as
    * `registered: false`, never an error, because an account without session
-   * administration rights relies on provisioning to register the stream. */
+   * administration rights relies on provisioning to register the stream.
+   * `partitions` defaults to 1 and `retention` to one day. */
   async bootstrap(
-    partitions: number,
-    retention: TopicRetention,
+    partitions = 1,
+    retention: TopicRetention = TopicRetention.expireAfter(DEFAULT_BOOTSTRAP_RETENTION_MS),
     options: CallOptions = {}
   ): Promise<SessionBootstrap> {
     const signal = options.signal
@@ -2001,7 +2017,12 @@ export class Session {
   }
 
   /** This session's memory in the configured namespace, scoped to the session. */
-  memory(namespace: string = this.config.memoryNamespaceName): ScopedMemory {
+  memory(): ScopedMemory {
+    return this.memoryIn(this.config.memoryNamespaceName)
+  }
+
+  /** `memory` in an explicit namespace. */
+  memoryIn(namespace: string): ScopedMemory {
     return this.scope.memory(namespace)
   }
 
@@ -2152,9 +2173,7 @@ function failureBody(error: unknown): AgentErrorBody {
 function requireStream(laser: Laser): string {
   const stream = laser.defaultStream
   if (stream === undefined) {
-    throw new NoStreamError(
-      "sessions require a default stream, use connectWithStream() or SessionConfig.stream()"
-    )
+    throw new NoStreamError("sessions require a default stream or SessionConfig.stream()")
   }
   return stream
 }

@@ -15,7 +15,7 @@ on Apache Iggy without a managed backend.
 Run it:
     LASER_CONNECTION_STRING=user:pwd@your-host python3 query.py
 
-Docs: https://docs.laserdata.cloud/laser-sdk/views
+Docs: https://docs.laserdata.com/laser-sdk/views
 Full scenario: fleet_tape.py (a queryable tape audited against the raw log)
 """
 

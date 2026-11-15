@@ -19,7 +19,7 @@ Run it:
     just up
     python3 recall.py
 
-Docs: https://docs.laserdata.cloud/laser-sdk/memory
+Docs: https://docs.laserdata.com/laser-sdk/memory
 Full scenario: memory.py (durable memory, then the knowledge graph over the same domain)
 """
 

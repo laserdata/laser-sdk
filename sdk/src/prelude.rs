@@ -11,7 +11,7 @@ pub use crate::agent::WORKFLOW_FENCE_NAMESPACE;
 pub use crate::agent::{
     Agent, AgentCtx, AgentHandle, AgentHandler, AgentMessage, Contract, ConversationState,
     ReliableConsumer, ReplayBound, RoutePolicy, Router, Session, SessionConfig, SessionLease,
-    SessionTurn, Sessions, TopicRetention, Workflow,
+    SessionTurn, Sessions, StepContext, TopicRetention, Workflow,
 };
 pub use crate::capabilities::Capabilities;
 #[cfg(feature = "streaming")]
@@ -76,8 +76,8 @@ pub mod full {
         CapabilitySelector, ChunkAssembler, ConcurrencyPolicy, ContractBuilder, DeadLetterSink,
         Deduplicator, Gather, GatherPolicy, InboxRoute, RegisteredCard, RetryPolicy,
         RouteCandidate, RouteScorer, ScatterOutcome, ScatterReport, SessionPolicy, SlidingWindow,
-        StepContext, StepFailure, StepFn, StepHandle, StreamEvent, Verifier, WarmDedupPolicy,
-        WorkflowBudget, WorkflowOutcome,
+        StepFailure, StepFn, StepHandle, StreamEvent, Verifier, WarmDedupPolicy, WorkflowBudget,
+        WorkflowOutcome,
     };
     #[cfg(feature = "agui")]
     pub use crate::agui::AgUiEvent;
@@ -144,8 +144,8 @@ pub mod full {
     };
     #[cfg(feature = "streaming")]
     pub use crate::stream::{
-        ConsumerGroupInfo, ConsumerGroupSummary, CreateConsumerGroup, PartitionInfo, StreamInfo,
-        TopicInfo,
+        ConsumerGroupInfo, ConsumerGroupSummary, CreateConsumerGroup, PartitionInfo, ScratchStream,
+        StreamInfo, TopicInfo,
     };
     #[cfg(feature = "projections")]
     pub use laser_wire::destination::{BackendBinding, BackendResourceId};

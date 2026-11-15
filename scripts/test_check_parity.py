@@ -829,7 +829,7 @@ class CapabilityTests(unittest.TestCase):
     """
     STUB = """
         class Laser:
-            def ping(self) -> None: ...
+            def ping(self) -> typing.Awaitable[None]: ...
     """
     REPORT = """
         export class Laser {
@@ -1003,6 +1003,48 @@ class RawClientDerivationTests(unittest.TestCase):
             with patch.object(parity, "rust_raw_operations", lambda: ("iggy_common", "0.12.0", None, None)), patch.object(parity, "typescript_raw_operations", lambda: ("apache-iggy", "0.11.0", ["system.ping"], None)):
                 clients, found = parity.raw_clients()
         self.assertEqual((clients["Rust"]["operations"], found), (["ping"], []))
+
+
+class ReturnKindTests(unittest.TestCase):
+    RUST = """
+        pub struct Workflow;
+        impl Workflow {
+            pub fn budget(self, budget: u32) -> Self { todo!() }
+            pub async fn run(self) -> Result<u32, LaserError> { todo!() }
+        }
+    """
+
+    def test_given_a_peer_method_that_returns_nothing_where_rust_chains_when_compared_then_should_report_it(self):
+        with workspace(
+            rust=self.RUST,
+            stub="""
+                import typing
+                class Workflow:
+                    def budget(self, budget: int) -> None: ...
+                    def run(self) -> None: ...
+            """,
+        ):
+            found = problems()
+            self.assertTrue(any("Workflow::budget: Python `Workflow.budget` returns nothing where Rust returns itself to chain" in problem for problem in found), found)
+            self.assertTrue(any("Workflow::run: Python `Workflow.run` returns nothing where Rust returns an awaitable" in problem for problem in found), found)
+
+    def test_given_peer_methods_that_chain_and_await_like_rust_when_compared_then_should_report_no_return_kind(self):
+        with workspace(
+            rust=self.RUST,
+            stub="""
+                import typing
+                class Workflow:
+                    def budget(self, budget: int) -> Workflow: ...
+                    def run(self) -> typing.Awaitable[int]: ...
+            """,
+            report="""
+                export class Workflow {
+                    budget(budget: number): this;
+                    run(): Promise<number>;
+                }
+            """,
+        ):
+            self.assertFalse([problem for problem in problems() if "where Rust returns" in problem])
 
 
 if __name__ == "__main__":

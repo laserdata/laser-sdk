@@ -21,5 +21,5 @@ LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host \
 
 ## Learn more
 
-- Docs: https://docs.laserdata.cloud/laser-sdk/graph
+- Docs: https://docs.laserdata.com/laser-sdk/graph
 - Full system built on this primitive: [`memory`](../memory/README.md)

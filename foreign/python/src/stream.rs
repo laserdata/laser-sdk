@@ -15,6 +15,7 @@ use crate::typed::{PyTypedTopic, TypedForm, body_to_json};
 use iggy::prelude::IggyExpiry;
 use laser_sdk::error::LaserError;
 use laser_sdk::laser::Laser;
+use laser_sdk::stream::ScratchStream;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -29,6 +30,18 @@ impl PyLaser {
         PyStream {
             laser: self.inner.clone(),
             name,
+        }
+    }
+
+    /// A uniquely named stream for one program run: `async with
+    /// laser.scratch_stream(prefix) as scratch:` creates `{prefix}-` and eight
+    /// lowercase hex characters, `scratch.laser` uses it as the default
+    /// stream, and leaving the block deletes it, also when the block raised.
+    fn scratch_stream(&self, prefix: String) -> PyScratchStream {
+        PyScratchStream {
+            laser: self.inner.clone(),
+            prefix,
+            opened: Arc::default(),
         }
     }
 
@@ -759,6 +772,99 @@ impl PyTopic {
         match &self.stream {
             Some(stream) => format!("Topic(stream={stream}, name={})", self.name),
             None => format!("Topic(name={})", self.name),
+        }
+    }
+}
+
+/// A stream that lives for one program run, from `Laser.scratch_stream`.
+/// Entering `async with` creates it, leaving deletes it. `name` and `laser`
+/// read it once entered, and `delete()` removes it earlier.
+#[gen_stub_pyclass]
+#[pyclass(name = "ScratchStream")]
+pub struct PyScratchStream {
+    laser: Laser,
+    prefix: String,
+    opened: Arc<Mutex<Option<Arc<ScratchStream>>>>,
+}
+
+impl PyScratchStream {
+    fn opened(&self) -> PyResult<Arc<ScratchStream>> {
+        self.opened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                InvalidError::new_err(
+                    "the scratch stream is not open: enter it with `async with laser.scratch_stream(prefix) as scratch`",
+                )
+            })
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyScratchStream {
+    /// The stream's unique name.
+    #[getter]
+    fn name(&self) -> PyResult<String> {
+        Ok(self.opened()?.name().to_owned())
+    }
+
+    /// A handle on the same connection whose default stream is this one.
+    #[getter]
+    fn laser(&self) -> PyResult<PyLaser> {
+        Ok(PyLaser::from_inner(self.opened()?.laser().clone()))
+    }
+
+    /// Delete the stream with every topic and message in it. Idempotent.
+    fn delete<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, ()>> {
+        let scratch = self.opened()?;
+        awaitable(py, async move { scratch.delete().await.map_err(to_pyerr) })
+    }
+
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Awaitable<'py, Py<Self>>> {
+        let (laser, prefix, opened) = {
+            let this = slf.borrow(py);
+            (
+                this.laser.clone(),
+                this.prefix.clone(),
+                Arc::clone(&this.opened),
+            )
+        };
+        awaitable(py, async move {
+            let scratch = laser.scratch_stream(prefix).await.map_err(to_pyerr)?;
+            *opened
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(scratch));
+            Ok(slf)
+        })
+    }
+
+    /// Delete the stream and let an exception in the block propagate.
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<Awaitable<'py, bool>> {
+        let scratch = self
+            .opened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        awaitable(py, async move {
+            if let Some(scratch) = scratch {
+                scratch.delete().await.map_err(to_pyerr)?;
+            }
+            Ok(false)
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        match self.opened() {
+            Ok(scratch) => format!("ScratchStream(name={})", scratch.name()),
+            Err(_) => format!("ScratchStream(prefix={}, not open)", self.prefix),
         }
     }
 }

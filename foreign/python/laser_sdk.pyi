@@ -320,6 +320,7 @@ __all__ = [
     "ScatterReport",
     "Schemas",
     "ScopedMemory",
+    "ScratchStream",
     "SdkInfo",
     "Selection",
     "SendMessagesConfirmationResponse",
@@ -4906,11 +4907,11 @@ class Laser:
         envelope. A `signing_key` signs `command`, `respond`, `emit`, `status`, and `fail` sends.
         Chunk streams and `request_input` use the Rust unsigned helpers.
         """
-    def bootstrap(self, partitions: builtins.int, retention: TopicRetention) -> typing.Awaitable[None]:
+    def bootstrap(self, partitions: builtins.int = 1, retention: typing.Optional[TopicRetention] = None) -> typing.Awaitable[None]:
         r"""
         Create the agent topics on the default stream, `partitions` each.
-        `agent.sessions` needs a `TopicRetention`. Idempotent. Requires a
-        default stream.
+        `retention` bounds `agent.sessions`, by default one day. Idempotent.
+        Requires a default stream.
         """
     def send_agent(self, topic: builtins.str, payload: builtins.str | builtins.bytes | builtins.bytearray, provenance: Provenance) -> typing.Awaitable[None]:
         r"""
@@ -4940,7 +4941,7 @@ class Laser:
         `attempts` an int, `detail` an optional string, and `payload` the
         poison message's raw bytes.
         """
-    def spawn_agent(self, agent_id: typing.Optional[builtins.str], listen_on: builtins.str, handler: typing.Any, *, consumer_group: typing.Optional[builtins.str] = None, respond_on: typing.Optional[builtins.str] = None, fixed_inbox: typing.Optional[builtins.str] = None, max_wait_ms: typing.Optional[builtins.float] = None, warm_dedup: builtins.bool = False, warm_dedup_policy: typing.Literal['dead_letters', 'unexpired', 'all'] = "dead_letters", dedup: typing.Optional[typing.Any] = None, dedup_window: typing.Optional[builtins.int] = None, consolidate_every_ms: typing.Optional[builtins.float] = None, consolidator: typing.Optional[typing.Any] = None, capabilities: typing.Optional[typing.Sequence[typing.Any]] = None, ack_on_pickup: builtins.bool = False, health: typing.Optional[builtins.str] = None, max_partitions: typing.Optional[builtins.int] = None, max_queued_records: typing.Optional[builtins.int] = None, max_queued_bytes: typing.Optional[builtins.int] = None, understood_features: builtins.int = 0, shutdown_grace_ms: typing.Optional[builtins.float] = None, dead_letter: typing.Optional[typing.Any] = None, middleware: typing.Optional[typing.Sequence[typing.Any]] = None, retry_max_attempts: typing.Optional[builtins.int] = None, retry_base_delay_ms: typing.Optional[builtins.float] = None, governor: typing.Optional[typing.Any] = None, governor_mode: typing.Literal['observe', 'enforce'] = "enforce", governor_retention: typing.Optional[tuple[builtins.int, builtins.float]] = None, signing_key: typing.Optional[SigningKey] = None, verifier: typing.Optional[KeyRegistry] = None, operations: typing.Optional[typing.Sequence[builtins.str]] = None, sessions: typing.Optional[Sessions] = None) -> AgentHandle:
+    def spawn_agent(self, agent_id: typing.Optional[builtins.str], listen_on: builtins.str, handler: typing.Callable[[AgentCtx, AgentMessage], typing.Awaitable[None]], *, consumer_group: typing.Optional[builtins.str] = None, respond_on: typing.Optional[builtins.str] = None, fixed_inbox: typing.Optional[builtins.str] = None, max_wait_ms: typing.Optional[builtins.float] = None, warm_dedup: builtins.bool = False, warm_dedup_policy: typing.Literal['dead_letters', 'unexpired', 'all'] = "dead_letters", dedup: typing.Optional[typing.Any] = None, dedup_window: typing.Optional[builtins.int] = None, consolidate_every_ms: typing.Optional[builtins.float] = None, consolidator: typing.Optional[typing.Any] = None, capabilities: typing.Optional[typing.Sequence[typing.Any]] = None, ack_on_pickup: builtins.bool = False, health: typing.Optional[builtins.str] = None, max_partitions: typing.Optional[builtins.int] = None, max_queued_records: typing.Optional[builtins.int] = None, max_queued_bytes: typing.Optional[builtins.int] = None, understood_features: builtins.int = 0, shutdown_grace_ms: typing.Optional[builtins.float] = None, dead_letter: typing.Optional[typing.Any] = None, middleware: typing.Optional[typing.Sequence[typing.Any]] = None, retry_max_attempts: typing.Optional[builtins.int] = None, retry_base_delay_ms: typing.Optional[builtins.float] = None, governor: typing.Optional[typing.Any] = None, governor_mode: typing.Literal['observe', 'enforce'] = "enforce", governor_retention: typing.Optional[tuple[builtins.int, builtins.float]] = None, signing_key: typing.Optional[SigningKey] = None, verifier: typing.Optional[KeyRegistry] = None, operations: typing.Optional[typing.Sequence[builtins.str]] = None, sessions: typing.Optional[Sessions] = None) -> AgentHandle:
         r"""
         Spawn an agent: join `consumer_group` (default `agent_id`) over
         `listen_on` and drive `handler` for each message, with at-least-once
@@ -5543,6 +5544,13 @@ class Laser:
         The stream accessor: a real Apache Iggy stream grouping topics, first
         class and dynamic. Free and synchronous, IO happens at the verbs.
         """
+    def scratch_stream(self, prefix: builtins.str) -> ScratchStream:
+        r"""
+        A uniquely named stream for one program run: `async with
+        laser.scratch_stream(prefix) as scratch:` creates `{prefix}-` and eight
+        lowercase hex characters, `scratch.laser` uses it as the default
+        stream, and leaving the block deletes it, also when the block raised.
+        """
     def topic(self, name: builtins.str) -> Topic:
         r"""
         The topic accessor against the default stream, the one-word shortcut
@@ -6070,19 +6078,34 @@ class MemoryHandle:
         `origin` is the `SourceRef` dict of the session record
         that motivated the item, and `producer` is a `{"name", "version"}` dict.
         """
+    def supersede(self, old_id: builtins.str, payload: builtins.str | builtins.bytes | builtins.bytearray, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, stream: typing.Optional[builtins.str] = None, kind: typing.Literal['fact', 'message', 'summary', 'entity', 'feedback', 'procedure'] = "fact", durable: builtins.bool = False, dedup: builtins.bool = False, origin: typing.Optional[typing.Any] = None, producer: typing.Optional[typing.Any] = None) -> typing.Awaitable[builtins.str]:
+        r"""
+        Correct a fact: remember `payload` as the new fact under the scope,
+        then forget `old_id` in every conversation, so no later recall returns
+        the old fact. Returns the new item's id. A failure in between leaves
+        both facts, so no fact is lost. `old_id` must be a memory id (a ULID
+        string), refused with `InvalidError` before any write.
+        """
     def append(self, id: builtins.str, payload: builtins.str | builtins.bytes | builtins.bytearray, *, kind: typing.Literal['fact', 'message', 'summary', 'entity', 'feedback', 'procedure'] = "fact", agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, stream: typing.Optional[builtins.str] = None, durable: builtins.bool = False) -> typing.Awaitable[builtins.str]:
         r"""
         Append with an explicit ID and kind. Built-ins preserve both. A custom backend uses its optional `append` callback, or falls back to `remember` when absent.
         """
-    def recall(self, *, limit: builtins.int = 50, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, semantic: typing.Optional[builtins.str] = None, strategy: typing.Optional[builtins.str] = None, folded: builtins.bool = False, stream: typing.Optional[builtins.str] = None, durable: builtins.bool = False, token_budget: typing.Optional[builtins.int] = None, block: builtins.bool = False) -> typing.Awaitable[typing.Any]:
+    def recall(self, *, limit: builtins.int = 50, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, semantic: typing.Optional[builtins.str] = None, strategy: typing.Optional[builtins.str] = None, folded: builtins.bool = False, stream: typing.Optional[builtins.str] = None, durable: builtins.bool = False, token_budget: typing.Optional[builtins.int] = None) -> typing.Awaitable[builtins.list[MemoryItem]]:
         r"""
         Recall up to `limit` items under the scope. Pass `semantic` text to rank
         by similarity, or a `strategy` (`auto`, `recent`, `semantic`, `keyword`,
         `graph`, `temporal`, `hybrid`) with the query text in `semantic`. The
-        log backend reads the managed key-value view by default. `folded=True`
-        rebuilds memory from the topic in process instead. `block=True` renders
-        the recalled items into one prompt-ready string under `token_budget`,
-        like `to_context_block`.
+        log backend ranks every item by word overlap for `semantic`, `hybrid`
+        and `auto`, and keeps only the items that share a word for `keyword`.
+        It reads the managed key-value view by default, waiting for this
+        connection's own writes to show there. `folded=True` rebuilds memory
+        from the topic in process instead. `recall_block` renders the same
+        recall as one prompt block.
+        """
+    def recall_block(self, *, limit: builtins.int = 50, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, semantic: typing.Optional[builtins.str] = None, strategy: typing.Optional[builtins.str] = None, folded: builtins.bool = False, stream: typing.Optional[builtins.str] = None, durable: builtins.bool = False, token_budget: typing.Optional[builtins.int] = None) -> typing.Awaitable[builtins.str]:
+        r"""
+        Recall like `recall` and render the items as one prompt-ready block
+        under `token_budget`, like `to_context_block`.
         """
     def context(self, conversation: builtins.str, *, token_budget: typing.Optional[builtins.int] = None) -> typing.Awaitable[builtins.str]:
         r"""
@@ -8173,6 +8196,34 @@ class ScopedMemory:
         """
 
 @typing.final
+class ScratchStream:
+    r"""
+    A stream that lives for one program run, from `Laser.scratch_stream`.
+    Entering `async with` creates it, leaving deletes it. `name` and `laser`
+    read it once entered, and `delete()` removes it earlier.
+    """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        The stream's unique name.
+        """
+    @property
+    def laser(self) -> Laser:
+        r"""
+        A handle on the same connection whose default stream is this one.
+        """
+    def delete(self) -> typing.Awaitable[None]:
+        r"""
+        Delete the stream with every topic and message in it. Idempotent.
+        """
+    def __aenter__(self) -> typing.Awaitable[ScratchStream]: ...
+    def __aexit__(self, _exc_type: typing.Any, _exc_value: typing.Any, _traceback: typing.Any) -> typing.Awaitable[builtins.bool]:
+        r"""
+        Delete the stream and let an exception in the block propagate.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class SdkInfo:
     r"""
     The SDK that created a session.
@@ -8381,10 +8432,10 @@ class Session:
         r"""
         The knowledge graph `name`, the same graph `laser.graph(name)` returns.
         """
-    def memory(self, memory: typing.Optional[MemoryHandle] = None) -> ScopedMemory:
+    def memory(self) -> ScopedMemory:
         r"""
-        This session's memory, scoped to the session: `memory` defaults to
-        `laser.memory(<configured namespace>)`, or pass any memory handle.
+        This session's memory in the configured namespace, scoped to the
+        session. `memory_in` opens another namespace.
         """
     def memory_in(self, namespace: builtins.str) -> ScopedMemory:
         r"""
@@ -8908,10 +8959,11 @@ class Sessions:
         The session over an existing id, as a lens: no IO, no lease, and no
         author until `Session.as_agent` names one.
         """
-    def bootstrap(self, partitions: builtins.int, retention: TopicRetention) -> typing.Awaitable[SessionBootstrap]:
+    def bootstrap(self, partitions: builtins.int = 1, retention: typing.Optional[TopicRetention] = None) -> typing.Awaitable[SessionBootstrap]:
         r"""
         Create the agent topics, then register the stream as a session source
         when the deployment serves sessions. Returns whether it registered.
+        `retention` bounds `agent.sessions`, by default one day.
         """
     def unregister(self) -> typing.Awaitable[None]:
         r"""
@@ -10111,7 +10163,7 @@ class Workflow:
     optional verifier panel, exclusivity (a fenced at-most-once effect), an
     on-timeout policy, and a compensation (the saga rollback).
     """
-    def run_id(self, run_id: builtins.str) -> None:
+    def run_id(self, run_id: builtins.str) -> Workflow:
         r"""
         Run under `run_id`: the engine replays that run's whole journal, skips
         the steps recorded complete, and dispatches only the unfinished ones. A
@@ -10121,18 +10173,23 @@ class Workflow:
         `JournalTruncatedError`. The run session reopens, so a run that ended
         completed or failed runs again under the same id and a canceled one
         raises `SessionEndedError`. Omit it to start a fresh run with its own id.
+        Returns the workflow, so calls chain.
         """
-    def budget(self, budget: WorkflowBudget) -> None:
+    def budget(self, budget: WorkflowBudget) -> Workflow:
         r"""
         Cap the workflow's spend with a `WorkflowBudget`. The token ceiling
         counts only the usage an AGDX reply carries, so it is advisory.
+        Returns the workflow, so calls chain.
         """
-    def step(self, label: builtins.str, *, build: typing.Any, to: typing.Optional[builtins.str] = None, to_capable: typing.Optional[builtins.str] = None, all_capable: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None, after: typing.Optional[typing.Sequence[builtins.str]] = None, verify: typing.Optional[typing.Any] = None, exclusive: builtins.bool = False, fence_namespace: typing.Optional[builtins.str] = None, on_timeout: typing.Literal['fail', 'reassign'] = "fail", compensate: typing.Optional[typing.Any] = None, policy: typing.Optional[typing.Any] = None, deadline_ms: typing.Optional[builtins.float] = None) -> None:
+    def step(self, label: builtins.str, *, build: typing.Optional[typing.Callable[[dict[builtins.str, builtins.bytes]], builtins.bytes | builtins.str | typing.Awaitable[builtins.bytes | builtins.str]]] = None, run: typing.Optional[typing.Callable[[dict[builtins.str, builtins.bytes]], builtins.bytes | builtins.str | typing.Awaitable[builtins.bytes | builtins.str]]] = None, to: typing.Optional[builtins.str] = None, to_capable: typing.Optional[builtins.str] = None, all_capable: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None, after: typing.Optional[typing.Sequence[builtins.str]] = None, verify: typing.Optional[typing.Callable[[builtins.bytes], builtins.bool | typing.Awaitable[builtins.bool]]] = None, exclusive: builtins.bool = False, fence_namespace: typing.Optional[builtins.str] = None, on_timeout: typing.Literal['fail', 'reassign'] = "fail", compensate: typing.Optional[typing.Callable[[dict[builtins.str, builtins.bytes]], builtins.bytes | builtins.str | typing.Awaitable[builtins.bytes | builtins.str]]] = None, policy: typing.Optional[typing.Any] = None, deadline_ms: typing.Optional[builtins.float] = None) -> Workflow:
         r"""
-        Add a step. Exactly one target is required: `to` (a named agent),
+        Add a step and return the workflow, so calls chain. A local step passes
+        `run(outputs) -> bytes | str`, which runs in this process and whose
+        result is the step output, so it needs no agent. A routed step passes
+        `build` and exactly one target: `to` (a named agent),
         `to_capable` (one agent advertising a skill), or `all_capable` (scatter to
         every agent advertising a skill and fold the replies, a verifier panel).
-        `build(outputs) -> bytes` forms the task from the prior outputs. Build, verify, and compensate callbacks can return directly or through an awaitable. Objects with `build` or `verify` methods also work. Callback exceptions retain their SDK error class.
+        `build(outputs) -> bytes | str` forms the task from the prior outputs. Build, verify, and compensate callbacks can return directly or through an awaitable. Objects with `build` or `verify` methods also work. Callback exceptions retain their SDK error class.
         `after`
         declares the dependencies that order the step. `verify(output) -> bool`
         gates completion. `exclusive` claims a fenced lease (needs the managed
@@ -10144,19 +10201,23 @@ class Workflow:
         exclusive step). `deadline_ms` bounds the step's build, dispatch,
         verification, and completion record (default 30000), never past the
         wall-clock budget left, and rides the command so a target that picks it
-        up later drops it. `compensate(outputs) -> bytes` is the rollback run if
-        a later step fails, sent to the agent that ran this step.
+        up later drops it. `compensate(outputs) -> bytes | str` is the rollback
+        for a later failure. A routed step sends it to the agent that ran the
+        step. A local step runs it in process and ignores its result.
         """
     def run(self) -> typing.Awaitable[WorkflowOutcome]:
         r"""
         Run the workflow, returning a `WorkflowOutcome` with the completed steps'
         outputs keyed by label and the run id.
         The workflow name is the orchestrator identity it dispatches as, so it must
-        be a valid agent id. A failed step runs the compensations in reverse and
-        raises `StepFailedError`, whose `reason` says how the step ended. A
-        misconfigured workflow (a duplicate label, a broadcast step, an exclusive
-        all-capable step, reassignment without exclusivity) raises before
-        anything is written. The run is a session whose id is the run id, and
+        be a valid agent id. A run on a stream without the agent topics creates
+        them with the `bootstrap` defaults first. A failed step runs the
+        compensations in reverse and raises `StepFailedError`, whose `reason`
+        says how the step ended. An exception from a step body or a verifier is
+        raised unchanged after the compensations. A misconfigured workflow (a
+        duplicate label, a broadcast step, an exclusive all-capable step,
+        reassignment without exclusivity) raises before anything is written.
+        The run is a session whose id is the run id, and
         each step and compensation is a child session of it. A cancel request on
         `agent.control` stops the run at the next step boundary with
         `CancelledError` after the compensations. Cancelling the Python task
@@ -10198,11 +10259,13 @@ class WorkflowBudget:
 @typing.final
 class WorkflowOutcome:
     r"""
-    The result of a completed `Workflow.run`: each step's output by label, plus
-    the run id. Pass the run id to `Workflow.run_id` to resume the same run.
+    The result of a completed `Workflow.run`: each step's output by label, the
+    run id, the completed step labels in completion order, and the run's end
+    status, `completed` for every returned outcome since a failed run raises.
+    Pass the run id to `Workflow.run_id` to resume the same run.
     """
     @property
-    def outputs(self) -> dict:
+    def outputs(self) -> dict[builtins.str, builtins.bytes]:
         r"""
         Each completed step's output, keyed by step label.
         """
@@ -10210,6 +10273,21 @@ class WorkflowOutcome:
     def run_id(self) -> builtins.str:
         r"""
         The run id, which resumes the same run when passed to `Workflow.run_id`.
+        """
+    @property
+    def completed_steps(self) -> builtins.list[builtins.str]:
+        r"""
+        The completed step labels, in completion order.
+        """
+    @property
+    def status(self) -> builtins.str:
+        r"""
+        The run's end status word, `completed` for a returned outcome.
+        """
+    def text(self, label: builtins.str) -> typing.Optional[builtins.str]:
+        r"""
+        The output of step `label` as text (invalid UTF-8 replaced), or `None`
+        when no completed step has that label.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -11322,11 +11400,13 @@ class QuarantinedError(LaserError):
 
 class StepFailedError(LaserError):
     r"""
-    A workflow step did not complete. `run` and `step` name it, and `reason` is `timed_out`, `failed`, `not_consumed`, `unverified`, or `no_completion`. Only `timed_out` is retryable. The completed steps' compensations have run.
+    A workflow step did not complete. `run` and `step` name it, and `reason` is `timed_out`, `failed`, `not_consumed`, `unverified`, or `no_completion`. `target` names the step's route and `deadline_ms` its configured deadline. Only `timed_out` is retryable. The completed steps' compensations have run.
     """
     run: builtins.str
     step: builtins.str
     reason: builtins.str
+    target: builtins.str
+    deadline_ms: builtins.int
 
 class JournalTruncatedError(LaserError):
     r"""
@@ -11356,3 +11436,5 @@ class ProvenanceError(LaserError):
     MALFORMED_HEADERS: typing.ClassVar[builtins.str]
     HEADER: typing.ClassVar[builtins.str]
     ID: typing.ClassVar[builtins.str]
+
+__version__: builtins.str

@@ -573,9 +573,7 @@ export class A2aBridge {
   private stream(): string {
     const stream = this.laser.defaultStream
     if (stream === undefined) {
-      throw new NoStreamError(
-        "an A2A bridge requires a default stream, use connectWithStream() or withDefaultStream()"
-      )
+      throw new NoStreamError("an A2A bridge requires a default stream")
     }
     return stream
   }

@@ -29,5 +29,5 @@ LASER_CONNECTION_STRING=user:pwd@your-host npm run example:kv
 
 ## Learn more
 
-- Docs: https://docs.laserdata.cloud/laser-sdk/state
+- Docs: https://docs.laserdata.com/laser-sdk/state
 - Full system built on this primitive: [`incident-desk`](../incident-desk): keyed state and forks used for real quota and what-if branching.

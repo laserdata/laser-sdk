@@ -58,6 +58,7 @@ REASONS = {
     "std-trait": ("The peer spells a Rust standard trait impl (FromStr, Display, From) as a function or static member", False),
     "serde-dict": ("Python passes the record as a dict that serde builds from the same Rust type, keyed by its serde field names", False),
     "signature-type": ("TypeScript exports the parameter, option, or result shape a public signature names, where Rust passes the values or a generic bound directly", False),
+    "subclass-handle": ("Python makes the memory backend a subclass of `MemoryHandle`, so it is usable wherever a handle is, where Rust wraps a separate type in a `MemoryHandle` variant", False),
 }
 
 # A serde derive on the Rust type, which fixes the dict keys a `serde-dict` peer carries.
@@ -86,6 +87,8 @@ TYPE_STANDINS = {"codec", "decoder", "codecOrDecoder", "decodeValue", "cls"}
 # Methods that finish a hand-written Rust builder. A peer that takes the
 # builder as keywords runs the operation in the same call.
 FINISHERS = {"build", "send", "fetch", "call", "commit", "run", "connect"}
+# What a method returns, as the return-kind comparison words it.
+RETURN_KINDS = {"chainable": "itself to chain", "awaitable": "an awaitable", "value": "a value", "nothing": "nothing"}
 
 # TypeScript members that implement a language protocol and so need no Rust
 # row of their own. Every Python dunder is a protocol member too.
@@ -209,6 +212,7 @@ PY_PEERS = {
     ("MemoryTopicBuilder", None): ("Laser.memory_topic", "keywords"),
     ("RecallBuilder", None): ("MemoryHandle.recall", "keywords"),
     ("RememberBuilder", None): ("MemoryHandle.remember", "keywords"),
+    ("SupersedeBuilder", None): ("MemoryHandle.supersede", "keywords"),
     ("MemoryQuery", None): ("MemoryHandle.recall", "keywords"),
     ("MemoryQueryBuilder", None): ("MemoryHandle.recall", "keywords"),
     ("MemoryScope", None): ("MemoryHandle.remember", "keywords"),
@@ -231,7 +235,9 @@ PY_PEERS = {
     ("StepHandle", "exclusive_in"): ("Workflow.step(fence_namespace=)", "keywords"),
     ("StepHandle", "verify_with"): ("Workflow.step(verify=)", "keywords"),
     ("StepHandle", "budget"): ("Workflow.budget", "native-binding"),
-    ("StepHandle", "run"): ("~Workflow.run", None),
+    ("StepHandle", "run"): ("Workflow.run", "native-binding"),
+    ("StepHandle", "step_local"): ("Workflow.step(run=)", "keywords"),
+    ("Workflow", "step_local"): ("Workflow.step(run=)", "keywords"),
     ("StepHandle", "run_id"): ("Workflow.run_id", "native-binding"),
     ("StepHandle", "step"): ("Workflow.step", "keywords"),
     ("StepHandle", "inbox_route"): ("Laser.workflow(fixed_inbox=)", "keywords"),
@@ -294,9 +300,6 @@ PY_PEERS = {
     ("Laser", "builder"): ("Laser.connect", "keywords"),
     ("Laser", "sessions_with"): ("Laser.sessions(stream=)", "overload"),
     ("Laser", "with_governor_retention"): ("Laser.with_governor_retention", None),
-    ("Gather", "replies"): ("~AgentCtx.fan_out", None),
-    ("ScatterReport", "completed"): ("~Laser.scatter_report", None),
-    ("ScatterReport", "failures"): ("~Laser.scatter_report", None),
     ("ClientMetadataRequest", "all"): ("Laser.client_metadata_all", "one-call"),
     ("LaserError", "publish_cause"): ("PublishFailedError", "protocol"),
     ("LaserError", "rejected"): ("new:RejectedError", "constructor"),
@@ -362,14 +365,18 @@ PY_PEERS = {
     ("NoSummarizer", None): ("MemoryHandle.consolidate(summarizer=)", "overload"),
     ("TokenBudget", "with_estimator"): ("new:TokenBudget(estimator=)", "overload"),
     ("MemoryHandle", "recall_folded"): ("MemoryHandle.recall(folded=)", "overload"),
+    ("LogMemory", None): ("LogMemory", "subclass-handle"),
+    ("VectorMemory", None): ("VectorMemory", "subclass-handle"),
+    ("RerankedMemory", None): ("RerankedMemory", "subclass-handle"),
     ("LogMemory", "recall_folded"): ("MemoryHandle.recall(folded=)", "overload"),
     ("LogMemory", "on_topic_named"): ("LogMemory.on_topic", "overload"),
     ("LogMemory", "on_stream_topic_named"): ("LogMemory.on_stream_topic", "overload"),
     ("RecallBuilder", "hybrid"): ("MemoryHandle.recall(strategy=)", "overload"),
     ("RecallBuilder", "keyword"): ("MemoryHandle.recall(strategy=)", "overload"),
     ("RecallBuilder", "recent"): ("MemoryHandle.recall(strategy=)", "overload"),
-    ("RecallBuilder", "block"): ("MemoryHandle.recall(block=)", "overload"),
+    ("RecallBuilder", "block"): ("MemoryHandle.recall_block", "one-call"),
     ("RememberBuilder", "scope"): ("MemoryHandle.remember(conversation=)", "keywords"),
+    ("SupersedeBuilder", "scope"): ("MemoryHandle.supersede(conversation=)", "keywords"),
     ("MemoryScopeBuilder", "app"): ("MemoryHandle.remember(application=)", "keywords"),
     ("MemoryScopeBuilder", "lifetime"): ("MemoryHandle.remember(durable=)", "keywords"),
     ("MemoryTopicBuilder", "no_expiry"): ("Laser.memory_topic(ttl_ms=)", "overload"),
@@ -859,8 +866,6 @@ TS_PEERS = {
     ("Capabilities", "with_filters"): ("{FilterCaps}.native", "keywords"),
     ("Capabilities", "OPEN"): ("const:OPEN_CAPABILITIES", "free-function"),
     ("FilterCaps", "evaluates"): ("fn:filterCapsEvaluates", "free-function"),
-    ("QueryRequest", "agg_as"): ("~QueryRequest.aggregateAs", None),
-    ("QueryRequest", "stddev"): ("~QueryRequest.stdDev", None),
     ("QueryRequest", "raw_sql_with"): ("QueryRequest.rawSql", "overload"),
     ("QueryRequest", "fetch_one_with"): ("QueryRequest.fetchOne", "overload"),
     ("QueryRequest", "fetch_typed_with"): ("QueryRequest.fetchTyped", "overload"),
@@ -868,7 +873,6 @@ TS_PEERS = {
     ("Filter", "any"): ("fn:filterAny", "free-function"),
     ("Filter", "negate"): ("fn:filterNegate", "free-function"),
     ("Filter", "pred"): ("fn:filterPred", "free-function"),
-    ("ForkHandle", "id"): ("~Fork.forkId", None),
     ("PolicyEvidence", "decode"): ("fn:decodePolicyEvidence", "free-function"),
     ("PolicyEvidence", "encode"): ("fn:encodePolicyEvidence", "free-function"),
     ("AgentTopic", "as_identifier"): ("-", "rust-crate"),
@@ -1540,6 +1544,8 @@ def compare(rows, python, typescript):
                 matrix.problems.append(f"{row.display}: {label} {cell.problem}{suffix} ({row.source})")
             elif cell.param_problem:
                 matrix.problems.append(f"{row.display}: {label} `{cell.spelling}` {cell.param_problem} ({row.source})")
+            elif problem := return_kind_problem(row, py if attribute == "python" else ts, cell):
+                matrix.problems.append(f"{row.display}: {label} `{cell.spelling}` {problem} ({row.source})")
     for label, table in (("PY_PEERS", PY_PEERS), ("TS_PEERS", TS_PEERS)):
         for key in table:
             if key not in by_key:
@@ -1587,6 +1593,45 @@ def compare(rows, python, typescript):
     matrix.problems += raw_problems
     matrix.problems += capability_problems(matrix, rows, by_key, python, typescript, shapes)
     return matrix
+
+
+def return_kind_problem(row, lookup, cell):
+    """A method a peer spells the same way must hand back what a program
+    copied across the tabs uses: a Rust method that chains or is awaited must
+    not return nothing in a peer. A keyword, property, or one-call mapping
+    changes the shape on purpose, so only a direct method mapping is
+    compared."""
+    if row.kind != "method" or cell.gap or cell.omitted or cell.reason not in (None, "native-binding"):
+        return None
+    target, keywords = split_call(cell.spelling)
+    if keywords or "." not in target or ":" in target:
+        return None
+    host, name = target.rsplit(".", 1)
+    found = lookup.members(host).get(name)
+    if not found or found[1].get("kind") != "method" or "returns" not in found[1]:
+        return None
+    rust = rust_return_kind(row)
+    peer = peer_return_kind(found[1]["returns"], host)
+    if rust in ("chainable", "awaitable") and peer == "nothing":
+        return f"returns nothing where Rust returns {RETURN_KINDS[rust]}"
+    return None
+
+
+def rust_return_kind(row):
+    if row.is_async or "Future" in row.returned:
+        return "awaitable"
+    if row.receiver and row.returns in ("Self", row.owner.rsplit("::", 1)[-1]):
+        return "chainable"
+    return "value"
+
+
+def peer_return_kind(returns, host):
+    text = " ".join(returns.split())
+    if text.startswith(("typing.Awaitable[", "Awaitable[", "Promise<")):
+        return "awaitable"
+    if text in (host, "Self", "typing.Self", "typing_extensions.Self", "this"):
+        return "chainable"
+    return "nothing" if text in ("", "None", "void") else "value"
 
 
 def capability_problems(matrix, rows, by_key, python, typescript, shapes):
@@ -3322,7 +3367,8 @@ def py_class(node):
                 known = {param["name"] for param in existing["params"]}
                 existing["params"] += [param for param in params if param["name"] not in known]
             else:
-                out.members[child.name] = {"kind": "method", "params": params}
+                returns = ast.unparse(child.returns) if child.returns is not None else ""
+                out.members[child.name] = {"kind": "method", "params": params, "returns": returns}
         elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
             out.members[child.target.id] = {"kind": "attribute"}
         elif isinstance(child, ast.ClassDef):
@@ -3501,7 +3547,9 @@ def ts_members(body, decl):
         info = {"kind": "method" if callable_ else "property", "static": "static" in words}
         if callable_:
             opening = rest.index("(", named.end(1))
-            info["params"] = ts_params(rest[opening + 1:matching(rest, opening)])
+            closing = matching(rest, opening)
+            info["params"] = ts_params(rest[opening + 1:closing])
+            info["returns"] = rest[closing + 1:].strip().removeprefix(":").strip().removesuffix(";").strip()
         existing = decl.members.get(name)
         if existing and existing.get("params") is not None and info.get("params") is not None:
             known = {param["name"] for param in existing["params"]}

@@ -2,8 +2,9 @@ use crate::async_bridge::{Awaitable, awaitable};
 use crate::client::PyLaser;
 use crate::convert::{duration_ms, payload_bytes, py_to_de, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
+use crate::session::PyTopicRetention;
 use iggy::prelude::{Identifier, IggyTimestamp};
-use laser_sdk::agent::AgentMessage;
+use laser_sdk::agent::{AgentMessage, TopicRetention};
 use laser_sdk::provenance::{AgentTopic, LlmUsage, Provenance};
 use laser_sdk::types::{AgentId, ConversationId, MessageId};
 use pyo3::prelude::*;
@@ -383,16 +384,17 @@ impl PyAgentMessage {
 #[pymethods]
 impl PyLaser {
     /// Create the agent topics on the default stream, `partitions` each.
-    /// `agent.sessions` needs a `TopicRetention`. Idempotent. Requires a
-    /// default stream.
+    /// `retention` bounds `agent.sessions`, by default one day. Idempotent.
+    /// Requires a default stream.
+    #[pyo3(signature = (partitions=1, retention=None))]
     fn bootstrap<'py>(
         &self,
         py: Python<'py>,
         partitions: u32,
-        retention: &crate::session::PyTopicRetention,
+        retention: Option<&PyTopicRetention>,
     ) -> PyResult<Awaitable<'py, ()>> {
         let laser = self.inner.clone();
-        let retention = retention.inner;
+        let retention = retention.map_or_else(TopicRetention::default, |retention| retention.inner);
         awaitable(py, async move {
             laser
                 .bootstrap(partitions, retention)

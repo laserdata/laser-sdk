@@ -3,8 +3,9 @@ import { millis, millisToMicros } from "../client/duration.js"
 import { InvalidError, NoStreamError } from "../client/errors.js"
 import type { Laser } from "../client/laser.js"
 import { MemoryHandle } from "./handle.js"
+import { DEFAULT_MEMORY_TOPIC_TTL_MS } from "./log-memory.js"
 
-export const DEFAULT_MEMORY_TOPIC_TTL_MS = 30 * 24 * 60 * 60 * 1_000
+export { DEFAULT_MEMORY_TOPIC_TTL_MS }
 
 /** Configures and opens a durable memory topic. */
 export class MemoryTopicBuilder {

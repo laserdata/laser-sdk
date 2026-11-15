@@ -5,7 +5,7 @@ Runnable examples of the Laser SDK, an open data-platform SDK over Apache Iggy. 
 - generic: low-latency streaming, projections, query, and resumable readers.
 - agentic: conversations, routing, memory, approvals, forks, and governed effects.
 
-**Consumer filters: 98.5% less payload transfer in the CDC example.** The reader receives 4 of 240 records from the shared feed, with original bytes and offsets. The example also covers typed records, one-byte numeric headers, previews, and saved group policies. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+**Consumer filters: 98.5% less payload transfer in the CDC example.** The reader receives 4 of 240 records from the shared feed, with original bytes and offsets. The example also covers typed records, one-byte numeric headers, previews, and saved group policies. See the [Consumer Filters guide](https://docs.laserdata.com/laser-sdk/consumer-filters).
 
 ## Layout
 
@@ -18,9 +18,20 @@ examples/
 
 Each SDK owns its connection security. The Rust SDK embeds the LaserData public CA, Python uses that same Rust connection path, and TypeScript embeds the same certificate in its package. `LASER_TLS_CERT=<path>` enables TLS with an explicit CA for local or privately signed hosts in every example. Examples do not carry certificates or reimplement TLS selection.
 
+## Copy a whole program
+
+Two programs run when copied alone, with no helper from this directory. Each connects with `connect_env` (`connectEnv` in TypeScript), which reads `LASER_CONNECTION_STRING`, works in a scratch stream, and deletes it at the end.
+
+| program | Rust | Python | TypeScript |
+| --- | --- | --- | --- |
+| A three-step workflow of in-process steps that prints its outcome as JSON | [`rust/src/workflow/main.rs`](rust/src/workflow/main.rs) | [`python/workflow.py`](python/workflow.py) | [`typescript/src/workflow/main.ts`](typescript/src/workflow/main.ts) |
+| A memory correction for one user with `supersede`, then a recall of the current facts | [`rust/src/memory-correction/main.rs`](rust/src/memory-correction/main.rs) | [`python/memory_correction.py`](python/memory_correction.py) | [`typescript/src/memory-correction/main.ts`](typescript/src/memory-correction/main.ts) |
+
+Both run on Apache Iggy, Laser Stack, and LaserData Cloud. The memory correction recalls through the managed memory view where the deployment serves one, and folds the memory topic in process on Apache Iggy.
+
 ## Start here
 
-Start with the focused `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, `context`, and `agent` examples. Each has Rust, Python, and TypeScript versions with matching steps. They link to [docs.laserdata.cloud/laser-sdk](https://docs.laserdata.cloud/laser-sdk) and to larger scenarios. `recall` is the focused memory example, while `memory` covers the larger scenario.
+Start with the focused `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, `context`, and `agent` examples. Each has Rust, Python, and TypeScript versions with matching steps. They link to [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk) and to larger scenarios. `recall` is the focused memory example, while `memory` covers the larger scenario.
 
 - Rust: [`rust/README.md`](rust/README.md): the full catalogue (each tagged agentic vs generic and whether it needs a managed deployment), with a per-example `README.md` under `rust/src/<name>/`.
 - Python: [`python/README.md`](python/README.md): the Python ports, the same environment conventions, one runnable script per scenario.

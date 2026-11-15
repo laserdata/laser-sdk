@@ -1,16 +1,8 @@
 # LaserData - Laser SDK
 
-This package provides the Python Laser SDK for Apache Iggy. [LaserData, Inc.](https://laserdata.com) maintains it. PyO3 exposes the Rust SDK to Python, so both clients use the same data contract, codecs, and runtime.
+The Python Laser SDK for Apache Iggy: streaming, queries, key-value state, graphs, forks, agent memory, durable workflows, sessions, and agent coordination over one connection. [LaserData, Inc.](https://laserdata.com) maintains it. PyO3 exposes the Rust SDK, so Python and Rust share the data contract, codecs, and runtime.
 
-Rust and Python share the data contract and Rust implementation. The bindings expose Python forms of the SDK operations, configuration, and errors. Shared examples and behavior scenarios cover language-neutral behavior.
-
-> This source tree is the `0.10.1` release. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
-
-`spawn_agent(agent_id, ..., consumer_group=None)` separates agent identity from its consumer group. The default group uses the agent ID spelling. Set `consumer_group` when the deployment needs a different group.
-
-One Apache Iggy connection supports streaming and managed operations for queries, key-value state, graphs, and forks. The optional AGDX agent runtime sends messages and runs asynchronous handlers. It supports at-least-once delivery, per-conversation ordering, duplicate suppression, retries, and dead letters.
-
-Apache Iggy is the underlying streaming core. Projections, the query layer, the key-value store, the knowledge graph, and forks are served by Laser Stack or LaserData Cloud over that same connection. Against Apache Iggy without a managed backend those calls raise `UnsupportedError`.
+> This source tree is the `0.10.2` release. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 ## Install
 
@@ -18,7 +10,84 @@ Apache Iggy is the underlying streaming core. Projections, the query layer, the 
 pip install laser-sdk
 ```
 
-Wheels ship for Linux (x86_64, aarch64) and macOS (Intel, Apple Silicon), Python 3.10 and later.
+Wheels ship for Linux (x86_64, aarch64), macOS (one universal2 wheel for Intel and Apple Silicon), and Windows (x64), for Python 3.10 and later.
+
+## Two complete programs
+
+Each program runs as written. It reads the connection string from `LASER_CONNECTION_STRING` with `Laser.connect_env()`, creates a uniquely named scratch stream, and deletes it when the `async with` block ends, also when the block raised. A LaserData API key is not a connection string. Copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it. To keep what a program writes, set `LASER_STREAM` or call `laser.with_default_stream(name)` instead of opening a scratch stream. A workflow run and the first memory write create a missing stream.
+
+### A three-step workflow
+
+`step(label, run=...)` runs the step's body in this process. The body gets the outputs of the steps before it as `dict[str, bytes]` and returns `bytes` or `str`, plain or async. `step` returns the workflow, so the calls chain. Each completion is journaled, so `run_id(id)` resumes a stopped run and keeps the steps it finished. The run creates its own topics, so the program needs no `bootstrap`, agent, or handler.
+
+```python
+import asyncio
+import json
+
+from laser_sdk import Laser
+
+
+async def main() -> None:
+    async with await Laser.connect_env() as laser:
+        async with laser.scratch_stream("workflow-demo") as scratch:
+            outcome = await (
+                scratch.laser.workflow("job-runner")
+                .step("create", run=lambda outputs: "job-42")
+                .step(
+                    "process",
+                    run=lambda outputs: "processed " + outputs["create"].decode(),
+                    after=["create"],
+                )
+                .step("finish", run=lambda outputs: "completed", after=["process"])
+                .run()
+            )
+    report = {
+        "run_id": outcome.run_id,
+        "status": outcome.status,
+        "completed_steps": outcome.completed_steps,
+        "outputs": {label: outcome.text(label) for label in outcome.completed_steps},
+    }
+    print(json.dumps(report, indent=2))
+
+
+asyncio.run(main())
+```
+
+It prints the run id, `"status": "completed"`, `"completed_steps": ["create", "process", "finish"]`, and the three outputs. A failed step raises `StepFailedError` with `run`, `step`, `reason`, `target`, and `deadline_ms`, once the compensations of the finished steps have run.
+
+### A memory correction
+
+The first conversation stores two facts about the user `sam`. A later conversation corrects the city with `supersede`, which remembers the new fact first and then forgets the old one in every conversation. A recall for the user reads every conversation, ranks the facts by the words they share with the query, and drops none. It waits for the writes this connection made, so the correction shows at once. On LaserData Cloud and Laser Stack recall reads the managed memory view. Apache Iggy serves no view, so there recall folds the memory topic in process, and the same program runs on every server.
+
+```python
+import asyncio
+import json
+
+from laser_sdk import Laser, new_conversation_id
+
+
+async def main() -> None:
+    async with await Laser.connect_env() as laser:
+        async with laser.scratch_stream("memory-demo") as scratch:
+            memory = scratch.laser.memory("assistant")
+            first = new_conversation_id()
+            home = await memory.remember("Sam lives in Berlin", user="sam", conversation=first)
+            await memory.remember("Sam is allergic to peanuts", user="sam", conversation=first)
+            await memory.supersede(
+                home, "Sam lives in Amsterdam", user="sam", conversation=new_conversation_id()
+            )
+            facts = await memory.recall(user="sam", semantic="where does Sam live")
+    print(json.dumps([item.text() for item in facts], indent=2))
+
+
+asyncio.run(main())
+```
+
+It prints `["Sam lives in Amsterdam", "Sam is allergic to peanuts"]`. Berlin is gone. Both programs are in [`examples/python`](../../examples/python/README.md) as `workflow.py` and `memory_correction.py`.
+
+## What runs where
+
+Streaming, the agent runtime, log-based memory writes, contracts, and workflows run on Apache Iggy. Projections, the query layer, the key-value store, the knowledge graph, forks, and the managed memory view are served by Laser Stack or LaserData Cloud over the same connection. Against Apache Iggy without a managed backend those calls raise `UnsupportedError`, except a memory recall or named `fetch`, which folds the memory topic in process there. The agent runtime supports at-least-once delivery, per-conversation ordering, duplicate suppression, retries, and dead letters.
 
 Every wheel and source build uses Apache Iggy's native VSR transport. Standard streaming commands, LaserData's non-replicated managed command band, and dedicated replicated authorization operations use the same connection.
 
@@ -26,15 +95,15 @@ Every wheel and source build uses Apache Iggy's native VSR transport. Standard s
 
 ```python
 import asyncio
+import os
+
 from laser_sdk import Laser
 
 
-async def main():
-    laser = await Laser.connect("iggy:iggy@127.0.0.1:8090")
-    readings = laser.stream("fleet").topic("readings")
-    await readings.ensure(partitions=4)
-    caps = await laser.capabilities()
-    print(caps.query.available, caps.kv.cas, caps.graph)
+async def main() -> None:
+    async with await Laser.connect(os.environ["LASER_CONNECTION_STRING"]) as laser:
+        caps = await laser.capabilities()
+        print(caps.query.available, caps.kv.cas, caps.graph)
 
 
 asyncio.run(main())
@@ -50,7 +119,7 @@ LaserData Cloud and Laser Stack enable managed surfaces only when their backend 
 
 ## Connect timeout
 
-`Laser.connect` gives up after 30 seconds. The budget covers the dial, the TLS handshake, the login, and the capability probe. Pass `connect_timeout_ms` to use another budget, or set `LASER_CONNECT_TIMEOUT_MS`. The argument overrides the variable. An expired budget raises `TimeoutError` that says whether the server never accepted the connection or never answered the login. `laser.stream(name).delete()` removes a stream you no longer need, and `await laser.close()` ends the shared connection. `async for event in laser.connection_events()` yields `"connected"`, `"disconnected"`, `"signed_in"`, `"signed_out"`, and `"shutdown"` as the connection changes, and stops after `"shutdown"`. See [connection events](../../docs/client-behavior.md#connection-events). `await laser.streams()` lists `StreamInfo` values. `stream.get()` returns a `StreamInfo` or `None`, `stream.exists()` returns a bool, and `stream.topics()` lists `TopicInfo` values. `topics()`, `partitions()`, and `consumer_groups()` raise an error with `stream_or_topic_not_found` set when the stream or topic does not exist. `topic.get()`, `exists()`, `delete()`, `partitions()`, `add_partitions(n)`, `delete_partitions(n)`, and `consumer_groups()` read and change one topic, and `topic.consumer_group(name).delete()` removes a group. `stream.rename(name)`, `topic.update(name=, expire_after_ms=, never_expire=, max_topic_bytes=, unlimited_topic_size=)`, and `topic.delete_segments(partition_id, count)` rename streams and change topic settings. `await laser.users()` lists `UserInfo` values, and `laser.user(name)` has `get()`, `exists()`, `create(password, status=, permissions=)`, `update(username=, status=)`, `set_permissions(permissions)`, `change_password(current, new)`, and `delete()`. Permissions are dicts with `global` and `streams` keys. `laser.personal_access_tokens()` and `laser.personal_access_token(name).create(expiry_ms=)` manage tokens. `ping()`, `stats()`, `me()`, `clients()`, `client_info(id)`, `cluster()`, and `snapshot()` read the server. `describe_options(scope)` lists the `OptionInfo` values the server accepts for a `topic`, `stream`, or `user`. `metadata_changes(start, groups=, since_micros=, until_micros=, limit=)` reads one `MetadataChanges` page of the metadata change feed, from a `MetadataChangeStart`, and needs the manage servers permission. See [connect timeout and cleanup](../../docs/connect-timeout.md) and [server administration](../../docs/client-behavior.md#server-administration).
+`Laser.connect` gives up after 30 seconds. The budget covers the dial, the TLS handshake, the login, and the capability probe. Pass `connect_timeout_ms` to use another budget, or set `LASER_CONNECT_TIMEOUT_MS`. The argument overrides the variable. An expired budget raises `TimeoutError` that says whether the server never accepted the connection or never answered the login. `async with laser.scratch_stream(prefix) as scratch:` creates a stream named `{prefix}-` and eight lowercase hex characters, refuses a name that already exists, hands its default-stream handle as `scratch.laser` and its name as `scratch.name`, and deletes it when the block ends, also when the block raised. `await scratch.delete()` deletes it earlier and does nothing for a stream already gone. `laser.stream(name).delete()` removes a stream you no longer need, and `await laser.close()` ends the shared connection. `async for event in laser.connection_events()` yields `"connected"`, `"disconnected"`, `"signed_in"`, `"signed_out"`, and `"shutdown"` as the connection changes, and stops after `"shutdown"`. See [connection events](../../docs/client-behavior.md#connection-events). `await laser.streams()` lists `StreamInfo` values. `stream.get()` returns a `StreamInfo` or `None`, `stream.exists()` returns a bool, and `stream.topics()` lists `TopicInfo` values. `topics()`, `partitions()`, and `consumer_groups()` raise an error with `stream_or_topic_not_found` set when the stream or topic does not exist. `topic.get()`, `exists()`, `delete()`, `partitions()`, `add_partitions(n)`, `delete_partitions(n)`, and `consumer_groups()` read and change one topic, and `topic.consumer_group(name).delete()` removes a group. `stream.rename(name)`, `topic.update(name=, expire_after_ms=, never_expire=, max_topic_bytes=, unlimited_topic_size=)`, and `topic.delete_segments(partition_id, count)` rename streams and change topic settings. `await laser.users()` lists `UserInfo` values, and `laser.user(name)` has `get()`, `exists()`, `create(password, status=, permissions=)`, `update(username=, status=)`, `set_permissions(permissions)`, `change_password(current, new)`, and `delete()`. Permissions are dicts with `global` and `streams` keys. `laser.personal_access_tokens()` and `laser.personal_access_token(name).create(expiry_ms=)` manage tokens. `ping()`, `stats()`, `me()`, `clients()`, `client_info(id)`, `cluster()`, and `snapshot()` read the server. `describe_options(scope)` lists the `OptionInfo` values the server accepts for a `topic`, `stream`, or `user`. `metadata_changes(start, groups=, since_micros=, until_micros=, limit=)` reads one `MetadataChanges` page of the metadata change feed, from a `MetadataChangeStart`, and needs the manage servers permission. See [connect timeout and cleanup](../../docs/connect-timeout.md) and [server administration](../../docs/client-behavior.md#server-administration).
 
 Every relative duration in the Python SDK is in milliseconds and its keyword ends in `_ms`, for example `timeout_ms`, `ttl_ms`, `linger_ms`, `wait_ms`, `max_wait_ms`, `deadline_ms`, and `TopicRetention.expire_after(age_ms)`, matching the TypeScript SDK. It takes an `int` or a `float`, a fraction of a millisecond is kept, and a negative or non-finite value raises `InvalidError`. An absolute deadline is named with `_at` and its unit, `deadline_at_micros` in epoch microseconds. Other absolute times and wire fields stay in epoch microseconds (`*_micros`).
 
@@ -286,7 +355,7 @@ Call `close()` or use `async with` to retire the client. Later execution fails b
 
 ## Consumer filters
 
-**Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
+**Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.com/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 
 Configure a consumer group's policy once. Its ordinary consumers and page readers then use that saved policy. An unbound group receives all records without payload decoding.
 
@@ -356,7 +425,7 @@ A traversal starts from `start_ids`, from every node matching `start_match(Filte
 ## Agents
 
 ```python
-from laser_sdk import Laser
+from laser_sdk import Laser, Provenance
 
 
 async def handle(ctx, message):
@@ -365,12 +434,10 @@ async def handle(ctx, message):
 
 
 laser = await Laser.connect("iggy:iggy@127.0.0.1:8090", stream="agents")
-await laser.bootstrap(partitions=4, retention=ls.TopicRetention.expire_after(86_400_000))
+await laser.bootstrap()  # one partition, records expire after one day
 
 handle_agent = laser.spawn_agent("echo", "agent.sessions", handle, respond_on="agent.sessions")
 await handle_agent.ready()
-
-from laser_sdk import Provenance
 
 reply = await laser.request(
     "agent.sessions",
@@ -388,7 +455,7 @@ The agent's reads are held on the server: `max_wait_ms` (default 5000) is how lo
 
 Keep the handle until `shutdown()` or `join()`. Dropping it signals a graceful stop and cancels periodic consolidation, and `abort()` stops the agent immediately. `async with laser.spawn_agent(...) as handle:` waits for readiness and stops the agent on exit. An agent that stops before it becomes ready raises the error it stopped with from `ready()` and from entering `async with`, such as `PresenceConflictError` for a second agent advertising on one connection, and raises it again from a later `ready()`, `shutdown()`, or `join()`.
 
-Each agent id reads through its own consumer group, named after the agent id unless `consumer_group=` names another, so every instance of one agent shares its work. The handler only sees work for this agent: commands addressed to it or to every agent. Replies, status records, and records for other agents are committed without calling it. On `agent.sessions` and `agent.control`, when the server resolves group policies and serves filtered reads and the filter catalog, the group is bound to the addressee filter `agdx.to In [<agent id>, "*"]` before the first read, so the server sends only those records. Otherwise the agent reads every record and sorts them itself. [Agents, groups, and layouts](../../docs/building-agents.md#agents-groups-and-layouts) explains how to pick a layout.
+`bootstrap(partitions=1, retention=None)` creates the agent topics, one partition and a one-day expiry by default. Pass a `TopicRetention` for a longer life. Each agent id reads through its own consumer group, named after the agent id unless `consumer_group=` names another, so every instance of one agent shares its work and the agent identity stays apart from its group. The handler only sees work for this agent: commands addressed to it or to every agent. Replies, status records, and records for other agents are committed without calling it. On `agent.sessions` and `agent.control`, when the server resolves group policies and serves filtered reads and the filter catalog, the group is bound to the addressee filter `agdx.to In [<agent id>, "*"]` before the first read, so the server sends only those records. Otherwise the agent reads every record and sorts them itself. [Agents, groups, and layouts](../../docs/building-agents.md#agents-groups-and-layouts) explains how to pick a layout.
 
 ### Agent memory and configuration
 
@@ -603,7 +670,7 @@ print(context.summarize())
 
 ## Sessions
 
-A session is one conversation with a recorded lifecycle. Its id is the conversation id, so every conversation read finds it. Bootstrap the agent topics once. `agent.sessions` needs an explicit retention, because it holds every session's records.
+A session is one conversation with a recorded lifecycle. Its id is the conversation id, so every conversation read finds it. Bootstrap the agent topics once. `sessions.bootstrap()` creates them with one partition and a one-day expiry. Pass partitions and a `TopicRetention` when sessions must live longer, because `agent.sessions` holds every session's records.
 
 ```python
 import laser_sdk as ls
@@ -658,7 +725,7 @@ await control.cancel()  # the agents end it at their next boundary
 await control.force_cancel()  # ends a session whose agent is gone
 ```
 
-`laser.sessions(stream=, layout=, idle_timeout_ms=, heartbeat_ms=, register_source=, fail_on_dead_letter=, memory_namespace=, context_turns=, context_tokens=, sdk=)` configures the factory. The defaults are a 300-second idle timeout and a 60-second heartbeat. `layout=ls.SessionLayout.PerAgentPartition({"planner": 0, "worker": 2})` puts the work addressed to each declared agent on its own partition of `agent.sessions`. `SessionLayout.PerAgentTopic(topics={"planner": "planner.inbox", "worker": "worker.inbox"})` routes the work addressed to each declared agent onto its own topic, `SessionLayout.SinglePartition()` puts everything on one partition, and `SessionLayout.Shared()` is the default. Lifecycle and state always stay on the session's partition. `sessions.bootstrap(partitions, retention)` also registers the stream as a session source when the server announces `sessions`, and reports `registered`.
+`laser.sessions(stream=, layout=, idle_timeout_ms=, heartbeat_ms=, register_source=, fail_on_dead_letter=, memory_namespace=, context_turns=, context_tokens=, sdk=)` configures the factory. The defaults are a 300-second idle timeout and a 60-second heartbeat. `layout=ls.SessionLayout.PerAgentPartition({"planner": 0, "worker": 2})` puts the work addressed to each declared agent on its own partition of `agent.sessions`. `SessionLayout.PerAgentTopic(topics={"planner": "planner.inbox", "worker": "worker.inbox"})` routes the work addressed to each declared agent onto its own topic, `SessionLayout.SinglePartition()` puts everything on one partition, and `SessionLayout.Shared()` is the default. Lifecycle and state always stay on the session's partition. `sessions.bootstrap(partitions=1, retention=None)` also registers the stream as a session source when the server announces `sessions`, and reports `registered`.
 
 On a deployment that announces `sessions`, the factory reads the managed session index. Replies are dicts, and a failed read raises `SessionError`:
 
@@ -684,7 +751,7 @@ An operator can pause a session. `pause()` names the agents that must acknowledg
 
 `await session.over_budget()` tells you whether the session's recorded usage passed the budget in its start record, by tokens or by cost. A deployment that indexes sessions answers from its index, and open Apache Iggy folds the retained lane. On a deployment that indexes sessions, an agent with an id checks each session before its handler runs. When the session is over its budget, the agent fails it once with reason `budget` and commits the work without handling it. A workflow checks its run at every step boundary, compensates, raises `BudgetExceededError`, and ends the run session failed with reason `budget`. Budget reads are eventually consistent, so a budget is a cooperative limit, not a hard spending cap.
 
-Workflows run as sessions too. A run is a root session and each step and compensation is a child session. `contract(..., parent=, root=)`, `A2aBridge.submit_in(parent, params, root=)`, and `McpBridge.call_tool_in(parent, name, params, root=)` run as child sessions of `parent`. The bridge calls also take `target=` to address one agent.
+Workflows run as sessions too. A run is a root session and each routed step and compensation is a child session. A step with `build=` and one target (`to`, `to_capable`, or `all_capable`) is a task to an agent. A step with `run=` runs in this process, like the [workflow program](#a-three-step-workflow), and mixes with routed steps in one workflow. `contract(..., parent=, root=)`, `A2aBridge.submit_in(parent, params, root=)`, and `McpBridge.call_tool_in(parent, name, params, root=)` run as child sessions of `parent`. The bridge calls also take `target=` to address one agent.
 
 ```python
 wf = laser.workflow("incident-response")
@@ -700,7 +767,7 @@ wf.step(
 )
 ```
 
-Each step has a deadline (`deadline_ms=`, 30 seconds by default) that bounds its build, dispatch, verification, and completion record. A step that does not complete raises `StepFailedError` with `run`, `step`, and `reason` (`timed_out`, `failed`, `not_consumed`, `unverified`, or `no_completion`), retryable only when it timed out, after the steps with an effect were compensated, each by the agent that ran it. `wf.run_id(id)` resumes a run that stopped: recorded steps never run again, a step dispatched before the stop is answered by its reply if one landed and sent again otherwise, also when an earlier copy expired unconsumed, and a journal that retention shortened past the run's start raises `JournalTruncatedError`. A duplicate label, a broadcast step, or `on_timeout="reassign"` without exclusivity raises before anything is written.
+`step`, `budget`, and `run_id` return the workflow, so a whole workflow is one chain. The first write of a run creates a missing stream and its `agent.sessions` and `agent.workflow_journal` topics with the `bootstrap` defaults. Each step has a deadline (`deadline_ms=`, 30 seconds by default) that bounds its build or body, dispatch, verification, and completion record. A step that does not complete raises `StepFailedError` with `run`, `step`, `reason` (`timed_out`, `failed`, `not_consumed`, `unverified`, or `no_completion`), `target` (the route in words, `local step` for an in-process step), and `deadline_ms`, retryable only when it timed out, after the steps with an effect were compensated, each by the agent that ran it or in process for a local step. An exception a local body or a verifier raises comes back unchanged after the compensations. `outcome.status` is `"completed"`, `outcome.completed_steps` lists the labels in completion order, and `outcome.text(label)` decodes one output. `wf.run_id(id)` resumes a run that stopped: recorded steps never run again, a local step that stopped before its completion record runs again, a step dispatched before the stop is answered by its reply if one landed and sent again otherwise, also when an earlier copy expired unconsumed, and a journal that retention shortened past the run's start raises `JournalTruncatedError`. A duplicate label, a broadcast step, `on_timeout="reassign"` without exclusivity, and `run=` together with `build`, a route (`to`, `to_capable`, `all_capable`, `principal`), `policy`, `exclusive`, `fence_namespace`, or `on_timeout="reassign"` raise before anything is written.
 
 ## Change feed (managed)
 
@@ -750,9 +817,9 @@ later = await session.turns_since(ls.Checkpoint.from_json(saved))
 
 ## Memory and state
 
-Agent memory is a `MemoryHandle` with `remember`, `recall`, `forget(id)`, and `improve(target, weight)` over a log-based backend, a local vector backend, or a custom one. `laser.memory(namespace)` returns the log-based handle, and the `LogMemory(laser)`, `VectorMemory(embedder)`, and `RerankedMemory(inner, reranker)` subclasses build each backend directly. The log-based handle also supports named state through `set(key, value)`, `fetch(key)`, `update(key, patch)`, and `remove(key)`, which `LogMemory` also spells `set_named`, `fetch_named`, `update_named`, and `forget_named`. These named operations raise `UnsupportedError` on the vector and custom backends.
+Agent memory is a `MemoryHandle` with `remember`, `recall`, `supersede(old_id, payload)`, `forget(id)`, and `improve(target, weight)` over a log-based backend, a local vector backend, or a custom one. `laser.memory(namespace)` returns the log-based handle, and the `LogMemory(laser)`, `VectorMemory(embedder)`, and `RerankedMemory(inner, reranker)` subclasses build each backend directly. The log-based handle also supports named state through `set(key, value)`, `fetch(key)`, `update(key, patch)`, and `remove(key)`, which `LogMemory` also spells `set_named`, `fetch_named`, `update_named`, and `forget_named`. These named operations raise `UnsupportedError` on the vector and custom backends.
 
-Log-based writes publish to the memory topic and work on Apache Iggy. Default `recall` and `fetch` reads use a managed key-value view, so they need Laser Stack or LaserData Cloud. Use `recall(folded=True)` or `fetch_folded` to build the view locally from the topic. `remember(payload, kind=, durable=, dedup=, user=, application=, stream=)` mirrors the Rust remember builder (a `stream` other than the one a log memory writes to raises `InvalidError`, and `dedup` ids include the conversation), `recall(..., block=True)` and `context(conversation, token_budget=)` render a prompt block, and `consolidate(max_items, ...)` prunes a scope. `laser.memory_with(namespace, "vector", embedder=...)` selects the backend explicitly. `ContextScope.memory(..)` and `Session.memory(..)` return a `ScopedMemory` with `recall(folded=)`, `search(folded=)`, `remember`, `block`, `consolidate`, `forget`, and `improve`, and `Session.memory_in(namespace)` picks another namespace. The local vector backend ranks records by similarity. Its embedder can return `list[float]` or an awaitable for an external model call.
+Log-based writes publish to the memory topic and work on Apache Iggy. The first write creates a missing memory topic (one partition, a 30-day expiry) and its stream, while `memory_topic(name)` keeps its own partitions and expiry. Default `recall` and `fetch` reads use the managed key-value view where the deployment serves one. On a server without it, such as Apache Iggy alone, they fold the memory topic in process as `recall(folded=True)` and `fetch_folded` do, so one program runs on every server. A default recall from the view waits, for at most 10 seconds, until the view reflects every remember and forget this connection made in the recall's scope, then raises `TimeoutError`. `recall(folded=True)` and `fetch_folded` fold the topic on any server. On log memory a `semantic` or `hybrid` query ranks every item of the scope by the share of query words it holds plus its feedback weight, ties newest first, then keeps `limit`, so a fact that shares no word still comes back. `keyword` keeps only the items that share a word, and an unknown `strategy` raises `InvalidError` listing the valid ones. `await memory.supersede(old_id, payload, user=, conversation=, ...)` takes the remember scope keywords, remembers the new fact, then forgets `old_id` in every conversation and returns the new id. A failure between the two leaves both facts, so no fact is lost. `remember(payload, kind=, durable=, dedup=, user=, application=, stream=)` mirrors the Rust remember builder (a `stream` other than the one a log memory writes to raises `InvalidError`, and `dedup` ids include the conversation), `recall` always returns a `list[MemoryItem]`, `recall_block(...)` takes the same keywords and returns the prompt block as a `str` under `token_budget`, `context(conversation, token_budget=)` renders one conversation's block, and `consolidate(max_items, ...)` prunes a scope. `laser.memory_with(namespace, "vector", embedder=...)` selects the backend explicitly. `ContextScope.memory(namespace)` and `Session.memory()` return a `ScopedMemory` with `recall(folded=)`, `search(folded=)`, `remember`, `block`, `consolidate`, `forget`, and `improve`, and `Session.memory_in(namespace)` opens another namespace. The local vector backend ranks records by similarity. Its embedder can return `list[float]` or an awaitable for an external model call.
 
 ```python
 from laser_sdk import VectorMemory
@@ -829,6 +896,8 @@ events = await laser.agui_events(conversation_id, "agent.sessions")
 
 Every failure raises a subclass of `LaserError`. The classes are `ConfigError` (with `NoStreamError`, `NoRespondTopicError`, and `HandlerConfigError` below it), `HandlerError`, `RejectedError`, `TimeoutError`, `AmbiguousMutationError`, `StateStoreError`, `QueryError`, `KvError`, `ForkError`, `GraphError`, `AuthzError`, `FilterError` (with `FilterFaultError`, `FilterOversizedRecordError`, and `ConsumerGroupSetupError`), `SignatureError`, `UnsupportedError`, `InvalidError` (with `IntentError`, `ValidateError`, and `IdError`), `CodecError` (with `TypedDecodeError`), `ProtocolError`, `TransportError`, `PublishFailedError`, `IntegrityError`, `PolicyBlockedError`, `StepUpRequiredError`, `PolicyDeferredError`, `RoutingError` (with `NoCapableAgentError`, `NoInboxError`, and `RoutePrincipalMismatchError`), `PresenceConflictError`, `FenceViolationError`, `BudgetExceededError`, `CancelledError`, `QuarantinedError`, and `ProvenanceError`. Each instance carries `code`, `retryable`, `iggy_error_code`, `filter_reason`, `unavailable`, `unsupported`, `not_found`, `version_skew`, `version_conflict`, `ambiguous_mutation`, `stale`, `permission_denied`, `stream_or_topic_not_found`, `no_capable_agent`, `lease_lost`, `fence_violation`, `budget_exceeded`, `quarantined`, and `not_leader` attributes so you can branch without matching on the type. The broad ones (`retryable`, `unavailable`, `unsupported`, `not_found`, `version_skew`, `stale`, `permission_denied`) follow `code`, the same rule the Rust and TypeScript classifiers use, see [client behavior](../../docs/client-behavior.md#errors). `IntentError`, `ValidateError`, `IdError`, and `ProvenanceError` add a `kind` with class constants such as `IdError.INVALID_ULID`. A publish that gives up raises `PublishFailedError`, whose `committed` and `unconfirmed` report what it left. A handler rejection raises `RejectedError`. `TimeoutError` also subclasses the builtin `TimeoutError` and `InvalidError` also subclasses `ValueError`, so stdlib-style `except TimeoutError` and `except ValueError` catch them too. `CancelledError` reports a run whose recorded cancel intent was observed and derives from `LaserError` only, so a task that raises it fails with it instead of counting as cancelled, and `asyncio.TaskGroup`, `asyncio.gather` and `task.exception()` keep its `run`.
 
+An error whose fix is another call names it. `NoStreamError` says to pass a stream or set a default stream with `stream=` or `with_default_stream`. A publish to a missing stream or topic says to create the agent topics with `bootstrap` or a memory topic with `memory_topic`. `NoInboxError` says to start the agent with capabilities so it advertises its inbox, or to give the workflow a `fixed_inbox`. A timed-out `StepFailedError` names the step's target and its deadline in milliseconds, and a connect timeout to a `*.laserdata.cloud` or `*.laserdata.com` host says to add an access rule for the caller's address.
+
 ## Reading
 
 Use `async for message in laser.stream("fleet").topic("events").replay()` to read raw records. `WatchReader` and `topic.records(reader_name)` also support asynchronous iteration. They stop when caught up. A later iteration resumes from the same offsets. Use `poll()` for a batch of records.
@@ -873,7 +942,7 @@ These calls match the Rust and TypeScript surfaces:
 
 `Laser.assemble_context` accepts `across_subconversations`, `from_offsets`, `from_checkpoint`, `to_checkpoint`, and an explicit context `policy`. A start-offset map applies to every topic. A start checkpoint replaces the raw offset map. Topics absent from it start at offset zero. An end checkpoint bounds the read to saved offsets. An explicit policy replaces `roles`, `last_n`, and `token_budget` and cannot be combined with them.
 
-`MemoryHandle.recall` and `ScopedMemory.recall` accept `stream`, `durable`, and `token_budget`. The full scope and query reach the selected backend. `durable` sets the scope lifetime for custom callbacks. Built-ins do not persist or filter that value. Omit `conversation` to read across conversations. A token budget in the query is advisory and does not trim the returned item list. Use `context` or `block` to render a budgeted text block. `MemoryHandle.improve`, `forget`, and `consolidate` accept the full scope. Feedback can include a `note`.
+`MemoryHandle.recall` and `ScopedMemory.recall` accept `stream`, `durable`, and `token_budget`. The full scope and query reach the selected backend. `durable` sets the scope lifetime for custom callbacks. Built-ins do not persist or filter that value. Omit `conversation` to read across conversations. A token budget in the query is advisory and does not trim the returned item list. Use `recall_block`, `context`, or `ScopedMemory.block` to render a budgeted text block. `MemoryHandle.improve`, `forget`, and `consolidate` accept the full scope. Feedback can include a `note`.
 
 `Provenance(fence_token=...)` stamps the fence used by the reliable consumer. Received messages expose it through `message.provenance.fence_token`.
 
@@ -891,7 +960,7 @@ A custom memory backend can add `append(scope, id, kind, payload)` to preserve a
 
 `MemoryHandle.append(id, payload, kind=, ...)` writes with a supplied ID and memory kind under the full scope. Built-in backends preserve both.
 
-Workflow `build`, `verify`, and `compensate` callbacks can return directly or through an awaitable. Objects with `build` or `verify` methods also work. SDK exceptions keep their error class. A build must produce bytes, and a verifier must produce a boolean. Cancelling a running workflow retires its active Python callback task.
+Workflow `build`, `run`, `verify`, and `compensate` callbacks can return directly or through an awaitable. Objects with `build` or `verify` methods also work. SDK exceptions keep their error class. A build or a local body must produce `bytes` or `str`, and a verifier must produce a boolean. Cancelling a running workflow retires its active Python callback task.
 
 `SnapshotStore(backend)` wraps custom `latest(conversation)` and `save(snapshot)` methods. Both can return directly or through an awaitable. A snapshot is a dict with `conversation`, inclusive per-partition `as_of` offsets, and opaque `state` bytes. `ContextScope.state_with` also accepts the backend object directly. It JSON-decodes the saved state and resumes after those offsets.
 

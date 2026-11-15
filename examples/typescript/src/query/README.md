@@ -24,5 +24,5 @@ LASER_CONNECTION_STRING=user:pwd@your-host npm run example:query
 
 ## Learn more
 
-- Docs: https://docs.laserdata.cloud/laser-sdk/views
+- Docs: https://docs.laserdata.com/laser-sdk/views
 - Full system built on this primitive: [`fleet-tape`](../fleet-tape): the same projection pattern powering a live fleet view and materialized reading tape.

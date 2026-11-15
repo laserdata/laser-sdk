@@ -16,8 +16,11 @@ import {
   type Lease,
   type MemoryId,
   type MutationPosition,
+  type ScratchStream,
   type Session,
   type SessionLease,
+  type Workflow,
+  type WorkflowOutcome,
 } from "@laserdata/laser-sdk";
 import { randomUUID } from "node:crypto";
 import type { wire } from "@laserdata/laser-sdk/full";
@@ -93,6 +96,21 @@ export class LaserWorld {
   filter?: ConsumerFilter;
   verdict?: FilterVerdict;
   filtered: readonly Uint8Array[] = [];
+  /** Every scratch stream the scenario opened, the last one current. */
+  readonly scratches: ScratchStream[] = [];
+  /** The user every fact of a log memory scenario is remembered for. */
+  memoryUser?: string;
+  lastMemoryId?: MemoryId;
+  /** A fresh conversation per label, created on first use. */
+  readonly conversationLabels = new Map<string, ConversationId>();
+  workflow?: Workflow;
+  workflowOutcome?: WorkflowOutcome;
+  workflowError?: unknown;
+  /** The step bodies a local workflow ran and the compensations it ran, in order. */
+  readonly localRan: string[] = [];
+  readonly localUndone: string[] = [];
+  /** The compensation bodies each answering agent received, in order. */
+  readonly compensations = new Map<string, string[]>();
 
   constructor(_options: IWorldOptions) {}
 
@@ -142,6 +160,7 @@ export class LaserWorld {
     this.sessionLease?.release();
     if (this.worker !== undefined) await this.worker.shutdown();
     for (const responder of this.responders) await responder.shutdown();
+    for (const scratch of this.scratches) await scratch.delete();
     if (this.laser !== undefined) await this.laser.close();
   }
 }

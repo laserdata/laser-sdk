@@ -36,6 +36,12 @@ pub struct LaserWorld {
     pub schema_registrations: Vec<(String, String, u32)>,
     pub laser: Option<Laser>,
     pub platform: Option<Arc<TestIggy>>,
+    /// The workflow scenarios' agents, outcome, and local step logs.
+    pub workflow: crate::steps::workflow::WorkflowWorld,
+    /// The scratch streams a scenario opened.
+    pub scratch_streams: Vec<laser_sdk::stream::ScratchStream>,
+    /// The memory correction scenarios' handle, conversations, and last fact.
+    pub correction: crate::steps::memory_correction::Correction,
     pub conversation: Option<ConversationId>,
     /// The session, its lease, and its checkpoint in the session scenarios.
     pub session: Option<Session>,

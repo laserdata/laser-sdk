@@ -37,7 +37,7 @@ commits it. Binary alerts use a one-byte uint8 priority header.
 Run it:
     LASER_CONNECTION_STRING=user:pwd@your-host python3 cdc.py
 
-Docs: https://docs.laserdata.cloud/laser-sdk/consumer-filters
+Docs: https://docs.laserdata.com/laser-sdk/consumer-filters
 Related primitive: watch.py (reports view progress instead of filtering the log)
 """
 

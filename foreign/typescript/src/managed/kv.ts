@@ -1,3 +1,4 @@
+import { utf8 } from "../client/bytes.js"
 import { microsToMillis, millis, millisToMicros } from "../client/duration.js"
 import { BARE_SCOPE, type ResourceScope } from "../client/resource-scope.js"
 import { type Capabilities, requireCapability } from "../client/capabilities.js"
@@ -168,14 +169,19 @@ function unexpected(op: string, outcome: KvOutcome): ProtocolError {
   return new ProtocolError(`kv ${op}: unexpected reply outcome \`${outcome.kind}\``)
 }
 
-function validatedKey(key: Uint8Array): Uint8Array {
-  if (key.byteLength === 0) throw new InvalidError("key must not be empty")
-  if (key.byteLength > MAX_KEY_BYTES) {
+function validatedKey(key: Uint8Array | string): Uint8Array {
+  const bytes = keyBytes(key)
+  if (bytes.byteLength === 0) throw new InvalidError("key must not be empty")
+  if (bytes.byteLength > MAX_KEY_BYTES) {
     throw new InvalidError(
-      `key is ${String(key.byteLength)}B, exceeds cap ${String(MAX_KEY_BYTES)}B`
+      `key is ${String(bytes.byteLength)}B, exceeds cap ${String(MAX_KEY_BYTES)}B`
     )
   }
-  return key
+  return bytes
+}
+
+function keyBytes(key: Uint8Array | string): Uint8Array {
+  return typeof key === "string" ? utf8(key) : key
 }
 
 function validatedValue(value: Uint8Array): void {
@@ -276,12 +282,15 @@ export class Kv {
     return localNamespaces(await fetchNamespaces(backend, capabilities, scope, options), scope)
   }
 
-  async get(key: Uint8Array, options: CallOptions = {}): Promise<Uint8Array | undefined> {
+  async get(key: Uint8Array | string, options: CallOptions = {}): Promise<Uint8Array | undefined> {
     const entry = await this.getEntry(key, options)
     return entry?.value
   }
 
-  async getEntry(key: Uint8Array, options: CallOptions = {}): Promise<KvEntry | undefined> {
+  async getEntry(
+    key: Uint8Array | string,
+    options: CallOptions = {}
+  ): Promise<KvEntry | undefined> {
     const capabilities = await cancellable(options.signal, "kv get", this.getCapabilities)
     const outcome = await executeKv(
       this.backend,
@@ -302,7 +311,7 @@ export class Kv {
    * still holds `version` (the entry version of a prior read), else the entry
    * as it stands now. An up-to-date cache skips the body transfer. */
   async getEntryIfChanged(
-    key: Uint8Array,
+    key: Uint8Array | string,
     version: bigint,
     options: CallOptions = {}
   ): Promise<KvRevalidation> {
@@ -333,7 +342,7 @@ export class Kv {
    * absent value. Needs the `kvFencedLeases` capability: a pre-fencing server
    * would silently ignore the barrier. */
   async getEntryAtLeast(
-    key: Uint8Array,
+    key: Uint8Array | string,
     minPosition: MutationPosition,
     options: CallOptions = {}
   ): Promise<KvEntry | undefined> {
@@ -359,7 +368,7 @@ export class Kv {
 
   /** Decodes a value with the supplied codec, or returns undefined. */
   async getAs<T>(
-    key: Uint8Array,
+    key: Uint8Array | string,
     codec: Codec<T>,
     options: CallOptions = {}
   ): Promise<T | undefined> {
@@ -368,7 +377,7 @@ export class Kv {
   }
 
   async getTyped<T>(
-    key: Uint8Array,
+    key: Uint8Array | string,
     decodeValue: (value: unknown) => T,
     options: CallOptions = {}
   ): Promise<T | undefined> {
@@ -376,7 +385,7 @@ export class Kv {
   }
 
   /** Starts a value write or compare-and-swap request. */
-  set(key: Uint8Array): KvSetRequest {
+  set(key: Uint8Array | string): KvSetRequest {
     return KvSetRequest.create(
       this.backend,
       this.getCapabilities,
@@ -390,9 +399,9 @@ export class Kv {
    * (`fenceNamespace`, `fenceKey`) and a fence sequence still equal to
    * `fenceToken`. */
   casFenced(
-    key: Uint8Array,
+    key: Uint8Array | string,
     fenceNamespace: string,
-    fenceKey: Uint8Array,
+    fenceKey: Uint8Array | string,
     fenceToken: bigint
   ): KvCasFencedRequest {
     validateNamespace(fenceNamespace)
@@ -408,7 +417,7 @@ export class Kv {
     )
   }
 
-  async delete(key: Uint8Array, options: CallOptions = {}): Promise<boolean> {
+  async delete(key: Uint8Array | string, options: CallOptions = {}): Promise<boolean> {
     return this.deleteMatching(key, undefined, options)
   }
 
@@ -416,7 +425,7 @@ export class Kv {
    * read), a conditional delete. A live entry at another version throws the
    * typed version-conflict error carrying the current version. */
   async deleteIfVersion(
-    key: Uint8Array,
+    key: Uint8Array | string,
     version: bigint,
     options: CallOptions = {}
   ): Promise<boolean> {
@@ -424,7 +433,7 @@ export class Kv {
   }
 
   private async deleteMatching(
-    key: Uint8Array,
+    key: Uint8Array | string,
     ifMatch: bigint | undefined,
     options: CallOptions
   ): Promise<boolean> {
@@ -446,7 +455,10 @@ export class Kv {
     throw unexpected("delete", outcome)
   }
 
-  async exists(key: Uint8Array, options: CallOptions = {}): Promise<KvMetadata | undefined> {
+  async exists(
+    key: Uint8Array | string,
+    options: CallOptions = {}
+  ): Promise<KvMetadata | undefined> {
     const capabilities = await cancellable(options.signal, "kv exists", this.getCapabilities)
     const outcome = await executeKv(
       this.backend,
@@ -466,7 +478,11 @@ export class Kv {
   /** Expires an entry `ttlMs` milliseconds after the server's time of the
    * write, without rewriting its value, or clears its expiry when `ttlMs` is
    * omitted. Returns the new version. */
-  async expire(key: Uint8Array, ttlMs?: number, options: CallOptions = {}): Promise<bigint> {
+  async expire(
+    key: Uint8Array | string,
+    ttlMs?: number,
+    options: CallOptions = {}
+  ): Promise<bigint> {
     if (ttlMs === undefined) return this.expireAt(key, undefined, options)
     return this.expireWith(key, { ttlMicros: durationMicros(ttlMs, "expire ttlMs") }, options)
   }
@@ -475,7 +491,7 @@ export class Kv {
    * its value, or clears it when `expiresAtMicros` is omitted. Returns the new
    * version. */
   async expireAt(
-    key: Uint8Array,
+    key: Uint8Array | string,
     expiresAtMicros?: bigint,
     options: CallOptions = {}
   ): Promise<bigint> {
@@ -483,7 +499,7 @@ export class Kv {
   }
 
   private async expireWith(
-    key: Uint8Array,
+    key: Uint8Array | string,
     expiry: { readonly expiresAtMicros?: bigint; readonly ttlMicros?: bigint },
     options: CallOptions
   ): Promise<bigint> {
@@ -505,14 +521,18 @@ export class Kv {
   }
 
   /** Applies a codec-specific merge patch and returns the new version. */
-  async patch(key: Uint8Array, patch: Uint8Array, options: CallOptions = {}): Promise<bigint> {
+  async patch(
+    key: Uint8Array | string,
+    patch: Uint8Array,
+    options: CallOptions = {}
+  ): Promise<bigint> {
     return this.patchMatching(key, patch, undefined, options)
   }
 
   /** `patch` applied only while `key` holds `version`. A live entry at another
    * version throws the typed version-conflict error. */
   async patchIfVersion(
-    key: Uint8Array,
+    key: Uint8Array | string,
     patch: Uint8Array,
     version: bigint,
     options: CallOptions = {}
@@ -521,7 +541,7 @@ export class Kv {
   }
 
   private async patchMatching(
-    key: Uint8Array,
+    key: Uint8Array | string,
     patch: Uint8Array,
     ifMatch: bigint | undefined,
     options: CallOptions
@@ -563,7 +583,7 @@ export class Kv {
    * that arrives after its `validUntilMs` throws the typed lease-lost error.
    * The grant position joins this connection's read-your-writes frontier. */
   async lease(
-    key: Uint8Array,
+    key: Uint8Array | string,
     holderId: string,
     ttlMs: number,
     options: CallOptions = {}
@@ -586,19 +606,24 @@ export class Kv {
   /** `lease` held by a `LeaseGuard`, which releases it when the scope that
    * holds it with `await using` ends. */
   async leaseGuard(
-    key: Uint8Array,
+    key: Uint8Array | string,
     holderId: string,
     ttlMs: number,
     options: CallOptions = {}
   ): Promise<LeaseGuard> {
-    return LeaseGuard.create(this, key, holderId, await this.lease(key, holderId, ttlMs, options))
+    return LeaseGuard.create(
+      this,
+      validatedKey(key),
+      holderId,
+      await this.lease(key, holderId, ttlMs, options)
+    )
   }
 
   /** `lease` that resolves `undefined` instead of throwing when a live lease
    * holds `key`, the non-blocking acquire. Every other failure, an ambiguous
    * outcome included, throws as `lease` throws it. */
   async tryLease(
-    key: Uint8Array,
+    key: Uint8Array | string,
     holderId: string,
     ttlMs: number,
     options: CallOptions = {}
@@ -620,7 +645,7 @@ export class Kv {
    * the typed lease-lost error: stop the protected work, a new epoch needs a
    * fresh `lease`. */
   async renewLease(
-    key: Uint8Array,
+    key: Uint8Array | string,
     holderId: string,
     token: bigint,
     ttlMs: number,
@@ -659,7 +684,7 @@ export class Kv {
    * ambiguous attempt under its identity until `deadlineMs` on the
    * `performance.now()` clock, then throwing the typed lease-lost error. */
   async renewLeaseUntil(
-    key: Uint8Array,
+    key: Uint8Array | string,
     holderId: string,
     token: bigint,
     ttlMs: number,
@@ -685,7 +710,7 @@ export class Kv {
   /** Releases a held lease early, presenting the same `holderId` and its
    * token. Resolves `true` when a held lease was released. */
   async release(
-    key: Uint8Array,
+    key: Uint8Array | string,
     holderId: string,
     token: bigint,
     options: CallOptions = {}
@@ -709,7 +734,7 @@ export class Kv {
   }
 
   /** Starts an atomic value copy that preserves remaining expiry. */
-  copyTo(key: Uint8Array, toKey: Uint8Array): KvCopyRequest {
+  copyTo(key: Uint8Array | string, toKey: Uint8Array | string): KvCopyRequest {
     return KvCopyRequest.create(
       this.backend,
       this.getCapabilities,
@@ -721,7 +746,7 @@ export class Kv {
     )
   }
 
-  moveTo(key: Uint8Array, toKey: Uint8Array): KvCopyRequest {
+  moveTo(key: Uint8Array | string, toKey: Uint8Array | string): KvCopyRequest {
     return KvCopyRequest.create(
       this.backend,
       this.getCapabilities,
@@ -735,7 +760,7 @@ export class Kv {
 
   /** Reads several keys in one round trip while preserving key order. */
   async getMany(
-    keys: readonly Uint8Array[],
+    keys: readonly (Uint8Array | string)[],
     options: CallOptions = {}
   ): Promise<readonly (Uint8Array | undefined)[]> {
     const capabilities = await cancellable(options.signal, "kv get many", this.getCapabilities)
@@ -1115,14 +1140,14 @@ export class KvScanRequest {
     return this
   }
 
-  prefix(prefix: Uint8Array): this {
-    this.boundPrefix = prefix
+  prefix(prefix: Uint8Array | string): this {
+    this.boundPrefix = keyBytes(prefix)
     return this
   }
 
-  range(start: Uint8Array, end: Uint8Array): this {
-    this.boundStart = start
-    this.boundEnd = end
+  range(start: Uint8Array | string, end: Uint8Array | string): this {
+    this.boundStart = keyBytes(start)
+    this.boundEnd = keyBytes(end)
     return this
   }
 
@@ -1252,14 +1277,14 @@ export class KvDeleteManyRequest {
     return this
   }
 
-  prefix(prefix: Uint8Array): this {
-    this.boundPrefix = prefix
+  prefix(prefix: Uint8Array | string): this {
+    this.boundPrefix = keyBytes(prefix)
     return this
   }
 
-  range(start: Uint8Array, end: Uint8Array): this {
-    this.boundStart = start
-    this.boundEnd = end
+  range(start: Uint8Array | string, end: Uint8Array | string): this {
+    this.boundStart = keyBytes(start)
+    this.boundEnd = keyBytes(end)
     return this
   }
 

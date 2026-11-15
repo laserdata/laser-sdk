@@ -1,3 +1,4 @@
+import { CREATE_STREAM } from "apache-iggy/dist/wire/stream/create-stream.command.js"
 import { UPDATE_STREAM } from "apache-iggy/dist/wire/stream/update-stream.command.js"
 import { UPDATE_TOPIC } from "apache-iggy/dist/wire/topic/update-topic.command.js"
 import { DELETE_SEGMENTS } from "apache-iggy/dist/wire/segment/delete-segments.command.js"
@@ -499,6 +500,11 @@ export interface TopicSettings {
   readonly neverExpire?: boolean
   readonly maxTopicBytes?: bigint
   readonly unlimitedTopicSize?: boolean
+}
+
+/** @internal */
+export async function createStream(client: AdminClient, name: string): Promise<void> {
+  await command(client, CREATE_STREAM.code, CREATE_STREAM.serialize({ name }))
 }
 
 /** @internal */

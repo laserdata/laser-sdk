@@ -182,7 +182,7 @@ export class ScopedMemory {
     return new ScopedMemory(handle, conversation)
   }
 
-  remember(payload: Uint8Array) {
+  remember(payload: Uint8Array | string) {
     const builder = this.handle.remember(payload).scope(this.conversation)
     if (this.originValue !== undefined) builder.origin(this.originValue)
     if (this.producerValue !== undefined) builder.producer(this.producerValue)
@@ -225,11 +225,7 @@ export class ScopedMemory {
   /** This conversation's recalled items as one prompt-ready block, trimmed to
    * `tokenBudget` estimated tokens when given. */
   block(tokenBudget?: number, options: CallOptions = {}): Promise<string> {
-    return this.handle.context(
-      { conversation: this.conversation },
-      tokenBudget === undefined ? {} : { tokenBudget },
-      options
-    )
+    return this.handle.context(this.conversation, tokenBudget, options)
   }
 
   /** One consolidation pass over this conversation, keeping the newest

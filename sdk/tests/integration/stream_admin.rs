@@ -159,3 +159,59 @@ async fn given_a_consumer_group_when_listed_and_deleted_then_should_report_it_un
         .await
         .expect("the stream is removed");
 }
+
+#[tokio::test]
+async fn given_a_scratch_stream_when_opened_and_deleted_then_should_exist_only_in_between() {
+    let laser = harness::connected_laser().await;
+    let scratch = laser
+        .scratch_stream("scratch")
+        .await
+        .expect("the scratch stream opens");
+    let (prefix, suffix) = scratch
+        .name()
+        .rsplit_once('-')
+        .expect("the name joins the prefix and the suffix");
+    assert_eq!(prefix, "scratch");
+    assert_eq!(suffix.len(), 8);
+    assert!(
+        suffix
+            .chars()
+            .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character)),
+        "{suffix} is lowercase hex"
+    );
+    assert_eq!(scratch.laser().default_stream(), Some(scratch.name()));
+    let stream = laser.stream(scratch.name());
+    assert!(stream.exists().await.expect("the scratch stream reads"));
+    let other = laser
+        .scratch_stream("scratch")
+        .await
+        .expect("a second scratch stream opens");
+    assert_ne!(other.name(), scratch.name());
+    other
+        .delete()
+        .await
+        .expect("the second scratch stream deletes");
+
+    scratch.delete().await.expect("the scratch stream deletes");
+    assert!(!stream.exists().await.expect("a deleted stream reads"));
+    scratch
+        .delete()
+        .await
+        .expect("deleting a deleted scratch stream succeeds");
+}
+
+#[tokio::test]
+async fn given_a_scratch_stream_when_dropped_undeleted_then_should_delete_it() {
+    let laser = harness::connected_laser().await;
+    let scratch = laser
+        .scratch_stream("dropped")
+        .await
+        .expect("the scratch stream opens");
+    let stream = laser.stream(scratch.name());
+    assert!(stream.exists().await.expect("the scratch stream reads"));
+    drop(scratch);
+    harness::eventually(|| async {
+        (!stream.exists().await.expect("the stream reads")).then_some(())
+    })
+    .await;
+}

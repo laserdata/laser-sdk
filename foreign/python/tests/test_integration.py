@@ -697,7 +697,7 @@ async def test_given_a_failing_step_builder_when_running_then_should_fail_before
     workflow = laser.workflow("broken-workflow", fixed_inbox="agent.sessions")
     workflow.step("broken", to="worker", build=broken_builder)
 
-    with pytest.raises(ls.LaserError, match="cannot build task"):
+    with pytest.raises(RuntimeError, match="cannot build task"):
         await workflow.run()
 
 
@@ -1492,9 +1492,9 @@ async def test_given_feedback_when_improving_vector_memory_then_should_promote_t
     assert after[0].score == 5.0
 
 
-async def test_given_an_unknown_strategy_when_recalling_then_should_raise_codec_error(laser):
+async def test_given_an_unknown_strategy_when_recalling_then_should_raise_invalid_error(laser):
     memory = laser.memory("notes")
-    with pytest.raises(ls.CodecError):
+    with pytest.raises(ls.InvalidError, match="unknown recall strategy 'nonsense': use one of"):
         await memory.recall(conversation=ls.new_conversation_id(), strategy="nonsense")
 
 

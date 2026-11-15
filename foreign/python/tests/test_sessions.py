@@ -6,43 +6,6 @@ import pytest
 pytestmark = pytest.mark.integration
 
 
-async def _eventually(read, description):
-    deadline = asyncio.get_running_loop().time() + 15
-    while True:
-        value = await read()
-        if value is not None:
-            return value
-        assert asyncio.get_running_loop().time() < deadline, description
-        await asyncio.sleep(0.05)
-
-
-async def _bootstrap(laser):
-    await laser.bootstrap(4, ls.TopicRetention.expire_after(86_400_000))
-    return laser.sessions()
-
-
-async def _heartbeat_bodies(laser):
-    # Every heartbeat body on the default stream, in log order. Python has no
-    # typed heartbeat, so a body decodes to a dict through the CBOR codec.
-    cursor = laser.topic(ls.AgentTopic.Heartbeats).replay()
-    bodies = []
-    while True:
-        batch = await cursor.poll()
-        if not batch:
-            return bodies
-        for message in batch:
-            bodies.append(bytes(ls.Cbor.decode(bytes(message.payload))["body"]))
-
-
-async def _statuses(laser, session_id):
-    turns = await laser.sessions().open(session_id).context_with(ls.LastN(20))
-    return [
-        ls.TaskState.from_code(turn.message.envelope["task_state"])
-        for turn in turns
-        if turn.message.envelope is not None and turn.message.envelope.get("operation") == "session"
-    ]
-
-
 async def test_given_recorded_calls_on_its_lane_when_the_agent_runs_then_should_get_only_real_work(
     laser,
 ):
@@ -189,3 +152,62 @@ async def test_given_a_heartbeat_of_a_deleted_stream_when_read_then_should_name_
     assert ls.Cbor.decode(late).get("stream_generation") != generation, (
         "a heartbeat of the deleted stream names the replacement's generation"
     )
+
+
+async def test_given_a_session_when_opening_its_memory_then_should_use_the_configured_or_named_one(
+    laser,
+):
+    await laser.bootstrap()
+    session, lease = await laser.sessions(memory_namespace="notes").start().agent("planner").begin()
+    await session.memory().remember("the deploy key rotates on fridays")
+    await session.memory_in("runbook").remember("restart the gateway first")
+    lease.release()
+
+    async def recalled(namespace):
+        async def read():
+            items = await laser.memory(namespace).recall(
+                conversation=session.conversation, folded=True
+            )
+            return [item.text() for item in items] or None
+
+        return await _eventually(read, f"the {namespace} memory is read back")
+
+    assert await recalled("notes") == ["the deploy key rotates on fridays"]
+    assert await recalled("runbook") == ["restart the gateway first"]
+
+
+async def _eventually(read, description):
+    deadline = asyncio.get_running_loop().time() + 15
+    while True:
+        value = await read()
+        if value is not None:
+            return value
+        assert asyncio.get_running_loop().time() < deadline, description
+        await asyncio.sleep(0.05)
+
+
+async def _bootstrap(laser):
+    await laser.bootstrap(4, ls.TopicRetention.expire_after(86_400_000))
+    return laser.sessions()
+
+
+async def _heartbeat_bodies(laser):
+    # Every heartbeat body on the default stream, in log order. Python has no
+    # typed heartbeat, so a body decodes to a dict through the CBOR codec.
+    cursor = laser.topic(ls.AgentTopic.Heartbeats).replay()
+    bodies = []
+    while True:
+        batch = await cursor.poll()
+        if not batch:
+            return bodies
+        for message in batch:
+            bodies.append(bytes(ls.Cbor.decode(bytes(message.payload))["body"]))
+
+
+async def _statuses(laser, session_id):
+    turns = await laser.sessions().open(session_id).context_with(ls.LastN(20))
+    return [
+        ls.TaskState.from_code(turn.message.envelope["task_state"])
+        for turn in turns
+        if turn.message.envelope is not None and turn.message.envelope.get("operation") == "session"
+    ]

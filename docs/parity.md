@@ -31,6 +31,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | std-trait | The peer spells a Rust standard trait impl (FromStr, Display, From) as a function or static member |
 | serde-dict | Python passes the record as a dict that serde builds from the same Rust type, keyed by its serde field names |
 | signature-type | TypeScript exports the parameter, option, or result shape a public signature names, where Rust passes the values or a generic bound directly |
+| subclass-handle | Python makes the memory backend a subclass of `MemoryHandle`, so it is usable wherever a handle is, where Rust wraps a separate type in a `MemoryHandle` variant |
 
 ## Capabilities
 
@@ -201,6 +202,8 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `LaserError.StepFailed.run` | `StepFailedError.run` | `StepFailedError.run` | error-class |
 | `LaserError.StepFailed.step` | `StepFailedError.step` | `StepFailedError.step` | error-class |
 | `LaserError.StepFailed.reason` | `StepFailedError.reason` | `StepFailedError.reason` | error-class |
+| `LaserError.StepFailed.target` | `StepFailedError.target` | `StepFailedError.target` | error-class |
+| `LaserError.StepFailed.deadline_ms` | `StepFailedError.deadline_ms` | `StepFailedError.deadlineMs` | error-class |
 | `LaserError::JournalTruncated` | `JournalTruncatedError` | `JournalTruncatedError` | error-class |
 | `LaserError.JournalTruncated.run` | `JournalTruncatedError.run` | `JournalTruncatedError.run` | error-class |
 | `LaserError::SessionEnded` | `SessionEndedError` | `SessionEndedError` | error-class |
@@ -777,6 +780,7 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `Laser::scatter` | `Laser.scatter` | `Laser.scatter` | keywords |
 | `Laser::scatter_report` | `Laser.scatter_report` | `Laser.scatterReport` | keywords |
 | `Laser::schemas` | `Laser.schemas` | `Laser.schemas` |  |
+| `Laser::scratch_stream` | `Laser.scratch_stream` | `Laser.scratchStream` |  |
 | `Laser::seen_positions` | `Laser.seen_positions` | `Laser.seenPositions` |  |
 | `Laser::send_agent` | `Laser.send_agent` | `Laser.sendAgent` |  |
 | `Laser::send_command` | `Laser.send_command` | `Laser.sendCommand` |  |
@@ -1005,7 +1009,7 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `Session::linked_graph` | `Session.linked_graph` | `Session.linkedGraph` |  |
 | `Session::linked_memory` | `Session.linked_memory` | `Session.linkedMemory` |  |
 | `Session::memory` | `Session.memory` | `Session.memory` |  |
-| `Session::memory_in` | `Session.memory_in` | `Session.memory(namespace=)` | overload |
+| `Session::memory_in` | `Session.memory_in` | `Session.memoryIn` |  |
 | `Session::model` | `Session.model` | `Session.model` |  |
 | `Session::over_budget` | `Session.over_budget` | `Session.overBudget` |  |
 | `Session::parent` | `Session.parent` | `Session.parent` | property |
@@ -1289,9 +1293,10 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `StepHandle::exclusive_in` | `Workflow.step(fence_namespace=)` | `StepHandle.exclusiveIn` | keywords |
 | `StepHandle::inbox_route` | `Laser.workflow(fixed_inbox=)` | `StepHandle.inboxRoute` | keywords |
 | `StepHandle::on_timeout` | `Workflow.step(on_timeout=)` | `StepHandle.onTimeout` | keywords |
-| `StepHandle::run` | `Workflow.step` | `StepHandle.run` | one-call |
+| `StepHandle::run` | `Workflow.run` | `StepHandle.run` | native-binding |
 | `StepHandle::run_id` | `Workflow.run_id` | `StepHandle.runId` | native-binding |
 | `StepHandle::step` | `Workflow.step` | `StepHandle.step` | keywords |
+| `StepHandle::step_local` | `Workflow.step(run=)` | `StepHandle.stepLocal` | keywords |
 | `StepHandle::verify_with` | `Workflow.step(verify=)` | `StepHandle.verifyWith` | keywords |
 | `StreamEvent` | dict via `ChunkAssembler.feed` | `StreamEvent` | serde-dict |
 | `StreamEvent::Body` | dict key | `StreamEvent` | serde-dict, plain-value |
@@ -1336,6 +1341,7 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `Workflow::run` | `Workflow.run` | `Workflow.run` |  |
 | `Workflow::run_id` | `Workflow.run_id` | `Workflow.runId` |  |
 | `Workflow::step` | `Workflow.step` | `Workflow.step` | keywords |
+| `Workflow::step_local` | `Workflow.step(run=)` | `Workflow.stepLocal` | keywords |
 | `WorkflowBudget` | `WorkflowBudget` | `WorkflowBudget` |  |
 | `WorkflowBudget::invocations` | `WorkflowBudget.invocations` | `WorkflowBudget.invocations` |  |
 | `WorkflowBudget::tokens` | `WorkflowBudget.tokens` | `WorkflowBudget.tokens` | constructor |
@@ -1344,6 +1350,9 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `WorkflowOutcome` | `WorkflowOutcome` | `WorkflowOutcome` |  |
 | `WorkflowOutcome.outputs` | `WorkflowOutcome.outputs` | `WorkflowOutcome.outputs` | keywords |
 | `WorkflowOutcome.run_id` | `WorkflowOutcome.run_id` | `WorkflowOutcome.runId` | keywords |
+| `WorkflowOutcome.completed_steps` | `WorkflowOutcome.completed_steps` | `WorkflowOutcome.completedSteps` | keywords |
+| `WorkflowOutcome.status` | `WorkflowOutcome.status` | `WorkflowOutcome.status` | keywords |
+| `WorkflowOutcome::text` | `WorkflowOutcome.text` | `WorkflowOutcome.text` | keywords |
 | `agent::checkpoint_from_snapshot` | `fn:checkpoint_from_snapshot` | `fn:checkpointFromSnapshot` |  |
 | `agent::default_redact` | `fn:default_redact` | `fn:defaultRedact` |  |
 | `agent::derive_session_id` | `fn:derive_session_id` | `fn:deriveSessionId` |  |
@@ -2923,7 +2932,7 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `LocalReranker::rerank` | `MemoryHandle.reranker(reranker=)` | `Reranker.rerank` | callback, keywords |
 | `LocalSummarizer` | `MemoryHandle.consolidate(summarizer=)` | `Summarizer` | callback, trait-variant |
 | `LocalSummarizer::summarize` | `MemoryHandle.consolidate(summarizer=)` | `Summarizer.summarize` | callback, keywords |
-| `LogMemory` | `LogMemory` | `LogMemory` |  |
+| `LogMemory` | `LogMemory` | `LogMemory` | subclass-handle |
 | `LogMemory::fetch_named` | `LogMemory.fetch_named` | `LogMemory.fetchNamed` |  |
 | `LogMemory::fetch_named_folded` | `LogMemory.fetch_named_folded` | `LogMemory.fetchNamedFolded` |  |
 | `LogMemory::forget_named` | `LogMemory.forget_named` | `LogMemory.forgetNamed` |  |
@@ -2972,6 +2981,7 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `MemoryHandle::remove` | `MemoryHandle.remove` | `MemoryHandle.remove` |  |
 | `MemoryHandle::reranker` | `MemoryHandle.reranker` | `MemoryHandle.reranker` |  |
 | `MemoryHandle::set` | `MemoryHandle.set` | `MemoryHandle.set` |  |
+| `MemoryHandle::supersede` | `MemoryHandle.supersede` | `MemoryHandle.supersede` |  |
 | `MemoryHandle::update` | `MemoryHandle.update` | `MemoryHandle.update` |  |
 | `MemoryHandle::vector` | `MemoryHandle.vector` | `MemoryHandle.vector` |  |
 | `MemoryId` | omitted | `MemoryId` | plain-value |
@@ -3058,7 +3068,7 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `RecallBuilder` | `MemoryHandle.recall` | `RecallBuilder` | keywords |
 | `RecallBuilder::agent` | `MemoryHandle.recall(agent=)` | `RecallBuilder.agent` | keywords |
 | `RecallBuilder::application` | `MemoryHandle.recall(application=)` | `RecallBuilder.application` | keywords |
-| `RecallBuilder::block` | `MemoryHandle.recall(block=)` | `RecallBuilder.block` | overload |
+| `RecallBuilder::block` | `MemoryHandle.recall_block` | `RecallBuilder.block` | one-call |
 | `RecallBuilder::fetch` | `MemoryHandle.recall` | `RecallBuilder.fetch` | one-call |
 | `RecallBuilder::folded` | `MemoryHandle.recall(folded=)` | `RecallBuilder.folded` | keywords |
 | `RecallBuilder::hybrid` | `MemoryHandle.recall(strategy=)` | `RecallBuilder.hybrid` | overload |
@@ -3093,7 +3103,7 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `RememberBuilder::send` | `MemoryHandle.remember` | `RememberBuilder.send` | one-call |
 | `RememberBuilder::stream` | `MemoryHandle.remember(stream=)` | `RememberBuilder.stream` | keywords |
 | `RememberBuilder::user` | `MemoryHandle.remember(user=)` | `RememberBuilder.user` | keywords |
-| `RerankedMemory` | `RerankedMemory` | `RerankedMemory` |  |
+| `RerankedMemory` | `RerankedMemory` | `RerankedMemory` | subclass-handle |
 | `RerankedMemory::new` | `new RerankedMemory()` | `new RerankedMemory()` | constructor |
 | `Reranker` | `MemoryHandle.reranker(reranker=)` | `Reranker` | callback |
 | `Reranker::rerank` | `MemoryHandle.reranker(reranker=)` | `Reranker.rerank` | callback, keywords |
@@ -3103,7 +3113,19 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `SharedReranker` | omitted | omitted | shared-ownership |
 | `Summarizer` | `MemoryHandle.consolidate(summarizer=)` | `Summarizer` | callback |
 | `Summarizer::summarize` | `MemoryHandle.consolidate(summarizer=)` | `Summarizer.summarize` | callback, keywords |
-| `VectorMemory` | `VectorMemory` | `VectorMemory` |  |
+| `SupersedeBuilder` | `MemoryHandle.supersede` | `SupersedeBuilder` | keywords |
+| `SupersedeBuilder::agent` | `MemoryHandle.supersede(agent=)` | `SupersedeBuilder.agent` | keywords |
+| `SupersedeBuilder::application` | `MemoryHandle.supersede(application=)` | `SupersedeBuilder.application` | keywords |
+| `SupersedeBuilder::dedup` | `MemoryHandle.supersede(dedup=)` | `SupersedeBuilder.dedup` | keywords |
+| `SupersedeBuilder::durable` | `MemoryHandle.supersede(durable=)` | `SupersedeBuilder.durable` | keywords |
+| `SupersedeBuilder::kind` | `MemoryHandle.supersede(kind=)` | `SupersedeBuilder.kind` | keywords |
+| `SupersedeBuilder::origin` | `MemoryHandle.supersede(origin=)` | `SupersedeBuilder.origin` | keywords |
+| `SupersedeBuilder::producer` | `MemoryHandle.supersede(producer=)` | `SupersedeBuilder.producer` | keywords |
+| `SupersedeBuilder::scope` | `MemoryHandle.supersede(conversation=)` | `SupersedeBuilder.scope` | keywords |
+| `SupersedeBuilder::send` | `MemoryHandle.supersede` | `SupersedeBuilder.send` | one-call |
+| `SupersedeBuilder::stream` | `MemoryHandle.supersede(stream=)` | `SupersedeBuilder.stream` | keywords |
+| `SupersedeBuilder::user` | `MemoryHandle.supersede(user=)` | `SupersedeBuilder.user` | keywords |
+| `VectorMemory` | `VectorMemory` | `VectorMemory` | subclass-handle |
 | `VectorMemory::governed` | `VectorMemory.governed` | `VectorMemory.governed` |  |
 | `VectorMemory::new` | `new VectorMemory()` | `new VectorMemory()` | constructor |
 | `memory::fuse_reciprocal_rank` | `fn:fuse_reciprocal_rank` | `fn:fuseReciprocalRank` |  |
@@ -4897,6 +4919,10 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `Routing::Key` | `Topic.producer(key=)` | `Routing.key` | keywords |
 | `Routing::Partition` | `Topic.producer(partition=)` | `Routing.partition` | keywords |
 | `Routing::key` | `Topic.producer(key=)` | `Routing.key` | keywords |
+| `ScratchStream` | `ScratchStream` | `ScratchStream` |  |
+| `ScratchStream::delete` | `ScratchStream.delete` | `ScratchStream.delete` |  |
+| `ScratchStream::laser` | `ScratchStream.laser` | `ScratchStream.laser` | property |
+| `ScratchStream::name` | `ScratchStream.name` | `ScratchStream.name` | property |
 | `SendMessagesConfirmationResponse` | `SendMessagesConfirmationResponse` | omitted | rust-crate |
 | `SendMessagesResponse` | `SendMessagesResponse` | omitted | rust-crate |
 | `ShardRequest` | `ShardRequest` | `ShardRequest` |  |

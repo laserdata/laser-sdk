@@ -11,6 +11,9 @@ const ACCEPT_STAGE: &str = "the Iggy server to accept the connection";
 // an unreachable server, so the stage names that cause too.
 const VERIFIED_QUIC_ACCEPT_STAGE: &str = "the Iggy server to accept the QUIC connection: QUIC may be off on the server, or its certificate is not in the operating system trust store, so install the LaserData root CA there or connect over TCP or WebSocket";
 const LOGIN_STAGE: &str = "the Iggy login reply";
+// A LaserData deployment drops connections from an address no access rule
+// admits, which looks like a server that never accepts.
+const LASERDATA_ACCEPT_STAGE: &str = "the Iggy server to accept the connection: the deployment admits only addresses its access rules allow: add an access rule for this address";
 
 /// Budget for the initial connect: the dial over TCP, QUIC or WebSocket, TLS handshake, login, and the managed capability probe.
 #[derive(Clone, Copy, Debug)]
@@ -51,11 +54,12 @@ impl ConnectOptions {
     }
 }
 
-/// Connect `client` before `deadline`. The Iggy client retries a failed dial by itself, and the deadline stops those retries. `verified_quic` names the certificate cause when the server never accepts.
+/// Connect `client` before `deadline`. The Iggy client retries a failed dial by itself, and the deadline stops those retries. `verified_quic` names the certificate cause and `laserdata_host` the access rules when the server never accepts.
 pub(crate) async fn connect_before(
     client: &IggyClient,
     deadline: Instant,
     verified_quic: bool,
+    laserdata_host: bool,
 ) -> Result<(), LaserError> {
     let mut events = client.subscribe_events().await;
     match tokio::time::timeout_at(deadline, client.connect()).await {
@@ -67,11 +71,14 @@ pub(crate) async fn connect_before(
             while let Ok(event) = events.try_recv() {
                 accepted |= event == DiagnosticEvent::Connected;
             }
-            Err(LaserError::Timeout(match (accepted, verified_quic) {
-                (true, _) => LOGIN_STAGE,
-                (false, true) => VERIFIED_QUIC_ACCEPT_STAGE,
-                (false, false) => ACCEPT_STAGE,
-            }))
+            Err(LaserError::Timeout(
+                match (accepted, verified_quic, laserdata_host) {
+                    (true, _, _) => LOGIN_STAGE,
+                    (false, true, _) => VERIFIED_QUIC_ACCEPT_STAGE,
+                    (false, false, true) => LASERDATA_ACCEPT_STAGE,
+                    (false, false, false) => ACCEPT_STAGE,
+                },
+            ))
         }
     }
 }
@@ -121,7 +128,8 @@ mod tests {
                 .build()
                 .expect("build the client");
         let started = Instant::now();
-        let result = connect_before(&client, started + Duration::from_millis(300), false).await;
+        let result =
+            connect_before(&client, started + Duration::from_millis(300), false, false).await;
         assert!(matches!(result, Err(LaserError::Timeout(LOGIN_STAGE))));
         assert!(started.elapsed() < Duration::from_secs(5));
         server.abort();
@@ -141,8 +149,36 @@ mod tests {
                 .build()
                 .expect("build the client");
         let started = Instant::now();
-        let result = connect_before(&client, started + Duration::from_millis(300), false).await;
+        let result =
+            connect_before(&client, started + Duration::from_millis(300), false, false).await;
         assert!(matches!(result, Err(LaserError::Timeout(ACCEPT_STAGE))));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn given_an_unreachable_laserdata_host_when_connecting_then_should_name_the_access_rule()
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local listener");
+        let address = listener.local_addr().expect("read the bound address");
+        drop(listener);
+        let client =
+            IggyClientBuilder::from_connection_string(&format!("iggy+tcp://iggy:iggy@{address}"))
+                .expect("parse the connection string")
+                .build()
+                .expect("build the client");
+        let result = connect_before(
+            &client,
+            Instant::now() + Duration::from_millis(300),
+            false,
+            true,
+        )
+        .await
+        .expect_err("an unreachable server times out");
+        assert_eq!(
+            result.to_string(),
+            "timed out waiting for the Iggy server to accept the connection: the deployment admits only addresses its access rules allow: add an access rule for this address"
+        );
     }
 }

@@ -21,6 +21,7 @@ bdd/
 │   ├── clients.feature                live connections listed from every node of the cluster
 │   ├── consistency.feature            managed reads carry the client's highest seen position
 │   ├── context_window.feature         the bounded context read window per partition
+│   ├── defaults.feature               bootstrap with no arguments, and the errors that name the next call
 │   ├── filters.feature                consumer-filter evaluation rules (shared evaluator)
 │   ├── filters_live.feature           server-side filtered reads + the catalog Unsupported boundary
 │   ├── governance.feature             action governance at the effect boundary
@@ -29,12 +30,16 @@ bdd/
 │   ├── kv_leases.feature              fenced leases on the managed store: renew, release, takeover read, stale holder fenced out
 │   ├── managed_sessions.feature       the managed session index: layouts, child rollup, links, state history, liveness, change feed, reads, budget enforcement
 │   ├── memory.feature                 agentic memory recall semantics (reference engine)
+│   ├── memory_correction.feature      log memory: topic on first write, supersede, ranking by word overlap, keyword filter, recall after a correction
 │   ├── provenance.feature             provenance + causality round-trip
 │   ├── query.feature                  the query DSL semantics (reference engine)
 │   ├── query_managed.feature          2,000 materialized records read through each SDK's query builder: filter totals, ordering, groups, offset walk
 │   ├── schema_registry.feature        writer schema registries per stream on the managed backend: ids from 1 in every stream, reads and listings of one registry
+│   ├── scratch_stream.feature         a uniquely named stream for one run, deleted at the end
 │   ├── session.feature                sessions on the lane over open Apache Iggy: lifecycle and the terminal latch, state, model and tool records, submit, control, layouts, heartbeats
-│   └── streaming.feature              typed publish on the log
+│   ├── streaming.feature              typed publish on the log
+│   ├── workflow.feature               multi-step workflows: dependency order, verify, compensate, routing by skill, step timeout text
+│   └── workflow_local.feature         workflows of local steps: no agent topics, resume, local compensation
 ├── rust/                              Rust reference runner (cucumber-rs)
 ├── python/                            Python runner (pytest-bdd), same scenarios
 ├── typescript/                        TypeScript runner (Cucumber), same scenarios

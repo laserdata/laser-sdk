@@ -49,6 +49,15 @@ pub async fn fresh_laser() -> FreshLaser {
     FreshLaser { laser, iggy }
 }
 
+/// A `Laser` on the shared server with no default stream.
+pub async fn laser_without_stream() -> FreshLaser {
+    let (client, iggy) = connect_client().await;
+    FreshLaser {
+        laser: Laser::from_client(client),
+        iggy,
+    }
+}
+
 /// A `Laser` connected through a connection string on a fresh stream, so the
 /// capability probe runs and partition-primary data connections can open.
 pub async fn fresh_connected_laser() -> FreshLaser {

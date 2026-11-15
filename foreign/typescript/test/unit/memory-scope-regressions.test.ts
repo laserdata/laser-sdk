@@ -2,7 +2,9 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { ProtocolError } from "../../src/client/errors.js"
+import { INTERNAL_MEMORY_WRITES } from "../../src/client/internals.js"
 import type { Laser } from "../../src/client/laser.js"
+import { MemoryWrites } from "../../src/memory/writes.js"
 import { LogMemory } from "../../src/memory/log-memory.js"
 import { MemoryHandle } from "../../src/memory/handle.js"
 import {
@@ -41,9 +43,12 @@ interface ScanCall {
 
 function memory(pages: readonly KvPage[]) {
   const calls: ScanCall[] = []
+  const writes = new MemoryWrites()
   const laser = {
     defaultStream: "records",
     ...BARE_NAMING,
+    capabilities: () => Promise.resolve({ kv: { available: true } }),
+    [INTERNAL_MEMORY_WRITES]: () => writes,
     kv: () => ({
       scan: () => {
         const current: ScanCall = {}
@@ -439,5 +444,52 @@ void test("given_a_second_pass_over_the_same_turns_when_consolidated_then_should
   assert.deepEqual(
     appended.map((id) => id.toString()),
     ["7F2QS1XVSXGDJJPKXJTE739WP7"]
+  )
+})
+
+void test("given_view_rows_when_a_semantic_query_is_recalled_then_should_rank_every_row_by_overlap_plus_weight", async () => {
+  const conversation = ConversationId.derive("rank")
+  const row = (id: bigint, body: string, timestampMicros: bigint, weight?: number): KvEntry => ({
+    key: new TextEncoder().encode(MemoryId.fromU128(id).toString()),
+    value: new TextEncoder().encode(body),
+    version: 1n,
+    scope: {
+      kind: "fact",
+      user: "ana",
+      conversation: conversation.toString(),
+      timestampMicros,
+      ...(weight === undefined ? {} : { weight })
+    }
+  })
+  const rows = [
+    row(1n, "the user is allergic to peanuts", 10n),
+    row(2n, "green tea every morning", 20n),
+    row(3n, "the user lives in Lisbon", 30n),
+    row(4n, "black coffee", 5n, 0.5)
+  ]
+  const page = { items: rows, page: 1, totalPages: 1, totalResults: 4 }
+  const query = { semantic: "which city does the user live in" }
+
+  const ranked = await memory([page]).handle.recall({ user: "ana" }, { ...query, limit: 3 })
+  const keyword = await memory([page]).handle.recall(
+    { user: "ana" },
+    { ...query, strategy: RecallStrategy.Keyword }
+  )
+
+  assert.deepEqual(
+    ranked.map((item) => [new TextDecoder().decode(item.payload), item.score]),
+    [
+      ["black coffee", 0.5],
+      ["the user lives in Lisbon", 3 / 7],
+      ["the user is allergic to peanuts", 2 / 7]
+    ]
+  )
+  assert.deepEqual(ranked[0]?.signals, [
+    { strategy: RecallStrategy.Keyword, rank: 0, score: 0 },
+    { strategy: RecallStrategy.Auto, rank: 0, score: 0.5 }
+  ])
+  assert.deepEqual(
+    keyword.map((item) => new TextDecoder().decode(item.payload)),
+    ["the user lives in Lisbon", "the user is allergic to peanuts"]
   )
 })

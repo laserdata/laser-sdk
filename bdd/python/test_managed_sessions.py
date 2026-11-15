@@ -45,6 +45,12 @@ def _managed(world):
     return world.managed
 
 
+def _admin_endpoint(world):
+    # The lane fixtures administer streams and users as the server's root,
+    # like the Rust runner, so the scenarios themselves can run as any login.
+    return "iggy:iggy@" + world.endpoint.rsplit("@", 1)[1]
+
+
 def _eventually(world, read, description, show=lambda: ""):
     # Waiting runs the loop, so an agent spawned on it keeps handling records.
     deadline = time.monotonic() + CONVERGE_SECS
@@ -83,7 +89,7 @@ def _stream(world, layout=None, heartbeat_ms=None):
         [
             "node",
             str(SCENARIOS.parent / "session-lane-admin.mjs"),
-            world.endpoint,
+            _admin_endpoint(world),
             stream,
             "readiness",
             "4",
@@ -1023,7 +1029,7 @@ def change_lane_source(world, change):
         [
             "node",
             str(helper),
-            world.endpoint,
+            _admin_endpoint(world),
             world.session.stream,
             change,
             str(count),
@@ -1098,7 +1104,7 @@ def _lane_record_count(world):
         [
             "node",
             str(SCENARIOS.parent / "session-lane-admin.mjs"),
-            world.endpoint,
+            _admin_endpoint(world),
             world.session.stream,
             "record count",
             "1",
@@ -1206,7 +1212,7 @@ def _stream_created_at(world):
         [
             "node",
             str(SCENARIOS.parent / "session-lane-admin.mjs"),
-            world.endpoint,
+            _admin_endpoint(world),
             world.session.stream,
             "stream created at",
             "1",
@@ -1248,7 +1254,7 @@ def native_lane_writer(world):
         [
             "node",
             str(SCENARIOS.parent / "session-lane-admin.mjs"),
-            world.endpoint,
+            _admin_endpoint(world),
             stream,
             "writer credentials",
             "4",

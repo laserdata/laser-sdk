@@ -493,12 +493,12 @@ async def test_given_a_semantic_recall_when_reading_signals_then_should_report_r
     assert items[0].signals == items[0].signals
 
 
-async def test_given_block_when_recalling_then_should_render_the_context_block():
+async def test_given_recall_block_when_recalling_then_should_render_the_context_block():
     memory = ls.MemoryHandle.vector(bag_of_words(["auth"]))
     for body in ("auth one", "auth two"):
         await memory.remember(body)
     items = await memory.recall(strategy="recent")
-    block = await memory.recall(strategy="recent", block=True, token_budget=1)
+    block = await memory.recall_block(strategy="recent", token_budget=1)
     assert block == ls.to_context_block(items, token_budget=1)
     assert block.startswith(items[0].text())
 

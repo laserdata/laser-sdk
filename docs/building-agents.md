@@ -1,6 +1,6 @@
 # Building agentic apps
 
-This guide builds a support-triage workflow, then maps related application tasks to SDK calls. Start with the [tutorial](tutorial.md) for individual operations. Read the [AGDX notes](agdx.md) for the data contract. The snippets use Rust, the reference SDK. The [three-language guides](https://docs.laserdata.cloud/laser-sdk) show each feature in TypeScript, Rust, and Python, and the [parity matrix](parity.md) maps every Rust call to its Python and TypeScript spelling.
+This guide builds a support-triage workflow, then maps related application tasks to SDK calls. Start with the [tutorial](tutorial.md) for individual operations, or copy one of the two complete programs at the top of the [repository README](../README.md#two-complete-programs): a three-step workflow and a memory correction, each in TypeScript, Rust, and Python. Read the [AGDX notes](agdx.md) for the data contract. The snippets use Rust, the reference SDK, and the session chapter also shows Python. The [three-language guides](https://docs.laserdata.com/laser-sdk) show each feature in TypeScript, Rust, and Python, and the [parity matrix](parity.md) maps every Rust call to its Python and TypeScript spelling.
 
 Applications append records to topics and read them by offset. Memory, state, and queryable views derive from these records. Agents use the same log to coordinate and retain history.
 
@@ -25,7 +25,10 @@ All append, consume, reliable-agent, AGDX, cursor, and folded log-memory code ru
 | Look up structured facts | the query surface | `laser.query("readings").where_eq(..).fetch_typed::<Reading>().await?`, or `.raw_sql(SqlDialect::Sqlite, ..)` |
 | Reason over how things connect | the graph | `laser.graph("services").neighbors(node, EdgeDir::Out, None, 2).await?` |
 | Remember and recall | memory | `laser.memory("support").remember(fact).scope(c).dedup().send().await?` / `.recall(c).semantic(q).fetch()`, a vector handle built from a governed `Laser` applies the same pre-write policy locally |
+| Correct a remembered fact | memory supersede | `laser.memory("support").supersede(old_id, fact).user(u).send().await?` remembers the new fact, then forgets the old one in every conversation |
 | Keep named working state | memory named items | `laser.memory("session").set("plan", json).await?` / `.fetch("plan")` |
+| Run steps in order, resumably | a workflow | `laser.workflow("triage").step_local("classify", run).step("resolve", Router::to(agent), build).after("classify").run().await?`, a local step runs in this process and a routed one goes to an agent |
+| Work in a stream that lives for one run | a scratch stream | `let scratch = laser.scratch_stream("triage").await?`, work through `scratch.laser()`, then `scratch.delete().await?` |
 | Pause for a human, then resume | the human-input gate | `ctx.approval_gate(approver, reply, prompt, timeout).await?` returns an `ApprovalGrant`, an approver that lists `input_request` among its operations replies with `ctx.respond_input(..)` |
 | Move a task through its lifecycle | the session lifecycle | `session.end()`, `fail(error)`, or `cancel()`, and responses carry `TaskState` (`Working`, `InputRequired`, `Completed`, `Failed`) |
 | Survive a crash mid-flow | replay + idempotency | `ConversationState::load(.., ReplayBound::Full, ..)`, and commit offsets only after the effect's key |
@@ -161,7 +164,7 @@ Agent::builder()
 
 ## Each ticket is a session
 
-A session is one conversation with a recorded lifecycle. Its id is the conversation id, so every existing conversation read finds it. Bootstrap the agent topics once with a retention for `agent.sessions`, then open one session per ticket. The label derives a stable id, so the same ticket always reaches the same session.
+A session is one conversation with a recorded lifecycle. Its id is the conversation id, so every existing conversation read finds it. Bootstrap the agent topics once, then open one session per ticket. `bootstrap` keeps records for one day by default (`TopicRetention::default()`, Python `retention=None`), so pass a longer retention when tickets must outlive that. The label derives a stable id, so the same ticket always reaches the same session.
 
 ```rust
 let sessions = laser.sessions();
@@ -193,6 +196,21 @@ session
     .await?;
 ```
 
+In Python the session is an async context manager. `async with` begins it, ends it when the block finishes, and fails it with the exception type and traceback when the block raises:
+
+```python
+import laser_sdk as ls
+
+sessions = laser.sessions()
+await sessions.bootstrap(4, ls.TopicRetention.expire_after(7 * 86_400_000))
+async with sessions.create(f"ticket-{ticket_id}").agent("classifier") as session:
+    assembled = await session.assemble(ls.LastN(20))
+    call = await session.model(ls.ModelRequest("gpt-4o", assembled.text()), assembled)
+    answer = await llm.complete(assembled.text())
+    await call.complete(ls.ModelResponse(answer))
+    await session.state().set("category", "infra")
+```
+
 The SDK never calls a model. `assemble` selects from the conversation records of the session, the user, agent, tool, and model response records, and leaves out lifecycle, state, and the model requests the session recorded, so the prompt built from `assembled.text()` never contains an earlier prompt and stays the size of the last 20 turns. `text()` joins the record bodies, not the encoded envelopes. `model` records the request and the context manifest, the application calls its provider, and `complete` records the answer with its usage. `tool(name, args)` records a tool call the same way, with secret-looking argument values redacted. `state()` keeps a JSON document per session as patches on the lane.
 
 A client can also hand a ticket to an agent. `submit` writes a submitted session and a command addressed to the agent. The agent's reliable consumer marks the session working when it picks the command up, and the handler reaches the session through `ctx.session()`.
@@ -206,6 +224,18 @@ let submitted = laser
     .send()
     .await?;
 ```
+
+```python
+submitted = await (
+    laser.sessions()
+    .submit("classifier", ticket_json)
+    .from_("intake")
+    .label(f"ticket-{ticket_id}")
+    .send()
+)
+```
+
+A later process reopens the same session by its id with `laser.sessions().open(id)` (Python the same), reads its state with `session.state().get()`, and writes as an agent after `as_agent(id)`.
 
 Inside the handler, `ctx.session().end().await?` completes it. To freeze a ticket while a human reviews it, an operator calls `laser.sessions().control(stream, id).as_operator(op).pause()`. Agents finish the action in flight, hold any new work for that session, and handle it after `resume()`. A handler can check `ctx.session().pending_control()` at its own boundaries. An operator cancels a stuck ticket with `laser.sessions().control(stream, id).as_operator(op).cancel()`, which writes on `agent.control`. Workflows use the same model: a run is a root session and each step is a child session. On a deployment with the managed session index, `laser.sessions().list().status(SessionStatus::Active).fetch()` lists the open tickets, and `get(id)` reports each one's idle and `over_budget` flags. `ctx.session().over_budget()` gives the same answer on open Apache Iggy by folding the lane. On a deployment with the index, the runtime fails a session that passed its budget once, with reason `budget`, and commits its work without calling the handler. A workflow stops at the next step boundary with `LaserError::BudgetExceeded` and ends its run session failed with reason `budget`.
 

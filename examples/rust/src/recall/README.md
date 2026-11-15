@@ -21,5 +21,5 @@ just up && cargo run --example recall
 
 ## Learn more
 
-- Docs: https://docs.laserdata.cloud/laser-sdk/memory
+- Docs: https://docs.laserdata.com/laser-sdk/memory
 - Full system built on this primitive: [`memory`](../memory/README.md)

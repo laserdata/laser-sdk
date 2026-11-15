@@ -2436,7 +2436,7 @@ export const DEFAULT_MAX_BYTES: number;
 // @public
 export const DEFAULT_MAX_RECORDS = 512;
 
-// @public (undocumented)
+// @public
 export const DEFAULT_MEMORY_TOPIC_TTL_MS: number;
 
 // @public
@@ -4177,42 +4177,42 @@ export class KeyRegistry {
 
 // @public
 export class Kv {
-    casFenced(key: Uint8Array, fenceNamespace: string, fenceKey: Uint8Array, fenceToken: bigint): KvCasFencedRequest;
-    copyTo(key: Uint8Array, toKey: Uint8Array): KvCopyRequest;
+    casFenced(key: Uint8Array | string, fenceNamespace: string, fenceKey: Uint8Array | string, fenceToken: bigint): KvCasFencedRequest;
+    copyTo(key: Uint8Array | string, toKey: Uint8Array | string): KvCopyRequest;
     // (undocumented)
-    delete(key: Uint8Array, options?: CallOptions): Promise<boolean>;
-    deleteIfVersion(key: Uint8Array, version: bigint, options?: CallOptions): Promise<boolean>;
+    delete(key: Uint8Array | string, options?: CallOptions): Promise<boolean>;
+    deleteIfVersion(key: Uint8Array | string, version: bigint, options?: CallOptions): Promise<boolean>;
     deleteMany(): KvDeleteManyRequest;
     // (undocumented)
-    exists(key: Uint8Array, options?: CallOptions): Promise<KvMetadata | undefined>;
-    expire(key: Uint8Array, ttlMs?: number, options?: CallOptions): Promise<bigint>;
-    expireAt(key: Uint8Array, expiresAtMicros?: bigint, options?: CallOptions): Promise<bigint>;
+    exists(key: Uint8Array | string, options?: CallOptions): Promise<KvMetadata | undefined>;
+    expire(key: Uint8Array | string, ttlMs?: number, options?: CallOptions): Promise<bigint>;
+    expireAt(key: Uint8Array | string, expiresAtMicros?: bigint, options?: CallOptions): Promise<bigint>;
     // (undocumented)
-    get(key: Uint8Array, options?: CallOptions): Promise<Uint8Array | undefined>;
-    getAs<T>(key: Uint8Array, codec: Codec<T>, options?: CallOptions): Promise<T | undefined>;
+    get(key: Uint8Array | string, options?: CallOptions): Promise<Uint8Array | undefined>;
+    getAs<T>(key: Uint8Array | string, codec: Codec<T>, options?: CallOptions): Promise<T | undefined>;
     // (undocumented)
-    getEntry(key: Uint8Array, options?: CallOptions): Promise<KvEntry | undefined>;
-    getEntryAtLeast(key: Uint8Array, minPosition: MutationPosition, options?: CallOptions): Promise<KvEntry | undefined>;
-    getEntryIfChanged(key: Uint8Array, version: bigint, options?: CallOptions): Promise<KvRevalidation>;
-    getMany(keys: readonly Uint8Array[], options?: CallOptions): Promise<readonly (Uint8Array | undefined)[]>;
+    getEntry(key: Uint8Array | string, options?: CallOptions): Promise<KvEntry | undefined>;
+    getEntryAtLeast(key: Uint8Array | string, minPosition: MutationPosition, options?: CallOptions): Promise<KvEntry | undefined>;
+    getEntryIfChanged(key: Uint8Array | string, version: bigint, options?: CallOptions): Promise<KvRevalidation>;
+    getMany(keys: readonly (Uint8Array | string)[], options?: CallOptions): Promise<readonly (Uint8Array | undefined)[]>;
     // (undocumented)
-    getTyped<T>(key: Uint8Array, decodeValue: (value: unknown) => T, options?: CallOptions): Promise<T | undefined>;
+    getTyped<T>(key: Uint8Array | string, decodeValue: (value: unknown) => T, options?: CallOptions): Promise<T | undefined>;
     inSession(session: SessionRef): Kv;
-    lease(key: Uint8Array, holderId: string, ttlMs: number, options?: CallOptions): Promise<Lease>;
-    leaseGuard(key: Uint8Array, holderId: string, ttlMs: number, options?: CallOptions): Promise<LeaseGuard>;
+    lease(key: Uint8Array | string, holderId: string, ttlMs: number, options?: CallOptions): Promise<Lease>;
+    leaseGuard(key: Uint8Array | string, holderId: string, ttlMs: number, options?: CallOptions): Promise<LeaseGuard>;
     // (undocumented)
-    moveTo(key: Uint8Array, toKey: Uint8Array): KvCopyRequest;
+    moveTo(key: Uint8Array | string, toKey: Uint8Array | string): KvCopyRequest;
     get namespace(): string;
-    patch(key: Uint8Array, patch: Uint8Array, options?: CallOptions): Promise<bigint>;
-    patchIfVersion(key: Uint8Array, patch: Uint8Array, version: bigint, options?: CallOptions): Promise<bigint>;
-    release(key: Uint8Array, holderId: string, token: bigint, options?: CallOptions): Promise<boolean>;
-    renewLease(key: Uint8Array, holderId: string, token: bigint, ttlMs: number, options?: CallOptions): Promise<Lease>;
+    patch(key: Uint8Array | string, patch: Uint8Array, options?: CallOptions): Promise<bigint>;
+    patchIfVersion(key: Uint8Array | string, patch: Uint8Array, version: bigint, options?: CallOptions): Promise<bigint>;
+    release(key: Uint8Array | string, holderId: string, token: bigint, options?: CallOptions): Promise<boolean>;
+    renewLease(key: Uint8Array | string, holderId: string, token: bigint, ttlMs: number, options?: CallOptions): Promise<Lease>;
     readonly resourceNamespace: string;
     // (undocumented)
     scan(): KvScanRequest;
     session(): SessionRef | undefined;
-    set(key: Uint8Array): KvSetRequest;
-    tryLease(key: Uint8Array, holderId: string, ttlMs: number, options?: CallOptions): Promise<Lease | undefined>;
+    set(key: Uint8Array | string): KvSetRequest;
+    tryLease(key: Uint8Array | string, holderId: string, ttlMs: number, options?: CallOptions): Promise<Lease | undefined>;
 }
 
 // @public (undocumented)
@@ -4290,9 +4290,9 @@ export class KvDeleteManyRequest {
     // (undocumented)
     keyContains(substring: string): this;
     // (undocumented)
-    prefix(prefix: Uint8Array): this;
+    prefix(prefix: Uint8Array | string): this;
     // (undocumented)
-    range(start: Uint8Array, end: Uint8Array): this;
+    range(start: Uint8Array | string, end: Uint8Array | string): this;
     // (undocumented)
     send(options?: CallOptions): Promise<number>;
 }
@@ -4498,9 +4498,9 @@ export class KvScanRequest {
     keyContains(substring: string): this;
     page(page: number): this;
     // (undocumented)
-    prefix(prefix: Uint8Array): this;
+    prefix(prefix: Uint8Array | string): this;
     // (undocumented)
-    range(start: Uint8Array, end: Uint8Array): this;
+    range(start: Uint8Array | string, end: Uint8Array | string): this;
     results(results: number): this;
 }
 
@@ -4561,7 +4561,7 @@ export class Laser implements AsyncDisposable {
     // (undocumented)
     bindRoles(userId: number, roles: readonly string[], expectRevision?: bigint, options?: CallOptions): Promise<BindingsReply>;
     bindRolesAs(userId: number, roles: readonly string[], mutationId: string, expectRevision?: bigint, options?: CallOptions): Promise<BindingsReply>;
-    bootstrap(partitions: number, retention: TopicRetention, options?: CallOptions): Promise<void>;
+    bootstrap(partitions?: number, retention?: TopicRetention, options?: CallOptions): Promise<void>;
     // (undocumented)
     static builder(): LaserBuilder;
     // (undocumented)
@@ -4670,6 +4670,7 @@ export class Laser implements AsyncDisposable {
     scatterReport(source: AgentId, selector: CapabilitySelector, payload: BytesLike, inboxRoute: InboxRoute, policy: GatherPolicy, deadlineMs: number, options?: CallOptions): Promise<ScatterReport>;
     // (undocumented)
     schemas(): Schemas;
+    scratchStream(prefix: string, options?: CallOptions): Promise<ScratchStream>;
     seenPositions(): AppliedFrontier;
     // (undocumented)
     sendAgent(topic: string, payload: BytesLike, provenance: Provenance, options?: CallOptions & {
@@ -5279,11 +5280,10 @@ export function memoryClass(kind: MemoryKind): MemoryClass;
 // @public (undocumented)
 export class MemoryHandle implements Memory {
     // (undocumented)
-    append(scope: MemoryScope, id: MemoryId, kind: MemoryKind, payload: Uint8Array, options?: CallOptions): Promise<MemoryId>;
+    append(scope: MemoryScope, id: MemoryId, kind: MemoryKind, payload: Uint8Array | string, options?: CallOptions): Promise<MemoryId>;
     get backend(): MemoryBackendKind;
     consolidate(scope: MemoryScope, maxItems: number, options?: ConsolidateOptions): Promise<ConsolidationReport>;
-    // (undocumented)
-    context(scope: MemoryScope, query?: MemoryQuery, options?: CallOptions): Promise<string>;
+    context(conversation: ConversationId, tokenBudget?: number, options?: CallOptions): Promise<string>;
     embedder(embedder: Embedder): MemoryHandle;
     fetch(key: string, options?: CallOptions): Promise<Uint8Array | undefined>;
     fetchFolded(key: string, options?: CallOptions): Promise<Uint8Array | undefined>;
@@ -5293,15 +5293,15 @@ export class MemoryHandle implements Memory {
     // (undocumented)
     recall(scope: MemoryScope, query: MemoryQuery, options?: CallOptions): Promise<readonly MemoryItem[]>;
     recallFolded(scope: MemoryScope, query: MemoryQuery, options?: CallOptions): Promise<readonly MemoryItem[]>;
+    remember(payload: Uint8Array | string): RememberBuilder;
     // (undocumented)
-    remember(payload: Uint8Array): RememberBuilder;
-    // (undocumented)
-    remember(scope: MemoryScope, payload: Uint8Array, options?: CallOptions): Promise<MemoryId>;
+    remember(scope: MemoryScope, payload: Uint8Array | string, options?: CallOptions): Promise<MemoryId>;
     remove(key: string, options?: CallOptions): Promise<void>;
     // (undocumented)
     reranker(reranker: Reranker): MemoryHandle;
-    set(key: string, payload: Uint8Array, options?: CallOptions): Promise<void>;
-    update(key: string, patch: Uint8Array, options?: CallOptions): Promise<void>;
+    set(key: string, payload: Uint8Array | string, options?: CallOptions): Promise<void>;
+    supersede(oldId: MemoryId | string, payload: Uint8Array | string): SupersedeBuilder;
+    update(key: string, patch: Uint8Array | string, options?: CallOptions): Promise<void>;
     static vector(embedder: Embedder): MemoryHandle;
 }
 
@@ -5721,6 +5721,9 @@ export class NoRespondTopicError extends ConfigError {
 
 // @public
 export class NoStreamError extends ConfigError {
+    constructor(fact?: string, options?: {
+        cause?: unknown;
+    });
     // (undocumented)
     readonly kind: LaserErrorKind;
 }
@@ -7597,12 +7600,21 @@ export class ScopedMemory {
     // (undocumented)
     recall(): RecallBuilder;
     // (undocumented)
-    remember(payload: Uint8Array): RememberBuilder;
+    remember(payload: Uint8Array | string): RememberBuilder;
     search(query: string, options?: CallOptions & {
         readonly limit?: number;
         readonly folded?: boolean;
     }): Promise<readonly MemoryItem[]>;
     withLineage(origin?: SourceRef, producer?: ProducerInfo): ScopedMemory;
+}
+
+// @public
+export class ScratchStream implements AsyncDisposable {
+    // (undocumented)
+    [Symbol.asyncDispose](): Promise<void>;
+    delete(options?: CallOptions): Promise<void>;
+    readonly laser: Laser;
+    readonly name: string;
 }
 
 // @public (undocumented)
@@ -7721,7 +7733,8 @@ export class Session {
     kv(namespace: string): Kv;
     linkedGraph(name: string): GraphHandle;
     linkedMemory(): ScopedMemory;
-    memory(namespace?: string): ScopedMemory;
+    memory(): ScopedMemory;
+    memoryIn(namespace: string): ScopedMemory;
     model(request: ModelRequest, assembled?: AssembledContext, options?: CallOptions): Promise<ModelCall>;
     overBudget(options?: CallOptions): Promise<boolean>;
     get parent(): ConversationId | undefined;
@@ -8132,7 +8145,7 @@ export interface SessionRef {
 
 // @public
 export class Sessions {
-    bootstrap(partitions: number, retention: TopicRetention, options?: CallOptions): Promise<SessionBootstrap>;
+    bootstrap(partitions?: number, retention?: TopicRetention, options?: CallOptions): Promise<SessionBootstrap>;
     changes(page: number, results: number, options?: CallOptions): Promise<SessionChangesView>;
     // (undocumented)
     readonly config: SessionConfig;
@@ -8436,20 +8449,24 @@ export interface StepContext {
 
 // @public
 export class StepFailedError extends LaserError {
-    constructor(run: string, step: string, reason: StepFailure);
+    constructor(run: string, step: string, reason: StepFailure, target: string, deadlineMs: number);
+    // (undocumented)
+    readonly deadlineMs: number;
     // (undocumented)
     readonly reason: StepFailure;
     // (undocumented)
     readonly run: string;
     // (undocumented)
     readonly step: string;
+    // (undocumented)
+    readonly target: string;
 }
 
 // @public
 export type StepFailure = "timed_out" | "failed" | "not_consumed" | "unverified" | "no_completion";
 
-// @public (undocumented)
-export type StepFn = (context: StepContext) => BytesLike | Promise<BytesLike>;
+// @public
+export type StepFn = (context: StepContext) => BytesLike | string | Promise<BytesLike | string>;
 
 // @public (undocumented)
 export class StepHandle {
@@ -8476,6 +8493,8 @@ export class StepHandle {
     runId(runId: ConversationId): this;
     // (undocumented)
     step(label: string, target: Router, build: StepFn): StepHandle;
+    // (undocumented)
+    stepLocal(label: string, run: StepFn): StepHandle;
     // (undocumented)
     verifyWith(verifier: Verifier): this;
 }
@@ -8585,6 +8604,28 @@ export interface Submitted {
 export interface Summarizer {
     // (undocumented)
     summarize(bodies: readonly Uint8Array[]): Promise<Uint8Array>;
+}
+
+// @public
+export class SupersedeBuilder {
+    // (undocumented)
+    agent(agent: AgentId): this;
+    // (undocumented)
+    application(application: string): this;
+    // (undocumented)
+    dedup(): this;
+    // (undocumented)
+    durable(): this;
+    // (undocumented)
+    kind(kind: MemoryKind): this;
+    origin(origin: SourceRef): this;
+    producer(producer: ProducerInfo): this;
+    scope(conversation: ConversationId): this;
+    send(options?: CallOptions): Promise<MemoryId>;
+    // (undocumented)
+    stream(stream: string): this;
+    // (undocumented)
+    user(user: string): this;
 }
 
 // @public (undocumented)
@@ -9345,6 +9386,7 @@ export class Workflow {
     runId(runId: ConversationId): this;
     // (undocumented)
     step(label: string, target: Router, build: StepFn): StepHandle;
+    stepLocal(label: string, run: StepFn): StepHandle;
 }
 
 // @public (undocumented)
@@ -9362,12 +9404,17 @@ export class WorkflowBudget {
     wallClock(wallClockMs: number): WorkflowBudget;
 }
 
-// @public (undocumented)
+// @public
 export interface WorkflowOutcome {
+    // (undocumented)
+    readonly completedSteps: readonly string[];
     // (undocumented)
     readonly outputs: ReadonlyMap<string, Uint8Array>;
     // (undocumented)
     readonly runId: ConversationId;
+    // (undocumented)
+    readonly status: SessionStatus;
+    text(label: string): string | undefined;
 }
 
 // (No @packageDocumentation comment for this package)

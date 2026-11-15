@@ -31,6 +31,7 @@ mod encryption;
 pub(crate) mod producer_statistics;
 mod publish;
 mod record;
+mod scratch;
 mod sharding;
 pub(crate) mod transport;
 
@@ -40,6 +41,7 @@ pub use consumer_group::{ConsumerGroup, ConsumerGroupInfo, CreateConsumerGroup, 
 pub use encryption::Encryption;
 pub use publish::{BatchPublishRequest, PublishRequest};
 pub use record::{Record, RecordBuilder};
+pub use scratch::ScratchStream;
 pub use sharding::ShardRequest;
 pub use transport::{
     CommitPolicy, Consumer, ConsumerBuilder, ConsumerMessage, ConsumerStart, Headers, Producer,

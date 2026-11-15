@@ -21,5 +21,5 @@ npm run example:agent
 
 ## Learn more
 
-- Docs: https://docs.laserdata.cloud/laser-sdk/fabric
+- Docs: https://docs.laserdata.com/laser-sdk/fabric
 - Full system built on this primitive: [`orchestra`](../orchestra): discovery, contracts, scatter/gather, workflows, and quarantine in one durable orchestration.

@@ -54,9 +54,14 @@ mod workflow;
 
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
+use pyo3_async_runtimes::tokio as async_runtime;
 use pyo3_stub_gen::define_stub_info_gatherer;
+use tokio::runtime::Builder;
 
 pub use errors::exception_stub;
+
+// A debug build overflows Tokio's 2 MiB worker stack on a routed workflow compensation.
+const RUNTIME_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 // The Iggy producer warns that its client has been shut down whenever a Laser
 // closes, because every cached producer watches the client it publishes
@@ -113,7 +118,13 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     // diagnostics land on the `laser_sdk` logger a host app already configures
     // instead of on stderr. Best effort: a second import must not fail the module.
     let _ = install_logger();
+    let mut runtime = Builder::new_multi_thread();
+    runtime
+        .enable_all()
+        .thread_stack_size(RUNTIME_THREAD_STACK_BYTES);
+    async_runtime::init(runtime);
     errors::register(py, module)?;
+    module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     client::register_constants(module)?;
     module.add_class::<client::PyLaser>()?;
     module.add_class::<client::PyCapabilities>()?;
@@ -261,6 +272,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<kv::PyKvPage>()?;
     module.add_class::<kv::PyKvRevalidation>()?;
     module.add_class::<stream::PyStream>()?;
+    module.add_class::<stream::PyScratchStream>()?;
     module.add_class::<stream::PyTopic>()?;
     module.add_class::<admin::PyStreamInfo>()?;
     module.add_class::<admin::PyTopicInfo>()?;

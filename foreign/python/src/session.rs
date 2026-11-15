@@ -6,7 +6,7 @@ use crate::context::{
 };
 use crate::convert::py_to_de;
 use crate::errors::{InvalidError, to_pyerr};
-use crate::memory::{Backend, PyMemory};
+use crate::memory::Backend;
 use laser_sdk::agent::{
     Session, SessionBuilder, SessionConfig, SessionLayout, SessionLease, SessionPolicy,
     SessionTurn, Sessions, TopicRetention,
@@ -343,14 +343,16 @@ impl PySessions {
 
     /// Create the agent topics, then register the stream as a session source
     /// when the deployment serves sessions. Returns whether it registered.
+    /// `retention` bounds `agent.sessions`, by default one day.
+    #[pyo3(signature = (partitions=1, retention=None))]
     fn bootstrap<'py>(
         &self,
         py: Python<'py>,
         partitions: u32,
-        retention: &PyTopicRetention,
+        retention: Option<&PyTopicRetention>,
     ) -> PyResult<Awaitable<'py, PySessionBootstrap>> {
         let sessions = self.inner.clone();
-        let retention = retention.inner;
+        let retention = retention.map_or_else(TopicRetention::default, |retention| retention.inner);
         awaitable(py, async move {
             let bootstrap = sessions
                 .bootstrap(partitions, retention)
@@ -938,20 +940,18 @@ impl PySession {
         crate::graph::PyGraph::new(self.inner.scope().laser().clone(), name)
     }
 
-    /// This session's memory, scoped to the session: `memory` defaults to
-    /// `laser.memory(<configured namespace>)`, or pass any memory handle.
-    #[pyo3(signature = (memory=None))]
-    fn memory(&self, memory: Option<&PyMemory>) -> PyScopedMemory {
-        let backend = match memory {
-            Some(memory) => memory.backend(),
-            None => Backend::new(
+    /// This session's memory in the configured namespace, scoped to the
+    /// session. `memory_in` opens another namespace.
+    fn memory(&self) -> PyScopedMemory {
+        PyScopedMemory::new(
+            Backend::new(
                 self.inner
                     .scope()
                     .laser()
                     .memory(self.inner.config().memory_namespace_name()),
             ),
-        };
-        PyScopedMemory::new(backend, self.inner.conversation())
+            self.inner.conversation(),
+        )
     }
 
     /// This session's memory in an explicit `namespace`, scoped to the session.

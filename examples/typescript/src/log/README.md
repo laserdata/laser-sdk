@@ -26,5 +26,5 @@ LASER_CONNECTION_STRING=user:pwd@your-host npm run example:log
 
 ## Learn more
 
-- Docs: https://docs.laserdata.cloud/laser-sdk/log
+- Docs: https://docs.laserdata.com/laser-sdk/log
 - Full system built on this primitive: [`native-streaming`](../native-streaming): the same log, wired into producers, batches, and consumer groups.
