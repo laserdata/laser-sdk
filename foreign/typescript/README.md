@@ -2,13 +2,13 @@
 
 This package provides the native TypeScript Laser SDK for Apache Iggy. [LaserData, Inc.](https://laserdata.com) maintains it. One connection supports streaming and managed operations for queries, state, forks, graphs, and agents.
 
-This prerelease targets Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
+This package needs Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
 > This source tree is the `0.10.2` release. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 ## Start here
 
-Install the package with `npm install @laserdata/laser-sdk`, set `LASER_CONNECTION_STRING`, and run either program as an ES module. Each one creates a scratch stream with a unique name, prints its result as JSON, and deletes the stream when it ends.
+In a new directory, run `npm init -y && npm pkg set type=module && npm install @laserdata/laser-sdk tsx`, set `LASER_CONNECTION_STRING`, save either program as `main.ts`, and run it with `npx tsx main.ts`. The programs use top-level `await`, so the project must be an ES module. Each one creates a scratch stream with a unique name, prints its result as JSON, and deletes the stream when it ends.
 
 A durable workflow of three steps whose bodies run in this process. The run journals every completed step and creates the agent topics it needs, so it needs no `bootstrap`, agent, or handler. `.runId(outcome.runId)` on the same workflow resumes the run and skips every recorded step:
 
@@ -67,7 +67,7 @@ Both programs run against plain Apache Iggy, Laser Stack, and LaserData Cloud: a
 npm install @laserdata/laser-sdk
 ```
 
-The package is ESM-first. A CommonJS application can load it with dynamic `import()`.
+The package is ESM-first. A CommonJS application can load it with dynamic `import()`. A new project that runs the programs on this page as written needs the setup line under [Start here](#start-here).
 
 ## Connect and stream
 

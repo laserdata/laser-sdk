@@ -6,7 +6,7 @@ Laser SDK provides streaming, queries, key-value state, forks, graphs, agent mem
 
 Each program below runs as written. It reads the connection string from `LASER_CONNECTION_STRING` with `connect_env` (`connectEnv` in TypeScript), creates a scratch stream with a unique name, and deletes the stream when it ends. A LaserData API key is not a connection string. Copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it.
 
-- TypeScript: `npm install @laserdata/laser-sdk`, Node 22.14 or later, in an ES module.
+- TypeScript: `npm init -y && npm pkg set type=module && npm install @laserdata/laser-sdk tsx`, Node 22.14 or later. The programs use top-level `await`, so the project must be an ES module. Save a program as `main.ts` and run it with `npx tsx main.ts`.
 - Rust: `cargo add laser-sdk --features agent,kv`, `cargo add tokio --features macros,rt-multi-thread`, `cargo add serde --features derive`, and `cargo add serde_json`.
 - Python: `pip install laser-sdk`, Python 3.10 or later.
 
@@ -264,7 +264,7 @@ The examples below publish one record and read it back. Like the programs above,
 TypeScript ([npm](https://www.npmjs.com/package/@laserdata/laser-sdk))
 
 ```sh
-npm install @laserdata/laser-sdk
+npm init -y && npm pkg set type=module && npm install @laserdata/laser-sdk tsx
 ```
 
 ```ts
