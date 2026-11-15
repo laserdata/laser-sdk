@@ -216,7 +216,10 @@ sdk/src/
                       matching PublishRequest/BatchPublishRequest), all returning Iggy's
                       SendMessagesResponse commit positions, replay() -> Cursor,
                       ensure(partitions, replication_factor), producer/consumer/consumer_group, plus the raw
-                      iggy_producer/iggy_consumer/iggy_consumer_group escape hatch)
+                      iggy_producer/iggy_consumer/iggy_consumer_group escape hatch).
+                      stream/scratch.rs: Laser::scratch_stream(prefix) -> ScratchStream, a
+                      `{prefix}-<8 hex>` stream created for one run, deleted by delete() (and
+                      on drop, best effort)
                       Iggy provides the VSR transport. Standard Iggy commands and managed reads use the
                       non-replicated extension path, and authorization writes use dedicated
                       replicated operations
@@ -271,7 +274,15 @@ sdk/src/
                       and vector writes through the enrolled governor over the item body.
                       MemoryHandle::vector(embedder) builds a standalone vector handle with no
                       connection. RememberBuilder and RecallBuilder take user/application, and
-                      RecallBuilder::block renders a token-budgeted prompt block
+                      RecallBuilder::block renders a token-budgeted prompt block.
+                      MemoryHandle::supersede(old_id, payload) -> SupersedeBuilder remembers the
+                      correction, then forgets the old id in every conversation. Log memory
+                      ranks semantic, hybrid and auto text queries by word overlap plus
+                      feedback and drops nothing, keyword stays a filter. A default recall
+                      waits for the view to show this connection's own writes (OwnWrites in
+                      LaserInner, 10 s bound, then LaserError::Timeout), and folds the topic
+                      when the deployment serves no key-value view. The first write to a
+                      missing memory stream or topic creates it
   govern.rs           ActionGovernor pre-effect policy hook (feature = "agent"): decide before
                       agent sends / AGDX verbs / typed publishes / memory writes,
                       allow|observe|block|step_up|
@@ -342,6 +353,8 @@ sdk/src/
     clock.rs          Clock seam: SystemClock (real time) + TestClock (deterministic, advance/set),
                       the SLA-timer and deadline-check seam a test drives without sleeping
     laser.rs          Laser facade: bootstrap(partitions, TopicRetention) creating agent.sessions,
+                      (TopicRetention::default() keeps records one day, Python and TypeScript
+                      default to one partition and that retention),
                       agent.heartbeats and the satellites (never agent.control), send_agent,
                       request/reply, producer cache, spawn_subconversation, capabilities
     partitioning.rs   send-boundary partition routing from the declared SessionLayout: a command
@@ -377,7 +390,11 @@ sdk/src/
                       directed-task state machine, ContractBuilder::parent(parent, root) runs it as
                       a child session. Laser::scatter + scatter_report (per-agent ScatterReport)
     workflow.rs       Laser::workflow -> the engine: topo-ordered steps, budgets, verifier panels,
-                      saga compensation, journal/replay/resume, all_capable scatter, fenced steps.
+                      saga compensation, journal/replay/resume, all_capable scatter, fenced steps,
+                      step_local steps whose body runs in process (journaled, no child session).
+                      A run whose stream lacks agent.sessions or agent.workflow_journal bootstraps
+                      it with the defaults. WorkflowOutcome holds outputs, run_id,
+                      completed_steps (completion order), status (SessionStatus) and text(label).
                       The run is a root session (id = run id), steps and compensations are child
                       sessions, and a cancel on agent.control, then the run's over_budget, is
                       checked at every step boundary
@@ -494,7 +511,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-This inventory describes the `0.10.1` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.10.2` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
 Capabilities identify managed support such as queries, key-value, forks, graphs, and an A2A gateway, plus native consumer filters served by the streaming server. Every capability flag maps to a hello feature bit or an op version. Memory combines query and graph operations and has no separate managed command group.
 
@@ -541,7 +558,7 @@ Multi-agent orchestration, all conventions over the log (client-side state machi
 - `Laser::publish_card` records capabilities, and `AgentPresence` uses `set_client_metadata` for live discovery. `AgentRegistry` combines both and excludes unhealthy or quarantined agents. `Laser::quarantine` and `unquarantine` record reversible changes. Their signed variants require valid signatures. `Laser::agent_registry` caches state per stream and resumes from saved offsets.
 - Routing: `Router::{To,Broadcast,ToCapable,AllCapable}` + `InboxRoute::{Advertised,Fixed}`, resolving to an advertised inbox (live presence, else the card's `inbox`, the only source on Apache Iggy), never a hard-coded shared topic. A named route to a quarantined agent fails with `LaserError::Quarantined`.
 - `Laser::contract` reports `Contract::{Completed,Failed,NotConsumed,TimedOut}` and optional pickup `Working` status, awaited on the shared reply dispatcher, and every command carries its completion deadline as `deadline_micros`. `AgentCtx::fan_out` and `Laser::scatter`/`scatter_report` take a `GatherPolicy::{RequireAll,Quorum,BestEffort}`, refuse `Quorum(0)`, and report the cancelled branches and whether the policy was `satisfied`. `AgentCtx::approval_gate(approver, ..)` waits for that approver's decision and returns an `ApprovalGrant` that `AgdxSend::with_grant` carries through a governor step-up. A configured verifier checks reply signatures before accepting completion.
-- `Laser::workflow` runs dependency-ordered steps with `WorkflowBudget`, `verify_with`, `compensate_with`, a per-step `deadline` (30 s default), replay of the whole run journal, and `all_capable` dispatch. A step that does not complete is `LaserError::StepFailed { run, step, reason }`, retryable only when it timed out, and a journal retention shortened is `LaserError::JournalTruncated`. A resumed run never runs a recorded step again and finds the reply of a step dispatched before it stopped. `.exclusive()` acquires a fenced lease through `Kv::lease` and requires `KV_FENCED_LEASES`, waiting out a crashed holder's 15 s lease inside the step deadline. Renewal stays bounded by the lease's `valid_until` and the workflow deadline. The lease covers verification and the completion journal write. `StepHandle::on_timeout(OnTimeout::Reassign)` can then reacquire under a new fence. The handler protects external state through its own `Kv::cas_fenced` commit.
+- `Laser::workflow` runs dependency-ordered steps with `WorkflowBudget`, `verify_with`, `compensate_with`, a per-step `deadline` (30 s default), replay of the whole run journal, and `all_capable` dispatch. `step_local(label, run)` (Python `step(label, run=)`, TypeScript `stepLocal`) runs the step body in process: journaled as a completion, resumable by run id, compensated in process, never exclusive. A run on a stream without its topics bootstraps them with the defaults, so local steps need no agent. `WorkflowOutcome` carries `completed_steps` in completion order, `status` (`completed` for every returned outcome) and `text(label)`. A step that does not complete is `LaserError::StepFailed { run, step, reason, target, deadline_ms }`, retryable only when it timed out (its text then names the target and the deadline), and a journal retention shortened is `LaserError::JournalTruncated`. A resumed run never runs a recorded step again and finds the reply of a step dispatched before it stopped. `.exclusive()` acquires a fenced lease through `Kv::lease` and requires `KV_FENCED_LEASES`, waiting out a crashed holder's 15 s lease inside the step deadline. Renewal stays bounded by the lease's `valid_until` and the workflow deadline. The lease covers verification and the completion journal write. `StepHandle::on_timeout(OnTimeout::Reassign)` can then reacquire under a new fence. The handler protects external state through its own `Kv::cas_fenced` commit.
 - Bound in Python and TypeScript (contracts with `expire_if_not_consumed`, `reply_on`, `conversation`, `fence`, `parent`/`root`, and named-agent routing, `scatter`, quarantine, the agent registry, `Laser.agent(id)`, `spawn_agent` capabilities/ack_on_pickup/health, `AgentCtx.fan_out`/`approval_gate`, and the `agent_message`/`agent_ctx` handler-test seam), matched by the `orchestra` example in all three languages.
 
 Still planned, not present:

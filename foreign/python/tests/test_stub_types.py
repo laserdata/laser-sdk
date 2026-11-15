@@ -189,3 +189,13 @@ def test_given_connection_events_when_typed_then_should_iterate_the_shared_event
         + literal(("connected", "disconnected", "signed_in", "signed_out", "shutdown"))
         + "]"
     )
+
+
+def test_given_the_stub_when_read_then_should_type_recall_outputs_and_the_version():
+    stub = STUB.read_text()
+    assert "def recall(self, *, limit: builtins.int = 50" in stub
+    assert "-> typing.Awaitable[builtins.list[MemoryItem]]:" in stub
+    assert "def recall_block(" in stub
+    assert "def outputs(self) -> dict[builtins.str, builtins.bytes]:" in stub
+    assert "\n__version__: builtins.str\n" in stub
+    assert ls.__version__ == "0.10.2"

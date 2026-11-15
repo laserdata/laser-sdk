@@ -18,7 +18,7 @@ on Apache Iggy without a managed backend.
 Run it:
     LASER_CONNECTION_STRING=user:pwd@your-host python3 kv.py
 
-Docs: https://docs.laserdata.cloud/laser-sdk/state
+Docs: https://docs.laserdata.com/laser-sdk/state
 Full scenario: incident_desk.py (compare-and-swap ledgers and a speculative fork under load)
 """
 

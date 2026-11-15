@@ -1,5 +1,5 @@
 import { breachError, exceededBreach } from "./budget.js"
-import { ownedBytes, type BytesLike } from "../client/bytes.js"
+import { decodeUtf8, ownedBytes, utf8, type BytesLike } from "../client/bytes.js"
 import { throwIfAborted } from "../client/call-options.js"
 import {
   BudgetExceededError,
@@ -17,9 +17,10 @@ import { LastN, replayContext } from "../context.js"
 import { LeaseGuard, type Lease } from "../managed/kv.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
 import { warn } from "../runtime/warn.js"
-import type { Session } from "../session.js"
+import { type Session, isMissingLane } from "../session.js"
+import type { SessionLease } from "./lease.js"
 import { AgentId, ConversationId } from "../types/ids.js"
-import { parseIdempotencyKey, type IdempotencyKey } from "../wire/agent.js"
+import { parseIdempotencyKey, type IdempotencyKey, type SessionStatus } from "../wire/agent.js"
 import { decodeOne, encodeNamed, expectMap, field, type CborMap } from "../wire/cbor.js"
 import { CorrelationId } from "../wire/ids.js"
 import { REQUIRE_ALL } from "./context.js"
@@ -84,13 +85,16 @@ export interface StepContext {
   readonly outputs: ReadonlyMap<string, Uint8Array>
 }
 
-export type StepFn = (context: StepContext) => BytesLike | Promise<BytesLike>
+/** A step body: a routed step's command payload, or a local step's output.
+ * Text becomes its UTF-8 bytes. */
+export type StepFn = (context: StepContext) => BytesLike | string | Promise<BytesLike | string>
 export type Verifier = (output: Uint8Array) => boolean | Promise<boolean>
 export type OnTimeout = "fail" | "reassign"
 
+// A step without a target runs its body in process.
 interface Step {
   readonly label: string
-  readonly target: Router
+  readonly target: Router | undefined
   readonly build: StepFn
   readonly after: string[]
   verifier?: Verifier
@@ -101,9 +105,18 @@ interface Step {
   deadlineMs: number
 }
 
+/** The result of a completed run: each step's output by label, the labels in
+ * completion order (a resumed run's journaled steps first), the run session's
+ * end status, and the run id. A failed, canceled, or over-budget run throws
+ * instead, so `status` reads `completed`. */
 export interface WorkflowOutcome {
   readonly outputs: ReadonlyMap<string, Uint8Array>
+  readonly completedSteps: readonly string[]
+  readonly status: SessionStatus
   readonly runId: ConversationId
+  /** The output of step `label` as UTF-8 text, invalid sequences replaced,
+   * or `undefined` for a label that did not complete. */
+  text(label: string): string | undefined
 }
 
 /** One workflow-journal record, keyed on the log by the run id. The encoding
@@ -413,6 +426,25 @@ export class Workflow {
     return StepHandle.create(this, step)
   }
 
+  /** Add a step whose body `run` runs in this process: its result is the
+   * step output, journaled like a routed step's reply, so a resumed run skips
+   * it once recorded and runs it again when it stopped before its record. It
+   * runs inside the step deadline, a compensation of it runs in process too,
+   * and it cannot be exclusive. */
+  stepLocal(label: string, run: StepFn): StepHandle {
+    const step: Step = {
+      label,
+      target: undefined,
+      build: run,
+      after: [],
+      exclusive: false,
+      onTimeout: "fail",
+      deadlineMs: DEFAULT_STEP_DEADLINE_MS
+    }
+    this.steps.push(step)
+    return StepHandle.create(this, step)
+  }
+
   /** Run the workflow to completion, returning each step's output. A step
    * that does not complete throws `StepFailedError` after the compensations
    * of the steps with an effect ran in reverse. A misconfigured workflow (a
@@ -437,12 +469,24 @@ export class Workflow {
     const runId = this.resumeId ?? ConversationId.new()
     this.resumeId = runId
     const journal = await this.replay(runId, resumed)
-    let builder = this.laser.sessions().start().withId(runId).agent(source)
     const tokens = this.budgetValue.tokenLimit
-    if (tokens !== undefined) builder = builder.budget({ tokens })
     // A run id the caller named may name a run that already ended completed
     // or failed, which a resume reopens. A canceled run stays ended.
-    const { session, lease } = resumed ? await builder.resume() : await builder.begin()
+    const open = (): Promise<{ readonly session: Session; readonly lease: SessionLease }> => {
+      let builder = this.laser.sessions().start().withId(runId).agent(source)
+      if (tokens !== undefined) builder = builder.budget({ tokens })
+      return resumed ? builder.resume() : builder.begin()
+    }
+    let begun: { readonly session: Session; readonly lease: SessionLease }
+    try {
+      begun = await open()
+    } catch (error) {
+      // A stream without agent topics gets them with the bootstrap defaults.
+      if (!isMissingLane(error)) throw error
+      await this.laser.bootstrap()
+      begun = await open()
+    }
+    const { session, lease } = begun
     try {
       let outcome: WorkflowOutcome
       try {
@@ -478,6 +522,12 @@ export class Workflow {
         throw new InvalidError(`workflow step label \`${step.label}\` is declared twice`)
       }
       labels.add(step.label)
+      if (step.target === undefined) {
+        if (step.exclusive || step.onTimeout === "reassign") {
+          throw new InvalidError("a local step runs in process, so it cannot be exclusive")
+        }
+        continue
+      }
       if (step.target.kind === "broadcast") {
         throw new InvalidError("a broadcast workflow step has no gather target")
       }
@@ -555,7 +605,18 @@ export class Workflow {
         throw error
       }
     }
-    return { outputs, runId }
+    // A label enters `outputs` once, when its step completes, so key order is
+    // completion order.
+    return {
+      outputs,
+      completedSteps: [...outputs.keys()],
+      status: "completed",
+      runId,
+      text: (label) => {
+        const output = outputs.get(label)
+        return output === undefined ? undefined : decodeUtf8(output)
+      }
+    }
   }
 
   // The step-boundary checks: an aborted signal or a cancel request, a run
@@ -590,7 +651,8 @@ export class Workflow {
   }
 
   // One step: build its payload, dispatch it, verify the reply, and journal
-  // the completion, all inside the step deadline.
+  // the completion, all inside the step deadline. A local step's body result
+  // is its output, verified and journaled the same way, with no dispatch.
   private async runStep(
     source: AgentId,
     step: Step,
@@ -602,19 +664,22 @@ export class Workflow {
     const deadlineAt = performance.now() + this.stepDeadline(step, started)
     const built = await withinDeadline(deadlineAt, Promise.resolve(step.build({ outputs })))
     if (built.kind === "timedOut") throw new StepError(this.failed(runId, step, "timed_out"))
-    const payload = ownedBytes(built.value)
-    if (step.target.kind === "allCapable") {
-      return this.runAllCapable(source, step, step.target, payload, runId, attempt, deadlineAt)
+    const payload = stepBytes(built.value)
+    const route = step.target
+    if (route === undefined) return this.finish(runId, step, payload, 0n, [], deadlineAt)
+    if (route.kind === "allCapable") {
+      return this.runAllCapable(source, step, route, payload, runId, attempt, deadlineAt)
     }
     if (step.exclusive) {
-      return this.runExclusive(source, step, payload, runId, attempt, started, deadlineAt)
+      return this.runExclusive(source, step, route, payload, runId, attempt, started, deadlineAt)
     }
-    return this.runDirected(source, step, payload, runId, attempt, deadlineAt)
+    return this.runDirected(source, step, route, payload, runId, attempt, deadlineAt)
   }
 
   private async runDirected(
     source: AgentId,
     step: Step,
+    route: Router,
     payload: Uint8Array,
     runId: ConversationId,
     attempt: Attempt,
@@ -623,7 +688,7 @@ export class Workflow {
     const ids = dispatchIds(runId, step.label, attempt.number)
     const replyFrom = await this.dispatchPoint(source, runId, step, attempt)
     const { target, contract } = await this.laser
-      .contract(step.target)
+      .contract(route)
       .from(source)
       .payload(payload)
       .inboxRoute(this.route)
@@ -644,6 +709,7 @@ export class Workflow {
   private async runExclusive(
     source: AgentId,
     step: Step,
+    route: Router,
     payload: Uint8Array,
     runId: ConversationId,
     first: Attempt,
@@ -659,6 +725,7 @@ export class Workflow {
       const outcome = await this.exclusiveAttempt(
         source,
         step,
+        route,
         payload,
         runId,
         taskConversation,
@@ -681,6 +748,7 @@ export class Workflow {
   private async exclusiveAttempt(
     source: AgentId,
     step: Step,
+    route: Router,
     payload: Uint8Array,
     runId: ConversationId,
     taskConversation: ConversationId,
@@ -701,7 +769,7 @@ export class Workflow {
     const completed = (async (): Promise<AttemptOutcome> => {
       const replyFrom = await this.dispatchPoint(source, runId, step, attempt)
       const { target, contract } = await this.laser
-        .contract(step.target)
+        .contract(route)
         .from(source)
         .payload(payload)
         .inboxRoute(this.route)
@@ -994,7 +1062,8 @@ export class Workflow {
   }
 
   // The compensations of the steps with an effect in reverse order, each to
-  // the agents that ran its step under the step's principal requirement. A
+  // the agents that ran its step under the step's principal requirement, or in
+  // process for a local step, whose compensation result is ignored. A
   // compensation that completes is journaled, so a resume runs the undone
   // step again. One that does not is reported and the rollback goes on.
   private async compensate(
@@ -1016,15 +1085,20 @@ export class Workflow {
           report(runId, step, "timed out building its compensation")
           continue
         }
-        payload = ownedBytes(built.value)
+        payload = stepBytes(built.value)
       } catch (error) {
         report(runId, step, "failed to build its compensation", error)
         continue
       }
+      const route = step.target
+      if (route === undefined) {
+        await this.recordCompensated(runId, step)
+        continue
+      }
       const targets =
         effect.agents.length === 0
-          ? [step.target]
-          : effect.agents.map((agent) => compensationRoute(step.target, agent))
+          ? [route]
+          : effect.agents.map((agent) => compensationRoute(route, agent))
       let undone = true
       for (const [index, target] of targets.entries()) {
         try {
@@ -1048,18 +1122,26 @@ export class Workflow {
           report(runId, step, "compensation failed", error)
         }
       }
-      if (undone) {
-        await this.record(runId, { kind: "stepCompensated", label: step.label }).catch(
-          (error: unknown) => {
-            report(runId, step, "failed to journal its compensation", error)
-          }
-        )
-      }
+      if (undone) await this.recordCompensated(runId, step)
     }
   }
 
+  private recordCompensated(runId: ConversationId, step: Step): Promise<void> {
+    return this.record(runId, { kind: "stepCompensated", label: step.label }).catch(
+      (error: unknown) => {
+        report(runId, step, "failed to journal its compensation", error)
+      }
+    )
+  }
+
   private failed(runId: ConversationId, step: Step, reason: StepFailure): StepFailedError {
-    return new StepFailedError(runId.toString(), step.label, reason)
+    return new StepFailedError(
+      runId.toString(),
+      step.label,
+      reason,
+      step.target === undefined ? "local step" : targetText(step.target),
+      Math.trunc(step.deadlineMs)
+    )
   }
 
   // The step's completion deadline, never past what the wall-clock budget
@@ -1165,6 +1247,10 @@ export class StepHandle {
     return this.owner.step(label, target, build)
   }
 
+  stepLocal(label: string, run: StepFn): StepHandle {
+    return this.owner.stepLocal(label, run)
+  }
+
   run(options: { readonly signal?: AbortSignal } = {}): Promise<WorkflowOutcome> {
     return this.owner.run(options)
   }
@@ -1202,6 +1288,26 @@ function compensationRoute(target: Router, agent: AgentId): Router {
         ? target.selector.principal
         : undefined
   return principal === undefined ? routeTo(agent) : routeToPrincipal(agent, principal)
+}
+
+function stepBytes(value: BytesLike | string): Uint8Array {
+  return typeof value === "string" ? utf8(value) : ownedBytes(value)
+}
+
+// The step's route in words, for a failure message.
+function targetText(target: Router): string {
+  switch (target.kind) {
+    case "to":
+      return `agent \`${target.agent.asStr()}\``
+    case "toPrincipal":
+      return `agent \`${target.agent.asStr()}\` as principal ${target.principal.toString()}`
+    case "toCapable":
+      return `an agent with capability \`${target.selector.skill}\``
+    case "allCapable":
+      return `every agent with capability \`${target.selector.skill}\``
+    case "broadcast":
+      return "every agent"
+  }
 }
 
 function report(runId: ConversationId, step: Step, what: string, error?: unknown): void {

@@ -5,11 +5,14 @@ import {
   CancelledError,
   InvalidError,
   KvExecutionError,
+  SessionError,
   StepFailedError
 } from "../../src/client/errors.js"
 import { isLeaseLost, isRetryable } from "../../src/client/error-classify.js"
 import { INTERNAL_REPLY_HUB, INTERNAL_TRANSPORT } from "../../src/client/internals.js"
 import {
+  type JournalEntry,
+  type StepHandle,
   Workflow,
   decodeJournalEntry,
   dispatchIds,
@@ -275,6 +278,40 @@ void test("given_a_step_without_a_reply_when_run_then_should_fail_it_typed_and_r
       error.step === "triage" &&
       error.reason === "timed_out" &&
       isRetryable(error)
+  )
+})
+
+void test("given_steps_authored_out_of_order_when_run_then_should_report_the_labels_in_completion_order", async () => {
+  const fake = fakeLaser({
+    contract: () => fakeContract(() => Promise.resolve(completed("done")))
+  })
+  const workflow = Workflow.create(fake, "orchestrator")
+  workflow.step("publish", routeTo(WORKER), () => new Uint8Array()).after("transform")
+  workflow.step("fetch", routeTo(WORKER), () => new Uint8Array())
+  workflow.step("transform", routeTo(WORKER), () => new Uint8Array()).after("fetch")
+
+  const outcome = await workflow.run()
+
+  assert.deepEqual(outcome.completedSteps, ["fetch", "transform", "publish"])
+  assert.equal(outcome.status, "completed")
+})
+
+void test("given_a_step_that_times_out_when_run_then_should_name_its_target_and_deadline", async () => {
+  const fake = fakeLaser({
+    contract: () => fakeContract(() => Promise.resolve({ kind: "timedOut" }))
+  })
+  const workflow = Workflow.create(fake, "orchestrator")
+  workflow.step("triage", routeTo(WORKER), () => new Uint8Array()).deadline(90_000)
+  await assert.rejects(
+    workflow.run(),
+    (error: unknown) =>
+      error instanceof StepFailedError &&
+      error.reason === "timed_out" &&
+      error.target === "agent `worker`" &&
+      error.deadlineMs === 90_000 &&
+      error.message.endsWith(
+        "step `triage` failed: timed_out, target agent `worker`, deadline 90000 ms"
+      )
   )
 })
 
@@ -654,4 +691,169 @@ void test("given_a_verifier_that_never_settles_when_the_step_deadline_passes_the
   } finally {
     clearTimeout(guard)
   }
+})
+
+// A connection whose journal writes are decoded in order and whose contracts
+// must never be sent.
+function localLaser(journal: JournalEntry[], verbs: string[] = []): Laser {
+  return fakeLaser({
+    sessions: fakeSessions(verbs),
+    contract: () => {
+      throw new Error("a local step sent a contract")
+    },
+    sendAgent: (_topic: string, payload: Uint8Array) => {
+      journal.push(decodeJournalEntry(payload))
+      return Promise.resolve()
+    }
+  })
+}
+
+void test("given_local_steps_when_run_then_should_run_each_body_in_process_and_journal_only_completions", async () => {
+  const journal: JournalEntry[] = []
+  const ran: string[] = []
+  const workflow = Workflow.create(localLaser(journal), "jobs")
+  const body =
+    (label: string) => (context: { readonly outputs: ReadonlyMap<string, Uint8Array> }) => {
+      ran.push(`${label} after ${String(context.outputs.size)}`)
+      return `${label} done in process`
+    }
+  workflow.stepLocal("finish", body("finish")).after("process")
+  workflow
+    .stepLocal("generate", body("generate"))
+    .stepLocal("process", body("process"))
+    .after("generate")
+
+  const outcome = await workflow.run()
+
+  assert.deepEqual(ran, ["generate after 0", "process after 1", "finish after 2"])
+  assert.deepEqual(outcome.completedSteps, ["generate", "process", "finish"])
+  assert.equal(outcome.text("finish"), "finish done in process")
+  assert.equal(outcome.text("absent"), undefined)
+  assert.deepEqual(
+    journal.map((entry) =>
+      entry.kind === "stepCompleted" ? [entry.kind, entry.label, entry.agents] : [entry.kind]
+    ),
+    [
+      ["runStarted"],
+      ["stepCompleted", "generate", []],
+      ["stepCompleted", "process", []],
+      ["stepCompleted", "finish", []]
+    ]
+  )
+})
+
+void test("given_a_local_step_past_its_deadline_when_run_then_should_fail_timed_out_naming_the_local_step", async () => {
+  const workflow = Workflow.create(localLaser([]), "jobs")
+  workflow
+    .stepLocal(
+      "slow",
+      () =>
+        new Promise<string>((resolve) => {
+          setTimeout(() => {
+            resolve("late")
+          }, 200)
+        })
+    )
+    .deadline(20.9)
+
+  await assert.rejects(
+    workflow.run(),
+    (error: unknown) =>
+      error instanceof StepFailedError &&
+      error.reason === "timed_out" &&
+      error.target === "local step" &&
+      error.deadlineMs === 20 &&
+      error.message.endsWith("step `slow` failed: timed_out, target local step, deadline 20 ms")
+  )
+})
+
+void test("given_a_local_step_that_throws_when_run_then_should_compensate_in_process_in_reverse_and_rethrow_its_error", async () => {
+  const journal: JournalEntry[] = []
+  const undone: string[] = []
+  const failure = new Error("ship failed")
+  const workflow = Workflow.create(localLaser(journal), "billing")
+  for (const label of ["reserve", "charge"]) {
+    workflow
+      .stepLocal(label, () => `${label} done in process`)
+      .compensateWith(() => {
+        undone.push(`undo ${label}`)
+        return "ignored"
+      })
+  }
+  workflow.stepLocal("ship", () => {
+    throw failure
+  })
+
+  await assert.rejects(workflow.run(), (error: unknown) => error === failure)
+
+  assert.deepEqual(undone, ["undo charge", "undo reserve"])
+  assert.deepEqual(
+    journal.filter((entry) => entry.kind === "stepCompensated").map((entry) => entry.label),
+    ["charge", "reserve"]
+  )
+})
+
+void test("given_an_exclusive_or_reassigned_local_step_when_run_then_should_refuse_before_anything_is_written", async () => {
+  for (const configure of [
+    (handle: StepHandle) => handle.exclusive(),
+    (handle: StepHandle) => handle.exclusiveIn("fences"),
+    (handle: StepHandle) => handle.onTimeout("reassign")
+  ]) {
+    const verbs: string[] = []
+    const journal: JournalEntry[] = []
+    const workflow = Workflow.create(localLaser(journal, verbs), "jobs")
+    configure(workflow.stepLocal("only", () => "done"))
+
+    await assert.rejects(
+      workflow.run(),
+      (error: unknown) =>
+        error instanceof InvalidError &&
+        error.message === "a local step runs in process, so it cannot be exclusive"
+    )
+    assert.deepEqual([verbs, journal], [[], []])
+  }
+})
+
+void test("given_a_stream_without_agent_topics_when_a_workflow_runs_then_should_bootstrap_it_and_begin_again_once", async () => {
+  let bootstraps = 0
+  let begins = 0
+  const missing = new SessionError("stale session generation: agent.sessions does not exist", {
+    kind: "stale",
+    message: "agent.sessions does not exist"
+  })
+  const session = {
+    cancelRequested: () => Promise.resolve(false),
+    budgetBreach: () => Promise.resolve(undefined),
+    end: () => Promise.resolve()
+  }
+  const builder = {
+    withId: () => builder,
+    agent: () => builder,
+    budget: () => builder,
+    begin: () => {
+      begins += 1
+      return begins === 1
+        ? Promise.reject(missing)
+        : Promise.resolve({ session, lease: { release: () => undefined } })
+    }
+  }
+  const bootstrapped: unknown[][] = []
+  const laser = fakeLaser({
+    sessions: () => ({
+      start: () => builder,
+      bootstrap: () => Promise.reject(new Error("a run registered the stream as a session source"))
+    }),
+    bootstrap: (...given: unknown[]) => {
+      bootstraps += 1
+      bootstrapped.push(given)
+      return Promise.resolve()
+    }
+  })
+
+  const outcome = await Workflow.create(laser, "jobs")
+    .stepLocal("only", () => "done")
+    .run()
+
+  assert.deepEqual([bootstraps, begins, outcome.text("only")], [1, 2, "done"])
+  assert.deepEqual(bootstrapped, [[]], "the run bootstraps with the defaults")
 })

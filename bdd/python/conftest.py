@@ -187,6 +187,13 @@ def fresh_stream_bootstrapped(world, partitions):
     world.run(lambda: wait_for_partition_reads(world.laser))
 
 
+@given("a fresh stream bootstrapped with the defaults")
+def fresh_stream_bootstrapped_with_defaults(world):
+    world.connect()
+    world.run(world.laser.bootstrap)
+    world.run(lambda: wait_for_partition_reads(world.laser))
+
+
 async def wait_for_partition_reads(laser):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 5

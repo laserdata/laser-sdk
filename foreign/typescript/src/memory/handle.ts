@@ -1,3 +1,4 @@
+import { utf8 } from "../client/bytes.js"
 import { type CallOptions, abortable, cancellable, throwIfAborted } from "../client/call-options.js"
 import { InvalidError, UnsupportedError } from "../client/errors.js"
 import type { Laser } from "../client/laser.js"
@@ -76,18 +77,33 @@ export class MemoryHandle implements Memory {
     })
   }
 
-  remember(payload: Uint8Array): RememberBuilder
-  remember(scope: MemoryScope, payload: Uint8Array, options?: CallOptions): Promise<MemoryId>
+  /** Starts a remember of `payload`. Text is stored as its UTF-8 bytes. */
+  remember(payload: Uint8Array | string): RememberBuilder
   remember(
-    scopeOrPayload: MemoryScope | Uint8Array,
-    payload?: Uint8Array,
+    scope: MemoryScope,
+    payload: Uint8Array | string,
+    options?: CallOptions
+  ): Promise<MemoryId>
+  remember(
+    scopeOrPayload: MemoryScope | Uint8Array | string,
+    payload?: Uint8Array | string,
     options: CallOptions = {}
   ): RememberBuilder | Promise<MemoryId> {
-    if (scopeOrPayload instanceof Uint8Array) return RememberBuilder.create(this, scopeOrPayload)
-    const body = required(payload)
+    if (scopeOrPayload instanceof Uint8Array || typeof scopeOrPayload === "string")
+      return RememberBuilder.create(this, payloadBytes(scopeOrPayload))
+    const body = payloadBytes(required(payload))
     return cancellable(options.signal, "memory remember", () =>
       this.store.remember(scopeOrPayload, body, options)
     )
+  }
+
+  /** Starts a correction: `send` remembers `payload` under the builder's scope,
+   * then forgets `oldId` in every conversation, so no recall returns the old
+   * fact. A failure between the two leaves both facts. `oldId` that is not a
+   * memory id throws `InvalidError` before anything is written. */
+  supersede(oldId: MemoryId | string, payload: Uint8Array | string): SupersedeBuilder {
+    const old = typeof oldId === "string" ? MemoryId.parse(oldId) : oldId
+    return SupersedeBuilder.create(this, old, payloadBytes(payload))
   }
 
   /** A recall builder scoped to `conversation`, or to every conversation
@@ -105,7 +121,10 @@ export class MemoryHandle implements Memory {
   ): RecallBuilder | Promise<readonly MemoryItem[]> {
     if (scope === undefined) return RecallBuilder.create(this)
     if (scope instanceof ConversationId) return RecallBuilder.create(this, scope)
-    return cancellable(options.signal, "memory recall", () => this.store.recall(scope, query ?? {}))
+    return cancellable(options.signal, "memory recall", async () => {
+      if (query?.strategy !== undefined) knownStrategy(query.strategy)
+      return this.store.recall(scope, query ?? {})
+    })
   }
 
   /** Recall by folding the memory topic in process instead of reading the
@@ -137,15 +156,14 @@ export class MemoryHandle implements Memory {
     return cancellable(options.signal, "memory forget", () => this.store.forget(scope, id, options))
   }
 
-  async context(
-    scope: MemoryScope,
-    query: MemoryQuery = {},
+  /** Recalls `conversation`'s most relevant items and renders them as one
+   * prompt-ready block, trimmed to `tokenBudget` estimated tokens when given. */
+  context(
+    conversation: ConversationId,
+    tokenBudget?: number,
     options: CallOptions = {}
   ): Promise<string> {
-    return toContextBlock(
-      await cancellable(options.signal, "memory context", () => this.store.recall(scope, query)),
-      query.tokenBudget
-    )
+    return RecallBuilder.create(this, conversation).block(tokenBudget, options)
   }
 
   /** One consolidation pass over `scope`: keeps the newest `maxItems` and
@@ -228,9 +246,9 @@ export class MemoryHandle implements Memory {
 
   /** Registers the embedding seam for similarity recall. It configures the
    * in-process vector index, so a vector handle starts a fresh index over
-   * `embedder` with the same governance. The durable log model recalls by
-   * recency and a custom backend owns its retrieval, so both are returned
-   * unchanged. */
+   * `embedder` with the same governance. The durable log model ranks by word
+   * overlap and feedback and a custom backend owns its retrieval, so both are
+   * returned unchanged. */
   embedder(embedder: Embedder): MemoryHandle {
     const store = withEmbedder(this.store, embedder)
     return store === this.store ? this : new MemoryHandle(store)
@@ -244,9 +262,11 @@ export class MemoryHandle implements Memory {
   /** Writes named point state under your own `key`. Every write is a durable
    * event on the memory topic. Only the log-backed handle has a key space, so
    * the vector handle refuses with `UnsupportedError`. */
-  set(key: string, payload: Uint8Array, options: CallOptions = {}): Promise<void> {
+  set(key: string, payload: Uint8Array | string, options: CallOptions = {}): Promise<void> {
     const memory = this.namedMemory("set")
-    return cancellable(options.signal, "memory set", () => memory.setNamed(key, payload, options))
+    return cancellable(options.signal, "memory set", () =>
+      memory.setNamed(key, payloadBytes(payload), options)
+    )
   }
 
   /** Point-reads the named item written by `set`, from the managed key-value
@@ -264,10 +284,10 @@ export class MemoryHandle implements Memory {
 
   /** Merge-patches the named item (RFC 7386 over a JSON value): fields in
    * `patch` overwrite, `null` removes. */
-  update(key: string, patch: Uint8Array, options: CallOptions = {}): Promise<void> {
+  update(key: string, patch: Uint8Array | string, options: CallOptions = {}): Promise<void> {
     const memory = this.namedMemory("update")
     return cancellable(options.signal, "memory update", () =>
-      memory.updateNamed(key, patch, options)
+      memory.updateNamed(key, payloadBytes(patch), options)
     )
   }
 
@@ -292,11 +312,11 @@ export class MemoryHandle implements Memory {
     scope: MemoryScope,
     id: MemoryId,
     kind: MemoryKind,
-    payload: Uint8Array,
+    payload: Uint8Array | string,
     options: CallOptions = {}
   ): Promise<MemoryId> {
     return cancellable(options.signal, "memory append", () =>
-      appendOn(this.store, scope, id, kind, payload, options)
+      appendOn(this.store, scope, id, kind, payloadBytes(payload), options)
     )
   }
 }
@@ -377,6 +397,90 @@ export class RememberBuilder {
   }
 }
 
+/** Builds a correction: the new fact takes the remember scope setters, and
+ * `send` forgets the old fact afterwards. */
+export class SupersedeBuilder {
+  private readonly replacement: RememberBuilder
+  private forgetScope: MemoryScope = {}
+
+  private constructor(
+    private readonly handle: MemoryHandle,
+    private readonly oldId: MemoryId,
+    payload: Uint8Array
+  ) {
+    this.replacement = RememberBuilder.create(handle, payload)
+  }
+
+  /** @internal */
+  static create(handle: MemoryHandle, oldId: MemoryId, payload: Uint8Array): SupersedeBuilder {
+    return new SupersedeBuilder(handle, oldId, payload)
+  }
+
+  /** Records the session record that motivated the new fact. */
+  origin(origin: SourceRef): this {
+    this.replacement.origin(origin)
+    return this
+  }
+
+  /** Records the component that produced the new fact. */
+  producer(producer: ProducerInfo): this {
+    this.replacement.producer(producer)
+    return this
+  }
+
+  /** Scopes the new fact to a conversation. The old one is forgotten in every conversation. */
+  scope(conversation: ConversationId): this {
+    this.replacement.scope(conversation)
+    return this
+  }
+
+  user(user: string): this {
+    this.replacement.user(user)
+    this.forgetScope = { ...this.forgetScope, user }
+    return this
+  }
+
+  agent(agent: AgentId): this {
+    this.replacement.agent(agent)
+    this.forgetScope = { ...this.forgetScope, agent }
+    return this
+  }
+
+  application(application: string): this {
+    this.replacement.application(application)
+    this.forgetScope = { ...this.forgetScope, app: application }
+    return this
+  }
+
+  stream(stream: string): this {
+    this.replacement.stream(stream)
+    this.forgetScope = { ...this.forgetScope, stream }
+    return this
+  }
+
+  durable(): this {
+    this.replacement.durable()
+    return this
+  }
+
+  kind(kind: MemoryKind): this {
+    this.replacement.kind(kind)
+    return this
+  }
+
+  dedup(): this {
+    this.replacement.dedup()
+    return this
+  }
+
+  /** Remembers the new fact, then forgets the old one, and resolves the new id. */
+  async send(options: CallOptions = {}): Promise<MemoryId> {
+    const id = await this.replacement.send(options)
+    await this.handle.forget(this.forgetScope, this.oldId, options)
+    return id
+  }
+}
+
 export class RecallBuilder {
   private scope: MemoryScope = {}
   private query: MemoryQuery = {}
@@ -435,7 +539,7 @@ export class RecallBuilder {
   }
 
   strategy(strategy: RecallStrategy): this {
-    this.query = { ...this.query, strategy }
+    this.query = { ...this.query, strategy: knownStrategy(strategy) }
     return this
   }
 
@@ -600,7 +704,20 @@ function withEmbedder(memory: Memory, embedder: Embedder): Memory {
   return memory
 }
 
-function required(payload: Uint8Array | undefined): Uint8Array {
+function required(payload: Uint8Array | string | undefined): Uint8Array | string {
   if (payload === undefined) throw new TypeError("memory payload is required")
   return payload
+}
+
+// A strategy word from untyped code, refused with the valid words.
+function knownStrategy(strategy: RecallStrategy): RecallStrategy {
+  const words: readonly string[] = Object.values(RecallStrategy)
+  if (!words.includes(strategy)) {
+    throw new InvalidError(`unknown recall strategy '${strategy}': use one of ${words.join(", ")}`)
+  }
+  return strategy
+}
+
+function payloadBytes(payload: Uint8Array | string): Uint8Array {
+  return typeof payload === "string" ? utf8(payload) : payload
 }

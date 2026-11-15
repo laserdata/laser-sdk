@@ -530,3 +530,79 @@ async fn given_shared_topic_namespaces_when_feedback_and_forget_run_then_should_
     assert_eq!(untouched[0].id, right_id);
     assert_eq!(untouched[0].score, None);
 }
+
+#[tokio::test]
+async fn given_a_stream_without_a_memory_topic_when_remembering_then_should_create_it() {
+    let laser = harness::connected_laser().await;
+    let stream = format!(
+        "{}_memory_first",
+        laser
+            .default_stream()
+            .expect("the test laser names its stream")
+    );
+    let laser = laser.with_default_stream(stream.clone());
+    let memory = laser.memory("prefs");
+    memory
+        .remember("the user prefers green tea")
+        .user("ana")
+        .send()
+        .await
+        .expect("the first write creates the memory topic");
+    let topic = laser
+        .stream(&stream)
+        .topic(AgentTopic::Memory.topic_string())
+        .get()
+        .await
+        .expect("the memory topic reads")
+        .expect("the memory topic exists");
+    assert_eq!(
+        (topic.partitions_count, topic.message_expiry),
+        (1, Some(laser_sdk::memory::DEFAULT_MEMORY_TOPIC_TTL))
+    );
+    let recalled = memory
+        .recall(None)
+        .user("ana")
+        .folded()
+        .fetch()
+        .await
+        .expect("a folded recall reads the fact back");
+    assert_eq!(recalled.len(), 1);
+    laser
+        .stream(&stream)
+        .delete()
+        .await
+        .expect("the stream deletes");
+}
+
+#[tokio::test]
+async fn given_a_fact_from_an_earlier_conversation_when_superseded_then_should_fold_only_the_correction()
+ {
+    let laser = harness::connected_laser().await;
+    let memory = laser.memory("prefs");
+    let old = memory
+        .remember("the user is allergic to peanuts")
+        .scope(ConversationId::new())
+        .user("ana")
+        .send()
+        .await
+        .expect("the old fact is remembered");
+    memory
+        .supersede(old, "the user is allergic to shellfish")
+        .scope(ConversationId::new())
+        .user("ana")
+        .send()
+        .await
+        .expect("the correction is stored");
+    let recalled = memory
+        .recall(None)
+        .user("ana")
+        .semantic("what is the user allergic to")
+        .folded()
+        .fetch()
+        .await
+        .expect("a folded recall");
+    assert_eq!(
+        recalled.iter().map(MemoryItem::text).collect::<Vec<_>>(),
+        ["the user is allergic to shellfish"]
+    );
+}

@@ -63,13 +63,16 @@ import {
   type UserInfo,
   serverVerbs
 } from "./server.js"
+import { MemoryWrites } from "../memory/writes.js"
+import { ScratchStream } from "../stream/scratch.js"
 import { Stream } from "../stream/stream.js"
 import { ContextScope } from "../context-scope.js"
 import {
+  DEFAULT_BOOTSTRAP_RETENTION_MS,
   Sessions,
   type SessionConfig,
   type SessionLayout,
-  type TopicRetention
+  TopicRetention
 } from "../session.js"
 import { LeaseRegistry } from "../agent/lease.js"
 import {
@@ -206,6 +209,7 @@ import {
   INTERNAL_GOVERN,
   INTERNAL_ENSURE_RETAINED,
   INTERNAL_LAYOUTS,
+  INTERNAL_MEMORY_WRITES,
   INTERNAL_PUBLISH_CONTROL,
   INTERNAL_REPLY_HUB,
   INTERNAL_SESSION_LEASES,
@@ -501,6 +505,8 @@ interface LaserSharedState {
   readonly sessionLeases: LeaseRegistry
   // The session layout declared per stream, read at every agent send.
   readonly layouts: Map<string, SessionLayout>
+  // The log-memory writes a default recall waits for the view to apply.
+  readonly memoryWrites: MemoryWrites
   // Whether this client dialed a connection string, so it can open further
   // connections of its own.
   readonly dialed: boolean
@@ -540,6 +546,7 @@ function newSharedState(connectionString: string | undefined): LaserSharedState 
     leases: LeaseCoordinator.forConnection(connectionString),
     sessionLeases: new LeaseRegistry(),
     layouts: new Map(),
+    memoryWrites: new MemoryWrites(),
     dialed: connectionString !== undefined,
     announcedTopology: DEFAULT_TOPOLOGY
   }
@@ -1224,6 +1231,11 @@ export class Laser implements AsyncDisposable {
   }
 
   /** @internal */
+  [INTERNAL_MEMORY_WRITES](): MemoryWrites {
+    return this.shared.memoryWrites
+  }
+
+  /** @internal */
   [INTERNAL_PUBLISH_CONTROL](command: ControlCommand, options: CallOptions = {}): Promise<void> {
     return this.publishControl(command, undefined, undefined, options)
   }
@@ -1428,20 +1440,23 @@ export class Laser implements AsyncDisposable {
     return abortable(list(), options.signal, "stream listing")
   }
 
+  /** Creates a stream named `{prefix}-{8 lowercase hex}` and returns it with a
+   * view whose default stream it is. `await using` deletes it when the scope
+   * ends. */
+  scratchStream(prefix: string, options: CallOptions = {}): Promise<ScratchStream> {
+    return ScratchStream.open(this, prefix, options)
+  }
+
   topic(name: string): Topic {
     if (this.defaultStream === undefined) {
-      throw new NoStreamError(
-        "topic() requires a default stream, use stream(name).topic(name) or withDefaultStream(name)"
-      )
+      throw new NoStreamError("topic() requires a default stream")
     }
     return this.stream(this.defaultStream).topic(name)
   }
 
   agdx(topic: string, source: AgentId, conversation: ConversationId): Agdx {
     if (this.defaultStream === undefined) {
-      throw new NoStreamError(
-        "agdx() requires a default stream, use connectWithStream() or withDefaultStream()"
-      )
+      throw new NoStreamError("agdx() requires a default stream")
     }
     const stream = this.defaultStream
     return createAgdx(
@@ -1627,10 +1642,10 @@ export class Laser implements AsyncDisposable {
    * because only operators may send to it, and the registry topic is created
    * by the first card or registry fact. The seven topics hold
    * `7 * partitions` partitions on the server, so keep `partitions` small on
-   * small tiers. */
+   * small tiers. `partitions` defaults to 1 and `retention` to one day. */
   async bootstrap(
-    partitions: number,
-    retention: TopicRetention,
+    partitions = 1,
+    retention: TopicRetention = TopicRetention.expireAfter(DEFAULT_BOOTSTRAP_RETENTION_MS),
     options: CallOptions = {}
   ): Promise<void> {
     throwIfAborted(options.signal, "bootstrap")
@@ -2264,9 +2279,7 @@ export class Laser implements AsyncDisposable {
 
   private requireDefaultStream(operation: string): string {
     if (this.defaultStream === undefined) {
-      throw new NoStreamError(
-        `${operation} requires a default stream, use connectWithStream() or withDefaultStream()`
-      )
+      throw new NoStreamError(`${operation} requires a default stream`)
     }
     return this.defaultStream
   }

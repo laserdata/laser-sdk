@@ -12,7 +12,7 @@ Run it:
     just up
     python3 context.py
 
-Docs: https://docs.laserdata.cloud/laser-sdk/context
+Docs: https://docs.laserdata.com/laser-sdk/context
 Full scenario: incident_desk.py (an incident rebuilt from its own conversation as the audit trail)
 """
 

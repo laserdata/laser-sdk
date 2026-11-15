@@ -13,7 +13,7 @@ Run it:
     just up
     python3 agent.py
 
-Docs: https://docs.laserdata.cloud/laser-sdk/fabric
+Docs: https://docs.laserdata.com/laser-sdk/fabric
 Full scenario: orchestra.py (six agents, discovery, workflows, quarantine, deadline recovery)
 """
 

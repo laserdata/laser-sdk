@@ -58,9 +58,9 @@ impl SessionPolicy {
     }
 }
 
-/// How long `agent.sessions` keeps records. Bootstrap needs one, because the
-/// session topic holds every session's lane and there is no safe default.
-/// A policy that never expires and has no size bound is refused.
+/// How long `agent.sessions` keeps records. The session topic holds every
+/// session's lane, so a policy that never expires and has no size bound is
+/// refused. The default expires records after one day.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TopicRetention {
     expiry: IggyExpiry,
@@ -101,6 +101,12 @@ impl TopicRetention {
     /// The topic size bound.
     pub fn max_size(&self) -> MaxTopicSize {
         self.max_size
+    }
+}
+
+impl Default for TopicRetention {
+    fn default() -> Self {
+        Self::expire_after(Duration::from_secs(86_400))
     }
 }
 
@@ -789,12 +795,12 @@ impl LaneGuard {
         let details = client
             .get_stream(&stream)
             .await?
-            .ok_or_else(|| stale_lane("the session stream does not exist"))?;
+            .ok_or_else(|| missing_lane("the session stream does not exist"))?;
         let topic = details
             .topics
             .iter()
             .find(|topic| topic.name == laser_wire::topics::AGENT_SESSIONS)
-            .ok_or_else(|| stale_lane("agent.sessions does not exist"))?;
+            .ok_or_else(|| missing_lane("agent.sessions does not exist"))?;
         let current = LaneIdentity {
             stream_id: details.id,
             stream_generation: details.created_at.as_micros(),
@@ -854,6 +860,11 @@ impl LaneGuard {
 
 fn stale_lane(message: &str) -> LaserError {
     LaserError::Session(laser_wire::session::SessionError::Stale(message.to_owned()))
+}
+
+// A missing stream or session topic names the calls that create them.
+fn missing_lane(missing: &str) -> LaserError {
+    stale_lane(&format!("{missing}: {}", crate::error::MISSING_TOPIC_FIX))
 }
 
 /// One session. A cheap handle: clones share the terminal latch. Build it
@@ -1663,6 +1674,29 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn given_a_missing_session_topic_when_reported_then_should_name_the_calls_that_create_it() {
+        assert_eq!(
+            missing_lane("agent.sessions does not exist").to_string(),
+            "session: stale session generation: agent.sessions does not exist: the topic does not exist: create the agent topics with bootstrap, or a memory topic with memory_topic"
+        );
+        assert!(
+            !stale_lane("agent.sessions has no partitions")
+                .to_string()
+                .contains("bootstrap")
+        );
+    }
+
+    #[test]
+    fn given_no_retention_when_defaulted_then_should_expire_records_after_one_day() {
+        let retention = TopicRetention::default();
+        assert_eq!(
+            retention.expiry(),
+            IggyExpiry::ExpireDuration(iggy::prelude::IggyDuration::from(86_400_000_000u64))
+        );
+        assert_eq!(retention.max_size(), MaxTopicSize::ServerDefault);
     }
 
     #[test]

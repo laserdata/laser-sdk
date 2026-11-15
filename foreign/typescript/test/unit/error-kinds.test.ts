@@ -22,7 +22,6 @@ import {
   JournalTruncatedError,
   KvExecutionError,
   LaserError,
-  NoStreamError,
   PolicyBlockedError,
   PolicyDeferredError,
   PresenceConflictError,
@@ -44,7 +43,6 @@ import {
 // without matching on message text.
 const MESSAGE_ONLY = [
   [ConfigError, "config"],
-  [NoStreamError, "no-stream"],
   [TimeoutError, "timeout"],
   [AmbiguousMutationError, "ambiguous-mutation"],
   [CancelledError, "cancelled"],
@@ -152,12 +150,17 @@ void test("given_the_self_describing_errors_when_constructed_then_should_build_t
 })
 
 void test("given_workflow_failures_when_classified_then_should_match_the_rust_codes", () => {
-  const timedOut = new StepFailedError("run", "triage", "timed_out")
+  const timedOut = new StepFailedError("run", "triage", "timed_out", "agent `worker`", 30_000)
   assert.equal(timedOut.kind, "step-failed")
-  assert.equal(timedOut.message, "workflow run run step `triage` failed: timed_out")
+  assert.equal(
+    timedOut.message,
+    "workflow run run step `triage` failed: timed_out, target agent `worker`, deadline 30000 ms"
+  )
+  assert.deepEqual([timedOut.target, timedOut.deadlineMs], ["agent `worker`", 30_000])
   assert.equal(isRetryable(timedOut), true)
   assert.deepEqual(code(timedOut), { kind: "known", name: "DeadlineExceeded" })
-  const rejected = new StepFailedError("run", "triage", "unverified")
+  const rejected = new StepFailedError("run", "triage", "unverified", "agent `worker`", 30_000)
+  assert.equal(rejected.message, "workflow run run step `triage` failed: unverified")
   assert.equal(isRetryable(rejected), false)
   const truncated = new JournalTruncatedError("run")
   assert.equal(truncated.run, "run")

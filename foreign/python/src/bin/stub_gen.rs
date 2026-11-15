@@ -13,6 +13,7 @@ fn main() -> Result<()> {
     let path = Path::new("laser_sdk.pyi");
     let mut content = fs::read_to_string(path)?;
     content.push_str(&exceptions);
+    content.push_str("\n__version__: builtins.str\n");
     let mut normalized = String::with_capacity(content.len());
     for line in content.lines() {
         normalized.push_str(line.trim_end());

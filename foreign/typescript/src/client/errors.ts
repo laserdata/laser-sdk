@@ -61,10 +61,29 @@ export class ConfigError extends LaserError {
   }
 }
 
-/** A convenience call needed a default stream and none was set. A
- * configuration mistake, never retryable. */
+/** Apache Iggy's codes for a stream or topic that does not exist.
+ * @internal */
+export const STREAM_OR_TOPIC_NOT_FOUND_CODES: ReadonlySet<number> = new Set([
+  1009, 1010, 2010, 2011
+])
+
+const NO_STREAM_HINT =
+  "pass a stream, or set a default stream when connecting (stream option) or with withDefaultStream"
+/** The next call after a send to a stream or topic that does not exist.
+ * @internal */
+export const MISSING_TOPIC_HINT =
+  "the topic does not exist: create the agent topics with bootstrap, or a memory topic with memoryTopic"
+const NO_INBOX_HINT =
+  'start the agent with capabilities so it advertises its inbox, or give the workflow a fixed inbox topic (inboxRoute({ kind: "fixed", topic }))'
+
+/** A convenience call needed a default stream and none was set. `fact` says
+ * which call. A configuration mistake, never retryable. */
 export class NoStreamError extends ConfigError {
   override readonly kind: LaserErrorKind = "no-stream"
+
+  constructor(fact = "no default stream set", options?: { cause?: unknown }) {
+    super(`${fact}: ${NO_STREAM_HINT}`, options)
+  }
 }
 
 export class TimeoutError extends LaserError {
@@ -441,7 +460,7 @@ export class NoCapableAgentError extends RoutingError {
 /** The capable `agent` advertises no inbox topic in its live presence. */
 export class NoInboxError extends RoutingError {
   constructor(readonly agent: string) {
-    super(`no inbox advertised for agent \`${agent}\``)
+    super(`no inbox advertised for agent \`${agent}\`: ${NO_INBOX_HINT}`)
   }
 }
 
@@ -541,14 +560,21 @@ export class BudgetExceededError extends LaserError {
 export type StepFailure = "timed_out" | "failed" | "not_consumed" | "unverified" | "no_completion"
 
 /** A workflow step did not complete. `reason` says how, and only a step that
- * timed out is retryable. The completed steps' compensations have run. */
+ * timed out is retryable. The completed steps' compensations have run.
+ * `target` is the step's route in words and `deadlineMs` its configured
+ * deadline, both named in the text of a timed-out step. */
 export class StepFailedError extends LaserError {
   constructor(
     readonly run: string,
     readonly step: string,
-    readonly reason: StepFailure
+    readonly reason: StepFailure,
+    readonly target: string,
+    readonly deadlineMs: number
   ) {
-    super(`workflow run ${run} step \`${step}\` failed: ${reason}`, "step-failed")
+    super(
+      `workflow run ${run} step \`${step}\` failed: ${reason}${reason === "timed_out" ? `, target ${target}, deadline ${String(deadlineMs)} ms` : ""}`,
+      "step-failed"
+    )
   }
 }
 
@@ -583,8 +609,13 @@ export class PublishFailedError extends LaserError {
     readonly unconfirmed: readonly MessageWithHeaders[],
     cause: unknown
   ) {
+    // A rewrapped failure already carries the hint in its message.
+    const hint =
+      !(cause instanceof PublishFailedError) && missingStreamOrTopic(cause)
+        ? `: ${MISSING_TOPIC_HINT}`
+        : ""
     super(
-      `publish failed to ${stream}/${topic}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      `publish failed to ${stream}/${topic}: ${cause instanceof Error ? cause.message : String(cause)}${hint}`,
       "publish-failed",
       { cause }
     )
@@ -601,6 +632,19 @@ export function publishCause(error: unknown): unknown {
   let current = error
   while (current instanceof PublishFailedError) current = current.cause
   return current
+}
+
+// Whether Apache Iggy's code anywhere in the cause chain names a missing stream
+// or topic.
+function missingStreamOrTopic(error: unknown): boolean {
+  let current = error
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (typeof current !== "object" || current === null) return false
+    const errorCode = (current as { readonly errorCode?: unknown }).errorCode
+    if (typeof errorCode === "number") return STREAM_OR_TOPIC_NOT_FOUND_CODES.has(errorCode)
+    current = (current as { readonly cause?: unknown }).cause
+  }
+  return false
 }
 
 /** A fenced write lost the fence: the `held` token is below the `current`

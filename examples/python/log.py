@@ -15,7 +15,7 @@ Run it:
     just up
     python3 log.py
 
-Docs: https://docs.laserdata.cloud/laser-sdk/log
+Docs: https://docs.laserdata.com/laser-sdk/log
 Full scenario: native_streaming.py (a tuned producer and consumer group over the log)
 """
 

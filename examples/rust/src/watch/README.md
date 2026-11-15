@@ -22,5 +22,5 @@ LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host \
 
 ## Learn more
 
-- Docs: https://docs.laserdata.cloud/laser-sdk/change-feed
+- Docs: https://docs.laserdata.com/laser-sdk/change-feed
 - Full system built on this primitive: [`event-analytics`](../event-analytics/README.md)

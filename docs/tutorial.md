@@ -1,6 +1,6 @@
 # LaserData - Laser SDK tutorial
 
-This tutorial builds an observability application for model calls. It records calls and queries them by latency, result, model, and user. Chapters 1 through 8 cover publication, projections, queries, batches, codecs, and similarity reads. Chapter 9 adds agent coordination, Chapter 10 adds multi-agent orchestration, and Chapter 11 reads only matching records with a server-side filter. The snippets use Rust, the reference SDK. The [three-language guides](https://docs.laserdata.cloud/laser-sdk) show each feature in TypeScript, Rust, and Python, and the [parity matrix](parity.md) maps every Rust call to its Python and TypeScript spelling.
+This tutorial builds an observability application for model calls. It records calls and queries them by latency, result, model, and user. Chapters 1 through 8 cover publication, projections, queries, batches, codecs, and similarity reads. Chapter 9 adds agent coordination, Chapter 10 adds multi-agent orchestration, and Chapter 11 reads only matching records with a server-side filter. The snippets use Rust, the reference SDK. The [three-language guides](https://docs.laserdata.com/laser-sdk) show each feature in TypeScript, Rust, and Python, and the [parity matrix](parity.md) maps every Rust call to its Python and TypeScript spelling.
 
 Prerequisites: the install snippet from the [README](../README.md) and a running Apache Iggy server. `just up` starts one on `127.0.0.1:8090` through Docker.
 
@@ -509,14 +509,14 @@ The `agent` feature adds coordination to streaming. It supplies correlation, ret
 | session policy | `SessionPolicy::PerCall` / `SessionPolicy::PerUser` | per-user mode derives a stable `ConversationId` from the user key (versioned FNV-1a) so the same user keeps the same conversation across processes. |
 | context assembly | `ContextAssembler::builder().conversation_id(c).policy(Box::new(LastN(20))).build().assemble(&laser)` | read one partition (or walk the causality tree with `across_subconversations`) and apply a `ContextPolicy` (`LastN`, `RoleFilter`, or your own) to feed an LLM call. Each partition read examines at most its newest 10,000 raw records before the conversation filter runs, see [client behavior](client-behavior.md). |
 | log replay -> state | `ConversationState::load(laser, conv, topics, bound, init, fold)` | deterministic fold of the conversation back to current state, under an explicit `ReplayBound` (`FromOffsets` incremental, `Last(n)`, `Full` written out, or a `Checkpoint` bound through `FromCheckpoint` and `At`). `load_with(store, ..)` seeds from a `SnapshotStore` and folds only the tail past the snapshot. Same idea as event sourcing on the conversation partition. The same 10,000-record window applies, so `Full` covers a partition only when it holds no more than that. |
-| memory | `Laser::memory(ns)` -> `MemoryHandle`, the one model: every `remember` / `recall` / `improve` / `forget` rides the memory topic (`agent.memory` by default) that materializes to a versioned key-value read view. `memory_topic(name).stream(..).partitions(n).ttl(d)` configures the topic. `memory_with(ns, MemoryBackend::Vector)` is the in-process similarity index for tests and offline recall. | one API, scope by agent / conversation. User isolation lives at the stream boundary. |
+| memory | `Laser::memory(ns)` -> `MemoryHandle`, the one model: every `remember` / `recall` / `improve` / `forget` / `supersede` rides the memory topic (`agent.memory` by default, created on the first write) that materializes to a versioned key-value read view. `memory_topic(name).stream(..).partitions(n).ttl(d)` configures the topic. `memory_with(ns, MemoryBackend::Vector)` is the in-process similarity index for tests and offline recall. | one API, scope by agent / conversation. User isolation lives at the stream boundary. |
 | state | `StateStore` trait (`get`/`set`/`delete`) + `InMemoryStore` / `FileStore`, and managed `Kv` (which implements `StateStore`) | one point-store seam for dedup persistence, checkpoints, per-agent state. `FileStore` does atomic `<file>.<ulid>.tmp` + rename. Swap in `laser.kv(ns)` for the managed durable backend, same trait. |
 | stream cursor | `laser.stream(stream).topic(topic).replay()` -> `Cursor` (`poll` / `offsets` / `from_offsets` / `stream`) | resumable, offset-addressable read over the log. Checkpoint `offsets()` into any `StateStore` to resume after a restart. `stream()` drives it as a `futures::Stream` (draining then ending when caught up, the shape the Python binding exposes as `async for`). The open primitive the `Agent` runtime sits above. |
 | A2A interop | `A2aBridge` (feature `a2a-bridge`, plus `a2a-http` for the axum router) | speaks Google's A2A JSON-RPC over the agent runtime. One axum route, the agent topology underneath. |
 
 ### Sessions: one unit of work
 
-A session is one conversation with a recorded lifecycle. Its id is the conversation id, so every conversation read finds it. Bootstrap the agent topics once. `agent.sessions` needs an explicit retention, because it holds every session's records and there is no safe default.
+A session is one conversation with a recorded lifecycle. Its id is the conversation id, so every conversation read finds it. Bootstrap the agent topics once. `TopicRetention::default()` keeps records for one day, and Python `bootstrap()` and TypeScript `bootstrap()` default to one partition and that one-day retention. `agent.sessions` holds every session's records, so pass a retention that outlives your longest session, as below.
 
 ```rust
 use laser_sdk::agent::{ModelRequest, ModelResponse, TopicRetention};
@@ -622,18 +622,41 @@ Each sub-conversation gets its own partition (= total order within that branch) 
 
 ### Memory, semantic recall
 
-`Laser::memory(namespace)` publishes memory changes to a topic. A managed deployment builds a versioned key-value view from those records. Default recall reads that view, while the topic retains history under its own policy.
+`Laser::memory(namespace)` publishes memory changes to a topic, which the first write creates when it is missing. A managed deployment builds a versioned key-value view from those records. Default recall reads that view, while the topic retains history under its own policy. On a server that serves no view, such as Apache Iggy alone, it folds the topic in process instead. From the view it waits, for at most 10 seconds, until the view reflects the remembers and forgets this connection made, so a recall right after a write returns it.
 
 ```rust
 // One handle per namespace, reused so recall stays incremental across calls.
 let mem = laser.memory("assistant");
-mem.remember(b"user prefers concise tone".to_vec())
+let tone = mem
+    .remember("user prefers concise tone")
     .scope(conv)
+    .user("ada")
+    .send()
+    .await?;
+
+// A later conversation corrects the fact: remember the new one, forget the old
+// one in every conversation.
+mem.supersede(tone, "user prefers detailed answers")
+    .scope(ConversationId::new())
+    .user("ada")
     .send()
     .await?;
 
 let recent = mem.recall(conv).limit(10).fetch().await?;
+let ranked = mem.recall(None).user("ada").semantic("how should I answer").fetch().await?;
 ```
+
+```python
+mem = laser.memory("assistant")
+tone = await mem.remember("user prefers concise tone", conversation=conv, user="ada")
+await mem.supersede(
+    tone, "user prefers detailed answers", conversation=ls.new_conversation_id(), user="ada"
+)
+recent = await mem.recall(conversation=conv, limit=10)
+ranked = await mem.recall(user="ada", semantic="how should I answer")
+```
+
+A `semantic` or `hybrid` query on log memory ranks every item of the scope by the share of query words it holds plus its feedback weight, ties newest first, and keeps `limit`, so a fact that shares no word with the query still comes back. `keyword` keeps only the items that share a word. Recall without a conversation reads every conversation of the scope. The [memory correction program](../README.md#a-memory-correction) is a complete version of this in all three languages.
 
 `laser.memory_topic("assistant").stream("laser-agents").partitions(4).ttl(Duration::from_secs(7 * 86_400)).build()` configures the memory topic. Each scope maps to one partition. Topic expiry is separate from read-view retention.
 
@@ -652,7 +675,7 @@ Capabilities group support under `managed`, `query`, `kv`, `graph`, `forks`, `se
 | transport | one Iggy connection, publish + batch API | same connection, same wire. Adds capability negotiation at login + the query API |
 | query / projections | not available, returns `LaserError::Unsupported` | picks up `Projection` + `ProjectionBinding` configuration and materializes read models served off the log |
 | reliable consumption | `ReliableConsumer` with in-memory dedup + DLQ | the same `ReliableConsumer`. Effects that must happen once use a KV compare-and-swap or a fenced write |
-| memory | `Laser::memory(ns)` runs here: remember publishes to the memory topic, and folded recall (`recall().folded()`, Python `recall(folded=True)`) rebuilds memory from the log in process. In-process `VectorMemory<E>` (cosine recall, bring your own `Embedder`) needs no server either | the same `Laser::memory(ns)` - a deployment materializes the topic into a versioned key-value read view for fast recall. Memory itself has no capability flag |
+| memory | `Laser::memory(ns)` runs here: remember publishes to the memory topic, and a default recall folds the topic in process, as the explicit `recall().folded()` (Python `recall(folded=True)`) does, because no view is served. In-process `VectorMemory<E>` (cosine recall, bring your own `Embedder`) needs no server either | the same `Laser::memory(ns)` - a deployment materializes the topic into a versioned key-value read view for fast recall. Memory itself has no capability flag |
 | sessions | `Laser::sessions` runs here: lifecycle, model and tool records, state, context, checkpoints, replay, and operator control over the session lane | the same `Laser::sessions`. A registered stream also gets a session index with lists, timelines, folded state, and links. Session memory recall reads the managed key-value view |
 | forks | not available, returns `LaserError::Unsupported` | copy-on-write branches of the read model, surfaced through `Capabilities::forks` |
 | A2A | `A2aBridge` axum route you self-host | managed A2A gateway with auth, streaming, persisted task store, agent-card metadata, surfaced through `Capabilities::a2a_gateway` |
@@ -722,7 +745,7 @@ match outcome {
 
 ### A workflow: dependency-ordered steps, panels, and exclusivity
 
-The workflow engine runs steps in dependency order and passes results between them. An `all_capable` step sends work to every matching agent. Budgets limit work, and the journal supports recovery. `.exclusive()` acquires a lease in `WORKFLOW_FENCE_NAMESPACE` for stale-holder rejection.
+The workflow engine runs steps in dependency order and passes results between them. A routed step sends its task to an agent. `step_local(label, run)` (Python `step(label, run=..)`, TypeScript `stepLocal(label, run)`) runs the step's body in this process instead, journaled and resumable like a routed step, and the two mix in one workflow. A run that finds its stream or its topics missing creates them, so a workflow of local steps needs no `bootstrap` and no agent. An `all_capable` step sends work to every matching agent. Budgets limit work, and the journal supports recovery. `.exclusive()` acquires a lease in `WORKFLOW_FENCE_NAMESPACE` for stale-holder rejection.
 
 For protected external state, use `.exclusive_in(namespace)`. In the handler, use `kv(target_namespace).cas_fenced(key, namespace, run_id, token)` with the recorded token and run ID. This binds the effect to the same live lease and fence counter. Renewal starts halfway through the granted lifetime and remains bounded by lease expiry and the workflow deadline.
 
@@ -738,9 +761,25 @@ let result = laser
     .step("diagnose", Router::all_capable("diagnose", RoutePolicy::Any),
           |ctx: &StepContext<'_>| ctx.outputs.get("triage").cloned().unwrap_or_default())
         .after("triage")
+    .step_local("report", |ctx: &StepContext<'_>| ctx.outputs.get("diagnose").cloned().unwrap_or_default())
+        .after("diagnose")
     .run()
     .await?;
+println!("{:?} after {:?}: {:?}", result.status, result.completed_steps, result.text("report"));
 ```
+
+```python
+wf = laser.workflow("incident", fixed_inbox="agent.sessions")
+result = await (
+    wf.step("triage", to_capable="triage", build=lambda outputs: b"incident")
+    .step("diagnose", all_capable="diagnose", build=lambda outputs: outputs["triage"], after=["triage"])
+    .step("report", run=lambda outputs: outputs["diagnose"], after=["diagnose"])
+    .run()
+)
+print(result.status, result.completed_steps, result.text("report"))
+```
+
+A completed run returns its outputs by label, the run id, `status` (`completed`), and `completed_steps` in completion order, and `text(label)` decodes one output. A failed step returns `StepFailed` with the step, the reason, its target, and its deadline, after the compensations ran. The [workflow program](../README.md#a-three-step-workflow) is a complete run of three local steps in all three languages.
 
 ### Health and quarantine
 

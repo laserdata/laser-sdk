@@ -29,7 +29,9 @@
     "example:recall": "npm run build && node dist/src/recall/main.js",
     "example:context": "npm run build && node dist/src/context/main.js",
     "example:agent": "npm run build && node dist/src/agent/main.js",
-    "example:sessions": "npm run build && node dist/src/sessions/main.js"
+    "example:sessions": "npm run build && node dist/src/sessions/main.js",
+    "example:workflow": "npm run build && node dist/src/workflow/main.js",
+    "example:memory-correction": "npm run build && node dist/src/memory-correction/main.js"
   },
   "dependencies": {
     "@laserdata/laser-sdk": "file:../../foreign/typescript"

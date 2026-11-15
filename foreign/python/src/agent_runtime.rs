@@ -544,6 +544,7 @@ impl PyLaser {
         py: Python<'_>,
         agent_id: Option<String>,
         listen_on: String,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[AgentCtx, AgentMessage], typing.Awaitable[None]]", imports = ("typing",)))]
         handler: &Bound<'_, PyAny>,
         consumer_group: Option<String>,
         respond_on: Option<String>,

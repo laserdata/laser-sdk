@@ -34,5 +34,5 @@ The example requires managed group configuration and group-policy reads. Unsuppo
 
 ## Learn more
 
-- [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters)
+- [Consumer Filters guide](https://docs.laserdata.com/laser-sdk/consumer-filters)
 - Related example: [`watch`](../watch/README.md), the change feed that reports view progress.

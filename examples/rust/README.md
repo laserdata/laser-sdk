@@ -4,7 +4,7 @@ The Rust examples share one connection helper. They run against Apache Iggy, Las
 
 Run the commands below from this directory (`examples/rust/`).
 
-**Consumer filters: 98.5% less payload transfer in the CDC example.** The reader receives 4 of 240 records from the shared feed, with original bytes and offsets. The example also covers typed records, one-byte numeric headers, previews, and saved group policies. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+**Consumer filters: 98.5% less payload transfer in the CDC example.** The reader receives 4 of 240 records from the shared feed, with original bytes and offsets. The example also covers typed records, one-byte numeric headers, previews, and saved group policies. See the [Consumer Filters guide](https://docs.laserdata.com/laser-sdk/consumer-filters).
 
 ## Run locally
 
@@ -72,21 +72,30 @@ The firehose reads its own `LASER_FIREHOSE_*` knobs, the incident desk reads `LA
 
 Each example uses `laser-<example>-rust` unless `LASER_STREAM` supplies a name, so different examples never share agent topics or offsets. Managed indexes carry a per-run token so a rerun counts only its own rows. A run deletes the previous run's stream first and keeps its own result on the server, so you can inspect it afterwards with the SDK, the Iggy CLI, or the LaserData Cloud Console. A stream supplied through `LASER_STREAM` is never deleted. Key-value entries, leases, forks, and memory views live under the stream's scoped names and belong to that stream, so a rerun of a managed example on a recreated stream starts from empty state.
 
+## Copy a whole program
+
+`workflow` and `memory-correction` use only `laser-sdk`, `tokio`, `serde` and `serde_json`, with no helper from this crate, so each `main.rs` runs when copied into a new project. Each reads `LASER_CONNECTION_STRING` through `Laser::connect_env()`, works in a scratch stream, and deletes it at the end. A new project adds `cargo add laser-sdk --features agent,kv`, `cargo add tokio --features macros,rt-multi-thread`, `cargo add serde --features derive`, and `cargo add serde_json`.
+
+| binary | shows | run |
+| --- | --- | --- |
+| [`workflow`](src/workflow/README.md) | three in-process steps, journaled and resumable, with the outcome printed as JSON | `cargo run --example workflow` |
+| [`memory-correction`](src/memory-correction/README.md) | two facts for one user, a `supersede` in a later conversation, and a recall of the current facts | `cargo run --example memory-correction` |
+
 ## Primitives: start here
 
 Nine focused examples cover the core data and agent primitives. Unsupported managed phases report the missing capability and exit cleanly.
 
 | binary | primitive | shows | run | docs |
 | --- | --- | --- | --- | --- |
-| [`log`](src/log/README.md) | Log | write two messages, read them back through one typed handle | `just up && cargo run --example log` | [`/laser-sdk/log`](https://docs.laserdata.cloud/laser-sdk/log) |
-| [`query`](src/query/README.md) | Views | declare a view over a topic, then query the materialized rows (managed) | `cargo run --example query` | [`/laser-sdk/views`](https://docs.laserdata.cloud/laser-sdk/views) |
-| [`watch`](src/watch/README.md) | Change feed | react to an advancement record instead of re-querying blind (managed) | `cargo run --example watch` | [`/laser-sdk/change-feed`](https://docs.laserdata.cloud/laser-sdk/change-feed) |
-| [`kv`](src/kv/README.md) | State | set/get keyed JSON with a TTL, change it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row (managed) | `cargo run --example kv` | [`/laser-sdk/state`](https://docs.laserdata.cloud/laser-sdk/state) |
-| [`cdc`](src/cdc/README.md) | Consumer filters | read four safe-mode events out of a 240-record feed of typed serde records, sample-test and preview filters, route binary alerts on a header, then save filters and bind a consumer group (managed) | `cargo run --example cdc` | [`/laser-sdk/consumer-filters`](https://docs.laserdata.cloud/laser-sdk/consumer-filters) |
-| [`graph`](src/graph/README.md) | Graph | relate entities, then traverse one relation out of a node (managed) | `cargo run --example graph` | [`/laser-sdk/graph`](https://docs.laserdata.cloud/laser-sdk/graph) |
-| [`recall`](src/recall/README.md) | Memory | all four durable verbs: remember, recall recent, improve, forget | `just up && cargo run --example recall` | [`/laser-sdk/memory`](https://docs.laserdata.cloud/laser-sdk/memory) |
-| [`context`](src/context/README.md) | Context | assemble one conversation under a last-N + token-budget policy | `just up && cargo run --example context` | [`/laser-sdk/context`](https://docs.laserdata.cloud/laser-sdk/context) |
-| [`agent`](src/agent/README.md) | Fabric | spawn a handler, contract it a deadline-bounded task by capability | `just up && cargo run --example agent` | [`/laser-sdk/fabric`](https://docs.laserdata.cloud/laser-sdk/fabric) |
+| [`log`](src/log/README.md) | Log | write two messages, read them back through one typed handle | `just up && cargo run --example log` | [`/laser-sdk/log`](https://docs.laserdata.com/laser-sdk/log) |
+| [`query`](src/query/README.md) | Views | declare a view over a topic, then query the materialized rows (managed) | `cargo run --example query` | [`/laser-sdk/views`](https://docs.laserdata.com/laser-sdk/views) |
+| [`watch`](src/watch/README.md) | Change feed | react to an advancement record instead of re-querying blind (managed) | `cargo run --example watch` | [`/laser-sdk/change-feed`](https://docs.laserdata.com/laser-sdk/change-feed) |
+| [`kv`](src/kv/README.md) | State | set/get keyed JSON with a TTL, change it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row (managed) | `cargo run --example kv` | [`/laser-sdk/state`](https://docs.laserdata.com/laser-sdk/state) |
+| [`cdc`](src/cdc/README.md) | Consumer filters | read four safe-mode events out of a 240-record feed of typed serde records, sample-test and preview filters, route binary alerts on a header, then save filters and bind a consumer group (managed) | `cargo run --example cdc` | [`/laser-sdk/consumer-filters`](https://docs.laserdata.com/laser-sdk/consumer-filters) |
+| [`graph`](src/graph/README.md) | Graph | relate entities, then traverse one relation out of a node (managed) | `cargo run --example graph` | [`/laser-sdk/graph`](https://docs.laserdata.com/laser-sdk/graph) |
+| [`recall`](src/recall/README.md) | Memory | all four durable verbs: remember, recall recent, improve, forget | `just up && cargo run --example recall` | [`/laser-sdk/memory`](https://docs.laserdata.com/laser-sdk/memory) |
+| [`context`](src/context/README.md) | Context | assemble one conversation under a last-N + token-budget policy | `just up && cargo run --example context` | [`/laser-sdk/context`](https://docs.laserdata.com/laser-sdk/context) |
+| [`agent`](src/agent/README.md) | Fabric | spawn a handler, contract it a deadline-bounded task by capability | `just up && cargo run --example agent` | [`/laser-sdk/fabric`](https://docs.laserdata.com/laser-sdk/fabric) |
 
 `recall` is the Memory primitive's example. The name `memory` already belongs to the deep-dive scenario below.
 

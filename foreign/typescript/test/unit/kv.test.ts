@@ -381,6 +381,35 @@ void test("given_a_deleted_many_outcome_when_delete_many_is_sent_then_should_ret
 
 const emptyPage = { items: [], page: 1, totalPages: 0, totalResults: 0 }
 
+void test("given_text_keys_when_any_op_is_called_then_should_send_the_same_bytes_as_their_utf8_form", async () => {
+  const replies = [
+    okFrame({ kind: "written" }),
+    okFrame({ kind: "value" }),
+    okFrame({ kind: "deleted", removed: true }),
+    okFrame({ kind: "page", page: emptyPage }),
+    okFrame({ kind: "committed", version: 3n })
+  ]
+  const textual = kv("sessions", replies)
+  const binary = kv("sessions", replies)
+  const key = new TextEncoder().encode("plan:42")
+  const prefix = new TextEncoder().encode("plan:")
+  const target = new TextEncoder().encode("plan:43")
+
+  await textual.kv.set("plan:42").bytes(Uint8Array.of(2)).send()
+  await textual.kv.get("plan:42")
+  await textual.kv.delete("plan:42")
+  await textual.kv.scan().prefix("plan:").fetch()
+  await textual.kv.copyTo("plan:42", "plan:43").send()
+  await binary.kv.set(key).bytes(Uint8Array.of(2)).send()
+  await binary.kv.get(key)
+  await binary.kv.delete(key)
+  await binary.kv.scan().prefix(prefix).fetch()
+  await binary.kv.copyTo(key, target).send()
+
+  assert.deepEqual(textual.transport.calls, binary.transport.calls)
+  await assert.rejects(() => textual.kv.get(""), InvalidError)
+})
+
 void test("given_two_pages_when_scan_entries_is_called_then_should_read_each_page_number_until_the_last", async () => {
   const entryA = { key: Uint8Array.of(1), value: Uint8Array.of(1), version: 1n }
   const entryB = { key: Uint8Array.of(2), value: Uint8Array.of(2), version: 1n }

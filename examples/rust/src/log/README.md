@@ -21,5 +21,5 @@ just up && cargo run --example log
 
 ## Learn more
 
-- Docs: https://docs.laserdata.cloud/laser-sdk/log
+- Docs: https://docs.laserdata.com/laser-sdk/log
 - Full system built on this primitive: [`native-streaming`](../native-streaming/README.md)

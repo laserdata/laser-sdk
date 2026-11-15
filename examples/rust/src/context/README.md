@@ -20,5 +20,5 @@ just up && cargo run --example context
 
 ## Learn more
 
-- Docs: https://docs.laserdata.cloud/laser-sdk/context
+- Docs: https://docs.laserdata.com/laser-sdk/context
 - Full system built on this primitive: [`incident-desk`](../incident-desk/README.md)

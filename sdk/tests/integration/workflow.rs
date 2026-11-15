@@ -5,8 +5,8 @@ use laser_sdk::agent::{Clock, SystemClock};
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{AgentCard, AgentEnvelope, AgentKind, CapabilityDescriptor};
 use laser_sdk::wire::framing::decode_named;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // A worker that tags its reply with its role and echoes the input, so a step's
@@ -759,4 +759,157 @@ async fn envelopes_on_log(laser: &Laser, kind: AgentKind, target: &str) -> usize
                     .is_some_and(|addressee| addressee.as_str() == target)
         })
         .count()
+}
+
+// A laser on a fresh stream that nothing bootstrapped, so the workflow run
+// itself has to create the topics it writes.
+async fn unbootstrapped_laser(suffix: &str) -> Laser {
+    let laser = harness::connected_laser().await;
+    let stream = format!(
+        "{}_{suffix}",
+        laser
+            .default_stream()
+            .expect("the test laser names its stream")
+    );
+    laser.with_default_stream(stream)
+}
+
+#[tokio::test]
+async fn given_local_steps_on_a_stream_without_agent_topics_when_run_then_should_complete_them_in_order()
+ {
+    let laser = unbootstrapped_laser("local").await;
+    let outcome = laser
+        .workflow("jobs")
+        .step_local("generate", |_: &StepContext<'_>| b"job-7".to_vec())
+        .step_local("process", |context: &StepContext<'_>| {
+            let job = String::from_utf8_lossy(&context.outputs["generate"]).into_owned();
+            format!("{job} processed").into_bytes()
+        })
+        .after("generate")
+        .step_local("finish", |_: &StepContext<'_>| b"completed".to_vec())
+        .after("process")
+        .run()
+        .await
+        .expect("a workflow of local steps completes");
+    assert_eq!(outcome.completed_steps, ["generate", "process", "finish"]);
+    assert_eq!(outcome.status, SessionStatus::Completed);
+    assert_eq!(outcome.text("process").as_deref(), Some("job-7 processed"));
+    assert_eq!(outcome.text("missing"), None);
+    laser
+        .stream(laser.default_stream().expect("a default stream"))
+        .delete()
+        .await
+        .expect("the stream deletes");
+}
+
+#[tokio::test]
+async fn given_a_local_step_that_failed_when_the_run_resumes_then_should_run_only_the_unfinished_step()
+ {
+    let laser = unbootstrapped_laser("local_resume").await;
+    let runs = Arc::new(Mutex::new(Vec::<String>::new()));
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let workflow = |run_id: Option<ConversationId>| {
+        let step = |label: &'static str| {
+            let runs = Arc::clone(&runs);
+            let fail_once = Arc::clone(&fail_once);
+            LocalBody {
+                label,
+                runs,
+                fail_once: (label == "finish").then_some(fail_once),
+            }
+        };
+        let mut workflow = laser.workflow("jobs");
+        if let Some(run_id) = run_id {
+            workflow = workflow.run_id(run_id);
+        }
+        workflow
+            .step_local("generate", step("generate"))
+            .step_local("process", step("process"))
+            .step_local("finish", step("finish"))
+    };
+    let run_id = ConversationId::new();
+    let first = workflow(Some(run_id)).run().await;
+    assert!(
+        matches!(&first, Err(LaserError::Handler(message)) if message == "finish failed"),
+        "the first run fails at its last step: {first:?}"
+    );
+    assert_eq!(
+        *runs.lock().expect("the run log"),
+        ["generate", "process", "finish"]
+    );
+    let outcome = workflow(Some(run_id))
+        .run()
+        .await
+        .expect("the resumed run completes");
+    assert_eq!(
+        *runs.lock().expect("the run log"),
+        ["generate", "process", "finish", "finish"]
+    );
+    assert_eq!(outcome.completed_steps, ["generate", "process", "finish"]);
+}
+
+#[tokio::test]
+async fn given_a_local_step_that_fails_when_the_run_compensates_then_should_undo_in_reverse_in_process()
+ {
+    let laser = unbootstrapped_laser("local_saga").await;
+    let undone = Arc::new(Mutex::new(Vec::<String>::new()));
+    let undo = |label: &'static str| {
+        let undone = Arc::clone(&undone);
+        move |_: &StepContext<'_>| {
+            undone
+                .lock()
+                .expect("the undo log")
+                .push(format!("undo {label}"));
+            Vec::new()
+        }
+    };
+    let result = laser
+        .workflow("billing")
+        .step_local("reserve", |_: &StepContext<'_>| b"reserved".to_vec())
+        .compensate_with(undo("reserve"))
+        .step_local("charge", |_: &StepContext<'_>| b"charged".to_vec())
+        .compensate_with(undo("charge"))
+        .step_local(
+            "ship",
+            LocalBody {
+                label: "ship",
+                runs: Arc::default(),
+                fail_once: Some(Arc::new(AtomicBool::new(true))),
+            },
+        )
+        .run()
+        .await;
+    assert!(
+        matches!(&result, Err(LaserError::Handler(message)) if message == "ship failed"),
+        "{result:?}"
+    );
+    assert_eq!(
+        *undone.lock().expect("the undo log"),
+        ["undo charge", "undo reserve"]
+    );
+}
+
+// A local step body that records each run and fails its first one when asked.
+struct LocalBody {
+    label: &'static str,
+    runs: Arc<Mutex<Vec<String>>>,
+    fail_once: Option<Arc<AtomicBool>>,
+}
+
+#[async_trait::async_trait]
+impl StepFn for LocalBody {
+    async fn build(&self, _context: &StepContext<'_>) -> Result<Vec<u8>, LaserError> {
+        self.runs
+            .lock()
+            .expect("the run log")
+            .push(self.label.to_owned());
+        if self
+            .fail_once
+            .as_ref()
+            .is_some_and(|flag| flag.swap(false, Ordering::SeqCst))
+        {
+            return Err(LaserError::Handler(format!("{} failed", self.label)));
+        }
+        Ok(format!("{} done in process", self.label).into_bytes())
+    }
 }

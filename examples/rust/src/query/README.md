@@ -22,5 +22,5 @@ LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host \
 
 ## Learn more
 
-- Docs: https://docs.laserdata.cloud/laser-sdk/views
+- Docs: https://docs.laserdata.com/laser-sdk/views
 - Full system built on this primitive: [`fleet-tape`](../fleet-tape/README.md)

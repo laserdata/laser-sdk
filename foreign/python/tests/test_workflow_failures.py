@@ -35,6 +35,11 @@ async def test_given_a_rejected_reply_when_verified_then_should_fail_typed_and_c
         assert raised.value.step == "charge"
         assert raised.value.reason == "unverified"
         assert raised.value.retryable is False
+        assert (raised.value.target, raised.value.deadline_ms) == (
+            "agent `rejected-worker`",
+            30_000,
+        )
+        assert str(raised.value).endswith("step `charge` failed: unverified")
         assert seen == [b"charge", b"refund"]
     finally:
         await agent.shutdown()

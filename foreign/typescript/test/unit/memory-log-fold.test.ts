@@ -2,7 +2,12 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { CodecError, InvalidError } from "../../src/client/errors.js"
-import { INTERNAL_GOVERN, INTERNAL_TRANSPORT } from "../../src/client/internals.js"
+import {
+  INTERNAL_GOVERN,
+  INTERNAL_MEMORY_WRITES,
+  INTERNAL_TRANSPORT
+} from "../../src/client/internals.js"
+import { MemoryWrites } from "../../src/memory/writes.js"
 import type { Laser } from "../../src/client/laser.js"
 import type { HeaderValue } from "../../src/stream/header-value.js"
 import { LogMemory } from "../../src/memory/log-memory.js"
@@ -32,6 +37,8 @@ interface Stored {
 // `partitions` null models a topic that does not exist.
 class FakeTopic {
   readonly governed: Uint8Array[] = []
+  // The create settings each write handed the transport for a missing topic.
+  readonly created: unknown[] = []
   polls = 0
 
   constructor(
@@ -42,13 +49,20 @@ class FakeTopic {
   memory(namespace = "notes"): LogMemory {
     const transport = {
       findTopicPartitionCount: () => Promise.resolve(this.partitions?.length ?? undefined),
-      sendMessageWithHeaders: (
+      sendMessagesWithHeaders: (
         _stream: string,
         _topic: string,
-        payload: Uint8Array,
-        headers: ReadonlyMap<string, HeaderValue>
+        messages: readonly {
+          readonly payload: Uint8Array
+          readonly headers: ReadonlyMap<string, HeaderValue>
+        }[],
+        _key: unknown,
+        _partition: unknown,
+        options: { readonly createTopic?: unknown }
       ) => {
-        this.partitions?.[0]?.push({ payload: payload.slice(), headers })
+        this.created.push(options.createTopic)
+        for (const { payload, headers } of messages)
+          this.partitions?.[0]?.push({ payload: payload.slice(), headers })
         return Promise.resolve({ confirmations: [] })
       },
       pollMessages: (
@@ -70,10 +84,14 @@ class FakeTopic {
         )
       }
     }
+    const writes = new MemoryWrites()
     const laser = {
       defaultStream: "records",
       ...BARE_NAMING,
+      // Apache Iggy without a managed backend: no key-value view.
+      capabilities: () => Promise.resolve({ kv: { available: false } }),
       [INTERNAL_TRANSPORT]: () => transport,
+      [INTERNAL_MEMORY_WRITES]: () => writes,
       [INTERNAL_GOVERN]: (action: { readonly payload: Uint8Array }) => {
         this.governed.push(action.payload.slice())
         return Promise.resolve(this.governor(action.payload.slice()))
@@ -121,6 +139,123 @@ void test("given_a_governor_when_remembering_on_the_log_then_should_see_and_rewr
     ["card 4111"]
   )
   assert.deepEqual(bodies(await memory.recallFolded({}, {})), ["card [redacted]"])
+})
+
+const FACTS = [
+  "the user is allergic to peanuts",
+  "green tea every morning",
+  "the user lives in Lisbon"
+]
+const CITY = "which city does the user live in"
+
+async function remembered(): Promise<{ readonly memory: LogMemory; readonly ids: MemoryId[] }> {
+  const memory = new FakeTopic().memory()
+  const ids: MemoryId[] = []
+  for (const fact of FACTS) ids.push(await memory.remember({}, encoder.encode(fact)))
+  return { memory, ids }
+}
+
+void test("given_a_semantic_query_when_recalled_folded_then_should_rank_every_fact_by_word_overlap", async () => {
+  const { memory } = await remembered()
+
+  for (const strategy of [RecallStrategy.Semantic, RecallStrategy.Hybrid, undefined]) {
+    const items = await memory.recallFolded(
+      {},
+      { semantic: CITY, ...(strategy === undefined ? {} : { strategy }) }
+    )
+    assert.deepEqual(bodies(items), [FACTS[2], FACTS[0], FACTS[1]], String(strategy))
+    assert.deepEqual(
+      items.map((item) => item.score),
+      [3 / 7, 2 / 7, 0]
+    )
+    assert.deepEqual(
+      items.map((item) => item.signals),
+      [
+        [{ strategy: RecallStrategy.Keyword, rank: 0, score: 3 / 7 }],
+        [{ strategy: RecallStrategy.Keyword, rank: 1, score: 2 / 7 }],
+        [{ strategy: RecallStrategy.Keyword, rank: 2, score: 0 }]
+      ]
+    )
+  }
+  const limited = await memory.recallFolded(
+    {},
+    { semantic: CITY, strategy: RecallStrategy.Semantic, limit: 1 }
+  )
+  assert.deepEqual(bodies(limited), [FACTS[2]])
+})
+
+void test("given_a_semantic_query_without_a_word_when_recalled_folded_then_should_return_the_newest_first_unranked", async () => {
+  const { memory } = await remembered()
+
+  const items = await memory.recallFolded({}, { semantic: "?!", strategy: RecallStrategy.Semantic })
+
+  assert.deepEqual(bodies(items), [FACTS[2], FACTS[1], FACTS[0]])
+  assert.deepEqual(
+    items.map((item) => [item.score, item.signals]),
+    [
+      [undefined, []],
+      [undefined, []],
+      [undefined, []]
+    ]
+  )
+})
+
+void test("given_feedback_when_a_semantic_query_is_recalled_folded_then_should_add_the_weight_to_the_overlap", async () => {
+  const { memory, ids } = await remembered()
+  await memory.improve({}, { target: ids[1] ?? MemoryId.new(), weight: 1 })
+
+  const items = await memory.recallFolded({}, { semantic: CITY, strategy: RecallStrategy.Semantic })
+
+  const [top] = items
+  assert.ok(top !== undefined, "the recall returned items")
+  assert.deepEqual(bodies(items), [FACTS[1], FACTS[2], FACTS[0]])
+  assert.equal(top.score, 1)
+  assert.deepEqual(top.signals, [
+    { strategy: RecallStrategy.Keyword, rank: 0, score: 0 },
+    { strategy: RecallStrategy.Auto, rank: 0, score: 1 }
+  ])
+})
+
+void test("given_a_keyword_or_recent_query_when_recalled_folded_then_should_filter_or_ignore_the_text", async () => {
+  const { memory } = await remembered()
+
+  const keyword = await memory.recallFolded(
+    {},
+    { semantic: "Lisbon", strategy: RecallStrategy.Keyword }
+  )
+  const recent = await memory.recallFolded(
+    {},
+    { semantic: "Lisbon", strategy: RecallStrategy.Recent }
+  )
+
+  assert.deepEqual(bodies(keyword), [FACTS[2]])
+  assert.deepEqual(bodies(recent), [FACTS[2], FACTS[1], FACTS[0]])
+})
+
+void test("given_a_deployment_without_a_key_value_view_when_recalled_by_default_then_should_fold_the_topic", async () => {
+  const topic = new FakeTopic()
+  const memory = topic.memory()
+  await memory.remember({ user: "ana" }, encoder.encode("prefers aisle seats"))
+  await memory.setNamed("plan", encoder.encode('{"step":1}'))
+
+  const recalled = await memory.recall({ user: "ana" }, {})
+  const named = await memory.fetchNamed("plan")
+
+  assert.deepEqual(bodies(recalled), ["prefers aisle seats"])
+  assert.equal(decoder.decode(named), '{"step":1}')
+})
+
+void test("given_any_memory_write_when_sent_then_should_ask_for_a_thirty_day_topic_if_it_is_missing", async () => {
+  const topic = new FakeTopic()
+  const memory = topic.memory()
+  const id = await memory.remember({}, encoder.encode("prefers aisle seats"))
+  await memory.forget({}, id)
+  await memory.setNamed("plan", encoder.encode("{}"))
+  assert.deepEqual(topic.created, [
+    { messageExpiryMicros: 2_592_000_000_000n },
+    { messageExpiryMicros: 2_592_000_000_000n },
+    { messageExpiryMicros: 2_592_000_000_000n }
+  ])
 })
 
 void test("given_feedback_folded_before_its_item_when_recalled_folded_then_should_still_rank_the_item", async () => {

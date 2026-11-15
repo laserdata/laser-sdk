@@ -1,8 +1,8 @@
-use crate::agent::Session;
 use crate::agent::budget::BudgetBreach;
 use crate::agent::contract::Contract;
 use crate::agent::ctx::GatherPolicy;
 use crate::agent::router::{CapabilitySelector, InboxRoute, Router};
+use crate::agent::{Session, SessionLease, TopicRetention};
 use crate::context::{ContextAssembler, LastN};
 use crate::error::LaserError;
 #[cfg(feature = "kv")]
@@ -13,7 +13,7 @@ use crate::types::{AgentId, ConversationId};
 use iggy::prelude::{
     Consumer, Identifier, MessageClient, PollOptions, PollingStrategy, TopicClient,
 };
-use laser_wire::agent::{CorrelationId, IdempotencyKey};
+use laser_wire::agent::{CorrelationId, IdempotencyKey, SessionStatus};
 use laser_wire::framing::{decode_named, encode_named};
 use laser_wire::result::ResultCode;
 use serde::{Deserialize, Serialize};
@@ -224,7 +224,8 @@ impl StepFailure {
 
 struct Step {
     label: String,
-    target: Router,
+    // `None` runs the step body in this process.
+    target: Option<Router>,
     run: Box<dyn StepFn>,
     after: Vec<String>,
     verifier: Option<Box<dyn Verifier>>,
@@ -233,6 +234,15 @@ struct Step {
     on_timeout: OnTimeout,
     compensate: Option<Box<dyn StepFn>>,
     deadline: Duration,
+}
+
+impl Step {
+    // The route of a step that dispatches. A local step never reaches here.
+    fn router(&self) -> Result<&Router, LaserError> {
+        self.target
+            .as_ref()
+            .ok_or_else(|| LaserError::Invalid(format!("local step `{}` has no route", self.label)))
+    }
 }
 
 /// A journalled directed-acyclic workflow over the built coordination primitives.
@@ -290,11 +300,25 @@ impl Workflow {
     /// the prior outputs with `run`. Returns a [`StepHandle`] so the step can be
     /// refined (`after`, `verify_with`, `exclusive`, `deadline`,
     /// `compensate_with`) before the next `step`.
-    pub fn step(mut self, label: &str, target: Router, run: impl StepFn + 'static) -> StepHandle {
+    pub fn step(self, label: &str, target: Router, run: impl StepFn + 'static) -> StepHandle {
+        self.add_step(label, Some(target), Box::new(run))
+    }
+
+    /// Add a step `label` whose body `run` runs in this process: it gets the
+    /// prior outputs and its result is the step output, so the step needs no
+    /// agent. Its completion is journaled like a routed step, so a resumed run
+    /// keeps the recorded output instead of running it again, and a step that
+    /// stopped before its completion record runs again. A local step cannot be
+    /// exclusive. Its compensation runs in process too.
+    pub fn step_local(self, label: &str, run: impl StepFn + 'static) -> StepHandle {
+        self.add_step(label, None, Box::new(run))
+    }
+
+    fn add_step(mut self, label: &str, target: Option<Router>, run: Box<dyn StepFn>) -> StepHandle {
         self.steps.push(Step {
             label: label.to_owned(),
             target,
-            run: Box::new(run),
+            run,
             after: Vec::new(),
             verifier: None,
             exclusive: false,
@@ -343,27 +367,7 @@ impl Workflow {
         let resumed = self.run_id.is_some();
         let run_id = self.run_id.unwrap_or_default();
         self.run_id = Some(run_id);
-        let journal = self.replay(run_id, resumed).await?;
-        let mut builder = self
-            .laser
-            .sessions()
-            .start()
-            .with_id(run_id)
-            .agent(source.wire_id());
-        if let Some(tokens) = self.budget.tokens {
-            builder = builder.budget(laser_wire::agent::Budget {
-                tokens: Some(tokens),
-                cost_micros: None,
-            });
-        }
-        // A run id the caller named may name a run that already ended
-        // completed or failed, which a resume reopens. A canceled run stays
-        // ended.
-        let (session, lease) = if resumed {
-            builder.resume().await?
-        } else {
-            builder.begin().await?
-        };
+        let (journal, session, lease) = self.open(&source, run_id, resumed).await?;
         let result = self
             .execute(&session, &source, &order, run_id, journal)
             .await;
@@ -394,6 +398,69 @@ impl Workflow {
         }
     }
 
+    // Start the run, after bootstrapping a stream without the run's topics
+    // with the defaults, so a workflow of local steps needs no setup. One
+    // async fn holds the retry, so the run's own frame holds one future.
+    async fn open(
+        &self,
+        source: &AgentId,
+        run_id: ConversationId,
+        resumed: bool,
+    ) -> Result<(Journal, Session, SessionLease), LaserError> {
+        match self.start(source, run_id, resumed).await {
+            Ok(started) => Ok(started),
+            Err(error) => {
+                if !self.run_topics_missing().await? {
+                    return Err(error);
+                }
+                self.laser.bootstrap(1, TopicRetention::default()).await?;
+                self.start(source, run_id, resumed).await
+            }
+        }
+    }
+
+    // Replay the run's journal and open its root session.
+    async fn start(
+        &self,
+        source: &AgentId,
+        run_id: ConversationId,
+        resumed: bool,
+    ) -> Result<(Journal, Session, SessionLease), LaserError> {
+        let journal = self.replay(run_id, resumed).await?;
+        let mut builder = self
+            .laser
+            .sessions()
+            .start()
+            .with_id(run_id)
+            .agent(source.wire_id());
+        if let Some(tokens) = self.budget.tokens {
+            builder = builder.budget(laser_wire::agent::Budget {
+                tokens: Some(tokens),
+                cost_micros: None,
+            });
+        }
+        // A run id the caller named may name a run that already ended
+        // completed or failed, which a resume reopens. A canceled run stays
+        // ended.
+        let (session, lease) = if resumed {
+            builder.resume().await?
+        } else {
+            builder.begin().await?
+        };
+        Ok((journal, session, lease))
+    }
+
+    // Whether the stream lacks a topic the run writes.
+    async fn run_topics_missing(&self) -> Result<bool, LaserError> {
+        let stream = self.laser.stream(self.laser.stream_required()?);
+        for topic in [AgentTopic::Sessions, AgentTopic::WorkflowJournal] {
+            if !stream.topic(topic.topic_string()).exists().await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     // Every configuration error, before the run writes anything.
     fn validate(&self) -> Result<Vec<usize>, LaserError> {
         let mut labels = BTreeSet::new();
@@ -404,7 +471,7 @@ impl Workflow {
                     step.label
                 )));
             }
-            if matches!(step.target, Router::Broadcast) {
+            if matches!(step.target, Some(Router::Broadcast)) {
                 return Err(LaserError::Invalid(
                     "a broadcast workflow step has no gather target".to_owned(),
                 ));
@@ -413,7 +480,12 @@ impl Workflow {
             // target to fence), and reassign-on-timeout needs an exclusive step,
             // since the fence is what makes handing the task to a fresh holder
             // safe from the timed-out one double-executing.
-            if step.exclusive && matches!(step.target, Router::AllCapable(_)) {
+            if step.target.is_none() && (step.exclusive || step.on_timeout == OnTimeout::Reassign) {
+                return Err(LaserError::Invalid(
+                    "a local step runs in process, so it cannot be exclusive".to_owned(),
+                ));
+            }
+            if step.exclusive && matches!(step.target, Some(Router::AllCapable(_))) {
                 return Err(LaserError::Invalid(
                     "an exclusive step must be directed (to / to_capable)".to_owned(),
                 ));
@@ -467,6 +539,7 @@ impl Workflow {
         let Journal {
             started: journaled,
             mut outputs,
+            mut completed,
             mut agents,
             in_flight,
             attempts,
@@ -526,6 +599,7 @@ impl Workflow {
                 Ok(done) => {
                     tokens_spent = tokens_spent.saturating_add(done.tokens);
                     outputs.insert(step.label.clone(), done.output);
+                    completed.push(step.label.clone());
                     effects.push(Effect {
                         index,
                         agents: done.agents,
@@ -545,7 +619,12 @@ impl Workflow {
             }
         }
 
-        Ok(WorkflowOutcome { outputs, run_id })
+        Ok(WorkflowOutcome {
+            outputs,
+            run_id,
+            completed_steps: completed,
+            status: SessionStatus::Completed,
+        })
     }
 
     // The step-boundary checks: a cancel request, a run session over its
@@ -595,7 +674,11 @@ impl Workflow {
                 Err(_) => return Err(self.failed(run_id, step, StepFailure::TimedOut).into()),
             };
         match &step.target {
-            Router::AllCapable(selector) => {
+            None => {
+                self.finish(run_id, step, payload, 0, Vec::new(), deadline_at)
+                    .await
+            }
+            Some(Router::AllCapable(selector)) => {
                 self.run_all_capable(
                     source,
                     step,
@@ -640,7 +723,7 @@ impl Workflow {
         let reply_from = self.dispatch_point(source, run_id, step, &attempt).await?;
         let (agent, outcome) = self
             .laser
-            .contract(step.target.clone())
+            .contract(step.router()?.clone())
             .from(source.clone())
             .payload(payload)
             .inbox_route(self.inbox_route.clone())
@@ -748,7 +831,7 @@ impl Workflow {
             let reply_from = self.dispatch_point(source, run_id, step, &attempt).await?;
             let (agent, outcome) = self
                 .laser
-                .contract(step.target.clone())
+                .contract(step.router()?.clone())
                 .from(source.clone())
                 .payload(payload.to_vec())
                 .inbox_route(self.inbox_route.clone())
@@ -1138,14 +1221,15 @@ impl Workflow {
                     continue;
                 }
             };
-            let targets: Vec<Router> = if effect.agents.is_empty() {
-                vec![step.target.clone()]
-            } else {
-                effect
+            // A local step's compensation ran in process when it built.
+            let targets: Vec<Router> = match &step.target {
+                None => Vec::new(),
+                Some(target) if effect.agents.is_empty() => vec![target.clone()],
+                Some(target) => effect
                     .agents
                     .iter()
-                    .map(|agent| compensation_route(&step.target, agent))
-                    .collect()
+                    .map(|agent| compensation_route(target, agent))
+                    .collect(),
             };
             let mut undone = true;
             for (index, target) in targets.into_iter().enumerate() {
@@ -1203,6 +1287,11 @@ impl Workflow {
             run: run_id.to_string(),
             step: step.label.clone(),
             reason,
+            target: step
+                .target
+                .as_ref()
+                .map_or_else(|| "local step".to_owned(), route_text),
+            deadline_ms: u64::try_from(step.deadline.as_millis()).unwrap_or(u64::MAX),
         }
     }
 
@@ -1330,18 +1419,38 @@ impl StepHandle {
         self.workflow.step(label, target, run)
     }
 
+    /// Add the next step running in this process (forwards to
+    /// [`Workflow::step_local`]).
+    pub fn step_local(self, label: &str, run: impl StepFn + 'static) -> StepHandle {
+        self.workflow.step_local(label, run)
+    }
+
     /// Run the workflow (forwards to [`Workflow::run`]).
     pub async fn run(self) -> Result<WorkflowOutcome, LaserError> {
         self.workflow.run().await
     }
 }
 
-/// The result of a completed [`Workflow::run`]: each step's output by label, plus
-/// the run id. Pass the run id to [`Workflow::run_id`] to resume the same run.
+/// The result of a completed [`Workflow::run`]: each step's output by label,
+/// the run id, the labels of the completed steps in completion order, and the
+/// run's end status, `Completed` for every returned outcome since a failed run
+/// is an error. Pass the run id to [`Workflow::run_id`] to resume the same run.
 #[derive(Debug)]
 pub struct WorkflowOutcome {
     pub outputs: BTreeMap<String, Vec<u8>>,
     pub run_id: ConversationId,
+    pub completed_steps: Vec<String>,
+    pub status: SessionStatus,
+}
+
+impl WorkflowOutcome {
+    /// The output of step `label` as text (invalid UTF-8 replaced), or `None`
+    /// when no completed step has that label.
+    pub fn text(&self, label: &str) -> Option<String> {
+        self.outputs
+            .get(label)
+            .map(|output| String::from_utf8_lossy(output).into_owned())
+    }
 }
 
 impl Laser {
@@ -1368,6 +1477,7 @@ struct Journal {
     started: bool,
     records: usize,
     outputs: BTreeMap<String, Vec<u8>>,
+    completed: Vec<String>,
     agents: BTreeMap<String, Vec<AgentId>>,
     in_flight: BTreeMap<String, InFlight>,
     attempts: BTreeMap<String, u32>,
@@ -1401,6 +1511,9 @@ impl Journal {
                     agents,
                 } => {
                     journal.in_flight.remove(&label);
+                    if !journal.completed.contains(&label) {
+                        journal.completed.push(label.clone());
+                    }
                     journal.agents.insert(
                         label.clone(),
                         agents
@@ -1411,6 +1524,7 @@ impl Journal {
                     journal.outputs.insert(label, output);
                 }
                 WorkflowJournalEntry::StepCompensated { label } => {
+                    journal.completed.retain(|completed| completed != &label);
                     journal.in_flight.remove(&label);
                     journal.agents.remove(&label);
                     journal.outputs.remove(&label);
@@ -1531,6 +1645,21 @@ fn compensation_route(target: &Router, agent: &AgentId) -> Router {
     match principal {
         Some(principal) => Router::to_principal(agent.clone(), principal),
         None => Router::to(agent.clone()),
+    }
+}
+
+// The step's route in words, for a failure message.
+fn route_text(target: &Router) -> String {
+    match target {
+        Router::To(agent) => format!("agent `{agent}`"),
+        Router::ToPrincipal { agent, principal } => {
+            format!("agent `{agent}` as principal {principal}")
+        }
+        Router::ToCapable(selector) => format!("an agent with capability `{}`", selector.skill),
+        Router::AllCapable(selector) => {
+            format!("every agent with capability `{}`", selector.skill)
+        }
+        Router::Broadcast => "every agent".to_owned(),
     }
 }
 
@@ -1664,6 +1793,105 @@ mod tests {
     }
 
     #[test]
+    fn given_completions_and_a_compensation_when_folded_then_should_keep_the_completion_order() {
+        let journal = Journal::fold([
+            completed("store", b"stored"),
+            completed("fetch", b"fetched"),
+            completed("parse", b"parsed"),
+            WorkflowJournalEntry::StepCompensated {
+                label: "fetch".to_owned(),
+            },
+            completed("store", b"stored again"),
+        ]);
+        assert_eq!(journal.completed, ["store", "parse"]);
+    }
+
+    #[test]
+    fn given_each_route_when_named_for_a_failure_then_should_say_who_it_targets() {
+        let principal = crate::types::PrincipalId::new(7);
+        let selector = || CapabilitySelector::new("triage", Default::default());
+        assert_eq!(route_text(&Router::to(agent())), "agent `worker`");
+        assert_eq!(
+            route_text(&Router::ToPrincipal {
+                agent: agent(),
+                principal,
+            }),
+            "agent `worker` as principal 7"
+        );
+        assert_eq!(
+            route_text(&Router::ToCapable(selector())),
+            "an agent with capability `triage`"
+        );
+        assert_eq!(
+            route_text(&Router::AllCapable(selector())),
+            "every agent with capability `triage`"
+        );
+        assert_eq!(route_text(&Router::Broadcast), "every agent");
+    }
+
+    #[tokio::test]
+    async fn given_an_exclusive_or_reassigned_local_step_when_run_then_should_refuse_it_before_writing()
+     {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        let local = || {
+            laser
+                .workflow("flow")
+                .step_local("charge", |_: &StepContext<'_>| Vec::new())
+        };
+        for refused in [
+            local().exclusive(),
+            local().exclusive_in("fences"),
+            local().on_timeout(OnTimeout::Reassign),
+        ] {
+            let error = refused
+                .run()
+                .await
+                .expect_err("an exclusive or reassigned local step is refused");
+            assert!(
+                matches!(&error, LaserError::Invalid(message) if message == "a local step runs in process, so it cannot be exclusive"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_local_step_when_it_times_out_then_should_name_the_local_step_as_its_target() {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        let mut step = step("generate", &[]);
+        step.target = None;
+        let error =
+            laser
+                .workflow("flow")
+                .failed(ConversationId::new(), &step, StepFailure::TimedOut);
+        assert!(
+            error
+                .to_string()
+                .ends_with("failed: timed_out, target local step, deadline 30000 ms")
+        );
+    }
+
+    #[test]
+    fn given_a_step_when_it_fails_then_should_carry_its_target_and_deadline() {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        let mut step = step("triage", &[]);
+        step.target = Some(Router::to(agent()));
+        step.deadline = Duration::from_millis(500);
+        let error =
+            laser
+                .workflow("flow")
+                .failed(ConversationId::new(), &step, StepFailure::TimedOut);
+        assert!(matches!(
+            &error,
+            LaserError::StepFailed { target, deadline_ms: 500, .. } if target == "agent `worker`"
+        ));
+        assert!(
+            error
+                .to_string()
+                .ends_with("failed: timed_out, target agent `worker`, deadline 500 ms")
+        );
+    }
+
+    #[test]
     fn given_journal_records_without_the_run_start_when_folded_then_should_report_no_start() {
         let journal = Journal::fold([completed("triage", b"sev2")]);
         assert!(!journal.started);
@@ -1717,6 +1945,8 @@ mod tests {
                 run: "run".to_owned(),
                 step: "triage".to_owned(),
                 reason: *reason,
+                target: "agent `worker`".to_owned(),
+                deadline_ms: 30_000,
             };
             assert_eq!(
                 error.is_retryable(),
@@ -1728,6 +1958,8 @@ mod tests {
             run: "run".to_owned(),
             step: "triage".to_owned(),
             reason: StepFailure::TimedOut,
+            target: "agent `worker`".to_owned(),
+            deadline_ms: 30_000,
         };
         assert_eq!(timed_out.code(), ResultCode::DeadlineExceeded);
         assert_eq!(StepFailure::Unverified.to_string(), "unverified");
@@ -1834,7 +2066,7 @@ mod tests {
     fn step(label: &str, after: &[&str]) -> Step {
         Step {
             label: label.to_owned(),
-            target: Router::broadcast(),
+            target: Some(Router::broadcast()),
             run: Box::new(|_: &StepContext<'_>| Vec::new()),
             after: after
                 .iter()

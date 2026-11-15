@@ -63,6 +63,14 @@ name = "agent"
 path = "src/agent/main.rs"
 
 [[example]]
+name = "workflow"
+path = "src/workflow/main.rs"
+
+[[example]]
+name = "memory-correction"
+path = "src/memory-correction/main.rs"
+
+[[example]]
 name = "event-analytics"
 path = "src/event-analytics/main.rs"
 

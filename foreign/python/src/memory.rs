@@ -454,6 +454,43 @@ impl Backend {
         builder.send().await
     }
 
+    pub(crate) async fn supersede(
+        &self,
+        options: RememberOptions,
+        old: MemoryId,
+        payload: Vec<u8>,
+    ) -> Result<MemoryId, LaserError> {
+        let mut builder = self.handle.supersede(old, payload).kind(options.kind);
+        if let Some(agent) = options.agent {
+            builder = builder.agent(agent);
+        }
+        if let Some(conversation) = options.conversation {
+            builder = builder.scope(conversation);
+        }
+        if let Some(stream) = options.stream {
+            builder = builder.stream(stream);
+        }
+        if let Some(user) = options.user {
+            builder = builder.user(user);
+        }
+        if let Some(application) = options.application {
+            builder = builder.application(application);
+        }
+        if options.durable {
+            builder = builder.durable();
+        }
+        if options.dedup {
+            builder = builder.dedup();
+        }
+        if let Some(origin) = options.origin {
+            builder = builder.origin(origin);
+        }
+        if let Some(producer) = options.producer {
+            builder = builder.producer(producer);
+        }
+        builder.send().await
+    }
+
     pub(crate) async fn recall(
         &self,
         scope: MemoryScope,
@@ -533,8 +570,8 @@ pub(crate) fn map_strategy(strategy: &str) -> PyResult<RecallStrategy> {
         "temporal" => RecallStrategy::Temporal,
         "hybrid" => RecallStrategy::Hybrid,
         other => {
-            return Err(crate::errors::CodecError::new_err(format!(
-                "unknown recall strategy '{other}'"
+            return Err(crate::errors::InvalidError::new_err(format!(
+                "unknown recall strategy '{other}': use one of auto, recent, semantic, keyword, graph, temporal, hybrid"
             )));
         }
     })
@@ -856,6 +893,59 @@ impl PyMemory {
         })
     }
 
+    /// Correct a fact: remember `payload` as the new fact under the scope,
+    /// then forget `old_id` in every conversation, so no later recall returns
+    /// the old fact. Returns the new item's id. A failure in between leaves
+    /// both facts, so no fact is lost. `old_id` must be a memory id (a ULID
+    /// string), refused with `InvalidError` before any write.
+    #[pyo3(signature = (old_id, payload, *, agent=None, conversation=None, user=None, application=None, stream=None, kind="fact", durable=false, dedup=false, origin=None, producer=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn supersede<'py>(
+        &self,
+        py: Python<'py>,
+        old_id: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.bytes | builtins.bytearray", imports = ("builtins",)))]
+        payload: &Bound<'_, PyAny>,
+        agent: Option<String>,
+        conversation: Option<String>,
+        user: Option<String>,
+        application: Option<String>,
+        stream: Option<String>,
+        #[gen_stub(override_type(
+            type_repr = "typing.Literal['fact', 'message', 'summary', 'entity', 'feedback', 'procedure']",
+            imports = ("typing",)
+        ))]
+        kind: &str,
+        durable: bool,
+        dedup: bool,
+        origin: Option<&Bound<'_, PyAny>>,
+        producer: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Awaitable<'py, String>> {
+        let backend = self.inner.clone();
+        let old = MemoryId::from_str(&old_id).map_err(|error| to_pyerr(error.into()))?;
+        let (origin, producer) = lineage(origin, producer)?;
+        let options = RememberOptions {
+            origin,
+            producer,
+            agent: parse_agent(agent)?,
+            conversation: parse_conversation(conversation)?,
+            stream,
+            user,
+            application,
+            kind: map_kind(kind)?,
+            durable,
+            dedup,
+        };
+        let payload = payload_bytes(payload)?;
+        awaitable(py, async move {
+            let id = backend
+                .supersede(options, old, payload)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(id.to_string())
+        })
+    }
+
     /// Append with an explicit ID and kind. Built-ins preserve both. A custom backend uses its optional `append` callback, or falls back to `remember` when absent.
     #[pyo3(signature = (id, payload, *, kind="fact", agent=None, conversation=None, user=None, application=None, stream=None, durable=false))]
     #[allow(clippy::too_many_arguments)]
@@ -893,11 +983,13 @@ impl PyMemory {
     /// Recall up to `limit` items under the scope. Pass `semantic` text to rank
     /// by similarity, or a `strategy` (`auto`, `recent`, `semantic`, `keyword`,
     /// `graph`, `temporal`, `hybrid`) with the query text in `semantic`. The
-    /// log backend reads the managed key-value view by default. `folded=True`
-    /// rebuilds memory from the topic in process instead. `block=True` renders
-    /// the recalled items into one prompt-ready string under `token_budget`,
-    /// like `to_context_block`.
-    #[pyo3(signature = (*, limit=50, agent=None, conversation=None, user=None, application=None, semantic=None, strategy=None, folded=false, stream=None, durable=false, token_budget=None, block=false))]
+    /// log backend ranks every item by word overlap for `semantic`, `hybrid`
+    /// and `auto`, and keeps only the items that share a word for `keyword`.
+    /// It reads the managed key-value view by default, waiting for this
+    /// connection's own writes to show there. `folded=True` rebuilds memory
+    /// from the topic in process instead. `recall_block` renders the same
+    /// recall as one prompt block.
+    #[pyo3(signature = (*, limit=50, agent=None, conversation=None, user=None, application=None, semantic=None, strategy=None, folded=false, stream=None, durable=false, token_budget=None))]
     #[allow(clippy::too_many_arguments)]
     fn recall<'py>(
         &self,
@@ -913,12 +1005,10 @@ impl PyMemory {
         stream: Option<String>,
         durable: bool,
         token_budget: Option<usize>,
-        block: bool,
-    ) -> PyResult<Awaitable<'py, Py<PyAny>>> {
+    ) -> PyResult<Awaitable<'py, Vec<PyMemoryItem>>> {
         let backend = self.inner.clone();
         let scope = build_full_scope(agent, conversation, user, application, stream, durable)?;
-        let query_budget = if block { None } else { token_budget };
-        let query = recall_query(&scope, limit, semantic, strategy, query_budget)?;
+        let query = recall_query(&scope, limit, semantic, strategy, token_budget)?;
         awaitable(py, async move {
             let items = if folded {
                 backend.recall_folded(scope, query).await
@@ -926,19 +1016,40 @@ impl PyMemory {
                 backend.recall(scope, query).await
             }
             .map_err(to_pyerr)?;
-            Python::attach(|py| {
-                if block {
-                    let text = laser_sdk::memory::to_context_block(&items, token_budget);
-                    return Ok(text.into_pyobject(py)?.into_any().unbind());
-                }
-                Ok(items
-                    .into_iter()
-                    .map(PyMemoryItem::from)
-                    .collect::<Vec<_>>()
-                    .into_pyobject(py)?
-                    .into_any()
-                    .unbind())
-            })
+            Ok(items.into_iter().map(PyMemoryItem::from).collect())
+        })
+    }
+
+    /// Recall like `recall` and render the items as one prompt-ready block
+    /// under `token_budget`, like `to_context_block`.
+    #[pyo3(signature = (*, limit=50, agent=None, conversation=None, user=None, application=None, semantic=None, strategy=None, folded=false, stream=None, durable=false, token_budget=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn recall_block<'py>(
+        &self,
+        py: Python<'py>,
+        limit: usize,
+        agent: Option<String>,
+        conversation: Option<String>,
+        user: Option<String>,
+        application: Option<String>,
+        semantic: Option<String>,
+        strategy: Option<String>,
+        folded: bool,
+        stream: Option<String>,
+        durable: bool,
+        token_budget: Option<usize>,
+    ) -> PyResult<Awaitable<'py, String>> {
+        let backend = self.inner.clone();
+        let scope = build_full_scope(agent, conversation, user, application, stream, durable)?;
+        let query = recall_query(&scope, limit, semantic, strategy, None)?;
+        awaitable(py, async move {
+            let items = if folded {
+                backend.recall_folded(scope, query).await
+            } else {
+                backend.recall(scope, query).await
+            }
+            .map_err(to_pyerr)?;
+            Ok(laser_sdk::memory::to_context_block(&items, token_budget))
         })
     }
 

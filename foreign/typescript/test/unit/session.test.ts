@@ -378,7 +378,7 @@ void test("given_a_scoped_memory_when_searched_then_should_run_a_keyword_recall_
     max: number
   }[]
   assert.deepEqual(hits, [{ namespace: "support.sessions", text: "login bug", max: 3 }])
-  const defaults = (await session.memory("other").search("x")) as unknown as readonly {
+  const defaults = (await session.memoryIn("other").search("x")) as unknown as readonly {
     namespace: string
     max: number
   }[]

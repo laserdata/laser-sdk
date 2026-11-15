@@ -16,7 +16,7 @@ on Apache Iggy without a managed backend.
 Run it:
     LASER_CONNECTION_STRING=user:pwd@your-host python3 graph.py
 
-Docs: https://docs.laserdata.cloud/laser-sdk/graph
+Docs: https://docs.laserdata.com/laser-sdk/graph
 Full scenario: memory.py (a full ops knowledge graph, bitemporal edges, point-in-time reads)
 """
 

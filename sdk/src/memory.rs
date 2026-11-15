@@ -31,6 +31,21 @@ const CONSOLIDATION_WINDOW: usize = 10_000;
 pub const DEFAULT_MEMORY_TOPIC_TTL: std::time::Duration =
     std::time::Duration::from_secs(30 * 24 * 60 * 60);
 
+// How long a default recall waits for the managed view to show this
+// connection's own writes, and the backoff between its scans.
+#[cfg(feature = "kv")]
+const OWN_WRITES_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(feature = "kv")]
+const OWN_WRITES_FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+#[cfg(feature = "kv")]
+const OWN_WRITES_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+// The most writes a connection remembers waiting on, the oldest dropped first.
+#[cfg(feature = "kv")]
+const MAX_OWN_WRITES: usize = 4096;
+#[cfg(feature = "kv")]
+const OWN_WRITES_STAGE: &str =
+    "the memory view to apply this connection's writes: a folded recall reads the topic directly";
+
 /// What a remembered item is. Agentic memory is an SDK layer over the streaming,
 /// query, and graph primitives, so this is an SDK type, not a wire op field.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -400,12 +415,14 @@ pub struct MemoryQuery {
     /// dependency in the SDK).
     pub token_budget: Option<usize>,
     pub agent: Option<AgentId>,
-    /// A semantic query. Backends that embed (e.g. `VectorMemory`) rank results
-    /// by similarity to this text. The log-backed default ignores it.
+    /// The query text. Backends that embed (e.g. `VectorMemory`) rank results
+    /// by similarity to it. Log memory ranks every item by word overlap with
+    /// it, and keeps only the items that share a word for `Keyword`.
     pub semantic: Option<String>,
     /// How recall finds items. `Auto` (the default) lets the backend route from
-    /// the available state: a backend with an embedder and a `semantic` query
-    /// ranks by similarity, otherwise it returns the most recent.
+    /// the available state: a backend with an embedder ranks by similarity, log
+    /// memory ranks by word overlap, and without query text it returns the most
+    /// recent.
     #[builder(default)]
     pub strategy: RecallStrategy,
 }
@@ -677,6 +694,117 @@ struct StoredMemoryScope {
     timestamp_micros: u64,
 }
 
+/// The log-memory writes a connection made that a default recall has not seen
+/// in the managed view yet. One per `Laser` connection, shared by every
+/// memory handle built from it, so a recall waits for its own writes.
+#[cfg(feature = "kv")]
+#[derive(Default)]
+pub(crate) struct OwnWrites {
+    writes: std::collections::VecDeque<OwnWrite>,
+}
+
+// One memory view: the stream and topic the records ride and the namespace
+// the fold keys them under.
+#[cfg(feature = "kv")]
+#[derive(Clone, Debug, PartialEq)]
+struct MemoryView {
+    stream: String,
+    topic: String,
+    namespace: String,
+}
+
+#[cfg(feature = "kv")]
+#[derive(Clone, Debug, PartialEq)]
+struct OwnWrite {
+    view: MemoryView,
+    id: MemoryId,
+    expect: Expected,
+}
+
+// What the view must show for a write: a remembered item, under the scope it
+// was written with, or a forgotten one gone from the forget's conversation.
+#[cfg(feature = "kv")]
+#[derive(Clone, Debug, PartialEq)]
+enum Expected {
+    Present {
+        conversation: ConversationId,
+        user: Option<String>,
+        agent: Option<AgentId>,
+        app: Option<String>,
+    },
+    Absent {
+        conversation: Option<ConversationId>,
+    },
+}
+
+// One row a view scan returned: its item id and the conversation it holds.
+#[cfg(feature = "kv")]
+type ViewRow = (MemoryId, Option<ConversationId>);
+
+#[cfg(feature = "kv")]
+impl OwnWrites {
+    fn record(&mut self, write: OwnWrite) {
+        self.writes
+            .retain(|held| held.view != write.view || held.id != write.id);
+        self.writes.push_back(write);
+        while self.writes.len() > MAX_OWN_WRITES {
+            self.writes.pop_front();
+        }
+    }
+
+    // The writes on `view` a recall under `scope` and `agent` returns or
+    // leaves out: a remembered item inside every lens the recall sets, and
+    // every forgotten one.
+    fn pending(
+        &self,
+        view: &MemoryView,
+        scope: &MemoryScope,
+        agent: Option<&AgentId>,
+    ) -> Vec<OwnWrite> {
+        self.writes
+            .iter()
+            .filter(|write| &write.view == view)
+            .filter(|write| match &write.expect {
+                Expected::Present {
+                    conversation,
+                    user,
+                    agent: written_by,
+                    app,
+                } => {
+                    scope.conversation.is_none_or(|lens| lens == *conversation)
+                        && scope
+                            .user
+                            .as_ref()
+                            .is_none_or(|lens| user.as_ref() == Some(lens))
+                        && scope
+                            .app
+                            .as_ref()
+                            .is_none_or(|lens| app.as_ref() == Some(lens))
+                        && agent.is_none_or(|lens| written_by.as_ref() == Some(lens))
+                }
+                Expected::Absent { .. } => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn settle(&mut self, settled: &[OwnWrite]) {
+        self.writes.retain(|write| !settled.contains(write));
+    }
+}
+
+#[cfg(feature = "kv")]
+impl OwnWrite {
+    fn reflected(&self, rows: &[ViewRow]) -> bool {
+        match &self.expect {
+            Expected::Present { .. } => rows.iter().any(|(id, _)| *id == self.id),
+            Expected::Absent { conversation } => !rows.iter().any(|(id, held)| {
+                *id == self.id && conversation.is_none_or(|limit| *held == Some(limit))
+            }),
+        }
+    }
+}
+
 impl Projection {
     // Fold one audit message in by decoding its typed entry: a `Forget` records a
     // tombstone, a `Feedback` accumulates a weight on its target, an `Item` becomes
@@ -826,6 +954,7 @@ fn folded_memory_items(
     scope: &MemoryScope,
     query: &MemoryQuery,
 ) -> Vec<MemoryItem> {
+    let words = QueryWords::of(query);
     let agent_filter = query.agent.as_ref().or(scope.agent.as_ref());
     let mut items: Vec<MemoryItem> = projection
         .items
@@ -853,37 +982,23 @@ fn folded_memory_items(
         .filter(|item| {
             agent_filter.is_none_or(|agent| item.provenance.agent.as_ref() == Some(agent))
         })
-        .filter(|item| memory_query_matches(query, &item.payload))
+        .filter(|item| words.keeps(&item.payload))
         .cloned()
         .collect();
     items.reverse();
     // Recent recall is recency alone, so feedback never reorders it.
-    if query.strategy != RecallStrategy::Recent && !projection.feedback.is_empty() {
-        for item in &mut items {
-            if let Some(weight) = projection.feedback_for(item) {
-                item.score = Some(weight);
-            }
-        }
-        items.sort_by(|left, right| {
-            right
-                .score
-                .unwrap_or(0.0)
-                .total_cmp(&left.score.unwrap_or(0.0))
-        });
-        for (rank, item) in items.iter_mut().enumerate() {
-            if let Some(score) = item.score {
-                // Feedback is not a strategy the caller picked, so its signal
-                // reads `Auto` in every backend.
-                item.signals.push(RecallSignal {
-                    strategy: RecallStrategy::Auto,
-                    rank,
-                    score: Some(score),
-                });
-            }
-        }
-    }
-    items.truncate(query.limit);
-    items
+    let weighted = query.strategy != RecallStrategy::Recent && !projection.feedback.is_empty();
+    let mut scored: Vec<ScoredItem> = items
+        .into_iter()
+        .map(|item| ScoredItem {
+            overlap: words.overlap(&item.payload),
+            weight: weighted.then(|| projection.feedback_for(&item)).flatten(),
+            item,
+        })
+        .collect();
+    scored.sort_by(|left, right| right.score().total_cmp(&left.score()));
+    scored.truncate(query.limit);
+    with_signals(scored)
 }
 
 impl LogMemory {
@@ -905,6 +1020,30 @@ impl LogMemory {
     fn resource_stream(&self) -> Option<&str> {
         self.laser
             .resource_scope(self.stream.as_deref().or(self.laser.default_stream()))
+    }
+
+    #[cfg(feature = "kv")]
+    fn view(&self) -> Result<MemoryView, LaserError> {
+        Ok(MemoryView {
+            stream: self.stream_name()?.to_owned(),
+            topic: self.topic.to_string(),
+            namespace: self.resource_namespace(),
+        })
+    }
+
+    #[cfg(feature = "kv")]
+    fn note_write(&self, id: MemoryId, expect: Expected) -> Result<(), LaserError> {
+        let write = OwnWrite {
+            view: self.view()?,
+            id,
+            expect,
+        };
+        self.laser
+            .own_memory_writes()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(write);
+        Ok(())
     }
 
     /// A log-backed memory over an owned `Laser` (cheap to clone, shares the one
@@ -1040,15 +1179,54 @@ impl LogMemory {
         }
         let key = provenance.partition_key();
         let topic = self.topic.to_string();
+        // A new producer creates a missing topic without the memory expiry,
+        // so the first write through this connection creates the topic first.
+        if !self.laser.has_producer(self.stream_name()?, &topic) {
+            self.ensure_topic(&topic).await?;
+        }
+        match self
+            .send(&topic, payload.clone(), headers.clone(), &key)
+            .await
+        {
+            // A topic deleted under a live producer is created again.
+            Err(error) if error.is_stream_or_topic_not_found() => {
+                self.ensure_topic(&topic).await?;
+                self.send(&topic, payload, headers, &key).await
+            }
+            sent => sent,
+        }
+    }
+
+    // Create the memory topic when it is missing: one partition and the
+    // memory expiry, the stream too. An existing topic keeps its settings.
+    async fn ensure_topic(&self, topic: &str) -> Result<(), LaserError> {
+        self.laser
+            .ensure_topic_on_with(
+                self.stream_name()?,
+                topic,
+                1,
+                IggyExpiry::ExpireDuration(IggyDuration::from(DEFAULT_MEMORY_TOPIC_TTL)),
+                None,
+            )
+            .await
+    }
+
+    async fn send(
+        &self,
+        topic: &str,
+        payload: Vec<u8>,
+        headers: std::collections::BTreeMap<HeaderKey, HeaderValue>,
+        key: &str,
+    ) -> Result<(), LaserError> {
         match &self.stream {
             Some(stream) => self
                 .laser
-                .send_with_headers_on(stream, &topic, payload, headers, Some(&key))
+                .send_with_headers_on(stream, topic, payload, headers, Some(key))
                 .await
                 .map(|_| ()),
             None => self
                 .laser
-                .send_with_headers(&topic, payload, headers, Some(&key))
+                .send_with_headers(topic, payload, headers, Some(key))
                 .await
                 .map(|_| ()),
         }
@@ -1108,6 +1286,16 @@ impl LogMemory {
         };
         self.publish_unchecked(&provenance, scope, entry.encode()?)
             .await?;
+        #[cfg(feature = "kv")]
+        self.note_write(
+            id,
+            Expected::Present {
+                conversation: provenance.conversation_id,
+                user: scope.user.clone(),
+                agent: scope.agent.clone(),
+                app: scope.app.clone(),
+            },
+        )?;
         Ok(id)
     }
 
@@ -1170,24 +1358,19 @@ impl LogMemory {
     /// Read named point state, folding the topic first so a fresh handle sees what
     /// was written before it.
     pub async fn fetch_named(&self, key: &str) -> Result<Option<Vec<u8>>, LaserError> {
-        // Read the managed key-value read view, like recall. Folding the topic is
-        // the opt-in `fetch_named_folded`, never the default.
+        // Read the managed key-value read view, like recall, and fold the
+        // topic on a deployment that serves no view.
         #[cfg(feature = "kv")]
         {
-            self.laser
-                .kv(self.resource_namespace())
-                .get(self.named_key(key))
-                .await
+            if self.laser.current_capabilities().kv.available {
+                return self
+                    .laser
+                    .kv(self.resource_namespace())
+                    .get(self.named_key(key))
+                    .await;
+            }
         }
-        #[cfg(not(feature = "kv"))]
-        {
-            let _ = key;
-            Err(LaserError::unsupported(
-                "memory fetch",
-                "named point-state read reads the managed key-value view. Build with the `kv` \
-                 feature, or call `fetch_named_folded` to fold the topic in process",
-            ))
-        }
+        self.fetch_named_folded(key).await
     }
 
     /// Read named point state by folding the topic in process, the opt-in path
@@ -1369,22 +1552,104 @@ impl LogMemory {
             .as_ref()
             .or(scope.agent.as_ref())
             .map(|agent| agent.as_str().to_owned());
-        recall_kv_pages(scope, query, |page| {
-            // The server narrows by the scope's lenses, and the rows are checked
-            // again here, so a server without them returns the same items.
-            let mut scan = kv
-                .scan()
-                .memory_lens(scope.user.clone(), agent.clone(), scope.app.clone())
-                .page(page);
-            if let Some(conversation) = scope.conversation {
-                scan = scan
-                    .conversation(conversation)
-                    .lens_stream(lens_stream.clone());
-            }
-            async move { scan.fetch().await }
-        })
+        recall_own_writes(
+            self.laser.own_memory_writes(),
+            &self.view()?,
+            scope,
+            query,
+            OWN_WRITES_WAIT,
+            |page| {
+                // The server narrows by the scope's lenses, and the rows are checked
+                // again here, so a server without them returns the same items.
+                let mut scan = kv
+                    .scan()
+                    .memory_lens(scope.user.clone(), agent.clone(), scope.app.clone())
+                    .page(page);
+                if let Some(conversation) = scope.conversation {
+                    scan = scan
+                        .conversation(conversation)
+                        .lens_stream(lens_stream.clone());
+                }
+                async move { scan.fetch().await }
+            },
+        )
         .await
     }
+}
+
+// Recall from the view, scanning again until it shows every write of this
+// connection the recall's lenses cover, or `wait` has passed. A write the view
+// showed once, or one the wait gave up on, leaves the record.
+#[cfg(feature = "kv")]
+async fn recall_own_writes<F, Fut>(
+    writes: &std::sync::Mutex<OwnWrites>,
+    view: &MemoryView,
+    scope: &MemoryScope,
+    query: &MemoryQuery,
+    wait: std::time::Duration,
+    mut fetch: F,
+) -> Result<Vec<MemoryItem>, LaserError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<laser_wire::kv::KvPage, LaserError>>,
+{
+    let lock = || {
+        writes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
+    // A recall of no items reads no row, so it has nothing to wait for.
+    if query.limit == 0 {
+        return Ok(Vec::new());
+    }
+    let started = tokio::time::Instant::now();
+    let mut backoff = OWN_WRITES_FIRST_BACKOFF;
+    loop {
+        let pending = lock().pending(view, scope, query.agent.as_ref().or(scope.agent.as_ref()));
+        let rows = std::sync::Mutex::new(Vec::new());
+        let items = recall_kv_pages(scope, query, |page| {
+            let scanned = fetch(page);
+            let rows = &rows;
+            async move {
+                let page = scanned.await?;
+                rows.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend(page.items.iter().filter_map(view_row));
+                Ok(page)
+            }
+        })
+        .await?;
+        if pending.is_empty() {
+            return Ok(items);
+        }
+        let rows = rows
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (reflected, waiting): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|write| write.reflected(&rows));
+        lock().settle(&reflected);
+        if waiting.is_empty() {
+            return Ok(items);
+        }
+        if started.elapsed() >= wait {
+            lock().settle(&waiting);
+            return Err(LaserError::Timeout(OWN_WRITES_STAGE));
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(OWN_WRITES_MAX_BACKOFF);
+    }
+}
+
+#[cfg(feature = "kv")]
+fn view_row(entry: &laser_wire::kv::KvEntry) -> Option<ViewRow> {
+    let id = entry.key_str()?.parse().ok()?;
+    let conversation = entry
+        .scope
+        .as_deref()
+        .and_then(|scope| scope.conversation.as_deref())
+        .and_then(|conversation| conversation.parse().ok());
+    Some((id, conversation))
 }
 
 #[cfg(feature = "kv")]
@@ -1400,8 +1665,10 @@ where
     if query.limit == 0 {
         return Ok(Vec::new());
     }
-    // Feedback ranks every strategy except recent, then arrival breaks ties.
+    // Word overlap and feedback rank every strategy except recent, then
+    // arrival breaks ties.
     let weighted = query.strategy != RecallStrategy::Recent;
+    let words = QueryWords::of(query);
     let mut selected = std::collections::BTreeMap::new();
     let mut requested = 1;
     loop {
@@ -1421,10 +1688,17 @@ where
                 .and_then(|stored| stored.weight)
                 .filter(|_| weighted);
             if let Some(item) = memory_item_from_entry(scope, query.agent.as_ref(), entry)
-                .filter(|item| memory_query_matches(query, &item.payload))
+                .filter(|item| words.keeps(&item.payload))
             {
-                let rank = weight_order(weight.unwrap_or(0.0));
-                selected.insert((rank, arrival, item.id), (item, weight));
+                let scored = ScoredItem {
+                    overlap: words.overlap(&item.payload),
+                    weight,
+                    item,
+                };
+                selected.insert(
+                    (weight_order(scored.score()), arrival, scored.item.id),
+                    scored,
+                );
                 if selected.len() > query.limit {
                     selected.pop_first();
                 }
@@ -1435,24 +1709,7 @@ where
         }
         requested += 1;
     }
-    Ok(selected
-        .into_values()
-        .rev()
-        .enumerate()
-        .map(|(rank, (mut item, weight))| {
-            if let Some(score) = weight {
-                item.score = Some(score);
-                // Feedback is not a strategy the caller picked, so its signal
-                // reads `Auto` in every backend.
-                item.signals.push(RecallSignal {
-                    strategy: RecallStrategy::Auto,
-                    rank,
-                    score: Some(score),
-                });
-            }
-            item
-        })
-        .collect())
+    Ok(with_signals(selected.into_values().rev().collect()))
 }
 
 // The total order of `f32::total_cmp` as an integer, so a weight can key the
@@ -1555,22 +1812,16 @@ impl Memory for LogMemory {
         query: &MemoryQuery,
     ) -> Result<Vec<MemoryItem>, LaserError> {
         // Recall reads the managed key-value read view the deployment materializes
-        // from the memory topic, so a huge topic never folds in process. Folding
-        // is the opt-in [`recall_folded`](LogMemory::recall_folded), for small
-        // serverless scenarios, never the default.
+        // from the memory topic, so a huge topic never folds in process. A
+        // deployment that serves no view leaves the topic as the only source,
+        // so recall folds it there.
         #[cfg(feature = "kv")]
         {
-            self.recall_kv(scope, query).await
+            if self.laser.current_capabilities().kv.available {
+                return self.recall_kv(scope, query).await;
+            }
         }
-        #[cfg(not(feature = "kv"))]
-        {
-            let _ = (scope, query);
-            Err(LaserError::unsupported(
-                "memory recall",
-                "durable recall reads the managed key-value view. Build with the `kv` feature, \
-                 or call `recall_folded` to fold the topic in process",
-            ))
-        }
+        self.recall_folded(scope, query).await
     }
 
     async fn improve(
@@ -1601,6 +1852,13 @@ impl Memory for LogMemory {
         };
         let provenance = Self::provenance(scope, MemoryId::new().to_string());
         self.publish(&provenance, scope, entry.encode()?).await?;
+        #[cfg(feature = "kv")]
+        self.note_write(
+            id,
+            Expected::Absent {
+                conversation: scope.conversation,
+            },
+        )?;
         Ok(())
     }
 }
@@ -2347,15 +2605,91 @@ fn keyword_score(query_tokens: &HashSet<String>, body: &[u8]) -> f32 {
     hits as f32 / query_tokens.len() as f32
 }
 
-fn memory_query_matches(query: &MemoryQuery, body: &[u8]) -> bool {
-    if query.strategy == RecallStrategy::Recent {
-        return true;
+// Record the score and each signal of ranked items at the rank they hold.
+// Feedback is not a strategy the caller picked, so its signal reads `Auto`
+// in every backend.
+fn with_signals(ranked: Vec<ScoredItem>) -> Vec<MemoryItem> {
+    ranked
+        .into_iter()
+        .enumerate()
+        .map(|(rank, scored)| {
+            let score = scored.score();
+            let mut item = scored.item;
+            if scored.overlap.is_some() || scored.weight.is_some() {
+                item.score = Some(score);
+            }
+            for (strategy, signal) in [
+                (RecallStrategy::Keyword, scored.overlap),
+                (RecallStrategy::Auto, scored.weight),
+            ] {
+                if let Some(signal) = signal {
+                    item.signals.push(RecallSignal {
+                        strategy,
+                        rank,
+                        score: Some(signal),
+                    });
+                }
+            }
+            item
+        })
+        .collect()
+}
+
+// How log memory uses a query's words: `semantic`, `hybrid`, and `auto` rank
+// every item by overlap, `keyword`, `graph`, and `temporal` keep only the
+// items that share a word, and `recent` ignores them.
+enum QueryWords {
+    Ignore,
+    Rank(HashSet<String>),
+    Filter(HashSet<String>),
+}
+
+impl QueryWords {
+    fn of(query: &MemoryQuery) -> Self {
+        let Some(text) = query.semantic.as_deref() else {
+            return Self::Ignore;
+        };
+        let tokens = tokenize(text);
+        if tokens.is_empty() {
+            return Self::Ignore;
+        }
+        match query.strategy {
+            RecallStrategy::Recent => Self::Ignore,
+            RecallStrategy::Auto | RecallStrategy::Semantic | RecallStrategy::Hybrid => {
+                Self::Rank(tokens)
+            }
+            RecallStrategy::Keyword | RecallStrategy::Graph | RecallStrategy::Temporal => {
+                Self::Filter(tokens)
+            }
+        }
     }
-    let Some(text) = query.semantic.as_deref() else {
-        return true;
-    };
-    let tokens = tokenize(text);
-    tokens.is_empty() || keyword_score(&tokens, body) > 0.0
+
+    fn keeps(&self, body: &[u8]) -> bool {
+        match self {
+            Self::Filter(tokens) => keyword_score(tokens, body) > 0.0,
+            Self::Ignore | Self::Rank(_) => true,
+        }
+    }
+
+    fn overlap(&self, body: &[u8]) -> Option<f32> {
+        match self {
+            Self::Rank(tokens) => Some(keyword_score(tokens, body)),
+            Self::Ignore | Self::Filter(_) => None,
+        }
+    }
+}
+
+// A log-memory candidate with its word overlap and folded feedback weight.
+struct ScoredItem {
+    item: MemoryItem,
+    overlap: Option<f32>,
+    weight: Option<f32>,
+}
+
+impl ScoredItem {
+    fn score(&self) -> f32 {
+        self.overlap.unwrap_or(0.0) + self.weight.unwrap_or(0.0)
+    }
 }
 
 /// The backend a memory handle runs on. [`Auto`](Self::Auto) is the default and
@@ -2778,6 +3112,18 @@ impl MemoryHandle {
             scope: MemoryScope::default(),
             kind: MemoryKind::Fact,
             dedup: false,
+        }
+    }
+
+    /// Correct a fact: remember `payload` as the new fact, then forget `old_id` in
+    /// every conversation, so no later recall returns the old fact. Takes the
+    /// same scope setters as [`remember`](Self::remember) for the new fact and
+    /// returns its id. A failure in between leaves both facts, so no fact is
+    /// lost.
+    pub fn supersede(&self, old_id: MemoryId, payload: impl Into<Vec<u8>>) -> SupersedeBuilder<'_> {
+        SupersedeBuilder {
+            remember: self.remember(payload),
+            old_id,
         }
     }
 
@@ -3222,6 +3568,102 @@ impl RememberBuilder<'_> {
     }
 }
 
+/// A fluent correction, created by [`MemoryHandle::supersede`]. The setters
+/// scope the new fact like [`RememberBuilder`].
+pub struct SupersedeBuilder<'a> {
+    remember: RememberBuilder<'a>,
+    old_id: MemoryId,
+}
+
+impl SupersedeBuilder<'_> {
+    /// Record the session record that motivated the new fact.
+    #[must_use]
+    pub fn origin(mut self, origin: SourceRef) -> Self {
+        self.remember = self.remember.origin(origin);
+        self
+    }
+
+    /// Record the component that produced the new fact.
+    #[must_use]
+    pub fn producer(mut self, producer: laser_wire::graph::ProducerInfo) -> Self {
+        self.remember = self.remember.producer(producer);
+        self
+    }
+
+    /// Scope the new fact to a conversation.
+    #[must_use]
+    pub fn scope(mut self, conversation: ConversationId) -> Self {
+        self.remember = self.remember.scope(conversation);
+        self
+    }
+
+    /// Attribute the new fact to an agent.
+    #[must_use]
+    pub fn agent(mut self, agent: AgentId) -> Self {
+        self.remember = self.remember.agent(agent);
+        self
+    }
+
+    /// Scope the new fact to a stream.
+    #[must_use]
+    pub fn stream(mut self, stream: impl Into<String>) -> Self {
+        self.remember = self.remember.stream(stream);
+        self
+    }
+
+    /// Attribute the new fact to an end user.
+    #[must_use]
+    pub fn user(mut self, user: impl Into<String>) -> Self {
+        self.remember = self.remember.user(user);
+        self
+    }
+
+    /// Attribute the new fact to an application or org.
+    #[must_use]
+    pub fn application(mut self, application: impl Into<String>) -> Self {
+        self.remember = self.remember.application(application);
+        self
+    }
+
+    /// Store the new fact as durable.
+    #[must_use]
+    pub fn durable(mut self) -> Self {
+        self.remember = self.remember.durable();
+        self
+    }
+
+    /// Set the new fact's kind.
+    #[must_use]
+    pub fn kind(mut self, kind: MemoryKind) -> Self {
+        self.remember = self.remember.kind(kind);
+        self
+    }
+
+    /// Content-address the new fact's id.
+    #[must_use]
+    pub fn dedup(mut self) -> Self {
+        self.remember = self.remember.dedup();
+        self
+    }
+
+    /// Remember the new fact, then forget the old one, returning the new id.
+    pub async fn send(self) -> Result<MemoryId, LaserError> {
+        let handle = self.remember.handle;
+        // The forget carries no conversation, so it removes the old fact
+        // wherever it was remembered.
+        let forget = MemoryScope {
+            stream: self.remember.scope.stream.clone(),
+            user: self.remember.scope.user.clone(),
+            agent: self.remember.scope.agent.clone(),
+            app: self.remember.scope.app.clone(),
+            ..MemoryScope::default()
+        };
+        let id = self.remember.send().await?;
+        handle.forget(&forget, self.old_id).await?;
+        Ok(id)
+    }
+}
+
 /// A fluent recall, created by [`MemoryHandle::recall`]. Awaiting the builder
 /// runs [`fetch`](Self::fetch).
 pub struct RecallBuilder<'a> {
@@ -3235,7 +3677,8 @@ pub struct RecallBuilder<'a> {
 
 impl RecallBuilder<'_> {
     /// Rank by semantic similarity to `text` (sets the `Semantic` strategy).
-    /// Honored by an embedding backend. The log backend returns the most recent.
+    /// An embedding backend ranks by similarity, the log backend by word
+    /// overlap, and neither drops an item.
     #[must_use]
     pub fn semantic(mut self, text: impl Into<String>) -> Self {
         self.semantic = Some(text.into());
@@ -4912,7 +5355,8 @@ mod tests {
     }
 
     #[test]
-    fn given_folded_log_memory_when_searched_then_should_exclude_unrelated_items_before_limiting() {
+    fn given_folded_log_memory_when_searched_by_keyword_then_should_exclude_unrelated_items_before_limiting()
+     {
         let conversation = ConversationId::new();
         let mut projection = Projection::default();
         for (id, body) in [(1u128, b"apple".as_slice()), (2, b"orange"), (3, b"pear")] {
@@ -4921,20 +5365,427 @@ mod tests {
                 Provenance::builder().conversation_id(conversation).build(),
             );
         }
+        let query = MemoryQuery::builder()
+            .semantic("apple".to_owned())
+            .strategy(RecallStrategy::Keyword)
+            .limit(3)
+            .build();
+        let items = folded_memory_items(&projection, &MemoryScope::default(), &query);
+        assert_eq!(payloads(&items), ["apple"]);
+    }
+
+    #[test]
+    fn given_folded_log_memory_when_recalled_by_meaning_then_should_rank_by_word_overlap_and_drop_nothing()
+     {
+        let conversation = ConversationId::new();
+        let mut projection = Projection::default();
+        for (id, body) in [
+            (1u128, b"the user is allergic to peanuts".as_slice()),
+            (2, b"green tea every morning"),
+            (3, b"the user lives in Lisbon"),
+        ] {
+            projection.absorb(
+                &item_entry(MemoryId(Ulid::from(id)), body),
+                Provenance::builder().conversation_id(conversation).build(),
+            );
+        }
         for strategy in [
-            RecallStrategy::Keyword,
             RecallStrategy::Semantic,
             RecallStrategy::Hybrid,
+            RecallStrategy::Auto,
         ] {
             let query = MemoryQuery::builder()
-                .semantic("apple".to_owned())
+                .semantic("which city does the user live in".to_owned())
                 .strategy(strategy)
-                .limit(1)
                 .build();
             let items = folded_memory_items(&projection, &MemoryScope::default(), &query);
-            assert_eq!(items.len(), 1);
-            assert_eq!(items[0].payload, b"apple");
+            assert_eq!(
+                payloads(&items),
+                [
+                    "the user lives in Lisbon",
+                    "the user is allergic to peanuts",
+                    "green tea every morning"
+                ],
+                "{strategy:?}"
+            );
+            assert_eq!(items[0].score, Some(3.0 / 7.0));
+            assert_eq!(items[2].score, Some(0.0));
+            assert_eq!(
+                items[1].signals,
+                [RecallSignal {
+                    strategy: RecallStrategy::Keyword,
+                    rank: 1,
+                    score: Some(2.0 / 7.0),
+                }]
+            );
         }
+    }
+
+    #[test]
+    fn given_feedback_and_overlap_when_folded_recall_ranks_by_meaning_then_should_add_them() {
+        let conversation = ConversationId::new();
+        let mut projection = Projection::default();
+        let promoted = MemoryId(Ulid::from(1u128));
+        for (id, body) in [(1u128, b"green tea".as_slice()), (2, b"black tea")] {
+            projection.absorb(
+                &item_entry(MemoryId(Ulid::from(id)), body),
+                Provenance::builder().conversation_id(conversation).build(),
+            );
+        }
+        let feedback = MemoryLogEntry::Feedback {
+            target: promoted,
+            weight: 2.0,
+            conversation: None,
+        };
+        projection.absorb(
+            &feedback.encode().expect("encode"),
+            Provenance::builder().conversation_id(conversation).build(),
+        );
+        let query = MemoryQuery::builder()
+            .semantic("black tea".to_owned())
+            .strategy(RecallStrategy::Hybrid)
+            .build();
+        let items = folded_memory_items(&projection, &MemoryScope::default(), &query);
+        assert_eq!(payloads(&items), ["green tea", "black tea"]);
+        assert_eq!(items[0].score, Some(2.5));
+        assert_eq!(items[1].score, Some(1.0));
+        assert_eq!(
+            items[0]
+                .signals
+                .iter()
+                .map(|signal| signal.strategy)
+                .collect::<Vec<_>>(),
+            [RecallStrategy::Keyword, RecallStrategy::Auto]
+        );
+    }
+
+    #[cfg(feature = "kv")]
+    #[tokio::test]
+    async fn given_view_rows_when_recalled_by_meaning_then_should_rank_by_word_overlap_and_drop_nothing()
+     {
+        let conversation = ConversationId::new();
+        let row = |id: u128, body: &str, timestamp: u64| {
+            let mut entry = scoped_kv_entry(id, conversation, "ana", "prefs");
+            entry.value = body.as_bytes().to_vec();
+            entry.scope.as_mut().expect("memory scope").timestamp_micros = Some(timestamp);
+            entry
+        };
+        let page = || {
+            std::future::ready(Ok(laser_wire::kv::KvPage {
+                items: vec![
+                    row(1, "the user is allergic to peanuts", 10),
+                    row(2, "green tea every morning", 20),
+                    row(3, "the user lives in Lisbon", 30),
+                    row(4, "an older note on tea", 5),
+                ],
+                page: 1,
+                total_pages: 1,
+                total_results: 4,
+            }))
+        };
+        for strategy in [
+            RecallStrategy::Semantic,
+            RecallStrategy::Hybrid,
+            RecallStrategy::Auto,
+        ] {
+            let query = MemoryQuery::builder()
+                .semantic("which city does the user live in".to_owned())
+                .strategy(strategy)
+                .limit(3)
+                .build();
+            let items = recall_kv_pages(&MemoryScope::default(), &query, |_| page())
+                .await
+                .expect("recall");
+            assert_eq!(
+                payloads(&items),
+                [
+                    "the user lives in Lisbon",
+                    "the user is allergic to peanuts",
+                    "green tea every morning"
+                ],
+                "{strategy:?}: zero-overlap ties keep the newest within the limit"
+            );
+            assert_eq!(items[0].score, Some(3.0 / 7.0));
+            assert_eq!(items[0].signals[0].strategy, RecallStrategy::Keyword);
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_fact_from_another_conversation_when_superseded_then_should_recall_only_the_new_fact()
+     {
+        let handle = MemoryHandle::vector(WordEmbedder);
+        let first = ConversationId::new();
+        let second = ConversationId::new();
+        let old = handle
+            .remember("the user lives in Berlin")
+            .scope(first)
+            .user("ana")
+            .send()
+            .await
+            .expect("the old fact is remembered");
+        let new = handle
+            .supersede(old, "the user lives in Amsterdam")
+            .scope(second)
+            .user("ana")
+            .send()
+            .await
+            .expect("the correction is stored");
+        assert_ne!(new, old);
+        let recalled = handle
+            .recall(None)
+            .user("ana")
+            .recent()
+            .fetch()
+            .await
+            .expect("recall");
+        assert_eq!(payloads(&recalled), ["the user lives in Amsterdam"]);
+        assert_eq!(recalled[0].provenance.conversation_id, second);
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn given_own_writes_when_a_recall_sets_lenses_then_should_wait_only_for_writes_it_covers() {
+        let view = own_view();
+        let conversation = ConversationId::new();
+        let mut writes = OwnWrites::default();
+        writes.record(present(&view, 1, conversation, Some("ana")));
+        writes.record(present(&view, 2, ConversationId::new(), Some("bo")));
+        writes.record(OwnWrite {
+            view: view.clone(),
+            id: MemoryId(Ulid::from(3u128)),
+            expect: Expected::Absent { conversation: None },
+        });
+        writes.record(OwnWrite {
+            view: MemoryView {
+                namespace: "other".to_owned(),
+                ..view.clone()
+            },
+            id: MemoryId(Ulid::from(4u128)),
+            expect: Expected::Absent { conversation: None },
+        });
+        let ids = |pending: Vec<OwnWrite>| {
+            pending
+                .iter()
+                .map(|write| write.id.as_u128())
+                .collect::<Vec<_>>()
+        };
+        let for_ana = MemoryScope::builder().user("ana".to_owned()).build();
+        assert_eq!(ids(writes.pending(&view, &for_ana, None)), [1, 3]);
+        assert_eq!(
+            ids(writes.pending(&view, &MemoryScope::default(), None)),
+            [1, 2, 3]
+        );
+        let elsewhere = MemoryScope::builder()
+            .conversation(ConversationId::new())
+            .build();
+        assert_eq!(ids(writes.pending(&view, &elsewhere, None)), [3]);
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn given_view_rows_when_checked_then_should_reflect_a_remembered_item_and_a_forget_in_its_conversation()
+     {
+        let view = own_view();
+        let id = MemoryId(Ulid::from(1u128));
+        let conversation = ConversationId::new();
+        let remembered = present(&view, 1, conversation, None);
+        assert!(!remembered.reflected(&[]));
+        assert!(remembered.reflected(&[(id, Some(conversation))]));
+        let forgotten_anywhere = OwnWrite {
+            view: view.clone(),
+            id,
+            expect: Expected::Absent { conversation: None },
+        };
+        assert!(!forgotten_anywhere.reflected(&[(id, Some(conversation))]));
+        assert!(forgotten_anywhere.reflected(&[]));
+        let forgotten_in_another = OwnWrite {
+            view,
+            id,
+            expect: Expected::Absent {
+                conversation: Some(ConversationId::new()),
+            },
+        };
+        assert!(forgotten_in_another.reflected(&[(id, Some(conversation))]));
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn given_more_writes_than_the_cap_when_recorded_then_should_drop_the_oldest() {
+        let view = own_view();
+        let mut writes = OwnWrites::default();
+        for id in 0..=MAX_OWN_WRITES as u128 {
+            writes.record(present(&view, id, ConversationId::new(), None));
+        }
+        let pending = writes.pending(&view, &MemoryScope::default(), None);
+        assert_eq!(pending.len(), MAX_OWN_WRITES);
+        assert_eq!(pending[0].id.as_u128(), 1);
+    }
+
+    #[cfg(feature = "kv")]
+    #[tokio::test]
+    async fn given_a_view_behind_this_connection_when_recalled_then_should_scan_again_until_it_shows_the_write()
+     {
+        let view = own_view();
+        let conversation = ConversationId::new();
+        let writes = std::sync::Mutex::new(OwnWrites::default());
+        writes
+            .lock()
+            .expect("the record")
+            .record(present(&view, 7, conversation, Some("ana")));
+        let mut scans = 0;
+        let items = recall_own_writes(
+            &writes,
+            &view,
+            &MemoryScope::default(),
+            &MemoryQuery::builder().build(),
+            std::time::Duration::from_secs(5),
+            |_| {
+                scans += 1;
+                let items = if scans == 1 {
+                    Vec::new()
+                } else {
+                    vec![scoped_kv_entry(7, conversation, "ana", "prefs")]
+                };
+                std::future::ready(Ok(laser_wire::kv::KvPage {
+                    items,
+                    page: 1,
+                    total_pages: 1,
+                    total_results: 1,
+                }))
+            },
+        )
+        .await
+        .expect("the recall waits for the write");
+        assert_eq!(scans, 2);
+        assert_eq!(items.len(), 1);
+        assert!(
+            writes
+                .lock()
+                .expect("the record")
+                .pending(&view, &MemoryScope::default(), None)
+                .is_empty(),
+            "a reflected write leaves the record"
+        );
+    }
+
+    #[cfg(feature = "kv")]
+    #[tokio::test]
+    async fn given_a_view_that_never_shows_the_write_when_recalled_then_should_time_out_and_forget_it()
+     {
+        let view = own_view();
+        let writes = std::sync::Mutex::new(OwnWrites::default());
+        writes
+            .lock()
+            .expect("the record")
+            .record(present(&view, 7, ConversationId::new(), None));
+        let empty = || {
+            std::future::ready(Ok(laser_wire::kv::KvPage {
+                items: Vec::new(),
+                page: 1,
+                total_pages: 1,
+                total_results: 0,
+            }))
+        };
+        let error = recall_own_writes(
+            &writes,
+            &view,
+            &MemoryScope::default(),
+            &MemoryQuery::builder().build(),
+            std::time::Duration::from_millis(120),
+            |_| empty(),
+        )
+        .await
+        .expect_err("the wait gives up");
+        assert_eq!(
+            error.to_string(),
+            "timed out waiting for the memory view to apply this connection's writes: a folded recall reads the topic directly"
+        );
+        assert!(error.is_retryable());
+        let again = recall_own_writes(
+            &writes,
+            &view,
+            &MemoryScope::default(),
+            &MemoryQuery::builder().build(),
+            std::time::Duration::from_millis(120),
+            |_| empty(),
+        )
+        .await
+        .expect("a write the wait gave up on is not waited on again");
+        assert!(again.is_empty());
+    }
+
+    #[cfg(feature = "kv")]
+    #[tokio::test]
+    async fn given_a_pending_own_write_when_recalled_with_a_zero_limit_then_should_return_nothing_without_scanning()
+     {
+        let view = own_view();
+        let writes = std::sync::Mutex::new(OwnWrites::default());
+        writes
+            .lock()
+            .expect("the record")
+            .record(present(&view, 7, ConversationId::new(), None));
+        let mut scans = 0;
+        let items = recall_own_writes(
+            &writes,
+            &view,
+            &MemoryScope::default(),
+            &MemoryQuery::builder().limit(0).build(),
+            std::time::Duration::from_millis(120),
+            |_| {
+                scans += 1;
+                std::future::ready(Ok(laser_wire::kv::KvPage {
+                    items: Vec::new(),
+                    page: 1,
+                    total_pages: 1,
+                    total_results: 0,
+                }))
+            },
+        )
+        .await
+        .expect("a recall of no items does not wait for the view");
+        assert!(items.is_empty());
+        assert_eq!(scans, 0);
+        assert_eq!(
+            writes
+                .lock()
+                .expect("the record")
+                .pending(&view, &MemoryScope::default(), None)
+                .len(),
+            1,
+            "the write stays recorded for the next recall"
+        );
+    }
+
+    #[cfg(feature = "kv")]
+    fn own_view() -> MemoryView {
+        MemoryView {
+            stream: "agents".to_owned(),
+            topic: "agent.memory".to_owned(),
+            namespace: "stream:agents/prefs".to_owned(),
+        }
+    }
+
+    #[cfg(feature = "kv")]
+    fn present(
+        view: &MemoryView,
+        id: u128,
+        conversation: ConversationId,
+        user: Option<&str>,
+    ) -> OwnWrite {
+        OwnWrite {
+            view: view.clone(),
+            id: MemoryId(Ulid::from(id)),
+            expect: Expected::Present {
+                conversation,
+                user: user.map(str::to_owned),
+                agent: None,
+                app: None,
+            },
+        }
+    }
+
+    fn payloads(items: &[MemoryItem]) -> Vec<String> {
+        items.iter().map(MemoryItem::text).collect()
     }
 
     #[cfg(feature = "kv")]

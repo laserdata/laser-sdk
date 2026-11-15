@@ -21,5 +21,5 @@ npm run example:recall
 
 ## Learn more
 
-- Docs: https://docs.laserdata.cloud/laser-sdk/memory
+- Docs: https://docs.laserdata.com/laser-sdk/memory
 - Full system built on this primitive: [`memory`](../memory): durable, governed memory combined with the graph primitive in one woven scenario.

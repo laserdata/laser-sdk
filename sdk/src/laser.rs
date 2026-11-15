@@ -307,6 +307,10 @@ struct LaserInner {
     // replies. Every KV, fork and graph read sends it back, so whichever node
     // answers has applied at least what this client wrote or read before.
     seen_frontier: std::sync::Mutex<laser_wire::mutation::AppliedFrontier>,
+    // The log-memory writes this connection made that a default recall has
+    // not seen in the managed view yet, shared by every memory handle.
+    #[cfg(all(feature = "agent", feature = "kv"))]
+    memory_writes: std::sync::Mutex<crate::memory::OwnWrites>,
     // The node each managed request goes to.
     nodes: Nodes,
     pub(crate) producer_statistics: Arc<crate::stream::producer_statistics::ProducerRegistry>,
@@ -488,6 +492,8 @@ impl Laser {
                 publish_options: PublishOptions::default(),
                 reconnect_gate: tokio::sync::Mutex::new(()),
                 seen_frontier: std::sync::Mutex::default(),
+                #[cfg(all(feature = "agent", feature = "kv"))]
+                memory_writes: std::sync::Mutex::default(),
                 nodes: Nodes::new(caller_key()),
                 publish_generation: std::sync::atomic::AtomicU64::new(0),
                 connection_string: None,
@@ -615,6 +621,12 @@ impl Laser {
         let mut scoped = self.clone();
         scoped.changes_topic_override = Some(changes_topic.into());
         scoped
+    }
+
+    // The memory writes a default recall waits for, shared by every clone.
+    #[cfg(all(feature = "agent", feature = "kv"))]
+    pub(crate) fn own_memory_writes(&self) -> &std::sync::Mutex<crate::memory::OwnWrites> {
+        &self.inner.memory_writes
     }
 
     /// A clone of this `Laser` pinned to a default data `stream`, sharing the one
@@ -1648,6 +1660,15 @@ impl Laser {
         Ok(self.client().consumer_group(group, stream, topic)?)
     }
 
+    // Whether this connection already built its producer for the topic.
+    #[cfg(feature = "agent")]
+    pub(crate) fn has_producer(&self, stream: &str, topic: &str) -> bool {
+        self.inner
+            .producers
+            .get(&(stream.to_owned(), topic.to_owned()))
+            .is_some_and(|cell| cell.initialized())
+    }
+
     pub(crate) async fn producer_on(
         &self,
         stream: &str,
@@ -2113,7 +2134,8 @@ impl LaserBuilder {
                             .split('&')
                             .any(|pair| pair == "validate_certificate=true")
                     });
-                connect_before(&client, connect_deadline, verified_quic).await?;
+                let laserdata_host = is_laserdata_host(host_of(&normalized));
+                connect_before(&client, connect_deadline, verified_quic, laserdata_host).await?;
                 (client, Some(normalized))
             }
         };
@@ -2153,6 +2175,8 @@ impl LaserBuilder {
                 publish_options,
                 reconnect_gate: tokio::sync::Mutex::new(()),
                 seen_frontier: std::sync::Mutex::default(),
+                #[cfg(all(feature = "agent", feature = "kv"))]
+                memory_writes: std::sync::Mutex::default(),
                 nodes,
                 publish_generation: std::sync::atomic::AtomicU64::new(0),
                 connection_string,

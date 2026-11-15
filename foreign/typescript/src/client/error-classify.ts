@@ -29,6 +29,7 @@ import {
   ProtocolError,
   PublishFailedError,
   QuarantinedError,
+  STREAM_OR_TOPIC_NOT_FOUND_CODES,
   StepFailedError,
   QueryExecutionError,
   RoutePrincipalMismatchError,
@@ -43,7 +44,6 @@ import { type AuthzError, authzErrorResultCode } from "../wire/authz.js"
 const IGGY_RESOURCE_NOT_FOUND = 20
 const IGGY_UNAUTHENTICATED = 40
 const IGGY_UNAUTHORIZED = 41
-const IGGY_STREAM_OR_TOPIC_NOT_FOUND: ReadonlySet<number> = new Set([1009, 1010, 2010, 2011])
 // The codes Rust `is_transient_iggy_io_error` names: a lost or refused link,
 // and a write or read the cluster could not serve yet.
 const IGGY_TRANSIENT: ReadonlySet<number> = new Set([
@@ -310,7 +310,7 @@ export function filterReason(error: unknown): FilterErrorReason | undefined {
  * missing one. */
 export function isStreamOrTopicNotFound(error: unknown): boolean {
   const serverCode = iggyErrorCode(error)
-  return serverCode !== undefined && IGGY_STREAM_OR_TOPIC_NOT_FOUND.has(serverCode)
+  return serverCode !== undefined && STREAM_OR_TOPIC_NOT_FOUND_CODES.has(serverCode)
 }
 
 /** Whether a compare-and-swap lost its precondition. Re-read, recompute, and
@@ -400,7 +400,7 @@ function codeIs(error: unknown, name: keyof typeof ResultCodeName): boolean {
 }
 
 function iggyResultCode(serverCode: number): ResultCode {
-  if (serverCode === IGGY_RESOURCE_NOT_FOUND || IGGY_STREAM_OR_TOPIC_NOT_FOUND.has(serverCode))
+  if (serverCode === IGGY_RESOURCE_NOT_FOUND || STREAM_OR_TOPIC_NOT_FOUND_CODES.has(serverCode))
     return known("NotFound")
   if (serverCode === IGGY_UNAUTHORIZED) return known("Forbidden")
   if (serverCode === IGGY_UNAUTHENTICATED) return known("Unauthenticated")

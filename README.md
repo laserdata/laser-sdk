@@ -1,18 +1,248 @@
 # LaserData - Laser SDK
 
-Laser SDK provides streaming, queries, key-value state, forks, graphs, and agent coordination through one client over [Apache Iggy](https://iggy.apache.org). [LaserData, Inc.](https://laserdata.com) maintains the SDK. A log stores records in append order. Managed services build query results and state from those records.
+Laser SDK provides streaming, queries, key-value state, forks, graphs, agent memory, durable workflows, and agent coordination through one client over [Apache Iggy](https://iggy.apache.org). [LaserData, Inc.](https://laserdata.com) maintains the SDK. Rust ([`laser-sdk` on crates.io](https://crates.io/crates/laser-sdk)) defines the reference behavior. Python ([`laser-sdk` on PyPI](https://pypi.org/project/laser-sdk/), [source](foreign/python/README.md)) calls the Rust implementation. TypeScript ([`@laserdata/laser-sdk` on npm](https://www.npmjs.com/package/@laserdata/laser-sdk), [source](foreign/typescript/README.md)) is a native Node client.
 
-**The log is the source of truth.** A read model is data organized for a specific query. Services can rebuild these models from retained log records. A support task can record messages, keep working memory, and track dependencies through the same SDK.
+## Two complete programs
 
-Rust ([`laser-sdk` on crates.io](https://crates.io/crates/laser-sdk)) defines the reference SDK behavior. Python ([`laser-sdk` on PyPI](https://pypi.org/project/laser-sdk/), [source](foreign/python/README.md)) calls the Rust implementation. TypeScript ([`@laserdata/laser-sdk` on npm](https://www.npmjs.com/package/@laserdata/laser-sdk), [source](foreign/typescript/README.md)) provides a native Node client. Shared test data and behavior scenarios compare the clients. The [`laser-wire` crate](https://crates.io/crates/laser-wire) ([source](wire/README.md)) defines the data exchanged between them.
+Each program below runs as written. It reads the connection string from `LASER_CONNECTION_STRING` with `connect_env` (`connectEnv` in TypeScript), creates a scratch stream with a unique name, and deletes the stream when it ends. A LaserData API key is not a connection string. Copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it.
+
+- TypeScript: `npm install @laserdata/laser-sdk`, Node 22.14 or later, in an ES module.
+- Rust: `cargo add laser-sdk --features agent,kv`, `cargo add tokio --features macros,rt-multi-thread`, `cargo add serde --features derive`, and `cargo add serde_json`.
+- Python: `pip install laser-sdk`, Python 3.10 or later.
+
+To keep what a program writes, use a named stream instead of the scratch stream: set `LASER_STREAM` for `connect_env`, or call `with_default_stream(name)` (`withDefaultStream` in TypeScript). A workflow run and the first memory write create a missing stream.
+
+### A three-step workflow
+
+The steps run in this process. Each step gets the outputs of the steps before it, and each completion is journaled, so a run resumed by its id keeps the steps it finished. The run creates its own topics, so the program needs no `bootstrap`, agent, or handler. Steps addressed to agents mix with these in one workflow.
+
+TypeScript
+
+```ts
+import { Laser } from "@laserdata/laser-sdk"
+
+await using laser = await Laser.connectEnv()
+await using scratch = await laser.scratchStream("workflow-demo")
+const outcome = await scratch.laser
+  .workflow("job-runner")
+  .stepLocal("create", () => "job-42")
+  .stepLocal(
+    "process",
+    ({ outputs }) => `processed ${new TextDecoder().decode(outputs.get("create"))}`
+  )
+  .after("create")
+  .stepLocal("finish", () => "completed")
+  .after("process")
+  .run()
+const report = {
+  run_id: outcome.runId.toString(),
+  status: outcome.status,
+  completed_steps: outcome.completedSteps,
+  outputs: Object.fromEntries(outcome.completedSteps.map((label) => [label, outcome.text(label)]))
+}
+console.log(JSON.stringify(report, null, 2))
+```
+
+Rust
+
+```rust,no_run
+use laser_sdk::agent::StepContext;
+use laser_sdk::prelude::*;
+use laser_sdk::wire::agent::SessionStatus;
+use serde::Serialize;
+use std::collections::BTreeMap;
+
+#[derive(Serialize)]
+struct Report {
+    run_id: ConversationId,
+    status: SessionStatus,
+    completed_steps: Vec<String>,
+    outputs: BTreeMap<String, String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let laser = Laser::connect_env().await?;
+    let scratch = laser.scratch_stream("workflow-demo").await?;
+    let report = run(scratch.laser()).await;
+    scratch.delete().await?;
+    println!("{}", serde_json::to_string_pretty(&report?)?);
+    Ok(())
+}
+
+async fn run(laser: &Laser) -> Result<Report, LaserError> {
+    let outcome = laser
+        .workflow("job-runner")
+        .step_local("create", |_: &StepContext<'_>| b"job-42".to_vec())
+        .step_local("process", |context: &StepContext<'_>| {
+            let job = context.outputs.get("create").cloned().unwrap_or_default();
+            [b"processed ".to_vec(), job].concat()
+        })
+        .after("create")
+        .step_local("finish", |_: &StepContext<'_>| b"completed".to_vec())
+        .after("process")
+        .run()
+        .await?;
+    let outputs = outcome
+        .completed_steps
+        .iter()
+        .map(|label| (label.clone(), outcome.text(label).unwrap_or_default()))
+        .collect();
+    Ok(Report {
+        run_id: outcome.run_id,
+        status: outcome.status,
+        completed_steps: outcome.completed_steps,
+        outputs,
+    })
+}
+```
+
+Python
+
+```python
+import asyncio
+import json
+
+from laser_sdk import Laser
+
+
+async def main() -> None:
+    async with await Laser.connect_env() as laser:
+        async with laser.scratch_stream("workflow-demo") as scratch:
+            outcome = await (
+                scratch.laser.workflow("job-runner")
+                .step("create", run=lambda outputs: "job-42")
+                .step(
+                    "process",
+                    run=lambda outputs: "processed " + outputs["create"].decode(),
+                    after=["create"],
+                )
+                .step("finish", run=lambda outputs: "completed", after=["process"])
+                .run()
+            )
+    report = {
+        "run_id": outcome.run_id,
+        "status": outcome.status,
+        "completed_steps": outcome.completed_steps,
+        "outputs": {label: outcome.text(label) for label in outcome.completed_steps},
+    }
+    print(json.dumps(report, indent=2))
+
+
+asyncio.run(main())
+```
+
+Each prints the run id, `"status": "completed"`, `"completed_steps": ["create", "process", "finish"]`, and the three outputs. A failed step raises `StepFailed` (`StepFailedError` in Python and TypeScript) naming the step, the reason, its target, and its deadline, once the compensations of the finished steps have run.
+
+### A memory correction
+
+The first conversation stores two facts about the user `sam`. A later conversation corrects the city with `supersede`, which remembers the new fact first and then forgets the old one in every conversation. A recall for the user reads every conversation, ranks the facts by the words they share with the query, and drops none. It waits for the writes this connection made, so the correction shows at once. On LaserData Cloud and Laser Stack recall reads the managed memory view. Apache Iggy serves no view, so there recall folds the memory topic in process, and the same program runs on every server.
+
+TypeScript
+
+```ts
+import { ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
+
+await using laser = await Laser.connectEnv()
+await using scratch = await laser.scratchStream("memory-demo")
+const memory = scratch.laser.memory("assistant")
+const first = ConversationId.new()
+const home = await memory.remember("Sam lives in Berlin").scope(first).user("sam").send()
+await memory.remember("Sam is allergic to peanuts").scope(first).user("sam").send()
+await memory
+  .supersede(home, "Sam lives in Amsterdam")
+  .scope(ConversationId.new())
+  .user("sam")
+  .send()
+const facts = await memory.recall().user("sam").semantic("where does Sam live").fetch()
+console.log(JSON.stringify(facts.map(memoryItemText), null, 2))
+```
+
+Rust
+
+```rust,no_run
+use laser_sdk::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let laser = Laser::connect_env().await?;
+    let scratch = laser.scratch_stream("memory-demo").await?;
+    let facts = run(scratch.laser()).await;
+    scratch.delete().await?;
+    println!("{}", serde_json::to_string_pretty(&facts?)?);
+    Ok(())
+}
+
+async fn run(laser: &Laser) -> Result<Vec<String>, LaserError> {
+    let memory = laser.memory("assistant");
+    let first = ConversationId::new();
+    let home = memory
+        .remember("Sam lives in Berlin")
+        .scope(first)
+        .user("sam")
+        .send()
+        .await?;
+    memory
+        .remember("Sam is allergic to peanuts")
+        .scope(first)
+        .user("sam")
+        .send()
+        .await?;
+    memory
+        .supersede(home, "Sam lives in Amsterdam")
+        .scope(ConversationId::new())
+        .user("sam")
+        .send()
+        .await?;
+    let facts = memory
+        .recall(None)
+        .user("sam")
+        .semantic("where does Sam live")
+        .fetch()
+        .await?;
+    Ok(facts.iter().map(MemoryItem::text).collect())
+}
+```
+
+Python
+
+```python
+import asyncio
+import json
+
+from laser_sdk import Laser, new_conversation_id
+
+
+async def main() -> None:
+    async with await Laser.connect_env() as laser:
+        async with laser.scratch_stream("memory-demo") as scratch:
+            memory = scratch.laser.memory("assistant")
+            first = new_conversation_id()
+            home = await memory.remember("Sam lives in Berlin", user="sam", conversation=first)
+            await memory.remember("Sam is allergic to peanuts", user="sam", conversation=first)
+            await memory.supersede(
+                home, "Sam lives in Amsterdam", user="sam", conversation=new_conversation_id()
+            )
+            facts = await memory.recall(user="sam", semantic="where does Sam live")
+    print(json.dumps([item.text() for item in facts], indent=2))
+
+
+asyncio.run(main())
+```
+
+Each prints `["Sam lives in Amsterdam", "Sam is allergic to peanuts"]`. Berlin is gone. The same programs live in [`examples/`](examples/README.md) as `workflow` and `memory-correction` (`workflow.py` and `memory_correction.py` in Python), where each runs when copied alone.
+
+## More about the SDK
+
+**The log is the source of truth.** A log stores records in append order, and managed services build query results and state from those records. A read model is data organized for a specific query, and services can rebuild it from retained log records. Shared test data and behavior scenarios compare the clients. The [`laser-wire` crate](https://crates.io/crates/laser-wire) ([source](wire/README.md)) defines the data exchanged between them.
 
 > [Laser Stack](https://github.com/laserdata/laser-stack) runs Laser Streams and the managed backend for local development. It supports the managed SDK operations, including queries. In the Laser Stack checkout, run `./scripts/up` to start the services and obtain `LASER_CONNECTION_STRING`. Laser Stack excludes proprietary Cloud features such as the Stream and Data UI.
 
-Read the three-language guides at [docs.laserdata.cloud/laser-sdk](https://docs.laserdata.cloud/laser-sdk). Start with the [quickstart](https://docs.laserdata.cloud/laser-sdk/quickstart) or the focused [`examples/`](examples/README.md).
+Read the three-language guides at [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk). Start with the [quickstart](https://docs.laserdata.com/laser-sdk/quickstart) or the focused [`examples/`](examples/README.md).
 
 After the focused examples, two public example repositories go further. [Photon Market](https://github.com/laserdata/laser-example-photon-market) shows a more realistic Rust system built with Laser SDK across multiple modules and microservices. [Frostline](https://github.com/laserdata/laser-example-frostline) is the consumer-filter showcase: one change feed, three teams reading their own slice, and a benchmark that measures how much payload never left the server.
 
-**Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
+**Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.com/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 
 ## Quick start
 
@@ -29,12 +259,33 @@ export LASER_CONNECTION_STRING='<connection string>'
 LASER_CONNECTION_STRING='<connection string>' cargo run --example log
 ```
 
-The examples below connect to local Apache Iggy. The default TCP port is `:8090`, so the address can omit it. Laser SDK uses the transport that Iggy provides.
+The examples below publish one record and read it back. Like the programs above, they read `LASER_CONNECTION_STRING`, work in a scratch stream, and delete it at the end. The default TCP port is `:8090`, so a connection string can omit it. Laser SDK uses the transport that Iggy provides.
+
+TypeScript ([npm](https://www.npmjs.com/package/@laserdata/laser-sdk))
+
+```sh
+npm install @laserdata/laser-sdk
+```
+
+```ts
+import { Laser } from "@laserdata/laser-sdk"
+
+await using laser = await Laser.connectEnv()
+await using scratch = await laser.scratchStream("telemetry")
+const topic = scratch.laser.topic("inferences")
+await topic.ensure(4)
+await topic.publish().json({ latency_ms: 42 }).send()
+
+const messages = await (await topic.replay()).poll()
+console.log(`read ${messages.length} message(s)`)
+```
 
 Rust ([crates.io](https://crates.io/crates/laser-sdk))
 
 ```sh
 cargo add laser-sdk
+cargo add tokio --features macros,rt-multi-thread
+cargo add serde_json
 ```
 
 ```rust,no_run
@@ -42,14 +293,15 @@ use laser_sdk::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), LaserError> {
-    let laser = Laser::connect("iggy:iggy@127.0.0.1").await?;
-    let topic = laser.stream("telemetry").topic("inferences");
+    let laser = Laser::connect_env().await?;
+    let scratch = laser.scratch_stream("telemetry").await?;
+    let topic = scratch.laser().topic("inferences");
     topic.ensure(4, None).await?;
     topic.publish().json(&serde_json::json!({ "latency_ms": 42 }))?.send().await?;
 
     let messages = topic.replay()?.poll().await?;
     println!("read {} message(s)", messages.len());
-    Ok(())
+    scratch.delete().await
 }
 ```
 
@@ -61,36 +313,22 @@ pip install laser-sdk
 
 ```python
 import asyncio
-import laser_sdk as ls
 
-async def main():
-    laser = await ls.Laser.connect("iggy:iggy@127.0.0.1")
-    topic = laser.stream("telemetry").topic("inferences")
-    await topic.ensure(partitions=4)
-    await topic.publish().json({"latency_ms": 42}).send()
+from laser_sdk import Laser
 
-    messages = await topic.replay().poll()
-    print(f"read {len(messages)} message(s)")
+
+async def main() -> None:
+    async with await Laser.connect_env() as laser:
+        async with laser.scratch_stream("telemetry") as scratch:
+            topic = scratch.laser.topic("inferences")
+            await topic.ensure(partitions=4)
+            await topic.publish().json({"latency_ms": 42}).send()
+
+            messages = await topic.replay().poll()
+            print(f"read {len(messages)} message(s)")
+
 
 asyncio.run(main())
-```
-
-TypeScript ([npm](https://www.npmjs.com/package/@laserdata/laser-sdk))
-
-```sh
-npm install @laserdata/laser-sdk
-```
-
-```ts
-import { Laser } from "@laserdata/laser-sdk"
-
-await using laser = await Laser.connect("iggy:iggy@127.0.0.1")
-const topic = laser.stream("telemetry").topic("inferences")
-await topic.ensure(4)
-await topic.publish().json({ latency_ms: 42 }).send()
-
-const messages = await (await topic.replay()).poll()
-console.log(`read ${messages.length} message(s)`)
 ```
 
 The examples use open streaming. Add `managed` for projections, queries, KV, forks, and graphs on Laser Stack or LaserData Cloud. Add `agent` for handlers, memory, contracts, and workflows.
@@ -109,9 +347,9 @@ An accessor selects a feature on the connected client. A method performs an acti
 | `laser.query(index)` | Views | filter, aggregate and page operational queries |
 | `laser.graph(name)` | Graph | link entities, traverse, find neighbors and nearest vectors |
 | `laser.watch()` | Change feed | consume advancement records instead of re-querying blind |
-| `topic.consumer_group(...).filter()` | [Consumer filters](https://docs.laserdata.cloud/laser-sdk/consumer-filters) | read only the records a filter selects, on the server, with fenced acknowledgments, previews, saved filters, and bound consumer groups |
+| `topic.consumer_group(...).filter()` | [Consumer filters](https://docs.laserdata.com/laser-sdk/consumer-filters) | read only the records a filter selects, on the server, with fenced acknowledgments, previews, saved filters, and bound consumer groups |
 | `laser.kv(namespace)` / `laser.fork(id)` | State | point reads and writes, CAS, leases, copy-on-write branches |
-| `laser.memory(scope)` | Memory | remember, recall (semantic / keyword / hybrid), consolidate |
+| `laser.memory(scope)` | Memory | remember, supersede a fact, recall (semantic / keyword / hybrid), consolidate |
 | `laser.context(id)` | Context | append and assemble one conversation's record, and scope its memory to that conversation |
 | `laser.sessions()` | Session | start and end a unit of work, record model and tool calls, keep state, hand work to an agent, and replay from saved offsets |
 | `laser.agent(id)` / `laser.contract(..)` / `laser.workflow(..)` | Fabric | directed asks, deadline contracts, ordered workflows whose steps are child sessions |
@@ -237,7 +475,7 @@ const nearby = await laser.graph("kg").neighbors(node, "out", undefined, 2)
 const feed = await laser.watch().index("readings_v1").fromEnd().records()
 
 // State
-await laser.kv("sessions").set(key).json(session).ttl(300_000_000n).send()
+await laser.kv("sessions").set(key).json(session).ttl(300_000).send()
 const draft = laser.fork("what-if")
 
 // Fabric: one task streams its messages, keeps its memory, resolves its deps
@@ -288,10 +526,10 @@ Agent fabric (opt in with the `agent` feature):
 | Primitive | What you get |
 | --- | --- |
 | Reliable runtime | A consumer with **dedup, retry, and dead-letter**, request/reply correlation, conversation and causality tracking, routing, sessions, and context assembly. |
-| Agentic memory | One durable model: `remember` / `recall` / `improve` / `forget` publish to the memory topic (`agent.memory` by default) that materializes to a versioned key-value read view and recalls by recency, ranked first by the summed feedback for every strategy except recent. A forget is a timed tombstone, so an older write stays forgotten whichever partition it rides. The topic is configurable (`memory_topic(name).stream(..).partitions(n).ttl(d)`). The in-process vector backend and rerank seam add semantic / keyword / hybrid ranking. Consolidation, token-budgeted `to_context_block`, and content-addressed dedup compose above both. Vector memory created from a `Laser` inherits its action governor even though the index itself stays local. A scan over the read view narrows to one conversation with `conversation(id)`, the same lens the query and graph reads carry. |
+| Agentic memory | One durable model: `remember` / `recall` / `improve` / `forget` / `supersede` publish to the memory topic (`agent.memory` by default, created on the first write) that materializes to a versioned key-value read view. A default recall waits until the view reflects the writes the same connection made, for at most 10 seconds. On a server without the view, such as Apache Iggy alone, a default recall folds the topic in process. It recalls by recency, ranked first by the summed feedback for every strategy except recent. A semantic or hybrid query ranks by the share of query words each item holds plus its feedback and drops nothing, while keyword keeps only the items that share a word. `supersede(old_id, fact)` remembers the new fact and then forgets the old one in every conversation. A forget is a timed tombstone, so an older write stays forgotten whichever partition it rides. The topic is configurable (`memory_topic(name).stream(..).partitions(n).ttl(d)`). The in-process vector backend and rerank seam add embedding similarity ranking. Consolidation, token-budgeted `to_context_block`, and content-addressed dedup compose above both. Vector memory created from a `Laser` inherits its action governor even though the index itself stays local. A scan over the read view narrows to one conversation with `conversation(id)`, the same lens the query and graph reads carry. |
 | Discovery | Agents advertise a capability card and a live inbox, fused into one cached registry with health-aware resolution and reversible operator `quarantine` / `unquarantine`. One connection may advertise one agent. Sensitive routes can require the presence's server-authenticated principal. |
 | Coordination | `contract` (a directed task with a deadline and a real consumed / completed / timed-out answer), `fan_out` / `scatter` (ask every capable agent, gather under a policy), and `approval_gate` (pause for a named approver and get a grant a governed re-send carries). With signing enabled, terminals fail closed on unsigned or wrongly signed replies and expose the verified principal. |
-| Workflow engine | `laser.workflow(..).step(..)`: dependency-ordered steps, budgets, verifier panels, saga compensation, **crash-recovery replay from a journal**, and per-step fenced leases. Use `.exclusive_in(namespace)` when the handler commits an external effect with `kv(target_namespace).cas_fenced(key, namespace, ..)`. The engine races bounded renewal against completion, keeps the lease through verification and completion journaling, then releases it before `OnTimeout::Reassign` gives a fresh holder a new fence. |
+| Workflow engine | `laser.workflow(..).step(..)` and `.step_local(..)`: dependency-ordered steps routed to agents or run in process, a run that creates its own topics, an outcome with the status and the completed steps in order, budgets, verifier panels, saga compensation, **crash-recovery replay from a journal**, and per-step fenced leases. Use `.exclusive_in(namespace)` when the handler commits an external effect with `kv(target_namespace).cas_fenced(key, namespace, ..)`. The engine races bounded renewal against completion, keeps the lease through verification and completion journaling, then releases it before `OnTimeout::Reassign` gives a fresh holder a new fence. |
 | Sessions | `laser.sessions()`: one conversation with a recorded lifecycle on `agent.sessions`. Start, end, fail, or cancel it, record model and tool calls with the context they received, keep a JSON state document, hand work to an agent with a budget that agents and workflows enforce, and stop it through the operator-only `agent.control` topic. Workflows run as root sessions with a child session per step. A registered stream gets a managed session index that `laser.sessions()` reads with `list`, `get`, `events`, `state`, `links`, `sources`, `changes`, and `watch`, and the log stays the truth. |
 | AGDX envelope | A typed, versioned, fixture-pinned agent message format on the log, with producer verbs, resumable token streams, and deterministic reassembly. ([notes](docs/agdx.md)) |
 | Action governance | A pre-effect policy hook (`ActionGovernor`) over everything an agent publishes: allow, observe, block, step-up, modify, or defer each send, every record of a typed or raw topic publish, batch, producer send, or session append, AGDX verb, and memory write **before it runs**. Enforce or shadow mode records every non-allow decision as digest-chained evidence, one chain per governed handle and conversation. `QuorumGovernor` runs named governors concurrently under `All` / `Any` / `AtLeast(n)`, each bounded by a voter timeout. Every mandatory voter must affirm, invalid configurations and mandatory errors block, and conflicting body replacements block. `SwappableGovernor` changes the active policy without reconnecting. Defense in depth above server-owned RBAC. |
@@ -336,7 +574,7 @@ Connections to `*.laserdata.cloud` and `*.laserdata.com` automatically use the p
 
 ## Consumer groups and offsets
 
-Provision a filtered group once, then consume it by name or ID. Every consumer in the group shares its policy and divides the partitions, so use separate groups for A/B revisions to keep their offsets independent. A fresh consumer that starts at `Next` begins at the first retained record. The default `all` commit policy stores a poll once its last record is handled. Under the polling commit policy a native consumer can store a polled batch's offset before the application has handled it, and a group-aware automatic commit advances only past records already delivered, on the next read or at shutdown. When that matters, disable automatic commits and commit after processing. Filtered readers acknowledge explicitly and keep at most 1024 unacknowledged record-bearing pages per partition by default (`max_unacked_pages` in Rust and Python, `maxUnackedPages` in TypeScript), so a reader that never acknowledges stops at the bound instead of growing without limit. A record the default `stop` fault policy stops on blocks its partition until the reader or the group consumer calls `skip(partition, offset)` with the offset the fault names, which acknowledges past it once the records before it are handled. An unnamed TypeScript consumer gets an isolated identity and does not commit automatically. Give it a stable name to resume durable progress. Codec profiles and examples are in the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+Provision a filtered group once, then consume it by name or ID. Every consumer in the group shares its policy and divides the partitions, so use separate groups for A/B revisions to keep their offsets independent. A fresh consumer that starts at `Next` begins at the first retained record. The default `all` commit policy stores a poll once its last record is handled. Under the polling commit policy a native consumer can store a polled batch's offset before the application has handled it, and a group-aware automatic commit advances only past records already delivered, on the next read or at shutdown. When that matters, disable automatic commits and commit after processing. Filtered readers acknowledge explicitly and keep at most 1024 unacknowledged record-bearing pages per partition by default (`max_unacked_pages` in Rust and Python, `maxUnackedPages` in TypeScript), so a reader that never acknowledges stops at the bound instead of growing without limit. A record the default `stop` fault policy stops on blocks its partition until the reader or the group consumer calls `skip(partition, offset)` with the offset the fault names, which acknowledges past it once the records before it are handled. An unnamed TypeScript consumer gets an isolated identity and does not commit automatically. Give it a stable name to resume durable progress. Codec profiles and examples are in the [Consumer Filters guide](https://docs.laserdata.com/laser-sdk/consumer-filters).
 
 ## Connect and publish limits
 
@@ -360,7 +598,7 @@ Connecting gives up after 30 seconds. Each publish attempt times out after 60 se
 | [`laser-sdk`](sdk/README.md) (`sdk/`) | the client and agent runtime, re-exporting the wire crate as `laser_sdk::wire`. |
 | [`foreign/python`](foreign/python/README.md) | the Python SDK, PyO3 bindings over the Rust crate. |
 | [`foreign/typescript`](foreign/typescript/README.md) | the native TypeScript SDK over Apache Iggy. |
-| [`examples`](examples/README.md) | Nine focused examples cover `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, `context`, and `agent` in Rust, Python, and TypeScript. Nine larger examples cover streaming, event analytics, a fleet telemetry tape (`fleet-tape`), load generation, an incident desk (`incident-desk`), memory, interoperability, `orchestra`, and governance. |
+| [`examples`](examples/README.md) | Two standalone programs, `workflow` and `memory-correction`, run when copied alone. Nine focused examples cover `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, `context`, and `agent` in Rust, Python, and TypeScript. Nine larger examples cover streaming, event analytics, a fleet telemetry tape (`fleet-tape`), load generation, an incident desk (`incident-desk`), memory, interoperability, `orchestra`, and governance. |
 
 ## Benchmarks
 

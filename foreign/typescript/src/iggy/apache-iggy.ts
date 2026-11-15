@@ -190,8 +190,10 @@ const DEFAULT_RECONNECT_INTERVAL_MS = 1_000
 const UNLIMITED_RECONNECT_RETRIES = 4_294_967_295
 // The Apache Iggy TCP default port, as in Rust.
 const DEFAULT_TCP_PORT = 8090
-const ACCEPT_STAGE = "Iggy server to accept the connection"
-const LOGIN_STAGE = "Iggy login reply"
+const ACCEPT_STAGE = "timed out waiting for the Iggy server to accept the connection"
+const ACCESS_RULE_HINT =
+  "the deployment admits only addresses its access rules allow: add an access rule for this address"
+const LOGIN_STAGE = "timed out waiting for the Iggy login reply"
 const VSR_HEARTBEAT_INTERVAL_MS = 5_000
 // partition_id u32, current_offset u64, messages_count u32, then the
 // partition context: incarnation, owner generation, and metadata op, u64 each.
@@ -482,6 +484,9 @@ export interface LaserTransport {
         /** Sends each batch with the producer section of its partition, so a resend is written once.
          * @internal */
         readonly idempotence?: ProducerSequences
+        /** The settings of a topic this send creates after the server refused it as missing.
+         * @internal */
+        readonly createTopic?: TopicCreateSettings
         readonly beforeSend?: () => Promise<{
           readonly streamId: number
           readonly topicId: number
@@ -1292,6 +1297,14 @@ interface ParsedConnectionString {
   readonly reestablishAfterMs?: number
 }
 
+/** The stage a connect timeout names before the server accepted the
+ * connection. A LaserData deployment that never accepts usually refuses the
+ * caller's address, so the stage names the access rule.
+ * @internal */
+export function acceptStage(host: string): string {
+  return laserDataHost(host) ? `${ACCEPT_STAGE}: ${ACCESS_RULE_HINT}` : ACCEPT_STAGE
+}
+
 function laserDataHost(host: string): boolean {
   const normalized = host.toLowerCase()
   return (
@@ -1623,7 +1636,9 @@ async function connectSimpleClient(
               new Promise<never>((_, reject) => {
                 timer = setTimeout(
                   () => {
-                    reject(new TimeoutError(transportUp(raw) ? LOGIN_STAGE : ACCEPT_STAGE))
+                    reject(
+                      new TimeoutError(transportUp(raw) ? LOGIN_STAGE : acceptStage(parsed.host))
+                    )
                   },
                   Math.max(0, deadline - Date.now())
                 )
@@ -1735,7 +1750,7 @@ async function connectWithRetry(
         break
       }
       const remaining = deadline - Date.now()
-      if (remaining <= 0) throw new TimeoutError(ACCEPT_STAGE, { cause: error })
+      if (remaining <= 0) throw new TimeoutError(acceptStage(parsed.host), { cause: error })
       await sleep(
         Math.min(parsed.reconnection.intervalMs, remaining),
         undefined,
@@ -3263,6 +3278,9 @@ export class ApacheIggyTransport implements LaserTransport {
         /** Sends each batch with the producer section of its partition, so a resend is written once.
          * @internal */
         readonly idempotence?: ProducerSequences
+        /** The settings of a topic this send creates after the server refused it as missing.
+         * @internal */
+        readonly createTopic?: TopicCreateSettings
         readonly beforeSend?: () => Promise<{
           readonly streamId: number
           readonly topicId: number
@@ -3302,6 +3320,9 @@ export class ApacheIggyTransport implements LaserTransport {
         /** Sends each batch with the producer section of its partition, so a resend is written once.
          * @internal */
         readonly idempotence?: ProducerSequences
+        /** The settings of a topic this send creates after the server refused it as missing.
+         * @internal */
+        readonly createTopic?: TopicCreateSettings
         readonly beforeSend?: () => Promise<{
           readonly streamId: number
           readonly topicId: number
@@ -3391,7 +3412,7 @@ export class ApacheIggyTransport implements LaserTransport {
           if (!MISSING_RESOURCE_CODES.has(code) && !missedRoute) throw cause
           if (MISSING_RESOURCE_CODES.has(code) && options?.beforeSend === undefined) {
             await this.ensureStream(streamId)
-            await this.createTopicIfAbsent(streamId, topicId, 1, {})
+            await this.createTopicIfAbsent(streamId, topicId, 1, options?.createTopic ?? {})
           }
           // Rebuild the routing once, as a recreated stream or topic or a
           // topic with fewer partitions needs.

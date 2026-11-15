@@ -37,6 +37,9 @@ const FLAGS: [&str; 15] = [
     "not_leader",
 ];
 const DETAIL: (&str, &str) = ("detail", "typing.Any");
+// The fix a publish to a missing stream or topic names, the text the Rust
+// publish failure ends with.
+const MISSING_TOPIC_HINT: &str = ": the topic does not exist: create the agent topics with bootstrap, or a memory topic with memory_topic";
 // A class constant naming one variant of a Rust error enum. Its value is the
 // lowercase constant name, the word a raised instance carries in `kind`.
 const VARIANT: &str = "typing.ClassVar[builtins.str]";
@@ -415,8 +418,9 @@ create_exception!(
     StepFailedError,
     LaserError,
     "A workflow step did not complete. `run` and `step` name it, and `reason` is `timed_out`, \
-     `failed`, `not_consumed`, `unverified`, or `no_completion`. Only `timed_out` is retryable. \
-     The completed steps' compensations have run."
+     `failed`, `not_consumed`, `unverified`, or `no_completion`. `target` names the step's \
+     route and `deadline_ms` its configured deadline. Only `timed_out` is retryable. The \
+     completed steps' compensations have run."
 );
 create_exception!(
     laser_sdk,
@@ -621,6 +625,8 @@ pub(crate) fn from_callback_error(error: PyErr) -> SdkError {
                 reason: text("reason")
                     .and_then(|reason| reason.parse().ok())
                     .unwrap_or(laser_sdk::agent::StepFailure::Failed),
+                target: text("target").unwrap_or_default(),
+                deadline_ms: number("deadline_ms"),
             }
         } else if is(py.get_type::<JournalTruncatedError>()) {
             SdkError::JournalTruncated {
@@ -1199,6 +1205,8 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
                 ("run", "builtins.str"),
                 ("step", "builtins.str"),
                 ("reason", "builtins.str"),
+                ("target", "builtins.str"),
+                ("deadline_ms", "builtins.int"),
             ],
         ),
         class(
@@ -1305,7 +1313,14 @@ fn message_of(err: &SdkError) -> String {
                 stream_name,
                 topic_name,
                 ..
-            } => format!("publish failed to {stream_name}/{topic_name}: {cause}"),
+            } => {
+                let hint = if err.is_stream_or_topic_not_found() {
+                    MISSING_TOPIC_HINT
+                } else {
+                    ""
+                };
+                format!("publish failed to {stream_name}/{topic_name}: {cause}{hint}")
+            }
             _ => err.to_string(),
         },
         _ => err.to_string(),
@@ -1437,10 +1452,18 @@ fn set_fields(py: Python<'_>, pyerr: &PyErr, err: &SdkError) -> PyResult<()> {
             value.setattr("spent", spent)?;
         }
         SdkError::Cancelled { run } => value.setattr("run", run)?,
-        SdkError::StepFailed { run, step, reason } => {
+        SdkError::StepFailed {
+            run,
+            step,
+            reason,
+            target,
+            deadline_ms,
+        } => {
             value.setattr("run", run)?;
             value.setattr("step", step)?;
             value.setattr("reason", reason.to_string())?;
+            value.setattr("target", target)?;
+            value.setattr("deadline_ms", deadline_ms)?;
         }
         SdkError::JournalTruncated { run } => value.setattr("run", run)?,
         SdkError::AmbiguousMutation { operation_id, .. } => {

@@ -43,9 +43,7 @@ export class TopicSnapshotStore implements SnapshotStore {
   async latest(conversation: SdkConversationId): Promise<FoldSnapshot | undefined> {
     const stream = this.laser.defaultStream
     if (stream === undefined) {
-      throw new NoStreamError(
-        "a snapshot lookup requires a default stream, use connectWithStream() or withDefaultStream()"
-      )
+      throw new NoStreamError("a snapshot lookup requires a default stream")
     }
     const transport = this.laser[INTERNAL_TRANSPORT]()
     const partitions = await transport.findTopicPartitionCount(stream, this.topic)

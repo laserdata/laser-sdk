@@ -4,7 +4,8 @@ export {
   MemoryHandle,
   RecallBuilder,
   RememberBuilder,
-  RerankedMemory
+  RerankedMemory,
+  SupersedeBuilder
 } from "./memory/handle.js"
 export type { MemoryBackendKind } from "./memory/handle.js"
 export { DEFAULT_MEMORY_TOPIC_TTL_MS, MemoryTopicBuilder } from "./memory/topic.js"

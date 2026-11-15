@@ -444,6 +444,7 @@ export {
   RecallStrategy,
   RememberBuilder,
   RerankedMemory,
+  SupersedeBuilder,
   VectorMemory,
   fuseReciprocalRank,
   memoryClass,
@@ -623,6 +624,7 @@ export {
   messageIdToString
 } from "./types/ids.js"
 export type { MessageId } from "./types/ids.js"
+export { ScratchStream } from "./stream/scratch.js"
 export { Stream } from "./stream/stream.js"
 export { Topic } from "./stream/topic.js"
 export { Consumer } from "./stream/consumer.js"

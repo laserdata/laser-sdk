@@ -216,6 +216,10 @@ async def test_given_a_deleted_stream_when_a_producer_sends_then_should_name_cau
     with pytest.raises(ls.PublishFailedError) as failure:
         await producer.send_batch([b"a", b"b", b"c"])
     assert str(failure.value).startswith(f"publish failed to {stream}/pulse: ")
+    assert str(failure.value).endswith(
+        ": the topic does not exist: create the agent topics with bootstrap, "
+        "or a memory topic with memory_topic"
+    )
     assert (failure.value.stream, failure.value.topic) == (stream, "pulse")
     assert isinstance(failure.value.__cause__, ls.TransportError)
     assert [message.payload for message in failure.value.unconfirmed] == [b"a", b"b", b"c"]

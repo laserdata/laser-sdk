@@ -70,21 +70,30 @@ LASER_TOKEN='<token>' \
 | `LASER_DESK_GRANT_TIMEOUT_SECS` | the incident desk's grant-apply deadline (default 180s), raise it for a heavily rate-limited deployment |
 | `ANTHROPIC_API_KEY` | the incident desk uses real Claude for its LLM seam instead of the deterministic mock (`ANTHROPIC_MODEL` optional) |
 
+## Copy a whole program
+
+`workflow.py` and `memory_correction.py` import only `laser_sdk` and the standard library, not `_common.py`, so each runs when copied alone after `pip install laser-sdk`. Each reads `LASER_CONNECTION_STRING` through `Laser.connect_env()`, works in a scratch stream, and deletes it when its `async with` block ends.
+
+| script | shows | needs a managed backend? |
+| --- | --- | --- |
+| [`workflow.py`](workflow.py) | three in-process steps, journaled and resumable, with the outcome printed as JSON | no |
+| [`memory_correction.py`](memory_correction.py) | two facts for one user, a `supersede` in a later conversation, and a recall of the current facts | no |
+
 ## Primitives: start here
 
 Each focused script covers one primitive. Unsupported managed phases report the missing capability and exit cleanly.
 
 | script | primitive | shows | needs a managed backend? | docs |
 | --- | --- | --- | --- | --- |
-| [`log.py`](log.py) | Log | write two messages, read them back through one typed reader | no | [`/laser-sdk/log`](https://docs.laserdata.cloud/laser-sdk/log) |
-| [`query.py`](query.py) | Views | declare a view over a topic, publish host readings, query the maintained view | yes | [`/laser-sdk/views`](https://docs.laserdata.cloud/laser-sdk/views) |
-| [`watch.py`](watch.py) | Change feed | react to an advancement record instead of re-querying blind | yes | [`/laser-sdk/change-feed`](https://docs.laserdata.cloud/laser-sdk/change-feed) |
-| [`kv.py`](kv.py) | State | set/get keyed JSON with a TTL, change it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row | yes | [`/laser-sdk/state`](https://docs.laserdata.cloud/laser-sdk/state) |
-| [`cdc.py`](cdc.py) | Consumer filters | read four safe-mode events out of a 240-record feed of typed dataclasses, sample-test and preview filters, route binary alerts on a header, then save filters and bind a consumer group | yes | [`/laser-sdk/consumer-filters`](https://docs.laserdata.cloud/laser-sdk/consumer-filters) |
-| [`graph.py`](graph.py) | Graph | link entities and traverse one relation out of a node | yes | [`/laser-sdk/graph`](https://docs.laserdata.cloud/laser-sdk/graph) |
-| [`recall.py`](recall.py) | Memory | all four durable verbs: remember, recall recent, improve, forget | no | [`/laser-sdk/memory`](https://docs.laserdata.cloud/laser-sdk/memory) |
-| [`context.py`](context.py) | Context | assemble one conversation under a last-N bound and a token budget | no | [`/laser-sdk/context`](https://docs.laserdata.cloud/laser-sdk/context) |
-| [`agent.py`](agent.py) | Fabric | spawn a handler agent and send it a deadline-bounded contract | no | [`/laser-sdk/fabric`](https://docs.laserdata.cloud/laser-sdk/fabric) |
+| [`log.py`](log.py) | Log | write two messages, read them back through one typed reader | no | [`/laser-sdk/log`](https://docs.laserdata.com/laser-sdk/log) |
+| [`query.py`](query.py) | Views | declare a view over a topic, publish host readings, query the maintained view | yes | [`/laser-sdk/views`](https://docs.laserdata.com/laser-sdk/views) |
+| [`watch.py`](watch.py) | Change feed | react to an advancement record instead of re-querying blind | yes | [`/laser-sdk/change-feed`](https://docs.laserdata.com/laser-sdk/change-feed) |
+| [`kv.py`](kv.py) | State | set/get keyed JSON with a TTL, change it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row | yes | [`/laser-sdk/state`](https://docs.laserdata.com/laser-sdk/state) |
+| [`cdc.py`](cdc.py) | Consumer filters | read four safe-mode events out of a 240-record feed of typed dataclasses, sample-test and preview filters, route binary alerts on a header, then save filters and bind a consumer group | yes | [`/laser-sdk/consumer-filters`](https://docs.laserdata.com/laser-sdk/consumer-filters) |
+| [`graph.py`](graph.py) | Graph | link entities and traverse one relation out of a node | yes | [`/laser-sdk/graph`](https://docs.laserdata.com/laser-sdk/graph) |
+| [`recall.py`](recall.py) | Memory | all four durable verbs: remember, recall recent, improve, forget | no | [`/laser-sdk/memory`](https://docs.laserdata.com/laser-sdk/memory) |
+| [`context.py`](context.py) | Context | assemble one conversation under a last-N bound and a token budget | no | [`/laser-sdk/context`](https://docs.laserdata.com/laser-sdk/context) |
+| [`agent.py`](agent.py) | Fabric | spawn a handler agent and send it a deadline-bounded contract | no | [`/laser-sdk/fabric`](https://docs.laserdata.com/laser-sdk/fabric) |
 
 `recall.py` is the Memory primitive's example. It is not named `memory` because the full scenario below already owns that name, and `recall` is one of Memory's four verbs.
 
@@ -104,7 +113,7 @@ Each focused script covers one primitive. Unsupported managed phases report the 
 
 Every example runs green on a local Apache Iggy. The managed phases (query, key-value, graph, and RBAC) print how to point at a deployment and skip when the connected server is Apache Iggy. Key-value entries, leases, forks, and memory views live under the stream's scoped names and belong to that stream, so a rerun of a managed example on a recreated stream starts from empty state.
 
-**Consumer filters save 98.5% of payload transfer in the CDC example.** [cdc.py](cdc.py) reads 4 of 240 records from a shared feed. It uses dataclasses, record-by-record acknowledgments, one-byte numeric headers, previews, and saved group policies. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+**Consumer filters save 98.5% of payload transfer in the CDC example.** [cdc.py](cdc.py) reads 4 of 240 records from a shared feed. It uses dataclasses, record-by-record acknowledgments, one-byte numeric headers, previews, and saved group policies. See the [Consumer Filters guide](https://docs.laserdata.com/laser-sdk/consumer-filters).
 
 The CDC managed phase also demonstrates **create-and-bind setup, the group's numeric ID, and independent A/B groups**. Revision pause stops new reads while allowing in-flight acknowledgments, then resume continues the same policy.
 

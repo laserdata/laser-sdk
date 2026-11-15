@@ -1,6 +1,12 @@
-import type { CallOptions } from "../client/call-options.js"
-import { CodecError, InvalidError, NoStreamError, ProtocolError } from "../client/errors.js"
-import { INTERNAL_GOVERN, INTERNAL_TRANSPORT } from "../client/internals.js"
+import { type CallOptions, delay } from "../client/call-options.js"
+import {
+  CodecError,
+  InvalidError,
+  NoStreamError,
+  ProtocolError,
+  TimeoutError
+} from "../client/errors.js"
+import { INTERNAL_GOVERN, INTERNAL_MEMORY_WRITES, INTERNAL_TRANSPORT } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import { ActionKind } from "../govern.js"
 import type { HeaderValue } from "../stream/header-value.js"
@@ -29,8 +35,24 @@ import {
   type MemoryScope
 } from "./types.js"
 import { keywordScore, tokenize } from "./vector-memory.js"
+import type { MemoryWrite } from "./writes.js"
+
+/** How long a memory topic keeps records, the expiry of a topic a memory
+ * write or `memoryTopic` creates: 30 days. */
+export const DEFAULT_MEMORY_TOPIC_TTL_MS = 30 * 24 * 60 * 60 * 1_000
 
 const READ_BATCH = 1000
+// The settings of a memory topic a write creates because it was missing.
+const CREATED_TOPIC = {
+  messageExpiryMicros: BigInt(DEFAULT_MEMORY_TOPIC_TTL_MS) * 1_000n
+} as const
+const OWN_WRITES_FIRST_BACKOFF_MS = 50
+const OWN_WRITES_MAX_BACKOFF_MS = 500
+const OWN_WRITES_TIMEOUT =
+  "timed out waiting for the memory view to apply this connection's writes: a folded recall reads the topic directly"
+
+// The ids one view walk held, each with the conversations it held it in.
+type Held = ReadonlyMap<string, ReadonlySet<string>>
 
 interface FoldedItem {
   readonly item: MemoryItem
@@ -110,19 +132,68 @@ export class LogMemory implements Memory {
       }),
       options
     )
+    this.laser[INTERNAL_MEMORY_WRITES]().record({
+      view: this.viewKey(),
+      id: id.toString(),
+      forgotten: false,
+      conversation: target.conversation.toString(),
+      ...writeLenses(scope)
+    })
     return id
   }
 
   /** Reads the managed key-value view the deployment materializes from the
    * memory topic, so a large topic never folds in process. Folding is the
-   * opt-in {@link LogMemory.recallFolded}, never the default, matching Rust and Python. */
+   * opt-in {@link LogMemory.recallFolded}, never the default, matching Rust and
+   * Python. The view applies writes in the background, so a recall waits until
+   * it reflects every remember this connection made inside the recall's lenses
+   * and every forget it made, scanning again after 50 ms doubling to 500 ms,
+   * and throws a retryable `TimeoutError` after 10 seconds. A deployment that serves no
+   * key-value view folds the topic instead, like {@link LogMemory.recallFolded}. */
   async recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]> {
     const limit = recallLimit(query)
     if (limit === 0 || (scope.stream !== undefined && scope.stream !== this.stream)) return []
-    // Feedback ranks every strategy except recent, then arrival breaks ties.
-    const weighted = query.strategy !== RecallStrategy.Recent
-    const selected = new Map<string, Selected>()
+    if (!(await this.viewServed())) return this.recallFolded(scope, query)
     const agent = query.agent ?? scope.agent
+    const writes = this.laser[INTERNAL_MEMORY_WRITES]()
+    const lenses = {
+      ...(scope.conversation !== undefined ? { conversation: scope.conversation.toString() } : {}),
+      ...(scope.user !== undefined ? { user: scope.user } : {}),
+      ...(agent !== undefined ? { agent: agent.asStr() } : {}),
+      ...(scope.app !== undefined ? { app: scope.app } : {})
+    }
+    const deadline = performance.now() + writes.waitMs
+    let backoffMs = OWN_WRITES_FIRST_BACKOFF_MS
+    for (;;) {
+      const { items, held } = await this.scanView(scope, query, limit, agent)
+      const waited = writes.within(this.viewKey(), lenses)
+      const pending = waited.filter((write) => !reflected(write, held))
+      writes.settle(waited.filter((write) => reflected(write, held)))
+      if (pending.length === 0) return items
+      const remainingMs = deadline - performance.now()
+      if (remainingMs <= 0) {
+        writes.settle(pending)
+        throw new TimeoutError(OWN_WRITES_TIMEOUT)
+      }
+      await delay(Math.min(backoffMs, remainingMs), undefined, "memory recall")
+      backoffMs = Math.min(backoffMs * 2, OWN_WRITES_MAX_BACKOFF_MS)
+    }
+  }
+
+  // One walk of the view: the ranked items, and every id it holds inside the
+  // scope's lenses with the conversations it holds it in.
+  private async scanView(
+    scope: MemoryScope,
+    query: MemoryQuery,
+    limit: number,
+    agent: AgentId | undefined
+  ): Promise<{ readonly items: readonly MemoryItem[]; readonly held: Held }> {
+    // Feedback ranks every strategy except recent, a ranking strategy adds the
+    // query's word overlap, then arrival breaks ties.
+    const weighted = query.strategy !== RecallStrategy.Recent
+    const tokens = rankingTokens(query)
+    const selected = new Map<string, Selected>()
+    const held = new Map<string, Set<string>>()
     let requested = 1
     for (;;) {
       // The server narrows by the scope's lenses, and the rows are checked again
@@ -152,13 +223,24 @@ export class LogMemory implements Memory {
         const item = itemFromEntry(scope.conversation, entry)
         if (
           item === undefined ||
-          !matchesQueryText(query, item.payload) ||
           (scope.conversation !== undefined &&
             !item.provenance.conversationId.equals(scope.conversation))
         )
           continue
+        const id = item.id.toString()
+        const conversations = held.get(id) ?? new Set<string>()
+        conversations.add(item.provenance.conversationId.toString())
+        held.set(id, conversations)
+        if (!matchesQueryText(query, item.payload)) continue
         const weight = weighted ? stored.weight : undefined
-        selected.set(item.id.toString(), { arrival: arrivalKey(entry, item.id), item, weight })
+        const overlap = tokens === undefined ? undefined : keywordScore(tokens, item.payload)
+        selected.set(id, {
+          arrival: arrivalKey(entry, item.id),
+          item,
+          weight,
+          overlap,
+          score: (overlap ?? 0) + (weight ?? 0)
+        })
         if (selected.size > limit) {
           const lowest = [...selected].sort(([, left], [, right]) => compareRank(left, right))[0]
           if (lowest !== undefined) selected.delete(lowest[0])
@@ -167,23 +249,17 @@ export class LogMemory implements Memory {
       if (page.items.length === 0 || page.page >= page.totalPages) break
       requested += 1
     }
-    return [...selected.values()]
+    const items = [...selected.values()]
       .sort((left, right) => compareRank(right, left))
-      .map(({ item, weight }, rank) =>
-        weight === undefined
-          ? item
-          : {
-              ...item,
-              score: weight,
-              signals: [{ strategy: RecallStrategy.Auto, rank, score: weight }]
-            }
-      )
+      .map(({ item, overlap, weight }, rank) => rankedItem(item, rank, overlap, weight))
+    return { items, held }
   }
 
   /** Recall by folding the memory topic in process, the opt-in path for a small
-   * deployment with no materialized read view. Items come newest first.
-   * Feedback reorders every strategy except `Recent`, and its signal carries
-   * `RecallStrategy.Auto`. */
+   * deployment with no materialized read view. Items come newest first, ranked
+   * like the view recall: feedback reorders every strategy except `Recent`
+   * with a `RecallStrategy.Auto` signal, and a semantic, hybrid, or auto query
+   * with text adds its word overlap with a `RecallStrategy.Keyword` signal. */
   async recallFolded(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]> {
     const limit = recallLimit(query)
     if (limit === 0 || (scope.stream !== undefined && scope.stream !== this.stream)) return []
@@ -194,21 +270,22 @@ export class LogMemory implements Memory {
       .map((entry) => entry.item)
       .filter((item) => matchesQueryText(query, item.payload))
       .reverse()
-    if (query.strategy === RecallStrategy.Recent || this.feedback.size === 0)
+    const tokens = rankingTokens(query)
+    if (
+      query.strategy === RecallStrategy.Recent ||
+      (tokens === undefined && this.feedback.size === 0)
+    )
       return newestFirst.slice(0, limit).map(copyItem)
+    // A stable sort keeps newest first among equal scores.
     return newestFirst
-      .map((item) => ({ item, weight: this.feedbackFor(item) }))
-      .sort((left, right) => (right.weight ?? 0) - (left.weight ?? 0))
+      .map((item) => {
+        const overlap = tokens === undefined ? undefined : keywordScore(tokens, item.payload)
+        const weight = this.feedbackFor(item)
+        return { item, overlap, weight, score: (overlap ?? 0) + (weight ?? 0) }
+      })
+      .sort((left, right) => right.score - left.score)
       .slice(0, limit)
-      .map(({ item, weight }, rank) =>
-        weight === undefined
-          ? copyItem(item)
-          : {
-              ...copyItem(item),
-              score: weight,
-              signals: [{ strategy: RecallStrategy.Auto, rank, score: weight }]
-            }
-      )
+      .map(({ item, overlap, weight }, rank) => rankedItem(copyItem(item), rank, overlap, weight))
   }
 
   async improve(
@@ -244,6 +321,12 @@ export class LogMemory implements Memory {
       },
       options
     )
+    this.laser[INTERNAL_MEMORY_WRITES]().record({
+      view: this.viewKey(),
+      id: id.toString(),
+      forgotten: true,
+      ...(scope.conversation !== undefined ? { conversation: scope.conversation.toString() } : {})
+    })
   }
 
   /** Writes named point state: a keyed item on the topic, reflected in the
@@ -264,10 +347,12 @@ export class LogMemory implements Memory {
     this.named.set(id, payload.slice())
   }
 
-  /** Reads named point state from the managed key-value view, like {@link LogMemory.recall}.
-   * Folding the topic is the opt-in {@link LogMemory.fetchNamedFolded}. */
+  /** Reads named point state from the managed key-value view, like {@link LogMemory.recall},
+   * or folds the topic on a deployment that serves no view. Folding is the
+   * explicit opt-in {@link LogMemory.fetchNamedFolded}. */
   async fetchNamed(key: string): Promise<Uint8Array | undefined> {
-    return this.laser.kv(this.resourceNamespace()).get(new TextEncoder().encode(this.namedKey(key)))
+    if (!(await this.viewServed())) return this.fetchNamedFolded(key)
+    return this.laser.kv(this.resourceNamespace()).get(this.namedKey(key))
   }
 
   /** Reads named point state by folding the topic in process. */
@@ -341,14 +426,16 @@ export class LogMemory implements Memory {
     headers.set(MEMORY_NAMESPACE, stringHeader(this.resourceNamespace()))
     if (scope.user !== undefined) headers.set(MEMORY_USER, stringHeader(scope.user))
     if (scope.app !== undefined) headers.set(MEMORY_APP, stringHeader(scope.app))
-    await this.laser[INTERNAL_TRANSPORT]().sendMessageWithHeaders(
+    await this.laser[INTERNAL_TRANSPORT]().sendMessagesWithHeaders(
       target.stream,
       this.topic,
-      payload,
-      headers,
+      [{ payload, headers }],
       target.conversation.toString(),
       undefined,
-      { signal: options.signal }
+      {
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+        createTopic: CREATED_TOPIC
+      }
     )
   }
 
@@ -506,6 +593,17 @@ export class LogMemory implements Memory {
     return this.laser.resourceScope(this.stream)
   }
 
+  // Whether the deployment materializes the memory view, which rides the
+  // managed key-value store.
+  private async viewServed(): Promise<boolean> {
+    return (await this.laser.capabilities()).kv.available
+  }
+
+  // The view a write lands in and a recall reads: stream, topic, and namespace.
+  private viewKey(): string {
+    return `${this.stream ?? ""}\0${this.topic}\0${this.resourceNamespace()}`
+  }
+
   private namedKey(key: string): string {
     return `${this.namespace}/${key}`
   }
@@ -525,6 +623,24 @@ export class LogMemory implements Memory {
       throw new NoStreamError("log memory requires a default stream")
     }
     return this.stream
+  }
+}
+
+// Whether one view walk reflects `write`: a remembered id is held, a forgotten
+// one is not held in the forget's conversation, or anywhere without one.
+function reflected(write: MemoryWrite, held: Held): boolean {
+  const conversations = held.get(write.id)
+  if (!write.forgotten) return conversations !== undefined
+  if (conversations === undefined) return true
+  return write.conversation !== undefined && !conversations.has(write.conversation)
+}
+
+// The user, agent, and application lenses a write is recorded under.
+function writeLenses(scope: MemoryScope): Pick<MemoryWrite, "user" | "agent" | "app"> {
+  return {
+    ...(scope.user !== undefined ? { user: scope.user } : {}),
+    ...(scope.agent !== undefined ? { agent: scope.agent.asStr() } : {}),
+    ...(scope.app !== undefined ? { app: scope.app } : {})
   }
 }
 
@@ -591,6 +707,8 @@ interface Selected {
   readonly arrival: ArrivalKey
   readonly item: MemoryItem
   readonly weight: number | undefined
+  readonly overlap: number | undefined
+  readonly score: number
 }
 
 function arrivalKey(entry: KvEntry, id: MemoryId): ArrivalKey {
@@ -611,8 +729,28 @@ function compareArrival(left: ArrivalKey, right: ArrivalKey): number {
 }
 
 function compareRank(left: Selected, right: Selected): number {
-  const weight = (left.weight ?? 0) - (right.weight ?? 0)
-  return weight === 0 ? compareArrival(left.arrival, right.arrival) : Math.sign(weight)
+  const score = left.score - right.score
+  return score === 0 ? compareArrival(left.arrival, right.arrival) : Math.sign(score)
+}
+
+// The item with its ranked score and signals, unchanged when nothing ranked it.
+function rankedItem(
+  item: MemoryItem,
+  rank: number,
+  overlap: number | undefined,
+  weight: number | undefined
+): MemoryItem {
+  if (overlap === undefined && weight === undefined) return item
+  return {
+    ...item,
+    score: (overlap ?? 0) + (weight ?? 0),
+    signals: [
+      ...(overlap === undefined
+        ? []
+        : [{ strategy: RecallStrategy.Keyword, rank, score: overlap }]),
+      ...(weight === undefined ? [] : [{ strategy: RecallStrategy.Auto, rank, score: weight }])
+    ]
+  }
 }
 
 function itemFromEntry(
@@ -673,8 +811,28 @@ function matchesScope(
   )
 }
 
+// The query's words when they rank the scope instead of filtering it: a
+// semantic, hybrid, or auto query with text keeps every item.
+function rankingTokens(query: MemoryQuery): ReadonlySet<string> | undefined {
+  const strategy = query.strategy ?? RecallStrategy.Auto
+  const ranks =
+    strategy === RecallStrategy.Semantic ||
+    strategy === RecallStrategy.Hybrid ||
+    strategy === RecallStrategy.Auto
+  if (!ranks || query.semantic === undefined) return undefined
+  // Text without a word ranks nothing, so the recall stays newest first.
+  const tokens = tokenize(query.semantic)
+  return tokens.size === 0 ? undefined : tokens
+}
+
+// Keyword, graph, and temporal queries keep only the items that share a word.
 function matchesQueryText(query: MemoryQuery, payload: Uint8Array): boolean {
-  if (query.strategy === RecallStrategy.Recent || query.semantic === undefined) return true
+  if (
+    query.strategy === RecallStrategy.Recent ||
+    query.semantic === undefined ||
+    rankingTokens(query) !== undefined
+  )
+    return true
   const tokens = tokenize(query.semantic)
   return tokens.size === 0 || keywordScore(tokens, payload) > 0
 }

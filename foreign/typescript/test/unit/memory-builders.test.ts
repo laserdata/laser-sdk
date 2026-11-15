@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
+import { InvalidError } from "../../src/client/errors.js"
 import { MemoryHandle } from "../../src/memory/handle.js"
 import {
   MemoryId,
@@ -20,10 +21,13 @@ class RecordingMemory implements Memory {
   readonly recalled: { scope: MemoryScope; query: MemoryQuery }[] = []
   readonly improved: { scope: MemoryScope; feedback: Feedback }[] = []
   readonly forgotten: { scope: MemoryScope; id: MemoryId }[] = []
+  readonly order: string[] = []
   items: readonly MemoryItem[] = []
+  forgetFails = false
 
   remember(scope: MemoryScope, payload: Uint8Array): Promise<MemoryId> {
     this.remembered.push({ scope, payload })
+    this.order.push("remember")
     return Promise.resolve(MemoryId.new())
   }
 
@@ -38,7 +42,9 @@ class RecordingMemory implements Memory {
   }
 
   forget(scope: MemoryScope, id: MemoryId): Promise<void> {
+    if (this.forgetFails) return Promise.reject(new Error("the log refused the tombstone"))
     this.forgotten.push({ scope, id })
+    this.order.push("forget")
     return Promise.resolve()
   }
 }
@@ -122,6 +128,63 @@ void test("given_each_recall_strategy_when_selected_then_should_set_that_ranking
   )
 })
 
+void test("given_a_correction_when_superseded_then_should_remember_the_new_fact_first_and_forget_the_old_in_every_conversation", async () => {
+  const backend = new RecordingMemory()
+  const memory = MemoryHandle.custom(backend)
+  const old = MemoryId.new()
+  const second = ConversationId.new()
+
+  const corrected = await memory
+    .supersede(old.toString(), "the user is allergic to shellfish")
+    .scope(second)
+    .user("ana")
+    .stream("prefs")
+    .send()
+
+  const [written] = backend.remembered
+  assert.ok(written !== undefined, "the new fact was remembered")
+  assert.deepEqual(backend.order, ["remember", "forget"])
+  assert.deepEqual(written.scope, { conversation: second, user: "ana", stream: "prefs" })
+  assert.equal(new TextDecoder().decode(written.payload), "the user is allergic to shellfish")
+  assert.deepEqual(backend.forgotten, [{ scope: { user: "ana", stream: "prefs" }, id: old }])
+  assert.ok(corrected instanceof MemoryId)
+  await memory.supersede(old, "the user is allergic to shellfish").send()
+  assert.equal(backend.forgotten[1]?.id.toString(), old.toString())
+})
+
+void test("given_a_supersede_whose_forget_fails_when_sent_then_should_keep_both_facts_and_reject", async () => {
+  const backend = new RecordingMemory()
+  backend.forgetFails = true
+  const memory = MemoryHandle.custom(backend)
+
+  await assert.rejects(memory.supersede(MemoryId.new().toString(), "new").send(), /tombstone/u)
+
+  assert.equal(backend.remembered.length, 1)
+  assert.equal(backend.forgotten.length, 0)
+})
+
+void test("given_an_old_id_that_is_not_a_memory_id_when_superseded_then_should_refuse_before_any_write", () => {
+  const backend = new RecordingMemory()
+  const memory = MemoryHandle.custom(backend)
+
+  assert.throws(() => memory.supersede("not an id", "new"), InvalidError)
+
+  assert.deepEqual(backend.order, [])
+})
+
+void test("given_an_unknown_recall_strategy_when_selected_then_should_list_the_valid_ones", async () => {
+  const backend = new RecordingMemory()
+  const memory = MemoryHandle.custom(backend)
+  const unknown = (error: unknown) =>
+    error instanceof InvalidError &&
+    error.message ===
+      "unknown recall strategy 'vector': use one of auto, recent, semantic, keyword, graph, temporal, hybrid"
+
+  assert.throws(() => memory.recall().strategy("vector" as RecallStrategy), unknown)
+  await assert.rejects(memory.recall({}, { strategy: "vector" as RecallStrategy }), unknown)
+  assert.equal(backend.recalled.length, 0)
+})
+
 void test("given_recalled_items_when_rendered_as_a_block_then_should_join_them_under_the_budget", async () => {
   const backend = new RecordingMemory()
   backend.items = [item("sits in the eu-west pool"), item("rotates keys monthly")]
@@ -130,8 +193,36 @@ void test("given_recalled_items_when_rendered_as_a_block_then_should_join_them_u
   const block = await memory.recall().limit(2).block()
   assert.match(block, /sits in the eu-west pool/u)
 
-  const budgeted = await memory.context({}, { tokenBudget: 4 })
+  const budgeted = await memory.context(ConversationId.new(), 4)
   assert.ok(budgeted.length > 0, "a budget of four tokens still keeps one item")
+})
+
+void test("given_a_conversation_when_its_context_is_rendered_then_should_recall_that_conversation_under_the_budget", async () => {
+  const backend = new RecordingMemory()
+  backend.items = [item("sits in the eu-west pool"), item("rotates keys monthly")]
+  const memory = MemoryHandle.custom(backend)
+  const conversation = ConversationId.new()
+
+  const block = await memory.context(conversation, 1)
+
+  assert.equal(block, "sits in the eu-west pool\n\n[... 1 more recalled item(s) omitted ...]")
+  assert.deepEqual(backend.recalled, [{ scope: { conversation }, query: {} }])
+})
+
+void test("given_a_text_payload_when_remembered_then_should_store_its_utf8_bytes", async () => {
+  const backend = new RecordingMemory()
+  const memory = MemoryHandle.custom(backend)
+
+  await memory.remember("prefers aisle seats").user("u-42").send()
+  await memory.remember({ user: "u-42" }, "rotates keys monthly")
+
+  assert.deepEqual(
+    backend.remembered.map(({ scope, payload }) => [scope, new TextDecoder().decode(payload)]),
+    [
+      [{ user: "u-42" }, "prefers aisle seats"],
+      [{ user: "u-42" }, "rotates keys monthly"]
+    ]
+  )
 })
 
 void test("given_a_token_budget_when_a_recall_is_rendered_as_a_block_then_should_bound_the_block_by_it", async () => {

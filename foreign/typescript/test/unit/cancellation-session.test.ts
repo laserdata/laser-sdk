@@ -359,7 +359,7 @@ void test("given_an_aborted_signal_when_a_memory_call_is_made_then_should_reject
     () => handle.recallFolded({}, {}, options),
     () => handle.improve({}, feedback, options),
     () => handle.forget({}, MemoryId.new(), options),
-    () => handle.context({}, {}, options),
+    () => handle.context(ConversationId.new(), undefined, options),
     () => handle.consolidate({}, 1, options),
     () => handle.append({}, MemoryId.new(), MemoryKind.Fact, payload, options),
     () => named.set("plan", payload, options),

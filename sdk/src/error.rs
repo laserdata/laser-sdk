@@ -64,7 +64,7 @@ pub enum LaserError {
     #[error("invalid configuration: {0}")]
     Config(&'static str),
     #[error(
-        "no default stream set: address one explicitly (laser.stream(name).topic(name)) or pin a default with Laser::connect_with_stream / with_default_stream. Under the substrate's RBAC the stream must also be one this principal is permitted to use"
+        "no default stream set: pass a stream, or set a default stream when connecting (stream option) or with with_default_stream"
     )]
     NoStream,
     /// LaserData Cloud answered a query/browse/control op with a typed failure.
@@ -192,7 +192,9 @@ pub enum LaserError {
     /// caller waits for the agent to advertise, supplies an explicit
     /// `InboxRoute::Fixed`, or routes elsewhere.
     /// Never falls back to a shared topic name.
-    #[error("agent has no advertised inbox: {agent}")]
+    #[error(
+        "agent has no advertised inbox: {agent}: start the agent with capabilities so it advertises its inbox, or give the workflow a fixed inbox topic (fixed_inbox)"
+    )]
     NoInbox { agent: String },
     /// One physical connection may advertise one logical agent. A second agent
     /// would overwrite connection metadata and steal the first agent's route.
@@ -224,14 +226,17 @@ pub enum LaserError {
     #[error("run cancelled: {run}")]
     Cancelled { run: String },
     /// A workflow step did not complete. `reason` says how, and only a step
-    /// that timed out is retryable. The completed steps' compensations have
-    /// run.
+    /// that timed out is retryable. `target` names the step's route in words
+    /// and `deadline_ms` its configured deadline. The completed steps'
+    /// compensations have run.
     #[cfg(feature = "agent")]
-    #[error("workflow run {run} step `{step}` failed: {reason}")]
+    #[error("workflow run {run} step `{step}` failed: {reason}{}", step_failure_detail(*reason, target, *deadline_ms))]
     StepFailed {
         run: String,
         step: String,
         reason: crate::agent::StepFailure,
+        target: String,
+        deadline_ms: u64,
     },
     /// A workflow resume found the run's journal shortened by retention, so
     /// the steps the run completed cannot be known. Not retryable on the same
@@ -262,7 +267,10 @@ pub enum LaserError {
 /// What a failed publish left behind. [`LaserError::publish_cause`] reaches
 /// the original error, so every classifier answers for it.
 #[derive(Debug, thiserror::Error)]
-#[error("publish failed to {stream}/{topic}: {source}")]
+#[error(
+    "publish failed to {stream}/{topic}: {source}{}",
+    missing_topic_hint(source)
+)]
 #[non_exhaustive]
 pub struct PublishFailure {
     #[source]
@@ -761,6 +769,33 @@ fn unsupported_message(surface: &str, feature: Option<&str>, message: &str) -> S
     }
 }
 
+// The calls that create a missing topic, named wherever one is missing.
+pub(crate) const MISSING_TOPIC_FIX: &str = "the topic does not exist: create the agent topics with bootstrap, or a memory topic with memory_topic";
+
+// A publish to a missing stream or topic names the calls that create one.
+fn missing_topic_hint(source: &LaserError) -> String {
+    if source.is_stream_or_topic_not_found() {
+        format!(": {MISSING_TOPIC_FIX}")
+    } else {
+        String::new()
+    }
+}
+
+// A timed-out step names its route and deadline, the two things to check.
+#[cfg(feature = "agent")]
+fn step_failure_detail(
+    reason: crate::agent::StepFailure,
+    target: &str,
+    deadline_ms: u64,
+) -> String {
+    match reason {
+        crate::agent::StepFailure::TimedOut => {
+            format!(", target {target}, deadline {deadline_ms} ms")
+        }
+        _ => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1040,6 +1075,81 @@ mod tests {
             assert!(error.code().is_retryable());
             assert!(!error.is_unsupported());
         }
+    }
+
+    #[test]
+    fn given_no_default_stream_when_displayed_then_should_name_the_calls_that_set_one() {
+        assert_eq!(
+            LaserError::NoStream.to_string(),
+            "no default stream set: pass a stream, or set a default stream when connecting (stream option) or with with_default_stream"
+        );
+    }
+
+    #[test]
+    fn given_a_publish_to_a_missing_topic_when_displayed_then_should_name_the_calls_that_create_topics()
+     {
+        let missing = |source| {
+            LaserError::PublishFailed(Box::new(PublishFailure {
+                source,
+                stream: "fleet".to_owned(),
+                topic: "readings".to_owned(),
+                committed: Vec::new(),
+                unconfirmed: Vec::new(),
+            }))
+            .to_string()
+        };
+        for source in [
+            IggyError::TopicNameNotFound("readings".into(), "fleet".into()),
+            IggyError::StreamNameNotFound("fleet".into()),
+        ] {
+            assert!(
+                missing(LaserError::from(source)).ends_with(
+                    ": the topic does not exist: create the agent topics with bootstrap, or a memory topic with memory_topic"
+                )
+            );
+        }
+        assert_eq!(
+            missing(LaserError::from(IggyError::Disconnected)),
+            format!(
+                "publish failed to fleet/readings: {}",
+                LaserError::from(IggyError::Disconnected)
+            )
+        );
+    }
+
+    #[test]
+    fn given_no_advertised_inbox_when_displayed_then_should_name_capabilities_and_the_fixed_inbox()
+    {
+        assert_eq!(
+            LaserError::NoInbox {
+                agent: "worker".to_owned()
+            }
+            .to_string(),
+            "agent has no advertised inbox: worker: start the agent with capabilities so it advertises its inbox, or give the workflow a fixed inbox topic (fixed_inbox)"
+        );
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn given_a_timed_out_step_when_displayed_then_should_name_its_target_and_deadline() {
+        let failed = |reason| {
+            LaserError::StepFailed {
+                run: "run".to_owned(),
+                step: "triage".to_owned(),
+                reason,
+                target: "agent `worker`".to_owned(),
+                deadline_ms: 90_000,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            failed(crate::agent::StepFailure::TimedOut),
+            "workflow run run step `triage` failed: timed_out, target agent `worker`, deadline 90000 ms"
+        );
+        assert_eq!(
+            failed(crate::agent::StepFailure::Unverified),
+            "workflow run run step `triage` failed: unverified"
+        );
     }
 
     #[derive(serde::Deserialize)]

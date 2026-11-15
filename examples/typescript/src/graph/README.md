@@ -24,5 +24,5 @@ LASER_CONNECTION_STRING=user:pwd@your-host npm run example:graph
 
 ## Learn more
 
-- Docs: https://docs.laserdata.cloud/laser-sdk/graph
+- Docs: https://docs.laserdata.com/laser-sdk/graph
 - Full system built on this primitive: [`memory`](../memory): the same graph primitive used alongside durable memory in one woven scenario.
