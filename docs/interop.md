@@ -2,7 +2,7 @@
 
 AGDX is the SDK message format for agents on the log. A2A, MCP, and AG-UI adapters expose external interfaces over these records. Fields shared with AGDX map to envelope fields. Other data stays in the body with `agdx.ct = json` and returns unchanged.
 
-Select the optional `a2a-bridge`, `mcp-bridge`, and `agui` features as needed. Add `a2a-http` or `mcp-http` for the ready-made axum `router()`. They use log records through the Iggy transport. This guide describes their use with Rust. Python and TypeScript expose the bridge adapters. The [parity matrix](parity.md) lists their spellings and the Rust-only pieces, such as the axum `router()`. The [AGDX data exchange model](agdx.md) defines the underlying contract.
+Select the optional `a2a-bridge`, `mcp-bridge`, and `agui` features as needed. Add `a2a-http` or `mcp-http` for the ready-made axum `router()`. They use log records through the Iggy transport. This guide describes their use with Rust. Python and TypeScript expose the bridge adapters and serve them over HTTP with `serve`, see [serving from Python and TypeScript](#serving-from-python-and-typescript). The [parity matrix](parity.md) lists their spellings. The [AGDX data exchange model](agdx.md) defines the underlying contract.
 
 ## Streams, topics, and RBAC
 
@@ -35,7 +35,7 @@ let collector = Agent::builder()
 Credentials and the hosted HTTP endpoint control access:
 
 - A `with_default_stream` view can access only streams permitted to its connection credentials.
-- Use separate `Laser::connect` calls for separate principals. Apache Iggy enforces stream and topic permissions. Protect a bridge JSON-RPC `router` with the hosting application authentication middleware. `laser_sdk::edge_auth::authorize_edge` checks the audience and scope of a decoded bearer token.
+- Use separate `Laser::connect` calls for separate principals. Apache Iggy enforces stream and topic permissions. Protect a bridge JSON-RPC `router` with the hosting application authentication middleware, or with the `caller` hook of `serve` in Python and TypeScript. `laser_sdk::edge_auth::authorize_edge` checks the audience and scope of a decoded bearer token.
 
 Clients read streamed records by offset. After a disconnect, they can resume from a saved position and reconstruct the retained transcript. The [AGDX spec](agdx.md) defines the mapping. The `interop` example demonstrates the complete flow.
 
@@ -90,7 +90,7 @@ When the bridge's `Laser` has a verifier, `GetTask` honors only answers that ver
 
 By default anyone who knows a task id can read or cancel the task. `A2aBridge::with_task_binding(key, ttl)` ties each task id to the caller that submitted it. The id then has three dot-separated parts: the conversation, an expiry in Unix microseconds, and a keyed BLAKE3 digest. The digest covers the caller, the stream creation time, the conversation and the expiry, under the 32-byte `key`. So an id works only for its own caller, only on the stream it was made on, and only until it expires. A recreated stream with the same name does not accept old ids.
 
-Once binding is on, every task operation needs a caller. Use `bridge.caller(principal)` and call `submit`, `submit_to`, `submit_with_hops`, `submit_in`, `submit_in_to`, `task`, `cancel` or `handle_rpc` on it. The bridge methods without a caller refuse with `HandlerConfig` before they publish anything. Another caller's id, an expired id and a changed id are refused the same way as a malformed id, and over JSON-RPC they answer `-32001` task not found. So a caller cannot tell whether a task exists. The `router()` reads the caller from an `A2aCallerPrincipal` request extension. Your authentication layer must insert it, and a request without it is refused. Keep the key secret and the same on every bridge replica that serves the same stream. Rotating the key ends every open task id. A bound id proves the bridge made it, so `GetTask` answers it even after its command has left retention.
+Once binding is on, every task operation needs a caller. Use `bridge.caller(principal)` and call `submit`, `submit_to`, `submit_with_hops`, `submit_in`, `submit_in_to`, `task`, `cancel` or `handle_rpc` on it. The bridge methods without a caller refuse with `HandlerConfig` before they publish anything. Another caller's id, an expired id and a changed id are refused the same way as a malformed id, and over JSON-RPC they answer `-32001` task not found. So a caller cannot tell whether a task exists. The `router()` reads the caller from an `A2aCallerPrincipal` request extension. Your authentication layer must insert it, and a request without it is refused. In Python and TypeScript the `caller` hook of `serve` names the caller. Keep the key secret and the same on every bridge replica that serves the same stream. Rotating the key ends every open task id. A bound id proves the bridge made it, so `GetTask` answers it even after its command has left retention.
 
 Python passes `task_binding_key=` (32 bytes) and `task_binding_ttl_ms=` to the `A2aBridge` constructor, and `caller=` to `submit`, `submit_in`, `task`, `cancel` and `handle_rpc`. TypeScript uses `withTaskBinding(key, ttlMs)` and `caller(principal)`, which returns an `A2aCaller` with the same methods. All three SDKs make the same digest, so a task id made by one works in the others.
 
@@ -152,7 +152,35 @@ A tool call is addressed to the agent set with `with_target(agent)`, else to eve
 
 ### Browser origins
 
-Both Rust routers guard their JSON-RPC endpoint the same way. A request without an `Origin` header comes from a non-browser client and is accepted. A browser request is accepted when its `Origin` is in `with_allowed_origins(origins)` (exact values such as `https://app.example.com`), or when it is same-origin with a `Host` that is an IP literal or `localhost`, such as a page the bridge serves itself on `http://127.0.0.1:8080`. Every other browser request is refused with `403`. A same-origin page on a named host needs the allowlist: in a DNS rebinding attack the browser sends the attacker's name as both `Origin` and `Host`, so a same-origin rule on names would let the rebound page through. Development servers such as Vite (`server.allowedHosts`) and webpack-dev-server (`allowedHosts`) draw the same line. The A2A card path stays open to any origin, as public discovery. TypeScript and Python ship no HTTP router, so the guard is Rust-only there. An application that serves `handle_rpc` from its own HTTP framework applies its own origin policy.
+Both Rust routers guard their JSON-RPC endpoint the same way. A request without an `Origin` header comes from a non-browser client and is accepted. A browser request is accepted when its `Origin` is in `with_allowed_origins(origins)` (exact values such as `https://app.example.com`), or when it is same-origin with a `Host` that is an IP literal or `localhost`, such as a page the bridge serves itself on `http://127.0.0.1:8080`. Every other browser request is refused with `403`. A same-origin page on a named host needs the allowlist: in a DNS rebinding attack the browser sends the attacker's name as both `Origin` and `Host`, so a same-origin rule on names would let the rebound page through. Development servers such as Vite (`server.allowedHosts`) and webpack-dev-server (`allowedHosts`) draw the same line. The A2A card path stays open to any origin, as public discovery. The Python and TypeScript `serve` apply the same guard with the same allowlist, set with the `allowed_origins=` constructor keyword in Python and `withAllowedOrigins(origins)` in TypeScript. An application that serves `handle_rpc` from its own HTTP framework applies its own origin policy.
+
+### Serving from Python and TypeScript
+
+Python and TypeScript serve a bridge over HTTP with `serve`. Python runs the Rust router inside the binding. It adds no pip dependency, and the router links axum into the native module. TypeScript uses the built-in Node `http` module and adds no npm dependency. `serve` listens on `127.0.0.1` and a free port unless you name a host and a port, and it returns a `BridgeServer` with its `host`, `port`, and `url`. If the address cannot be bound, for example because the port is taken, `serve` fails with `InvalidError` and the message `cannot listen on <host>:<port>: <cause>`. `close()` stops the server and waits for the requests in flight.
+
+The routes and answers match the Rust routers. `POST /` is the JSON-RPC endpoint. The A2A server also serves the card at `GET /.well-known/agent-card.json`, signed when the bridge has a signing key, and it answers `404` until the public URL is set. The MCP server answers a notification with `202` and no body, and it refuses an unsupported `MCP-Protocol-Version` header with `400`. Both apply the [browser origin guard](#browser-origins). A body that is not JSON gets `400`, a content type other than JSON gets `415`, a body over 2 MiB gets `413`, another method gets `405`, and another path gets `404`.
+
+The A2A `serve` takes an optional `caller` hook for the `with_task_binding` caller. The hook gets the request headers with lowercase names and returns the caller principal, or no value for none. It runs only for JSON-RPC requests. In Python it can be a plain or an async function. A hook that raises, or returns anything other than a string or no value, refuses the request with `401`.
+
+```python
+bridge = ls.A2aBridge(
+    laser, "a2a-gateway", "agent.sessions", "agent.sessions",
+    public_url="https://agents.example.com/a2a",
+    allowed_origins=["https://app.example.com"],
+)
+server = await bridge.serve(port=8080, caller=lambda headers: headers.get("x-principal"))
+await server.close()
+```
+
+```ts
+const server = await new A2aBridge(laser, AgentId.new("a2a-gateway"), "agent.sessions", "agent.sessions")
+  .withPublicUrl("https://agents.example.com/a2a")
+  .withAllowedOrigins(["https://app.example.com"])
+  .serve({ port: 8080, caller: (headers) => headers["x-principal"] })
+await server.close()
+```
+
+The `caller` hook in these examples trusts a header. Use it only behind a proxy that authenticates the request and sets that header.
 
 ### The hop path across bridges
 

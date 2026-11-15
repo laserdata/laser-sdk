@@ -11,10 +11,12 @@ mod agui;
 #[cfg(feature = "rbac")]
 mod authz_receipts;
 mod budget;
+mod connection_events;
 mod context;
 mod contract;
 mod deadletter;
 mod decomposition;
+mod encryption;
 mod fanout;
 mod filtered_wait;
 #[cfg(feature = "filters")]
@@ -24,6 +26,7 @@ mod filters_group;
 mod governance;
 mod handoff;
 mod human_input;
+mod idempotent_producer;
 #[cfg(feature = "kv")]
 mod managed_unsupported;
 #[cfg(feature = "mcp-bridge")]
@@ -39,12 +42,15 @@ mod reliable;
 mod replay;
 mod request;
 mod runtime;
+mod server_admin;
+mod server_system;
 mod session;
 mod session_lane;
 mod shutdown;
 #[cfg(feature = "sign")]
 mod signing;
 mod state;
+mod stream_admin;
 mod streaming;
 mod transports;
 #[cfg(feature = "query")]

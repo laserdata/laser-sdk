@@ -70,7 +70,8 @@ export {
   isUnavailable,
   isUnsupported,
   isVersionConflict,
-  isVersionSkew
+  isVersionSkew,
+  uncertainOperation
 } from "./client/error-classify.js"
 export {
   ActionDecision,
@@ -512,6 +513,8 @@ export type {
   McpTool,
   McpToolResult
 } from "./bridges/mcp.js"
+export { BridgeServer } from "./bridges/http.js"
+export type { A2aCallerHook } from "./bridges/http.js"
 export type { AgUiEvent } from "./bridges/agui.js"
 export { authorizeEdge, edgeDenialChallenge, edgeDenialCode } from "./bridges/edge-auth.js"
 export type { EdgeClaims, EdgeDenial } from "./bridges/edge-auth.js"
@@ -631,6 +634,46 @@ export type {
 } from "./stream/consumer.js"
 export { ConsumerGroup, GroupFilter } from "./stream/consumer-group.js"
 export type { ConsumerGroupInfo, CreateConsumerGroupOptions } from "./stream/consumer-group.js"
+export type {
+  ConsumerGroupSummary,
+  PartitionInfo,
+  StreamInfo,
+  TopicInfo,
+  UpdateTopicOptions
+} from "./stream/admin.js"
+export { PersonalAccessToken, User } from "./client/server.js"
+export type {
+  CacheMetrics,
+  ClientConsumerGroup,
+  ClientInfo,
+  ClusterInfo,
+  ClusterNode,
+  ClusterNodeRole,
+  ClusterNodeStatus,
+  CreateUserOptions,
+  GlobalPermissions,
+  MetadataChangeGroup,
+  MetadataChangeKind,
+  MetadataChangePhase,
+  MetadataChangeReason,
+  MetadataChangeRecord,
+  MetadataChangeStart,
+  MetadataChangeStatus,
+  MetadataChanges,
+  MetadataChangesQuery,
+  MetadataItem,
+  MetadataSubject,
+  OptionInfo,
+  OptionsScope,
+  Permissions,
+  PersonalAccessTokenInfo,
+  ServerStats,
+  StreamPermissions,
+  TopicPermissions,
+  UpdateUserOptions,
+  UserInfo,
+  UserStatus
+} from "./client/server.js"
 export type { ConsumerStart } from "./stream/consumer-start.js"
 export type { Headers, Message } from "./stream/message.js"
 export { Producer, ProducerMessage } from "./stream/producer.js"
@@ -642,7 +685,8 @@ export {
   DEFAULT_MAX_RECORDS,
   MIN_LINGER_MS
 } from "./stream/batching.js"
-export type { ProducerBackgroundOptions, ProducerOptions } from "./stream/producer.js"
+export type { ProducerBackgroundOptions, ProducerOptions, ShardRequest } from "./stream/producer.js"
+export { Encryption } from "./stream/encryption.js"
 export { Cursor } from "./stream/cursor.js"
 export type { Codec, Decoder } from "./stream/codecs.js"
 export {
@@ -747,6 +791,7 @@ export {
 export { contentTypeCode, isRawContentType } from "./wire/content.js"
 export type { PublishOptions } from "./client/publish-options.js"
 export type { CallOptions } from "./client/call-options.js"
+export { ConnectionEvents, type ConnectionEvent } from "./client/connection-events.js"
 export type { ObserveEffect } from "./stream/topic.js"
 
 export { DEFAULT_MEMORY_TOPIC_TTL_MS } from "./memory/topic.js"

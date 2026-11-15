@@ -18,9 +18,11 @@ import {
 } from "../client/errors.js"
 import { publishWithin } from "../client/publish-options.js"
 import {
+  encodeHeaderBlock,
   type LaserTransport,
   type MessageWithHeaders,
   NEVER_EXPIRE,
+  ProducerSequences,
   type SendMessagesConfirmation,
   type SendMessagesResponse,
   UNLIMITED_TOPIC_SIZE,
@@ -29,6 +31,7 @@ import {
   xxHash32
 } from "../iggy/apache-iggy.js"
 import { decodeProvenanceHeaders, type Provenance } from "../provenance/provenance.js"
+import type { Encryption } from "./encryption.js"
 import type { HeaderValue } from "./header-value.js"
 import type { Headers } from "./message.js"
 import { ProducerRecorder } from "./producer-statistics.js"
@@ -79,6 +82,31 @@ export interface ProducerOptions {
    * returns once its records are queued, with no confirmations. Call
    * `shutdown()` to wait for the writes. */
   readonly background?: ProducerBackgroundOptions
+  /** Picks the background shard of each send with your own code, in place of
+   * `background.sharding`, and needs `background`. It returns an index below
+   * `request.shards`. A throw, or an index out of range, fails the send before
+   * anything is queued. */
+  readonly sharding?: (request: ShardRequest) => number
+  /** Encrypts the payload and the user-header block of every record before it
+   * leaves the client. Read the records with a consumer built with the same
+   * key. A publish failure lists its records as sent, before encryption. */
+  readonly encryption?: Encryption
+  /** Writes each batch once per partition, also when a lost reply makes the
+   * producer send it again. The producer takes a producer id, and a resend
+   * keeps the id, the sequence, and the message ids of the first attempt.
+   * Defaults to `false`. */
+  readonly idempotent?: boolean
+}
+
+/** What a producer's own `sharding` sees for one background send: the shard
+ * count, the target, and how many records the send carries. */
+export interface ShardRequest {
+  /** The background shard count, at least one. */
+  readonly shards: number
+  readonly stream: string
+  readonly topic: string
+  /** The records of this send. */
+  readonly records: number
 }
 
 /** Background mode, mirroring Apache Iggy's `BackgroundConfig` defaults.
@@ -268,6 +296,32 @@ function backgroundSettings(background: ProducerBackgroundOptions): BackgroundSe
   }
 }
 
+// The shard a caller's sharding picks, refused unless it indexes a shard.
+function pickedShard(sharding: (request: ShardRequest) => number, request: ShardRequest): number {
+  const shard = sharding(request)
+  if (!Number.isSafeInteger(shard) || shard < 0 || shard >= request.shards) {
+    throw new InvalidError(
+      `sharding picked shard ${String(shard)}, but the producer has ${String(request.shards)} shards`
+    )
+  }
+  return shard
+}
+
+// Each record with its payload and user-header block encrypted, keeping its id.
+function sealed(
+  records: readonly MessageWithHeaders[],
+  encryption: Encryption
+): readonly MessageWithHeaders[] {
+  return records.map((record) => ({
+    ...(record.id === undefined ? {} : { id: record.id }),
+    payload: encryption.encrypt(record.payload),
+    headers: new Map(),
+    ...(record.headers.size === 0
+      ? {}
+      : { userHeaders: encryption.encrypt(encodeHeaderBlock(record.headers)) })
+  }))
+}
+
 function lowerMessage(message: ProducerMessage): MessageWithHeaders {
   return { payload: message.payload, headers: message.headers }
 }
@@ -304,6 +358,7 @@ export class Producer implements AsyncDisposable {
   private readonly writeWaiters: (() => void)[] = []
   private backgroundFailure: PublishFailedError | undefined
   private readonly roomWaiters: (() => void)[] = []
+  private readonly sequences: ProducerSequences | undefined
 
   private constructor(
     private readonly transport: LaserTransport,
@@ -358,8 +413,12 @@ export class Producer implements AsyncDisposable {
     if (options.replicationFactor !== undefined)
       validateReplicationFactor(options.replicationFactor)
     const background = options.background
+    if (options.sharding !== undefined && background === undefined) {
+      throw new InvalidError("producer sharding needs background mode")
+    }
     this.onError = background?.onError
     this.background = background === undefined ? undefined : backgroundSettings(background)
+    this.sequences = options.idempotent === true ? new ProducerSequences() : undefined
     for (let shard = 0; shard < (this.background?.shards ?? 0); shard += 1) {
       this.shards.push({ queue: [], queuedBytes: 0, timer: undefined, draining: undefined })
     }
@@ -675,7 +734,7 @@ export class Producer implements AsyncDisposable {
     this.throwIfClosed("send")
     const bytes = payloadBytes(messages)
     await this.waitForRoom(messages, bytes, background, signal)
-    const shard = this.pickShard(background)
+    const shard = this.pickShard(background, messages.length)
     shard.queue.push({ messages, routing, bytes })
     shard.queuedBytes += bytes
     this.bufferedBytes += bytes
@@ -756,13 +815,22 @@ export class Producer implements AsyncDisposable {
 
   // Ordered sharding keeps this producer's one destination on one worker, as
   // Apache Iggy's ordered sharding hashes the stream and topic. Balanced
-  // sharding deals sends out round-robin.
-  private pickShard(background: BackgroundSettings): Shard {
+  // sharding deals sends out round-robin. The caller's own sharding picks it
+  // instead.
+  private pickShard(background: BackgroundSettings, records: number): Shard {
+    const sharding = this.options.sharding
     const index =
-      background.sharding === "balanced"
-        ? this.nextShard++ % background.shards
-        : xxHash32(new TextEncoder().encode(`${this.streamName}\0${this.topicName}`)) %
-          background.shards
+      sharding !== undefined
+        ? pickedShard(sharding, {
+            shards: background.shards,
+            stream: this.streamName,
+            topic: this.topicName,
+            records
+          })
+        : background.sharding === "balanced"
+          ? this.nextShard++ % background.shards
+          : xxHash32(new TextEncoder().encode(`${this.streamName}\0${this.topicName}`)) %
+            background.shards
     const shard = this.shards[index]
     if (shard === undefined) throw new InvalidError("background shard is out of range")
     return shard
@@ -869,6 +937,29 @@ export class Producer implements AsyncDisposable {
   // backoff each time, and every failure is resent except one that implies the
   // batch committed.
   private async sendAttempts(
+    records: readonly MessageWithHeaders[],
+    routing: Routing,
+    signal: AbortSignal | undefined
+  ): Promise<SendMessagesResponse> {
+    const encryption = this.options.encryption
+    if (encryption === undefined) return this.sendSealed(records, routing, signal)
+    try {
+      return await this.sendSealed(sealed(records, encryption), routing, signal)
+    } catch (error) {
+      if (!(error instanceof PublishFailedError)) throw error
+      // The failure lists the records as the caller sent them.
+      const sent = new Map(records.map((record) => [record.id, record]))
+      throw new PublishFailedError(
+        error.stream,
+        error.topic,
+        error.committed,
+        error.unconfirmed.map((record) => sent.get(record.id) ?? record),
+        error.cause
+      )
+    }
+  }
+
+  private async sendSealed(
     messages: readonly MessageWithHeaders[],
     routing: Routing,
     signal: AbortSignal | undefined
@@ -889,6 +980,7 @@ export class Producer implements AsyncDisposable {
               ? {}
               : { retryBackoffMs: this.retryBackoffMs }),
             ...(background ? { fixedRetryIntervalMs: this.retryBackoffMs } : {}),
+            ...(this.sequences === undefined ? {} : { idempotence: this.sequences }),
             signal
           }
         )
@@ -903,7 +995,7 @@ export class Producer implements AsyncDisposable {
             messages,
             routing.kind === "key" ? routing.key : undefined,
             routing.kind === "partition" ? routing.partition : undefined,
-            { signal }
+            { ...(this.sequences === undefined ? {} : { idempotence: this.sequences }), signal }
           )
         )
       } catch (error) {

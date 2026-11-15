@@ -14,8 +14,8 @@ TABLES = ("PY_PEERS", "TS_PEERS", "PY_ERROR_CLASSES", "TS_ERROR_CLASSES", "PY_ON
 
 
 @contextlib.contextmanager
-def workspace(rust="", wire="", stub="", report="", **tables):
-    """A throwaway repository with one Rust crate, a stub, and an API report, and the mapping tables replaced."""
+def workspace(rust="", wire="", stub="", report="", capabilities=(), retired=(), omissions=None, raw=None, **tables):
+    """A throwaway repository with one Rust crate, a stub, and an API report, the mapping tables replaced, and raw clients with the given operations."""
     with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
         root = pathlib.Path(directory)
         files = {"sdk/src/lib.rs": rust, "wire/src/lib.rs": wire, "foreign/python/laser_sdk.pyi": stub, "foreign/typescript/api/laser-sdk.api.md": report}
@@ -24,9 +24,16 @@ def workspace(rust="", wire="", stub="", report="", **tables):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(textwrap.dedent(text))
+        (root / "scripts").mkdir()
         stack.enter_context(patch.object(parity, "ROOT", root))
         for table in TABLES:
             stack.enter_context(patch.dict(getattr(parity, table), tables.get(table.lower(), {}), clear=True))
+        stack.enter_context(patch.dict(parity.OMISSION_CAPABILITIES, omissions or {}, clear=True))
+        stack.enter_context(patch.dict(parity.CAPABILITY_SIGNOFFS, {}, clear=True))
+        stack.enter_context(patch.object(parity, "CAPABILITIES", tuple(capabilities)))
+        stack.enter_context(patch.object(parity, "RETIRED_RAW_CALLS", tuple(retired)))
+        clients = {label: {"source": "fixture", "version": "1", "operations": sorted((raw or {}).get(label, ()))} for label in ("Rust", "TypeScript")}
+        stack.enter_context(patch.object(parity, "raw_clients", lambda: (clients, [])))
         yield root
 
 
@@ -526,6 +533,8 @@ class ComparisonTests(unittest.TestCase):
             """,
             py_peers={("Topic", "iggy_producer"): ("-", "rust-crate"), ("Topic", "flush"): ("-", "keywords")},
             ts_peers={("Topic", "iggy_producer"): ("-", "rust-crate")},
+            capabilities=[("message.send", "Send messages", (), (), "Topic", "Topic", "Topic")],
+            omissions={("Topic", "iggy_producer"): ("message.send",)},
         ):
             self.assertEqual(problems(), ["Topic::flush: Python omitted without an omission reason (keywords) (sdk/src/lib.rs:5)"])
 
@@ -809,6 +818,191 @@ class ComparisonTests(unittest.TestCase):
                     self.assertEqual(parity.main(), 0)
                 self.assertEqual(parity.main(), 0)
             self.assertIn("| `Topic` | `Topic` | `Topic` |  |", (root / "docs" / "parity.md").read_text())
+
+
+class CapabilityTests(unittest.TestCase):
+    RUST = """
+        pub struct Laser;
+        impl Laser {
+            pub async fn ping(&self) {}
+        }
+    """
+    STUB = """
+        class Laser:
+            def ping(self) -> None: ...
+    """
+    REPORT = """
+        export class Laser {
+            private constructor();
+            ping(): Promise<void>;
+        }
+    """
+    PING = ("system.ping", "Ping the server", ("ping",), ("system.ping",), "Laser::ping", "Laser.ping", "Laser.ping")
+    RAW = {"Rust": ["ping"], "TypeScript": ["system.ping"]}
+
+    def test_given_every_raw_call_served_in_every_client_when_checking_then_should_report_no_problem(self):
+        with workspace(rust=self.RUST, stub=self.STUB, report=self.REPORT, capabilities=[self.PING], raw=self.RAW):
+            self.assertEqual(problems(), [])
+
+    def test_given_a_removed_capability_api_when_checking_then_should_fail(self):
+        report = "export class Laser {\n    private constructor();\n}\n"
+        with workspace(rust=self.RUST, stub=self.STUB, report=report, capabilities=[self.PING], raw=self.RAW):
+            self.assertIn("capability `system.ping` (Ping the server): TypeScript has no first-class API, `Laser.ping` is absent", problems())
+
+    def test_given_an_unlisted_raw_call_when_checking_then_should_fail(self):
+        raw = {"Rust": ["ping", "next_producer_id"], "TypeScript": ["system.ping", "sendBinaryRequest"]}
+        with workspace(rust=self.RUST, stub=self.STUB, report=self.REPORT, capabilities=[self.PING], raw=raw):
+            found = problems()
+        self.assertIn("raw call `next_producer_id` (Rust fixture 1) is neither a capability nor retired", found)
+        self.assertIn("raw call `sendBinaryRequest` (TypeScript fixture 1) is neither a capability nor retired", found)
+
+    def test_given_a_raw_call_on_the_retired_list_when_checking_then_should_need_no_api(self):
+        raw = {"Rust": ["ping"], "TypeScript": ["system.ping", "stream.purge"]}
+        retired = [("stream.purge", "Remove every message of a stream", (), ("stream.purge",), 205)]
+        with workspace(rust=self.RUST, stub=self.STUB, report=self.REPORT, capabilities=[self.PING], retired=retired, raw=raw):
+            self.assertEqual(problems(), [])
+
+    def test_given_a_raw_call_named_twice_or_absent_from_the_client_when_checking_then_should_fail(self):
+        twice = ("system.health", "Check the server", ("ping", "get_health"), (), "Laser::ping", "Laser.ping", "Laser.ping")
+        with workspace(rust=self.RUST, stub=self.STUB, report=self.REPORT, capabilities=[self.PING, twice], raw=self.RAW):
+            found = problems()
+        self.assertIn("raw call `ping` (Rust fixture 1) belongs to 2 rows: `system.ping`, `system.health`", found)
+        self.assertIn("`system.health` names raw call `get_health`, which the Rust fixture 1 client does not have", found)
+
+    def test_given_an_omitted_zero_argument_method_that_reaches_the_raw_client_when_checking_then_should_fail(self):
+        rust = """
+            pub struct Laser;
+            impl Laser {
+                pub async fn ping(&self) {}
+                pub async fn reconnect(&self) -> Result<(), String> {}
+                pub fn name(&self) -> &str {}
+            }
+        """
+        omitted = {("Laser", "reconnect"): ("-", "plain-value"), ("Laser", "name"): ("-", "plain-value")}
+        with workspace(rust=rust, stub=self.STUB, report=self.REPORT, capabilities=[self.PING], raw=self.RAW, py_peers=omitted, ts_peers=omitted):
+            found = problems()
+        self.assertIn("Laser::reconnect: Python omits it as `plain-value`, but it reaches the raw client or does more than convert, construct, or read a plain value, so OMISSION_CAPABILITIES must name the capabilities it reaches (sdk/src/lib.rs:5)", found)
+        self.assertFalse([problem for problem in found if problem.startswith("Laser::name")])
+
+    def test_given_an_omitted_zero_argument_method_with_its_capabilities_when_checking_then_should_pass(self):
+        rust = """
+            pub struct Laser;
+            impl Laser {
+                pub async fn ping(&self) {}
+                pub async fn reconnect(&self) -> Result<(), String> {}
+            }
+        """
+        omitted = {("Laser", "reconnect"): ("-", "plain-value")}
+        with workspace(rust=rust, stub=self.STUB, report=self.REPORT, capabilities=[self.PING], raw=self.RAW, py_peers=omitted, ts_peers=omitted, omissions={("Laser", "reconnect"): ("system",)}):
+            self.assertEqual(problems(), [])
+
+
+class RawClientDerivationTests(unittest.TestCase):
+    def test_given_a_client_trait_with_supertraits_when_deriving_then_should_list_every_method(self):
+        with tempfile.TemporaryDirectory() as directory:
+            src = pathlib.Path(directory)
+            (src / "client.rs").write_text(textwrap.dedent("""
+                pub trait Client: StreamClient + Sync + Send {
+                    async fn connect(&self) -> Result<(), IggyError>;
+                    /// fn not_a_method(&self);
+                    async fn abandon_operation(&self, _op: u64) -> Result<(), IggyError> {
+                        let inner = |value: u64| { value };
+                        Err(IggyError::FeatureUnavailable)
+                    }
+                }
+            """))
+            (src / "stream_client.rs").write_text("pub trait StreamClient {\n    async fn get_stream(&self) -> u32;\n}\npub trait Unrelated {\n    fn other(&self);\n}\n")
+            self.assertEqual(parity.trait_operations(src, "Client"), ["abandon_operation", "connect", "get_stream"])
+
+    def test_given_client_declarations_when_deriving_then_should_list_commands_of_groups_methods_and_bases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dist = pathlib.Path(directory)
+            (dist / "command-set.d.ts").write_text(textwrap.dedent("""
+                declare const streamAPI: (c: ClientProvider) => {
+                    get: (arg: GetStream) => Promise<Stream | null>;
+                    ensure: (streamName: string) => Promise<Stream>;
+                };
+                type StreamAPI = ReturnType<typeof streamAPI>;
+                export declare abstract class AbstractAPI {
+                    clientProvider: ClientProvider;
+                    constructor(getClient: ClientProvider);
+                }
+                export declare abstract class CommandAPI extends AbstractAPI {
+                    stream: StreamAPI;
+                    consumer: ({ name, streamId }: ConsumerRequest) => Promise<IggyConsumer>;
+                    /** sendRaw(code: number): void; */
+                    sendBinaryRequest(code: number, payload: Buffer): Promise<Buffer>;
+                    private sendRawCommand;
+                }
+            """))
+            (dist / "client.d.ts").write_text("export declare class SimpleClient extends CommandAPI {\n    constructor(client: RawClient);\n    destroy(): Promise<void>;\n}\n")
+            self.assertEqual(parity.client_commands(dist, "SimpleClient"), ["clientProvider", "consumer", "destroy", "sendBinaryRequest", "stream.ensure", "stream.get"])
+
+    def test_given_iggy_client_impls_when_deriving_inherent_methods_then_should_list_only_public_inherent_ones(self):
+        with tempfile.TemporaryDirectory() as directory:
+            src = pathlib.Path(directory)
+            (src / "client.rs").write_text(textwrap.dedent("""
+                impl IggyClient {
+                    pub fn builder() -> IggyClientBuilder { IggyClientBuilder::new() }
+                    /// pub fn not_a_method(&self);
+                    pub async fn send_binary_request(&self, code: u32) -> Result<Bytes, IggyError> {
+                        let inner = || { "pub fn quoted()" };
+                        Ok(Bytes::new())
+                    }
+                    pub(crate) fn restricted(&self) {}
+                    fn private(&self) {}
+                }
+                impl Client for IggyClient {
+                    async fn connect(&self) -> Result<(), IggyError> { Ok(()) }
+                }
+                impl IggyClientBuilder {
+                    pub fn build(self) -> IggyClient { IggyClient }
+                }
+            """))
+            (src / "binary.rs").write_text("impl IggyClient {\n    pub async fn send_http_request(&self) {}\n}\n")
+            self.assertEqual(parity.inherent_operations(src, "IggyClient"), ["builder", "send_binary_request", "send_http_request"])
+
+    def test_given_pinned_iggy_crates_when_deriving_rust_operations_then_should_join_trait_and_inherent_methods(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as cargo, patch.object(parity, "ROOT", pathlib.Path(directory)), patch.dict(parity.os.environ, {"CARGO_HOME": cargo}):
+            (pathlib.Path(directory) / "Cargo.lock").write_text('[[package]]\nname = "iggy"\nversion = "0.12.0"\n\n[[package]]\nname = "iggy_common"\nversion = "0.12.0"\n')
+            registry = pathlib.Path(cargo) / "registry" / "src" / "index"
+            (registry / "iggy_common-0.12.0" / "src").mkdir(parents=True)
+            (registry / "iggy-0.12.0" / "src").mkdir(parents=True)
+            (registry / "iggy_common-0.12.0" / "src" / "client.rs").write_text("pub trait Client {\n    async fn ping(&self);\n}\n")
+            (registry / "iggy-0.12.0" / "src" / "client.rs").write_text("impl IggyClient {\n    pub async fn send_binary_request(&self) {}\n}\n")
+            derived = parity.rust_raw_operations()
+        self.assertEqual(derived, ("iggy_common and iggy", "0.12.0", ["ping", "send_binary_request"], None))
+
+    def test_given_a_static_member_when_deriving_client_commands_then_should_leave_it_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dist = pathlib.Path(directory)
+            (dist / "client.d.ts").write_text("export declare class SimpleClient {\n    static create(config: string): SimpleClient;\n    get connected(): boolean;\n    destroy(): Promise<void>;\n}\n")
+            self.assertEqual(parity.client_commands(dist, "SimpleClient"), ["connected", "destroy"])
+
+    def test_given_a_derived_raw_call_without_a_row_when_checking_then_should_fail(self):
+        clients = {"Rust": {"source": "iggy_common and iggy", "version": "0.12.0", "operations": ["ping", "send_http_request"]}, "TypeScript": {"source": "apache-iggy", "version": "0.11.0", "operations": ["system.ping"]}}
+        with patch.object(parity, "CAPABILITIES", (("system.ping", "Ping the server", ("ping",), ("system.ping",), "Laser::ping", "Laser.ping", "Laser.ping"),)):
+            found = parity.raw_call_problems(clients)
+        self.assertEqual(found, ["raw call `send_http_request` (Rust iggy_common and iggy 0.12.0) is neither a capability nor retired"])
+
+    def test_given_a_missing_source_when_the_stored_version_differs_from_the_pin_then_should_fail(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(parity, "ROOT", pathlib.Path(directory)):
+            root = pathlib.Path(directory)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "iggy-client-operations.json").write_text('{"Rust": {"source": "iggy_common", "version": "0.11.0", "operations": ["ping"]}}')
+            with patch.object(parity, "rust_raw_operations", lambda: ("iggy_common", "0.12.0", None, None)), patch.object(parity, "typescript_raw_operations", lambda: ("apache-iggy", "0.11.0", ["system.ping"], None)):
+                clients, found = parity.raw_clients()
+        self.assertEqual(clients["TypeScript"]["operations"], ["system.ping"])
+        self.assertEqual(found, ["Rust raw client iggy_common 0.12.0 is not installed and scripts/iggy-client-operations.json holds iggy_common 0.11.0, so install it and run `python3 scripts/check-parity.py --write`"])
+
+    def test_given_a_missing_source_when_the_stored_version_matches_the_pin_then_should_read_the_stored_operations(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(parity, "ROOT", pathlib.Path(directory)):
+            root = pathlib.Path(directory)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "iggy-client-operations.json").write_text('{"Rust": {"source": "iggy_common", "version": "0.12.0", "operations": ["ping"]}}')
+            with patch.object(parity, "rust_raw_operations", lambda: ("iggy_common", "0.12.0", None, None)), patch.object(parity, "typescript_raw_operations", lambda: ("apache-iggy", "0.11.0", ["system.ping"], None)):
+                clients, found = parity.raw_clients()
+        self.assertEqual((clients["Rust"]["operations"], found), (["ping"], []))
 
 
 if __name__ == "__main__":

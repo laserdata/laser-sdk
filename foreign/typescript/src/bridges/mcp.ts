@@ -19,6 +19,7 @@ import { ContentType } from "../wire/content.js"
 import { ConversationId as WireConversationId, CorrelationId, type RecordId } from "../wire/ids.js"
 import { SDK_VERSION } from "./a2a.js"
 import { bridgeHopMetadata, callHops, enterBridge, inboundHops } from "./hops.js"
+import { BridgeServer, originAllowed } from "./http.js"
 
 /** The protocol version `initialize` answers when the client asks for one
  * this bridge does not serve: the latest it does. */
@@ -198,6 +199,7 @@ export class McpBridge {
   private hops: readonly string[]
   private signingKey: SigningKey | undefined
   private target: AgentId | undefined
+  private allowedOrigins: readonly string[] = []
 
   constructor(
     private readonly laser: Laser,
@@ -465,6 +467,40 @@ export class McpBridge {
     } finally {
       ticket.cancel()
     }
+  }
+
+  /** The browser origins `serve` accepts, each as the exact `Origin` header
+   * value (`https://app.example.com`). A request without an `Origin` header,
+   * a non-browser client, is always accepted, and so is a same-origin page
+   * on an IP literal or `localhost` host. Any other browser request is
+   * refused with 403, the DNS rebinding guard. */
+  withAllowedOrigins(origins: readonly string[]): this {
+    this.allowedOrigins = [...origins]
+    return this
+  }
+
+  /** Serves the bridge over MCP Streamable HTTP with Node's built-in `http`
+   * module. `POST /` takes one JSON-RPC message and answers it, or answers
+   * 202 with no body for a notification. It refuses a browser origin outside
+   * `withAllowedOrigins` with 403 and an unsupported `MCP-Protocol-Version`
+   * header with 400. */
+  async serve(
+    options: CallOptions & { readonly host?: string; readonly port?: number } = {}
+  ): Promise<BridgeServer> {
+    return BridgeServer.listen(
+      {
+        rpc: async (body, request) => {
+          if (!originAllowed(request.origin, request.host, this.allowedOrigins))
+            return { status: 403 }
+          const version = request.headers["mcp-protocol-version"]
+          if (version !== undefined && !MCP_SUPPORTED_PROTOCOL_VERSIONS.includes(version))
+            return { status: 400 }
+          const response = await this.handleRpc(body)
+          return response === undefined ? { status: 202 } : { status: 200, body: response }
+        }
+      },
+      options
+    )
   }
 
   /** Handle one JSON-RPC message. A notification, a message without an

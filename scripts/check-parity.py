@@ -12,6 +12,8 @@ committed one, when a row is MISSING, or when a peer API has no Rust row.
 """
 
 import ast
+import json
+import os
 import pathlib
 import re
 import sys
@@ -106,6 +108,14 @@ PY_PROTOCOL = {"to_dict", "from_dict", "to_json", "from_json"}
 # members of that Rust type keywords of that call. A type row spelled `Class`
 # or `~Class` makes `Class` host the members.
 PY_PEERS = {
+    ("Permissions", None): ("dict:User.set_permissions", "serde-dict"),
+    ("GlobalPermissions", None): ("dict:User.set_permissions", "serde-dict"),
+    ("StreamPermissions", None): ("dict:User.set_permissions", "serde-dict"),
+    ("TopicPermissions", None): ("dict:User.set_permissions", "serde-dict"),
+    ("CreateUserOptions", None): ("User.create", "keywords"),
+    ("UpdateUserOptions", None): ("User.update", "keywords"),
+    ("UpdateTopicOptions", None): ("Topic.update", "keywords"),
+    ("UnknownUserStatus", None): ("-", "converted-error"),
     ("FilteredRecords", None): ("FilteredReader", "protocol"),
     ("SessionLayout", "per_agent_topic"): ("SessionLayout.PerAgentTopic", "constructor"),
     ("SessionLayout", "per_agent_partition"): ("SessionLayout.PerAgentPartition", "constructor"),
@@ -310,6 +320,7 @@ PY_PEERS = {
     ("LaserError", "is_version_skew"): ("LaserError.version_skew", "property"),
     ("TransportError", "as_iggy"): ("-", "rust-crate"),
     ("TransportError", "iggy_error_code"): ("TransportError.iggy_error_code", "property"),
+    ("TransportError", "uncertain_operation"): ("TransportError.uncertain_operation", "property"),
     ("PublishFailure", None): ("PublishFailedError", "error-class"),
     ("PublishFailure", "source"): ("PublishFailedError", "protocol"),
     ("ConsumerBuilder", "create_group"): ("ConsumerGroup.consumer(create_group=)", "keywords"),
@@ -395,10 +406,11 @@ PY_PEERS = {
     ("A2aBridge", "with_public_url"): ("new:A2aBridge(public_url=)", "keywords"),
     ("A2aBridge", "with_description"): ("new:A2aBridge(description=)", "keywords"),
     ("A2aBridge", "with_version"): ("new:A2aBridge(version=)", "keywords"),
-    ("A2aBridge", "router"): ("-", "rust-crate"),
-    ("McpBridge", "router"): ("-", "rust-crate"),
-    ("McpBridge", "with_allowed_origins"): ("-", "rust-crate"),
-    ("A2aBridge", "with_allowed_origins"): ("-", "rust-crate"),
+    ("A2aBridge", "router"): ("A2aBridge.serve", "one-call"),
+    ("McpBridge", "router"): ("McpBridge.serve", "one-call"),
+    ("McpBridge", "with_allowed_origins"): ("new:McpBridge(allowed_origins=)", "keywords"),
+    ("A2aBridge", "with_allowed_origins"): ("new:A2aBridge(allowed_origins=)", "keywords"),
+    ("MetadataChangesQuery", None): ("Laser.metadata_changes", "keywords"),
     ("McpBridge", "with_signing_key"): ("new:McpBridge(signing_key=)", "keywords"),
     ("McpBridge", "with_target"): ("new:McpBridge(target=)", "keywords"),
     ("McpBridge", "with_memory_tools"): ("new:McpBridge(memory_tools=)", "keywords"),
@@ -734,6 +746,7 @@ PY_PEERS = {
     ("HeaderValueRef", None): ("-", "plain-value"),
 }
 TS_PEERS = {
+    ("UnknownUserStatus", None): ("-", "converted-error"),
     ("FilteredRecords", None): ("FilteredReader", "protocol"),
     ("ConversationState", "load"): ("ConversationStateLoader.load", "free-function"),
     ("ConversationState", "load_with"): ("ConversationStateLoader.loadWith", "free-function"),
@@ -865,11 +878,11 @@ TS_PEERS = {
     ("KvKeyRegistry", "in_namespace"): ("new:KvKeyRegistry", "overload"),
     ("KvSnapshotStore", "in_namespace"): ("new:KvSnapshotStore", "overload"),
     ("TopicSnapshotStore", "on_topic"): ("new:TopicSnapshotStore", "overload"),
-    ("A2aBridge", "router"): ("-", "rust-crate"),
-    ("A2aCallerPrincipal", None): ("-", "rust-crate"),
-    ("McpBridge", "router"): ("-", "rust-crate"),
-    ("McpBridge", "with_allowed_origins"): ("-", "rust-crate"),
-    ("A2aBridge", "with_allowed_origins"): ("-", "rust-crate"),
+    ("A2aBridge", "router"): ("A2aBridge.serve", "one-call"),
+    ("A2aCallerPrincipal", None): ("A2aCallerHook", "callback"),
+    ("McpBridge", "router"): ("McpBridge.serve", "one-call"),
+    ("McpBridge", "with_allowed_origins"): ("McpBridge.withAllowedOrigins", None),
+    ("A2aBridge", "with_allowed_origins"): ("A2aBridge.withAllowedOrigins", None),
     ("CrashContext", "assemble"): ("new:CrashContext", "constructor"),
     ("AgentEnvelope", "event"): ("fn:eventEnvelope", "free-function"),
     ("TaskState", "from_code"): ("fn:taskStateFromCode", "free-function"),
@@ -884,8 +897,10 @@ TS_PEERS = {
     ("MemoryKind", "code"): ("fn:memoryKindCode", "free-function"),
     ("ProducerMessageBuilder", "build"): ("new:ProducerMessage", "one-call"),
     ("LaserError", "iggy_error_code"): ("fn:iggyErrorCode", "error-function"),
+    ("LaserError", "uncertain_operation"): ("fn:uncertainOperation", "error-function"),
     ("TransportError", "as_iggy"): ("-", "rust-crate"),
     ("TransportError", "iggy_error_code"): ("fn:iggyErrorCode", "error-function"),
+    ("TransportError", "uncertain_operation"): ("fn:uncertainOperation", "error-function"),
     ("GraphNode", "entity"): ("fn:graphNodeEntity", "free-function"),
     ("GraphEdge", "relate"): ("fn:graphEdgeRelate", "free-function"),
     ("AgentEnvelope", "requiring"): ("fn:requiring", "free-function"),
@@ -964,6 +979,7 @@ TS_PEERS = {
 
 # Peer APIs with no Rust row of their own, each kept for a language reason.
 PY_ONLY = {
+    "BridgeServer": "one-call",
     "QueryRow.keys": "protocol",
     "AmbiguousMutationRecovery.ttl_ms": "property",
     "KvRevalidation.entry": "property",
@@ -1008,6 +1024,7 @@ PY_ONLY = {
     "decode_session_reply": "native-binding",
 }
 TS_ONLY = {
+    "BridgeServer": "one-call",
     "QueryValue": "signature-type",
     "RoutingError": "error-class",
     "FilterExecutionError.reason": "error-class",
@@ -1066,13 +1083,148 @@ TS_ERROR_CLASSES = {
     "RoutePrincipalMismatch": "RoutePrincipalMismatchError",
 }
 
+# What a raw Apache Iggy client reaches. Rust hands one out through
+# `Laser::client`, TypeScript through `Laser.client`, and Python has none. So
+# each capability needs a first-class Laser API in every client. A row is
+# (key, capability, Rust raw calls, TypeScript raw calls, Rust, Python,
+# TypeScript spelling). The raw calls are operation names as raw_clients
+# derives them: a method of the Rust `Client` trait or a trait it extends, a
+# public inherent method of the Rust `IggyClient` type, and a public method or
+# command of the TypeScript client class and its bases, such as `stream.get`. Every derived
+# operation belongs to exactly one row or to RETIRED_RAW_CALLS. The Rust
+# spelling is `Owner::member` or a type, the peers use the PEERS grammar, and
+# `A + B` names several APIs that serve the row together. `None` marks a
+# client without a first-class API, a gap that fails the check until the API
+# ships or the user signs it off in CAPABILITY_SIGNOFFS.
+CAPABILITIES = (
+    ("connection.connect", "Connect and sign in with a password or a personal access token, with the transport options of the connection string", ("builder", "builder_from_connection_string", "connect", "create", "from_connection_string", "heartbeat_interval", "login_user", "login_with_personal_access_token", "new"), ("session.login", "session.loginWithToken"), "Laser::connect", "Laser.connect", "Laser.connect"),
+    ("connection.close", "Sign out and close the connection", ("logout_user", "disconnect", "shutdown"), ("session.logout", "destroy"), "Laser::close", "Laser.close", "Laser.close"),
+    ("connection.events", "Watch the connection get connected, disconnected, signed in, signed out, and shut down", ("subscribe_events",), (), "Laser::connection_events", "Laser.connection_events", "Laser.connectionEvents"),
+    ("operation.settle", "Prove the outcome of a request the client could not confirm, or give the request up", ("resolve_operation", "abandon_operation"), ("resolveOperation", "abandonOperation"), "Laser::resolve_operation + Laser::abandon_operation + TransportError::uncertain_operation", "Laser.resolve_operation + Laser.abandon_operation + TransportError.uncertain_operation", "Laser.resolveOperation + Laser.abandonOperation + fn:uncertainOperation"),
+    ("command.raw", "Send a command by its code with a raw payload, to the connected node or to one replica", ("client", "send_binary_request", "send_binary_request_to_replica", "send_binary_request_to_replica_with_deadline", "send_binary_request_with_deadline"), ("sendBinaryRequest", "sendBinaryRequestToReplica", "clientProvider"), "Laser::send_command + Laser::send_command_to_replica", "Laser.send_command + Laser.send_command_to_replica", "Laser.sendCommand + Laser.sendCommandToReplica"),
+    ("stream.list", "List the streams", ("get_streams",), ("stream.list",), "Laser::streams", "Laser.streams", "Laser.streams"),
+    ("stream.get", "Read one stream or check that it exists", ("get_stream",), ("stream.get",), "Stream::get + Stream::exists", "Stream.get + Stream.exists", "Stream.get + Stream.exists"),
+    ("stream.create", "Create a stream", ("create_stream",), ("stream.create", "stream.ensure"), "Stream::ensure", "Stream.ensure", "Stream.ensure"),
+    ("stream.update", "Rename a stream", ("update_stream",), ("stream.update",), "Stream::rename", "Stream.rename", "Stream.rename"),
+    ("stream.delete", "Delete a stream", ("delete_stream",), ("stream.delete",), "Stream::delete", "Stream.delete", "Stream.delete"),
+    ("topic.list", "List the topics of a stream", ("get_topics",), ("topic.list",), "Stream::topics", "Stream.topics", "Stream.topics"),
+    ("topic.get", "Read one topic with its partitions, or check that it exists", ("get_topic",), ("topic.get",), "Topic::get + Topic::exists + Topic::partitions", "Topic.get + Topic.exists + Topic.partitions", "Topic.get + Topic.exists + Topic.partitions"),
+    ("topic.create", "Create a topic", ("create_topic",), ("topic.create", "topic.ensure"), "Topic::ensure", "Topic.ensure", "Topic.ensure"),
+    ("topic.update", "Change the settings of a topic", ("update_topic",), ("topic.update",), "Topic::update", "Topic.update", "Topic.update"),
+    ("topic.delete", "Delete a topic", ("delete_topic",), ("topic.delete",), "Topic::delete", "Topic.delete", "Topic.delete"),
+    ("partition.create", "Add partitions to a topic", ("create_partitions",), ("partition.create",), "Topic::add_partitions", "Topic.add_partitions", "Topic.addPartitions"),
+    ("partition.delete", "Remove partitions from a topic", ("delete_partitions",), ("partition.delete",), "Topic::delete_partitions", "Topic.delete_partitions", "Topic.deletePartitions"),
+    ("segment.delete", "Delete the oldest segments of a partition", ("delete_segments",), ("segment.delete",), "Topic::delete_segments", "Topic.delete_segments", "Topic.deleteSegments"),
+    ("consumer_group.list", "List the consumer groups of a topic", ("get_consumer_groups",), ("group.list",), "Topic::consumer_groups", "Topic.consumer_groups", "Topic.consumerGroups"),
+    ("consumer_group.get", "Read one consumer group", ("get_consumer_group",), ("group.get",), "ConsumerGroup::info", "ConsumerGroup.info", "ConsumerGroup.info"),
+    ("consumer_group.create", "Create a consumer group", ("create_consumer_group",), ("group.create", "group.ensure"), "ConsumerGroup::create", "ConsumerGroup.create", "ConsumerGroup.create"),
+    ("consumer_group.delete", "Delete a consumer group", ("delete_consumer_group",), ("group.delete",), "ConsumerGroup::delete", "ConsumerGroup.delete", "ConsumerGroup.delete"),
+    ("consumer_group.join", "Join and leave a consumer group, and follow its partition assignment, to read its partitions", ("consumer_group", "join_consumer_group", "leave_consumer_group", "refresh_consumer_group_assignments", "sync_consumer_group"), ("group.join", "group.leave", "group.ensureAndJoin", "consumerGroup"), "ConsumerGroup::consumer", "ConsumerGroup.consumer", "ConsumerGroup.consumer"),
+    ("consumer_offset.get", "Read a stored consumer offset", ("get_consumer_offset",), ("offset.get",), "Consumer::stored_offset", "Consumer.stored_offset", "Consumer.storedOffset"),
+    ("consumer_offset.store", "Store a consumer offset", ("store_consumer_offset",), ("offset.store",), "Consumer::store_offset", "Consumer.store_offset", "Consumer.storeOffset"),
+    ("consumer_offset.commit", "Store the offset of a delivered record, fenced to the partition history and the reader that delivered it", ("store_consumer_position",), ("offset.storePosition",), "Consumer::commit", "Consumer.commit", "Consumer.commit"),
+    ("consumer_offset.delete", "Delete a stored consumer offset", ("delete_consumer_offset", "delete_consumer_position"), ("offset.delete", "offset.deletePosition"), "Consumer::delete_offset", "Consumer.delete_offset", "Consumer.deleteOffset"),
+    ("message.send", "Send messages", ("producer", "send_messages"), ("message.send",), "Topic::send", "Topic.send", "Topic.send"),
+    ("message.poll", "Poll messages, one partition or every partition of a standalone consumer", ("consumer", "poll_messages", "poll_messages_raw", "reader"), ("message.poll", "message.reader", "consumer"), "Topic::consumer", "Topic.consumer", "Topic.consumer"),
+    ("message.headers", "Send and read user headers", (), (), "PublishRequest::header", "PublishRequest.header", "PublishRequest.header"),
+    ("producer.idempotent", "Write each batch of a producer once per partition, also when a lost reply makes the producer send it again", ("send_producer_messages", "next_producer_id"), (), "ProducerBuilder::idempotent", "Topic.producer(idempotent=)", "ProducerOptions.idempotent"),
+    ("producer.batching", "Batch and route sends in the background, ordered or balanced over shards", (), (), "ProducerBuilder::background", "Topic.producer(background=)", "ProducerOptions.background"),
+    ("producer.sharding", "Pick the background shard with caller code", (), (), "ProducerBuilder::sharding", "Topic.producer(sharding=)", "ProducerOptions.sharding"),
+    ("producer.encryption", "Encrypt payloads on the client", (), (), "ProducerBuilder::encryption", "Topic.producer(encryption=)", "ProducerOptions.encryption"),
+    ("consumer.encryption", "Decrypt payloads on the client", (), (), "ConsumerBuilder::encryption", "Topic.consumer(encryption=)", "ConsumerOptions.encryption"),
+    ("publish.failure", "Read the committed and unconfirmed messages of a failed publish", (), (), "LaserError::PublishFailed", "PublishFailedError", "PublishFailedError"),
+    ("error.code", "Read the Apache Iggy error code of a transport failure", (), (), "TransportError::iggy_error_code", "TransportError.iggy_error_code", "fn:iggyErrorCode"),
+    ("agent.topic_names", "Name the well-known agent topics", (), (), "AgentTopic::topic_string", "AgentTopic", "AgentTopic"),
+    ("bridge.rpc", "Answer A2A and MCP JSON-RPC requests", (), (), "A2aBridge::handle_rpc", "A2aBridge.handle_rpc", "A2aBridge.handleRpc"),
+    ("bridge.http", "Serve a bridge over HTTP with a browser origin guard", (), (), "A2aBridge::router", "A2aBridge.serve", "A2aBridge.serve"),
+    ("user.list", "List the users", ("get_users",), ("user.list",), "Laser::users", "Laser.users", "Laser.users"),
+    ("user.get", "Read one user with its permissions, or check that it exists", ("get_user",), ("user.get",), "User::get + User::exists", "User.get + User.exists", "User.get + User.exists"),
+    ("user.create", "Create a user", ("create_user",), ("user.create",), "User::create", "User.create", "User.create"),
+    ("user.update", "Rename a user or change its status", ("update_user",), ("user.update",), "User::update", "User.update", "User.update"),
+    ("user.permissions", "Replace the permissions of a user", ("update_permissions",), ("user.updatePermissions",), "User::set_permissions", "User.set_permissions", "User.setPermissions"),
+    ("user.password", "Change the password of a user", ("change_password",), ("user.changePassword",), "User::change_password", "User.change_password", "User.changePassword"),
+    ("user.delete", "Delete a user", ("delete_user",), ("user.delete",), "User::delete", "User.delete", "User.delete"),
+    ("token.list", "List the personal access tokens of the signed-in user", ("get_personal_access_tokens",), ("token.list",), "Laser::personal_access_tokens", "Laser.personal_access_tokens", "Laser.personalAccessTokens"),
+    ("token.create", "Create a personal access token", ("create_personal_access_token",), ("token.create",), "PersonalAccessToken::create", "PersonalAccessToken.create", "PersonalAccessToken.create"),
+    ("token.delete", "Delete a personal access token", ("delete_personal_access_token",), ("token.delete",), "PersonalAccessToken::delete", "PersonalAccessToken.delete", "PersonalAccessToken.delete"),
+    ("system.ping", "Ping the server", ("ping",), ("system.ping",), "Laser::ping", "Laser.ping", "Laser.ping"),
+    ("system.stats", "Read the server statistics", ("get_stats",), ("system.getStats",), "Laser::stats", "Laser.stats", "Laser.stats"),
+    ("system.me", "Read this connection as the server sees it", ("get_me",), ("client.getMe",), "Laser::me", "Laser.me", "Laser.me"),
+    ("system.clients", "List the connected clients", ("get_clients",), ("client.list",), "Laser::clients", "Laser.clients", "Laser.clients"),
+    ("system.client", "Read one connected client", ("get_client",), ("client.get",), "Laser::client_info", "Laser.client_info", "Laser.clientInfo"),
+    ("system.cluster", "Read the cluster nodes and their roles", ("get_cluster_metadata",), ("cluster.getClusterMetadata",), "Laser::cluster", "Laser.cluster", "Laser.cluster"),
+    ("system.snapshot", "Download a server diagnostics snapshot", ("snapshot",), ("system.snapshot",), "Laser::snapshot", "Laser.snapshot", "Laser.snapshot"),
+    ("system.options", "Describe the server options", ("describe_options",), ("system.describeOptions",), "Laser::describe_options", "Laser.describe_options", "Laser.describeOptions"),
+    ("system.metadata_changes", "Read the server metadata change feed", ("get_metadata_changes",), ("system.getMetadataChanges",), "Laser::metadata_changes", "Laser.metadata_changes", "Laser.metadataChanges"),
+)
+
+# Raw client operations the Iggy server no longer serves. A row is (key,
+# operation, Rust raw calls, TypeScript raw calls, retired command code). It
+# belongs here only when the Iggy server's binary protocol lists the code as
+# retired, and then no client can offer it and it needs no first-class API.
+RETIRED_RAW_CALLS = ()
+
+# Where the raw client operations live between jobs. Rust's `IggyClient`
+# implements the `Client` trait of `iggy_common` and every trait it extends,
+# and adds the public inherent methods of the `iggy` crate, each at the
+# version Cargo.lock pins. TypeScript's `IggyClient` is the `apache-iggy`
+# client class that its adapter names, with its base classes, at the version
+# package.json pins. A job without one of the
+# sources reads its operations from RAW_SURFACE, which `--write` keeps current,
+# and only while the stored version still matches the pin.
+RAW_SURFACE = ("scripts", "iggy-client-operations.json")
+
+# Written user sign-offs for a capability a client goes without, keyed by
+# capability and then by client ("Rust", "Python", "TypeScript"), each value
+# quoting the sign-off and its date. Only the user adds an entry.
+CAPABILITY_SIGNOFFS = {}
+
+# Every omitted row that hands out or takes an Apache Iggy type, and every
+# omitted method that does more than convert or construct a value, names the
+# capabilities a caller reaches through it, as keys or key prefixes. The check
+# fails when such a row has no entry, so an omission never hides a capability.
+OMISSION_CAPABILITIES = {
+    ("Laser", "client"): ("connection", "operation", "command", "stream", "topic", "partition", "segment", "consumer_group", "consumer_offset", "message", "producer.idempotent", "user", "token", "system"),
+    ("LaserBuilder", "client"): ("connection.connect",),
+    ("Laser", "from_client"): ("connection.connect",),
+    ("Topic", "iggy_producer"): ("message.send", "message.headers", "producer"),
+    ("Topic", "iggy_consumer"): ("message.poll", "consumer_offset", "consumer"),
+    ("Topic", "iggy_consumer_group"): ("consumer_group", "consumer_offset", "consumer"),
+    ("IggyProducer", None): ("message.send", "producer"),
+    ("IggyProducerBuilder", None): ("message.send", "producer"),
+    ("IggyConsumer", None): ("message.poll", "consumer"),
+    ("IggyConsumerBuilder", None): ("message.poll", "consumer"),
+    ("Sharding", None): ("producer",),
+    ("BalancedSharding", None): ("producer.batching",),
+    ("OrderedSharding", None): ("producer.batching",),
+    ("DirectConfig", None): ("producer.batching",),
+    ("HeaderKey", None): ("message.headers",),
+    ("HeaderValue", None): ("message.headers",),
+    ("Headers", None): ("message.headers",),
+    ("IggyMessage", None): ("message.send", "publish.failure"),
+    ("SendMessagesResponse", None): ("message.send",),
+    ("SendMessagesConfirmationResponse", None): ("publish.failure",),
+    ("TransportError", "as_iggy"): ("error.code",),
+    ("AgentTopic", "as_identifier"): ("agent.topic_names",),
+}
+# What a plain-value accessor hands back: a number, a flag, text, bytes, a
+# time, an id, or nothing, borrowed or optional.
+PLAIN_RETURN = re.compile(r"^(?:Option\s*<\s*)?(?:&\s*(?:'\w+\s+)?)?(?:str|String|bool|char|[ui](?:8|16|32|64|128|size)|f32|f64|Duration|SystemTime|Instant|Ulid|Uuid|\[u8\]|Vec<u8>|NonZero\w+|\(\))\s*>?$")
+# Rust types whose appearance in an omitted row means it exposes the raw client.
+RAW_CLIENT_TYPES = re.compile(r"\b(?:IggyClient|IggyProducer|IggyProducerBuilder|IggyConsumer|IggyConsumerBuilder|IggyError|Identifier|Router)\b")
+
 
 def main():
-    text, problems = check()
+    text, surface, problems = check()
+    stored = ROOT.joinpath(*RAW_SURFACE)
     if "--write" in sys.argv:
         DOC.write_text(text)
-    elif not DOC.exists() or DOC.read_text() != text:
-        problems.insert(0, "docs/parity.md is stale, run `python3 scripts/check-parity.py --write`")
+        stored.write_text(surface)
+    else:
+        if not DOC.exists() or DOC.read_text() != text:
+            problems.insert(0, "docs/parity.md is stale, run `python3 scripts/check-parity.py --write`")
+        if not stored.exists() or stored.read_text() != surface:
+            problems.insert(0, f"{'/'.join(RAW_SURFACE)} is stale, run `python3 scripts/check-parity.py --write`")
     for problem in problems:
         print(problem)
     if problems:
@@ -1083,10 +1235,180 @@ def main():
 
 
 def check():
-    """The rendered matrix and every parity problem."""
+    """The rendered matrix, the raw client operations to store, and every
+    parity problem."""
     rows = rust_surface()
     matrix = compare(rows, python_surface(), typescript_surface())
-    return render(matrix), matrix.problems
+    return render(matrix), json.dumps(matrix.raw_clients, indent=2) + "\n", matrix.problems
+
+
+def raw_clients():
+    """The operations of each raw client, and the problems of deriving them.
+    An operation list comes from the pinned source, or from RAW_SURFACE when
+    that source is not installed and the stored version matches the pin."""
+    path = ROOT.joinpath(*RAW_SURFACE)
+    stored = json.loads(path.read_text()) if path.exists() else {}
+    clients, problems = {}, []
+    for label, derive in (("Rust", rust_raw_operations), ("TypeScript", typescript_raw_operations)):
+        source, version, operations, problem = derive()
+        if problem:
+            problems.append(problem)
+        kept = stored.get(label, {})
+        if operations is None:
+            if (kept.get("source"), kept.get("version")) != (source, version):
+                problems.append(f"{label} raw client {source} {version} is not installed and {'/'.join(RAW_SURFACE)} holds {kept.get('source')} {kept.get('version')}, so install it and run `python3 scripts/check-parity.py --write`")
+            operations = kept.get("operations", [])
+        clients[label] = {"source": source, "version": version, "operations": sorted(operations)}
+    return clients, problems
+
+
+RUST_RAW_CRATES = ("iggy_common", "iggy")
+
+
+# Calls of the Iggy HTTP transport. Laser refuses HTTP in every client, so
+# no client offers them.
+HTTP_TRANSPORT_CALLS = {"send_http_request", "get_connection_info"}
+
+
+def rust_raw_operations():
+    """Every method of the `iggy_common` `Client` trait and the traits it
+    extends, and every public inherent method of the `iggy` `IggyClient`
+    type, from the registry sources of the versions Cargo.lock pins."""
+    source = " and ".join(RUST_RAW_CRATES)
+    lock = ROOT / "Cargo.lock"
+    text = lock.read_text() if lock.exists() else ""
+    pins = {}
+    for crate in RUST_RAW_CRATES:
+        versions = sorted(set(re.findall(r'name = "' + crate + r'"\nversion = "([^"]+)"', text)))
+        if len(versions) != 1:
+            return source, None, None, f"Cargo.lock pins {len(versions)} versions of {crate}, expected one"
+        pins[crate] = versions[0]
+    version = " and ".join(dict.fromkeys(pins.values()))
+    home = pathlib.Path(os.environ.get("CARGO_HOME") or pathlib.Path.home() / ".cargo")
+    roots = {crate: sorted(home.glob(f"registry/src/*/{crate}-{pin}/src")) for crate, pin in pins.items()}
+    if not all(roots.values()):
+        return source, version, None, None
+    operations = set(trait_operations(roots["iggy_common"][0], "Client")) | set(inherent_operations(roots["iggy"][0], "IggyClient"))
+    operations -= HTTP_TRANSPORT_CALLS
+    return source, version, sorted(operations), None
+
+
+def inherent_operations(src, owner):
+    """Public method names of every inherent `impl owner` block, read from the
+    Rust sources under `src`. Trait impls and restricted methods are left out."""
+    operations = set()
+    for path in sorted(src.rglob("*.rs")):
+        code = strip_rust(path.read_text())
+        for match in re.finditer(r"\bimpl\s*(?:<[^{>]*>\s*)?" + re.escape(owner) + r"\s*(?:<[^{>]*>\s*)?\{", code):
+            body = code[match.end():close(code, match.end() - 1)]
+            depth = 0
+            for token in re.finditer(r"[{}]|\bpub\s+(?:(?:async|const|unsafe)\s+)*fn\s+(\w+)", body):
+                if token.group(0) == "{":
+                    depth += 1
+                elif token.group(0) == "}":
+                    depth -= 1
+                elif depth == 0:
+                    operations.add(token.group(1))
+    return sorted(operations)
+
+
+def trait_operations(src, root):
+    """Method names of trait `root` and of every trait it extends, read from
+    the Rust sources under `src`."""
+    traits = {}
+    for path in sorted(src.rglob("*.rs")):
+        code = strip_rust(path.read_text())
+        for match in re.finditer(r"\bpub\s+trait\s+(\w+)([^{;]*)\{", code):
+            body = code[match.end():close(code, match.end() - 1)]
+            depth, methods = 0, []
+            for token in re.finditer(r"[{}]|\bfn\s+(\w+)", body):
+                if token.group(0) == "{":
+                    depth += 1
+                elif token.group(0) == "}":
+                    depth -= 1
+                elif depth == 0:
+                    methods.append(token.group(1))
+            bounds = match.group(2).split(":", 1)[1] if ":" in match.group(2) else ""
+            traits.setdefault(match.group(1), (re.findall(r"\b([A-Z]\w*)", bounds.split("where")[0]), methods))
+    operations, pending, seen = set(), [root], set()
+    while pending:
+        name = pending.pop()
+        if name in seen or name not in traits:
+            continue
+        seen.add(name)
+        supertraits, methods = traits[name]
+        operations.update(methods)
+        pending += supertraits
+    return sorted(operations)
+
+
+def typescript_raw_operations():
+    """Every public command of the client class the TypeScript adapter hands
+    out, from the `apache-iggy` declarations of the version package.json pins."""
+    package = ROOT / "foreign" / "typescript"
+    manifest = json.loads((package / "package.json").read_text()) if (package / "package.json").exists() else {}
+    pinned = {**manifest.get("devDependencies", {}), **manifest.get("dependencies", {})}.get("apache-iggy")
+    installed = package / "node_modules" / "apache-iggy"
+    if not (installed / "package.json").exists():
+        return "apache-iggy", pinned, None, None
+    version = json.loads((installed / "package.json").read_text()).get("version")
+    if version != pinned:
+        return "apache-iggy", pinned, None, f"foreign/typescript/node_modules holds apache-iggy {version}, but package.json pins {pinned}, so run `npm ci`"
+    adapter = (package / "src" / "iggy" / "apache-iggy.ts").read_text()
+    handed = re.search(r"export\s+type\s+IggyClient\s*=\s*(\w+)", adapter)
+    return "apache-iggy", pinned, client_commands(installed / "dist", handed.group(1) if handed else "SimpleClient"), None
+
+
+def client_commands(dist, root):
+    """Public instance member names of the TypeScript client class `root` and
+    every base class it extends: a method, a function property, or a command
+    of a command group such as `stream.get`. Static members are left out."""
+    classes, groups = {}, {}
+    for path in sorted(dist.rglob("*.d.ts")):
+        text = re.sub(r"/\*.*?\*/|//[^\n]*", "", path.read_text(), flags=re.S)
+        for match in re.finditer(r"declare\s+const\s+(\w+)\s*:\s*\(c:\s*ClientProvider\)\s*=>\s*\{", text):
+            body = text[match.end():close(text, match.end() - 1)]
+            groups[match.group(1)] = [name for name, _ in d_ts_members(body)]
+        for match in re.finditer(r"type\s+(\w+)\s*=\s*ReturnType<typeof\s+(\w+)>", text):
+            groups.setdefault(f"type:{match.group(1)}", match.group(2))
+        for match in re.finditer(r"declare\s+(?:abstract\s+)?class\s+(\w+)(?:<[^{]*?>)?(?:\s+extends\s+(\w+))?[^{]*\{", text):
+            body = text[match.end():close(text, match.end() - 1)]
+            classes.setdefault(match.group(1), (match.group(2), d_ts_members(body)))
+    commands, name = set(), root
+    while name in classes:
+        base, members = classes[name]
+        for member, kind in members:
+            group = groups.get(f"type:{kind}")
+            if group in groups:
+                commands.update(f"{member}.{command}" for command in groups[group])
+            else:
+                commands.add(member)
+        name = base
+    return sorted(commands)
+
+
+def d_ts_members(body):
+    """(name, type) of each public member of a declaration body, where the
+    type is a method's `method` or a property's type text."""
+    members, depth, begin = [], 0, 0
+    statements = []
+    for position, char in enumerate(body):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == ";" and depth == 0:
+            statements.append(body[begin:position])
+            begin = position + 1
+    for statement in statements:
+        statement = " ".join(statement.split())
+        modifiers = re.match(r"^((?:(?:public|static|readonly|abstract|override|declare|async|get|set)\s+)*)", statement)
+        rest = statement[modifiers.end():]
+        member = re.match(r"^(\w+)\??\s*([(<:])", rest)
+        if member is None or member.group(1) == "constructor" or re.match(r"(?:private|protected)\b", rest) or re.search(r"\bstatic\b", modifiers.group(1)):
+            continue
+        members.append((member.group(1), "method" if member.group(2) in "(<" else rest[member.end():].strip()))
+    return members
 
 
 def rust_surface():
@@ -1261,7 +1583,115 @@ def compare(rows, python, typescript):
     matrix.typescript_only = [name for name in matrix.typescript_only if name.rstrip("()") not in TS_ONLY]
     matrix.problems += [f"Python only: {name} has no Rust row" for name in matrix.python_only]
     matrix.problems += [f"TypeScript only: {name} has no Rust row" for name in matrix.typescript_only]
+    matrix.raw_clients, raw_problems = raw_clients()
+    matrix.problems += raw_problems
+    matrix.problems += capability_problems(matrix, rows, by_key, python, typescript, shapes)
     return matrix
+
+
+def capability_problems(matrix, rows, by_key, python, typescript, shapes):
+    """Resolve each raw-client capability in every client, make sure that
+    every derived raw operation belongs to exactly one capability or retired
+    call, and that no omitted row hides one."""
+    problems = []
+    keys = [entry[0] for entry in CAPABILITIES]
+    for key, *_ in RETIRED_RAW_CALLS:
+        if key in keys:
+            problems.append(f"`{key}` is both a capability and a retired raw call")
+    for key in sorted({key for key in keys if keys.count(key) > 1}):
+        problems.append(f"CAPABILITIES lists `{key}` more than once")
+    problems += raw_call_problems(matrix.raw_clients)
+    lookups = {"Python": Lookup("Python", python, {}, {}, set(), shapes), "TypeScript": Lookup("TypeScript", typescript, {}, {}, set(), shapes)}
+    for key, text, rust_calls, ts_calls, *spellings in CAPABILITIES:
+        cells = []
+        for label, spelling in zip(("Rust", "Python", "TypeScript"), spellings):
+            found = spelling is not None and (rust_has(spelling, by_key) if label == "Rust" else lookups[label].resolve(spelling)[0])
+            signoff = CAPABILITY_SIGNOFFS.get(key, {}).get(label)
+            if found:
+                cells.append(show_spelling(spelling))
+            elif signoff:
+                cells.append(f"signed off: {signoff}")
+            else:
+                cells.append(f"{MISSING} (`{spelling}`)" if spelling else MISSING)
+                wanted = f", `{spelling}` is absent" if spelling else ""
+                problems.append(f"capability `{key}` ({text}): {label} has no first-class API{wanted}")
+        matrix.capabilities.append((key, text, show_raw_calls(rust_calls, ts_calls), cells))
+    for key, clients in CAPABILITY_SIGNOFFS.items():
+        if key not in keys:
+            problems.append(f"CAPABILITY_SIGNOFFS entry `{key}` names no capability")
+    omitted = set()
+    for row in rows:
+        for label, cell in (("Python", row.python), ("TypeScript", row.typescript)):
+            if not cell.omitted or not hides_capability(row, cell):
+                continue
+            omitted.add((row.owner, row.member))
+            if (row.owner, row.member) not in OMISSION_CAPABILITIES:
+                problems.append(f"{row.display}: {label} omits it as `{cell.reason}`, but it reaches the raw client or does more than convert, construct, or read a plain value, so OMISSION_CAPABILITIES must name the capabilities it reaches ({row.source})")
+    for item, targets in OMISSION_CAPABILITIES.items():
+        if item not in omitted:
+            problems.append(f"OMISSION_CAPABILITIES entry {item} names no omitted row that reaches a capability")
+        for target in targets:
+            if not any(key == target or key.startswith(f"{target}.") for key in keys):
+                problems.append(f"OMISSION_CAPABILITIES entry {item} names no capability `{target}`")
+    matrix.omission_capabilities = sorted((by_key[item].display, targets) for item, targets in OMISSION_CAPABILITIES.items() if item in by_key)
+    return problems
+
+
+def raw_call_problems(clients):
+    """Every derived raw operation belongs to exactly one capability or
+    retired call, and every named raw call is a derived operation."""
+    problems = []
+    entries = [(key, rust, ts) for key, _, rust, ts, *_ in CAPABILITIES] + [(key, rust, ts) for key, _, rust, ts, _ in RETIRED_RAW_CALLS]
+    for index, label in enumerate(("Rust", "TypeScript")):
+        client = clients.get(label, {})
+        operations = set(client.get("operations", []))
+        source = f"{label} {client.get('source')} {client.get('version')}"
+        owners = {}
+        for key, *calls in entries:
+            for call in calls[index]:
+                owners.setdefault(call, []).append(key)
+                if call not in operations:
+                    problems.append(f"`{key}` names raw call `{call}`, which the {source} client does not have")
+        for call in sorted(operations):
+            keys = owners.get(call, [])
+            if not keys:
+                problems.append(f"raw call `{call}` ({source}) is neither a capability nor retired")
+            elif len(keys) > 1:
+                problems.append(f"raw call `{call}` ({source}) belongs to {len(keys)} rows: {', '.join(f'`{key}`' for key in keys)}")
+    return problems
+
+
+def show_raw_calls(rust_calls, ts_calls):
+    return " / ".join(", ".join(f"`{call}`" for call in calls) or "none" for calls in (rust_calls, ts_calls))
+
+
+def rust_has(spelling, by_key):
+    for part in spelling.split(" + "):
+        owner, _, member = part.rpartition("::")
+        if (part, None) not in by_key and not (owner and (owner, member) in by_key):
+            return False
+    return True
+
+
+def hides_capability(row, cell):
+    """Whether an omitted row could hide a capability: it is a Rust-only
+    crate item, it names a raw Apache Iggy type, or it is a method that is
+    neither a conversion, a constructor, nor a plain-value accessor."""
+    if cell.reason == "rust-crate" or row.kind == "extern":
+        return True
+    if any(RAW_CLIENT_TYPES.search(text or "") for text in [row.returns, row.value_type] + [kind for _, kind in row.params]):
+        return True
+    if row.kind not in ("method", "fn"):
+        return False
+    if row.returns in ("Self", row.owner.rsplit("::", 1)[-1]) or CONVERSIONS.match(row.member or row.name or ""):
+        return False
+    return not is_plain_accessor(row)
+
+
+def is_plain_accessor(row):
+    """A synchronous method that takes only its receiver and hands back a
+    plain value: a number, a flag, text, bytes, a time, or an id."""
+    return row.receiver and not row.params and not row.is_async and bool(PLAIN_RETURN.match(row.returned or "()"))
 
 
 def render(matrix):
@@ -1277,6 +1707,35 @@ def render(matrix):
         "| --- | --- |",
     ]
     lines += [f"| {key} | {text} |" for key, (text, _) in REASONS.items()]
+    lines += [
+        "",
+        "## Capabilities",
+        "",
+        "Rust hands out the raw Apache Iggy client through `Laser::client` and TypeScript through `Laser.client`. Python has no raw client. So every operation that the raw client reaches needs a first-class Laser API in all three clients. A MISSING cell is a gap, and the check fails until the API ships or the user signs off on the gap in writing. A signed-off cell quotes that sign-off.",
+        "",
+        "The check reads the raw operations from the client sources. " + " ".join(f"{label} has {len(client['operations'])} operations in {client['source']} {client['version']}." for label, client in matrix.raw_clients.items()) + " Each operation belongs to exactly one capability below or to a retired call, and an operation in neither fails the check.",
+        "",
+        "| Capability | Raw Apache Iggy call (Rust / TypeScript) | Rust | Python | TypeScript |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    lines += [f"| {text} (`{key}`) | {raw} | {' | '.join(cells)} |" for key, text, raw, cells in matrix.capabilities]
+    if RETIRED_RAW_CALLS:
+        lines += [
+            "",
+            "The Iggy server retired these raw calls, so no client offers them.",
+            "",
+            "| Retired call | Raw Apache Iggy call (Rust / TypeScript) | Retired command code |",
+            "| --- | --- | --- |",
+        ]
+        lines += [f"| {text} (`{key}`) | {show_raw_calls(rust, ts)} | {code} |" for key, text, rust, ts, code in RETIRED_RAW_CALLS]
+    lines += [
+        "",
+        "An omitted row that reaches the raw client, or a method that does more than convert a value, names the capabilities a caller reaches through it. The check fails when such a row names none.",
+        "",
+        "| Omitted Rust item | Capabilities |",
+        "| --- | --- |",
+    ]
+    lines += [f"| `{item}` | {', '.join(f'`{target}`' for target in targets)} |" for item, targets in matrix.omission_capabilities]
     section = None
     for row in matrix.rows:
         if row.section != section:
@@ -1305,6 +1764,8 @@ class Row:
         self.name = member
         self.params = []
         self.returns = ""
+        self.returned = ""
+        self.is_async = False
         self.receiver = False
         self.setter_of = None
         self.finish = False
@@ -1361,6 +1822,9 @@ class Matrix:
         self.python_only = []
         self.typescript_only = []
         self.accepted = []
+        self.capabilities = []
+        self.omission_capabilities = []
+        self.raw_clients = {}
 
 
 class PySurface:
@@ -2042,7 +2506,7 @@ def item_rows(section, display, item, resolver, displays):
     if item.kind in ("fn", "const", "static"):
         name = display.rsplit("::", 1)[-1]
         owner = f"{section}::{name}" if section else name
-        row = Row(section, owner, None, item.kind, source, name=name, returns=type_base(return_type(item.header)))
+        row = Row(section, owner, None, item.kind, source, name=name, returns=type_base(return_type(item.header)), returned=" ".join(return_type(item.header).split()), is_async=bool(re.search(r"\basync\b", item.header)))
         if item.kind in ("const", "static"):
             row.value_type = item.header.split(":", 1)[-1].split("=", 1)[0].strip()
         row.params = [(param.name, getattr(param, "type", "")) for param in item.params if not getattr(param, "receiver", False)]
@@ -2071,7 +2535,7 @@ def item_rows(section, display, item, resolver, displays):
                 for field in variant.fields:
                     rows.append(Row(section, display, f"{variant.name}.{field.name}", "variant-field", f"{item.file}:{field.line}"))
     for member in resolver.members(item):
-        row = Row(section, display, member.name, member.kind, f"{member.file}:{member.line}", returns=type_base(return_type(member.header)))
+        row = Row(section, display, member.name, member.kind, f"{member.file}:{member.line}", returns=type_base(return_type(member.header)), returned=" ".join(return_type(member.header).split()), is_async=bool(re.search(r"\basync\b", member.header)))
         row.params = [(param.name, getattr(param, "type", "")) for param in member.params if not getattr(param, "receiver", False)]
         row.receiver = member.kind == "setter" or any(getattr(param, "receiver", False) for param in member.params)
         row.setter_of = getattr(member, "setter_of", None)

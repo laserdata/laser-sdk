@@ -293,6 +293,13 @@ impl TransportError {
         send_cause(&self.0).as_code()
     }
 
+    /// The request this failure left with an unknown outcome, to settle with
+    /// `Laser::resolve_operation` or `Laser::abandon_operation`. `None` for
+    /// any other failure.
+    pub fn uncertain_operation(&self) -> Option<u64> {
+        send_cause(&self.0).operation_id()
+    }
+
     /// The Apache Iggy client error underneath.
     pub fn as_iggy(&self) -> &IggyError {
         &self.0
@@ -624,6 +631,13 @@ impl LaserError {
         self.iggy_cause().map(IggyError::as_code)
     }
 
+    /// The request a transport failure left with an unknown outcome, read
+    /// like [`iggy_error_code`](Self::iggy_error_code). Settle it with
+    /// `Laser::resolve_operation` or `Laser::abandon_operation`.
+    pub fn uncertain_operation(&self) -> Option<u64> {
+        self.iggy_cause().and_then(IggyError::operation_id)
+    }
+
     /// The typed consumer-filter cause, when the failure is one. A group setup
     /// failure answers for the catalog refusal under it.
     pub fn filter_reason(&self) -> Option<FilterErrorReason> {
@@ -911,6 +925,36 @@ mod tests {
         );
         assert_eq!(
             LaserError::Handler("not an Iggy failure".to_owned()).iggy_error_code(),
+            None
+        );
+    }
+
+    #[test]
+    fn given_an_unknown_outcome_when_reading_its_operation_then_should_unwrap_the_send_cause() {
+        let send = LaserError::from(IggyError::ProducerSendFailed {
+            cause: Box::new(IggyError::OperationUncertain(7)),
+            failed: std::sync::Arc::new(Vec::new()),
+            uncertain: 1,
+            committed: std::sync::Arc::new(Vec::new()),
+            stream_name: "s".into(),
+            topic_name: "t".into(),
+        });
+        assert_eq!(send.uncertain_operation(), Some(7));
+        assert_eq!(
+            LaserError::from(IggyError::PartitionLaneBlocked(3, 9)).uncertain_operation(),
+            Some(9)
+        );
+        let LaserError::Transport(fetch) = LaserError::from(IggyError::FetchProgressUncertain(4))
+        else {
+            panic!("an Iggy failure is a transport error");
+        };
+        assert_eq!(fetch.uncertain_operation(), Some(4));
+        assert_eq!(
+            LaserError::from(IggyError::Disconnected).uncertain_operation(),
+            None
+        );
+        assert_eq!(
+            LaserError::Handler("not an Iggy failure".to_owned()).uncertain_operation(),
             None
         );
     }

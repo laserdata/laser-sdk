@@ -39,6 +39,7 @@ import {
 import { ContentType } from "../wire/content.js"
 import { ConversationId as WireConversationId, CorrelationId, type RecordId } from "../wire/ids.js"
 import { bridgeHopMetadata, callHops, enterBridge, inboundHops } from "./hops.js"
+import { type A2aCallerHook, BridgeServer, originAllowed } from "./http.js"
 import { SDK_VERSION } from "../version.js"
 
 export const A2A_PROTOCOL_VERSION = "1.0"
@@ -432,6 +433,7 @@ export class A2aBridge {
   private publicUrl: string | undefined
   private description = "LaserData AGDX bridge over the durable log"
   private version = SDK_VERSION
+  private allowedOrigins: readonly string[] = []
 
   constructor(
     private readonly laser: Laser,
@@ -505,6 +507,51 @@ export class A2aBridge {
       throw new InvalidError("the task binding ttl must be a positive number")
     this.taskBinding = { key: key.slice(), ttlMicros: BigInt(Math.ceil(ttlMs * 1000)) }
     return this
+  }
+
+  /** The browser origins `serve` accepts on the JSON-RPC endpoint, each as
+   * the exact `Origin` header value (`https://app.example.com`). A request
+   * without an `Origin` header, a non-browser client, is always accepted,
+   * and so is a same-origin page on an IP literal or `localhost` host. Any
+   * other browser request is refused with 403, the DNS rebinding guard. */
+  withAllowedOrigins(origins: readonly string[]): this {
+    this.allowedOrigins = [...origins]
+    return this
+  }
+
+  /** Serves the bridge over HTTP with Node's built-in `http` module. `POST /`
+   * is the JSON-RPC endpoint and `GET /.well-known/agent-card.json` the Agent
+   * Card, signed with the bridge's key when it has one and answered with 404
+   * until `withPublicUrl` names the endpoint. The endpoint refuses a browser
+   * origin outside `withAllowedOrigins` with 403, the card is public and
+   * served to any origin. `caller` names the authenticated caller of each
+   * JSON-RPC request, the principal a bridge with `withTaskBinding` needs. */
+  async serve(
+    options: CallOptions & { readonly host?: string; readonly port?: number } & {
+      readonly caller?: A2aCallerHook
+    } = {}
+  ): Promise<BridgeServer> {
+    return BridgeServer.listen(
+      {
+        rpc: async (body, request) => {
+          if (!originAllowed(request.origin, request.host, this.allowedOrigins))
+            return { status: 403 }
+          return { status: 200, body: await this[HANDLE_RPC_FOR](body, request.caller) }
+        },
+        get: { "/.well-known/agent-card.json": () => this.servedCard() },
+        ...(options.caller === undefined ? {} : { caller: options.caller })
+      },
+      options
+    )
+  }
+
+  private servedCard(): { readonly status: number; readonly body?: unknown } {
+    try {
+      const card = this.signingKey === undefined ? this.card() : this.signedCard(this.signingKey)
+      return { status: 200, body: card }
+    } catch {
+      return { status: 404 }
+    }
   }
 
   /** The bridge acting for one authenticated caller. */

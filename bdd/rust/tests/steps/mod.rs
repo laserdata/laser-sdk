@@ -18,5 +18,6 @@ pub mod query_managed;
 pub mod schema_codecs;
 pub mod schema_registry;
 pub mod session;
+pub mod stream_admin;
 pub mod streaming;
 pub mod warm_dedup;

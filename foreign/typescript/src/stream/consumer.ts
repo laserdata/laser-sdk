@@ -8,6 +8,7 @@ import { mintUlidValue } from "../runtime/ulid.js"
 import {
   type ConsumerTarget,
   DEFAULT_POLL_MAX_BYTES,
+  decodeHeaderBlock,
   type LaserTransport,
   MAX_DEFERRED_POLL_WAIT_MS,
   MIN_DEFERRED_POLL_MAX_BYTES,
@@ -30,6 +31,7 @@ import type { FilteredReader, MatchedRecord } from "../managed/filters.js"
 import type { MessageId } from "../types/ids.js"
 import { Json } from "./codecs.js"
 import { type ConsumerStart, storeSeeds } from "./consumer-start.js"
+import type { Encryption } from "./encryption.js"
 import type { Message } from "./message.js"
 
 /** A message a live consumer delivered, with its stored header like the Rust
@@ -125,6 +127,12 @@ export interface ConsumerOptions {
    * for example after moving the start back. Without it, such records are
    * skipped. */
   readonly allowReplay?: boolean
+  /** Decrypts the payload and the user-header block of every record with the
+   * key its producer encrypted them with. A record that does not decrypt
+   * throws `TransportError` once, with Apache Iggy error code 72, and is read
+   * past. It refuses the `polling` and `intervalOrPolling` commit policies,
+   * because the server would store a poll before it is decrypted. */
+  readonly encryption?: Encryption
 }
 
 const DEFAULT_BATCH_LENGTH = 1000
@@ -189,6 +197,7 @@ export interface ResolvedConsumerOptions {
   readonly pollingRetryIntervalMs: number
   readonly initRetries: { readonly retries: number; readonly intervalMs: number }
   readonly allowReplay: boolean
+  readonly encryption: Encryption | undefined
 }
 
 function commitInterval(policy: CommitPolicy): number | undefined {
@@ -225,7 +234,16 @@ export function resolveConsumerOptions(
     createGroup: options.createGroup ?? true,
     pollingRetryIntervalMs: options.pollingRetryIntervalMs ?? DEFAULT_POLLING_RETRY_INTERVAL_MS,
     initRetries,
-    allowReplay: options.allowReplay ?? false
+    allowReplay: options.allowReplay ?? false,
+    encryption: options.encryption
+  }
+  if (
+    resolved.encryption !== undefined &&
+    (commitPolicy.kind === "polling" || commitPolicy.kind === "intervalOrPolling")
+  ) {
+    throw new InvalidError(
+      "an encrypted consumer takes a commit policy that stores handled records, not polling"
+    )
   }
   if (!Number.isFinite(resolved.pollingRetryIntervalMs) || resolved.pollingRetryIntervalMs <= 0) {
     throw new InvalidError("consumer pollingRetryIntervalMs must be a positive finite number")
@@ -290,6 +308,7 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
   private readonly wait: PollWait
   private readonly pollingRetryIntervalMs: number
   private readonly allowReplay: boolean
+  private readonly encryption: Encryption | undefined
   private buffer: PolledMessage[] = []
   // Native deliveries handed back, yielded again before the buffer.
   private readonly returned: ConsumerMessage[] = []
@@ -390,6 +409,7 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     }
     this.pollingRetryIntervalMs = resolved.pollingRetryIntervalMs
     this.allowReplay = resolved.allowReplay
+    this.encryption = resolved.encryption
     this.leavesGroup = this.target.kind === "group"
   }
 
@@ -790,7 +810,10 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
       if (message === undefined) {
         const polled = this.buffer.shift()
         if (polled === undefined) return undefined
-        message = withJson(polled, polled.headersMalformed !== undefined)
+        // A record that does not decrypt is reported once and read past.
+        const opened =
+          this.encryption === undefined ? polled : openedRecord(polled, this.encryption)
+        message = withJson(opened, opened.headersMalformed !== undefined)
         this.deliveries.set(
           message,
           polled.context === undefined ? {} : { context: polled.context }
@@ -809,7 +832,12 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     if (record === undefined) return undefined
     if (this.autoCommit) this.lastDelivery = { record, lastOfPage: this.records.length === 0 }
     this.consumedOffsets.set(record.partitionId, record.offset)
-    const message = record.message
+    // A record that does not decrypt is reported once and counts as handled,
+    // so the read goes past it.
+    const message =
+      this.encryption === undefined
+        ? record.message
+        : openedMessage(record.message, this.encryption)
     this.delivered.set(message, record)
     this.latestDelivered = message
     return message
@@ -1317,6 +1345,43 @@ function withJson(
   // Not enumerable, so a delivered message still compares equal to its plain
   // fields.
   return Object.defineProperty(delivered, "json", { value: json }) as ConsumerMessage
+}
+
+// A polled record with its payload and user-header block decrypted.
+function openedRecord(polled: PolledMessage, encryption: Encryption): PolledMessage {
+  const { headersMalformed: _, userHeaders, ...rest } = polled
+  const payload = encryption.decrypt(polled.payload)
+  if (userHeaders === undefined) return { ...rest, payload }
+  const block = encryption.decrypt(userHeaders)
+  return {
+    ...rest,
+    payload,
+    ...(block.byteLength > 0 ? { userHeaders: block } : {}),
+    ...decodeHeaderBlock(block)
+  }
+}
+
+// A group delivery with its payload and user-header block decrypted.
+function openedMessage(message: ConsumerMessage, encryption: Encryption): ConsumerMessage {
+  const block =
+    message.userHeaders === undefined ? undefined : encryption.decrypt(message.userHeaders)
+  const decoded: ReturnType<typeof decodeHeaderBlock> =
+    block === undefined ? { headers: message.headers } : decodeHeaderBlock(block)
+  return withJson(
+    {
+      payload: encryption.decrypt(message.payload),
+      partitionId: message.partitionId,
+      offset: message.position.offset,
+      headers: decoded.headers,
+      messageId: message.messageId,
+      checksum: message.checksum,
+      currentOffset: message.currentOffset,
+      timestampMicros: message.timestampMicros,
+      originTimestampMicros: message.originTimestampMicros,
+      ...(block !== undefined && block.byteLength > 0 ? { userHeaders: block } : {})
+    },
+    decoded.headersMalformed !== undefined
+  )
 }
 
 // A native delivery the caller holds, and whether it ended its poll.

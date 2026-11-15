@@ -754,6 +754,11 @@ impl Laser {
         self.client().shutdown().await.map_err(LaserError::from)
     }
 
+    /// Watch this connection get connected, disconnected, signed in, signed out, and shut down, from now on. A leader change that moves the client to another node is not a disconnect.
+    pub async fn connection_events(&self) -> crate::connection::ConnectionEvents {
+        crate::connection::ConnectionEvents::new(self.client().subscribe_events().await)
+    }
+
     pub(crate) fn publish_generation(&self) -> u64 {
         self.inner
             .publish_generation
@@ -3216,7 +3221,7 @@ pub(crate) async fn ensure_stream(client: &IggyClient, stream: &str) -> Result<(
     Ok(())
 }
 
-fn is_missing_resource(error: &IggyError) -> bool {
+pub(crate) fn is_missing_resource(error: &IggyError) -> bool {
     matches!(
         error,
         IggyError::ResourceNotFound(_)
@@ -3228,15 +3233,17 @@ fn is_missing_resource(error: &IggyError) -> bool {
 }
 
 pub(crate) async fn delete_stream(laser: &Laser, stream: &str) -> Result<bool, LaserError> {
-    let client = laser.client();
     let identifier = Identifier::named(stream)?;
-    let existed = client.get_stream(&identifier).await?.is_some();
-    if existed
-        && let Err(error) = client.delete_stream(&identifier).await
-        && client.get_stream(&identifier).await?.is_some()
-    {
-        return Err(error.into());
-    }
+    let existed = match laser.client().delete_stream(&identifier).await {
+        Ok(()) => true,
+        Err(error) if is_missing_resource(&error) => false,
+        Err(error) => return Err(error.into()),
+    };
+    forget_stream(laser, stream);
+    Ok(existed)
+}
+
+pub(crate) fn forget_stream(laser: &Laser, stream: &str) {
     laser
         .inner
         .producers
@@ -3249,7 +3256,39 @@ pub(crate) async fn delete_stream(laser: &Laser, stream: &str) -> Result<bool, L
             .reply_hubs
             .retain(|(hub_stream, _), _| hub_stream != stream);
     }
+}
+
+pub(crate) async fn delete_topic(
+    laser: &Laser,
+    stream: &str,
+    topic: &str,
+) -> Result<bool, LaserError> {
+    let stream_id = Identifier::named(stream)?;
+    let topic_id = Identifier::named(topic)?;
+    let existed = match laser.client().delete_topic(&stream_id, &topic_id).await {
+        Ok(()) => true,
+        Err(error) if is_missing_resource(&error) => false,
+        Err(error) => return Err(error.into()),
+    };
+    forget_topic(laser, stream, topic);
     Ok(existed)
+}
+
+pub(crate) fn forget_topic(laser: &Laser, stream: &str, topic: &str) {
+    laser
+        .inner
+        .producers
+        .remove(&(stream.to_owned(), topic.to_owned()));
+    #[cfg(feature = "agent")]
+    {
+        if topic == laser_wire::topics::AGENT_REGISTRY {
+            laser.inner.registry_caches.remove(stream);
+        }
+        laser
+            .inner
+            .reply_hubs
+            .remove(&(stream.to_owned(), topic.to_owned()));
+    }
 }
 
 #[cfg(feature = "agent")]
@@ -4449,6 +4488,60 @@ mod connection_string_tests {
             }
             AutoLogin::Disabled => panic!("the client must log in by itself"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_forget_tests {
+    use super::{Laser, forget_stream, forget_topic};
+
+    fn laser_with_producers() -> Laser {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        for (stream, topic) in [
+            ("hosts", "metrics"),
+            ("hosts", "logs"),
+            ("fleet", "metrics"),
+        ] {
+            laser
+                .inner
+                .producers
+                .insert((stream.to_owned(), topic.to_owned()), Default::default());
+        }
+        laser
+    }
+
+    fn cached(laser: &Laser) -> Vec<(String, String)> {
+        let mut keys: Vec<_> = laser
+            .inner
+            .producers
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn given_cached_producers_when_a_stream_is_forgotten_then_should_drop_every_topic_of_it() {
+        let laser = laser_with_producers();
+        forget_stream(&laser, "hosts");
+        assert_eq!(
+            cached(&laser),
+            vec![("fleet".to_owned(), "metrics".to_owned())]
+        );
+    }
+
+    #[test]
+    fn given_cached_producers_when_a_topic_is_forgotten_then_should_drop_only_that_topic() {
+        let laser = laser_with_producers();
+        forget_topic(&laser, "hosts", "metrics");
+        assert_eq!(
+            cached(&laser),
+            vec![
+                ("fleet".to_owned(), "metrics".to_owned()),
+                ("hosts".to_owned(), "logs".to_owned())
+            ]
+        );
     }
 }
 

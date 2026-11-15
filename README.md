@@ -97,7 +97,7 @@ The examples use open streaming. Add `managed` for projections, queries, KV, for
 
 Streaming sends return Apache Iggy commit confirmations. A confirmation identifies the stream, topic, partition, and first offset in a batch. The list can be empty when the server does not report offsets. Completion follows the topic durability policy. Use the stream, topic, and partition together with the offset.
 
-One connection can address every stream that the user can access. Use `laser.stream(name).topic(name)` to name the stream and topic. A default stream enables the shorter `laser.topic(name)` form. It does not restrict the connection to that stream.
+One connection can address every stream that the user can access. Use `laser.stream(name).topic(name)` to name the stream and topic. A default stream enables the shorter `laser.topic(name)` form. It does not restrict the connection to that stream. `laser.streams()`, `stream(name).get()`, `exists()`, and `topics()` inspect streams in Rust, Python, and TypeScript. `topic.get()`, `partitions()`, `consumer_groups()`, `delete()`, `add_partitions(n)`, and `delete_partitions(n)` inspect and change topics. `get()` and `exists()` read a missing stream or topic as absent, and `topics()`, `partitions()`, and `consumer_groups()` fail with the stream-or-topic-not-found error. `stream(name).rename(new_name)`, `topic.update(...)`, and `topic.delete_segments(partition_id, count)` rename streams and change topic settings, see [client behavior](docs/client-behavior.md#stream-and-topic-inspection). `laser.users()`, `laser.user(name)`, `laser.personal_access_tokens()`, `laser.ping()`, `laser.stats()`, `laser.me()`, `laser.clients()`, `laser.cluster()`, `laser.snapshot()`, `laser.describe_options(scope)`, and `laser.metadata_changes(...)` administer the server under its own permission checks, see [server administration](docs/client-behavior.md#server-administration).
 
 ## One grammar, every primitive
 
@@ -340,7 +340,7 @@ Provision a filtered group once, then consume it by name or ID. Every consumer i
 
 ## Connect and publish limits
 
-Connecting gives up after 30 seconds. Each publish attempt times out after 60 seconds and is retried three times with exponential backoff. Every client can change these limits on its builder or connect call, or through `LASER_CONNECT_TIMEOUT_MS` and the `LASER_PUBLISH_*` environment variables. A publish that gives up returns an error listing the committed and unconfirmed records, and it never exits the process. See [connect timeout and cleanup](docs/connect-timeout.md) and [publish recovery](docs/publish-recovery.md).
+Connecting gives up after 30 seconds. Each publish attempt times out after 60 seconds and is retried three times with exponential backoff. Every client can change these limits on its builder or connect call, or through `LASER_CONNECT_TIMEOUT_MS` and the `LASER_PUBLISH_*` environment variables. A publish that gives up returns an error listing the committed and unconfirmed records, and it never exits the process. Each client also reports when its connection is connected, disconnected, signed in, signed out, and shut down, through `connection_events()` (`connectionEvents()` in TypeScript). See [connect timeout and cleanup](docs/connect-timeout.md), [publish recovery](docs/publish-recovery.md), and [connection events](docs/client-behavior.md#connection-events).
 
 ## Documentation
 

@@ -14,6 +14,8 @@ pub use crate::agent::{
     SessionTurn, Sessions, TopicRetention, Workflow,
 };
 pub use crate::capabilities::Capabilities;
+#[cfg(feature = "streaming")]
+pub use crate::connection::{ConnectionEvent, ConnectionEvents};
 #[cfg(feature = "agent")]
 pub use crate::context::Checkpoint;
 #[cfg(feature = "agent")]
@@ -141,7 +143,10 @@ pub mod full {
         PublishRequest, Record, RecordBuilder, Sharding,
     };
     #[cfg(feature = "streaming")]
-    pub use crate::stream::{ConsumerGroupInfo, CreateConsumerGroup};
+    pub use crate::stream::{
+        ConsumerGroupInfo, ConsumerGroupSummary, CreateConsumerGroup, PartitionInfo, StreamInfo,
+        TopicInfo,
+    };
     #[cfg(feature = "projections")]
     pub use laser_wire::destination::{BackendBinding, BackendResourceId};
     #[cfg(feature = "graph")]

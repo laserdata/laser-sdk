@@ -27,6 +27,8 @@ mod bridge_origin;
 pub mod capabilities;
 #[cfg(feature = "streaming")]
 mod connect_options;
+#[cfg(feature = "streaming")]
+pub mod connection;
 #[cfg(feature = "agent")]
 pub mod context;
 #[cfg(feature = "agent")]
@@ -88,6 +90,8 @@ pub mod rbac;
 mod retry;
 #[cfg(feature = "schema-codecs")]
 pub mod schema_codecs;
+#[cfg(feature = "streaming")]
+pub mod server;
 #[cfg(feature = "sign")]
 pub mod sign;
 pub mod snapshot;

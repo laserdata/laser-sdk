@@ -1,10 +1,12 @@
 use crate::capabilities::{Capabilities, HelloOutcome};
-use crate::error::LaserError;
+use crate::error::{LaserError, TransportError};
 use crate::filters::group::settled_assignment;
 use crate::filters::reader::{DEFAULT_IDLE_INTERVAL, Delivery, FilteredReader, MatchedRecord};
 use crate::laser::{ensure_stream, ensure_topic_retained, validate_replication_factor};
 use crate::poll::current_tail_offset;
 use crate::stream::consumer_group::ConsumerGroup;
+use crate::stream::encryption::Encryption;
+use crate::stream::sharding::{PickedSharding, ShardPicker, ShardRequest, on_shard, pick};
 use crate::stream::{HeaderKey, HeaderValue, Topic};
 use crate::types::MessageId;
 use bytes::Bytes;
@@ -248,6 +250,9 @@ pub struct ProducerBuilder {
     max_topic_bytes: Option<u64>,
     unlimited_topic_size: bool,
     background: Option<BackgroundConfig>,
+    sharding: Option<ShardPicker>,
+    encryption: Option<Encryption>,
+    idempotent: bool,
 }
 
 impl ProducerBuilder {
@@ -272,6 +277,9 @@ impl ProducerBuilder {
             max_topic_bytes: None,
             unlimited_topic_size: false,
             background: None,
+            sharding: None,
+            encryption: None,
+            idempotent: false,
         }
     }
 
@@ -427,6 +435,43 @@ impl ProducerBuilder {
         self
     }
 
+    /// Picks the background shard of each send with your own code, in place
+    /// of the sharding of [`background`](Self::background), which this needs.
+    /// The picker gets a [`ShardRequest`] and returns a shard index below its
+    /// `shards`. An error, or an index out of range, fails the send before
+    /// anything is queued.
+    #[must_use]
+    pub fn sharding(
+        mut self,
+        picker: impl Fn(&ShardRequest<'_>) -> Result<usize, LaserError> + Send + Sync + 'static,
+    ) -> Self {
+        self.sharding = Some(Arc::new(picker));
+        self
+    }
+
+    /// Encrypts the payload and the user-header block of every record before
+    /// it leaves the client. Read the records with a consumer built with the
+    /// same key. A publish failure, and a background `error_callback`, lists
+    /// its records as you sent them, before encryption.
+    #[must_use]
+    pub fn encryption(mut self, encryption: Encryption) -> Self {
+        self.encryption = Some(encryption);
+        self
+    }
+
+    /// Writes each batch once per partition, also when a lost reply makes the
+    /// producer send it again. The producer takes a producer id from the
+    /// connection, and each batch carries that id with the sequence of its
+    /// first record. A resend keeps the id, the sequence, and the message ids
+    /// of the first attempt, so the partition answers it with the offset of
+    /// the first write. Needs a TCP, QUIC, or WebSocket connection to a server
+    /// that keeps producer state.
+    #[must_use]
+    pub fn idempotent(mut self) -> Self {
+        self.idempotent = true;
+        self
+    }
+
     pub async fn build(self) -> Result<Producer, LaserError> {
         let (expiry, max_topic_size) = self.topic_limits()?;
         if self.background.is_none() && self.batch_length == 0 {
@@ -442,6 +487,11 @@ impl ProducerBuilder {
         if let Some(factor) = self.replication_factor {
             validate_replication_factor(factor)?;
         }
+        if self.sharding.is_some() && self.background.is_none() {
+            return Err(LaserError::Invalid(
+                "producer sharding needs background mode".to_owned(),
+            ));
+        }
         // The upstream producer creates a topic without a replication factor,
         // so a topic that needs one is created here first.
         let replicated_topic = self.replication_factor.filter(|_| self.create_topic);
@@ -454,10 +504,27 @@ impl ProducerBuilder {
         publish_options.validate()?;
         let failure = Arc::new(std::sync::Mutex::new(None));
         let partitioning = self.routing.into_partitioning()?;
-        let recipe = self.background.map(|config| {
-            BackgroundRecipe::new(self.topic.clone(), config, partitioning.clone(), &failure)
+        let picked = self.sharding.is_some();
+        let recipe = self.background.map(|mut config| {
+            if picked {
+                config.sharding = Box::new(PickedSharding);
+            }
+            BackgroundRecipe::new(
+                self.topic.clone(),
+                config,
+                partitioning.clone(),
+                self.encryption.clone(),
+                self.idempotent,
+                &failure,
+            )
         });
         let mut builder = self.topic.iggy_producer()?;
+        if let Some(encryption) = &self.encryption {
+            builder = builder.encryptor(encryption.encryptor());
+        }
+        if self.idempotent {
+            builder = builder.idempotent();
+        }
         builder = match &recipe {
             Some(recipe) => builder.background(recipe.config()),
             None => builder.direct(
@@ -527,6 +594,8 @@ impl ProducerBuilder {
                 producer: tokio::sync::RwLock::new(Some(producer)),
                 recipe,
                 failure,
+                sharding: self.sharding,
+                encryption: self.encryption,
             }),
             laser: self.topic.laser.clone(),
             publish_options,
@@ -680,7 +749,20 @@ impl Producer {
             ));
         };
         if self.background {
-            return Ok(producer.send_with_partitioning(messages, routing).await?);
+            let (Some(picker), Some(recipe)) = (&self.inner.sharding, &self.inner.recipe) else {
+                return Ok(producer.send_with_partitioning(messages, routing).await?);
+            };
+            // Apache Iggy reads a shard count of zero as one worker.
+            let shard = pick(
+                picker,
+                &ShardRequest {
+                    shards: recipe.num_shards.max(1),
+                    stream: &self.inner.stream,
+                    topic: &self.inner.topic,
+                    records: messages.len(),
+                },
+            )?;
+            return Ok(on_shard(shard, producer.send_with_partitioning(messages, routing)).await?);
         }
         crate::laser::prepare_publish_messages(&mut messages);
         let mut confirmations = Vec::new();
@@ -710,7 +792,7 @@ impl Producer {
                 .await
                 .map_err(|error| {
                     crate::laser::publish_failure(
-                        error,
+                        self.inner.plaintext(error),
                         &messages[index * self.batch_length..],
                         std::mem::take(&mut confirmations),
                         chunk.len(),
@@ -767,9 +849,24 @@ struct ProducerSlot {
     topic: String,
     recipe: Option<BackgroundRecipe>,
     failure: Arc<std::sync::Mutex<Option<LaserError>>>,
+    sharding: Option<ShardPicker>,
+    encryption: Option<Encryption>,
 }
 
 impl ProducerSlot {
+    // A failed send carries the records the encryptor sealed. They are opened
+    // again, so the failure lists them as the caller sent them.
+    fn plaintext(&self, mut error: LaserError) -> LaserError {
+        if let (
+            Some(encryption),
+            LaserError::Transport(TransportError(IggyError::ProducerSendFailed { failed, .. })),
+        ) = (&self.encryption, &mut error)
+        {
+            opened(encryption, failed);
+        }
+        error
+    }
+
     fn take_failure(&self) -> Result<(), LaserError> {
         match self
             .failure
@@ -798,6 +895,8 @@ struct BackgroundRecipe {
     failure_mode: BackpressureMode,
     max_buffer_size: IggyByteSize,
     max_in_flight: usize,
+    encryption: Option<Encryption>,
+    idempotent: bool,
 }
 
 impl BackgroundRecipe {
@@ -808,6 +907,8 @@ impl BackgroundRecipe {
         topic: Topic,
         config: BackgroundConfig,
         partitioning: Partitioning,
+        encryption: Option<Encryption>,
+        idempotent: bool,
         failure: &Arc<std::sync::Mutex<Option<LaserError>>>,
     ) -> Self {
         let BackgroundConfig {
@@ -827,6 +928,13 @@ impl BackgroundRecipe {
             } else {
                 error_callback
             };
+        let error_callback: Arc<Box<dyn ErrorCallback + Send + Sync>> = match &encryption {
+            Some(encryption) => Arc::new(Box::new(OpenedFailure {
+                callback: error_callback,
+                encryption: encryption.clone(),
+            })),
+            None => error_callback,
+        };
         Self {
             topic,
             partitioning,
@@ -839,6 +947,8 @@ impl BackgroundRecipe {
             failure_mode,
             max_buffer_size,
             max_in_flight,
+            encryption,
+            idempotent,
         }
     }
 
@@ -858,9 +968,14 @@ impl BackgroundRecipe {
 
     // The topic exists by now, so the rebuilt producer creates nothing.
     fn producer(&self) -> Result<IggyProducer, LaserError> {
-        Ok(self
-            .topic
-            .iggy_producer()?
+        let mut builder = self.topic.iggy_producer()?;
+        if let Some(encryption) = &self.encryption {
+            builder = builder.encryptor(encryption.encryptor());
+        }
+        if self.idempotent {
+            builder = builder.idempotent();
+        }
+        Ok(builder
             .background(self.config())
             .partitioning(self.partitioning.clone())
             .do_not_create_stream_if_not_exists()
@@ -906,6 +1021,38 @@ impl ErrorCallback for KeptFailure {
             }
         })
     }
+}
+
+// Hands a background write failure on with its records opened again, so the
+// callback sees them as the caller sent them.
+#[derive(Debug)]
+struct OpenedFailure {
+    callback: Arc<Box<dyn ErrorCallback + Send + Sync>>,
+    encryption: Encryption,
+}
+
+impl ErrorCallback for OpenedFailure {
+    fn call(&self, mut context: ErrorCtx) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        opened(&self.encryption, &mut context.messages);
+        self.callback.call(context)
+    }
+}
+
+// Opens the records an encryptor sealed. A record that does not open stays
+// as it was.
+fn opened(encryption: &Encryption, sealed: &mut Arc<Vec<IggyMessage>>) {
+    *sealed = Arc::new(
+        sealed
+            .iter()
+            .map(|message| {
+                let mut opened = crate::laser::clone_iggy_message(message);
+                match encryption.decrypt_message(&mut opened) {
+                    Ok(()) => opened,
+                    Err(_) => crate::laser::clone_iggy_message(message),
+                }
+            })
+            .collect(),
+    );
 }
 
 // One sharding strategy shared by every producer a flush builds.
@@ -961,6 +1108,7 @@ pub struct ConsumerBuilder {
     init_retries: Option<(u32, Duration)>,
     allow_replay: bool,
     native: bool,
+    encryption: Option<Encryption>,
 }
 
 impl ConsumerBuilder {
@@ -996,6 +1144,7 @@ impl ConsumerBuilder {
             init_retries: None,
             allow_replay: false,
             native: false,
+            encryption: None,
         }
     }
 
@@ -1094,6 +1243,19 @@ impl ConsumerBuilder {
         self
     }
 
+    /// Decrypts the payload and the user-header block of every record with
+    /// the key its producer encrypted them with. A record that does not
+    /// decrypt is reported once as an error, Apache Iggy error 72, and read
+    /// past. It takes a commit policy that stores handled records, so
+    /// [`CommitPolicy::Polling`] and [`CommitPolicy::IntervalOrPolling`] fail
+    /// [`build`](Self::build): the server would store a poll before it is
+    /// decrypted.
+    #[must_use]
+    pub fn encryption(mut self, encryption: Encryption) -> Self {
+        self.encryption = Some(encryption);
+        self
+    }
+
     // A group reads `Next` everywhere, because upstream applies any other
     // start again to every partition a rebalance hands the member.
     fn reader_start(&self) -> ConsumerStart {
@@ -1123,6 +1285,17 @@ impl ConsumerBuilder {
             return Err(LaserError::Invalid(format!(
                 "consumer max_bytes must be at least {MIN_DEFERRED_POLL_MAX_BYTES}"
             )));
+        }
+        if self.encryption.is_some()
+            && matches!(
+                self.commit,
+                CommitPolicy::Polling | CommitPolicy::IntervalOrPolling(_)
+            )
+        {
+            return Err(LaserError::Invalid(
+                "an encrypted consumer takes a commit policy that stores handled records, not polling"
+                    .to_owned(),
+            ));
         }
         if let ConsumerTarget::Group(group) = &self.target
             && !self.native
@@ -1200,6 +1373,7 @@ impl ConsumerBuilder {
                     last_flush: Instant::now(),
                     offsets: Arc::clone(&offsets),
                     deferred: Arc::clone(&deferred),
+                    encryption: self.encryption,
                 },
             )))),
             manual_commit: self.commit == CommitPolicy::Disabled,
@@ -1291,6 +1465,9 @@ impl ConsumerBuilder {
         }
         if self.allow_replay {
             builder = builder.allow_replay();
+        }
+        if let Some(encryption) = &self.encryption {
+            builder = builder.encryptor(encryption.encryptor());
         }
         let seeds = group && self.start.seeds();
         if seeds {
@@ -1874,6 +2051,7 @@ struct GroupEngine {
     last_flush: Instant,
     offsets: Arc<std::sync::Mutex<GroupOffsets>>,
     deferred: DeferredAcks,
+    encryption: Option<Encryption>,
 }
 
 impl GroupEngine {
@@ -1899,8 +2077,16 @@ impl GroupEngine {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .consumed
                     .insert(delivery.partition_id, delivery.offset);
+                let mut message = record.message;
+                // A record that does not decrypt is reported once and counts
+                // as handled, so the read goes past it.
+                if let Some(encryption) = &self.encryption
+                    && let Err(error) = encryption.decrypt_message(&mut message)
+                {
+                    return Some(Err(error));
+                }
                 return Some(Ok(ConsumerMessage::of(
-                    record.message,
+                    message,
                     record.partition_id,
                     record.frontier,
                     Some(delivery),
@@ -2557,6 +2743,13 @@ mod tests {
         assert_eq!(disabled.retry_interval, Some(publish.retry_backoff));
     }
 
+    #[test]
+    fn given_a_producer_builder_when_idempotent_is_chosen_then_should_send_through_producer_batches()
+     {
+        assert!(!producer_builder().idempotent, "off by default");
+        assert!(producer_builder().idempotent().idempotent);
+    }
+
     #[tokio::test]
     async fn given_both_expiry_settings_when_building_a_producer_then_should_refuse_it() {
         let result = producer_builder()
@@ -3191,6 +3384,8 @@ mod tests {
             topic: "readings".to_owned(),
             recipe: None,
             failure: kept,
+            sharding: None,
+            encryption: None,
         };
         let failure = slot.take_failure().expect_err("the failures are kept");
         let LaserError::PublishFailed(failure) = failure else {
@@ -3226,6 +3421,8 @@ mod tests {
             topic.clone(),
             BackgroundConfig::builder().build(),
             Partitioning::balanced(),
+            None,
+            false,
             &kept,
         );
         default
@@ -3245,6 +3442,8 @@ mod tests {
                 .error_callback(Arc::new(Box::new(KeptFailure(Arc::clone(&received)))))
                 .build(),
             Partitioning::balanced(),
+            None,
+            false,
             &kept,
         );
         own.config()
@@ -3258,6 +3457,48 @@ mod tests {
         assert!(
             kept.lock().expect("kept").is_none(),
             "a failure the caller's callback took is not kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_encrypted_background_producer_when_a_write_fails_then_should_report_the_records_as_sent()
+     {
+        let laser = crate::laser::Laser::from_client(iggy::prelude::IggyClient::default());
+        let encryption = Encryption::aes256_gcm([9u8; 32]).expect("a 32-byte key");
+        let kept = Arc::new(std::sync::Mutex::new(None));
+        let recipe = BackgroundRecipe::new(
+            laser.stream("fleet").topic("readings"),
+            BackgroundConfig::builder().build(),
+            Partitioning::balanced(),
+            Some(encryption.clone()),
+            false,
+            &kept,
+        );
+        let mut write = failed_write(IggyError::Disconnected, 2);
+        write.messages = Arc::new(
+            write
+                .messages
+                .iter()
+                .map(|message| {
+                    IggyMessage::builder()
+                        .payload(Bytes::from(
+                            encryption.encrypt(&message.payload).expect("encrypt"),
+                        ))
+                        .build()
+                        .expect("a message")
+                })
+                .collect(),
+        );
+        recipe.config().error_callback.call(write).await;
+        let Some(LaserError::PublishFailed(failure)) = kept.lock().expect("kept").take() else {
+            panic!("the failed write is kept");
+        };
+        assert!(
+            failure
+                .unconfirmed
+                .iter()
+                .all(|message| message.payload.as_ref() == b"reading"),
+            "the records are listed as sent"
         );
     }
 

@@ -757,6 +757,7 @@ pub(crate) fn to_pyerr_ref(err: &SdkError) -> PyErr {
         let _ = value.setattr("code", format!("{:?}", err.code()));
         let _ = value.setattr("retryable", err.is_retryable());
         let _ = value.setattr("iggy_error_code", err.iggy_error_code());
+        let _ = value.setattr("uncertain_operation", err.uncertain_operation());
         let _ = value.setattr(
             "filter_reason",
             err.filter_reason().map(|reason| reason.to_string()),
@@ -884,6 +885,7 @@ pub(crate) fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult
                 class.setattr(flag, false)?;
             }
             class.setattr("iggy_error_code", py.None())?;
+            class.setattr("uncertain_operation", py.None())?;
             class.setattr("filter_reason", py.None())?;
         }
         if let Some(code) = entry.code {
@@ -954,10 +956,11 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
             fields,
         }
     }
-    const BASE_FIELDS: [(&str, &str); 19] = [
+    const BASE_FIELDS: [(&str, &str); 20] = [
         ("code", "builtins.str"),
         ("retryable", "builtins.bool"),
         ("iggy_error_code", "builtins.int | None"),
+        ("uncertain_operation", "builtins.int | None"),
         ("filter_reason", "builtins.str | None"),
         ("unavailable", "builtins.bool"),
         ("unsupported", "builtins.bool"),
@@ -1490,7 +1493,13 @@ fn set_filter_stop(
 pub(crate) fn classify_as_source(py: Python<'_>, error: &PyErr, source: &PyErr) {
     let value = error.value(py);
     let source = source.value(py);
-    let names = ["code", "retryable", "iggy_error_code", "filter_reason"];
+    let names = [
+        "code",
+        "retryable",
+        "iggy_error_code",
+        "uncertain_operation",
+        "filter_reason",
+    ];
     for name in names.into_iter().chain(FLAGS) {
         if let Ok(classification) = source.getattr(name) {
             let _ = value.setattr(name, classification);

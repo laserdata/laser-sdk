@@ -106,6 +106,14 @@ impl PyConsumerGroup {
         })
     }
 
+    /// Delete the group with its stored offsets. Returns `False` when the
+    /// group, its topic or its stream did not exist. A recreated group is
+    /// another identity and inherits no policy.
+    fn delete<'py>(&self, py: Python<'py>) -> PyResult<Awaitable<'py, bool>> {
+        let group = self.group.clone();
+        awaitable(py, async move { group.delete().await.map_err(to_pyerr) })
+    }
+
     /// The group's filter policy: configure it, inspect it, pause and resume
     /// it, release it, preview and sample-test it.
     fn filter(&self) -> PyGroupFilter {
@@ -132,8 +140,9 @@ impl PyConsumerGroup {
     /// only seeds a partition the group never stored, before its first read
     /// (the native consumer only those it holds when it joins), and a refused
     /// seed, such as an offset past a partition's end, fails `init` or the
-    /// first `next` with the Iggy error.
-    #[pyo3(signature = (*, batch_length=1000, max_wait_ms=5000.0, min_count=1, max_bytes=1048576, polling="next", offset=None, timestamp_micros=None, auto_commit="all", commit_interval_ms=0.0, commit_every=None, create_group=true, polling_retry_interval_ms=1000.0, init_retries=None, init_retry_interval_ms=1000.0, allow_replay=false))]
+    /// first `next` with the Iggy error. `encryption=Encryption.aes256_gcm(key)`
+    /// decrypts every record as `Topic.consumer` does.
+    #[pyo3(signature = (*, batch_length=1000, max_wait_ms=5000.0, min_count=1, max_bytes=1048576, polling="next", offset=None, timestamp_micros=None, auto_commit="all", commit_interval_ms=0.0, commit_every=None, create_group=true, polling_retry_interval_ms=1000.0, init_retries=None, init_retry_interval_ms=1000.0, allow_replay=false, encryption=None))]
     #[allow(clippy::too_many_arguments)]
     fn consumer(
         &self,
@@ -160,6 +169,7 @@ impl PyConsumerGroup {
         init_retries: Option<u32>,
         init_retry_interval_ms: f64,
         allow_replay: bool,
+        encryption: Option<PyRef<'_, crate::encryption::PyEncryption>>,
     ) -> PyResult<PyConsumer> {
         configure_consumer(
             self.group.consumer(),
@@ -180,6 +190,7 @@ impl PyConsumerGroup {
                 init_retries,
                 init_retry_interval_ms,
                 allow_replay,
+                encryption: encryption.map(|encryption| encryption.inner.clone()),
             },
             true,
         )
