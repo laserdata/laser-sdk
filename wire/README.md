@@ -4,7 +4,7 @@
 
 The `laser-wire` crate defines the data contract shared by LaserData clients and services. [LaserData, Inc.](https://laserdata.com) maintains it for the [Apache Iggy](https://iggy.apache.org) binding. It defines command codes, envelopes, schemas, queries, and state operations. It also defines agent messages, HTTP representations, limits, and reference test data.
 
-Context manifests, compaction, retrieval, state deltas, and state snapshots use named CBOR fixtures that Rust, Python, and TypeScript re-encode byte for byte. The shared JSON Patch cases check application behavior in all three languages. A state JSON integer must fit JavaScript's exact integer range so the clients preserve the same value.
+Context manifests, compaction, retrieval, state deltas, and state snapshots use named CBOR fixtures that Rust, Python, TypeScript, and the in-progress Go client re-encode byte for byte. The shared JSON Patch cases check application behavior in each of them. A state JSON integer must fit JavaScript's exact integer range so the clients preserve the same value.
 
 Rust exposes these types as `laser_sdk::wire`. Python calls the same Rust code. TypeScript decodes and re-encodes the same reference test data. LaserData Cloud uses the definitions directly. The crate needs no I/O, clock, randomness, or asynchronous runtime. It supports native targets and `wasm32-unknown-unknown`.
 

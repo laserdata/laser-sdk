@@ -1,0 +1,135 @@
+name: ci-go
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "go-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+defaults:
+  run:
+    working-directory: foreign/go
+
+jobs:
+  # Decide whether this change can affect the Go client at all. It reads the
+  # fixture corpus and the contract crate's sources, so a change to either is
+  # meaningful even when no Go file moved.
+  flags:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    outputs:
+      run_ci: ${{ steps.decide.outputs.run_ci }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Decide whether the Go gates run
+        id: decide
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          run_ci=run
+          if [[ "${GITHUB_REF}" != refs/tags/* ]] &&
+            [[ "${EVENT_NAME}" == "pull_request" || "${EVENT_NAME}" == "push" ]] &&
+            git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            meaningful_paths="$(
+              git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" |
+                grep -E '^foreign/go/|^wire/src/|^wire/fixtures/|^\.github/workflows/ci-go\.yml$|^scripts/check-parity\.py$' || true
+            )"
+            if [[ -z "${meaningful_paths}" ]]; then
+              run_ci=skip
+            fi
+          fi
+          echo "Go CI: ${run_ci}"
+          echo "run_ci=${run_ci}" >> "${GITHUB_OUTPUT}"
+
+  quality:
+    name: quality
+    needs: [flags]
+    if: needs.flags.outputs.run_ci == 'run'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: foreign/go/go.mod
+          cache-dependency-path: foreign/go/go.sum
+      - name: Formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "${unformatted}" ]]; then
+            echo "gofmt would rewrite:"
+            echo "${unformatted}"
+            exit 1
+          fi
+      - run: go vet ./...
+      - name: Module file is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - run: go build ./...
+
+  # The minimum the module declares, and the current release. A client is
+  # consumed by applications on both.
+  unit:
+    name: unit-go-${{ matrix.go }}
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - "1.24"
+          - "1.26"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: foreign/go/go.sum
+      - run: go test ./... -count=1
+
+  # The contract is pinned by shared corpora that several goroutines may
+  # evaluate at once, so the suite runs under the race detector too.
+  race:
+    name: race
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: foreign/go/go.mod
+          cache-dependency-path: foreign/go/go.sum
+      - run: go test ./... -race -count=1
+
+  ci-go-complete:
+    name: ci-go-complete
+    if: always()
+    needs:
+      - flags
+      - quality
+      - unit
+      - race
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every job succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+        working-directory: ${{ github.workspace }}

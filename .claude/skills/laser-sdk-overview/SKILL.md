@@ -22,7 +22,7 @@ Repo-wide rules (verification order, idiomatic-traits, no `cargo install`, no em
 
 Laser SDK uses an append-only log for source records. Projections, queries, key-value state, and forks provide views over that data. AGDX defines the shared exchange contract.
 
-The workspace publishes `laser-wire`, the Rust `laser-sdk`, Python bindings, and a native TypeScript client, all at version `0.10.2`. The three clients expose streaming, managed, and agent surfaces. The [cross-SDK parity matrix](../../../docs/parity.md) maps Rust types, fields, error payloads, constants, and callable APIs to their Python and TypeScript forms, and reports unresolved mappings and peer-only APIs. Update it in the same change as any public API. Rust defines the codes, envelopes, dictionaries, limits, and reference files. Python calls the Rust implementation. TypeScript uses the same encoded files and behavior scenarios. The SDKs do not call language models.
+The workspace publishes `laser-wire`, the Rust `laser-sdk`, Python bindings, and a native TypeScript client, all at version `0.10.2`. The three clients expose streaming, managed, and agent surfaces. A fourth client, Go under `foreign/go/`, is in progress and currently ports the wire contract only, so it is absent from the parity matrix and from the behavior scenarios. The [cross-SDK parity matrix](../../../docs/parity.md) maps Rust types, fields, error payloads, constants, and callable APIs to their Python and TypeScript forms, and reports unresolved mappings and peer-only APIs. Update it in the same change as any public API. Rust defines the codes, envelopes, dictionaries, limits, and reference files. Python calls the Rust implementation. TypeScript uses the same encoded files and behavior scenarios. The SDKs do not call language models.
 
 `laser_sdk::prelude::*` imports the common accessors and types. `laser_sdk::prelude::full::*` also imports bridge, projection, and memory types. Examples and integration tests use `full`. Application code can use the smaller prelude with explicit imports. `ReliableConsumer` is the public consumer, and `ReliableWorker` is its private message adapter.
 
@@ -60,6 +60,7 @@ Every client uses standard Iggy transport, picked by the connection string schem
 - A2A, MCP, and AG-UI map external interfaces to AGDX. Features are `a2a-bridge`, `mcp-bridge`, and `agui`. Read [a2a-bridge](../a2a-bridge/SKILL.md) for task operations, cards, tools, and event rendering.
 - The Python SDK under `foreign/python/` (PyO3 bindings over this crate), its maturin packaging, the `.pyi` stubs, the pytest suite, or the Python BDD runner -> [python-bindings](../python-bindings/SKILL.md)
 - The native TypeScript SDK under `foreign/typescript/`, its Node transport, npm package, fixture port, Cucumber runner, and examples -> [typescript-sdk](../typescript-sdk/SKILL.md)
+- The Go client under `foreign/go/`. It is in progress and ports the wire contract only, so there is no transport, streaming client, agent runtime, or bridge to change there yet. Its gate is `just go-check`.
 
 ## The spine in one paragraph
 

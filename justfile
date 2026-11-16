@@ -48,6 +48,25 @@ parity-check:
   python3 -m unittest scripts/test_check_parity.py
   python3 scripts/check-parity.py
 
+# the Go client's gate set, the same one ci-go runs
+go-check:
+  cd foreign/go && test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+  cd foreign/go && go vet ./...
+  cd foreign/go && go build ./...
+  cd foreign/go && go test ./... -count=1
+  cd foreign/go && go test ./... -race -count=1
+
+# Differential check: the Go port writes one value per shape the fixture
+# corpus does not carry, and this crate decodes and re-encodes each. A shape
+# that returns the same bytes is one both implementations agree on, which is
+# what a fixture proves, for a shape no fixture exists for.
+go-differential:
+  rm -rf target/go-vectors
+  cd foreign/go && LASER_GO_VECTORS={{justfile_directory()}}/target/go-vectors \
+    go test ./wire -run Export -count=1
+  LASER_GO_VECTORS={{justfile_directory()}}/target/go-vectors \
+    cargo test -p laser-wire --test go_differential
+
 # integration tests against the released Laser Streams server
 test-it:
   cargo test -p laser-sdk --features "integration a2a-bridge agui managed mcp-bridge schema-codecs sign"

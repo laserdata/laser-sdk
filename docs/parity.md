@@ -4,6 +4,8 @@ This matrix lists every public item of the Rust `laser_sdk` crate, including the
 
 A peer may differ from the Rust spelling only for one of the reasons below. Any other difference is a gap. A MISSING cell names where the capability lives today when the peer has it under another name or shape.
 
+The Go client under `foreign/go/` is deliberately absent from this matrix. It ports the wire contract only and has no public SDK surface, so most rows here have nothing on the Go side to map to. It joins the matrix when it has an SDK surface to compare. `foreign/go/wire/parity_test.go` covers what exists today, asserting that every public type of `wire/src` has a Go peer.
+
 | Note | Reason |
 | --- | --- |
 | native-binding | Python exposes a native Rust value through its binding name and delegates the operation to that same Rust type |
