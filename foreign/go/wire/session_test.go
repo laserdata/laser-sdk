@@ -42,18 +42,42 @@ func TestGivenSessionRequestFixturesWhenDecodedThenShouldReEncodeByteIdentically
 		if err := heartbeat.Validate(); err != nil {
 			t.Fatalf("the corpus heartbeat must validate: %v", err)
 		}
+		// A heartbeat naming no generation counts for whichever is live, so
+		// one written before generations existed is not discarded.
+		if heartbeat.StreamGeneration != nil {
+			t.Error("the plain fixture names no stream generation")
+		}
+		if !heartbeat.CountsFor(7) {
+			t.Error("a heartbeat naming no generation counts for any")
+		}
+	})
+	t.Run("session_heartbeat_generation.bin", func(t *testing.T) {
+		heartbeat := roundTripFixture[wire.SessionHeartbeat](t,
+			"session_heartbeat_generation.bin")
+		if heartbeat.StreamGeneration == nil {
+			t.Fatal("this fixture names the stream its leases were taken on")
+		}
+		// It counts only for the generation it names, so a lease taken on a
+		// recreated stream does not hold the new one open.
+		if !heartbeat.CountsFor(*heartbeat.StreamGeneration) {
+			t.Error("a heartbeat counts for the generation it names")
+		}
+		if heartbeat.CountsFor(*heartbeat.StreamGeneration + 1) {
+			t.Error("a heartbeat must not count for another generation")
+		}
 	})
 }
 
 func TestGivenSessionReplyFixturesWhenDecodedThenShouldReEncodeByteIdentically(t *testing.T) {
 	for name, want := range map[string]wire.SessionOutcomeKind{
-		"session_reply_info.bin":    wire.SessionInfoOutcome,
-		"session_reply_page.bin":    wire.SessionPageOutcome,
-		"session_reply_events.bin":  wire.SessionEventsOutcome,
-		"session_reply_state.bin":   wire.SessionStateOutcome,
-		"session_reply_links.bin":   wire.SessionLinksOutcome,
-		"session_reply_sources.bin": wire.SessionSourcesOutcome,
-		"session_reply_changes.bin": wire.SessionChangesOutcome,
+		"session_reply_info.bin":       wire.SessionInfoOutcome,
+		"session_reply_page.bin":       wire.SessionPageOutcome,
+		"session_reply_events.bin":     wire.SessionEventsOutcome,
+		"session_reply_state.bin":      wire.SessionStateOutcome,
+		"session_reply_state_head.bin": wire.SessionStateOutcome,
+		"session_reply_links.bin":      wire.SessionLinksOutcome,
+		"session_reply_sources.bin":    wire.SessionSourcesOutcome,
+		"session_reply_changes.bin":    wire.SessionChangesOutcome,
 	} {
 		t.Run(name, func(t *testing.T) {
 			reply := roundTripFixture[wire.SessionReply](t, name)

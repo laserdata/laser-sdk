@@ -147,6 +147,19 @@ func TestGivenContextFixturesWhenDecodedThenShouldReEncodeByteIdentically(t *tes
 		}
 	})
 
+	t.Run("state_delta_base_op.bin", func(t *testing.T) {
+		delta := roundTripFixture[wire.StateDelta](t, "state_delta_base_op.bin")
+		// Naming the operation that produced the base lets a reader tell a
+		// delta continuing its own chain from one that resumed another's.
+		if delta.BaseOpID == nil {
+			t.Error("this fixture names the operation its base came from")
+		}
+		plain := roundTripFixture[wire.StateDelta](t, "state_delta.bin")
+		if plain.BaseOpID != nil {
+			t.Error("a writer that does not know the base names none")
+		}
+	})
+
 	t.Run("state_snapshot.bin", func(t *testing.T) {
 		snapshot := roundTripFixture[wire.StateSnapshot](t, "state_snapshot.bin")
 		if snapshot.BaseRevision == 0 {
@@ -154,6 +167,16 @@ func TestGivenContextFixturesWhenDecodedThenShouldReEncodeByteIdentically(t *tes
 		}
 		if _, present := snapshot.Document.Field("ready"); !present {
 			t.Error("the snapshot carries its document")
+		}
+		if snapshot.BaseOpID != nil {
+			t.Error("a writer that does not know the base names none")
+		}
+	})
+
+	t.Run("state_snapshot_base_op.bin", func(t *testing.T) {
+		snapshot := roundTripFixture[wire.StateSnapshot](t, "state_snapshot_base_op.bin")
+		if snapshot.BaseOpID == nil {
+			t.Error("this fixture names the operation its base came from")
 		}
 	})
 }

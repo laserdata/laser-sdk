@@ -55,6 +55,16 @@ func TestGivenSessionReadFixturesWhenDecodedThenShouldReEncodeByteIdentically(t 
 		}
 	})
 
+	t.Run("session_http_state_head.json", func(t *testing.T) {
+		view := roundTripJSONFixture[wire.SessionStateView](t,
+			"session_http_state_head.json")
+		// Naming the operation that produced the revision lets a caller match
+		// its own write against the state it is reading back.
+		if view.HeadOpID == nil {
+			t.Error("this fixture names the operation its revision came from")
+		}
+	})
+
 	t.Run("session_http_state.json", func(t *testing.T) {
 		view := roundTripJSONFixture[wire.SessionStateView](t, "session_http_state.json")
 		if view.Revision == 0 {

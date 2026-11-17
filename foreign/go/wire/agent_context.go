@@ -323,6 +323,10 @@ type StateDelta struct {
 	BaseRevision uint64           `cbor:"base_revision"`
 	Patch        []PatchOperation `cbor:"patch"`
 	OpID         string           `cbor:"op_id"`
+	// BaseOpID is the operation id of the delta that produced the base
+	// revision, when the writer knows it. It lets a reader tell a delta
+	// that continues its own chain from one that resumed another.
+	BaseOpID *string `cbor:"base_op_id,omitempty"`
 }
 
 // Validate checks the patch length against the cap.
@@ -343,4 +347,8 @@ func (delta StateDelta) Validate() error {
 type StateSnapshot struct {
 	BaseRevision uint64   `cbor:"base_revision"`
 	Document     DynValue `cbor:"document"`
+	// BaseOpID is the operation id of the delta that produced the base
+	// revision, when the writer knows it. It lets a reader tell a delta
+	// that continues its own chain from one that resumed another.
+	BaseOpID *string `cbor:"base_op_id,omitempty"`
 }

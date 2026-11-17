@@ -423,6 +423,9 @@ type SessionStateView struct {
 	History  []StateChange   `cbor:"history,omitempty"`
 	Frontier *SourceFrontier `cbor:"frontier,omitempty"`
 	Complete bool            `cbor:"complete"`
+	// HeadOpID is the operation id of the delta that produced the revision,
+	// when known.
+	HeadOpID *string `cbor:"head_op_id,omitempty"`
 }
 
 // SessionLink is one resource a session wrote, recalled or touched.
@@ -552,6 +555,18 @@ type SessionHeartbeat struct {
 	Process  string           `cbor:"process"`
 	Stream   string           `cbor:"stream"`
 	Sessions []ConversationID `cbor:"sessions"`
+	// StreamGeneration is the creation time of the stream the leases were
+	// taken on. Absent when the writer does not know it, so a heartbeat that
+	// names none counts for whichever generation is live.
+	StreamGeneration *uint64 `cbor:"stream_generation,omitempty"`
+}
+
+// CountsFor reports whether this heartbeat counts toward a stream
+// generation. One that names no generation counts for any, so a heartbeat
+// written before generations existed is not discarded.
+func (heartbeat SessionHeartbeat) CountsFor(streamGeneration uint64) bool {
+	return heartbeat.StreamGeneration == nil ||
+		*heartbeat.StreamGeneration == streamGeneration
 }
 
 // Validate bounds how many sessions one heartbeat lists.
