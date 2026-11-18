@@ -1285,6 +1285,9 @@ GO_SURFACES = (
     ("Approvals", "Requester.ApprovalGate and laser.GrantFrom, with AgdxSend.WithGrant answering a governor's step-up"),
     ("Signing", "laser.SigningKey and AgdxSend.Signed, with the preimage pinned against the Rust client's own vectors"),
     ("Key registry", "laser.KeyRegistry in memory and Laser.KeyRegistry over the managed store, with key kinds, validity windows, revocation and laser.VerifyDelegation"),
+    ("Control commands", "Laser.PublishControl, PublishControlIn and PublishControlAs over the control band, with the stream scoping and operation identity every registry write carries"),
+    ("Projections", "Laser.Projections: register, register a graph, drop, read, read status, and the filterable listing, plus Laser.Bindings apply and remove"),
+    ("Schema registry", "Laser.Schemas: register, drop, read, list and server-side decode of the writer schemas a schema-first payload is stamped with"),
 )
 
 OMISSION_CAPABILITIES = {

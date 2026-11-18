@@ -10,8 +10,8 @@ negotiation, the managed command band and its typed surfaces (key-value, query,
 forks, graph, session reads and writes, authorization, consumer filters and the
 saved-filter catalog), streams, topics and publishing, consuming, replay, typed
 records, provenance headers, AGDX agent messaging and gates, the registry and
-router, request and reply, memory, context assembly, record signing with its
-key registry, action governance with its approval gate, and the bridge value
+router, request and reply, memory, context assembly, the projection, binding
+and writer-schema registries, record signing with its key registry, action governance with its approval gate, and the bridge value
 mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
 
 It is not published yet. [docs/parity.md](../../docs/parity.md) lists its
@@ -414,6 +414,42 @@ attempt whose reply was lost may still have applied.
 Each verb returns what its change produced and where the fold applied it. That
 position is what a group read can wait for, which is what gives an application
 that just configured a group read-your-writes through any node.
+
+## Projections, bindings and schemas
+
+`Laser.Projections()` administers what a deployment materializes from a topic
+and into what shape. `Register` declares a projection and the deployment
+creates its backing table. `RegisterGraph` declares a graph projection, which
+materializes nodes and edges rather than a row table, so the two are not
+interchangeable: each refuses the other's kind rather than registering
+something that creates the wrong thing. `Drop` stops a projection being
+applied and leaves the rows it already wrote alone, because dropping a plan is
+not deleting data.
+
+`Laser.Bindings()` routes sources into projections. `Apply` starts a projector
+for a `(stream, topic)` source, and `Remove` stops it. Naming one projection
+scopes the removal to it rather than to the whole binding.
+
+`Laser.Schemas()` administers the writer-schema registry. `Register` is
+synchronous and answers the allocated id, because the id is what a producer
+stamps on every record and a caller cannot proceed without it. `Drop`
+tombstones rather than deletes: records already stamped with the id keep
+decoding, and the id stays reserved against re-registration under a different
+definition.
+
+Writes append control commands, which the deployment applies asynchronously,
+so a caller observes the apply by reading the registry back rather than by the
+append succeeding. Each carries an operation identity, so a transport retry is
+applied once, and `PublishControlAs` lets a caller choose the identity so a
+retry that outlives the process still applies once. Reads are registry
+browses, served off the snapshot by a managed backend. Browse has no topic
+transport, so a deployment without a backend is refused rather than left
+waiting for a reply nothing will send.
+
+Every resource name is scoped to the handle's stream, which is how two streams
+in one deployment keep separate registries, and listings come back under the
+names the caller wrote so a caller never sees scoping it did not ask for.
+`Options.ResourceNaming` opts out.
 
 ## Signing and keys
 
