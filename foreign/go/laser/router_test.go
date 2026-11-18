@@ -1,9 +1,12 @@
 package laser_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
+
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
@@ -348,5 +351,223 @@ func TestGivenNoRegistryWhenResolvingACapabilityRouteThenShouldRefuseIt(t *testi
 	var invalid *laser.InvalidError
 	if !errors.As(err, &invalid) {
 		t.Fatalf("want an InvalidError, got %T: %v", err, err)
+	}
+}
+
+// cardRecord builds the record an agent publishes to advertise itself, so the
+// fold is tested against what a real registry topic carries.
+func cardRecord(
+	t *testing.T, author string, operation string, card wire.AgentCard, at uint64,
+) iggcon.IggyMessage {
+	t.Helper()
+	server := &streamServer{}
+	agdx := streamHandle(server, laser.Options{DefaultStream: "agents"}).
+		Agdx(agentID(t, author), conversation(1))
+
+	var send *laser.AgdxSend
+	switch operation {
+	case wire.OperationCard:
+		body, err := wire.Marshal(card)
+		if err != nil {
+			t.Fatalf("encode the card: %v", err)
+		}
+		send = agdx.Status(wire.OperationCard).Body(body)
+	default:
+		send = agdx.Quarantine(time.Now().Add(time.Hour), []byte("{}"))
+		if operation == wire.OperationUnquarantine {
+			send = agdx.Unquarantine(time.Now().Add(time.Hour), []byte("{}"))
+		}
+	}
+	if _, err := send.Send(context.Background()); err != nil {
+		t.Fatalf("publish the %s record: %v", operation, err)
+	}
+	message := server.sentMessages[0]
+	message.Header.Timestamp = at
+	return message
+}
+
+// The cards are on the log rather than in a store, so a client that starts
+// after the agents did still learns what they advertise by reading it.
+func TestGivenCardsOnTheLogWhenFoldedThenShouldBuildTheRegistry(t *testing.T) {
+	now := time.Now()
+	lifetime := uint64(600_000_000)
+	card := cardFor("summarise", nil, nil, nil, nil)
+	card.TTLMicros = &lifetime
+
+	server := &cursorServer{
+		partitions: 1,
+		byPartition: map[uint32][]iggcon.IggyMessage{0: {
+			cardRecord(t, "planner", wire.OperationCard, card, uint64(now.UnixMicro())),
+		}},
+	}
+	cursor, err := cursorHandle(server).Topic(wire.AgentRegistry).Replay()
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	registry := laser.NewAgentRegistry()
+
+	if err := registry.Refresh(context.Background(), cursor); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	capable := registry.Capable("summarise", now)
+	if len(capable) != 1 {
+		t.Fatalf("want the agent folded, got %d", len(capable))
+	}
+	if capable[0].Agent != agentID(t, "planner") {
+		t.Errorf("want the publishing agent, got %v", capable[0].Agent)
+	}
+	// The card names its agent through the envelope's source, so the registry
+	// never has to trust a card to say who it belongs to.
+	if capable[0].Card.TTLMicros == nil {
+		t.Error("want the card itself folded")
+	}
+}
+
+// An operator's quarantine is a fact on the same topic, so folding must apply
+// it rather than only the cards.
+func TestGivenAQuarantineOnTheLogWhenFoldedThenShouldTakeTheAgentOut(t *testing.T) {
+	now := time.Now()
+	card := cardFor("summarise", nil, nil, nil, nil)
+
+	server := &cursorServer{
+		partitions: 1,
+		byPartition: map[uint32][]iggcon.IggyMessage{0: {
+			cardRecord(t, "planner", wire.OperationCard, card, uint64(now.UnixMicro())),
+			cardRecord(t, "planner", wire.OperationQuarantine, card,
+				uint64(now.Add(time.Second).UnixMicro())),
+		}},
+	}
+	cursor, err := cursorHandle(server).Topic(wire.AgentRegistry).Replay()
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	registry := laser.NewAgentRegistry()
+
+	if err := registry.Refresh(context.Background(), cursor); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	if !registry.Quarantined(agentID(t, "planner")) {
+		t.Error("want the agent taken out of rotation")
+	}
+	if len(registry.Capable("summarise", now)) != 0 {
+		t.Error("a quarantined agent must not be a candidate")
+	}
+}
+
+// The topic carries more than cards, so a record that is not one must be left
+// alone rather than stopping the fold.
+func TestGivenANonCardRecordWhenFoldedThenShouldBeLeftAlone(t *testing.T) {
+	now := time.Now()
+	plain, err := iggcon.NewIggyMessage([]byte("not an agent message"))
+	if err != nil {
+		t.Fatalf("build a record: %v", err)
+	}
+	card := cardFor("summarise", nil, nil, nil, nil)
+
+	server := &cursorServer{
+		partitions: 1,
+		byPartition: map[uint32][]iggcon.IggyMessage{0: {
+			plain,
+			cardRecord(t, "planner", wire.OperationCard, card, uint64(now.UnixMicro())),
+		}},
+	}
+	cursor, err := cursorHandle(server).Topic(wire.AgentRegistry).Replay()
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	registry := laser.NewAgentRegistry()
+
+	if err := registry.Refresh(context.Background(), cursor); err != nil {
+		t.Fatalf("a record that is not a card must not stop the fold: %v", err)
+	}
+	if len(registry.Capable("summarise", now)) != 1 {
+		t.Error("want the card after it still folded")
+	}
+}
+
+// An operator who set a quarantine and moved on must not exclude an agent
+// forever, so one that has lapsed is not applied.
+func TestGivenALapsedQuarantineWhenFoldedThenShouldNotApplyIt(t *testing.T) {
+	now := time.Now()
+	card := cardFor("summarise", nil, nil, nil, nil)
+	cardAt := uint64(now.UnixMicro())
+
+	server := &streamServer{}
+	agdx := streamHandle(server, laser.Options{DefaultStream: "agents"}).
+		Agdx(agentID(t, "planner"), conversation(1))
+	// A quarantine that expired an hour before the record was folded.
+	if _, err := agdx.Quarantine(now.Add(-time.Hour), []byte("{}")).
+		Send(context.Background()); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	lapsed := server.sentMessages[0]
+	lapsed.Header.Timestamp = cardAt
+	lapsed.Header.Offset = 1
+
+	cards := &cursorServer{
+		partitions: 1,
+		byPartition: map[uint32][]iggcon.IggyMessage{0: {
+			cardRecord(t, "planner", wire.OperationCard, card, cardAt),
+			lapsed,
+		}},
+	}
+	cursor, err := cursorHandle(cards).Topic(wire.AgentRegistry).Replay()
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	registry := laser.NewAgentRegistry()
+
+	if err := registry.Refresh(context.Background(), cursor); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	if registry.Quarantined(agentID(t, "planner")) {
+		t.Error("a lapsed quarantine must not keep an agent out")
+	}
+	if len(registry.Capable("summarise", now)) != 1 {
+		t.Error("want the agent back in rotation")
+	}
+}
+
+// A card that fails the contract would advertise a capability the deployment
+// never agreed to, so it is not folded.
+func TestGivenAnInvalidCardWhenFoldedThenShouldNotAdvertiseIt(t *testing.T) {
+	now := time.Now()
+	// A capability with no skill id fails the contract's own card rule.
+	broken := wire.AgentCard{
+		Capabilities: []wire.CapabilityDescriptor{{SkillID: ""}},
+	}
+	body, err := wire.Marshal(broken)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	server := &streamServer{}
+	agdx := streamHandle(server, laser.Options{DefaultStream: "agents"}).
+		Agdx(agentID(t, "planner"), conversation(1))
+	if _, err := agdx.Status(wire.OperationCard).Body(body).
+		Send(context.Background()); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	message := server.sentMessages[0]
+	message.Header.Timestamp = uint64(now.UnixMicro())
+
+	cards := &cursorServer{
+		partitions:  1,
+		byPartition: map[uint32][]iggcon.IggyMessage{0: {message}},
+	}
+	cursor, err := cursorHandle(cards).Topic(wire.AgentRegistry).Replay()
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	registry := laser.NewAgentRegistry()
+
+	if err := registry.Refresh(context.Background(), cursor); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	if len(registry.Agents(now)) != 0 {
+		t.Error("a card that fails the contract must not be folded")
 	}
 }

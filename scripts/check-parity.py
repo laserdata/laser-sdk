@@ -1201,6 +1201,8 @@ GO_CAPABILITIES = {
     "connection.events": MISSING,
     "operation.settle": MISSING,
     "command.raw": "Laser.SendManaged + Laser.SendManagedWithOperation",
+    # request/reply rides the agent topics rather than a raw call, so it is
+    # listed with the agent surfaces below rather than here.
     "stream.list": MISSING,
     "stream.get": MISSING,
     "stream.create": "Stream.Ensure",

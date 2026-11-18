@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -16,6 +17,10 @@ import (
 // can state what reached the server rather than only that nothing failed.
 type streamServer struct {
 	iggcon.Client
+	// mutex guards what a concurrent test reads while a send is in flight.
+	// A fake that is not safe makes the race detector point at the test
+	// rather than at the code under test, which hides a real one.
+	mutex        sync.Mutex
 	streamExists bool
 	topicExists  bool
 	createFails  bool
@@ -33,7 +38,11 @@ type streamServer struct {
 
 func (server *streamServer) Close() error { return nil }
 
-func (server *streamServer) record(call string) { server.calls = append(server.calls, call) }
+func (server *streamServer) record(call string) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	server.calls = append(server.calls, call)
+}
 
 func (server *streamServer) GetStream(
 	_ context.Context, _ iggcon.Identifier,
@@ -104,10 +113,20 @@ func (server *streamServer) SendMessages(
 	_ context.Context, _, _ iggcon.Identifier,
 	partitioning iggcon.Partitioning, messages []iggcon.IggyMessage,
 ) (*iggcon.SendMessagesResponse, error) {
-	server.record("send")
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	server.calls = append(server.calls, "send")
 	server.sentPartitions = partitioning
 	server.sentMessages = messages
 	return &iggcon.SendMessagesResponse{}, nil
+}
+
+// sent is what reached the server, copied so a caller reading it while another
+// send is in flight does not race the write.
+func (server *streamServer) sent() []iggcon.IggyMessage {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	return append([]iggcon.IggyMessage(nil), server.sentMessages...)
 }
 
 func streamHandle(server iggcon.Client, options laser.Options) *laser.Laser {

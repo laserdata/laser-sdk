@@ -282,6 +282,16 @@ because the deadline is for a reply that never comes rather than for a handler
 that is slow. `Acknowledged` reports it, so a slow handler is waited out rather
 than retried into a duplicate.
 
+`Laser.Requester(source, topic)` ties the two halves together: `Request` sends
+a command and waits for its answer, narrowing the wait to the command it sent
+once the send returns. Nothing drives the hub on its own, so a caller feeds
+`Hub().Deliver` from whatever reads the reply topic. `Deliver` returns false
+for anything that answers no waiting request, so one reader serves both the
+requests and the rest of the traffic.
+
+`Laser.DeadLetter` publishes a record the gates turned away, keeping the
+payload so the work can be replayed and naming where the original sat.
+
 ## Memory
 
 `Laser.Memory(namespace)` opens the agentic memory surface. `Remember`,

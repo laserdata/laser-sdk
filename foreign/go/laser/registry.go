@@ -1,6 +1,7 @@
 package laser
 
 import (
+	"context"
 	"sort"
 	"sync"
 	"time"
@@ -150,6 +151,78 @@ func (registry *AgentRegistry) Capable(skill string, now time.Time) []Registered
 		return capable[first].Agent.String() < capable[second].Agent.String()
 	})
 	return capable
+}
+
+// Refresh folds the registry topic into the registry.
+//
+// The cards are on the log rather than in a store, so a registry is rebuilt by
+// reading it: a client that starts after the agents did still learns what they
+// advertise. Reading from the cursor's position rather than from the start is
+// what lets a long-running client refresh cheaply.
+//
+// A record that is not a card is left alone, because the topic also carries
+// the quarantine facts an operator writes.
+func (registry *AgentRegistry) Refresh(ctx context.Context, cursor *Cursor) error {
+	records, err := cursor.Poll(ctx)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		message, err := OpenAgdx(record)
+		if err != nil {
+			// A record that is not an agent message is another writer's
+			// business, not a reason to stop folding.
+			continue
+		}
+		registry.fold(message, record)
+	}
+	return nil
+}
+
+// fold applies one registry record.
+//
+// A card names the agent that published it through the envelope's source, so
+// the registry never has to trust a card to say who it belongs to.
+func (registry *AgentRegistry) fold(message *AgdxMessage, record *Record) {
+	envelope := message.Envelope
+	if envelope.Operation == nil {
+		return
+	}
+	observed := time.UnixMicro(int64(record.Message.Header.Timestamp))
+	switch *envelope.Operation {
+	case wire.OperationCard:
+		var card wire.AgentCard
+		if err := wire.Unmarshal(envelope.Body, &card); err != nil {
+			return
+		}
+		if err := card.Validate(); err != nil {
+			// A card that fails the contract would advertise a capability the
+			// deployment never agreed to, so it is not folded.
+			return
+		}
+		registry.Observe(envelope.Source, card, observed)
+	case wire.OperationQuarantine:
+		// A quarantine is bounded, so one that has lapsed is not applied: an
+		// operator who set it and moved on does not exclude an agent forever.
+		if lapsed(envelope, observed) {
+			return
+		}
+		registry.Quarantine(envelope.Source)
+	case wire.OperationUnquarantine:
+		registry.Release(envelope.Source)
+	}
+}
+
+// lapsed reports whether a bounded fact has passed its expiry.
+//
+// The fold reads the record's own append time rather than the local clock, so
+// replaying a log settles to the same registry however long afterwards it is
+// read.
+func lapsed(envelope wire.AgentEnvelope, observed time.Time) bool {
+	if envelope.DeadlineMicros == nil {
+		return false
+	}
+	return observed.After(time.UnixMicro(int64(*envelope.DeadlineMicros)))
 }
 
 // Agents lists every agent holding a fresh card, quarantined or not, sorted by

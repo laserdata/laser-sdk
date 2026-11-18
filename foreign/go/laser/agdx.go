@@ -139,12 +139,34 @@ func (agdx *Agdx) sessionStatus(state wire.TaskState, body any) *AgdxSend {
 	return send
 }
 
-// Status reports a lifecycle signal that is neither a task nor a session: a
-// card, progress, a quarantine or an unquarantine.
+// Quarantine takes an agent out of rotation until an instant.
 //
-// Those two have their own constructors, because the contract requires a state
-// on them and this shape cannot carry one. The operation is a closed
-// vocabulary, which the contract checks before the record leaves.
+// The contract requires the expiry, so it is a parameter: a quarantine that
+// never lapsed would silently exclude an agent forever once the operator who
+// set it forgot about it. Renew it to keep an agent out longer.
+func (agdx *Agdx) Quarantine(until time.Time, body []byte) *AgdxSend {
+	return agdx.send(wire.KindStatus).
+		WithOperation(wire.OperationQuarantine).
+		WithDeadline(until).
+		Body(body)
+}
+
+// Unquarantine puts an agent back in rotation, bounded the same way.
+func (agdx *Agdx) Unquarantine(until time.Time, body []byte) *AgdxSend {
+	return agdx.send(wire.KindStatus).
+		WithOperation(wire.OperationUnquarantine).
+		WithDeadline(until).
+		Body(body)
+}
+
+// Status reports a lifecycle signal that is neither a task, a session, nor a
+// quarantine: a card or progress.
+//
+// Those have their own constructors, because the contract requires a field on
+// each that this shape cannot carry.
+//
+// The operation is a closed vocabulary, which the contract checks before the
+// record leaves.
 func (agdx *Agdx) Status(operation string) *AgdxSend {
 	return agdx.send(wire.KindStatus).WithOperation(operation)
 }

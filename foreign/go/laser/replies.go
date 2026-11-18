@@ -138,14 +138,21 @@ func (hub *ReplyHub) Deliver(message *AgdxMessage) bool {
 	if message.Envelope.Correlation == nil {
 		return false
 	}
+	// The expectation is copied under the lock rather than read through the
+	// waiter afterwards: a requester narrows it to the command it sent once
+	// the send returns, which races a delivery that is already in flight.
 	hub.mutex.Lock()
 	waiter, waiting := hub.waiters[*message.Envelope.Correlation]
+	var expected ExpectedReply
+	if waiting {
+		expected = waiter.expected
+	}
 	hub.mutex.Unlock()
 	if !waiting {
 		return false
 	}
 
-	if waiter.expected.Acknowledges(message) {
+	if expected.Acknowledges(message) {
 		waiter.acknowledged.Store(true)
 		// A dropped signal is harmless: one unread acknowledgment is already
 		// pending, and the waiter only needs to know work is happening.
@@ -155,7 +162,7 @@ func (hub *ReplyHub) Deliver(message *AgdxMessage) bool {
 		}
 		return true
 	}
-	if !waiter.expected.Accepts(message) {
+	if !expected.Accepts(message) {
 		return false
 	}
 	select {
@@ -209,6 +216,17 @@ func (ticket *Ticket) Await(ctx context.Context, timeout time.Duration) (*AgdxMe
 // request.
 func (ticket *Ticket) Acknowledged() bool {
 	return ticket.waiter.acknowledged.Load()
+}
+
+// Expect narrows the wait to the command that was sent.
+//
+// A requester only learns the record id after the send, and the wait has to be
+// registered before it, so the expectation is narrowed here rather than being
+// complete at subscribe time.
+func (ticket *Ticket) Expect(command wire.RecordID) {
+	ticket.hub.mutex.Lock()
+	defer ticket.hub.mutex.Unlock()
+	ticket.waiter.expected.Command = &command
 }
 
 // Correlation is what this ticket waits on.

@@ -217,6 +217,39 @@ func DeadLetterCapsule(
 	return capsule
 }
 
+// DeadLetter publishes a capsule on the stream's dead-letter topic.
+//
+// A record the gates turned away is kept rather than dropped: the payload is
+// on the dead-letter topic so the work can be replayed once the cause is
+// fixed, and the source names where the original sat so a reader can find it.
+//
+// It is partitioned by the record's conversation, so one conversation's dead
+// letters stay in the order they failed.
+func (laser *Laser) DeadLetter(
+	ctx context.Context, record *Record, decision Decision, attempts uint32,
+) error {
+	if laser.defaultStream == "" {
+		return errNoStream()
+	}
+	source := wire.LogPosition{PartitionID: record.PartitionID, Offset: record.Offset()}
+	capsule := DeadLetterCapsule(source, record, decision, attempts)
+	payload, err := wire.Marshal(capsule)
+	if err != nil {
+		return &CodecError{Reason: "encode the dead letter", Cause: err}
+	}
+	key := ""
+	if record.Provenance != nil {
+		key = record.Provenance.Conversation.String()
+	}
+	publish := laser.Stream(laser.defaultStream).Topic(wire.AgentDLQ).
+		Publish().Payload(payload)
+	if key != "" {
+		publish = publish.Key(key)
+	}
+	_, err = publish.Send(ctx)
+	return err
+}
+
 // Run reads a consumer and hands each record that passes the gates to handle.
 //
 // A handler that fails is reported through onFailure and the loop goes on, so
