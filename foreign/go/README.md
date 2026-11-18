@@ -7,10 +7,10 @@ The Go client for [LaserData](https://laserdata.com), a native port of the
 against the shared corpus, and the connection layer has started: `Connect`,
 the shared connection string grammar, TLS resolution, and the connect-time
 capability negotiation, all over the Apache Iggy Go SDK's TCP transport. There
-Key-value, query and the authorization verbs are the typed surfaces so far.
-There is no streaming client, no session surface, no agent runtime, and no
-bridge yet, so the handle hands out the underlying Iggy client for anything
-beyond that.
+Key-value, query, fork, graph and the authorization verbs are the typed
+surfaces so far. There is no streaming client, no session surface, no agent
+runtime, and no bridge yet, so the handle hands out the underlying Iggy client
+for anything beyond that.
 
 ## Managed commands
 
@@ -84,7 +84,30 @@ additionally needs a ready backend that announced that dialect.
 The deadline is absolute on the wire and resolved at send time, so a request
 built and held does not arrive already expired. Every execution carries its own
 identity. A result whose rows do not match its schema is refused rather than
-read, since misaligned values look like data rather than a fault. It is not published, it is absent from the [cross-SDK parity
+read, since misaligned values look like data rather than a fault.
+
+## Forks
+
+`Laser.Fork(id)` branches the read model. A fork overlays speculative rows on
+the trunk without writing to it, so a what-if can be explored and then promoted
+or discarded. `Create` makes one (continuous by default, `Severed` freezes it
+at the trunk's current offsets), `PutRow` writes a speculative row or a
+tombstone, and `Promote` or `Squash` ends it. `Laser.Forks` lists them.
+
+An embedding travels as a JSON array literal, so a component that is not a
+finite number is refused: JSON has no spelling for one, and it would silently
+change which rows a nearest-neighbour search returns.
+
+## Graph
+
+`Laser.Graph(name)` builds a traversal: a start (`StartIDs`, `StartMatch`,
+`StartNearest`), hops (`Out`, `In`, `Both`, `Hop`), filters, and what to return.
+`Neighbors` is the cheap one-hop read. `AsOf` reads the graph as it stood at an
+instant, keeping only edges whose valid-time window contains it.
+
+`Upsert` and `Link` write facts. Ids are content-addressed, so re-applying the
+same extraction converges on the same elements instead of duplicating them,
+which is what lets a projector replay without the graph growing. It is not published, it is absent from the [cross-SDK parity
 matrix](../../docs/parity.md), and it does not run the shared behavior
 scenarios. Use the [Rust](../../sdk/README.md),
 [Python](../python/README.md), or [TypeScript](../typescript/README.md)
