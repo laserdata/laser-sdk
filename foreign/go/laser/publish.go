@@ -163,8 +163,7 @@ func (topic *Topic) sendMessages(
 	if topic.stream == "" {
 		return nil, errNoStream()
 	}
-	client, err := topic.laser.connected()
-	if err != nil {
+	if _, err := topic.laser.connected(); err != nil {
 		return nil, err
 	}
 	streamID, topicID, err := topic.identifiers()
@@ -175,11 +174,23 @@ func (topic *Topic) sendMessages(
 	if err != nil {
 		return nil, err
 	}
-	response, err := client.SendMessages(ctx, streamID, topicID, partitioning, messages)
-	if err != nil {
-		return nil, &TransportError{Reason: "publish", Cause: err}
-	}
-	return response, nil
+	// Publishing is retried on a lost or stalled link under the shared
+	// recovery schedule, because a dropped connection is the one publish
+	// failure a resend reliably fixes.
+	return runWithRecovery(ctx, topic.laser.publishSchedule(),
+		func(attempt context.Context) (*iggcon.SendMessagesResponse, error) {
+			live, err := topic.laser.connected()
+			if err != nil {
+				return nil, err
+			}
+			response, err := live.SendMessages(
+				attempt, streamID, topicID, partitioning, messages)
+			if err != nil {
+				return nil, &TransportError{Reason: "publish", Cause: err}
+			}
+			return response, nil
+		},
+		topic.laser.reconnect)
 }
 
 // partitioningFor turns a key into the partitioning the server reads.

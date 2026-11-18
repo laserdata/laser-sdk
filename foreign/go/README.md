@@ -11,7 +11,7 @@ forks, graph, session reads and writes, authorization, consumer filters and the
 saved-filter catalog), streams, topics and publishing, consuming, replay, typed
 records, provenance headers, AGDX agent messaging and gates, the registry and
 router, request and reply, memory, context assembly, the projection, binding
-and writer-schema registries, materialization, a batching producer, record signing with its key registry, action governance with its approval gate, and the bridge value
+and writer-schema registries, materialization, a batching producer with the shared publish recovery schedule, record signing with its key registry, action governance with its approval gate, and the bridge value
 mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
 
 It is not published yet. [docs/parity.md](../../docs/parity.md) lists its
@@ -414,6 +414,38 @@ attempt whose reply was lost may still have applied.
 Each verb returns what its change produced and where the fold applied it. That
 position is what a group read can wait for, which is what gives an application
 that just configured a group read-your-writes through any node.
+
+## Publish recovery
+
+A publish is retried under the schedule every Laser client shares, documented
+in [publish recovery](../../docs/publish-recovery.md): a 60 second attempt
+timeout, three attempts after the first, and a delay starting at 250
+milliseconds that doubles per attempt, stops at 30 seconds, and is spread over
+its upper half so clients that failed together do not come back together.
+
+Only a lost or stalled link and an expired session are retried. A refusal the
+server reasoned about, a malformed request or a missing topic will fail the
+same way however many times it is sent, and retrying it only delays the
+report.
+
+Publishing is at-least-once: a reply lost after the server applied the append
+cannot be told from one it never received, so a resend can duplicate a record.
+A caller that cannot tolerate that sets the retries to zero.
+
+One deadline covers the reconnect and the attempt together, so a reconnect
+that hangs cannot eat the budget and leave no time to send. An attempt that
+timed out is followed by a cleanup whatever happens next, because a cancelled
+read must not leave its late reply on a shared connection for the next caller
+to decode as its own. A caller's own deadline is reported as the caller's
+rather than as a stage this client timed out: retrying is not the answer to a
+caller that has stopped waiting.
+
+A schedule the client could not honour is refused before anything is dialed,
+since a client that connects and then fails on every send is harder to
+diagnose than one that refuses to start. `Options.Publish` pins it,
+`Laser.WithPublishOptions` derives a handle with its own, and the
+`LASER_PUBLISH_*` variables are read when neither does. Configuration a caller
+wrote is never overridden by what is ambient.
 
 ## Batching producer
 

@@ -37,6 +37,10 @@ type Options struct {
 	// ResourceNaming decides whether managed names are scoped to the default
 	// stream. The zero value scopes them, as every client does by default.
 	ResourceNaming ResourceNaming
+	// Publish is how a publish is retried. Nil reads the LASER_PUBLISH_*
+	// variables, then falls back to the shared defaults every Laser client
+	// uses.
+	Publish *PublishOptions
 	// Environment reads the LASER_* variables, nil for the process
 	// environment.
 	Environment Environment
@@ -78,6 +82,8 @@ func (options Options) timeout() (time.Duration, error) {
 // are the only fields the lock covers. Everything else is fixed once the
 // handle exists and is read without one.
 type Laser struct {
+	// publish is how this handle retries a publish.
+	publish PublishOptions
 	// shared is held in common by every handle derived from this one, so a
 	// derived handle reads through the same connection and the same applied
 	// frontier rather than starting over.
@@ -210,6 +216,14 @@ func (options Options) Resolve() (Options, error) {
 		return options, err
 	}
 	options.Timeout = timeout
+	// A misconfigured publish schedule is refused before anything is dialed,
+	// because a client that connects and then fails on every send is harder
+	// to diagnose than one that refuses to start.
+	publish, err := options.publishOptions()
+	if err != nil {
+		return options, err
+	}
+	options.Publish = &publish
 	return options, nil
 }
 
@@ -252,12 +266,17 @@ func ConnectWith(
 	if options.Capabilities != nil {
 		configured = *options.Capabilities
 	}
+	publish := DefaultPublishOptions()
+	if options.Publish != nil {
+		publish = *options.Publish
+	}
 	return &Laser{
 		shared:         &connection{client: connected},
 		connectionInfo: parsed,
 		capabilities:   NegotiateCapabilities(ctx, connected, configured),
 		defaultStream:  options.DefaultStream,
 		resourceNaming: options.ResourceNaming,
+		publish:        publish,
 	}, nil
 }
 
@@ -286,11 +305,16 @@ func FromClient(client iggcon.Client, options Options) *Laser {
 	if options.Capabilities != nil {
 		capabilities = *options.Capabilities
 	}
+	publish := DefaultPublishOptions()
+	if options.Publish != nil {
+		publish = *options.Publish
+	}
 	return &Laser{
 		shared:         &connection{client: client},
 		capabilities:   capabilities,
 		defaultStream:  options.DefaultStream,
 		resourceNaming: options.ResourceNaming,
+		publish:        publish,
 	}
 }
 
@@ -327,6 +351,47 @@ func (laser *Laser) Close() error {
 	err := client.Close()
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return &TransportError{Reason: "close the connection", Cause: err}
+	}
+	return nil
+}
+
+// publishSchedule is how this handle retries a publish.
+func (laser *Laser) publishSchedule() PublishOptions {
+	if laser.publish.Timeout == 0 {
+		// A handle built as a zero value still publishes, under the shared
+		// defaults rather than a zero timeout that would fail every attempt.
+		return DefaultPublishOptions()
+	}
+	return laser.publish
+}
+
+// WithPublishOptions derives a handle that retries a publish on its own
+// schedule.
+func (laser *Laser) WithPublishOptions(options PublishOptions) (*Laser, error) {
+	if err := options.Validate(); err != nil {
+		return nil, err
+	}
+	derived := laser.copy()
+	derived.publish = options
+	return derived, nil
+}
+
+// reconnect reopens the connection between two publish attempts.
+//
+// The Apache Iggy client reconnects on its own as it dials, so this is the
+// hook the recovery schedule drives rather than a second dialer: a handle
+// whose connection was closed cannot be revived here, and says so.
+func (laser *Laser) reconnect(ctx context.Context) error {
+	client, err := laser.connected()
+	if err != nil {
+		return err
+	}
+	if reconnectable, ok := client.(interface {
+		Connect(context.Context) error
+	}); ok {
+		if err := reconnectable.Connect(ctx); err != nil {
+			return &TransportError{Reason: "reconnect", Cause: err}
+		}
 	}
 	return nil
 }

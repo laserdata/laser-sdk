@@ -1,14 +1,14 @@
 # Connect timeout and cleanup
 
-Rust, Python, and TypeScript give the initial connect a 30-second budget. The budget covers the dial over TCP, QUIC or WebSocket, the TLS handshake, the login, and the managed capability probe. The Iggy client retries a failed dial by itself. The budget stops those retries.
+Rust, Python, TypeScript, and Go give the initial connect a 30-second budget. The budget covers the dial over TCP, QUIC or WebSocket, the TLS handshake, the login, and the managed capability probe. The Iggy client retries a failed dial by itself. The budget stops those retries.
 
-| Configuration | Rust builder | Python `Laser.connect` | TypeScript builder | Environment variable | Default |
-| --- | --- | --- | --- | --- | --- |
-| Connect budget | `connect_timeout` | `connect_timeout_ms` | `connectTimeout` | `LASER_CONNECT_TIMEOUT_MS` | `30000` |
+| Configuration | Rust builder | Python `Laser.connect` | TypeScript builder | Go `Options` | Environment variable | Default |
+| --- | --- | --- | --- | --- | --- | --- |
+| Connect budget | `connect_timeout` | `connect_timeout_ms` | `connectTimeout` | `Timeout` | `LASER_CONNECT_TIMEOUT_MS` | `30000` |
 
 Explicit configuration overrides the environment variable. The budget must be positive and at most 2147483647 milliseconds. Invalid configuration fails before any connection attempt. `Laser::connect`, `Laser.connect`, and the other convenience connect methods use the environment variable or the default.
 
-An expired budget returns a timeout error that names the stage that stalled, with the same text in all three clients.
+An expired budget returns a timeout error that names the stage that stalled, with the same text in every client.
 
 | Message | Meaning |
 | --- | --- |
