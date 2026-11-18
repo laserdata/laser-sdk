@@ -7,7 +7,8 @@ The Go client for [LaserData](https://laserdata.com), a native port of the
 against the shared corpus, and the connection layer has started: `Connect`,
 the shared connection string grammar, TLS resolution, and the connect-time
 capability negotiation, all over the Apache Iggy Go SDK's TCP transport. There
-is no streaming client, no typed managed surface, no agent runtime, and no
+The key-value store is the first typed managed surface. There is no streaming
+client, no query, session or authorization surface, no agent runtime, and no
 bridge yet, so the handle hands out the underlying Iggy client for anything
 beyond that.
 
@@ -30,7 +31,26 @@ caller's own names.
 
 Every managed reply raises the client's applied frontier, and a later read of
 that surface sends it, so whichever node answers has applied at least what this
-client already wrote or read. It is not published, it is absent from the [cross-SDK parity
+client already wrote or read.
+
+Each surface is gated twice before a call leaves: once on the capability the
+deployment announced, and once on the op version it serves, because a payload
+sent across a version gap would be read under a contract neither side agreed
+to.
+
+## Key-value
+
+`Laser.Kv(namespace)` opens a namespace. Reads are `Get`, `GetEntry`,
+`GetEntryIfChanged` (a conditional read that skips the body transfer) and
+`Exists`. Writes are the `Set` builder with `TTL` or `ExpiresAt`, turning into
+a compare-and-swap through `ExpectVersion` or `ExpectAbsent`. `Scan` lists a
+namespace by prefix, range or substring, with `Each` for a bounded walk and
+`All` to collect. `DeleteMany` applies the same bounds in bulk.
+
+A refusal arrives as a `KvError` carrying the contract's own classification, so
+`Retryable` and `Conflict` tell a momentary outage from a precondition that
+will never hold. Keys are arbitrary bytes, so every read hands back a `[]byte`
+rather than a string. It is not published, it is absent from the [cross-SDK parity
 matrix](../../docs/parity.md), and it does not run the shared behavior
 scenarios. Use the [Rust](../../sdk/README.md),
 [Python](../python/README.md), or [TypeScript](../typescript/README.md)
