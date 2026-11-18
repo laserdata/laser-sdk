@@ -276,6 +276,7 @@ PY_PEERS = {
     ("SessionPolicy", "conversation_for"): ("fn:session_policy_conversation_for", "free-function"),
     ("ChunkAssembler", "is_finished"): ("ChunkAssembler.finished", "property"),
     ("Laser", "bind_roles_expect_revision"): ("Laser.bind_roles(expect_revision=)", "overload"),
+    ("Laser", "connect_env_with_stream"): ("Laser.connect_env(stream=)", "overload"),
     ("Laser", "bind_roles_as"): ("Laser.bind_roles(mutation_id=)", "overload"),
     ("Laser", "define_role_as"): ("Laser.define_role(mutation_id=)", "overload"),
     ("Laser", "delete_role_as"): ("Laser.delete_role(mutation_id=)", "overload"),

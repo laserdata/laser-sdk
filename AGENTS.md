@@ -177,7 +177,8 @@ sdk/src/
                       progress.rs, route.rs
   error.rs            LaserError (the one crate error, maps wire DecodeError/InvalidError)
   prelude.rs          the single glob downstreams import
-  laser.rs            Laser + LaserBuilder: connect/connect_env/connect_with_stream/local,
+  laser.rs            Laser + LaserBuilder: connect/connect_env/connect_env_with_stream/
+                      connect_with_stream/local,
                       ResourceNaming { Stream (default), Bare } and resource_name: every
                       managed name scoped to `stream:<default stream>/<name>` unless Bare,
                       producer cache, send_raw_with_response (the raw managed-command
@@ -511,7 +512,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-This inventory describes the `0.10.2` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.11.0` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
 Capabilities identify managed support such as queries, key-value, forks, graphs, and an A2A gateway, plus native consumer filters served by the streaming server. Every capability flag maps to a hello feature bit or an op version. Memory combines query and graph operations and has no separate managed command group.
 

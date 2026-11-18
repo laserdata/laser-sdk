@@ -6,6 +6,7 @@ import {
   throwIfAborted
 } from "./client/call-options.js"
 import { millisToMicros } from "./client/duration.js"
+import type { ManagedSendOptions } from "./iggy/apache-iggy.js"
 import type { Laser } from "./client/laser.js"
 import { isStale, isUnavailable } from "./client/error-classify.js"
 import { publishOptions, publishWithin } from "./client/publish-options.js"
@@ -589,7 +590,7 @@ export class Sessions {
     while (Date.now() < deadline) {
       try {
         await publishWithin(
-          this.readChanges(0, 1, { ...options, deadline }),
+          this.readChanges(0, 1, { ...options, deadline, walk: { kind: "once" } }),
           Math.max(0, deadline - Date.now())
         )
         return true
@@ -636,6 +637,15 @@ export class Sessions {
 
   /** One session's summary from the deployment's session index. */
   async get(id: ConversationId, options: CallOptions = {}): Promise<SessionInfo> {
+    return this.info(id, options)
+  }
+
+  /** `get` with the walk a read takes while every node refuses it.
+   * @internal */
+  async info(
+    id: ConversationId,
+    options: ManagedSendOptions & CallOptions = {}
+  ): Promise<SessionInfo> {
     const outcome = await readSession(
       this.laser,
       SessionGetCommand,
@@ -664,6 +674,16 @@ export class Sessions {
     id: ConversationId,
     historyLimit: number,
     options: CallOptions = {}
+  ): Promise<SessionStateView> {
+    return this.stateView(id, historyLimit, options)
+  }
+
+  /** `state` with the walk a read takes while every node refuses it.
+   * @internal */
+  async stateView(
+    id: ConversationId,
+    historyLimit: number,
+    options: ManagedSendOptions & CallOptions = {}
   ): Promise<SessionStateView> {
     const outcome = await readSession(
       this.laser,
@@ -738,7 +758,7 @@ export class Sessions {
   private async readChanges(
     page: number,
     results: number,
-    options: CallOptions & { readonly deadline?: number }
+    options: ManagedSendOptions & CallOptions
   ): Promise<SessionChangesView> {
     const outcome = await readSession(
       this.laser,
@@ -1432,7 +1452,9 @@ export class Session {
       !(await abortable(this.laser.capabilities(), options.signal, "session state read")).sessions
     )
       return undefined
-    return this.laser.sessions(this.config).state(this.conversation, 0, options)
+    return this.laser
+      .sessions(this.config)
+      .stateView(this.conversation, 0, { ...options, walk: { kind: "once" } })
   }
 
   /** Assemble the model context under `policy` from the conversation records
@@ -1572,7 +1594,13 @@ export class Session {
   /** This session's summary from the deployment's session index: status,
    * participants, counters, and the derived idle and over-budget flags. */
   status(options: CallOptions = {}): Promise<SessionInfo> {
-    return this.laser.sessions().get(this.conversation, options)
+    return this.indexInfo(options)
+  }
+
+  /** `status` with the walk a read takes while every node refuses it.
+   * @internal */
+  indexInfo(options: ManagedSendOptions & CallOptions = {}): Promise<SessionInfo> {
+    return this.laser.sessions().info(this.conversation, options)
   }
 
   /** The pause and cancel requests operators sent this session on
@@ -1643,7 +1671,7 @@ export class Session {
       (await abortable(this.laser.capabilities(), options.signal, "session budget read")).sessions
     ) {
       try {
-        return breachOfInfo(await this.status(options))
+        return breachOfInfo(await this.indexInfo({ ...options, walk: { kind: "once" } }))
       } catch (error) {
         if (!indexUnusable(error)) throw error
       }

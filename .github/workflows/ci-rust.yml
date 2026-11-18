@@ -441,6 +441,9 @@ jobs:
       - name: BDD scenarios (Rust runner)
         working-directory: bdd/rust
         run: cargo test --locked
+      - name: Read from a recovering catalog
+        working-directory: bdd/rust
+        run: python3 ../../scripts/run-with-recovering-catalog.py cargo test --locked --test open
 
   # One aggregate gate so branch protection requires a single check, not every
   # job and matrix leg. Runs after all of them and fails if any did not succeed.

@@ -15,10 +15,18 @@ use cucumber::World;
 
 #[tokio::main]
 async fn main() {
+    let recovering_catalog = std::env::var_os("LASER_BDD_RECOVERING_CATALOG").is_some();
     let managed = std::env::var_os("LASER_BDD_MANAGED").is_some();
     let remote_sql = std::env::var_os("LASER_BDD_SQL_BACKEND").is_some();
     LaserWorld::cucumber()
         .max_concurrent_scenarios(1)
+        .after(|_, _, _, _, world| {
+            Box::pin(async move {
+                if let Some(world) = world {
+                    world.managed.cleanup().await;
+                }
+            })
+        })
         .filter_run_and_exit("../scenarios", move |feature, _, scenario| {
             // A tag on the feature applies to every scenario in it.
             let tagged = |name: &str| {
@@ -28,6 +36,9 @@ async fn main() {
                     .chain(&scenario.tags)
                     .any(|tag| tag == name)
             };
+            if recovering_catalog || tagged("recovering_catalog") {
+                return recovering_catalog && tagged("recovering_catalog");
+            }
             !(managed && tagged("unmanaged"))
                 && !(!managed && tagged("managed"))
                 && !(!remote_sql && tagged("remote_sql"))

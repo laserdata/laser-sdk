@@ -45,9 +45,10 @@ const JITTER_LOW: f64 = 0.5;
 const JITTER_HIGH: f64 = 1.0;
 
 /// A managed mutation or control append whose outcome is unknown repeats with
-/// the same identity on this backoff until the deadline.
-pub(crate) const MANAGED_MUTATION: Backoff = Backoff::from_millis(100, 2_000);
-pub(crate) const MANAGED_MUTATION_DEADLINE: Duration = Duration::from_secs(30);
+/// the same identity on this backoff until the deadline, and so does a managed
+/// read every node refused.
+pub(crate) const MANAGED_RETRY: Backoff = Backoff::from_millis(100, 2_000);
+pub(crate) const MANAGED_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The first attempt of a managed mutation gets this long before it counts as
 /// lost, the scale the route recheck uses, and each later one twice as long,
@@ -105,21 +106,12 @@ mod tests {
             .expect("the table parses");
         assert_eq!(table["jitter"]["low"].as_f64(), Some(JITTER_LOW));
         assert_eq!(table["jitter"]["high"].as_f64(), Some(JITTER_HIGH));
-        assert_eq!(
-            MANAGED_MUTATION.base,
-            millis(&table, "managed_mutation", "base_ms")
-        );
-        assert_eq!(
-            MANAGED_MUTATION.max,
-            millis(&table, "managed_mutation", "max_ms")
-        );
-        assert_eq!(
-            MANAGED_MUTATION_DEADLINE,
-            millis(&table, "managed_mutation", "deadline_ms")
-        );
+        assert_eq!(MANAGED_RETRY.base, millis(&table, "managed", "base_ms"));
+        assert_eq!(MANAGED_RETRY.max, millis(&table, "managed", "max_ms"));
+        assert_eq!(MANAGED_DEADLINE, millis(&table, "managed", "deadline_ms"));
         assert_eq!(
             MANAGED_ATTEMPT_FIRST,
-            millis(&table, "managed_mutation", "attempt_first_ms")
+            millis(&table, "managed", "attempt_first_ms")
         );
         assert_eq!(CONSUMER.base, millis(&table, "consumer", "base_ms"));
         assert_eq!(CONSUMER.max, millis(&table, "consumer", "max_ms"));
@@ -157,8 +149,8 @@ mod tests {
         assert_eq!(CONSUMER.ceiling(1), Duration::from_millis(50));
         assert_eq!(CONSUMER.ceiling(2), Duration::from_millis(100));
         assert_eq!(CONSUMER.ceiling(40), Duration::from_secs(1));
-        assert_eq!(MANAGED_MUTATION.ceiling(0), Duration::from_millis(100));
-        assert_eq!(MANAGED_MUTATION.ceiling(6), Duration::from_secs(2));
+        assert_eq!(MANAGED_RETRY.ceiling(0), Duration::from_millis(100));
+        assert_eq!(MANAGED_RETRY.ceiling(6), Duration::from_secs(2));
         for _ in 0..100 {
             let delay = CONSUMER.delay(3);
             assert!(delay >= Duration::from_millis(100) && delay <= Duration::from_millis(200));

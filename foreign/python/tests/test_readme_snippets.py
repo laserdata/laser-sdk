@@ -18,6 +18,24 @@ README_PATHS = (
 )
 PROGRAM_MARKER = "asyncio.run("
 PROGRAM_TIMEOUT_SECONDS = 60
+EXAMPLES = REPOSITORY_ROOT / "examples"
+STANDALONE_PROGRAMS = {
+    "```python\n": (EXAMPLES / "python/workflow.py", EXAMPLES / "python/memory_correction.py"),
+    "```rust,no_run\n": (
+        EXAMPLES / "rust/src/workflow/main.rs",
+        EXAMPLES / "rust/src/memory-correction/main.rs",
+    ),
+    "```ts\n": (
+        EXAMPLES / "typescript/src/workflow/main.ts",
+        EXAMPLES / "typescript/src/memory-correction/main.ts",
+    ),
+}
+STANDALONE_READMES = {
+    REPOSITORY_ROOT / "README.md": ("```python\n", "```rust,no_run\n", "```ts\n"),
+    REPOSITORY_ROOT / "foreign/python/README.md": ("```python\n",),
+    REPOSITORY_ROOT / "sdk/README.md": ("```rust,no_run\n",),
+    REPOSITORY_ROOT / "foreign/typescript/README.md": ("```ts\n",),
+}
 
 
 def python_blocks(path: Path) -> list[str]:
@@ -45,6 +63,26 @@ def programs() -> list[tuple[str, str]]:
 
 
 class ReadmeSnippetTests(unittest.TestCase):
+    def test_given_the_readmes_when_read_then_should_show_the_standalone_programs_verbatim(
+        self,
+    ) -> None:
+        for readme, fences in STANDALONE_READMES.items():
+            text = readme.read_text()
+            for fence in fences:
+                for program in STANDALONE_PROGRAMS[fence]:
+                    with self.subTest(readme=readme.name, program=program.name):
+                        self.assertIn(fence + program.read_text() + "```\n", text)
+
+    def test_given_the_workflow_and_memory_docstrings_when_read_then_should_show_the_standalone_programs(  # noqa: E501
+        self,
+    ) -> None:
+        stub = (REPOSITORY_ROOT / "foreign/python/laser_sdk.pyi").read_text()
+        for program in STANDALONE_PROGRAMS["```python\n"]:
+            lines = [line for line in program.read_text().splitlines() if not line.startswith("#")]
+            body = "\n".join(lines).strip("\n")
+            shown = "\n".join(("        " + line).rstrip() for line in body.splitlines())
+            self.assertIn(f"        ```python\n{shown}\n        ```", stub, program.name)
+
     def test_python_blocks_compile(self) -> None:
         for path in README_PATHS:
             for index, block in enumerate(python_blocks(path), start=1):

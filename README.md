@@ -4,95 +4,285 @@ Laser SDK provides streaming, queries, key-value state, forks, graphs, agent mem
 
 ## Two complete programs
 
-Each program below runs as written. It reads the connection string from `LASER_CONNECTION_STRING` with `connect_env` (`connectEnv` in TypeScript), creates a scratch stream with a unique name, and deletes the stream when it ends. A LaserData API key is not a connection string. Copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it.
+Each program below runs as written. It reads the connection string from `LASER_CONNECTION_STRING` with `connect_env` (`connectEnv` in TypeScript), works in a scratch stream with a unique name, and deletes the stream when it ends, so a second run prints the same, apart from the workflow's run id. `LASER_CONNECTION_STRING` is usually already set where the program runs, such as a LaserData Cloud workload, CI, or an agent sandbox, so check it before you look for a server: `echo "${LASER_CONNECTION_STRING:+configured}"` prints `configured` when it is. Then there is no server to start. A LaserData API key is not a connection string. Only without the variable, copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it.
 
-- TypeScript: `npm init -y && npm pkg set type=module && npm install @laserdata/laser-sdk tsx`, Node 22.14 or later. The programs use top-level `await`, so the project must be an ES module. Save a program as `main.ts` and run it with `npx tsx main.ts`.
-- Rust: `cargo add laser-sdk --features agent,kv`, `cargo add tokio --features macros,rt-multi-thread`, `cargo add serde --features derive`, and `cargo add serde_json`.
-- Python: `pip install laser-sdk`, Python 3.10 or later.
+- TypeScript: `npm install @laserdata/laser-sdk tsx`, Node 22.14 or later. Save a program as `main.mts` and run it with `npx tsx main.mts`.
+- Rust: `cargo add laser-sdk --features agent,kv`, `cargo add tokio --features macros,rt-multi-thread,time`, `cargo add serde --features derive`, `cargo add serde_json`, and `cargo add async-trait` for the workflow's awaiting step.
+- Python: `python -m pip install laser-sdk`, Python 3.10 or later. `python -c "import laser_sdk; print(laser_sdk.__doc__)"` then prints the package's own summary of the calls below.
 
-To keep what a program writes, use a named stream instead of the scratch stream: set `LASER_STREAM` for `connect_env`, or call `with_default_stream(name)` (`withDefaultStream` in TypeScript). A workflow run and the first memory write create a missing stream.
+To keep what a program writes, use a named stream instead of the scratch stream: set `LASER_STREAM`, pass it when connecting (`Laser.connect_env(stream=name)` in Python, `Laser.connectEnvWithStream(name)` in TypeScript, `Laser::connect_env_with_stream(name)` in Rust), or call `with_default_stream(name)` (`withDefaultStream` in TypeScript). A workflow run and the first memory write create a missing stream. Coding agents can read these docs through [Context7](https://context7.com/laserdata/laser-sdk) as well as [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk).
 
 ### A three-step workflow
 
-The steps run in this process. Each step gets the outputs of the steps before it, and each completion is journaled, so a run resumed by its id keeps the steps it finished. The run creates its own topics, so the program needs no `bootstrap`, agent, or handler. Steps addressed to agents mix with these in one workflow.
+The steps run in this process in dependency order, and `analyze` awaits one second before it returns. A step's body gets the earlier outputs by label as bytes and returns a string or bytes. It is a plain or async function in Python and TypeScript. In Rust a closure cannot await, so the awaiting step is a type implementing `StepFn`. Each completion is journaled, so a run resumed by its id keeps the steps it finished. The run creates its own topics, so the program needs no `bootstrap`, agent, or handler.
 
 TypeScript
 
 ```ts
+// npm install @laserdata/laser-sdk tsx
+// Run with: npx tsx main.mts
+// Needs only LASER_CONNECTION_STRING, which connectEnv() reads. No server to start when it is set.
+// Check: echo "${LASER_CONNECTION_STRING:+configured}"
+import { setTimeout as sleep } from "node:timers/promises"
 import { Laser } from "@laserdata/laser-sdk"
 
-await using laser = await Laser.connectEnv()
-await using scratch = await laser.scratchStream("workflow-demo")
+const decode = (bytes?: Uint8Array) => new TextDecoder().decode(bytes)
+
+await using root = await Laser.connectEnv()
+await using scratch = await root.scratchStream("workflow")
+
 const outcome = await scratch.laser
-  .workflow("job-runner")
-  .stepLocal("create", () => "job-42")
-  .stepLocal(
-    "process",
-    ({ outputs }) => `processed ${new TextDecoder().decode(outputs.get("create"))}`
-  )
-  .after("create")
-  .stepLocal("finish", () => "completed")
-  .after("process")
+  .workflow("pipeline")
+  .stepLocal("ingest", () => "frames from sat-7")
+  .stepLocal("analyze", async ({ outputs }) => {
+    await sleep(1000)
+    return `analyzed ${decode(outputs.get("ingest"))}`
+  })
+  .after("ingest")
+  .stepLocal("report", ({ outputs }) => `report on ${decode(outputs.get("analyze"))}`)
+  .after("analyze")
   .run()
-const report = {
-  run_id: outcome.runId.toString(),
-  status: outcome.status,
-  completed_steps: outcome.completedSteps,
-  outputs: Object.fromEntries(outcome.completedSteps.map((label) => [label, outcome.text(label)]))
-}
-console.log(JSON.stringify(report, null, 2))
+
+console.log(
+  JSON.stringify({
+    run_id: outcome.runId.toString(),
+    status: outcome.status,
+    completed_steps: outcome.completedSteps,
+    report: outcome.text("report")
+  })
+)
 ```
 
 Rust
 
 ```rust,no_run
-use laser_sdk::agent::StepContext;
+// cargo add laser-sdk --features agent,kv
+// cargo add tokio --features macros,rt-multi-thread,time
+// cargo add serde --features derive
+// cargo add serde_json
+// cargo add async-trait
+// Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
+// Check: echo "${LASER_CONNECTION_STRING:+configured}"
 use laser_sdk::prelude::*;
-use laser_sdk::wire::agent::SessionStatus;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::time::Duration;
 
 #[derive(Serialize)]
 struct Report {
-    run_id: ConversationId,
+    run_id: String,
     status: SessionStatus,
     completed_steps: Vec<String>,
-    outputs: BTreeMap<String, String>,
+    report: Option<String>,
+}
+
+struct Analyze;
+
+#[async_trait::async_trait]
+impl StepFn for Analyze {
+    async fn build(&self, context: &StepContext<'_>) -> Result<Vec<u8>, LaserError> {
+        let ingested = context.outputs.get("ingest").cloned().unwrap_or_default();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        Ok([b"analyzed ".to_vec(), ingested].concat())
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let laser = Laser::connect_env().await?;
-    let scratch = laser.scratch_stream("workflow-demo").await?;
-    let report = run(scratch.laser()).await;
+    let root = Laser::connect_env().await?;
+    let scratch = root.scratch_stream("workflow").await?;
+    let result = run_pipeline(scratch.laser()).await;
     scratch.delete().await?;
-    println!("{}", serde_json::to_string_pretty(&report?)?);
+    let outcome = result?;
+
+    let report = Report {
+        run_id: outcome.run_id.to_string(),
+        report: outcome.text("report"),
+        status: outcome.status,
+        completed_steps: outcome.completed_steps,
+    };
+    println!("{}", serde_json::to_string(&report)?);
     Ok(())
 }
 
-async fn run(laser: &Laser) -> Result<Report, LaserError> {
-    let outcome = laser
-        .workflow("job-runner")
-        .step_local("create", |_: &StepContext<'_>| b"job-42".to_vec())
-        .step_local("process", |context: &StepContext<'_>| {
-            let job = context.outputs.get("create").cloned().unwrap_or_default();
-            [b"processed ".to_vec(), job].concat()
+async fn run_pipeline(laser: &Laser) -> Result<WorkflowOutcome, LaserError> {
+    laser
+        .workflow("pipeline")
+        .step_local("ingest", |_: &StepContext<'_>| {
+            b"frames from sat-7".to_vec()
         })
-        .after("create")
-        .step_local("finish", |_: &StepContext<'_>| b"completed".to_vec())
-        .after("process")
+        .step_local("analyze", Analyze)
+        .after("ingest")
+        .step_local("report", |context: &StepContext<'_>| {
+            let analyzed = context.outputs.get("analyze").cloned().unwrap_or_default();
+            [b"report on ".to_vec(), analyzed].concat()
+        })
+        .after("analyze")
         .run()
+        .await
+}
+```
+
+Python
+
+```python
+# python -m pip install laser-sdk
+# Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
+# Check: echo "${LASER_CONNECTION_STRING:+configured}"
+import asyncio
+import json
+
+import laser_sdk as ls
+
+
+async def analyze(outputs):
+    await asyncio.sleep(1)
+    return b"analyzed " + outputs["ingest"]
+
+
+async def main():
+    async with await ls.Laser.connect_env() as root:
+        async with root.scratch_stream("workflow") as scratch:
+            outcome = await (
+                scratch.laser.workflow("pipeline")
+                .step("ingest", run=lambda outputs: "frames from sat-7")
+                .step("analyze", after=["ingest"], run=analyze)
+                .step(
+                    "report",
+                    after=["analyze"],
+                    run=lambda outputs: b"report on " + outputs["analyze"],
+                )
+                .run()
+            )
+
+    print(
+        json.dumps(
+            {
+                "run_id": outcome.run_id,
+                "status": outcome.status,
+                "completed_steps": outcome.completed_steps,
+                "report": outcome.text("report"),
+            }
+        )
+    )
+
+
+asyncio.run(main())
+```
+
+It prints the run as JSON: `run_id`, `"status": "completed"`, `"completed_steps": ["ingest", "analyze", "report"]`, and `"report": "report on analyzed frames from sat-7"`. The `WorkflowOutcome` also carries `outputs`, each step's output by label as bytes, and `text(label)` decodes one. A failed step raises `StepFailed` (`StepFailedError` in Python and TypeScript) naming the step, the reason, its target, and its deadline, once the compensations of the finished steps have run.
+
+### A memory correction
+
+A first conversation stores three facts about the user `user-42`. A later conversation corrects the city with `supersede`, which remembers the new fact first and then forgets the old one in every conversation. A recall for the user reads every conversation and returns a list of `MemoryItem`, ranked by the words each fact shares with the query, newest first among equals, and drops none. It waits for the writes this connection made, so the correction shows at once. On LaserData Cloud and Laser Stack recall reads the managed memory view. Apache Iggy serves no view, so there recall folds the memory topic in process, and the same program runs on every server.
+
+TypeScript
+
+```ts
+// npm install @laserdata/laser-sdk tsx
+// Run with: npx tsx main.mts
+// Needs only LASER_CONNECTION_STRING, which connectEnv() reads. No server to start when it is set.
+// Check: echo "${LASER_CONNECTION_STRING:+configured}"
+import { ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
+
+const user = "user-42"
+const query = "Where does the user live, and what should I know before booking dinner?"
+
+await using root = await Laser.connectEnv()
+await using scratch = await root.scratchStream("memory")
+const memory = scratch.laser.memory("assistant")
+
+// Conversation 1: the user shares three facts.
+const first = ConversationId.new()
+const city = await memory.remember("Lives in Gdansk").scope(first).user(user).send()
+await memory.remember("Allergic to peanuts").scope(first).user(user).send()
+await memory.remember("Prefers a window seat").scope(first).user(user).send()
+
+// Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+const second = ConversationId.new()
+await memory.supersede(city, "Lives in Lisbon").scope(second).user(user).send()
+
+// Recall for the user across every conversation.
+const facts = await memory.recall().user(user).semantic(query).limit(10).fetch()
+console.log(JSON.stringify({ user, query, facts: facts.map(memoryItemText) }, null, 2))
+```
+
+Rust
+
+```rust,no_run
+// cargo add laser-sdk --features agent,kv
+// cargo add tokio --features macros,rt-multi-thread
+// cargo add serde --features derive
+// cargo add serde_json
+// Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
+// Check: echo "${LASER_CONNECTION_STRING:+configured}"
+use laser_sdk::prelude::*;
+use serde::Serialize;
+
+const USER: &str = "user-42";
+const QUERY: &str = "Where does the user live, and what should I know before booking dinner?";
+
+#[derive(Serialize)]
+struct Recall {
+    user: &'static str,
+    query: &'static str,
+    facts: Vec<String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let root = Laser::connect_env().await?;
+    let scratch = root.scratch_stream("memory").await?;
+    let result = correct_and_recall(scratch.laser()).await;
+    scratch.delete().await?;
+    println!("{}", serde_json::to_string_pretty(&result?)?);
+    Ok(())
+}
+
+async fn correct_and_recall(laser: &Laser) -> Result<Recall, LaserError> {
+    let memory = laser.memory("assistant");
+
+    // Conversation 1: the user shares three facts.
+    let first = ConversationId::new();
+    let city = memory
+        .remember("Lives in Gdansk")
+        .scope(first)
+        .user(USER)
+        .send()
         .await?;
-    let outputs = outcome
-        .completed_steps
-        .iter()
-        .map(|label| (label.clone(), outcome.text(label).unwrap_or_default()))
-        .collect();
-    Ok(Report {
-        run_id: outcome.run_id,
-        status: outcome.status,
-        completed_steps: outcome.completed_steps,
-        outputs,
+    memory
+        .remember("Allergic to peanuts")
+        .scope(first)
+        .user(USER)
+        .send()
+        .await?;
+    memory
+        .remember("Prefers a window seat")
+        .scope(first)
+        .user(USER)
+        .send()
+        .await?;
+
+    // Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+    let second = ConversationId::new();
+    memory
+        .supersede(city, "Lives in Lisbon")
+        .scope(second)
+        .user(USER)
+        .send()
+        .await?;
+
+    // Recall for the user across every conversation.
+    let facts = memory
+        .recall(None)
+        .user(USER)
+        .semantic(QUERY)
+        .limit(10)
+        .fetch()
+        .await?;
+    Ok(Recall {
+        user: USER,
+        query: QUERY,
+        facts: facts.iter().map(MemoryItem::text).collect(),
     })
 }
 ```
@@ -100,137 +290,47 @@ async fn run(laser: &Laser) -> Result<Report, LaserError> {
 Python
 
 ```python
+# python -m pip install laser-sdk
+# Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
+# Check: echo "${LASER_CONNECTION_STRING:+configured}"
 import asyncio
 import json
 
-from laser_sdk import Laser
+import laser_sdk as ls
+
+USER = "user-42"
+QUERY = "Where does the user live, and what should I know before booking dinner?"
 
 
-async def main() -> None:
-    async with await Laser.connect_env() as laser:
-        async with laser.scratch_stream("workflow-demo") as scratch:
-            outcome = await (
-                scratch.laser.workflow("job-runner")
-                .step("create", run=lambda outputs: "job-42")
-                .step(
-                    "process",
-                    run=lambda outputs: "processed " + outputs["create"].decode(),
-                    after=["create"],
-                )
-                .step("finish", run=lambda outputs: "completed", after=["process"])
-                .run()
-            )
-    report = {
-        "run_id": outcome.run_id,
-        "status": outcome.status,
-        "completed_steps": outcome.completed_steps,
-        "outputs": {label: outcome.text(label) for label in outcome.completed_steps},
-    }
-    print(json.dumps(report, indent=2))
-
-
-asyncio.run(main())
-```
-
-Each prints the run id, `"status": "completed"`, `"completed_steps": ["create", "process", "finish"]`, and the three outputs. A failed step raises `StepFailed` (`StepFailedError` in Python and TypeScript) naming the step, the reason, its target, and its deadline, once the compensations of the finished steps have run.
-
-### A memory correction
-
-The first conversation stores two facts about the user `sam`. A later conversation corrects the city with `supersede`, which remembers the new fact first and then forgets the old one in every conversation. A recall for the user reads every conversation, ranks the facts by the words they share with the query, and drops none. It waits for the writes this connection made, so the correction shows at once. On LaserData Cloud and Laser Stack recall reads the managed memory view. Apache Iggy serves no view, so there recall folds the memory topic in process, and the same program runs on every server.
-
-TypeScript
-
-```ts
-import { ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
-
-await using laser = await Laser.connectEnv()
-await using scratch = await laser.scratchStream("memory-demo")
-const memory = scratch.laser.memory("assistant")
-const first = ConversationId.new()
-const home = await memory.remember("Sam lives in Berlin").scope(first).user("sam").send()
-await memory.remember("Sam is allergic to peanuts").scope(first).user("sam").send()
-await memory
-  .supersede(home, "Sam lives in Amsterdam")
-  .scope(ConversationId.new())
-  .user("sam")
-  .send()
-const facts = await memory.recall().user("sam").semantic("where does Sam live").fetch()
-console.log(JSON.stringify(facts.map(memoryItemText), null, 2))
-```
-
-Rust
-
-```rust,no_run
-use laser_sdk::prelude::*;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let laser = Laser::connect_env().await?;
-    let scratch = laser.scratch_stream("memory-demo").await?;
-    let facts = run(scratch.laser()).await;
-    scratch.delete().await?;
-    println!("{}", serde_json::to_string_pretty(&facts?)?);
-    Ok(())
-}
-
-async fn run(laser: &Laser) -> Result<Vec<String>, LaserError> {
-    let memory = laser.memory("assistant");
-    let first = ConversationId::new();
-    let home = memory
-        .remember("Sam lives in Berlin")
-        .scope(first)
-        .user("sam")
-        .send()
-        .await?;
-    memory
-        .remember("Sam is allergic to peanuts")
-        .scope(first)
-        .user("sam")
-        .send()
-        .await?;
-    memory
-        .supersede(home, "Sam lives in Amsterdam")
-        .scope(ConversationId::new())
-        .user("sam")
-        .send()
-        .await?;
-    let facts = memory
-        .recall(None)
-        .user("sam")
-        .semantic("where does Sam live")
-        .fetch()
-        .await?;
-    Ok(facts.iter().map(MemoryItem::text).collect())
-}
-```
-
-Python
-
-```python
-import asyncio
-import json
-
-from laser_sdk import Laser, new_conversation_id
-
-
-async def main() -> None:
-    async with await Laser.connect_env() as laser:
-        async with laser.scratch_stream("memory-demo") as scratch:
+async def main():
+    async with await ls.Laser.connect_env() as root:
+        async with root.scratch_stream("memory") as scratch:
             memory = scratch.laser.memory("assistant")
-            first = new_conversation_id()
-            home = await memory.remember("Sam lives in Berlin", user="sam", conversation=first)
-            await memory.remember("Sam is allergic to peanuts", user="sam", conversation=first)
-            await memory.supersede(
-                home, "Sam lives in Amsterdam", user="sam", conversation=new_conversation_id()
+
+            # Conversation 1: the user shares three facts.
+            first = ls.new_conversation_id()
+            city = await memory.remember("Lives in Gdansk", conversation=first, user=USER)
+            await memory.remember("Allergic to peanuts", conversation=first, user=USER)
+            await memory.remember("Prefers a window seat", conversation=first, user=USER)
+
+            # Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+            second = ls.new_conversation_id()
+            await memory.supersede(city, "Lives in Lisbon", conversation=second, user=USER)
+
+            # Recall for the user across every conversation.
+            facts = await memory.recall(user=USER, semantic=QUERY, limit=10)
+            print(
+                json.dumps(
+                    {"user": USER, "query": QUERY, "facts": [fact.text() for fact in facts]},
+                    indent=2,
+                )
             )
-            facts = await memory.recall(user="sam", semantic="where does Sam live")
-    print(json.dumps([item.text() for item in facts], indent=2))
 
 
 asyncio.run(main())
 ```
 
-Each prints `["Sam lives in Amsterdam", "Sam is allergic to peanuts"]`. Berlin is gone. The same programs live in [`examples/`](examples/README.md) as `workflow` and `memory-correction` (`workflow.py` and `memory_correction.py` in Python), where each runs when copied alone.
+It prints `{"user": "user-42", "query": "Where does the user live, and what should I know before booking dinner?", "facts": ["Lives in Lisbon", "Prefers a window seat", "Allergic to peanuts"]}`. Gdansk is gone. In Python `memory(...)`, `workflow(...)`, `step(...)` and `sessions(...)` return at once, and `scratch_stream(prefix)` is entered with `async with`. `Laser.connect_env()`, `memory_topic(...)` and every call that reads or writes (`remember`, `supersede`, `recall`, `forget`, `workflow.run()`, `bootstrap`) return an awaitable. The same programs live in [`examples/`](examples/README.md) as `workflow` and `memory-correction` (`workflow.py` and `memory_correction.py` in Python), where each runs when copied alone.
 
 ## More about the SDK
 
@@ -264,7 +364,7 @@ The examples below publish one record and read it back. Like the programs above,
 TypeScript ([npm](https://www.npmjs.com/package/@laserdata/laser-sdk))
 
 ```sh
-npm init -y && npm pkg set type=module && npm install @laserdata/laser-sdk tsx
+npm install @laserdata/laser-sdk tsx
 ```
 
 ```ts
@@ -308,7 +408,7 @@ async fn main() -> Result<(), LaserError> {
 Python ([PyPI](https://pypi.org/project/laser-sdk/))
 
 ```sh
-pip install laser-sdk
+python -m pip install laser-sdk
 ```
 
 ```python

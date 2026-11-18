@@ -1,49 +1,64 @@
-use laser_sdk::agent::StepContext;
+// cargo add laser-sdk --features agent,kv
+// cargo add tokio --features macros,rt-multi-thread,time
+// cargo add serde --features derive
+// cargo add serde_json
+// cargo add async-trait
+// Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
+// Check: echo "${LASER_CONNECTION_STRING:+configured}"
 use laser_sdk::prelude::*;
-use laser_sdk::wire::agent::SessionStatus;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::time::Duration;
 
 #[derive(Serialize)]
 struct Report {
-    run_id: ConversationId,
+    run_id: String,
     status: SessionStatus,
     completed_steps: Vec<String>,
-    outputs: BTreeMap<String, String>,
+    report: Option<String>,
+}
+
+struct Analyze;
+
+#[async_trait::async_trait]
+impl StepFn for Analyze {
+    async fn build(&self, context: &StepContext<'_>) -> Result<Vec<u8>, LaserError> {
+        let ingested = context.outputs.get("ingest").cloned().unwrap_or_default();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        Ok([b"analyzed ".to_vec(), ingested].concat())
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let laser = Laser::connect_env().await?;
-    let scratch = laser.scratch_stream("workflow-demo").await?;
-    let report = run(scratch.laser()).await;
+    let root = Laser::connect_env().await?;
+    let scratch = root.scratch_stream("workflow").await?;
+    let result = run_pipeline(scratch.laser()).await;
     scratch.delete().await?;
-    println!("{}", serde_json::to_string_pretty(&report?)?);
+    let outcome = result?;
+
+    let report = Report {
+        run_id: outcome.run_id.to_string(),
+        report: outcome.text("report"),
+        status: outcome.status,
+        completed_steps: outcome.completed_steps,
+    };
+    println!("{}", serde_json::to_string(&report)?);
     Ok(())
 }
 
-async fn run(laser: &Laser) -> Result<Report, LaserError> {
-    let outcome = laser
-        .workflow("job-runner")
-        .step_local("create", |_: &StepContext<'_>| b"job-42".to_vec())
-        .step_local("process", |context: &StepContext<'_>| {
-            let job = context.outputs.get("create").cloned().unwrap_or_default();
-            [b"processed ".to_vec(), job].concat()
+async fn run_pipeline(laser: &Laser) -> Result<WorkflowOutcome, LaserError> {
+    laser
+        .workflow("pipeline")
+        .step_local("ingest", |_: &StepContext<'_>| {
+            b"frames from sat-7".to_vec()
         })
-        .after("create")
-        .step_local("finish", |_: &StepContext<'_>| b"completed".to_vec())
-        .after("process")
+        .step_local("analyze", Analyze)
+        .after("ingest")
+        .step_local("report", |context: &StepContext<'_>| {
+            let analyzed = context.outputs.get("analyze").cloned().unwrap_or_default();
+            [b"report on ".to_vec(), analyzed].concat()
+        })
+        .after("analyze")
         .run()
-        .await?;
-    let outputs = outcome
-        .completed_steps
-        .iter()
-        .map(|label| (label.clone(), outcome.text(label).unwrap_or_default()))
-        .collect();
-    Ok(Report {
-        run_id: outcome.run_id,
-        status: outcome.status,
-        completed_steps: outcome.completed_steps,
-        outputs,
-    })
+        .await
 }

@@ -2,88 +2,118 @@
 
 The Python Laser SDK for Apache Iggy: streaming, queries, key-value state, graphs, forks, agent memory, durable workflows, sessions, and agent coordination over one connection. [LaserData, Inc.](https://laserdata.com) maintains it. PyO3 exposes the Rust SDK, so Python and Rust share the data contract, codecs, and runtime.
 
-> This source tree is the `0.10.2` release. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+> This source tree is the `0.11.0` release. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 ## Install
 
 ```bash
-pip install laser-sdk
+python -m pip install laser-sdk
+python -c "import laser_sdk; print(laser_sdk.__doc__)"
 ```
 
-Wheels ship for Linux (x86_64, aarch64), macOS (one universal2 wheel for Intel and Apple Silicon), and Windows (x64), for Python 3.10 and later.
+The second command prints the package's own summary of the workflow, memory, and session calls, with what each one takes and returns. Wheels ship for Linux (x86_64, aarch64), macOS (one universal2 wheel for Intel and Apple Silicon), and Windows (x64), for Python 3.10 and later.
 
 ## Two complete programs
 
-Each program runs as written. It reads the connection string from `LASER_CONNECTION_STRING` with `Laser.connect_env()`, creates a uniquely named scratch stream, and deletes it when the `async with` block ends, also when the block raised. A LaserData API key is not a connection string. Copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it. To keep what a program writes, set `LASER_STREAM` or call `laser.with_default_stream(name)` instead of opening a scratch stream. A workflow run and the first memory write create a missing stream.
+Each program runs as written. It reads the connection string from `LASER_CONNECTION_STRING` with `Laser.connect_env()`, creates a uniquely named scratch stream, and deletes it when the `async with` block ends, also when the block raised. `LASER_CONNECTION_STRING` is usually already set where the program runs, such as a LaserData Cloud workload, CI, or an agent sandbox, so check it before you look for a server: `echo "${LASER_CONNECTION_STRING:+configured}"` prints `configured` when it is. Then there is no server to start. A LaserData API key is not a connection string. Only without the variable, copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it. To keep what a program writes, set `LASER_STREAM`, connect with `Laser.connect_env(stream=name)`, or call `laser.with_default_stream(name)` instead of opening a scratch stream. A workflow run and the first memory write create a missing stream. Coding agents can read these docs through [Context7](https://context7.com/laserdata/laser-sdk) as well as [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk).
 
 ### A three-step workflow
 
-`step(label, run=...)` runs the step's body in this process. The body gets the outputs of the steps before it as `dict[str, bytes]` and returns `bytes` or `str`, plain or async. `step` returns the workflow, so the calls chain. Each completion is journaled, so `run_id(id)` resumes a stopped run and keeps the steps it finished. The run creates its own topics, so the program needs no `bootstrap`, agent, or handler.
+`step(label, run=...)` runs the step's body in this process, and `analyze` is an `async def` that awaits one second before it returns. The body is a plain function or an `async def`, gets the outputs of the steps before it as `dict[str, bytes]`, and returns `str` or `bytes`. `step` returns the workflow, so the calls chain. Each completion is journaled, so `run_id(id)` resumes a stopped run and keeps the steps it finished. The run creates its own topics, so the program needs no `bootstrap`, agent, or handler.
 
 ```python
+# python -m pip install laser-sdk
+# Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
+# Check: echo "${LASER_CONNECTION_STRING:+configured}"
 import asyncio
 import json
 
-from laser_sdk import Laser
+import laser_sdk as ls
 
 
-async def main() -> None:
-    async with await Laser.connect_env() as laser:
-        async with laser.scratch_stream("workflow-demo") as scratch:
+async def analyze(outputs):
+    await asyncio.sleep(1)
+    return b"analyzed " + outputs["ingest"]
+
+
+async def main():
+    async with await ls.Laser.connect_env() as root:
+        async with root.scratch_stream("workflow") as scratch:
             outcome = await (
-                scratch.laser.workflow("job-runner")
-                .step("create", run=lambda outputs: "job-42")
+                scratch.laser.workflow("pipeline")
+                .step("ingest", run=lambda outputs: "frames from sat-7")
+                .step("analyze", after=["ingest"], run=analyze)
                 .step(
-                    "process",
-                    run=lambda outputs: "processed " + outputs["create"].decode(),
-                    after=["create"],
+                    "report",
+                    after=["analyze"],
+                    run=lambda outputs: b"report on " + outputs["analyze"],
                 )
-                .step("finish", run=lambda outputs: "completed", after=["process"])
                 .run()
             )
-    report = {
-        "run_id": outcome.run_id,
-        "status": outcome.status,
-        "completed_steps": outcome.completed_steps,
-        "outputs": {label: outcome.text(label) for label in outcome.completed_steps},
-    }
-    print(json.dumps(report, indent=2))
+
+    print(
+        json.dumps(
+            {
+                "run_id": outcome.run_id,
+                "status": outcome.status,
+                "completed_steps": outcome.completed_steps,
+                "report": outcome.text("report"),
+            }
+        )
+    )
 
 
 asyncio.run(main())
 ```
 
-It prints the run id, `"status": "completed"`, `"completed_steps": ["create", "process", "finish"]`, and the three outputs. A failed step raises `StepFailedError` with `run`, `step`, `reason`, `target`, and `deadline_ms`, once the compensations of the finished steps have run.
+It prints the run as JSON: `run_id`, `"status": "completed"`, `"completed_steps": ["ingest", "analyze", "report"]`, and `"report": "report on analyzed frames from sat-7"`. The `WorkflowOutcome` also carries `outputs`, each step's output by label as bytes, and `text(label)` decodes one. A failed step raises `StepFailedError` with `run`, `step`, `reason`, `target`, and `deadline_ms`, once the compensations of the finished steps have run.
 
 ### A memory correction
 
-The first conversation stores two facts about the user `sam`. A later conversation corrects the city with `supersede`, which remembers the new fact first and then forgets the old one in every conversation. A recall for the user reads every conversation, ranks the facts by the words they share with the query, and drops none. It waits for the writes this connection made, so the correction shows at once. On LaserData Cloud and Laser Stack recall reads the managed memory view. Apache Iggy serves no view, so there recall folds the memory topic in process, and the same program runs on every server.
+A first conversation stores three facts about the user `user-42`. A later conversation corrects the city with `supersede`, which remembers the new fact first and then forgets the old one in every conversation. A recall for the user reads every conversation and returns a list of `MemoryItem`, ranked by the words each fact shares with the query, newest first among equals, and drops none. It waits for the writes this connection made, so the correction shows at once. On LaserData Cloud and Laser Stack recall reads the managed memory view. Apache Iggy serves no view, so there recall folds the memory topic in process, and the same program runs on every server.
 
 ```python
+# python -m pip install laser-sdk
+# Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
+# Check: echo "${LASER_CONNECTION_STRING:+configured}"
 import asyncio
 import json
 
-from laser_sdk import Laser, new_conversation_id
+import laser_sdk as ls
+
+USER = "user-42"
+QUERY = "Where does the user live, and what should I know before booking dinner?"
 
 
-async def main() -> None:
-    async with await Laser.connect_env() as laser:
-        async with laser.scratch_stream("memory-demo") as scratch:
+async def main():
+    async with await ls.Laser.connect_env() as root:
+        async with root.scratch_stream("memory") as scratch:
             memory = scratch.laser.memory("assistant")
-            first = new_conversation_id()
-            home = await memory.remember("Sam lives in Berlin", user="sam", conversation=first)
-            await memory.remember("Sam is allergic to peanuts", user="sam", conversation=first)
-            await memory.supersede(
-                home, "Sam lives in Amsterdam", user="sam", conversation=new_conversation_id()
+
+            # Conversation 1: the user shares three facts.
+            first = ls.new_conversation_id()
+            city = await memory.remember("Lives in Gdansk", conversation=first, user=USER)
+            await memory.remember("Allergic to peanuts", conversation=first, user=USER)
+            await memory.remember("Prefers a window seat", conversation=first, user=USER)
+
+            # Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+            second = ls.new_conversation_id()
+            await memory.supersede(city, "Lives in Lisbon", conversation=second, user=USER)
+
+            # Recall for the user across every conversation.
+            facts = await memory.recall(user=USER, semantic=QUERY, limit=10)
+            print(
+                json.dumps(
+                    {"user": USER, "query": QUERY, "facts": [fact.text() for fact in facts]},
+                    indent=2,
+                )
             )
-            facts = await memory.recall(user="sam", semantic="where does Sam live")
-    print(json.dumps([item.text() for item in facts], indent=2))
 
 
 asyncio.run(main())
 ```
 
-It prints `["Sam lives in Amsterdam", "Sam is allergic to peanuts"]`. Berlin is gone. Both programs are in [`examples/python`](../../examples/python/README.md) as `workflow.py` and `memory_correction.py`.
+It prints `{"user": "user-42", "query": "Where does the user live, and what should I know before booking dinner?", "facts": ["Lives in Lisbon", "Prefers a window seat", "Allergic to peanuts"]}`. Gdansk is gone. In Python `memory(...)`, `workflow(...)`, `step(...)` and `sessions(...)` return at once, and `scratch_stream(prefix)` is entered with `async with`. `Laser.connect_env()`, `memory_topic(...)` and every call that reads or writes (`remember`, `supersede`, `recall`, `forget`, `workflow.run()`, `bootstrap`) return an awaitable. Both programs are in [`examples/python`](../../examples/python/README.md) as `workflow.py` and `memory_correction.py`.
 
 ## What runs where
 

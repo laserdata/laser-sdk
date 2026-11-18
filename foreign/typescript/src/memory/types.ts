@@ -188,7 +188,8 @@ export interface Feedback {
   readonly note?: string
 }
 
-/** A memory backend. A write gets the caller's options, so it can stop retrying on abort. */
+/** A memory backend. A write and a recall get the caller's options, so they can stop retrying
+ * or waiting on abort. */
 export interface Memory {
   append?(
     scope: MemoryScope,
@@ -198,7 +199,11 @@ export interface Memory {
     options?: CallOptions
   ): Promise<MemoryId>
   remember(scope: MemoryScope, payload: Uint8Array, options?: CallOptions): Promise<MemoryId>
-  recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]>
+  recall(
+    scope: MemoryScope,
+    query: MemoryQuery,
+    options?: CallOptions
+  ): Promise<readonly MemoryItem[]>
   improve(scope: MemoryScope, feedback: Feedback, options?: CallOptions): Promise<MemoryId>
   forget(scope: MemoryScope, id: MemoryId, options?: CallOptions): Promise<void>
 }

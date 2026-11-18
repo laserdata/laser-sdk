@@ -358,6 +358,8 @@ function reader(
   coordinator: Coordinator,
   layout: {
     readonly guarded?: ConsumerFilter
+    // Answers the catalog and schema reads of a guard the reader loads itself.
+    readonly guardLoads?: FilterTransport["sendManaged"]
     readonly partitionIds?: readonly number[]
     readonly idleIntervalMs?: number
     readonly maxUnackedPages?: number
@@ -365,13 +367,18 @@ function reader(
     readonly start?: FilteredStart
   } = {}
 ): FilteredReader {
-  const transport = baseTransport(() =>
-    Promise.reject(new Error("the shared transport is not used"))
+  const transport = baseTransport(
+    layout.guardLoads ?? (() => Promise.reject(new Error("the shared transport is not used")))
   )
+  const served: Capabilities =
+    layout.guardLoads === undefined
+      ? capabilities
+      : { ...capabilities, filters: { ...capabilities.filters, catalog: true } }
   const start: FilteredStart = layout.start ?? { kind: "first" }
   return FilteredReader.create({
     transport,
-    filters: new Filters(transport, () => Promise.resolve(capabilities)),
+    filters: new Filters(transport, () => Promise.resolve(served)),
+    ...(layout.guardLoads === undefined ? {} : { guardEnabled: true }),
     coordinator: coordinator.connection,
     request: {
       v: FILTER_OP_VERSION,
@@ -674,6 +681,38 @@ void test("given_inconsistent_reply_metadata_when_reading_without_a_guard_then_s
     await assert.rejects(filtered.tryNextPage(), ProtocolError)
     await filtered.close()
   }
+})
+
+void test("given_a_guard_load_every_node_refuses_when_the_page_signal_aborts_then_should_end_the_transport_wait", async () => {
+  const roster = refusingRoster()
+  const filtered = reader(
+    coordinatorOf({ poll: () => Promise.resolve(pageReply(page({ offsets: [0n] }))) }),
+    { guardLoads: roster.sendManaged }
+  )
+  const controller = new AbortController()
+  const reading = filtered.nextPage({ signal: controller.signal })
+  await until(() => roster.waiting() === 1, 1_000)
+  controller.abort()
+  await assert.rejects(reading, CancelledError)
+  await until(() => roster.waiting() === 0, 1_000)
+  await filtered.close()
+})
+
+void test("given_a_guard_load_every_node_refuses_when_the_page_times_out_then_should_end_the_load_by_the_page_deadline", async () => {
+  const roster = refusingRoster()
+  const filtered = reader(
+    coordinatorOf({ poll: () => Promise.resolve(pageReply(page({ offsets: [0n] }))) }),
+    { guardLoads: roster.sendManaged }
+  )
+  await assert.rejects(within(filtered.nextPage({ timeoutMs: 50 }), 1_000), (error: unknown) => {
+    assert.ok(
+      !(error instanceof Error && error.message.startsWith("not settled")),
+      "the page deadline ends the guard load"
+    )
+    return true
+  })
+  assert.equal(roster.waiting(), 0)
+  await filtered.close()
 })
 
 void test("given_stored_record_headers_when_matched_then_should_carry_them_to_the_record", async () => {
@@ -2196,6 +2235,51 @@ function unavailableReply(): Uint8Array {
       }
     })
   )
+}
+
+// A roster whose every node refuses each managed read. The transport waits the
+// refusals out until the signal it was handed aborts or the walk it was handed
+// ends, then answers the last refusal, as `Nodes.read` does.
+function refusingRoster(): {
+  readonly sendManaged: FilterTransport["sendManaged"]
+  readonly waiting: () => number
+} {
+  let waiting = 0
+  const refused = encodeNamed(
+    new Map([
+      ["code", "backend_unavailable"],
+      ["message", "replaying its logs"]
+    ])
+  )
+  const sendManaged: FilterTransport["sendManaged"] = (_code, _payload, options) => {
+    waiting += 1
+    return new Promise((resolve, reject) => {
+      let ended = false
+      const end = (): boolean => {
+        if (ended) return false
+        ended = true
+        waiting -= 1
+        return true
+      }
+      const walk = options?.walk
+      if (walk?.kind === "until") {
+        setTimeout(
+          () => {
+            if (end()) resolve(refused)
+          },
+          Math.max(0, walk.deadline - Date.now())
+        )
+      }
+      options?.signal?.addEventListener(
+        "abort",
+        () => {
+          if (end()) reject(new CancelledError("managed read aborted"))
+        },
+        { once: true }
+      )
+    })
+  }
+  return { sendManaged, waiting: () => waiting }
 }
 
 // A page that examined nothing past `at`, where the read started.

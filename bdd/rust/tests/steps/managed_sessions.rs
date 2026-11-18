@@ -30,6 +30,7 @@ const CONVERGE: Duration = Duration::from_secs(30);
 /// The state of one managed-session scenario.
 #[derive(Default)]
 pub struct Managed {
+    owned_streams: Vec<ScratchStream>,
     laser: Option<Laser>,
     sessions: Option<Sessions>,
     layout: SessionLayout,
@@ -52,6 +53,41 @@ pub struct Managed {
 }
 
 impl Managed {
+    pub async fn cleanup(&mut self) {
+        let mut failures = Vec::new();
+        drop(self.lease.take());
+        drop(self.watch.take());
+        if let Some(worker) = self.worker.take()
+            && let Err(error) = worker.shutdown().await
+        {
+            failures.push(error.to_string());
+        }
+        if let Some(writer) = self.writer.take()
+            && let Err(error) = writer.close().await
+        {
+            failures.push(error.to_string());
+        }
+        for scratch in self.owned_streams.drain(..) {
+            let name = scratch.name();
+            let client = scratch.laser();
+            let stream = client.stream(name);
+            let removed = async {
+                scratch.delete().await?;
+                stream.exists().await
+            }
+            .await;
+            match removed {
+                Ok(false) => {}
+                Ok(true) => failures.push(format!("scenario left stream {name}")),
+                Err(error) => failures.push(format!("could not remove stream {name}: {error}")),
+            }
+            if let Err(error) = client.close().await {
+                failures.push(error.to_string());
+            }
+        }
+        assert!(failures.is_empty(), "scenario cleanup failed: {failures:?}");
+    }
+
     fn sessions(&self) -> &Sessions {
         self.sessions.as_ref().expect("a managed session stream")
     }
@@ -115,9 +151,16 @@ async fn eventually_showing<T>(
 
 // A stream bootstrapped for sessions in `layout` on a connection-string
 // client, registered as a session source.
-async fn managed_stream(config: SessionConfig) -> (Laser, Sessions) {
+async fn managed_stream(world: &mut LaserWorld, config: SessionConfig) -> (Laser, Sessions) {
     let fresh = fresh_connected_laser().await;
-    let sessions = fresh.laser.sessions_with(config);
+    let scratch = fresh
+        .laser
+        .scratch_stream("bdd")
+        .await
+        .expect("create a fresh session stream");
+    let laser = scratch.laser().clone();
+    world.managed.owned_streams.push(scratch);
+    let sessions = laser.sessions_with(config);
     let bootstrap = sessions
         .bootstrap(4, TopicRetention::expire_after(Duration::from_secs(86_400)))
         .await
@@ -143,7 +186,7 @@ async fn managed_stream(config: SessionConfig) -> (Laser, Sessions) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    (fresh.laser, sessions)
+    (laser, sessions)
 }
 
 fn layout(name: &str) -> SessionLayout {
@@ -169,7 +212,8 @@ async fn indexed(sessions: &Sessions, id: ConversationId) -> Option<SessionInfo>
 #[given(regex = r"^a managed session stream in the (.+) layout$")]
 async fn managed_layout(world: &mut LaserWorld, name: String) {
     let layout = layout(&name);
-    let (laser, sessions) = managed_stream(SessionConfig::new().layout(layout.clone())).await;
+    let (laser, sessions) =
+        managed_stream(world, SessionConfig::new().layout(layout.clone())).await;
     world.managed.layout = layout;
     world.managed.laser = Some(laser);
     world.managed.sessions = Some(sessions);
@@ -178,14 +222,14 @@ async fn managed_layout(world: &mut LaserWorld, name: String) {
 #[given(regex = r"^a managed session stream whose agents heartbeat every (\d+) seconds?$")]
 async fn managed_heartbeat(world: &mut LaserWorld, seconds: u64) {
     let config = SessionConfig::new().heartbeat(Duration::from_secs(seconds));
-    let (laser, sessions) = managed_stream(config).await;
+    let (laser, sessions) = managed_stream(world, config).await;
     world.managed.laser = Some(laser);
     world.managed.sessions = Some(sessions);
 }
 
 #[given("a second managed session stream")]
 async fn second_stream(world: &mut LaserWorld) {
-    world.managed.second = Some(managed_stream(SessionConfig::new()).await.1);
+    world.managed.second = Some(managed_stream(world, SessionConfig::new()).await.1);
 }
 
 #[when(

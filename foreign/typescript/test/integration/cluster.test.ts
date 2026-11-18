@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { randomUUID } from "node:crypto"
+import { createServer, type Server } from "node:net"
 import { test } from "node:test"
 import { Agent, type AgentHandle } from "../../src/agent/builder.js"
 import { TimeoutError } from "../../src/client/errors.js"
@@ -31,7 +32,7 @@ import {
   decodeFilteredWaitCancel,
   decodeFilteredWaitRequest
 } from "../../src/wire/filter.js"
-import { TestIggyCluster } from "../support/test-iggy.js"
+import { TestIggyCluster, uniquePorts } from "../support/test-iggy.js"
 
 // One filtered wait the reader sent: the node, its partitions, and when it ended.
 interface HeldWait {
@@ -1222,5 +1223,80 @@ function within<Value>(promise: Promise<Value>, timeoutMs: number): Promise<Valu
         reject(error instanceof Error ? error : new Error(String(error)))
       }
     )
+  })
+}
+
+// A reserved port is free until its node binds it, and any process can take it in between.
+void test(
+  "given_a_reserved_cluster_port_taken_before_a_node_binds_when_starting_then_should_start_on_fresh_ports",
+  { timeout: 120_000 },
+  async () => {
+    const holder = await listenOn(0)
+    const heldPort = portOf(holder)
+    let reservations = 0
+    const cluster = await TestIggyCluster.start(3, undefined, async (count) => {
+      reservations += 1
+      const ports = await uniquePorts(count)
+      if (reservations === 1) ports[0] = heldPort
+      return ports
+    })
+    try {
+      assert.ok(reservations > 1, "the cluster reserved ports again")
+      assert.notEqual(cluster.nodeEndpoint(0).port, heldPort)
+      await cluster.leaderAndFollower()
+    } finally {
+      await cluster.close()
+      await closed(holder)
+    }
+  }
+)
+
+// A stopped node comes back on the address its peers know, so it cannot move to another port.
+void test(
+  "given_a_stopped_node_whose_port_is_taken_when_starting_it_again_then_should_rejoin_once_the_port_is_free",
+  { timeout: 120_000 },
+  async () => {
+    const cluster = await TestIggyCluster.start()
+    try {
+      const [, follower] = await cluster.leaderAndFollower()
+      await cluster.stopNode(follower)
+      const holder = await listenOn(cluster.nodeEndpoint(follower).port)
+      const released = new Promise<void>((resolveReleased) => {
+        setTimeout(() => {
+          void closed(holder).then(resolveReleased)
+        }, 1_000)
+      })
+
+      await cluster.startNode(follower)
+
+      await released
+      await cluster.leaderAndFollower(follower)
+    } finally {
+      await cluster.close()
+    }
+  }
+)
+
+function listenOn(port: number): Promise<Server> {
+  return new Promise((resolveListening, reject) => {
+    const server = createServer()
+    server.once("error", reject)
+    server.listen(port, "127.0.0.1", () => {
+      resolveListening(server)
+    })
+  })
+}
+
+function portOf(server: Server): number {
+  const address = server.address()
+  if (address === null || typeof address === "string") throw new Error("the holder has no port")
+  return address.port
+}
+
+function closed(server: Server): Promise<void> {
+  return new Promise((resolveClosed) => {
+    server.close(() => {
+      resolveClosed()
+    })
   })
 }

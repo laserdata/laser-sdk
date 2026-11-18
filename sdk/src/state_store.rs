@@ -39,7 +39,8 @@ pub trait LocalStateStore {
     async fn delete(&self, key: &str) -> Result<(), LaserError>;
 }
 
-/// An in-memory `StateStore` (a `HashMap`). Fast, not durable across restarts.
+/// Keeps state in this process only and loses it when the program exits.
+/// `FileStore` keeps it on disk and `laser.kv(namespace)` in the managed store.
 #[derive(Default)]
 pub struct InMemoryStore {
     entries: Mutex<HashMap<String, Vec<u8>>>,

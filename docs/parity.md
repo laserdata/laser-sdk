@@ -723,6 +723,7 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `Laser::cluster` | `Laser.cluster` | `Laser.cluster` |  |
 | `Laser::connect` | `Laser.connect` | `Laser.connect` |  |
 | `Laser::connect_env` | `Laser.connect_env` | `Laser.connectEnv` |  |
+| `Laser::connect_env_with_stream` | `Laser.connect_env(stream=)` | `Laser.connectEnvWithStream` | overload |
 | `Laser::connect_with_stream` | `Laser.connect_with_stream` | `Laser.connectWithStream` |  |
 | `Laser::connection_events` | `Laser.connection_events` | `Laser.connectionEvents` |  |
 | `Laser::consumed` | `Laser.consumed` | `Laser.consumed` |  |
@@ -3150,6 +3151,14 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `EdgeDir::In` | omitted | `EdgeDir` | plain-value |
 | `EdgeDir::Both` | omitted | `EdgeDir` | plain-value |
 | `EdgeDir::is_out` | `fn:edge_dir_is_out` | `fn:edgeDirIsOut` | free-function |
+| `SessionStatus` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Submitted` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Active` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Paused` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Completed` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Failed` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Canceled` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Unrecognized` | omitted | `SessionStatus` | plain-value |
 
 ## prelude::full
 
@@ -3348,14 +3357,6 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `SchemaFingerprint::BYTES` | `const:SCHEMA_FINGERPRINT_BYTES` | `SchemaFingerprint.BYTES` | free-function |
 | `SchemaFingerprint::as_bytes` | omitted | omitted | plain-value |
 | `SchemaFingerprint::new` | omitted | omitted | plain-value |
-| `SessionStatus` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Submitted` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Active` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Paused` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Completed` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Failed` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Canceled` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Unrecognized` | omitted | `SessionStatus` | plain-value |
 | `SourceRef` | dict via `GraphHandle.fetch` | `SourceRef` | serde-dict |
 | `SourceRef::Message` | dict key | `SourceRef` | serde-dict, plain-value |
 | `SourceRef::Kv` | dict key | `SourceRef` | serde-dict, plain-value |
@@ -5063,6 +5064,7 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `IdError::Empty` | `IdError.EMPTY` | `IdError.empty` |  |
 | `IdError::TooLong` | `IdError.TOO_LONG` | `IdError.tooLong` |  |
 | `IdError::InvalidChar` | `IdError.INVALID_CHAR` | `IdError.invalidChar` |  |
+| `IdError::InvalidConversationId` | `IdError.INVALID_CONVERSATION_ID` | `IdError.invalidConversationId` |  |
 | `IdError::InvalidUlid` | `IdError.INVALID_ULID` | `IdError.invalidUlid` |  |
 | `IdError::InvalidMessageId` | `IdError.INVALID_MESSAGE_ID` | `IdError.invalidMessageId` |  |
 | `IntentId` | omitted | `IntentId` | plain-value |

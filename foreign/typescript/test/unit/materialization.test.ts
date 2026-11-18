@@ -3,7 +3,12 @@ import { test } from "node:test"
 import { Materialization, MaterializeRequest } from "../../src/managed/materialize.js"
 import { OPEN_CAPABILITIES } from "../../src/client/capabilities.js"
 import { BARE_SCOPE } from "../../src/client/resource-scope.js"
-import { InvalidError, QueryExecutionError, UnsupportedError } from "../../src/client/errors.js"
+import {
+  CancelledError,
+  InvalidError,
+  QueryExecutionError,
+  UnsupportedError
+} from "../../src/client/errors.js"
 import { code } from "../../src/client/error-classify.js"
 import type { BindingStatus, ProjectionInfo } from "../../src/wire/browse.js"
 import {
@@ -209,6 +214,27 @@ void test("given_a_slow_materialization_when_waiting_then_should_back_off_betwee
     reads <= 5,
     `pauses of 50, 100, 200 and 400 ms leave at most five reads in 600 ms, got ${String(reads)}`
   )
+})
+
+void test("given_a_status_read_every_node_refuses_when_the_wait_times_out_then_should_end_the_transport_wait", async () => {
+  let waiting = 0
+  const materialization = Materialization.create((options) => {
+    waiting += 1
+    // The transport waits the refusals out until the signal it was handed aborts.
+    return new Promise((_resolve, reject) => {
+      options?.signal?.addEventListener(
+        "abort",
+        () => {
+          waiting -= 1
+          reject(new CancelledError("managed read aborted"))
+        },
+        { once: true }
+      )
+    })
+  })
+  assert.deepEqual(await materialization.wait("applied", 50), { kind: "timed_out", status: [] })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(waiting, 0, "the status read stops with the wait")
 })
 
 void test("given_a_source_moved_to_another_index_when_waiting_on_the_applied_handle_then_should_report_not_found", async () => {

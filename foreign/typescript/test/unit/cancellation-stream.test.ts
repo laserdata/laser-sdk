@@ -6,11 +6,16 @@ import { CancelledError, PublishFailedError, TransportError } from "../../src/cl
 import {
   ApacheIggyTransport,
   type IggyClient,
-  type LaserTransport
+  type LaserTransport,
+  type ManagedSendOptions
 } from "../../src/iggy/apache-iggy.js"
 import { BatchingProducerBuilder } from "../../src/stream/batching.js"
 import { Json } from "../../src/stream/codecs.js"
-import { ConsumerGroup, type GroupContext } from "../../src/stream/consumer-group.js"
+import {
+  ConsumerGroup,
+  type GroupContext,
+  type GroupFilter
+} from "../../src/stream/consumer-group.js"
 import { Consumer, type ConsumerMessage } from "../../src/stream/consumer.js"
 import { Cursor } from "../../src/stream/cursor.js"
 import { Producer, ProducerMessage } from "../../src/stream/producer.js"
@@ -20,7 +25,11 @@ import { TypedRecords } from "../../src/stream/typed-topic.js"
 import { encodeNamed } from "../../src/wire/cbor.js"
 import {
   AGDX_FILTER_MUTATE_CODE,
+  AGDX_FILTER_PREVIEW_CODE,
+  AGDX_FILTER_TEST_CODE,
   AGDX_GET_FILTER_BINDING_CODE,
+  AGDX_LIST_FILTER_REVISIONS_CODE,
+  AGDX_LIST_FILTERS_CODE,
   FILTER_OP_VERSION
 } from "../../src/wire/codes.js"
 import {
@@ -362,6 +371,51 @@ void test("given_a_group_filter_read_waiting_for_its_reply_when_the_signal_abort
   await assert.rejects(reading, CancelledError)
 })
 
+void test("given_a_group_filter_read_every_node_refuses_when_the_signal_aborts_then_should_end_the_transport_wait", async () => {
+  const bound = encodeNamed(
+    encodeFilterCatalogReply({ kind: "ok", outcome: { kind: "binding", binding } })
+  )
+  const reads: readonly (readonly [
+    number,
+    (filter: GroupFilter, signal: AbortSignal) => unknown
+  ])[] = [
+    [AGDX_GET_FILTER_BINDING_CODE, (filter, signal) => filter.get({ signal })],
+    [AGDX_LIST_FILTERS_CODE, (filter, signal) => filter.summary({ signal })],
+    [AGDX_LIST_FILTER_REVISIONS_CODE, (filter, signal) => filter.revisions(1, 10, { signal })],
+    [AGDX_FILTER_PREVIEW_CODE, (filter, signal) => filter.preview(0, { signal })],
+    [AGDX_FILTER_TEST_CODE, (filter, signal) => filter.test("{}", [], { signal })]
+  ]
+  for (const [refused, read] of reads) {
+    let waiting = 0
+    const fixture = managedGroup(
+      (code, signal) => {
+        if (code !== refused)
+          return code === AGDX_GET_FILTER_BINDING_CODE ? Promise.resolve(bound) : undefined
+        waiting += 1
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => {
+              waiting -= 1
+              reject(new CancelledError("managed read aborted"))
+            },
+            { once: true }
+          )
+        })
+      },
+      { ...capabilities, filters: { ...capabilities.filters, native: true } }
+    )
+    const controller = new AbortController()
+    const reading = Promise.resolve(read(fixture.group.filter(), controller.signal))
+    for (let step = 0; step < 100 && fixture.codes.at(-1) !== refused; step += 1) await settled()
+    assert.equal(fixture.codes.at(-1), refused)
+    controller.abort()
+    await assert.rejects(reading, CancelledError)
+    await settled()
+    assert.equal(waiting, 0, `the transport stops waiting out refusals of ${String(refused)}`)
+  }
+})
+
 void test("given_a_topic_send_in_flight_when_the_signal_aborts_then_should_reject_with_cancelled_not_a_publish_failure", async () => {
   const controller = new AbortController()
   let sends = 0
@@ -560,26 +614,36 @@ function nativeGroup(transport: LaserTransport): ConsumerGroup {
 
 // A managed group whose stream, topic and group metadata answer at once, and
 // whose other commands `reply` answers.
-function managedGroup(reply: (code: number) => Promise<Uint8Array> | undefined): {
+function managedGroup(
+  reply: (code: number, signal?: AbortSignal) => Promise<Uint8Array> | undefined,
+  served: Capabilities = capabilities
+): {
   readonly group: ConsumerGroup
   readonly codes: readonly number[]
 } {
   const codes: number[] = []
   const transport = {
     ensureConsumerGroup: () => Promise.resolve(),
-    sendManaged: (code: number): Promise<Uint8Array> => {
+    sendManaged: (
+      code: number,
+      _payload: Uint8Array,
+      options?: ManagedSendOptions
+    ): Promise<Uint8Array> => {
       codes.push(code)
       if (code === 200) return Promise.resolve(metadata(1, 1n))
       if (code === 300) return Promise.resolve(metadata(2, 2n))
       if (code === 600) return Promise.resolve(groupMetadata(7))
-      return reply(code) ?? Promise.reject(new Error(`unexpected command ${code.toString()}`))
+      return (
+        reply(code, options?.signal) ??
+        Promise.reject(new Error(`unexpected command ${code.toString()}`))
+      )
     }
   } as unknown as LaserTransport
   const group = ConsumerGroup.create(
     transport,
     Topic.create(transport, "orbit", "fleet"),
     { kind: "name", name: "workers" },
-    { transport, capabilities: () => Promise.resolve(capabilities) }
+    { transport, capabilities: () => Promise.resolve(served) }
   )
   return { group, codes }
 }

@@ -33,10 +33,11 @@ void test("given_the_rust_golden_seed_when_derived_then_should_match_the_pinned_
   assert.equal(ConversationId.derive("user-1").toString(), "6X4VM88293CP9BFK3H58TFMMS7")
 })
 
-void test("given_an_invalid_string_when_parsing_a_conversation_id_then_should_error", () => {
-  assert.throws(() => ConversationId.parse("not-a-ulid"), {
+void test("given_a_malformed_conversation_id_when_parsed_then_should_name_the_call_that_makes_one", () => {
+  assert.throws(() => ConversationId.parse("conv-1"), {
     name: "IdError",
-    message: "invalid ULID `not-a-ulid`"
+    message:
+      "invalid conversation id `conv-1`: a conversation id is a ULID, make one with ConversationId.new()"
   })
 })
 

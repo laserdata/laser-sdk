@@ -7146,6 +7146,8 @@ export class IdError extends InvalidError {
     // (undocumented)
     static invalidChar(char: string): IdError;
     // (undocumented)
+    static invalidConversationId(text: string): IdError;
+    // (undocumented)
     static invalidMessageId(text: string): IdError;
     // (undocumented)
     static invalidUlid(text: string): IdError;
@@ -7205,7 +7207,7 @@ export class IndexSchemaBuilder {
 // @public (undocumented)
 const INLINE_PAYLOAD = "agdx.inline";
 
-// @public (undocumented)
+// @public
 export class InMemoryStore implements StateStore {
     // (undocumented)
     delete(key: string): Promise<void>;
@@ -8261,8 +8263,8 @@ export class Laser implements AsyncDisposable {
     close(): Promise<void>;
     cluster(options?: CallOptions): Promise<ClusterInfo>;
     static connect(connectionString: string, options?: CallOptions): Promise<Laser>;
-    // (undocumented)
     static connectEnv(env?: Readonly<Record<string, string | undefined>>, options?: CallOptions): Promise<Laser>;
+    static connectEnvWithStream(stream: string, env?: Readonly<Record<string, string | undefined>>, options?: CallOptions): Promise<Laser>;
     connectionEvents(options?: CallOptions): ConnectionEvents;
     // (undocumented)
     static connectWithStream(connectionString: string, stream: string, options?: CallOptions): Promise<Laser>;
@@ -8306,12 +8308,10 @@ export class Laser implements AsyncDisposable {
         readonly namePrefix?: string;
         readonly search?: string;
     }): Promise<readonly Role[]>;
-    // (undocumented)
     static local(options?: CallOptions): Promise<Laser>;
     // (undocumented)
     materialization(projectionId: string): Materialization;
     me(options?: CallOptions): Promise<ClientInfo>;
-    // (undocumented)
     memory(namespace: string): MemoryHandle;
     // (undocumented)
     memoryCustom(memory: Memory): MemoryHandle;
@@ -8395,7 +8395,6 @@ export class Laser implements AsyncDisposable {
     withObserver(observer: LaserObserver): Laser;
     withOpsStream(opsStream: string): Laser;
     withResourceNaming(naming: ResourceNaming): Laser;
-    // (undocumented)
     workflow(name: string): Workflow;
 }
 
@@ -8718,14 +8717,14 @@ export class LogMemory implements Memory {
     constructor(laser: Laser, namespace?: string, topic?: string, stream?: string | undefined);
     // (undocumented)
     append(scope: MemoryScope, id: MemoryId, kind: MemoryKind, payload: Uint8Array, options?: CallOptions): Promise<MemoryId>;
-    fetchNamed(key: string): Promise<Uint8Array | undefined>;
+    fetchNamed(key: string, options?: CallOptions): Promise<Uint8Array | undefined>;
     fetchNamedFolded(key: string): Promise<Uint8Array | undefined>;
     // (undocumented)
     forget(scope: MemoryScope, id: MemoryId, options?: CallOptions): Promise<void>;
     forgetNamed(key: string, options?: CallOptions): Promise<void>;
     // (undocumented)
     improve(scope: MemoryScope, feedback: Feedback, options?: CallOptions): Promise<MemoryId>;
-    recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]>;
+    recall(scope: MemoryScope, query: MemoryQuery, options?: CallOptions): Promise<readonly MemoryItem[]>;
     recallFolded(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]>;
     // (undocumented)
     remember(scope: MemoryScope, payload: Uint8Array, options?: CallOptions): Promise<MemoryId>;
@@ -9375,7 +9374,7 @@ export interface Memory {
     // (undocumented)
     improve(scope: MemoryScope, feedback: Feedback, options?: CallOptions): Promise<MemoryId>;
     // (undocumented)
-    recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]>;
+    recall(scope: MemoryScope, query: MemoryQuery, options?: CallOptions): Promise<readonly MemoryItem[]>;
     // (undocumented)
     remember(scope: MemoryScope, payload: Uint8Array, options?: CallOptions): Promise<MemoryId>;
 }
@@ -9415,7 +9414,7 @@ export type MemoryClass = (typeof MemoryClass)[keyof typeof MemoryClass];
 // @public (undocumented)
 export function memoryClass(kind: MemoryKind): MemoryClass;
 
-// @public (undocumented)
+// @public
 export class MemoryHandle implements Memory {
     // (undocumented)
     append(scope: MemoryScope, id: MemoryId, kind: MemoryKind, payload: Uint8Array | string, options?: CallOptions): Promise<MemoryId>;
@@ -11563,7 +11562,6 @@ interface RecordSkip {
     readonly reason: string;
     // (undocumented)
     readonly source: SourceSelector;
-    // (undocumented)
     readonly target: string;
     // (undocumented)
     readonly topicCreatedAtMicros: bigint;
@@ -11742,7 +11740,7 @@ export class RerankedMemory implements Memory {
     // (undocumented)
     improve(scope: MemoryScope, feedback: Feedback, options?: CallOptions): Promise<MemoryId>;
     // (undocumented)
-    recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]>;
+    recall(scope: MemoryScope, query: MemoryQuery, options?: CallOptions): Promise<readonly MemoryItem[]>;
     // (undocumented)
     remember(scope: MemoryScope, payload: Uint8Array, options?: CallOptions): Promise<MemoryId>;
 }
@@ -13474,7 +13472,6 @@ export function statusEnvelope(record: RecordId, conversation: WireConversationI
 
 // @public (undocumented)
 export interface StepContext {
-    // (undocumented)
     readonly outputs: ReadonlyMap<string, Uint8Array>;
 }
 
@@ -14422,7 +14419,7 @@ export function valueFromInput(input: string): Value;
 // @public (undocumented)
 const VECTOR_FIELD = "embedding";
 
-// @public (undocumented)
+// @public
 export class VectorMemory implements Memory {
     [WITH_EMBEDDER](embedder: Embedder): VectorMemory;
     constructor(embedder: Embedder, laser?: Laser | undefined);
@@ -16256,7 +16253,7 @@ function withTool(envelope: AgentEnvelope, tool: string): AgentEnvelope;
 // @public (undocumented)
 function withUsage(envelope: AgentEnvelope, usage: TokenUsage): AgentEnvelope;
 
-// @public (undocumented)
+// @public
 export class Workflow {
     // (undocumented)
     budget(budget: WorkflowBudget): this;
@@ -16288,13 +16285,9 @@ export class WorkflowBudget {
 
 // @public
 export interface WorkflowOutcome {
-    // (undocumented)
     readonly completedSteps: readonly string[];
-    // (undocumented)
     readonly outputs: ReadonlyMap<string, Uint8Array>;
-    // (undocumented)
     readonly runId: ConversationId;
-    // (undocumented)
     readonly status: SessionStatus;
     text(label: string): string | undefined;
 }

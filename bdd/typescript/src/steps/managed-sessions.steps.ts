@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -21,6 +20,7 @@ import {
   isPermissionDenied,
   routeTo,
   type AgentHandle,
+  type ScratchStream,
   type MemoryItem,
   type Session,
   type SessionInfo,
@@ -40,10 +40,10 @@ const decoder = new TextDecoder();
 
 /** The streams, sessions, and reads of one managed-session scenario. */
 interface Managed {
+  readonly ownedStreams: ScratchStream[];
   laser?: Laser;
   sessions?: Sessions;
   layout: string;
-  secondLaser?: Laser;
   second?: Sessions;
   secondSession?: ConversationId;
   readonly labels: Map<string, ConversationId>;
@@ -68,7 +68,13 @@ const scenarios = new WeakMap<LaserWorld, Managed>();
 function managed(world: LaserWorld): Managed {
   let state = scenarios.get(world);
   if (state === undefined) {
-    state = { layout: "shared", labels: new Map(), children: [], handled: [] };
+    state = {
+      layout: "shared",
+      labels: new Map(),
+      children: [],
+      handled: [],
+      ownedStreams: [],
+    };
     scenarios.set(world, state);
   }
   return state;
@@ -141,10 +147,16 @@ async function managedStream(
   world: LaserWorld,
   config: SessionConfig,
 ): Promise<{ laser: Laser; sessions: Sessions }> {
-  const laser = await Laser.connectWithStream(
-    world.endpoint,
-    `bdd-ts-${randomUUID().slice(0, 12)}`,
-  );
+  const root = await Laser.connect(world.endpoint);
+  let scratch: ScratchStream;
+  try {
+    scratch = await root.scratchStream("bdd-ts");
+  } catch (error) {
+    await root.close();
+    throw error;
+  }
+  managed(world).ownedStreams.push(scratch);
+  const laser = scratch.laser;
   const sessions = laser.sessions(config);
   const bootstrap = await sessions.bootstrap(
     4,
@@ -218,8 +230,8 @@ Given(
 );
 
 Given("a second managed session stream", async function (this: LaserWorld) {
-  const { laser, sessions } = await managedStream(this, new SessionConfig());
-  Object.assign(managed(this), { secondLaser: laser, second: sessions });
+  const { sessions } = await managedStream(this, new SessionConfig());
+  managed(this).second = sessions;
 });
 
 async function begin(
@@ -1289,11 +1301,31 @@ Then(
 After(async function (this: LaserWorld) {
   const state = scenarios.get(this);
   if (state === undefined) return;
-  state.watchAbort?.abort("scenario cleanup");
-  state.lease?.release();
-  if (state.worker !== undefined) await state.worker.shutdown();
-  if (state.secondLaser !== undefined) await state.secondLaser.close();
-  scenarios.delete(this);
+  try {
+    state.watchAbort?.abort("scenario cleanup");
+    state.lease?.release();
+    if (state.worker !== undefined) await state.worker.shutdown();
+    if (state.writer !== undefined) await state.writer.close();
+  } finally {
+    const results = await Promise.allSettled(
+      state.ownedStreams.map(async (scratch) => {
+        try {
+          await scratch.delete();
+          assert.equal(
+            await scratch.laser.stream(scratch.name).exists(),
+            false,
+            `scenario left stream ${scratch.name}`,
+          );
+        } finally {
+          await scratch.laser.close();
+        }
+      }),
+    );
+    scenarios.delete(this);
+    for (const result of results) {
+      if (result.status === "rejected") throw result.reason;
+    }
+  }
 });
 
 When(

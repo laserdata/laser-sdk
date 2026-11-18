@@ -4,60 +4,83 @@ This package provides the native TypeScript Laser SDK for Apache Iggy. [LaserDat
 
 This package needs Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> This source tree is the `0.10.2` release. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+> This source tree is the `0.11.0` release. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 ## Start here
 
-In a new directory, run `npm init -y && npm pkg set type=module && npm install @laserdata/laser-sdk tsx`, set `LASER_CONNECTION_STRING`, save either program as `main.ts`, and run it with `npx tsx main.ts`. The programs use top-level `await`, so the project must be an ES module. Each one creates a scratch stream with a unique name, prints its result as JSON, and deletes the stream when it ends.
+In a new directory, run `npm install @laserdata/laser-sdk tsx`, save either program as `main.mts`, and run it with `npx tsx main.mts`. `LASER_CONNECTION_STRING` is usually already set where the program runs, such as a LaserData Cloud workload, CI, or an agent sandbox, so check it before you look for a server: `echo "${LASER_CONNECTION_STRING:+configured}"` prints `configured` when it is. Then there is no server to start. Each one creates a scratch stream with a unique name, prints its result as JSON, and deletes the stream when it ends. To keep what a program writes, connect with `Laser.connectEnvWithStream(name)` or call `withDefaultStream(name)` instead of opening a scratch stream. Coding agents can read these docs through [Context7](https://context7.com/laserdata/laser-sdk) as well as [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk).
 
-A durable workflow of three steps whose bodies run in this process. The run journals every completed step and creates the agent topics it needs, so it needs no `bootstrap`, agent, or handler. `.runId(outcome.runId)` on the same workflow resumes the run and skips every recorded step:
+A durable workflow of three steps whose bodies run in this process, in dependency order. `analyze` is an async function that awaits one second. A body gets `{ outputs }`, the earlier outputs by label as bytes, and returns a string or bytes, directly or as a promise. The run journals every completed step and creates the agent topics it needs, so it needs no `bootstrap`, agent, or handler. `.runId(outcome.runId)` on the same workflow resumes the run and skips every recorded step:
 
 ```ts
+// npm install @laserdata/laser-sdk tsx
+// Run with: npx tsx main.mts
+// Needs only LASER_CONNECTION_STRING, which connectEnv() reads. No server to start when it is set.
+// Check: echo "${LASER_CONNECTION_STRING:+configured}"
+import { setTimeout as sleep } from "node:timers/promises"
 import { Laser } from "@laserdata/laser-sdk"
 
-await using laser = await Laser.connectEnv()
-await using scratch = await laser.scratchStream("workflow-demo")
+const decode = (bytes?: Uint8Array) => new TextDecoder().decode(bytes)
+
+await using root = await Laser.connectEnv()
+await using scratch = await root.scratchStream("workflow")
+
 const outcome = await scratch.laser
-  .workflow("job-runner")
-  .stepLocal("create", () => "job-42")
-  .stepLocal(
-    "process",
-    ({ outputs }) => `processed ${new TextDecoder().decode(outputs.get("create"))}`
-  )
-  .after("create")
-  .stepLocal("finish", () => "completed")
-  .after("process")
+  .workflow("pipeline")
+  .stepLocal("ingest", () => "frames from sat-7")
+  .stepLocal("analyze", async ({ outputs }) => {
+    await sleep(1000)
+    return `analyzed ${decode(outputs.get("ingest"))}`
+  })
+  .after("ingest")
+  .stepLocal("report", ({ outputs }) => `report on ${decode(outputs.get("analyze"))}`)
+  .after("analyze")
   .run()
-const report = {
-  runId: outcome.runId.toString(),
-  status: outcome.status,
-  completedSteps: outcome.completedSteps,
-  outputs: Object.fromEntries(outcome.completedSteps.map((label) => [label, outcome.text(label)]))
-}
-console.log(JSON.stringify(report, null, 2))
+
+console.log(
+  JSON.stringify({
+    run_id: outcome.runId.toString(),
+    status: outcome.status,
+    completed_steps: outcome.completedSteps,
+    report: outcome.text("report")
+  })
+)
 ```
 
-A memory correction for one user. `supersede` remembers the new fact and forgets the old one in every conversation. Recall waits until the memory view shows this connection's own writes and ranks every fact of the user by the words it shares with the question:
+It prints the run as JSON: `run_id`, `"status": "completed"`, `"completed_steps": ["ingest", "analyze", "report"]`, and `"report": "report on analyzed frames from sat-7"`. The `WorkflowOutcome` also carries `outputs`, each step's output by label as bytes, and `text(label)` decodes one.
+
+A memory correction for one user. `supersede` remembers the new fact and forgets the old one in every conversation. Recall waits until the memory view shows this connection's own writes and ranks every fact of the user by the words it shares with the question, newest first among equals:
 
 ```ts
+// npm install @laserdata/laser-sdk tsx
+// Run with: npx tsx main.mts
+// Needs only LASER_CONNECTION_STRING, which connectEnv() reads. No server to start when it is set.
+// Check: echo "${LASER_CONNECTION_STRING:+configured}"
 import { ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
 
-await using laser = await Laser.connectEnv()
-await using scratch = await laser.scratchStream("memory-demo")
+const user = "user-42"
+const query = "Where does the user live, and what should I know before booking dinner?"
+
+await using root = await Laser.connectEnv()
+await using scratch = await root.scratchStream("memory")
 const memory = scratch.laser.memory("assistant")
+
+// Conversation 1: the user shares three facts.
 const first = ConversationId.new()
-const home = await memory.remember("Sam lives in Berlin").scope(first).user("sam").send()
-await memory.remember("Sam is allergic to peanuts").scope(first).user("sam").send()
-await memory
-  .supersede(home, "Sam lives in Amsterdam")
-  .scope(ConversationId.new())
-  .user("sam")
-  .send()
-const facts = await memory.recall().user("sam").semantic("where does Sam live").fetch()
-console.log(JSON.stringify(facts.map(memoryItemText), null, 2))
+const city = await memory.remember("Lives in Gdansk").scope(first).user(user).send()
+await memory.remember("Allergic to peanuts").scope(first).user(user).send()
+await memory.remember("Prefers a window seat").scope(first).user(user).send()
+
+// Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+const second = ConversationId.new()
+await memory.supersede(city, "Lives in Lisbon").scope(second).user(user).send()
+
+// Recall for the user across every conversation.
+const facts = await memory.recall().user(user).semantic(query).limit(10).fetch()
+console.log(JSON.stringify({ user, query, facts: facts.map(memoryItemText) }, null, 2))
 ```
 
-Both programs run against plain Apache Iggy, Laser Stack, and LaserData Cloud: a deployment that serves no managed memory view folds the memory topic in process for the same recall. Both programs are the standalone [`workflow`](../../examples/typescript/src/workflow/main.ts) and [`memory-correction`](../../examples/typescript/src/memory-correction/main.ts) examples.
+It prints `{"user": "user-42", "query": "Where does the user live, and what should I know before booking dinner?", "facts": ["Lives in Lisbon", "Prefers a window seat", "Allergic to peanuts"]}`. Gdansk is gone. Both programs run against plain Apache Iggy, Laser Stack, and LaserData Cloud: a deployment that serves no managed memory view folds the memory topic in process for the same recall. Both programs are the standalone [`workflow`](../../examples/typescript/src/workflow/main.ts) and [`memory-correction`](../../examples/typescript/src/memory-correction/main.ts) examples.
 
 **Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.com/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 

@@ -39,6 +39,8 @@ pub struct CatalogState {
     pub owner_lookups: Vec<FilterGroupIdentity>,
     // The node and command code of every forwarded command, in arrival order.
     pub forwarded: Vec<(usize, u32)>,
+    // Binding reads still to leave unanswered, as a backend that does not answer.
+    pub unanswered_binding_reads: u32,
 }
 
 pub struct OwnedFilter {
@@ -285,6 +287,12 @@ impl CatalogState {
     }
 
     fn answer(&mut self, forwarded: &ForwardedCommand) -> Option<Vec<u8>> {
+        if forwarded.command_code == AGDX_GET_FILTER_BINDING_CODE
+            && self.unanswered_binding_reads > 0
+        {
+            self.unanswered_binding_reads -= 1;
+            return None;
+        }
         let reply = match forwarded.command_code {
             AGDX_BACKEND_HELLO_CODE => {
                 return encode_named(&BackendAnnounce::new(

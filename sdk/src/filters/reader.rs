@@ -11,7 +11,7 @@ use crate::iggy::prelude::{
 };
 use crate::laser::{Laser, transport_client};
 use crate::nodes::{Answered, Target, is_route_stale, partition_primary};
-use crate::retry::{MANAGED_MUTATION, MANAGED_MUTATION_DEADLINE};
+use crate::retry::{MANAGED_DEADLINE, MANAGED_RETRY};
 use crate::stream::ConsumerStart;
 use crate::stream::transport::{policy_aware, seed_group_partition};
 use bytes::Bytes;
@@ -1320,19 +1320,19 @@ impl FilteredReader {
         error
     }
 
-    // Store the completed prefix like `flush`, again on the managed mutation
+    // Store the completed prefix like `flush`, again on the managed retry
     // backoff while a failover leaves the partition without a primary that
     // takes it. Each repeat sends the same target, never past what was
     // delivered.
     async fn store(&mut self, partition_id: u32) -> Result<(), LaserError> {
-        let deadline = Instant::now() + MANAGED_MUTATION_DEADLINE;
+        let deadline = Instant::now() + MANAGED_DEADLINE;
         let mut attempt = 0;
         loop {
             match self.flush(partition_id).await {
                 Err(error) if is_route_moved(&error) && Instant::now() < deadline => {
                     attempt += 1;
                     tracing::debug!(target: "laser", partition_id, attempt, %error, "Storing the progress of partition {partition_id} found no primary, it is sent again.");
-                    sleep(MANAGED_MUTATION.delay(attempt)).await;
+                    sleep(MANAGED_RETRY.delay(attempt)).await;
                 }
                 stored => return stored,
             }

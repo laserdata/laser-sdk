@@ -1001,12 +1001,63 @@ impl PyLaser {
         })
     }
 
-    /// Open a [`Workflow`](crate::workflow::PyWorkflow): dependency-ordered steps
-    /// over the coordination primitives, with budgets, verifier panels, fenced
-    /// exclusivity, on-timeout reassignment, and saga compensation. Declare steps,
-    /// then `await wf.run()`. The name is the orchestrator identity the run
-    /// dispatches as. `fixed_inbox` routes every step to a fixed topic (a
-    /// server with no presence command). Omit it to resolve advertised inboxes.
+    /// A `Workflow` named `name`, returned at once: chain `step` calls, then
+    /// `outcome = await wf.run()`. A step with `run=` runs in this process and
+    /// needs no agent, and the run creates its topics, so it needs no
+    /// `bootstrap`. Steps routed to agents, budgets, verifier panels, fenced
+    /// exclusivity, on-timeout reassignment, and saga compensation mix in. The
+    /// name is the orchestrator identity the run dispatches as, a valid agent
+    /// id. `fixed_inbox` routes every step to a fixed topic (a server with no
+    /// presence command). Omit it to resolve advertised inboxes.
+    ///
+    /// A complete program. It needs only `LASER_CONNECTION_STRING`:
+    ///
+    /// ```python
+    /// import asyncio
+    /// import json
+    ///
+    /// import laser_sdk as ls
+    ///
+    ///
+    /// async def analyze(outputs):
+    ///     await asyncio.sleep(1)
+    ///     return b"analyzed " + outputs["ingest"]
+    ///
+    ///
+    /// async def main():
+    ///     async with await ls.Laser.connect_env() as root:
+    ///         async with root.scratch_stream("workflow") as scratch:
+    ///             outcome = await (
+    ///                 scratch.laser.workflow("pipeline")
+    ///                 .step("ingest", run=lambda outputs: "frames from sat-7")
+    ///                 .step("analyze", after=["ingest"], run=analyze)
+    ///                 .step(
+    ///                     "report",
+    ///                     after=["analyze"],
+    ///                     run=lambda outputs: b"report on " + outputs["analyze"],
+    ///                 )
+    ///                 .run()
+    ///             )
+    ///
+    ///     print(
+    ///         json.dumps(
+    ///             {
+    ///                 "run_id": outcome.run_id,
+    ///                 "status": outcome.status,
+    ///                 "completed_steps": outcome.completed_steps,
+    ///                 "report": outcome.text("report"),
+    ///             }
+    ///         )
+    ///     )
+    ///
+    ///
+    /// asyncio.run(main())
+    /// ```
+    ///
+    /// A step's `run` is a plain function or an `async def`. It gets the
+    /// earlier steps' outputs by label as bytes and returns `str` or `bytes`.
+    /// The outcome has `run_id`, `status` (`"completed"`), `completed_steps`,
+    /// `outputs` and `text(label)`.
     #[pyo3(signature = (name, *, fixed_inbox=None))]
     fn workflow(&self, name: String, fixed_inbox: Option<String>) -> crate::workflow::PyWorkflow {
         crate::workflow::PyWorkflow::new(self.inner.clone(), name, fixed_inbox)

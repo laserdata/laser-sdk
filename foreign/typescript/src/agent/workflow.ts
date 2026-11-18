@@ -82,11 +82,13 @@ export class WorkflowBudget {
 }
 
 export interface StepContext {
+  /** Every earlier step's output by label, as bytes. */
   readonly outputs: ReadonlyMap<string, Uint8Array>
 }
 
 /** A step body: a routed step's command payload, or a local step's output.
- * Text becomes its UTF-8 bytes. */
+ * A plain function or an async function, returning a string or bytes
+ * directly or as a promise. Text becomes its UTF-8 bytes. */
 export type StepFn = (context: StepContext) => BytesLike | string | Promise<BytesLike | string>
 export type Verifier = (output: Uint8Array) => boolean | Promise<boolean>
 export type OnTimeout = "fail" | "reassign"
@@ -110,9 +112,13 @@ interface Step {
  * end status, and the run id. A failed, canceled, or over-budget run throws
  * instead, so `status` reads `completed`. */
 export interface WorkflowOutcome {
+  /** Each completed step's output by label, as bytes. */
   readonly outputs: ReadonlyMap<string, Uint8Array>
+  /** The completed step labels, in completion order. */
   readonly completedSteps: readonly string[]
+  /** The run's end status, `completed` for a returned outcome. */
   readonly status: SessionStatus
+  /** The run id, which resumes the same run when passed to `Workflow.runId`. */
   readonly runId: ConversationId
   /** The output of step `label` as UTF-8 text, invalid sequences replaced,
    * or `undefined` for a label that did not complete. */
@@ -373,6 +379,28 @@ export function topologicalOrder(
   return order
 }
 
+/** A journaled workflow from `laser.workflow(name)`, returned at once. Chain
+ * `stepLocal` or `step` calls, then await `run()` for a `WorkflowOutcome`:
+ *
+ * ```ts
+ * const outcome = await laser
+ *   .workflow("pipeline")
+ *   .stepLocal("ingest", () => "frames from sat-7")
+ *   .stepLocal("analyze", async ({ outputs }) => {
+ *     await new Promise((resolve) => setTimeout(resolve, 1000))
+ *     return `analyzed ${new TextDecoder().decode(outputs.get("ingest"))}`
+ *   })
+ *   .after("ingest")
+ *   .run()
+ * console.log(outcome.status, outcome.completedSteps, outcome.text("analyze"))
+ * ```
+ *
+ * A step's body is a plain function or an async function. It gets the
+ * earlier outputs by label as bytes and returns a string or bytes. Steps run
+ * in the order `after` declares, a routed step sends its task to an agent
+ * instead, and each step can carry a verifier panel, exclusivity (a fenced
+ * at-most-once effect), an on-timeout policy, and a compensation (the saga
+ * rollback). `budget` caps the run. */
 export class Workflow {
   private budgetValue = WorkflowBudget.unlimited()
   private route: InboxRoute = ADVERTISED_INBOX_ROUTE
@@ -427,7 +455,11 @@ export class Workflow {
   }
 
   /** Add a step whose body `run` runs in this process: its result is the
-   * step output, journaled like a routed step's reply, so a resumed run skips
+   * step output, so the step needs no agent. `run` is a plain function or an
+   * async function, gets `{ outputs }` with every earlier step's output by
+   * label as bytes, and returns a string or bytes, directly or as a promise.
+   * `WorkflowOutcome.text(label)` decodes one output. The output is
+   * journaled like a routed step's reply, so a resumed run skips
    * it once recorded and runs it again when it stopped before its record. It
    * runs inside the step deadline, a compensation of it runs in process too,
    * and it cannot be exclusive. */
@@ -445,7 +477,9 @@ export class Workflow {
     return StepHandle.create(this, step)
   }
 
-  /** Run the workflow to completion, returning each step's output. A step
+  /** Await it to run the workflow to completion: it resolves to a
+   * `WorkflowOutcome` with `runId`, `status` (`completed`), `completedSteps`
+   * in completion order, `outputs` (label to bytes), and `text(label)`. A step
    * that does not complete throws `StepFailedError` after the compensations
    * of the steps with an effect ran in reverse. A misconfigured workflow (a
    * duplicate label, a broadcast step, an exclusive all-capable step,

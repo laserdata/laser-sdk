@@ -1,43 +1,42 @@
-"""workflow: three in-process steps, journaled and resumable, printed as JSON.
-
-Each step's body runs in this process and gets the outputs of the steps before
-it. The run creates its own topics, so the program needs no bootstrap, agent or
-handler. It copies alone: it imports only the SDK.
-
-Run it:
-    LASER_CONNECTION_STRING='<connection string>' python3 workflow.py
-
-Docs: https://docs.laserdata.com/laser-sdk/workflow
-"""
-
+# python -m pip install laser-sdk
+# Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
+# Check: echo "${LASER_CONNECTION_STRING:+configured}"
 import asyncio
 import json
 
-from laser_sdk import Laser
+import laser_sdk as ls
 
 
-async def main() -> None:
-    async with await Laser.connect_env() as laser:
-        async with laser.scratch_stream("workflow-demo") as scratch:
+async def analyze(outputs):
+    await asyncio.sleep(1)
+    return b"analyzed " + outputs["ingest"]
+
+
+async def main():
+    async with await ls.Laser.connect_env() as root:
+        async with root.scratch_stream("workflow") as scratch:
             outcome = await (
-                scratch.laser.workflow("job-runner")
-                .step("create", run=lambda outputs: "job-42")
+                scratch.laser.workflow("pipeline")
+                .step("ingest", run=lambda outputs: "frames from sat-7")
+                .step("analyze", after=["ingest"], run=analyze)
                 .step(
-                    "process",
-                    run=lambda outputs: "processed " + outputs["create"].decode(),
-                    after=["create"],
+                    "report",
+                    after=["analyze"],
+                    run=lambda outputs: b"report on " + outputs["analyze"],
                 )
-                .step("finish", run=lambda outputs: "completed", after=["process"])
                 .run()
             )
-    report = {
-        "run_id": outcome.run_id,
-        "status": outcome.status,
-        "completed_steps": outcome.completed_steps,
-        "outputs": {label: outcome.text(label) for label in outcome.completed_steps},
-    }
-    print(json.dumps(report, indent=2))
+
+    print(
+        json.dumps(
+            {
+                "run_id": outcome.run_id,
+                "status": outcome.status,
+                "completed_steps": outcome.completed_steps,
+                "report": outcome.text("report"),
+            }
+        )
+    )
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())

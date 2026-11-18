@@ -1667,27 +1667,36 @@ async fn given_groups_sharing_a_policy_name_when_one_is_deleted_then_should_dele
 }
 
 #[tokio::test]
-async fn given_a_failed_owner_lookup_when_deletion_is_retried_then_should_report_the_error_and_converge()
- {
+async fn given_a_failed_owner_lookup_when_deleting_then_should_wait_it_out_and_delete() {
     let laser = harness::connected_laser_at(&catalog_server().await.connection_string()).await;
     let (group, before) = deletion_group(&laser, 8).await;
     let (_, _, state) = CATALOG_SERVER.get().expect("the catalog runs");
+    let lookups = || {
+        state
+            .lock()
+            .expect("catalog state")
+            .owner_lookups
+            .iter()
+            .filter(|owner| **owner == before.identity)
+            .count()
+    };
+    let looked_up = lookups();
     state
         .lock()
         .expect("catalog state")
         .owner_lookup_failures
         .insert(before.identity);
-    let error = group
-        .filter()
-        .delete()
-        .await
-        .expect_err("the owner lookup fails");
-    assert_eq!(
-        error.filter_reason(),
-        Some(FilterErrorReason::CatalogUnavailable)
+    assert!(
+        group
+            .filter()
+            .delete()
+            .await
+            .expect("the refused lookup is waited out")
     );
-    assert_eq!(group.filter().get().await.expect("readable"), Some(before));
-    assert!(group.filter().delete().await.expect("the retry deletes"));
+    assert!(
+        lookups() >= looked_up + 2,
+        "the refused owner lookup is asked again"
+    );
     assert!(!group.filter().delete().await.expect("nothing left"));
 }
 

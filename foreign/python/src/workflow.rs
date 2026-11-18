@@ -214,12 +214,29 @@ impl PyWorkflowBudget {
     }
 }
 
-/// A journalled directed-acyclic workflow over the coordination primitives, the
-/// Python view of the Rust engine. Declare steps with [`step`](Self::step), set a
-/// [`budget`](Self::budget), then `await wf.run()`. Each step is a
-/// directed task to its target, ordered by its declared dependencies, with an
-/// optional verifier panel, exclusivity (a fenced at-most-once effect), an
-/// on-timeout policy, and a compensation (the saga rollback).
+/// A journaled workflow from `Laser.workflow(name)`, returned at once. Chain
+/// `step` calls, then await `run()` for a `WorkflowOutcome`:
+///
+/// ```python
+/// async def analyze(outputs):
+///     await asyncio.sleep(1)
+///     return b"analyzed " + outputs["ingest"]
+///
+/// outcome = await (
+///     laser.workflow("pipeline")
+///     .step("ingest", run=lambda outputs: "frames from sat-7")
+///     .step("analyze", after=["ingest"], run=analyze)
+///     .run()
+/// )
+/// print(outcome.status, outcome.completed_steps, outcome.text("analyze"))
+/// ```
+///
+/// A step's `run` is a plain function or an async def. It gets the earlier
+/// outputs by label as `bytes` and returns `str` or `bytes`. Steps run in the
+/// order `after` declares, a routed step sends its task to an agent instead,
+/// and each step can carry a verifier panel, exclusivity (a fenced
+/// at-most-once effect), an on-timeout policy, and a compensation (the saga
+/// rollback). `budget` caps the run.
 #[gen_stub_pyclass]
 #[pyclass(name = "Workflow")]
 pub struct PyWorkflow {
@@ -273,13 +290,18 @@ impl PyWorkflow {
     }
 
     /// Add a step and return the workflow, so calls chain. A local step passes
-    /// `run(outputs) -> bytes | str`, which runs in this process and whose
-    /// result is the step output, so it needs no agent. A routed step passes
+    /// `run(outputs) -> str | bytes`, which runs in this process and whose
+    /// result is the step output, so it needs no agent. `run` is a plain
+    /// function or an async def (an awaitable result is awaited), and
+    /// `outputs` holds every earlier step's output by label as `bytes`, so
+    /// `outputs["ingest"].decode()` reads one as text. A routed step passes
     /// `build` and exactly one target: `to` (a named agent),
     /// `to_capable` (one agent advertising a skill), or `all_capable` (scatter to
     /// every agent advertising a skill and fold the replies, a verifier panel).
-    /// `build(outputs) -> bytes | str` forms the task from the prior outputs. Build, verify, and compensate callbacks can return directly or through an awaitable. Objects with `build` or `verify` methods also work. Callback exceptions retain their SDK error class.
-    /// `after`
+    /// `build(outputs) -> str | bytes` forms the task from the prior outputs.
+    /// Run, build, verify, and compensate callbacks can return directly or
+    /// through an awaitable. Objects with `build` or `verify` methods also
+    /// work. Callback exceptions retain their SDK error class. `after`
     /// declares the dependencies that order the step. `verify(output) -> bool`
     /// gates completion. `exclusive` claims a fenced lease (needs the managed
     /// backend). `fence_namespace` also makes the step exclusive and aligns the
@@ -418,8 +440,9 @@ impl PyWorkflow {
         Ok(slf)
     }
 
-    /// Run the workflow, returning a `WorkflowOutcome` with the completed steps'
-    /// outputs keyed by label and the run id.
+    /// Await it to run the workflow: it returns a `WorkflowOutcome` with
+    /// `run_id`, `status` (`completed`), `completed_steps` in completion order,
+    /// `outputs` (label to `bytes`), and `text(label)`.
     /// The workflow name is the orchestrator identity it dispatches as, so it must
     /// be a valid agent id. A run on a stream without the agent topics creates
     /// them with the `bootstrap` defaults first. A failed step runs the
@@ -538,10 +561,12 @@ impl PyWorkflow {
     }
 }
 
-/// The result of a completed `Workflow.run`: each step's output by label, the
-/// run id, the completed step labels in completion order, and the run's end
-/// status, `completed` for every returned outcome since a failed run raises.
-/// Pass the run id to `Workflow.run_id` to resume the same run.
+/// The result of a completed `Workflow.run`: `outputs` (each step's output by
+/// label, as `bytes`), `run_id` (a string), `completed_steps` (the labels in
+/// completion order), `status` (`completed` for every returned outcome, since
+/// a failed run raises `StepFailedError`), and `text(label)` (one output
+/// decoded as UTF-8, or `None`). Pass the run id to `Workflow.run_id` to
+/// resume the same run.
 #[gen_stub_pyclass]
 #[pyclass(name = "WorkflowOutcome", frozen)]
 pub struct PyWorkflowOutcome {

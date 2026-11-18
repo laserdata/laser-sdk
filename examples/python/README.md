@@ -72,12 +72,12 @@ LASER_TOKEN='<token>' \
 
 ## Copy a whole program
 
-`workflow.py` and `memory_correction.py` import only `laser_sdk` and the standard library, not `_common.py`, so each runs when copied alone after `pip install laser-sdk`. Each reads `LASER_CONNECTION_STRING` through `Laser.connect_env()`, works in a scratch stream, and deletes it when its `async with` block ends.
+`workflow.py` and `memory_correction.py` import only `laser_sdk` and the standard library, not `_common.py`, so each runs when copied alone after `python -m pip install laser-sdk`. Each reads `LASER_CONNECTION_STRING` through `Laser.connect_env()`, works in a scratch stream, and deletes it when its `async with` block ends.
 
 | script | shows | needs a managed backend? |
 | --- | --- | --- |
-| [`workflow.py`](workflow.py) | three in-process steps, journaled and resumable, with the outcome printed as JSON | no |
-| [`memory_correction.py`](memory_correction.py) | two facts for one user, a `supersede` in a later conversation, and a recall of the current facts | no |
+| [`workflow.py`](workflow.py) | three in-process steps, one an `async def` that awaits one second, journaled and resumable, with the outcome printed as JSON | no |
+| [`memory_correction.py`](memory_correction.py) | three facts for one user, a `supersede` in a later conversation, and a recall of the current facts printed as JSON | no |
 
 ## Primitives: start here
 

@@ -22,16 +22,16 @@ void test(
   "given_the_standalone_workflow_when_run_then_should_print_three_completed_local_steps",
   { concurrency: false, timeout: 70_000 },
   async () => {
-    const report = (await printed("workflow")) as { readonly runId: unknown }
+    const report = (await printed("workflow")) as { readonly run_id: unknown }
 
-    assert.equal(typeof report.runId, "string")
+    assert.equal(typeof report.run_id, "string")
     assert.deepEqual(
-      { ...report, runId: "" },
+      { ...report, run_id: "" },
       {
-        runId: "",
+        run_id: "",
         status: "completed",
-        completedSteps: ["create", "process", "finish"],
-        outputs: { create: "job-42", process: "processed job-42", finish: "completed" }
+        completed_steps: ["ingest", "analyze", "report"],
+        report: "report on analyzed frames from sat-7"
       }
     )
   }
@@ -41,12 +41,23 @@ void test(
   "given_the_standalone_memory_correction_when_run_then_should_recall_the_correction_first",
   { concurrency: false, timeout: 70_000 },
   async () => {
-    assert.deepEqual(await printed("memory-correction"), [
-      "Sam lives in Amsterdam",
-      "Sam is allergic to peanuts"
-    ])
+    assert.deepEqual(await printed("memory-correction"), {
+      user: "user-42",
+      query: "Where does the user live, and what should I know before booking dinner?",
+      facts: ["Lives in Lisbon", "Prefers a window seat", "Allergic to peanuts"]
+    })
   }
 )
+
+void test("given_an_existing_project_when_setting_up_an_example_then_should_keep_its_module_type", async () => {
+  for (const program of ["workflow", "memory-correction"]) {
+    const source = await readFile(new URL(`../../src/${program}/main.ts`, import.meta.url), "utf8")
+    assert.deepEqual(source.split("\n").slice(0, 2), [
+      "// npm install @laserdata/laser-sdk tsx",
+      "// Run with: npx tsx main.mts"
+    ])
+  }
+})
 
 void test("given_the_package_readme_when_read_then_should_show_both_standalone_programs_verbatim", async () => {
   const readme = await readFile(

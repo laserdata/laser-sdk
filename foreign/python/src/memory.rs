@@ -1,5 +1,7 @@
 use crate::agent::PyProvenance;
-use crate::async_bridge::{Awaitable, HookLoop, PyHook, awaitable, call_hook, hook_callable};
+use crate::async_bridge::{
+    Awaitable, HandleCall, HookLoop, PyHook, awaitable, call_hook, handle_awaitable, hook_callable,
+};
 use crate::client::PyLaser;
 use crate::convert::{duration_ms, json_to_py, payload_bytes};
 use crate::errors::to_pyerr;
@@ -14,6 +16,12 @@ use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 use std::str::FromStr;
 use std::sync::Arc;
+
+const MEMORY_TOPIC: HandleCall = HandleCall {
+    call: "laser.memory_topic(...)",
+    handle: "memory",
+    enters: false,
+};
 
 // An `Embedder` over a Python callable or an object with `embed(text)`,
 // returning `list[float]` directly or through an awaitable.
@@ -678,13 +686,25 @@ impl PyConsolidationReport {
     }
 }
 
-/// Agent memory: `remember` a payload, `recall` the most relevant items, and
-/// `forget` one by id. The backend decides how recall ranks: the vector backend
-/// scores by semantic similarity to a query, the durable log backend reads the
-/// managed key-value view (or folds the topic with `folded=True`). Scope every
-/// call to an agent, a conversation, a user, or an application. `LogMemory`,
-/// `VectorMemory`, and `RerankedMemory` are handles over one backend each, and
-/// `Laser.memory` builds the durable one.
+/// Agent memory, from `Laser.memory(namespace)` without `await`. Every verb
+/// is awaited:
+///
+/// ```python
+/// memory = laser.memory("assistant")
+/// city = await memory.remember("Lives in Gdansk", conversation=first, user="user-42")
+/// await memory.supersede(city, "Lives in Lisbon", conversation=second, user="user-42")
+/// facts = await memory.recall(user="user-42", semantic="Where does the user live?")
+/// print([fact.text() for fact in facts])  # ['Lives in Lisbon']
+/// ```
+///
+/// `remember` returns the new item's id, `supersede` replaces a fact in every
+/// conversation, `recall` returns a list of `MemoryItem`, and `forget(id)`
+/// drops one. Scope a call to a user, an agent, a conversation, or an
+/// application. The backend decides how recall ranks: the durable log
+/// backend by the words an item shares with `semantic`, the vector backend by
+/// embedding similarity. `LogMemory`, `VectorMemory`, and `RerankedMemory`
+/// are handles over one backend each, and `Laser.memory` builds the durable
+/// one.
 #[gen_stub_pyclass]
 #[pyclass(name = "MemoryHandle", frozen, subclass)]
 pub struct PyMemory {
@@ -782,7 +802,8 @@ impl PyMemory {
     }
 
     /// Point-read the named item written by `set`, or `None`. Reads the managed
-    /// key-value view.
+    /// key-value view where the deployment serves one, and folds the topic in
+    /// process elsewhere.
     #[gen_stub(override_return_type(
         type_repr = "typing.Awaitable[typing.Optional[builtins.bytes]]",
         imports = ("typing", "builtins")
@@ -839,8 +860,9 @@ impl PyMemory {
         })
     }
 
-    /// Remember `payload` (`str`, `bytes`, or `bytearray`). Returns the new
-    /// item's id (a ULID string). `kind` is `fact` (default), `message`,
+    /// Remember `payload` (`str`, `bytes`, or `bytearray`). Await it for the new
+    /// item's id (a ULID string), the id `supersede` and `forget` take. The
+    /// first write creates the memory topic. `kind` is `fact` (default), `message`,
     /// `summary`, `entity`, `feedback`, or `procedure`. `durable=True` sets the
     /// scope lifetime for custom backends. Built-ins do not persist or filter
     /// that value. Omit `conversation` on recall to read across conversations.
@@ -850,6 +872,7 @@ impl PyMemory {
     /// than the one a log memory writes to is refused with `InvalidError`.
     /// `origin` is the `SourceRef` dict of the session record
     /// that motivated the item, and `producer` is a `{"name", "version"}` dict.
+    /// `conversation` is a ULID string, `new_conversation_id()` makes one.
     #[pyo3(signature = (payload, *, agent=None, conversation=None, stream=None, user=None, application=None, kind="fact", durable=false, dedup=false, origin=None, producer=None))]
     #[allow(clippy::too_many_arguments)]
     fn remember<'py>(
@@ -895,9 +918,10 @@ impl PyMemory {
 
     /// Correct a fact: remember `payload` as the new fact under the scope,
     /// then forget `old_id` in every conversation, so no later recall returns
-    /// the old fact. Returns the new item's id. A failure in between leaves
-    /// both facts, so no fact is lost. `old_id` must be a memory id (a ULID
-    /// string), refused with `InvalidError` before any write.
+    /// the old fact. Await it for the new item's id. A failure in between
+    /// leaves both facts, so no fact is lost. `old_id` must be a memory id (a
+    /// ULID string, as `remember` returned), refused with `InvalidError` before
+    /// any write. `conversation` is a ULID string, `new_conversation_id()` makes one.
     #[pyo3(signature = (old_id, payload, *, agent=None, conversation=None, user=None, application=None, stream=None, kind="fact", durable=false, dedup=false, origin=None, producer=None))]
     #[allow(clippy::too_many_arguments)]
     fn supersede<'py>(
@@ -980,15 +1004,21 @@ impl PyMemory {
         })
     }
 
-    /// Recall up to `limit` items under the scope. Pass `semantic` text to rank
-    /// by similarity, or a `strategy` (`auto`, `recent`, `semantic`, `keyword`,
+    /// Await it for a list of up to `limit` `MemoryItem` under the scope,
+    /// newest first: `item.text()` is the payload as text and `item.id` its id.
+    /// Omit `conversation` to read every conversation. Forgotten and
+    /// superseded items are left out. Pass `semantic` text to rank by
+    /// similarity, or a `strategy` (`auto`, `recent`, `semantic`, `keyword`,
     /// `graph`, `temporal`, `hybrid`) with the query text in `semantic`. The
-    /// log backend ranks every item by word overlap for `semantic`, `hybrid`
-    /// and `auto`, and keeps only the items that share a word for `keyword`.
-    /// It reads the managed key-value view by default, waiting for this
-    /// connection's own writes to show there. `folded=True` rebuilds memory
-    /// from the topic in process instead. `recall_block` renders the same
-    /// recall as one prompt block.
+    /// log backend ranks every item by the words it shares with `semantic` for
+    /// `semantic` (the default with a query), `hybrid` and `auto`, newest first
+    /// among equals, and drops none. `keyword`, `graph` and `temporal` keep
+    /// only the items that share a word, and `recent` ignores the query. It
+    /// reads the managed key-value view where the deployment serves one,
+    /// waiting for this connection's own writes to show there, and folds the
+    /// topic in process elsewhere. `folded=True` always folds. `recall_block`
+    /// renders the same recall as one prompt block.
+    /// `conversation` is a ULID string, `new_conversation_id()` makes one.
     #[pyo3(signature = (*, limit=50, agent=None, conversation=None, user=None, application=None, semantic=None, strategy=None, folded=false, stream=None, durable=false, token_budget=None))]
     #[allow(clippy::too_many_arguments)]
     fn recall<'py>(
@@ -1143,7 +1173,10 @@ impl PyMemory {
         })
     }
 
-    /// Forget the item with id `id` (a ULID string) under the scope.
+    /// Forget the item with id `id` (a ULID string) under the scope. Await it.
+    /// With `conversation` it is forgotten in that conversation, without one
+    /// in every conversation, and remembering it again later brings it back.
+    /// To correct a fact use `supersede`, which also stores the new one.
     #[pyo3(signature = (id, *, agent=None, conversation=None, user=None, application=None, stream=None, durable=false))]
     #[allow(clippy::too_many_arguments)]
     fn forget<'py>(
@@ -1190,8 +1223,9 @@ pub(crate) fn recall_query(
         .build())
 }
 
-/// One remembered item: its id, the raw payload bytes, and the provenance it was
-/// stored under (its scope's agent and conversation).
+/// One remembered item, as `recall` returns it: `text()` the payload as text,
+/// `id` its id (the one `remember` returned), `payload` the raw bytes, and the
+/// provenance it was stored under (its scope's agent and conversation).
 #[gen_stub_pyclass]
 #[pyclass(name = "MemoryItem", frozen)]
 pub struct PyMemoryItem {
@@ -1328,21 +1362,70 @@ impl PyMemoryItem {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyLaser {
-    /// Agent memory in `namespace`: `remember` publishes to the memory topic
-    /// (the durable audit), `forget` appends a tombstone, and a deployment
-    /// materializes the topic into the versioned key-value read view. Default
-    /// `recall` and `fetch` read that managed view, so they need Laser Stack or
-    /// LaserData Cloud and raise `UnsupportedError` otherwise. `recall(folded=True)`
-    /// and `fetch_folded` rebuild memory from the topic in process and work on
-    /// plain Apache Iggy. `namespace` prefixes the named-item keys (`set`,
-    /// `fetch`). For an isolated per-topic memory stream use `memory_on_topic`
-    /// or `memory_topic`. Reuse the handle: each folded recall reads only what
-    /// is new.
+    /// Agent memory in `namespace` on the stream's `agent.memory` topic,
+    /// returned at once without `await`: `memory = laser.memory("assistant")`.
+    /// `remember` publishes to the memory topic (the durable audit) and creates
+    /// it on the first write, `supersede` corrects a fact, `forget` appends a
+    /// tombstone, and a deployment materializes the topic into the versioned
+    /// key-value read view. Default `recall` and `fetch` read that managed view
+    /// where the deployment serves one (Laser Stack, LaserData Cloud), and
+    /// fold the topic in process on plain Apache Iggy, so the same program
+    /// runs on every server. `recall(folded=True)` and `fetch_folded` always
+    /// fold. `namespace` prefixes the named-item keys (`set`, `fetch`). For an
+    /// isolated per-topic memory stream use `memory_on_topic` or
+    /// `memory_topic`. Reuse the handle: each folded recall reads only what is
+    /// new.
+    ///
+    /// A complete program that corrects a fact in a later conversation. It
+    /// needs only `LASER_CONNECTION_STRING`:
+    ///
+    /// ```python
+    /// import asyncio
+    /// import json
+    ///
+    /// import laser_sdk as ls
+    ///
+    /// USER = "user-42"
+    /// QUERY = "Where does the user live, and what should I know before booking dinner?"
+    ///
+    ///
+    /// async def main():
+    ///     async with await ls.Laser.connect_env() as root:
+    ///         async with root.scratch_stream("memory") as scratch:
+    ///             memory = scratch.laser.memory("assistant")
+    ///
+    ///             # Conversation 1: the user shares three facts.
+    ///             first = ls.new_conversation_id()
+    ///             city = await memory.remember("Lives in Gdansk", conversation=first, user=USER)
+    ///             await memory.remember("Allergic to peanuts", conversation=first, user=USER)
+    ///             await memory.remember("Prefers a window seat", conversation=first, user=USER)
+    ///
+    ///             # Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+    ///             second = ls.new_conversation_id()
+    ///             await memory.supersede(city, "Lives in Lisbon", conversation=second, user=USER)
+    ///
+    ///             # Recall for the user across every conversation.
+    ///             facts = await memory.recall(user=USER, semantic=QUERY, limit=10)
+    ///             print(
+    ///                 json.dumps(
+    ///                     {"user": USER, "query": QUERY, "facts": [fact.text() for fact in facts]},
+    ///                     indent=2,
+    ///                 )
+    ///             )
+    ///
+    ///
+    /// asyncio.run(main())
+    /// ```
+    ///
+    /// `remember` returns the fact's id. `supersede(old_id, text, ...)` stores
+    /// the new fact and forgets the old one in every conversation. `recall`
+    /// returns `MemoryItem` objects, `item.text()` is the fact.
     fn memory(&self, namespace: String) -> PyMemory {
         PyMemory::from_handle(self.inner.memory(namespace))
     }
 
-    /// Memory in `namespace` on an explicit backend: `auto` and `log` are the
+    /// Memory in `namespace` on an explicit backend, returned at once without
+    /// `await`: `auto` and `log` are the
     /// durable stream model `memory` uses, `vector` is the governed in-process
     /// similarity index and needs `embedder` (a callable returning
     /// `list[float]`, directly or through an awaitable).
@@ -1384,9 +1467,11 @@ impl PyLaser {
         Ok(PyMemory::from_handle(handle))
     }
 
-    /// Agent memory on a caller-named topic (and optional stream), so a
-    /// deployment can keep several isolated memory streams. Ensure the topic up
-    /// front like any other, for example `await laser.topic(name).ensure(...)`.
+    /// Agent memory on an existing caller-named topic (and optional stream),
+    /// returned at once without `await`, so a deployment can keep several
+    /// isolated memory streams. Ensure the topic up front like any other, for
+    /// example `await laser.topic(name).ensure(...)`, or let `memory_topic`
+    /// create it.
     #[pyo3(signature = (topic, *, stream=None))]
     fn memory_on_topic(&self, topic: String, stream: Option<String>) -> PyResult<PyMemory> {
         let memory = LogMemory::on_stream_topic_named(self.inner.clone(), stream, &topic)
@@ -1394,10 +1479,13 @@ impl PyLaser {
         Ok(PyMemory::from_handle(MemoryHandle::Log(memory)))
     }
 
-    /// Configure and ensure a memory topic, then return memory on it: the
-    /// stream, the partition count (each scope keyed to one partition), and the
-    /// stream message-expiry. `ttl_ms` (milliseconds) defaults to thirty days. Pass `0` to
-    /// keep the history until topic retention rotates it out.
+    /// Await it for memory on `topic`, created when missing: `memory = await
+    /// laser.memory_topic(name)`. `stream` picks another stream, `partitions`
+    /// spreads the scopes (each scope keyed to one partition), and `ttl_ms`
+    /// (milliseconds) is the message expiry, thirty days by default. Pass `0`
+    /// to keep the history until topic retention rotates it out.
+    /// `memory(namespace)` needs no `await` and creates the default topic on
+    /// its first write.
     #[pyo3(signature = (topic, *, stream=None, partitions=1, ttl_ms=None))]
     fn memory_topic<'py>(
         &self,
@@ -1408,7 +1496,7 @@ impl PyLaser {
         ttl_ms: Option<f64>,
     ) -> PyResult<Awaitable<'py, PyMemory>> {
         let laser = self.inner.clone();
-        awaitable(py, async move {
+        handle_awaitable(py, MEMORY_TOPIC, async move {
             let mut builder = laser.memory_topic(&topic).partitions(partitions);
             if let Some(stream) = &stream {
                 builder = builder.stream(stream);
@@ -1587,8 +1675,10 @@ impl PyLogMemory {
     }
 }
 
-/// In-process semantic memory over an embedder: a callable or an object with
-/// `embed(text)` returning `list[float]` directly or through an awaitable.
+/// Keeps facts in this process only and loses them when the program exits.
+/// The durable memory on the log is `laser.memory(namespace)`. Semantic
+/// memory over an embedder: a callable or an object with `embed(text)`
+/// returning `list[float]` directly or through an awaitable.
 /// `VectorMemory(embedder)` has no connection and no governance.
 /// `VectorMemory.governed(laser, embedder)` applies the connection's governor.
 #[gen_stub_pyclass]

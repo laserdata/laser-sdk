@@ -6,6 +6,7 @@ use crate::context::{
 use crate::context_scope::{ContextScope, ScopedMemory};
 use crate::error::LaserError;
 use crate::laser::Laser;
+use crate::nodes::Walk;
 use crate::provenance::AgentTopic;
 use crate::types::{ConversationId, MintUlid};
 use futures::FutureExt;
@@ -512,7 +513,7 @@ impl Sessions {
     // race it.
     async fn registration_visible(&self, stream: &str) -> bool {
         wait_for_registration(stream, self.laser.publish_options().timeout, || async {
-            self.changes(0, 1).await.map(|_| ())
+            self.read_changes(0, 1, Walk::Once).await.map(|_| ())
         })
         .await
     }

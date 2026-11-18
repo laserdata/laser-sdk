@@ -74,12 +74,12 @@ Each example uses `laser-<example>-rust` unless `LASER_STREAM` supplies a name, 
 
 ## Copy a whole program
 
-`workflow` and `memory-correction` use only `laser-sdk`, `tokio`, `serde` and `serde_json`, with no helper from this crate, so each `main.rs` runs when copied into a new project. Each reads `LASER_CONNECTION_STRING` through `Laser::connect_env()`, works in a scratch stream, and deletes it at the end. A new project adds `cargo add laser-sdk --features agent,kv`, `cargo add tokio --features macros,rt-multi-thread`, `cargo add serde --features derive`, and `cargo add serde_json`.
+`workflow` and `memory-correction` use only `laser-sdk`, `tokio`, `serde` and `serde_json`, plus `async-trait` for the workflow's awaiting step, with no helper from this crate, so each `main.rs` runs when copied into a new project. Each reads `LASER_CONNECTION_STRING` through `Laser::connect_env()`, works in a scratch stream, and deletes it at the end. A new project adds `cargo add laser-sdk --features agent,kv`, `cargo add tokio --features macros,rt-multi-thread,time`, `cargo add serde --features derive`, `cargo add serde_json`, and `cargo add async-trait`.
 
 | binary | shows | run |
 | --- | --- | --- |
-| [`workflow`](src/workflow/README.md) | three in-process steps, journaled and resumable, with the outcome printed as JSON | `cargo run --example workflow` |
-| [`memory-correction`](src/memory-correction/README.md) | two facts for one user, a `supersede` in a later conversation, and a recall of the current facts | `cargo run --example memory-correction` |
+| [`workflow`](src/workflow/README.md) | three in-process steps, one a `StepFn` that awaits one second, journaled and resumable, with the outcome printed as JSON | `cargo run --example workflow` |
+| [`memory-correction`](src/memory-correction/README.md) | three facts for one user, a `supersede` in a later conversation, and a recall of the current facts printed as JSON | `cargo run --example memory-correction` |
 
 ## Primitives: start here
 

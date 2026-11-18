@@ -119,15 +119,34 @@ impl WorkflowBudget {
 /// The prior steps' outputs, by label, handed to a [`StepFn`] so it can build this
 /// step's payload from what came before.
 pub struct StepContext<'a> {
+    /// Every earlier step's output by label, as bytes.
     pub outputs: &'a BTreeMap<String, Vec<u8>>,
 }
 
-/// Builds a step's task payload from the outputs of the steps before it. Async
-/// and fallible, so a step that must call a model or a service to build its input
-/// can, and a build failure fails the step rather than panicking. A plain
-/// synchronous closure `Fn(&StepContext) -> Vec<u8>` still is a `StepFn` (the
-/// blanket impl wraps it), so the common step stays a one-line closure. A build
-/// is bounded by the step deadline.
+/// Builds a step's task payload, or a local step's output, from the outputs of
+/// the steps before it. Async and fallible, so a step that must call a model
+/// or a service, or wait, can, and a build failure fails the step rather than
+/// panicking. A plain synchronous closure `Fn(&StepContext) -> Vec<u8>` still
+/// is a `StepFn` (the blanket impl wraps it), so the common step stays a
+/// one-line closure. A closure cannot await, so a step that awaits is a type
+/// implementing `StepFn` (with `cargo add async-trait`), passed in place of
+/// the closure. A build is bounded by the step deadline.
+///
+/// ```
+/// use laser_sdk::prelude::*;
+/// use std::time::Duration;
+///
+/// struct Analyze;
+///
+/// #[async_trait::async_trait]
+/// impl StepFn for Analyze {
+///     async fn build(&self, context: &StepContext<'_>) -> Result<Vec<u8>, LaserError> {
+///         let ingested = context.outputs.get("ingest").cloned().unwrap_or_default();
+///         tokio::time::sleep(Duration::from_secs(1)).await;
+///         Ok([b"analyzed ".to_vec(), ingested].concat())
+///     }
+/// }
+/// ```
 #[async_trait::async_trait]
 pub trait StepFn: Send + Sync {
     async fn build(&self, ctx: &StepContext<'_>) -> Result<Vec<u8>, LaserError>;
@@ -306,7 +325,11 @@ impl Workflow {
 
     /// Add a step `label` whose body `run` runs in this process: it gets the
     /// prior outputs and its result is the step output, so the step needs no
-    /// agent. Its completion is journaled like a routed step, so a resumed run
+    /// agent. `run` is a closure `|context: &StepContext<'_>| -> Vec<u8>`, or a
+    /// type implementing [`StepFn`] for a step that awaits. `context.outputs`
+    /// holds every earlier step's output by label as bytes, and
+    /// [`WorkflowOutcome::text`] decodes one. Its completion is journaled like
+    /// a routed step, so a resumed run
     /// keeps the recorded output instead of running it again, and a step that
     /// stopped before its completion record runs again. A local step cannot be
     /// exclusive. Its compensation runs in process too.
@@ -334,7 +357,10 @@ impl Workflow {
         }
     }
 
-    /// Run the workflow to completion, returning each step's output. Steps run in
+    /// Await it to run the workflow to completion: it returns a
+    /// [`WorkflowOutcome`] with `run_id`, `status` (`Completed`),
+    /// `completed_steps` in completion order, `outputs` (label to bytes), and
+    /// `text(label)`. Steps run in
     /// dependency order. A step that does not complete fails the workflow with
     /// [`LaserError::StepFailed`] after running the compensations of the steps
     /// with an effect in reverse (the saga rollback). A misconfigured workflow
@@ -1437,9 +1463,13 @@ impl StepHandle {
 /// is an error. Pass the run id to [`Workflow::run_id`] to resume the same run.
 #[derive(Debug)]
 pub struct WorkflowOutcome {
+    /// Each completed step's output by label, as bytes.
     pub outputs: BTreeMap<String, Vec<u8>>,
+    /// The run id, which resumes the same run when passed to [`Workflow::run_id`].
     pub run_id: ConversationId,
+    /// The completed step labels, in completion order.
     pub completed_steps: Vec<String>,
+    /// The run's end status, `Completed` for a returned outcome.
     pub status: SessionStatus,
 }
 
@@ -1454,9 +1484,11 @@ impl WorkflowOutcome {
 }
 
 impl Laser {
-    /// Open a [`Workflow`] named `name` (also the orchestrator identity it
-    /// dispatches as). Describe it with fluent [`step`](Workflow::step) calls, then
-    /// [`run`](Workflow::run).
+    /// A [`Workflow`] named `name` (also the orchestrator identity it
+    /// dispatches as), returned at once. Describe it with fluent
+    /// [`step_local`](Workflow::step_local) or [`step`](Workflow::step) calls,
+    /// then await [`run`](Workflow::run). A local step needs no agent, and the
+    /// run creates its topics, so it needs no `bootstrap`.
     pub fn workflow(&self, name: &str) -> Workflow {
         Workflow {
             laser: self.clone(),

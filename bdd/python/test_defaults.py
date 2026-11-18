@@ -47,7 +47,8 @@ def advertised_step(world, name, label, agent):
 @then("the error names the call that sets a default stream")
 def names_default_stream_call(world):
     assert isinstance(world.error, ls.NoStreamError), world.error
-    assert "with_default_stream" in str(world.error)
+    assert "scratch_stream(prefix)" in str(world.error)
+    assert "with_default_stream(name)" in str(world.error)
 
 
 @then("the error names the agent capabilities and the fixed inbox route")

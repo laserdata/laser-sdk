@@ -84,7 +84,9 @@ When(
 Then(
   "the error names the call that sets a default stream",
   function (this: LaserWorld) {
-    assert.match(errorText(this), /set a default stream .*withDefaultStream/u);
+    const error = errorText(this);
+    assert.ok(error.includes("scratchStream(prefix)"), error);
+    assert.ok(error.includes("withDefaultStream(name)"), error);
   },
 );
 

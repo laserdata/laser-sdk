@@ -29,6 +29,23 @@ const CONSOLIDATION_WINDOW = 10_000
 export const MemoryBackend = { Auto: "auto", Log: "log", Vector: "vector" } as const
 export type MemoryBackend = (typeof MemoryBackend)[keyof typeof MemoryBackend]
 
+/** Agent memory, from `laser.memory(namespace)` without `await`. Every verb
+ * ends with an awaited `send()` or `fetch()`:
+ *
+ * ```ts
+ * const memory = laser.memory("assistant")
+ * const city = await memory.remember("Lives in Gdansk").scope(first).user("user-42").send()
+ * await memory.supersede(city, "Lives in Lisbon").scope(second).user("user-42").send()
+ * const facts = await memory.recall().user("user-42").semantic("Where does the user live?").fetch()
+ * console.log(facts.map(memoryItemText)) // ["Lives in Lisbon"]
+ * ```
+ *
+ * `remember` resolves to the new item's id, `supersede` replaces a fact in
+ * every conversation, `recall` resolves to `MemoryItem`s, and
+ * `forget(scope, id)` drops one. Scope a call to a user, an agent, a conversation, or an
+ * application. The backend decides how recall ranks: the durable log backend
+ * by the words an item shares with `semantic`, the vector backend by
+ * embedding similarity. */
 export class MemoryHandle implements Memory {
   private constructor(private readonly store: Memory) {}
 
@@ -71,13 +88,16 @@ export class MemoryHandle implements Memory {
     return new MemoryHandle({
       ...(append === undefined ? {} : { append }),
       remember: (scope, payload, options) => memory.remember(scope, payload, options),
-      recall: (scope, query) => memory.recall(scope, query),
+      recall: (scope, query, options) => memory.recall(scope, query, options),
       improve: (scope, feedback, options) => memory.improve(scope, feedback, options),
       forget: (scope, id, options) => memory.forget(scope, id, options)
     })
   }
 
-  /** Starts a remember of `payload`. Text is stored as its UTF-8 bytes. */
+  /** Starts a remember of `payload`. Text is stored as its UTF-8 bytes. Chain
+   * `scope`, `user`, `agent`, then await `send()` for the new item's id, the
+   * id `supersede` and `forget` take. The first write creates the memory
+   * topic. A conversation id is a ULID, `ConversationId.new()` makes one. */
   remember(payload: Uint8Array | string): RememberBuilder
   remember(
     scope: MemoryScope,
@@ -99,15 +119,24 @@ export class MemoryHandle implements Memory {
 
   /** Starts a correction: `send` remembers `payload` under the builder's scope,
    * then forgets `oldId` in every conversation, so no recall returns the old
-   * fact. A failure between the two leaves both facts. `oldId` that is not a
-   * memory id throws `InvalidError` before anything is written. */
+   * fact, and resolves to the new item's id. A failure between the two leaves
+   * both facts. `oldId` that is not a memory id (as `remember` resolved to)
+   * throws `InvalidError` before anything is written. A conversation id is a
+   * ULID, `ConversationId.new()` makes one. */
   supersede(oldId: MemoryId | string, payload: Uint8Array | string): SupersedeBuilder {
     const old = typeof oldId === "string" ? MemoryId.parse(oldId) : oldId
     return SupersedeBuilder.create(this, old, payloadBytes(payload))
   }
 
   /** A recall builder scoped to `conversation`, or to every conversation
-   * when it is omitted. */
+   * when it is omitted. Chain `user`, `semantic`, `limit`, then await
+   * `fetch()` for up to `limit` (50) `MemoryItem`s, newest first, without the
+   * forgotten and superseded ones. `memoryItemText(item)` reads one as text.
+   * On the log backend `semantic(query)` ranks every item by the words it
+   * shares with the query, newest first among equals, and drops none. A
+   * recall reads the managed view where the deployment serves one, waiting
+   * for this connection's own writes, and folds the topic in process
+   * elsewhere. A conversation id is a ULID, `ConversationId.new()` makes one. */
   recall(conversation?: ConversationId): RecallBuilder
   recall(
     scope: MemoryScope,
@@ -123,7 +152,7 @@ export class MemoryHandle implements Memory {
     if (scope instanceof ConversationId) return RecallBuilder.create(this, scope)
     return cancellable(options.signal, "memory recall", async () => {
       if (query?.strategy !== undefined) knownStrategy(query.strategy)
-      return this.store.recall(scope, query ?? {})
+      return this.store.recall(scope, query ?? {}, options)
     })
   }
 
@@ -136,7 +165,7 @@ export class MemoryHandle implements Memory {
     options: CallOptions = {}
   ): Promise<readonly MemoryItem[]> {
     return cancellable(options.signal, "memory recall", () =>
-      recallFoldedOn(this.store, scope, query)
+      recallFoldedOn(this.store, scope, query, options)
     )
   }
 
@@ -151,7 +180,8 @@ export class MemoryHandle implements Memory {
 
   /** Forgets the item `id`. With a conversation in `scope`, the built-in
    * backends forget it only when it was remembered in that conversation,
-   * without one in any conversation. */
+   * without one in any conversation. Remembering it again later brings it
+   * back. To correct a fact use `supersede`, which also stores the new one. */
   forget(scope: MemoryScope, id: MemoryId, options: CallOptions = {}): Promise<void> {
     return cancellable(options.signal, "memory forget", () => this.store.forget(scope, id, options))
   }
@@ -180,7 +210,11 @@ export class MemoryHandle implements Memory {
     if (!Number.isSafeInteger(maxItems) || maxItems < 0)
       throw new InvalidError("consolidation maxItems must be a non-negative safe integer")
     const items = await abortable(
-      this.store.recall(scope, { limit: CONSOLIDATION_WINDOW, strategy: RecallStrategy.Recent }),
+      this.store.recall(
+        scope,
+        { limit: CONSOLIDATION_WINDOW, strategy: RecallStrategy.Recent },
+        { signal }
+      ),
       signal,
       "memory consolidate"
     )
@@ -273,7 +307,7 @@ export class MemoryHandle implements Memory {
    * view, or `undefined`. */
   fetch(key: string, options: CallOptions = {}): Promise<Uint8Array | undefined> {
     const memory = this.namedMemory("fetch")
-    return cancellable(options.signal, "memory fetch", () => memory.fetchNamed(key))
+    return cancellable(options.signal, "memory fetch", () => memory.fetchNamed(key, options))
   }
 
   /** Point-reads the named item by folding the memory topic in process. */
@@ -574,15 +608,16 @@ export class RecallBuilder {
 async function recallFoldedOn(
   backend: Memory,
   scope: MemoryScope,
-  query: MemoryQuery
+  query: MemoryQuery,
+  options: CallOptions
 ): Promise<readonly MemoryItem[]> {
   if (backend instanceof LogMemory) return backend.recallFolded(scope, query)
   if (backend instanceof RerankedMemory) {
     const { inner, reranker } = backend[RERANKED]()
-    const items = await recallFoldedOn(inner, scope, query)
+    const items = await recallFoldedOn(inner, scope, query, options)
     return query.semantic === undefined ? items : reranker.rerank(query.semantic, items)
   }
-  return backend.recall(scope, query)
+  return backend.recall(scope, query, options)
 }
 
 function appendOn(
@@ -677,8 +712,12 @@ export class RerankedMemory implements Memory {
     return appendOn(this.inner, scope, id, kind, payload, options)
   }
 
-  async recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]> {
-    const items = await this.inner.recall(scope, query)
+  async recall(
+    scope: MemoryScope,
+    query: MemoryQuery,
+    options: CallOptions = {}
+  ): Promise<readonly MemoryItem[]> {
+    const items = await this.inner.recall(scope, query, options)
     return query.semantic === undefined ? items : this.reranker.rerank(query.semantic, items)
   }
 

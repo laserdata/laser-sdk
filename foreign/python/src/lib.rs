@@ -63,6 +63,71 @@ pub use errors::exception_stub;
 // A debug build overflows Tokio's 2 MiB worker stack on a routed workflow compensation.
 const RUNTIME_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
+// `help(laser_sdk)` and `laser_sdk.__doc__` show it, and the stub carries it.
+const PACKAGE_DOC: &str = r#"Laser SDK: durable workflows, long-term agent memory and sessions on one log, over Apache Iggy.
+
+Connect with the connection string in LASER_CONNECTION_STRING. Every call that
+reaches the server returns an awaitable, so await it. `memory(...)`,
+`workflow(...)`, `step(...)` and `sessions(...)` return at once. A scratch
+stream is deleted when its block ends, so a second run prints the same:
+
+    import asyncio, json
+    import laser_sdk as ls
+
+    async def main():
+        async with await ls.Laser.connect_env() as root:
+            async with root.scratch_stream("demo") as scratch:
+                laser = scratch.laser
+                ...  # one of the programs below
+
+    asyncio.run(main())
+
+Without a scratch stream, pick one when connecting, `ls.Laser.connect_env(stream="orders")`,
+or a call that needs a default stream raises NoStreamError.
+
+Workflow. A step runs in this process. Its `run` is a plain function or an
+async def, gets the earlier outputs by label as bytes, and returns str or
+bytes. `run()` returns a WorkflowOutcome: run_id, status ("completed"),
+completed_steps in completion order, outputs (label to bytes), text(label).
+
+    async def analyze(outputs):
+        await asyncio.sleep(1)
+        return b"analyzed " + outputs["ingest"]
+
+    outcome = await (
+        laser.workflow("pipeline")
+        .step("ingest", run=lambda outputs: "frames from sat-7")
+        .step("analyze", after=["ingest"], run=analyze)
+        .run()
+    )
+    print(json.dumps({"status": outcome.status, "analyze": outcome.text("analyze")}))
+
+Memory. remember returns the fact's id. supersede stores a correction and
+forgets the old fact in every conversation. recall returns a list of
+MemoryItem (item.text(), item.id), ranked by the words they share with
+`semantic`, newest first among equals:
+
+    memory = laser.memory("assistant")
+    city = await memory.remember("Lives in Gdansk", conversation=ls.new_conversation_id(), user="user-42")
+    await memory.supersede(city, "Lives in Lisbon", conversation=ls.new_conversation_id(), user="user-42")
+    facts = await memory.recall(user="user-42", semantic="Where does the user live?", limit=10)
+    print(json.dumps([fact.text() for fact in facts]))
+
+Session. A session records model calls, tool calls and state on the log:
+
+    sessions = laser.sessions()
+    await sessions.bootstrap()
+    async with sessions.start().agent("triage") as session:
+        tool = await session.tool("read_metrics", {"host": "node-7"})
+        await tool.complete("cache hit rate 41%")
+
+Docs: https://docs.laserdata.com/laser-sdk
+Context7: https://context7.com/laserdata/laser-sdk
+
+Install it and print this summary:
+
+    python -m pip install laser-sdk && python -c "import laser_sdk; print(laser_sdk.__doc__)""#;
+
 // The Iggy producer warns that its client has been shut down whenever a Laser
 // closes, because every cached producer watches the client it publishes
 // through. That record is the expected end of a producer, so it reaches Python
@@ -124,6 +189,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
         .thread_stack_size(RUNTIME_THREAD_STACK_BYTES);
     async_runtime::init(runtime);
     errors::register(py, module)?;
+    module.add("__doc__", PACKAGE_DOC)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     client::register_constants(module)?;
     module.add_class::<client::PyLaser>()?;
@@ -690,6 +756,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 define_stub_info_gatherer!(stub_info);
+pyo3_stub_gen::module_doc!("laser_sdk", "{}", PACKAGE_DOC);
 
 #[cfg(test)]
 mod tests {

@@ -113,6 +113,14 @@ def fault_policy_digest(bench):
     assert dropping.digest != bench.filter.digest
 
 
+@then("the group reads back its saved binding after three refusals")
+def binding_after_catalog_refusals(world):
+    group = world.laser.topic(TOPIC).consumer_group("anomaly-desk")
+    info = world.run(lambda: group.create(filter=safe_mode(), filter_name="safe-mode"))
+    assert info.filter is not None
+    assert world.run(group.filter().get) == info.filter
+
+
 @given("a fresh fleet change feed")
 def fresh_feed(world):
     world.connect()

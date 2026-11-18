@@ -8,8 +8,8 @@ Each imports only `@laserdata/laser-sdk`, reads `LASER_CONNECTION_STRING` throug
 
 | Example | What it shows | Needs Cloud? |
 | --- | --- | --- |
-| [`workflow`](src/workflow/README.md) | Three local workflow steps, journaled and resumable, with the run's status, completed steps, and outputs | no |
-| [`memory-correction`](src/memory-correction/README.md) | Remember two facts for a user, correct one with `supersede` in a later conversation, recall the current facts ranked by the question | no |
+| [`workflow`](src/workflow/README.md) | Three local workflow steps, one an async function that awaits one second, journaled and resumable, with the run's status, completed steps, and last output | no |
+| [`memory-correction`](src/memory-correction/README.md) | Remember three facts for a user, correct one with `supersede` in a later conversation, recall the current facts ranked by the question | no |
 
 ```sh
 LASER_CONNECTION_STRING='<connection string>' npm run example:workflow

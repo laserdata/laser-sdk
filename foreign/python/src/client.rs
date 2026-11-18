@@ -1,4 +1,4 @@
-use crate::async_bridge::{Awaitable, awaitable};
+use crate::async_bridge::{Awaitable, HandleCall, awaitable, handle_awaitable};
 use crate::convert::{duration_ms, py_to_de};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::sign::PyKeyRegistry;
@@ -10,6 +10,27 @@ use laser_sdk::wire::batch::BatchItem;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
+
+const CONNECT: HandleCall = HandleCall {
+    call: "Laser.connect(...)",
+    handle: "laser",
+    enters: true,
+};
+const CONNECT_ENV: HandleCall = HandleCall {
+    call: "Laser.connect_env()",
+    handle: "laser",
+    enters: true,
+};
+const LOCAL: HandleCall = HandleCall {
+    call: "Laser.local()",
+    handle: "laser",
+    enters: true,
+};
+const CONNECT_WITH_STREAM: HandleCall = HandleCall {
+    call: "Laser.connect_with_stream(...)",
+    handle: "laser",
+    enters: true,
+};
 
 // The SDK's public defaults, read from the Rust constants. A duration carries
 // the unit of the Python argument that takes it.
@@ -179,9 +200,16 @@ constants! {
     "UUID_VALUE_BYTES": usize = laser_sdk::wire::schema::UuidValue::BYTES,
 }
 
-/// The connected LaserData / Apache Iggy client. Cheap to clone: the connection
-/// and producer cache are shared internally, so one `Laser` serves any number of
-/// concurrent operations.
+/// The connected LaserData / Apache Iggy client. Start with `async with await
+/// Laser.connect_env() as root:` (the connection string in
+/// `LASER_CONNECTION_STRING`) and `async with root.scratch_stream(prefix) as
+/// scratch:` (a stream deleted when the block ends). On `scratch.laser` the
+/// task entry points return at once: `workflow(name)` (steps in this process,
+/// then `await run()`), `memory(namespace)` (`remember`, `supersede`,
+/// `recall`, `forget`, each awaited), and `sessions()` (model calls, tool
+/// calls and state). Cheap to clone: the connection and producer cache are
+/// shared internally, so one `Laser` serves any number of concurrent
+/// operations.
 #[gen_stub_pyclass]
 #[pyclass(name = "Laser", frozen)]
 pub struct PyLaser {
@@ -210,7 +238,9 @@ impl PyLaser {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyLaser {
-    /// Connect with a connection string or a bare `user:password@host:port`
+    /// Await it for a connected `Laser`: `async with await
+    /// Laser.connect(connection_string) as laser:`. Connect with a connection
+    /// string or a bare `user:password@host:port`
     /// endpoint, or over TCP with `address` (`host:port`) and `credentials`
     /// (`(username, password)`). The scheme selects the transport: none,
     /// `iggy://` or `iggy+tcp://` for TCP, `iggy+quic://` for QUIC and
@@ -268,7 +298,7 @@ impl PyLaser {
             )),
             None => None,
         };
-        awaitable(py, async move {
+        handle_awaitable(py, CONNECT, async move {
             let mut builder = Laser::builder();
             if let Some(naming) = resource_naming {
                 builder = builder.resource_naming(parse_resource_naming(&naming)?);
@@ -328,37 +358,48 @@ impl PyLaser {
         })
     }
 
-    /// Connect from the environment: `LASER_CONNECTION_STRING` (required, else
-    /// `ConfigError`) and an optional `LASER_STREAM` default stream. The timeout
-    /// and publish variables (`LASER_CONNECT_TIMEOUT_MS` and the `LASER_PUBLISH_*`
-    /// family) apply as on `connect`.
+    /// Await it for a connected `Laser`: `async with await Laser.connect_env()
+    /// as laser:` reads `LASER_CONNECTION_STRING` (required, else
+    /// `ConfigError`) and an optional `LASER_STREAM` default stream, an empty
+    /// value counting as unset, and closes
+    /// the connection when the block ends. `stream` names the default stream
+    /// and wins over `LASER_STREAM`. For a stream deleted at the end of the run
+    /// use `scratch_stream` instead. The timeout and publish variables
+    /// (`LASER_CONNECT_TIMEOUT_MS` and the `LASER_PUBLISH_*` family) apply as on
+    /// `connect`.
     #[staticmethod]
-    fn connect_env(py: Python<'_>) -> PyResult<Awaitable<'_, PyLaser>> {
-        awaitable(py, async move {
-            let laser = Laser::connect_env().await.map_err(to_pyerr)?;
+    #[pyo3(signature = (stream=None))]
+    fn connect_env(py: Python<'_>, stream: Option<String>) -> PyResult<Awaitable<'_, PyLaser>> {
+        handle_awaitable(py, CONNECT_ENV, async move {
+            let laser = match stream {
+                Some(stream) => Laser::connect_env_with_stream(&stream).await,
+                None => Laser::connect_env().await,
+            }
+            .map_err(to_pyerr)?;
             Ok(PyLaser::owning(laser))
         })
     }
 
-    /// Connect to a local Apache Iggy on `iggy:iggy@127.0.0.1:8090`, the Laser
-    /// Stack default.
+    /// Await it for a `Laser` connected to a server you started on this
+    /// machine, at `iggy:iggy@127.0.0.1:8090`. When `LASER_CONNECTION_STRING`
+    /// is set, call `connect_env()` instead.
     #[staticmethod]
     fn local(py: Python<'_>) -> PyResult<Awaitable<'_, PyLaser>> {
-        awaitable(py, async move {
+        handle_awaitable(py, LOCAL, async move {
             let laser = Laser::local().await.map_err(to_pyerr)?;
             Ok(PyLaser::owning(laser))
         })
     }
 
-    /// Connect and pin a default `stream`, the shorthand for
-    /// `connect(connection_string, stream=stream)`.
+    /// Await it for a `Laser` connected with a default `stream`, the shorthand
+    /// for `connect(connection_string, stream=stream)`.
     #[staticmethod]
     fn connect_with_stream(
         py: Python<'_>,
         connection_string: String,
         stream: String,
     ) -> PyResult<Awaitable<'_, PyLaser>> {
-        awaitable(py, async move {
+        handle_awaitable(py, CONNECT_WITH_STREAM, async move {
             let laser = Laser::connect_with_stream(&connection_string, &stream)
                 .await
                 .map_err(to_pyerr)?;

@@ -1,3 +1,66 @@
+/**
+ * Laser SDK: durable workflows, long-term agent memory and sessions on one
+ * log, over Apache Iggy.
+ *
+ * `Laser.connectEnv()` connects with the connection string in
+ * `LASER_CONNECTION_STRING`. Every call that reaches the server returns a
+ * promise, so await it. `workflow`, `memory` and `sessions` return at once.
+ * `await using` closes the connection and deletes a scratch stream when the
+ * scope ends:
+ *
+ * ```ts
+ * import { AgentId, ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
+ *
+ * await using root = await Laser.connectEnv()
+ * await using scratch = await root.scratchStream("demo")
+ * const laser = scratch.laser
+ *
+ * // Workflow: a step runs in this process, gets the earlier outputs by label
+ * // as bytes, and returns a string or bytes, directly or as a promise.
+ * const outcome = await laser
+ *   .workflow("pipeline")
+ *   .stepLocal("ingest", () => "frames from sat-7")
+ *   .stepLocal("analyze", async ({ outputs }) => {
+ *     await new Promise((resolve) => setTimeout(resolve, 1000))
+ *     return `analyzed ${new TextDecoder().decode(outputs.get("ingest"))}`
+ *   })
+ *   .after("ingest")
+ *   .run()
+ * console.log(JSON.stringify({ status: outcome.status, analyze: outcome.text("analyze") }))
+ *
+ * // Memory: remember resolves to the fact's id, supersede stores a correction
+ * // and forgets the old fact in every conversation, recall resolves to
+ * // MemoryItems ranked by the words they share with the query, newest first
+ * // among equals.
+ * const memory = laser.memory("assistant")
+ * const city = await memory.remember("Lives in Gdansk").scope(ConversationId.new()).user("user-42").send()
+ * await memory.supersede(city, "Lives in Lisbon").scope(ConversationId.new()).user("user-42").send()
+ * const facts = await memory.recall().user("user-42").semantic("Where does the user live?").limit(10).fetch()
+ * console.log(JSON.stringify(facts.map(memoryItemText)))
+ *
+ * // Session: model calls, tool calls and state on the log.
+ * const sessions = laser.sessions()
+ * await sessions.bootstrap()
+ * const { session, lease } = await sessions.start().agent(AgentId.new("triage")).begin()
+ * const tool = await session.tool("read_metrics", { host: "node-7" })
+ * await tool.complete(new TextEncoder().encode("cache hit rate 41%"))
+ * await session.end()
+ * lease.release()
+ * ```
+ *
+ * Without a scratch stream, pick one when connecting,
+ * `Laser.connectEnvWithStream("orders")`, or a call that needs a default
+ * stream throws `NoStreamError`.
+ *
+ * Docs: https://docs.laserdata.com/laser-sdk. Context7:
+ * https://context7.com/laserdata/laser-sdk.
+ *
+ * Install: `npm install @laserdata/laser-sdk tsx`. Save a program as
+ * `main.mts` and run it with `npx tsx main.mts`.
+ *
+ * @packageDocumentation
+ */
+
 /// <reference types="node" preserve="true" />
 
 export {

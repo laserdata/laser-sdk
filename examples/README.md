@@ -24,10 +24,10 @@ Two programs run when copied alone, with no helper from this directory. Each con
 
 | program | Rust | Python | TypeScript |
 | --- | --- | --- | --- |
-| A three-step workflow of in-process steps that prints its outcome as JSON | [`rust/src/workflow/main.rs`](rust/src/workflow/main.rs) | [`python/workflow.py`](python/workflow.py) | [`typescript/src/workflow/main.ts`](typescript/src/workflow/main.ts) |
+| A three-step workflow of in-process steps, one awaiting a one second sleep, that prints its outcome as JSON | [`rust/src/workflow/main.rs`](rust/src/workflow/main.rs) | [`python/workflow.py`](python/workflow.py) | [`typescript/src/workflow/main.ts`](typescript/src/workflow/main.ts) |
 | A memory correction for one user with `supersede`, then a recall of the current facts | [`rust/src/memory-correction/main.rs`](rust/src/memory-correction/main.rs) | [`python/memory_correction.py`](python/memory_correction.py) | [`typescript/src/memory-correction/main.ts`](typescript/src/memory-correction/main.ts) |
 
-Both run on Apache Iggy, Laser Stack, and LaserData Cloud. The memory correction recalls through the managed memory view where the deployment serves one, and folds the memory topic in process on Apache Iggy.
+The three languages print the same fields in the same order, and every README shows the programs verbatim. Both run on Apache Iggy, Laser Stack, and LaserData Cloud. The memory correction recalls through the managed memory view where the deployment serves one, and folds the memory topic in process on Apache Iggy.
 
 ## Start here
 

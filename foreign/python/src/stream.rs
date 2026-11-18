@@ -33,10 +33,12 @@ impl PyLaser {
         }
     }
 
-    /// A uniquely named stream for one program run: `async with
-    /// laser.scratch_stream(prefix) as scratch:` creates `{prefix}-` and eight
-    /// lowercase hex characters, `scratch.laser` uses it as the default
-    /// stream, and leaving the block deletes it, also when the block raised.
+    /// A uniquely named stream for one program run, entered without `await`:
+    /// `async with laser.scratch_stream(prefix) as scratch:` creates `{prefix}-`
+    /// and eight lowercase hex characters, `scratch.laser` uses it as the
+    /// default stream, and leaving the block deletes it, also when the block
+    /// raised. Use a named stream (`LASER_STREAM` or `with_default_stream`)
+    /// to keep what the program writes.
     fn scratch_stream(&self, prefix: String) -> PyScratchStream {
         PyScratchStream {
             laser: self.inner.clone(),

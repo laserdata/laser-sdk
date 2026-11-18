@@ -1,6 +1,6 @@
 use crate::error::LaserError;
 use crate::laser::Laser;
-use crate::nodes::Target;
+use crate::nodes::{Target, Walk};
 use crate::query::{
     AGDX_QUERY_CODE, AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, Filter, KeyMatch,
     QUERY_OP_VERSION, Query, QueryError, QueryExecutionId, QueryFrontier, QueryResult, QueryTarget,
@@ -14,7 +14,7 @@ use laser_wire::schema::{LogicalField, ORIGINAL_PAYLOAD_FIELD_NAME};
 use laser_wire::validate::Validate;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::retry::{QUERY_DEADLINE as DEFAULT_QUERY_DEADLINE, QUERY_REPLY_GRACE};
 
@@ -149,6 +149,8 @@ impl Laser {
     /// [`DEFAULT_QUERY_DEADLINE`] is refused, because the reply could not
     /// come back before the transport stops waiting for it. A timed out wait
     /// does not mean the query stopped. The server ends it at its deadline.
+    /// A query every node refused walks the roster again until its deadline,
+    /// so the last refusal comes back before the reply wait ends.
     async fn send_query_until(
         &self,
         code: u32,
@@ -156,9 +158,14 @@ impl Laser {
         deadline_micros: u64,
         target: Target,
     ) -> Result<(Vec<u8>, Option<u8>), LaserError> {
+        let now = now_micros();
+        let reply_wait = query_reply_wait(deadline_micros, now)?;
+        let walk = Walk::Until(
+            Instant::now() + Duration::from_micros(deadline_micros.saturating_sub(now)),
+        );
         tokio::time::timeout(
-            query_reply_wait(deadline_micros, now_micros())?,
-            self.send_managed_to(code, payload, target),
+            reply_wait,
+            self.send_managed_walking(code, payload, target, walk),
         )
         .await
         .map_err(|_| LaserError::Timeout("no query reply by the query deadline"))?
@@ -1213,6 +1220,36 @@ mod tests {
             laser.execute_query(query).await,
             Err(LaserError::Invalid(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn given_a_query_every_node_refuses_when_fetched_then_should_walk_again_until_the_query_deadline()
+     {
+        let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default())
+            .with_capabilities(crate::capabilities::Capabilities::OPEN.with_query(true));
+        let deadline = Duration::from_secs(1);
+        let started = Instant::now();
+
+        let error = laser
+            .query("readings")
+            .deadline(deadline)
+            .fetch()
+            .await
+            .expect_err("no node serves the query");
+
+        let waited = started.elapsed();
+        assert!(
+            !matches!(error, LaserError::Timeout(_)),
+            "the last refusal comes back, not the reply wait, got: {error}"
+        );
+        assert!(
+            waited >= Duration::from_millis(300),
+            "the roster is walked again before the query deadline, waited {waited:?}"
+        );
+        assert!(
+            waited < deadline + QUERY_REPLY_GRACE,
+            "the query deadline ends the walk, waited {waited:?}"
+        );
     }
 
     #[test]

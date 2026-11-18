@@ -8,6 +8,10 @@ import { promisify } from "node:util"
 const execute = promisify(execFile)
 const REPOSITORY_ROOT = resolve(process.cwd(), "../..")
 const RESOLVER = join(REPOSITORY_ROOT, "scripts", "resolve-test-iggy-server.sh")
+// A reserved port is released before the server binds it, so another process
+// can take it in between. The server then exits at startup, and a fresh port
+// on the next attempt starts it.
+const STARTUP_ATTEMPTS = 5
 
 function freePort(): Promise<number> {
   return new Promise((resolvePort, reject) => {
@@ -26,6 +30,45 @@ function freePort(): Promise<number> {
       })
     })
   })
+}
+
+// The server reports a taken port as `CannotBindToSocket` and drops the OS error.
+// The proxy of a cluster reports its own as `EADDRINUSE`.
+function foundPortTaken(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.message.includes("Cannot bind to socket") || error.message.includes("EADDRINUSE"))
+  )
+}
+
+async function startOnFreshPorts<T>(start: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await start()
+    } catch (error) {
+      if (attempt >= STARTUP_ATTEMPTS || !foundPortTaken(error)) throw error
+    }
+  }
+}
+
+// Resolves once `port` can be bound again or 30 s passed.
+async function waitForFreePort(port: number): Promise<void> {
+  const deadline = Date.now() + 30_000
+  while (Date.now() < deadline) {
+    const free = await new Promise<boolean>((resolveFree) => {
+      const server = createServer()
+      server.once("error", () => {
+        resolveFree(false)
+      })
+      server.listen(port, "127.0.0.1", () => {
+        server.close(() => {
+          resolveFree(true)
+        })
+      })
+    })
+    if (free) return
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50))
+  }
 }
 
 function waitForExit(child: ChildProcess): Promise<void> {
@@ -84,23 +127,35 @@ export class TestIggy {
 
   static async start(): Promise<TestIggy> {
     const binary = await resolveBinary()
-    const directory = await mkdtemp(join(tmpdir(), "laser-iggy-"))
-    const port = await freePort()
-    const log = await open(join(directory, "test-server.log"), "w")
-    const server = new TestIggy(binary, directory, port, log)
-    try {
-      await server.spawn()
-      return server
-    } catch (error) {
-      await server.close()
-      throw error
-    }
+    return startOnFreshPorts(async () => {
+      const directory = await mkdtemp(join(tmpdir(), "laser-iggy-"))
+      const port = await freePort()
+      const log = await open(join(directory, "test-server.log"), "w")
+      const server = new TestIggy(binary, directory, port, log)
+      try {
+        await server.spawn()
+        return server
+      } catch (error) {
+        await server.close()
+        throw error
+      }
+    })
   }
 
+  /** Starts the server again on its port, waiting for the port when another process holds it. */
   async restart(): Promise<void> {
     await stop(this.child)
     this.child = undefined
-    await this.spawn()
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await this.spawn()
+        return
+      } catch (error) {
+        if (attempt >= STARTUP_ATTEMPTS || !foundPortTaken(error)) throw error
+        await this.log.truncate(0)
+        await waitForFreePort(this.port)
+      }
+    }
   }
 
   /** Stops the server and keeps its data, so a client sees it gone. */
@@ -189,13 +244,25 @@ export class TestIggyCluster {
     return `iggy:iggy@127.0.0.1:${String(this.proxyPort)}`
   }
 
-  /** Starts `nodes` nodes, each with the extra variables `environment` gives it. */
+  /** Starts `nodes` nodes, each with the extra variables `environment` gives it,
+   * on ports from `reserve`, asked again when a node finds one taken. */
   static async start(
     nodes = 3,
-    environment?: (replicaId: number) => NodeJS.ProcessEnv
+    environment?: (replicaId: number) => NodeJS.ProcessEnv,
+    reserve: (count: number) => Promise<number[]> = uniquePorts
   ): Promise<TestIggyCluster> {
     const binary = await resolveBinary()
-    const ports = await uniquePorts(nodes * 3 + 1)
+    return startOnFreshPorts(() => TestIggyCluster.startOn(binary, nodes, reserve, environment))
+  }
+
+  // Every node names every port, so a taken one starts the whole cluster again on a fresh set.
+  private static async startOn(
+    binary: string,
+    nodes: number,
+    reserve: (count: number) => Promise<number[]>,
+    environment?: (replicaId: number) => NodeJS.ProcessEnv
+  ): Promise<TestIggyCluster> {
+    const ports = await reserve(nodes * 3 + 1)
     const cluster = new TestIggyCluster(
       binary,
       ports.slice(0, nodes),
@@ -261,9 +328,21 @@ export class TestIggyCluster {
     )
   }
 
+  /** Starts a stopped node on the address its peers know, waiting for its
+   * ports when another process holds one. */
   async startNode(replicaId: number): Promise<void> {
-    this.spawn(replicaId)
-    await this.waitForMesh(replicaId)
+    for (let attempt = 1; ; attempt += 1) {
+      this.spawn(replicaId)
+      try {
+        await this.waitForMesh(replicaId)
+        return
+      } catch (error) {
+        if (attempt >= STARTUP_ATTEMPTS || !foundPortTaken(error)) throw error
+        await this.stopNode(replicaId)
+        await waitForFreePort(required(this.tcpPorts[replicaId], "node TCP port"))
+        await waitForFreePort(required(this.replicaPorts[replicaId], "node replica port"))
+      }
+    }
   }
 
   routeEndpointTo(replicaId: number): void {
@@ -468,7 +547,7 @@ function required<T>(value: T | undefined, name: string): T {
   return value
 }
 
-async function uniquePorts(count: number): Promise<number[]> {
+export async function uniquePorts(count: number): Promise<number[]> {
   const ports = new Set<number>()
   while (ports.size < count) ports.add(await freePort())
   return [...ports]

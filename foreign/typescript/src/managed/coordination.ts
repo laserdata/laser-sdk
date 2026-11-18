@@ -209,7 +209,9 @@ export class DedicatedKvTransport implements ManagedKvTransport, AsyncDisposable
       this.probedAtMs = performance.now()
       let supported = false
       try {
-        const reply = await transport.sendManaged(AGDX_HELLO_CODE, new Uint8Array())
+        const reply = await transport.sendManaged(AGDX_HELLO_CODE, new Uint8Array(), {
+          walk: { kind: "once" }
+        })
         supported = managedCapabilitiesFrom(decodeBackendAnnounce(reply)).kv.fencedLeases
       } catch {
         // A failed probe does not advertise fenced leases.
