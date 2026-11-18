@@ -1,0 +1,43 @@
+// Package laser is the LaserData client for Go. It connects to a LaserData
+// deployment over Apache Iggy and speaks the AGDX contract that
+// [github.com/laserdata/laser-sdk/foreign/go/wire] defines.
+//
+// The client connects over TCP, plain or TLS. QUIC and WebSocket are served by
+// the Rust and Python clients, because the Apache Iggy Go SDK this client
+// builds on implements the TCP transport only.
+package laser
+
+// ConfigError reports a connection string, environment variable, or builder
+// setting the client cannot act on, the Go form of laser_sdk's
+// LaserError::Config. It is raised before any network call, so a misconfigured
+// client fails without dialing anything.
+//
+// A connection string carries a password, so no ConfigError ever quotes the
+// value it rejected.
+type ConfigError struct{ Reason string }
+
+func (e *ConfigError) Error() string { return e.Reason }
+
+// configError keeps the reason a constant at every call site, which is what
+// stops a credential reaching a log through an error message.
+func configError(reason string) error { return &ConfigError{Reason: reason} }
+
+// TransportError reports a connection that could not be established, used, or
+// closed, the Go form of laser_sdk's LaserError::Transport.
+//
+// The cause is kept so a caller can match on the Apache Iggy error underneath,
+// and the reason names the stage rather than echoing the connection string,
+// which carries a password.
+type TransportError struct {
+	Reason string
+	Cause  error
+}
+
+func (e *TransportError) Error() string {
+	if e.Cause == nil {
+		return e.Reason
+	}
+	return e.Reason + ": " + e.Cause.Error()
+}
+
+func (e *TransportError) Unwrap() error { return e.Cause }
