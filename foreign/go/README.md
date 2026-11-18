@@ -200,6 +200,27 @@ One unreadable record is usually one bad writer, not a broken topic, so a
 decode failure names the partition and offset it sat at and the read carries
 on. Passing no error handler skips those records quietly.
 
+## Agent messaging
+
+`Laser.Agdx(source, conversation)` sends AGDX messages on one conversation.
+`Command`, `Respond`, `Emit`, `Fail` and `Chunk` cover the kinds, and
+`OpenAgdx` reads one back off a record.
+
+Each record carries the whole envelope as its body, because a reader needs the
+routing and causality to decide anything. The envelope stamps and the
+provenance spine ride one header block, each key once, so a reader can route
+and audit without decoding the body. The conversation is the partition key.
+
+Where the contract ties fields together, the constructor does too rather than
+leaving a chain a caller can half build. `TaskStatus` takes the correlation and
+the state it requires. `SessionStarted`, `SessionProgressed` and `SessionEnded`
+each take the typed lifecycle record their state calls for, and the terminal
+flag is derived from the state rather than taken from the caller, which is the
+only way the two cannot drift apart.
+
+Cost rides the envelope in integer micro-units and the headers in whole
+currency, so it is converted between them rather than copied.
+
 Like the TypeScript client, this is a native port rather than a binding over
 the Rust crate. The Rust crates expose no C ABI, cgo would cost consumers
 cross-compilation, and the Apache Iggy Go client is itself pure Go.

@@ -464,8 +464,9 @@ foreign/go/             the Go client, in progress (outside the workspace): wire
                         the managed command path with its operation identities,
                         resource scoping and applied frontier, and the key-value, query, fork,
                         graph, session-read and authorization surfaces plus the
-                        stream, topic, publish and consume facade with the
-                        agentic provenance headers. There is no agent runtime,
+                        stream, topic, publish, consume, replay and typed-record
+                        facade with the agentic provenance headers and AGDX
+                        messaging. There is no agent runtime loop, memory,
                         bridge, or entry in docs/parity.md yet. wire/
                         parity_test.go asserts that every public type of wire/src has a
                         Go peer, so a type added upstream fails the Go suite.
