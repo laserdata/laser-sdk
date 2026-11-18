@@ -240,6 +240,27 @@ scoped to the producing agent, so one producer cannot suppress or replay
 another's key. Both are bounded by the recently active working set rather than
 by every record ever seen.
 
+## Registry and routing
+
+`NewAgentRegistry()` holds what the deployment knows about its agents: the
+cards they published and the ones an operator took out of rotation. A card with
+a lifetime stops describing a live agent once it runs out, which is what makes
+a card liveness and not only discovery.
+
+`To`, `Broadcast`, `ToCapable`, `AllCapable`, `Sticky` and `WithScorer` build a
+route, and `ResolveTargets` names the agents it reaches. `RouteCheapest`,
+`RouteFastest` and `RouteLeastLoaded` rank on the advisory classes a card
+advertises.
+
+A capability route that matches no live agent is an error, not a silent
+broadcast: the caller asked for a skill, and handing the work to whoever is
+listening is not that. An agent that declared itself unavailable is skipped,
+while a degraded one still routes, since a struggling agent beats no agent. A
+sticky route falls back when its agent is gone, because pinning a conversation
+is a preference rather than a requirement. Candidates come back in a stable
+order, so two resolutions pick the same agent and a retry lands where the
+first attempt did.
+
 Like the TypeScript client, this is a native port rather than a binding over
 the Rust crate. The Rust crates expose no C ABI, cgo would cost consumers
 cross-compilation, and the Apache Iggy Go client is itself pure Go.
