@@ -14,8 +14,11 @@ import (
 // registryServer answers control commands and registry browses from a script.
 type registryServer struct {
 	iggcon.Client
-	guard    sync.Mutex
+	guard sync.Mutex
+	// outcome answers every browse, and script answers them in turn when it
+	// is set, so a test can watch a status change between reads.
 	outcome  *wire.BrowseOutcome
+	script   []*wire.BrowseOutcome
 	failure  *wire.QueryError
 	command  wire.ResultCode
 	message  string
@@ -40,7 +43,16 @@ func (server *registryServer) SendBinaryRequest(
 	if server.failure != nil {
 		return wire.Marshal(wire.BrowseReply{Err: server.failure})
 	}
-	return wire.Marshal(wire.BrowseReply{Outcome: server.outcome})
+	server.guard.Lock()
+	outcome := server.outcome
+	if len(server.script) > 0 {
+		outcome = server.script[0]
+		if len(server.script) > 1 {
+			server.script = server.script[1:]
+		}
+	}
+	server.guard.Unlock()
+	return wire.Marshal(wire.BrowseReply{Outcome: outcome})
 }
 
 // control reads back the control envelope the client appended.

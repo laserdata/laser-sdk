@@ -11,7 +11,7 @@ forks, graph, session reads and writes, authorization, consumer filters and the
 saved-filter catalog), streams, topics and publishing, consuming, replay, typed
 records, provenance headers, AGDX agent messaging and gates, the registry and
 router, request and reply, memory, context assembly, the projection, binding
-and writer-schema registries, record signing with its key registry, action governance with its approval gate, and the bridge value
+and writer-schema registries, materialization, record signing with its key registry, action governance with its approval gate, and the bridge value
 mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
 
 It is not published yet. [docs/parity.md](../../docs/parity.md) lists its
@@ -414,6 +414,49 @@ attempt whose reply was lost may still have applied.
 Each verb returns what its change produced and where the fold applied it. That
 position is what a group read can wait for, which is what gives an application
 that just configured a group read-your-writes through any node.
+
+## Materialization
+
+`topic.Materialize()` is the short path through those registries: a topic goes
+from a log to a queryable table in one call, rather than through a projection,
+a binding and an index the caller keeps consistent by hand. With nothing else
+set it materializes every record whole into an index named after the topic.
+
+`Typed` materializes the fields a projection extracts instead of whole
+records, `Index` and `ProjectionID` name what it writes, `Backend` says where
+the index lives, and `Retention` says how long rows stay.
+
+`InvalidRecords` and `Oversize` both default to holding the partition, because
+skipping silently is how a table quietly stops matching its log. A keyed view
+keeps its rows unless told otherwise, since the row is the current value rather
+than one event among many, and a retention that expired one would answer as
+though the key had been deleted.
+
+`Apply` registers and binds under derived identities of one setup, so a retry
+of either step applies once and the pair cannot half-apply under two unrelated
+identities. Changing the setup mints a fresh identity, so a corrected setup is
+never refused as a replay of the one it corrects, and `OperationID` pins one
+for a caller driving its own recovery across a restart. The binding is checked
+locally first, because the register goes out first: a binding the backend
+would refuse must not leave a registered projection behind with nothing
+routing into it.
+
+`Status` reports each followed binding's progress, and a handle tied to one
+source reports that source alone. A binding that was removed reads as gone,
+the same as a projection that never existed, which is what a caller waiting on
+a setup needs to be told.
+
+`Wait` reads until every followed binding reaches a readiness level, a record
+or a gap holds one, realization fails for good, the binding is gone, or the
+bound passes. Each pause doubles the one before it, so a setup that lands
+quickly is noticed quickly and a slow one is not polled to death.
+
+A level past realized is measured against the heads the first complete read
+captured rather than against whatever the source holds now, because a source
+that keeps growing would otherwise never be caught up with. A source recreated
+during the wait drops that target, since the heads it captured no longer
+exist, and a binding that was in the target and vanishes holds the wait rather
+than letting the remaining ones declare it finished.
 
 ## Projections, bindings and schemas
 
