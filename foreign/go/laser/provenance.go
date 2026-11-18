@@ -283,9 +283,7 @@ func ProvenanceFromHeaders(entries []iggcon.HeaderEntry) (*Provenance, error) {
 	}
 
 	if !hasConversation {
-		return nil, &InvalidError{
-			Reason: "a record's provenance must name its conversation (" +
-				wire.HeaderConversationID + ")"}
+		return nil, &NoProvenanceError{}
 	}
 	if hasUsage {
 		provenance.Usage = &usage

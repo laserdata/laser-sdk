@@ -166,6 +166,24 @@ conversation to belong to. A broadcast addressee reads back as no target rather
 than an agent named `*`. A non-finite cost is refused in both directions,
 because it would be rolled up into a total as a number that is not one.
 
+## Consuming
+
+`Topic.Consumer(name, options)` opens a standalone consumer and
+`Topic.ConsumerGroup(group, options)` joins a group. A standalone consumer
+names the partitions it reads, because nothing assigns them to it. A group
+member names none, because the server assigns and rebalances them.
+
+`Next` hands over one record and `Each` runs a handler over them. A record
+arrives with its provenance already read: a record with no spine carries none,
+which is the normal case on a plain data topic, while a record whose spine is
+present but broken is refused rather than handed over with its fence silently
+missing.
+
+Nothing is committed unless the caller asks. `ConsumerOptions.AutoCommit`
+turns on client-side commits, and `Commit` and `Mark` do it explicitly. The
+default suits a handler with side effects: a record is re-delivered after a
+crash rather than quietly skipped.
+
 Like the TypeScript client, this is a native port rather than a binding over
 the Rust crate. The Rust crates expose no C ABI, cgo would cost consumers
 cross-compilation, and the Apache Iggy Go client is itself pure Go.

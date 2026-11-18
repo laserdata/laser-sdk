@@ -90,3 +90,16 @@ func (e *VersionError) Error() string {
 	return e.Surface + " is served at op version " + itoa(int(e.Served)) +
 		", but this client speaks " + itoa(int(e.Pinned))
 }
+
+// NoProvenanceError reports a record that carries no agentic spine at all,
+// which is the normal case on a plain data topic.
+//
+// It is kept apart from a spine that is present but broken, because the two
+// want opposite handling: a record with no spine is delivered without one,
+// while a record whose fence or deadline failed to decode must not be
+// delivered as though it had neither.
+type NoProvenanceError struct{}
+
+func (e *NoProvenanceError) Error() string {
+	return "the record names no conversation, so it carries no provenance"
+}

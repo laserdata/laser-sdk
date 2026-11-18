@@ -162,12 +162,11 @@ func TestGivenNoConversationWhenDecodedThenShouldRefuseIt(t *testing.T) {
 
 	_, err = laser.ProvenanceFromHeaders(entries)
 
-	var invalid *laser.InvalidError
-	if !errors.As(err, &invalid) {
-		t.Fatalf("want an InvalidError, got %T: %v", err, err)
-	}
-	if !strings.Contains(err.Error(), wire.HeaderConversationID) {
-		t.Errorf("want the missing key named, got %v", err)
+	// It is its own type, because a record with no spine and a record whose
+	// spine is broken want opposite handling.
+	var absent *laser.NoProvenanceError
+	if !errors.As(err, &absent) {
+		t.Fatalf("want a NoProvenanceError, got %T: %v", err, err)
 	}
 }
 
