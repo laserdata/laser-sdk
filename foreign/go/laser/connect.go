@@ -5,10 +5,12 @@ import (
 	"errors"
 	"regexp"
 	"strconv"
+	"sync"
 	"time"
 
 	iggy "github.com/apache/iggy/foreign/go/client"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
 // DefaultConnectTimeout bounds a connect that neither the caller nor
@@ -32,6 +34,9 @@ type Options struct {
 	// Capabilities is the starting point for negotiation, not a ceiling. The
 	// probe adds whatever the connected deployment serves on top.
 	Capabilities *Capabilities
+	// ResourceNaming decides whether managed names are scoped to the default
+	// stream. The zero value scopes them, as every client does by default.
+	ResourceNaming ResourceNaming
 	// Environment reads the LASER_* variables, nil for the process
 	// environment.
 	Environment Environment
@@ -68,11 +73,22 @@ func (options Options) timeout() (time.Duration, error) {
 }
 
 // Laser is a connected client. It is safe for concurrent use.
+//
+// The connection and the applied frontier are the only mutable state, so they
+// are the only fields the lock covers. Everything else is fixed once the
+// handle exists and is read without one.
 type Laser struct {
-	client        iggcon.Client
-	connection    *ConnectionString
-	capabilities  Capabilities
-	defaultStream string
+	mutex  sync.RWMutex
+	client iggcon.Client
+	// frontier is the highest mutation position seen per managed surface.
+	// Every managed reply raises it, and a later read of that surface sends
+	// it, so whichever node answers has applied at least what this client
+	// already wrote or read.
+	frontier       wire.AppliedFrontier
+	connection     *ConnectionString
+	capabilities   Capabilities
+	defaultStream  string
+	resourceNaming ResourceNaming
 }
 
 // Connect opens a connection and negotiates what the deployment serves.
@@ -175,10 +191,11 @@ func ConnectWith(
 		configured = *options.Capabilities
 	}
 	return &Laser{
-		client:        connected,
-		connection:    parsed,
-		capabilities:  NegotiateCapabilities(ctx, connected, configured),
-		defaultStream: options.DefaultStream,
+		client:         connected,
+		connection:     parsed,
+		capabilities:   NegotiateCapabilities(ctx, connected, configured),
+		defaultStream:  options.DefaultStream,
+		resourceNaming: options.ResourceNaming,
 	}, nil
 }
 
@@ -208,9 +225,10 @@ func FromClient(client iggcon.Client, options Options) *Laser {
 		capabilities = *options.Capabilities
 	}
 	return &Laser{
-		client:        client,
-		capabilities:  capabilities,
-		defaultStream: options.DefaultStream,
+		client:         client,
+		capabilities:   capabilities,
+		defaultStream:  options.DefaultStream,
+		resourceNaming: options.ResourceNaming,
 	}
 }
 
@@ -227,16 +245,24 @@ func (laser *Laser) Connection() *ConnectionString { return laser.connection }
 func (laser *Laser) DefaultStream() string { return laser.defaultStream }
 
 // Client hands out the underlying Apache Iggy client, for an operation this
-// package does not wrap yet.
-func (laser *Laser) Client() iggcon.Client { return laser.client }
+// package does not wrap yet. It is nil once the handle is closed.
+func (laser *Laser) Client() iggcon.Client {
+	laser.mutex.RLock()
+	defer laser.mutex.RUnlock()
+	return laser.client
+}
 
-// Close releases the connection. It is safe to call more than once.
+// Close releases the connection. It is safe to call more than once, and safe
+// to call while another goroutine is using the handle.
 func (laser *Laser) Close() error {
-	if laser.client == nil {
+	laser.mutex.Lock()
+	client := laser.client
+	laser.client = nil
+	laser.mutex.Unlock()
+	if client == nil {
 		return nil
 	}
-	err := laser.client.Close()
-	laser.client = nil
+	err := client.Close()
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return &TransportError{Reason: "close the connection", Cause: err}
 	}

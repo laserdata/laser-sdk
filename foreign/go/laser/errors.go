@@ -41,3 +41,36 @@ func (e *TransportError) Error() string {
 }
 
 func (e *TransportError) Unwrap() error { return e.Cause }
+
+// InvalidError reports a value the client refuses to send, the Go form of
+// laser_sdk's LaserError::Invalid.
+type InvalidError struct{ Reason string }
+
+func (e *InvalidError) Error() string { return e.Reason }
+
+// UnsupportedError reports a surface the connected deployment does not serve,
+// the Go form of laser_sdk's LaserError::Unsupported.
+//
+// It is raised before the call leaves, because plain Apache Iggy answers an
+// unknown managed command with a transport error that says nothing about why.
+type UnsupportedError struct{ Surface string }
+
+func (e *UnsupportedError) Error() string {
+	return e.Surface + " need a managed backend, which this deployment does not have"
+}
+
+// CodecError reports a value that could not be encoded or decoded, the Go form
+// of laser_sdk's LaserError::Codec.
+type CodecError struct {
+	Reason string
+	Cause  error
+}
+
+func (e *CodecError) Error() string {
+	if e.Cause == nil {
+		return e.Reason
+	}
+	return e.Reason + ": " + e.Cause.Error()
+}
+
+func (e *CodecError) Unwrap() error { return e.Cause }
