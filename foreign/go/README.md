@@ -146,6 +146,26 @@ one partition. Omitting the key balances across partitions and promises no
 order between records. An empty key is refused, because it would hash every
 record onto one partition while reading as "no key given".
 
+## Provenance
+
+`Provenance` is the agentic spine: conversation, causality, routing and usage.
+`Publish().Provenance(p)` stamps it onto a record and partitions by the
+conversation, which is what keeps one conversation ordered.
+`ProvenanceFrom(message)` reads it back.
+
+Numbers ride typed rather than as decimal text, using the contract's own
+encoder, so there is one implementation of the byte layout rather than two that
+can drift. A header outside the dictionary is foreign and ignored, so an
+application's keys and the AGDX envelope stamps pass through. A key the
+dictionary does know, carrying the wrong kind, is corruption and is reported:
+silently dropping a fence would skip the gate and let a stale holder's replay
+through as if it were unfenced.
+
+A record with no conversation is refused, since it has no partition key and no
+conversation to belong to. A broadcast addressee reads back as no target rather
+than an agent named `*`. A non-finite cost is refused in both directions,
+because it would be rolled up into a total as a number that is not one.
+
 Like the TypeScript client, this is a native port rather than a binding over
 the Rust crate. The Rust crates expose no C ABI, cgo would cost consumers
 cross-compilation, and the Apache Iggy Go client is itself pure Go.

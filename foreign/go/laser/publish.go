@@ -75,6 +75,23 @@ func (request *PublishRequest) Header(name, value string) *PublishRequest {
 	return request
 }
 
+// Provenance stamps the agentic spine onto the record and partitions by its
+// conversation, which is what keeps one conversation ordered.
+//
+// An explicit Key still wins, for the rare case where a caller routes by
+// something other than the conversation.
+func (request *PublishRequest) Provenance(provenance *Provenance) *PublishRequest {
+	entries, err := provenance.Headers()
+	if err != nil {
+		return request.fail(err)
+	}
+	request.headers = append(request.headers, entries...)
+	if !request.hasKey {
+		request.key, request.hasKey = provenance.PartitionKey(), true
+	}
+	return request
+}
+
 // Key sets the partition key.
 //
 // Records sharing a key land on one partition, which is the only ordering
