@@ -184,6 +184,22 @@ turns on client-side commits, and `Commit` and `Mark` do it explicitly. The
 default suits a handler with side effects: a record is re-delivered after a
 crash rather than quietly skipped.
 
+## Replay and typed records
+
+`Topic.Replay()` opens a positional cursor. It owns its offsets rather than
+storing them server-side, so persist `Offsets()` and resume with
+`FromOffsets()`. `Poll` drains what is there and stops, which is the bounded
+read below a consumer. Records come back ordered by the server's own clock,
+then partition and offset, so two readers of one topic see one order.
+
+`TypedJSON[T]`, `TypedCBOR[T]` and `TypedWith[T]` view a topic as carrying one
+body type through one codec. `Publish` stamps the codec's content type and
+`Records` walks a cursor handing over decoded bodies.
+
+One unreadable record is usually one bad writer, not a broken topic, so a
+decode failure names the partition and offset it sat at and the read carries
+on. Passing no error handler skips those records quietly.
+
 Like the TypeScript client, this is a native port rather than a binding over
 the Rust crate. The Rust crates expose no C ABI, cgo would cost consumers
 cross-compilation, and the Apache Iggy Go client is itself pure Go.
