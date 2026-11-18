@@ -282,6 +282,26 @@ because the deadline is for a reply that never comes rather than for a handler
 that is slow. `Acknowledged` reports it, so a slow handler is waited out rather
 than retried into a duplicate.
 
+## Memory
+
+`Laser.Memory(namespace)` opens the agentic memory surface. `Remember`,
+`Forget` and `Improve` write to the memory topic, so memory is replayable: the
+log is the audit, and a deployment folds it into a read view.
+
+An item's id is derived from its owner, kind and body. The owner is part of the
+hash, so two users never share an item and the same fact in two conversations
+is two items. Remembering the same thing twice converges on one item rather
+than growing the store. Forgetting writes a tombstone: it changes what is
+recalled rather than erasing what happened.
+
+`Rank` orders items against a query, which is the ranking a client can do with
+no model: overlap on words. It counts query words covered rather than item
+words matched, so a long item does not outrank a precise one. `ToContextBlock`
+renders them for a prompt, filling in rank order until the token budget is
+reached. The budget is advisory, since tokens are estimated rather than
+tokenized: a real count needs the model's tokenizer, and carrying one would tie
+the client to a provider.
+
 Like the TypeScript client, this is a native port rather than a binding over
 the Rust crate. The Rust crates expose no C ABI, cgo would cost consumers
 cross-compilation, and the Apache Iggy Go client is itself pure Go.
