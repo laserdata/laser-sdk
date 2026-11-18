@@ -7,10 +7,10 @@ The Go client for [LaserData](https://laserdata.com), a native port of the
 against the shared corpus, and the connection layer has started: `Connect`,
 the shared connection string grammar, TLS resolution, and the connect-time
 capability negotiation, all over the Apache Iggy Go SDK's TCP transport. There
-Key-value, query, fork, graph and the authorization verbs are the typed
-surfaces so far. There is no streaming client, no session surface, no agent
-runtime, and no bridge yet, so the handle hands out the underlying Iggy client
-for anything beyond that.
+Key-value, query, fork, graph, session reads and the authorization verbs are
+the typed surfaces so far. There is no streaming client, no agent runtime, and
+no bridge yet, so the handle hands out the underlying Iggy client for anything
+beyond that.
 
 ## Managed commands
 
@@ -107,7 +107,23 @@ instant, keeping only edges whose valid-time window contains it.
 
 `Upsert` and `Link` write facts. Ids are content-addressed, so re-applying the
 same extraction converges on the same elements instead of duplicating them,
-which is what lets a projector replay without the graph growing. It is not published, it is absent from the [cross-SDK parity
+which is what lets a projector replay without the graph growing.
+
+## Session reads
+
+`Laser.Sessions()` reads the deployment's session index for the default
+stream, and `SessionsIn(stream)` for another. `Get`, `List`, `Events`, `State`,
+`Links`, `Sources` and `Changes` cover it.
+
+Every request names its stream first, because the index is per stream: a
+session id alone does not say which index to look in. The stream is sent as
+given rather than scoped, since it is a stream name and not a managed resource
+name.
+
+A list or timeline walked page by page would shift under appends, so the first
+page returns a boundary and later pages pass it back through `Bound`. The
+boundary carries its change series too, because a rebuilt index restarts the
+sequence and the offset alone would then mean something else. It is not published, it is absent from the [cross-SDK parity
 matrix](../../docs/parity.md), and it does not run the shared behavior
 scenarios. Use the [Rust](../../sdk/README.md),
 [Python](../python/README.md), or [TypeScript](../typescript/README.md)
