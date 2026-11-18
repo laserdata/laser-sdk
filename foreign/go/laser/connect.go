@@ -1,0 +1,244 @@
+package laser
+
+import (
+	"context"
+	"errors"
+	"regexp"
+	"strconv"
+	"time"
+
+	iggy "github.com/apache/iggy/foreign/go/client"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+)
+
+// DefaultConnectTimeout bounds a connect that neither the caller nor
+// LASER_CONNECT_TIMEOUT_MS pins. See docs/connect-timeout.md for what the
+// deadline covers and what it leaves behind.
+const DefaultConnectTimeout = 30 * time.Second
+
+// LocalConnectionString reaches the Apache Iggy container the examples run
+// against.
+const LocalConnectionString = "iggy:iggy@127.0.0.1:8090"
+
+// Options configure a connect. The zero value takes every default.
+type Options struct {
+	// Timeout bounds the whole connect: the dial, the login, and the
+	// capability probe. Zero reads LASER_CONNECT_TIMEOUT_MS, then falls back to
+	// DefaultConnectTimeout.
+	Timeout time.Duration
+	// DefaultStream pins the stream the one-word topic shortcut addresses.
+	// Purely ergonomic: any other stream stays one accessor away.
+	DefaultStream string
+	// Capabilities is the starting point for negotiation, not a ceiling. The
+	// probe adds whatever the connected deployment serves on top.
+	Capabilities *Capabilities
+	// Environment reads the LASER_* variables, nil for the process
+	// environment.
+	Environment Environment
+}
+
+func (options Options) environment() Environment {
+	if options.Environment != nil {
+		return options.Environment
+	}
+	return OSEnvironment
+}
+
+var digits = regexp.MustCompile(`^\d+$`)
+
+// timeout resolves the connect deadline, preferring the caller's value over
+// the environment over the default.
+func (options Options) timeout() (time.Duration, error) {
+	if options.Timeout != 0 {
+		return options.Timeout, nil
+	}
+	raw, present := options.environment()("LASER_CONNECT_TIMEOUT_MS")
+	if !present || raw == "" {
+		return DefaultConnectTimeout, nil
+	}
+	if !digits.MatchString(raw) {
+		return 0, configError("LASER_CONNECT_TIMEOUT_MS must be an integer")
+	}
+	milliseconds, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil || milliseconds < 1 {
+		return 0, configError(
+			"LASER_CONNECT_TIMEOUT_MS must be an integer between 1 and 2147483647")
+	}
+	return time.Duration(milliseconds) * time.Millisecond, nil
+}
+
+// Laser is a connected client. It is safe for concurrent use.
+type Laser struct {
+	client        iggcon.Client
+	connection    *ConnectionString
+	capabilities  Capabilities
+	defaultStream string
+}
+
+// Connect opens a connection and negotiates what the deployment serves.
+//
+// The connection string takes the grammar every Laser client shares, and a
+// LaserData host is encrypted automatically. See TCPSettings for the transport
+// this lowers onto, and Capabilities for what the connect-time probe decides.
+func Connect(ctx context.Context, connectionString string) (*Laser, error) {
+	return ConnectWith(ctx, connectionString, Options{})
+}
+
+// ConnectEnv connects from the environment: LASER_CONNECTION_STRING, which is
+// exactly what Connect takes, plus the optional LASER_STREAM pinning the
+// default stream. The same two variables every deployment guide uses, so a
+// program moves between local, staging and LaserData Cloud with no code change.
+func ConnectEnv(ctx context.Context) (*Laser, error) {
+	return ConnectEnvWith(ctx, Options{})
+}
+
+// ConnectEnvWith is ConnectEnv with explicit options. A DefaultStream the
+// caller pins wins over LASER_STREAM.
+func ConnectEnvWith(ctx context.Context, options Options) (*Laser, error) {
+	connectionString, resolved, err := ConnectionFromEnv(options)
+	if err != nil {
+		return nil, err
+	}
+	return ConnectWith(ctx, connectionString, resolved)
+}
+
+// ConnectionFromEnv reads the connection string and the optional default
+// stream from the environment, returning the options ConnectEnv would connect
+// with. Exposed so a caller can see what the environment resolved to before
+// anything is dialed.
+//
+// A DefaultStream the caller pinned wins over LASER_STREAM, because an explicit
+// setting is never overridden by ambient configuration.
+func ConnectionFromEnv(options Options) (string, Options, error) {
+	environment := options.environment()
+	connectionString, present := environment("LASER_CONNECTION_STRING")
+	if !present || connectionString == "" {
+		return "", options, configError("LASER_CONNECTION_STRING is not set")
+	}
+	if options.DefaultStream == "" {
+		if stream, present := environment("LASER_STREAM"); present {
+			options.DefaultStream = stream
+		}
+	}
+	return connectionString, options, nil
+}
+
+// Resolve fills in what an Options left zero, reading the environment for the
+// values it does not pin. Connect calls it, and a caller can call it first to
+// see the deadline a connect will run under.
+func (options Options) Resolve() (Options, error) {
+	timeout, err := options.timeout()
+	if err != nil {
+		return options, err
+	}
+	options.Timeout = timeout
+	return options, nil
+}
+
+// Local connects to the Apache Iggy container at iggy:iggy@127.0.0.1:8090.
+func Local(ctx context.Context) (*Laser, error) {
+	return ConnectWith(ctx, LocalConnectionString, Options{})
+}
+
+// ConnectWith is Connect with explicit options.
+func ConnectWith(
+	ctx context.Context, connectionString string, options Options,
+) (*Laser, error) {
+	options, err := options.Resolve()
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := ParseConnectionStringWithEnv(connectionString, options.environment())
+	if err != nil {
+		return nil, err
+	}
+	tcpOptions, err := parsed.TCPOptions()
+	if err != nil {
+		return nil, err
+	}
+	// Every stage shares one deadline, so a server that accepts the socket and
+	// then stalls cannot hold the caller past the budget it set.
+	ctx, cancel := context.WithTimeout(ctx, options.Timeout)
+	defer cancel()
+
+	connected, err := iggy.NewIggyClient(iggy.WithTcp(tcpOptions...))
+	if err != nil {
+		return nil, &TransportError{Reason: "build the client", Cause: err}
+	}
+	if err := connected.Connect(ctx); err != nil {
+		return nil, &TransportError{Reason: connectStage(parsed.Host), Cause: err}
+	}
+	// The probe is the last stage, and it is never fatal: a client that cannot
+	// classify the deployment still connects, with the open surface alone.
+	configured := OpenCapabilities()
+	if options.Capabilities != nil {
+		configured = *options.Capabilities
+	}
+	return &Laser{
+		client:        connected,
+		connection:    parsed,
+		capabilities:  NegotiateCapabilities(ctx, connected, configured),
+		defaultStream: options.DefaultStream,
+	}, nil
+}
+
+// connectStage names what was being attempted when a connect failed. A
+// LaserData deployment that never accepts usually refuses the caller's address,
+// so the stage names the access rule rather than leaving a bare timeout.
+func connectStage(host string) string {
+	if isLaserDataHost(host) {
+		return "connect: the deployment did not accept the connection, " +
+			"which is usually an access rule that does not list this address"
+	}
+	return "connect: the deployment did not accept the connection"
+}
+
+// FromClient wraps a client the caller already connected, so an application
+// that configures the Apache Iggy SDK itself still gets the Laser surface over
+// it. The Rust client takes a caller-supplied client the same way.
+//
+// No probe runs, because the caller owns the connection and may have opened it
+// against something this package never dialed. The capability set is therefore
+// exactly what Options.Capabilities pins, and its Hello outcome stays
+// HelloUnknown: nothing was established, as opposed to positively absent.
+// Call NegotiateCapabilities explicitly to probe such a connection.
+func FromClient(client iggcon.Client, options Options) *Laser {
+	capabilities := OpenCapabilities()
+	if options.Capabilities != nil {
+		capabilities = *options.Capabilities
+	}
+	return &Laser{
+		client:        client,
+		capabilities:  capabilities,
+		defaultStream: options.DefaultStream,
+	}
+}
+
+// Capabilities reports what the connected deployment serves, as the
+// connect-time probe established it.
+func (laser *Laser) Capabilities() Capabilities { return laser.capabilities }
+
+// Connection reports the parsed connection string this client dialed with. The
+// credentials it carries are the caller's own, so they are never logged here.
+func (laser *Laser) Connection() *ConnectionString { return laser.connection }
+
+// DefaultStream is the stream the one-word topic shortcut addresses, empty
+// when none was pinned.
+func (laser *Laser) DefaultStream() string { return laser.defaultStream }
+
+// Client hands out the underlying Apache Iggy client, for an operation this
+// package does not wrap yet.
+func (laser *Laser) Client() iggcon.Client { return laser.client }
+
+// Close releases the connection. It is safe to call more than once.
+func (laser *Laser) Close() error {
+	if laser.client == nil {
+		return nil
+	}
+	err := laser.client.Close()
+	laser.client = nil
+	if err != nil && !errors.Is(err, context.Canceled) {
+		return &TransportError{Reason: "close the connection", Cause: err}
+	}
+	return nil
+}
