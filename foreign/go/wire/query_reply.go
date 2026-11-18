@@ -50,6 +50,27 @@ type ResolvedQueryTarget struct {
 }
 
 // MarshalCBOR writes the internally tagged resolved target.
+// NewResolvedOperationalTarget names the index a query actually resolved to,
+// with the backend that answered and the generation and revision it ran at.
+//
+// A client reads this rather than building it, but the contract's own variant
+// is constructible, so this one is too: a test or a fake server that could not
+// build a reply could not exercise a client that reads one.
+func NewResolvedOperationalTarget(
+	index string, backendResourceID BackendResourceID,
+	backendGeneration, runtimeConfigurationRevision uint64,
+) ResolvedQueryTarget {
+	return ResolvedQueryTarget{
+		Kind: ResolvedOperational,
+		Operational: &resolvedOperationalFields{
+			Index:                        index,
+			BackendResourceID:            backendResourceID,
+			BackendGeneration:            backendGeneration,
+			RuntimeConfigurationRevision: runtimeConfigurationRevision,
+		},
+	}
+}
+
 func (target ResolvedQueryTarget) MarshalCBOR() (cborform.Value, error) {
 	switch target.Kind {
 	case ResolvedOperational:

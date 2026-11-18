@@ -7,10 +7,10 @@ The Go client for [LaserData](https://laserdata.com), a native port of the
 against the shared corpus, and the connection layer has started: `Connect`,
 the shared connection string grammar, TLS resolution, and the connect-time
 capability negotiation, all over the Apache Iggy Go SDK's TCP transport. There
-The key-value store and the authorization verbs are the typed surfaces so far.
-There is no streaming client, no query or session surface, no agent runtime,
-and no bridge yet, so the handle hands out the underlying Iggy client for
-anything beyond that.
+Key-value, query and the authorization verbs are the typed surfaces so far.
+There is no streaming client, no session surface, no agent runtime, and no
+bridge yet, so the handle hands out the underlying Iggy client for anything
+beyond that.
 
 ## Managed commands
 
@@ -66,7 +66,25 @@ Every write carries a receipt identity, so an exact repeat after a lost reply
 returns the original outcome instead of applying twice. `DefineRoleAs`,
 `DeleteRoleAs` and `BindRolesAs` let a caller choose it and keep it across a
 restart. `BindRolesExpectRevision` makes a bind conditional, so two
-administrators editing one user cannot both win. It is not published, it is absent from the [cross-SDK parity
+administrators editing one user cannot both win.
+
+## Query
+
+`Laser.Query(index)` builds a query against a materialized index. Predicates
+chain and compose with AND, `AnyOf` adds a disjunction, and the aggregate,
+grouping, ordering, paging and projection steps read as one expression.
+`Fetch` sends it.
+
+Three fields are additive on the wire, so an unaware backend would drop them
+and answer anyway: a consistency level, a lexical search, and raw SQL. Each is
+refused before sending unless the deployment announced it, because an answer
+that is wider or staler than was asked for still looks like success. Raw SQL
+additionally needs a ready backend that announced that dialect.
+
+The deadline is absolute on the wire and resolved at send time, so a request
+built and held does not arrive already expired. Every execution carries its own
+identity. A result whose rows do not match its schema is refused rather than
+read, since misaligned values look like data rather than a fault. It is not published, it is absent from the [cross-SDK parity
 matrix](../../docs/parity.md), and it does not run the shared behavior
 scenarios. Use the [Rust](../../sdk/README.md),
 [Python](../python/README.md), or [TypeScript](../typescript/README.md)
