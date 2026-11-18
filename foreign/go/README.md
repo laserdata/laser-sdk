@@ -4,9 +4,11 @@ The Go client for [LaserData](https://laserdata.com), a native port of the
 `laser-wire` contract.
 
 **This client is in progress.** The wire contract is complete and pinned
-against the shared corpus. There is no SDK surface yet: no transport, no
-streaming client, no managed clients, no agent runtime, and no bridges. It is
-not published, it is absent from the [cross-SDK parity
+against the shared corpus, and the connection layer has started: `Connect`,
+the shared connection string grammar, TLS resolution, and the connect-time
+capability negotiation, all over the Apache Iggy Go SDK's TCP transport. There
+is no streaming client, managed client, agent runtime, or bridge yet, so the
+handle hands out the underlying Iggy client for anything beyond that. It is not published, it is absent from the [cross-SDK parity
 matrix](../../docs/parity.md), and it does not run the shared behavior
 scenarios. Use the [Rust](../../sdk/README.md),
 [Python](../python/README.md), or [TypeScript](../typescript/README.md)
@@ -21,7 +23,28 @@ cross-compilation, and the Apache Iggy Go client is itself pure Go.
 | Package | Owns |
 |---|---|
 | `wire` | the contract: codes, headers, topics, envelopes, queries, projections and bindings, logical and writer schemas, filters, sessions, the HTTP surface, and a typed client over a caller-supplied transport |
+| `laser` | the client: connect, the connection string grammar and TLS resolution, and the capability negotiation. The grammar is parsed here rather than by the Apache Iggy Go SDK, because the TLS decision is Laser's and because the accepted grammar has to match the Rust and TypeScript clients |
 | `internal/cborform` | an order-preserving CBOR value tree and a shortest-form encoder. The CBOR and JSON encoders both walk it, so field order and the skip rules cannot drift between the two encodings |
+
+## Transport
+
+The client reaches a deployment over TCP, plain or TLS, because the [Apache Iggy Go
+SDK](https://pkg.go.dev/github.com/apache/iggy/foreign/go) implements that transport
+alone. QUIC and WebSocket are served by the Rust and Python clients, and a connection
+string naming one is refused with that hint rather than silently downgraded.
+
+A `*.laserdata.cloud` or `*.laserdata.com` host is encrypted automatically against the
+root CA this package carries, a copy of `sdk/certs/laserdata.crt` that a test checks
+byte for byte. That SDK reads a CA from a path, so the bundled root is cached in an
+owner-only per-user directory and reused. `LASER_TLS_CERT=<path>` names a CA for any
+host, and `LASER_NO_TLS=1` opts out of the automatic choice. See
+[client behavior](../../docs/client-behavior.md).
+
+The reconnection options (`reconnection_retries`, `reconnection_interval`,
+`reestablish_after`) are parsed and validated for compatibility and then not forwarded:
+that SDK keeps its own reconnect pacing and exposes no setting for it. A value the
+other clients reject is still rejected here, so one connection string means the same
+thing wherever it is read.
 
 ## How the port is verified
 
