@@ -4,13 +4,18 @@ The Go client for [LaserData](https://laserdata.com), a native port of the
 `laser-wire` contract.
 
 **This client is in progress.** The wire contract is complete and pinned
-against the shared corpus, and the connection layer has started: `Connect`,
-the shared connection string grammar, TLS resolution, and the connect-time
-capability negotiation, all over the Apache Iggy Go SDK's TCP transport. There
-Key-value, query, fork, graph, session reads and the authorization verbs are
-the typed surfaces so far. There is no streaming client, no agent runtime, and
-no bridge yet, so the handle hands out the underlying Iggy client for anything
-beyond that.
+against the shared corpus, and the client is being built on it: `Connect`, the
+shared connection string grammar, TLS resolution, the connect-time capability
+negotiation, the managed command band, and the key-value, query, fork, graph,
+session-read and authorization surfaces, plus addressing streams and topics and
+publishing to them. All of it rides the Apache Iggy Go SDK's TCP transport.
+
+There is no consumer, no agent runtime, and no bridge yet, so the handle hands
+out the underlying Iggy client for anything beyond that. It is not published,
+it is absent from the [cross-SDK parity matrix](../../docs/parity.md), and it
+does not run the shared behavior scenarios. Use the [Rust](../../sdk/README.md),
+[Python](../python/README.md), or [TypeScript](../typescript/README.md)
+clients for anything this one does not cover yet.
 
 ## Managed commands
 
@@ -123,11 +128,23 @@ name.
 A list or timeline walked page by page would shift under appends, so the first
 page returns a boundary and later pages pass it back through `Bound`. The
 boundary carries its change series too, because a rebuilt index restarts the
-sequence and the offset alone would then mean something else. It is not published, it is absent from the [cross-SDK parity
-matrix](../../docs/parity.md), and it does not run the shared behavior
-scenarios. Use the [Rust](../../sdk/README.md),
-[Python](../python/README.md), or [TypeScript](../typescript/README.md)
-clients for anything beyond encoding and decoding the contract.
+sequence and the offset alone would then mean something else.
+
+## Streams, topics and publishing
+
+`Laser.Stream(name).Topic(name)` addresses a topic, and `Laser.Topic(name)`
+uses the stream pinned at connect. `Ensure` creates what is absent and leaves
+what exists alone, so it is safe on every start: two callers racing to create
+one stream both succeed, because the loser re-reads and finds what it wanted.
+
+`Publish` builds a record (`Payload`, `JSON`, `CBOR`, `Header`, `Key`) and
+`Send` appends it. `Topic.Send` is the same path with explicit headers, and
+`Topic.Batch` appends many records in one call under one partitioning.
+
+A partition key is the only ordering Iggy gives: records sharing a key land on
+one partition. Omitting the key balances across partitions and promises no
+order between records. An empty key is refused, because it would hash every
+record onto one partition while reading as "no key given".
 
 Like the TypeScript client, this is a native port rather than a binding over
 the Rust crate. The Rust crates expose no C ABI, cgo would cost consumers
@@ -138,7 +155,7 @@ cross-compilation, and the Apache Iggy Go client is itself pure Go.
 | Package | Owns |
 |---|---|
 | `wire` | the contract: codes, headers, topics, envelopes, queries, projections and bindings, logical and writer schemas, filters, sessions, the HTTP surface, and a typed client over a caller-supplied transport |
-| `laser` | the client: connect, the connection string grammar and TLS resolution, the capability negotiation, and the managed command path every managed surface rides on. The grammar is parsed here rather than by the Apache Iggy Go SDK, because the TLS decision is Laser's and because the accepted grammar has to match the Rust and TypeScript clients |
+| `laser` | the client: connect, the connection string grammar and TLS resolution, the capability negotiation, the managed command band and the typed surfaces on it, and the stream, topic and publish facade. The grammar is parsed here rather than by the Apache Iggy Go SDK, because the TLS decision is Laser's and because the accepted grammar has to match the Rust and TypeScript clients |
 | `internal/cborform` | an order-preserving CBOR value tree and a shortest-form encoder. The CBOR and JSON encoders both walk it, so field order and the skip rules cannot drift between the two encodings |
 
 ## Transport

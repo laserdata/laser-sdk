@@ -463,9 +463,10 @@ foreign/go/             the Go client, in progress (outside the workspace): wire
                         grammar, TLS resolution, the AGDX_HELLO capability negotiation,
                         the managed command path with its operation identities,
                         resource scoping and applied frontier, and the key-value, query, fork,
-                        graph, session-read and authorization surfaces. There is no
-                        streaming client, agent runtime, bridge, or entry in
-                        docs/parity.md yet. wire/
+                        graph, session-read and authorization surfaces plus the
+                        stream, topic and publish facade. There is no consumer,
+                        agent runtime, bridge, or entry in docs/parity.md yet.
+                        wire/
                         parity_test.go asserts that every public type of wire/src has a
                         Go peer, so a type added upstream fails the Go suite.
 bdd/                    cross-SDK conformance (outside the workspace): scenarios/
