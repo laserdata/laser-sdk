@@ -80,9 +80,9 @@ func (laser *Laser) ensureScopable(code uint32) error {
 // surface sends it, so whichever node answers has applied at least what this
 // client wrote or read before.
 func (laser *Laser) SeenPositions() wire.AppliedFrontier {
-	laser.mutex.RLock()
-	defer laser.mutex.RUnlock()
-	return laser.frontier
+	laser.state().mutex.RLock()
+	defer laser.state().mutex.RUnlock()
+	return laser.state().frontier
 }
 
 // SendManaged sends a managed command and returns the surface reply.
@@ -130,9 +130,9 @@ func (laser *Laser) sendManagedFrame(
 	if err := laser.ensureScopable(code); err != nil {
 		return nil, err
 	}
-	laser.mutex.RLock()
-	client := laser.client
-	laser.mutex.RUnlock()
+	laser.state().mutex.RLock()
+	client := laser.state().client
+	laser.state().mutex.RUnlock()
 	if client == nil {
 		return nil, &TransportError{Reason: "the client is closed"}
 	}
@@ -153,9 +153,9 @@ func (laser *Laser) openPositioned(reply []byte) []byte {
 	if err := wire.Unmarshal(reply, &envelope); err != nil {
 		return reply
 	}
-	laser.mutex.Lock()
-	wire.MergeFrontier(&laser.frontier, envelope.Frontier)
-	laser.mutex.Unlock()
+	laser.state().mutex.Lock()
+	wire.MergeFrontier(&laser.state().frontier, envelope.Frontier)
+	laser.state().mutex.Unlock()
 	return envelope.Reply
 }
 

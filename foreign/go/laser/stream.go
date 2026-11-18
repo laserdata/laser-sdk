@@ -185,12 +185,12 @@ func (topic *Topic) identifiers() (iggcon.Identifier, iggcon.Identifier, error) 
 // connected hands out the live client, refusing a handle that was closed
 // rather than letting a nil connection surface as a panic.
 func (laser *Laser) connected() (iggcon.Client, error) {
-	laser.mutex.RLock()
-	defer laser.mutex.RUnlock()
-	if laser.client == nil {
+	laser.state().mutex.RLock()
+	defer laser.state().mutex.RUnlock()
+	if laser.state().client == nil {
 		return nil, &TransportError{Reason: "the client is closed"}
 	}
-	return laser.client, nil
+	return laser.state().client, nil
 }
 
 func errNoStream() error {

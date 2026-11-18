@@ -7,6 +7,7 @@ import (
 	"time"
 	"unicode"
 
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
@@ -302,9 +303,36 @@ func (memory *Memory) write(ctx context.Context, record wire.MemoryRecord) error
 		key = memory.scope.Conversation.String()
 	}
 	topic := memory.laser.Stream(memory.stream).Topic(memory.topic)
-	_, err = topic.Publish().Payload(payload).
-		Header(wire.HeaderMemoryNamespace, memory.namespace).
-		Key(key).Send(ctx)
+	namespace, err := iggcon.NewHeaderKeyString(wire.HeaderMemoryNamespace)
+	if err != nil {
+		return &InvalidError{Reason: "the memory namespace header: " + err.Error()}
+	}
+	headers := []iggcon.HeaderEntry{{
+		Key:   namespace,
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte(memory.namespace)},
+	}}
+	// A memory write is governed as what it is rather than as a plain
+	// publish, so a policy can bound what an agent may remember without
+	// bounding everything it may send.
+	action := &GovernedAction{
+		Kind: ActionMemoryWrite, Stream: memory.stream, Topic: memory.topic,
+		Conversation: memory.scope.Conversation, Payload: payload,
+	}
+	if memory.scope.Agent != nil {
+		action.Source = memory.scope.Agent.String()
+	}
+	governed, err := memory.laser.govern(ctx, action)
+	if err != nil {
+		return err
+	}
+	if governed != nil {
+		payload = governed
+	}
+	message, err := iggcon.NewIggyMessage(payload, iggcon.WithUserHeaders(headers))
+	if err != nil {
+		return &InvalidError{Reason: "build the memory record: " + err.Error()}
+	}
+	_, err = topic.sendMessages(ctx, []iggcon.IggyMessage{message}, key, true)
 	return err
 }
 

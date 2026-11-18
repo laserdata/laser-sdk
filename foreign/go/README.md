@@ -10,8 +10,8 @@ negotiation, the managed command band and its typed surfaces (key-value, query,
 forks, graph, session reads and writes, authorization, consumer filters and the
 saved-filter catalog), streams, topics and publishing, consuming, replay, typed
 records, provenance headers, AGDX agent messaging and gates, the registry and
-router, request and reply, memory, context assembly, and the bridge value
-mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
+router, request and reply, memory, context assembly, action governance with
+its approval gate, and the bridge value mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
 
 It is not published yet. [docs/parity.md](../../docs/parity.md) lists its
 standing on each capability in its own section, and `bdd/go/` runs the shared
@@ -414,6 +414,75 @@ Each verb returns what its change produced and where the fold applied it. That
 position is what a group read can wait for, which is what gives an application
 that just configured a group read-your-writes through any node.
 
+## Action governance
+
+`laser.WithGovernor(governor, mode)` derives a handle whose publishes, AGDX
+verbs, requests and memory writes run a policy hook before the effect. It is
+defense in depth at the effect boundary: authorization on the managed surfaces
+stays server-owned, and this hook cannot widen it. It can only stop or narrow
+what the client was already allowed to do.
+
+The governor sees who is acting, where the effect lands, the body about to be
+published, and the session's running counters. Every agent-written field it
+reads is a claim rather than a fact: a declared purpose is advisory unless the
+envelope is signed.
+
+The vocabulary is broader than allow and deny, because a policy that can only
+refuse forces every nuance into a refusal. `Allow` runs the effect and records
+nothing. `Observe` runs it and records evidence. `Modify` replaces the body,
+applied before signing so a signature always covers what the log carries.
+`Block` and `Defer` reject, the second retryable. `StepUp` rejects naming the
+scope an approval must grant, so a handler knows what to ask for.
+
+`GovernorObserve` is a shadow rollout: every decision is recorded with what
+enforcement would have done, the effect always runs unmodified, and a failed
+evidence write only warns. Observing never impacts production, a failing
+governor included. `GovernorEnforce` applies the verdict, and a governor that
+fails or answers nothing fails the effect rather than failing open. Under
+enforcement a proceeding decision whose evidence did not land fails the call,
+because a governed effect nobody recorded is an ungoverned effect. A denial
+stands whether or not its evidence landed.
+
+Each decision is appended to the audit topic as an AGDX event, sealed with
+BLAKE3 over its own canonical encoding and chained to the previous decision in
+the same conversation. `VerifyEvidenceChain` checks a chain read back: a
+reordered, dropped or edited record breaks it, which is the point, since
+evidence nobody can check is not evidence. Chain heads are process-local, so a
+restart or a retention eviction starts a new chain rather than breaking the
+old one, and chains of several processes interleave on one topic. Evidence
+goes straight to the log rather than back through the governed verbs, so a
+blocking policy cannot stop its own decision being recorded.
+
+`laser.NewQuorumGovernor(policy)` composes independent voters and is itself a
+governor, so it enrolls exactly like a single one. Voters run concurrently and
+each is bounded, so one hung voter never stalls every governed effect: a
+mandatory one that does not answer blocks and any other abstains. When the
+quorum is met the composite is the strongest affirmative, in order modify,
+observe, allow. When it is not, it is the most actionable denial, in order
+block, step-up, defer. Every voter's verdict is recorded, so the audit trail
+names who said what. Nothing here reaches a durable log: it is an in-process
+combinator, not the crash-safe propose, vote and commit lifecycle a durable
+version would need.
+
+## Approvals
+
+`Requester.ApprovalGate` asks a named approver and waits for the answer. The
+reply mints an `ApprovalGrant`, which is the only way to hold one: a grant
+cannot be constructed from a message the approver never sent, and a reply from
+anyone else decides nothing.
+
+`AgdxSend.WithGrant` carries a grant with an effect. A governor stepping up in
+the grant's own conversation is answered by it rather than raising the step-up
+again, which is what lets a handler gate once and then act. A grant from
+another conversation approves nothing, because an approval given for one piece
+of work is not an approval for another. The step-up is still recorded with its
+scope: the approval answered it, it did not make it disappear.
+
+Waiting in place is the whole of this gate. The Rust client can instead park
+the work and replay the handler once the decision lands, which frees the
+consumer for the session's other work. That runtime is not ported here, so a
+gate held open holds its caller open.
+
 ## Bridges
 
 `bridges` maps external agent interfaces onto AGDX. A bridge is a translation
@@ -489,11 +558,19 @@ None has crossed a socket, because there is no transport yet.
 
 ## Dependencies
 
-One, `google.golang.org/protobuf`, for descriptor resolution in the Protobuf
-filter codec. Hand-rolling descriptor semantics means reimplementing oneofs,
-proto3 synthetic optionals, map entries and packed repeated fields, which is
-where a canonical implementation earns its place. Rust uses `prost-reflect`
-and TypeScript uses `protobufjs` for the same reason.
+Two beyond the Apache Iggy client.
+
+`google.golang.org/protobuf`, for descriptor resolution in the Protobuf filter
+codec. Hand-rolling descriptor semantics means reimplementing oneofs, proto3
+synthetic optionals, map entries and packed repeated fields, which is where a
+canonical implementation earns its place. Rust uses `prost-reflect` and
+TypeScript uses `protobufjs` for the same reason.
+
+`github.com/zeebo/blake3`, for the policy-evidence receipt digest. The hash is
+part of the contract rather than an implementation choice: evidence sealed
+with anything else reads as a broken chain to every other client. Go's
+standard library has no BLAKE3, Rust uses the `blake3` crate and TypeScript
+uses `@noble/hashes`.
 
 Everything else is written directly: Avro, MessagePack, BSON, the JSON codec,
 and the regular expression engine.

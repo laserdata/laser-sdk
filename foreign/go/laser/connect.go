@@ -78,17 +78,79 @@ func (options Options) timeout() (time.Duration, error) {
 // are the only fields the lock covers. Everything else is fixed once the
 // handle exists and is read without one.
 type Laser struct {
+	// shared is held in common by every handle derived from this one, so a
+	// derived handle reads through the same connection and the same applied
+	// frontier rather than starting over.
+	shared         *connection
+	connectionInfo *ConnectionString
+	capabilities   Capabilities
+	defaultStream  string
+	resourceNaming ResourceNaming
+	// governor runs before every effect this handle has, nil when it governs
+	// nothing.
+	governor *governorState
+}
+
+// connection is the state every copy of one handle holds in common.
+type connection struct {
 	mutex  sync.RWMutex
 	client iggcon.Client
 	// frontier is the highest mutation position seen per managed surface.
 	// Every managed reply raises it, and a later read of that surface sends
 	// it, so whichever node answers has applied at least what this client
 	// already wrote or read.
-	frontier       wire.AppliedFrontier
-	connection     *ConnectionString
-	capabilities   Capabilities
-	defaultStream  string
-	resourceNaming ResourceNaming
+	frontier wire.AppliedFrontier
+}
+
+// unconnected stands in for the shared state of a handle that never
+// connected, so a zero value is still safe to ask and to close. It holds no
+// client, so the mutex it shares is never contended for one.
+var unconnected connection
+
+// state is this handle's shared connection.
+func (laser *Laser) state() *connection {
+	if laser.shared == nil {
+		return &unconnected
+	}
+	return laser.shared
+}
+
+// copy derives a handle sharing this one's connection and frontier.
+//
+// What a derived handle may change is its own configuration, never the
+// connection: two handles on one socket that disagreed about what they had
+// already read would each answer from a different point in the log.
+func (laser *Laser) copy() *Laser {
+	derived := *laser
+	return &derived
+}
+
+// WithDefaultStream derives a handle whose unqualified topics resolve on
+// another stream.
+func (laser *Laser) WithDefaultStream(stream string) *Laser {
+	derived := laser.copy()
+	derived.defaultStream = stream
+	return derived
+}
+
+// WithResourceNaming derives a handle that scopes managed resource names
+// differently.
+//
+// Stream scoping is how two streams in one deployment keep separate
+// namespaces, so opting out is a deployment-wide decision rather than a
+// per-call one.
+func (laser *Laser) WithResourceNaming(naming ResourceNaming) *Laser {
+	derived := laser.copy()
+	derived.resourceNaming = naming
+	return derived
+}
+
+// WithCapabilities derives a handle that treats the deployment as serving
+// exactly these surfaces, for a caller that knows better than the probe.
+func (laser *Laser) WithCapabilities(capabilities Capabilities) *Laser {
+	derived := laser.copy()
+	derived.capabilities = capabilities
+	return derived
 }
 
 // Connect opens a connection and negotiates what the deployment serves.
@@ -191,8 +253,8 @@ func ConnectWith(
 		configured = *options.Capabilities
 	}
 	return &Laser{
-		client:         connected,
-		connection:     parsed,
+		shared:         &connection{client: connected},
+		connectionInfo: parsed,
 		capabilities:   NegotiateCapabilities(ctx, connected, configured),
 		defaultStream:  options.DefaultStream,
 		resourceNaming: options.ResourceNaming,
@@ -225,7 +287,7 @@ func FromClient(client iggcon.Client, options Options) *Laser {
 		capabilities = *options.Capabilities
 	}
 	return &Laser{
-		client:         client,
+		shared:         &connection{client: client},
 		capabilities:   capabilities,
 		defaultStream:  options.DefaultStream,
 		resourceNaming: options.ResourceNaming,
@@ -238,7 +300,7 @@ func (laser *Laser) Capabilities() Capabilities { return laser.capabilities }
 
 // Connection reports the parsed connection string this client dialed with. The
 // credentials it carries are the caller's own, so they are never logged here.
-func (laser *Laser) Connection() *ConnectionString { return laser.connection }
+func (laser *Laser) Connection() *ConnectionString { return laser.connectionInfo }
 
 // DefaultStream is the stream the one-word topic shortcut addresses, empty
 // when none was pinned.
@@ -247,18 +309,18 @@ func (laser *Laser) DefaultStream() string { return laser.defaultStream }
 // Client hands out the underlying Apache Iggy client, for an operation this
 // package does not wrap yet. It is nil once the handle is closed.
 func (laser *Laser) Client() iggcon.Client {
-	laser.mutex.RLock()
-	defer laser.mutex.RUnlock()
-	return laser.client
+	laser.state().mutex.RLock()
+	defer laser.state().mutex.RUnlock()
+	return laser.state().client
 }
 
 // Close releases the connection. It is safe to call more than once, and safe
 // to call while another goroutine is using the handle.
 func (laser *Laser) Close() error {
-	laser.mutex.Lock()
-	client := laser.client
-	laser.client = nil
-	laser.mutex.Unlock()
+	laser.state().mutex.Lock()
+	client := laser.state().client
+	laser.state().client = nil
+	laser.state().mutex.Unlock()
 	if client == nil {
 		return nil
 	}

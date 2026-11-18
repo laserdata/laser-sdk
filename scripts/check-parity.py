@@ -1281,6 +1281,8 @@ GO_SURFACES = (
     ("Consumer filters", "Topic.Filters: filtered reads with page validation, acknowledgment through the safe offset, previews and record tests"),
     ("Filter catalog", "Laser.FilterCatalog: register, revise, describe, pause, archive, drop, bind, unbind, release, configure a group, and read filters, revisions, bindings and operation outcomes"),
     ("Retry schedule", "laser.Backoff and the shared schedule pinned to sdk/tests/fixtures/retry-table.json"),
+    ("Action governance", "Laser.WithGovernor: the pre-effect hook over publishes, AGDX verbs, requests and memory writes, observe and enforce modes, chained policy evidence on the audit topic, and laser.QuorumGovernor"),
+    ("Approvals", "Requester.ApprovalGate and laser.GrantFrom, with AgdxSend.WithGrant answering a governor's step-up"),
 )
 
 OMISSION_CAPABILITIES = {

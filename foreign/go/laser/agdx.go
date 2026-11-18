@@ -220,7 +220,30 @@ type AgdxSend struct {
 	usage       *LlmUsage
 	deadlineAt  *time.Time
 	broadcast   bool
-	err         error
+	// governAs overrides the governed kind this send is decided as, for a
+	// surface that knows better than the envelope does: a request is a
+	// command on the wire but a request to a policy.
+	governAs ActionKind
+	// grant is the approval this send carries, so a governor's step-up in the
+	// grant's own conversation is answered rather than raised again.
+	grant *ApprovalGrant
+	err   error
+}
+
+// WithGrant carries an approval with this send.
+//
+// A governor that steps up on an effect in the grant's own conversation is
+// answered by the approval instead of stepping up again, which is what lets a
+// handler gate once and then act.
+func (send *AgdxSend) WithGrant(grant *ApprovalGrant) *AgdxSend {
+	send.grant = grant
+	return send
+}
+
+// governedAs decides this send as another kind.
+func (send *AgdxSend) governedAs(kind ActionKind) *AgdxSend {
+	send.governAs = kind
+	return send
 }
 
 func (send *AgdxSend) fail(err error) *AgdxSend {
@@ -400,9 +423,22 @@ func (send *AgdxSend) Send(ctx context.Context) (*AgdxReceipt, error) {
 	if err != nil {
 		return nil, &CodecError{Reason: "encode the agent envelope", Cause: err}
 	}
+	// The governor sees the AGDX verb rather than a plain publish, so a
+	// policy can tell a tool command from a status it should ignore. It runs
+	// before the body is built into a record, because a replacement body must
+	// be what the record carries.
+	if body, err := send.agdx.laser.govern(ctx, send.action(payload)); err != nil {
+		return nil, err
+	} else if body != nil {
+		payload = body
+	}
 	topic := send.agdx.laser.Stream(send.agdx.stream).Topic(send.agdx.topic)
-	response, err := topic.Send(ctx, payload, headers,
-		send.envelope.Conversation.String())
+	message, err := iggcon.NewIggyMessage(payload, iggcon.WithUserHeaders(headers))
+	if err != nil {
+		return nil, &InvalidError{Reason: "build the agent record: " + err.Error()}
+	}
+	response, err := topic.sendMessages(ctx, []iggcon.IggyMessage{message},
+		send.envelope.Conversation.String(), true)
 	if err != nil {
 		return nil, err
 	}
@@ -411,6 +447,37 @@ func (send *AgdxSend) Send(ctx context.Context) (*AgdxReceipt, error) {
 		receipt.Record = *send.envelope.Record
 	}
 	return receipt, nil
+}
+
+// action is this send as the governor sees it.
+func (send *AgdxSend) action(payload []byte) *GovernedAction {
+	conversation := send.envelope.Conversation
+	kind := send.governAs
+	if kind == "" {
+		kind = ActionKindOf(send.envelope.Kind)
+	}
+	action := &GovernedAction{
+		Kind:         kind,
+		Stream:       send.agdx.stream,
+		Topic:        send.agdx.topic,
+		Source:       send.envelope.Source.String(),
+		Conversation: &conversation,
+		Payload:      payload,
+		Approval:     send.grant,
+	}
+	if send.envelope.Target != nil {
+		action.Target = send.envelope.Target.String()
+	}
+	if send.envelope.Correlation != nil {
+		action.Correlation = send.envelope.Correlation.String()
+	}
+	if send.envelope.Operation != nil {
+		action.Operation = *send.envelope.Operation
+	}
+	if send.envelope.Tool != nil {
+		action.Tool = *send.envelope.Tool
+	}
+	return action
 }
 
 // provenance is the spine this message carries, derived from the envelope so

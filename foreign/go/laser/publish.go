@@ -112,7 +112,7 @@ func (request *PublishRequest) Send(ctx context.Context) (*iggcon.SendMessagesRe
 	if err != nil {
 		return nil, &InvalidError{Reason: "build the record: " + err.Error()}
 	}
-	return request.topic.sendMessages(ctx, []iggcon.IggyMessage{message},
+	return request.topic.governedSend(ctx, []iggcon.IggyMessage{message},
 		request.key, request.hasKey)
 }
 
@@ -125,7 +125,7 @@ func (topic *Topic) Send(
 	if err != nil {
 		return nil, &InvalidError{Reason: "build the record: " + err.Error()}
 	}
-	return topic.sendMessages(ctx, []iggcon.IggyMessage{message}, key, key != "")
+	return topic.governedSend(ctx, []iggcon.IggyMessage{message}, key, key != "")
 }
 
 // Batch appends many pre-built records in one call, all sharing one
@@ -136,7 +136,23 @@ func (topic *Topic) Batch(
 	if len(messages) == 0 {
 		return &iggcon.SendMessagesResponse{}, nil
 	}
-	return topic.sendMessages(ctx, messages, key, key != "")
+	return topic.governedSend(ctx, messages, key, key != "")
+}
+
+// governedSend runs the governor over every record before it reaches the log.
+//
+// It sits between the public publish verbs and sendMessages rather than
+// inside sendMessages, so the paths that carry their own governed kind (an
+// AGDX verb, a memory write) and the evidence writes themselves reach the log
+// without being decided twice.
+func (topic *Topic) governedSend(
+	ctx context.Context, messages []iggcon.IggyMessage, key string, hasKey bool,
+) (*iggcon.SendMessagesResponse, error) {
+	if err := topic.laser.governMessages(
+		ctx, topic.stream, topic.name, messages); err != nil {
+		return nil, err
+	}
+	return topic.sendMessages(ctx, messages, key, hasKey)
 }
 
 // sendMessages is the one place a record reaches the log, so the partitioning

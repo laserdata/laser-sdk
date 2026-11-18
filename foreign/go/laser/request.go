@@ -32,6 +32,10 @@ type RequestOptions struct {
 	// request's own timeout as its deadline, since a caller that has stopped
 	// waiting does not want the work done either.
 	Deadline time.Time
+	// Grant is an approval this request carries, so a governor's step-up in
+	// the grant's own conversation is answered by it rather than raised
+	// again.
+	Grant *ApprovalGrant
 }
 
 // Requester sends a request and waits for its answer.
@@ -118,7 +122,10 @@ func (requester *Requester) Request(
 		// either, so the request expires when the wait does.
 		deadline = time.Now().Add(timeout)
 	}
-	send = send.WithDeadline(deadline)
+	send = send.WithDeadline(deadline).governedAs(ActionRequest)
+	if options.Grant != nil {
+		send = send.WithGrant(options.Grant)
+	}
 
 	receipt, err := send.Send(ctx)
 	if err != nil {

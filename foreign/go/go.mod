@@ -2,7 +2,10 @@ module github.com/laserdata/laser-sdk/foreign/go
 
 go 1.25.0
 
-require google.golang.org/protobuf v1.36.12
+require (
+	github.com/zeebo/blake3 v0.2.4
+	google.golang.org/protobuf v1.36.12
+)
 
 require (
 	github.com/apache/iggy/foreign/go v0.10.0
