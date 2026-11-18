@@ -195,6 +195,8 @@ Beyond the raw capabilities, the Go client serves these managed and agent surfac
 | Retry schedule | laser.Backoff and the shared schedule pinned to sdk/tests/fixtures/retry-table.json |
 | Action governance | Laser.WithGovernor: the pre-effect hook over publishes, AGDX verbs, requests and memory writes, observe and enforce modes, chained policy evidence on the audit topic, and laser.QuorumGovernor |
 | Approvals | Requester.ApprovalGate and laser.GrantFrom, with AgdxSend.WithGrant answering a governor's step-up |
+| Signing | laser.SigningKey and AgdxSend.Signed, with the preimage pinned against the Rust client's own vectors |
+| Key registry | laser.KeyRegistry in memory and Laser.KeyRegistry over the managed store, with key kinds, validity windows, revocation and laser.VerifyDelegation |
 
 An omitted row that reaches the raw client, or a method that does more than convert a value, names the capabilities a caller reaches through it. The check fails when such a row names none.
 

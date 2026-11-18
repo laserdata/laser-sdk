@@ -227,7 +227,9 @@ type AgdxSend struct {
 	// grant is the approval this send carries, so a governor's step-up in the
 	// grant's own conversation is answered rather than raised again.
 	grant *ApprovalGrant
-	err   error
+	// signer turns this message's authorship claim into a proof.
+	signer *SigningKey
+	err    error
 }
 
 // WithGrant carries an approval with this send.
@@ -403,6 +405,26 @@ func (send *AgdxSend) Send(ctx context.Context) (*AgdxReceipt, error) {
 	if err := send.envelope.Validate(); err != nil {
 		return nil, &InvalidError{Reason: err.Error()}
 	}
+	// The governor sees the AGDX verb rather than a plain publish, so a
+	// policy can tell a tool command from a status it should ignore. It runs
+	// before signing, so a replacement body is what the record carries and
+	// what the signature covers.
+	if body, err := send.agdx.laser.govern(ctx, send.action()); err != nil {
+		return nil, err
+	} else if body != nil {
+		send.envelope.Body = body
+	}
+	// The signature covers the envelope as it will be encoded, with the
+	// interpretation attributes the record carries bound into the preimage,
+	// so an intermediary cannot flip how the signed bytes are read.
+	if send.signer != nil {
+		signature, err := send.signer.SignWithContext(
+			send.envelope, send.signContext())
+		if err != nil {
+			return nil, err
+		}
+		send.envelope.Signature = signature
+	}
 	// The envelope stamps carry the version and content type, and the
 	// provenance carries the spine. Both ride the same block, so a reader can
 	// route and audit without decoding the body.
@@ -423,15 +445,6 @@ func (send *AgdxSend) Send(ctx context.Context) (*AgdxReceipt, error) {
 	if err != nil {
 		return nil, &CodecError{Reason: "encode the agent envelope", Cause: err}
 	}
-	// The governor sees the AGDX verb rather than a plain publish, so a
-	// policy can tell a tool command from a status it should ignore. It runs
-	// before the body is built into a record, because a replacement body must
-	// be what the record carries.
-	if body, err := send.agdx.laser.govern(ctx, send.action(payload)); err != nil {
-		return nil, err
-	} else if body != nil {
-		payload = body
-	}
 	topic := send.agdx.laser.Stream(send.agdx.stream).Topic(send.agdx.topic)
 	message, err := iggcon.NewIggyMessage(payload, iggcon.WithUserHeaders(headers))
 	if err != nil {
@@ -450,7 +463,11 @@ func (send *AgdxSend) Send(ctx context.Context) (*AgdxReceipt, error) {
 }
 
 // action is this send as the governor sees it.
-func (send *AgdxSend) action(payload []byte) *GovernedAction {
+//
+// The payload offered is the envelope body rather than the whole envelope:
+// what a policy may replace is the content, never the routing and causality
+// a reader needs to make sense of it.
+func (send *AgdxSend) action() *GovernedAction {
 	conversation := send.envelope.Conversation
 	kind := send.governAs
 	if kind == "" {
@@ -462,8 +479,15 @@ func (send *AgdxSend) action(payload []byte) *GovernedAction {
 		Topic:        send.agdx.topic,
 		Source:       send.envelope.Source.String(),
 		Conversation: &conversation,
-		Payload:      payload,
-		Approval:     send.grant,
+		Payload:      send.envelope.Body,
+		// A policy reads the declared purpose and classification as claims,
+		// and whether this client will sign says only that, not that a peer
+		// verified anything.
+		Purpose:            metadataText(send.envelope, wire.MetadataPurpose),
+		DataClassification: metadataText(send.envelope, wire.MetadataDataClassification),
+		OnBehalfOf:         metadataText(send.envelope, wire.MetadataDelegatedBy),
+		Signed:             send.signer != nil,
+		Approval:           send.grant,
 	}
 	if send.envelope.Target != nil {
 		action.Target = send.envelope.Target.String()
@@ -478,6 +502,16 @@ func (send *AgdxSend) action(payload []byte) *GovernedAction {
 		action.Tool = *send.envelope.Tool
 	}
 	return action
+}
+
+// metadataText reads one metadata string, empty when the envelope carries
+// none under that name or carries something that is not text.
+func metadataText(envelope wire.AgentEnvelope, name string) string {
+	value, named := envelope.Metadata[name]
+	if !named || value.Kind != wire.ValueStr {
+		return ""
+	}
+	return value.Str
 }
 
 // provenance is the spine this message carries, derived from the envelope so

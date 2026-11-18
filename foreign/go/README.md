@@ -10,8 +10,9 @@ negotiation, the managed command band and its typed surfaces (key-value, query,
 forks, graph, session reads and writes, authorization, consumer filters and the
 saved-filter catalog), streams, topics and publishing, consuming, replay, typed
 records, provenance headers, AGDX agent messaging and gates, the registry and
-router, request and reply, memory, context assembly, action governance with
-its approval gate, and the bridge value mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
+router, request and reply, memory, context assembly, record signing with its
+key registry, action governance with its approval gate, and the bridge value
+mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
 
 It is not published yet. [docs/parity.md](../../docs/parity.md) lists its
 standing on each capability in its own section, and `bdd/go/` runs the shared
@@ -413,6 +414,52 @@ attempt whose reply was lost may still have applied.
 Each verb returns what its change produced and where the fold applied it. That
 position is what a group read can wait for, which is what gives an application
 that just configured a group read-your-writes through any node.
+
+## Signing and keys
+
+A record on a shared topic says who sent it. `AgdxSend.Signed(key)` makes that
+something a reader can check: the signature covers the envelope with its own
+signature cleared, prefixed by the contract's domain separator so an AGDX
+signature can never be replayed into another protocol.
+
+The interpretation attributes the record is stamped with, its content type and
+wire version, are bound into the preimage too. Without that, an intermediary
+could flip the codec on a signed record and the same bytes would read as
+something else entirely while the signature still verified. A signature that
+bound nothing reproduces the preimage a signature written before contexts
+existed covered, so an old record still verifies.
+
+`KeyRegistry` holds enrolled verifying keys, each bound to the authenticated
+principal that enrolled it. Verifying returns that principal, and a caller
+compares it against the server-stamped identity. That comparison is the
+authorship binding: a key proves the principal it was enrolled under, never
+the source an envelope claims for itself. A key carries a kind, so a
+privileged control fact can require an operator key and an enrolled agent
+cannot quarantine another agent.
+
+A key also carries a window, so a rotation overlaps rather than cuts over: the
+old key stays valid long enough to cover the records already in flight.
+`Verify` reads no clock and checks the bytes alone, `VerifyAt` holds the key to
+its window, and `VerifyObservedAt` additionally refuses a signature whose bound
+context differs from what the record carried, before any cryptography runs.
+Revocation disables a key whatever its window says.
+
+`VerifyDelegation` reads whom a signer acted for. The claim rides inside the
+signed span rather than on a header, so a signer cannot forge it and an
+intermediary cannot rewrite it. The server authorizes only the authenticated
+caller, so a caller intersects the two principals' grants itself: an agent
+must never exceed the user it acts for.
+
+`Laser.KeyRegistry()` is the managed sibling, storing lifecycle-aware records
+in a reserved key-value namespace keyed by canonical key id. Enrollments are
+conditional on what is already there, so two administrators cannot both
+believe they won. `Snapshot` reads them into the in-memory registry a verifier
+folds with, skipping any entry that does not hold up: one corrupt enrollment
+must not stop every other principal's records from verifying.
+
+The preimage is pinned against the Rust client: `sign_test.go` carries
+signature vectors Rust produced for the same envelope and seed, so a change to
+any part of the preimage shows up as a signature no other client can verify.
 
 ## Action governance
 
