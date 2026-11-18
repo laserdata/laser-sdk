@@ -4,16 +4,19 @@ The Go client for [LaserData](https://laserdata.com), a native port of the
 `laser-wire` contract.
 
 **This client is in progress.** The wire contract is complete and pinned
-against the shared corpus, and the client is being built on it: `Connect`, the
-shared connection string grammar, TLS resolution, the connect-time capability
-negotiation, the managed command band, and the key-value, query, fork, graph,
-session-read and authorization surfaces, plus addressing streams and topics and
-publishing to them. All of it rides the Apache Iggy Go SDK's TCP transport.
+against the shared corpus, and the client is built on it: `Connect`, the shared
+connection string grammar, TLS resolution, the connect-time capability
+negotiation, the managed command band and its typed surfaces (key-value, query,
+forks, graph, session reads and writes, authorization, consumer filters and the
+saved-filter catalog), streams, topics and publishing, consuming, replay, typed
+records, provenance headers, AGDX agent messaging and gates, the registry and
+router, request and reply, memory, context assembly, and the bridge value
+mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
 
-There is no consumer, no agent runtime, and no bridge yet, so the handle hands
-out the underlying Iggy client for anything beyond that. It is not published,
-it is absent from the [cross-SDK parity matrix](../../docs/parity.md), and it
-does not run the shared behavior scenarios. Use the [Rust](../../sdk/README.md),
+It is not published yet. [docs/parity.md](../../docs/parity.md) lists its
+standing on each capability in its own section, and `bdd/go/` runs the shared
+behavior scenarios it covers. The handle hands out the underlying Iggy client
+for anything beyond what it serves. Use the [Rust](../../sdk/README.md),
 [Python](../python/README.md), or [TypeScript](../typescript/README.md)
 clients for anything this one does not cover yet.
 
@@ -350,6 +353,66 @@ the same golden vector the Rust client pins, so a drift in either is caught
 rather than silently addressing different sessions. Bumping the version remaps
 every derived conversation, which is why it is a constant to change on purpose
 rather than an implementation detail.
+
+## Consumer filters
+
+`topic.Filters(consumer)` reads a topic through a server-side filter. The
+server evaluates it and sends back only what matched, so a reader pays for the
+records it wanted rather than for the whole topic: that saving is in what never
+leaves the server, and it is why the feature exists.
+
+`Read(partition, filter)` builds one filtered poll. `Count` bounds the matches
+a page returns and `MaxExamined` bounds how many source records the server
+looks at: a normal consumer sets it to the count, so a sparse filter returns
+quickly rather than scanning a whole partition, while a sweep over a cold topic
+leaves it unset and takes the server's own budget. `Each` walks pages until the
+partition is exhausted or the caller stops.
+
+Every page is held to the request before a record is read from it. The record
+body's framing is walked first, because the count in its head is what a decoder
+sizes an allocation against, and then the page itself: the partition, the
+incarnation, the policy, the budget, the scan boundary, the record order, and
+the faults it reports. A page that misstates its boundary is worse than a lost
+one, since the records it skipped past are never read again.
+
+`Ack` stores progress through the page's safe offset, which is the last record
+examined rather than the last one matched: a reader that stored only its
+matches would re-examine everything the filter rejected on the next read. A
+page that examined nothing offers no progress, so nothing is sent. The server
+refuses an acknowledgment once the source generation moved on or the consumer
+no longer owns the partition.
+
+`Preview` says what a filter would select over real records without joining a
+group or storing progress, and `Explain` turns that from testable into
+debuggable by saying why each record did or did not match. `Test` judges one
+record a caller holds. `ValidateFilter` compiles a filter locally with the
+contract's own evaluator, which costs no round trip and works against a
+deployment that serves no filters at all.
+
+Filtered delivery is served by the streaming server, so it is gated on the
+native capability. The saved catalog needs a managed backend and is gated
+separately: a deployment can filter without saving anything.
+
+## The saved-filter catalog
+
+`Laser.FilterCatalog()` administers the saved filters and the groups bound to
+them. `Register` saves the first revision, `Revise` appends one conditional on
+which is currently latest, and `Describe`, `SetRevisionEnabled`, `Archive` and
+`Drop` change a filter without changing what a bound group reads mid-page.
+`Bind`, `Unbind`, `ReleaseBinding` and `ConfigureGroup` move groups between
+revisions.
+
+Every change carries an operation identity, so a change repeated under the same
+one returns the recorded outcome rather than applying twice. A retryable
+refusal is repeated under that identity rather than under a fresh one. A change
+the catalog has accepted but not yet folded is read back by its identity rather
+than sent again, and a change whose outcome never arrives is reported as
+`AmbiguousMutationError` naming the identity to recover under, because an
+attempt whose reply was lost may still have applied.
+
+Each verb returns what its change produced and where the fold applied it. That
+position is what a group read can wait for, which is what gives an application
+that just configured a group read-your-writes through any node.
 
 ## Bridges
 

@@ -1278,6 +1278,9 @@ GO_SURFACES = (
     ("Context assembly", "laser.Assemble with LastN, RoleFilter, TokenBudget and Chain"),
     ("Typed records", "laser.TypedJSON, laser.TypedCBOR and laser.TypedWith"),
     ("Bridges", "bridges: the A2A, MCP and AG-UI value mappings"),
+    ("Consumer filters", "Topic.Filters: filtered reads with page validation, acknowledgment through the safe offset, previews and record tests"),
+    ("Filter catalog", "Laser.FilterCatalog: register, revise, describe, pause, archive, drop, bind, unbind, release, configure a group, and read filters, revisions, bindings and operation outcomes"),
+    ("Retry schedule", "laser.Backoff and the shared schedule pinned to sdk/tests/fixtures/retry-table.json"),
 )
 
 OMISSION_CAPABILITIES = {
