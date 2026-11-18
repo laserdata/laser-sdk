@@ -4,7 +4,7 @@ This matrix lists every public item of the Rust `laser_sdk` crate, including the
 
 A peer may differ from the Rust spelling only for one of the reasons below. Any other difference is a gap. A MISSING cell names where the capability lives today when the peer has it under another name or shape.
 
-The Go client under `foreign/go/` is deliberately absent from this matrix. It ports the wire contract in full, and its SDK surface has only begun with the connection layer, so most rows here still have nothing on the Go side to map to. It joins the matrix when it has an SDK surface to compare. `foreign/go/wire/parity_test.go` covers what exists today, asserting that every public type of `wire/src` has a Go peer.
+The Go client under `foreign/go/` is in progress, so it has its own section under Capabilities rather than a fourth column in the tables below. It ports the wire contract in full, and its SDK surface is partial: a fourth column would put a Go gap through the three-way comparison that gates the clients that ship, reading it as a gap in all of them. `foreign/go/wire/parity_test.go` asserts that every public type of `wire/src` has a Go peer, and the Go capability table below says where the client stands on each raw capability.
 
 | Note | Reason |
 | --- | --- |
@@ -102,6 +102,94 @@ The check reads the raw operations from the client sources. Rust has 74 operatio
 | Download a server diagnostics snapshot (`system.snapshot`) | `snapshot` / `system.snapshot` | `Laser::snapshot` | `Laser.snapshot` | `Laser.snapshot` |
 | Describe the server options (`system.options`) | `describe_options` / `system.describeOptions` | `Laser::describe_options` | `Laser.describe_options` | `Laser.describeOptions` |
 | Read the server metadata change feed (`system.metadata_changes`) | `get_metadata_changes` / `system.getMetadataChanges` | `Laser::metadata_changes` | `Laser.metadata_changes` | `Laser.metadataChanges` |
+
+### The Go client
+
+The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 14 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
+
+A capability it does not wrap is still reachable: `Laser.Client` hands out the underlying Apache Iggy client, exactly as `Laser::client` does in Rust.
+
+| Capability | Go |
+| --- | --- |
+| `connection.connect` | `laser.Connect + laser.ConnectEnv + laser.Local` |
+| `connection.close` | `Laser.Close` |
+| `connection.events` | MISSING |
+| `operation.settle` | MISSING |
+| `command.raw` | `Laser.SendManaged + Laser.SendManagedWithOperation` |
+| `stream.list` | MISSING |
+| `stream.get` | MISSING |
+| `stream.create` | `Stream.Ensure` |
+| `stream.update` | MISSING |
+| `stream.delete` | `Stream.Delete` |
+| `topic.list` | MISSING |
+| `topic.get` | MISSING |
+| `topic.create` | `Topic.Ensure` |
+| `topic.update` | MISSING |
+| `topic.delete` | `Topic.Delete` |
+| `partition.create` | MISSING |
+| `partition.delete` | MISSING |
+| `segment.delete` | MISSING |
+| `consumer_group.list` | MISSING |
+| `consumer_group.get` | MISSING |
+| `consumer_group.create` | MISSING |
+| `consumer_group.delete` | MISSING |
+| `consumer_group.join` | `Topic.ConsumerGroup` |
+| `consumer_offset.get` | MISSING |
+| `consumer_offset.store` | MISSING |
+| `consumer_offset.commit` | `Consumer.Commit + Consumer.Mark` |
+| `consumer_offset.delete` | MISSING |
+| `message.send` | `Topic.Send + Topic.Batch + Topic.Publish` |
+| `message.poll` | `Topic.Consumer + Topic.Replay` |
+| `message.headers` | `PublishRequest.Header + Provenance.Headers` |
+| `producer.idempotent` | MISSING |
+| `producer.batching` | MISSING |
+| `producer.sharding` | MISSING |
+| `producer.encryption` | MISSING |
+| `consumer.encryption` | MISSING |
+| `publish.failure` | MISSING |
+| `error.code` | MISSING |
+| `agent.topic_names` | `wire.AgentSessions and the other wire topic constants` |
+| `bridge.rpc` | `bridges.TaskFromEnvelope + bridges.ToolResultFromEnvelope (mapping only, no server)` |
+| `bridge.http` | MISSING |
+| `user.list` | MISSING |
+| `user.get` | MISSING |
+| `user.create` | MISSING |
+| `user.update` | MISSING |
+| `user.permissions` | MISSING |
+| `user.password` | MISSING |
+| `user.delete` | MISSING |
+| `token.list` | MISSING |
+| `token.create` | MISSING |
+| `token.delete` | MISSING |
+| `system.ping` | MISSING |
+| `system.stats` | MISSING |
+| `system.me` | MISSING |
+| `system.clients` | MISSING |
+| `system.client` | MISSING |
+| `system.cluster` | MISSING |
+| `system.snapshot` | MISSING |
+| `system.options` | MISSING |
+| `system.metadata_changes` | MISSING |
+
+Beyond the raw capabilities, the Go client serves these managed and agent surfaces. They have no raw Apache Iggy equivalent, so they are listed on their own rather than as rows with an empty raw cell.
+
+| Surface | Go |
+| --- | --- |
+| Key-value | Laser.Kv: get, entry, conditional read, exists, set, compare-and-swap, expire, scan, delete-many, namespaces |
+| Query | Laser.Query: predicates, aggregates, grouping, ordering, paging, raw SQL, consistency and text gates |
+| Fork | Laser.Fork: create, promote, squash, speculative rows, listing |
+| Graph | Laser.Graph: traversal, neighbours, upsert, link |
+| Session reads | Laser.Sessions: get, list, events, state, links, sources, changes |
+| Session writes | Laser.Sessions: create, start, begin, progress, complete, fail |
+| Authorization | Laser.Whoami and the role, binding and history verbs |
+| Agent messaging | Laser.Agdx: command, respond, emit, chunk, status, fail, and OpenAgdx |
+| Agent gates | Laser.Agent: expiry, must-understand, fence and dedup decisions |
+| Registry and routing | laser.NewAgentRegistry with To, Broadcast, ToCapable, AllCapable, Sticky, WithScorer |
+| Request and reply | laser.NewReplyHub: subscribe, deliver, await, acknowledge |
+| Memory | Laser.Memory: remember, forget, improve, plus laser.Rank and laser.ToContextBlock |
+| Context assembly | laser.Assemble with LastN, RoleFilter, TokenBudget and Chain |
+| Typed records | laser.TypedJSON, laser.TypedCBOR and laser.TypedWith |
+| Bridges | bridges: the A2A, MCP and AG-UI value mappings |
 
 An omitted row that reaches the raw client, or a method that does more than convert a value, names the capabilities a caller reaches through it. The check fails when such a row names none.
 

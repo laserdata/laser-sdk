@@ -48,13 +48,18 @@ parity-check:
   python3 -m unittest scripts/test_check_parity.py
   python3 scripts/check-parity.py
 
-# the Go client's gate set, the same one ci-go runs
+# the Go client's gate set, the same one ci-go runs. It covers the three Go
+# modules: the client, the examples beside it, and the conformance runner.
 go-check:
   cd foreign/go && test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
   cd foreign/go && go vet ./...
   cd foreign/go && go build ./...
   cd foreign/go && go test ./... -count=1
   cd foreign/go && go test ./... -race -count=1
+  cd examples/go && test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+  cd examples/go && go vet ./... && go build ./...
+  cd bdd/go && test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+  cd bdd/go && go vet ./... && go test ./... -count=1
 
 # Differential check: the Go port writes one value per shape the fixture
 # corpus does not carry, and this crate decodes and re-encodes each. A shape

@@ -341,6 +341,26 @@ rather than silently addressing different sessions. Bumping the version remaps
 every derived conversation, which is why it is a constant to change on purpose
 rather than an implementation detail.
 
+## Bridges
+
+`bridges` maps external agent interfaces onto AGDX. A bridge is a translation
+and nothing more: the log stays the source of truth, so a task survives a
+bridge restart and remains replayable.
+
+A2A task states map both ways, and a word outside the vocabulary is refused
+rather than guessed, since an edge sending one is speaking a protocol this
+bridge does not implement. A paused task reads as working, because A2A has no
+paused state and reporting anything terminal would say the work ended when it
+has not.
+
+MCP marks a failure as one rather than returning it as ordinary content, since
+an edge that cannot tell them apart shows an error to a user as though it were
+the answer.
+
+AG-UI renders envelopes as the events a front end consumes. A chunk stream's
+purpose is declared only on its opening chunk, so `AgUiStream` remembers it per
+channel and forgets a channel once it closes.
+
 Like the TypeScript client, this is a native port rather than a binding over
 the Rust crate. The Rust crates expose no C ABI, cgo would cost consumers
 cross-compilation, and the Apache Iggy Go client is itself pure Go.

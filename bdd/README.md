@@ -8,6 +8,9 @@ Reference files under `wire/fixtures/` define expected `.bin` and `.json` encodi
 
 ## Layer 2: behavior (actions)
 
+The Go runner under `bdd/go/` is in progress: it reads the same scenario files and implements the provenance feature. It skips rather than passing when it reaches no deployment, so a run that found no server is visibly a skip and is never read as evidence that the client conforms. Six of the shared features use a scenario outline it does not implement yet, and it refuses those rather than half-reading them.
+
+
 The Gherkin scenarios in `scenarios/` describe end-to-end behavior. Rust, Python, and TypeScript run against the versioned Apache Iggy server:
 
 ```text

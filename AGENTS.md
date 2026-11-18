@@ -465,9 +465,13 @@ foreign/go/             the Go client, in progress (outside the workspace): wire
                         resource scoping and applied frontier, and the key-value, query, fork,
                         graph, session-read and authorization surfaces plus the
                         stream, topic, publish, consume, replay and typed-record
-                        facade with the agentic provenance headers and AGDX
-                        messaging. There is no agent runtime loop, memory,
-                        bridge, or entry in docs/parity.md yet. wire/
+                        facade, the agentic provenance headers, AGDX messaging,
+                        the agent gates, registry and router, request/reply,
+                        memory, context assembly and sessions. bridges/ holds
+                        the A2A, MCP and AG-UI value mappings. examples/go/ and
+                        bdd/go/ are modules of their own. docs/parity.md lists
+                        the Go client's standing on each capability in its own
+                        section. wire/
                         parity_test.go asserts that every public type of wire/src has a
                         Go peer, so a type added upstream fails the Go suite.
 bdd/                    cross-SDK conformance (outside the workspace): scenarios/

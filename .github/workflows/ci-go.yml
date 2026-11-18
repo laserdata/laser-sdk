@@ -50,7 +50,7 @@ jobs:
             git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
             meaningful_paths="$(
               git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" |
-                grep -E '^foreign/go/|^wire/src/|^wire/fixtures/|^\.github/workflows/ci-go\.yml$|^scripts/check-parity\.py$' || true
+                grep -E '^foreign/go/|^examples/go/|^bdd/go/|^wire/src/|^wire/fixtures/|^\.github/workflows/ci-go\.yml$|^scripts/check-parity\.py$' || true
             )"
             if [[ -z "${meaningful_paths}" ]]; then
               run_ci=skip
@@ -84,6 +84,25 @@ jobs:
           go mod tidy
           git diff --exit-code -- go.mod go.sum
       - run: go build ./...
+      # The examples and the conformance runner are modules of their own, so
+      # they are gated here too: a client change that breaks either should
+      # fail now rather than when someone next runs an example.
+      - name: Examples and the conformance runner
+        working-directory: ${{ github.workspace }}
+        run: |
+          for module in examples/go bdd/go; do
+            ( cd "${module}"
+              unformatted="$(gofmt -l .)"
+              if [[ -n "${unformatted}" ]]; then
+                echo "gofmt would rewrite in ${module}:"
+                echo "${unformatted}"
+                exit 1
+              fi
+              go vet ./...
+              go build ./...
+              go test ./... -count=1
+            )
+          done
 
   # The minimum the module declares, and the current release. A client is
   # consumed by applications on both.

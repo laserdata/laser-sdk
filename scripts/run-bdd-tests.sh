@@ -4,7 +4,7 @@
 # LASER_TEST_IGGY_SERVER or an external LASER_BDD_ADDR is provided.
 #
 # Usage: scripts/run-bdd-tests.sh [language]
-#   language: rust | python | typescript   (rust is the default)
+#   language: rust | python | typescript | go   (rust is the default)
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,6 +26,12 @@ case "$language" in
     npm run build
     cd "$repo_root/bdd/typescript"
     npm test
+    ;;
+  go)
+    # The Go runner skips rather than passing when it reaches no deployment, so
+    # a run that found no server is visibly a skip and never read as evidence.
+    cd "$repo_root/bdd/go"
+    go test ./... -count=1 -v
     ;;
   *)
     echo "no runner for language: $language" >&2
