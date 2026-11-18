@@ -60,7 +60,7 @@ Every client uses standard Iggy transport, picked by the connection string schem
 - A2A, MCP, and AG-UI map external interfaces to AGDX. Features are `a2a-bridge`, `mcp-bridge`, and `agui`. Read [a2a-bridge](../a2a-bridge/SKILL.md) for task operations, cards, tools, and event rendering.
 - The Python SDK under `foreign/python/` (PyO3 bindings over this crate), its maturin packaging, the `.pyi` stubs, the pytest suite, or the Python BDD runner -> [python-bindings](../python-bindings/SKILL.md)
 - The native TypeScript SDK under `foreign/typescript/`, its Node transport, npm package, fixture port, Cucumber runner, and examples -> [typescript-sdk](../typescript-sdk/SKILL.md)
-- The Go client under `foreign/go/`. It is in progress: `wire/` is the complete contract port and `laser/` is the connection layer: connect, the connection string grammar, TLS resolution, and the `AGDX_HELLO` capability negotiation, dialing through the Apache Iggy Go SDK over TCP. There is no streaming client, agent runtime, or bridge to change there yet. Its gate is `just go-check`.
+- The Go client under `foreign/go/`. It is in progress: `wire/` is the complete contract port and `laser/` is the client layer: connect, the connection string grammar, TLS resolution, the `AGDX_HELLO` capability negotiation, and the managed command path, dialing through the Apache Iggy Go SDK over TCP. There is no streaming client, agent runtime, or bridge to change there yet. Its gate is `just go-check`.
 
 ## The spine in one paragraph
 

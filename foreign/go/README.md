@@ -7,8 +7,30 @@ The Go client for [LaserData](https://laserdata.com), a native port of the
 against the shared corpus, and the connection layer has started: `Connect`,
 the shared connection string grammar, TLS resolution, and the connect-time
 capability negotiation, all over the Apache Iggy Go SDK's TCP transport. There
-is no streaming client, managed client, agent runtime, or bridge yet, so the
-handle hands out the underlying Iggy client for anything beyond that. It is not published, it is absent from the [cross-SDK parity
+is no streaming client, no typed managed surface, no agent runtime, and no
+bridge yet, so the handle hands out the underlying Iggy client for anything
+beyond that.
+
+## Managed commands
+
+The managed surfaces (query, key-value, sessions, authorization, filters,
+forks, graph) ride one command band off the log, which this client reaches
+through the Apache Iggy Go SDK's `SendBinaryRequest`. `Laser.SendManaged` is
+that path.
+
+A command that changes state is wrapped in a managed envelope carrying an
+operation identity, so a transport retry of the same call is applied once.
+`SendManagedWithOperation` lets a caller choose the identity, so a retry that
+outlives the process still applies once. Reads are sent as given.
+
+Managed names are scoped to the default stream (`stream:<stream>/<name>`),
+which is how two streams in one deployment keep separate namespaces.
+`Options.ResourceNaming` opts out, and listings are mapped back to the
+caller's own names.
+
+Every managed reply raises the client's applied frontier, and a later read of
+that surface sends it, so whichever node answers has applied at least what this
+client already wrote or read. It is not published, it is absent from the [cross-SDK parity
 matrix](../../docs/parity.md), and it does not run the shared behavior
 scenarios. Use the [Rust](../../sdk/README.md),
 [Python](../python/README.md), or [TypeScript](../typescript/README.md)
@@ -23,7 +45,7 @@ cross-compilation, and the Apache Iggy Go client is itself pure Go.
 | Package | Owns |
 |---|---|
 | `wire` | the contract: codes, headers, topics, envelopes, queries, projections and bindings, logical and writer schemas, filters, sessions, the HTTP surface, and a typed client over a caller-supplied transport |
-| `laser` | the client: connect, the connection string grammar and TLS resolution, and the capability negotiation. The grammar is parsed here rather than by the Apache Iggy Go SDK, because the TLS decision is Laser's and because the accepted grammar has to match the Rust and TypeScript clients |
+| `laser` | the client: connect, the connection string grammar and TLS resolution, the capability negotiation, and the managed command path every managed surface rides on. The grammar is parsed here rather than by the Apache Iggy Go SDK, because the TLS decision is Laser's and because the accepted grammar has to match the Rust and TypeScript clients |
 | `internal/cborform` | an order-preserving CBOR value tree and a shortest-form encoder. The CBOR and JSON encoders both walk it, so field order and the skip rules cannot drift between the two encodings |
 
 ## Transport
