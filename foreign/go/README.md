@@ -221,6 +221,25 @@ only way the two cannot drift apart.
 Cost rides the envelope in integer micro-units and the headers in whole
 currency, so it is converted between them rather than copied.
 
+## Agent gates
+
+`Laser.Agent(identity, options)` holds the gates a running agent applies.
+`Decide` returns a verdict for a record and `DecideMessage` for an AGDX
+message. `Run` reads a consumer through them.
+
+The order is the point. Expiry and the must-understand set come first, because
+a record failing either can never be handled, and spending a dedup key on it
+would suppress a later record that could be. The fence comes next, so a stale
+holder's replay advances nothing. Dedup comes last, so a key is spent only on a
+record that would otherwise have been handled.
+
+The fence is the real at-most-once gate: it refuses a record whose fence is
+behind the highest accepted for its task, accepts an equal one as the same
+holder retrying, and lets unfenced work through. Dedup is a best-effort window
+scoped to the producing agent, so one producer cannot suppress or replay
+another's key. Both are bounded by the recently active working set rather than
+by every record ever seen.
+
 Like the TypeScript client, this is a native port rather than a binding over
 the Rust crate. The Rust crates expose no C ABI, cgo would cost consumers
 cross-compilation, and the Apache Iggy Go client is itself pure Go.
