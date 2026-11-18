@@ -261,6 +261,27 @@ is a preference rather than a requirement. Candidates come back in a stable
 order, so two resolutions pick the same agent and a retry lands where the
 first attempt did.
 
+## Request and reply
+
+`NewReplyHub()` matches incoming replies to the requests waiting for them. One
+hub reads a reply topic once for every waiter, so many concurrent requests
+share one read rather than each scanning the topic.
+
+`Subscribe` registers a wait **before** the request is sent, because the reply
+cannot exist until it is: a hub that started listening afterwards could miss an
+answer that arrived in between. `Await` blocks for it.
+
+A correlation alone does not match. Two conversations can reuse one, and a
+shared reply topic carries every agent's answers, so the session and the
+addressee are checked too. A waiter that knows who it is will not take an
+unaddressed reply; one that does not care takes whatever arrives, which is what
+a sole consumer of a private reply topic wants.
+
+An acknowledgment (`task`/`working`) extends the wait rather than ending it,
+because the deadline is for a reply that never comes rather than for a handler
+that is slow. `Acknowledged` reports it, so a slow handler is waited out rather
+than retried into a duplicate.
+
 Like the TypeScript client, this is a native port rather than a binding over
 the Rust crate. The Rust crates expose no C ABI, cgo would cost consumers
 cross-compilation, and the Apache Iggy Go client is itself pure Go.
