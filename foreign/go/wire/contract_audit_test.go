@@ -233,6 +233,13 @@ var rustValidateImpl = regexp.MustCompile(`(?m)^impl Validate for (\w+)`)
 
 var goValidateMethod = regexp.MustCompile(`func \(\w+ \*?(\w+)\) Validate\(\) error`)
 
+// Not every rule is a trait impl. Some are free functions over a value the
+// contract does not own a Validate impl for, and those were invisible to the
+// audit above until a port went looking for one and found it missing.
+var rustValidateFunction = regexp.MustCompile(`(?m)^pub fn (validate_\w+)`)
+
+var goValidateFunction = regexp.MustCompile(`(?m)^func (Validate\w+)\(`)
+
 // validatorsAwaitingAPort are the contract's validation rules this port does
 // not enforce yet, each of which refuses a request the server would refuse.
 //
@@ -245,6 +252,51 @@ var validatorsAwaitingAPort = map[string]bool{
 	// Rust validates a private request enum, whose arms this port validates
 	// on each request type instead.
 	"request": true,
+}
+
+// Every free-function validation rule the contract declares must have a Go
+// peer.
+//
+// These are the rules that are not Validate impls, so the audit over those
+// never saw them. validate_role was missing for exactly that reason.
+func TestGivenTheContractCrateWhenComparedThenEveryValidatorFunctionShouldHaveAGoPeer(
+	t *testing.T,
+) {
+	ported := map[string]bool{}
+	for _, match := range goValidateFunction.FindAllStringSubmatch(goSourceText(t), -1) {
+		ported[match[1]] = true
+	}
+
+	var missing []string
+	eachContractFile(t, func(file, text string) {
+		for _, match := range rustValidateFunction.FindAllStringSubmatch(text, -1) {
+			if !ported[goName(match[1])] {
+				missing = append(missing, file+": "+match[1]+" -> "+goName(match[1]))
+			}
+		}
+	})
+	sort.Strings(missing)
+	for _, name := range missing {
+		t.Errorf("the contract validates this and the Go port does not: %s", name)
+	}
+}
+
+// goName renders a Rust snake_case name the way this port spells it, so a
+// comparison is between the two spellings of one thing rather than between a
+// name and a guess.
+func goName(rustName string) string {
+	var built strings.Builder
+	for _, part := range strings.Split(rustName, "_") {
+		if initialism, known := goInitialisms[part]; known {
+			built.WriteString(initialism)
+			continue
+		}
+		if part == "" {
+			continue
+		}
+		built.WriteString(strings.ToUpper(part[:1]) + part[1:])
+	}
+	return built.String()
 }
 
 // Every validation rule the contract declares must be enforced here, or

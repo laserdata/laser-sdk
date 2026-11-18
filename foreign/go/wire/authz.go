@@ -720,3 +720,24 @@ func ValidateMutationID(mutationID string) error {
 	}
 	return nil
 }
+
+// ValidateRole checks a role before it is defined: a valid name, and no grant
+// on a feature no request is authorized against.
+//
+// A grant on an inert feature is refused rather than stored, because it reads
+// as a permission that was given while matching nothing, which is how an
+// operator believes access was granted when it was not.
+func ValidateRole(role Role) error {
+	if err := ValidateRoleName(role.Name); err != nil {
+		return err
+	}
+	for _, grant := range role.Grants {
+		switch grant.Feature {
+		case FeatureMemory, FeatureAgent, FeatureWorkflow, FeatureUnrecognized:
+			return &InvalidError{Reason: fmt.Sprintf(
+				"no request is authorized against the `%s` feature, "+
+					"so a grant on it has no effect", grant.Feature)}
+		}
+	}
+	return nil
+}
