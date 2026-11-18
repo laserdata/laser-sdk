@@ -322,6 +322,25 @@ real tokenizer when a caller has one; the default is the contract's own
 estimate, which memory spends too, so history and recalled memory share one
 notion of a budget.
 
+## Sessions
+
+`Laser.Sessions()` opens and writes agent sessions, alongside the index reads
+above. `Create(label)` derives a session id from its stream, namespace and
+label, so a job that runs nightly resumes its session rather than starting a
+new one each time. `Start()` opens a fresh one.
+
+`Begin`, `Progress`, `Complete` and `Fail` write the lifecycle. A session
+writes as an agent, so one that names none with `As` is refused before it
+sends. `Session.Memory()` is scoped to the conversation and `Session.Context()`
+carries the configured token bound.
+
+A derived id is wire-visible identity: the same seed reaches the same
+conversation in every client. The algorithm is a versioned FNV-1a, pinned by
+the same golden vector the Rust client pins, so a drift in either is caught
+rather than silently addressing different sessions. Bumping the version remaps
+every derived conversation, which is why it is a constant to change on purpose
+rather than an implementation detail.
+
 Like the TypeScript client, this is a native port rather than a binding over
 the Rust crate. The Rust crates expose no C ABI, cgo would cost consumers
 cross-compilation, and the Apache Iggy Go client is itself pure Go.

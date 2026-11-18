@@ -12,21 +12,31 @@ import (
 // per stream: a session id alone does not say which stream's index to look in.
 type Sessions struct {
 	laser  *Laser
-	stream string
+	config SessionConfig
 }
 
-// Sessions opens the session index of the handle's default stream.
+// Sessions opens the session surface of the handle's default stream, under the
+// default configuration.
 func (laser *Laser) Sessions() *Sessions {
-	return &Sessions{laser: laser, stream: laser.defaultStream}
+	return laser.SessionsWith(SessionConfig{})
 }
 
-// SessionsIn opens the session index of a named stream.
+// SessionsIn opens the session surface of a named stream.
 func (laser *Laser) SessionsIn(stream string) *Sessions {
-	return &Sessions{laser: laser, stream: stream}
+	return laser.SessionsWith(SessionConfig{Stream: stream})
 }
 
-// Stream is the stream whose index these reads cover.
-func (sessions *Sessions) Stream() string { return sessions.stream }
+// SessionsWith opens the session surface under an explicit configuration. It
+// is free to build: nothing is sent until a verb is called.
+func (laser *Laser) SessionsWith(config SessionConfig) *Sessions {
+	return &Sessions{laser: laser, config: config.withDefaults(laser)}
+}
+
+// Stream is the stream these sessions ride.
+func (sessions *Sessions) Stream() string { return sessions.config.Stream }
+
+// Config is how these sessions behave.
+func (sessions *Sessions) Config() SessionConfig { return sessions.config }
 
 // Get reads one session's summary.
 func (sessions *Sessions) Get(
@@ -276,11 +286,11 @@ func (sessions *Sessions) read(
 	if !sessions.laser.capabilities.Managed || !sessions.laser.capabilities.Sessions {
 		return nil, &UnsupportedError{Surface: "managed session reads"}
 	}
-	if sessions.stream == "" {
+	if sessions.config.Stream == "" {
 		return nil, &InvalidError{Reason: "session reads need a stream: " +
 			"pin one with Options.DefaultStream or use SessionsIn"}
 	}
-	payload, err := wire.Marshal(build(sessions.stream))
+	payload, err := wire.Marshal(build(sessions.config.Stream))
 	if err != nil {
 		return nil, &CodecError{Reason: "encode session request", Cause: err}
 	}
