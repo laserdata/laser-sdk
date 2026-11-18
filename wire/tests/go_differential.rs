@@ -42,11 +42,13 @@ type Verifier = fn(&[u8]) -> Result<Vec<u8>, String>;
 /// decode as. A name with no entry here is reported rather than skipped, so a
 /// shape added on the Go side is noticed instead of silently unchecked.
 fn verifiers() -> Vec<(&'static str, Verifier)> {
+    use laser_wire::agent::SessionPauseRequest;
     use laser_wire::authz::{
-        BindingsReply, DefineRoleReq, DeleteRoleReq, GetBindingsReq, GetRoleReq, ListRolesReq,
-        RoleBinding, WhoamiReq,
+        DefineRoleReq, DeleteRoleReq, GetBindingsReq, GetRoleReq, ListRolesReq, RoleBinding,
+        WhoamiReq,
     };
-    use laser_wire::clients::{ClientMetadata, ClientMetadataList};
+    use laser_wire::browse::{GetSchema, ListSchemas, MaterializationReadiness};
+    use laser_wire::filter::HeaderScalar;
     use laser_wire::filter::{
         FilterCatalogVersion, FilterHeader, FilterPolicyRef, FilterPreviewRequest,
         FilterTestRequest, GetFilter, GetFilterBinding, GetFilterOperation, ListFilterBindings,
@@ -63,9 +65,6 @@ fn verifiers() -> Vec<(&'static str, Verifier)> {
         SessionLinksQuery, SessionStateQuery, SessionsQuery, StreamQuery,
     };
     use laser_wire::kv::{KvDeleteMany, KvExists, KvExpire};
-    use laser_wire::agent::SessionPauseRequest;
-    use laser_wire::browse::{GetSchema, ListSchemas, MaterializationReadiness};
-    use laser_wire::filter::HeaderScalar;
     use laser_wire::schema::{BinaryValue, UuidValue};
 
     macro_rules! shapes {
