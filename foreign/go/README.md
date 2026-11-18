@@ -7,10 +7,10 @@ The Go client for [LaserData](https://laserdata.com), a native port of the
 against the shared corpus, and the connection layer has started: `Connect`,
 the shared connection string grammar, TLS resolution, and the connect-time
 capability negotiation, all over the Apache Iggy Go SDK's TCP transport. There
-The key-value store is the first typed managed surface. There is no streaming
-client, no query, session or authorization surface, no agent runtime, and no
-bridge yet, so the handle hands out the underlying Iggy client for anything
-beyond that.
+The key-value store and the authorization verbs are the typed surfaces so far.
+There is no streaming client, no query or session surface, no agent runtime,
+and no bridge yet, so the handle hands out the underlying Iggy client for
+anything beyond that.
 
 ## Managed commands
 
@@ -50,7 +50,23 @@ namespace by prefix, range or substring, with `Each` for a bounded walk and
 A refusal arrives as a `KvError` carrying the contract's own classification, so
 `Retryable` and `Conflict` tell a momentary outage from a precondition that
 will never hold. Keys are arbitrary bytes, so every read hands back a `[]byte`
-rather than a string. It is not published, it is absent from the [cross-SDK parity
+rather than a string.
+
+## Authorization
+
+`Whoami` reads the caller's own effective capabilities. `ListRoles`, `GetRole`,
+`DefineRole`, `DeleteRole`, `GetBindings`, `BindRoles` and `AuthzHistory`
+administer the rest. Deny wins over allow, and the default is deny.
+
+This surface is served by the streaming server itself rather than by a managed
+backend, so a deployment announcing the authorization feature serves it either
+way. The gate is that feature, not the managed root.
+
+Every write carries a receipt identity, so an exact repeat after a lost reply
+returns the original outcome instead of applying twice. `DefineRoleAs`,
+`DeleteRoleAs` and `BindRolesAs` let a caller choose it and keep it across a
+restart. `BindRolesExpectRevision` makes a bind conditional, so two
+administrators editing one user cannot both win. It is not published, it is absent from the [cross-SDK parity
 matrix](../../docs/parity.md), and it does not run the shared behavior
 scenarios. Use the [Rust](../../sdk/README.md),
 [Python](../python/README.md), or [TypeScript](../typescript/README.md)

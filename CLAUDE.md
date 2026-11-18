@@ -2,7 +2,7 @@
 
 Repo-wide agent guidelines live in [AGENTS.md](AGENTS.md). Read it first.
 
-This workspace holds the `wire/` and `sdk/` Rust crates, Python bindings under `foreign/python/`, and the native Node client under `foreign/typescript/`. All three SDKs consume the Rust-owned wire contract and the shared BDD scenarios. A Go client is in progress under `foreign/go/`, which ports the wire contract in full and has started the client itself in `laser/` with connect, TLS resolution, capability negotiation, the managed command path, and the key-value surface. It has no streaming, query, session, or agent surface yet.
+This workspace holds the `wire/` and `sdk/` Rust crates, Python bindings under `foreign/python/`, and the native Node client under `foreign/typescript/`. All three SDKs consume the Rust-owned wire contract and the shared BDD scenarios. A Go client is in progress under `foreign/go/`, which ports the wire contract in full and has started the client itself in `laser/` with connect, TLS resolution, capability negotiation, the managed command path, and the key-value and authorization surfaces. It has no streaming, query, session, or agent surface yet.
 
 Area skills are under `.claude/skills/`. Start with [laser-sdk-overview](.claude/skills/laser-sdk-overview/SKILL.md). TypeScript work also loads [typescript-sdk](.claude/skills/typescript-sdk/SKILL.md). Consumer filters (`sdk/src/filters/`, `wire/src/filter/`, and their TypeScript and Python peers) load [consumer-filters](.claude/skills/consumer-filters/SKILL.md).
 
