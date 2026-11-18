@@ -200,20 +200,25 @@ func TestGivenAZeroOperationWhenSentThenShouldRefuseIt(t *testing.T) {
 	}
 }
 
-// Plain Apache Iggy answers an unknown managed command with a transport error
-// that says nothing about why, so the refusal happens here instead.
-func TestGivenNoManagedBackendWhenSendingManagedThenShouldRefuseWithTheReason(t *testing.T) {
+// The band itself asks no capability question, because its surfaces do not
+// share one answer: the key-value store needs a managed backend, while the
+// authorization verbs are served by the streaming server itself. Gating here
+// would refuse a deployment that serves authz without a backend.
+func TestGivenNoManagedBackendWhenSendingAServerNativeCommandThenShouldStillSend(t *testing.T) {
 	client := &managedClient{}
 	handle := laser.FromClient(client, laser.Options{})
 
-	_, err := handle.SendManaged(context.Background(), wire.AgdxKvGetCode, nil)
-
-	var unsupported *laser.UnsupportedError
-	if !errors.As(err, &unsupported) {
-		t.Fatalf("want an UnsupportedError, got %T: %v", err, err)
+	if _, err := handle.SendManaged(
+		context.Background(), wire.AgdxAuthzWhoamiCode, nil); err != nil {
+		t.Fatalf("a server-native command must not be gated on a backend: %v", err)
 	}
-	if client.calls != 0 {
-		t.Error("an unsupported call must not reach the socket")
+	if client.calls != 1 {
+		t.Errorf("want the command sent, got %d calls", client.calls)
+	}
+	// An authorization verb carries its own mutation id, so it is not wrapped
+	// in the managed envelope a backend-served write uses.
+	if len(client.lastBody) != 0 {
+		t.Errorf("want the payload sent as given, got %v", client.lastBody)
 	}
 }
 

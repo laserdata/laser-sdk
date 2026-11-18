@@ -69,6 +69,9 @@ func (kv *Kv) execute(
 
 // requireKv refuses a key-value call a deployment cannot serve.
 func (laser *Laser) requireKv() error {
+	if !laser.capabilities.Managed {
+		return &UnsupportedError{Surface: "the key-value surface"}
+	}
 	if !laser.capabilities.Kv.Available {
 		return &UnsupportedError{Surface: "the key-value surface"}
 	}

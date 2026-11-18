@@ -91,10 +91,11 @@ func (laser *Laser) SeenPositions() wire.AppliedFrontier {
 // fresh operation identity, so a transport retry of the same call is applied
 // once rather than twice. A read is sent as given.
 //
-// Managed commands reach a managed backend, so a deployment without one
-// refuses them. That refusal is reported before the call leaves, because plain
-// Apache Iggy answers an unknown command with a transport error that says
-// nothing about why.
+// This is the raw band. Whether a deployment serves a given surface is the
+// surface's own question, because they do not share one answer: the key-value
+// store and query need a managed backend, while the authorization verbs are
+// served by the streaming server itself. Each typed surface gates its own
+// calls, so a refusal names the surface rather than the band.
 func (laser *Laser) SendManaged(
 	ctx context.Context, code uint32, payload []byte,
 ) ([]byte, error) {
@@ -128,9 +129,6 @@ func (laser *Laser) sendManagedFrame(
 ) ([]byte, error) {
 	if err := laser.ensureScopable(code); err != nil {
 		return nil, err
-	}
-	if !laser.capabilities.Managed && code != wire.AgdxHelloCode {
-		return nil, &UnsupportedError{Surface: "managed commands"}
 	}
 	laser.mutex.RLock()
 	client := laser.client
