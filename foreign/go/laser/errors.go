@@ -74,3 +74,19 @@ func (e *CodecError) Error() string {
 }
 
 func (e *CodecError) Unwrap() error { return e.Cause }
+
+// VersionError reports a surface whose advertised op version is not the one
+// this client pins, the Go form of a surface's typed Version error.
+//
+// It is raised before the round trip, because a payload sent across a version
+// gap would be read under a contract neither side agreed to.
+type VersionError struct {
+	Surface string
+	Pinned  uint32
+	Served  uint32
+}
+
+func (e *VersionError) Error() string {
+	return e.Surface + " is served at op version " + itoa(int(e.Served)) +
+		", but this client speaks " + itoa(int(e.Pinned))
+}
