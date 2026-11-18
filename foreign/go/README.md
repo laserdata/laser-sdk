@@ -302,6 +302,26 @@ reached. The budget is advisory, since tokens are estimated rather than
 tokenized: a real count needs the model's tokenizer, and carrying one would tie
 the client to a provider.
 
+## Context assembly
+
+`Assemble(conversation)` builds a conversation's history into the messages a
+prompt carries. `Add` offers records and keeps what belongs to the
+conversation, since a topic carries many.
+
+Ordering is by the server's append time, which is the one clock every topic
+shares. It is best effort rather than strictly chronological: Apache Iggy
+orders per partition, so no total order exists across them to read. Ties are
+broken on topic then offset, because a prompt that reorders between runs is not
+reproducible.
+
+`LastN`, `RoleFilter`, `TokenBudget` and `Chain` narrow the history. A budget
+walks newest first, since a prompt wants what just happened, and always keeps
+at least one message so an oversized one reaches the model to be truncated
+there rather than vanishing before it arrives. `TokenBudget.Estimate` takes a
+real tokenizer when a caller has one; the default is the contract's own
+estimate, which memory spends too, so history and recalled memory share one
+notion of a budget.
+
 Like the TypeScript client, this is a native port rather than a binding over
 the Rust crate. The Rust crates expose no C ABI, cgo would cost consumers
 cross-compilation, and the Apache Iggy Go client is itself pure Go.

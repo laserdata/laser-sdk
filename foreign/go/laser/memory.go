@@ -437,15 +437,12 @@ func ToContextBlock(items []MemoryItem, tokenBudget int) string {
 	return built.String()
 }
 
-// estimateTokens approximates a token count from characters.
+// estimateTokens approximates a token count from a body's size.
 //
-// Four characters per token is the usual rough ratio. It is deliberately an
-// estimate: a real count needs the model's tokenizer, and carrying one here
-// would tie the client to a provider.
+// The estimate is the contract's own, not a second one written here: a budget
+// that two clients spend differently is not one budget. It is deliberately an
+// estimate, because a real count needs the model's tokenizer and carrying one
+// would tie this client to a provider.
 func estimateTokens(text string) int {
-	estimate := (len(text) + 3) / 4
-	if estimate < 1 {
-		return 1
-	}
-	return estimate
+	return int(wire.EstimateTokens(len(text)))
 }
