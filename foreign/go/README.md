@@ -11,7 +11,7 @@ forks, graph, session reads and writes, authorization, consumer filters and the
 saved-filter catalog), streams, topics and publishing, consuming, replay, typed
 records, provenance headers, AGDX agent messaging and gates, the registry and
 router, request and reply, memory, context assembly, the projection, binding
-and writer-schema registries, materialization, record signing with its key registry, action governance with its approval gate, and the bridge value
+and writer-schema registries, materialization, a batching producer, record signing with its key registry, action governance with its approval gate, and the bridge value
 mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
 
 It is not published yet. [docs/parity.md](../../docs/parity.md) lists its
@@ -414,6 +414,43 @@ attempt whose reply was lost may still have applied.
 Each verb returns what its change produced and where the fold applied it. That
 position is what a group read can wait for, which is what gives an application
 that just configured a group read-your-writes through any node.
+
+## Batching producer
+
+The Apache Iggy Go SDK has no high-level producer, so `topic.Batching()`
+builds one here: the batching, the linger timer and the failure accounting are
+this client's own. The unbatched publish path is untouched, so batching is
+opted into rather than imposed.
+
+Many records become one append, which is the point: the per-call overhead is
+paid once rather than per record. The batch flushes on whichever of the record
+count, the payload bytes or the linger trips first, so a trickle of records
+never waits for a batch that never fills.
+
+One partition key per handle by construction. A batch is flushed whole under
+one partitioning, so ordering within a key is never silently interleaved by
+records that went out under another. Without a key the server's balanced
+partitioner spreads each flushed batch.
+
+A failed append says what landed and what did not. A caller that replayed
+everything would double what is already on the log, and one that replayed
+nothing would lose what never arrived, so `PublishFailure` names the
+confirmations that arrived and the records without one. Those records keep the
+ids their attempt used, so a resend stays deduplicated on a server that
+deduplicates.
+
+A failed linger flush has nobody to tell, so it keeps its failure and the next
+`Send`, `Flush` or `Close` hears it exactly once. The timer keeps running: one
+failed batch does not stop the producer. A `Send` that finds a kept failure
+refuses its own record rather than queueing behind a batch the caller has not
+heard about yet, and the report lists both the lost batch and the refused
+record.
+
+`Flush` is the guaranteed path and `Close` is the graceful one: the timer is
+signalled and waited for rather than cancelled, because a cancelled flush
+would drop a batch already taken out of the queue. Each record is governed
+before it is queued, so a policy that refuses one refuses it before it is
+batched with records that were allowed.
 
 ## Materialization
 

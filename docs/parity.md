@@ -105,7 +105,7 @@ The check reads the raw operations from the client sources. Rust has 74 operatio
 
 ### The Go client
 
-The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 14 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
+The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 16 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
 
 A capability it does not wrap is still reachable: `Laser.Client` hands out the underlying Apache Iggy client, exactly as `Laser::client` does in Rust.
 
@@ -142,11 +142,11 @@ A capability it does not wrap is still reachable: `Laser.Client` hands out the u
 | `message.poll` | `Topic.Consumer + Topic.Replay` |
 | `message.headers` | `PublishRequest.Header + Provenance.Headers` |
 | `producer.idempotent` | MISSING |
-| `producer.batching` | MISSING |
+| `producer.batching` | `Topic.Batching: record, byte and linger bounds, one pinned key per handle, kept linger failures and laser.PublishFailure` |
 | `producer.sharding` | MISSING |
 | `producer.encryption` | MISSING |
 | `consumer.encryption` | MISSING |
-| `publish.failure` | MISSING |
+| `publish.failure` | `laser.PublishFailure: the confirmations that arrived and the records without one` |
 | `error.code` | MISSING |
 | `agent.topic_names` | `wire.AgentSessions and the other wire topic constants` |
 | `bridge.rpc` | `bridges.TaskFromEnvelope + bridges.ToolResultFromEnvelope (mapping only, no server)` |
