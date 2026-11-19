@@ -2,6 +2,7 @@ package wire
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/laserdata/laser-sdk/foreign/go/internal/cborform"
 )
@@ -351,4 +352,66 @@ type StateSnapshot struct {
 	// revision, when the writer knows it. It lets a reader tell a delta
 	// that continues its own chain from one that resumed another.
 	BaseOpID *string `cbor:"base_op_id,omitempty"`
+}
+
+// Validate checks the document against the byte cap and the portable number
+// range.
+//
+// A snapshot is a whole document rather than a change to one, so an oversized
+// or unportable one is refused here rather than at the reader that folds it:
+// a client that read it back would have to decide what to do with a number no
+// other client can represent.
+func (snapshot StateSnapshot) Validate() error {
+	size, err := jsonByteSize(snapshot.Document)
+	if err != nil {
+		return &InvalidError{Reason: "state document: " + err.Error()}
+	}
+	if size > MaxStateDocumentBytes {
+		return &InvalidError{Reason: "state document exceeds its byte cap"}
+	}
+	return validatePortableJSON(snapshot.Document.Item())
+}
+
+// maxExactJSONInteger is the largest integer every JSON reader holds exactly.
+//
+// Past it a reader that parses numbers as doubles, which is most of them,
+// silently rounds. A state document is read by whatever client folds it, so a
+// number only some of them can represent is not a number to write.
+const maxExactJSONInteger = 9_007_199_254_740_991
+
+// validatePortableJSON refuses a number outside the exact range, at any depth.
+func validatePortableJSON(item cborform.Value) error {
+	switch typed := item.(type) {
+	case cborform.Uint:
+		if uint64(typed) > maxExactJSONInteger {
+			return &InvalidError{
+				Reason: "state JSON integer exceeds the exact number range"}
+		}
+	case cborform.NegInt:
+		// The argument n encodes -1-n, so the magnitude is one more than it.
+		if uint64(typed)+1 > maxExactJSONInteger {
+			return &InvalidError{
+				Reason: "state JSON integer exceeds the exact number range"}
+		}
+	case cborform.Float:
+		whole := typed.Value == math.Trunc(typed.Value)
+		if math.IsInf(typed.Value, 0) || math.IsNaN(typed.Value) ||
+			(whole && math.Abs(typed.Value) > maxExactJSONInteger) {
+			return &InvalidError{
+				Reason: "state JSON integer exceeds the exact number range"}
+		}
+	case cborform.Array:
+		for _, element := range typed {
+			if err := validatePortableJSON(element); err != nil {
+				return err
+			}
+		}
+	case cborform.Map:
+		for _, entry := range typed {
+			if err := validatePortableJSON(entry.Value); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

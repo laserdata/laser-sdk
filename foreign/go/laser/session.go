@@ -166,6 +166,7 @@ func (sessions *Sessions) Open(conversation wire.ConversationID, label string) *
 		config:       sessions.config,
 		conversation: conversation,
 		label:        label,
+		state:        &stateCursor{},
 	}
 }
 
@@ -176,6 +177,59 @@ type Session struct {
 	conversation wire.ConversationID
 	label        string
 	agent        *wire.AgentID
+	// state is the revision this handle's state writes continue from, shared
+	// with every handle derived from it so their writes land in order.
+	state *stateCursor
+}
+
+// cursor is this handle's state cursor, opened for a handle built without
+// one so a zero value still writes rather than panicking.
+func (session *Session) cursor() *stateCursor {
+	if session.state == nil {
+		session.state = &stateCursor{}
+	}
+	return session.state
+}
+
+// writeEvent appends one session event on the lane.
+func (session *Session) writeEvent(
+	ctx context.Context, operation string, body []byte,
+) (*AgdxReceipt, error) {
+	lane, err := session.Agdx()
+	if err != nil {
+		return nil, err
+	}
+	return lane.Emit(body).WithOperation(operation).
+		ContentType(wire.ContentCBOR).Send(ctx)
+}
+
+// laneEnvelopes is this session's records on its lane, decoded.
+//
+// A record that is not an envelope is skipped: a lane carries whatever its
+// writers put there, and one unreadable record is not a reason to refuse the
+// rest.
+func (session *Session) laneEnvelopes(
+	ctx context.Context,
+) ([]wire.AgentEnvelope, error) {
+	scope := session.laser.WithDefaultStream(session.config.Stream).
+		Context(session.conversation)
+	records, err := scope.read(ctx, wire.AgentSessions)
+	if err != nil {
+		return nil, err
+	}
+	envelopes := make([]wire.AgentEnvelope, 0, len(records))
+	for _, record := range records {
+		if record == nil || record.Provenance == nil ||
+			record.Provenance.Conversation != session.conversation {
+			continue
+		}
+		var envelope wire.AgentEnvelope
+		if err := wire.Unmarshal(record.Payload(), &envelope); err != nil {
+			continue
+		}
+		envelopes = append(envelopes, envelope)
+	}
+	return envelopes, nil
 }
 
 // Conversation is the session's identity, and the partition key its records

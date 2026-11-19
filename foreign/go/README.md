@@ -677,6 +677,43 @@ The Rust client additionally re-checks the stream generation at the send
 boundary, inside the same lane-identity guard noted under [Session
 layout](#session-layout). Here the check is the one in the heartbeat loop.
 
+## Session state
+
+`Session.State` is the session's state document: RFC 6902 patches on the
+session lane, applied in lane order, with snapshots as checkpoints. `Set`,
+`Patch` and `Replace` write, and `Get` folds the lane back into the document.
+
+A successful append does not prove a patch applied. Another writer may have
+reached the same revision first, and a reader learns the outcome from the
+folded state rather than from the receipt. Each delta names both the revision
+it continues from and the delta that reached it, which is what tells a writer
+that lost a race from one that did not: two writers can reach the same
+revision, only one reached it with this parent.
+
+The cursor is shared by a session handle and every handle derived from it, and
+held across each publish, so one process's writes land in revision order. A
+failed publish clears it, because a record that reached the log with a lost
+acknowledgment looks exactly like one that never landed, and naming the old
+revision again would write a delta the fold skips. The next write reseeds from
+the lane instead.
+
+`Snapshot` writes the whole document, and refuses with a stale session error
+when the session's document is no longer this handle's, so a handle whose
+earlier write did not apply never overwrites a later change. One is written
+automatically every 64 deltas, because without a checkpoint a long-lived
+session's state costs more to read every time it is written to. A failed
+automatic snapshot is not a failed write: the delta is on the log and the next
+write retries the checkpoint.
+
+`FoldSessionState` is the fold itself. The first snapshot is the baseline; a
+later one counts only at the revision the fold has reached and with the
+document it holds, so a second writer's checkpoint of a document the session
+never reached changes nothing. A record that does not decode, or a snapshot
+carrying a number no JSON reader holds exactly, is skipped the way the session
+index skips it. `Complete` is false when retention removed the records the
+document starts from, which is what separates a document that is empty from
+one whose beginning is gone.
+
 ## Operator control
 
 `ControlRequestOf` reads what a record on `agent.control` asks of a session:
