@@ -229,7 +229,11 @@ type AgdxSend struct {
 	grant *ApprovalGrant
 	// signer turns this message's authorship claim into a proof.
 	signer *SigningKey
-	err    error
+	// blobStore and claimThreshold externalize a body too large to ride the
+	// log, replacing it with the capsule that names where it went.
+	blobStore      BlobStore
+	claimThreshold int
+	err            error
 }
 
 // WithGrant carries an approval with this send.
@@ -414,6 +418,20 @@ func (send *AgdxSend) Send(ctx context.Context) (*AgdxReceipt, error) {
 	} else if body != nil {
 		send.envelope.Body = body
 	}
+	// The claim check runs after the governor and before the signature, so a
+	// policy decides on the body the producer meant while the signature
+	// covers the capsule the log actually carries.
+	if send.blobStore != nil {
+		body, contentType, err := CheckIn(
+			ctx, send.blobStore, send.claimThreshold, send.envelope.Body)
+		if err != nil {
+			return nil, err
+		}
+		send.envelope.Body = body
+		if contentType != nil {
+			send.contentType = *contentType
+		}
+	}
 	// The signature covers the envelope as it will be encoded, with the
 	// interpretation attributes the record carries bound into the preimage,
 	// so an intermediary cannot flip how the signed bytes are read.
@@ -578,6 +596,34 @@ func OpenAgdx(record *Record) (*AgdxMessage, error) {
 		return nil, &InvalidError{Reason: "agent envelope: " + err.Error()}
 	}
 	return &AgdxMessage{Envelope: envelope, Record: record}, nil
+}
+
+// ContentType is how the body is encoded, read off the record's own stamp.
+//
+// It rides the headers rather than the envelope, so a reader knows how to
+// read the body without decoding it first. A record carrying no stamp is
+// raw: there is nothing that says otherwise.
+func (message *AgdxMessage) ContentType() wire.ContentType {
+	if message.Record == nil {
+		return wire.ContentRaw
+	}
+	headers, err := iggcon.DeserializeHeaders(message.Record.Message.UserHeaders)
+	if err != nil {
+		return wire.ContentRaw
+	}
+	for _, entry := range headers {
+		if string(entry.Key.Value) != wire.HeaderContentType {
+			continue
+		}
+		if len(entry.Value.Value) != 1 {
+			return wire.ContentRaw
+		}
+		if contentType, named := wire.ContentTypeFromCode(entry.Value.Value[0]); named {
+			return contentType
+		}
+		return wire.ContentRaw
+	}
+	return wire.ContentRaw
 }
 
 // Understood reports whether this build can safely process the message.

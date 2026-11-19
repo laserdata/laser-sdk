@@ -10,7 +10,8 @@ negotiation, the managed command band and its typed surfaces (key-value, query,
 forks, graph, session reads and writes, authorization, consumer filters and the
 saved-filter catalog), streams, topics and publishing, consuming, replay, typed
 records, provenance headers, AGDX agent messaging and gates, the registry and
-router, request and reply, memory, context assembly, the agent topology bootstrap, dead-letter redrives, chunk
+router, request and reply, memory, context assembly, claim-checked bodies, local state, swarm activity, crash
+context, edge authorization, the agent topology bootstrap, dead-letter redrives, chunk
 stream reassembly, the projection, binding
 and writer-schema registries, materialization, the change feed, a batching producer with the shared publish
 recovery schedule, record signing with its key registry, action governance with its approval gate, and the bridge value
@@ -416,6 +417,80 @@ attempt whose reply was lost may still have applied.
 Each verb returns what its change produced and where the fold applied it. That
 position is what a group read can wait for, which is what gives an application
 that just configured a group read-your-writes through any node.
+
+## Claim-checked bodies
+
+A body too large for the log is externalized and replaced by a capsule naming
+where it went. `AgdxSend.ClaimCheck` does it at send, after the governor and
+before the signature, so a policy decides on the body the producer meant and
+the signature covers the capsule the log actually carries. Under the threshold
+the payload is untouched, byte-identical to no claim check at all.
+
+No store ships with this client. The deployment chooses one, because a body
+externalized to the wrong place is a body nobody can read back.
+
+`ResolveBody` fetches and verifies. The capsule's digest is the reader's proof
+that the store returned what the producer externalized, so a mismatch is
+refused rather than handed over: a body nobody can vouch for is worse than no
+body at all. The capsule comes off the log, where any writer can forge one, so
+its reference is held to the contract's bounds before it reaches the store.
+
+## Local state
+
+`InMemoryStore` and `FileStore` are the same contract, so a caller swaps one
+for the other without changing anything else. What they hold is a process's
+own state beside the log: dedup keys, cursors, whatever has to survive a
+restart.
+
+The file store encodes keys into file names, so any key is safe and none can
+traverse out of the directory however it was built. A key that names nothing
+is refused by both stores, since an empty name is the directory itself. The
+directory is narrowed to its owner even when it already existed, because state
+written into one anybody can read is state anybody can read.
+
+A write stages into a file of its own and renames into place, because a crash
+partway through a plain write leaves a partial file the next read returns as
+though it were valid state. The bytes are flushed before the rename, since a
+rename can otherwise reach disk first, and the directory is flushed after so
+the rename itself survives. The staging name carries an identity, so two
+writers on one key cannot clobber each other and whichever renames last wins
+whole.
+
+## Swarm activity and crash context
+
+`SwarmActivity` folds policy evidence a caller has already read into per-agent
+counts, so a coordinator answers "what has the swarm been doing" without
+re-deriving them. It is a pure fold rather than a reader of its own, so it
+composes with whatever offset-resume convention the caller already uses.
+Evidence is replayable, so a decision already folded is dropped rather than
+counted twice, and one naming no acting agent is dropped rather than counted
+against a name nobody chose. The latest decision is the one that happened
+last, not the one that arrived last.
+
+`CrashContext` combines three pieces a recovery tool has already read: the
+recent journal, the dead-letter capsule for the record that crashed, and the
+last governance decision. `Summarize` renders them in one fixed order every
+time, because two identical crashes should read identically. A payload is
+previewed by characters rather than bytes, so a multi-byte character is never
+cut in half, and control characters are escaped so a payload carrying a
+newline cannot forge a field of its own.
+
+## Edge authorization
+
+`AuthorizeEdge` decides an external request against a decoded token: the
+audience first, then the scope. This client parses no tokens. The transport
+decodes one and this decides on what it decoded, which keeps the token format
+the deployment's business.
+
+The order is the point. A token minted for another audience is never inspected
+further, because reading its scopes would be trusting a credential that was
+not issued to this server. A wrong audience is a hard refusal, where a missing
+scope is a step-up naming what to acquire, and the challenge escapes it so a
+scope carrying a quote cannot smuggle in another parameter.
+
+A bridge never forwards the caller's token upstream. It acts under its own
+enrolled identity and mints a fresh credential, so a compromised bridge cannot
+replay the caller's.
 
 ## Bootstrap and readiness
 
