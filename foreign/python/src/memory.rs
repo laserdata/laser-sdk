@@ -690,11 +690,21 @@ impl PyConsolidationReport {
 /// is awaited:
 ///
 /// ```python
-/// memory = laser.memory("assistant")
-/// city = await memory.remember("Lives in Gdansk", conversation=first, user="user-42")
-/// await memory.supersede(city, "Lives in Lisbon", conversation=second, user="user-42")
-/// facts = await memory.recall(user="user-42", semantic="Where does the user live?")
-/// print([fact.text() for fact in facts])  # ['Lives in Lisbon']
+/// import asyncio
+/// import laser_sdk as ls
+///
+/// async def main():
+///     async with await ls.Laser.connect_env() as root:
+///         async with root.scratch_stream("memory") as scratch:
+///             memory = scratch.laser.memory("assistant")
+///             first = ls.new_conversation_id()
+///             city = await memory.remember("Lives in Gdansk", conversation=first, user="user-42")
+///             second = ls.new_conversation_id()
+///             await memory.supersede(city, "Lives in Lisbon", conversation=second, user="user-42")
+///             facts = await memory.recall(user="user-42", semantic="Where does the user live?")
+///             print([fact.text() for fact in facts])  # ['Lives in Lisbon']
+///
+/// asyncio.run(main())
 /// ```
 ///
 /// `remember` returns the new item's id, `supersede` replaces a fact in every
@@ -861,7 +871,9 @@ impl PyMemory {
     }
 
     /// Remember `payload` (`str`, `bytes`, or `bytearray`). Await it for the new
-    /// item's id (a ULID string), the id `supersede` and `forget` take. The
+    /// item's id (a ULID string), the id `supersede` and `forget` take.
+    /// `conversation` is an id from `new_conversation_id()`, and any other
+    /// string raises `IdError`. The
     /// first write creates the memory topic. `kind` is `fact` (default), `message`,
     /// `summary`, `entity`, `feedback`, or `procedure`. `durable=True` sets the
     /// scope lifetime for custom backends. Built-ins do not persist or filter
@@ -872,7 +884,6 @@ impl PyMemory {
     /// than the one a log memory writes to is refused with `InvalidError`.
     /// `origin` is the `SourceRef` dict of the session record
     /// that motivated the item, and `producer` is a `{"name", "version"}` dict.
-    /// `conversation` is a ULID string, `new_conversation_id()` makes one.
     #[pyo3(signature = (payload, *, agent=None, conversation=None, stream=None, user=None, application=None, kind="fact", durable=false, dedup=false, origin=None, producer=None))]
     #[allow(clippy::too_many_arguments)]
     fn remember<'py>(
@@ -1362,19 +1373,11 @@ impl PyMemoryItem {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyLaser {
-    /// Agent memory in `namespace` on the stream's `agent.memory` topic,
-    /// returned at once without `await`: `memory = laser.memory("assistant")`.
-    /// `remember` publishes to the memory topic (the durable audit) and creates
-    /// it on the first write, `supersede` corrects a fact, `forget` appends a
-    /// tombstone, and a deployment materializes the topic into the versioned
-    /// key-value read view. Default `recall` and `fetch` read that managed view
-    /// where the deployment serves one (Laser Stack, LaserData Cloud), and
-    /// fold the topic in process on plain Apache Iggy, so the same program
-    /// runs on every server. `recall(folded=True)` and `fetch_folded` always
-    /// fold. `namespace` prefixes the named-item keys (`set`, `fetch`). For an
-    /// isolated per-topic memory stream use `memory_on_topic` or
-    /// `memory_topic`. Reuse the handle: each folded recall reads only what is
-    /// new.
+    /// Agent memory in `namespace`, returned at once without `await`:
+    /// `memory = laser.memory("assistant")`. It writes to the client's default
+    /// stream, which `scratch.laser` has. `Laser.connect_env(stream="assistant")`
+    /// names a stream that stays, and a client with no default stream raises
+    /// `NoStreamError`.
     ///
     /// A complete program that corrects a fact in a later conversation. It
     /// needs only `LASER_CONNECTION_STRING`:
@@ -1420,6 +1423,19 @@ impl PyLaser {
     /// `remember` returns the fact's id. `supersede(old_id, text, ...)` stores
     /// the new fact and forgets the old one in every conversation. `recall`
     /// returns `MemoryItem` objects, `item.text()` is the fact.
+    ///
+    /// The memory lives on the stream's `agent.memory` topic.
+    /// `remember` publishes to the memory topic (the durable audit) and creates
+    /// it on the first write, `supersede` corrects a fact, `forget` appends a
+    /// tombstone, and a deployment materializes the topic into the versioned
+    /// key-value read view. Default `recall` and `fetch` read that managed view
+    /// where the deployment serves one (Laser Stack, LaserData Cloud), and
+    /// fold the topic in process on plain Apache Iggy, so the same program
+    /// runs on every server. `recall(folded=True)` and `fetch_folded` always
+    /// fold. `namespace` prefixes the named-item keys (`set`, `fetch`). For an
+    /// isolated per-topic memory stream use `memory_on_topic` or
+    /// `memory_topic`. Reuse the handle: each folded recall reads only what is
+    /// new.
     fn memory(&self, namespace: String) -> PyMemory {
         PyMemory::from_handle(self.inner.memory(namespace))
     }

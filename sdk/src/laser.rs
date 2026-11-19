@@ -2572,7 +2572,7 @@ mod announcement_tests {
 }
 
 const CONNECTION_STRING_VARIABLE: &str = "LASER_CONNECTION_STRING";
-const STREAM_VARIABLE: &str = "LASER_STREAM";
+pub(crate) const STREAM_VARIABLE: &str = "LASER_STREAM";
 
 // Apache Iggy's default ports. A connection string or address may omit the port.
 const DEFAULT_TCP_PORT: u16 = 8090;

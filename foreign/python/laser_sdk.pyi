@@ -3,10 +3,40 @@
 r"""
 Laser SDK: durable workflows, long-term agent memory and sessions on one log, over Apache Iggy.
 
-Connect with the connection string in LASER_CONNECTION_STRING. Every call that
-reaches the server returns an awaitable, so await it. `memory(...)`,
-`workflow(...)`, `step(...)` and `sessions(...)` return at once. A scratch
-stream is deleted when its block ends, so a second run prints the same:
+Connect with the connection string in LASER_CONNECTION_STRING. With that
+variable set, a program needs no Docker and no local server.
+
+Workflow. Decorate plain functions with @ls.step and @ls.workflow. A step takes
+and returns what JSON holds. The run connects by itself, closes its connection
+when it ends, and uses LASER_STREAM or a stream named after the workflow, which
+stays after the run. `run()` returns a WorkflowOutcome: run_id, status
+("completed"), completed_steps in completion order, value (what the workflow
+function returned), outputs (label to bytes), json(label), text(label).
+`resume(run_id)` returns the recorded value of a finished step without calling
+it again. Laser.workflow(name).step(...) is the builder for steps routed to
+agents, verifiers, compensation and budgets.
+
+    import json
+    import laser_sdk as ls
+
+    @ls.step
+    def ingest():
+        return "frames from sat-7"
+
+    @ls.step
+    def analyze(frames):
+        return f"analyzed {frames}"
+
+    @ls.workflow
+    def pipeline():
+        return analyze(ingest())
+
+    run = pipeline.run()
+    print(json.dumps({"status": run.status, "steps": run.completed_steps, "report": run.value}))
+
+Memory and sessions run on a client. Every call that reaches the server returns
+an awaitable, so await it. `memory(...)` and `sessions(...)` return at once. A
+scratch stream is deleted when its block ends, so a second run prints the same:
 
     import asyncio, json
     import laser_sdk as ls
@@ -19,25 +49,8 @@ stream is deleted when its block ends, so a second run prints the same:
 
     asyncio.run(main())
 
-Without a scratch stream, pick one when connecting, `ls.Laser.connect_env(stream="orders")`,
+Without a scratch stream, pick one when connecting, `ls.Laser.connect_env(stream="telemetry")`,
 or a call that needs a default stream raises NoStreamError.
-
-Workflow. A step runs in this process. Its `run` is a plain function or an
-async def, gets the earlier outputs by label as bytes, and returns str or
-bytes. `run()` returns a WorkflowOutcome: run_id, status ("completed"),
-completed_steps in completion order, outputs (label to bytes), text(label).
-
-    async def analyze(outputs):
-        await asyncio.sleep(1)
-        return b"analyzed " + outputs["ingest"]
-
-    outcome = await (
-        laser.workflow("pipeline")
-        .step("ingest", run=lambda outputs: "frames from sat-7")
-        .step("analyze", after=["ingest"], run=analyze)
-        .run()
-    )
-    print(json.dumps({"status": outcome.status, "analyze": outcome.text("analyze")}))
 
 Memory. remember returns the fact's id. supersede stores a correction and
 forgets the old fact in every conversation. recall returns a list of
@@ -408,6 +421,7 @@ __all__ = [
     "SigningKey",
     "SnapshotStore",
     "StateStore",
+    "Step",
     "StoredOffset",
     "Stream",
     "StreamInfo",
@@ -446,6 +460,7 @@ __all__ = [
     "WhoamiReply",
     "Workflow",
     "WorkflowBudget",
+    "WorkflowFunction",
     "WorkflowOutcome",
     "agent_ctx",
     "agent_message",
@@ -568,6 +583,7 @@ __all__ = [
     "snapshot_from_checkpoint",
     "source_selector_new",
     "status_envelope",
+    "step",
     "task_from_envelope",
     "text_predicate_validate",
     "timestamp_format_micros_from_integer",
@@ -590,6 +606,7 @@ __all__ = [
     "verify_card",
     "verify_delegation",
     "verify_evidence_chain",
+    "workflow",
 ]
 
 A2A_JSONRPC_BINDING: builtins.str = 'JSONRPC'
@@ -5100,7 +5117,9 @@ class Laser:
         exclusivity, on-timeout reassignment, and saga compensation mix in. The
         name is the orchestrator identity the run dispatches as, a valid agent
         id. `fixed_inbox` routes every step to a fixed topic (a server with no
-        presence command). Omit it to resolve advertised inboxes.
+        presence command). Omit it to resolve advertised inboxes. For a workflow
+        of plain functions, decorate them with `laser_sdk.workflow` and
+        `laser_sdk.step`.
 
         A complete program. It needs only `LASER_CONNECTION_STRING`:
 
@@ -5374,19 +5393,11 @@ class Laser:
     def materialization(self, projection_id: builtins.str) -> Materialization: ...
     def memory(self, namespace: builtins.str) -> MemoryHandle:
         r"""
-        Agent memory in `namespace` on the stream's `agent.memory` topic,
-        returned at once without `await`: `memory = laser.memory("assistant")`.
-        `remember` publishes to the memory topic (the durable audit) and creates
-        it on the first write, `supersede` corrects a fact, `forget` appends a
-        tombstone, and a deployment materializes the topic into the versioned
-        key-value read view. Default `recall` and `fetch` read that managed view
-        where the deployment serves one (Laser Stack, LaserData Cloud), and
-        fold the topic in process on plain Apache Iggy, so the same program
-        runs on every server. `recall(folded=True)` and `fetch_folded` always
-        fold. `namespace` prefixes the named-item keys (`set`, `fetch`). For an
-        isolated per-topic memory stream use `memory_on_topic` or
-        `memory_topic`. Reuse the handle: each folded recall reads only what is
-        new.
+        Agent memory in `namespace`, returned at once without `await`:
+        `memory = laser.memory("assistant")`. It writes to the client's default
+        stream, which `scratch.laser` has. `Laser.connect_env(stream="assistant")`
+        names a stream that stays, and a client with no default stream raises
+        `NoStreamError`.
 
         A complete program that corrects a fact in a later conversation. It
         needs only `LASER_CONNECTION_STRING`:
@@ -5432,6 +5443,19 @@ class Laser:
         `remember` returns the fact's id. `supersede(old_id, text, ...)` stores
         the new fact and forgets the old one in every conversation. `recall`
         returns `MemoryItem` objects, `item.text()` is the fact.
+
+        The memory lives on the stream's `agent.memory` topic.
+        `remember` publishes to the memory topic (the durable audit) and creates
+        it on the first write, `supersede` corrects a fact, `forget` appends a
+        tombstone, and a deployment materializes the topic into the versioned
+        key-value read view. Default `recall` and `fetch` read that managed view
+        where the deployment serves one (Laser Stack, LaserData Cloud), and
+        fold the topic in process on plain Apache Iggy, so the same program
+        runs on every server. `recall(folded=True)` and `fetch_folded` always
+        fold. `namespace` prefixes the named-item keys (`set`, `fetch`). For an
+        isolated per-topic memory stream use `memory_on_topic` or
+        `memory_topic`. Reuse the handle: each folded recall reads only what is
+        new.
         """
     def memory_with(self, namespace: builtins.str, backend: typing.Literal['auto', 'log', 'vector'] = "auto", *, embedder: typing.Optional[typing.Any] = None) -> MemoryHandle:
         r"""
@@ -6184,11 +6208,21 @@ class MemoryHandle:
     is awaited:
 
     ```python
-    memory = laser.memory("assistant")
-    city = await memory.remember("Lives in Gdansk", conversation=first, user="user-42")
-    await memory.supersede(city, "Lives in Lisbon", conversation=second, user="user-42")
-    facts = await memory.recall(user="user-42", semantic="Where does the user live?")
-    print([fact.text() for fact in facts])  # ['Lives in Lisbon']
+    import asyncio
+    import laser_sdk as ls
+
+    async def main():
+        async with await ls.Laser.connect_env() as root:
+            async with root.scratch_stream("memory") as scratch:
+                memory = scratch.laser.memory("assistant")
+                first = ls.new_conversation_id()
+                city = await memory.remember("Lives in Gdansk", conversation=first, user="user-42")
+                second = ls.new_conversation_id()
+                await memory.supersede(city, "Lives in Lisbon", conversation=second, user="user-42")
+                facts = await memory.recall(user="user-42", semantic="Where does the user live?")
+                print([fact.text() for fact in facts])  # ['Lives in Lisbon']
+
+    asyncio.run(main())
     ```
 
     `remember` returns the new item's id, `supersede` replaces a fact in every
@@ -6267,7 +6301,9 @@ class MemoryHandle:
     def remember(self, payload: builtins.str | builtins.bytes | builtins.bytearray, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, stream: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, kind: typing.Literal['fact', 'message', 'summary', 'entity', 'feedback', 'procedure'] = "fact", durable: builtins.bool = False, dedup: builtins.bool = False, origin: typing.Optional[typing.Any] = None, producer: typing.Optional[typing.Any] = None) -> typing.Awaitable[builtins.str]:
         r"""
         Remember `payload` (`str`, `bytes`, or `bytearray`). Await it for the new
-        item's id (a ULID string), the id `supersede` and `forget` take. The
+        item's id (a ULID string), the id `supersede` and `forget` take.
+        `conversation` is an id from `new_conversation_id()`, and any other
+        string raises `IdError`. The
         first write creates the memory topic. `kind` is `fact` (default), `message`,
         `summary`, `entity`, `feedback`, or `procedure`. `durable=True` sets the
         scope lifetime for custom backends. Built-ins do not persist or filter
@@ -6278,7 +6314,6 @@ class MemoryHandle:
         than the one a log memory writes to is refused with `InvalidError`.
         `origin` is the `SourceRef` dict of the session record
         that motivated the item, and `producer` is a `{"name", "version"}` dict.
-        `conversation` is a ULID string, `new_conversation_id()` makes one.
         """
     def supersede(self, old_id: builtins.str, payload: builtins.str | builtins.bytes | builtins.bytearray, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, stream: typing.Optional[builtins.str] = None, kind: typing.Literal['fact', 'message', 'summary', 'entity', 'feedback', 'procedure'] = "fact", durable: builtins.bool = False, dedup: builtins.bool = False, origin: typing.Optional[typing.Any] = None, producer: typing.Optional[typing.Any] = None) -> typing.Awaitable[builtins.str]:
         r"""
@@ -9350,6 +9385,21 @@ class StateStore:
         """
 
 @typing.final
+class Step:
+    r"""
+    A function decorated with `step`. Inside a workflow function a call journals
+    the step, and a resumed run returns the recorded value without calling it.
+    `fn` is the plain function.
+    """
+    @property
+    def fn(self) -> typing.Any:
+        r"""
+        The plain function, which runs without a workflow and journals nothing.
+        """
+    def __call__(self, *args: typing.Any, **kwargs: typing.Any) -> typing.Any: ...
+    def __get__(self, instance: typing.Optional[typing.Any], _owner: typing.Optional[typing.Any]) -> typing.Any: ...
+
+@typing.final
 class StoredOffset:
     r"""
     A consumer's offset as the server stores it, read by
@@ -10495,6 +10545,37 @@ class WorkflowBudget:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class WorkflowFunction:
+    r"""
+    A function decorated with `workflow`. Calling it runs the workflow and
+    returns the function's value. `run(...)` returns the `WorkflowOutcome`,
+    `resume(run_id, ...)` continues a run, and `bind(laser)` runs on a client
+    the program already holds. An `async def` function makes each of them
+    awaitable.
+    """
+    def __call__(self, *args: typing.Any, **kwargs: typing.Any) -> typing.Any: ...
+    def run(self, *args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        r"""
+        Run the workflow and return its `WorkflowOutcome`: `run_id`, `status`,
+        `completed_steps` in completion order, `value` (what the function
+        returned), `json(label)` and `text(label)`.
+        """
+    def resume(self, run_id: builtins.str, *args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        r"""
+        Continue the run `run_id`: a step call the run recorded with the same
+        arguments returns its value without being called. A call with other
+        arguments is a new call and runs. Pass the function's arguments again,
+        the journal does not hold them.
+        """
+    def bind(self, laser: Laser) -> WorkflowFunction:
+        r"""
+        This workflow on `laser`, which stays open after the run. The run uses
+        the client's default stream, else `LASER_STREAM`, else a stream named
+        after the workflow.
+        """
+    def __get__(self, instance: typing.Optional[typing.Any], _owner: typing.Optional[typing.Any]) -> typing.Any: ...
+
+@typing.final
 class WorkflowOutcome:
     r"""
     The result of a completed `Workflow.run`: `outputs` (each step's output by
@@ -10524,10 +10605,21 @@ class WorkflowOutcome:
         r"""
         The run's end status word, `completed` for a returned outcome.
         """
+    @property
+    def value(self) -> typing.Any:
+        r"""
+        What a function decorated with `workflow` returned, `None` for a run of
+        declared steps.
+        """
     def text(self, label: builtins.str) -> typing.Optional[builtins.str]:
         r"""
         The output of step `label` as text (invalid UTF-8 replaced), or `None`
         when no completed step has that label.
+        """
+    def json(self, label: builtins.str) -> typing.Any:
+        r"""
+        The output of step `label` decoded as JSON, or `None` when no completed
+        step has that label.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -11183,6 +11275,30 @@ def status_envelope(record: builtins.str, conversation: builtins.str, source: bu
     `task_state`. Takes the `command_envelope` refinement keywords.
     """
 
+def step(function: typing.Optional[typing.Any] = None, *, name: typing.Optional[builtins.str] = None) -> typing.Any:
+    r"""
+    Make a function a workflow step. Inside a function decorated with `workflow`
+    each call of the step is journaled, so a resumed run returns the recorded
+    value and does not call the function again. A step takes and returns what
+    JSON holds: dict, list, str, int, float, bool or None. A call is known by the
+    step's name and its arguments, so a call with other arguments runs as a new
+    call. The step's name is the function's name, or `@step("name")`.
+
+    ```python
+    import laser_sdk as ls
+
+    @ls.step
+    def ingest():
+        return {"satellite": "sat-7", "frames": 12}
+
+    @ls.workflow
+    def pipeline():
+        return ingest()
+
+    print(pipeline())
+    ```
+    """
+
 def task_from_envelope(task_id: builtins.str, context_id: builtins.str, envelope: typing.Any) -> typing.Any:
     r"""
     Render an AGDX envelope as the A2A v1.0 task view in the context
@@ -11318,6 +11434,51 @@ def verify_evidence_chain(evidence: typing.Sequence[PolicyEvidence]) -> builtins
     Whether `evidence`, in log order for one conversation, is an unbroken
     chain: every record reproduces its own `receipt_digest` and names the
     previous record's digest as its `previous_digest`.
+    """
+
+def workflow(function: typing.Optional[typing.Any] = None, *, name: typing.Optional[builtins.str] = None, stream: typing.Optional[builtins.str] = None) -> typing.Any:
+    r"""
+    Make a function a durable workflow. It connects with
+    `LASER_CONNECTION_STRING`, journals each step the function calls, and closes
+    the connection when the run ends. With that variable set, it needs no Docker
+    and no local server. Calling it returns the function's value. `run()`
+    returns a `WorkflowOutcome` with `run_id`, `status`, `completed_steps` and
+    `value`, and `resume(run_id)` continues a run. The run uses `stream=`, else
+    `LASER_STREAM`, else a stream named after the workflow, and creates it when
+    it is missing. An `async def` function is awaited, and its steps can be
+    `async def` too.
+
+    ```python
+    import json
+    import time
+
+    import laser_sdk as ls
+
+
+    @ls.step
+    def ingest():
+        return "frames from sat-7"
+
+
+    @ls.step
+    def analyze(frames):
+        time.sleep(1)
+        return f"analyzed {frames}"
+
+
+    @ls.step
+    def report(analysis):
+        return f"report on {analysis}"
+
+
+    @ls.workflow
+    def pipeline():
+        return report(analyze(ingest()))
+
+
+    run = pipeline.run()
+    print(json.dumps({"status": run.status, "steps": run.completed_steps, "report": run.value}))
+    ```
     """
 
 

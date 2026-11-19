@@ -4,7 +4,9 @@ members = ["examples/rust", "sdk", "test-support", "wire"]
 resolver = "2"
 
 [workspace.package]
+documentation = "https://docs.rs/laser-sdk"
 edition = "2024"
+homepage = "https://docs.laserdata.com/laser-sdk"
 license = "Apache-2.0"
 repository = "https://github.com/laserdata/laser-sdk"
 rust-version = "1.100.0"

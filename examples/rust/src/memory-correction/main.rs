@@ -1,9 +1,8 @@
-// cargo add laser-sdk --features agent,kv
+// cargo add laser-sdk
 // cargo add tokio --features macros,rt-multi-thread
 // cargo add serde --features derive
 // cargo add serde_json
 // Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
-// Check: echo "${LASER_CONNECTION_STRING:+configured}"
 use laser_sdk::prelude::*;
 use serde::Serialize;
 

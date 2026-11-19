@@ -1,6 +1,5 @@
 # python -m pip install laser-sdk
 # Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
-# Check: echo "${LASER_CONNECTION_STRING:+configured}"
 import asyncio
 import json
 

@@ -1,7 +1,7 @@
 {
   "name": "@laserdata/laser-sdk",
   "version": "0.11.0",
-  "description": "LaserData SDK over Apache Iggy: typed streaming, operational query, materialization, key-value state, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX).",
+  "description": "Durable workflows and long-term memory for AI agents, with sessions, key-value state, operational query and typed streaming on Apache Iggy.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -29,7 +29,7 @@
     "url": "git+https://github.com/laserdata/laser-sdk.git",
     "directory": "foreign/typescript"
   },
-  "homepage": "https://laserdata.com",
+  "homepage": "https://docs.laserdata.com/laser-sdk",
   "bugs": {
     "url": "https://github.com/laserdata/laser-sdk/issues"
   },

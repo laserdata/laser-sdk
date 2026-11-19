@@ -9,7 +9,8 @@ void test("given_the_package_when_its_doc_is_read_then_should_open_with_the_thre
   for (const line of [
     "await using root = await Laser.connectEnv()",
     'await using scratch = await root.scratchStream("demo")',
-    '.stepLocal("analyze", async ({ outputs }) => {',
+    'const analyze = step("analyze", async (frames: string) => {',
+    'const pipeline = workflow("pipeline", async () => report(await analyze(await ingest())))',
     'const memory = laser.memory("assistant")',
     "await memory.supersede(city,",
     "const sessions = laser.sessions()",

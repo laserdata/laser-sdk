@@ -1,14 +1,16 @@
-# workflow: three in-process steps, one of them async
+# workflow: three plain functions as durable steps
 
-This program runs a durable workflow of three steps whose bodies run in the calling process, then prints the run id, its end status, the completed steps in order, and the last step's output as JSON. It imports only `@laserdata/laser-sdk` and Node's own `node:timers/promises`, so it runs when copied alone into any project that installed the package.
+This program runs a durable workflow of three steps in the calling process, then prints the run's status, the completed steps in order, and the workflow's value as JSON. It imports only `@laserdata/laser-sdk` and Node's own `node:timers/promises`, so it runs when copied alone into any project that installed the package.
 
 ## What it shows
 
-- `Laser.connectEnv()` reads the connection string from `LASER_CONNECTION_STRING`.
-- `root.scratchStream("workflow")` creates a stream with a unique name, and `await using` deletes it when the program ends.
-- `scratch.laser.workflow("pipeline").stepLocal(label, run)` adds a step whose body runs here. `run` gets `{ outputs }`, the outputs of the steps before it by label as bytes, and returns a string. `analyze` is an async function that awaits one second. `.after(label)` orders the steps.
-- The first run on the new stream creates the agent topics with the `bootstrap` defaults, so the program needs no `bootstrap`, agent, or handler.
-- `outcome.status`, `outcome.completedSteps`, and `outcome.text(label)` report the run. The program prints `run_id`, `status`, `completed_steps` and `report`, the same fields in the same order as the Python and Rust programs. Running the same workflow again with `.runId(outcome.runId)` resumes it and skips every step the journal recorded.
+- `step(name, fn)` makes a function a step and `workflow(name, fn)` makes a function a workflow. The workflow calls its steps in ordinary code.
+- `pipeline.run()` reads the connection string from `LASER_CONNECTION_STRING`, runs the function, and closes its connection when the run ends.
+- The run uses the stream named by `LASER_STREAM`, or a stream named `pipeline` after the workflow. It creates the stream and its topics when they are missing and keeps them after the run, so the run can be resumed.
+- A step takes and returns what JSON holds. A step name holding `#` is refused, because the journal numbers repeated calls with it.
+- The run journals each completed step, so `pipeline.resume(runId)` returns the recorded values without running those steps again. A resumed run must call the same steps in the same order. A failed run returns no outcome, so a caller that wants to resume one names the run ID first with `pipeline.resume(runId)`.
+- `run.status`, `run.completedSteps`, and `run.value` report the run, and `run.json(label)` and `run.text(label)` read one step's output.
+- For steps routed to agents, verifiers, compensation and budgets, use the builder, `laser.workflow(name).step(...)`, with `stepLocal` for its in-process steps.
 
 ## Run it
 
@@ -16,4 +18,4 @@ This program runs a durable workflow of three steps whose bodies run in the call
 LASER_CONNECTION_STRING='<connection string>' npm run example:workflow
 ```
 
-It runs against plain Apache Iggy, Laser Stack, and LaserData Cloud.
+It prints `{"status":"completed","steps":["ingest","analyze","report"],"report":"report on analyzed frames from sat-7"}` and runs against plain Apache Iggy, Laser Stack, and LaserData Cloud.

@@ -8,14 +8,11 @@ Run the commands below from this directory (`examples/python/`).
 
 Choose either the published package or the local checkout.
 
-Both paths use `uv` and do not require `pip` in `/usr/bin/python3`.
-
 Published package:
 
 ```sh
-uv venv
-uv pip install laser-sdk
-uv run python log.py
+python -m pip install laser-sdk
+python log.py
 ```
 
 Local checkout:
@@ -72,11 +69,11 @@ LASER_TOKEN='<token>' \
 
 ## Copy a whole program
 
-`workflow.py` and `memory_correction.py` import only `laser_sdk` and the standard library, not `_common.py`, so each runs when copied alone after `python -m pip install laser-sdk`. Each reads `LASER_CONNECTION_STRING` through `Laser.connect_env()`, works in a scratch stream, and deletes it when its `async with` block ends.
+`workflow.py` and `memory_correction.py` import only `laser_sdk` and the standard library, not `_common.py`, so each runs when copied alone after `python -m pip install laser-sdk`. Each reads `LASER_CONNECTION_STRING`. `workflow.py` runs on the stream named by `LASER_STREAM`, or on a stream named `pipeline` after the workflow, and keeps it after the run so the run can be resumed. `memory_correction.py` works in a scratch stream and deletes it when its `async with` block ends.
 
 | script | shows | needs a managed backend? |
 | --- | --- | --- |
-| [`workflow.py`](workflow.py) | three in-process steps, one an `async def` that awaits one second, journaled and resumable, with the outcome printed as JSON | no |
+| [`workflow.py`](workflow.py) | three plain functions as steps with `@ls.step` and `@ls.workflow`, journaled and resumable, with the outcome printed as JSON. The builder, `Laser.workflow(name).step(...)`, is for steps routed to agents, verifiers, compensation and budgets, as [`orchestra.py`](orchestra.py) shows | no |
 | [`memory_correction.py`](memory_correction.py) | three facts for one user, a `supersede` in a later conversation, and a recall of the current facts printed as JSON | no |
 
 ## Primitives: start here

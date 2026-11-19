@@ -8,46 +8,31 @@ This package needs Node 22.14 or later. Bun, Deno, and browsers are not supporte
 
 ## Start here
 
-In a new directory, run `npm install @laserdata/laser-sdk tsx`, save either program as `main.mts`, and run it with `npx tsx main.mts`. `LASER_CONNECTION_STRING` is usually already set where the program runs, such as a LaserData Cloud workload, CI, or an agent sandbox, so check it before you look for a server: `echo "${LASER_CONNECTION_STRING:+configured}"` prints `configured` when it is. Then there is no server to start. Each one creates a scratch stream with a unique name, prints its result as JSON, and deletes the stream when it ends. To keep what a program writes, connect with `Laser.connectEnvWithStream(name)` or call `withDefaultStream(name)` instead of opening a scratch stream. Coding agents can read these docs through [Context7](https://context7.com/laserdata/laser-sdk) as well as [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk).
+In a new directory, run `npm install @laserdata/laser-sdk tsx`, save either program as `main.mts`, and run it with `npx tsx main.mts`. With `LASER_CONNECTION_STRING` set, a program needs no Docker and no local server. Then there is no server to start. Each one prints its result as JSON. The workflow runs on the stream named by `LASER_STREAM`, or on a stream named after the workflow, and keeps that stream after the run so the run can be resumed. The memory program creates a scratch stream with a unique name and deletes it when it ends. To keep what the memory program writes, connect with `Laser.connectEnvWithStream(name)` or call `withDefaultStream(name)` instead of opening a scratch stream. The guides are at [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk) and on [Context7](https://context7.com/laserdata/laser-sdk).
 
-A durable workflow of three steps whose bodies run in this process, in dependency order. `analyze` is an async function that awaits one second. A body gets `{ outputs }`, the earlier outputs by label as bytes, and returns a string or bytes, directly or as a promise. The run journals every completed step and creates the agent topics it needs, so it needs no `bootstrap`, agent, or handler. `.runId(outcome.runId)` on the same workflow resumes the run and skips every recorded step:
+A durable workflow of three plain functions. `step(name, fn)` makes a function a step, `workflow(name, fn)` makes a function a workflow, and the workflow calls its steps in ordinary code. `pipeline.run()` connects, runs the function, closes the connection, and resolves to the `WorkflowOutcome`. Calling `pipeline()` resolves to the function's value instead. A step takes and returns what JSON holds. Each completed step is journaled, so `pipeline.resume(runId)` returns the recorded value without running that step again, and it must call the same steps in the same order. A step name holding `#` is refused, because the journal numbers repeated calls with it. For steps routed to agents, verifiers, compensation and budgets, use the builder, `laser.workflow(name).step(...)`, with `stepLocal` for its in-process steps.
 
 ```ts
 // npm install @laserdata/laser-sdk tsx
 // Run with: npx tsx main.mts
-// Needs only LASER_CONNECTION_STRING, which connectEnv() reads. No server to start when it is set.
-// Check: echo "${LASER_CONNECTION_STRING:+configured}"
+// Needs only LASER_CONNECTION_STRING. No server to start when it is set.
 import { setTimeout as sleep } from "node:timers/promises"
-import { Laser } from "@laserdata/laser-sdk"
+import { step, workflow } from "@laserdata/laser-sdk"
 
-const decode = (bytes?: Uint8Array) => new TextDecoder().decode(bytes)
+const ingest = step("ingest", () => "frames from sat-7")
+const analyze = step("analyze", async (frames: string) => {
+  await sleep(1000)
+  return `analyzed ${frames}`
+})
+const report = step("report", (analysis: string) => `report on ${analysis}`)
 
-await using root = await Laser.connectEnv()
-await using scratch = await root.scratchStream("workflow")
+const pipeline = workflow("pipeline", async () => report(await analyze(await ingest())))
 
-const outcome = await scratch.laser
-  .workflow("pipeline")
-  .stepLocal("ingest", () => "frames from sat-7")
-  .stepLocal("analyze", async ({ outputs }) => {
-    await sleep(1000)
-    return `analyzed ${decode(outputs.get("ingest"))}`
-  })
-  .after("ingest")
-  .stepLocal("report", ({ outputs }) => `report on ${decode(outputs.get("analyze"))}`)
-  .after("analyze")
-  .run()
-
-console.log(
-  JSON.stringify({
-    run_id: outcome.runId.toString(),
-    status: outcome.status,
-    completed_steps: outcome.completedSteps,
-    report: outcome.text("report")
-  })
-)
+const run = await pipeline.run()
+console.log(JSON.stringify({ status: run.status, steps: run.completedSteps, report: run.value }))
 ```
 
-It prints the run as JSON: `run_id`, `"status": "completed"`, `"completed_steps": ["ingest", "analyze", "report"]`, and `"report": "report on analyzed frames from sat-7"`. The `WorkflowOutcome` also carries `outputs`, each step's output by label as bytes, and `text(label)` decodes one.
+It prints `{"status":"completed","steps":["ingest","analyze","report"],"report":"report on analyzed frames from sat-7"}`. The `WorkflowOutcome` also carries `runId`, `value` (what the workflow function returned), `outputs`, each step's output by label as bytes, `json(label)`, and `text(label)`. A step that throws ends the run as failed and the same error reaches the caller, with no outcome to read the run ID from, so a caller that wants to resume a failed run names the run ID first with `pipeline.resume(runId)`. The completed steps stay journaled, so that resume runs the failed step and what follows it.
 
 A memory correction for one user. `supersede` remembers the new fact and forgets the old one in every conversation. Recall waits until the memory view shows this connection's own writes and ranks every fact of the user by the words it shares with the question, newest first among equals:
 
@@ -55,7 +40,6 @@ A memory correction for one user. `supersede` remembers the new fact and forgets
 // npm install @laserdata/laser-sdk tsx
 // Run with: npx tsx main.mts
 // Needs only LASER_CONNECTION_STRING, which connectEnv() reads. No server to start when it is set.
-// Check: echo "${LASER_CONNECTION_STRING:+configured}"
 import { ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
 
 const user = "user-42"

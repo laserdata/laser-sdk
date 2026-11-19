@@ -19,7 +19,9 @@ def test_given_the_package_when_its_doc_is_read_then_should_open_with_the_three_
     for line in (
         "async with await ls.Laser.connect_env() as root:",
         'async with root.scratch_stream("demo") as scratch:',
-        '.step("analyze", after=["ingest"], run=analyze)',
+        "@ls.workflow",
+        "run = pipeline.run()",
+        "value (what the workflow",
         'memory = laser.memory("assistant")',
         "await memory.supersede(city,",
         "sessions = laser.sessions()",

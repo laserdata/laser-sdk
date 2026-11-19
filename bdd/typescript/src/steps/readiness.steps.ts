@@ -16,6 +16,8 @@ import {
   retryBackoff,
   routeTo,
   routeToCapable,
+  step as workflowStep,
+  workflow as workflowFunction,
 } from "@laserdata/laser-sdk";
 import { eventual } from "../support/eventual.js";
 import type { LaserWorld } from "../world.js";
@@ -452,6 +454,59 @@ When(
   },
 );
 
+When(
+  /^the workflow function "([^"]+)" calls the steps "([^"]+)", "([^"]+)", "([^"]+)"$/,
+  async function (
+    this: LaserWorld,
+    name: string,
+    first: string,
+    second: string,
+    third: string,
+  ) {
+    await runFunction(this, name, [first, second, third]);
+  },
+);
+
+When(
+  /^the workflow function "([^"]+)" calls the steps "([^"]+)", "([^"]+)", "([^"]+)" and step "([^"]+)" fails once$/,
+  async function (
+    this: LaserWorld,
+    name: string,
+    first: string,
+    second: string,
+    third: string,
+    failing: string,
+  ) {
+    await runFunction(this, name, [first, second, third], failing);
+  },
+);
+
+When(
+  /^the workflow function "([^"]+)" calls the step "([^"]+)" twice and then "([^"]+)"$/,
+  async function (this: LaserWorld, name: string, twice: string, last: string) {
+    await runFunction(this, name, [twice, twice, last]);
+  },
+);
+
+When(
+  /^the workflow function "([^"]+)" resumes the same run$/,
+  async function (this: LaserWorld, name: string) {
+    assert.ok(this.functionRun !== undefined, "no workflow function ran before the resume");
+    await runFunction(this, name, this.functionRun.labels);
+  },
+);
+
+Then(
+  /^the workflow function returned "([^"]+)"$/,
+  function (this: LaserWorld, expected: string) {
+    assert.ok(
+      this.workflowOutcome !== undefined,
+      `the workflow failed: ${String(this.workflowError)}`,
+    );
+    assert.equal(this.workflowOutcome.value, expected);
+  },
+);
+
 Then(
   /^the workflow completed the steps (.+) in order$/,
   function (this: LaserWorld, labels: string) {
@@ -583,6 +638,44 @@ function localChain(
     if (previous !== undefined) step.after(previous);
   });
   return workflow;
+}
+
+// Runs the labels as steps of a workflow function under one run id, so a later
+// call resumes the run. A step function records each run and answers "<label> done".
+async function runFunction(
+  world: LaserWorld,
+  name: string,
+  labels: readonly string[],
+  failing?: string,
+): Promise<void> {
+  const runId = world.functionRun?.runId ?? ConversationId.new();
+  world.functionRun = { runId, labels };
+  const steps = new Map(
+    labels.map((label) => [
+      label,
+      workflowStep(label, () => {
+        world.localRan.push(label);
+        if (label === failing) throw new Error(`${label} failed`);
+        return `${label} done`;
+      }),
+    ]),
+  );
+  const pipeline = workflowFunction(name, async () => {
+    let value = "";
+    for (const label of labels) {
+      const call = steps.get(label);
+      assert.ok(call !== undefined, `no step named ${label}`);
+      value = await call();
+    }
+    return value;
+  }).bind(world.requireLaser());
+  delete world.workflowOutcome;
+  world.workflowError = undefined;
+  try {
+    world.workflowOutcome = await pipeline.resume(runId);
+  } catch (error) {
+    world.workflowError = error;
+  }
 }
 
 async function runWorkflow(world: LaserWorld, workflow: Workflow): Promise<void> {

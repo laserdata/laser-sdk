@@ -1,32 +1,17 @@
 // npm install @laserdata/laser-sdk tsx
 // Run with: npx tsx main.mts
-// Needs only LASER_CONNECTION_STRING, which connectEnv() reads. No server to start when it is set.
-// Check: echo "${LASER_CONNECTION_STRING:+configured}"
+// Needs only LASER_CONNECTION_STRING. No server to start when it is set.
 import { setTimeout as sleep } from "node:timers/promises"
-import { Laser } from "@laserdata/laser-sdk"
+import { step, workflow } from "@laserdata/laser-sdk"
 
-const decode = (bytes?: Uint8Array) => new TextDecoder().decode(bytes)
+const ingest = step("ingest", () => "frames from sat-7")
+const analyze = step("analyze", async (frames: string) => {
+  await sleep(1000)
+  return `analyzed ${frames}`
+})
+const report = step("report", (analysis: string) => `report on ${analysis}`)
 
-await using root = await Laser.connectEnv()
-await using scratch = await root.scratchStream("workflow")
+const pipeline = workflow("pipeline", async () => report(await analyze(await ingest())))
 
-const outcome = await scratch.laser
-  .workflow("pipeline")
-  .stepLocal("ingest", () => "frames from sat-7")
-  .stepLocal("analyze", async ({ outputs }) => {
-    await sleep(1000)
-    return `analyzed ${decode(outputs.get("ingest"))}`
-  })
-  .after("ingest")
-  .stepLocal("report", ({ outputs }) => `report on ${decode(outputs.get("analyze"))}`)
-  .after("analyze")
-  .run()
-
-console.log(
-  JSON.stringify({
-    run_id: outcome.runId.toString(),
-    status: outcome.status,
-    completed_steps: outcome.completedSteps,
-    report: outcome.text("report")
-  })
-)
+const run = await pipeline.run()
+console.log(JSON.stringify({ status: run.status, steps: run.completedSteps, report: run.value }))

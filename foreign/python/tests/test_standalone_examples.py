@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 
+import laser_sdk as ls
 import pytest
 
 pytestmark = pytest.mark.integration
@@ -16,12 +17,12 @@ async def test_given_the_standalone_workflow_when_run_then_should_print_three_co
     iggy_endpoint,
 ):
     report = await printed(iggy_endpoint, "workflow.py")
+    async with await ls.Laser.connect(iggy_endpoint) as laser:
+        await laser.stream("pipeline").delete()
 
-    assert isinstance(report["run_id"], str)
-    assert {**report, "run_id": ""} == {
-        "run_id": "",
+    assert report == {
         "status": "completed",
-        "completed_steps": ["ingest", "analyze", "report"],
+        "steps": ["ingest", "analyze", "report"],
         "report": "report on analyzed frames from sat-7",
     }
 

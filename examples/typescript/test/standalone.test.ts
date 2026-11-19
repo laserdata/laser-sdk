@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
+import { Laser } from "@laserdata/laser-sdk"
 
 const execute = promisify(execFile)
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
@@ -22,18 +23,19 @@ void test(
   "given_the_standalone_workflow_when_run_then_should_print_three_completed_local_steps",
   { concurrency: false, timeout: 70_000 },
   async () => {
-    const report = (await printed("workflow")) as { readonly run_id: unknown }
+    const report = await printed("workflow")
+    const laser = await Laser.connect(CONNECTION_STRING)
+    try {
+      await laser.stream("pipeline").delete()
+    } finally {
+      await laser.close()
+    }
 
-    assert.equal(typeof report.run_id, "string")
-    assert.deepEqual(
-      { ...report, run_id: "" },
-      {
-        run_id: "",
-        status: "completed",
-        completed_steps: ["ingest", "analyze", "report"],
-        report: "report on analyzed frames from sat-7"
-      }
-    )
+    assert.deepEqual(report, {
+      status: "completed",
+      steps: ["ingest", "analyze", "report"],
+      report: "report on analyzed frames from sat-7"
+    })
   }
 )
 

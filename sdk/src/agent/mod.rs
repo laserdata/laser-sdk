@@ -26,6 +26,7 @@ pub use session_ops::{
     SubmitBuilder, Submitted, ToolCall, default_redact,
 };
 mod state;
+mod step_value;
 mod workflow;
 
 pub use crate::laser::Laser;
@@ -75,6 +76,6 @@ pub use state::{
 #[cfg(feature = "kv")]
 pub use workflow::WORKFLOW_FENCE_NAMESPACE;
 pub use workflow::{
-    OnTimeout, StepContext, StepFailure, StepFn, StepHandle, Verifier, Workflow, WorkflowBudget,
-    WorkflowOutcome,
+    OnTimeout, StepCall, StepContext, StepFailure, StepFn, StepHandle, Verifier, Workflow,
+    WorkflowBudget, WorkflowOutcome, WorkflowRun,
 };

@@ -2,11 +2,32 @@
  * Laser SDK: durable workflows, long-term agent memory and sessions on one
  * log, over Apache Iggy.
  *
- * `Laser.connectEnv()` connects with the connection string in
- * `LASER_CONNECTION_STRING`. Every call that reaches the server returns a
- * promise, so await it. `workflow`, `memory` and `sessions` return at once.
- * `await using` closes the connection and deletes a scratch stream when the
- * scope ends:
+ * A workflow is a function that calls steps. It connects with the connection
+ * string in `LASER_CONNECTION_STRING`, journals each step call, and a resumed
+ * run returns a recorded value without running the step again. A step takes and
+ * returns what JSON holds:
+ *
+ * ```ts
+ * import { setTimeout as sleep } from "node:timers/promises"
+ * import { step, workflow } from "@laserdata/laser-sdk"
+ *
+ * const ingest = step("ingest", () => "frames from sat-7")
+ * const analyze = step("analyze", async (frames: string) => {
+ *   await sleep(1000)
+ *   return `analyzed ${frames}`
+ * })
+ * const report = step("report", (analysis: string) => `report on ${analysis}`)
+ *
+ * const pipeline = workflow("pipeline", async () => report(await analyze(await ingest())))
+ *
+ * const run = await pipeline.run()
+ * console.log(JSON.stringify({ status: run.status, steps: run.completedSteps, report: run.value }))
+ * ```
+ *
+ * `Laser.connectEnv()` connects for everything else. Every call that reaches
+ * the server returns a promise, so await it. `memory` and `sessions` return at
+ * once. `await using` closes the connection and deletes a scratch stream when
+ * the scope ends:
  *
  * ```ts
  * import { AgentId, ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
@@ -14,19 +35,6 @@
  * await using root = await Laser.connectEnv()
  * await using scratch = await root.scratchStream("demo")
  * const laser = scratch.laser
- *
- * // Workflow: a step runs in this process, gets the earlier outputs by label
- * // as bytes, and returns a string or bytes, directly or as a promise.
- * const outcome = await laser
- *   .workflow("pipeline")
- *   .stepLocal("ingest", () => "frames from sat-7")
- *   .stepLocal("analyze", async ({ outputs }) => {
- *     await new Promise((resolve) => setTimeout(resolve, 1000))
- *     return `analyzed ${new TextDecoder().decode(outputs.get("ingest"))}`
- *   })
- *   .after("ingest")
- *   .run()
- * console.log(JSON.stringify({ status: outcome.status, analyze: outcome.text("analyze") }))
  *
  * // Memory: remember resolves to the fact's id, supersede stores a correction
  * // and forgets the old fact in every conversation, recall resolves to
@@ -49,7 +57,7 @@
  * ```
  *
  * Without a scratch stream, pick one when connecting,
- * `Laser.connectEnvWithStream("orders")`, or a call that needs a default
+ * `Laser.connectEnvWithStream("telemetry")`, or a call that needs a default
  * stream throws `NoStreamError`.
  *
  * Docs: https://docs.laserdata.com/laser-sdk. Context7:
@@ -535,8 +543,23 @@ export { Agent, AgentBuilder, AgentHandle } from "./agent/builder.js"
 export { MemoryHandler } from "./agent/memory-handler.js"
 export { ContractBuilder, ScatterReport } from "./agent/contract.js"
 export type { Contract, ScatterOutcome } from "./agent/contract.js"
-export { StepHandle, WORKFLOW_FENCE_NAMESPACE, Workflow, WorkflowBudget } from "./agent/workflow.js"
-export type { OnTimeout, StepContext, StepFn, WorkflowOutcome, Verifier } from "./agent/workflow.js"
+export {
+  StepHandle,
+  WORKFLOW_FENCE_NAMESPACE,
+  Workflow,
+  WorkflowBudget,
+  WorkflowRun
+} from "./agent/workflow.js"
+export type {
+  JsonRoundTrip,
+  OnTimeout,
+  StepContext,
+  StepFn,
+  WorkflowOutcome,
+  Verifier
+} from "./agent/workflow.js"
+export { step, workflow } from "./agent/workflow-function.js"
+export type { Step, WorkflowFunction, WorkflowOptions } from "./agent/workflow-function.js"
 export {
   A2A_JSONRPC_BINDING,
   A2A_PROTOCOL_VERSION,

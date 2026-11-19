@@ -51,6 +51,7 @@ mod transport;
 mod typed;
 mod watch;
 mod workflow;
+mod workflow_function;
 
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
@@ -66,10 +67,40 @@ const RUNTIME_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 // `help(laser_sdk)` and `laser_sdk.__doc__` show it, and the stub carries it.
 const PACKAGE_DOC: &str = r#"Laser SDK: durable workflows, long-term agent memory and sessions on one log, over Apache Iggy.
 
-Connect with the connection string in LASER_CONNECTION_STRING. Every call that
-reaches the server returns an awaitable, so await it. `memory(...)`,
-`workflow(...)`, `step(...)` and `sessions(...)` return at once. A scratch
-stream is deleted when its block ends, so a second run prints the same:
+Connect with the connection string in LASER_CONNECTION_STRING. With that
+variable set, a program needs no Docker and no local server.
+
+Workflow. Decorate plain functions with @ls.step and @ls.workflow. A step takes
+and returns what JSON holds. The run connects by itself, closes its connection
+when it ends, and uses LASER_STREAM or a stream named after the workflow, which
+stays after the run. `run()` returns a WorkflowOutcome: run_id, status
+("completed"), completed_steps in completion order, value (what the workflow
+function returned), outputs (label to bytes), json(label), text(label).
+`resume(run_id)` returns the recorded value of a finished step without calling
+it again. Laser.workflow(name).step(...) is the builder for steps routed to
+agents, verifiers, compensation and budgets.
+
+    import json
+    import laser_sdk as ls
+
+    @ls.step
+    def ingest():
+        return "frames from sat-7"
+
+    @ls.step
+    def analyze(frames):
+        return f"analyzed {frames}"
+
+    @ls.workflow
+    def pipeline():
+        return analyze(ingest())
+
+    run = pipeline.run()
+    print(json.dumps({"status": run.status, "steps": run.completed_steps, "report": run.value}))
+
+Memory and sessions run on a client. Every call that reaches the server returns
+an awaitable, so await it. `memory(...)` and `sessions(...)` return at once. A
+scratch stream is deleted when its block ends, so a second run prints the same:
 
     import asyncio, json
     import laser_sdk as ls
@@ -82,25 +113,8 @@ stream is deleted when its block ends, so a second run prints the same:
 
     asyncio.run(main())
 
-Without a scratch stream, pick one when connecting, `ls.Laser.connect_env(stream="orders")`,
+Without a scratch stream, pick one when connecting, `ls.Laser.connect_env(stream="telemetry")`,
 or a call that needs a default stream raises NoStreamError.
-
-Workflow. A step runs in this process. Its `run` is a plain function or an
-async def, gets the earlier outputs by label as bytes, and returns str or
-bytes. `run()` returns a WorkflowOutcome: run_id, status ("completed"),
-completed_steps in completion order, outputs (label to bytes), text(label).
-
-    async def analyze(outputs):
-        await asyncio.sleep(1)
-        return b"analyzed " + outputs["ingest"]
-
-    outcome = await (
-        laser.workflow("pipeline")
-        .step("ingest", run=lambda outputs: "frames from sat-7")
-        .step("analyze", after=["ingest"], run=analyze)
-        .run()
-    )
-    print(json.dumps({"status": outcome.status, "analyze": outcome.text("analyze")}))
 
 Memory. remember returns the fact's id. supersede stores a correction and
 forgets the old fact in every conversation. recall returns a list of
@@ -437,6 +451,10 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<workflow::PyWorkflowOutcome>()?;
     module.add_class::<workflow::PyWorkflow>()?;
     module.add_class::<workflow::PyWorkflowBudget>()?;
+    module.add_class::<workflow_function::PyStep>()?;
+    module.add_class::<workflow_function::PyWorkflowFunction>()?;
+    module.add_function(wrap_pyfunction!(workflow_function::step, module)?)?;
+    module.add_function(wrap_pyfunction!(workflow_function::workflow, module)?)?;
     module.add_class::<rbac::PyGrant>()?;
     module.add_class::<rbac::PyRole>()?;
     module.add_class::<rbac::PyResourcePattern>()?;

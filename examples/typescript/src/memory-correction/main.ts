@@ -1,7 +1,6 @@
 // npm install @laserdata/laser-sdk tsx
 // Run with: npx tsx main.mts
 // Needs only LASER_CONNECTION_STRING, which connectEnv() reads. No server to start when it is set.
-// Check: echo "${LASER_CONNECTION_STRING:+configured}"
 import { ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
 
 const user = "user-42"

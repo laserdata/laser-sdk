@@ -8,99 +8,70 @@
 
 ```toml
 [dependencies]
-laser-sdk = "0.11.0" # typed streaming plus provenance
-# Add only the layers the application uses:
-laser-sdk = { version = "0.11.0", features = ["agent", "managed"] }
+laser-sdk = "0.11.0" # workflows, memory, sessions, key-value state and typed streaming
+# Add the managed surfaces:
+laser-sdk = { version = "0.11.0", features = ["managed"] }
+# A program that only streams trims the build:
+laser-sdk = { version = "0.11.0", default-features = false, features = ["streaming"] }
 ```
 
 ## Two complete programs
 
-Each program runs as written in a new project with `cargo add laser-sdk --features agent,kv`, `cargo add tokio --features macros,rt-multi-thread,time`, `cargo add serde --features derive`, `cargo add serde_json`, and `cargo add async-trait` for the workflow's awaiting step. It reads the connection string from `LASER_CONNECTION_STRING` with `Laser::connect_env()`, creates a uniquely named scratch stream, and deletes it with `scratch.delete()` whatever the program body returned. `LASER_CONNECTION_STRING` is usually already set where the program runs, such as a LaserData Cloud workload, CI, or an agent sandbox, so check it before you look for a server: `echo "${LASER_CONNECTION_STRING:+configured}"` prints `configured` when it is. Then there is no server to start. A LaserData API key is not a connection string. Only without the variable, copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it. To keep what a program writes, set `LASER_STREAM`, connect with `Laser::connect_env_with_stream(name)`, or call `laser.with_default_stream(name)` instead of opening a scratch stream. A workflow run and the first memory write create a missing stream. Coding agents can read these docs through [Context7](https://context7.com/laserdata/laser-sdk) as well as [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk).
+Each program runs as written in a new project with `cargo add laser-sdk`, `cargo add tokio --features macros,rt-multi-thread,time`, `cargo add serde_json`, and `cargo add serde --features derive` for the memory program. It reads the connection string from `LASER_CONNECTION_STRING` with `Laser::connect_env()`. The workflow runs on the stream named by `LASER_STREAM`, or on a stream named after the workflow, and keeps that stream after the run so the run can be resumed. The memory program creates a uniquely named scratch stream and deletes it with `scratch.delete()` whatever the program body returned. With `LASER_CONNECTION_STRING` set, a program needs no Docker and no local server. Then there is no server to start. A LaserData API key is not a connection string. Only without the variable, copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it. To keep what the memory program writes, set `LASER_STREAM`, connect with `Laser::connect_env_with_stream(name)`, or call `laser.with_default_stream(name)` instead of opening a scratch stream. A workflow run and the first memory write create a missing stream. The guides are at [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk) and on [Context7](https://context7.com/laserdata/laser-sdk).
 
 ### A three-step workflow
 
-`step_local(label, run)` runs the step's body in this process, and `analyze` awaits one second before it returns. A closure body names its argument type, `|context: &StepContext<'_>|`, gets the earlier outputs through `StepContext::outputs` as bytes, and returns the step's output. A closure cannot await, so the awaiting step is a type implementing `StepFn` under `#[async_trait::async_trait]`, passed in place of the closure. Each completion is journaled, so `run_id(id)` resumes a stopped run and keeps the steps it finished. The run creates its own topics, so the program needs no `bootstrap`, agent, or handler.
+`run_with` runs an async closure as the workflow, and `run.step(label, body)` runs one step in this process. A step's value is any type that implements `Serialize` and `DeserializeOwned`, and the body can await, so `analyze` waits one second before it returns. Each completed step is journaled, so `laser.workflow(name).run_id(id).run_with(...)` resumes a stopped run, returns the recorded values without running those steps again, and must call the same steps in the same order. A step name holding `#` is refused, because the journal numbers repeated calls with it. The run creates its own stream and topics, so the program needs no `bootstrap`, agent, or handler. For steps routed to agents, verifiers, compensation and budgets, use the builder, `laser.workflow(name).step(...)`, with `step_local` for its in-process steps.
 
 ```rust,no_run
-// cargo add laser-sdk --features agent,kv
+// cargo add laser-sdk
 // cargo add tokio --features macros,rt-multi-thread,time
-// cargo add serde --features derive
 // cargo add serde_json
-// cargo add async-trait
 // Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
-// Check: echo "${LASER_CONNECTION_STRING:+configured}"
 use laser_sdk::prelude::*;
-use serde::Serialize;
 use std::time::Duration;
 
-#[derive(Serialize)]
-struct Report {
-    run_id: String,
-    status: SessionStatus,
-    completed_steps: Vec<String>,
-    report: Option<String>,
-}
-
-struct Analyze;
-
-#[async_trait::async_trait]
-impl StepFn for Analyze {
-    async fn build(&self, context: &StepContext<'_>) -> Result<Vec<u8>, LaserError> {
-        let ingested = context.outputs.get("ingest").cloned().unwrap_or_default();
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        Ok([b"analyzed ".to_vec(), ingested].concat())
-    }
-}
-
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = Laser::connect_env().await?;
-    let scratch = root.scratch_stream("workflow").await?;
-    let result = run_pipeline(scratch.laser()).await;
-    scratch.delete().await?;
-    let outcome = result?;
-
-    let report = Report {
-        run_id: outcome.run_id.to_string(),
-        report: outcome.text("report"),
-        status: outcome.status,
-        completed_steps: outcome.completed_steps,
-    };
-    println!("{}", serde_json::to_string(&report)?);
-    Ok(())
-}
-
-async fn run_pipeline(laser: &Laser) -> Result<WorkflowOutcome, LaserError> {
-    laser
+async fn main() -> Result<(), LaserError> {
+    let laser = Laser::connect_env().await?;
+    let run = laser
         .workflow("pipeline")
-        .step_local("ingest", |_: &StepContext<'_>| {
-            b"frames from sat-7".to_vec()
+        .run_with(async |run| {
+            let frames: String = run
+                .step("ingest", async || Ok("frames from sat-7".to_owned()))
+                .await?;
+            let analysis: String = run
+                .step("analyze", async || {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Ok(format!("analyzed {frames}"))
+                })
+                .await?;
+            run.step("report", async || Ok(format!("report on {analysis}")))
+                .await
         })
-        .step_local("analyze", Analyze)
-        .after("ingest")
-        .step_local("report", |context: &StepContext<'_>| {
-            let analyzed = context.outputs.get("analyze").cloned().unwrap_or_default();
-            [b"report on ".to_vec(), analyzed].concat()
-        })
-        .after("analyze")
-        .run()
-        .await
+        .await?;
+    let report = serde_json::json!({
+        "status": run.status,
+        "steps": run.completed_steps,
+        "report": run.json::<String>("report")?,
+    });
+    println!("{report}");
+    laser.close().await
 }
 ```
 
-It prints the run as JSON: `run_id`, `"status": "completed"`, `"completed_steps": ["ingest", "analyze", "report"]`, and `"report": "report on analyzed frames from sat-7"`. The `WorkflowOutcome` also carries `outputs`, each step's output by label as bytes, and `text(label)` decodes one. A failed step is `LaserError::StepFailed` naming the step, the reason, its target, and its deadline, once the compensations of the finished steps have run.
+It prints `{"report":"report on analyzed frames from sat-7","status":"completed","steps":["ingest","analyze","report"]}`, with the keys sorted by `serde_json::json!`. The `WorkflowOutcome` also carries `run_id`, `value` (the JSON bytes of what the closure returned), `outputs`, each step's output by label as bytes, `json::<T>(label)`, and `text(label)`. A step that fails ends the run as failed and its error reaches the caller unchanged, with no outcome to read the run ID from, so a caller that wants to resume a failed run names the run ID first with `run_id(id)`. The completed steps stay journaled, so that resume runs the failed step and what follows it.
 
 ### A memory correction
 
 A first conversation stores three facts about the user `user-42`. A later conversation corrects the city with `supersede`, which remembers the new fact first and then forgets the old one in every conversation. A recall for the user reads every conversation and returns a list of `MemoryItem`, ranked by the words each fact shares with the query, newest first among equals, and drops none. It waits for the writes this connection made, so the correction shows at once. On LaserData Cloud and Laser Stack recall reads the managed memory view. Apache Iggy serves no view, so there recall folds the memory topic in process, and the same program runs on every server.
 
 ```rust,no_run
-// cargo add laser-sdk --features agent,kv
+// cargo add laser-sdk
 // cargo add tokio --features macros,rt-multi-thread
 // cargo add serde --features derive
 // cargo add serde_json
 // Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
-// Check: echo "${LASER_CONNECTION_STRING:+configured}"
 use laser_sdk::prelude::*;
 use serde::Serialize;
 
@@ -181,7 +152,7 @@ Laser SDK ships in independently adoptable layers:
 
 - **Streaming** (`streaming` feature, default), streams, topics, raw and typed publish, batches, resumable cursors, and JSON/CBOR/MessagePack codecs on Apache Iggy.
 - **Managed platform** (`managed` feature), projections, query, key-value state, forks, graph, and watch against LaserData Cloud or Laser Stack. Consumer-group policies and reads are part of `streaming`.
-- **Agentic** (`agent` feature), sessions, reliable consumer + DLQ, conversation and causality, request/reply, routing, memory, handlers, typed AGDX verbs, workflows, effect governance, and durable intent records.
+- **Agentic** (`agent` feature, default), sessions, reliable consumer + DLQ, conversation and causality, request/reply, routing, memory, handlers, typed AGDX verbs, workflows, effect governance, and durable intent records.
 - **Edges**, the optional A2A, MCP, and AG-UI adapters.
 
 The SDK carries `gen_ai.*` provenance describing model calls but never makes them. It moves and coordinates messages only.
@@ -228,7 +199,7 @@ while let Some(record) = records.next().await {
 # Ok(()) }
 ```
 
-This example uses only the default `streaming` and `provenance` features and runs against Apache Iggy. One connection addresses every stream on the server. `Laser::connect_with_stream` only pins a default stream so `laser.topic(name)` can be used as a shortcut. It does not limit the connection to that stream. `Laser::connect_env()` reads `LASER_CONNECTION_STRING` and the optional `LASER_STREAM`, and `Laser::local()` targets local Apache Iggy. A connection string is `user:password@host[:port]` or `token@host[:port]`. Keep it in `LASER_CONNECTION_STRING`, read it inside the program, and never print or log it. The scheme selects the transport: none, `iggy://` or `iggy+tcp://` for TCP (port 8090), `iggy+quic://` for QUIC (8080) and `iggy+ws://` for WebSocket (8092), each with the options Apache Iggy reads for it. `iggy+http://` is refused because HTTP has no binary request path. [Client behavior](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md#connections) lists the options and the TLS rules per transport. An IPv6 address goes in brackets, as in `token@[::1]:8090`. Credentials are required and percent-decoded, so a `:`, `@`, `?` or `%` inside one is written `%3A`, `%40`, `%3F` or `%25`. `LaserBuilder::address(..).credentials(user, password)` takes both parts as given, any character included. Other schemes, options another transport reads, unknown or repeated options, and malformed credentials, escapes or ports return `LaserError::Config` before dialing.
+This example uses only the `streaming` and `provenance` features and runs against Apache Iggy. One connection addresses every stream on the server. `Laser::connect_with_stream` only pins a default stream so `laser.topic(name)` can be used as a shortcut. It does not limit the connection to that stream. `Laser::connect_env()` reads `LASER_CONNECTION_STRING` and the optional `LASER_STREAM`, and `Laser::local()` targets local Apache Iggy. A connection string is `user:password@host[:port]` or `token@host[:port]`. Keep it in `LASER_CONNECTION_STRING`, read it inside the program, and never print or log it. The scheme selects the transport: none, `iggy://` or `iggy+tcp://` for TCP (port 8090), `iggy+quic://` for QUIC (8080) and `iggy+ws://` for WebSocket (8092), each with the options Apache Iggy reads for it. `iggy+http://` is refused because HTTP has no binary request path. [Client behavior](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md#connections) lists the options and the TLS rules per transport. An IPv6 address goes in brackets, as in `token@[::1]:8090`. Credentials are required and percent-decoded, so a `:`, `@`, `?` or `%` inside one is written `%3A`, `%40`, `%3F` or `%25`. `LaserBuilder::address(..).credentials(user, password)` takes both parts as given, any character included. Other schemes, options another transport reads, unknown or repeated options, and malformed credentials, escapes or ports return `LaserError::Config` before dialing.
 
 `Topic::ensure(partitions, replication_factor)` creates the topic when absent. `None` takes the server's default replication factor, `Some(factor)` stores each partition on that many nodes, 1 to `MAX_REPLICATION_FACTOR` (32) and at most the cluster's node count. `ProducerBuilder::replication_factor(factor)` does the same for a topic the producer creates. An out-of-range factor fails with `LaserError::Invalid` before anything is sent, and the server's refusal of a factor above the node count surfaces as `LaserError::Transport`. Reads and writes go to each partition's primary, which always stores it. See [client behavior](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md#publication-and-reads).
 
@@ -514,7 +485,7 @@ For an application checkpoint inside a filtered page, call `reader.ack_through(r
 
 ## Features
 
-- `default = ["streaming", "provenance"]`
+- `default = ["agent", "kv", "provenance", "streaming"]`. A program that only streams trims the build with `default-features = false, features = ["streaming"]`.
 - `streaming`, the open Apache Iggy foundation: `Laser`, streams, topics, direct producers, live partition and consumer-group streams, server offsets, raw and typed publish, batches, explicit-offset cursors, and JSON/CBOR/MessagePack codecs. The SDK uses Iggy's native VSR transport. Managed reads use the non-replicated extension path, and managed authorization writes use dedicated replicated operation codes.
 - `provenance`, wire contract + provenance encoding/decoding
 - `agent`, sessions, reliable consumer, `Agent::builder`, context, memory, state, contracts, workflows, and the `ActionGovernor` effect-boundary policy hook

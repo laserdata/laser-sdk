@@ -22,6 +22,7 @@ pub struct WorkflowWorld {
     run_id: Option<ConversationId>,
     local_runs: Arc<Mutex<Vec<String>>>,
     compensations: Arc<Mutex<Vec<String>>>,
+    function_labels: Vec<String>,
 }
 
 impl std::fmt::Debug for WorkflowWorld {
@@ -288,6 +289,56 @@ async fn local_steps_compensated(
     world.workflow.outcome = Some(outcome);
 }
 
+#[when(
+    regex = r#"^the workflow function "([^"]+)" calls the steps "([^"]+)", "([^"]+)", "([^"]+)"$"#
+)]
+async fn function_steps(
+    world: &mut LaserWorld,
+    name: String,
+    first: String,
+    second: String,
+    third: String,
+) {
+    function_run(world, &name, vec![first, second, third], None).await;
+}
+
+#[when(
+    regex = r#"^the workflow function "([^"]+)" calls the steps "([^"]+)", "([^"]+)", "([^"]+)" and step "([^"]+)" fails once$"#
+)]
+async fn function_steps_failing_once(
+    world: &mut LaserWorld,
+    name: String,
+    first: String,
+    second: String,
+    third: String,
+    failing: String,
+) {
+    function_run(world, &name, vec![first, second, third], Some(failing)).await;
+}
+
+#[when(
+    regex = r#"^the workflow function "([^"]+)" calls the step "([^"]+)" twice and then "([^"]+)"$"#
+)]
+async fn function_step_twice(world: &mut LaserWorld, name: String, twice: String, last: String) {
+    function_run(world, &name, vec![twice.clone(), twice, last], None).await;
+}
+
+#[when(regex = r#"^the workflow function "([^"]+)" resumes the same run$"#)]
+async fn function_resumed(world: &mut LaserWorld, name: String) {
+    let labels = world.workflow.function_labels.clone();
+    function_run(world, &name, labels, None).await;
+}
+
+#[then(regex = r#"^the workflow function returned "([^"]+)"$"#)]
+async fn function_returned(world: &mut LaserWorld, expected: String) {
+    let value = completed(world)
+        .value
+        .as_deref()
+        .expect("the workflow's value");
+    let value: String = serde_json::from_slice(value).expect("the value is JSON text");
+    assert_eq!(value, expected);
+}
+
 #[then(regex = r#"^the workflow completed the steps (".+") in order$"#)]
 async fn completed_in_order(world: &mut LaserWorld, labels: String) {
     let outcome = completed(world);
@@ -438,6 +489,43 @@ async fn local_workflow(
         .step_local(third, LocalBody::new(third, runs, fails(third)))
         .run()
         .await
+}
+
+// Runs the labels as steps of a workflow function under one run id, so a later
+// call resumes the run. A step function records each run and answers "<label> done".
+async fn function_run(
+    world: &mut LaserWorld,
+    name: &str,
+    labels: Vec<String>,
+    failing: Option<String>,
+) {
+    let run_id = *world
+        .workflow
+        .run_id
+        .get_or_insert_with(ConversationId::new);
+    world.workflow.function_labels = labels.clone();
+    let runs = Arc::clone(&world.workflow.local_runs);
+    let outcome = world
+        .laser()
+        .workflow(name)
+        .run_id(run_id)
+        .run_with(async |run| {
+            let mut value = String::new();
+            for label in &labels {
+                value = run
+                    .step(label, async || {
+                        runs.lock().expect("the run log").push(label.clone());
+                        if failing.as_deref() == Some(label.as_str()) {
+                            return Err(LaserError::Handler(format!("{label} failed")));
+                        }
+                        Ok(format!("{label} done"))
+                    })
+                    .await?;
+            }
+            Ok(value)
+        })
+        .await;
+    world.workflow.outcome = Some(outcome);
 }
 
 fn completed(world: &LaserWorld) -> &WorkflowOutcome {

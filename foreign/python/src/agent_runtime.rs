@@ -1008,7 +1008,9 @@ impl PyLaser {
     /// exclusivity, on-timeout reassignment, and saga compensation mix in. The
     /// name is the orchestrator identity the run dispatches as, a valid agent
     /// id. `fixed_inbox` routes every step to a fixed topic (a server with no
-    /// presence command). Omit it to resolve advertised inboxes.
+    /// presence command). Omit it to resolve advertised inboxes. For a workflow
+    /// of plain functions, decorate them with `laser_sdk.workflow` and
+    /// `laser_sdk.step`.
     ///
     /// A complete program. It needs only `LASER_CONNECTION_STRING`:
     ///

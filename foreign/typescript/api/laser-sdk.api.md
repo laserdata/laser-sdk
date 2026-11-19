@@ -4087,6 +4087,17 @@ export class Json<T = unknown> implements Codec<T> {
     encode(value: T): Uint8Array;
 }
 
+// @public
+export type JsonRoundTrip<T> = unknown extends T ? T : T extends string | number | boolean | null ? T : T extends {
+    toJSON(): infer Json;
+} ? JsonRoundTrip<Json> : T extends readonly unknown[] ? {
+    -readonly [Index in keyof T]: undefined extends T[Index] ? JsonRoundTrip<Exclude<T[Index], undefined>> | null : JsonRoundTrip<T[Index]>;
+} : T extends bigint | symbol | undefined | ((...args: never[]) => unknown) ? never : T extends ReadonlyMap<unknown, unknown> | ReadonlySet<unknown> | ArrayBufferView ? never : {
+    -readonly [Key in keyof T as undefined extends T[Key] ? never : Key]: JsonRoundTrip<T[Key]>;
+} & {
+    -readonly [Key in keyof T as undefined extends T[Key] ? Key : never]?: JsonRoundTrip<Exclude<T[Key], undefined>>;
+};
+
 // @public (undocumented)
 export interface JsonRpcError {
     // (undocumented)
@@ -8440,6 +8451,15 @@ export class StateStoreError extends LaserError {
 // @public (undocumented)
 export function statusEnvelope(record: RecordId, conversation: WireConversationId, source: WireAgentId, operation: string): AgentEnvelope;
 
+// @public
+export interface Step<Args extends readonly unknown[], Result> {
+    (...args: Args): Promise<JsonRoundTrip<Awaited<Result>>>;
+    readonly fn: (...args: Args) => Result;
+}
+
+// @public
+export function step<Args extends readonly unknown[], Result>(name: string, fn: (...args: Args) => Result): Step<Args, Result>;
+
 // @public (undocumented)
 export interface StepContext {
     readonly outputs: ReadonlyMap<string, Uint8Array>;
@@ -9382,10 +9402,16 @@ export class Workflow {
         readonly signal?: AbortSignal;
     }): Promise<WorkflowOutcome>;
     runId(runId: ConversationId): this;
+    runWith<Result>(body: (run: WorkflowRun) => Result, options?: {
+        readonly signal?: AbortSignal;
+    }): Promise<WorkflowOutcome<Awaited<Result>>>;
     // (undocumented)
     step(label: string, target: Router, build: StepFn): StepHandle;
     stepLocal(label: string, run: StepFn): StepHandle;
 }
+
+// @public
+export function workflow<Args extends readonly unknown[], Result>(name: string, fn: (...args: Args) => Result, options?: WorkflowOptions): WorkflowFunction<Args, Result>;
 
 // @public (undocumented)
 export const WORKFLOW_FENCE_NAMESPACE = "agdx.workflow.fence";
@@ -9403,12 +9429,35 @@ export class WorkflowBudget {
 }
 
 // @public
-export interface WorkflowOutcome {
+export interface WorkflowFunction<Args extends readonly unknown[], Result> {
+    (...args: Args): Promise<Awaited<Result>>;
+    bind(laser: Laser): WorkflowFunction<Args, Result>;
+    resume(runId: ConversationId | string, ...args: Args): Promise<WorkflowOutcome<Awaited<Result>>>;
+    run(...args: Args): Promise<WorkflowOutcome<Awaited<Result>>>;
+}
+
+// @public
+export interface WorkflowOptions {
+    readonly stream?: string;
+}
+
+// @public
+export interface WorkflowOutcome<Value = undefined> {
     readonly completedSteps: readonly string[];
+    json(label: string): unknown;
     readonly outputs: ReadonlyMap<string, Uint8Array>;
     readonly runId: ConversationId;
     readonly status: SessionStatus;
     text(label: string): string | undefined;
+    readonly value: Value;
+}
+
+// @public
+export class WorkflowRun {
+    readonly runId: ConversationId;
+    step<Result>(label: string, fn: () => Result, options?: {
+        readonly signal?: AbortSignal;
+    }): Promise<JsonRoundTrip<Awaited<Result>>>;
 }
 
 ```

@@ -12,7 +12,7 @@ pub use crate::agent::{
     Agent, AgentCtx, AgentHandle, AgentHandler, AgentMessage, Contract, ConversationState,
     InboxRoute, ReliableConsumer, ReplayBound, RoutePolicy, Router, Session, SessionConfig,
     SessionLease, SessionTurn, Sessions, StepContext, StepFn, TopicRetention, Workflow,
-    WorkflowBudget, WorkflowOutcome,
+    WorkflowBudget, WorkflowOutcome, WorkflowRun,
 };
 pub use crate::capabilities::Capabilities;
 #[cfg(feature = "streaming")]
@@ -79,8 +79,8 @@ pub mod full {
         CapabilitySelector, ChunkAssembler, ConcurrencyPolicy, ContractBuilder, DeadLetterSink,
         Deduplicator, Gather, GatherPolicy, InboxRoute, RegisteredCard, RetryPolicy,
         RouteCandidate, RouteScorer, ScatterOutcome, ScatterReport, SessionPolicy, SlidingWindow,
-        StepFailure, StepFn, StepHandle, StreamEvent, Verifier, WarmDedupPolicy, WorkflowBudget,
-        WorkflowOutcome,
+        StepCall, StepFailure, StepFn, StepHandle, StreamEvent, Verifier, WarmDedupPolicy,
+        WorkflowBudget, WorkflowOutcome,
     };
     #[cfg(feature = "agui")]
     pub use crate::agui::AgUiEvent;
