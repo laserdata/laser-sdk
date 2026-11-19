@@ -1054,6 +1054,24 @@ AG-UI renders envelopes as the events a front end consumes. A chunk stream's
 purpose is declared only on its opening chunk, so `AgUiStream` remembers it per
 channel and forgets a channel once it closes.
 
+A bridge that forwards a call to another bridge's HTTP endpoint carries an
+ordered hop path under `BridgeHopsMetaKey`, so the next bridge can refuse a
+loop. `EnterBridge` appends this bridge and refuses a path that already names
+it: the call has been here before, so handling it again is the loop. A hop the
+configured path already names is not repeated, because a path listing one
+bridge twice would read as a loop that is not there. Anything but a list of
+strings under that key is refused rather than read past, a null included: a
+guard the sender blanked is not no guard.
+
+`OriginAllowed` guards a bridge HTTP endpoint a caller serves. A request with
+no `Origin` header comes from a non-browser client and passes, because the
+header is a browser's statement about itself and its absence is not a claim to
+check. A browser request passes when its origin is allowlisted, or when it is
+same-origin with a host no DNS answer can point a foreign page at: an IP
+literal or localhost. That host restriction is the point, since a rebound page
+sends its own name as both origin and host and a same-origin check on any
+other host would wave it through.
+
 Like the TypeScript client, this is a native port rather than a binding over
 the Rust crate. The Rust crates expose no C ABI, cgo would cost consumers
 cross-compilation, and the Apache Iggy Go client is itself pure Go.

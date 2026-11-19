@@ -189,7 +189,7 @@ Beyond the raw capabilities, the Go client serves these managed and agent surfac
 | Memory | Laser.Memory: remember, forget, improve, plus laser.Rank and laser.ToContextBlock |
 | Context assembly | laser.Assemble with LastN, RoleFilter, TokenBudget and Chain |
 | Typed records | laser.TypedJSON, laser.TypedCBOR and laser.TypedWith |
-| Bridges | bridges: the A2A, MCP and AG-UI value mappings |
+| Bridges | bridges: the A2A, MCP and AG-UI value mappings, the bridge hop loop guard, and the HTTP origin check |
 | Consumer filters | Topic.Filters: filtered reads with page validation, acknowledgment through the safe offset, previews and record tests |
 | Filter catalog | Laser.FilterCatalog: register, revise, describe, pause, archive, drop, bind, unbind, release, configure a group, and read filters, revisions, bindings and operation outcomes |
 | Retry schedule | laser.Backoff and the shared schedule pinned to sdk/tests/fixtures/retry-table.json |
