@@ -84,6 +84,17 @@ func (server *batchServer) appended() [][]iggcon.IggyMessage {
 	return batches
 }
 
+// hold makes the next append block until release is called, so a test can
+// act while an append is in flight and the flush it belongs to has not
+// settled yet.
+func (server *batchServer) hold() chan struct{} {
+	gate := make(chan struct{})
+	server.guard.Lock()
+	defer server.guard.Unlock()
+	server.gate = gate
+	return gate
+}
+
 // refuseNext tells the fake to refuse the next appends.
 func (server *batchServer) refuseNext(count int) {
 	server.guard.Lock()
@@ -430,6 +441,7 @@ func TestGivenAKeptFailureWhenSendingThenShouldRefuseTheRecordAndReportBoth(t *t
 func TestGivenSeveralFailedBatchesWhenFlushedThenShouldReportThemTogether(t *testing.T) {
 	server := &batchServer{}
 	server.refuseNext(2)
+	gate := server.hold()
 	producer := batchingHandle(server).Topic("events").Batching().
 		MaxRecords(1000).Linger(2 * time.Millisecond).Build()
 	defer producer.Close(context.Background())
@@ -438,12 +450,17 @@ func TestGivenSeveralFailedBatchesWhenFlushedThenShouldReportThemTogether(t *tes
 		t.Fatalf("send: %v", err)
 	}
 	server.awaitAttempt(t)
-	// The first failure is kept rather than reported, so a sender that
-	// bypasses it queues into the next batch. Flushing clears it first.
-	_ = producer.Send(context.Background(), []byte("two"), nil)
+	// The first batch's append is held mid-flight, so the failure it is
+	// about to leave is not observable yet and this record queues behind it
+	// rather than being refused. Holding the append is what makes that
+	// deterministic: without it the record queues or is refused depending on
+	// which goroutine wins.
 	if err := producer.Send(context.Background(), []byte("two"), nil); err != nil {
-		t.Fatalf("send: %v", err)
+		t.Fatalf("the record must queue behind the batch in flight: %v", err)
 	}
+	close(gate)
+	// The second batch lingers out and fails too, with nobody told about
+	// either one.
 	server.awaitAttempt(t)
 
 	reported := producer.Flush(context.Background())
@@ -452,8 +469,18 @@ func TestGivenSeveralFailedBatchesWhenFlushedThenShouldReportThemTogether(t *tes
 	if !errors.As(reported, &failure) {
 		t.Fatalf("want one report, got %T: %v", reported, reported)
 	}
-	if len(failure.Unconfirmed) != 1 {
-		t.Errorf("want the second batch's record, got %+v", failure.Unconfirmed)
+	if len(failure.Unconfirmed) != 2 {
+		t.Fatalf("want both batches' records in one report, got %+v",
+			failure.Unconfirmed)
+	}
+	if string(failure.Unconfirmed[0].Payload) != "one" ||
+		string(failure.Unconfirmed[1].Payload) != "two" {
+		t.Errorf("want the batches in the order they failed, got %+v",
+			failure.Unconfirmed)
+	}
+	// Reported once: a second flush has nothing left to say.
+	if again := producer.Flush(context.Background()); again != nil {
+		t.Errorf("a kept failure is reported once, got %v", again)
 	}
 }
 
