@@ -1301,6 +1301,7 @@ GO_SURFACES = (
     ("Materialization", "Topic.Materialize: typed and whole-record setups, rejection and oversize policies, retention, derived step identities, and Materialization.Wait with captured-target readiness"),
     ("Durable intents", "laser.NewIntent, Intent.CastVote, laser.Decide and IntentDecision.Authorizes: the record shapes and the pure quorum fold, pinned against the Rust client's own vectors"),
     ("Session layout", "SessionConfig.Layout with the shared, per-agent topic, per-agent partition and single-partition layouts, Laser.DeclaredTopic, and Sessions.Bootstrap and Unregister"),
+    ("Session leases", "Laser.LeaseSession and laser.LeaseRegistry: one heartbeat per stream per tick at the shortest held interval, scoped to the stream incarnation the lease was taken on"),
 )
 
 OMISSION_CAPABILITIES = {

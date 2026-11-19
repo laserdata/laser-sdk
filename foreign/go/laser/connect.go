@@ -118,6 +118,10 @@ type connection struct {
 	// handles that disagreed about where an agent's work goes would split
 	// one agent's inbox across two topics.
 	layouts map[string]SessionLayout
+	// leases is where this connection's session leases are held, opened on
+	// first use. One registry per connection is what keeps a process to one
+	// heartbeat per stream.
+	leases *LeaseRegistry
 }
 
 // unconnected stands in for the shared state of a handle that never

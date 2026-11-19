@@ -615,6 +615,43 @@ The Rust client additionally pins the lane's identity and partition count
 across a session's lifetime, so a lane recreated underneath a running session
 is caught. That guard is not ported here yet.
 
+## Session leases and heartbeats
+
+`Laser.LeaseSession` takes a lease on one session's liveness. While any lease
+on a session is held, the process lists it in a heartbeat on
+`agent.heartbeats`, which is how a deployment tells a session somebody is
+still working on from one whose process died.
+
+Go has no destructor, so `Release` is the whole protocol and
+`defer lease.Release()` is the shape that gets it right. A lease never
+released keeps its session alive for as long as the process runs. Releasing
+twice is a no-op rather than a dropped holder somebody else still has, and a
+terminal verb on the session releases nothing: one part of a process ending
+its work says nothing about another part's.
+
+One registry per connection serves every lease, so a process holding a
+hundred sessions publishes one heartbeat per stream per tick rather than a
+hundred. Several leases beat at the shortest interval among them, because the
+holder that asked for the tightest liveness window is the one that needs it.
+The loop ends when the last lease is released, so a process holding none
+publishes nothing. It notices at its next tick rather than at once, as it does
+in Rust: a newly taken lease with a tighter interval applies from the next
+tick, and releasing a long-interval lease leaves one sleeping goroutine until
+that interval elapses. `LeaseRegistry.Loops` reports whether the loop is still
+running.
+
+A lease is scoped to the stream incarnation it was taken on, and the stream's
+creation time is re-read every tick. A stream recreated since then holds none
+of these sessions, so nothing is published for it: claiming them alive would
+keep a deployment waiting on work nobody is doing. A failed read or publish is
+retried on the next tick and never fails a session, because a missed heartbeat
+is a liveness signal the deployment did not get rather than work that went
+wrong.
+
+The Rust client additionally re-checks the stream generation at the send
+boundary, inside the same lane-identity guard noted under [Session
+layout](#session-layout). Here the check is the one in the heartbeat loop.
+
 ## Agent sends, redrives and replays
 
 `SendAgent` appends to an agent topic with a provenance the caller built. It
