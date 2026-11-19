@@ -677,6 +677,42 @@ The Rust client additionally re-checks the stream generation at the send
 boundary, inside the same lane-identity guard noted under [Session
 layout](#session-layout). Here the check is the one in the heartbeat loop.
 
+## Operator control
+
+`ControlRequestOf` reads what a record on `agent.control` asks of a session:
+a pause, a resume or a cancel. A forced cancel is a canceled session status on
+that topic. A request addressed to another agent is not this agent's to read,
+and a reader that is nobody in particular, an operator console say, reads them
+all.
+
+A pause applies to every agent it reaches. Its participant list only decides
+whose acknowledgment it waits for, so an agent the list omits still pauses but
+is not named by the request.
+
+`ControlBook` folds those requests per session. A resume lifts the pause it
+follows; a cancel is terminal and nothing lifts it. Records are ordered by
+offset within a partition, so a replayed earlier record cannot undo a later
+one, and a record on another partition is taken as newer rather than compared
+against a sequence it is not part of.
+
+Every session's control records have one home: the `agent.control` partition
+its conversation key hashes to, which is the rule the managed backend applies
+too. A request that arrives anywhere else is flagged and never applied, here
+or there, because it cannot be ordered against the records that belong to the
+session.
+
+A book nobody follows does not answer at all rather than answering stale, and
+a session whose history has not been read is reported as unknown rather than
+as having no requests. Live requests that arrive while that history is being
+read are held and replayed on top of the fold, since applying a resume to
+nothing would report it as though no pause preceded it.
+
+The Rust client drives all of this from its own runtime, which reads
+`agent.control` at startup and follows it. That runtime is not ported here, so
+a caller reading the topic feeds the book itself. The folding rules are the
+same either way, which is what lets a Go process and a Rust one agree about
+whether a session is paused.
+
 ## Agent sends, redrives and replays
 
 `SendAgent` appends to an agent topic with a provenance the caller built. It
