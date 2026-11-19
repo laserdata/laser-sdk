@@ -677,6 +677,45 @@ The Rust client additionally re-checks the stream generation at the send
 boundary, inside the same lane-identity guard noted under [Session
 layout](#session-layout). Here the check is the one in the heartbeat loop.
 
+## Session budgets
+
+A budget is a token and cost ceiling a session's start record asks for.
+`Session.OverBudget` and `Session.BudgetBreach` report whether its usage has
+passed one.
+
+It is a cooperative limit, not a hard spending cap. The answer is folded from
+records that are already written, so it is eventually consistent and a session
+always passes its ceiling by a little before anybody notices. A deployment
+that indexes sessions answers from the index, whose own flag decides: when its
+counters do not line up with that flag the breach is reported by its numbers
+rather than denied, because the index said the session is over. On open Apache
+Iggy, or for a session the index has not caught up to, the retained lane is
+folded instead: an index that cannot answer yet is not a session with no
+budget. A read refused for any other reason surfaces rather than quietly
+falling back.
+
+A lane whose start record retention has removed reads as within budget, since
+the ceiling it was given is no longer on the log and inventing one would end
+sessions nobody limited. Tokens are checked before cost, the order the index
+applies, so both answers name the same dimension. Usage sums input and output,
+and saturates rather than wrapping: a total that wrapped would read as under
+budget, which is the one answer a runaway session must not get.
+
+`Session.FailOverBudget` ends a session with the pinned reason `budget`, so a
+reader can tell a budget stop from any other failure without parsing a
+message. The failure is not retryable: the same work against the same ceiling
+spends the same again.
+
+`BudgetGate` decides whether a session's work reaches a handler. It reads the
+index once per session per poll batch, so a later poll that moved the head
+reads again and the records of one poll share a verdict. A failed read lets
+the record through, because a budget nobody could check is not a reason to
+drop work, and caches nothing. A session over its budget is ended once and its
+work is skipped; one the index already shows as ended is skipped without
+writing anything. The Rust client drives this from its own consumer runtime,
+which is not ported here, so a caller driving its own loop calls it before
+handing a record to its handler.
+
 ## Submitting work
 
 `Sessions.Submit` hands a new session to an agent with a first command. The
