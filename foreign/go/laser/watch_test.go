@@ -83,8 +83,12 @@ func (server *feedServer) expireBelow(partition uint32, offset uint64) {
 }
 
 func (server *feedServer) GetTopic(
-	_ context.Context, _ iggcon.Identifier, topic iggcon.Identifier,
+	ctx context.Context, _ iggcon.Identifier, topic iggcon.Identifier,
 ) (*iggcon.TopicDetails, error) {
+	// A real client stops on a cancelled caller, so the fake does too.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	named, err := topic.String()
 	if err != nil {
 		return nil, err
@@ -101,9 +105,12 @@ func (server *feedServer) GetTopic(
 }
 
 func (server *feedServer) PollMessages(
-	_ context.Context, _ iggcon.Identifier, _ iggcon.Identifier, partition uint32,
+	ctx context.Context, _ iggcon.Identifier, _ iggcon.Identifier, partition uint32,
 	_ iggcon.Consumer, strategy iggcon.PollingStrategy, options iggcon.PollOptions,
 ) (*iggcon.PolledMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	server.guard.Lock()
 	defer server.guard.Unlock()
 	server.polls++

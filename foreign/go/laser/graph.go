@@ -37,6 +37,9 @@ func (laser *Laser) Graph(name string) *Graph {
 	}
 }
 
+// Name is the graph this handle addresses, as the deployment names it.
+func (graph *Graph) Name() string { return graph.name }
+
 func (graph *Graph) fail(err error) *Graph {
 	if graph.err == nil {
 		graph.err = err

@@ -10,7 +10,7 @@ negotiation, the managed command band and its typed surfaces (key-value, query,
 forks, graph, session reads and writes, authorization, consumer filters and the
 saved-filter catalog), streams, topics and publishing, consuming, replay, typed
 records, provenance headers, AGDX agent messaging and gates, the registry and
-router, request and reply, memory, context assembly, claim-checked bodies, local state, swarm activity, crash
+router, request and reply, memory, context assembly, the per-conversation context scope, claim-checked bodies, local state, swarm activity, crash
 context, edge authorization, the agent topology bootstrap, dead-letter redrives, chunk
 stream reassembly, the projection, binding
 and writer-schema registries, materialization, the change feed, a batching producer with the shared publish
@@ -417,6 +417,35 @@ attempt whose reply was lost may still have applied.
 Each verb returns what its change produced and where the fold applied it. That
 position is what a group read can wait for, which is what gives an application
 that just configured a group read-your-writes through any node.
+
+## The context scope
+
+`Laser.Context(conversation)` is one conversation's working context: append to
+it, read it back bounded, or render the prompt-ready block. It is never a
+second store. Appending rides an ordinary publish keyed by the conversation
+and reading rides the assembler, so what a handler sees is the log rather than
+a copy that can drift from it.
+
+A read is bounded by turns and, when a budget is set, by prompt size at once,
+because either alone leaves the other unbounded. The bound is required rather
+than optional: an unbounded read of a long-lived conversation is a replay
+nobody asked for, so the full walk has its own deliberate spelling.
+
+`Checkpoint` says where the topics stood, and `FetchSince` reads only what
+arrived after it, so a caller that already folded up to a moment does not fold
+the same records twice. Offsets are per topic partition rather than per
+conversation, because a conversation is a key within a partition and the log
+has no per-key position to resume from.
+
+`laser.State` folds the history into whatever a caller's state is. The fold is
+theirs: this knows how to read the log in order and nothing about what it
+says.
+
+The scope's memory carries the conversation already, so remembering and
+recalling never repeat it. Durable facts and the knowledge graph stay
+deliberately cross-conversation, because a fact learned in one session is
+worth recalling in the next and a dependency edge holds whichever task asked,
+so the graph comes back unnarrowed.
 
 ## Claim-checked bodies
 
