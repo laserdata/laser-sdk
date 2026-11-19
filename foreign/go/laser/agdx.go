@@ -463,13 +463,30 @@ func (send *AgdxSend) Send(ctx context.Context) (*AgdxReceipt, error) {
 	if err != nil {
 		return nil, &CodecError{Reason: "encode the agent envelope", Cause: err}
 	}
-	topic := send.agdx.laser.Stream(send.agdx.stream).Topic(send.agdx.topic)
 	message, err := iggcon.NewIggyMessage(payload, iggcon.WithUserHeaders(headers))
 	if err != nil {
 		return nil, &InvalidError{Reason: "build the agent record: " + err.Error()}
 	}
-	response, err := topic.sendMessages(ctx, []iggcon.IggyMessage{message},
-		send.envelope.Conversation.String(), true)
+	// The stream's declared layout decides where this record lands: a
+	// per-agent topic layout moves addressed work off the lane, and a
+	// per-agent partition layout keeps it on the lane but on its addressee's
+	// partition. Everything else rides the session's own partition.
+	layout := send.agdx.laser.layoutFor(send.agdx.stream)
+	name := send.agdx.topic
+	if moved := destinationTopic(
+		layout, name, send.envelope.Kind, send.envelope.Target); moved != "" {
+		name = moved
+	}
+	topic := send.agdx.laser.Stream(send.agdx.stream).Topic(name)
+	var response *iggcon.SendMessagesResponse
+	if partition, declared := declaredPartition(
+		layout, send.agdx.topic, send.envelope.Kind, send.envelope.Target); declared {
+		response, err = topic.sendOnPartition(
+			ctx, []iggcon.IggyMessage{message}, partition)
+	} else {
+		response, err = topic.sendMessages(ctx, []iggcon.IggyMessage{message},
+			send.envelope.Conversation.String(), true)
+	}
 	if err != nil {
 		return nil, err
 	}

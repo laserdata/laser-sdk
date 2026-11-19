@@ -166,11 +166,33 @@ func (topic *Topic) sendMessages(
 	if _, err := topic.laser.connected(); err != nil {
 		return nil, err
 	}
-	streamID, topicID, err := topic.identifiers()
+	partitioning, err := partitioningFor(key, hasKey)
 	if err != nil {
 		return nil, err
 	}
-	partitioning, err := partitioningFor(key, hasKey)
+	return topic.sendResolved(ctx, messages, partitioning)
+}
+
+// sendOnPartition appends to one named partition rather than keying by a
+// value, for a declared per-agent partition layout.
+func (topic *Topic) sendOnPartition(
+	ctx context.Context, messages []iggcon.IggyMessage, partition uint32,
+) (*iggcon.SendMessagesResponse, error) {
+	if topic.stream == "" {
+		return nil, errNoStream()
+	}
+	if _, err := topic.laser.connected(); err != nil {
+		return nil, err
+	}
+	return topic.sendResolved(ctx, messages, iggcon.PartitionId(partition))
+}
+
+// sendResolved is the one place a record reaches the log once its
+// partitioning is settled.
+func (topic *Topic) sendResolved(
+	ctx context.Context, messages []iggcon.IggyMessage, partitioning iggcon.Partitioning,
+) (*iggcon.SendMessagesResponse, error) {
+	streamID, topicID, err := topic.identifiers()
 	if err != nil {
 		return nil, err
 	}

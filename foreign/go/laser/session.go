@@ -96,6 +96,12 @@ func (policy SessionPolicy) ConversationFor(key string) wire.ConversationID {
 type SessionConfig struct {
 	// Stream is where session records ride. Empty takes the handle's default.
 	Stream string
+	// Layout is where this stream's agents put their work. The zero value is
+	// the shared lane.
+	//
+	// A declared layout holds for every later agent send on the stream
+	// through this connection, so agents and lenses route the same way.
+	Layout SessionLayout
 	// Namespace separates one application's sessions from another's inside one
 	// stream, and seeds a derived session id.
 	Namespace string

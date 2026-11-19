@@ -112,6 +112,12 @@ type connection struct {
 	// it, so whichever node answers has applied at least what this client
 	// already wrote or read.
 	frontier wire.AppliedFrontier
+	// layouts is the session layout declared per data stream, read at the
+	// agent send boundary. It is shared rather than per handle because a
+	// declared layout has to hold for every later send on the stream: two
+	// handles that disagreed about where an agent's work goes would split
+	// one agent's inbox across two topics.
+	layouts map[string]SessionLayout
 }
 
 // unconnected stands in for the shared state of a handle that never
@@ -135,6 +141,48 @@ func (laser *Laser) state() *connection {
 func (laser *Laser) copy() *Laser {
 	derived := *laser
 	return &derived
+}
+
+// declareLayout fixes where stream's agent work goes, for this connection and
+// every handle derived from it.
+func (laser *Laser) declareLayout(stream string, layout SessionLayout) {
+	shared := laser.state()
+	shared.mutex.Lock()
+	defer shared.mutex.Unlock()
+	if shared.layouts == nil {
+		shared.layouts = map[string]SessionLayout{}
+	}
+	shared.layouts[stream] = layout
+}
+
+// layoutFor is the layout declared for stream, the shared one when none is.
+func (laser *Laser) layoutFor(stream string) SessionLayout {
+	shared := laser.state()
+	shared.mutex.RLock()
+	defer shared.mutex.RUnlock()
+	return shared.layouts[stream]
+}
+
+// AgentDestination is the topic one agent record lands on, given the topic it
+// was addressed to, its kind and its addressee.
+//
+// It is the empty string when the record keeps the topic it was sent on,
+// which is every record under the default layout. A kind of "" is a record
+// with no envelope, routed by its addressee alone.
+func (laser *Laser) AgentDestination(
+	topic string, kind wire.AgentKind, target *wire.AgentID,
+) string {
+	return destinationTopic(laser.layoutFor(laser.defaultStream), topic, kind, target)
+}
+
+// DeclaredTopic is the topic agent reads instead of agent.sessions on the
+// default stream, empty when the stream declares no topic for it.
+//
+// A per-agent topic layout moves an agent's work off the lane, so an agent
+// that kept reading agent.sessions would see its own lifecycle records and
+// none of its work. This is how a consumer asks where to read.
+func (laser *Laser) DeclaredTopic(agent wire.AgentID) string {
+	return declaredTopic(laser.layoutFor(laser.defaultStream), agent)
 }
 
 // WithDefaultStream derives a handle whose unqualified topics resolve on

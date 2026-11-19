@@ -68,7 +68,15 @@ func (laser *Laser) SendAgentAs(
 	if err != nil {
 		return nil, &InvalidError{Reason: "build the agent record: " + err.Error()}
 	}
-	return laser.Stream(laser.defaultStream).Topic(topic).sendMessages(
+	// A declared per-agent topic layout moves a record addressed to a
+	// declared agent off the lane onto that agent's topic. A record with no
+	// envelope carries no kind, so its addressee alone routes it.
+	destination := topic
+	if moved := laser.AgentDestination(
+		topic, "", provenance.TargetAgent); moved != "" {
+		destination = moved
+	}
+	return laser.Stream(laser.defaultStream).Topic(destination).sendMessages(
 		ctx, []iggcon.IggyMessage{message}, provenance.PartitionKey(), true)
 }
 

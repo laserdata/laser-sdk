@@ -29,7 +29,18 @@ func (laser *Laser) SessionsIn(stream string) *Sessions {
 // SessionsWith opens the session surface under an explicit configuration. It
 // is free to build: nothing is sent until a verb is called.
 func (laser *Laser) SessionsWith(config SessionConfig) *Sessions {
-	return &Sessions{laser: laser, config: config.withDefaults(laser)}
+	resolved := config.withDefaults(laser)
+	scoped := laser
+	if resolved.Stream != laser.defaultStream {
+		scoped = laser.WithDefaultStream(resolved.Stream)
+	}
+	// A declared layout holds for every later send on the stream through this
+	// connection, so an agent and a lens opened from different handles route
+	// one agent's work to the same place.
+	if resolved.Layout.Kind() != LayoutShared {
+		scoped.declareLayout(resolved.Stream, resolved.Layout)
+	}
+	return &Sessions{laser: scoped, config: resolved}
 }
 
 // Stream is the stream these sessions ride.

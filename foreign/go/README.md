@@ -575,6 +575,46 @@ out: there is nothing there that will ever become ready. A backend the
 deployment observes as degraded is not ready however it describes itself,
 because the observation is the more reliable half.
 
+## Session layout
+
+`SessionConfig.Layout` decides where a stream's agents put their work, and
+`Laser.SessionsWith` declares it for the connection, so an agent and a lens
+opened from different handles route one agent's work to the same place.
+
+The default is one shared lane. `PerAgentTopicLayout` gives each declared
+agent its own topic and `PerAgentPartitionLayout` keeps work on the lane but
+on a declared partition per agent, both so one agent's work stays out of
+another's read path. `SinglePartitionLayout` gives up parallelism for total
+order across the whole stream.
+
+Only addressed work moves: a command to a declared agent, and the response,
+error or chunk that answers it. Lifecycle, state, broadcasts, and anything
+addressed to an agent the layout never declared stay on the lane, so a reader
+always finds a session's spine in one place. Moving a record off the lane
+never changes its key, so an agent's own topic is still ordered by session.
+`Laser.DeclaredTopic` is how a consumer asks where to read, because an agent
+that kept reading `agent.sessions` under a per-agent topic layout would see
+its own lifecycle records and none of its work.
+
+`Sessions.Bootstrap` creates the agent topology under the layout: a
+single-partition layout creates every topic with one partition whatever count
+was asked for, and a per-agent topic layout also creates each declared topic
+with the lane's partition count and retention, since each one carries a share
+of the same work. A layout that declared `agent.sessions` or `agent.control`
+is refused rather than routed around, because it would send an agent's work to
+the very lane the layout exists to keep it off.
+
+On a deployment that indexes sessions, bootstrap then registers the stream as
+a session source and waits, bounded by the publish timeout, for the index to
+answer. A refused or not-yet-visible registration is reported as
+`Registered: false` and never raised: the topics are there either way, and an
+account without session administration rights relies on provisioning.
+`Sessions.Unregister` stops the indexing again.
+
+The Rust client additionally pins the lane's identity and partition count
+across a session's lifetime, so a lane recreated underneath a running session
+is caught. That guard is not ported here yet.
+
 ## Agent sends, redrives and replays
 
 `SendAgent` appends to an agent topic with a provenance the caller built. It
