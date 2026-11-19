@@ -180,6 +180,11 @@ type Session struct {
 	// state is the revision this handle's state writes continue from, shared
 	// with every handle derived from it so their writes land in order.
 	state *stateCursor
+	// redactor rewrites recorded arguments and prompts. redactorSet
+	// separates a handle that chose none from one that never chose, so the
+	// default applies only until a caller says otherwise.
+	redactor    Redactor
+	redactorSet bool
 }
 
 // cursor is this handle's state cursor, opened for a handle built without

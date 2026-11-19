@@ -677,6 +677,37 @@ The Rust client additionally re-checks the stream generation at the send
 boundary, inside the same lane-identity guard noted under [Session
 layout](#session-layout). Here the check is the one in the heartbeat loop.
 
+## Model and tool calls
+
+This client never calls a model. The application calls its provider and
+records the call through the session, so the log holds what was asked and what
+came back without the SDK sitting in the path.
+
+`Session.Model` records the request and hands back a call to finish when the
+provider answers; `Session.Tool` does the same for a tool. Both records are
+marked recorded, so the agent's own runtime never picks its own timeline entry
+up as new work addressed to it. `Session.RecordModelCall` records a call that
+already happened in one go.
+
+A response that names no duration is timed from when the call was opened,
+because the application asked this handle to hold it and the elapsed time is
+the only measurement there is. A call recorded after the fact was not timed
+here at all, so it records zero rather than a number this client invented. The
+model that answered is recorded beside the one that was asked for, since they
+differ often enough to matter.
+
+Tool arguments and JSON prompts are redacted before they are recorded:
+`authorization`, `api_key`, `token`, `password`, `secret` and `cookie`, at any
+depth, whatever their case. Only the values go, so a reader still sees what was
+passed. It is a convenience and not a guarantee, and `Session.Redact` replaces
+it: a nil redactor records arguments unchanged, which is what a caller that
+redacts upstream wants. A prompt that is not JSON cannot be read key by key, so
+it is recorded as it stands.
+
+A failure carries the structured error body rather than a message a reader
+would have to parse, and a failed tool call names its tool so a reader can tell
+which one failed.
+
 ## Session state
 
 `Session.State` is the session's state document: RFC 6902 patches on the

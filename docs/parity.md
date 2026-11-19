@@ -214,6 +214,7 @@ Beyond the raw capabilities, the Go client serves these managed and agent surfac
 | Durable intents | laser.NewIntent, Intent.CastVote, laser.Decide and IntentDecision.Authorizes: the record shapes and the pure quorum fold, pinned against the Rust client's own vectors |
 | Session layout | SessionConfig.Layout with the shared, per-agent topic, per-agent partition and single-partition layouts, Laser.DeclaredTopic, and Sessions.Bootstrap and Unregister |
 | Session leases | Laser.LeaseSession and laser.LeaseRegistry: one heartbeat per stream per tick at the shortest held interval, scoped to the stream incarnation the lease was taken on |
+| Model and tool calls | Session.Model, Session.Tool and Session.RecordModelCall with their completion and failure records, the redactor, and laser.AssembledContext |
 | Session state | Session.State with Set, Patch, Replace, Snapshot and Get, and laser.FoldSessionState: revision-guarded patches on the session lane with snapshots as checkpoints |
 | Operator control | Sessions.Control with pause, resume, cancel and force-cancel, and laser.ControlRequestOf, laser.FoldControl, laser.ControlPartition and laser.ControlBook: the fold per session, with a request off the session's control route flagged and never applied |
 | Stream administration | Laser.Streams, Stream.Get, Exists, Rename and Topics, and Topic.Get, Exists, Update, Partitions, AddPartitions, DeletePartitions, DeleteSegments and ConsumerGroups |
