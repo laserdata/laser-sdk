@@ -11,7 +11,8 @@ forks, graph, session reads and writes, authorization, consumer filters and the
 saved-filter catalog), streams, topics and publishing, consuming, replay, typed
 records, provenance headers, AGDX agent messaging and gates, the registry and
 router, request and reply, memory, context assembly, the projection, binding
-and writer-schema registries, materialization, a batching producer with the shared publish recovery schedule, record signing with its key registry, action governance with its approval gate, and the bridge value
+and writer-schema registries, materialization, the change feed, a batching producer with the shared publish
+recovery schedule, record signing with its key registry, action governance with its approval gate, and the bridge value
 mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
 
 It is not published yet. [docs/parity.md](../../docs/parity.md) lists its
@@ -414,6 +415,44 @@ attempt whose reply was lost may still have applied.
 Each verb returns what its change produced and where the fold applied it. That
 position is what a group read can wait for, which is what gives an application
 that just configured a group read-your-writes through any node.
+
+## The change feed
+
+`Laser.Watch()` reads one record per committed projector batch, for a binding
+that opted into notifications. It turns "query after my data landed" from
+sleep-and-retry into await-then-query, and it composes with read-your-writes
+rather than replacing it: the feed says a batch landed, and the applied
+frontier says a read will see it.
+
+`Index` narrows to one materialized index and `FromEnd` starts at the feed's
+current end, for a caller awaiting its own write rather than catching up on a
+backlog. A deployment that does not publish the feed is refused rather than
+left polling a topic nothing writes to, because waiting on silence looks
+identical to waiting on work that never comes. Under stream tenancy each
+stream's feed rides its own ops topic, so a scoped handle reads its own.
+
+`Missed` counts what retention removed before the reader reached it, measured
+from where the reader started or resumed. Above zero means a caller should
+read the view itself rather than trust the feed to have told it everything. A
+partition the reader opened at the end of while it held nothing is anchored,
+so its first record is not mistaken for the end of a range of lost ones.
+
+`Skipped` counts feed records that were not change records. The changes topic
+is overridable, so other traffic on it is stepped over rather than allowed to
+wedge the reader. The version is read as an optional field precisely because
+absent and zero are different: a payload that is not a change record is
+skipped, while one claiming version zero is a change record this build cannot
+read.
+
+A change record of another version stops its partition where it sits. The
+changes before it come back, the partition stays parked at it, and a poll with
+nothing else to return says why. This build never guesses at a newer record
+and never steps over one, and one partition stopping does not stop the others.
+
+`PollWithin` waits for the first change to land, and `Each` walks until the
+reader is caught up. A caller that stops a walk early is left positioned at
+the first change it did not take, so the offsets it persists mean what they
+say: without that, stopping mid-batch would silently skip the rest of it.
 
 ## Publish recovery
 

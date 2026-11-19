@@ -1288,6 +1288,7 @@ GO_SURFACES = (
     ("Control commands", "Laser.PublishControl, PublishControlIn and PublishControlAs over the control band, with the stream scoping and operation identity every registry write carries"),
     ("Projections", "Laser.Projections: register, register a graph, drop, read, read status, and the filterable listing, plus Laser.Bindings apply and remove"),
     ("Schema registry", "Laser.Schemas: register, drop, read, list and server-side decode of the writer schemas a schema-first payload is stamped with"),
+    ("Change feed", "Laser.Watch: index narrowing, start at the end, missed and skipped accounting, the version stop, resumable offsets and a bounded wait"),
     ("Publish recovery", "laser.PublishOptions and Laser.WithPublishOptions: the shared attempt timeout, retry count and jittered backoff, with the connection cleaned up after a stall"),
     ("Materialization", "Topic.Materialize: typed and whole-record setups, rejection and oversize policies, retention, derived step identities, and Materialization.Wait with captured-target readiness"),
 )
