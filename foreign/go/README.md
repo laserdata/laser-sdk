@@ -677,6 +677,40 @@ The Rust client additionally re-checks the stream generation at the send
 boundary, inside the same lane-identity guard noted under [Session
 layout](#session-layout). Here the check is the one in the heartbeat loop.
 
+## Submitting work
+
+`Sessions.Submit` hands a new session to an agent with a first command. The
+submitted status is written before the command, so a session never has work on
+it before it exists on the log, and the command is marked submitted so the
+receiving agent knows to mark the session working when it picks it up.
+
+`SubmitBuilder.ID` names the session the submission will write, before it
+writes it, which is what lets a caller watch the session it is about to
+create. A label derives that id from the stream, the namespace and the label,
+so the same label reaches the same session and a nightly job resumes rather
+than starting a new one.
+
+A labeled session that ended completed or failed resumes. One an agent or an
+operator canceled is refused: a cancel is a decision somebody made, and
+resuming under the same label would undo it quietly. A forced cancel leaves no
+lane record, so the control route is read as well.
+
+When the command cannot be published after the status landed, the session is
+ended failed and the publish error is returned. A session that still reads as
+submitted with no work in it is worse than one that visibly failed. Ending it
+is best effort: the publish failure is what the caller asked about, and
+reporting a second one in its place would hide it.
+
+`FoldLaneLifecycle` folds a session's lane into whether it started, the
+terminal status it reached and the budget its start asked for. A start after a
+completed or failed end resumes the session and takes that start's budget,
+since a resumed session runs under the ceiling its resumer chose. A start
+after a cancel does not resume.
+
+A session with no idle timeout can only be reclaimed by an operator noticing
+it, so `SessionConfig.IdleTimeout` has a default of five minutes rather than
+being left absent.
+
 ## Model and tool calls
 
 This client never calls a model. The application calls its provider and

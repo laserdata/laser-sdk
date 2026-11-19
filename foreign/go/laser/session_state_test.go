@@ -16,8 +16,12 @@ import (
 type stateServer struct {
 	clusterOfOne
 	mutex sync.Mutex
-	// lane is every record on agent.sessions, in order.
-	lane []iggcon.IggyMessage
+	// lane is every record on agent.sessions, in order, and control is
+	// every record on agent.control. They are kept apart because a reader
+	// that saw one topic's records on the other would pass tests that prove
+	// nothing about where it looked.
+	lane    []iggcon.IggyMessage
+	control []iggcon.IggyMessage
 	// session is the conversation the written records carry.
 	session wire.ConversationID
 	// fail refuses the next append.
@@ -28,6 +32,11 @@ type stateServer struct {
 	// polls counts the lane reads, so a test can tell a cached cursor from
 	// one that reseeds every write.
 	polls int
+	// refuseAt refuses the append at this one-based position and passes every
+	// other, which is how a test puts a failure between two records of one
+	// operation without refusing what follows it.
+	refuseAt int
+	attempts int
 }
 
 func (server *stateServer) Close() error { return nil }
@@ -48,14 +57,22 @@ func (server *stateServer) GetTopic(
 }
 
 func (server *stateServer) PollMessages(
-	_ context.Context, _, _ iggcon.Identifier, _ uint32,
+	_ context.Context, _, topicID iggcon.Identifier, _ uint32,
 	_ iggcon.Consumer, strategy iggcon.PollingStrategy, options iggcon.PollOptions,
 ) (*iggcon.PolledMessage, error) {
+	name, err := topicID.String()
+	if err != nil {
+		return nil, err
+	}
 	server.mutex.Lock()
 	defer server.mutex.Unlock()
 	server.polls++
+	held := server.lane
+	if name == wire.AgentControl {
+		held = server.control
+	}
 	var out []iggcon.IggyMessage
-	for _, message := range server.lane {
+	for _, message := range held {
 		if message.Header.Offset >= strategy.Value &&
 			uint32(len(out)) < options.Count {
 			out = append(out, message)
@@ -74,6 +91,10 @@ func (server *stateServer) SendMessages(
 		failure := server.fail
 		server.fail = nil
 		return nil, failure
+	}
+	server.attempts++
+	if server.refuseAt > 0 && server.attempts == server.refuseAt {
+		return nil, errRefused{}
 	}
 	for _, message := range messages {
 		message.Header.Offset = uint64(len(server.lane))

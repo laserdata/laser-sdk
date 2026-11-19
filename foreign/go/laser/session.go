@@ -105,8 +105,11 @@ type SessionConfig struct {
 	// Namespace separates one application's sessions from another's inside one
 	// stream, and seeds a derived session id.
 	Namespace string
-	// IdleTimeout is how long a session may go quiet before the deployment may
-	// consider it abandoned. Zero leaves it to the deployment.
+	// IdleTimeout is how long a session may go quiet before the deployment
+	// may consider it abandoned. Zero takes DefaultSessionIdleTimeout.
+	//
+	// A session that records none can only be reclaimed by an operator
+	// noticing it, so there is a default rather than an absence.
 	IdleTimeout time.Duration
 	// MemoryNamespace is where this session's memory lives. Empty takes the
 	// session namespace.
@@ -122,6 +125,10 @@ type SessionConfig struct {
 // names no bound.
 const DefaultSessionContextTokens = 4000
 
+// DefaultSessionIdleTimeout is how long a session may go quiet before the
+// deployment may consider it abandoned, when the caller names no timeout.
+const DefaultSessionIdleTimeout = 300 * time.Second
+
 func (config SessionConfig) withDefaults(laser *Laser) SessionConfig {
 	if config.Stream == "" {
 		config.Stream = laser.defaultStream
@@ -134,6 +141,9 @@ func (config SessionConfig) withDefaults(laser *Laser) SessionConfig {
 	}
 	if config.ContextTokens == 0 {
 		config.ContextTokens = DefaultSessionContextTokens
+	}
+	if config.IdleTimeout == 0 {
+		config.IdleTimeout = DefaultSessionIdleTimeout
 	}
 	if config.SDK.Language == "" {
 		config.SDK = wire.SdkInfo{Language: "go", Version: ClientVersion}
