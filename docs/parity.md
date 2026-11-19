@@ -200,6 +200,7 @@ Beyond the raw capabilities, the Go client serves these managed and agent surfac
 | Control commands | Laser.PublishControl, PublishControlIn and PublishControlAs over the control band, with the stream scoping and operation identity every registry write carries |
 | Projections | Laser.Projections: register, register a graph, drop, read, read status, and the filterable listing, plus Laser.Bindings apply and remove |
 | Schema registry | Laser.Schemas: register, drop, read, list and server-side decode of the writer schemas a schema-first payload is stamped with |
+| Fold snapshots | laser.SnapshotStore with the managed and log-native backends, and wire.XXHash32 partition routing pinned against the Rust client |
 | Context scope | Laser.Context: bounded reads by turns and tokens, checkpoints and resumed reads, laser.State folding, and the conversation-scoped memory |
 | Claim checks | laser.BlobStore with CheckIn, ResolveBody and AgdxSend.ClaimCheck, digest-verified on the way back |
 | Local state | laser.InMemoryStore and laser.FileStore: hex-encoded keys, owner-only permissions and atomic staged writes |

@@ -919,6 +919,16 @@ func (store *keyStore) apply(code uint32, body []byte) (wire.KvOutcome, *wire.Kv
 			return wire.KvOutcome{Kind: wire.KvValue}, nil
 		}
 		return wire.KvOutcome{Kind: wire.KvValue, Entry: &held}, nil
+	case wire.AgdxKvSetCode:
+		var request wire.KvSet
+		if wire.Unmarshal(body, &request) != nil {
+			return wire.KvOutcome{}, &wire.KvError{Kind: wire.KvInvalidKey}
+		}
+		store.version++
+		store.entries[string(request.Key)] = wire.KvEntry{
+			Key: request.Key, Value: request.Value, Version: store.version,
+		}
+		return wire.KvOutcome{Kind: wire.KvWritten}, nil
 	case wire.AgdxKvCasCode:
 		var request wire.KvCas
 		if wire.Unmarshal(body, &request) != nil {

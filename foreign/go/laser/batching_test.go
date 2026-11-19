@@ -413,10 +413,15 @@ func TestGivenAKeptFailureWhenSendingThenShouldRefuseTheRecordAndReportBoth(t *t
 		t.Errorf("want the lost batch then the refused record, got %+v",
 			failure.Unconfirmed)
 	}
-	// The refused record was never queued, so nothing is waiting behind it.
-	if producer.Queued() != 0 {
-		t.Errorf("want nothing queued behind a failure, got %d", producer.Queued())
+	// The refused record is not in the queue: it was turned away rather than
+	// accepted. A send that got in before the failure was observable did
+	// queue, which is why the count itself is not what proves this.
+	for _, record := range failure.Unconfirmed {
+		if string(record.Payload) == "refused" {
+			return
+		}
 	}
+	t.Error("want the refused record reported rather than queued")
 }
 
 // Several batches failing before anyone asks is one report listing all their

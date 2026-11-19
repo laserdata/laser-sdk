@@ -10,7 +10,7 @@ negotiation, the managed command band and its typed surfaces (key-value, query,
 forks, graph, session reads and writes, authorization, consumer filters and the
 saved-filter catalog), streams, topics and publishing, consuming, replay, typed
 records, provenance headers, AGDX agent messaging and gates, the registry and
-router, request and reply, memory, context assembly, the per-conversation context scope, claim-checked bodies, local state, swarm activity, crash
+router, request and reply, memory, context assembly, fold snapshots, the per-conversation context scope, claim-checked bodies, local state, swarm activity, crash
 context, edge authorization, the agent topology bootstrap, dead-letter redrives, chunk
 stream reassembly, the projection, binding
 and writer-schema registries, materialization, the change feed, a batching producer with the shared publish
@@ -417,6 +417,33 @@ attempt whose reply was lost may still have applied.
 Each verb returns what its change produced and where the fold applied it. That
 position is what a group read can wait for, which is what gives an application
 that just configured a group read-your-writes through any node.
+
+## Fold snapshots
+
+A long conversation should resume from its last checkpoint rather than
+replaying every record, so `SnapshotStore` keeps fold snapshots. There are two
+honest backends and no behaviour difference a caller can see: the managed
+store is a point read and a point write, and the log-native one works where
+there is no managed backend at all.
+
+The log-native store partitions by conversation, so one conversation's
+checkpoints stay ordered, and a read walks that one partition backward from
+its tail and stops at the first record for the conversation. A hit costs the
+distance back to the last checkpoint. A conversation that was never
+snapshotted walks the partition fully before answering, so keep the snapshots
+topic on retention: its history is checkpoints rather than truth.
+
+Saving one fold's state under another's key would resume a fold from state it
+never produced, which is worse than resuming from the beginning, so both the
+save and the read hold a snapshot to the store's own identity.
+
+The key bytes matter beyond this client. The storage key decides where a
+checkpoint is filed and the partition key decides which partition it routes
+to, so a client spelling either differently would write a checkpoint where
+another client never looks. `wire.XXHash32` is the routing hash the streaming
+server itself uses, written here rather than taken as a dependency because the
+Go ecosystem's xxHash packages are the 64-bit and XXH3 variants. It is pinned
+against vectors the Rust client produced.
 
 ## The context scope
 
