@@ -211,6 +211,7 @@ Beyond the raw capabilities, the Go client serves these managed and agent surfac
 | Change feed | Laser.Watch: index narrowing, start at the end, missed and skipped accounting, the version stop, resumable offsets and a bounded wait |
 | Publish recovery | laser.PublishOptions and Laser.WithPublishOptions: the shared attempt timeout, retry count and jittered backoff, with the connection cleaned up after a stall |
 | Materialization | Topic.Materialize: typed and whole-record setups, rejection and oversize policies, retention, derived step identities, and Materialization.Wait with captured-target readiness |
+| Durable intents | laser.NewIntent, Intent.CastVote, laser.Decide and IntentDecision.Authorizes: the record shapes and the pure quorum fold, pinned against the Rust client's own vectors |
 
 An omitted row that reaches the raw client, or a method that does more than convert a value, names the capabilities a caller reaches through it. The check fails when such a row names none.
 

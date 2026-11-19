@@ -921,6 +921,42 @@ the work and replay the handler once the decision lands, which frees the
 consumer for the session's other work. That runtime is not ported here, so a
 gate held open holds its caller open.
 
+## Durable intents
+
+`laser.NewIntent` proposes an effect that several principals have to agree to.
+The intent, the `laser.Vote` records that name it, and the
+`laser.IntentDecision` the fold seals are ordinary typed records: publish them
+like any others. This surface defines record shapes and a pure fold, not a new
+wire protocol and not an implicit log integration, which is why nothing here
+reaches a topic on its own.
+
+`Proposer` and `Voter` are record claims. A deployment that needs trusted
+authorship enforces a signed-principal or topology-isolated profile, because
+the fold cannot authenticate who appended a record. This composes with action
+governance rather than replacing it: a governor can require a committed
+decision before it releases an effect.
+
+`laser.Decide` folds ballots into a decision, or reports none while the
+outcome is still reachable before the deadline. Each ballot is windowed and
+ordered by the time the reader observed it, the record's server timestamp,
+never by the voter's own stamp, so a late ballot cannot claim an earlier time.
+Ballots for another intent, body or policy version are ignored, as are ballots
+from voters the intent never enrolled. Identical repeats are idempotent, and
+one voter contradicting itself aborts. A mandatory voter must allow before any
+quorum commits. The valid set is sorted before folding, so input and replay
+order change neither the decision nor its recorded evidence.
+
+`IntentDecision.Authorizes` is the check before an effect. An aborted decision
+is valid evidence but authorizes nothing, and a committed one authorizes only
+when the votes it carries actually meet the intent's quorum, so a decision
+record stripped of its evidence is refused rather than trusted.
+
+The body hashes as one canonical CBOR byte string under the name `body`, then
+BLAKE3, then lower-case hex, which is what every other client hashes. On the
+log the body itself rides as serde's array of integers instead, and the
+SDK-level ids ride as their text. All three records are pinned byte for byte
+against vectors the Rust client printed, in both the CBOR and the JSON form.
+
 ## Bridges
 
 `bridges` maps external agent interfaces onto AGDX. A bridge is a translation
