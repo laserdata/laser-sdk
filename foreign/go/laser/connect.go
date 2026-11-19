@@ -101,6 +101,12 @@ type Laser struct {
 type connection struct {
 	mutex  sync.RWMutex
 	client iggcon.Client
+	// configured is the capability set negotiation starts from, so one failed
+	// probe cannot narrow a handle permanently: negotiation only ever adds.
+	configured *Capabilities
+	// negotiated is the most recent probe's answer, shared so a re-probe on
+	// one handle is seen by every handle derived from it.
+	negotiated *Capabilities
 	// frontier is the highest mutation position seen per managed surface.
 	// Every managed reply raises it, and a later read of that surface sends
 	// it, so whichever node answers has applied at least what this client
@@ -271,7 +277,9 @@ func ConnectWith(
 		publish = *options.Publish
 	}
 	return &Laser{
-		shared:         &connection{client: connected},
+		shared: &connection{
+			client: connected, configured: &configured,
+		},
 		connectionInfo: parsed,
 		capabilities:   NegotiateCapabilities(ctx, connected, configured),
 		defaultStream:  options.DefaultStream,
@@ -310,7 +318,9 @@ func FromClient(client iggcon.Client, options Options) *Laser {
 		publish = *options.Publish
 	}
 	return &Laser{
-		shared:         &connection{client: client},
+		shared: &connection{
+			client: client, configured: &capabilities,
+		},
 		capabilities:   capabilities,
 		defaultStream:  options.DefaultStream,
 		resourceNaming: options.ResourceNaming,

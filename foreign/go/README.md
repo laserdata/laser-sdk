@@ -10,7 +10,8 @@ negotiation, the managed command band and its typed surfaces (key-value, query,
 forks, graph, session reads and writes, authorization, consumer filters and the
 saved-filter catalog), streams, topics and publishing, consuming, replay, typed
 records, provenance headers, AGDX agent messaging and gates, the registry and
-router, request and reply, memory, context assembly, the projection, binding
+router, request and reply, memory, context assembly, the agent topology bootstrap, dead-letter redrives, chunk
+stream reassembly, the projection, binding
 and writer-schema registries, materialization, the change feed, a batching producer with the shared publish
 recovery schedule, record signing with its key registry, action governance with its approval gate, and the bridge value
 mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
@@ -415,6 +416,78 @@ attempt whose reply was lost may still have applied.
 Each verb returns what its change produced and where the fold applied it. That
 position is what a group read can wait for, which is what gives an application
 that just configured a group read-your-writes through any node.
+
+## Bootstrap and readiness
+
+`Laser.Bootstrap` creates the whole agent topology on the default stream, so
+an application does not have to know which topics the runtime needs. The
+session lane takes the retention the caller chose, the heartbeats expire after
+an hour because they only prove liveness, and the satellites take the server's
+defaults. It is idempotent, and a topic somebody already provisioned keeps the
+retention they chose rather than having this one's imposed on it.
+
+The control topic is not created: only operators may write to it, so a client
+creating it would be claiming a privilege it does not have. The session lane's
+retention must bound something, because a lane with neither an expiry nor a
+size bound grows until the deployment runs out of disk and the first anyone
+hears of it is a server that stops accepting writes.
+
+`RefreshCapabilities` probes again, so a deployment that began serving a
+surface after this client connected is visible without a restart.
+Re-negotiation starts from what the caller pinned rather than from the last
+probe's answer, so one failed probe cannot narrow a handle permanently.
+
+`WaitUntilReady` waits for every enabled backend to report itself serving. A
+disabled backend is not waited on, since nobody asked it to serve, and a
+deployment that announces none at all is refused at once rather than waited
+out: there is nothing there that will ever become ready. A backend the
+deployment observes as degraded is not ready however it describes itself,
+because the observation is the more reliable half.
+
+## Agent sends, redrives and replays
+
+`SendAgent` appends to an agent topic with a provenance the caller built. It
+is the low-altitude form: `Agdx` reads better because it derives the
+provenance from the envelope, so the two cannot disagree about who sent what
+to whom. A record on a shared lane that addresses nobody is addressed to every
+agent, so a role group bound to the addressee filter still receives it.
+
+`SpawnSubconversation` derives a child conversation carrying both its parent
+and the root. Without the root, a reconstruction three levels down would have
+to walk every parent to find out what the work was for.
+
+`RedriveDeadLetter` replays a dead-lettered record so a fixed handler
+reprocesses it. The payload goes back verbatim, but the idempotency key is
+re-keyed by the position the original sat at: a consumer that still remembers
+the original would otherwise drop the copy as a duplicate, while a key derived
+from the position means two redrives of one capsule still agree. A signed
+record is refused, because its signature covers both the record id and the
+idempotency key a redrive has to change, and one past its deadline is refused
+because it would only dead-letter again.
+
+A capsule names its own source, and any writer that can append to the
+dead-letter topic can forge one, so a redrive is confined to this connection's
+own stream rather than copying into a stream the caller did not choose.
+
+`ReassembleChannel` rebuilds a chunk stream from the log. This is what offset
+replay does that a server-sent event stream cannot: a finished stream
+reconstructs deterministically after the fact, with no transcript store
+anywhere. Chunks are ordered by sequence, so it reassembles the same way
+whichever partitions the stream was keyed onto, and a stream whose producer
+never ended it gets a synthetic ending once the bound its opening chunk
+declared has passed.
+
+`ChunkAssembler` is that reassembly on its own, pure and clock-free so the
+same code serves a live stream and a replayed one. A redelivered chunk is
+dropped and counted because a consumer is at-least-once, a missing sequence
+ends the stream because the log is in order within a channel, and the first
+terminal wins.
+
+`Consumed` asks whether a consumer has committed past a record. A consumer
+that never committed reads as not yet consumed, and so does a read the server
+could not authorize, so a caller deciding a reassignment on this needs
+verified read access: otherwise a misconfiguration reads as "not consumed" and
+drives a reassignment nobody needed.
 
 ## The change feed
 

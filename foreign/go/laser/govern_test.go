@@ -10,6 +10,7 @@ import (
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 	"github.com/zeebo/blake3"
@@ -28,6 +29,14 @@ type publishServer struct {
 }
 
 func (server *publishServer) Close() error { return nil }
+
+// SendBinaryRequest answers the way raw Apache Iggy does: it does not know the
+// managed commands, which is an answer rather than a failure.
+func (server *publishServer) SendBinaryRequest(
+	_ context.Context, _ uint32, _ []byte,
+) ([]byte, error) {
+	return nil, ierror.InvalidCommand{}
+}
 
 func (server *publishServer) SendMessages(
 	_ context.Context, _ iggcon.Identifier, topic iggcon.Identifier,

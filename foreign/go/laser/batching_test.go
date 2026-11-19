@@ -385,7 +385,19 @@ func TestGivenAKeptFailureWhenSendingThenShouldRefuseTheRecordAndReportBoth(t *t
 	}
 	server.awaitAttempt(t)
 
-	refused := producer.Send(context.Background(), []byte("refused"), nil)
+	// The flush that failed is still settling when the append returns, so a
+	// send a hair early queues instead of being refused. A queued record
+	// stays queued, so the refusal below still names exactly the lost batch
+	// and the one record it turned away.
+	var refused error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if refused = producer.Send(
+			context.Background(), []byte("refused"), nil); refused != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	var failure *laser.PublishFailure
 	if !errors.As(refused, &failure) {

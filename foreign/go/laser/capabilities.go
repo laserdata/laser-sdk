@@ -149,6 +149,47 @@ func OpenCapabilities() Capabilities {
 // Because the levels form a ladder this is "level is at most what is served",
 // so eventual is always served. An unknown future level is treated as not
 // served, which keeps the check fail-safe.
+// EnabledBackends are the backends an operator asked to be running.
+//
+// A disabled backend is not a problem to wait out: nobody asked it to serve,
+// so its state says nothing about whether the deployment is ready.
+func (capabilities Capabilities) EnabledBackends() []wire.BackendDescriptor {
+	enabled := make([]wire.BackendDescriptor, 0, len(capabilities.Backends))
+	for _, backend := range capabilities.Backends {
+		if backend.DesiredState == wire.BackendEnabledState {
+			enabled = append(enabled, backend)
+		}
+	}
+	return enabled
+}
+
+// UnreadyBackends are the enabled backends that are not serving, which is
+// what a caller waiting on readiness is waiting for.
+func (capabilities Capabilities) UnreadyBackends() []wire.BackendDescriptor {
+	unready := make([]wire.BackendDescriptor, 0, len(capabilities.Backends))
+	for _, backend := range capabilities.EnabledBackends() {
+		if backend.ObservedState != wire.BackendObservedReady ||
+			!backend.Readiness.Ready {
+			unready = append(unready, backend)
+		}
+	}
+	return unready
+}
+
+// Ready reports a deployment whose every enabled backend is serving.
+//
+// A deployment with no enabled backend at all is not ready: there is nothing
+// there to serve, which is a different thing from something that is serving.
+func (capabilities Capabilities) Ready() bool {
+	if !capabilities.Managed {
+		return false
+	}
+	if len(capabilities.EnabledBackends()) == 0 {
+		return false
+	}
+	return len(capabilities.UnreadyBackends()) == 0
+}
+
 func (capabilities Capabilities) ServesConsistency(level wire.Consistency) bool {
 	switch level {
 	case wire.ConsistencyEventual, wire.ConsistencyReadYourWrites:
