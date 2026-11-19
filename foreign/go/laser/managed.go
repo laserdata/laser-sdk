@@ -130,17 +130,42 @@ func (laser *Laser) sendManagedFrame(
 	if err := laser.ensureScopable(code); err != nil {
 		return nil, err
 	}
-	laser.state().mutex.RLock()
-	client := laser.state().client
-	laser.state().mutex.RUnlock()
+	shared := laser.state()
+	shared.mutex.RLock()
+	client := shared.client
+	shared.mutex.RUnlock()
 	if client == nil {
 		return nil, &TransportError{Reason: "the client is closed"}
 	}
-	reply, err := client.SendBinaryRequest(ctx, code, frame)
+	// On a single node the roster has one entry and this is the plain call it
+	// always was. On a cluster it keeps this client to one node, picked by a
+	// key of its own, and moves off a node whose link fails or that cannot
+	// reach its own backend.
+	routed, err := laser.nodes().send(ctx, client, code, frame, targetOfCode(code))
 	if err != nil {
 		return nil, &TransportError{Reason: "managed command", Cause: err}
 	}
-	return laser.openPositioned(reply), nil
+	if routed.frontier != nil {
+		shared.mutex.Lock()
+		wire.MergeFrontier(&shared.frontier, *routed.frontier)
+		shared.mutex.Unlock()
+	}
+	return routed.reply, nil
+}
+
+// nodes is this connection's node router, opened on first use.
+//
+// One router per connection is what makes the caller's node stable: a router
+// per handle would spread one client's requests over the cluster rather than
+// keeping it to the node it picked.
+func (laser *Laser) nodes() *nodeRouter {
+	shared := laser.state()
+	shared.mutex.Lock()
+	defer shared.mutex.Unlock()
+	if shared.router == nil {
+		shared.router = newNodeRouter()
+	}
+	return shared.router
 }
 
 // openPositioned unwraps the envelope a managed node may answer in, folding

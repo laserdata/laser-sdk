@@ -352,7 +352,7 @@ func TestGivenEitherStoreWhenUsedThenShouldAnswerTheSameContract(t *testing.T) {
 
 // snapshotTopic is a partitioned topic that keeps what was written to it.
 type snapshotTopic struct {
-	iggcon.Client
+	clusterOfOne
 	guard      sync.Mutex
 	partitions uint32
 	records    map[uint32][]iggcon.IggyMessage

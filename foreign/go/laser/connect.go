@@ -122,6 +122,9 @@ type connection struct {
 	// first use. One registry per connection is what keeps a process to one
 	// heartbeat per stream.
 	leases *LeaseRegistry
+	// router picks the node of every managed request, opened on first use.
+	// It is shared so the caller's node stays stable across handles.
+	router *nodeRouter
 }
 
 // unconnected stands in for the shared state of a handle that never

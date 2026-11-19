@@ -15,7 +15,7 @@ import (
 // kvServer answers key-value commands from a script, recording what reached it
 // so a test can assert both the request and what the client made of the reply.
 type kvServer struct {
-	iggcon.Client
+	clusterOfOne
 	outcomes []wire.KvOutcome
 	failure  *wire.KvError
 	codes    []uint32

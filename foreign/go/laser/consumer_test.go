@@ -17,7 +17,7 @@ import (
 // resolves its fetch path by type assertion, so this stand-in implements that
 // seam as well as the admin calls a consumer makes.
 type consumerServer struct {
-	iggcon.Client
+	clusterOfOne
 	mutex  sync.Mutex
 	joined string
 	stored []iggcon.ConsumerPosition

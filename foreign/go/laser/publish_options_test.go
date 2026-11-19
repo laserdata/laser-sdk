@@ -16,7 +16,7 @@ import (
 // recoveringServer fails a scripted number of appends, counting how often it
 // was reconnected.
 type recoveringServer struct {
-	iggcon.Client
+	clusterOfOne
 	guard       sync.Mutex
 	fail        []error
 	attempts    int

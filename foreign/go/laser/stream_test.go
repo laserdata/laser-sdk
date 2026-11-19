@@ -16,7 +16,7 @@ import (
 // streamServer records the admin and publish calls a facade makes, so a test
 // can state what reached the server rather than only that nothing failed.
 type streamServer struct {
-	iggcon.Client
+	clusterOfOne
 	// mutex guards what a concurrent test reads while a send is in flight.
 	// A fake that is not safe makes the race detector point at the test
 	// rather than at the code under test, which hides a real one.
@@ -475,4 +475,21 @@ func TestGivenAStreamHandleWhenAddressingATopicThenShouldUseThatStream(t *testin
 	if _, err := topic.Publish().Payload([]byte("x")).Send(context.Background()); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
+}
+
+// clusterOfOne stands in for the Apache Iggy client in a fake that is not
+// testing cluster routing: it answers the roster read with a single node, the
+// shape of every deployment that is not a cluster.
+//
+// Embedding it rather than the client interface itself keeps a fake from
+// panicking on the roster read with a nil interface, which would point the
+// failure at the test rather than at the code under test.
+type clusterOfOne struct {
+	iggcon.Client
+}
+
+func (clusterOfOne) GetClusterMetadata(
+	_ context.Context,
+) (*iggcon.ClusterMetadata, error) {
+	return &iggcon.ClusterMetadata{Nodes: []iggcon.ClusterNode{{ReplicaID: 0}}}, nil
 }

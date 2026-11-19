@@ -15,7 +15,7 @@ import (
 // feedServer is a change-feed topic: records per partition, pollable by
 // offset or from the end.
 type feedServer struct {
-	iggcon.Client
+	clusterOfOne
 	guard      sync.Mutex
 	partitions uint32
 	// records are what each partition holds, keyed by partition.

@@ -18,7 +18,7 @@ import (
 
 // publishServer records what reached the log.
 type publishServer struct {
-	iggcon.Client
+	clusterOfOne
 	guard    sync.Mutex
 	topics   []string
 	messages [][]iggcon.IggyMessage

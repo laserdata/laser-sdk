@@ -13,7 +13,7 @@ import (
 
 // registryServer answers control commands and registry browses from a script.
 type registryServer struct {
-	iggcon.Client
+	clusterOfOne
 	guard sync.Mutex
 	// outcome answers every browse, and script answers them in turn when it
 	// is set, so a test can watch a status change between reads.

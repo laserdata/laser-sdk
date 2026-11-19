@@ -13,7 +13,7 @@ import (
 )
 
 type forkServer struct {
-	iggcon.Client
+	clusterOfOne
 	outcome  wire.ForkOutcome
 	failure  *wire.ForkError
 	codes    []uint32

@@ -13,7 +13,7 @@ import (
 
 // authzServer answers authorization commands from a script.
 type authzServer struct {
-	iggcon.Client
+	clusterOfOne
 	reply    wire.AuthzReply
 	codes    []uint32
 	requests [][]byte

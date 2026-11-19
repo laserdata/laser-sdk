@@ -14,7 +14,7 @@ import (
 // cursorServer serves a fixed set of partitions, handing back the records at
 // or after the offset each poll asks for.
 type cursorServer struct {
-	iggcon.Client
+	clusterOfOne
 	partitions  uint32
 	byPartition map[uint32][]iggcon.IggyMessage
 	topicAbsent bool

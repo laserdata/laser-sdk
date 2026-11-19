@@ -14,7 +14,7 @@ import (
 // managedClient records what reached the socket and answers with a scripted
 // reply, so a test can state both halves of a managed call.
 type managedClient struct {
-	iggcon.Client
+	clusterOfOne
 	reply    []byte
 	err      error
 	lastCode uint32
@@ -343,7 +343,7 @@ func TestGivenConcurrentManagedCallsWhenRunThenShouldShareTheFrontierSafely(t *t
 // concurrentClient is safe to call from many goroutines, so the race detector
 // reports the handle under test rather than the stand-in.
 type concurrentClient struct {
-	iggcon.Client
+	clusterOfOne
 	reply []byte
 }
 

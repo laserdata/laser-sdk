@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
@@ -853,7 +852,7 @@ func TestGivenTheSigningSchemeWhenInspectedThenShouldBeEd25519(t *testing.T) {
 // keyStore is an in-memory key-value backend, so the managed key registry is
 // exercised against a store that really holds what it wrote.
 type keyStore struct {
-	iggcon.Client
+	clusterOfOne
 	guard   sync.Mutex
 	entries map[string]wire.KvEntry
 	version uint64

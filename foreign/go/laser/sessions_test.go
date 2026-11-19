@@ -12,7 +12,7 @@ import (
 )
 
 type sessionServer struct {
-	iggcon.Client
+	clusterOfOne
 	outcome  wire.SessionOutcome
 	failure  *wire.SessionError
 	codes    []uint32

@@ -17,7 +17,7 @@ import (
 
 // filterServer answers filter and catalog commands from a script.
 type filterServer struct {
-	iggcon.Client
+	clusterOfOne
 	outcome  wire.FilterOutcome
 	catalog  *wire.FilterCatalogOutcome
 	failure  *wire.FilterError
@@ -1271,7 +1271,7 @@ func TestGivenAFilterFailureWhenReportedThenShouldCarryItsReason(t *testing.T) {
 
 // pendingServer answers a mutation as pending, then folds it on the read back.
 type pendingServer struct {
-	iggcon.Client
+	clusterOfOne
 	applied wire.FilterMutationResult
 	never   bool
 	// missing answers the first read back as not found, the way a catalog

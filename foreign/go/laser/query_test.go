@@ -13,7 +13,7 @@ import (
 )
 
 type queryServer struct {
-	iggcon.Client
+	clusterOfOne
 	reply    wire.QueryReply
 	codes    []uint32
 	requests [][]byte

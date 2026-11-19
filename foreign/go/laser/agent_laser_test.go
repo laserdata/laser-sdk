@@ -15,7 +15,7 @@ import (
 
 // topologyServer records the streams and topics a bootstrap created.
 type topologyServer struct {
-	iggcon.Client
+	clusterOfOne
 	guard    sync.Mutex
 	streams  []string
 	topics   []string
@@ -548,7 +548,7 @@ func TestGivenAClosedWatcherWhenReportedToThenShouldDoNothing(t *testing.T) {
 
 // redriveServer holds one record and records what a redrive republished.
 type redriveServer struct {
-	iggcon.Client
+	clusterOfOne
 	guard       sync.Mutex
 	stream      string
 	topic       string
@@ -923,7 +923,7 @@ func TestGivenAConsumerOffsetWhenAskedThenShouldSayHowFarItGot(t *testing.T) {
 
 // offsetServer answers one stored consumer offset.
 type offsetServer struct {
-	iggcon.Client
+	clusterOfOne
 	stored *iggcon.ConsumerOffsetInfo
 }
 

@@ -15,7 +15,7 @@ import (
 
 // heartbeatServer records the heartbeats a lease registry published.
 type heartbeatServer struct {
-	iggcon.Client
+	clusterOfOne
 	mutex sync.Mutex
 	// generation is the stream's creation time, which a test changes to
 	// stand for a stream recreated underneath a lease.

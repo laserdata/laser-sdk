@@ -1107,6 +1107,39 @@ What none of this proves is interoperation. Every byte this port has produced
 was compared against a file or another implementation in the same process.
 None has crossed a socket, because there is no transport yet.
 
+## Cluster routing
+
+Every node of a Laser cluster answers every managed request from shared
+state, so there is no one node a client has to reach. The client keeps to one,
+picked by a random key of its own, which spreads clients over the cluster
+rather than piling them onto whichever node they dialled.
+
+A roster of one is a deployment with one node, and the request goes over the
+band as a plain call rather than naming the only replica there is. That is
+what a single-node Apache Iggy, and every deployment that predates
+clustering, understands.
+
+On a cluster the request names its node. A node whose link drops, or that
+answers but could not reach its own managed backend, is a node to move off:
+the caller walks to the next one, at most once per node, and the move sticks
+so the next request starts where the last one landed. A refusal the server
+reasoned about is returned rather than walked for, because every node would
+give the same answer and walking is only delay. When every node refuses with
+the same backend failure, the last refusal is handed back rather than
+swallowed.
+
+The roster is read once and kept. A replica id the cluster no longer knows
+means the roster is stale, so it is read again, once per request rather than
+once per attempt: a second stale id inside one request says the roster is not
+the problem.
+
+The three replicated authorization writes go to the metadata primary, over
+the band, because it is the only node that submits them and it is the node
+the connection already has.
+
+An attempt deadline ends a walk rather than being spent inside it, so the
+caller's next attempt starts on the next node with a fresh deadline.
+
 ## Dependencies
 
 Two beyond the Apache Iggy client.

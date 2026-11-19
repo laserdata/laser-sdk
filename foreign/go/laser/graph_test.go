@@ -11,7 +11,7 @@ import (
 )
 
 type graphServer struct {
-	iggcon.Client
+	clusterOfOne
 	result   wire.GraphResult
 	failure  *wire.GraphError
 	codes    []uint32

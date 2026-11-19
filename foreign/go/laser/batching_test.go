@@ -14,7 +14,7 @@ import (
 // batchServer records each batch that reached the log and can be told to
 // refuse the next ones.
 type batchServer struct {
-	iggcon.Client
+	clusterOfOne
 	guard   sync.Mutex
 	batches [][]iggcon.IggyMessage
 	topics  []string

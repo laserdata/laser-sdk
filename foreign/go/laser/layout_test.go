@@ -23,7 +23,7 @@ type routedSend struct {
 // routingServer records the topic each send reached, which the shared stream
 // fake does not, because where a record lands is the whole claim here.
 type routingServer struct {
-	iggcon.Client
+	clusterOfOne
 	mutex   sync.Mutex
 	sends   []routedSend
 	created []string

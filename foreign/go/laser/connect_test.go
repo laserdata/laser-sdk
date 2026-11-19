@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
 )
 
@@ -215,7 +214,7 @@ func TestGivenAServerThatAcceptsAndStallsWhenConnectingThenShouldStopAtTheDeadli
 // interface supplies the methods this test never calls, so only the two that
 // matter here need a body.
 type fakeClient struct {
-	iggcon.Client
+	clusterOfOne
 	closes int
 }
 
