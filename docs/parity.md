@@ -214,6 +214,7 @@ Beyond the raw capabilities, the Go client serves these managed and agent surfac
 | Durable intents | laser.NewIntent, Intent.CastVote, laser.Decide and IntentDecision.Authorizes: the record shapes and the pure quorum fold, pinned against the Rust client's own vectors |
 | Session layout | SessionConfig.Layout with the shared, per-agent topic, per-agent partition and single-partition layouts, Laser.DeclaredTopic, and Sessions.Bootstrap and Unregister |
 | Session leases | Laser.LeaseSession and laser.LeaseRegistry: one heartbeat per stream per tick at the shortest held interval, scoped to the stream incarnation the lease was taken on |
+| Stream administration | Laser.Streams, Stream.Get, Exists, Rename and Topics, and Topic.Get, Exists, Update, Partitions, AddPartitions, DeletePartitions, DeleteSegments and ConsumerGroups |
 | Cluster routing | the managed band keeps to one node picked by a random caller key, walks to the next on a failed link or an unreachable backend, rereads a stale roster once, and sends the replicated authorization writes to the metadata primary |
 
 An omitted row that reaches the raw client, or a method that does more than convert a value, names the capabilities a caller reaches through it. The check fails when such a row names none.

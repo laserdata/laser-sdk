@@ -153,6 +153,31 @@ one partition. Omitting the key balances across partitions and promises no
 order between records. An empty key is refused, because it would hash every
 record onto one partition while reading as "no key given".
 
+## Stream and topic administration
+
+`Laser.Streams`, `Stream.Get`, `Stream.Exists`, `Stream.Rename` and
+`Stream.Topics` read and rename the catalogue. `Topic.Get`, `Topic.Exists`,
+`Topic.Update`, `Topic.Partitions`, `Topic.AddPartitions`,
+`Topic.DeletePartitions`, `Topic.DeleteSegments` and `Topic.ConsumerGroups`
+do the same for a topic.
+
+A stream or topic that does not exist reads as absent from `Get` and `Exists`,
+because the caller asked whether it is there and the answer is no. A listing
+is different: the server lists a missing stream exactly the way it lists one
+with no topics, so the listing checks and fails rather than handing back an
+empty slice that means something else.
+
+`UpdateTopicOptions` leaves every field it does not set. An expiry together
+with never-expire, or a size cap together with an unlimited size, is refused
+rather than resolved: the caller asked for two different things and only it
+knows which it meant. A count of zero partitions or segments is refused before
+it is sent, since the server would either do nothing or refuse it and neither
+tells the caller it asked for nothing.
+
+Never-expire and unlimited are not a duration and not a cap, so each reads as
+none rather than as the largest value this build can hold. A caller planning
+around a limit that is not there is worse off than one told there is none.
+
 ## Provenance
 
 `Provenance` is the agentic spine: conversation, causality, routing and usage.
