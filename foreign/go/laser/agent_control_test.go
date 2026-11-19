@@ -35,7 +35,7 @@ func pauseBody(t *testing.T, participants ...string) []byte {
 	for _, name := range participants {
 		request.Participants = append(request.Participants, agentID(t, name))
 	}
-	encoded, err := wire.Marshal(request)
+	encoded, err := wire.MarshalJSON(request)
 	if err != nil {
 		t.Fatalf("encode the pause: %v", err)
 	}

@@ -106,9 +106,13 @@ func ControlRequestOf(
 
 // pauseLists reports whether a pause request names agent among the
 // participants it waits for.
+//
+// The body is JSON, which is what every client writes a pause request as, so
+// a control topic stays readable by an operator holding nothing but a log
+// viewer.
 func pauseLists(body []byte, agent wire.AgentID) bool {
 	var request wire.SessionPauseRequest
-	if err := wire.Unmarshal(body, &request); err != nil {
+	if err := wire.UnmarshalJSON(body, &request); err != nil {
 		return false
 	}
 	for _, participant := range request.Participants {

@@ -713,6 +713,27 @@ a caller reading the topic feeds the book itself. The folding rules are the
 same either way, which is what lets a Go process and a Rust one agree about
 whether a session is paused.
 
+`Sessions.Control` is the write side. An operator names itself with
+`AsOperator`, which is required: a control record nobody signed for is a
+record nobody can be asked about. `SignedBy` signs it, so a verifying reader
+can prove which operator sent it. Only accounts with send permission on
+`agent.control` can use any of this, which is what separates an operator from
+the agents doing the work, since a handler cannot pause its own session by
+writing a record.
+
+`Pause` names the agents whose acknowledgments complete it: the set given to
+`Participants`, or else the agents the session lane shows working on the
+session. A caller that named nobody meant nobody, so an empty set stays empty
+rather than having the lane read behind its back. The lane set is sorted, so
+two operators reading one lane write the same request. Model and tool calls
+are the session talking to something that is not an agent, and the control
+operations are the operator's own, so neither makes anyone a participant.
+
+`Cancel` asks and `ForceCancel` tells. The forced one ends the session as
+canceled without its agents, for a session whose agent is gone: nothing
+acknowledges it, so a session whose agent is in fact alive would find its
+lifecycle ended underneath it.
+
 ## Agent sends, redrives and replays
 
 `SendAgent` appends to an agent topic with a provenance the caller built. It
