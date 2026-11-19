@@ -226,7 +226,9 @@ export class BudgetGate {
     let verdict = this.cached(partition, head, session)
     if (verdict === undefined) {
       try {
-        const info = await sessions.get(ConversationId.parse(session))
+        const info = await sessions.info(ConversationId.parse(session), {
+          walk: { kind: "once" }
+        })
         const breach = breachOfInfo(info)
         verdict = {
           ...(breach !== undefined ? { breach } : {}),

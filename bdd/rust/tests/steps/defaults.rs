@@ -43,7 +43,8 @@ async fn publish_to_default_stream(world: &mut LaserWorld, payload: String, topi
 #[then("the error names the call that sets a default stream")]
 async fn names_default_stream_call(world: &mut LaserWorld) {
     let error = failed(world);
-    assert!(error.contains("with_default_stream"), "{error}");
+    assert!(error.contains("scratch_stream(prefix)"), "{error}");
+    assert!(error.contains("with_default_stream(name)"), "{error}");
 }
 
 async fn publish(world: &mut LaserWorld, payload: &str, topic: &str) {

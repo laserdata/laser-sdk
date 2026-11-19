@@ -3,3 +3,11 @@
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0436"
 reason = "paste is an unmaintained transitive Apache Iggy dependency with no safe upgrade. Remove this exception when Apache Iggy removes paste."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0542"
+reason = "humantime is an unmaintained transitive Apache Iggy dependency with no safe upgrade. Remove this exception when Apache Iggy removes humantime."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+reason = "chrono is an unmaintained transitive Apache Iggy dependency with no safe upgrade. Remove this exception when Apache Iggy removes chrono."

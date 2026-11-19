@@ -53,7 +53,7 @@ export class MemoryTopicBuilder {
     return this
   }
 
-  /** Ensures the topic and returns memory bound to it. */
+  /** Await it for memory bound to the topic, created when missing. */
   async build(options: CallOptions = {}): Promise<MemoryHandle> {
     throwIfAborted(options.signal, "memory topic build")
     const stream = this.streamValue ?? this.laser.defaultStream

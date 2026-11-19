@@ -64,7 +64,7 @@ pub enum LaserError {
     #[error("invalid configuration: {0}")]
     Config(&'static str),
     #[error(
-        "no default stream set: pass a stream, or set a default stream when connecting (stream option) or with with_default_stream"
+        "no default stream set: work in a scratch stream with scratch_stream(prefix), or pick one with with_default_stream(name)"
     )]
     NoStream,
     /// LaserData Cloud answered a query/browse/control op with a typed failure.
@@ -1081,7 +1081,7 @@ mod tests {
     fn given_no_default_stream_when_displayed_then_should_name_the_calls_that_set_one() {
         assert_eq!(
             LaserError::NoStream.to_string(),
-            "no default stream set: pass a stream, or set a default stream when connecting (stream option) or with with_default_stream"
+            "no default stream set: work in a scratch stream with scratch_stream(prefix), or pick one with with_default_stream(name)"
         );
     }
 

@@ -1539,8 +1539,10 @@ pub fn result_code_is_pending(code: &str) -> PyResult<bool> {
     Ok(parse_result_code(code)?.is_pending())
 }
 
-/// Whether this result code name means the node's own managed backend did not answer.
-/// The request may still apply, so only the same operation identity repeats it.
+/// Whether this result code name means the node's own managed backend did not answer,
+/// as a node still replaying its logs after a restart does. The request may still
+/// apply, so a mutation repeats only under the same operation identity and a read
+/// is repeated.
 #[gen_stub_pyfunction]
 #[pyfunction]
 pub fn result_code_is_backend_unavailable(code: &str) -> PyResult<bool> {

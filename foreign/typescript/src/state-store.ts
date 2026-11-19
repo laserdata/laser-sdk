@@ -10,6 +10,8 @@ export interface StateStore {
   delete(key: string): Promise<void>
 }
 
+/** Keeps state in this process only and loses it when the program exits.
+ * `FileStore` keeps it on disk and `laser.kv(namespace)` in the managed store. */
 export class InMemoryStore implements StateStore {
   private readonly entries = new Map<string, Uint8Array>()
 

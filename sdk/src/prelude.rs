@@ -10,14 +10,15 @@ pub use crate::agent::WORKFLOW_FENCE_NAMESPACE;
 #[cfg(feature = "agent")]
 pub use crate::agent::{
     Agent, AgentCtx, AgentHandle, AgentHandler, AgentMessage, Contract, ConversationState,
-    ReliableConsumer, ReplayBound, RoutePolicy, Router, Session, SessionConfig, SessionLease,
-    SessionTurn, Sessions, StepContext, TopicRetention, Workflow,
+    InboxRoute, ReliableConsumer, ReplayBound, RoutePolicy, Router, Session, SessionConfig,
+    SessionLease, SessionTurn, Sessions, StepContext, StepFn, TopicRetention, Workflow,
+    WorkflowBudget, WorkflowOutcome, WorkflowRun,
 };
 pub use crate::capabilities::Capabilities;
 #[cfg(feature = "streaming")]
 pub use crate::connection::{ConnectionEvent, ConnectionEvents};
 #[cfg(feature = "agent")]
-pub use crate::context::Checkpoint;
+pub use crate::context::{Checkpoint, LastN};
 #[cfg(feature = "agent")]
 pub use crate::context_scope::{ContextScope, ScopedMemory};
 #[cfg(feature = "streaming")]
@@ -50,6 +51,8 @@ pub use crate::stream::{
 pub use crate::typed::{TypedDecodeError, TypedRecord, TypedRecords, TypedTopic};
 #[cfg(feature = "watch")]
 pub use crate::watch::{Watch, WatchReader, WatchedChange};
+#[cfg(feature = "agent")]
+pub use laser_wire::agent::SessionStatus;
 #[cfg(feature = "graph")]
 pub use laser_wire::graph::EdgeDir;
 
@@ -76,8 +79,8 @@ pub mod full {
         CapabilitySelector, ChunkAssembler, ConcurrencyPolicy, ContractBuilder, DeadLetterSink,
         Deduplicator, Gather, GatherPolicy, InboxRoute, RegisteredCard, RetryPolicy,
         RouteCandidate, RouteScorer, ScatterOutcome, ScatterReport, SessionPolicy, SlidingWindow,
-        StepFailure, StepFn, StepHandle, StreamEvent, Verifier, WarmDedupPolicy, WorkflowBudget,
-        WorkflowOutcome,
+        StepCall, StepFailure, StepFn, StepHandle, StreamEvent, Verifier, WarmDedupPolicy,
+        WorkflowBudget, WorkflowOutcome,
     };
     #[cfg(feature = "agui")]
     pub use crate::agui::AgUiEvent;

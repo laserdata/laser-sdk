@@ -3,11 +3,18 @@ import { test } from "node:test"
 
 import { Laser } from "../../src/client/laser.js"
 import { OPEN_CAPABILITIES } from "../../src/client/capabilities.js"
-import { isUnsupported, isVersionSkew } from "../../src/client/error-classify.js"
-import { ProtocolError, PublishFailedError, QueryExecutionError } from "../../src/client/errors.js"
+import { isUnavailable, isUnsupported, isVersionSkew } from "../../src/client/error-classify.js"
+import {
+  ProtocolError,
+  PublishFailedError,
+  QueryExecutionError,
+  TimeoutError
+} from "../../src/client/errors.js"
 import { requireManagedCommand } from "../../src/client/managed.js"
 import type { IggyClient, LaserTransport } from "../../src/iggy/apache-iggy.js"
+import { QUERY_REPLY_GRACE_MS } from "../../src/retry.js"
 import { Topic } from "../../src/stream/topic.js"
+import { encodeNamed } from "../../src/wire/cbor.js"
 import { QueryCommand } from "../../src/wire/commands.js"
 import { encodeQueryReplyFrame } from "../../src/wire/query.js"
 
@@ -93,6 +100,40 @@ void test("given_an_unsupported_query_reply_when_fetching_then_should_raise_the_
     assert.equal(isUnsupported(error), true)
     return true
   })
+})
+
+void test("given_a_query_every_node_refuses_when_fetched_then_should_walk_again_until_the_query_deadline", async () => {
+  let attempts = 0
+  const client = oneNodeClient(() => {
+    attempts += 1
+    return encodeNamed(
+      new Map([
+        ["code", "backend_unavailable"],
+        ["message", `refusal ${String(attempts)}`]
+      ])
+    )
+  })
+  await using base = await Laser.fromClient(client)
+  const laser = base.withCapabilities({
+    ...OPEN_CAPABILITIES,
+    query: { ...OPEN_CAPABILITIES.query, available: true }
+  })
+  const deadlineMs = 1_000
+  const started = Date.now()
+
+  await assert.rejects(laser.query("readings").deadline(deadlineMs).fetch(), (error: unknown) => {
+    assert.ok(!(error instanceof TimeoutError), "the last refusal comes back, not the reply wait")
+    assert.equal(isUnavailable(error), true)
+    return true
+  })
+
+  const waited = Date.now() - started
+  assert.ok(attempts > 2, "the roster is walked again before the query deadline")
+  assert.ok(waited >= 300, `the roster is walked again, waited ${String(waited)} ms`)
+  assert.ok(
+    waited < deadlineMs + QUERY_REPLY_GRACE_MS,
+    `the query deadline ends the walk, waited ${String(waited)} ms`
+  )
 })
 
 void test("given_advertised_version_skew_when_using_query_then_should_preserve_the_typed_classifier", () => {

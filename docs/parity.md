@@ -31,6 +31,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | std-trait | The peer spells a Rust standard trait impl (FromStr, Display, From) as a function or static member |
 | serde-dict | Python passes the record as a dict that serde builds from the same Rust type, keyed by its serde field names |
 | signature-type | TypeScript exports the parameter, option, or result shape a public signature names, where Rust passes the values or a generic bound directly |
+| engine-seam | The peer's step and workflow functions call this engine seam themselves, so a program reaches it through them |
 | subclass-handle | Python makes the memory backend a subclass of `MemoryHandle`, so it is usable wherever a handle is, where Rust wraps a separate type in a `MemoryHandle` variant |
 
 ## Capabilities
@@ -723,6 +724,7 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `Laser::cluster` | `Laser.cluster` | `Laser.cluster` |  |
 | `Laser::connect` | `Laser.connect` | `Laser.connect` |  |
 | `Laser::connect_env` | `Laser.connect_env` | `Laser.connectEnv` |  |
+| `Laser::connect_env_with_stream` | `Laser.connect_env(stream=)` | `Laser.connectEnvWithStream` | overload |
 | `Laser::connect_with_stream` | `Laser.connect_with_stream` | `Laser.connectWithStream` |  |
 | `Laser::connection_events` | `Laser.connection_events` | `Laser.connectionEvents` |  |
 | `Laser::consumed` | `Laser.consumed` | `Laser.consumed` |  |
@@ -1274,6 +1276,9 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `StateOutcome::Stale` | omitted | `StateOutcome` | plain-value |
 | `StateOutcome::Duplicate` | omitted | `StateOutcome` | plain-value |
 | `StateOutcome::Unrecognized` | omitted | `StateOutcome` | plain-value |
+| `StepCall` | `fn:step` | `WorkflowRun.step` | engine-seam |
+| `StepCall::Recorded` | `fn:step` | `WorkflowRun.step` | engine-seam |
+| `StepCall::Due` | `fn:step` | `WorkflowRun.step` | engine-seam |
 | `StepContext` | `Workflow.step(build=)` | `StepContext` | callback |
 | `StepContext.outputs` | `Workflow.step(build=)` | `StepContext.outputs` | callback, keywords |
 | `StepFailure` | omitted | `StepFailure` | plain-value |
@@ -1340,6 +1345,8 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `Workflow::inbox_route` | `Laser.workflow(fixed_inbox=)` | `Workflow.inboxRoute` | keywords |
 | `Workflow::run` | `Workflow.run` | `Workflow.run` |  |
 | `Workflow::run_id` | `Workflow.run_id` | `Workflow.runId` |  |
+| `Workflow::run_with` | `fn:workflow` | `Workflow.runWith` | callback |
+| `Workflow::start` | `fn:workflow` | `Workflow.runWith` | engine-seam, one-call |
 | `Workflow::step` | `Workflow.step` | `Workflow.step` | keywords |
 | `Workflow::step_local` | `Workflow.step(run=)` | `Workflow.stepLocal` | keywords |
 | `WorkflowBudget` | `WorkflowBudget` | `WorkflowBudget` |  |
@@ -1352,7 +1359,19 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `WorkflowOutcome.run_id` | `WorkflowOutcome.run_id` | `WorkflowOutcome.runId` | keywords |
 | `WorkflowOutcome.completed_steps` | `WorkflowOutcome.completed_steps` | `WorkflowOutcome.completedSteps` | keywords |
 | `WorkflowOutcome.status` | `WorkflowOutcome.status` | `WorkflowOutcome.status` | keywords |
+| `WorkflowOutcome.value` | `WorkflowOutcome.value` | `WorkflowOutcome.value` | keywords |
+| `WorkflowOutcome::json` | `WorkflowOutcome.json` | `WorkflowOutcome.json` | keywords |
 | `WorkflowOutcome::text` | `WorkflowOutcome.text` | `WorkflowOutcome.text` | keywords |
+| `WorkflowRun` | `WorkflowFunction` | `WorkflowRun` | callback |
+| `WorkflowRun::abandon_step` | `WorkflowFunction` | `WorkflowRun.step` | callback, one-call |
+| `WorkflowRun::begin_step` | `WorkflowFunction` | `WorkflowRun.step` | callback, engine-seam |
+| `WorkflowRun::checkpoint` | `fn:step` | `WorkflowRun.step` | engine-seam, one-call |
+| `WorkflowRun::complete_step` | `WorkflowFunction` | `WorkflowRun.step` | callback, engine-seam |
+| `WorkflowRun::finish` | `WorkflowFunction` | `Workflow.runWith` | callback, engine-seam |
+| `WorkflowRun::refuse_new_steps` | `fn:workflow` | `Workflow.runWith` | engine-seam, one-call |
+| `WorkflowRun::release` | `fn:workflow` | `Workflow.runWith` | engine-seam, one-call |
+| `WorkflowRun::run_id` | `WorkflowOutcome.run_id` | `WorkflowRun.runId` | property |
+| `WorkflowRun::step` | `fn:step` | `WorkflowRun.step` | callback |
 | `agent::checkpoint_from_snapshot` | `fn:checkpoint_from_snapshot` | `fn:checkpointFromSnapshot` |  |
 | `agent::default_redact` | `fn:default_redact` | `fn:defaultRedact` |  |
 | `agent::derive_session_id` | `fn:derive_session_id` | `fn:deriveSessionId` |  |
@@ -3150,6 +3169,14 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `EdgeDir::In` | omitted | `EdgeDir` | plain-value |
 | `EdgeDir::Both` | omitted | `EdgeDir` | plain-value |
 | `EdgeDir::is_out` | `fn:edge_dir_is_out` | `fn:edgeDirIsOut` | free-function |
+| `SessionStatus` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Submitted` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Active` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Paused` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Completed` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Failed` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Canceled` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Unrecognized` | omitted | `SessionStatus` | plain-value |
 
 ## prelude::full
 
@@ -3348,14 +3375,6 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `SchemaFingerprint::BYTES` | `const:SCHEMA_FINGERPRINT_BYTES` | `SchemaFingerprint.BYTES` | free-function |
 | `SchemaFingerprint::as_bytes` | omitted | omitted | plain-value |
 | `SchemaFingerprint::new` | omitted | omitted | plain-value |
-| `SessionStatus` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Submitted` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Active` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Paused` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Completed` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Failed` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Canceled` | omitted | `SessionStatus` | plain-value |
-| `SessionStatus::Unrecognized` | omitted | `SessionStatus` | plain-value |
 | `SourceRef` | dict via `GraphHandle.fetch` | `SourceRef` | serde-dict |
 | `SourceRef::Message` | dict key | `SourceRef` | serde-dict, plain-value |
 | `SourceRef::Kv` | dict key | `SourceRef` | serde-dict, plain-value |
@@ -5063,6 +5082,7 @@ An omitted row that reaches the raw client, or a method that does more than conv
 | `IdError::Empty` | `IdError.EMPTY` | `IdError.empty` |  |
 | `IdError::TooLong` | `IdError.TOO_LONG` | `IdError.tooLong` |  |
 | `IdError::InvalidChar` | `IdError.INVALID_CHAR` | `IdError.invalidChar` |  |
+| `IdError::InvalidConversationId` | `IdError.INVALID_CONVERSATION_ID` | `IdError.invalidConversationId` |  |
 | `IdError::InvalidUlid` | `IdError.INVALID_ULID` | `IdError.invalidUlid` |  |
 | `IdError::InvalidMessageId` | `IdError.INVALID_MESSAGE_ID` | `IdError.invalidMessageId` |  |
 | `IntentId` | omitted | `IntentId` | plain-value |
@@ -5121,7 +5141,11 @@ These Python and TypeScript APIs have no Rust row for a language reason.
 | Python | `Message.header_kinds` | rust-crate |
 | Python | `Producer.init` | lazy-init |
 | Python | `QueryRow.keys` | protocol |
+| Python | `Step` | callback |
 | Python | `TypedRecord.header_kinds` | rust-crate |
+| Python | `WorkflowFunction.bind` | one-call |
+| Python | `WorkflowFunction.resume` | one-call |
+| Python | `WorkflowFunction.run` | one-call |
 | Python | `apply_json_patch()` | native-binding |
 | Python | `decode_context_compaction()` | native-binding |
 | Python | `decode_context_manifest()` | native-binding |
@@ -5164,6 +5188,7 @@ These Python and TypeScript APIs have no Rust row for a language reason.
 | TypeScript | `ConsolidateOptions.signal` | signature-type |
 | TypeScript | `FilterExecutionError.reason` | error-class |
 | TypeScript | `IggyClient` | signature-type |
+| TypeScript | `JsonRoundTrip` | signature-type |
 | TypeScript | `KvStore` | callback |
 | TypeScript | `Laser.withObserver` | telemetry |
 | TypeScript | `LaserBuilder.observer` | telemetry |
@@ -5185,8 +5210,13 @@ These Python and TypeScript APIs have no Rust row for a language reason.
 | TypeScript | `ReliableConsumerControl` | signature-type |
 | TypeScript | `RoutingError` | error-class |
 | TypeScript | `SpanScope` | telemetry |
+| TypeScript | `Step` | callback |
 | TypeScript | `TypedPollResult` | signature-type |
 | TypeScript | `UlidSource` | signature-type |
+| TypeScript | `WorkflowFunction` | callback |
+| TypeScript | `WorkflowOptions` | signature-type |
 | TypeScript | `messageIdToString()` | std-trait |
 | TypeScript | `parseIdempotencyKey()` | std-trait |
 | TypeScript | `parseMessageId()` | std-trait |
+| TypeScript | `step()` | callback |
+| TypeScript | `workflow()` | callback |

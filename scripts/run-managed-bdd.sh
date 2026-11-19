@@ -16,7 +16,7 @@
 # LASER_MANAGED_BACKEND_REPO. Set LASER_MANAGED_IGGY_SERVER or
 # LASER_MANAGED_BACKEND to use a prebuilt binary instead. Any extra runner
 # arguments go after `--`, for example
-#   scripts/run-managed-bdd.sh rust -- --name "Managed sessions"
+#   scripts/run-managed-bdd.sh rust -- --tags "@managed"
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -144,6 +144,7 @@ IGGY_TCP_ADDRESS="$address" \
 IGGY_HTTP_ENABLED=false \
 IGGY_QUIC_ENABLED=false \
 IGGY_WEBSOCKET_ENABLED=false \
+IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL="200 ms" \
 IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT=1s \
 IGGY_PLANE_ENABLED=true \
 IGGY_PLANE_SOCKET_PATH="$socket" \

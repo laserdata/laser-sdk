@@ -1097,7 +1097,10 @@ pub struct RecordSkip {
     pub topic_created_at_micros: u64,
     pub offset: u64,
     /// The operational index or graph the record failed to reach. The
-    /// record's other effects still apply.
+    /// record's other effects still apply. A target can also name a fold of
+    /// the managed backend, written `fold:<surface>` with the surfaces
+    /// `memory`, `session`, `kv`, `fork` and `graph`, which releases one
+    /// record that fold's store refuses.
     pub target: String,
     /// What the destination or the extraction said about the record.
     pub reason: String,

@@ -238,6 +238,17 @@ def test_given_an_invalid_identifier_when_parsed_then_should_raise_the_id_error(
     assert failure.value.filter_reason is None
 
 
+async def test_given_a_malformed_conversation_id_when_parsed_then_should_name_the_call_that_makes_one():  # noqa: E501
+    memory = ls.MemoryHandle.vector(lambda text: [1.0])
+    with pytest.raises(ls.IdError) as failure:
+        await memory.remember("Lives in Gdansk", conversation="conv-1")
+    assert (
+        str(failure.value)
+        == "invalid conversation id `conv-1`: a conversation id is a ULID, make one with new_conversation_id()"  # noqa: E501
+    )
+    assert failure.value.kind == ls.IdError.INVALID_CONVERSATION_ID == "invalid_conversation_id"
+
+
 def stub_exceptions():
     tree = ast.parse(STUB.read_text())
     return {

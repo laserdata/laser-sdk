@@ -599,11 +599,12 @@ export class GroupFilter {
     const native = await abortable(this.group.native(), signal, "group filter get")
     try {
       const binding = await abortable(
-        this.group.filters().binding({
-          stream: this.group.streamName,
-          topic: this.group.topicName,
-          group: native.name
-        }),
+        this.group
+          .filters()
+          .binding(
+            { stream: this.group.streamName, topic: this.group.topicName, group: native.name },
+            { signal }
+          ),
         signal,
         "group filter get"
       )
@@ -627,7 +628,8 @@ export class GroupFilter {
     return abortable(
       this.group.filters().revisions(active.filterId, {
         ...(page !== undefined ? { page } : {}),
-        ...(results !== undefined ? { results } : {})
+        ...(results !== undefined ? { results } : {}),
+        signal: options.signal
       }),
       options.signal,
       "group filter revisions"
@@ -660,7 +662,11 @@ export class GroupFilter {
     throwIfAborted(signal, "group filter summary")
     await abortable(this.group.filters().requireCatalog(), signal, "group filter summary")
     const native = await abortable(this.group.native(), signal, "group filter summary")
-    return abortable(this.group.filters().owned(native.identity), signal, "group filter summary")
+    return abortable(
+      this.group.filters().owned(native.identity, { signal }),
+      signal,
+      "group filter summary"
+    )
   }
 
   /**
@@ -733,7 +739,8 @@ export class GroupFilter {
         .test(
           { kind: "revision", filterId: active.filterId, revision: active.revision },
           payload,
-          headers
+          headers,
+          { signal: options.signal }
         ),
       options.signal,
       "group filter test"

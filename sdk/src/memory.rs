@@ -2130,9 +2130,10 @@ impl<M: Memory + Sync, R: Reranker + Sync> Memory for RerankedMemory<M, R> {
     }
 }
 
-/// A semantic `Memory` backend: embeds payloads on `remember` and ranks `recall`
-/// by cosine similarity to `query.semantic`. The index is in-memory. A durable
-/// vector store is a future drop-in behind the same trait.
+/// Keeps facts in this process only and loses them when the program exits.
+/// The durable memory on the log is `laser.memory(namespace)`. A semantic
+/// `Memory` backend: embeds payloads on `remember` and ranks `recall` by
+/// cosine similarity to `query.semantic`.
 pub struct VectorMemory<E> {
     embedder: E,
     items: Mutex<Vec<VectorEntry>>,
@@ -2928,10 +2929,15 @@ impl MemoryHandle {
 }
 
 impl Laser {
-    /// Agent memory in `namespace`: remember facts, recall the relevant ones,
+    /// Agent memory in `namespace` on the stream's `agent.memory` topic,
+    /// returned at once: remember facts, correct one with
+    /// [`supersede`](MemoryHandle::supersede), recall the relevant ones,
     /// improve their ranking with feedback, and forget what is stale. One model -
-    /// every write publishes to the memory topic (the durable, replayable audit)
-    /// that a deployment materializes into the versioned key-value read view.
+    /// every write publishes to the memory topic (the durable, replayable audit),
+    /// creating it on the first write, and a deployment materializes it into
+    /// the versioned key-value read view. Default recall reads that view where
+    /// the deployment serves one and folds the topic in process elsewhere, so
+    /// the same program runs on plain Apache Iggy.
     /// `namespace` prefixes the named-item altitude's keys
     /// ([`set`](MemoryHandle::set) / [`fetch`](MemoryHandle::fetch)), which ride
     /// the same topic as every other write. For an isolated, per-topic memory stream use
@@ -2943,8 +2949,9 @@ impl Laser {
         self.memory_with(namespace, MemoryBackend::Auto)
     }
 
-    /// Agent memory in a caller-named topic, so a deployment can keep several
-    /// isolated memory streams. The same verbs as [`memory`](Self::memory).
+    /// Agent memory in an existing caller-named topic, returned at once, so a
+    /// deployment can keep several isolated memory streams. The same verbs as
+    /// [`memory`](Self::memory).
     /// `stream` names the stream the topic lives on, `None` keeps the client's
     /// default stream. Ensure the topic up front like any other, for example
     /// `laser.topic(name).ensure(partitions)`.
@@ -2960,8 +2967,12 @@ impl Laser {
         )?))
     }
 
-    /// Configure a memory topic before use: pick its name, partition count, and
-    /// message-expiry, then `build` to ensure it and get the handle. Records for
+    /// A [`MemoryTopicBuilder`] for memory on `topic`, not the handle: chain
+    /// `stream`, `partitions`, `ttl` or `no_expiry`, then await
+    /// [`build`](MemoryTopicBuilder::build), which creates the topic when
+    /// missing and returns the handle. The message expiry defaults to thirty
+    /// days. [`memory`](Self::memory) needs no build and creates the default
+    /// topic on its first write. Records for
     /// one scope always share a partition key (the conversation), so a
     /// multi-partition topic keeps each scope's history in order while spreading
     /// scopes across partitions.
@@ -3103,8 +3114,10 @@ impl MemoryHandle {
         }
     }
 
-    /// Start a fluent remember. Chain `.scope`/`.agent`/`.durable`/`.dedup` and
-    /// finish with `.send().await`.
+    /// Start a fluent remember. Chain `.scope`/`.user`/`.agent`/`.durable`/`.dedup`
+    /// and finish with `.send().await`, which returns the new item's id, the id
+    /// [`supersede`](Self::supersede) and [`forget`](Self::forget) take. A
+    /// conversation id is a ULID, `ConversationId::new()` makes one.
     pub fn remember(&self, payload: impl Into<Vec<u8>>) -> RememberBuilder<'_> {
         RememberBuilder {
             handle: self,
@@ -3119,7 +3132,7 @@ impl MemoryHandle {
     /// every conversation, so no later recall returns the old fact. Takes the
     /// same scope setters as [`remember`](Self::remember) for the new fact and
     /// returns its id. A failure in between leaves both facts, so no fact is
-    /// lost.
+    /// lost. A conversation id is a ULID, `ConversationId::new()` makes one.
     pub fn supersede(&self, old_id: MemoryId, payload: impl Into<Vec<u8>>) -> SupersedeBuilder<'_> {
         SupersedeBuilder {
             remember: self.remember(payload),
@@ -3152,8 +3165,16 @@ impl MemoryHandle {
     }
 
     /// Start a fluent recall in `conversation`, or across every conversation
-    /// of the namespace with `None`. Chain `.semantic`/`.limit` and finish with
-    /// `.fetch().await` (or await the builder itself).
+    /// of the namespace with `None`. Chain `.user`/`.semantic`/`.limit` and
+    /// finish with `.fetch().await` (or await the builder itself), which
+    /// returns up to `limit` (50) [`MemoryItem`]s, newest first, without the
+    /// forgotten and superseded ones. [`MemoryItem::text`] reads one as text.
+    /// On the log backend `.semantic(query)` ranks every item by the words it
+    /// shares with the query, newest first among equals, and drops none. A
+    /// recall reads the managed view where the deployment serves one, waiting
+    /// for this connection's own writes, and folds the topic in process
+    /// elsewhere. A conversation id is a ULID, `ConversationId::new()` makes
+    /// one.
     pub fn recall(&self, conversation: impl Into<Option<ConversationId>>) -> RecallBuilder<'_> {
         RecallBuilder {
             handle: self,
@@ -3221,7 +3242,10 @@ impl MemoryHandle {
         Memory::improve(self, scope, feedback).await
     }
 
-    /// Forget the item `id` under `scope`.
+    /// Forget the item `id` under `scope`: in `scope`'s conversation when it
+    /// names one, in every conversation otherwise. Remembering it again later
+    /// brings it back. To correct a fact use [`supersede`](Self::supersede),
+    /// which also stores the new one.
     pub async fn forget(&self, scope: &MemoryScope, id: MemoryId) -> Result<(), LaserError> {
         Memory::forget(self, scope, id).await
     }

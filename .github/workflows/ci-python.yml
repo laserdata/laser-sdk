@@ -181,6 +181,9 @@ jobs:
       - name: Run the cross-SDK BDD conformance suite
         if: needs.flags.outputs.server_tests == 'run'
         run: uv run pytest -q ../../bdd/python
+      - name: Read from a recovering catalog
+        if: needs.flags.outputs.server_tests == 'run'
+        run: python3 ../../scripts/run-with-recovering-catalog.py uv run --no-sync pytest -q ../../bdd/python
 
   # abi3 wheels: one wheel per platform covers Python 3.10+. Each leg then
   # installs its wheel into a clean interpreter on the oldest supported Python

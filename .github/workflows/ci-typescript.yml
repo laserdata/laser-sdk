@@ -120,6 +120,11 @@ jobs:
           python3 -m unittest scripts/test_check_parity.py
           python3 scripts/check-parity.py
       - run: npm run verify
+      - name: Managed test fixtures
+        working-directory: .
+        run: |
+          python3 -m unittest scripts/test_managed_bdd_fixture.py
+          node --test bdd/session-lane-readiness.test.mjs
       - run: npm audit --omit=dev --audit-level=high
 
   unit-node:
@@ -217,6 +222,15 @@ jobs:
         working-directory: bdd/typescript
       - run: node ../../scripts/run-with-test-iggy.mjs npx cucumber-js --config cucumber.js --format progress --format json:reports/cucumber.json
         working-directory: bdd/typescript
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Read from a recovering catalog
+        working-directory: bdd/typescript
+        run: python3 ../../scripts/run-with-recovering-catalog.py npx cucumber-js --config cucumber.js --format progress
       - uses: actions/upload-artifact@v7
         if: always()
         with:

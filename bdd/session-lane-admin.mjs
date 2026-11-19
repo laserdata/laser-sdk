@@ -1,9 +1,6 @@
-import {
-  Laser,
-  TopicRetention,
-  isUnavailable,
-} from "../foreign/typescript/dist/index.js";
+import { Laser, TopicRetention } from "../foreign/typescript/dist/index.js";
 import { INTERNAL_TRANSPORT } from "../foreign/typescript/dist/client/internals.js";
+import { waitForPartitions } from "./session-lane-readiness.mjs";
 
 const [endpoint, stream, change, countText, username] = process.argv.slice(2);
 const count = Number(countText);
@@ -131,20 +128,7 @@ try {
         ? laser
         : await Laser.connectWithStream(endpoint, stream);
     try {
-      const topics = await reader.client.topic.list({ streamId: stream });
-      const deadline = performance.now() + 5000;
-      for (const topic of topics) {
-        while (true) {
-          try {
-            await reader.topic(topic.name).tailOffsets();
-            break;
-          } catch (error) {
-            if (!isUnavailable(error) || performance.now() >= deadline)
-              throw error;
-            await new Promise((resolve) => setTimeout(resolve, 100));
-          }
-        }
-      }
+      await waitForPartitions(reader, stream);
     } finally {
       if (reader !== laser) await reader.close();
     }

@@ -1,6 +1,6 @@
 use crate::errors::InvalidError;
 use pyo3::BoundObject;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use pyo3_async_runtimes::TaskLocals;
@@ -62,6 +62,72 @@ impl<T: PyStubType> PyStubType for Awaitable<'_, T> {
             import,
             type_refs,
         }
+    }
+}
+
+/// The handle a factory's awaitable resolves to, named by the error a use
+/// before `await` raises.
+#[derive(Clone, Copy)]
+pub struct HandleCall {
+    /// The call as a program writes it, such as `Laser.connect_env()`.
+    pub call: &'static str,
+    /// The name the awaited handle binds to, such as `laser`.
+    pub handle: &'static str,
+    /// Whether the handle opens an `async with` block.
+    pub enters: bool,
+}
+
+/// The awaitable a handle factory returns. Using it as the handle raises an
+/// error that names the missing `await`.
+#[pyclass(name = "Awaitable", module = "laser_sdk", frozen)]
+struct PendingHandle {
+    future: Py<PyAny>,
+    factory: HandleCall,
+}
+
+#[pymethods]
+impl PendingHandle {
+    fn __await__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.future.bind(py).call_method0("__await__")
+    }
+
+    fn __getattr__(&self, name: &str) -> PyResult<Py<PyAny>> {
+        let HandleCall { call, handle, .. } = self.factory;
+        Err(PyAttributeError::new_err(format!(
+            "{call} returns an awaitable, so it has no attribute `{name}`. Await it first: `{handle} = await {call}`"
+        )))
+    }
+
+    fn __aenter__(&self) -> PyResult<()> {
+        let HandleCall {
+            call,
+            handle,
+            enters,
+        } = self.factory;
+        Err(PyTypeError::new_err(if enters {
+            format!(
+                "{call} returns an awaitable, so `async with` needs it awaited first: `async with await {call} as {handle}:`"
+            )
+        } else {
+            format!(
+                "{call} returns an awaitable, not an `async with` block. Await it first: `{handle} = await {call}`"
+            )
+        }))
+    }
+
+    // `async with` looks both methods up before it calls `__aenter__`, which refuses.
+    fn __aexit__(
+        &self,
+        _exception_type: Py<PyAny>,
+        _exception: Py<PyAny>,
+        _traceback: Py<PyAny>,
+    ) -> bool {
+        false
+    }
+
+    fn __repr__(&self) -> String {
+        let HandleCall { call, handle, .. } = self.factory;
+        format!("<awaitable {call}, await it: {handle} = await {call}>")
     }
 }
 
@@ -683,6 +749,32 @@ where
     )
     .map(|future| Awaitable {
         future,
+        resolves_to: PhantomData,
+    })
+}
+
+/// [`awaitable`] for a factory whose value the caller uses as a handle, so a
+/// use before `await` names the `await` it is missing.
+pub fn handle_awaitable<'py, F, T>(
+    py: Python<'py>,
+    factory: HandleCall,
+    future: F,
+) -> PyResult<Awaitable<'py, T>>
+where
+    F: Future<Output = PyResult<T>> + Send + 'static,
+    T: for<'a> IntoPyObject<'a> + Send + 'static,
+    for<'a> <T as IntoPyObject<'a>>::Error: Into<PyErr>,
+{
+    let pending = awaitable(py, future)?;
+    let handle = Bound::new(
+        py,
+        PendingHandle {
+            future: pending.future.unbind(),
+            factory,
+        },
+    )?;
+    Ok(Awaitable {
+        future: handle.into_any(),
         resolves_to: PhantomData,
     })
 }

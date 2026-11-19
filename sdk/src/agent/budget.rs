@@ -1,6 +1,7 @@
 use crate::agent::session::LaneLifecycle;
 use crate::agent::{Session, Sessions};
 use crate::error::LaserError;
+use crate::nodes::Walk;
 use crate::types::ConversationId;
 use laser_wire::agent::{
     AgentEnvelope, AgentErrorBody, AgentErrorCode, Budget, SessionEnd, SessionStatus, TaskState,
@@ -31,7 +32,12 @@ impl Session {
     // How this session passed its budget, `None` while it is within it.
     pub(crate) async fn budget_breach(&self) -> Result<Option<BudgetBreach>, LaserError> {
         if self.laser.capabilities().await.sessions {
-            match self.status().await {
+            match self
+                .laser
+                .sessions()
+                .info(self.conversation(), Walk::Once)
+                .await
+            {
                 Ok(info) => return Ok(BudgetBreach::of_info(&info)),
                 Err(error) if index_unusable(&error) => {}
                 Err(error) => return Err(error),
@@ -215,7 +221,7 @@ impl BudgetGate {
         let verdict = match self.cached(partition, head, session) {
             Some(verdict) => verdict,
             None => {
-                let verdict = match sessions.get(session).await {
+                let verdict = match sessions.info(session, Walk::Once).await {
                     Ok(info) => Verdict {
                         breach: BudgetBreach::of_info(&info),
                         ended: matches!(

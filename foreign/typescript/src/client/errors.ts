@@ -68,7 +68,7 @@ export const STREAM_OR_TOPIC_NOT_FOUND_CODES: ReadonlySet<number> = new Set([
 ])
 
 const NO_STREAM_HINT =
-  "pass a stream, or set a default stream when connecting (stream option) or with withDefaultStream"
+  "work in a scratch stream with scratchStream(prefix), or pick one with withDefaultStream(name)"
 /** The next call after a send to a stream or topic that does not exist.
  * @internal */
 export const MISSING_TOPIC_HINT =
@@ -77,7 +77,9 @@ const NO_INBOX_HINT =
   'start the agent with capabilities so it advertises its inbox, or give the workflow a fixed inbox topic (inboxRoute({ kind: "fixed", topic }))'
 
 /** A convenience call needed a default stream and none was set. `fact` says
- * which call. A configuration mistake, never retryable. */
+ * which call. Work in a scratch stream with `scratchStream(prefix)`, or pick
+ * one with `withDefaultStream(name)` or `Laser.connectEnvWithStream(name)`. A
+ * configuration mistake, never retryable. */
 export class NoStreamError extends ConfigError {
   override readonly kind: LaserErrorKind = "no-stream"
 
@@ -145,7 +147,7 @@ export class InvalidError extends LaserError {
 
 /** Why parsing or validating an id failed: a conversation, agent, group, or
  * message id. Each static constructor is one Rust `IdError` variant with the
- * same message. */
+ * same message, naming this client's calls. */
 export class IdError extends InvalidError {
   override readonly kind: LaserErrorKind = "id"
 
@@ -163,6 +165,12 @@ export class IdError extends InvalidError {
 
   static invalidChar(char: string): IdError {
     return new IdError(`identifier contains invalid character \`${char}\``)
+  }
+
+  static invalidConversationId(text: string): IdError {
+    return new IdError(
+      `invalid conversation id \`${text}\`: a conversation id is a ULID, make one with ConversationId.new()`
+    )
   }
 
   static invalidUlid(text: string): IdError {

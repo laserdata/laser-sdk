@@ -745,6 +745,8 @@ match outcome {
 
 ### A workflow: dependency-ordered steps, panels, and exclusivity
 
+A workflow of steps that run in this process is a plain function that calls its steps: Rust `laser.workflow(name).run_with(body)` with `run.step(label, step_body)`, Python `@ls.step` and `@ls.workflow`, TypeScript `step(name, fn)` and `workflow(name, fn)`. A step takes and returns what JSON holds, and a resumed run returns the recorded values without running those steps again. The builder below is for steps routed to agents, verifier panels, compensation, budgets, and exclusive steps.
+
 The workflow engine runs steps in dependency order and passes results between them. A routed step sends its task to an agent. `step_local(label, run)` (Python `step(label, run=..)`, TypeScript `stepLocal(label, run)`) runs the step's body in this process instead, journaled and resumable like a routed step, and the two mix in one workflow. A run that finds its stream or its topics missing creates them, so a workflow of local steps needs no `bootstrap` and no agent. An `all_capable` step sends work to every matching agent. Budgets limit work, and the journal supports recovery. `.exclusive()` acquires a lease in `WORKFLOW_FENCE_NAMESPACE` for stale-holder rejection.
 
 For protected external state, use `.exclusive_in(namespace)`. In the handler, use `kv(target_namespace).cas_fenced(key, namespace, run_id, token)` with the recorded token and run ID. This binds the effect to the same live lease and fence counter. Renewal starts halfway through the granted lifetime and remains bounded by lease expiry and the workflow deadline.

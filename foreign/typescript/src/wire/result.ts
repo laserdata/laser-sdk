@@ -143,8 +143,9 @@ export function resultCodeIsPending(value: ResultCode): boolean {
 
 /**
  * Whether the streaming server could not reach its own managed backend, or
- * the backend did not answer in time. The request may still apply, so a
- * mutation is repeated under the same operation identity, possibly on another
+ * the backend did not answer in time, as a node still replaying its logs after
+ * a restart does. The request may still apply, so a mutation is repeated under
+ * the same operation identity and a read is repeated, possibly on another
  * node, as in Rust `is_backend_unavailable`.
  */
 export function resultCodeIsBackendUnavailable(value: ResultCode): boolean {

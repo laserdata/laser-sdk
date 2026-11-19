@@ -16,8 +16,8 @@ pub struct PyStateStore {
     inner: Store,
 }
 
-/// An in-memory `StateStore` over a process-local map. Fast and
-/// self-contained, lost on restart.
+/// Keeps state in this process only and loses it when the program exits.
+/// `FileStore` keeps it on disk and `laser.kv(namespace)` in the managed store.
 #[gen_stub_pyclass]
 #[pyclass(name = "InMemoryStore", extends = PyStateStore, frozen)]
 pub struct PyInMemoryStore;

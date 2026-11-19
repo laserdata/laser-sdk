@@ -4,95 +4,227 @@ Laser SDK provides streaming, queries, key-value state, forks, graphs, agent mem
 
 ## Two complete programs
 
-Each program below runs as written. It reads the connection string from `LASER_CONNECTION_STRING` with `connect_env` (`connectEnv` in TypeScript), creates a scratch stream with a unique name, and deletes the stream when it ends. A LaserData API key is not a connection string. Copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it.
+Each program below runs as written and reads the connection string from `LASER_CONNECTION_STRING`. The workflow runs on the stream named by `LASER_STREAM`, or on a stream named after the workflow. It creates that stream when it is missing and keeps it after the run, so the run can be resumed. The memory program works in a scratch stream with a unique name and deletes the stream when it ends, so a second run prints the same. With `LASER_CONNECTION_STRING` set, a program needs no Docker and no local server. Then there is no server to start. A LaserData API key is not a connection string. Only without the variable, copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it.
 
-- TypeScript: `npm init -y && npm pkg set type=module && npm install @laserdata/laser-sdk tsx`, Node 22.14 or later. The programs use top-level `await`, so the project must be an ES module. Save a program as `main.ts` and run it with `npx tsx main.ts`.
-- Rust: `cargo add laser-sdk --features agent,kv`, `cargo add tokio --features macros,rt-multi-thread`, `cargo add serde --features derive`, and `cargo add serde_json`.
-- Python: `pip install laser-sdk`, Python 3.10 or later.
+- TypeScript: `npm install @laserdata/laser-sdk tsx`, Node 22.14 or later. Save a program as `main.mts` and run it with `npx tsx main.mts`.
+- Rust: `cargo add laser-sdk`, `cargo add tokio --features macros,rt-multi-thread,time`, `cargo add serde_json`, and `cargo add serde --features derive` for the memory program.
+- Python: `python -m pip install laser-sdk`, Python 3.10 or later. `python -c "import laser_sdk; print(laser_sdk.__doc__)"` then prints the package's own summary of the calls below.
 
-To keep what a program writes, use a named stream instead of the scratch stream: set `LASER_STREAM` for `connect_env`, or call `with_default_stream(name)` (`withDefaultStream` in TypeScript). A workflow run and the first memory write create a missing stream.
+To keep what the memory program writes, use a named stream instead of the scratch stream: set `LASER_STREAM`, pass it when connecting (`Laser.connect_env(stream=name)` in Python, `Laser.connectEnvWithStream(name)` in TypeScript, `Laser::connect_env_with_stream(name)` in Rust), or call `with_default_stream(name)` (`withDefaultStream` in TypeScript). A workflow run and the first memory write create a missing stream. The guides are at [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk) and on [Context7](https://context7.com/laserdata/laser-sdk).
 
 ### A three-step workflow
 
-The steps run in this process. Each step gets the outputs of the steps before it, and each completion is journaled, so a run resumed by its id keeps the steps it finished. The run creates its own topics, so the program needs no `bootstrap`, agent, or handler. Steps addressed to agents mix with these in one workflow.
+A workflow is a function, and each step is a function it calls in ordinary code: `@ls.step` and `@ls.workflow` in Python, `step` and `workflow` in TypeScript, `run_with` and `run.step` in Rust. The steps run in this process, and `analyze` waits one second before it returns. A step takes and returns what JSON holds. Each completed step is journaled, so a resumed run returns the recorded value without running that step again, and it must call the same steps in the same order. A step name holding `#` is refused, because the journal numbers repeated calls with it. The run creates its own stream and topics, so the program needs no `bootstrap`, agent, or handler. For steps routed to agents, verifiers, compensation and budgets, use the builder, `Laser.workflow(name).step(...)`, with `step_local` in Rust and `stepLocal` in TypeScript for its in-process steps.
 
 TypeScript
 
 ```ts
-import { Laser } from "@laserdata/laser-sdk"
+// npm install @laserdata/laser-sdk tsx
+// Run with: npx tsx main.mts
+// Needs only LASER_CONNECTION_STRING. No server to start when it is set.
+import { setTimeout as sleep } from "node:timers/promises"
+import { step, workflow } from "@laserdata/laser-sdk"
 
-await using laser = await Laser.connectEnv()
-await using scratch = await laser.scratchStream("workflow-demo")
-const outcome = await scratch.laser
-  .workflow("job-runner")
-  .stepLocal("create", () => "job-42")
-  .stepLocal(
-    "process",
-    ({ outputs }) => `processed ${new TextDecoder().decode(outputs.get("create"))}`
-  )
-  .after("create")
-  .stepLocal("finish", () => "completed")
-  .after("process")
-  .run()
-const report = {
-  run_id: outcome.runId.toString(),
-  status: outcome.status,
-  completed_steps: outcome.completedSteps,
-  outputs: Object.fromEntries(outcome.completedSteps.map((label) => [label, outcome.text(label)]))
-}
-console.log(JSON.stringify(report, null, 2))
+const ingest = step("ingest", () => "frames from sat-7")
+const analyze = step("analyze", async (frames: string) => {
+  await sleep(1000)
+  return `analyzed ${frames}`
+})
+const report = step("report", (analysis: string) => `report on ${analysis}`)
+
+const pipeline = workflow("pipeline", async () => report(await analyze(await ingest())))
+
+const run = await pipeline.run()
+console.log(JSON.stringify({ status: run.status, steps: run.completedSteps, report: run.value }))
 ```
 
 Rust
 
 ```rust,no_run
-use laser_sdk::agent::StepContext;
+// cargo add laser-sdk
+// cargo add tokio --features macros,rt-multi-thread,time
+// cargo add serde_json
+// Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
 use laser_sdk::prelude::*;
-use laser_sdk::wire::agent::SessionStatus;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), LaserError> {
+    let laser = Laser::connect_env().await?;
+    let run = laser
+        .workflow("pipeline")
+        .run_with(async |run| {
+            let frames: String = run
+                .step("ingest", async || Ok("frames from sat-7".to_owned()))
+                .await?;
+            let analysis: String = run
+                .step("analyze", async || {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Ok(format!("analyzed {frames}"))
+                })
+                .await?;
+            run.step("report", async || Ok(format!("report on {analysis}")))
+                .await
+        })
+        .await?;
+    let report = serde_json::json!({
+        "status": run.status,
+        "steps": run.completed_steps,
+        "report": run.json::<String>("report")?,
+    });
+    println!("{report}");
+    laser.close().await
+}
+```
+
+Python
+
+```python
+# python -m pip install laser-sdk
+# Needs only LASER_CONNECTION_STRING. No server to start when it is set.
+import json
+import time
+
+import laser_sdk as ls
+
+
+@ls.step
+def ingest():
+    return "frames from sat-7"
+
+
+@ls.step
+def analyze(frames):
+    time.sleep(1)
+    return f"analyzed {frames}"
+
+
+@ls.step
+def report(analysis):
+    return f"report on {analysis}"
+
+
+@ls.workflow
+def pipeline():
+    return report(analyze(ingest()))
+
+
+run = pipeline.run()
+print(json.dumps({"status": run.status, "steps": run.completed_steps, "report": run.value}))
+```
+
+Each program prints the run as JSON with `status` `completed`, `steps` `["ingest", "analyze", "report"]`, and `report` `report on analyzed frames from sat-7`. Rust's `serde_json::json!` sorts the keys. The `WorkflowOutcome` also carries `run_id`, `value` (what the workflow returned, as JSON bytes in Rust), `outputs`, each step's output by label as bytes, `json(label)`, and `text(label)`. Resume a stopped run with `pipeline.resume(run_id)` in Python, `pipeline.resume(runId)` in TypeScript, and `laser.workflow(name).run_id(id).run_with(...)` in Rust. A step that fails ends the run as failed and its error reaches the caller unchanged, with no outcome to read the run ID from, so a caller that wants to resume a failed run names the run ID first with `resume(id)` (`run_id(id)` in Rust). The completed steps stay journaled, so that resume runs the failed step and what follows it.
+
+### A memory correction
+
+A first conversation stores three facts about the user `user-42`. A later conversation corrects the city with `supersede`, which remembers the new fact first and then forgets the old one in every conversation. A recall for the user reads every conversation and returns a list of `MemoryItem`, ranked by the words each fact shares with the query, newest first among equals, and drops none. It waits for the writes this connection made, so the correction shows at once. On LaserData Cloud and Laser Stack recall reads the managed memory view. Apache Iggy serves no view, so there recall folds the memory topic in process, and the same program runs on every server.
+
+TypeScript
+
+```ts
+// npm install @laserdata/laser-sdk tsx
+// Run with: npx tsx main.mts
+// Needs only LASER_CONNECTION_STRING, which connectEnv() reads. No server to start when it is set.
+import { ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
+
+const user = "user-42"
+const query = "Where does the user live, and what should I know before booking dinner?"
+
+await using root = await Laser.connectEnv()
+await using scratch = await root.scratchStream("memory")
+const memory = scratch.laser.memory("assistant")
+
+// Conversation 1: the user shares three facts.
+const first = ConversationId.new()
+const city = await memory.remember("Lives in Gdansk").scope(first).user(user).send()
+await memory.remember("Allergic to peanuts").scope(first).user(user).send()
+await memory.remember("Prefers a window seat").scope(first).user(user).send()
+
+// Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+const second = ConversationId.new()
+await memory.supersede(city, "Lives in Lisbon").scope(second).user(user).send()
+
+// Recall for the user across every conversation.
+const facts = await memory.recall().user(user).semantic(query).limit(10).fetch()
+console.log(JSON.stringify({ user, query, facts: facts.map(memoryItemText) }, null, 2))
+```
+
+Rust
+
+```rust,no_run
+// cargo add laser-sdk
+// cargo add tokio --features macros,rt-multi-thread
+// cargo add serde --features derive
+// cargo add serde_json
+// Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
+use laser_sdk::prelude::*;
 use serde::Serialize;
-use std::collections::BTreeMap;
+
+const USER: &str = "user-42";
+const QUERY: &str = "Where does the user live, and what should I know before booking dinner?";
 
 #[derive(Serialize)]
-struct Report {
-    run_id: ConversationId,
-    status: SessionStatus,
-    completed_steps: Vec<String>,
-    outputs: BTreeMap<String, String>,
+struct Recall {
+    user: &'static str,
+    query: &'static str,
+    facts: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let laser = Laser::connect_env().await?;
-    let scratch = laser.scratch_stream("workflow-demo").await?;
-    let report = run(scratch.laser()).await;
+    let root = Laser::connect_env().await?;
+    let scratch = root.scratch_stream("memory").await?;
+    let result = correct_and_recall(scratch.laser()).await;
     scratch.delete().await?;
-    println!("{}", serde_json::to_string_pretty(&report?)?);
+    println!("{}", serde_json::to_string_pretty(&result?)?);
     Ok(())
 }
 
-async fn run(laser: &Laser) -> Result<Report, LaserError> {
-    let outcome = laser
-        .workflow("job-runner")
-        .step_local("create", |_: &StepContext<'_>| b"job-42".to_vec())
-        .step_local("process", |context: &StepContext<'_>| {
-            let job = context.outputs.get("create").cloned().unwrap_or_default();
-            [b"processed ".to_vec(), job].concat()
-        })
-        .after("create")
-        .step_local("finish", |_: &StepContext<'_>| b"completed".to_vec())
-        .after("process")
-        .run()
+async fn correct_and_recall(laser: &Laser) -> Result<Recall, LaserError> {
+    let memory = laser.memory("assistant");
+
+    // Conversation 1: the user shares three facts.
+    let first = ConversationId::new();
+    let city = memory
+        .remember("Lives in Gdansk")
+        .scope(first)
+        .user(USER)
+        .send()
         .await?;
-    let outputs = outcome
-        .completed_steps
-        .iter()
-        .map(|label| (label.clone(), outcome.text(label).unwrap_or_default()))
-        .collect();
-    Ok(Report {
-        run_id: outcome.run_id,
-        status: outcome.status,
-        completed_steps: outcome.completed_steps,
-        outputs,
+    memory
+        .remember("Allergic to peanuts")
+        .scope(first)
+        .user(USER)
+        .send()
+        .await?;
+    memory
+        .remember("Prefers a window seat")
+        .scope(first)
+        .user(USER)
+        .send()
+        .await?;
+
+    // Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+    let second = ConversationId::new();
+    memory
+        .supersede(city, "Lives in Lisbon")
+        .scope(second)
+        .user(USER)
+        .send()
+        .await?;
+
+    // Recall for the user across every conversation.
+    let facts = memory
+        .recall(None)
+        .user(USER)
+        .semantic(QUERY)
+        .limit(10)
+        .fetch()
+        .await?;
+    Ok(Recall {
+        user: USER,
+        query: QUERY,
+        facts: facts.iter().map(MemoryItem::text).collect(),
     })
 }
 ```
@@ -100,137 +232,46 @@ async fn run(laser: &Laser) -> Result<Report, LaserError> {
 Python
 
 ```python
+# python -m pip install laser-sdk
+# Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
 import asyncio
 import json
 
-from laser_sdk import Laser
+import laser_sdk as ls
+
+USER = "user-42"
+QUERY = "Where does the user live, and what should I know before booking dinner?"
 
 
-async def main() -> None:
-    async with await Laser.connect_env() as laser:
-        async with laser.scratch_stream("workflow-demo") as scratch:
-            outcome = await (
-                scratch.laser.workflow("job-runner")
-                .step("create", run=lambda outputs: "job-42")
-                .step(
-                    "process",
-                    run=lambda outputs: "processed " + outputs["create"].decode(),
-                    after=["create"],
-                )
-                .step("finish", run=lambda outputs: "completed", after=["process"])
-                .run()
-            )
-    report = {
-        "run_id": outcome.run_id,
-        "status": outcome.status,
-        "completed_steps": outcome.completed_steps,
-        "outputs": {label: outcome.text(label) for label in outcome.completed_steps},
-    }
-    print(json.dumps(report, indent=2))
-
-
-asyncio.run(main())
-```
-
-Each prints the run id, `"status": "completed"`, `"completed_steps": ["create", "process", "finish"]`, and the three outputs. A failed step raises `StepFailed` (`StepFailedError` in Python and TypeScript) naming the step, the reason, its target, and its deadline, once the compensations of the finished steps have run.
-
-### A memory correction
-
-The first conversation stores two facts about the user `sam`. A later conversation corrects the city with `supersede`, which remembers the new fact first and then forgets the old one in every conversation. A recall for the user reads every conversation, ranks the facts by the words they share with the query, and drops none. It waits for the writes this connection made, so the correction shows at once. On LaserData Cloud and Laser Stack recall reads the managed memory view. Apache Iggy serves no view, so there recall folds the memory topic in process, and the same program runs on every server.
-
-TypeScript
-
-```ts
-import { ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
-
-await using laser = await Laser.connectEnv()
-await using scratch = await laser.scratchStream("memory-demo")
-const memory = scratch.laser.memory("assistant")
-const first = ConversationId.new()
-const home = await memory.remember("Sam lives in Berlin").scope(first).user("sam").send()
-await memory.remember("Sam is allergic to peanuts").scope(first).user("sam").send()
-await memory
-  .supersede(home, "Sam lives in Amsterdam")
-  .scope(ConversationId.new())
-  .user("sam")
-  .send()
-const facts = await memory.recall().user("sam").semantic("where does Sam live").fetch()
-console.log(JSON.stringify(facts.map(memoryItemText), null, 2))
-```
-
-Rust
-
-```rust,no_run
-use laser_sdk::prelude::*;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let laser = Laser::connect_env().await?;
-    let scratch = laser.scratch_stream("memory-demo").await?;
-    let facts = run(scratch.laser()).await;
-    scratch.delete().await?;
-    println!("{}", serde_json::to_string_pretty(&facts?)?);
-    Ok(())
-}
-
-async fn run(laser: &Laser) -> Result<Vec<String>, LaserError> {
-    let memory = laser.memory("assistant");
-    let first = ConversationId::new();
-    let home = memory
-        .remember("Sam lives in Berlin")
-        .scope(first)
-        .user("sam")
-        .send()
-        .await?;
-    memory
-        .remember("Sam is allergic to peanuts")
-        .scope(first)
-        .user("sam")
-        .send()
-        .await?;
-    memory
-        .supersede(home, "Sam lives in Amsterdam")
-        .scope(ConversationId::new())
-        .user("sam")
-        .send()
-        .await?;
-    let facts = memory
-        .recall(None)
-        .user("sam")
-        .semantic("where does Sam live")
-        .fetch()
-        .await?;
-    Ok(facts.iter().map(MemoryItem::text).collect())
-}
-```
-
-Python
-
-```python
-import asyncio
-import json
-
-from laser_sdk import Laser, new_conversation_id
-
-
-async def main() -> None:
-    async with await Laser.connect_env() as laser:
-        async with laser.scratch_stream("memory-demo") as scratch:
+async def main():
+    async with await ls.Laser.connect_env() as root:
+        async with root.scratch_stream("memory") as scratch:
             memory = scratch.laser.memory("assistant")
-            first = new_conversation_id()
-            home = await memory.remember("Sam lives in Berlin", user="sam", conversation=first)
-            await memory.remember("Sam is allergic to peanuts", user="sam", conversation=first)
-            await memory.supersede(
-                home, "Sam lives in Amsterdam", user="sam", conversation=new_conversation_id()
+
+            # Conversation 1: the user shares three facts.
+            first = ls.new_conversation_id()
+            city = await memory.remember("Lives in Gdansk", conversation=first, user=USER)
+            await memory.remember("Allergic to peanuts", conversation=first, user=USER)
+            await memory.remember("Prefers a window seat", conversation=first, user=USER)
+
+            # Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+            second = ls.new_conversation_id()
+            await memory.supersede(city, "Lives in Lisbon", conversation=second, user=USER)
+
+            # Recall for the user across every conversation.
+            facts = await memory.recall(user=USER, semantic=QUERY, limit=10)
+            print(
+                json.dumps(
+                    {"user": USER, "query": QUERY, "facts": [fact.text() for fact in facts]},
+                    indent=2,
+                )
             )
-            facts = await memory.recall(user="sam", semantic="where does Sam live")
-    print(json.dumps([item.text() for item in facts], indent=2))
 
 
 asyncio.run(main())
 ```
 
-Each prints `["Sam lives in Amsterdam", "Sam is allergic to peanuts"]`. Berlin is gone. The same programs live in [`examples/`](examples/README.md) as `workflow` and `memory-correction` (`workflow.py` and `memory_correction.py` in Python), where each runs when copied alone.
+It prints `{"user": "user-42", "query": "Where does the user live, and what should I know before booking dinner?", "facts": ["Lives in Lisbon", "Prefers a window seat", "Allergic to peanuts"]}`. Gdansk is gone. On a Python client `memory(...)`, `workflow(...)`, the builder's `step(...)` and `sessions(...)` return at once, and `scratch_stream(prefix)` is entered with `async with`. `Laser.connect_env()`, `memory_topic(...)` and every call that reads or writes (`remember`, `supersede`, `recall`, `forget`, the builder's `run()`, `bootstrap`) return an awaitable. The same programs live in [`examples/`](examples/README.md) as `workflow` and `memory-correction` (`workflow.py` and `memory_correction.py` in Python), where each runs when copied alone.
 
 ## More about the SDK
 
@@ -259,12 +300,12 @@ export LASER_CONNECTION_STRING='<connection string>'
 LASER_CONNECTION_STRING='<connection string>' cargo run --example log
 ```
 
-The examples below publish one record and read it back. Like the programs above, they read `LASER_CONNECTION_STRING`, work in a scratch stream, and delete it at the end. The default TCP port is `:8090`, so a connection string can omit it. Laser SDK uses the transport that Iggy provides.
+The examples below publish one record and read it back. Like the memory program above, they read `LASER_CONNECTION_STRING`, work in a scratch stream, and delete it at the end. The default TCP port is `:8090`, so a connection string can omit it. Laser SDK uses the transport that Iggy provides.
 
 TypeScript ([npm](https://www.npmjs.com/package/@laserdata/laser-sdk))
 
 ```sh
-npm init -y && npm pkg set type=module && npm install @laserdata/laser-sdk tsx
+npm install @laserdata/laser-sdk tsx
 ```
 
 ```ts
@@ -308,7 +349,7 @@ async fn main() -> Result<(), LaserError> {
 Python ([PyPI](https://pypi.org/project/laser-sdk/))
 
 ```sh
-pip install laser-sdk
+python -m pip install laser-sdk
 ```
 
 ```python
@@ -331,7 +372,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The examples use open streaming. Add `managed` for projections, queries, KV, forks, and graphs on Laser Stack or LaserData Cloud. Add `agent` for handlers, memory, contracts, and workflows.
+The examples use open streaming. Add `managed` for projections, queries, KV, forks, and graphs on Laser Stack or LaserData Cloud. Handlers, memory, contracts, and workflows are in the default Rust build.
 
 Streaming sends return Apache Iggy commit confirmations. A confirmation identifies the stream, topic, partition, and first offset in a batch. The list can be empty when the server does not report offsets. Completion follows the topic durability policy. Use the stream, topic, and partition together with the offset.
 
@@ -529,7 +570,7 @@ Agent fabric (opt in with the `agent` feature):
 | Agentic memory | One durable model: `remember` / `recall` / `improve` / `forget` / `supersede` publish to the memory topic (`agent.memory` by default, created on the first write) that materializes to a versioned key-value read view. A default recall waits until the view reflects the writes the same connection made, for at most 10 seconds. On a server without the view, such as Apache Iggy alone, a default recall folds the topic in process. It recalls by recency, ranked first by the summed feedback for every strategy except recent. A semantic or hybrid query ranks by the share of query words each item holds plus its feedback and drops nothing, while keyword keeps only the items that share a word. `supersede(old_id, fact)` remembers the new fact and then forgets the old one in every conversation. A forget is a timed tombstone, so an older write stays forgotten whichever partition it rides. The topic is configurable (`memory_topic(name).stream(..).partitions(n).ttl(d)`). The in-process vector backend and rerank seam add embedding similarity ranking. Consolidation, token-budgeted `to_context_block`, and content-addressed dedup compose above both. Vector memory created from a `Laser` inherits its action governor even though the index itself stays local. A scan over the read view narrows to one conversation with `conversation(id)`, the same lens the query and graph reads carry. |
 | Discovery | Agents advertise a capability card and a live inbox, fused into one cached registry with health-aware resolution and reversible operator `quarantine` / `unquarantine`. One connection may advertise one agent. Sensitive routes can require the presence's server-authenticated principal. |
 | Coordination | `contract` (a directed task with a deadline and a real consumed / completed / timed-out answer), `fan_out` / `scatter` (ask every capable agent, gather under a policy), and `approval_gate` (pause for a named approver and get a grant a governed re-send carries). With signing enabled, terminals fail closed on unsigned or wrongly signed replies and expose the verified principal. |
-| Workflow engine | `laser.workflow(..).step(..)` and `.step_local(..)`: dependency-ordered steps routed to agents or run in process, a run that creates its own topics, an outcome with the status and the completed steps in order, budgets, verifier panels, saga compensation, **crash-recovery replay from a journal**, and per-step fenced leases. Use `.exclusive_in(namespace)` when the handler commits an external effect with `kv(target_namespace).cas_fenced(key, namespace, ..)`. The engine races bounded renewal against completion, keeps the lease through verification and completion journaling, then releases it before `OnTimeout::Reassign` gives a fresh holder a new fence. |
+| Workflow engine | Plain functions as steps with `step` and `workflow` (`run_with` in Rust), and the builder `laser.workflow(..).step(..)` and `.step_local(..)`: dependency-ordered steps routed to agents or run in process, a run that creates its own topics, an outcome with the status and the completed steps in order, budgets, verifier panels, saga compensation, **crash-recovery replay from a journal**, and per-step fenced leases. Use `.exclusive_in(namespace)` when the handler commits an external effect with `kv(target_namespace).cas_fenced(key, namespace, ..)`. The engine races bounded renewal against completion, keeps the lease through verification and completion journaling, then releases it before `OnTimeout::Reassign` gives a fresh holder a new fence. |
 | Sessions | `laser.sessions()`: one conversation with a recorded lifecycle on `agent.sessions`. Start, end, fail, or cancel it, record model and tool calls with the context they received, keep a JSON state document, hand work to an agent with a budget that agents and workflows enforce, and stop it through the operator-only `agent.control` topic. Workflows run as root sessions with a child session per step. A registered stream gets a managed session index that `laser.sessions()` reads with `list`, `get`, `events`, `state`, `links`, `sources`, `changes`, and `watch`, and the log stays the truth. |
 | AGDX envelope | A typed, versioned, fixture-pinned agent message format on the log, with producer verbs, resumable token streams, and deterministic reassembly. ([notes](docs/agdx.md)) |
 | Action governance | A pre-effect policy hook (`ActionGovernor`) over everything an agent publishes: allow, observe, block, step-up, modify, or defer each send, every record of a typed or raw topic publish, batch, producer send, or session append, AGDX verb, and memory write **before it runs**. Enforce or shadow mode records every non-allow decision as digest-chained evidence, one chain per governed handle and conversation. `QuorumGovernor` runs named governors concurrently under `All` / `Any` / `AtLeast(n)`, each bounded by a voter timeout. Every mandatory voter must affirm, invalid configurations and mandatory errors block, and conflicting body replacements block. `SwappableGovernor` changes the active policy without reconnecting. Defense in depth above server-owned RBAC. |
@@ -632,10 +673,10 @@ just ci      # the full gate (lint, tests, integration, python-docs, vocabulary,
 
 Feature profiles select Laser capabilities:
 
-- Default: typed streaming and provenance.
-- `--no-default-features --features streaming`: streaming only.
-- `--features agent`: agent runtime and coordination.
+- Default: the agent runtime with workflows, memory and sessions, key-value state, typed streaming, and provenance.
 - `--features managed`: every managed surface.
+
+A program that only streams trims the build with `default-features = false, features = ["streaming"]`.
 
 Every profile uses VSR.
 

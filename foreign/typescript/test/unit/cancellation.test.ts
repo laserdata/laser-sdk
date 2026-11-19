@@ -49,6 +49,8 @@ const SEAMS = new Set([
 ])
 // Teardown takes no signal: a cancelled teardown would leak the handle.
 const TEARDOWN = new Set(["close", "shutdown", "[Symbol.asyncDispose]", "LeaseGuard.release"])
+// These forward the caller's own arguments, so a trailing signal would become one of them.
+const FORWARDED = new Set(["WorkflowFunction.run", "WorkflowFunction.resume"])
 const SIGNAL = "signal?: AbortSignal"
 const POSITIONAL_SIGNAL = /(?:\(|, )signal\?: AbortSignal/
 const METHOD =
@@ -152,7 +154,7 @@ function awaitingCallsWithoutSignal(report: string): readonly string[] {
       const end = member.lastIndexOf("): Promise<")
       if (end < 0) continue
       const label = declaration.kind === "function" ? name : `${declaration.name}.${name}`
-      if (TEARDOWN.has(name) || TEARDOWN.has(label)) continue
+      if (TEARDOWN.has(name) || TEARDOWN.has(label) || FORWARDED.has(label)) continue
       const parameters = member.slice(member.indexOf("("), end)
       if (POSITIONAL_SIGNAL.test(parameters)) missing.push(`${label} (positional signal)`)
       else if (!seam && !takesSignal(parameters)) missing.push(label)

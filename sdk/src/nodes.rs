@@ -1,5 +1,6 @@
 use crate::error::{driver_wrote, is_transient_iggy_io_error};
 use crate::iggy::prelude::{ClusterClient, Identifier, IggyClient, IggyError};
+use crate::retry::{MANAGED_DEADLINE, MANAGED_RETRY};
 use bytes::Bytes;
 use iggy_binary_protocol::codes::GET_PARTITION_ROUTE_CODE;
 use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
@@ -9,14 +10,19 @@ use iggy_common::wire_conversions::identifier_to_wire;
 use iggy_common::with_binary_deadline;
 use laser_wire::codes::{
     AGDX_AUTHZ_BIND_ROLES_CODE, AGDX_AUTHZ_DEFINE_ROLE_CODE, AGDX_AUTHZ_DELETE_ROLE_CODE,
+    AGDX_FILTER_OPERATION_CODE, AGDX_GET_FILTER_BINDING_CODE, AGDX_GET_FILTER_CODE,
+    AGDX_LIST_FILTER_BINDINGS_CODE, AGDX_LIST_FILTER_REVISIONS_CODE, AGDX_LIST_FILTERS_CODE,
 };
+use laser_wire::filter::{FilterError, FilterErrorReason};
 use laser_wire::framing::decode_named;
 use laser_wire::mutation::{AppliedFrontier, ManagedReplyEnvelope};
 use laser_wire::result::CommandError;
+use serde::Deserialize;
 use std::future::Future;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
 
 /// The node a managed request goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -40,6 +46,22 @@ impl Target {
             _ => Self::Caller,
         }
     }
+}
+
+/// How a request to the caller's node answers a roster whose every node
+/// refused it for want of its managed backend or with a lost link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Walk {
+    /// Walk the roster once and return the last refusal, for a caller that
+    /// answers a refusal itself.
+    Once,
+    /// Wait on the managed backoff and walk the roster again until the
+    /// request is served or [`MANAGED_DEADLINE`] passes, then return the last
+    /// refusal.
+    UntilServed,
+    /// [`UntilServed`](Self::UntilServed) with this deadline, the call's own.
+    #[cfg_attr(not(feature = "query"), allow(dead_code))]
+    Until(Instant),
 }
 
 /// Picks the node of every managed request. Every node answers every managed
@@ -97,9 +119,10 @@ impl Nodes {
     }
 
     /// Send `code` to `target`. A request to the caller's node moves on to the
-    /// next node after a failed link, at most once per node, and reads the
-    /// roster again once when a replica id is no longer in it. A request to a
-    /// named replica is sent there only.
+    /// next node after a failed link, at most once per node, reads the roster
+    /// again once when a replica id is no longer in it, and returns the last
+    /// refusal when every node refused it. A request to a named replica is
+    /// sent there only.
     pub(crate) async fn send(
         &self,
         client: &IggyClient,
@@ -107,7 +130,22 @@ impl Nodes {
         payload: Bytes,
         target: Target,
     ) -> Result<Answered, IggyError> {
-        self.send_until(client, code, payload, target, None).await
+        self.send_until(client, code, payload, target, None, Walk::Once)
+            .await
+    }
+
+    /// [`send`](Self::send) for a managed read, which walks the roster again
+    /// as `walk` allows while every node refuses it.
+    pub(crate) async fn read(
+        &self,
+        client: &IggyClient,
+        code: u32,
+        payload: Bytes,
+        target: Target,
+        walk: Walk,
+    ) -> Result<Answered, IggyError> {
+        self.send_until(client, code, payload, target, None, walk)
+            .await
     }
 
     /// [`send`](Self::send) for a request the server may hold, bounded by
@@ -122,7 +160,7 @@ impl Nodes {
     ) -> Result<Answered, IggyError> {
         with_binary_deadline(
             deadline.into(),
-            self.send_until(client, code, payload, target, Some(deadline)),
+            self.send_until(client, code, payload, target, Some(deadline), Walk::Once),
         )
         .await
     }
@@ -134,6 +172,7 @@ impl Nodes {
         payload: Bytes,
         target: Target,
         deadline: Option<Instant>,
+        walk: Walk,
     ) -> Result<Answered, IggyError> {
         match target {
             Target::MetadataPrimary => Ok(Answered::open(
@@ -151,21 +190,13 @@ impl Nodes {
                 send_to_replica(client, code, payload, replica, deadline).await?,
                 Some(replica),
             )),
-            Target::Caller => self.send_to_caller(client, code, payload, deadline).await,
+            Target::Caller => {
+                self.walk_caller_until(client, code, deadline, walk, |replica| {
+                    send_to_replica(client, code, payload.clone(), replica, deadline)
+                })
+                .await
+            }
         }
-    }
-
-    async fn send_to_caller(
-        &self,
-        client: &IggyClient,
-        code: u32,
-        payload: Bytes,
-        deadline: Option<Instant>,
-    ) -> Result<Answered, IggyError> {
-        self.walk_caller(client, deadline, &AtomicBool::new(false), |replica| {
-            send_to_replica(client, code, payload.clone(), replica, deadline)
-        })
-        .await
     }
 
     /// A request to the caller's node that marks `written` once an attempt
@@ -179,15 +210,59 @@ impl Nodes {
         payload: Bytes,
         written: &AtomicBool,
     ) -> Result<Answered, IggyError> {
-        self.walk_caller(client, None, written, |replica| {
+        self.walk_caller(client, code, None, written, |replica| {
             send_to_replica(client, code, payload.clone(), replica, None)
         })
         .await
     }
 
+    // Walk the roster as `walk` allows, each walk after the first behind the
+    // next jittered step of the managed backoff. A wait that would end past
+    // the deadline returns the last refusal instead.
+    async fn walk_caller_until<Attempt, Sent>(
+        &self,
+        client: &IggyClient,
+        code: u32,
+        deadline: Option<Instant>,
+        walk: Walk,
+        mut attempt: Attempt,
+    ) -> Result<Answered, IggyError>
+    where
+        Attempt: FnMut(u8) -> Sent,
+        Sent: Future<Output = Result<Bytes, IggyError>>,
+    {
+        let until = match walk {
+            Walk::Once => None,
+            Walk::UntilServed => Some(Instant::now() + MANAGED_DEADLINE),
+            Walk::Until(until) => Some(until),
+        };
+        let mut walks = 0;
+        loop {
+            let walked = self
+                .walk_caller(
+                    client,
+                    code,
+                    deadline,
+                    &AtomicBool::new(false),
+                    &mut attempt,
+                )
+                .await;
+            walks += 1;
+            let wait = MANAGED_RETRY.delay(walks);
+            if !walks_again(code, &walked, until, wait, Instant::now()) {
+                return walked;
+            }
+            sleep(wait).await;
+            if until.is_some_and(|until| Instant::now() >= until) {
+                return walked;
+            }
+        }
+    }
+
     async fn walk_caller<Attempt, Sent>(
         &self,
         client: &IggyClient,
+        code: u32,
         deadline: Option<Instant>,
         written: &AtomicBool,
         mut attempt: Attempt,
@@ -207,9 +282,7 @@ impl Nodes {
             match sent {
                 Ok(reply) => {
                     let answered = Answered::open(reply, Some(replica));
-                    if reply_error(&answered.reply)
-                        .is_some_and(|error| error.code.is_backend_unavailable())
-                    {
+                    if backend_refused(code, &answered.reply) {
                         self.failed(replica);
                         failed_links += 1;
                         if walks_on(failed_links, nodes, deadline, Instant::now()) {
@@ -274,6 +347,14 @@ impl Nodes {
     }
 }
 
+// The error arm of a filter catalog reply, decoded without the outcome a
+// served reply carries.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CatalogRefusal {
+    Err(FilterError),
+}
+
 /// The replica id of the primary of one partition, as any bound replica
 /// answers it from its applied metadata.
 pub(crate) async fn partition_primary(
@@ -331,11 +412,55 @@ fn reply_error(reply: &[u8]) -> Option<CommandError> {
     decode_named::<CommandError>(reply).ok()
 }
 
+/// Whether a node refused `code` for want of its managed backend:
+/// `BackendUnavailable`, or for a filter catalog read `catalog_unavailable`,
+/// the form the streaming server gives that refusal there.
+fn backend_refused(code: u32, reply: &[u8]) -> bool {
+    reply_error(reply).is_some_and(|error| error.code.is_backend_unavailable())
+        || (is_filter_catalog_read(code)
+            && matches!(
+                decode_named::<CatalogRefusal>(reply),
+                Ok(CatalogRefusal::Err(FilterError {
+                    reason: FilterErrorReason::CatalogUnavailable,
+                    ..
+                }))
+            ))
+}
+
+const fn is_filter_catalog_read(code: u32) -> bool {
+    matches!(
+        code,
+        AGDX_GET_FILTER_CODE
+            | AGDX_LIST_FILTERS_CODE
+            | AGDX_LIST_FILTER_REVISIONS_CODE
+            | AGDX_GET_FILTER_BINDING_CODE
+            | AGDX_LIST_FILTER_BINDINGS_CODE
+            | AGDX_FILTER_OPERATION_CODE
+    )
+}
+
 /// Whether a caller request whose link failed on `failed_links` nodes moves to
 /// the next one. An expired attempt deadline ends the walk, so the next attempt
 /// starts on the next node with a fresh deadline.
 fn walks_on(failed_links: usize, nodes: usize, deadline: Option<Instant>, now: Instant) -> bool {
     failed_links < nodes && deadline.is_none_or(|deadline| now < deadline)
+}
+
+/// Whether a read of `code` whose walk ended `walked` walks the roster again
+/// after `wait`: every node refused it for want of its managed backend or with
+/// a lost link, and the wait ends before `until`. `None` walks once.
+fn walks_again(
+    code: u32,
+    walked: &Result<Answered, IggyError>,
+    until: Option<Instant>,
+    wait: Duration,
+    now: Instant,
+) -> bool {
+    let refused = match walked {
+        Ok(answered) => backend_refused(code, &answered.reply),
+        Err(error) => is_transient_iggy_io_error(error),
+    };
+    refused && until.is_some_and(|until| now + wait < until)
 }
 
 fn pick(roster: &[u8], caller_key: u64, moved: u64) -> Option<u8> {
@@ -349,12 +474,15 @@ fn pick(roster: &[u8], caller_key: u64, moved: u64) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::poll;
     use iggy_common::locking::IggyRwLockFn;
-    use laser_wire::codes::AGDX_KV_SET_CODE;
+    use laser_wire::codes::{
+        AGDX_FILTER_MUTATE_CODE, AGDX_FILTERED_POLL_CODE, AGDX_KV_GET_CODE, AGDX_KV_SET_CODE,
+    };
+    use laser_wire::filter::FilterCatalogReply;
     use laser_wire::framing::encode_named;
     use laser_wire::mutation::AppliedFrontier;
     use laser_wire::result::ResultCode;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn given_a_blocked_roster_read_when_a_managed_attempt_expires_then_should_end_at_its_deadline()
@@ -393,7 +521,7 @@ mod tests {
         ];
 
         let outcome = nodes
-            .walk_caller(&client, None, &written, |_replica| {
+            .walk_caller(&client, AGDX_KV_SET_CODE, None, &written, |_replica| {
                 std::future::ready(attempts.pop().expect("an attempt per node"))
             })
             .await;
@@ -414,7 +542,7 @@ mod tests {
         let written = AtomicBool::new(false);
 
         let outcome = nodes
-            .walk_caller(&client, None, &written, |_replica| {
+            .walk_caller(&client, AGDX_KV_SET_CODE, None, &written, |_replica| {
                 std::future::ready(Err(IggyError::ClientShutdown))
             })
             .await;
@@ -458,6 +586,298 @@ mod tests {
         assert!(
             !walks_on(1, 3, Some(now), now),
             "an expired attempt leaves the next node to the next attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_one_node_that_refuses_then_serves_when_reading_then_should_return_the_served_reply()
+     {
+        let client = IggyClient::default();
+        let nodes = Nodes::new(0);
+        nodes.lock().roster = vec![0];
+        let served = Bytes::from_static(b"served");
+        let mut replies = vec![Ok(served.clone()), Ok(refusal("replaying its logs"))];
+
+        let answered = nodes
+            .walk_caller_until(
+                &client,
+                AGDX_KV_GET_CODE,
+                None,
+                Walk::Until(Instant::now() + Duration::from_secs(5)),
+                |_replica| std::future::ready(replies.pop().expect("an attempt per reply")),
+            )
+            .await
+            .expect("the read is served");
+
+        assert_eq!(answered.reply, served);
+        assert!(replies.is_empty(), "the refused node is asked again");
+    }
+
+    #[tokio::test]
+    async fn given_every_node_refusing_past_the_deadline_when_reading_then_should_return_the_last_refusal()
+     {
+        let client = IggyClient::default();
+        let nodes = Nodes::new(0);
+        nodes.lock().roster = vec![0, 1];
+        let started = Instant::now();
+        let mut attempts = 0;
+
+        let answered = nodes
+            .walk_caller_until(
+                &client,
+                AGDX_KV_GET_CODE,
+                None,
+                Walk::Until(started + Duration::from_millis(300)),
+                |_replica| {
+                    attempts += 1;
+                    std::future::ready(Ok(refusal(&format!("refusal {attempts}"))))
+                },
+            )
+            .await
+            .expect("a refusal is a reply");
+
+        let error = reply_error(&answered.reply).expect("a command error");
+        assert!(error.code.is_backend_unavailable());
+        assert!(
+            attempts > 2,
+            "the roster is walked again before the deadline"
+        );
+        assert_eq!(
+            error.message,
+            format!("refusal {attempts}"),
+            "the last refusal is returned"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the deadline ends the wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_every_node_losing_its_link_when_reading_then_should_walk_again_until_served() {
+        let client = IggyClient::default();
+        let nodes = Nodes::new(0);
+        nodes.lock().roster = vec![0, 1];
+        let served = Bytes::from_static(b"served");
+        let mut replies = vec![
+            Ok(served.clone()),
+            Err(IggyError::TransientNotAccepted),
+            Err(IggyError::TransientNotAccepted),
+        ];
+
+        let answered = nodes
+            .walk_caller_until(
+                &client,
+                AGDX_KV_GET_CODE,
+                None,
+                Walk::Until(Instant::now() + Duration::from_secs(5)),
+                |_replica| std::future::ready(replies.pop().expect("an attempt per reply")),
+            )
+            .await
+            .expect("the read is served");
+
+        assert_eq!(answered.reply, served);
+    }
+
+    #[tokio::test]
+    async fn given_a_filter_catalog_read_every_node_refuses_as_catalog_unavailable_when_reading_then_should_walk_again_until_served()
+     {
+        let client = IggyClient::default();
+        let nodes = Nodes::new(0);
+        nodes.lock().roster = vec![0, 1];
+        let served = Bytes::from_static(b"served");
+        let mut replies = vec![
+            Ok(served.clone()),
+            Ok(catalog_refusal()),
+            Ok(catalog_refusal()),
+        ];
+
+        let answered = nodes
+            .walk_caller_until(
+                &client,
+                AGDX_GET_FILTER_BINDING_CODE,
+                None,
+                Walk::Until(Instant::now() + Duration::from_secs(5)),
+                |_replica| std::future::ready(replies.pop().expect("an attempt per reply")),
+            )
+            .await
+            .expect("the read is served");
+
+        assert_eq!(answered.reply, served);
+        assert!(replies.is_empty(), "both nodes are asked, then asked again");
+    }
+
+    #[tokio::test]
+    async fn given_catalog_unavailable_for_a_mutation_or_another_surface_when_walked_then_should_return_it_after_one_attempt()
+     {
+        for code in [AGDX_FILTER_MUTATE_CODE, AGDX_FILTERED_POLL_CODE] {
+            let client = IggyClient::default();
+            let nodes = Nodes::new(0);
+            nodes.lock().roster = vec![0, 1, 2];
+            let mut attempts = 0;
+
+            let answered = nodes
+                .walk_caller_until(
+                    &client,
+                    code,
+                    None,
+                    Walk::Until(Instant::now() + Duration::from_secs(5)),
+                    |_replica| {
+                        attempts += 1;
+                        std::future::ready(Ok(catalog_refusal()))
+                    },
+                )
+                .await
+                .expect("a refusal is a reply");
+
+            assert_eq!(answered.reply, catalog_refusal());
+            assert_eq!(attempts, 1, "command {code} is not moved or repeated");
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_mutation_attempt_when_every_node_refuses_then_should_walk_once() {
+        let client = IggyClient::default();
+        let nodes = Nodes::new(0);
+        nodes.lock().roster = vec![0, 1, 2];
+        let mut attempts = 0;
+
+        let answered = nodes
+            .walk_caller_until(
+                &client,
+                AGDX_KV_SET_CODE,
+                Some(Instant::now() + Duration::from_secs(5)),
+                Walk::Once,
+                |_replica| {
+                    attempts += 1;
+                    std::future::ready(Ok(refusal("down")))
+                },
+            )
+            .await
+            .expect("a refusal is a reply");
+
+        assert!(
+            reply_error(&answered.reply).is_some_and(|error| error.code.is_backend_unavailable())
+        );
+        assert_eq!(
+            attempts, 3,
+            "one attempt per node, the mutation loop repeats"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_read_without_its_own_deadline_when_its_node_refuses_once_then_should_walk_again_until_served()
+     {
+        let client = IggyClient::default();
+        let nodes = Nodes::new(0);
+        nodes.lock().roster = vec![0];
+        let served = Bytes::from_static(b"served");
+        let mut replies = vec![Ok(served.clone()), Ok(refusal("replaying its logs"))];
+
+        let answered = nodes
+            .walk_caller_until(
+                &client,
+                AGDX_KV_GET_CODE,
+                None,
+                Walk::UntilServed,
+                |_replica| std::future::ready(replies.pop().expect("an attempt per reply")),
+            )
+            .await
+            .expect("the read is served");
+
+        assert_eq!(answered.reply, served);
+    }
+
+    #[tokio::test]
+    async fn given_every_node_refusing_when_reading_then_should_back_off_longer_before_each_walk() {
+        let client = IggyClient::default();
+        let nodes = Nodes::new(0);
+        nodes.lock().roster = vec![0];
+        let mut attempts = 0;
+
+        nodes
+            .walk_caller_until(
+                &client,
+                AGDX_KV_GET_CODE,
+                None,
+                Walk::Until(Instant::now() + Duration::from_secs(2)),
+                |_replica| {
+                    attempts += 1;
+                    std::future::ready(Ok(refusal("down")))
+                },
+            )
+            .await
+            .expect("a refusal is a reply");
+
+        // Waits of at least 50, 100, 200, 400 and 800 ms leave room for six walks in two seconds.
+        assert!(attempts <= 6, "{attempts} walks in two seconds");
+    }
+
+    #[tokio::test]
+    async fn given_a_retry_timer_that_wakes_after_the_read_deadline_when_resumed_then_should_return_the_last_refusal()
+     {
+        let client = IggyClient::default();
+        let nodes = Nodes::new(0);
+        nodes.lock().roster = vec![0];
+        let refused = refusal("replaying its logs");
+        let mut replies = vec![Bytes::from_static(b"served"), refused.clone()];
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut reading = Box::pin(nodes.walk_caller_until(
+            &client,
+            AGDX_KV_GET_CODE,
+            None,
+            Walk::Until(deadline),
+            |_| std::future::ready(Ok(replies.pop().expect("one reply per attempt"))),
+        ));
+
+        assert!(poll!(&mut reading).is_pending());
+        tokio::time::sleep_until(deadline.into()).await;
+        let answer = reading.await.expect("the refusal is returned");
+
+        assert_eq!(answer.reply, refused);
+        assert_eq!(replies.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn given_a_read_waiting_out_refusals_when_its_future_is_dropped_then_should_stop_at_once()
+    {
+        let client = IggyClient::default();
+        let nodes = Nodes::new(0);
+        nodes.lock().roster = vec![0];
+        let mut attempts = 0;
+        let mut reading = Box::pin(nodes.walk_caller_until(
+            &client,
+            AGDX_KV_GET_CODE,
+            None,
+            Walk::Until(Instant::now() + Duration::from_secs(5)),
+            |_| {
+                attempts += 1;
+                std::future::ready(Ok(refusal("replaying its logs")))
+            },
+        ));
+
+        assert!(poll!(&mut reading).is_pending());
+        drop(reading);
+        sleep(Duration::from_millis(250)).await;
+
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn given_a_wait_that_would_end_at_the_read_deadline_when_deciding_then_should_not_walk_again() {
+        let now = Instant::now();
+        let wait = Duration::from_millis(100);
+        let refused: Result<Answered, IggyError> = Ok(Answered::open(refusal("down"), Some(0)));
+
+        assert_eq!(
+            [now + wait + Duration::from_millis(1), now + wait].map(|until| walks_again(
+                AGDX_KV_GET_CODE,
+                &refused,
+                Some(until),
+                wait,
+                now
+            )),
+            [true, false]
         );
     }
 
@@ -533,5 +953,24 @@ mod tests {
             Target::of_code(laser_wire::codes::AGDX_KV_GET_CODE),
             Target::Caller
         );
+    }
+
+    fn refusal(message: &str) -> Bytes {
+        Bytes::from(
+            encode_named(&CommandError::new(ResultCode::BackendUnavailable, message))
+                .expect("encoded"),
+        )
+    }
+
+    // The refusal the streaming server gives a filter catalog read when it
+    // cannot reach its managed backend.
+    fn catalog_refusal() -> Bytes {
+        Bytes::from(
+            encode_named(&FilterCatalogReply::Err(FilterError::new(
+                FilterErrorReason::CatalogUnavailable,
+                "the managed backend did not answer",
+            )))
+            .expect("encoded"),
+        )
     }
 }

@@ -385,6 +385,24 @@ void test("given_client_metadata_paging_when_the_signal_aborts_then_should_rejec
   assert.equal(recorder.managedSends, 1)
 })
 
+void test("given_a_client_metadata_read_every_node_refuses_when_the_signal_aborts_then_should_end_the_transport_wait", async () => {
+  const reads = [
+    (request: ClientMetadataRequest, signal: AbortSignal) => request.page({ signal }),
+    (request: ClientMetadataRequest, signal: AbortSignal) => request.all({ signal })
+  ]
+  for (const read of reads) {
+    const roster = new RefusingRoster()
+    const controller = new AbortController()
+    const reading = read(ClientMetadataRequest.create(roster.transport), controller.signal)
+    await tick()
+    assert.equal(roster.waiting, 1)
+    controller.abort()
+    await assert.rejects(reading, CancelledError)
+    await tick()
+    assert.equal(roster.waiting, 0, "the transport stops waiting out the refusals")
+  }
+})
+
 void test("given_an_aborted_signal_when_an_agent_scope_publishes_then_should_reject_with_cancelled_before_sending", async () => {
   const calls: string[] = []
   const laser = {
@@ -884,6 +902,29 @@ function bytes(text: string): Uint8Array {
 
 function tick(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve))
+}
+
+// A roster whose every node refuses each managed read. The transport waits the
+// refusals out until the signal it was handed aborts, as `Nodes.read` does.
+class RefusingRoster {
+  waiting = 0
+  readonly transport: Pick<LaserTransport, "sendManaged"> = {
+    sendManaged: (_code, _payload, options) => this.refused(options?.signal)
+  }
+
+  private refused(signal: AbortSignal | undefined): Promise<Uint8Array> {
+    this.waiting += 1
+    return new Promise((_resolve, reject) => {
+      signal?.addEventListener(
+        "abort",
+        () => {
+          this.waiting -= 1
+          reject(new CancelledError("managed read aborted"))
+        },
+        { once: true }
+      )
+    })
+  }
 }
 
 // A client whose every send is refused with a transient server code.

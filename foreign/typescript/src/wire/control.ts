@@ -700,6 +700,11 @@ export interface RecordSkip {
   readonly partitionId: number
   readonly topicCreatedAtMicros: bigint
   readonly offset: bigint
+  /** The operational index or graph the record failed to reach. The record's
+   * other effects still apply. A target can also name a fold of the managed
+   * backend, written `fold:<surface>` with the surfaces `memory`, `session`,
+   * `kv`, `fork` and `graph`, which releases one record that fold's store
+   * refuses. */
   readonly target: string
   readonly reason: string
 }

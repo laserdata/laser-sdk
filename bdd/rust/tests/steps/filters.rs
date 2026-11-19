@@ -155,6 +155,24 @@ async fn receives(world: &mut LaserWorld, first: String, second: String, third: 
     assert_eq!(world.filtered_payloads, expected);
 }
 
+#[then("the group reads back its saved binding after three refusals")]
+async fn binding_after_catalog_refusals(world: &mut LaserWorld) {
+    let group = world.laser().topic(TOPIC).consumer_group("anomaly-desk");
+    let info = group
+        .create()
+        .filter("safe-mode", filter("safe mode"))
+        .build()
+        .await
+        .expect("group policy configured");
+    let expected = info.filter.expect("a saved binding");
+    let binding = group
+        .filter()
+        .get()
+        .await
+        .expect("the catalog serves the binding read");
+    assert_eq!(binding, Some(expected));
+}
+
 #[when("the anomaly desk lists its saved filters")]
 async fn list_filters(world: &mut LaserWorld) {
     let result = world

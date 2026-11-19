@@ -1,8 +1,5 @@
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
-
-#[cfg(doctest)]
-#[doc = include_str!("../README.md")]
-mod crate_readme {}
 
 #[cfg(doctest)]
 #[doc = include_str!("../../README.md")]

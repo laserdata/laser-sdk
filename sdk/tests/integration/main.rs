@@ -57,3 +57,4 @@ mod transports;
 mod typed_topics;
 mod warm_dedup;
 mod workflow;
+mod workflow_function;

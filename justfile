@@ -39,9 +39,10 @@ test-doc:
   cargo test --workspace --all-features --doc
 
 # Syntax-check every public Python README block with the standard library
-# compiler, including snippets that use top-level await for brevity.
+# compiler, including snippets that use top-level await for brevity, and check
+# context7.json against the Context7 schema limits.
 python-docs:
-  python3 -m unittest foreign/python/tests/test_readme_snippets.py
+  python3 -m unittest foreign/python/tests/test_readme_snippets.py foreign/python/tests/test_context7.py
 
 # Rust, Python, and TypeScript public surfaces match docs/parity.md with no MISSING row
 parity-check:

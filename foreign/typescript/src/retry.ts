@@ -29,9 +29,10 @@ export function backoffDelay(backoff: Backoff, attempt: number): number {
 }
 
 /** A managed mutation or control append whose outcome is unknown repeats with
- * the same identity on this backoff until the deadline. */
-export const MANAGED_MUTATION: Backoff = { baseMs: 100, maxMs: 2_000 }
-export const MANAGED_MUTATION_DEADLINE_MS = 30_000
+ * the same identity on this backoff until the deadline, and so does a managed
+ * read every node refused. */
+export const MANAGED_RETRY: Backoff = { baseMs: 100, maxMs: 2_000 }
+export const MANAGED_DEADLINE_MS = 30_000
 
 /** The first attempt of a managed mutation gets this long before it counts as
  * lost, the scale the route recheck uses, and each later one twice as long,

@@ -1,15 +1,16 @@
 # memory-correction: replace a fact for one user
 
-This example remembers two facts about a user, corrects one of them in a later conversation with `supersede`, and prints what recall returns as JSON. It copies alone: it uses only `laser-sdk`, `tokio` and `serde_json`, and no helper from this crate.
+This example remembers three facts about a user, corrects one of them in a later conversation with `supersede`, and prints what recall returns as JSON. It copies alone: it uses only `laser-sdk`, `tokio`, `serde` and `serde_json`, and no helper from this crate.
 
 ## What it shows
 
 - `Laser::connect_env()` reads `LASER_CONNECTION_STRING`.
-- `laser.scratch_stream("memory-demo")` creates a uniquely named stream, and `scratch.delete()` removes it whatever the run returned.
+- `root.scratch_stream("memory")` creates a uniquely named stream, and `scratch.delete()` removes it whatever the run returned.
 - `laser.memory("assistant")` creates its memory topic on the first write.
-- `.remember(fact).scope(conversation).user("sam").send()` returns the fact's id.
+- `.remember(fact).scope(conversation).user(USER).send()` returns the fact's id.
 - `.supersede(old_id, fact)` remembers the new fact, then forgets the old one in every conversation, so recall for the user never returns it again.
-- `.recall(None).user("sam").semantic(query).fetch()` reads every conversation of the user, ranks by the words the query shares with each fact, and drops nothing. It reads the writes this connection made, so it returns the correction at once.
+- `.recall(None).user(USER).semantic(QUERY).limit(10).fetch()` reads every conversation of the user, returns `MemoryItem`s ranked by the words the query shares with each fact, newest first among equals, and drops nothing. It reads the writes this connection made, so it returns the correction at once.
+- The program prints `user`, `query` and `facts`, the same fields in the same order as the Python and TypeScript programs.
 
 ## Run it
 

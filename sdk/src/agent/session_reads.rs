@@ -2,6 +2,7 @@ use crate::agent::{Session, Sessions};
 use crate::context::ContextMessage;
 use crate::error::LaserError;
 use crate::laser::Laser;
+use crate::nodes::Walk;
 use crate::types::ConversationId;
 use iggy::prelude::{
     Consumer, Identifier, MessageClient, PollOptions, PollingStrategy, TopicClient,
@@ -24,11 +25,22 @@ use std::time::Duration;
 impl Sessions {
     /// One session's summary from the deployment's session index.
     pub async fn get(&self, id: ConversationId) -> Result<SessionInfo, LaserError> {
+        self.info(id, Walk::UntilServed).await
+    }
+
+    pub(crate) async fn info(
+        &self,
+        id: ConversationId,
+        walk: Walk,
+    ) -> Result<SessionInfo, LaserError> {
         let request = request::SessionGet {
             stream: self.stream()?.to_owned(),
             id: id.into(),
         };
-        match self.read(AGDX_SESSION_GET_CODE, &request).await? {
+        match self
+            .read_walking(AGDX_SESSION_GET_CODE, &request, walk)
+            .await?
+        {
             SessionOutcome::Info(info) => Ok(*info),
             _ => Err(unexpected("get")),
         }
@@ -70,12 +82,24 @@ impl Sessions {
         id: ConversationId,
         history_limit: u32,
     ) -> Result<SessionStateView, LaserError> {
+        self.state_view(id, history_limit, Walk::UntilServed).await
+    }
+
+    pub(crate) async fn state_view(
+        &self,
+        id: ConversationId,
+        history_limit: u32,
+        walk: Walk,
+    ) -> Result<SessionStateView, LaserError> {
         let request = request::SessionState {
             stream: self.stream()?.to_owned(),
             id: id.into(),
             history_limit,
         };
-        match self.read(AGDX_SESSION_STATE_CODE, &request).await? {
+        match self
+            .read_walking(AGDX_SESSION_STATE_CODE, &request, walk)
+            .await?
+        {
             SessionOutcome::State(view) => Ok(view),
             _ => Err(unexpected("state")),
         }
@@ -133,12 +157,24 @@ impl Sessions {
     /// never shift it. Zero `results` leaves the page size to the server, and
     /// the reply names the size it used.
     pub async fn changes(&self, page: u32, results: u32) -> Result<SessionChanges, LaserError> {
+        self.read_changes(page, results, Walk::UntilServed).await
+    }
+
+    pub(crate) async fn read_changes(
+        &self,
+        page: u32,
+        results: u32,
+        walk: Walk,
+    ) -> Result<SessionChanges, LaserError> {
         let request = request::SessionChanges {
             stream: self.stream()?.to_owned(),
             page,
             results,
         };
-        match self.read(AGDX_SESSION_CHANGES_CODE, &request).await? {
+        match self
+            .read_walking(AGDX_SESSION_CHANGES_CODE, &request, walk)
+            .await?
+        {
             SessionOutcome::Changes(changes) => Ok(changes),
             _ => Err(unexpected("changes")),
         }
@@ -171,6 +207,17 @@ impl Sessions {
         code: u32,
         request: &T,
     ) -> Result<SessionOutcome, LaserError> {
+        self.read_walking(code, request, Walk::UntilServed).await
+    }
+
+    // A caller that answers a refusal itself (the budget gate, the state seed,
+    // the registration wait) walks the roster once.
+    async fn read_walking<T: serde::Serialize>(
+        &self,
+        code: u32,
+        request: &T,
+        walk: Walk,
+    ) -> Result<SessionOutcome, LaserError> {
         let laser = self.laser();
         if !laser.capabilities().await.sessions {
             return Err(LaserError::unsupported_feature(
@@ -180,7 +227,7 @@ impl Sessions {
             ));
         }
         let payload = laser_wire::framing::encode_named(request)?;
-        let reply = laser.send_raw_with_response(code, payload).await?;
+        let reply = laser.send_raw_walking(code, payload, walk).await?;
         match crate::error::decode_managed_reply::<SessionReply>(&reply)? {
             SessionReply::Ok(outcome) => Ok(outcome),
             SessionReply::Err(error) => Err(error.into()),

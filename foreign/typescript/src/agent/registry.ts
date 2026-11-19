@@ -238,7 +238,9 @@ export class ClientMetadataRequest {
     throwIfAborted(options.signal, "client metadata read")
     const payload = encodeNamed(encodeClientMetadataQuery(this.query))
     const reply = await abortable(
-      this.transport.sendManaged(AGDX_GET_CLIENTS_METADATA_CODE, payload),
+      this.transport.sendManaged(AGDX_GET_CLIENTS_METADATA_CODE, payload, {
+        signal: options.signal
+      }),
       options.signal,
       "client metadata read"
     )
@@ -262,7 +264,9 @@ export class ClientMetadataRequest {
         const reply =
           replica === undefined || this.transport.sendManagedTo === undefined
             ? await abortable(
-                this.transport.sendManaged(AGDX_GET_CLIENTS_METADATA_CODE, payload),
+                this.transport.sendManaged(AGDX_GET_CLIENTS_METADATA_CODE, payload, {
+                  signal: options.signal
+                }),
                 options.signal,
                 "client metadata read"
               )

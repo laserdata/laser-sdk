@@ -198,4 +198,4 @@ def test_given_the_stub_when_read_then_should_type_recall_outputs_and_the_versio
     assert "def recall_block(" in stub
     assert "def outputs(self) -> dict[builtins.str, builtins.bytes]:" in stub
     assert "\n__version__: builtins.str\n" in stub
-    assert ls.__version__ == "0.10.2"
+    assert ls.__version__ == "0.11.0"

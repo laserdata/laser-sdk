@@ -8,6 +8,7 @@ from pytest_bdd import given, parsers, scenarios, then, when
 SCENARIOS = Path(__file__).parent.parent / "scenarios"
 scenarios(str(SCENARIOS / "workflow.feature"))
 scenarios(str(SCENARIOS / "workflow_local.feature"))
+scenarios(str(SCENARIOS / "workflow_function.feature"))
 
 
 class Flow:
@@ -22,6 +23,7 @@ class Flow:
         self.run_id = None
         self.local_runs = []
         self.compensations = []
+        self.function_labels = []
 
 
 @pytest.fixture
@@ -165,6 +167,41 @@ def local_steps_compensated(world, flow, name, first, second, failing):
     run(world, flow, workflow)
 
 
+@when(
+    parsers.parse('the workflow function "{name}" calls the steps "{first}", "{second}", "{third}"')
+)
+def function_steps(world, flow, name, first, second, third):
+    function_run(world, flow, name, [first, second, third], None)
+
+
+@when(
+    parsers.parse(
+        'the workflow function "{name}" calls the steps "{first}", "{second}", "{third}" '
+        'and step "{failing}" fails once'
+    )
+)
+def function_steps_failing_once(world, flow, name, first, second, third, failing):
+    function_run(world, flow, name, [first, second, third], failing)
+
+
+@when(
+    parsers.parse('the workflow function "{name}" calls the step "{twice}" twice and then "{last}"')
+)
+def function_step_twice(world, flow, name, twice, last):
+    function_run(world, flow, name, [twice, twice, last], None)
+
+
+@when(parsers.parse('the workflow function "{name}" resumes the same run'))
+def function_resumed(world, flow, name):
+    function_run(world, flow, name, flow.function_labels, None)
+
+
+@then(parsers.parse('the workflow function returned "{expected}"'))
+def function_returned(flow, expected):
+    assert flow.error is None, flow.error
+    assert flow.outcome.value == expected
+
+
 @then(parsers.re(r'the workflow completed the steps (?P<labels>".+") in order'))
 def completed_in_order(flow, labels):
     assert flow.error is None, flow.error
@@ -261,6 +298,38 @@ def run(world, flow, workflow):
     except Exception as error:  # noqa: BLE001 the scenario asserts the error
         flow.outcome = None
         flow.error = error
+
+
+def function_run(world, flow, name, labels, failing):
+    """Run the labels as steps of a workflow function under one run id, so a later
+    call resumes the run."""
+    flow.run_id = flow.run_id or ls.new_conversation_id()
+    flow.function_labels = labels
+    steps = {label: function_step(flow, label, failing) for label in labels}
+
+    async def pipeline():
+        value = None
+        for label in labels:
+            value = await steps[label]()
+        return value
+
+    bound = ls.workflow(name=name)(pipeline).bind(world.laser)
+    try:
+        flow.outcome = world.run(lambda: bound.resume(str(flow.run_id)))
+        flow.error = None
+    except Exception as error:  # noqa: BLE001 the scenario asserts the error
+        flow.outcome = None
+        flow.error = error
+
+
+def function_step(flow, label, failing):
+    async def call():
+        flow.local_runs.append(label)
+        if label == failing:
+            raise RuntimeError(f"{label} failed")
+        return f"{label} done"
+
+    return ls.step(name=label)(call)
 
 
 def local_workflow(world, flow, name, labels, run_id, failing):
