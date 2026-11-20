@@ -117,23 +117,39 @@ func liveName(prefix string) string {
 // across partitions would only make the round trip racy.
 func liveTopic(t *testing.T, client *laser.Laser, ctx context.Context) *laser.Topic {
 	t.Helper()
-	streamName := liveName("laser-live")
-	stream := client.Stream(streamName)
-	topic := stream.Topic("records")
-
+	scratch := liveScratch(t, client, ctx, "laser-live")
+	topic := scratch.Laser().Topic("records")
 	if err := topic.Ensure(ctx, 1, nil); err != nil {
-		t.Fatalf("create stream %s and its topic: %v", streamName, err)
+		t.Fatalf("create a topic on %s: %v", scratch.Name(), err)
+	}
+	return topic
+}
+
+// liveScratch opens a scratch stream and removes it when the test ends.
+//
+// The scratch stream is what mints a name free on the server, so two runs
+// against one long lived container never read each other's records. Nothing
+// deletes it on its own, by design: Go has no destructor, so the cleanup is
+// registered here where a reader can see it rather than left to a finalizer
+// that might never run.
+func liveScratch(
+	t *testing.T, client *laser.Laser, ctx context.Context, prefix string,
+) *laser.ScratchStream {
+	t.Helper()
+	scratch, err := client.ScratchStream(ctx, prefix)
+	if err != nil {
+		t.Fatalf("create a scratch stream under %s: %v", prefix, err)
 	}
 	t.Cleanup(func() {
 		// A fresh context, because the test's own may already be done and the
 		// stream would then outlive the run and leak into the next one.
 		cleanup, cancel := context.WithTimeout(context.Background(), liveOperationTimeout)
 		defer cancel()
-		if _, err := client.Stream(streamName).Delete(cleanup); err != nil {
-			t.Errorf("delete stream %s: %v", streamName, err)
+		if err := scratch.Delete(cleanup); err != nil {
+			t.Errorf("delete the scratch stream %s: %v", scratch.Name(), err)
 		}
 	})
-	return topic
+	return scratch
 }
 
 // livePartitions is the partition ids the server actually assigned a topic.

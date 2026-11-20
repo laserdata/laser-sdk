@@ -200,19 +200,12 @@ func TestGivenRustPublishedRecordWhenGoConsumesThenShouldReadTheSameSpine(t *tes
 	binary := buildInterop(t)
 	ctx := liveContext(t)
 
-	streamName := liveName("laser-interop-rust-to-go")
+	streamName := liveScratch(t, client, ctx, "laser-interop-rust-to-go").Name()
 	topicName := "records"
-	t.Cleanup(func() {
-		cleanup, cancel := context.WithTimeout(context.Background(), liveOperationTimeout)
-		defer cancel()
-		if _, err := client.Stream(streamName).Delete(cleanup); err != nil {
-			t.Errorf("delete stream %s: %v", streamName, err)
-		}
-	})
 
-	// The Rust client creates the stream and the topic as it publishes, so the
-	// Go side here reads a topic it did not make: one more thing that has to
-	// agree across the two.
+	// The Rust client creates the topic as it publishes, so the Go side here
+	// reads a topic it did not make: one more thing that has to agree across
+	// the two.
 	published := runInterop(t, binary, "publish", streamName, topicName)
 	t.Logf("the Rust client published %s", published)
 
@@ -263,19 +256,12 @@ func TestGivenGoPublishedRecordWhenRustConsumesThenShouldReadTheSameSpine(t *tes
 	binary := buildInterop(t)
 	ctx := liveContext(t)
 
-	streamName := liveName("laser-interop-go-to-rust")
-	topicName := "records"
-	topic := client.Stream(streamName).Topic(topicName)
+	scratch := liveScratch(t, client, ctx, "laser-interop-go-to-rust")
+	streamName, topicName := scratch.Name(), "records"
+	topic := scratch.Laser().Topic(topicName)
 	if err := topic.Ensure(ctx, 1, nil); err != nil {
-		t.Fatalf("create stream %s and its topic: %v", streamName, err)
+		t.Fatalf("create a topic on %s: %v", streamName, err)
 	}
-	t.Cleanup(func() {
-		cleanup, cancel := context.WithTimeout(context.Background(), liveOperationTimeout)
-		defer cancel()
-		if _, err := client.Stream(streamName).Delete(cleanup); err != nil {
-			t.Errorf("delete stream %s: %v", streamName, err)
-		}
-	})
 
 	author, err := wire.NewAgentID("go-author")
 	if err != nil {
