@@ -131,6 +131,32 @@ func (state *SessionState) Snapshot(ctx context.Context) (*AgdxReceipt, error) {
 	return state.writeSnapshot(ctx, cursor)
 }
 
+// snapshotIfChanged checkpoints the document when this handle has written
+// deltas since the last snapshot, so a reader can start from the final
+// document rather than folding everything after it.
+//
+// A document another writer changed since this handle's last write is left
+// alone rather than refused. Ending the session is what the caller asked
+// for, and overwriting somebody's later change to save a reader some folding
+// would be a poor trade.
+func (state *SessionState) snapshotIfChanged(ctx context.Context) error {
+	cursor := state.session.cursor()
+	cursor.mutex.Lock()
+	defer cursor.mutex.Unlock()
+	if cursor.sinceSnapshot == 0 {
+		return nil
+	}
+	current, err := state.holdsCurrent(ctx, cursor)
+	if err != nil {
+		return err
+	}
+	if !current {
+		return nil
+	}
+	_, err = state.writeSnapshot(ctx, cursor)
+	return err
+}
+
 // Get folds the state from the whole retained session lane: the newest
 // snapshot plus the deltas after it.
 //

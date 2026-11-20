@@ -409,6 +409,38 @@ rather than silently addressing different sessions. Bumping the version remaps
 every derived conversation, which is why it is a constant to change on purpose
 rather than an implementation detail.
 
+## A session's lifecycle rules
+
+Three rules decide what a session will and will not write, and all three
+exist because a session is addressed by a derived id, so the same label
+reaches the same session on every run.
+
+**A session that ended refuses to begin again.** Beginning one would append a
+second start under an id a reader has already seen close. `Resume` opens it
+anyway, with one exception: a canceled session never resumes, because
+cancellation is a decision somebody made about the work and reopening it
+under the same label would quietly overturn that decision. A session started
+with `Start` holds a conversation minted on the spot, so it cannot have ended
+and is not read for.
+
+**The first terminal verb latches.** Ending a session a second time the same
+way repeats the same record rather than appending another, which is what
+makes ending idempotent for a caller that cannot tell whether its first
+attempt landed. Ending it a different way is refused: a session that
+completed did not then fail. The latch is shared with every derived handle,
+or a caller could contradict an ending simply by taking another one.
+
+**Completing checkpoints the document first.** A reader of a completed
+session then starts from its final state rather than folding every delta.
+Only a completion does this. A failed or canceled session stopped partway,
+so its last consistent document is whatever it managed to write, and
+presenting a half-finished document as a settled one would mislead. If
+another writer changed the document since this handle's last write, the
+session still ends and the checkpoint is skipped, because ending is what the
+caller asked for and overwriting somebody's later change to save a reader
+some folding would be a poor trade.
+
+
 ## Consumer filters
 
 `topic.Filters(consumer)` reads a topic through a server-side filter. The

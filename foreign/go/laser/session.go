@@ -3,6 +3,7 @@ package laser
 import (
 	"context"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
@@ -167,7 +168,11 @@ func (sessions *Sessions) Create(label string) *Session {
 
 // Start opens a fresh session, which is what a one-shot exchange wants.
 func (sessions *Sessions) Start() *Session {
-	return sessions.Open(NewConversationID(), "")
+	started := sessions.Open(NewConversationID(), "")
+	// A conversation minted here cannot already have ended, so Begin has
+	// nothing to read the log for.
+	started.fresh = true
+	return started
 }
 
 // Open addresses an existing session by its conversation.
@@ -178,6 +183,7 @@ func (sessions *Sessions) Open(conversation wire.ConversationID, label string) *
 		conversation: conversation,
 		label:        label,
 		state:        &stateCursor{},
+		terminal:     &terminalLatch{},
 	}
 }
 
@@ -196,6 +202,57 @@ type Session struct {
 	// default applies only until a caller says otherwise.
 	redactor    Redactor
 	redactorSet bool
+	// terminal latches the first terminal state written through this handle
+	// or any derived from it, so a repeat writes the same record and a
+	// different verb is refused rather than contradicting it on the lane.
+	terminal *terminalLatch
+	// fresh marks a session whose conversation was minted here, which cannot
+	// already have ended.
+	fresh bool
+	// resume lets Begin reopen a session that ended, which it otherwise
+	// refuses.
+	resume bool
+}
+
+// terminalLatch remembers how a session was first ended.
+type terminalLatch struct {
+	mutex  sync.Mutex
+	intent *terminalIntent
+}
+
+// terminalIntent is the terminal record a session settled on. The record id
+// is kept so a repeated end rewrites the same record rather than appending a
+// second ending that a reader would have to reconcile.
+type terminalIntent struct {
+	state  wire.TaskState
+	end    wire.SessionEnd
+	record wire.RecordID
+}
+
+// settle returns the terminal record to write. The first call fixes it. A
+// later call naming the same state repeats it, which is what makes ending a
+// session idempotent. A later call naming a different state is refused,
+// because a session that completed did not then fail.
+func (latch *terminalLatch) settle(
+	state wire.TaskState, end wire.SessionEnd,
+) (terminalIntent, error) {
+	latch.mutex.Lock()
+	defer latch.mutex.Unlock()
+	if latch.intent != nil {
+		if latch.intent.state != state {
+			return terminalIntent{}, &InvalidError{
+				Reason: "the session is already ending as " +
+					string(latch.intent.state)}
+		}
+		return *latch.intent, nil
+	}
+	settled := terminalIntent{
+		state:  state,
+		end:    end,
+		record: wire.RecordID{ID: wire.IDFromBytes(NewOperationID())},
+	}
+	latch.intent = &settled
+	return settled, nil
 }
 
 // cursor is this handle's state cursor, opened for a handle built without
@@ -350,6 +407,43 @@ func (session *Session) Agdx() (*Agdx, error) {
 		*session.agent, session.conversation), nil
 }
 
+// beginnable refuses a session that already ended, unless the caller asked
+// to resume it.
+//
+// A session addressed by label is the same session every run, so beginning
+// one that ended would append a second start under an id a reader has
+// already seen close. A freshly minted conversation cannot have ended, so it
+// is not read for.
+func (session *Session) beginnable(ctx context.Context) error {
+	if session.fresh {
+		return nil
+	}
+	ended, err := session.EndedAs(ctx)
+	if err != nil {
+		return err
+	}
+	if ended == "" {
+		return nil
+	}
+	// A canceled session never resumes. Cancellation is a decision somebody
+	// made about the work, and reopening it under the same label would
+	// quietly overturn that decision.
+	if session.resume && ended != wire.SessionCanceled {
+		return nil
+	}
+	return &SessionEndedError{Session: session.conversation, Status: ended}
+}
+
+// Resume lets Begin reopen a session that already ended.
+//
+// A canceled session still refuses, because cancellation is a decision about
+// the work rather than a state to be worked out of.
+func (session *Session) Resume() *Session {
+	resumed := *session
+	resumed.resume = true
+	return &resumed
+}
+
 // Begin writes the session's start record, opening it on the log.
 //
 // The ancestry a session carries is the envelope's, so a sub-session records
@@ -357,6 +451,9 @@ func (session *Session) Agdx() (*Agdx, error) {
 func (session *Session) Begin(ctx context.Context) (*AgdxReceipt, error) {
 	agdx, err := session.Agdx()
 	if err != nil {
+		return nil, err
+	}
+	if err := session.beginnable(ctx); err != nil {
 		return nil, err
 	}
 	start := wire.SessionStart{
@@ -397,11 +494,39 @@ func (session *Session) End(
 	if err != nil {
 		return nil, err
 	}
-	return agdx.SessionEnded(state, end).Send(ctx)
+	if !state.IsTerminal() {
+		// Settling the latch on a state the send would refuse anyway would
+		// latch the session into an ending it never wrote.
+		return agdx.SessionEnded(state, end).Send(ctx)
+	}
+	intent, err := session.latch().settle(state, end)
+	if err != nil {
+		return nil, err
+	}
+	send := agdx.SessionEnded(intent.state, intent.end)
+	record := intent.record
+	send.envelope.Record = &record
+	return send.Send(ctx)
+}
+
+// latch is this handle's terminal latch, opened for a handle built without
+// one so a zero value still ends rather than panicking.
+func (session *Session) latch() *terminalLatch {
+	if session.terminal == nil {
+		session.terminal = &terminalLatch{}
+	}
+	return session.terminal
 }
 
 // Complete closes the session successfully, the common ending.
 func (session *Session) Complete(ctx context.Context, reason string) (*AgdxReceipt, error) {
+	// State this handle changed is checkpointed first, so a reader of a
+	// completed session starts from its final document rather than folding
+	// every delta. Only a completion does this: a failed or canceled session
+	// stopped partway and its last consistent document is whatever it wrote.
+	if err := session.State().snapshotIfChanged(ctx); err != nil {
+		return nil, err
+	}
 	end := wire.SessionEnd{}
 	if reason != "" {
 		end.Reason = &reason
