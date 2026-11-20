@@ -214,6 +214,16 @@ A padded number is refused on the way in. It parses the same as its canonical
 spelling, so accepting it would let two clients disagree about whether
 `01:42` and `1:42` name the same record.
 
+One difference from the other clients is still open here. They synthesize a
+record's spine from the decoded envelope, so an AGDX record carries only the
+envelope header block that `wire/fixtures/header_block_envelope.json` pins.
+This client builds the spine from headers instead, so it also stamps
+`agdx.corr` on a correlated AGDX record, which that block does not carry. Both
+peers ignore it, because for an AGDX record they read the envelope rather than
+the headers, so this costs bytes and not correctness. Closing it means
+synthesizing the spine from the envelope on the way in, so the gates keep
+working once the header is gone.
+
 ## Consuming
 
 `Topic.Consumer(name, options)` opens a standalone consumer and
