@@ -114,36 +114,120 @@ Feature: Example
 	}
 }
 
-// Reading only an outline's template would run a scenario with placeholders
-// still in it, which would pass or fail for the wrong reason.
-func TestGivenAnOutlineWhenParsedThenShouldRefuseItRatherThanHalfReadIt(t *testing.T) {
+// An outline describes one case per example row, so reading only its template
+// would leave every row untested.
+func TestGivenAnOutlineWhenParsedThenShouldExpandOneScenarioPerRow(t *testing.T) {
+	feature, err := bdd.ParseFeature(write(t, `
+Feature: Example
+  Background:
+    Given a running data platform
+
+  @tagged
+  Scenario Outline: Templated <value>
+    Then <value> holds with <other>
+
+  Examples:
+    | value | other |
+    | one   | left  |
+    | two   | right |
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(feature.Scenarios) != 2 {
+		t.Fatalf("want one scenario per row, got %d", len(feature.Scenarios))
+	}
+	first := feature.Scenarios[0]
+	if !strings.Contains(first.Name, "Templated one") {
+		t.Errorf("want the row filled into the name, got %q", first.Name)
+	}
+	// Two rows under one name would hide which of them failed.
+	if first.Name == feature.Scenarios[1].Name {
+		t.Errorf("want distinct names, both are %q", first.Name)
+	}
+	if !first.HasTag("@tagged") {
+		t.Errorf("want the outline tag carried to the row, got %v", first.Tags)
+	}
+	if len(first.Steps) != 2 || first.Steps[0].Text != "a running data platform" {
+		t.Fatalf("want the background prefixed, got %v", first.Steps)
+	}
+	if first.Steps[1].Text != "one holds with left" {
+		t.Errorf("want every placeholder filled, got %q", first.Steps[1].Text)
+	}
+	if feature.Scenarios[1].Steps[1].Text != "two holds with right" {
+		t.Errorf("want the second row filled, got %q", feature.Scenarios[1].Steps[1].Text)
+	}
+}
+
+// A placeholder no column fills would run the step with the template still in
+// it, which would pass or fail for a reason the contract never stated.
+func TestGivenAnUnfilledPlaceholderWhenParsedThenShouldRefuseTheOutline(t *testing.T) {
 	_, err := bdd.ParseFeature(write(t, `
 Feature: Example
   Scenario Outline: Templated
-    Then <value> holds
+    Then <value> holds with <missing>
 
   Examples:
     | value |
     | one   |
 `))
 	if err == nil {
-		t.Fatal("an outline must be refused")
+		t.Fatal("an unfilled placeholder must be refused")
 	}
 	var unsupported *bdd.UnsupportedSyntaxError
 	if !asUnsupported(err, &unsupported) {
 		t.Fatalf("want an UnsupportedSyntaxError, got %T: %v", err, err)
 	}
-	if !strings.Contains(err.Error(), "Scenario Outline") {
-		t.Errorf("want the syntax named, got %v", err)
+	if !strings.Contains(err.Error(), "<missing>") {
+		t.Errorf("want the unfilled parameter named, got %v", err)
 	}
 }
 
+// asUnsupported narrows an error to the refusal this parser reports, so a
+// test distinguishes refused syntax from a read that simply failed.
 func asUnsupported(err error, target **bdd.UnsupportedSyntaxError) bool {
 	failure, ok := err.(*bdd.UnsupportedSyntaxError)
 	if ok {
 		*target = failure
 	}
 	return ok
+}
+
+// An outline sits among plain scenarios, so its rows must not swallow the
+// scenario that follows it nor inherit the one before it.
+func TestGivenAnOutlineBetweenScenariosWhenParsedThenShouldKeepThemSeparate(t *testing.T) {
+	feature, err := bdd.ParseFeature(write(t, `
+Feature: Example
+  Scenario: Before
+    Then it holds
+
+  Scenario Outline: Middle
+    Then <value> holds
+
+  Examples:
+    | value |
+    | one   |
+    | two   |
+
+  Scenario: After
+    Then it also holds
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := []string{"Before", "Middle [one]", "Middle [two]", "After"}
+	if len(feature.Scenarios) != len(want) {
+		t.Fatalf("want %d scenarios, got %d", len(want), len(feature.Scenarios))
+	}
+	for index, name := range want {
+		if feature.Scenarios[index].Name != name {
+			t.Errorf("at %d want %q, got %q", index, name, feature.Scenarios[index].Name)
+		}
+	}
+	if len(feature.Scenarios[3].Steps) != 1 {
+		t.Errorf("want the trailing scenario to hold its own step only, got %v",
+			feature.Scenarios[3].Steps)
+	}
 }
 
 // The scenarios are the shared contract, so the runner must read the real
@@ -153,21 +237,13 @@ func TestGivenTheSharedScenariosWhenParsedThenShouldAllRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the scenarios: %v", err)
 	}
-	read, outlines := 0, 0
+	read := 0
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".feature") {
 			continue
 		}
 		feature, err := bdd.ParseFeature(filepath.Join("../scenarios", entry.Name()))
 		if err != nil {
-			var unsupported *bdd.UnsupportedSyntaxError
-			if asUnsupported(err, &unsupported) {
-				// An outline is named rather than passed over, so the gap
-				// between what the shared set holds and what this runner reads
-				// stays visible.
-				outlines++
-				continue
-			}
 			t.Errorf("%s: %v", entry.Name(), err)
 			continue
 		}
@@ -179,6 +255,32 @@ func TestGivenTheSharedScenariosWhenParsedThenShouldAllRead(t *testing.T) {
 	if read == 0 {
 		t.Fatal("no shared scenarios were read, so this would pass vacuously")
 	}
-	t.Logf("read %d shared feature files, %d use an outline this runner does not implement",
-		read, outlines)
+	t.Logf("read %d shared feature files", read)
+}
+
+// An outline in the shared set must come back as its rows. Reading the file
+// without failing proves nothing on its own, because a parser that dropped
+// every outline would read it just as quietly.
+func TestGivenTheSharedOutlinesWhenParsedThenShouldComeBackAsRows(t *testing.T) {
+	feature, err := bdd.ParseFeature("../scenarios/filters.feature")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// The strict filter outline alone carries eight example rows.
+	rows := 0
+	for _, scenario := range feature.Scenarios {
+		if strings.HasPrefix(scenario.Name, "The strict filter needs evidence") {
+			rows++
+		}
+	}
+	if rows != 8 {
+		t.Fatalf("want the eight rows of the strict filter outline, got %d", rows)
+	}
+	for _, scenario := range feature.Scenarios {
+		for _, step := range scenario.Steps {
+			if strings.Contains(step.Text, "<") && strings.Contains(step.Text, ">") {
+				t.Errorf("%s: a placeholder survived into %q", scenario.Name, step.Text)
+			}
+		}
+	}
 }
