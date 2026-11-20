@@ -342,10 +342,7 @@ func (memory *Memory) write(ctx context.Context, record wire.MemoryRecord) error
 // deployment with embeddings ranks better server-side, and this is what is
 // available when one is not there.
 func Rank(items []MemoryItem, query MemoryQuery) []MemoryItem {
-	limit := query.Limit
-	if limit <= 0 {
-		limit = DefaultRecallLimit
-	}
+	limit := recallLimit(query)
 	kept := make([]MemoryItem, 0, len(items))
 	for _, item := range items {
 		if !matchesKind(item, query.Kinds) {
