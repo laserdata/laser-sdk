@@ -492,6 +492,72 @@ func TestGivenAHandledRecordWhenAskedWhereItSatThenShouldLocateItInTheTopic(t *t
 	}
 }
 
+// An answer and a branch both name their author, so an agent without an
+// identity refuses rather than publishing a record signed by nobody.
+func TestGivenNoIdentityWhenAnsweringOrBranchingThenShouldRefuseBoth(t *testing.T) {
+	server := newRuntimeServer()
+	runtime := runtimeFor(t, server, "", laser.RuntimeOptions{
+		RespondOn: wire.AgentSessions,
+	})
+	record := commandFor(t, 1, 2)
+	var answered, branched error
+	handler := laser.HandlerFunc(func(
+		ctx context.Context, _ *laser.AgentMessage, agent *laser.AgentCtx,
+	) error {
+		answered = agent.Respond(ctx, []byte("from nobody"))
+		_, branched = agent.SpawnSubconversation()
+		return nil
+	})
+
+	if err := runUntilDrained(t, runtime, sourceOf(record), handler); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	var invalid *laser.InvalidError
+	if !errors.As(answered, &invalid) {
+		t.Errorf("want the answer refused, got %v", answered)
+	}
+	if !errors.As(branched, &invalid) {
+		t.Errorf("want the branch refused, got %v", branched)
+	}
+	if len(server.on(wire.AgentSessions)) != 0 {
+		t.Error("a record signed by nobody must not reach the log")
+	}
+}
+
+// A handler that is not answering anything sends under a provenance it built,
+// so nothing of the handled record is wired in behind its back.
+func TestGivenAProvenanceAHandlerBuiltWhenSendingThenShouldUseItAsItStands(t *testing.T) {
+	server := newRuntimeServer()
+	record := commandFor(t, 1, 2)
+	own := conversation(4)
+
+	err := handledThrough(t, server, laser.RuntimeOptions{}, record,
+		func(ctx context.Context, agent *laser.AgentCtx) error {
+			return agent.Send(ctx, wire.AgentAudit, []byte("noted"),
+				&laser.Provenance{
+					Conversation: own, Agent: agentPointer(t, "executor")})
+		})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	written := server.on(wire.AgentAudit)
+	if len(written) != 1 {
+		t.Fatalf("want one record, got %d", len(written))
+	}
+	spine, err := laser.ProvenanceFrom(&written[0])
+	if err != nil {
+		t.Fatalf("read the spine: %v", err)
+	}
+	if spine.Conversation != own {
+		t.Errorf("want the handler's own conversation, got %v", spine.Conversation)
+	}
+	if spine.CausalParent != nil {
+		t.Error("a plain send names no cause, or it would read as an answer")
+	}
+}
+
 // plainRecord builds a record produced by a plain agent send, which carries a
 // spine and no envelope.
 func plainRecord(
