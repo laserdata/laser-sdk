@@ -1445,6 +1445,26 @@ the port where Go reads bytes another client produced rather than bytes it
 produced itself.
 
 
+## Scratch streams
+
+`Laser.ScratchStream` creates a stream for one program run, named for a
+prefix and eight random hex characters, and hands back a handle whose default
+stream it is. A name already taken is refused rather than reused, because
+reuse would quietly hand a caller another run's records as its own.
+
+Unlike the Rust and Python clients, nothing removes the stream when the handle
+goes out of scope. Go has no destructor, and a background delete would need a
+context the caller never supplied, so the cleanup is explicit: pair the call
+with a deferred `Delete`. An abandoned stream is then a visible omission in
+the code rather than a cleanup that silently did not run.
+
+`Delete` is idempotent, so a deferred call after an explicit one costs
+nothing and a stream something else already removed is not a failure. A
+delete the server refused is reported and stays retryable: the handle records
+the removal only once the server confirmed it, rather than remembering an
+attempt as a success.
+
+
 ## Dependencies
 
 Two beyond the Apache Iggy client.

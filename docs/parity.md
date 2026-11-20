@@ -221,6 +221,7 @@ Beyond the raw capabilities, the Go client serves these managed and agent surfac
 | Operator control | Sessions.Control with pause, resume, cancel and force-cancel, and laser.ControlRequestOf, laser.FoldControl, laser.ControlPartition and laser.ControlBook: the fold per session, with a request off the session's control route flagged and never applied |
 | Stream administration | Laser.Streams, Stream.Get, Exists, Rename and Topics, and Topic.Get, Exists, Update, Partitions, AddPartitions, DeletePartitions, DeleteSegments and ConsumerGroups |
 | Cluster routing | the managed band keeps to one node picked by a random caller key, walks to the next on a failed link or an unreachable backend, rereads a stale roster once, and sends the replicated authorization writes to the metadata primary |
+| Scratch streams | Laser.ScratchStream: a uniquely named stream for one program run, refusing a name already taken rather than reusing it, with an idempotent delete that stays retryable after a failure |
 | Client encryption | laser.AES256GCM: Apache Iggy's AES-256-GCM record format, refusing any key that is not 32 bytes and reporting a ciphertext it cannot open as Apache Iggy error 72, with the ciphertexts the Rust and Node clients sealed pinned as vectors |
 
 An omitted row that reaches the raw client, or a method that does more than convert a value, names the capabilities a caller reaches through it. The check fails when such a row names none.
