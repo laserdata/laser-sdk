@@ -209,6 +209,10 @@ type Memory struct {
 	stream    string
 	topic     string
 	scope     MemoryScope
+	// reader is the folded view recall is served from. It is shared by every
+	// handle narrowed off this one, because narrowing changes which items a
+	// recall returns and not which topic they were read from.
+	reader *memoryReader
 }
 
 // Memory opens the memory surface for a namespace on the handle's default
@@ -220,6 +224,7 @@ func (laser *Laser) Memory(namespace string) *Memory {
 		stream:    laser.defaultStream,
 		topic:     wire.AgentMemory,
 		scope:     MemoryScope{Stream: laser.defaultStream},
+		reader:    newMemoryReader(laser.defaultStream, namespace),
 	}
 }
 
@@ -270,6 +275,31 @@ func (memory *Memory) Forget(ctx context.Context, target MemoryID) error {
 	return memory.write(ctx, record)
 }
 
+// Supersede corrects a fact in one call: the new body is remembered, then the
+// old item is forgotten in every conversation, so no later recall returns what
+// was corrected.
+//
+// The tombstone carries no conversation on purpose. A correction learnt in one
+// session is about the user rather than about the session, so leaving the old
+// fact alive everywhere else would have a later conversation recall it again.
+//
+// The new fact is written first. A failure in between leaves both facts rather
+// than neither, because a duplicate is recoverable and a lost fact is not.
+func (memory *Memory) Supersede(
+	ctx context.Context, old MemoryID, kind MemoryKind, body []byte,
+) (MemoryID, error) {
+	id, err := memory.Remember(ctx, kind, body)
+	if err != nil {
+		return MemoryID{}, err
+	}
+	everywhere := *memory
+	everywhere.scope.Conversation = nil
+	if err := everywhere.Forget(ctx, old); err != nil {
+		return MemoryID{}, err
+	}
+	return id, nil
+}
+
 // Improve records feedback on a recalled item, reweighting it for later
 // recall.
 func (memory *Memory) Improve(ctx context.Context, feedback Feedback) error {
@@ -303,14 +333,10 @@ func (memory *Memory) write(ctx context.Context, record wire.MemoryRecord) error
 		key = memory.scope.Conversation.String()
 	}
 	topic := memory.laser.Stream(memory.stream).Topic(memory.topic)
-	namespace, err := iggcon.NewHeaderKeyString(wire.HeaderMemoryNamespace)
+	headers, err := memoryHeaders(memory.scope, memory.namespace)
 	if err != nil {
-		return &InvalidError{Reason: "the memory namespace header: " + err.Error()}
+		return err
 	}
-	headers := []iggcon.HeaderEntry{{
-		Key:   namespace,
-		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte(memory.namespace)},
-	}}
 	// A memory write is governed as what it is rather than as a plain
 	// publish, so a policy can bound what an agent may remember without
 	// bounding everything it may send.
