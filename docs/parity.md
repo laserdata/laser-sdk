@@ -105,7 +105,7 @@ The check reads the raw operations from the client sources. Rust has 74 operatio
 
 ### The Go client
 
-The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 16 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
+The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 26 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
 
 A capability it does not wrap is still reachable: `Laser.Client` hands out the underlying Apache Iggy client, exactly as `Laser::client` does in Rust.
 
@@ -116,20 +116,20 @@ A capability it does not wrap is still reachable: `Laser.Client` hands out the u
 | `connection.events` | MISSING |
 | `operation.settle` | MISSING |
 | `command.raw` | `Laser.SendManaged + Laser.SendManagedWithOperation` |
-| `stream.list` | MISSING |
-| `stream.get` | MISSING |
+| `stream.list` | `Laser.Streams` |
+| `stream.get` | `Stream.Get + Stream.Exists` |
 | `stream.create` | `Stream.Ensure` |
-| `stream.update` | MISSING |
+| `stream.update` | `Stream.Rename` |
 | `stream.delete` | `Stream.Delete` |
-| `topic.list` | MISSING |
-| `topic.get` | MISSING |
+| `topic.list` | `Stream.Topics` |
+| `topic.get` | `Topic.Get + Topic.Exists` |
 | `topic.create` | `Topic.Ensure` |
-| `topic.update` | MISSING |
+| `topic.update` | `Topic.Update: name, retention and the size cap` |
 | `topic.delete` | `Topic.Delete` |
-| `partition.create` | MISSING |
-| `partition.delete` | MISSING |
-| `segment.delete` | MISSING |
-| `consumer_group.list` | MISSING |
+| `partition.create` | `Topic.AddPartitions` |
+| `partition.delete` | `Topic.DeletePartitions` |
+| `segment.delete` | `Topic.DeleteSegments` |
+| `consumer_group.list` | `Topic.ConsumerGroups` |
 | `consumer_group.get` | MISSING |
 | `consumer_group.create` | MISSING |
 | `consumer_group.delete` | MISSING |
