@@ -1494,6 +1494,48 @@ partitions, err := topic.Partitions(ctx)
 A consumer group names no partitions at all, because the server assigns them.
 
 
+## Server administration
+
+`Laser.Users` administers the accounts a deployment signs in with: read one
+with its permissions or check that it exists, create, rename or change
+status, replace permissions, change a password, and delete.
+`Laser.PersonalAccessTokens` lists, creates and deletes the tokens of the
+signed-in user.
+
+The system reads are `Ping`, `Stats`, `Me`, `Clients`, `ClientInfo`,
+`Cluster`, `Snapshot` and `DescribeOptions`. `Me` is this connection as the
+server sees it, which is not always what the client believes it asked for.
+
+`system.metadata_changes` is the one capability of this group the Go client
+does not serve yet. It is listed as MISSING in the capability table rather
+than stubbed, because a surface that answers without reading the feed would
+be worse than one that is absent.
+
+## The agent runtime
+
+`laser.AgentRuntime` puts an agent's records through one reliable loop:
+decode, gate, dispatch, commit, and dead-letter whatever cannot be handled.
+
+The gate order matters and follows the Rust client rather than reading
+naturally. A fence is checked BEFORE a deadline, and a record behind a stale
+fence is skipped rather than dead-lettered, because there is nothing to
+redrive: a newer fence already settled what should happen. A record whose
+spine will not decode is a different case, and those bytes do go to the
+dead-letter topic, because something produced them and a human needs to see
+what.
+
+`laser.AgentCtx` is what a handler is given: `Respond`, `ReplyOn`, `Send`,
+`Request`, `Session`, `SpawnSubconversation` and the pending control book. A
+reply echoes its request's correlation, and a request that carries none
+becomes its own correlation, so a conversation can always be followed back to
+the record that started it.
+
+`AgentCtx` does NOT yet have its own tests. The runtime around it is covered,
+and the context type is exercised through that, but its own edges (the reply
+provenance rules, a refused respond topic, spawning a subconversation) are
+not yet pinned directly.
+
+
 ## Dependencies
 
 Two beyond the Apache Iggy client.

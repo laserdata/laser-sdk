@@ -105,7 +105,7 @@ The check reads the raw operations from the client sources. Rust has 74 operatio
 
 ### The Go client
 
-The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 26 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
+The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 44 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
 
 A capability it does not wrap is still reachable: `Laser.Client` hands out the underlying Apache Iggy client, exactly as `Laser::client` does in Rust.
 
@@ -151,24 +151,24 @@ A capability it does not wrap is still reachable: `Laser.Client` hands out the u
 | `agent.topic_names` | `wire.AgentSessions and the other wire topic constants` |
 | `bridge.rpc` | `bridges.TaskFromEnvelope + bridges.ToolResultFromEnvelope (mapping only, no server)` |
 | `bridge.http` | MISSING |
-| `user.list` | MISSING |
-| `user.get` | MISSING |
-| `user.create` | MISSING |
-| `user.update` | MISSING |
-| `user.permissions` | MISSING |
-| `user.password` | MISSING |
-| `user.delete` | MISSING |
-| `token.list` | MISSING |
-| `token.create` | MISSING |
-| `token.delete` | MISSING |
-| `system.ping` | MISSING |
-| `system.stats` | MISSING |
-| `system.me` | MISSING |
-| `system.clients` | MISSING |
-| `system.client` | MISSING |
-| `system.cluster` | MISSING |
-| `system.snapshot` | MISSING |
-| `system.options` | MISSING |
+| `user.list` | `Laser.Users` |
+| `user.get` | `User.Get + User.Exists` |
+| `user.create` | `User.Create` |
+| `user.update` | `User.Update` |
+| `user.permissions` | `User.SetPermissions` |
+| `user.password` | `User.ChangePassword` |
+| `user.delete` | `User.Delete` |
+| `token.list` | `Laser.PersonalAccessTokens` |
+| `token.create` | `PersonalAccessToken.Create` |
+| `token.delete` | `PersonalAccessToken.Delete` |
+| `system.ping` | `Laser.Ping` |
+| `system.stats` | `Laser.Stats` |
+| `system.me` | `Laser.Me` |
+| `system.clients` | `Laser.Clients` |
+| `system.client` | `Laser.ClientInfo` |
+| `system.cluster` | `Laser.Cluster` |
+| `system.snapshot` | `Laser.Snapshot` |
+| `system.options` | `Laser.DescribeOptions` |
 | `system.metadata_changes` | MISSING |
 
 Beyond the raw capabilities, the Go client serves these managed and agent surfaces. They have no raw Apache Iggy equivalent, so they are listed on their own rather than as rows with an empty raw cell.
@@ -222,6 +222,8 @@ Beyond the raw capabilities, the Go client serves these managed and agent surfac
 | Stream administration | Laser.Streams, Stream.Get, Exists, Rename and Topics, and Topic.Get, Exists, Update, Partitions, AddPartitions, DeletePartitions, DeleteSegments and ConsumerGroups |
 | Cluster routing | the managed band keeps to one node picked by a random caller key, walks to the next on a failed link or an unreachable backend, rereads a stale roster once, and sends the replicated authorization writes to the metadata primary |
 | Scratch streams | Laser.ScratchStream: a uniquely named stream for one program run, refusing a name already taken rather than reusing it, with an idempotent delete that stays retryable after a failure |
+| Server administration | Laser.Users and User.Get, Exists, Create, Update, SetPermissions, ChangePassword and Delete, Laser.PersonalAccessTokens with Create and Delete, and Laser.Ping, Stats, Me, Clients, ClientInfo, Cluster, Snapshot and DescribeOptions |
+| Agent runtime | laser.AgentRuntime: one reliable loop over an agent's records, with the gate order, dead-letter on an undecodable spine, retry, panic recovery and a shutdown grace, plus laser.AgentCtx for replying, sending, requesting and spawning a subconversation |
 | Client encryption | laser.AES256GCM: Apache Iggy's AES-256-GCM record format, refusing any key that is not 32 bytes and reporting a ciphertext it cannot open as Apache Iggy error 72, with the ciphertexts the Rust and Node clients sealed pinned as vectors |
 
 An omitted row that reaches the raw client, or a method that does more than convert a value, names the capabilities a caller reaches through it. The check fails when such a row names none.
