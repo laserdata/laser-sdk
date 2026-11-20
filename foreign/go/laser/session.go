@@ -2,6 +2,7 @@ package laser
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
@@ -218,7 +219,8 @@ func (session *Session) writeEvent(
 		ContentType(wire.ContentCBOR).Send(ctx)
 }
 
-// laneEnvelopes is this session's records on its lane, decoded.
+// laneEnvelopes is this session's records, decoded, across every topic they
+// ride.
 //
 // A record that is not an envelope is skipped: a lane carries whatever its
 // writers put there, and one unreadable record is not a reason to refuse the
@@ -226,20 +228,77 @@ func (session *Session) writeEvent(
 func (session *Session) laneEnvelopes(
 	ctx context.Context,
 ) ([]wire.AgentEnvelope, error) {
-	scope := session.laser.WithDefaultStream(session.config.Stream).
-		Context(session.conversation)
-	records, err := scope.read(ctx, wire.AgentSessions)
-	if err != nil {
-		return nil, err
+	return laneEnvelopesOf(
+		ctx, session.laser, session.config.Stream, session.conversation)
+}
+
+// laneTopics are the topics one session's records ride: the shared lane, and
+// the declared topics of a per-agent topic layout.
+//
+// Lifecycle and state stay on the lane in every layout, but addressed work
+// and its replies move, so a fold that read the lane alone would miss the
+// usage a model call spent and the agents a session handed work to.
+func laneTopics(laser *Laser, stream string) []string {
+	names := []string{wire.AgentSessions}
+	// A layout this client cannot route under declares nothing it can read
+	// either, and the error hands back no topics, so the lane alone is what
+	// is left.
+	declared, _ := laser.layoutFor(stream).DeclaredTopics()
+	return append(names, declared...)
+}
+
+// laneEnvelopesOf reads one conversation's records across its lane topics.
+//
+// The records are ordered by append time, then by topic and offset to break a
+// tie, so a fold sees one sequence rather than one topic after another. A
+// record that does not decode as an envelope is skipped rather than refused:
+// a lane carries whatever its writers put there, and one unreadable record is
+// not a reason to lose the rest.
+func laneEnvelopesOf(
+	ctx context.Context, laser *Laser, stream string,
+	conversation wire.ConversationID,
+) ([]wire.AgentEnvelope, error) {
+	scoped := laser.WithDefaultStream(stream)
+	scope := scoped.Context(conversation)
+	type placed struct {
+		record *Record
+		topic  string
 	}
-	envelopes := make([]wire.AgentEnvelope, 0, len(records))
-	for _, record := range records {
-		if record == nil || record.Provenance == nil ||
-			record.Provenance.Conversation != session.conversation {
-			continue
+	var found []placed
+	for _, topic := range laneTopics(scoped, stream) {
+		records, err := scope.read(ctx, topic)
+		if err != nil {
+			return nil, err
 		}
+		for _, record := range records {
+			if record == nil || record.Provenance == nil ||
+				record.Provenance.Conversation != conversation {
+				continue
+			}
+			found = append(found, placed{record: record, topic: topic})
+		}
+	}
+	sort.SliceStable(found, func(left, right int) bool {
+		first, second := found[left], found[right]
+		if first.record.Message.Header.Timestamp !=
+			second.record.Message.Header.Timestamp {
+			return first.record.Message.Header.Timestamp <
+				second.record.Message.Header.Timestamp
+		}
+		// Two records can share an append time across topics, and a fold that
+		// reordered between runs would not be replayable, so the tie breaks
+		// on something stable. The topic decides first, which is the order
+		// the other clients assemble in. Within one topic the offsets do,
+		// though a read already hands those back in order.
+		if first.topic != second.topic {
+			return first.topic < second.topic
+		}
+		return first.record.Offset() < second.record.Offset()
+	})
+	envelopes := make([]wire.AgentEnvelope, 0, len(found))
+	for _, item := range found {
 		var envelope wire.AgentEnvelope
-		if err := wire.Unmarshal(record.Payload(), &envelope); err != nil {
+		if err := wire.Unmarshal(item.record.Payload(), &envelope); err != nil {
 			continue
 		}
 		envelopes = append(envelopes, envelope)

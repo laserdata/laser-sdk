@@ -20,6 +20,8 @@ type controlServer struct {
 	// sent is every record that reached the log, with the topic it rode.
 	sent   []iggcon.IggyMessage
 	topics []string
+	// declared is a per-agent topic a layout moved addressed work onto.
+	declared map[string][]iggcon.IggyMessage
 }
 
 func (server *controlServer) Close() error { return nil }
@@ -40,11 +42,19 @@ func (server *controlServer) GetTopic(
 }
 
 func (server *controlServer) PollMessages(
-	_ context.Context, _, _ iggcon.Identifier, _ uint32,
+	_ context.Context, _, topicID iggcon.Identifier, _ uint32,
 	_ iggcon.Consumer, _ iggcon.PollingStrategy, _ iggcon.PollOptions,
 ) (*iggcon.PolledMessage, error) {
+	name, err := topicID.String()
+	if err != nil {
+		return nil, err
+	}
 	server.mutex.Lock()
 	defer server.mutex.Unlock()
+	if held, moved := server.declared[name]; moved {
+		server.declared[name] = nil
+		return &iggcon.PolledMessage{Messages: held}, nil
+	}
 	messages := server.lane
 	server.lane = nil
 	return &iggcon.PolledMessage{Messages: messages}, nil
@@ -395,5 +405,35 @@ func TestGivenAControlHandleWhenDerivedThenShouldNotChangeTheOriginal(t *testing
 	}
 	if _, err := withOperator.Cancel(context.Background()); err != nil {
 		t.Fatalf("the derived handle controls: %v", err)
+	}
+}
+
+func TestGivenWorkOnADeclaredTopicWhenPausingThenShouldStillNameItsAgent(t *testing.T) {
+	// A per-agent topic layout moves addressed work off the shared lane,
+	// which is exactly the work that names a participant. Reading the lane
+	// alone would pause a session and wait for nobody.
+	session := conversation(1)
+	server := &controlServer{}
+	handle := controlHandle(server)
+	executor := agentID(t, "executor")
+	handle.SessionsWith(laser.SessionConfig{
+		Layout: laser.PerAgentTopicLayout(
+			map[wire.AgentID]string{executor: "executor.inbox"}),
+	})
+	operation := "do_the_thing"
+	server.declared = map[string][]iggcon.IggyMessage{
+		"executor.inbox": {laneRecord(t, session, wire.AgentEnvelope{
+			Kind: wire.KindCommand, Source: agentID(t, "planner"),
+			Target: &executor, Operation: &operation,
+		})},
+	}
+
+	participants, err := handle.Sessions().Control("agents", session).
+		AsOperator(agentID(t, "ops")).LaneParticipants(context.Background())
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(participants) != 1 || participants[0] != executor {
+		t.Fatalf("got %v, want the agent the work went to", participants)
 	}
 }

@@ -2,6 +2,8 @@ package laser_test
 
 import (
 	"context"
+
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"strings"
 	"sync"
 	"testing"
@@ -510,5 +512,52 @@ func TestGivenASessionTheIndexDoesNotKnowWhenAdmittingThenShouldHandleIt(t *test
 func TestGivenNoSessionWhenAdmittingThenShouldLetItThrough(t *testing.T) {
 	if !laser.NewBudgetGate().Admit(context.Background(), nil, 0, 1) {
 		t.Fatal("a record with no session is not one to hold")
+	}
+}
+
+// declaredRecord puts one record on a per-agent topic a layout declared.
+func declaredRecord(
+	t *testing.T, server *budgetServer, topic string,
+	session wire.ConversationID, envelope wire.AgentEnvelope,
+) {
+	t.Helper()
+	message := laneRecord(t, session, envelope)
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	if server.declared == nil {
+		server.declared = map[string][]iggcon.IggyMessage{}
+	}
+	message.Header.Offset = uint64(len(server.declared[topic]))
+	server.declared[topic] = append(server.declared[topic], message)
+}
+
+func TestGivenUsageOnADeclaredTopicWhenFoldedThenShouldStillCountIt(t *testing.T) {
+	// A per-agent topic layout moves a model result off the shared lane. The
+	// usage it spent moved with it, and a fold that read the lane alone
+	// would report a session over its budget as comfortably within it.
+	server := &budgetServer{}
+	server.session = conversation(1)
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+	worker := agentID(t, "worker")
+	handle.SessionsWith(laser.SessionConfig{
+		Layout: laser.PerAgentTopicLayout(
+			map[wire.AgentID]string{worker: "worker.inbox"}),
+	})
+	session := handle.Sessions().Open(server.session, "").As(worker)
+
+	startWithBudget(t, server, server.session, uintOf(100), nil)
+	operation := wire.OperationChat
+	declaredRecord(t, server, "worker.inbox", server.session, wire.AgentEnvelope{
+		Kind: wire.KindResponse, Source: worker, Target: &worker,
+		Operation: &operation,
+		Usage:     &wire.TokenUsage{InputTokens: 60, OutputTokens: 50},
+	})
+
+	breach, over, err := session.BudgetBreach(context.Background())
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if !over || breach.Spent != 110 {
+		t.Fatalf("the usage off the lane must still count, got %+v %v", breach, over)
 	}
 }

@@ -314,9 +314,6 @@ func (gate *BudgetGate) Admit(
 	}
 	gate.mutex.Lock()
 	written := gate.ending[session.conversation]
-	if !written {
-		gate.ending[session.conversation] = false
-	}
 	gate.mutex.Unlock()
 	if !written {
 		if _, err := session.FailOverBudget(ctx, verdict.breach); err == nil {

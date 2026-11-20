@@ -703,6 +703,20 @@ The Rust client additionally re-checks the stream generation at the send
 boundary, inside the same lane-identity guard noted under [Session
 layout](#session-layout). Here the check is the one in the heartbeat loop.
 
+## What a session fold reads
+
+Lifecycle and state records stay on the shared lane in every layout, but
+addressed work and its replies move under a per-agent topic layout. So a fold
+reads the lane *and* every topic the layout declares: reading the lane alone
+would miss the usage a model call spent and the agents a session handed work
+to.
+
+Records from several topics are ordered by append time, with the topic and
+then the offset breaking a tie, which is the order the other clients assemble
+in. A fold that replayed them in the order the topics happened to be read
+would not be replayable, and two readers of one log could reach different
+documents.
+
 ## Session budgets
 
 A budget is a token and cost ceiling a session's start record asks for.

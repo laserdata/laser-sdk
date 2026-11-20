@@ -130,21 +130,16 @@ func (control *SessionControl) ForceCancel(ctx context.Context) (*AgdxReceipt, e
 func (control *SessionControl) LaneParticipants(
 	ctx context.Context,
 ) ([]wire.AgentID, error) {
-	records, err := control.laser.Context(control.session).
-		read(ctx, wire.AgentSessions)
+	// Every topic the session's records ride, not just the shared lane: a
+	// per-agent topic layout moves addressed work off it, which is exactly
+	// the work that names a participant.
+	envelopes, err := laneEnvelopesOf(
+		ctx, control.laser, control.laser.defaultStream, control.session)
 	if err != nil {
 		return nil, err
 	}
 	found := map[wire.AgentID]struct{}{}
-	for _, record := range records {
-		if record == nil || record.Provenance == nil ||
-			record.Provenance.Conversation != control.session {
-			continue
-		}
-		var envelope wire.AgentEnvelope
-		if err := wire.Unmarshal(record.Payload(), &envelope); err != nil {
-			continue
-		}
+	for _, envelope := range envelopes {
 		operation := ""
 		if envelope.Operation != nil {
 			operation = *envelope.Operation

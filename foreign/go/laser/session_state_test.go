@@ -22,6 +22,9 @@ type stateServer struct {
 	// nothing about where it looked.
 	lane    []iggcon.IggyMessage
 	control []iggcon.IggyMessage
+	// declared is a per-agent topic a layout moved addressed work onto,
+	// keyed by topic name.
+	declared map[string][]iggcon.IggyMessage
 	// session is the conversation the written records carry.
 	session wire.ConversationID
 	// fail refuses the next append.
@@ -68,8 +71,11 @@ func (server *stateServer) PollMessages(
 	defer server.mutex.Unlock()
 	server.polls++
 	held := server.lane
-	if name == wire.AgentControl {
+	switch {
+	case name == wire.AgentControl:
 		held = server.control
+	case server.declared[name] != nil:
+		held = server.declared[name]
 	}
 	var out []iggcon.IggyMessage
 	for _, message := range held {
@@ -178,6 +184,33 @@ func (server *stateServer) contentTypes(t *testing.T) []wire.ContentType {
 		}
 	}
 	return stamped
+}
+
+// appendAt puts one envelope on a named topic at an explicit append time, so
+// a test can order records across topics against the order they are read in.
+func (server *stateServer) appendAt(
+	t *testing.T, topic string, timestamp uint64, operation string, body []byte,
+) {
+	t.Helper()
+	message := laneRecord(t, server.session, wire.AgentEnvelope{
+		Kind:      wire.KindEvent,
+		Source:    agentID(t, "rival"),
+		Operation: &operation,
+		Body:      body,
+	})
+	message.Header.Timestamp = timestamp
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	if topic == wire.AgentSessions {
+		message.Header.Offset = uint64(len(server.lane))
+		server.lane = append(server.lane, message)
+		return
+	}
+	if server.declared == nil {
+		server.declared = map[string][]iggcon.IggyMessage{}
+	}
+	message.Header.Offset = uint64(len(server.declared[topic]))
+	server.declared[topic] = append(server.declared[topic], message)
 }
 
 // written is how many records reached the lane.
@@ -1020,5 +1053,84 @@ func TestGivenASnapshotThisClientCannotReadWhenFoldedThenShouldIgnoreIt(t *testi
 				t.Fatal("the unreadable snapshot must not become the document")
 			}
 		})
+	}
+}
+
+// orderingSession opens a session whose layout declares one agent topic, so
+// its records are spread over two topics.
+func orderingSession(
+	t *testing.T, server *stateServer, declared string,
+) *laser.Session {
+	t.Helper()
+	server.session = conversation(1)
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+	worker := agentID(t, "worker")
+	handle.SessionsWith(laser.SessionConfig{
+		Layout: laser.PerAgentTopicLayout(
+			map[wire.AgentID]string{worker: declared}),
+	})
+	return handle.Sessions().Open(server.session, "").As(worker)
+}
+
+// racingDelta is a delta from revision zero, so whichever the fold applies
+// first wins and the other is skipped for naming a revision already reached.
+func racingDelta(t *testing.T, opID, key string) []byte {
+	t.Helper()
+	body, err := wire.Marshal(wire.StateDelta{
+		BaseRevision: 0, OpID: opID,
+		Patch: []wire.PatchOperation{wire.AddOperation("/"+key, text("v"))},
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	return body
+}
+
+func TestGivenRecordsOnTwoTopicsWhenFoldedThenShouldOrderThemByAppendTime(t *testing.T) {
+	// A per-agent topic layout spreads a session's records over several
+	// topics. Folding one topic after another would replay them in an order
+	// no clock agrees with, so two readers of one log could reach different
+	// documents.
+	server := &stateServer{}
+	session := orderingSession(t, server, "worker.inbox")
+	server.appendAt(t, "worker.inbox", 1, wire.OperationStateDelta,
+		racingDelta(t, "01ARZ3NDEKTSV4RRFFQ69G5FAV", "earlier"))
+	server.appendAt(t, wire.AgentSessions, 5, wire.OperationStateDelta,
+		racingDelta(t, "01ARZ3NDEKTSV4RRFFQ69G5FAW", "later"))
+
+	view, err := session.State().Get(context.Background())
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if value, found := field(t, view, "earlier"); !found || value != "v" {
+		t.Fatalf("the earlier record must win, got %q %v", value, found)
+	}
+	if _, found := field(t, view, "later"); found {
+		t.Fatal("the later record starts from a revision already reached")
+	}
+}
+
+func TestGivenRecordsSharingAnAppendTimeWhenFoldedThenShouldOrderThemByTopic(t *testing.T) {
+	// Two records can land in the same microsecond on different topics. The
+	// topic breaks the tie, which is the order the other clients assemble
+	// in, so every reader of one log folds the same sequence. The declared
+	// topic here sorts before the lane, so the tie cannot be settled by the
+	// order the topics happen to be read in.
+	server := &stateServer{}
+	session := orderingSession(t, server, "aa.inbox")
+	server.appendAt(t, "aa.inbox", 3, wire.OperationStateDelta,
+		racingDelta(t, "01ARZ3NDEKTSV4RRFFQ69G5FAV", "first"))
+	server.appendAt(t, wire.AgentSessions, 3, wire.OperationStateDelta,
+		racingDelta(t, "01ARZ3NDEKTSV4RRFFQ69G5FAW", "second"))
+
+	view, err := session.State().Get(context.Background())
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if value, found := field(t, view, "first"); !found || value != "v" {
+		t.Fatalf("the topic that sorts first must win, got %q %v", value, found)
+	}
+	if _, found := field(t, view, "second"); found {
+		t.Fatal("the second record starts from a revision already reached")
 	}
 }
