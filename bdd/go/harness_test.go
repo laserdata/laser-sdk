@@ -95,6 +95,23 @@ type stepFunc func(ctx context.Context, state *world, step bdd.Step) error
 // open can make the next one pass.
 func runFeature(t *testing.T, file string, timeout time.Duration, run stepFunc) {
 	t.Helper()
+	runFeaturePlanned(t, file, timeout, run, nil)
+}
+
+// runFeaturePlanned runs a feature where some scenarios are knowingly not
+// covered yet.
+//
+// plan maps a scenario's name to why this runner does not run it, and those
+// scenarios report as skips naming that reason. It exists so a large feature
+// can be covered in slices without the uncovered ones either failing the gate
+// or, far worse, quietly reporting a pass: a scenario absent from the plan and
+// missing a step implementation still fails. Shrinking the plan to nothing is
+// the work.
+func runFeaturePlanned(
+	t *testing.T, file string, timeout time.Duration,
+	run stepFunc, plan map[string]string,
+) {
+	t.Helper()
 	address := deployment(t)
 	feature, err := bdd.ParseFeature(filepath.Join(scenarios, file))
 	if err != nil {
@@ -103,7 +120,19 @@ func runFeature(t *testing.T, file string, timeout time.Duration, run stepFunc) 
 	if len(feature.Scenarios) == 0 {
 		t.Fatalf("%s holds no scenarios, so this would pass vacuously", file)
 	}
-	runScenarios(t, feature, address, timeout, run)
+	// A plan entry naming a scenario this feature does not hold is stale, and
+	// would go on excusing a scenario that no longer exists.
+	named := map[string]bool{}
+	for _, scenario := range feature.Scenarios {
+		named[scenario.Name] = true
+	}
+	for name := range plan {
+		if !named[name] {
+			t.Fatalf("%s holds no scenario %q, so the plan entry is stale",
+				file, name)
+		}
+	}
+	runPlanned(t, feature, address, timeout, run, plan)
 }
 
 // runLocalFeature runs a feature whose steps reach no deployment.
@@ -128,10 +157,21 @@ func runScenarios(
 	timeout time.Duration, run stepFunc,
 ) {
 	t.Helper()
+	runPlanned(t, feature, address, timeout, run, nil)
+}
+
+func runPlanned(
+	t *testing.T, feature *bdd.Feature, address string,
+	timeout time.Duration, run stepFunc, plan map[string]string,
+) {
+	t.Helper()
 	for _, scenario := range feature.Scenarios {
 		t.Run(scenario.Name, func(t *testing.T) {
 			if scenario.HasTag("@managed") && !managed() {
 				t.Skip("needs a managed backend: set LASER_BDD_MANAGED=1")
+			}
+			if reason, planned := plan[scenario.Name]; planned {
+				t.Skip(reason)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
