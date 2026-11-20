@@ -274,8 +274,18 @@ func TestGivenASessionStartWhenSentThenShouldCarryItsOwnRecord(t *testing.T) {
 	}
 
 	envelope := sentEnvelope(t, server)
-	if envelope.TaskState == nil || *envelope.TaskState != wire.TaskSubmitted {
-		t.Errorf("want a submitted session, got %v", envelope.TaskState)
+	if envelope.TaskState == nil || *envelope.TaskState != wire.TaskWorking {
+		t.Errorf("want a working session, got %v", envelope.TaskState)
+	}
+	// The state alone is not the point. What matters is how every other
+	// client reads the record, so assert the display the shared dispatch
+	// rule produces: submitted would read as a session nobody ever began.
+	display := wire.DisplayTypeOf(
+		wire.SessionRecord{Kind: wire.RecordEnvelope, Envelope: &envelope},
+		wire.AgentSessions)
+	if display != wire.DisplaySessionStarted {
+		t.Errorf("a started session reads as %q, want %q",
+			display, wire.DisplaySessionStarted)
 	}
 	var start wire.SessionStart
 	if err := wire.Unmarshal(envelope.Body, &start); err != nil {

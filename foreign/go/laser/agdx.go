@@ -100,7 +100,11 @@ func (agdx *Agdx) TaskStatus(
 // constructor: a caller cannot pair a state with a body that does not belong
 // to it.
 func (agdx *Agdx) SessionStarted(start wire.SessionStart) *AgdxSend {
-	return agdx.sessionStatus(wire.TaskSubmitted, start)
+	// Working, not submitted. Submitted means handed to an agent that has not
+	// picked it up, so a start written as submitted reads everywhere else as
+	// a session nobody ever began. The start body is what separates this from
+	// a resume, which carries a transition instead.
+	return agdx.sessionStatus(wire.TaskWorking, start)
 }
 
 // SessionProgressed reports a session moving along, carrying what changed.

@@ -180,8 +180,17 @@ func TestGivenASessionWhenBegunThenShouldWriteItsStartRecord(t *testing.T) {
 	if envelope.Kind != wire.KindStatus {
 		t.Errorf("want a status, got %q", envelope.Kind)
 	}
-	if envelope.TaskState == nil || *envelope.TaskState != wire.TaskSubmitted {
-		t.Errorf("want a submitted session, got %v", envelope.TaskState)
+	if envelope.TaskState == nil || *envelope.TaskState != wire.TaskWorking {
+		t.Errorf("want a working session, got %v", envelope.TaskState)
+	}
+	// Submitted would read everywhere else as work handed to an agent that
+	// never picked it up, so pin the display rather than only the state.
+	display := wire.DisplayTypeOf(
+		wire.SessionRecord{Kind: wire.RecordEnvelope, Envelope: &envelope},
+		wire.AgentSessions)
+	if display != wire.DisplaySessionStarted {
+		t.Errorf("a begun session reads as %q, want %q",
+			display, wire.DisplaySessionStarted)
 	}
 	var start wire.SessionStart
 	if err := wire.Unmarshal(envelope.Body, &start); err != nil {
