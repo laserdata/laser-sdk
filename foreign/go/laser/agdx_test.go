@@ -532,3 +532,48 @@ func TestGivenAnEnvelopeThatFailsTheContractWhenOpenedThenShouldRefuseIt(t *test
 		t.Fatalf("want an InvalidError, got %T: %v", err, err)
 	}
 }
+
+// A reply names where the record it answers sits on the log, in the one form
+// every client spells it: partition and offset, not a record id.
+func TestGivenARepliedCauseWhenSentThenShouldStampTheLogPosition(t *testing.T) {
+	server := &streamServer{}
+	agdx := agdxHandle(server).Agdx(agentID(t, "planner"), conversation(1))
+	cause := wire.RecordID{ID: wire.IDFromBytes([16]byte{15: 9})}
+	at := wire.LogPosition{StreamID: 2, TopicID: 3, PartitionID: 4, Offset: 77}
+
+	if _, err := agdx.Respond(correlationID(2), []byte("answer")).
+		WithTarget(agentID(t, "executor")).
+		WithCause(cause, &at).Send(context.Background()); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	headers := sentHeaders(t, server)
+	if got := headers[wire.HeaderCausalParent]; got != "4:77" {
+		t.Fatalf("the cause header is %q, want the log position", got)
+	}
+	// The record id stays in the envelope, where the contract puts it. The
+	// header carries the position because that is what a reader needs to go
+	// and read the record the reply answers.
+	envelope := sentEnvelope(t, server)
+	if envelope.Cause == nil || *envelope.Cause != cause {
+		t.Fatalf("the envelope must keep the record id, got %v", envelope.Cause)
+	}
+}
+
+// A reply with no known position stamps no cause header rather than one a
+// reader cannot resolve.
+func TestGivenACauseWithNoPositionWhenSentThenShouldStampNoCauseHeader(t *testing.T) {
+	server := &streamServer{}
+	agdx := agdxHandle(server).Agdx(agentID(t, "planner"), conversation(1))
+	cause := wire.RecordID{ID: wire.IDFromBytes([16]byte{15: 9})}
+
+	if _, err := agdx.Respond(correlationID(2), []byte("answer")).
+		WithTarget(agentID(t, "executor")).
+		WithCause(cause, nil).Send(context.Background()); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	if got, stamped := sentHeaders(t, server)[wire.HeaderCausalParent]; stamped {
+		t.Fatalf("want no cause header, got %q", got)
+	}
+}

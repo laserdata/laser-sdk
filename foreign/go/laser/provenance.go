@@ -27,8 +27,12 @@ type Provenance struct {
 	// Conversation is the conversation this record belongs to, and the
 	// partition key that keeps one conversation ordered.
 	Conversation wire.ConversationID
-	// CausalParent is the record this one answers, if any.
-	CausalParent *wire.RecordID
+	// CausalParent is where the record this one answers sits on the log.
+	//
+	// It is a log position rather than a record id, because a consumer that
+	// wants to read what a reply answers needs to know where it is, and the
+	// contract spells it "partition:offset".
+	CausalParent *MessageID
 	// ParentConversation and RootConversation place a sub-conversation in its
 	// tree, so a reply can be traced back to the exchange that spawned it.
 	ParentConversation *wire.ConversationID
@@ -195,11 +199,11 @@ func ProvenanceFromHeaders(entries []iggcon.HeaderEntry) (*Provenance, error) {
 			if err != nil {
 				return nil, err
 			}
-			id, err := wire.ParseID(text)
+			id, err := ParseMessageID(text)
 			if err != nil {
 				return nil, invalidHeader(key)
 			}
-			provenance.CausalParent = &wire.RecordID{ID: id}
+			provenance.CausalParent = &id
 		case wire.HeaderParentConversation:
 			id, err := conversationText(entry.Value, key)
 			if err != nil {

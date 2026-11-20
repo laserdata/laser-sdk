@@ -52,7 +52,7 @@ func TestGivenAFullProvenanceWhenRoundTrippedThenShouldSurviveIntact(t *testing.
 	}
 	parent := wire.ConversationID{ID: wire.IDFromBytes([16]byte{15: 2})}
 	root := wire.ConversationID{ID: wire.IDFromBytes([16]byte{15: 3})}
-	cause := wire.RecordID{ID: wire.IDFromBytes([16]byte{15: 4})}
+	cause := laser.NewMessageID(1, 42)
 	cost := 0.0125
 
 	sent := &laser.Provenance{

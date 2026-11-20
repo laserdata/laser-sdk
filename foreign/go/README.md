@@ -198,6 +198,22 @@ conversation to belong to. A broadcast addressee reads back as no target rather
 than an agent named `*`. A non-finite cost is refused in both directions,
 because it would be rolled up into a total as a number that is not one.
 
+## Causality
+
+A record names the one it answers with `laser.MessageID`: the partition and
+offset of that record, spelled `partition:offset` on the `agdx.cause` header.
+A record id would not do, because a consumer that wants to read what a reply
+answers needs to know where it is.
+
+An AGDX envelope carries both: a record id in `cause`, which is portable, and
+the log position in `cause_at`, which is what the header is derived from. A
+reply whose caller knew no position stamps no cause header rather than one a
+reader cannot resolve.
+
+A padded number is refused on the way in. It parses the same as its canonical
+spelling, so accepting it would let two clients disagree about whether
+`01:42` and `1:42` name the same record.
+
 ## Consuming
 
 `Topic.Consumer(name, options)` opens a standalone consumer and

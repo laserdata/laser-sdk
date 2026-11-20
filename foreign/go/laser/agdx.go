@@ -558,9 +558,16 @@ func (send *AgdxSend) provenance() *Provenance {
 		RootConversation:   send.envelope.Root,
 		Agent:              &send.envelope.Source,
 		TargetAgent:        send.envelope.Target,
-		CausalParent:       send.envelope.Cause,
 		DeadlineAt:         send.deadlineAt,
 		Usage:              send.usage,
+	}
+	// The spine's causal parent is where the answered record sits on the
+	// log, which is what the envelope's cause_at carries. The envelope's own
+	// cause is a record id and belongs in the envelope, not in this header.
+	if send.envelope.CauseAt != nil {
+		cause := NewMessageID(
+			send.envelope.CauseAt.PartitionID, send.envelope.CauseAt.Offset)
+		provenance.CausalParent = &cause
 	}
 	if send.envelope.Correlation != nil {
 		correlation := send.envelope.Correlation.String()
