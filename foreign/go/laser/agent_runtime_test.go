@@ -968,3 +968,378 @@ func TestGivenRepeatedAttemptsWhenBackingOffThenShouldDoubleWithoutOverflowing(t
 		t.Errorf("want a capped positive delay, got %s", delay)
 	}
 }
+
+// The natural reading of the gates is deadline first, and it is wrong. A
+// record that is both stale and expired is a replay of work a newer fence
+// already settled, so there is nothing to keep: dead-lettering it would fill
+// the topic with copies of work that already happened.
+//
+// This fails if the two gates are ever reordered back.
+func TestGivenARecordBothStaleAndExpiredWhenDecidedThenShouldSkipItRatherThanKeepIt(t *testing.T) {
+	agent := laser.FromClient(&streamServer{}, laser.Options{}).
+		Agent(agentID(t, "executor"), laser.AgentOptions{})
+	past := time.Now().Add(-time.Minute)
+
+	ahead := agent.Decide(recordWith(&laser.Provenance{
+		Conversation: conversation(1), FenceToken: uint64Pointer(5),
+	}))
+	if ahead.Verdict != laser.Deliver {
+		t.Fatalf("want the holder's own record delivered, got %s", ahead.Verdict)
+	}
+
+	stale := agent.Decide(recordWith(&laser.Provenance{
+		Conversation: conversation(1),
+		FenceToken:   uint64Pointer(4),
+		DeadlineAt:   &past,
+	}))
+
+	if stale.Verdict != laser.Skip {
+		t.Fatalf("want the stale replay skipped rather than kept, got %s", stale.Verdict)
+	}
+	// An expired record that is not stale is still kept, so the skip above is
+	// the fence answering first rather than the deadline gate being gone.
+	expired := agent.Decide(recordWith(&laser.Provenance{
+		Conversation: conversation(2), DeadlineAt: &past,
+	}))
+	if expired.Verdict != laser.DeadLetter ||
+		expired.Reason != wire.DeadLetterDeadlineExceeded {
+		t.Errorf("want an expired record kept, got %s", expired.Verdict)
+	}
+}
+
+// A record whose spine did not decode is refused with the record attached, so
+// a runtime can keep its bytes. A caller matching on the reason underneath
+// must still find it, or every existing reader of that refusal breaks in
+// silence.
+func TestGivenAnUndecodableRecordWhenRefusedThenShouldStillMatchItsCause(t *testing.T) {
+	cause := &laser.CodecError{Reason: "read the record's headers"}
+	refusal := error(&laser.UndecodableRecord{Cause: cause})
+
+	var codec *laser.CodecError
+	if !errors.As(refusal, &codec) {
+		t.Fatal("want the cause still matchable through the refusal")
+	}
+	if codec != cause {
+		t.Error("want the original cause, not a copy of it")
+	}
+	if !errors.Is(refusal, error(cause)) {
+		t.Error("want the refusal to report the cause it wraps")
+	}
+	var unreadable *laser.UndecodableRecord
+	if !errors.As(refusal, &unreadable) {
+		t.Fatal("want the refusal itself matchable")
+	}
+}
+
+// A reader that hands over a record with a broken spine must not lose it. The
+// refusal carries the bytes and where they sat, which is the only way a
+// runtime can keep them rather than stopping on them forever.
+func TestGivenADeliveredRecordWithABrokenSpineWhenOpenedThenShouldCarryItInTheRefusal(t *testing.T) {
+	headers, err := (&laser.Provenance{Conversation: conversation(3)}).Headers()
+	if err != nil {
+		t.Fatalf("encode the spine: %v", err)
+	}
+	fence, err := iggcon.NewHeaderKeyString(wire.HeaderFence)
+	if err != nil {
+		t.Fatalf("header key: %v", err)
+	}
+	headers = append(headers, iggcon.HeaderEntry{
+		Key:   fence,
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("not a number")},
+	})
+	message, err := iggcon.NewIggyMessage([]byte("the work"),
+		iggcon.WithUserHeaders(headers))
+	if err != nil {
+		t.Fatalf("build a record: %v", err)
+	}
+	message.Header.Offset = 11
+	checkpoint, _ := (&iggcon.PolledMessage{
+		PartitionId: 2, Messages: []iggcon.IggyMessage{message},
+	}).Checkpoint()
+
+	record, err := laser.DeliveredRecord(2, message, checkpoint, true)
+
+	if record != nil {
+		t.Error("a record whose fence did not decode must not be handed over")
+	}
+	var unreadable *laser.UndecodableRecord
+	if !errors.As(err, &unreadable) {
+		t.Fatalf("want the record carried in the refusal, got %T", err)
+	}
+	if string(unreadable.Message.Payload) != "the work" {
+		t.Errorf("want the bytes kept, got %q", unreadable.Message.Payload)
+	}
+	if unreadable.PartitionID != 2 || unreadable.Checkpoint.Offset() != 11 {
+		t.Errorf("want where the record sat, got partition %d offset %d",
+			unreadable.PartitionID, unreadable.Checkpoint.Offset())
+	}
+	if unreadable.Cause == nil {
+		t.Error("want the reason the spine did not decode")
+	}
+}
+
+// A record with no spine at all is the normal case on a plain data topic, so
+// it is handed over with none rather than refused.
+func TestGivenADeliveredRecordWithNoSpineWhenOpenedThenShouldHandItOver(t *testing.T) {
+	message, err := iggcon.NewIggyMessage([]byte("plain"))
+	if err != nil {
+		t.Fatalf("build a record: %v", err)
+	}
+
+	record, err := laser.DeliveredRecord(1, message, iggcon.Checkpoint{}, false)
+
+	if err != nil {
+		t.Fatalf("a record with no spine is not a broken one: %v", err)
+	}
+	if record.Provenance != nil {
+		t.Error("want no spine rather than an invented one")
+	}
+	if record.PartitionID != 1 {
+		t.Errorf("want where the record came from, got %d", record.PartitionID)
+	}
+}
+
+// budgetRuntime opens a runtime over a steerable session index.
+func budgetRuntime(
+	t *testing.T, server *budgetServer, name string,
+) *laser.AgentRuntime {
+	t.Helper()
+	server.session = conversation(1)
+	capabilities := laser.Capabilities{Managed: true, Sessions: true}
+	handle := laser.FromClient(server, laser.Options{
+		DefaultStream: "agents", Capabilities: &capabilities,
+	})
+	agent := handle.Agent(agentID(t, name), laser.AgentOptions{})
+	runtime, err := handle.AgentRuntime(agent, laser.RuntimeOptions{
+		Topic: wire.AgentSessions, Budget: laser.NewBudgetGate(),
+	})
+	if err != nil {
+		t.Fatalf("open the runtime: %v", err)
+	}
+	return runtime
+}
+
+// A session over its budget stops spending, so its work is kept from the
+// handler rather than left to run up a bill nobody authorized.
+func TestGivenASessionOverItsBudgetWhenRunThenShouldKeepItsWorkFromTheHandler(t *testing.T) {
+	server := &budgetServer{}
+	runtime := budgetRuntime(t, server, "executor")
+	server.answerIndex(&wire.SessionInfo{
+		Status: wire.SessionActive, OverBudget: true,
+		TokensIn: 110, Budget: &wire.Budget{Tokens: uintOf(100)},
+	})
+	record := delivered(t, 0, 1, func(agdx *laser.Agdx) *laser.AgdxSend {
+		return agdx.Command(correlationID(2), []byte("spend more")).
+			WithTarget(agentID(t, "executor"))
+	})
+	source := sourceOf(record)
+	handler := &handling{}
+
+	if err := runUntilDrained(t, runtime, source, handler); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if tries := handler.tries(); tries != 0 {
+		t.Errorf("want the work kept from the handler, got %d attempts", tries)
+	}
+	if commits := source.commits(); len(commits) != 1 {
+		t.Errorf("want the record committed, got %v", commits)
+	}
+}
+
+// Records of one poll share a verdict, so the index is read once for the
+// batch rather than once per record, and read again for the next batch.
+func TestGivenRecordsOfOneBatchWhenRunThenShouldReadTheBudgetIndexOncePerBatch(t *testing.T) {
+	server := &budgetServer{}
+	runtime := budgetRuntime(t, server, "executor")
+	server.answerIndex(&wire.SessionInfo{Status: wire.SessionActive})
+	build := func(offset uint64, endsBatch bool) *laser.Record {
+		record := delivered(t, 0, offset, func(agdx *laser.Agdx) *laser.AgdxSend {
+			return agdx.Command(correlationID(byte(offset)), []byte("work")).
+				WithTarget(agentID(t, "executor"))
+		})
+		record.EndsBatch = endsBatch
+		return record
+	}
+	source := sourceOf(build(1, false), build(2, true), build(3, true))
+
+	if err := runUntilDrained(t, runtime, source, &handling{}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if reads := server.indexed(); reads != 2 {
+		t.Errorf("want one index read per batch, got %d", reads)
+	}
+}
+
+// A capsule must not be dropped for the very deadline that killed the record
+// it carries, so the deadline is cleared on the way out.
+func TestGivenAnExpiredRecordWhenKeptThenShouldClearTheDeadlineOnTheCapsule(t *testing.T) {
+	server := newRuntimeServer()
+	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{})
+	record := delivered(t, 0, 1, func(agdx *laser.Agdx) *laser.AgdxSend {
+		return agdx.Command(correlationID(2), []byte("stale")).
+			WithTarget(agentID(t, "executor")).
+			WithDeadline(time.Now().Add(-time.Second))
+	})
+
+	if err := runUntilDrained(t, runtime, sourceOf(record), &handling{}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	written := server.on(wire.AgentDLQ)
+	if len(written) != 1 {
+		t.Fatalf("want one capsule, got %d", len(written))
+	}
+	spine, err := laser.ProvenanceFrom(&written[0])
+	if err != nil {
+		t.Fatalf("read the capsule spine: %v", err)
+	}
+	if spine.DeadlineAt != nil {
+		t.Error("a capsule carrying a passed deadline would be dropped by its own reader")
+	}
+	if spine.Conversation != conversation(1) {
+		t.Errorf("want the capsule on the record's own session, got %v", spine.Conversation)
+	}
+	if spine.CausalParent == nil || spine.CausalParent.Offset != 1 {
+		t.Errorf("want the capsule pointed at the poison record, got %v", spine.CausalParent)
+	}
+}
+
+// A fenced effect carries its fence in the envelope, so a stale holder's
+// replay is refused there the same way a header-borne one is.
+func TestGivenAStaleFenceInTheEnvelopeWhenRunThenShouldSkipTheReplay(t *testing.T) {
+	server := newRuntimeServer()
+	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{})
+	fenced := func(offset uint64, fence uint64) *laser.Record {
+		return delivered(t, 0, offset, func(agdx *laser.Agdx) *laser.AgdxSend {
+			return agdx.Command(correlationID(byte(offset)), []byte("apply")).
+				WithTarget(agentID(t, "executor")).
+				WithMetadata(wire.HeaderFence, wire.UintValue(fence))
+		})
+	}
+	source := sourceOf(fenced(1, 5), fenced(2, 4))
+	handler := &handling{}
+
+	if err := runUntilDrained(t, runtime, source, handler); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if tries := handler.tries(); tries != 1 {
+		t.Errorf("want the stale holder's replay refused, got %d attempts", tries)
+	}
+	if kept := capsules(t, server); len(kept) != 0 {
+		t.Errorf("a replay is not poison, so nothing is kept, got %d", len(kept))
+	}
+	if commits := source.commits(); len(commits) != 2 {
+		t.Errorf("want both records committed, got %v", commits)
+	}
+}
+
+// A dead letter belongs on its session's timeline, so the conversation is
+// read off the header even when the rest of the spine did not decode.
+func TestGivenAnUndecodableRecordNamingItsSessionWhenKeptThenShouldStayOnIt(t *testing.T) {
+	server := newRuntimeServer()
+	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{})
+	headers, err := (&laser.Provenance{Conversation: conversation(5)}).Headers()
+	if err != nil {
+		t.Fatalf("encode the spine: %v", err)
+	}
+	fence, err := iggcon.NewHeaderKeyString(wire.HeaderFence)
+	if err != nil {
+		t.Fatalf("header key: %v", err)
+	}
+	headers = append(headers, iggcon.HeaderEntry{
+		Key:   fence,
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("not a number")},
+	})
+	message, err := iggcon.NewIggyMessage([]byte("body"), iggcon.WithUserHeaders(headers))
+	if err != nil {
+		t.Fatalf("build a record: %v", err)
+	}
+	if _, err := laser.OpenRecord(message); err == nil {
+		t.Fatal("this record must not decode, or the test proves nothing")
+	}
+	checkpoint, _ := (&iggcon.PolledMessage{
+		PartitionId: 0, Messages: []iggcon.IggyMessage{message},
+	}).Checkpoint()
+	source := &queuedSource{
+		steps: []step{{err: &laser.UndecodableRecord{
+			Message: message, Checkpoint: checkpoint,
+			Cause: &laser.CodecError{Reason: "the fence is not a number"},
+		}}},
+		drained: make(chan struct{}),
+	}
+
+	if err := runUntilDrained(t, runtime, source, &handling{}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	written := server.on(wire.AgentDLQ)
+	if len(written) != 1 {
+		t.Fatalf("want one capsule, got %d", len(written))
+	}
+	spine, err := laser.ProvenanceFrom(&written[0])
+	if err != nil {
+		t.Fatalf("read the capsule spine: %v", err)
+	}
+	if spine.Conversation != conversation(5) {
+		t.Errorf("want the capsule on the record's own session, got %v", spine.Conversation)
+	}
+}
+
+// An agent told to take only work addressed to it by name leaves a broadcast
+// alone, which is what a deployment that fans one topic out by hand wants.
+func TestGivenABroadcastWhenTheAgentWantsNamedWorkThenShouldLeaveItAlone(t *testing.T) {
+	server := newRuntimeServer()
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+	agent := handle.Agent(agentID(t, "executor"), laser.AgentOptions{
+		AcceptBroadcast: boolPointer(false),
+	})
+	runtime, err := handle.AgentRuntime(agent, laser.RuntimeOptions{
+		Topic: wire.AgentSessions,
+	})
+	if err != nil {
+		t.Fatalf("open the runtime: %v", err)
+	}
+	record := delivered(t, 0, 1, func(agdx *laser.Agdx) *laser.AgdxSend {
+		return agdx.Command(correlationID(2), []byte("anyone")).Broadcast()
+	})
+	source := sourceOf(record)
+	handler := &handling{}
+
+	if err := runUntilDrained(t, runtime, source, handler); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if tries := handler.tries(); tries != 0 {
+		t.Errorf("want the broadcast left alone, got %d attempts", tries)
+	}
+	if commits := source.commits(); len(commits) != 1 {
+		t.Errorf("want the skipped record committed, got %v", commits)
+	}
+}
+
+// A reply addressed to another agent is that agent's answer. A waiter here
+// that would take any reply must not be woken by it.
+func TestGivenAnotherAgentsReplyWhenRunThenShouldNotWakeAWaiterHere(t *testing.T) {
+	server := newRuntimeServer()
+	runtime := runtimeFor(t, server, "planner", laser.RuntimeOptions{})
+	ticket, err := runtime.Replies().Subscribe(correlationID(9),
+		laser.ExpectedReply{Session: conversation(1)})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	record := delivered(t, 0, 3, func(agdx *laser.Agdx) *laser.AgdxSend {
+		return agdx.Respond(correlationID(9), []byte("not yours")).
+			WithTarget(agentID(t, "reviewer"))
+	})
+
+	if err := runUntilDrained(t, runtime, sourceOf(record), &handling{}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if _, err := ticket.Await(context.Background(), 20*time.Millisecond); err == nil {
+		t.Error("another agent's reply must not answer a waiter here")
+	}
+}

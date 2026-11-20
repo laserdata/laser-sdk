@@ -834,9 +834,37 @@ func deadLetterConversation(record *Record, position wire.LogPosition) wire.Conv
 	if record.Provenance != nil {
 		return record.Provenance.Conversation
 	}
+	if conversation, named := conversationOf(&record.Message); named {
+		return conversation
+	}
 	return DeriveConversationID("dead-letter\x1f" +
 		itoa(int(position.StreamID)) + "\x1f" + itoa(int(position.TopicID)) + "\x1f" +
 		itoa(int(position.PartitionID)) + "\x1f" + utoa(position.Offset))
+}
+
+// conversationOf reads the conversation a record's header names, ignoring
+// everything else the block carries.
+//
+// It is read on its own because a record reaches this path precisely when its
+// spine did not decode: a dead letter still belongs on its session's timeline
+// when the header saying which session is readable, whatever else was wrong
+// with the rest.
+func conversationOf(message *iggcon.IggyMessage) (wire.ConversationID, bool) {
+	entries, err := iggcon.DeserializeHeaders(message.UserHeaders)
+	if err != nil {
+		return wire.ConversationID{}, false
+	}
+	for _, entry := range entries {
+		if string(entry.Key.Value) != wire.HeaderConversationID {
+			continue
+		}
+		conversation, err := conversationValue(entry.Value, wire.HeaderConversationID)
+		if err != nil {
+			return wire.ConversationID{}, false
+		}
+		return conversation, true
+	}
+	return wire.ConversationID{}, false
 }
 
 // publishCapsule writes one capsule on the dead-letter topic, retrying a
