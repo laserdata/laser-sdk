@@ -207,8 +207,9 @@ func TestGivenAnExpiredRecordWhenDecidedThenShouldNotSpendItsDedupKey(t *testing
 }
 
 // A stale holder's replay must not advance anything, so the fence is checked
-// before the key is spent.
-func TestGivenAFencedOutRecordWhenDecidedThenShouldDeadLetterIt(t *testing.T) {
+// before the key is spent. It is skipped rather than kept: the legitimate
+// holder's own record does the work, so there is nothing here to redrive.
+func TestGivenAFencedOutRecordWhenDecidedThenShouldSkipIt(t *testing.T) {
 	dedup := laser.NewDeduplicator(0)
 	agent := laser.FromClient(&streamServer{}, laser.Options{}).
 		Agent(agentID(t, "planner"), laser.AgentOptions{Dedup: dedup})
@@ -226,11 +227,8 @@ func TestGivenAFencedOutRecordWhenDecidedThenShouldDeadLetterIt(t *testing.T) {
 		IdempotencyKey: textPointer("order-7"),
 	}))
 
-	if behind.Verdict != laser.DeadLetter {
-		t.Fatalf("want a dead letter, got %s", behind.Verdict)
-	}
-	if behind.Reason != wire.DeadLetterRejected {
-		t.Errorf("want the rejected reason, got %d", behind.Reason)
+	if behind.Verdict != laser.Skip {
+		t.Fatalf("want the replay skipped, got %s", behind.Verdict)
 	}
 	if dedup.Remembered() != 0 {
 		t.Error("a fenced-out record must not spend its key either")
