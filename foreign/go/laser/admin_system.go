@@ -2,9 +2,14 @@ package laser
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"math"
+	"math/big"
 	"sort"
+	"strconv"
+	"unicode/utf8"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
@@ -447,4 +452,240 @@ func clusterStatusOf(status iggcon.ClusterNodeStatus) ClusterNodeStatus {
 	default:
 		return ClusterUnknown
 	}
+}
+
+// OptionsScope is the resource an option catalog describes.
+type OptionsScope uint8
+
+const (
+	OptionsScopeTopic  OptionsScope = 1
+	OptionsScopeStream OptionsScope = 2
+	OptionsScopeUser   OptionsScope = 3
+)
+
+// String is the scope word the other clients use.
+func (scope OptionsScope) String() string {
+	switch scope {
+	case OptionsScopeTopic:
+		return "topic"
+	case OptionsScopeStream:
+		return "stream"
+	case OptionsScopeUser:
+		return "user"
+	default:
+		return "unknown"
+	}
+}
+
+// ParseOptionsScope reads a scope word.
+func ParseOptionsScope(word string) (OptionsScope, error) {
+	switch word {
+	case "topic":
+		return OptionsScopeTopic, nil
+	case "stream":
+		return OptionsScopeStream, nil
+	case "user":
+		return OptionsScopeUser, nil
+	default:
+		return 0, &InvalidError{Reason: "unknown options scope " + quoted(word) +
+			", expected topic, stream or user"}
+	}
+}
+
+// OptionInfo is one option the server accepts for a scope.
+type OptionInfo struct {
+	Key string
+	// Kind names the value type, such as uint64, bool or string.
+	Kind string
+	// Updatable means an update may set the option.
+	Updatable bool
+	// Resettable means an update may reset the option to its default.
+	Resettable bool
+	// Secret means the server accepts the option and never returns it.
+	Secret bool
+	// ReadOnly means the server computes the option and never accepts it.
+	ReadOnly bool
+	// Critical means a node that does not know the option must not serve the
+	// resource.
+	Critical bool
+	// DefaultValue is the default in its text form, empty when the option has
+	// no default. Integers are decimal, floats are the 0x hex of their bits,
+	// and raw bytes are base64.
+	DefaultValue string
+	Description  string
+}
+
+// DescribeOptions is every option the server accepts for scope, with its
+// type, rules, default and description.
+//
+// The catalog of a server newer than this build names options this client
+// has no field for, which is the point of asking: it says what a raw option
+// patch may carry.
+func (laser *Laser) DescribeOptions(
+	ctx context.Context, scope OptionsScope,
+) ([]OptionInfo, error) {
+	// A scope the server does not know names no catalog, so it is refused
+	// here rather than sent for the server to reject.
+	if err := iggcon.OptionsScope(scope).Validate(); err != nil {
+		return nil, &InvalidError{
+			Reason: "an options scope must be topic, stream or user"}
+	}
+	client, err := laser.connected()
+	if err != nil {
+		return nil, err
+	}
+	specs, err := client.DescribeOptions(ctx, iggcon.OptionsScope(scope))
+	if err != nil {
+		return nil, &TransportError{Reason: "describe the options", Cause: err}
+	}
+	listed := make([]OptionInfo, 0, len(specs))
+	for _, spec := range specs {
+		listed = append(listed, OptionInfo{
+			Key:          spec.Key,
+			Kind:         headerKindName(spec.DefaultValue.Kind),
+			Updatable:    spec.Updatable,
+			Resettable:   spec.Resettable,
+			Secret:       spec.Secret,
+			ReadOnly:     spec.ReadOnly,
+			Critical:     spec.Critical,
+			DefaultValue: optionDefaultText(spec.DefaultValue),
+			Description:  spec.Description,
+		})
+	}
+	return listed, nil
+}
+
+// headerKindName is the type word the Rust, Python and TypeScript clients
+// print for a value kind, so one catalog reads the same through every
+// client.
+func headerKindName(kind iggcon.HeaderKind) string {
+	switch kind {
+	case iggcon.Raw:
+		return "raw"
+	case iggcon.String:
+		return "string"
+	case iggcon.Bool:
+		return "bool"
+	case iggcon.Int8:
+		return "int8"
+	case iggcon.Int16:
+		return "int16"
+	case iggcon.Int32:
+		return "int32"
+	case iggcon.Int64:
+		return "int64"
+	case iggcon.Int128:
+		return "int128"
+	case iggcon.Uint8:
+		return "uint8"
+	case iggcon.Uint16:
+		return "uint16"
+	case iggcon.Uint32:
+		return "uint32"
+	case iggcon.Uint64:
+		return "uint64"
+	case iggcon.Uint128:
+		return "uint128"
+	// Go spells the two floats Float and Double, where the contract and the
+	// other clients spell them by their width.
+	case iggcon.Float:
+		return "float32"
+	case iggcon.Double:
+		return "float64"
+	default:
+		return "unknown"
+	}
+}
+
+// maxOptionValueBytes is the field length the option codec enforces, so a
+// longer value is one this client never wrote and cannot read back.
+const maxOptionValueBytes = 255
+
+// optionDefaultText renders an option default the way the resource option
+// JSON does, so a default read here can be sent back in a raw patch.
+//
+// A value whose length does not match its kind reports no default rather
+// than a wrong one: the bytes would have to be read under a layout the
+// server did not write them in.
+func optionDefaultText(value iggcon.HeaderValue) string {
+	if len(value.Value) == 0 || len(value.Value) > maxOptionValueBytes {
+		return ""
+	}
+	if size := value.Kind.ExpectedSize(); size >= 0 && len(value.Value) != size {
+		return ""
+	}
+	switch value.Kind {
+	case iggcon.Raw:
+		return base64.StdEncoding.EncodeToString(value.Value)
+	case iggcon.String:
+		if !utf8.Valid(value.Value) {
+			return ""
+		}
+		return string(value.Value)
+	case iggcon.Bool:
+		switch value.Value[0] {
+		case 0:
+			return "false"
+		case 1:
+			return "true"
+		default:
+			return ""
+		}
+	case iggcon.Int8:
+		return strconv.FormatInt(int64(int8(value.Value[0])), 10)
+	case iggcon.Int16:
+		return strconv.FormatInt(
+			int64(int16(binary.LittleEndian.Uint16(value.Value))), 10)
+	case iggcon.Int32:
+		return strconv.FormatInt(
+			int64(int32(binary.LittleEndian.Uint32(value.Value))), 10)
+	case iggcon.Int64:
+		return strconv.FormatInt(
+			int64(binary.LittleEndian.Uint64(value.Value)), 10)
+	case iggcon.Uint8:
+		return strconv.FormatUint(uint64(value.Value[0]), 10)
+	case iggcon.Uint16:
+		return strconv.FormatUint(
+			uint64(binary.LittleEndian.Uint16(value.Value)), 10)
+	case iggcon.Uint32:
+		return strconv.FormatUint(
+			uint64(binary.LittleEndian.Uint32(value.Value)), 10)
+	case iggcon.Uint64:
+		return strconv.FormatUint(binary.LittleEndian.Uint64(value.Value), 10)
+	case iggcon.Int128, iggcon.Uint128:
+		return wideIntegerText(value.Value, value.Kind == iggcon.Int128)
+	case iggcon.Float:
+		return "0x" + paddedHex(
+			uint64(binary.LittleEndian.Uint32(value.Value)), 8)
+	case iggcon.Double:
+		return "0x" + paddedHex(binary.LittleEndian.Uint64(value.Value), 16)
+	default:
+		return ""
+	}
+}
+
+// wideIntegerText renders a 16-byte little-endian integer in decimal, which
+// no Go integer type is wide enough to hold.
+func wideIntegerText(value []byte, signed bool) string {
+	reversed := make([]byte, len(value))
+	for index, piece := range value {
+		reversed[len(value)-1-index] = piece
+	}
+	number := new(big.Int).SetBytes(reversed)
+	// A negative value is the two's complement of its magnitude, so the
+	// width is subtracted back off once the sign bit is set.
+	if signed && reversed[0]&0x80 != 0 {
+		number.Sub(number, new(big.Int).Lsh(big.NewInt(1), uint(len(value))*8))
+	}
+	return number.String()
+}
+
+// paddedHex renders the bits of a float in the fixed width the option text
+// uses, so one value has one text form.
+func paddedHex(bits uint64, width int) string {
+	text := strconv.FormatUint(bits, 16)
+	for len(text) < width {
+		text = "0" + text
+	}
+	return text
 }

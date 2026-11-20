@@ -2,6 +2,7 @@ package laser_test
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"math"
 	"sync"
@@ -30,6 +31,10 @@ type systemServer struct {
 	cluster *iggcon.ClusterMetadata
 	// archive is what the snapshot request answers with.
 	archive []byte
+	// options is the catalog a describe answers with, and scope records the
+	// one that was asked for.
+	options []iggcon.OptionSpec
+	scope   iggcon.OptionsScope
 
 	// requests records the raw command codes and bodies that were sent.
 	requests []rawRequest
@@ -120,6 +125,24 @@ func (server *systemServer) SendBinaryRequest(
 	server.requests = append(server.requests,
 		rawRequest{code: code, body: append([]byte(nil), payload...)})
 	return server.archive, nil
+}
+
+func (server *systemServer) DescribeOptions(
+	_ context.Context, scope iggcon.OptionsScope,
+) ([]iggcon.OptionSpec, error) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	if server.fail != nil {
+		return nil, server.fail
+	}
+	server.scope = scope
+	return server.options, nil
+}
+
+func (server *systemServer) describedScope() iggcon.OptionsScope {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	return server.scope
 }
 
 func (server *systemServer) sent() []rawRequest {
@@ -501,4 +524,208 @@ func TestGivenAClosedHandleWhenTheServerIsAdministeredThenShouldSaySo(t *testing
 	if _, err := handle.Snapshot(context.Background()); err == nil {
 		t.Fatal("a closed handle has no connection to snapshot over")
 	}
+}
+
+func TestGivenAScopeWhenItsOptionsAreDescribedThenShouldReportTheCatalog(t *testing.T) {
+	server := &systemServer{options: []iggcon.OptionSpec{{
+		Key: "segment_size",
+		DefaultValue: iggcon.HeaderValue{
+			Kind: iggcon.Uint64, Value: leBytes(1_073_741_824, 8)},
+		Updatable: true, Resettable: true, Secret: false, ReadOnly: false,
+		Critical: true, Description: "segment size",
+	}}}
+
+	listed, err := systemHandle(server).DescribeOptions(
+		context.Background(), laser.OptionsScopeTopic)
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	want := laser.OptionInfo{
+		Key: "segment_size", Kind: "uint64", Updatable: true, Resettable: true,
+		Critical: true, DefaultValue: "1073741824", Description: "segment size",
+	}
+	if len(listed) != 1 || listed[0] != want {
+		t.Fatalf("got %+v, want %+v", listed, want)
+	}
+	if scope := server.describedScope(); scope != iggcon.OptionsScopeTopic {
+		t.Fatalf("got scope %v", scope)
+	}
+}
+
+func TestGivenAnUnknownScopeWhenOptionsAreDescribedThenShouldRefuseIt(t *testing.T) {
+	// A scope the server does not know names no catalog, so it is refused
+	// here rather than sent for the server to reject.
+	server := &systemServer{}
+	if _, err := systemHandle(server).DescribeOptions(
+		context.Background(), laser.OptionsScope(9)); err == nil {
+		t.Fatal("an unknown scope must be refused")
+	}
+	if server.describedScope() != 0 {
+		t.Fatal("nothing must be sent")
+	}
+}
+
+func TestGivenScopeWordsWhenParsedThenShouldRoundTripThroughTheirText(t *testing.T) {
+	for _, scope := range []laser.OptionsScope{
+		laser.OptionsScopeTopic, laser.OptionsScopeStream, laser.OptionsScopeUser,
+	} {
+		parsed, err := laser.ParseOptionsScope(scope.String())
+		if err != nil || parsed != scope {
+			t.Fatalf("got %v %v for %v", parsed, err, scope)
+		}
+	}
+	if _, err := laser.ParseOptionsScope("partition"); err == nil {
+		t.Fatal("an unknown scope word must be refused")
+	}
+}
+
+func TestGivenAnOptionDefaultWhenRenderedThenShouldMatchItsTextForm(t *testing.T) {
+	// The text is what a raw option patch carries back, so it has to be the
+	// one form the server reads for each kind.
+	for _, probe := range []struct {
+		name  string
+		value iggcon.HeaderValue
+		kind  string
+		text  string
+	}{
+		{"a string", iggcon.HeaderValue{
+			Kind: iggcon.String, Value: []byte("lz4")}, "string", "lz4"},
+		{"raw bytes", iggcon.HeaderValue{
+			Kind: iggcon.Raw, Value: []byte{1, 2, 3}}, "raw", "AQID"},
+		{"a true", iggcon.HeaderValue{
+			Kind: iggcon.Bool, Value: []byte{1}}, "bool", "true"},
+		{"a false", iggcon.HeaderValue{
+			Kind: iggcon.Bool, Value: []byte{0}}, "bool", "false"},
+		{"a negative int8", iggcon.HeaderValue{
+			Kind: iggcon.Int8, Value: []byte{0xff}}, "int8", "-1"},
+		{"a negative int16", iggcon.HeaderValue{
+			Kind: iggcon.Int16, Value: []byte{0xff, 0xff}}, "int16", "-1"},
+		{"a negative int32", iggcon.HeaderValue{
+			Kind:  iggcon.Int32,
+			Value: []byte{0xff, 0xff, 0xff, 0xff}}, "int32", "-1"},
+		{"a negative int64", iggcon.HeaderValue{
+			Kind:  iggcon.Int64,
+			Value: leBytes(0xffff_ffff_ffff_ffff, 8)}, "int64", "-1"},
+		{"a uint8", iggcon.HeaderValue{
+			Kind: iggcon.Uint8, Value: []byte{200}}, "uint8", "200"},
+		{"a uint16", iggcon.HeaderValue{
+			Kind: iggcon.Uint16, Value: leBytes(65_535, 2)}, "uint16", "65535"},
+		{"a uint32", iggcon.HeaderValue{
+			Kind:  iggcon.Uint32,
+			Value: leBytes(4_294_967_295, 4)}, "uint32", "4294967295"},
+		{"a uint64", iggcon.HeaderValue{
+			Kind:  iggcon.Uint64,
+			Value: leBytes(0xffff_ffff_ffff_ffff, 8)}, "uint64",
+			"18446744073709551615"},
+		{"a uint128", iggcon.HeaderValue{
+			Kind: iggcon.Uint128, Value: wideBytes(1, 0)}, "uint128",
+			"18446744073709551616"},
+		{"a negative int128", iggcon.HeaderValue{
+			Kind: iggcon.Int128, Value: wideBytes(
+				0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff)}, "int128", "-1"},
+		// A float is carried as the hex of its bits, because a decimal of a
+		// float does not round trip through text.
+		{"a float32", iggcon.HeaderValue{
+			Kind:  iggcon.Float,
+			Value: leBytes(uint64(math.Float32bits(1.5)), 4)}, "float32",
+			"0x3fc00000"},
+		{"a float64", iggcon.HeaderValue{
+			Kind:  iggcon.Double,
+			Value: leBytes(math.Float64bits(1.5), 8)}, "float64",
+			"0x3ff8000000000000"},
+		// The hex is padded to the width of the float, so one value has one
+		// text form and a reader can tell the two widths apart.
+		{"a float32 with leading zero bits", iggcon.HeaderValue{
+			Kind: iggcon.Float, Value: leBytes(1, 4)}, "float32", "0x00000001"},
+		{"a float64 with leading zero bits", iggcon.HeaderValue{
+			Kind:  iggcon.Double,
+			Value: leBytes(1, 8)}, "float64", "0x0000000000000001"},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			server := &systemServer{options: []iggcon.OptionSpec{
+				{Key: "k", DefaultValue: probe.value}}}
+			listed, err := systemHandle(server).DescribeOptions(
+				context.Background(), laser.OptionsScopeStream)
+			if err != nil || len(listed) != 1 {
+				t.Fatalf("got %+v %v", listed, err)
+			}
+			if listed[0].Kind != probe.kind || listed[0].DefaultValue != probe.text {
+				t.Fatalf("got %q %q, want %q %q", listed[0].Kind,
+					listed[0].DefaultValue, probe.kind, probe.text)
+			}
+		})
+	}
+}
+
+func TestGivenAnOptionValueTheKindCannotHoldThenShouldReportNoDefault(t *testing.T) {
+	// The bytes would have to be read under a layout the server did not
+	// write them in, so no default is reported rather than a wrong one.
+	for _, probe := range []struct {
+		name  string
+		value iggcon.HeaderValue
+	}{
+		{"no value at all", iggcon.HeaderValue{Kind: iggcon.Bool}},
+		{"a short integer", iggcon.HeaderValue{
+			Kind: iggcon.Uint64, Value: []byte{1, 2}}},
+		{"a long integer", iggcon.HeaderValue{
+			Kind: iggcon.Uint32, Value: leBytes(1, 8)}},
+		{"a bool that is neither", iggcon.HeaderValue{
+			Kind: iggcon.Bool, Value: []byte{2}}},
+		{"a string that is not text", iggcon.HeaderValue{
+			Kind: iggcon.String, Value: []byte{0xff, 0xfe}}},
+		{"a kind this build has no name for", iggcon.HeaderValue{
+			Kind: iggcon.HeaderKind(99), Value: []byte{1}}},
+		{"a value longer than the codec allows", iggcon.HeaderValue{
+			Kind: iggcon.Raw, Value: make([]byte, 256)}},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			server := &systemServer{options: []iggcon.OptionSpec{
+				{Key: "k", DefaultValue: probe.value}}}
+			listed, err := systemHandle(server).DescribeOptions(
+				context.Background(), laser.OptionsScopeUser)
+			if err != nil || len(listed) != 1 {
+				t.Fatalf("got %+v %v", listed, err)
+			}
+			if listed[0].DefaultValue != "" {
+				t.Fatalf("got %q", listed[0].DefaultValue)
+			}
+		})
+	}
+}
+
+func TestGivenAServerThatRefusesWhenOptionsAreDescribedThenShouldReportIt(t *testing.T) {
+	server := &systemServer{fail: ierror.Disconnected{}}
+	_, err := systemHandle(server).DescribeOptions(
+		context.Background(), laser.OptionsScopeTopic)
+	var transport *laser.TransportError
+	if !errors.As(err, &transport) {
+		t.Fatalf("want a TransportError, got %T: %v", err, err)
+	}
+}
+
+func TestGivenAClosedHandleWhenOptionsAreDescribedThenShouldSaySo(t *testing.T) {
+	handle := systemHandle(&systemServer{})
+	if err := handle.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := handle.DescribeOptions(
+		context.Background(), laser.OptionsScopeTopic); err == nil {
+		t.Fatal("a closed handle has no connection to describe options over")
+	}
+}
+
+// leBytes is a little-endian integer of width bytes, the way the option
+// codec writes one.
+func leBytes(value uint64, width int) []byte {
+	encoded := make([]byte, 8)
+	binary.LittleEndian.PutUint64(encoded, value)
+	return encoded[:width]
+}
+
+// wideBytes is a little-endian 128-bit integer from its two halves.
+func wideBytes(high, low uint64) []byte {
+	encoded := make([]byte, 16)
+	binary.LittleEndian.PutUint64(encoded[0:8], low)
+	binary.LittleEndian.PutUint64(encoded[8:16], high)
+	return encoded
 }
