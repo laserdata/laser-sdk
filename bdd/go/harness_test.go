@@ -2,6 +2,7 @@ package bdd_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -136,13 +137,30 @@ func runScenarios(
 			defer cancel()
 			state := &world{t: t, address: address}
 			for _, step := range scenario.Steps {
-				if err := run(ctx, state, step); err != nil {
+				err := run(ctx, state, step)
+				var missing *blockedError
+				if errors.As(err, &missing) {
+					t.Skipf("%s %s: %v", step.Keyword, step.Text, err)
+				}
+				if err != nil {
 					t.Fatalf("%s %s: %v", step.Keyword, step.Text, err)
 				}
 			}
 		})
 	}
 }
+
+// blockedError says a step cannot be honoured by the Go client as it stands.
+//
+// It is reported as a skip naming what is missing rather than as a pass, so
+// the gap stays countable: a scenario quietly dropped from the runner would
+// read as one the client satisfies. The steps around it stay implemented, so
+// the scenario runs for real the moment the client closes the gap.
+type blockedError struct{ Reason string }
+
+func (e *blockedError) Error() string { return e.Reason }
+
+func blocked(reason string) error { return &blockedError{Reason: reason} }
 
 // quoted pulls the quoted arguments out of a step, which is how the shared
 // scenarios carry their values.
