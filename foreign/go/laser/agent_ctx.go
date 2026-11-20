@@ -2,6 +2,7 @@ package laser
 
 import (
 	"context"
+	"time"
 
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
@@ -104,6 +105,150 @@ func (agent *AgentCtx) respondOn(
 		return err
 	}
 	return agent.sendReply(ctx, topic, payload)
+}
+
+// RespondInput answers the input request being handled, on the topic the
+// waiting caller reads.
+//
+// It is how a handler that was asked for a decision gives one: the answer
+// carries the request's own correlation, so it reaches the caller that is
+// paused on it rather than any other waiter sharing the topic.
+//
+// A message that is not a correlated agent message cannot be answered this
+// way and is refused, rather than being sent as a plain record that nothing
+// correlates and nobody is waiting for.
+func (agent *AgentCtx) RespondInput(
+	ctx context.Context, replyTopic string, response []byte,
+) error {
+	if replyTopic == "" {
+		return &NoRespondTopicError{}
+	}
+	envelope := agent.message.Envelope
+	if envelope == nil {
+		return &InvalidError{Reason: "the handled message carries no agent " +
+			"envelope, so there is no input request to answer"}
+	}
+	if envelope.Correlation == nil {
+		return &InvalidError{Reason: "the handled input request carries no " +
+			"correlation, so an answer could not be paired with it"}
+	}
+	if agent.runtime.identity.IsZero() {
+		return &InvalidError{Reason: "an agent that answers an input request " +
+			"needs an identity, because the answer names its author"}
+	}
+	return agent.respondOn(ctx, replyTopic, response)
+}
+
+// ApprovalGate asks an approver to decide and waits for the answer.
+//
+// The session is marked as waiting for input, the prompt goes out as an input
+// request addressed to the approver, and the decision is the approver's
+// correlated reply. The wait is registered before the prompt is sent, because
+// the answer cannot exist until it is and a gate that listened afterwards
+// could miss one that arrived in between.
+//
+// Only the named approver decides. A reply on this correlation from anyone
+// else is a fault rather than a decision, since the correlation is minted here
+// and sent to nobody but the approver, so it is refused rather than waited
+// past.
+//
+// Waiting in place is the whole of this gate: the Rust client can instead park
+// the work and replay the handler once the decision lands, which frees the
+// consumer for the session's other work. That runtime is not ported, so a gate
+// held open holds its handler open.
+func (agent *AgentCtx) ApprovalGate(
+	ctx context.Context, approver wire.AgentID, prompt []byte, timeout time.Duration,
+) (*ApprovalGrant, error) {
+	if approver.IsZero() {
+		return nil, &InvalidError{Reason: "an approval gate must name its approver"}
+	}
+	if agent.runtime.identity.IsZero() {
+		return nil, &InvalidError{Reason: "an agent that asks for approval needs " +
+			"an identity, because the decision is addressed back to it"}
+	}
+	if timeout <= 0 {
+		timeout = DefaultRequestTimeout
+	}
+	conversation := agent.message.Conversation()
+	interrupt := wire.CorrelationID{ID: wire.IDFromBytes(NewOperationID())}
+	ticket, err := agent.runtime.replies.Subscribe(interrupt, ExpectedReply{
+		Session: conversation, Requester: agent.runtime.identity,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := agent.askApproval(ctx, approver, interrupt, prompt, timeout); err != nil {
+		// The wait is released here rather than left for the deadline: a
+		// prompt that never left should not hold a correlation.
+		ticket.Close()
+		return nil, err
+	}
+	reply, err := ticket.Await(ctx, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if reply.Envelope.Source != approver {
+		return nil, &InvalidError{Reason: "the decision on this approval came " +
+			"from " + reply.Envelope.Source.String() + " rather than from " +
+			approver.String() + ", so it decides nothing"}
+	}
+	// A refusal is a decision too, and it is not a grant. Turning one into a
+	// grant would let the work the gate exists to hold go ahead on the
+	// strength of the approver having said no.
+	if reply.Envelope.Kind == wire.KindError {
+		return nil, &ApprovalRefusedError{
+			Approver: approver, Reason: refusalReason(reply.Envelope.Body)}
+	}
+	return GrantFrom(approver, conversation, reply)
+}
+
+// refusalReason is what an approver said when refusing, and a plain statement
+// of the refusal when the body does not say.
+func refusalReason(body []byte) string {
+	var failure wire.AgentErrorBody
+	if err := wire.Unmarshal(body, &failure); err == nil && failure.Message != nil {
+		return *failure.Message
+	}
+	return "the input request was rejected"
+}
+
+// ApprovalRefusedError reports an approver that decided against the work.
+//
+// It is kept apart from a gate that failed or timed out, because the three
+// want different handling: a refusal is an answer and must not be retried into
+// a second asking, while a timeout may be.
+type ApprovalRefusedError struct {
+	Approver wire.AgentID
+	Reason   string
+}
+
+func (e *ApprovalRefusedError) Error() string {
+	return "the approval was refused by " + e.Approver.String() + ": " + e.Reason
+}
+
+// Retryable reports that asking again will not change the answer.
+func (e *ApprovalRefusedError) Retryable() bool { return false }
+
+// askApproval marks the session as waiting and sends the prompt.
+//
+// The status goes first, so a reader of the session's timeline sees it waiting
+// even if the prompt itself does not land.
+func (agent *AgentCtx) askApproval(
+	ctx context.Context, approver wire.AgentID,
+	interrupt wire.CorrelationID, prompt []byte, timeout time.Duration,
+) error {
+	producer := agent.runtime.laser.AgdxOn(agent.runtime.stream,
+		agent.runtime.topic, agent.runtime.identity, agent.message.Conversation())
+	if _, err := producer.TaskStatus(
+		interrupt, wire.TaskInputRequired).Send(ctx); err != nil {
+		return err
+	}
+	_, err := producer.Command(interrupt, prompt).
+		WithOperation(wire.OperationInputRequest).
+		WithTarget(approver).
+		WithDeadline(time.Now().Add(timeout)).
+		Send(ctx)
+	return err
 }
 
 // ReplyOn sends a reply to the handled message on a named topic, chaining its

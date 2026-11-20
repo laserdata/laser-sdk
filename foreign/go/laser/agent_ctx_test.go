@@ -558,6 +558,271 @@ func TestGivenAProvenanceAHandlerBuiltWhenSendingThenShouldUseItAsItStands(t *te
 	}
 }
 
+// An input request is answered on the topic its waiting caller reads, under
+// the correlation that caller is paused on.
+func TestGivenAnInputRequestWhenAnsweredThenShouldCarryTheCorrelationItPauses(t *testing.T) {
+	server := newRuntimeServer()
+	record := delivered(t, 0, 6, func(agdx *laser.Agdx) *laser.AgdxSend {
+		return agdx.Command(correlationID(7), []byte("approve?")).
+			WithTarget(agentID(t, "executor")).
+			WithOperation(wire.OperationInputRequest)
+	})
+
+	err := handledThrough(t, server,
+		laser.RuntimeOptions{Operations: []string{wire.OperationInputRequest}},
+		record, func(ctx context.Context, agent *laser.AgentCtx) error {
+			return agent.RespondInput(ctx, wire.AgentAudit, []byte("approved"))
+		})
+	if err != nil {
+		t.Fatalf("answer the input request: %v", err)
+	}
+
+	answers := envelopesOn(t, server, wire.AgentAudit)
+	if len(answers) != 1 {
+		t.Fatalf("want one answer, got %d", len(answers))
+	}
+	if answers[0].Kind != wire.KindResponse {
+		t.Errorf("want a response, got %q", answers[0].Kind)
+	}
+	if answers[0].Correlation == nil || *answers[0].Correlation != correlationID(7) {
+		t.Error("want the correlation the caller is paused on")
+	}
+	if answers[0].Target == nil || *answers[0].Target != agentID(t, "planner") {
+		t.Errorf("want the answer addressed to the asker, got %v", answers[0].Target)
+	}
+}
+
+// A record that is not a correlated agent message cannot be answered as an
+// input request, so it is refused rather than sent as a plain record that
+// nothing correlates and nobody waits for.
+func TestGivenAPlainRecordWhenAnsweredAsAnInputRequestThenShouldRefuseIt(t *testing.T) {
+	server := newRuntimeServer()
+	spine := &laser.Provenance{
+		Conversation: conversation(1), Agent: agentPointer(t, "planner"),
+	}
+	record := plainRecord(t, 0, 1, spine, []byte("question"))
+
+	err := handledThrough(t, server, laser.RuntimeOptions{}, record,
+		func(ctx context.Context, agent *laser.AgentCtx) error {
+			return agent.RespondInput(ctx, wire.AgentAudit, []byte("approved"))
+		})
+
+	var invalid *laser.InvalidError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("want the answer refused, got %v", err)
+	}
+	if len(server.on(wire.AgentAudit)) != 0 {
+		t.Error("a refused answer must not reach the log")
+	}
+}
+
+// An approval gate marks the session as waiting, asks the approver, and holds
+// the handler until the approver decides.
+func TestGivenAnApproverWhenGatedThenShouldAskAndWaitForTheDecision(t *testing.T) {
+	server := newRuntimeServer()
+	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{})
+	record := commandFor(t, 1, 2)
+	var grant *laser.ApprovalGrant
+	var gateErr error
+
+	handler := laser.HandlerFunc(func(
+		ctx context.Context, _ *laser.AgentMessage, agent *laser.AgentCtx,
+	) error {
+		go approve(t, server, runtime, wire.KindResponse, []byte("go ahead"))
+		grant, gateErr = agent.ApprovalGate(ctx, agentID(t, "reviewer"),
+			[]byte("may I?"), 2*time.Second)
+		return nil
+	})
+
+	if err := runUntilDrained(t, runtime, sourceOf(record), handler); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if gateErr != nil {
+		t.Fatalf("gate: %v", gateErr)
+	}
+	if grant.Approver() != agentID(t, "reviewer") {
+		t.Errorf("want the named approver, got %v", grant.Approver())
+	}
+	if string(grant.Decision()) != "go ahead" {
+		t.Errorf("want the approver's own words, got %q", grant.Decision())
+	}
+	asked := envelopesOn(t, server, wire.AgentSessions)
+	if len(asked) != 2 {
+		t.Fatalf("want a waiting status then the prompt, got %d", len(asked))
+	}
+	if asked[0].Kind != wire.KindStatus || asked[0].TaskState == nil ||
+		*asked[0].TaskState != wire.TaskInputRequired {
+		t.Error("want the session marked as waiting for input first")
+	}
+	if asked[1].Kind != wire.KindCommand || asked[1].Operation == nil ||
+		*asked[1].Operation != wire.OperationInputRequest {
+		t.Error("want the prompt sent as an input request")
+	}
+	if asked[1].Target == nil || *asked[1].Target != agentID(t, "reviewer") {
+		t.Errorf("want the prompt addressed to the approver, got %v", asked[1].Target)
+	}
+	if asked[0].Correlation == nil || asked[1].Correlation == nil ||
+		*asked[0].Correlation != *asked[1].Correlation {
+		t.Error("want the status and the prompt on one correlation")
+	}
+	if asked[1].DeadlineMicros == nil {
+		t.Error("want the prompt to expire, or an approver that never answers holds forever")
+	}
+}
+
+// A refusal is a decision, and it is not a grant: turning one into a grant
+// would let the work go ahead on the strength of the approver saying no.
+func TestGivenARefusingApproverWhenGatedThenShouldRefuseRatherThanGrant(t *testing.T) {
+	server := newRuntimeServer()
+	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{})
+	record := commandFor(t, 1, 2)
+	var grant *laser.ApprovalGrant
+	var gateErr error
+
+	reason := "not this quarter"
+	refusal, err := wire.Marshal(wire.AgentErrorBody{
+		Code: wire.ErrorUnauthorized, Message: &reason})
+	if err != nil {
+		t.Fatalf("encode the refusal: %v", err)
+	}
+	handler := laser.HandlerFunc(func(
+		ctx context.Context, _ *laser.AgentMessage, agent *laser.AgentCtx,
+	) error {
+		go approve(t, server, runtime, wire.KindError, refusal)
+		grant, gateErr = agent.ApprovalGate(ctx, agentID(t, "reviewer"),
+			[]byte("may I?"), 2*time.Second)
+		return nil
+	})
+
+	if err := runUntilDrained(t, runtime, sourceOf(record), handler); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if grant != nil {
+		t.Fatal("a refusal must not mint a grant")
+	}
+	var refused *laser.ApprovalRefusedError
+	if !errors.As(gateErr, &refused) {
+		t.Fatalf("want a refusal, got %v", gateErr)
+	}
+	if refused.Reason != reason {
+		t.Errorf("want the approver's own reason, got %q", refused.Reason)
+	}
+	if laser.RetryableError(gateErr) {
+		t.Error("asking again will not change the answer")
+	}
+}
+
+// Only the named approver decides, so a reply on this correlation from
+// anybody else is a fault rather than a decision.
+func TestGivenAReplyFromAnotherAgentWhenGatedThenShouldNotTakeItAsTheDecision(t *testing.T) {
+	server := newRuntimeServer()
+	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{})
+	record := commandFor(t, 1, 2)
+	var grant *laser.ApprovalGrant
+	var gateErr error
+
+	handler := laser.HandlerFunc(func(
+		ctx context.Context, _ *laser.AgentMessage, agent *laser.AgentCtx,
+	) error {
+		go approveAs(t, server, runtime, "impostor", wire.KindResponse,
+			[]byte("go ahead"))
+		grant, gateErr = agent.ApprovalGate(ctx, agentID(t, "reviewer"),
+			[]byte("may I?"), 2*time.Second)
+		return nil
+	})
+
+	if err := runUntilDrained(t, runtime, sourceOf(record), handler); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if grant != nil {
+		t.Fatal("an agent nobody asked must not decide an approval")
+	}
+	if gateErr == nil {
+		t.Fatal("want the wrong author reported")
+	}
+}
+
+// An approval gate must name who decides, or anybody could.
+func TestGivenNoApproverWhenAHandlerGatesThenShouldRefuseIt(t *testing.T) {
+	server := newRuntimeServer()
+	record := commandFor(t, 1, 2)
+
+	err := handledThrough(t, server, laser.RuntimeOptions{}, record,
+		func(ctx context.Context, agent *laser.AgentCtx) error {
+			_, err := agent.ApprovalGate(ctx, wire.AgentID{}, []byte("may I?"),
+				time.Second)
+			return err
+		})
+
+	var invalid *laser.InvalidError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("want the gate refused, got %v", err)
+	}
+	if len(server.on(wire.AgentSessions)) != 0 {
+		t.Error("a refused gate must not ask anybody")
+	}
+}
+
+// approve answers the prompt the gate under test sent, as the approver it
+// named.
+func approve(
+	t *testing.T, server *runtimeServer, runtime *laser.AgentRuntime,
+	kind wire.AgentKind, body []byte,
+) {
+	t.Helper()
+	approveAs(t, server, runtime, "reviewer", kind, body)
+}
+
+// approveAs answers the gate's prompt as a named agent, so a test can show
+// that only the approver decides.
+func approveAs(
+	t *testing.T, server *runtimeServer, runtime *laser.AgentRuntime,
+	author string, kind wire.AgentKind, body []byte,
+) {
+	t.Helper()
+	correlation, found := awaitPrompt(server)
+	if !found {
+		return
+	}
+	answer := delivered(t, 0, 2, func(agdx *laser.Agdx) *laser.AgdxSend {
+		return agdx.Respond(correlation, body).WithTarget(agentID(t, "executor"))
+	})
+	message, err := laser.OpenAgdx(answer)
+	if err != nil {
+		return
+	}
+	// The author and kind are rewritten here rather than produced, because a
+	// test needs to answer as somebody else and to refuse as well as agree.
+	message.Envelope.Source = agentID(t, author)
+	message.Envelope.Kind = kind
+	message.Envelope.Body = body
+	runtime.Replies().Deliver(message)
+}
+
+// awaitPrompt waits for the gate to send its input request and reads the
+// correlation the gate is waiting on.
+func awaitPrompt(server *runtimeServer) (wire.CorrelationID, bool) {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, message := range server.on(wire.AgentSessions) {
+			var envelope wire.AgentEnvelope
+			if err := wire.Unmarshal(message.Payload, &envelope); err != nil {
+				continue
+			}
+			if envelope.Kind == wire.KindCommand && envelope.Operation != nil &&
+				*envelope.Operation == wire.OperationInputRequest &&
+				envelope.Correlation != nil {
+				return *envelope.Correlation, true
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return wire.CorrelationID{}, false
+}
+
 // plainRecord builds a record produced by a plain agent send, which carries a
 // spine and no envelope.
 func plainRecord(
