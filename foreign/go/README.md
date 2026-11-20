@@ -1465,6 +1465,35 @@ the removal only once the server confirmed it, rather than remembering an
 attempt as a success.
 
 
+## Partitions are numbered from zero
+
+A topic's partitions start at 0, so a topic created with one partition
+delivers every record on partition 0, and a topic with four uses 0 to 3.
+
+This matters most for a standalone consumer, which names the partitions it
+reads:
+
+```go
+consumer, err := topic.Consumer(ctx, "worker", laser.ConsumerOptions{
+    Partitions: []uint32{0},
+})
+```
+
+Naming a partition the topic does not have is not reported as an error. The
+consumer simply never reads anything and the call blocks until the context
+deadline, which looks exactly like a publish that never arrived. If a read
+times out with nothing on the topic, check the partition number before
+suspecting the producer.
+
+Rather than assume the numbering, a consumer can read it back:
+
+```go
+partitions, err := topic.Partitions(ctx)
+```
+
+A consumer group names no partitions at all, because the server assigns them.
+
+
 ## Dependencies
 
 Two beyond the Apache Iggy client.
