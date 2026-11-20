@@ -116,6 +116,14 @@ func (agent *Agent) Fence() *FenceGate { return agent.fence }
 // from its own store.
 func (agent *Agent) Dedup() *Deduplicator { return agent.dedup }
 
+// Understood is the must-understand feature set this build implements, which a
+// runtime checks a message against before it decodes anything else.
+func (agent *Agent) Understood() uint64 { return agent.understood }
+
+// AcceptsBroadcast reports whether this agent takes records addressed to every
+// agent rather than only work addressed to it by name.
+func (agent *Agent) AcceptsBroadcast() bool { return agent.acceptBroadcast }
+
 // Decide applies every gate to a record, in the order that matters.
 //
 // Expiry and the must-understand set come first, because a record that fails
