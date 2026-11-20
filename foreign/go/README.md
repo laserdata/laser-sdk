@@ -1421,6 +1421,30 @@ the connection already has.
 An attempt deadline ends a walk rather than being spent inside it, so the
 caller's next attempt starts on the next node with a fresh deadline.
 
+## Client encryption
+
+`laser.AES256GCM` seals and opens records in Apache Iggy's own AES-256-GCM
+format: a random 12-byte nonce, the ciphertext, then the 16-byte tag. The
+server stores only ciphertext, so a deployment that holds records never holds
+the key that reads them.
+
+A key that is not 32 bytes is refused rather than stretched, because a
+stretched key produces records no other client can open. The nonce is drawn
+from the system source on every send: reusing one under a single key breaks
+GCM outright, and a counter would have to survive restarts to be safe.
+
+A ciphertext that is short, altered, or sealed with another key reports
+Apache Iggy error 72, which is what the Rust, Python and TypeScript clients
+raise, so one error matches across every client. Which of those three went
+wrong is deliberately not reported, because telling a bad tag from a bad key
+is a probe an attacker can run.
+
+The suite pins the ciphertexts that Apache Iggy's Rust encryptor and Node's
+AES-256-GCM sealed under a shared key, so this is one of the few places in
+the port where Go reads bytes another client produced rather than bytes it
+produced itself.
+
+
 ## Dependencies
 
 Two beyond the Apache Iggy client.
