@@ -469,16 +469,46 @@ func TestGivenABodyThatIsNotTextWhenRecalledThenShouldShareNoWord(t *testing.T) 
 	}
 }
 
-// Text holding no word ranks nothing, so the recall stays recency alone rather
-// than scoring every item zero and reordering them.
-func TestGivenAQueryOfPunctuationWhenFoldedThenShouldStayRecencyAlone(t *testing.T) {
+// Query text holding no word is no query at all: `QueryWords::of` in
+// sdk/src/memory.rs returns `Ignore` for empty tokens, whatever the strategy,
+// so a keyword recall keeps every item rather than filtering them all out and
+// a ranking recall stays recency alone.
+func TestGivenAQueryOfPunctuationWhenFoldedThenShouldIgnoreIt(t *testing.T) {
 	fold, _ := rememberedIn(t, "agents", "support", "ana", nil, "older", "newer")
 
-	items := fold.Recall(laser.MemoryScope{}, laser.MemoryQuery{Query: "!!! ..."})
+	for name, strategy := range map[string]laser.RecallStrategy{
+		"ranking": laser.RecallAuto,
+		"keyword": laser.RecallKeyword,
+	} {
+		t.Run(name, func(t *testing.T) {
+			items := fold.Recall(laser.MemoryScope{}, laser.MemoryQuery{
+				Query: "!!! ...", Strategy: strategy,
+			})
 
-	wantTexts(t, items, "newer", "older")
-	if items[0].Score != 0 {
-		t.Errorf("nothing ranked it, so the score stays zero, got %v", items[0].Score)
+			wantTexts(t, items, "newer", "older")
+			if items[0].Score != 0 {
+				t.Errorf("nothing ranked it, so the score stays zero, got %v", items[0].Score)
+			}
+		})
+	}
+}
+
+// Recent recall ignores the query rather than filtering or ranking by it:
+// `QueryWords::of` returns `Ignore` for `RecallStrategy::Recent` before it
+// ever looks at the text.
+func TestGivenRecentRecallWithQueryTextWhenFoldedThenShouldIgnoreTheQuery(t *testing.T) {
+	fold, _ := rememberedIn(t, "agents", "support", "ana", nil,
+		"deploy friday", "shares nothing with the query")
+
+	items := fold.Recall(laser.MemoryScope{}, laser.MemoryQuery{
+		Query: "deploy friday", Strategy: laser.RecallRecent,
+	})
+
+	wantTexts(t, items, "shares nothing with the query", "deploy friday")
+	for _, item := range items {
+		if item.Score != 0 {
+			t.Errorf("recent recall ranks nothing, got %v for %q", item.Score, item.Text())
+		}
 	}
 }
 
