@@ -267,10 +267,20 @@ func OpenRecord(message iggcon.IggyMessage) (*Record, error) {
 
 // openRecord adds what only a consumer knows: where the record came from and
 // where to commit.
+//
+// A record whose spine did not decode is still refused, but the refusal
+// carries the record: a runtime has to be able to keep the bytes on the
+// dead-letter topic, and a refusal that named only a reason would lose the
+// work inside them.
 func openRecord(received reader.ReceivedMessage) (*Record, error) {
 	record, err := OpenRecord(received.Message)
 	if err != nil {
-		return nil, err
+		return nil, &UndecodableRecord{
+			PartitionID: received.PartitionID,
+			Message:     received.Message,
+			Checkpoint:  received.Checkpoint,
+			Cause:       err,
+		}
 	}
 	record.PartitionID = received.PartitionID
 	record.Checkpoint = received.Checkpoint

@@ -126,26 +126,30 @@ func (agent *Agent) AcceptsBroadcast() bool { return agent.acceptBroadcast }
 
 // Decide applies every gate to a record, in the order that matters.
 //
-// Expiry and the must-understand set come first, because a record that fails
-// either can never be handled and burning a dedup key on it would suppress a
-// later record that could be. The fence comes next, because a stale holder's
-// replay must not advance anything. Dedup comes last, so a key is spent only
-// on a record that would otherwise have been handled.
+// The fence comes first: a stale holder's replay must not advance anything,
+// and it is skipped rather than kept, because there is nothing to redrive. The
+// legitimate holder's own record is the one that does the work.
+//
+// Expiry comes next. A record past its deadline can never be handled, so it is
+// kept on the dead-letter topic for whoever asks why the work never happened.
+//
+// Dedup comes last, so a key is spent only on a record that would otherwise
+// have been handled: a record the fence or the deadline turned away must not
+// consume the slot its legitimate resend needs.
 func (agent *Agent) Decide(record *Record) Decision {
 	now := agent.now()
 
+	if !agent.fence.Accept(agent.task(record), agent.fenceOf(record), now) {
+		return Decision{
+			Verdict: Skip,
+			Detail:  "the record's fence is behind the highest accepted for its task",
+		}
+	}
 	if record.Expired(now) {
 		return Decision{
 			Verdict: DeadLetter,
 			Reason:  wire.DeadLetterDeadlineExceeded,
 			Detail:  "the record passed its deadline before it was handled",
-		}
-	}
-	if !agent.fence.Accept(agent.task(record), agent.fenceOf(record), now) {
-		return Decision{
-			Verdict: DeadLetter,
-			Reason:  wire.DeadLetterRejected,
-			Detail:  "the record's fence is behind the highest accepted for its task",
 		}
 	}
 	if !agent.dedup.Accept(DedupKey(record.Provenance)) {
