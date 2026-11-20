@@ -265,27 +265,37 @@ func OpenRecord(message iggcon.IggyMessage) (*Record, error) {
 	return record, nil
 }
 
-// openRecord adds what only a consumer knows: where the record came from and
-// where to commit.
+// DeliveredRecord opens a record a reader handed over, adding what only the
+// delivery knows: where the record came from and where to commit.
 //
-// A record whose spine did not decode is still refused, but the refusal
-// carries the record: a runtime has to be able to keep the bytes on the
-// dead-letter topic, and a refusal that named only a reason would lose the
-// work inside them.
-func openRecord(received reader.ReceivedMessage) (*Record, error) {
-	record, err := OpenRecord(received.Message)
+// It is the form a caller driving its own reader wants, which a RecordSource
+// feeding an AgentRuntime is. A record whose spine did not decode is refused,
+// but the refusal carries the record: a runtime has to be able to keep those
+// bytes on the dead-letter topic, and a refusal naming only a reason would
+// lose the work inside them.
+func DeliveredRecord(
+	partitionID uint32, message iggcon.IggyMessage,
+	checkpoint iggcon.Checkpoint, endsBatch bool,
+) (*Record, error) {
+	record, err := OpenRecord(message)
 	if err != nil {
 		return nil, &UndecodableRecord{
-			PartitionID: received.PartitionID,
-			Message:     received.Message,
-			Checkpoint:  received.Checkpoint,
+			PartitionID: partitionID,
+			Message:     message,
+			Checkpoint:  checkpoint,
 			Cause:       err,
 		}
 	}
-	record.PartitionID = received.PartitionID
-	record.Checkpoint = received.Checkpoint
-	record.EndsBatch = received.EndsBatch
+	record.PartitionID = partitionID
+	record.Checkpoint = checkpoint
+	record.EndsBatch = endsBatch
 	return record, nil
+}
+
+// openRecord opens what this consumer's reader handed over.
+func openRecord(received reader.ReceivedMessage) (*Record, error) {
+	return DeliveredRecord(received.PartitionID, received.Message,
+		received.Checkpoint, received.EndsBatch)
 }
 
 func consumeError(err error) error {

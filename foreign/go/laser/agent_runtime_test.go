@@ -1031,6 +1031,74 @@ func TestGivenAnUndecodableRecordWhenRefusedThenShouldStillMatchItsCause(t *test
 	}
 }
 
+// A reader that hands over a record with a broken spine must not lose it. The
+// refusal carries the bytes and where they sat, which is the only way a
+// runtime can keep them rather than stopping on them forever.
+func TestGivenADeliveredRecordWithABrokenSpineWhenOpenedThenShouldCarryItInTheRefusal(t *testing.T) {
+	headers, err := (&laser.Provenance{Conversation: conversation(3)}).Headers()
+	if err != nil {
+		t.Fatalf("encode the spine: %v", err)
+	}
+	fence, err := iggcon.NewHeaderKeyString(wire.HeaderFence)
+	if err != nil {
+		t.Fatalf("header key: %v", err)
+	}
+	headers = append(headers, iggcon.HeaderEntry{
+		Key:   fence,
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("not a number")},
+	})
+	message, err := iggcon.NewIggyMessage([]byte("the work"),
+		iggcon.WithUserHeaders(headers))
+	if err != nil {
+		t.Fatalf("build a record: %v", err)
+	}
+	message.Header.Offset = 11
+	checkpoint, _ := (&iggcon.PolledMessage{
+		PartitionId: 2, Messages: []iggcon.IggyMessage{message},
+	}).Checkpoint()
+
+	record, err := laser.DeliveredRecord(2, message, checkpoint, true)
+
+	if record != nil {
+		t.Error("a record whose fence did not decode must not be handed over")
+	}
+	var unreadable *laser.UndecodableRecord
+	if !errors.As(err, &unreadable) {
+		t.Fatalf("want the record carried in the refusal, got %T", err)
+	}
+	if string(unreadable.Message.Payload) != "the work" {
+		t.Errorf("want the bytes kept, got %q", unreadable.Message.Payload)
+	}
+	if unreadable.PartitionID != 2 || unreadable.Checkpoint.Offset() != 11 {
+		t.Errorf("want where the record sat, got partition %d offset %d",
+			unreadable.PartitionID, unreadable.Checkpoint.Offset())
+	}
+	if unreadable.Cause == nil {
+		t.Error("want the reason the spine did not decode")
+	}
+}
+
+// A record with no spine at all is the normal case on a plain data topic, so
+// it is handed over with none rather than refused.
+func TestGivenADeliveredRecordWithNoSpineWhenOpenedThenShouldHandItOver(t *testing.T) {
+	message, err := iggcon.NewIggyMessage([]byte("plain"))
+	if err != nil {
+		t.Fatalf("build a record: %v", err)
+	}
+
+	record, err := laser.DeliveredRecord(1, message, iggcon.Checkpoint{}, false)
+
+	if err != nil {
+		t.Fatalf("a record with no spine is not a broken one: %v", err)
+	}
+	if record.Provenance != nil {
+		t.Error("want no spine rather than an invented one")
+	}
+	if record.PartitionID != 1 {
+		t.Errorf("want where the record came from, got %d", record.PartitionID)
+	}
+}
+
 // budgetRuntime opens a runtime over a steerable session index.
 func budgetRuntime(
 	t *testing.T, server *budgetServer, name string,
