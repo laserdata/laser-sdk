@@ -2,9 +2,11 @@ package laser_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"math"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -35,6 +37,10 @@ type systemServer struct {
 	// one that was asked for.
 	options []iggcon.OptionSpec
 	scope   iggcon.OptionsScope
+	// changes is the page a metadata change read answers with, nil to
+	// answer with no page at all, and asked records the query that arrived.
+	changes *iggcon.MetadataChanges
+	asked   iggcon.MetadataChangesQuery
 
 	// requests records the raw command codes and bodies that were sent.
 	requests []rawRequest
@@ -137,6 +143,24 @@ func (server *systemServer) DescribeOptions(
 	}
 	server.scope = scope
 	return server.options, nil
+}
+
+func (server *systemServer) GetMetadataChanges(
+	_ context.Context, query iggcon.MetadataChangesQuery,
+) (*iggcon.MetadataChanges, error) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	if server.fail != nil {
+		return nil, server.fail
+	}
+	server.asked = query
+	return server.changes, nil
+}
+
+func (server *systemServer) askedChanges() iggcon.MetadataChangesQuery {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	return server.asked
 }
 
 func (server *systemServer) describedScope() iggcon.OptionsScope {
@@ -728,4 +752,674 @@ func wideBytes(high, low uint64) []byte {
 	binary.LittleEndian.PutUint64(encoded[0:8], low)
 	binary.LittleEndian.PutUint64(encoded[8:16], high)
 	return encoded
+}
+
+// aCursor is a change cursor of the history the fake server pretends to
+// hold, which is the only way to spell one a parse accepts.
+func aCursor(op uint64, ordinal uint32) iggcon.MetadataChangeCursor {
+	return iggcon.MetadataChangeCursor{
+		LogID:    iggcon.Unsigned128{High: 1, Low: 2},
+		Op:       op,
+		Checksum: iggcon.Unsigned128{High: 3, Low: 4},
+		Ordinal:  ordinal,
+	}
+}
+
+// aPageToken is a current state scan token over the stream group, built the
+// way the server builds one so a parse accepts it.
+func aPageToken(t *testing.T) *iggcon.MetadataCurrentPageToken {
+	t.Helper()
+	payload, err := aCursor(9, 0).AppendBinary(nil)
+	if err != nil {
+		t.Fatalf("cursor: %v", err)
+	}
+	payload = binary.LittleEndian.AppendUint64(payload, 9)
+	// The mask names the stream group, the token's last item is in it, and
+	// a stream key is the four bytes of its id.
+	payload = append(payload, 1<<(iggcon.MetadataChangeGroupStreams-1),
+		byte(iggcon.MetadataChangeGroupStreams))
+	payload = binary.LittleEndian.AppendUint16(payload, 4)
+	payload = binary.LittleEndian.AppendUint32(payload, 7)
+	token, err := iggcon.ParseMetadataCurrentPageToken(
+		iggcon.MetadataCurrentPageTokenPrefix +
+			base64.RawURLEncoding.EncodeToString(payload))
+	if err != nil {
+		t.Fatalf("page token: %v", err)
+	}
+	return token
+}
+
+func TestGivenTheDefaultQueryWhenSentThenShouldReadTheFeedFromItsStart(t *testing.T) {
+	server := &systemServer{changes: &iggcon.MetadataChanges{}}
+
+	if _, err := systemHandle(server).MetadataChanges(
+		context.Background(), laser.MetadataChangesQuery{}); err != nil {
+		t.Fatalf("changes: %v", err)
+	}
+	asked := server.askedChanges()
+	// The zero value has to mean what the Rust client's default means, so an
+	// unset limit asks for the server's page size rather than for nothing.
+	if asked.Limit != iggcon.DefaultMetadataChangesLimit {
+		t.Fatalf("got limit %d", asked.Limit)
+	}
+	if asked.Start.Mode != iggcon.MetadataChangeStartEarliest {
+		t.Fatalf("got start %+v", asked.Start)
+	}
+	if len(asked.Groups) != 0 || asked.Since != nil || asked.Until != nil {
+		t.Fatalf("got %+v", asked)
+	}
+}
+
+func TestGivenAQueryWhenSentThenShouldCarryItsStartGroupsAndBounds(t *testing.T) {
+	server := &systemServer{changes: &iggcon.MetadataChanges{}}
+	since, until := uint64(5), uint64(9)
+
+	if _, err := systemHandle(server).MetadataChanges(
+		context.Background(), laser.MetadataChangesQuery{
+			Start:       laser.MetadataChangeStart{Mode: laser.MetadataStartAfter, Cursor: aCursor(4, 1).String()},
+			Groups:      []laser.MetadataChangeGroup{laser.MetadataGroupUsers},
+			SinceMicros: &since, UntilMicros: &until, Limit: 7,
+		}); err != nil {
+		t.Fatalf("changes: %v", err)
+	}
+	asked := server.askedChanges()
+	if asked.Start.Mode != iggcon.MetadataChangeStartAfter ||
+		asked.Start.Cursor != aCursor(4, 1) {
+		t.Fatalf("got %+v", asked.Start)
+	}
+	if len(asked.Groups) != 1 ||
+		asked.Groups[0] != iggcon.MetadataChangeGroupUsers {
+		t.Fatalf("got %+v", asked.Groups)
+	}
+	if asked.Limit != 7 || asked.Since == nil || *asked.Since != 5 ||
+		asked.Until == nil || *asked.Until != 9 {
+		t.Fatalf("got %+v", asked)
+	}
+}
+
+func TestGivenEachStartWhenSentThenShouldCarryItsOwnMode(t *testing.T) {
+	token := aPageToken(t)
+	for _, probe := range []struct {
+		name  string
+		start laser.MetadataChangeStart
+		mode  iggcon.MetadataChangeStartMode
+	}{
+		{"the earliest record", laser.MetadataChangeStart{},
+			iggcon.MetadataChangeStartEarliest},
+		{"the latest record",
+			laser.MetadataChangeStart{Mode: laser.MetadataStartLatest},
+			iggcon.MetadataChangeStartLatest},
+		{"a fresh current scan",
+			laser.MetadataChangeStart{Mode: laser.MetadataStartCurrent},
+			iggcon.MetadataChangeStartCurrent},
+		{"a continued current scan",
+			laser.MetadataChangeStart{
+				Mode: laser.MetadataStartCurrent, PageToken: token.String()},
+			iggcon.MetadataChangeStartCurrent},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			server := &systemServer{changes: &iggcon.MetadataChanges{}}
+			query := laser.MetadataChangesQuery{Start: probe.start}
+			// A current scan of a group must also name its parent groups,
+			// and the stream group is its own parent.
+			if probe.mode == iggcon.MetadataChangeStartCurrent {
+				query.Groups = []laser.MetadataChangeGroup{laser.MetadataGroupStreams}
+			}
+			if _, err := systemHandle(server).MetadataChanges(
+				context.Background(), query); err != nil {
+				t.Fatalf("changes: %v", err)
+			}
+			asked := server.askedChanges()
+			if asked.Start.Mode != probe.mode {
+				t.Fatalf("got %+v", asked.Start)
+			}
+			// A fresh scan carries no token, and a continued one carries the
+			// token the page before it handed out.
+			wantToken := probe.start.PageToken != ""
+			if (asked.Start.PageToken != nil) != wantToken {
+				t.Fatalf("got token %+v", asked.Start.PageToken)
+			}
+		})
+	}
+}
+
+func TestGivenAMalformedCursorOrTokenWhenSentThenShouldNameItBack(t *testing.T) {
+	// A cursor and a page token are opaque text the server minted, so text
+	// it did not mint is named back rather than sent for it to reject.
+	server := &systemServer{changes: &iggcon.MetadataChanges{}}
+	for _, start := range []laser.MetadataChangeStart{
+		{Mode: laser.MetadataStartAfter, Cursor: "mc1_nope"},
+		{Mode: laser.MetadataStartAfter},
+		{Mode: laser.MetadataStartCurrent, PageToken: "cs1_nope"},
+		{Mode: laser.MetadataChangeStartMode(9)},
+	} {
+		if _, err := systemHandle(server).MetadataChanges(
+			context.Background(), laser.MetadataChangesQuery{Start: start},
+		); err == nil {
+			t.Fatalf("%+v must be refused", start)
+		}
+	}
+	if server.askedChanges().Limit != 0 {
+		t.Fatal("nothing must be sent")
+	}
+}
+
+func TestGivenAQueryBreakingTheServerRulesWhenSentThenShouldRefuseIt(t *testing.T) {
+	// The rules are about the request rather than about the state, so the
+	// round trip could only come back with the same answer.
+	since, until := uint64(9), uint64(5)
+	one := uint64(1)
+	server := &systemServer{changes: &iggcon.MetadataChanges{}}
+	for _, query := range []laser.MetadataChangesQuery{
+		{Limit: 1001},
+		{SinceMicros: &since, UntilMicros: &until},
+		{Start: laser.MetadataChangeStart{Mode: laser.MetadataStartLatest},
+			SinceMicros: &one},
+		{Start: laser.MetadataChangeStart{Mode: laser.MetadataStartCurrent},
+			Groups: []laser.MetadataChangeGroup{laser.MetadataGroupTopics}},
+		{Groups: []laser.MetadataChangeGroup{laser.MetadataChangeGroup(9)}},
+	} {
+		if _, err := systemHandle(server).MetadataChanges(
+			context.Background(), query); err == nil {
+			t.Fatalf("%+v must be refused", query)
+		}
+	}
+	if server.askedChanges().Limit != 0 {
+		t.Fatal("nothing must be sent")
+	}
+}
+
+func TestGivenAPageWhenReadThenShouldReportItsPositionAndCursors(t *testing.T) {
+	next := aCursor(12, 1)
+	token := aPageToken(t)
+	server := &systemServer{changes: &iggcon.MetadataChanges{
+		Status: iggcon.MetadataChangeStatusBehind,
+		Phase:  iggcon.MetadataChangePhaseCurrent,
+		HeadOp: 12, OldestOp: 3, RetainedSince: 1_700_000_000_000_000,
+		Next: &next, HasMore: true, CurrentPageToken: token,
+	}}
+
+	page, err := systemHandle(server).MetadataChanges(
+		context.Background(), laser.MetadataChangesQuery{})
+	if err != nil || page == nil {
+		t.Fatalf("got %+v %v", page, err)
+	}
+	if page.Status != laser.MetadataStatusBehind ||
+		page.Phase != laser.MetadataPhaseCurrent || page.HeadOp != 12 ||
+		page.OldestOp != 3 || page.RetainedSinceMicros != 1_700_000_000_000_000 ||
+		!page.HasMore {
+		t.Fatalf("got %+v", page)
+	}
+	// The cursors go back out as the text they came in as, because that is
+	// what a caller stores and hands back to read on.
+	if page.Next != next.String() || page.PageToken != token.String() {
+		t.Fatalf("got %q %q", page.Next, page.PageToken)
+	}
+}
+
+func TestGivenAPageWithoutCursorsThenShouldReportNone(t *testing.T) {
+	// An expired and a reset status carry no cursor, so nothing is read out
+	// of one that is not there.
+	server := &systemServer{changes: &iggcon.MetadataChanges{
+		Status: iggcon.MetadataChangeStatusExpired,
+	}}
+
+	page, err := systemHandle(server).MetadataChanges(
+		context.Background(), laser.MetadataChangesQuery{})
+	if err != nil || page == nil {
+		t.Fatalf("got %+v %v", page, err)
+	}
+	if page.Next != "" || page.PageToken != "" {
+		t.Fatalf("got %q %q", page.Next, page.PageToken)
+	}
+}
+
+func TestGivenAPageThatReportsNothingThenShouldSaySo(t *testing.T) {
+	server := &systemServer{}
+	if _, err := systemHandle(server).MetadataChanges(
+		context.Background(), laser.MetadataChangesQuery{}); err == nil {
+		t.Fatal("a page that was never reported must not read as an empty one")
+	}
+}
+
+func TestGivenAMemberLeftRecordWhenReadThenShouldNameTheMemberAndReason(t *testing.T) {
+	server := &systemServer{changes: &iggcon.MetadataChanges{
+		Records: []iggcon.MetadataChangeRecord{{
+			Op: 9, Ordinal: 1, Timestamp: 1_700_000_000_000_000,
+			Group: iggcon.MetadataChangeGroupConsumerGroupMembers,
+			Kind:  iggcon.MetadataChangeKindConsumerGroupMemberLeft,
+			Body: &iggcon.MetadataMemberLeft{
+				MetadataTopicKey: iggcon.MetadataTopicKey{
+					MetadataStreamKey: iggcon.MetadataStreamKey{
+						StreamID: 1, StreamCreatedOp: 2},
+					TopicID: 3, TopicCreatedOp: 4,
+				},
+				GroupID: 5, MemberID: 6,
+				ClientID:     iggcon.Unsigned128{High: 0, Low: 7},
+				MembersCount: 0,
+				Reason:       iggcon.MetadataMemberLeftReasonSessionEnded,
+			},
+		}},
+	}}
+
+	page, err := systemHandle(server).MetadataChanges(
+		context.Background(), laser.MetadataChangesQuery{})
+	if err != nil || page == nil || len(page.Records) != 1 {
+		t.Fatalf("got %+v %v", page, err)
+	}
+	record := page.Records[0]
+	if record.Op != 9 || record.Ordinal != 1 ||
+		record.TimestampMicros != 1_700_000_000_000_000 ||
+		record.ActorUserID != nil {
+		t.Fatalf("got %+v", record)
+	}
+	if record.Kind != laser.MetadataKindConsumerGroupMemberLeft ||
+		!record.Kind.Known() ||
+		record.Group != laser.MetadataGroupConsumerGroupMembers {
+		t.Fatalf("got %v %v", record.Kind, record.Group)
+	}
+	subject := record.Subject
+	if valueOf(t, subject.StreamID) != 1 || valueOf(t, subject.StreamCreatedOp) != 2 ||
+		valueOf(t, subject.TopicID) != 3 || valueOf(t, subject.TopicCreatedOp) != 4 ||
+		valueOf(t, subject.GroupID) != 5 || valueOf(t, subject.MemberID) != 6 {
+		t.Fatalf("got %+v", subject)
+	}
+	if subject.ClientID == nil || *subject.ClientID !=
+		(laser.MetadataClientID{High: 0, Low: 7}) {
+		t.Fatalf("got %+v", subject.ClientID)
+	}
+	// A count of zero is a real value, so it is reported rather than left
+	// unset the way a field the change does not carry is.
+	if subject.MembersCount == nil || *subject.MembersCount != 0 {
+		t.Fatalf("got %+v", subject.MembersCount)
+	}
+	if subject.Reason == nil || *subject.Reason != laser.MetadataReasonSessionEnded {
+		t.Fatalf("got %+v", subject.Reason)
+	}
+	// A name belongs to a change that names a resource, and this one does
+	// not, so none is invented for it.
+	if subject.Name != "" || subject.Username != "" ||
+		subject.PartitionsCount != nil {
+		t.Fatalf("got %+v", subject)
+	}
+}
+
+func TestGivenEachChangeBodyWhenReadThenShouldFillItsOwnFields(t *testing.T) {
+	streamKey := iggcon.MetadataStreamKey{StreamID: 1, StreamCreatedOp: 2}
+	topicKey := iggcon.MetadataTopicKey{
+		MetadataStreamKey: streamKey, TopicID: 3, TopicCreatedOp: 4}
+	userKey := iggcon.MetadataUserKey{UserID: 5, UserCreatedAt: 6}
+	requested := uint64(11)
+	expiry := uint64(1_700_000_000_000_000)
+	handedTo := uint32(6)
+
+	for _, probe := range []struct {
+		name  string
+		body  iggcon.MetadataChangeBody
+		check func(*testing.T, laser.MetadataSubject)
+	}{
+		{"a stream change", &iggcon.MetadataStreamChange{
+			MetadataStreamKey: streamKey, CreatedAt: 7, Name: "agents"},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if subject.Name != "agents" ||
+					valueOf(t, subject.CreatedAtMicros) != 7 ||
+					valueOf(t, subject.StreamID) != 1 ||
+					subject.TopicID != nil {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a stream delete", &iggcon.MetadataStreamDeleted{
+			MetadataStreamKey: streamKey, CreatedAt: 7, Name: "agents",
+			RequestedOp: &requested},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if subject.Name != "agents" ||
+					valueOf(t, subject.RequestedOp) != 11 {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a topic change", &iggcon.MetadataTopicChange{
+			MetadataTopicKey: topicKey, CreatedAt: 7, Name: "metrics",
+			PartitionsCount: 3},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if subject.Name != "metrics" ||
+					valueOf(t, subject.TopicID) != 3 ||
+					valueOf(t, subject.PartitionsCount) != 3 {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a topic item", &iggcon.MetadataTopicItem{
+			MetadataTopicKey: topicKey, CreatedAt: 7, Name: "metrics"},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if subject.Name != "metrics" ||
+					valueOf(t, subject.CreatedAtMicros) != 7 ||
+					subject.PartitionsCount != nil {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a topic delete", &iggcon.MetadataTopicDeleted{
+			MetadataTopicKey: topicKey, CreatedAt: 7, Name: "metrics",
+			RequestedOp: &requested},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if subject.Name != "metrics" ||
+					valueOf(t, subject.RequestedOp) != 11 {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a partition change", &iggcon.MetadataPartitionsChanged{
+			MetadataTopicKey: topicKey, PartitionsCount: 2,
+			RemovedPartitionIDs: []uint32{3, 4}, RequestedOp: &requested},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if valueOf(t, subject.PartitionsCount) != 2 ||
+					len(subject.RemovedPartitionIDs) != 2 ||
+					subject.RemovedPartitionIDs[1] != 4 ||
+					valueOf(t, subject.RequestedOp) != 11 {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a partition item", &iggcon.MetadataPartitionsItem{
+			MetadataTopicKey: topicKey, PartitionsCount: 2},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if valueOf(t, subject.PartitionsCount) != 2 ||
+					len(subject.RemovedPartitionIDs) != 0 {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a group create", &iggcon.MetadataConsumerGroupCreated{
+			MetadataTopicKey: topicKey, GroupID: 5, Name: "readers",
+			ConsumerGroupsCount: 2},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if subject.Name != "readers" || valueOf(t, subject.GroupID) != 5 ||
+					valueOf(t, subject.ConsumerGroupsCount) != 2 {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a group delete", &iggcon.MetadataConsumerGroupDeleted{
+			MetadataTopicKey: topicKey, GroupID: 5, Name: "readers",
+			ConsumerGroupsCount: 1, RequestedOp: &requested},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if valueOf(t, subject.ConsumerGroupsCount) != 1 ||
+					valueOf(t, subject.RequestedOp) != 11 {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a group item", &iggcon.MetadataConsumerGroupItem{
+			MetadataTopicKey: topicKey, GroupID: 5, Name: "readers"},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if subject.Name != "readers" || valueOf(t, subject.GroupID) != 5 ||
+					subject.ConsumerGroupsCount != nil {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a member joining", &iggcon.MetadataMemberJoined{
+			MetadataTopicKey: topicKey, GroupID: 5, MemberID: 6,
+			ClientID:     iggcon.Unsigned128{High: 1, Low: 2},
+			MembersCount: 2, PartitionIDs: []uint32{1, 2}},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if valueOf(t, subject.MemberID) != 6 ||
+					valueOf(t, subject.MembersCount) != 2 ||
+					len(subject.PartitionIDs) != 2 ||
+					subject.ClientID == nil ||
+					*subject.ClientID != (laser.MetadataClientID{High: 1, Low: 2}) {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a partition handover", &iggcon.MetadataPartitionHandedOver{
+			MetadataTopicKey: topicKey, GroupID: 5, PartitionID: 2,
+			MemberID: &handedTo},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if valueOf(t, subject.PartitionID) != 2 ||
+					valueOf(t, subject.MemberID) != 6 {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a handover to nobody", &iggcon.MetadataPartitionHandedOver{
+			MetadataTopicKey: topicKey, GroupID: 5, PartitionID: 2},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				// A partition handed back to the group names no member, and
+				// that is not member zero.
+				if subject.MemberID != nil {
+					t.Fatalf("got %+v", subject.MemberID)
+				}
+			}},
+		{"a member item", &iggcon.MetadataMemberItem{
+			MetadataTopicKey: topicKey, GroupID: 5, MemberID: 6,
+			ClientID: iggcon.Unsigned128{Low: 7}, PartitionIDs: []uint32{1}},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if valueOf(t, subject.MemberID) != 6 ||
+					len(subject.PartitionIDs) != 1 ||
+					subject.MembersCount != nil {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a user change", &iggcon.MetadataUserChange{
+			MetadataUserKey: userKey, Username: "operator",
+			Status: iggcon.Inactive,
+			Permissions: &iggcon.Permissions{
+				Global: iggcon.GlobalPermissions{ReadUsers: true}}},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if subject.Username != "operator" ||
+					valueOf(t, subject.UserID) != 5 ||
+					valueOf(t, subject.UserCreatedAtMicros) != 6 {
+					t.Fatalf("got %+v", subject)
+				}
+				if subject.Status == nil || *subject.Status != laser.UserInactive {
+					t.Fatalf("got %+v", subject.Status)
+				}
+				if subject.Permissions == nil ||
+					!subject.Permissions.Global.ReadUsers {
+					t.Fatalf("got %+v", subject.Permissions)
+				}
+			}},
+		{"a user identity", &iggcon.MetadataUserIdentity{
+			MetadataUserKey: userKey, Username: "operator"},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				// A delete and a password change name the user and say
+				// nothing about its status or grants.
+				if subject.Username != "operator" || subject.Status != nil ||
+					subject.Permissions != nil {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a permissions update", &iggcon.MetadataUserPermissionsUpdated{
+			MetadataUserKey: userKey, Username: "operator",
+			Reason: iggcon.MetadataPermissionsUpdatedReasonResourceDeleted},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if subject.Reason == nil ||
+					*subject.Reason != laser.MetadataReasonResourceDeleted {
+					t.Fatalf("got %+v", subject.Reason)
+				}
+				// The grants were pruned to none, which is not the same as a
+				// change that carried no grant block.
+				if subject.Permissions != nil {
+					t.Fatalf("got %+v", subject.Permissions)
+				}
+			}},
+		{"a token create", &iggcon.MetadataTokenChange{
+			MetadataUserKey: userKey, Name: "ci", Expiry: &expiry},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if subject.Name != "ci" ||
+					valueOf(t, subject.ExpiresAtMicros) != expiry {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a token that never expires", &iggcon.MetadataTokenChange{
+			MetadataUserKey: userKey, Name: "ci"},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if subject.ExpiresAtMicros != nil {
+					t.Fatalf("got %+v", subject.ExpiresAtMicros)
+				}
+			}},
+		{"a token delete", &iggcon.MetadataTokenDeleted{
+			MetadataUserKey: userKey, Name: "ci",
+			Reason: iggcon.MetadataTokenDeletedReasonExpired},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if subject.Name != "ci" || subject.Reason == nil ||
+					*subject.Reason != laser.MetadataReasonExpired {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a session registering", &iggcon.MetadataSession{
+			MetadataUserKey: userKey, ClientID: iggcon.Unsigned128{Low: 7},
+			Session: 12},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if valueOf(t, subject.Session) != 12 || subject.ClientID == nil ||
+					subject.Reason != nil {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+		{"a session closing", &iggcon.MetadataSessionClosed{
+			MetadataUserKey: userKey, ClientID: iggcon.Unsigned128{Low: 7},
+			Session: 12, Reason: iggcon.MetadataSessionClosedReasonRevoked},
+			func(t *testing.T, subject laser.MetadataSubject) {
+				if valueOf(t, subject.Session) != 12 || subject.Reason == nil ||
+					*subject.Reason != laser.MetadataReasonRevoked {
+					t.Fatalf("got %+v", subject)
+				}
+			}},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			server := &systemServer{changes: &iggcon.MetadataChanges{
+				Items: []iggcon.MetadataCurrentItem{
+					{Group: iggcon.MetadataChangeGroupStreams, Body: probe.body}},
+			}}
+			page, err := systemHandle(server).MetadataChanges(
+				context.Background(), laser.MetadataChangesQuery{})
+			if err != nil || page == nil || len(page.Items) != 1 {
+				t.Fatalf("got %+v %v", page, err)
+			}
+			probe.check(t, page.Items[0].Subject)
+		})
+	}
+}
+
+func TestGivenPartitionIdsWhenReadThenShouldNotAliasTheDecodedPage(t *testing.T) {
+	// The page is decoded out of a reply buffer the connection reuses, so a
+	// subject that aliased it would change under a caller that kept it.
+	joined := []uint32{1, 2}
+	removed := []uint32{3, 4}
+	server := &systemServer{changes: &iggcon.MetadataChanges{
+		Items: []iggcon.MetadataCurrentItem{
+			{Group: iggcon.MetadataChangeGroupConsumerGroupMembers,
+				Body: &iggcon.MetadataMemberItem{PartitionIDs: joined}},
+			{Group: iggcon.MetadataChangeGroupPartitions,
+				Body: &iggcon.MetadataPartitionsChanged{
+					RemovedPartitionIDs: removed}},
+		},
+	}}
+
+	page, err := systemHandle(server).MetadataChanges(
+		context.Background(), laser.MetadataChangesQuery{})
+	if err != nil || page == nil || len(page.Items) != 2 {
+		t.Fatalf("got %+v %v", page, err)
+	}
+	joined[0], removed[0] = 9, 9
+	if page.Items[0].Subject.PartitionIDs[0] != 1 {
+		t.Fatalf("got %v", page.Items[0].Subject.PartitionIDs)
+	}
+	if page.Items[1].Subject.RemovedPartitionIDs[0] != 3 {
+		t.Fatalf("got %v", page.Items[1].Subject.RemovedPartitionIDs)
+	}
+}
+
+func TestGivenABodyThisBuildDoesNotKnowThenShouldCarryAnEmptySubject(t *testing.T) {
+	// Its shape is the only thing that says what its bytes mean, so nothing
+	// is guessed out of them. The wire codes are kept so a mirror can skip
+	// the record rather than mistake it for one it knows.
+	server := &systemServer{changes: &iggcon.MetadataChanges{
+		Records: []iggcon.MetadataChangeRecord{{
+			Op: 3, Group: iggcon.MetadataChangeGroup(99),
+			Kind: iggcon.MetadataChangeKind(200),
+			Body: &iggcon.MetadataUnknownBody{Body: []byte{1, 2, 3}},
+		}},
+		Items: []iggcon.MetadataCurrentItem{{
+			Group: iggcon.MetadataChangeGroup(99),
+			Body:  &iggcon.MetadataUnknownBody{Body: []byte{1}},
+		}},
+	}}
+
+	page, err := systemHandle(server).MetadataChanges(
+		context.Background(), laser.MetadataChangesQuery{})
+	if err != nil || page == nil || len(page.Records) != 1 || len(page.Items) != 1 {
+		t.Fatalf("got %+v %v", page, err)
+	}
+	record := page.Records[0]
+	if record.Kind.Known() || record.Group.Known() || record.Op != 3 {
+		t.Fatalf("got %+v", record)
+	}
+	if !reflect.DeepEqual(record.Subject, laser.MetadataSubject{}) {
+		t.Fatalf("got %+v", record.Subject)
+	}
+	if page.Items[0].Group.Known() ||
+		!reflect.DeepEqual(page.Items[0].Subject, laser.MetadataSubject{}) {
+		t.Fatalf("got %+v", page.Items[0])
+	}
+}
+
+func TestGivenMetadataWordsWhenPrintedThenShouldMatchTheOtherClients(t *testing.T) {
+	group, err := laser.ParseMetadataChangeGroup("consumer_group_members")
+	if err != nil || group != laser.MetadataGroupConsumerGroupMembers {
+		t.Fatalf("got %v %v", group, err)
+	}
+	if group.String() != "consumer_group_members" || !group.Known() {
+		t.Fatalf("got %q", group.String())
+	}
+	if _, err := laser.ParseMetadataChangeGroup("nodes"); err == nil {
+		t.Fatal("an unknown group word must be refused")
+	}
+	if laser.MetadataKindConsumerGroupPartitionHandedOver.String() !=
+		"consumer_group_partition_handed_over" {
+		t.Fatalf("got %q",
+			laser.MetadataKindConsumerGroupPartitionHandedOver.String())
+	}
+	if laser.MetadataStatusExpired.String() != "expired" ||
+		laser.MetadataPhaseCurrent.String() != "current" {
+		t.Fatal("a status and a phase print their own word")
+	}
+	for word, reason := range map[string]laser.MetadataChangeReason{
+		"left": laser.MetadataReasonLeft, "session_ended": laser.MetadataReasonSessionEnded,
+		"deleted": laser.MetadataReasonDeleted, "expired": laser.MetadataReasonExpired,
+		"logout": laser.MetadataReasonLogout, "revoked": laser.MetadataReasonRevoked,
+		"updated":          laser.MetadataReasonUpdated,
+		"resource_deleted": laser.MetadataReasonResourceDeleted,
+	} {
+		if reason.String() != word {
+			t.Fatalf("got %q, want %q", reason.String(), word)
+		}
+	}
+	if laser.MetadataChangeReason(99).String() != "unknown" {
+		t.Fatal("a reason this build does not know prints as unknown")
+	}
+}
+
+func TestGivenAServerThatRefusesWhenTheChangesAreReadThenShouldReportIt(t *testing.T) {
+	server := &systemServer{fail: ierror.Disconnected{}}
+	_, err := systemHandle(server).MetadataChanges(
+		context.Background(), laser.MetadataChangesQuery{})
+	var transport *laser.TransportError
+	if !errors.As(err, &transport) {
+		t.Fatalf("want a TransportError, got %T: %v", err, err)
+	}
+}
+
+func TestGivenAClosedHandleWhenTheChangesAreReadThenShouldSaySo(t *testing.T) {
+	handle := systemHandle(&systemServer{changes: &iggcon.MetadataChanges{}})
+	if err := handle.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := handle.MetadataChanges(
+		context.Background(), laser.MetadataChangesQuery{}); err == nil {
+		t.Fatal("a closed handle has no connection to read the changes over")
+	}
+}
+
+// valueOf reads a field the change was expected to fill, failing rather than
+// dereferencing nothing when it left the field unset.
+func valueOf[T any](t *testing.T, field *T) T {
+	t.Helper()
+	if field == nil {
+		var zero T
+		t.Fatalf("the field was left unset")
+		return zero
+	}
+	return *field
 }
