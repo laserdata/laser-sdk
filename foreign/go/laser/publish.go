@@ -187,6 +187,10 @@ func (topic *Topic) sendOnPartition(
 	return topic.sendResolved(ctx, messages, iggcon.PartitionId(partition))
 }
 
+// publishPartitions is how many partitions a topic created by a publish
+// gets, matching what the reference client's producer asks for.
+const publishPartitions uint32 = 1
+
 // sendResolved is the one place a record reaches the log once its
 // partitioning is settled.
 func (topic *Topic) sendResolved(
@@ -196,9 +200,32 @@ func (topic *Topic) sendResolved(
 	if err != nil {
 		return nil, err
 	}
-	// Publishing is retried on a lost or stalled link under the shared
-	// recovery schedule, because a dropped connection is the one publish
-	// failure a resend reliably fixes.
+	response, err := topic.publishOnce(ctx, streamID, topicID, partitioning, messages)
+	if err == nil || !isMissingResource(err) {
+		return response, err
+	}
+	// A publish creates the topic it names, which is what the reference
+	// client's producer does, so a first publish needs no bootstrap before
+	// it. Creating the topic is attempted rather than reasoned about: when
+	// it is the stream that is missing, the create fails too and the
+	// original publish error is returned, which already names what was not
+	// found.
+	if created := topic.createTopicForPublish(ctx); created != nil {
+		return nil, err
+	}
+	return topic.publishOnce(ctx, streamID, topicID, partitioning, messages)
+}
+
+// publishOnce sends one batch, recovering a lost link but not a missing
+// topic.
+//
+// Publishing is retried on a lost or stalled link under the shared recovery
+// schedule, because a dropped connection is the one publish failure a resend
+// reliably fixes.
+func (topic *Topic) publishOnce(
+	ctx context.Context, streamID, topicID iggcon.Identifier,
+	partitioning iggcon.Partitioning, messages []iggcon.IggyMessage,
+) (*iggcon.SendMessagesResponse, error) {
 	return runWithRecovery(ctx, topic.laser.publishSchedule(),
 		func(attempt context.Context) (*iggcon.SendMessagesResponse, error) {
 			live, err := topic.laser.connected()
@@ -213,6 +240,35 @@ func (topic *Topic) sendResolved(
 			return response, nil
 		},
 		topic.laser.reconnect)
+}
+
+// createTopicForPublish creates the topic a publish named, with one
+// partition and whatever retention the server defaults to.
+//
+// The stream is never created here. A governed identity has no stream-wide
+// create right, and a stream is provisioned with its tenant, so publishing
+// into a stream that does not exist is a mistake to report rather than
+// something to paper over.
+func (topic *Topic) createTopicForPublish(ctx context.Context) error {
+	client, err := topic.laser.connected()
+	if err != nil {
+		return err
+	}
+	streamID, topicID, err := topic.identifiers()
+	if err != nil {
+		return err
+	}
+	partitions := publishPartitions
+	if _, err := client.CreateTopic(ctx, streamID, topic.name,
+		&iggcon.TopicOptions{PartitionsCount: &partitions}); err != nil {
+		// A concurrent publish may have created it first, which is what both
+		// callers wanted.
+		if _, probe := client.GetTopic(ctx, streamID, topicID); probe == nil {
+			return nil
+		}
+		return &TransportError{Reason: "create the topic", Cause: err}
+	}
+	return nil
 }
 
 // partitioningFor turns a key into the partitioning the server reads.

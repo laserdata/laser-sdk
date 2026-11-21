@@ -1497,6 +1497,29 @@ the removal only once the server confirmed it, rather than remembering an
 attempt as a success.
 
 
+## A publish creates the topic it names
+
+Publishing to a topic that does not exist creates it with one partition and
+the server's own retention, so a first publish needs no bootstrap before it.
+This is what the reference client's producer does, and a Go client that
+refused instead would make the same program work in Rust and fail here.
+
+The topic is created only after a send comes back saying it was missing, not
+checked for beforehand. Checking first would double the cost of every publish
+to buy nothing on the path that matters.
+
+The stream is never created this way. A governed identity has no stream-wide
+create right and a stream is provisioned with its tenant, so publishing into
+a stream that does not exist is a mistake to report rather than paper over.
+When the stream is what was missing, the create fails too and the original
+publish error is returned, because that error already names what was not
+found.
+
+Two publishers racing to create the same topic both succeed. The one that
+loses the race reads the topic back, finds it there, and sends: both wanted
+the topic to exist, and it does.
+
+
 ## Partitions are numbered from zero
 
 A topic's partitions start at 0, so a topic created with one partition

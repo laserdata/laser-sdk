@@ -22,9 +22,59 @@ type recoveringServer struct {
 	attempts    int
 	reconnects  int
 	hangOnFirst bool
+
+	topicExists       bool
+	creates           int
+	createdPartitions uint32
+	createFails       error
+	createRace        bool
 }
 
 func (server *recoveringServer) Close() error { return nil }
+
+// GetTopic and CreateTopic answer the create path a publish takes when the
+// topic it names is missing. topicExists starts false, so the first create
+// is what brings the topic into being.
+func (server *recoveringServer) GetTopic(
+	_ context.Context, _, _ iggcon.Identifier,
+) (*iggcon.TopicDetails, error) {
+	server.guard.Lock()
+	defer server.guard.Unlock()
+	if server.topicExists {
+		return &iggcon.TopicDetails{}, nil
+	}
+	return nil, ierror.TopicIdNotFound{}
+}
+
+func (server *recoveringServer) CreateTopic(
+	_ context.Context, _ iggcon.Identifier, _ string, options *iggcon.TopicOptions,
+) (*iggcon.TopicDetails, error) {
+	server.guard.Lock()
+	defer server.guard.Unlock()
+	server.creates++
+	if server.createRace {
+		// Another publisher got there first: the topic now exists and this
+		// create is refused.
+		server.topicExists = true
+		return nil, ierror.TopicNameAlreadyExists{TopicName: "events"}
+	}
+	if server.createFails != nil {
+		return nil, server.createFails
+	}
+	if options != nil && options.PartitionsCount != nil {
+		server.createdPartitions = *options.PartitionsCount
+	}
+	server.topicExists = true
+	return &iggcon.TopicDetails{}, nil
+}
+
+// publishCounts is the attempts, the topic creates, and the partition count
+// the create asked for.
+func (server *recoveringServer) publishCounts() (int, int, uint32) {
+	server.guard.Lock()
+	defer server.guard.Unlock()
+	return server.attempts, server.creates, server.createdPartitions
+}
 
 func (server *recoveringServer) Connect(context.Context) error {
 	server.guard.Lock()
@@ -99,7 +149,10 @@ func TestGivenADroppedLinkWhenPublishingThenShouldReconnectAndRetry(t *testing.T
 // reasoned about will fail the same way however many times it is sent, and
 // retrying it only delays the report.
 func TestGivenAPermanentRefusalWhenPublishingThenShouldNotRetry(t *testing.T) {
-	server := &recoveringServer{fail: []error{ierror.TopicIdNotFound{}}}
+	// A payload the server refuses is permanent in a way a missing topic is
+	// not: a missing topic the publish creates and retries, so it would no
+	// longer show what this test is about.
+	server := &recoveringServer{fail: []error{ierror.InvalidMessagePayloadLength{}}}
 	handle := recoveringHandle(server, laser.PublishOptions{
 		Timeout: 2 * time.Second, MaxRetries: 5, RetryBackoff: time.Millisecond,
 	})
@@ -481,5 +534,95 @@ func TestGivenAZeroHandleWhenPublishingThenShouldUseTheSharedDefaults(t *testing
 
 	if attempts, _ := server.counts(); attempts != 1 {
 		t.Errorf("want one attempt, got %d", attempts)
+	}
+}
+
+func TestGivenAMissingTopicWhenPublishingThenShouldCreateItAndSend(t *testing.T) {
+	// The server refuses the first send because the topic is not there yet.
+	server := &recoveringServer{fail: []error{ierror.TopicIdNotFound{}}}
+	handle := recoveringHandle(server, laser.PublishOptions{
+		Timeout: 2 * time.Second, MaxRetries: 5, RetryBackoff: time.Millisecond,
+	})
+
+	if _, err := handle.Topic("created-by-publish").Publish().
+		Payload([]byte("x")).Key("k").Send(context.Background()); err != nil {
+		t.Fatalf("a publish creates the topic it names: %v", err)
+	}
+	attempts, creates, partitions := server.publishCounts()
+	if attempts != 2 {
+		t.Errorf("want the send retried once after the create, got %d attempts", attempts)
+	}
+	if creates != 1 {
+		t.Errorf("want the topic created once, got %d", creates)
+	}
+	// One partition, which is what the reference client's producer asks for.
+	if partitions != 1 {
+		t.Errorf("created the topic with %d partitions, want 1", partitions)
+	}
+}
+
+func TestGivenAnExistingTopicWhenPublishingThenShouldNotTryToCreateIt(t *testing.T) {
+	server := &recoveringServer{topicExists: true}
+	handle := recoveringHandle(server, laser.PublishOptions{
+		Timeout: 2 * time.Second, MaxRetries: 5, RetryBackoff: time.Millisecond,
+	})
+
+	if _, err := handle.Topic("events").Publish().
+		Payload([]byte("x")).Key("k").Send(context.Background()); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	attempts, creates, _ := server.publishCounts()
+	// The common path must cost one round trip. Checking first would double
+	// the cost of every publish to buy nothing.
+	if attempts != 1 {
+		t.Errorf("want one send, got %d", attempts)
+	}
+	if creates != 0 {
+		t.Errorf("a topic that was there was created %d times", creates)
+	}
+}
+
+func TestGivenAMissingStreamWhenPublishingThenShouldReportItRatherThanCreateIt(t *testing.T) {
+	// The stream is what is missing, so the create fails too.
+	server := &recoveringServer{
+		fail:        []error{ierror.StreamIdNotFound{}},
+		createFails: ierror.StreamIdNotFound{},
+	}
+	handle := recoveringHandle(server, laser.PublishOptions{
+		Timeout: 2 * time.Second, MaxRetries: 5, RetryBackoff: time.Millisecond,
+	})
+
+	_, err := handle.Topic("events").Publish().
+		Payload([]byte("x")).Key("k").Send(context.Background())
+	if err == nil {
+		t.Fatal("publishing into a stream that does not exist must fail")
+	}
+	// The original publish failure, which already names what was missing,
+	// rather than whatever the attempted create said.
+	if !errors.Is(err, ierror.StreamIdNotFound{}) {
+		t.Fatalf("reported %v, want the missing stream", err)
+	}
+	attempts, _, _ := server.publishCounts()
+	if attempts != 1 {
+		t.Errorf("want no resend when the stream is missing, got %d attempts", attempts)
+	}
+}
+
+func TestGivenAConcurrentCreateWhenPublishingThenShouldStillSend(t *testing.T) {
+	server := &recoveringServer{
+		fail: []error{ierror.TopicIdNotFound{}}, createRace: true}
+	handle := recoveringHandle(server, laser.PublishOptions{
+		Timeout: 2 * time.Second, MaxRetries: 5, RetryBackoff: time.Millisecond,
+	})
+
+	if _, err := handle.Topic("events").Publish().
+		Payload([]byte("x")).Key("k").Send(context.Background()); err != nil {
+		t.Fatalf("losing the create race is not a failure: %v", err)
+	}
+	// Two publishers racing both wanted the topic to exist, and it does, so
+	// refusing the loser would fail a publish that has nothing wrong with it.
+	attempts, creates, _ := server.publishCounts()
+	if attempts != 2 || creates != 1 {
+		t.Fatalf("got %d attempts and %d creates, want 2 and 1", attempts, creates)
 	}
 }
