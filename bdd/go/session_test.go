@@ -34,13 +34,11 @@ var sessionPlan = map[string]string{
 	"A model call and a tool call the session recorded never reach its agent as work": "needs an agent consuming the lane",
 	"A session lens never starts a heartbeat":                                         "needs an agent consuming the lane",
 
-	"A checkpoint splits the history into before and after":                                               "this runner has not written the context checkpoint steps",
 	"A stale handle's end leaves the newer state document in place":                                       "this runner has not written the second-handle state steps",
 	"A stale handle's state snapshot is refused as a stale session":                                       "this runner has not written the second-handle state steps",
 	"A stale handle's next delta leaves the newer state document in place":                                "this runner has not written the second-handle state steps",
 	"A declared partition layout routes commands to the addressee and replies to the requester":           "this runner has not written the declared layout steps",
 	"A declared topic layout routes commands and replies to the agents' own topics":                       "this runner has not written the declared layout steps",
-	"Remembered items carry the session agent as producer":                                                "this runner has not written the linked memory steps",
 	"A terminal verb after a refused publish re-sends the latched record and a different verb is refused": "this runner has not written the refusing policy steps",
 	"A refused state snapshot remains pending for the end retry":                                          "this runner has not written the refusing policy steps",
 	"Heartbeats stop when the last lease drops":                                                           "this runner has not written the heartbeat steps",
@@ -118,6 +116,29 @@ func sessionStep(ctx context.Context, state *world, step bdd.Step) error {
 
 	case strings.HasPrefix(text, "the context assembled from the session reads"):
 		return assembledReads(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "I take a session checkpoint after"):
+		counts := numbersOf(step)
+		if len(counts) != 1 {
+			return fmt.Errorf("want one record count, got %v", counts)
+		}
+		return takeCheckpoint(ctx, state, int(counts[0]))
+
+	case strings.HasPrefix(text, "the records since the checkpoint are"):
+		return sinceCheckpoint(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "the last record at the checkpoint is"):
+		return blocked("the Go client cannot read up to a checkpoint: " +
+			"ContextScope has Checkpoint and FetchSince but no fetch-at, " +
+			"where the Rust reference has turns_at(checkpoint) beside " +
+			"turns_since (sdk/src/agent/session.rs:1296), so there is no way " +
+			"to ask what the lane held at the moment the checkpoint was taken")
+
+	case strings.HasPrefix(text, "the session remembers"):
+		return rememberThroughSession(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "the remembered item names producer"):
+		return rememberedProducer(ctx, state, arguments)
 
 	default:
 		return fmt.Errorf("this runner does not implement the step")
