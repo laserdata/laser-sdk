@@ -718,6 +718,18 @@ func TestGivenAnUndecodableRecordWhenRunThenShouldKeepItsBytesAndCommitIt(t *tes
 	if commits := source.commits(); len(commits) != 1 || commits[0] != 4 {
 		t.Errorf("want the undecodable record committed, got %v", commits)
 	}
+	// A record naming no session still needs one, derived from where it sat
+	// so it is stable across redeliveries. The seed is the contract's, so
+	// every client derives the same session for the same poison record.
+	spine, err := laser.ProvenanceFrom(&server.on(wire.AgentDLQ)[0])
+	if err != nil {
+		t.Fatalf("read the capsule spine: %v", err)
+	}
+	derived := laser.DeriveConversationID("dead-letter\x1f7\x1f3\x1f1\x1f4")
+	if spine.Conversation != derived {
+		t.Errorf("want the session derived from the position, got %v",
+			spine.Conversation)
+	}
 }
 
 // A caller cannot tell a command that was consumed from one that expired
@@ -1096,6 +1108,46 @@ func TestGivenADeliveredRecordWithNoSpineWhenOpenedThenShouldHandItOver(t *testi
 	}
 	if record.PartitionID != 1 {
 		t.Errorf("want where the record came from, got %d", record.PartitionID)
+	}
+}
+
+// The failure a dead-lettered command answers with is read by whatever client
+// asked, so the code, the retryable flag and the reason carried in the detail
+// are the contract's rather than this client's.
+//
+// The values here are the reference's own: a passed deadline answers
+// DeadlineExceeded, a spent retry budget answers Internal and says a repeat
+// may help, and everything else answers InvalidRequest and says it will not.
+func TestGivenEachDeadLetterReasonWhenAnsweredThenShouldCarryTheContractsCode(t *testing.T) {
+	cases := []struct {
+		reason    wire.DeadLetterReason
+		code      wire.AgentErrorCode
+		retryable bool
+	}{
+		{wire.DeadLetterDeadlineExceeded, wire.ErrorDeadlineExceeded, false},
+		{wire.DeadLetterRetryExhausted, wire.ErrorInternal, true},
+		{wire.DeadLetterRejected, wire.ErrorInvalidRequest, false},
+		{wire.DeadLetterDecodeFailed, wire.ErrorInvalidRequest, false},
+	}
+	for _, testCase := range cases {
+		body := laser.DeadLetterErrorBody(testCase.reason, "why")
+		if body.Code != testCase.code {
+			t.Errorf("reason %d: want code %d, got %d",
+				testCase.reason, testCase.code, body.Code)
+		}
+		if body.Retryable != testCase.retryable {
+			t.Errorf("reason %d: want retryable %v", testCase.reason, testCase.retryable)
+		}
+		if body.Message == nil || *body.Message != "why" {
+			t.Errorf("reason %d: want the detail carried", testCase.reason)
+		}
+		// The code alone does not say a command was dropped unconsumed
+		// rather than refused, so the reason rides in the detail.
+		carried, named := body.Detail[laser.DeadLetterReasonDetail]
+		if !named || wholeNumber(carried) != uint64(testCase.reason) {
+			t.Errorf("reason %d: want the reason in the detail, got %v",
+				testCase.reason, carried)
+		}
 	}
 }
 
