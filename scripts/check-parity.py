@@ -1256,7 +1256,7 @@ GO_CAPABILITIES = {
     "system.cluster": "Laser.Cluster",
     "system.snapshot": "Laser.Snapshot",
     "system.options": "Laser.DescribeOptions",
-    "system.metadata_changes": MISSING,
+    "system.metadata_changes": "Laser.MetadataChanges",
 }
 
 # The managed and agent surfaces the Go client serves beyond the raw Apache

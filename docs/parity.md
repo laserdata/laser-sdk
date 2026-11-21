@@ -105,7 +105,7 @@ The check reads the raw operations from the client sources. Rust has 74 operatio
 
 ### The Go client
 
-The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 44 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
+The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 45 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
 
 A capability it does not wrap is still reachable: `Laser.Client` hands out the underlying Apache Iggy client, exactly as `Laser::client` does in Rust.
 
@@ -169,7 +169,7 @@ A capability it does not wrap is still reachable: `Laser.Client` hands out the u
 | `system.cluster` | `Laser.Cluster` |
 | `system.snapshot` | `Laser.Snapshot` |
 | `system.options` | `Laser.DescribeOptions` |
-| `system.metadata_changes` | MISSING |
+| `system.metadata_changes` | `Laser.MetadataChanges` |
 
 Beyond the raw capabilities, the Go client serves these managed and agent surfaces. They have no raw Apache Iggy equivalent, so they are listed on their own rather than as rows with an empty raw cell.
 

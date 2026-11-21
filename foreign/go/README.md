@@ -1561,10 +1561,9 @@ The system reads are `Ping`, `Stats`, `Me`, `Clients`, `ClientInfo`,
 `Cluster`, `Snapshot` and `DescribeOptions`. `Me` is this connection as the
 server sees it, which is not always what the client believes it asked for.
 
-`system.metadata_changes` is the one capability of this group the Go client
-does not serve yet. It is listed as MISSING in the capability table rather
-than stubbed, because a surface that answers without reading the feed would
-be worse than one that is absent.
+`MetadataChanges` reads the server's metadata change feed, which completes
+this group: every user, token and system capability the reference client
+serves is now served here.
 
 ## The agent runtime
 
