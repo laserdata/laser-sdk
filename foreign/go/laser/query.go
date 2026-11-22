@@ -339,7 +339,15 @@ func (laser *Laser) ExecuteQuery(
 	if err != nil {
 		return nil, &CodecError{Reason: "encode query", Cause: err}
 	}
-	raw, err := laser.SendManaged(ctx, wire.AgdxQueryCode, payload)
+	// A query every node refused walks the roster again until the query's own
+	// deadline rather than the managed one, so the last refusal comes back
+	// before the caller stops waiting for a reply. The deadline is absolute
+	// on the wire, and a query that names none takes the managed walk.
+	queryWalk := walkingUntilServed()
+	if query.DeadlineMicros > 0 {
+		queryWalk = walkingUntil(time.UnixMicro(int64(query.DeadlineMicros)))
+	}
+	raw, err := laser.sendManagedWalking(ctx, wire.AgdxQueryCode, payload, queryWalk)
 	if err != nil {
 		return nil, err
 	}

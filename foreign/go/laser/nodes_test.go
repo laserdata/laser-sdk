@@ -176,6 +176,14 @@ func sendProbe(ctx context.Context, handle *laser.Laser) ([]byte, error) {
 	return handle.SendManaged(ctx, wire.AgdxKvGetCode, nil)
 }
 
+// sendMutation is the probe of a command that changes state, which walks the
+// roster once: it repeats under its own operation identity rather than by
+// walking again, so one walk is the whole of what routing decides for it. A
+// read every node refused walks again, which the internal tests pin.
+func sendMutation(ctx context.Context, handle *laser.Laser) ([]byte, error) {
+	return handle.SendManaged(ctx, wire.AgdxKvSetCode, nil)
+}
+
 func TestGivenOneNodeWhenSendingManagedThenShouldUseThePlainBand(t *testing.T) {
 	server := newCluster(0)
 	handle := clusterHandle(server)
@@ -282,7 +290,7 @@ func TestGivenEveryNodesLinkFailsWhenSendingManagedThenShouldReportIt(t *testing
 	)
 	handle := clusterHandle(server)
 
-	_, err := sendProbe(context.Background(), handle)
+	_, err := sendMutation(context.Background(), handle)
 	if err == nil {
 		t.Fatal("a cluster that is wholly unreachable must be reported")
 	}
@@ -315,7 +323,7 @@ func TestGivenEveryNodeCannotReachItsBackendWhenSendingThenShouldReturnTheRefusa
 	server.answerWith(unavailableNode(t), unavailableNode(t), unavailableNode(t))
 	handle := clusterHandle(server)
 
-	reply, err := sendProbe(context.Background(), handle)
+	reply, err := sendMutation(context.Background(), handle)
 	if err != nil {
 		t.Fatalf("a refusal every node agrees on is an answer, not a failure: %v", err)
 	}
@@ -507,7 +515,7 @@ func TestGivenAClusterThatListsANodeTwiceWhenWalkingThenShouldCountItOnce(t *tes
 	)
 	handle := clusterHandle(server)
 
-	if _, err := sendProbe(context.Background(), handle); err == nil {
+	if _, err := sendMutation(context.Background(), handle); err == nil {
 		t.Fatal("a cluster that is wholly unreachable must be reported")
 	}
 	// Two nodes, so two attempts. A roster that counted the repeat would

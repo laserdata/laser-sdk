@@ -36,14 +36,14 @@ func TestGivenTheSharedRetryTableWhenComparedThenShouldMatchEveryGoValue(t *test
 		got   time.Duration
 		table time.Duration
 	}{
-		{"managed_mutation.base_ms", laser.ManagedMutation.Base,
-			millis("managed_mutation", "base_ms")},
-		{"managed_mutation.max_ms", laser.ManagedMutation.Max,
-			millis("managed_mutation", "max_ms")},
-		{"managed_mutation.deadline_ms", laser.ManagedMutationDeadline,
-			millis("managed_mutation", "deadline_ms")},
-		{"managed_mutation.attempt_first_ms", laser.ManagedAttemptFirst,
-			millis("managed_mutation", "attempt_first_ms")},
+		{"managed.base_ms", laser.ManagedRetry.Base,
+			millis("managed", "base_ms")},
+		{"managed.max_ms", laser.ManagedRetry.Max,
+			millis("managed", "max_ms")},
+		{"managed.deadline_ms", laser.ManagedDeadline,
+			millis("managed", "deadline_ms")},
+		{"managed.attempt_first_ms", laser.ManagedAttemptFirst,
+			millis("managed", "attempt_first_ms")},
 		{"consumer.base_ms", laser.ConsumerBackoff.Base, millis("consumer", "base_ms")},
 		{"consumer.max_ms", laser.ConsumerBackoff.Max, millis("consumer", "max_ms")},
 		{"control_discovery.max_ms", laser.ControlDiscoveryMax,

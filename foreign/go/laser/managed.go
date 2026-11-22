@@ -91,6 +91,13 @@ func (laser *Laser) SeenPositions() wire.AppliedFrontier {
 // fresh operation identity, so a transport retry of the same call is applied
 // once rather than twice. A read is sent as given.
 //
+// A read every node refused for want of its managed backend waits on the
+// managed backoff and walks the roster again until it is served or
+// ManagedDeadline passes, then returns the same refusal it would have
+// returned at once. A mutation already repeated under its identity; a read
+// has none, and on a single node, or on a cluster that restarted all at
+// once, the first refusal is one the deployment served a moment later.
+//
 // This is the raw band. Whether a deployment serves a given surface is the
 // surface's own question, because they do not share one answer: the key-value
 // store and query need a managed backend, while the authorization verbs are
@@ -99,8 +106,17 @@ func (laser *Laser) SeenPositions() wire.AppliedFrontier {
 func (laser *Laser) SendManaged(
 	ctx context.Context, code uint32, payload []byte,
 ) ([]byte, error) {
+	return laser.sendManagedWalking(ctx, code, payload, walkingUntilServed())
+}
+
+// sendManagedWalking is SendManaged with the walk a read takes while every
+// node refuses it. A mutation repeats under its own operation identity and
+// ignores the walk.
+func (laser *Laser) sendManagedWalking(
+	ctx context.Context, code uint32, payload []byte, w walk,
+) ([]byte, error) {
 	if !wire.IsIdempotentManagedRequest(code) {
-		return laser.sendManagedFrame(ctx, code, payload)
+		return laser.sendManagedFrame(ctx, code, payload, w)
 	}
 	return laser.SendManagedWithOperation(ctx, code, payload, NewOperationID())
 }
@@ -121,11 +137,11 @@ func (laser *Laser) SendManagedWithOperation(
 	if err != nil {
 		return nil, &CodecError{Reason: "encode managed request", Cause: err}
 	}
-	return laser.sendManagedFrame(ctx, code, framed)
+	return laser.sendManagedFrame(ctx, code, framed, walkingOnce())
 }
 
 func (laser *Laser) sendManagedFrame(
-	ctx context.Context, code uint32, frame []byte,
+	ctx context.Context, code uint32, frame []byte, w walk,
 ) ([]byte, error) {
 	if err := laser.ensureScopable(code); err != nil {
 		return nil, err
@@ -141,7 +157,7 @@ func (laser *Laser) sendManagedFrame(
 	// always was. On a cluster it keeps this client to one node, picked by a
 	// key of its own, and moves off a node whose link fails or that cannot
 	// reach its own backend.
-	routed, err := laser.nodes().send(ctx, client, code, frame, targetOfCode(code))
+	routed, err := laser.nodes().send(ctx, client, code, frame, targetOfCode(code), w)
 	if err != nil {
 		return nil, &TransportError{Reason: "managed command", Cause: err}
 	}

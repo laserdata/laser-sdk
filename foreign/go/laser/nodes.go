@@ -134,10 +134,11 @@ func newNodeRouter() *nodeRouter {
 //
 // A request to the caller's node moves on to the next node after a failed
 // link, at most once per node, and reads the roster again once when a replica
-// id is no longer in it. A request to a named replica is sent there only.
+// id is no longer in it. A roster whose every node refused is walked again as
+// w allows. A request to a named replica is sent there only.
 func (router *nodeRouter) send(
 	ctx context.Context, client ClusterRequester, code uint32, payload []byte,
-	target managedTarget,
+	target managedTarget, w walk,
 ) (answered, error) {
 	switch target.kind {
 	case targetPrimary:
@@ -154,8 +155,98 @@ func (router *nodeRouter) send(
 		}
 		return openAnswer(reply, &replica), nil
 	default:
-		return router.walkCaller(ctx, client, code, payload)
+		return router.walkCallerUntil(ctx, client, code, payload, w)
 	}
+}
+
+// walk is how a request to the caller's node answers a roster whose every
+// node refused it for want of its managed backend or with a lost link.
+//
+// A mutation owns its own repeat loop under its operation identity, so it
+// walks once. A read has no identity to repeat under and used to surface the
+// first refusal, which on a single node, or on a cluster that restarted all
+// at once, is a refusal the deployment served a moment later.
+type walk struct {
+	kind  walkKind
+	until time.Time
+}
+
+type walkKind uint8
+
+const (
+	// walkOnce returns the last refusal, for a caller that answers one
+	// itself.
+	walkOnce walkKind = iota
+	// walkUntilServed waits on the managed backoff and walks the roster
+	// again until the request is served or ManagedDeadline passes.
+	walkUntilServed
+	// walkUntilDeadline is walkUntilServed under the call's own deadline.
+	walkUntilDeadline
+)
+
+func walkingOnce() walk { return walk{kind: walkOnce} }
+
+func walkingUntilServed() walk { return walk{kind: walkUntilServed} }
+
+// walkingUntil is the walk of a call that carries its own deadline, so the
+// last refusal comes back before the caller stops waiting for a reply rather
+// than after the managed deadline it would otherwise take.
+func walkingUntil(until time.Time) walk {
+	return walk{kind: walkUntilDeadline, until: until}
+}
+
+// end is when this walk stops repeating, zero when it walks once.
+func (w walk) end(now time.Time) time.Time {
+	switch w.kind {
+	case walkUntilServed:
+		return now.Add(ManagedDeadline)
+	case walkUntilDeadline:
+		return w.until
+	default:
+		return time.Time{}
+	}
+}
+
+// walkCallerUntil walks the roster as w allows, each walk after the first
+// behind the next jittered step of the managed backoff. A wait that would end
+// past the walk's own end returns the last refusal instead of sleeping
+// through it.
+func (router *nodeRouter) walkCallerUntil(
+	ctx context.Context, client ClusterRequester, code uint32, payload []byte, w walk,
+) (answered, error) {
+	until := w.end(time.Now())
+	walks := uint32(0)
+	for {
+		walked, err := router.walkCaller(ctx, client, code, payload)
+		walks++
+		wait := ManagedRetry.Delay(walks)
+		if !walksAgain(code, walked, err, until, wait, time.Now()) {
+			return walked, err
+		}
+		select {
+		case <-ctx.Done():
+			return walked, err
+		case <-time.After(wait):
+		}
+		// The deadline is checked again on the way out, so a timer that fired
+		// late never starts another request.
+		if !time.Now().Before(until) {
+			return walked, err
+		}
+	}
+}
+
+// walksAgain reports whether a walk that ended this way is walked again after
+// wait: every node refused it for want of its managed backend or with a lost
+// link, and the wait ends before until. A zero until walks once.
+func walksAgain(
+	code uint32, walked answered, err error, until time.Time, wait time.Duration, now time.Time,
+) bool {
+	refused := transientTransport(err)
+	if err == nil {
+		refused = backendRefused(code, walked.reply)
+	}
+	return refused && !until.IsZero() && now.Add(wait).Before(until)
 }
 
 // walkCaller sends to the caller's node, moving on when a link fails or the
@@ -313,6 +404,36 @@ func walksOn(ctx context.Context, failedLinks, nodes int) bool {
 	}
 	deadline, set := ctx.Deadline()
 	return !set || time.Now().Before(deadline)
+}
+
+// backendRefused reports a node that refused code for want of its managed
+// backend: BackendUnavailable, or for a filter catalog read the
+// catalog_unavailable the streaming server gives that refusal there.
+func backendRefused(code uint32, reply []byte) bool {
+	if backendUnavailable(reply) {
+		return true
+	}
+	if !isFilterCatalogRead(code) {
+		return false
+	}
+	var refusal wire.FilterReply
+	if err := wire.Unmarshal(reply, &refusal); err != nil {
+		return false
+	}
+	return refusal.Err != nil && refusal.Err.Reason == wire.ReasonCatalogUnavailable
+}
+
+// isFilterCatalogRead reports the catalog reads that answer an unreachable
+// backend as a filter refusal rather than as a command error.
+func isFilterCatalogRead(code uint32) bool {
+	switch code {
+	case wire.AgdxGetFilterCode, wire.AgdxListFiltersCode,
+		wire.AgdxListFilterRevisionsCode, wire.AgdxGetFilterBindingCode,
+		wire.AgdxListFilterBindingsCode, wire.AgdxFilterOperationCode:
+		return true
+	default:
+		return false
+	}
 }
 
 // backendUnavailable reports a node that answered but could not reach its own

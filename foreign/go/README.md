@@ -1463,6 +1463,19 @@ give the same answer and walking is only delay. When every node refuses with
 the same backend failure, the last refusal is handed back rather than
 swallowed.
 
+A read every node refused is not answered with that refusal at once. It waits
+on the managed backoff and walks the roster again until it is served or its
+deadline passes, the query's own or `ManagedDeadline`, and only then returns
+the same refusal. A mutation repeats under its operation identity, and a read
+has no identity to repeat under, so on a single node, or on a cluster that
+restarted all at once, the first refusal used to reach the caller as final
+even though the deployment served again a moment later. A node still
+replaying its logs after a restart refuses the same way. The deadline is
+checked before each wait and again when the wait ends, so a timer that fired
+late never starts another request. A filter catalog read counts
+`catalog_unavailable` as that refusal too, which is the form the streaming
+server gives it there.
+
 The roster is read once and kept. A replica id the cluster no longer knows
 means the roster is stale, so it is read again, once per request rather than
 once per attempt: a second stale id inside one request says the roster is not

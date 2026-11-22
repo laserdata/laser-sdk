@@ -53,16 +53,18 @@ const (
 
 // The schedule itself.
 var (
-	// ManagedMutation is how a managed mutation or control append whose
-	// outcome is unknown repeats under the same identity.
-	ManagedMutation = Backoff{Base: 100 * time.Millisecond, Max: 2 * time.Second}
+	// ManagedRetry is how a managed mutation or control append whose outcome
+	// is unknown repeats under the same identity, and how a managed read
+	// every node refused walks the roster again.
+	ManagedRetry = Backoff{Base: 100 * time.Millisecond, Max: 2 * time.Second}
 	// ConsumerBackoff is how a reliable consumer reopens.
 	ConsumerBackoff = Backoff{Base: 50 * time.Millisecond, Max: time.Second}
 )
 
 const (
-	// ManagedMutationDeadline bounds how long a mutation is repeated for.
-	ManagedMutationDeadline = 30 * time.Second
+	// ManagedDeadline bounds how long a mutation is repeated for, and how
+	// long a read is walked again for when it names no deadline of its own.
+	ManagedDeadline = 30 * time.Second
 	// ManagedAttemptFirst is how long the first attempt of a managed mutation
 	// gets before it counts as lost, each later one twice as long and never
 	// past the operation deadline. A dead node then costs one bound rather
