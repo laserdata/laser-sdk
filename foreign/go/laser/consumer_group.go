@@ -108,6 +108,45 @@ func (group *ConsumerGroup) Filter() *GroupFilter {
 	return &GroupFilter{group: group}
 }
 
+// Selector names this group the way a filtered read addresses its consumer.
+//
+// A named handle selects by name and a numeric one by id, because the server
+// resolves either, and resolving a number to a name here would cost a round
+// trip on every read.
+func (group *ConsumerGroup) Selector() wire.FilterConsumer {
+	if group.target.byName {
+		return wire.NamedGroup(group.target.name)
+	}
+	return wire.GroupByID(group.target.id)
+}
+
+// Filters is the match-oriented reader of this group's policy: pages of
+// records with their original offsets, an independent scan budget, and
+// explicit acknowledgments.
+//
+// An unbound group receives every record, which is a supported way to run one
+// rather than a misconfiguration.
+func (group *ConsumerGroup) Filters() *Filters {
+	return group.topic.Filters(group.Selector())
+}
+
+// Consumer joins this group as one member, load balanced with the others.
+//
+// A member names no partitions of its own: the server assigns them and
+// rebalances as members come and go. Note that Apache Iggy identifies a member
+// by the client connection, so two consumers opened on one connected client
+// join as a single member and are each handed every partition. A second member
+// needs its own connection.
+func (group *ConsumerGroup) Consumer(
+	ctx context.Context, options ConsumerOptions,
+) (*Consumer, error) {
+	if !group.target.byName {
+		return nil, &InvalidError{Reason: "a consumer group is joined by name, " +
+			"address it with Topic.Group(name)"}
+	}
+	return group.topic.ConsumerGroup(ctx, group.target.name, options)
+}
+
 // EnsureNative creates the native group when it is absent and leaves an
 // existing one alone, without touching its policy.
 //
@@ -599,6 +638,141 @@ func (filter *GroupFilter) Get(ctx context.Context) (*wire.FilterBinding, error)
 			"the saved binding identifies another group incarnation")}
 	}
 	return binding, nil
+}
+
+// active is the policy the group runs, refusing an unbound group.
+//
+// The verbs below all address the group's own filter through its binding, so
+// a group with no policy has nothing for them to act on and says so rather
+// than acting on whichever filter happens to be first in the catalog.
+func (filter *GroupFilter) active(ctx context.Context) (*wire.FilterBinding, error) {
+	binding, err := filter.Get(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return binding, nil
+}
+
+// Summary is the group's own filter as a catalog row, bound or released: its
+// name, state, latest revision and the owning group. It is nil when the group
+// has no filter of its own.
+//
+// The row is looked up by the group's exact identity rather than by its name,
+// so a group recreated under the same name does not find the filter the
+// previous group owned.
+func (filter *GroupFilter) Summary(ctx context.Context) (*wire.FilterSummary, error) {
+	details, err := filter.group.native(ctx)
+	if err != nil {
+		return nil, err
+	}
+	identity, err := filter.group.identityOf(ctx, uint64(details.Id))
+	if err != nil {
+		return nil, err
+	}
+	page, err := filter.group.laser().FilterCatalog().Filters(
+		ctx, FilterQuery{Owner: &identity}, 1, 1)
+	if err != nil {
+		return nil, err
+	}
+	if page == nil {
+		return nil, nil
+	}
+	// The owner is checked again on the way out rather than trusted from the
+	// query, because a row whose owner is another incarnation would otherwise
+	// be returned as this group's own filter.
+	for index := range page.Items {
+		summary := &page.Items[index]
+		if summary.Owner != nil && summary.Owner.Identity == identity {
+			return summary, nil
+		}
+	}
+	return nil, nil
+}
+
+// Revisions pages through the revisions of the group's own filter, newest
+// first. Page counts from 1 and results is the page length.
+func (filter *GroupFilter) Revisions(
+	ctx context.Context, page, results uint32,
+) (*wire.FilterRevisionPage, error) {
+	active, err := filter.active(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return filter.group.laser().FilterCatalog().Revisions(
+		ctx, active.FilterID, page, results)
+}
+
+// SetRevisionEnabled pauses or resumes one revision of the group's own filter.
+//
+// A paused active revision refuses new reads while records already delivered
+// can still be acknowledged, which is what lets an operator stop a filter
+// without stranding the work its readers are already holding.
+func (filter *GroupFilter) SetRevisionEnabled(
+	ctx context.Context, revision uint32, enabled bool,
+) error {
+	active, err := filter.active(ctx)
+	if err != nil {
+		return err
+	}
+	position, err := filter.group.laser().FilterCatalog().SetRevisionEnabled(
+		ctx, active.FilterID, revision, enabled)
+	if err != nil {
+		return err
+	}
+	filter.group.rememberPosition(position)
+	return nil
+}
+
+// Delete removes the group's own filter with every revision, reporting whether
+// one was there to remove.
+//
+// A bound group is released first, so its consumers receive every record from
+// their next poll rather than reading through a filter that no longer exists.
+func (filter *GroupFilter) Delete(ctx context.Context) (bool, error) {
+	own, err := filter.Summary(ctx)
+	if err != nil {
+		return false, err
+	}
+	if own == nil {
+		return false, nil
+	}
+	position, err := filter.group.laser().FilterCatalog().Drop(ctx, own.ID)
+	if err != nil {
+		return false, err
+	}
+	filter.group.rememberPosition(position)
+	return true, nil
+}
+
+// Preview runs the active policy over the stored records of one partition.
+//
+// A preview joins no group, stores no offset and changes no consumer state, so
+// it is safe to run against a group that is being read right now. It is pinned
+// to the exact revision the group runs rather than to the group, so what it
+// shows is what the group's readers currently see.
+func (filter *GroupFilter) Preview(
+	ctx context.Context, partitionID uint32,
+) (*PreviewRequest, error) {
+	active, err := filter.active(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return filter.group.topic.Filters(filter.group.Selector()).Preview(
+		partitionID, wire.SavedRevision(active.FilterID, active.Revision)), nil
+}
+
+// Test evaluates the active policy against one supplied record and explains
+// the verdict. Nothing is read from a stream and nothing is stored.
+func (filter *GroupFilter) Test(
+	ctx context.Context, payload []byte, headers []wire.FilterHeader,
+) (*wire.FilterTestResult, error) {
+	active, err := filter.active(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return filter.group.topic.Filters(filter.group.Selector()).Test(
+		ctx, wire.SavedRevision(active.FilterID, active.Revision), payload, headers)
 }
 
 // Release releases this group's binding, leaving the group unbound and reading

@@ -3,6 +3,7 @@ package laser_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -210,7 +211,13 @@ func TestGivenANumericHandleWhenEnsuredThenShouldRefuseIt(t *testing.T) {
 	err := group.EnsureNative(context.Background())
 	var invalid *laser.InvalidError
 	if !errors.As(err, &invalid) {
-		t.Fatalf("creating by id must be refused with the remedy, got %v", err)
+		t.Fatalf("creating by id must be refused, got %v", err)
+	}
+	// The remedy is asserted for the same reason as in the join above: without
+	// the guard the handle creates a group under an empty name, which fails as
+	// invalid too, so the error type alone does not tell the two apart.
+	if !strings.Contains(err.Error(), "Topic.Group") {
+		t.Errorf("the refusal must name the remedy, got %v", err)
 	}
 }
 
@@ -417,5 +424,84 @@ func TestGivenNoStreamWhenAddressingAGroupThenShouldRefuseWithTheRemedy(t *testi
 	var invalid *laser.InvalidError
 	if !errors.As(err, &invalid) {
 		t.Fatalf("a group with no stream must be refused with the remedy, got %v", err)
+	}
+}
+
+func TestGivenANamedGroupWhenSelectingItThenShouldFollowItByName(t *testing.T) {
+	t.Parallel()
+	selector := groupTopic(newGroupServer()).Group("workers").Selector()
+
+	if selector.Kind != wire.ConsumerGroupName || selector.Name != "workers" {
+		t.Fatalf("a named group must be followed by name, got %+v", selector)
+	}
+	if !selector.IsGroup() {
+		t.Error("a group selector must read as a group")
+	}
+}
+
+func TestGivenANumericGroupWhenSelectingItThenShouldFollowItByID(t *testing.T) {
+	t.Parallel()
+	// A numeric handle selects by id rather than resolving a name, because
+	// resolving would cost a round trip on every filtered read.
+	selector := groupTopic(newGroupServer()).GroupByID(12).Selector()
+
+	if selector.Kind != wire.ConsumerGroupID || selector.ID != 12 {
+		t.Fatalf("a numeric group must be followed by id, got %+v", selector)
+	}
+}
+
+func TestGivenANumericHandleWhenJoiningAsAMemberThenShouldRefuseIt(t *testing.T) {
+	t.Parallel()
+	group := groupTopic(newGroupServer()).GroupByID(3)
+
+	_, err := group.Consumer(context.Background(), laser.ConsumerOptions{})
+	var invalid *laser.InvalidError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("joining by id must be refused, got %v", err)
+	}
+	// The message is asserted, not just the type. Without the guard a numeric
+	// handle falls through and joins under an empty name, which is also
+	// refused as invalid, so a check on the type alone passes whether or not
+	// the guard is there and proves nothing.
+	if !strings.Contains(err.Error(), "Topic.Group") {
+		t.Errorf("the refusal must name the remedy, got %v", err)
+	}
+}
+
+func TestGivenNoCatalogWhenReadingAPolicyVerbThenShouldNameTheMissingBackend(t *testing.T) {
+	t.Parallel()
+	server := newGroupServer()
+	group := groupTopic(server).Group("workers")
+	if err := group.EnsureNative(context.Background()); err != nil {
+		t.Fatalf("create the group: %v", err)
+	}
+
+	// A policy verb on a deployment with no filter catalog must say that is
+	// what is missing, rather than reporting the group as unpolicied. The two
+	// are different: one is a deployment that cannot hold a policy, the other
+	// a group that was never given one, and only the first is worth changing
+	// the deployment over.
+	_, err := group.Filter().Revisions(context.Background(), 1, 10)
+	if err == nil {
+		t.Fatal("a policy verb without a catalog must be refused")
+	}
+	if !strings.Contains(err.Error(), "managed backend") {
+		t.Errorf("the failure must name the missing backend, got %v", err)
+	}
+}
+
+func TestGivenAGroupWithNoOwnFilterWhenDeletingItThenShouldReportNothingRemoved(t *testing.T) {
+	t.Parallel()
+	server := newGroupServer()
+	group := groupTopic(server).Group("workers")
+	if err := group.EnsureNative(context.Background()); err != nil {
+		t.Fatalf("create the group: %v", err)
+	}
+
+	// Without a catalog there is no own filter to find, so the delete is a
+	// no-op rather than a failure: nothing was there to remove.
+	removed, err := group.Filter().Delete(context.Background())
+	if err == nil && removed {
+		t.Fatal("a group with no own filter must report that nothing was removed")
 	}
 }
