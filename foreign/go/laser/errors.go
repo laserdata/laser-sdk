@@ -7,6 +7,12 @@
 // builds on implements the TCP transport only.
 package laser
 
+import (
+	"errors"
+
+	ierror "github.com/apache/iggy/foreign/go/errors"
+)
+
 // ConfigError reports a connection string, environment variable, or builder
 // setting the client cannot act on, the Go form of laser_sdk's
 // LaserError::Config. It is raised before any network call, so a misconfigured
@@ -41,6 +47,43 @@ func (e *TransportError) Error() string {
 }
 
 func (e *TransportError) Unwrap() error { return e.Cause }
+
+// IggyErrorCode is the Apache Iggy error code underneath, and whether one was
+// there to read.
+//
+// A failure that came from the transport carries a code every Iggy client
+// classifies the same way, which is what lets a caller branch on the server's
+// own vocabulary rather than on message text.
+func (e *TransportError) IggyErrorCode() (ierror.Code, bool) {
+	var coded ierror.IggyError
+	if errors.As(e.Cause, &coded) {
+		return coded.Code(), true
+	}
+	return 0, false
+}
+
+// UncertainOperation is the request this failure left with an unknown
+// outcome, to settle with Laser.ResolveOperation or Laser.AbandonOperation,
+// and whether this failure named one at all.
+//
+// The transport retains such a request so its outcome can still be proved.
+// Until it is resolved or abandoned the lane it blocks stays blocked, so a
+// caller that ignores the id stalls the operations behind it.
+func (e *TransportError) UncertainOperation() (uint64, bool) {
+	var uncertain ierror.OperationUncertain
+	if errors.As(e.Cause, &uncertain) {
+		return uncertain.OperationID, true
+	}
+	var blocked ierror.LaneBlocked
+	if errors.As(e.Cause, &blocked) {
+		return blocked.OperationID, true
+	}
+	var partition ierror.PartitionLaneBlocked
+	if errors.As(e.Cause, &partition) {
+		return partition.OperationID, true
+	}
+	return 0, false
+}
 
 // InvalidError reports a value the client refuses to send, the Go form of
 // laser_sdk's LaserError::Invalid.

@@ -106,7 +106,7 @@ The check reads the raw operations from the client sources. Rust has 74 operatio
 
 ### The Go client
 
-The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 50 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
+The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 56 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
 
 A capability it does not wrap is still reachable: `Laser.Client` hands out the underlying Apache Iggy client, exactly as `Laser::client` does in Rust.
 
@@ -114,8 +114,8 @@ A capability it does not wrap is still reachable: `Laser.Client` hands out the u
 | --- | --- |
 | `connection.connect` | `laser.Connect + laser.ConnectEnv + laser.Local` |
 | `connection.close` | `Laser.Close` |
-| `connection.events` | MISSING |
-| `operation.settle` | MISSING |
+| `connection.events` | `Laser.ConnectionEvents` |
+| `operation.settle` | `Laser.ResolveOperation + Laser.AbandonOperation + TransportError.UncertainOperation` |
 | `command.raw` | `Laser.SendManaged + Laser.SendManagedWithOperation` |
 | `stream.list` | `Laser.Streams` |
 | `stream.get` | `Stream.Get + Stream.Exists` |
@@ -135,10 +135,10 @@ A capability it does not wrap is still reachable: `Laser.Client` hands out the u
 | `consumer_group.create` | `ConsumerGroup.Create` |
 | `consumer_group.delete` | `ConsumerGroup.Delete` |
 | `consumer_group.join` | `ConsumerGroup.Consumer + Topic.ConsumerGroup` |
-| `consumer_offset.get` | MISSING |
-| `consumer_offset.store` | MISSING |
+| `consumer_offset.get` | `Consumer.StoredOffset` |
+| `consumer_offset.store` | `Consumer.StoreOffset` |
 | `consumer_offset.commit` | `Consumer.Commit + Consumer.Mark` |
-| `consumer_offset.delete` | MISSING |
+| `consumer_offset.delete` | `Consumer.DeleteOffset` |
 | `message.send` | `Topic.Send + Topic.Batch + Topic.Publish` |
 | `message.poll` | `Topic.Consumer + Topic.Replay` |
 | `message.headers` | `PublishRequest.Header + Provenance.Headers` |
@@ -148,7 +148,7 @@ A capability it does not wrap is still reachable: `Laser.Client` hands out the u
 | `producer.encryption` | `Topic.WithEncryption` |
 | `consumer.encryption` | `ConsumerOptions.Encryption` |
 | `publish.failure` | `laser.PublishFailure: the confirmations that arrived and the records without one` |
-| `error.code` | MISSING |
+| `error.code` | `TransportError.IggyErrorCode` |
 | `agent.topic_names` | `wire.AgentSessions and the other wire topic constants` |
 | `bridge.rpc` | `bridges.TaskFromEnvelope + bridges.ToolResultFromEnvelope (mapping only, no server)` |
 | `bridge.http` | MISSING |

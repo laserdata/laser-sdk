@@ -264,14 +264,77 @@ type ConnectionEvents struct {
 
 // ConnectionEvents opens a watcher over this connection.
 //
-// The Apache Iggy Go SDK publishes no diagnostic events, so nothing drives
-// this on its own yet: a caller that observes the connection itself feeds it
-// with Report. The shape is here so the surface a program writes against does
-// not change when the transport starts publishing them.
+// The Apache Iggy Go SDK publishes no diagnostic events of its own, so this
+// client reports what it can see for itself: the connect it made, the
+// transport failures its calls ran into, the recovery that followed, and the
+// close. A caller observing the connection some other way can feed the same
+// watcher with Report.
+//
+// Two of the five therefore read differently here. A disconnect is noticed
+// when a call fails rather than when the socket drops, so it arrives on the
+// next call rather than at the moment itself, and the reconnect that follows
+// is reported when a call next succeeds. EventSignedOut never arrives,
+// because this client never signs out on its own: the transport ends the
+// session when the connection closes, which is EventShutdown.
 func (laser *Laser) ConnectionEvents() *ConnectionEvents {
-	return &ConnectionEvents{
+	events := &ConnectionEvents{
 		events: make(chan ConnectionEvent, connectionEventBuffer),
 		stop:   make(chan struct{}),
+	}
+	shared := laser.state()
+	shared.mutex.Lock()
+	shared.watchers = append(shared.watchers, events)
+	shared.mutex.Unlock()
+	return events
+}
+
+// reportConnection tells every open watcher about a transition.
+//
+// A repeated transport state is dropped, so a run of failing calls reports
+// one disconnect rather than one per call, and the recovery after it reports
+// one reconnect.
+func (laser *Laser) reportConnection(event ConnectionEvent) {
+	shared := laser.state()
+	shared.mutex.Lock()
+	if event == EventConnected || event == EventDisconnected {
+		if shared.linkState == event {
+			shared.mutex.Unlock()
+			return
+		}
+		shared.linkState = event
+	}
+	watchers := append([]*ConnectionEvents(nil), shared.watchers...)
+	shared.mutex.Unlock()
+	for _, watcher := range watchers {
+		watcher.Report(event)
+	}
+}
+
+// reportLink reports what one call said about the transport: a transient
+// failure is a connection that is down, and any answer at all is one that is
+// up again.
+//
+// Only a transport failure counts. A server that refused a request answered
+// it, so the connection carrying that refusal is working.
+func (laser *Laser) reportLink(err error) {
+	switch {
+	case err == nil:
+		laser.reportConnection(EventConnected)
+	case transientTransport(err):
+		laser.reportConnection(EventDisconnected)
+	}
+}
+
+// closeWatchers ends every open watcher, which a reader sees as its channel
+// closing.
+func (laser *Laser) closeWatchers() {
+	shared := laser.state()
+	shared.mutex.Lock()
+	watchers := shared.watchers
+	shared.watchers = nil
+	shared.mutex.Unlock()
+	for _, watcher := range watchers {
+		watcher.Close()
 	}
 }
 

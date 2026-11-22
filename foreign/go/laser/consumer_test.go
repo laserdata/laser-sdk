@@ -9,6 +9,7 @@ import (
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
@@ -313,5 +314,130 @@ func TestGivenConsumerLimitsWhenResolvedThenShouldCarryThemToTheRead(t *testing.
 	committing := laser.ConsumerOptions{AutoCommit: &auto}.PollOptions()
 	if committing.Commit.Kind != iggcon.CommitAuto {
 		t.Errorf("want auto-commit carried, got %v", committing.Commit.Kind)
+	}
+}
+
+// storedOffsetServer answers the three stored-offset calls and records them.
+type storedOffsetServer struct {
+	consumerServer
+	guard   sync.Mutex
+	stores  []uint64
+	deletes int
+	held    *iggcon.ConsumerOffsetInfo
+	missing bool
+}
+
+func (server *storedOffsetServer) StoreConsumerOffset(
+	_ context.Context, _ iggcon.Consumer, _, _ iggcon.Identifier,
+	offset uint64, _ *uint32,
+) error {
+	server.guard.Lock()
+	defer server.guard.Unlock()
+	server.stores = append(server.stores, offset)
+	return nil
+}
+
+func (server *storedOffsetServer) GetConsumerOffset(
+	_ context.Context, _ iggcon.Consumer, _, _ iggcon.Identifier, _ *uint32,
+) (*iggcon.ConsumerOffsetInfo, error) {
+	if server.missing {
+		return nil, ierror.ConsumerOffsetNotFound{}
+	}
+	return server.held, nil
+}
+
+func (server *storedOffsetServer) DeleteConsumerOffset(
+	_ context.Context, _ iggcon.Consumer, _, _ iggcon.Identifier, _ *uint32,
+) error {
+	server.guard.Lock()
+	defer server.guard.Unlock()
+	if server.missing {
+		return ierror.ConsumerOffsetNotFound{}
+	}
+	server.deletes++
+	return nil
+}
+
+func storedOffsetConsumer(t *testing.T, server iggcon.Client) *laser.Consumer {
+	t.Helper()
+	consumer, err := streamHandle(server, laser.Options{DefaultStream: "agents"}).
+		Topic("inferences").Consumer(context.Background(), "worker",
+		laser.ConsumerOptions{Partitions: []uint32{1}})
+	if err != nil {
+		t.Fatalf("open the consumer: %v", err)
+	}
+	t.Cleanup(func() { _ = consumer.Close(context.Background()) })
+	return consumer
+}
+
+func TestGivenAStoredOffsetWhenReadThenShouldReportItWithThePartitionHead(t *testing.T) {
+	server := &storedOffsetServer{held: &iggcon.ConsumerOffsetInfo{
+		PartitionId: 1, StoredOffset: 40, CurrentOffset: 57}}
+	consumer := storedOffsetConsumer(t, server)
+
+	stored, err := consumer.StoredOffset(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("read the stored offset: %v", err)
+	}
+
+	// The head comes back with it, or a caller cannot tell a consumer that
+	// is caught up from one that is far behind.
+	if stored == nil || stored.Offset != 40 || stored.CurrentOffset != 57 {
+		t.Fatalf("want 40 of 57, got %+v", stored)
+	}
+}
+
+func TestGivenNoStoredOffsetWhenReadThenShouldReportAbsenceRatherThanZero(t *testing.T) {
+	consumer := storedOffsetConsumer(t, &storedOffsetServer{missing: true})
+
+	stored, err := consumer.StoredOffset(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("read the stored offset: %v", err)
+	}
+
+	// Offset zero is a stored position like any other, so absence cannot be
+	// reported as a zero a caller would resume from.
+	if stored != nil {
+		t.Fatalf("want absence, got %+v", stored)
+	}
+}
+
+func TestGivenAnExplicitOffsetWhenStoredThenShouldSendItToTheServer(t *testing.T) {
+	server := &storedOffsetServer{}
+	consumer := storedOffsetConsumer(t, server)
+
+	if err := consumer.StoreOffset(context.Background(), 40, nil); err != nil {
+		t.Fatalf("store the offset: %v", err)
+	}
+
+	server.guard.Lock()
+	defer server.guard.Unlock()
+	if len(server.stores) != 1 || server.stores[0] != 40 {
+		t.Fatalf("want offset 40 stored, got %v", server.stores)
+	}
+}
+
+func TestGivenAStoredOffsetWhenDeletedThenShouldRemoveIt(t *testing.T) {
+	server := &storedOffsetServer{}
+	consumer := storedOffsetConsumer(t, server)
+
+	if err := consumer.DeleteOffset(context.Background(), nil); err != nil {
+		t.Fatalf("delete the offset: %v", err)
+	}
+
+	server.guard.Lock()
+	defer server.guard.Unlock()
+	if server.deletes != 1 {
+		t.Fatalf("want one delete, got %d", server.deletes)
+	}
+}
+
+func TestGivenNoStoredOffsetWhenDeletedThenShouldReadAsAlreadyGone(t *testing.T) {
+	consumer := storedOffsetConsumer(t, &storedOffsetServer{missing: true})
+
+	// Deleting what is not there is the state the caller asked for, which is
+	// what lets a cleanup run twice without being special-cased.
+	if err := consumer.DeleteOffset(context.Background(), nil); err != nil {
+		t.Fatalf("want absence read as done, got %v", err)
 	}
 }

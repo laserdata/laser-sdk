@@ -125,6 +125,13 @@ type connection struct {
 	// router picks the node of every managed request, opened on first use.
 	// It is shared so the caller's node stays stable across handles.
 	router *nodeRouter
+	// watchers are the open connection-event readers. They sit on the shared
+	// state rather than on a handle, so a watcher opened on one handle sees
+	// what every handle derived from it observes.
+	watchers []*ConnectionEvents
+	// linkState is the last transport transition reported, so a stream of
+	// failed calls reports one disconnect rather than one per call.
+	linkState ConnectionEvent
 }
 
 // unconnected stands in for the shared state of a handle that never
@@ -331,16 +338,18 @@ func ConnectWith(
 	if options.Publish != nil {
 		publish = *options.Publish
 	}
-	return &Laser{
+	opened := &Laser{
 		shared: &connection{
 			client: connected, configured: &configured,
+			linkState: EventConnected,
 		},
 		connectionInfo: parsed,
 		capabilities:   NegotiateCapabilities(ctx, connected, configured),
 		defaultStream:  options.DefaultStream,
 		resourceNaming: options.ResourceNaming,
 		publish:        publish,
-	}, nil
+	}
+	return opened, nil
 }
 
 // connectStage names what was being attempted when a connect failed. A
@@ -414,6 +423,8 @@ func (laser *Laser) Close() error {
 		return nil
 	}
 	err := client.Close()
+	laser.reportConnection(EventShutdown)
+	laser.closeWatchers()
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return &TransportError{Reason: "close the connection", Cause: err}
 	}

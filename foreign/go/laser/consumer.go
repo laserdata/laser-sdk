@@ -7,6 +7,7 @@ import (
 
 	"github.com/apache/iggy/foreign/go/client/reader"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 // DefaultConsumerPollWait is how long a consumer waits for records before
@@ -107,8 +108,11 @@ func (options ConsumerOptions) readerOptions() []reader.Option {
 // interleave the commits as well as the records, so a consumer is handed to one
 // worker rather than shared.
 type Consumer struct {
-	inner      *reader.IggyConsumer
-	topic      *Topic
+	inner *reader.IggyConsumer
+	topic *Topic
+	// identity is who the server stores offsets against, the consumer name
+	// or the group this member joined.
+	identity   iggcon.Consumer
 	encryption *Encryption
 }
 
@@ -169,7 +173,8 @@ func (topic *Topic) openConsumer(
 	if err != nil {
 		return nil, &TransportError{Reason: "open the consumer", Cause: err}
 	}
-	return &Consumer{inner: inner, topic: topic, encryption: options.Encryption}, nil
+	return &Consumer{inner: inner, topic: topic, identity: consumer,
+		encryption: options.Encryption}, nil
 }
 
 // Next hands over the next record, reading its provenance off the headers.
@@ -319,4 +324,104 @@ func consumeError(err error) error {
 		return &TransportError{Reason: "read records", Cause: err}
 	}
 	return err
+}
+
+// StoredOffset is what the server holds for a consumer on one partition.
+type StoredOffset struct {
+	// Offset is the offset the server stored for the consumer.
+	Offset uint64
+	// CurrentOffset is the partition's current head, so a caller can see how
+	// far behind the stored position is.
+	CurrentOffset uint64
+}
+
+// StoredOffset reads the offset the server stores for this consumer, or for
+// its group, on a partition, with the partition's current head.
+//
+// It is a server read rather than this client's own bookkeeping, so it
+// answers what a restart would resume from, including what another member of
+// the group stored. Nil when the server holds nothing for it yet.
+func (consumer *Consumer) StoredOffset(
+	ctx context.Context, partition uint32,
+) (*StoredOffset, error) {
+	client, streamID, topicID, err := consumer.offsetTarget()
+	if err != nil {
+		return nil, err
+	}
+	info, err := client.GetConsumerOffset(
+		ctx, consumer.identity, streamID, topicID, &partition)
+	if err != nil {
+		if isMissingOffset(err) {
+			return nil, nil
+		}
+		return nil, &TransportError{Reason: "read the stored offset", Cause: err}
+	}
+	if info == nil {
+		return nil, nil
+	}
+	return &StoredOffset{Offset: info.StoredOffset, CurrentOffset: info.CurrentOffset}, nil
+}
+
+// StoreOffset stores an explicit offset for a partition, nil for the
+// consumer's own.
+//
+// This is the escape hatch, not the usual path: it names a position nothing
+// delivered, so a caller that stores one past what it handled skips records
+// silently. Commit a delivered record instead, and keep this for a
+// deliberate reposition.
+func (consumer *Consumer) StoreOffset(
+	ctx context.Context, offset uint64, partition *uint32,
+) error {
+	client, streamID, topicID, err := consumer.offsetTarget()
+	if err != nil {
+		return err
+	}
+	if err := client.StoreConsumerOffset(
+		ctx, consumer.identity, streamID, topicID, offset, partition); err != nil {
+		return &TransportError{Reason: "store the consumer offset", Cause: err}
+	}
+	return nil
+}
+
+// DeleteOffset removes the server's stored offset for a partition, nil for
+// the consumer's own.
+//
+// A consumer with no stored offset starts where its options say rather than
+// where it left off, so this is how a reader is sent back to the beginning
+// of what the topic still holds.
+func (consumer *Consumer) DeleteOffset(ctx context.Context, partition *uint32) error {
+	client, streamID, topicID, err := consumer.offsetTarget()
+	if err != nil {
+		return err
+	}
+	if err := client.DeleteConsumerOffset(
+		ctx, consumer.identity, streamID, topicID, partition); err != nil {
+		if isMissingOffset(err) {
+			return nil
+		}
+		return &TransportError{Reason: "delete the consumer offset", Cause: err}
+	}
+	return nil
+}
+
+// offsetTarget is the live client and the identifiers an offset call needs.
+func (consumer *Consumer) offsetTarget() (
+	iggcon.Client, iggcon.Identifier, iggcon.Identifier, error,
+) {
+	client, err := consumer.topic.laser.connected()
+	if err != nil {
+		return nil, iggcon.Identifier{}, iggcon.Identifier{}, err
+	}
+	streamID, topicID, err := consumer.topic.identifiers()
+	if err != nil {
+		return nil, iggcon.Identifier{}, iggcon.Identifier{}, err
+	}
+	return client, streamID, topicID, nil
+}
+
+// isMissingOffset reports a server that holds no offset for a consumer,
+// which is absence rather than failure: offset zero is a stored position
+// like any other, so it cannot stand in for "none".
+func isMissingOffset(err error) bool {
+	return errors.Is(err, ierror.ConsumerOffsetNotFound{}) || isMissingResource(err)
 }

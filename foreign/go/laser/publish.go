@@ -243,6 +243,7 @@ func (topic *Topic) publishOnce(
 			}
 			response, err := live.SendMessages(
 				attempt, streamID, topicID, partitioning, messages)
+			topic.laser.reportLink(err)
 			if err != nil {
 				return nil, &TransportError{Reason: "publish", Cause: err}
 			}

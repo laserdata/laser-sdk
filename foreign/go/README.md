@@ -253,6 +253,29 @@ the headers, so this costs bytes and not correctness. Closing it means
 synthesizing the spine from the envelope on the way in, so the gates keep
 working once the header is gone.
 
+## Settling an uncertain request
+
+A send whose reply never arrived leaves a request the client cannot account
+for. The transport retains it and reports its id, which
+`TransportError.UncertainOperation` reads, and the lane it blocks stays
+blocked until it is settled.
+
+`Laser.ResolveOperation` replays the retained request until the deployment
+gives its final result, which is the only honest way to learn whether it
+applied. `Laser.AbandonOperation` gives it up and frees the lane, and cannot
+undo anything the server did: an abandoned request may well have applied,
+and nothing afterwards will say whether it did. That is why it is the second
+choice rather than the quick way out.
+
+The transport keeps the outcomes its replays proved, so asking twice answers
+from that record. An operation it never proved, because a session reset or
+an abandon came first or the record aged out, is reported as not retained
+rather than as a success nobody checked.
+
+`TransportError.IggyErrorCode` reads the Apache Iggy code underneath a
+transport failure, so a caller branches on the server's own vocabulary
+rather than on message text.
+
 ## Consuming
 
 `Topic.Consumer(name, options)` opens a standalone consumer and
@@ -270,6 +293,23 @@ Nothing is committed unless the caller asks. `ConsumerOptions.AutoCommit`
 turns on client-side commits, and `Commit` and `Mark` do it explicitly. The
 default suits a handler with side effects: a record is re-delivered after a
 crash rather than quietly skipped.
+
+## Stored offsets
+
+`Consumer.StoredOffset` reads what the server holds for this consumer, or
+for its group, on one partition, with the partition's head beside it so a
+caller can see how far behind it is. It is a server read rather than this
+client's own bookkeeping, so it answers what a restart would resume from,
+including a position another member of the group stored. A server holding
+nothing reports absence rather than zero, because offset zero is a stored
+position like any other.
+
+`Consumer.StoreOffset` writes a position directly and `Consumer.DeleteOffset`
+removes one. Storing is the escape hatch rather than the usual path: it names
+a position nothing delivered, so a caller that stores past what it handled
+skips records silently. Commit a delivered record instead, and keep this for
+a deliberate reposition. Deleting what is not there reads as done, which lets
+a cleanup run twice.
 
 ## Replay and typed records
 

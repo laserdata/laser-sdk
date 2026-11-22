@@ -166,6 +166,7 @@ func (laser *Laser) sendManagedFrame(
 	// key of its own, and moves off a node whose link fails or that cannot
 	// reach its own backend.
 	routed, err := laser.nodes().send(ctx, client, code, frame, targetOfCode(code), w)
+	laser.reportLink(err)
 	if err != nil {
 		return nil, &TransportError{Reason: "managed command", Cause: err}
 	}

@@ -1236,8 +1236,8 @@ CAPABILITY_SIGNOFFS = {}
 GO_CAPABILITIES = {
     "connection.connect": "laser.Connect + laser.ConnectEnv + laser.Local",
     "connection.close": "Laser.Close",
-    "connection.events": MISSING,
-    "operation.settle": MISSING,
+    "connection.events": "Laser.ConnectionEvents",
+    "operation.settle": "Laser.ResolveOperation + Laser.AbandonOperation + TransportError.UncertainOperation",
     "command.raw": "Laser.SendManaged + Laser.SendManagedWithOperation",
     # request/reply rides the agent topics rather than a raw call, so it is
     # listed with the agent surfaces below rather than here.
@@ -1259,10 +1259,10 @@ GO_CAPABILITIES = {
     "consumer_group.create": "ConsumerGroup.Create",
     "consumer_group.delete": "ConsumerGroup.Delete",
     "consumer_group.join": "ConsumerGroup.Consumer + Topic.ConsumerGroup",
-    "consumer_offset.get": MISSING,
-    "consumer_offset.store": MISSING,
+    "consumer_offset.get": "Consumer.StoredOffset",
+    "consumer_offset.store": "Consumer.StoreOffset",
     "consumer_offset.commit": "Consumer.Commit + Consumer.Mark",
-    "consumer_offset.delete": MISSING,
+    "consumer_offset.delete": "Consumer.DeleteOffset",
     "message.send": "Topic.Send + Topic.Batch + Topic.Publish",
     "message.poll": "Topic.Consumer + Topic.Replay",
     "message.headers": "PublishRequest.Header + Provenance.Headers",
@@ -1272,7 +1272,7 @@ GO_CAPABILITIES = {
     "producer.encryption": "Topic.WithEncryption",
     "consumer.encryption": "ConsumerOptions.Encryption",
     "publish.failure": "laser.PublishFailure: the confirmations that arrived and the records without one",
-    "error.code": MISSING,
+    "error.code": "TransportError.IggyErrorCode",
     "agent.topic_names": "wire.AgentSessions and the other wire topic constants",
     "bridge.rpc": "bridges.TaskFromEnvelope + bridges.ToolResultFromEnvelope (mapping only, no server)",
     "bridge.http": MISSING,
