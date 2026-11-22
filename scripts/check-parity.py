@@ -1258,7 +1258,7 @@ GO_CAPABILITIES = {
     "consumer_group.get": "ConsumerGroup.Info",
     "consumer_group.create": "ConsumerGroup.Create",
     "consumer_group.delete": "ConsumerGroup.Delete",
-    "consumer_group.join": "ConsumerGroup.Consumer",
+    "consumer_group.join": "ConsumerGroup.Consumer + Topic.ConsumerGroup",
     "consumer_offset.get": MISSING,
     "consumer_offset.store": MISSING,
     "consumer_offset.commit": "Consumer.Commit + Consumer.Mark",
