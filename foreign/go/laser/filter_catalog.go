@@ -141,9 +141,11 @@ func ValidateFilter(
 	}, nil
 }
 
-// AmbiguousMutationError reports a catalog change whose outcome is unknown:
+// AmbiguousMutationError reports a managed mutation whose outcome is unknown:
 // the attempt timed out or the transport failed after dispatch, so the server
-// may or may not have applied it.
+// may or may not have applied it. A catalog change is one such mutation, and
+// so is any command the managed band repeated to its deadline without an
+// answer.
 //
 // It is deliberately not a retryable failure. The identity is what makes
 // recovery possible: repeating the change under the same OperationID returns
@@ -155,7 +157,7 @@ type AmbiguousMutationError struct {
 }
 
 func (e *AmbiguousMutationError) Error() string {
-	return "the catalog mutation " + e.OperationID.String() +
+	return "the managed mutation " + e.OperationID.String() +
 		" has an unknown outcome: " + e.Reason
 }
 
