@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
@@ -84,4 +85,63 @@ func (encryption *Encryption) String() string { return "Encryption(Aes256Gcm)" }
 func cannotDecrypt() error {
 	return &TransportError{
 		Reason: "decrypt a record", Cause: ierror.CannotDecryptData{}}
+}
+
+// seal is each record with its payload and user-header block encrypted,
+// keeping the id and origin timestamp it was built with.
+//
+// The block goes over as raw bytes rather than as header entries, because
+// ciphertext is not a header block any reader could decode. The lengths in
+// the message header are restated for the sealed sizes, which is what the
+// encoder writes and the server stores.
+func (encryption *Encryption) seal(
+	messages []iggcon.IggyMessage,
+) ([]iggcon.IggyMessage, error) {
+	sealed := make([]iggcon.IggyMessage, 0, len(messages))
+	for _, message := range messages {
+		payload, err := encryption.Encrypt(message.Payload)
+		if err != nil {
+			return nil, &InvalidError{Reason: "encrypt the record: " + err.Error()}
+		}
+		closed := iggcon.IggyMessage{Header: message.Header, Payload: payload}
+		if len(message.UserHeaders) > 0 {
+			block, err := encryption.Encrypt(message.UserHeaders)
+			if err != nil {
+				return nil, &InvalidError{
+					Reason: "encrypt the record headers: " + err.Error()}
+			}
+			closed.UserHeaders = block
+		}
+		closed.Header.PayloadLength = uint32(len(closed.Payload))
+		closed.Header.UserHeaderLength = uint32(len(closed.UserHeaders))
+		sealed = append(sealed, closed)
+	}
+	return sealed, nil
+}
+
+// open is one record with its payload and user-header block decrypted.
+//
+// A record that will not decrypt is reported rather than passed on as
+// ciphertext: handing a caller bytes it cannot read, under a key it believes
+// it holds, hides the misconfiguration until something downstream fails.
+func (encryption *Encryption) open(
+	message iggcon.IggyMessage,
+) (iggcon.IggyMessage, error) {
+	payload, err := encryption.Decrypt(message.Payload)
+	if err != nil {
+		return iggcon.IggyMessage{}, &CodecError{
+			Reason: "decrypt the record", Cause: err}
+	}
+	opened := iggcon.IggyMessage{Header: message.Header, Payload: payload}
+	if len(message.UserHeaders) > 0 {
+		block, err := encryption.Decrypt(message.UserHeaders)
+		if err != nil {
+			return iggcon.IggyMessage{}, &CodecError{
+				Reason: "decrypt the record headers", Cause: err}
+		}
+		opened.UserHeaders = block
+	}
+	opened.Header.PayloadLength = uint32(len(opened.Payload))
+	opened.Header.UserHeaderLength = uint32(len(opened.UserHeaders))
+	return opened, nil
 }

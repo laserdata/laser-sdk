@@ -200,6 +200,15 @@ func (topic *Topic) sendResolved(
 	if err != nil {
 		return nil, err
 	}
+	if topic.encryption != nil {
+		// Sealed here rather than at each publish verb, so every path to the
+		// log goes over encrypted: a verb that sealed its own records would
+		// leave the next one to remember.
+		messages, err = topic.encryption.seal(messages)
+		if err != nil {
+			return nil, err
+		}
+	}
 	response, err := topic.publishOnce(ctx, streamID, topicID, partitioning, messages)
 	if err == nil || !isMissingResource(err) {
 		return response, err

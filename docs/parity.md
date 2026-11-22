@@ -106,7 +106,7 @@ The check reads the raw operations from the client sources. Rust has 74 operatio
 
 ### The Go client
 
-The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 48 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
+The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 50 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
 
 A capability it does not wrap is still reachable: `Laser.Client` hands out the underlying Apache Iggy client, exactly as `Laser::client` does in Rust.
 
@@ -145,8 +145,8 @@ A capability it does not wrap is still reachable: `Laser.Client` hands out the u
 | `producer.idempotent` | MISSING |
 | `producer.batching` | `Topic.Batching: record, byte and linger bounds, one pinned key per handle, kept linger failures and laser.PublishFailure` |
 | `producer.sharding` | MISSING |
-| `producer.encryption` | MISSING |
-| `consumer.encryption` | MISSING |
+| `producer.encryption` | `Topic.WithEncryption` |
+| `consumer.encryption` | `ConsumerOptions.Encryption` |
 | `publish.failure` | `laser.PublishFailure: the confirmations that arrived and the records without one` |
 | `error.code` | MISSING |
 | `agent.topic_names` | `wire.AgentSessions and the other wire topic constants` |
@@ -225,7 +225,7 @@ Beyond the raw capabilities, the Go client serves these managed and agent surfac
 | Scratch streams | Laser.ScratchStream: a uniquely named stream for one program run, refusing a name already taken rather than reusing it, with an idempotent delete that stays retryable after a failure |
 | Server administration | Laser.Users and User.Get, Exists, Create, Update, SetPermissions, ChangePassword and Delete, Laser.PersonalAccessTokens with Create and Delete, and Laser.Ping, Stats, Me, Clients, ClientInfo, Cluster, Snapshot and DescribeOptions |
 | Agent runtime | laser.AgentRuntime: one reliable loop over an agent's records, with the gate order, dead-letter on an undecodable spine, retry, panic recovery and a shutdown grace, plus laser.AgentCtx for replying, sending, requesting, spawning a subconversation and fanning out to every capable agent under a GatherPolicy of all, quorum or best effort |
-| Client encryption | laser.AES256GCM: Apache Iggy's AES-256-GCM record format, refusing any key that is not 32 bytes and reporting a ciphertext it cannot open as Apache Iggy error 72, with the ciphertexts the Rust and Node clients sealed pinned as vectors |
+| Client encryption | laser.AES256GCM on Topic.WithEncryption and ConsumerOptions.Encryption: Apache Iggy's AES-256-GCM record format sealing each payload and user-header block, refusing any key that is not 32 bytes and reporting a ciphertext it cannot open as Apache Iggy error 72, with the ciphertexts the Rust and Node clients sealed pinned as vectors |
 
 An omitted row that reaches the raw client, or a method that does more than convert a value, names the capabilities a caller reaches through it. The check fails when such a row names none.
 

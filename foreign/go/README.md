@@ -1524,6 +1524,23 @@ format: a random 12-byte nonce, the ciphertext, then the 16-byte tag. The
 server stores only ciphertext, so a deployment that holds records never holds
 the key that reads them.
 
+`topic.WithEncryption(key)` derives a publishing handle that seals every
+record it sends, and `ConsumerOptions.Encryption` opens them again. Both the
+payload and the user-header block are sealed, the block whole and as raw
+bytes, because ciphertext is not a header block any reader could decode. The
+sealing happens at the one place a record reaches the log rather than in each
+publish verb, so a path that was added later cannot forget it, and a record
+is opened before its agentic spine is read, or a sealed provenance would look
+undecodable and be dead-lettered.
+
+What the key buys costs something: a server that cannot read a record cannot
+filter, index or materialize it either, so server-side filters and the
+managed read views see ciphertext. A consumer opened without the key is
+handed what the log holds rather than an error, because a reader that is not
+meant to see those records should not be stopped by them, while a consumer
+that holds the wrong key is told so rather than passed bytes it believes it
+can read.
+
 A key that is not 32 bytes is refused rather than stretched, because a
 stretched key produces records no other client can open. The nonce is drawn
 from the system source on every send: reusing one under a single key breaks

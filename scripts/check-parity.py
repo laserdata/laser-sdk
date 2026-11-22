@@ -1269,8 +1269,8 @@ GO_CAPABILITIES = {
     "producer.idempotent": MISSING,
     "producer.batching": "Topic.Batching: record, byte and linger bounds, one pinned key per handle, kept linger failures and laser.PublishFailure",
     "producer.sharding": MISSING,
-    "producer.encryption": MISSING,
-    "consumer.encryption": MISSING,
+    "producer.encryption": "Topic.WithEncryption",
+    "consumer.encryption": "ConsumerOptions.Encryption",
     "publish.failure": "laser.PublishFailure: the confirmations that arrived and the records without one",
     "error.code": MISSING,
     "agent.topic_names": "wire.AgentSessions and the other wire topic constants",
@@ -1350,7 +1350,7 @@ GO_SURFACES = (
     ("Scratch streams", "Laser.ScratchStream: a uniquely named stream for one program run, refusing a name already taken rather than reusing it, with an idempotent delete that stays retryable after a failure"),
     ("Server administration", "Laser.Users and User.Get, Exists, Create, Update, SetPermissions, ChangePassword and Delete, Laser.PersonalAccessTokens with Create and Delete, and Laser.Ping, Stats, Me, Clients, ClientInfo, Cluster, Snapshot and DescribeOptions"),
     ("Agent runtime", "laser.AgentRuntime: one reliable loop over an agent's records, with the gate order, dead-letter on an undecodable spine, retry, panic recovery and a shutdown grace, plus laser.AgentCtx for replying, sending, requesting, spawning a subconversation and fanning out to every capable agent under a GatherPolicy of all, quorum or best effort"),
-    ("Client encryption", "laser.AES256GCM: Apache Iggy's AES-256-GCM record format, refusing any key that is not 32 bytes and reporting a ciphertext it cannot open as Apache Iggy error 72, with the ciphertexts the Rust and Node clients sealed pinned as vectors"),
+    ("Client encryption", "laser.AES256GCM on Topic.WithEncryption and ConsumerOptions.Encryption: Apache Iggy's AES-256-GCM record format sealing each payload and user-header block, refusing any key that is not 32 bytes and reporting a ciphertext it cannot open as Apache Iggy error 72, with the ciphertexts the Rust and Node clients sealed pinned as vectors"),
 )
 
 OMISSION_CAPABILITIES = {

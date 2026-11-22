@@ -2,11 +2,15 @@ package laser
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 
+	"github.com/apache/iggy/foreign/go/client/reader"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
@@ -144,5 +148,203 @@ func TestGivenAnEncryptionWhenPrintedThenShouldNotShowTheKey(t *testing.T) {
 	}
 	if bytes.Contains([]byte(printed), encryptionKey) {
 		t.Fatal("printing an encryption leaked its key")
+	}
+}
+
+// sealingServer keeps every record that reached the log, so a test can read
+// what the server would have stored.
+type sealingServer struct {
+	iggcon.Client
+	guard    sync.Mutex
+	messages []iggcon.IggyMessage
+}
+
+func (server *sealingServer) Close() error { return nil }
+
+func (server *sealingServer) SendBinaryRequest(
+	_ context.Context, _ uint32, _ []byte,
+) ([]byte, error) {
+	return nil, ierror.InvalidCommand{}
+}
+
+func (server *sealingServer) SendMessages(
+	_ context.Context, _ iggcon.Identifier, _ iggcon.Identifier,
+	_ iggcon.Partitioning, messages []iggcon.IggyMessage,
+) (*iggcon.SendMessagesResponse, error) {
+	server.guard.Lock()
+	defer server.guard.Unlock()
+	server.messages = append(server.messages, messages...)
+	return &iggcon.SendMessagesResponse{}, nil
+}
+
+func (server *sealingServer) stored() []iggcon.IggyMessage {
+	server.guard.Lock()
+	defer server.guard.Unlock()
+	return append([]iggcon.IggyMessage(nil), server.messages...)
+}
+
+// stringHeader is one string header entry.
+func stringHeader(t *testing.T, name, value string) iggcon.HeaderEntry {
+	t.Helper()
+	key, err := iggcon.NewHeaderKeyString(name)
+	if err != nil {
+		t.Fatalf("build the header key: %v", err)
+	}
+	return iggcon.HeaderEntry{
+		Key:   key,
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte(value)},
+	}
+}
+
+func encryptionOf(t *testing.T) *Encryption {
+	t.Helper()
+	key := make([]byte, 32)
+	for index := range key {
+		key[index] = byte(index)
+	}
+	encryption, err := AES256GCM(key)
+	if err != nil {
+		t.Fatalf("build the encryption: %v", err)
+	}
+	return encryption
+}
+
+func TestGivenAnEncryptedTopicWhenPublishingThenShouldStoreNeitherPayloadNorHeaders(t *testing.T) {
+	server := &sealingServer{}
+	handle := FromClient(server, Options{DefaultStream: "fleet"})
+	topic := handle.Topic("telemetry").WithEncryption(encryptionOf(t))
+
+	if _, err := topic.Send(context.Background(), []byte("safe mode engaged"),
+		[]iggcon.HeaderEntry{stringHeader(t, "mode", "safe")}, ""); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	stored := server.stored()
+	if len(stored) != 1 {
+		t.Fatalf("want one record, got %d", len(stored))
+	}
+	// The server holds ciphertext, which is the whole point: what it cannot
+	// read it cannot filter, index or leak.
+	if bytes.Contains(stored[0].Payload, []byte("safe mode engaged")) {
+		t.Error("the payload reached the log in the clear")
+	}
+	if bytes.Contains(stored[0].UserHeaders, []byte("mode")) {
+		t.Error("the header block reached the log in the clear")
+	}
+	// The header still describes the record, or a reader sizes the wrong
+	// allocation off it.
+	if int(stored[0].Header.PayloadLength) != len(stored[0].Payload) {
+		t.Errorf("want the sealed payload length, got %d",
+			stored[0].Header.PayloadLength)
+	}
+	if int(stored[0].Header.UserHeaderLength) != len(stored[0].UserHeaders) {
+		t.Errorf("want the sealed header length, got %d",
+			stored[0].Header.UserHeaderLength)
+	}
+}
+
+func TestGivenASealedRecordWhenReadWithTheSameKeyThenShouldGiveBackWhatWasSent(t *testing.T) {
+	encryption := encryptionOf(t)
+	server := &sealingServer{}
+	handle := FromClient(server, Options{DefaultStream: "fleet"})
+	topic := handle.Topic("telemetry").WithEncryption(encryption)
+	headers := []iggcon.HeaderEntry{stringHeader(t, "mode", "safe")}
+
+	if _, err := topic.Send(
+		context.Background(), []byte("safe mode engaged"), headers, ""); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	stored := server.stored()[0]
+	opened, err := encryption.open(stored)
+	if err != nil {
+		t.Fatalf("open the record: %v", err)
+	}
+	if string(opened.Payload) != "safe mode engaged" {
+		t.Errorf("want the payload back, got %q", opened.Payload)
+	}
+	if !bytes.Equal(opened.UserHeaders, iggcon.GetHeadersBytes(headers)) {
+		t.Error("want the header block back exactly as it was sent")
+	}
+}
+
+func TestGivenASealedRecordWhenReadWithAnotherKeyThenShouldReportItRatherThanPassCiphertext(t *testing.T) {
+	server := &sealingServer{}
+	handle := FromClient(server, Options{DefaultStream: "fleet"})
+	topic := handle.Topic("telemetry").WithEncryption(encryptionOf(t))
+	if _, err := topic.Send(
+		context.Background(), []byte("safe mode engaged"), nil, ""); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	other, err := AES256GCM(make([]byte, 32))
+	if err != nil {
+		t.Fatalf("build the other key: %v", err)
+	}
+
+	_, err = other.open(server.stored()[0])
+
+	// Handing back bytes the caller cannot read, under a key it believes it
+	// holds, hides the misconfiguration until something downstream fails.
+	if err == nil {
+		t.Fatal("a record that will not decrypt must be reported")
+	}
+}
+
+func TestGivenNoEncryptionWhenPublishingThenShouldLeaveTheRecordAsItWas(t *testing.T) {
+	server := &sealingServer{}
+	handle := FromClient(server, Options{DefaultStream: "fleet"})
+
+	if _, err := handle.Topic("telemetry").Send(
+		context.Background(), []byte("safe mode engaged"), nil, ""); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	if string(server.stored()[0].Payload) != "safe mode engaged" {
+		t.Error("a topic with no key must publish the record as it stands")
+	}
+}
+
+func TestGivenAConsumerHoldingTheKeyWhenARecordArrivesThenShouldOpenItBeforeTheSpineIsRead(t *testing.T) {
+	encryption := encryptionOf(t)
+	server := &sealingServer{}
+	handle := FromClient(server, Options{DefaultStream: "fleet"})
+	topic := handle.Topic("telemetry").WithEncryption(encryption)
+	if _, err := topic.Send(
+		context.Background(), []byte("safe mode engaged"), nil, ""); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	delivered := reader.ReceivedMessage{PartitionID: 1, Message: server.stored()[0]}
+
+	record, err := openRecord(delivered, encryption)
+	if err != nil {
+		t.Fatalf("open the delivered record: %v", err)
+	}
+
+	// The record is opened before its spine is read, or a sealed provenance
+	// would decode as an undecodable one and go to the dead-letter topic.
+	if string(record.Payload()) != "safe mode engaged" {
+		t.Errorf("want the payload back, got %q", record.Payload())
+	}
+}
+
+func TestGivenAConsumerWithoutTheKeyWhenASealedRecordArrivesThenShouldLeaveItSealed(t *testing.T) {
+	server := &sealingServer{}
+	handle := FromClient(server, Options{DefaultStream: "fleet"})
+	topic := handle.Topic("telemetry").WithEncryption(encryptionOf(t))
+	if _, err := topic.Send(
+		context.Background(), []byte("safe mode engaged"), nil, ""); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	delivered := reader.ReceivedMessage{PartitionID: 1, Message: server.stored()[0]}
+
+	record, err := openRecord(delivered, nil)
+	if err != nil {
+		t.Fatalf("a consumer with no key reads what is stored: %v", err)
+	}
+
+	// Nothing guesses at a key. A reader without one is handed the bytes the
+	// log holds, which is what a reader that is not meant to see them gets.
+	if string(record.Payload()) == "safe mode engaged" {
+		t.Error("a consumer with no key must not read the plaintext")
 	}
 }

@@ -63,6 +63,10 @@ type ConsumerOptions struct {
 	// handler with side effects wants: a record is then re-delivered after a
 	// crash rather than silently skipped.
 	AutoCommit *iggcon.AutoCommit
+	// Encryption opens each record's payload and user-header block with this
+	// key, for a topic published under the same one. Nil reads records as
+	// they are stored.
+	Encryption *Encryption
 }
 
 // PollOptions renders the read limits a consumer opened with these options
@@ -103,8 +107,9 @@ func (options ConsumerOptions) readerOptions() []reader.Option {
 // interleave the commits as well as the records, so a consumer is handed to one
 // worker rather than shared.
 type Consumer struct {
-	inner *reader.IggyConsumer
-	topic *Topic
+	inner      *reader.IggyConsumer
+	topic      *Topic
+	encryption *Encryption
 }
 
 // Consumer opens a standalone consumer on this topic under a name, which is
@@ -164,7 +169,7 @@ func (topic *Topic) openConsumer(
 	if err != nil {
 		return nil, &TransportError{Reason: "open the consumer", Cause: err}
 	}
-	return &Consumer{inner: inner, topic: topic}, nil
+	return &Consumer{inner: inner, topic: topic, encryption: options.Encryption}, nil
 }
 
 // Next hands over the next record, reading its provenance off the headers.
@@ -176,7 +181,7 @@ func (consumer *Consumer) Next(ctx context.Context) (*Record, error) {
 	if err != nil {
 		return nil, consumeError(err)
 	}
-	return openRecord(received)
+	return openRecord(received, consumer.encryption)
 }
 
 // Each reads records until the context ends or handle returns an error, which
@@ -188,7 +193,7 @@ func (consumer *Consumer) Each(
 	ctx context.Context, handle func(context.Context, *Record) error,
 ) error {
 	err := consumer.inner.Consume(ctx, func(inner context.Context, received reader.ReceivedMessage) error {
-		record, err := openRecord(received)
+		record, err := openRecord(received, consumer.encryption)
 		if err != nil {
 			return err
 		}
@@ -293,8 +298,18 @@ func DeliveredRecord(
 }
 
 // openRecord opens what this consumer's reader handed over.
-func openRecord(received reader.ReceivedMessage) (*Record, error) {
-	return DeliveredRecord(received.PartitionID, received.Message,
+func openRecord(
+	received reader.ReceivedMessage, encryption *Encryption,
+) (*Record, error) {
+	message := received.Message
+	if encryption != nil {
+		opened, err := encryption.open(message)
+		if err != nil {
+			return nil, err
+		}
+		message = opened
+	}
+	return DeliveredRecord(received.PartitionID, message,
 		received.Checkpoint, received.EndsBatch)
 }
 

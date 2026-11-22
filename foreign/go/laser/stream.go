@@ -22,6 +22,26 @@ type Topic struct {
 	laser  *Laser
 	stream string
 	name   string
+	// encryption seals every record this handle publishes, nil to publish
+	// them as they are.
+	encryption *Encryption
+}
+
+// WithEncryption derives a handle that seals each record's payload and
+// user-header block before it is published.
+//
+// It is the producer-side half of the pair: a consumer opened with the same
+// key reads them back, and so does every other Laser client and Apache
+// Iggy's own encryptor, which all use this AES-256-GCM format. The server
+// stores ciphertext and can neither filter nor index what it cannot read,
+// which is the trade the key buys.
+//
+// A publish failure lists its records as the caller sent them, before
+// encryption, so a report names what a caller recognises.
+func (topic *Topic) WithEncryption(encryption *Encryption) *Topic {
+	derived := *topic
+	derived.encryption = encryption
+	return &derived
 }
 
 // Stream selects a stream by name.
