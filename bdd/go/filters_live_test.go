@@ -80,6 +80,9 @@ func liveFilterStep(ctx context.Context, state *world, step bdd.Step) error {
 	case text == "the advanced reader follows the group-aware read capability":
 		return followedGroupCapability(state)
 
+	case text == "the group reads back its saved binding after three refusals":
+		return bindingAfterCatalogRefusals(ctx, state)
+
 	default:
 		return fmt.Errorf("this runner does not implement the step")
 	}
@@ -256,6 +259,43 @@ func followedGroupCapability(state *world) error {
 	delivered, found := state.get("delivered")
 	if !found || len(delivered.([][]byte)) == 0 {
 		return fmt.Errorf("the advanced reader delivered nothing")
+	}
+	return nil
+}
+
+// bindingAfterCatalogRefusals configures a group policy and reads it back
+// through a catalog that refuses the first three reads.
+//
+// The read carries no operation identity to repeat under, so before the
+// managed band walked the roster again a refusal the catalog served a moment
+// later reached the caller as a final answer.
+func bindingAfterCatalogRefusals(ctx context.Context, state *world) error {
+	filters, err := namedFilters()
+	if err != nil {
+		return err
+	}
+	safeMode, named := filters["safe mode"]
+	if !named {
+		return fmt.Errorf("the corpus names no \"safe mode\" filter")
+	}
+	group := state.topic(feedTopic).Group("anomaly-desk")
+	info, err := group.Create().Filter("safe-mode", safeMode).Build(ctx)
+	if err != nil {
+		return fmt.Errorf("configure the group policy: %w", err)
+	}
+	if info.Filter == nil {
+		return fmt.Errorf("the group was created without a saved binding")
+	}
+	binding, err := group.Filter().Get(ctx)
+	if err != nil {
+		return fmt.Errorf("the catalog must serve the binding read: %w", err)
+	}
+	if binding == nil {
+		return fmt.Errorf("the binding read came back empty")
+	}
+	if binding.Identity != info.Filter.Identity {
+		return fmt.Errorf("want the saved binding %v, got %v",
+			info.Filter.Identity, binding.Identity)
 	}
 	return nil
 }

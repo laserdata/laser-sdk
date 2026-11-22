@@ -47,6 +47,17 @@ func managed() bool {
 	return os.Getenv("LASER_BDD_MANAGED") == "1"
 }
 
+// recoveringCatalog reports whether the scenarios tagged @recovering_catalog
+// may run.
+//
+// They need a catalog that refuses the first three binding reads, which
+// `scripts/run-bdd-tests.sh <language> --recovering-catalog` stands up. That
+// catalog refuses every other scenario too, so the run is one or the other
+// rather than both, as the Rust, Python and TypeScript runners also decide.
+func recoveringCatalog() bool {
+	return os.Getenv("LASER_BDD_RECOVERING_CATALOG") != ""
+}
+
 // world is the state one scenario builds up as its steps run.
 //
 // One struct serves every feature rather than one per runner, because the
@@ -167,6 +178,15 @@ func runPlanned(
 	t.Helper()
 	for _, scenario := range feature.Scenarios {
 		t.Run(scenario.Name, func(t *testing.T) {
+			if recoveringCatalog() || scenario.HasTag("@recovering_catalog") {
+				if !recoveringCatalog() {
+					t.Skip("needs a catalog that refuses the first three " +
+						"binding reads: run with --recovering-catalog")
+				}
+				if !scenario.HasTag("@recovering_catalog") {
+					t.Skip("a refusing catalog refuses this scenario too")
+				}
+			}
 			if scenario.HasTag("@managed") && !managed() {
 				t.Skip("needs a managed backend: set LASER_BDD_MANAGED=1")
 			}
