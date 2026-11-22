@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
@@ -27,6 +28,13 @@ type registryServer struct {
 }
 
 func (server *registryServer) Close() error { return nil }
+
+// commands is how many requests the server saw, which a repeat raises.
+func (server *registryServer) commands() int {
+	server.guard.Lock()
+	defer server.guard.Unlock()
+	return len(server.codes)
+}
 
 func (server *registryServer) SendBinaryRequest(
 	_ context.Context, code uint32, payload []byte,
@@ -626,8 +634,13 @@ func TestGivenAnotherQueryVersionWhenBrowsingThenShouldRefuseIt(t *testing.T) {
 // A command the deployment refused is reported with the code it refused
 // under, so a caller can tell a permanent refusal from a retryable one.
 func TestGivenARefusedCommandWhenAppendedThenShouldCarryItsCode(t *testing.T) {
+	// A definite refusal, not one that leaves the outcome open: an
+	// unavailable managed backend says the command may yet apply, so the
+	// client repeats it under its identity rather than handing the refusal
+	// straight back.
 	server := &registryServer{
-		command: wire.ResultUnavailable, message: "the control topic is rebuilding",
+		command: wire.ResultTargetUnavailable,
+		message: "the node holding the control topic is not serving it",
 	}
 	handle := registryHandle(server, laser.Options{})
 
@@ -637,11 +650,38 @@ func TestGivenARefusedCommandWhenAppendedThenShouldCarryItsCode(t *testing.T) {
 	if !errors.As(err, &failure) {
 		t.Fatalf("want a CommandFailure, got %T: %v", err, err)
 	}
-	if failure.ResultCode() != wire.ResultUnavailable {
+	if failure.ResultCode() != wire.ResultTargetUnavailable {
 		t.Errorf("want the code carried, got %q", failure.ResultCode())
 	}
 	if !failure.Retryable() {
-		t.Error("an unavailable control topic may take the command later")
+		t.Error("a target that is not serving may take the command later")
+	}
+}
+
+func TestGivenAnUnavailableBackendWhenACommandIsAppendedThenShouldRepeatItUnderItsIdentity(t *testing.T) {
+	server := &registryServer{
+		command: wire.ResultUnavailable, message: "the control topic is rebuilding",
+	}
+	handle := registryHandle(server, laser.Options{})
+	// The caller's own deadline, rather than the managed one, so the test
+	// reads the repeat without waiting it out.
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	err := handle.Projections().Drop(ctx, "reading.v1")
+
+	// A refusal that says the command may yet apply is not an answer: the
+	// frame goes again under the same identity, and what the caller is told
+	// at the end names that identity to recover under.
+	var ambiguous *laser.AmbiguousMutationError
+	if !errors.As(err, &ambiguous) {
+		t.Fatalf("want an AmbiguousMutationError, got %T: %v", err, err)
+	}
+	if ambiguous.OperationID.IsZero() {
+		t.Error("the identity to recover under must be named")
+	}
+	if attempts := server.commands(); attempts < 2 {
+		t.Errorf("want the command repeated, got %d attempts", attempts)
 	}
 }
 

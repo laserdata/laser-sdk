@@ -123,6 +123,14 @@ func (laser *Laser) sendManagedWalking(
 
 // SendManagedWithOperation is SendManaged with a caller-chosen operation
 // identity, so a retry that outlives the process still applies once.
+//
+// The identity is also what lets this client repeat the mutation itself
+// while its outcome is unknown, up to ManagedDeadline. A reply that never
+// came back is not a mutation that did not happen, so the frame is sent
+// again rather than reported as a failure the deployment may have carried
+// out. An outcome still unknown at the deadline, or a refusal after an
+// attempt whose outcome was never known, is an AmbiguousMutationError naming
+// the identity to recover under.
 func (laser *Laser) SendManagedWithOperation(
 	ctx context.Context, code uint32, payload []byte, operationID wire.U128,
 ) ([]byte, error) {
@@ -137,7 +145,7 @@ func (laser *Laser) SendManagedWithOperation(
 	if err != nil {
 		return nil, &CodecError{Reason: "encode managed request", Cause: err}
 	}
-	return laser.sendManagedFrame(ctx, code, framed, walkingOnce())
+	return laser.sendManagedMutation(ctx, code, operationID, framed)
 }
 
 func (laser *Laser) sendManagedFrame(

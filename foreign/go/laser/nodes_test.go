@@ -176,14 +176,6 @@ func sendProbe(ctx context.Context, handle *laser.Laser) ([]byte, error) {
 	return handle.SendManaged(ctx, wire.AgdxKvGetCode, nil)
 }
 
-// sendMutation is the probe of a command that changes state, which walks the
-// roster once: it repeats under its own operation identity rather than by
-// walking again, so one walk is the whole of what routing decides for it. A
-// read every node refused walks again, which the internal tests pin.
-func sendMutation(ctx context.Context, handle *laser.Laser) ([]byte, error) {
-	return handle.SendManaged(ctx, wire.AgdxKvSetCode, nil)
-}
-
 func TestGivenOneNodeWhenSendingManagedThenShouldUseThePlainBand(t *testing.T) {
 	server := newCluster(0)
 	handle := clusterHandle(server)
@@ -280,27 +272,6 @@ func TestGivenAFailedLinkWhenSendingManagedThenShouldMoveToTheNextNode(t *testin
 	}
 }
 
-func TestGivenEveryNodesLinkFailsWhenSendingManagedThenShouldReportIt(t *testing.T) {
-	server := newCluster(0, 1, 2)
-	server.answerWith(
-		failing(ierror.Disconnected{}),
-		failing(ierror.Disconnected{}),
-		failing(ierror.Disconnected{}),
-		failing(ierror.Disconnected{}),
-	)
-	handle := clusterHandle(server)
-
-	_, err := sendMutation(context.Background(), handle)
-	if err == nil {
-		t.Fatal("a cluster that is wholly unreachable must be reported")
-	}
-	// Each node is tried once. Walking them again would turn an outage into
-	// an endless loop.
-	if calls := server.routed(); len(calls) != 3 {
-		t.Fatalf("want one attempt per node, got %d", len(calls))
-	}
-}
-
 func TestGivenANodeThatCannotReachItsBackendWhenSendingThenShouldMoveOn(t *testing.T) {
 	server := newCluster(0, 1, 2)
 	server.answerWith(unavailableNode(t))
@@ -315,29 +286,6 @@ func TestGivenANodeThatCannotReachItsBackendWhenSendingThenShouldMoveOn(t *testi
 	calls := server.routed()
 	if len(calls) != 2 || calls[0].replica == calls[1].replica {
 		t.Fatalf("want a move to another node, got %+v", calls)
-	}
-}
-
-func TestGivenEveryNodeCannotReachItsBackendWhenSendingThenShouldReturnTheRefusal(t *testing.T) {
-	server := newCluster(0, 1)
-	server.answerWith(unavailableNode(t), unavailableNode(t), unavailableNode(t))
-	handle := clusterHandle(server)
-
-	reply, err := sendMutation(context.Background(), handle)
-	if err != nil {
-		t.Fatalf("a refusal every node agrees on is an answer, not a failure: %v", err)
-	}
-	// The last node's refusal is handed back rather than swallowed, so the
-	// caller sees what the cluster said.
-	var failure wire.CommandError
-	if err := wire.Unmarshal(reply, &failure); err != nil {
-		t.Fatalf("decode the refusal: %v", err)
-	}
-	if !failure.Code.IsBackendUnavailable() {
-		t.Fatalf("want the backend refusal, got %v", failure.Code)
-	}
-	if calls := server.routed(); len(calls) != 2 {
-		t.Fatalf("want one attempt per node, got %d", len(calls))
 	}
 }
 
@@ -504,24 +452,6 @@ func TestGivenARosterReadAgainInAnotherOrderWhenSendingThenShouldKeepTheSameNode
 	after := calls[len(calls)-1].replica
 	if after != picked {
 		t.Fatalf("the caller moved from %d to %d on a reordered roster", picked, after)
-	}
-}
-
-func TestGivenAClusterThatListsANodeTwiceWhenWalkingThenShouldCountItOnce(t *testing.T) {
-	server := newCluster(0, 0, 1)
-	server.answerWith(
-		failing(ierror.Disconnected{}), failing(ierror.Disconnected{}),
-		failing(ierror.Disconnected{}), failing(ierror.Disconnected{}),
-	)
-	handle := clusterHandle(server)
-
-	if _, err := sendMutation(context.Background(), handle); err == nil {
-		t.Fatal("a cluster that is wholly unreachable must be reported")
-	}
-	// Two nodes, so two attempts. A roster that counted the repeat would
-	// walk a third time to a node it had already given up on.
-	if calls := server.routed(); len(calls) != 2 {
-		t.Fatalf("want one attempt per distinct node, got %d", len(calls))
 	}
 }
 

@@ -2,7 +2,9 @@ package laser
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -196,5 +198,200 @@ func TestGivenACatalogRefusalOnAnotherSurfaceWhenWalkedThenShouldReturnItAtOnce(
 	// server already decided.
 	if cluster.attempts != 1 {
 		t.Fatalf("want one attempt, got %d", cluster.attempts)
+	}
+}
+
+// rosterOf is a cluster that reports these nodes, so a test drives the
+// roster read rather than setting the roster behind it.
+type rosterOf struct {
+	scriptedCluster
+	nodes []uint8
+	reads int
+}
+
+func (cluster *rosterOf) GetClusterMetadata(
+	context.Context,
+) (*iggcon.ClusterMetadata, error) {
+	cluster.reads++
+	nodes := make([]iggcon.ClusterNode, 0, len(cluster.nodes))
+	for _, replica := range cluster.nodes {
+		nodes = append(nodes, iggcon.ClusterNode{ReplicaID: replica})
+	}
+	return &iggcon.ClusterMetadata{Nodes: nodes}, nil
+}
+
+func TestGivenEveryNodesLinkFailsWhenWalkedThenShouldReportIt(t *testing.T) {
+	cluster := &rosterOf{nodes: []uint8{0, 1, 2}}
+	cluster.answers = answers(func() ([]byte, error) {
+		return nil, ierror.Disconnected{}
+	})
+	router := newNodeRouter()
+
+	if _, err := router.walkCallerUntil(context.Background(), cluster,
+		wire.AgdxKvGetCode, nil, walkingOnce()); err == nil {
+		t.Fatal("a cluster that is wholly unreachable must be reported")
+	}
+
+	// Each node is tried once. Walking them again inside one walk would turn
+	// an outage into an endless loop; repeating the whole walk is the
+	// caller's decision, and a mutation or a read makes it differently.
+	if cluster.attempts != 3 {
+		t.Fatalf("want one attempt per node, got %d", cluster.attempts)
+	}
+}
+
+func TestGivenEveryNodeCannotReachItsBackendWhenWalkedThenShouldReturnTheRefusal(t *testing.T) {
+	cluster := &rosterOf{nodes: []uint8{0, 1}}
+	cluster.answers = answers(replying(refusedBackend(t, "the backend is out of reach")))
+	router := newNodeRouter()
+
+	walked, err := router.walkCallerUntil(context.Background(), cluster,
+		wire.AgdxKvGetCode, nil, walkingOnce())
+	if err != nil {
+		t.Fatalf("a refusal every node agrees on is an answer, not a failure: %v", err)
+	}
+
+	// The last node's refusal is handed back rather than swallowed, so the
+	// caller sees what the cluster said.
+	var failure wire.CommandError
+	if err := wire.Unmarshal(walked.reply, &failure); err != nil {
+		t.Fatalf("decode the refusal: %v", err)
+	}
+	if !failure.Code.IsBackendUnavailable() {
+		t.Fatalf("want the backend refusal, got %v", failure.Code)
+	}
+	if cluster.attempts != 2 {
+		t.Fatalf("want one attempt per node, got %d", cluster.attempts)
+	}
+}
+
+func TestGivenAClusterThatListsANodeTwiceWhenWalkedThenShouldCountItOnce(t *testing.T) {
+	cluster := &rosterOf{nodes: []uint8{0, 0, 1}}
+	cluster.answers = answers(func() ([]byte, error) {
+		return nil, ierror.Disconnected{}
+	})
+	router := newNodeRouter()
+
+	if _, err := router.walkCallerUntil(context.Background(), cluster,
+		wire.AgdxKvGetCode, nil, walkingOnce()); err == nil {
+		t.Fatal("a cluster that is wholly unreachable must be reported")
+	}
+
+	// Two nodes, so two attempts. A roster that counted the repeat would
+	// walk a third time to a node it had already given up on.
+	if cluster.attempts != 2 {
+		t.Fatalf("want one attempt per distinct node, got %d", cluster.attempts)
+	}
+}
+
+// replyOf is one managed reply carrying code.
+func replyOf(t *testing.T, code wire.ResultCode) []byte {
+	t.Helper()
+	encoded, err := wire.Marshal(wire.NewCommandError(code, "a refusal"))
+	if err != nil {
+		t.Fatalf("encode the reply: %v", err)
+	}
+	return encoded
+}
+
+// batchOf is a batch frame of these per-item replies.
+func batchOf(t *testing.T, items ...[]byte) []byte {
+	t.Helper()
+	encoded, err := wire.Marshal(wire.BatchReply{Results: items})
+	if err != nil {
+		t.Fatalf("encode the batch reply: %v", err)
+	}
+	return encoded
+}
+
+func answeredWith(reply []byte) mutationAttempt {
+	return mutationAttempt{kind: attemptAnswered, reply: reply}
+}
+
+func TestGivenAPendingAttemptWhenALaterOneIsForbiddenThenShouldStayAmbiguous(t *testing.T) {
+	attempts := mutationAttemptsFor(wire.AgdxKvSetCode)
+	if _, settled, err := attempts.settle(answeredWith(replyOf(t, wire.ResultPending))); settled ||
+		err != nil {
+		t.Fatalf("a pending outcome is not settled: settled=%v err=%v", settled, err)
+	}
+
+	_, _, err := attempts.settle(answeredWith(replyOf(t, wire.ResultForbidden)))
+
+	// The pending attempt may still apply, so the refusal of this one does
+	// not say the mutation did not happen.
+	var ambiguous *AmbiguousMutationError
+	if !errors.As(err, &ambiguous) {
+		t.Fatalf("want an ambiguous outcome, got %T: %v", err, err)
+	}
+}
+
+func TestGivenALostAttemptWhenALaterOneIsRefusedThenShouldStayAmbiguous(t *testing.T) {
+	attempts := mutationAttemptsFor(wire.AgdxKvSetCode)
+	if _, settled, err := attempts.settle(
+		mutationAttempt{kind: attemptLost, reason: "connection reset"},
+	); settled || err != nil {
+		t.Fatalf("a lost attempt is not settled: settled=%v err=%v", settled, err)
+	}
+
+	_, _, err := attempts.settle(mutationAttempt{
+		kind: attemptRefused, err: &InvalidError{Reason: "refused"}})
+
+	var ambiguous *AmbiguousMutationError
+	if !errors.As(err, &ambiguous) {
+		t.Fatalf("want an ambiguous outcome, got %T: %v", err, err)
+	}
+}
+
+func TestGivenAFirstAttemptThatIsRefusedThenShouldReportTheRefusalItself(t *testing.T) {
+	attempts := mutationAttemptsFor(wire.AgdxKvSetCode)
+	refusal := &InvalidError{Reason: "refused"}
+
+	_, _, err := attempts.settle(mutationAttempt{kind: attemptRefused, err: refusal})
+
+	// Nothing came before it, so the refusal is the whole answer rather than
+	// an ambiguity. Reporting it as ambiguous would send callers looking for
+	// an outcome that was never in doubt.
+	if !errors.Is(err, error(refusal)) {
+		t.Fatalf("want the refusal itself, got %T: %v", err, err)
+	}
+}
+
+func TestGivenABatchItemLeftUnresolvedWhenALaterAttemptRefusesItThenShouldStayAmbiguous(t *testing.T) {
+	attempts := mutationAttemptsFor(wire.AgdxBatchCode)
+	if _, settled, err := attempts.settle(answeredWith(batchOf(t,
+		replyOf(t, wire.ResultOk), replyOf(t, wire.ResultPending)))); settled || err != nil {
+		t.Fatalf("an unresolved item leaves the frame open: settled=%v err=%v", settled, err)
+	}
+
+	_, _, err := attempts.settle(answeredWith(batchOf(t,
+		replyOf(t, wire.ResultOk), replyOf(t, wire.ResultForbidden))))
+
+	var ambiguous *AmbiguousMutationError
+	if !errors.As(err, &ambiguous) {
+		t.Fatalf("want an ambiguous outcome, got %T: %v", err, err)
+	}
+	if !strings.Contains(ambiguous.Reason, "item 1") {
+		t.Errorf("want the unresolved item named, got %q", ambiguous.Reason)
+	}
+}
+
+func TestGivenABatchWhoseItemsAreAllFinalWhenSettledThenShouldSettleWithIt(t *testing.T) {
+	attempts := mutationAttemptsFor(wire.AgdxBatchCode)
+	frame := batchOf(t, replyOf(t, wire.ResultForbidden), replyOf(t, wire.ResultOk))
+
+	reply, settled, err := attempts.settle(answeredWith(frame))
+	if err != nil || !settled {
+		t.Fatalf("a definite refusal of one item is final: settled=%v err=%v", settled, err)
+	}
+	if string(reply) != string(frame) {
+		t.Fatal("the frame is handed back as it arrived")
+	}
+
+	// Only the batch code settles item by item. Another code reads those
+	// bytes as its surface's own reply.
+	single := mutationAttemptsFor(wire.AgdxKvSetCode)
+	pending := batchOf(t, replyOf(t, wire.ResultPending))
+	if _, settled, err := single.settle(answeredWith(pending)); !settled || err != nil {
+		t.Fatalf("not a batch code: settled=%v err=%v", settled, err)
 	}
 }

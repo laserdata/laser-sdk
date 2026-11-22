@@ -1318,7 +1318,7 @@ GO_SURFACES = (
     ("Bridges", "bridges: the A2A, MCP and AG-UI value mappings, the bridge hop loop guard, and the HTTP origin check"),
     ("Consumer filters", "Topic.Filters: filtered reads with page validation, acknowledgment through the safe offset, previews and record tests, and Topic.ConsumerGroup(name) for the group that owns a policy: Selector, Filters for the match-oriented reader, Consumer for a load-balanced member, and Filter for the group's own summary, revisions, preview, test, release and delete"),
     ("Filter catalog", "Laser.FilterCatalog: register, revise, describe, pause, archive, drop, bind, unbind, release, configure a group, and read filters, revisions, bindings and operation outcomes"),
-    ("Retry schedule", "laser.Backoff and the shared schedule pinned to sdk/tests/fixtures/retry-table.json"),
+    ("Retry schedule", "laser.Backoff and the shared schedule pinned to sdk/tests/fixtures/retry-table.json, driving the managed read walk and the mutation repeat: a mutation whose outcome is unknown goes again under its identity on bounded attempts until ManagedDeadline, then reports AmbiguousMutationError"),
     ("Action governance", "Laser.WithGovernor: the pre-effect hook over publishes, AGDX verbs, requests and memory writes, observe and enforce modes, chained policy evidence on the audit topic, and laser.QuorumGovernor"),
     ("Approvals", "Requester.ApprovalGate and laser.GrantFrom, with AgdxSend.WithGrant answering a governor's step-up"),
     ("Signing", "laser.SigningKey and AgdxSend.Signed, with the preimage pinned against the Rust client's own vectors"),

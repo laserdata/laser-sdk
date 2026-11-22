@@ -36,6 +36,35 @@ operation identity, so a transport retry of the same call is applied once.
 `SendManagedWithOperation` lets a caller choose the identity, so a retry that
 outlives the process still applies once. Reads are sent as given.
 
+That identity is also what lets this client repeat the mutation itself. A
+reply that never came back is not a mutation that did not happen: the request
+may have reached a node and applied there, so reporting the lost link as a
+failure would name an outcome nobody knows. The frame goes again under the
+same identity instead, for up to `ManagedDeadline`, and the backend answers
+the outcome it recorded rather than applying a second time. A refusal that
+says the command may yet apply, pending or an unavailable backend, counts the
+same way.
+
+Each attempt is bounded on its own, the first by `ManagedAttemptFirst` and
+each later one by twice that, never past the whole deadline, so one dead node
+costs one bound rather than the entire deadline. Between attempts the managed
+backoff spreads the repeats.
+
+What a caller is told at the end is either the outcome or an
+`AmbiguousMutationError` naming the identity to recover under, and the
+ambiguity is reported in two places: an outcome still unknown when the
+deadline passes, and a refusal that arrives after an attempt whose outcome
+was never known. The second is the one worth stating plainly. A refusal on
+the first attempt is the whole answer. The same refusal after a lost attempt
+only says this attempt was not admitted, and the earlier one may have applied
+already, so it is reported as ambiguous rather than as a clean failure.
+
+A batch frame settles item by item. One item whose outcome is unknown leaves
+the whole frame unresolved and the same frame is sent again, where each item
+answers under its own derived identity: a mutation with its recorded outcome,
+a read with a fresh result. An item that was unknown and is then refused by
+admission is ambiguous exactly like a single mutation, and names the item.
+
 Managed names are scoped to the default stream (`stream:<stream>/<name>`),
 which is how two streams in one deployment keep separate namespaces.
 `Options.ResourceNaming` opts out, and listings are mapped back to the
