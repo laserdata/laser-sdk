@@ -13,6 +13,10 @@ Feature: Consumer filters on a streaming server
     When the anomaly desk reads the feed with the "safe mode" filter
     Then it receives the "mode update", "telemetry", and "decommission" records
 
+  @recovering_catalog
+  Scenario: A group reads its binding after three catalog refusals
+    Then the group reads back its saved binding after three refusals
+
   @unmanaged
   Scenario: A server without a managed backend refuses the catalog
     When the anomaly desk lists its saved filters

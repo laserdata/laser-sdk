@@ -104,7 +104,9 @@ export class LaserWorld {
   /** A fresh conversation per label, created on first use. */
   readonly conversationLabels = new Map<string, ConversationId>();
   workflow?: Workflow;
-  workflowOutcome?: WorkflowOutcome;
+  workflowOutcome?: WorkflowOutcome<unknown>;
+  /** The run a workflow function scenario resumes, with the steps it calls. */
+  functionRun?: { readonly runId: ConversationId; readonly labels: readonly string[] };
   workflowError?: unknown;
   /** The step bodies a local workflow ran and the compensations it ran, in order. */
   readonly localRan: string[] = [];

@@ -1,49 +1,34 @@
-use laser_sdk::agent::StepContext;
+// cargo add laser-sdk
+// cargo add tokio --features macros,rt-multi-thread,time
+// cargo add serde_json
+// Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
 use laser_sdk::prelude::*;
-use laser_sdk::wire::agent::SessionStatus;
-use serde::Serialize;
-use std::collections::BTreeMap;
-
-#[derive(Serialize)]
-struct Report {
-    run_id: ConversationId,
-    status: SessionStatus,
-    completed_steps: Vec<String>,
-    outputs: BTreeMap<String, String>,
-}
+use std::time::Duration;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), LaserError> {
     let laser = Laser::connect_env().await?;
-    let scratch = laser.scratch_stream("workflow-demo").await?;
-    let report = run(scratch.laser()).await;
-    scratch.delete().await?;
-    println!("{}", serde_json::to_string_pretty(&report?)?);
-    Ok(())
-}
-
-async fn run(laser: &Laser) -> Result<Report, LaserError> {
-    let outcome = laser
-        .workflow("job-runner")
-        .step_local("create", |_: &StepContext<'_>| b"job-42".to_vec())
-        .step_local("process", |context: &StepContext<'_>| {
-            let job = context.outputs.get("create").cloned().unwrap_or_default();
-            [b"processed ".to_vec(), job].concat()
+    let run = laser
+        .workflow("pipeline")
+        .run_with(async |run| {
+            let frames: String = run
+                .step("ingest", async || Ok("frames from sat-7".to_owned()))
+                .await?;
+            let analysis: String = run
+                .step("analyze", async || {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Ok(format!("analyzed {frames}"))
+                })
+                .await?;
+            run.step("report", async || Ok(format!("report on {analysis}")))
+                .await
         })
-        .after("create")
-        .step_local("finish", |_: &StepContext<'_>| b"completed".to_vec())
-        .after("process")
-        .run()
         .await?;
-    let outputs = outcome
-        .completed_steps
-        .iter()
-        .map(|label| (label.clone(), outcome.text(label).unwrap_or_default()))
-        .collect();
-    Ok(Report {
-        run_id: outcome.run_id,
-        status: outcome.status,
-        completed_steps: outcome.completed_steps,
-        outputs,
-    })
+    let report = serde_json::json!({
+        "status": run.status,
+        "steps": run.completed_steps,
+        "report": run.json::<String>("report")?,
+    });
+    println!("{report}");
+    laser.close().await
 }

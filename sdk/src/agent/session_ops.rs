@@ -2,6 +2,7 @@ use crate::agent::Session;
 use crate::agent::agdx::AgdxReceipt;
 use crate::context::{ContextMessage, ContextPolicy};
 use crate::error::LaserError;
+use crate::nodes::Walk;
 use crate::provenance::AgentTopic;
 use crate::types::MintUlid;
 use iggy::prelude::{Identifier, TopicClient};
@@ -393,7 +394,7 @@ impl SessionState {
             .session
             .laser
             .sessions()
-            .state(self.session.conversation(), 0)
+            .state_view(self.session.conversation(), 0, Walk::Once)
             .await
         {
             Ok(view) if view.revision >= lane.revision => Ok(view),

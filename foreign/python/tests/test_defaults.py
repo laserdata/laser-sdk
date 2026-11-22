@@ -27,8 +27,8 @@ async def test_given_no_default_stream_when_publishing_then_should_name_the_call
         with pytest.raises(ls.NoStreamError) as raised:
             await laser.topic("orders").send(b"hello")
     assert str(raised.value) == (
-        "no default stream set: pass a stream, or set a default stream when connecting "
-        "(stream option) or with with_default_stream"
+        "no default stream set: work in a scratch stream with scratch_stream(prefix), "
+        "or pick one with with_default_stream(name)"
     )
 
 

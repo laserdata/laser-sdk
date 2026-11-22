@@ -1,3 +1,74 @@
+/**
+ * Laser SDK: durable workflows, long-term agent memory and sessions on one
+ * log, over Apache Iggy.
+ *
+ * A workflow is a function that calls steps. It connects with the connection
+ * string in `LASER_CONNECTION_STRING`, journals each step call, and a resumed
+ * run returns a recorded value without running the step again. A step takes and
+ * returns what JSON holds:
+ *
+ * ```ts
+ * import { setTimeout as sleep } from "node:timers/promises"
+ * import { step, workflow } from "@laserdata/laser-sdk"
+ *
+ * const ingest = step("ingest", () => "frames from sat-7")
+ * const analyze = step("analyze", async (frames: string) => {
+ *   await sleep(1000)
+ *   return `analyzed ${frames}`
+ * })
+ * const report = step("report", (analysis: string) => `report on ${analysis}`)
+ *
+ * const pipeline = workflow("pipeline", async () => report(await analyze(await ingest())))
+ *
+ * const run = await pipeline.run()
+ * console.log(JSON.stringify({ status: run.status, steps: run.completedSteps, report: run.value }))
+ * ```
+ *
+ * `Laser.connectEnv()` connects for everything else. Every call that reaches
+ * the server returns a promise, so await it. `memory` and `sessions` return at
+ * once. `await using` closes the connection and deletes a scratch stream when
+ * the scope ends:
+ *
+ * ```ts
+ * import { AgentId, ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
+ *
+ * await using root = await Laser.connectEnv()
+ * await using scratch = await root.scratchStream("demo")
+ * const laser = scratch.laser
+ *
+ * // Memory: remember resolves to the fact's id, supersede stores a correction
+ * // and forgets the old fact in every conversation, recall resolves to
+ * // MemoryItems ranked by the words they share with the query, newest first
+ * // among equals.
+ * const memory = laser.memory("assistant")
+ * const city = await memory.remember("Lives in Gdansk").scope(ConversationId.new()).user("user-42").send()
+ * await memory.supersede(city, "Lives in Lisbon").scope(ConversationId.new()).user("user-42").send()
+ * const facts = await memory.recall().user("user-42").semantic("Where does the user live?").limit(10).fetch()
+ * console.log(JSON.stringify(facts.map(memoryItemText)))
+ *
+ * // Session: model calls, tool calls and state on the log.
+ * const sessions = laser.sessions()
+ * await sessions.bootstrap()
+ * const { session, lease } = await sessions.start().agent(AgentId.new("triage")).begin()
+ * const tool = await session.tool("read_metrics", { host: "node-7" })
+ * await tool.complete(new TextEncoder().encode("cache hit rate 41%"))
+ * await session.end()
+ * lease.release()
+ * ```
+ *
+ * Without a scratch stream, pick one when connecting,
+ * `Laser.connectEnvWithStream("telemetry")`, or a call that needs a default
+ * stream throws `NoStreamError`.
+ *
+ * Docs: https://docs.laserdata.com/laser-sdk. Context7:
+ * https://context7.com/laserdata/laser-sdk.
+ *
+ * Install: `npm install @laserdata/laser-sdk tsx`. Save a program as
+ * `main.mts` and run it with `npx tsx main.mts`.
+ *
+ * @packageDocumentation
+ */
+
 /// <reference types="node" preserve="true" />
 
 export {
@@ -472,8 +543,23 @@ export { Agent, AgentBuilder, AgentHandle } from "./agent/builder.js"
 export { MemoryHandler } from "./agent/memory-handler.js"
 export { ContractBuilder, ScatterReport } from "./agent/contract.js"
 export type { Contract, ScatterOutcome } from "./agent/contract.js"
-export { StepHandle, WORKFLOW_FENCE_NAMESPACE, Workflow, WorkflowBudget } from "./agent/workflow.js"
-export type { OnTimeout, StepContext, StepFn, WorkflowOutcome, Verifier } from "./agent/workflow.js"
+export {
+  StepHandle,
+  WORKFLOW_FENCE_NAMESPACE,
+  Workflow,
+  WorkflowBudget,
+  WorkflowRun
+} from "./agent/workflow.js"
+export type {
+  JsonRoundTrip,
+  OnTimeout,
+  StepContext,
+  StepFn,
+  WorkflowOutcome,
+  Verifier
+} from "./agent/workflow.js"
+export { step, workflow } from "./agent/workflow-function.js"
+export type { Step, WorkflowFunction, WorkflowOptions } from "./agent/workflow-function.js"
 export {
   A2A_JSONRPC_BINDING,
   A2A_PROTOCOL_VERSION,

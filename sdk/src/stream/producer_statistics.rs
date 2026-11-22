@@ -1,5 +1,6 @@
 use crate::capabilities::HelloOutcome;
 use crate::laser::Laser;
+use crate::nodes::Walk;
 use iggy::prelude::Client;
 use laser_wire::clients::{ProducerLatency, ProducerPresence, ProducerStatistics};
 use std::sync::{Arc, Mutex, Weak};
@@ -153,9 +154,10 @@ impl ProducerRecorder {
                     }
                     let sent = tokio::time::timeout(
                         Duration::from_secs(3),
-                        client.send_raw_with_response(
+                        client.send_raw_walking(
                             laser_wire::codes::AGDX_SET_CLIENT_METADATA_CODE,
                             bytes,
+                            Walk::Once,
                         ),
                     )
                     .await;

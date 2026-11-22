@@ -150,7 +150,11 @@ export class LogMemory implements Memory {
    * and every forget it made, scanning again after 50 ms doubling to 500 ms,
    * and throws a retryable `TimeoutError` after 10 seconds. A deployment that serves no
    * key-value view folds the topic instead, like {@link LogMemory.recallFolded}. */
-  async recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]> {
+  async recall(
+    scope: MemoryScope,
+    query: MemoryQuery,
+    options: CallOptions = {}
+  ): Promise<readonly MemoryItem[]> {
     const limit = recallLimit(query)
     if (limit === 0 || (scope.stream !== undefined && scope.stream !== this.stream)) return []
     if (!(await this.viewServed())) return this.recallFolded(scope, query)
@@ -165,7 +169,7 @@ export class LogMemory implements Memory {
     const deadline = performance.now() + writes.waitMs
     let backoffMs = OWN_WRITES_FIRST_BACKOFF_MS
     for (;;) {
-      const { items, held } = await this.scanView(scope, query, limit, agent)
+      const { items, held } = await this.scanView(scope, query, limit, agent, options)
       const waited = writes.within(this.viewKey(), lenses)
       const pending = waited.filter((write) => !reflected(write, held))
       writes.settle(waited.filter((write) => reflected(write, held)))
@@ -175,7 +179,7 @@ export class LogMemory implements Memory {
         writes.settle(pending)
         throw new TimeoutError(OWN_WRITES_TIMEOUT)
       }
-      await delay(Math.min(backoffMs, remainingMs), undefined, "memory recall")
+      await delay(Math.min(backoffMs, remainingMs), options.signal, "memory recall")
       backoffMs = Math.min(backoffMs * 2, OWN_WRITES_MAX_BACKOFF_MS)
     }
   }
@@ -186,7 +190,8 @@ export class LogMemory implements Memory {
     scope: MemoryScope,
     query: MemoryQuery,
     limit: number,
-    agent: AgentId | undefined
+    agent: AgentId | undefined,
+    options: CallOptions
   ): Promise<{ readonly items: readonly MemoryItem[]; readonly held: Held }> {
     // Feedback ranks every strategy except recent, a ranking strategy adds the
     // query's word overlap, then arrival breaks ties.
@@ -206,7 +211,7 @@ export class LogMemory implements Memory {
       if (scope.conversation !== undefined) {
         scan.conversation(scope.conversation.toString()).lensStream(this.resourceStream())
       }
-      const page = await scan.fetch()
+      const page = await scan.fetch(options)
       if (page.page !== requested)
         throw new ProtocolError(
           `memory scan asked for page ${String(requested)} and was answered page ${String(page.page)}`
@@ -350,9 +355,9 @@ export class LogMemory implements Memory {
   /** Reads named point state from the managed key-value view, like {@link LogMemory.recall},
    * or folds the topic on a deployment that serves no view. Folding is the
    * explicit opt-in {@link LogMemory.fetchNamedFolded}. */
-  async fetchNamed(key: string): Promise<Uint8Array | undefined> {
+  async fetchNamed(key: string, options: CallOptions = {}): Promise<Uint8Array | undefined> {
     if (!(await this.viewServed())) return this.fetchNamedFolded(key)
-    return this.laser.kv(this.resourceNamespace()).get(this.namedKey(key))
+    return this.laser.kv(this.resourceNamespace()).get(this.namedKey(key), options)
   }
 
   /** Reads named point state by folding the topic in process. */

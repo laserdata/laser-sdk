@@ -2,10 +2,11 @@ import asyncio
 import json
 import subprocess
 import time
-import uuid
+from contextlib import ExitStack, suppress
 from pathlib import Path
 
 import laser_sdk as ls
+import pytest
 from pytest_bdd import given, parsers, scenarios, then, when
 
 SCENARIOS = Path(__file__).parent.parent / "scenarios"
@@ -72,9 +73,40 @@ def _index(world, read):
         return None
 
 
+@pytest.fixture(autouse=True)
+def managed_stream_cleanup(world):
+    with ExitStack() as cleanup:
+        world.managed_stream_cleanup = cleanup
+        try:
+            yield
+        finally:
+            state = getattr(world, "managed", None)
+            if state is not None:
+                if state.watch is not None and not state.watch.done():
+                    state.watch.cancel()
+                    with suppress(asyncio.CancelledError):
+                        world.run(lambda: state.watch)
+                if state.lease is not None:
+                    state.lease.release()
+                if state.worker is not None:
+                    world.run(state.worker.shutdown)
+                if getattr(state, "writer", None) is not None:
+                    world.run(state.writer.close)
+
+
+def remove_stream(world, scratch):
+    source = scratch.laser.stream(scratch.name)
+    world.run(scratch.delete)
+    assert not world.run(source.exists), "scenario left its stream"
+
+
 def _stream(world, layout=None, heartbeat_ms=None):
-    stream = f"bdd-{uuid.uuid4().hex[:10]}"
-    laser = world.run(lambda: world._connect(stream))
+    root = world.run(lambda: world._connect(None))
+    world.managed_stream_cleanup.callback(world.run, root.close)
+    scratch = world.run(root.scratch_stream("bdd").__aenter__)
+    world.managed_stream_cleanup.callback(remove_stream, world, scratch)
+    stream = scratch.name
+    laser = scratch.laser
     options = {}
     if layout is not None:
         options["layout"] = layout

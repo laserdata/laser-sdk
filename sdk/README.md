@@ -8,122 +8,143 @@
 
 ```toml
 [dependencies]
-laser-sdk = "0.10.2" # typed streaming plus provenance
-# Add only the layers the application uses:
-laser-sdk = { version = "0.10.2", features = ["agent", "managed"] }
+laser-sdk = "0.11.0" # workflows, memory, sessions, key-value state and typed streaming
+# Add the managed surfaces:
+laser-sdk = { version = "0.11.0", features = ["managed"] }
+# A program that only streams trims the build:
+laser-sdk = { version = "0.11.0", default-features = false, features = ["streaming"] }
 ```
 
 ## Two complete programs
 
-Each program runs as written in a new project with `cargo add laser-sdk --features agent,kv`, `cargo add tokio --features macros,rt-multi-thread`, `cargo add serde --features derive`, and `cargo add serde_json`. It reads the connection string from `LASER_CONNECTION_STRING` with `Laser::connect_env()`, creates a uniquely named scratch stream, and deletes it with `scratch.delete()` whatever the program body returned. A LaserData API key is not a connection string. Copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it. To keep what a program writes, set `LASER_STREAM` or call `laser.with_default_stream(name)` instead of opening a scratch stream. A workflow run and the first memory write create a missing stream.
+Each program runs as written in a new project with `cargo add laser-sdk`, `cargo add tokio --features macros,rt-multi-thread,time`, `cargo add serde_json`, and `cargo add serde --features derive` for the memory program. It reads the connection string from `LASER_CONNECTION_STRING` with `Laser::connect_env()`. The workflow runs on the stream named by `LASER_STREAM`, or on a stream named after the workflow, and keeps that stream after the run so the run can be resumed. The memory program creates a uniquely named scratch stream and deletes it with `scratch.delete()` whatever the program body returned. With `LASER_CONNECTION_STRING` set, a program needs no Docker and no local server. Then there is no server to start. A LaserData API key is not a connection string. Only without the variable, copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it. To keep what the memory program writes, set `LASER_STREAM`, connect with `Laser::connect_env_with_stream(name)`, or call `laser.with_default_stream(name)` instead of opening a scratch stream. A workflow run and the first memory write create a missing stream. The guides are at [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk) and on [Context7](https://context7.com/laserdata/laser-sdk).
 
 ### A three-step workflow
 
-`step_local(label, run)` runs the step's body in this process. The body gets the outputs of the steps before it through `StepContext::outputs` and returns the step's output. A closure passed as a step names its argument type, `|context: &StepContext<'_>|`. Each completion is journaled, so `run_id(id)` resumes a stopped run and keeps the steps it finished. The run creates its own topics, so the program needs no `bootstrap`, agent, or handler.
+`run_with` runs an async closure as the workflow, and `run.step(label, body)` runs one step in this process. A step's value is any type that implements `Serialize` and `DeserializeOwned`, and the body can await, so `analyze` waits one second before it returns. Each completed step is journaled, so `laser.workflow(name).run_id(id).run_with(...)` resumes a stopped run, returns the recorded values without running those steps again, and must call the same steps in the same order. A step name holding `#` is refused, because the journal numbers repeated calls with it. The run creates its own stream and topics, so the program needs no `bootstrap`, agent, or handler. For steps routed to agents, verifiers, compensation and budgets, use the builder, `laser.workflow(name).step(...)`, with `step_local` for its in-process steps.
 
 ```rust,no_run
-use laser_sdk::agent::StepContext;
+// cargo add laser-sdk
+// cargo add tokio --features macros,rt-multi-thread,time
+// cargo add serde_json
+// Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
 use laser_sdk::prelude::*;
-use laser_sdk::wire::agent::SessionStatus;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), LaserError> {
+    let laser = Laser::connect_env().await?;
+    let run = laser
+        .workflow("pipeline")
+        .run_with(async |run| {
+            let frames: String = run
+                .step("ingest", async || Ok("frames from sat-7".to_owned()))
+                .await?;
+            let analysis: String = run
+                .step("analyze", async || {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Ok(format!("analyzed {frames}"))
+                })
+                .await?;
+            run.step("report", async || Ok(format!("report on {analysis}")))
+                .await
+        })
+        .await?;
+    let report = serde_json::json!({
+        "status": run.status,
+        "steps": run.completed_steps,
+        "report": run.json::<String>("report")?,
+    });
+    println!("{report}");
+    laser.close().await
+}
+```
+
+It prints `{"report":"report on analyzed frames from sat-7","status":"completed","steps":["ingest","analyze","report"]}`, with the keys sorted by `serde_json::json!`. The `WorkflowOutcome` also carries `run_id`, `value` (the JSON bytes of what the closure returned), `outputs`, each step's output by label as bytes, `json::<T>(label)`, and `text(label)`. A step that fails ends the run as failed and its error reaches the caller unchanged, with no outcome to read the run ID from, so a caller that wants to resume a failed run names the run ID first with `run_id(id)`. The completed steps stay journaled, so that resume runs the failed step and what follows it.
+
+### A memory correction
+
+A first conversation stores three facts about the user `user-42`. A later conversation corrects the city with `supersede`, which remembers the new fact first and then forgets the old one in every conversation. A recall for the user reads every conversation and returns a list of `MemoryItem`, ranked by the words each fact shares with the query, newest first among equals, and drops none. It waits for the writes this connection made, so the correction shows at once. On LaserData Cloud and Laser Stack recall reads the managed memory view. Apache Iggy serves no view, so there recall folds the memory topic in process, and the same program runs on every server.
+
+```rust,no_run
+// cargo add laser-sdk
+// cargo add tokio --features macros,rt-multi-thread
+// cargo add serde --features derive
+// cargo add serde_json
+// Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
+use laser_sdk::prelude::*;
 use serde::Serialize;
-use std::collections::BTreeMap;
+
+const USER: &str = "user-42";
+const QUERY: &str = "Where does the user live, and what should I know before booking dinner?";
 
 #[derive(Serialize)]
-struct Report {
-    run_id: ConversationId,
-    status: SessionStatus,
-    completed_steps: Vec<String>,
-    outputs: BTreeMap<String, String>,
+struct Recall {
+    user: &'static str,
+    query: &'static str,
+    facts: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let laser = Laser::connect_env().await?;
-    let scratch = laser.scratch_stream("workflow-demo").await?;
-    let report = run(scratch.laser()).await;
+    let root = Laser::connect_env().await?;
+    let scratch = root.scratch_stream("memory").await?;
+    let result = correct_and_recall(scratch.laser()).await;
     scratch.delete().await?;
-    println!("{}", serde_json::to_string_pretty(&report?)?);
+    println!("{}", serde_json::to_string_pretty(&result?)?);
     Ok(())
 }
 
-async fn run(laser: &Laser) -> Result<Report, LaserError> {
-    let outcome = laser
-        .workflow("job-runner")
-        .step_local("create", |_: &StepContext<'_>| b"job-42".to_vec())
-        .step_local("process", |context: &StepContext<'_>| {
-            let job = context.outputs.get("create").cloned().unwrap_or_default();
-            [b"processed ".to_vec(), job].concat()
-        })
-        .after("create")
-        .step_local("finish", |_: &StepContext<'_>| b"completed".to_vec())
-        .after("process")
-        .run()
+async fn correct_and_recall(laser: &Laser) -> Result<Recall, LaserError> {
+    let memory = laser.memory("assistant");
+
+    // Conversation 1: the user shares three facts.
+    let first = ConversationId::new();
+    let city = memory
+        .remember("Lives in Gdansk")
+        .scope(first)
+        .user(USER)
+        .send()
         .await?;
-    let outputs = outcome
-        .completed_steps
-        .iter()
-        .map(|label| (label.clone(), outcome.text(label).unwrap_or_default()))
-        .collect();
-    Ok(Report {
-        run_id: outcome.run_id,
-        status: outcome.status,
-        completed_steps: outcome.completed_steps,
-        outputs,
+    memory
+        .remember("Allergic to peanuts")
+        .scope(first)
+        .user(USER)
+        .send()
+        .await?;
+    memory
+        .remember("Prefers a window seat")
+        .scope(first)
+        .user(USER)
+        .send()
+        .await?;
+
+    // Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+    let second = ConversationId::new();
+    memory
+        .supersede(city, "Lives in Lisbon")
+        .scope(second)
+        .user(USER)
+        .send()
+        .await?;
+
+    // Recall for the user across every conversation.
+    let facts = memory
+        .recall(None)
+        .user(USER)
+        .semantic(QUERY)
+        .limit(10)
+        .fetch()
+        .await?;
+    Ok(Recall {
+        user: USER,
+        query: QUERY,
+        facts: facts.iter().map(MemoryItem::text).collect(),
     })
 }
 ```
 
-It prints the run id, `"status": "completed"`, `"completed_steps": ["create", "process", "finish"]`, and the three outputs. A failed step returns `LaserError::StepFailed` with the run, the step, the reason, its `target`, and its `deadline_ms`, once the compensations of the finished steps have run.
-
-### A memory correction
-
-The first conversation stores two facts about the user `sam`. A later conversation corrects the city with `supersede`, which remembers the new fact first and then forgets the old one in every conversation. A recall for the user reads every conversation, ranks the facts by the words they share with the query, and drops none. It waits for the writes this connection made, for at most 10 seconds, so the correction shows at once. If the view never shows them in that time, the recall fails with a timeout error that is safe to retry. On LaserData Cloud and Laser Stack recall reads the managed memory view. Apache Iggy serves no view, so there recall folds the memory topic in process, and the same program runs on every server.
-
-```rust,no_run
-use laser_sdk::prelude::*;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let laser = Laser::connect_env().await?;
-    let scratch = laser.scratch_stream("memory-demo").await?;
-    let facts = run(scratch.laser()).await;
-    scratch.delete().await?;
-    println!("{}", serde_json::to_string_pretty(&facts?)?);
-    Ok(())
-}
-
-async fn run(laser: &Laser) -> Result<Vec<String>, LaserError> {
-    let memory = laser.memory("assistant");
-    let first = ConversationId::new();
-    let home = memory
-        .remember("Sam lives in Berlin")
-        .scope(first)
-        .user("sam")
-        .send()
-        .await?;
-    memory
-        .remember("Sam is allergic to peanuts")
-        .scope(first)
-        .user("sam")
-        .send()
-        .await?;
-    memory
-        .supersede(home, "Sam lives in Amsterdam")
-        .scope(ConversationId::new())
-        .user("sam")
-        .send()
-        .await?;
-    let facts = memory
-        .recall(None)
-        .user("sam")
-        .semantic("where does Sam live")
-        .fetch()
-        .await?;
-    Ok(facts.iter().map(MemoryItem::text).collect())
-}
-```
-
-It prints `["Sam lives in Amsterdam", "Sam is allergic to peanuts"]`. Berlin is gone. Both programs are the `workflow` and `memory-correction` examples in [`examples/rust`](https://github.com/laserdata/laser-sdk/tree/main/examples/rust).
+It prints `{"user": "user-42", "query": "Where does the user live, and what should I know before booking dinner?", "facts": ["Lives in Lisbon", "Prefers a window seat", "Allergic to peanuts"]}`. Gdansk is gone. Both programs are the `workflow` and `memory-correction` examples in [`examples/rust`](https://github.com/laserdata/laser-sdk/tree/main/examples/rust).
 
 ## Layers
 
@@ -131,7 +152,7 @@ Laser SDK ships in independently adoptable layers:
 
 - **Streaming** (`streaming` feature, default), streams, topics, raw and typed publish, batches, resumable cursors, and JSON/CBOR/MessagePack codecs on Apache Iggy.
 - **Managed platform** (`managed` feature), projections, query, key-value state, forks, graph, and watch against LaserData Cloud or Laser Stack. Consumer-group policies and reads are part of `streaming`.
-- **Agentic** (`agent` feature), sessions, reliable consumer + DLQ, conversation and causality, request/reply, routing, memory, handlers, typed AGDX verbs, workflows, effect governance, and durable intent records.
+- **Agentic** (`agent` feature, default), sessions, reliable consumer + DLQ, conversation and causality, request/reply, routing, memory, handlers, typed AGDX verbs, workflows, effect governance, and durable intent records.
 - **Edges**, the optional A2A, MCP, and AG-UI adapters.
 
 The SDK carries `gen_ai.*` provenance describing model calls but never makes them. It moves and coordinates messages only.
@@ -178,9 +199,9 @@ while let Some(record) = records.next().await {
 # Ok(()) }
 ```
 
-This example uses only the default `streaming` and `provenance` features and runs against Apache Iggy. One connection addresses every stream on the server. `Laser::connect_with_stream` only pins a default stream so `laser.topic(name)` can be used as a shortcut. It does not limit the connection to that stream. `Laser::connect_env()` reads `LASER_CONNECTION_STRING` and the optional `LASER_STREAM`, and `Laser::local()` targets local Apache Iggy. A connection string is `user:password@host[:port]` or `token@host[:port]`. Keep it in `LASER_CONNECTION_STRING`, read it inside the program, and never print or log it. The scheme selects the transport: none, `iggy://` or `iggy+tcp://` for TCP (port 8090), `iggy+quic://` for QUIC (8080) and `iggy+ws://` for WebSocket (8092), each with the options Apache Iggy reads for it. `iggy+http://` is refused because HTTP has no binary request path. [Client behavior](../docs/client-behavior.md#connections) lists the options and the TLS rules per transport. An IPv6 address goes in brackets, as in `token@[::1]:8090`. Credentials are required and percent-decoded, so a `:`, `@`, `?` or `%` inside one is written `%3A`, `%40`, `%3F` or `%25`. `LaserBuilder::address(..).credentials(user, password)` takes both parts as given, any character included. Other schemes, options another transport reads, unknown or repeated options, and malformed credentials, escapes or ports return `LaserError::Config` before dialing.
+This example uses only the `streaming` and `provenance` features and runs against Apache Iggy. One connection addresses every stream on the server. `Laser::connect_with_stream` only pins a default stream so `laser.topic(name)` can be used as a shortcut. It does not limit the connection to that stream. `Laser::connect_env()` reads `LASER_CONNECTION_STRING` and the optional `LASER_STREAM`, and `Laser::local()` targets local Apache Iggy. A connection string is `user:password@host[:port]` or `token@host[:port]`. Keep it in `LASER_CONNECTION_STRING`, read it inside the program, and never print or log it. The scheme selects the transport: none, `iggy://` or `iggy+tcp://` for TCP (port 8090), `iggy+quic://` for QUIC (8080) and `iggy+ws://` for WebSocket (8092), each with the options Apache Iggy reads for it. `iggy+http://` is refused because HTTP has no binary request path. [Client behavior](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md#connections) lists the options and the TLS rules per transport. An IPv6 address goes in brackets, as in `token@[::1]:8090`. Credentials are required and percent-decoded, so a `:`, `@`, `?` or `%` inside one is written `%3A`, `%40`, `%3F` or `%25`. `LaserBuilder::address(..).credentials(user, password)` takes both parts as given, any character included. Other schemes, options another transport reads, unknown or repeated options, and malformed credentials, escapes or ports return `LaserError::Config` before dialing.
 
-`Topic::ensure(partitions, replication_factor)` creates the topic when absent. `None` takes the server's default replication factor, `Some(factor)` stores each partition on that many nodes, 1 to `MAX_REPLICATION_FACTOR` (32) and at most the cluster's node count. `ProducerBuilder::replication_factor(factor)` does the same for a topic the producer creates. An out-of-range factor fails with `LaserError::Invalid` before anything is sent, and the server's refusal of a factor above the node count surfaces as `LaserError::Transport`. Reads and writes go to each partition's primary, which always stores it. See [client behavior](../docs/client-behavior.md#publication-and-reads).
+`Topic::ensure(partitions, replication_factor)` creates the topic when absent. `None` takes the server's default replication factor, `Some(factor)` stores each partition on that many nodes, 1 to `MAX_REPLICATION_FACTOR` (32) and at most the cluster's node count. `ProducerBuilder::replication_factor(factor)` does the same for a topic the producer creates. An out-of-range factor fails with `LaserError::Invalid` before anything is sent, and the server's refusal of a factor above the node count surfaces as `LaserError::Transport`. Reads and writes go to each partition's primary, which always stores it. See [client behavior](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md#publication-and-reads).
 
 Direct producers, topic sends, and publish builders return `SendMessagesResponse`. Each confirmation identifies the stream, topic, partition, and first offset in a batch. A server that does not report offsets returns an empty list. Completion follows the topic durability policy. An offset identifies a position only within its stream, topic, and partition.
 
@@ -192,7 +213,7 @@ A connection string's own `tls_ca_file=<path>` turns TLS on without `tls=true`, 
 
 ## Batch and any payload
 
-`publish_batch` groups typed records for sending. A service can use `topic.producer()` for batching, delays, retries, and routing. `.background(BackgroundConfig::builder()..)` selects buffered sends through Apache Iggy. `Producer::flush()` writes everything queued so far, and `Producer::shutdown()` flushes and stops the producer for every clone. Call it before dropping a background producer, or unflushed messages can be lost. Both return the background write failures no error callback took. `.sharding(|request| ..)` picks the background shard of each send with your own code. `.encryption(Encryption::aes256_gcm(key)?)` encrypts each payload and header block in the Apache Iggy AES-256-GCM format, and a consumer with `.encryption(..)` and the same key decrypts them. `.idempotent()` gives the producer a producer id, so a partition writes a resent batch once ([publish recovery](../docs/publish-recovery.md#idempotent-producers)). See [client behavior](../docs/client-behavior.md). `topic.consumer_group(name)` selects a group. `group.consumer().build().await` starts continuous reads with offsets stored on the server. The server holds each poll for up to `max_wait` (5 seconds by default, zero answers at once) and answers as soon as `min_count` records (default 1) land, with at most `max_bytes` of records (default 1 MiB).
+`publish_batch` groups typed records for sending. A service can use `topic.producer()` for batching, delays, retries, and routing. `.background(BackgroundConfig::builder()..)` selects buffered sends through Apache Iggy. `Producer::flush()` writes everything queued so far, and `Producer::shutdown()` flushes and stops the producer for every clone. Call it before dropping a background producer, or unflushed messages can be lost. Both return the background write failures no error callback took. `.sharding(|request| ..)` picks the background shard of each send with your own code. `.encryption(Encryption::aes256_gcm(key)?)` encrypts each payload and header block in the Apache Iggy AES-256-GCM format, and a consumer with `.encryption(..)` and the same key decrypts them. `.idempotent()` gives the producer a producer id, so a partition writes a resent batch once ([publish recovery](https://github.com/laserdata/laser-sdk/blob/main/docs/publish-recovery.md#idempotent-producers)). See [client behavior](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md). `topic.consumer_group(name)` selects a group. `group.consumer().build().await` starts continuous reads with offsets stored on the server. The server holds each poll for up to `max_wait` (5 seconds by default, zero answers at once) and answers as soon as `min_count` records (default 1) land, with at most `max_bytes` of records (default 1 MiB).
 
 A replay cursor reads a bounded set of records and keeps its offsets in the client. Save those offsets to resume later. Failed or canceled polls do not advance the saved offsets. Each partition read returns at most 10,000 messages, even when the configured request batch is larger.
 
@@ -295,7 +316,7 @@ while let Some(next) = records.next().await {
 # Ok(()) }
 ```
 
-`laser.stream("fleet").topic("readings").schema::<Reading>(id).await?` uses a registered schema. This form requires `schema-codecs` and the registry served by the managed backend. The handle resolves and compiles the schema once, checks each body, and adds `agdx.ct` and `agdx.sid`. A body that does not match fails before publication. Reads decode into the model every client and the managed backend share (schema field names, numeric enums, exact 64-bit integers, bytes as integer arrays, proto3 defaults present, Avro logical types as physical values), so a Protobuf `int64` field fits an `i64` struct field ([client behavior](../docs/client-behavior.md#writer-schemas)). `laser.schemas().list().page(n).results(n).fetch().await?` returns one `SchemaPage`.
+`laser.stream("fleet").topic("readings").schema::<Reading>(id).await?` uses a registered schema. This form requires `schema-codecs` and the registry served by the managed backend. The handle resolves and compiles the schema once, checks each body, and adds `agdx.ct` and `agdx.sid`. A body that does not match fails before publication. Reads decode into the model every client and the managed backend share (schema field names, numeric enums, exact 64-bit integers, bytes as integer arrays, proto3 defaults present, Avro logical types as physical values), so a Protobuf `int64` field fits an `i64` struct field ([client behavior](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md#writer-schemas)). `laser.schemas().list().page(n).results(n).fetch().await?` returns one `SchemaPage`.
 
 The `records` reader reports `TypedDecodeError { position, source }` for a record that does not decode, then continues. An `Agent` handler can decode through the same API. Its existing dead-letter policy handles invalid records.
 
@@ -391,7 +412,7 @@ let answer = session
     .await?;
 ```
 
-`run` ends the session as completed on success and as failed on an error or a panic, then re-raises the panic. `begin` refuses a labeled session that already ended with `LaserError::SessionEnded`, and `resume` reopens one that ended completed or failed. Lifecycle and state records ride the session's partition of `agent.sessions`. Every record there carries its addressee in `agdx.to`, with `*` for every agent. `SessionConfig::layout` picks a per-agent partition, per-agent topic, or single-partition layout instead of the shared default, and [Agents, groups, and layouts](../docs/building-agents.md#agents-groups-and-layouts) explains the choice. `laser.sessions().submit(agent, input).from(me).send()` hands a new session to an agent, whose handler reaches it through `ctx.session()`. `laser.sessions().control(stream, id).as_operator(op).cancel()` writes on `agent.control`, which only operators can send to. `pause()` names the participants that must acknowledge (`participants(..)` sets them), agents hold work that arrives while the session is paused and replay it after `resume()`, and `session.parked()` lists held work that was never handled. `session.over_budget()` reports whether the session's usage passed the budget in its start record. On a deployment that indexes sessions, an agent with an id fails an over-budget session once with reason `budget` instead of calling its handler, and a workflow stops at the next step boundary with `LaserError::BudgetExceeded` and ends the run session failed with reason `budget`. On a deployment that announces `sessions`, `laser.sessions().list()`, `get(id)`, `events(id)`, `state(id, history_limit)`, `links(id, surface)`, `sources(id)`, `changes(after, limit)`, and `watch(poll_every)` read the managed session index, and `laser.read_at(source)` fetches the one record a timeline row points at. The [client behavior guide](../docs/client-behavior.md) and the [AGDX specification](../docs/agdx.md) describe the details.
+`run` ends the session as completed on success and as failed on an error or a panic, then re-raises the panic. `begin` refuses a labeled session that already ended with `LaserError::SessionEnded`, and `resume` reopens one that ended completed or failed. Lifecycle and state records ride the session's partition of `agent.sessions`. Every record there carries its addressee in `agdx.to`, with `*` for every agent. `SessionConfig::layout` picks a per-agent partition, per-agent topic, or single-partition layout instead of the shared default, and [Agents, groups, and layouts](https://github.com/laserdata/laser-sdk/blob/main/docs/building-agents.md#agents-groups-and-layouts) explains the choice. `laser.sessions().submit(agent, input).from(me).send()` hands a new session to an agent, whose handler reaches it through `ctx.session()`. `laser.sessions().control(stream, id).as_operator(op).cancel()` writes on `agent.control`, which only operators can send to. `pause()` names the participants that must acknowledge (`participants(..)` sets them), agents hold work that arrives while the session is paused and replay it after `resume()`, and `session.parked()` lists held work that was never handled. `session.over_budget()` reports whether the session's usage passed the budget in its start record. On a deployment that indexes sessions, an agent with an id fails an over-budget session once with reason `budget` instead of calling its handler, and a workflow stops at the next step boundary with `LaserError::BudgetExceeded` and ends the run session failed with reason `budget`. On a deployment that announces `sessions`, `laser.sessions().list()`, `get(id)`, `events(id)`, `state(id, history_limit)`, `links(id, surface)`, `sources(id)`, `changes(after, limit)`, and `watch(poll_every)` read the managed session index, and `laser.read_at(source)` fetches the one record a timeline row points at. The [client behavior guide](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md) and the [AGDX specification](https://github.com/laserdata/laser-sdk/blob/main/docs/agdx.md) describe the details.
 
 ## Stream-scoped names
 
@@ -403,13 +424,13 @@ Choose the read API that provides the behavior your application needs.
 
 | Rung | Call | You get |
 | --- | --- | --- |
-| live consumer | `topic.consumer(..)` / `topic.consumer_group(..).consumer()` | a Laser async `Stream` over Apache Iggy with batching, polling, replay, retries, groups, automatic or explicit server offset commits, and `next_within(timeout)` for a bounded single-record wait. A group consumer always resumes after the group's stored offset, and `start_at` only seeds partitions the group never stored ([client behavior](../docs/client-behavior.md#consumers-and-polling)) |
+| live consumer | `topic.consumer(..)` / `topic.consumer_group(..).consumer()` | a Laser async `Stream` over Apache Iggy with batching, polling, replay, retries, groups, automatic or explicit server offset commits, and `next_within(timeout)` for a bounded single-record wait. A group consumer always resumes after the group's stored offset, and `start_at` only seeds partitions the group never stored ([client behavior](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md#consumers-and-polling)) |
 | replay | `topic.replay()` | a resumable `Cursor` by explicit offsets: bounded, restartable, nothing consumed (`topic.json::<T>().records(reader_name)` is the same rung, typed) |
 | change feed | `laser.watch()` | lightweight advancement records, so feed-poll-then-query replaces repeated blind queries |
-| reliable consumer | `Agent::builder` / `ReliableConsumer` | consumer-group delivery plus dedup, retry, deadline, and dead-lettering. `warm_dedup(true)` refills the dedup window after a restart from the records the group committed, and `warm_dedup_policy(WarmDedupPolicy::..)` decides which, by default leaving out copies dead-lettered past their deadline ([client behavior](../docs/client-behavior.md#dispatch-and-replies)) |
+| reliable consumer | `Agent::builder` / `ReliableConsumer` | consumer-group delivery plus dedup, retry, deadline, and dead-lettering. `warm_dedup(true)` refills the dedup window after a restart from the records the group committed, and `warm_dedup_policy(WarmDedupPolicy::..)` decides which, by default leaving out copies dead-lettered past their deadline ([client behavior](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md#dispatch-and-replies)) |
 | query | `laser.query(index)` | the materialized read model: filters, aggregates, vector recall, consistency levels |
 
-Use `topic.send(..)` for raw publication. Use `publish()` and `publish_batch()` for typed builders. Use `topic.producer()` for a persistent producer with batching, retries, topology discovery, and routing. `topic.batching()` adds governed batches that flush by size or time. `contract(..)` sends a directed task, and `workflow(name)` runs steps in dependency order, each routed to an agent with `step(label, router, build)` or run in process with `step_local(label, run)`, and resumes a stopped run under its `run_id` ([recovery](../docs/client-behavior.md#workflows-and-child-sessions)). Apache Iggy builders and the client remain available for detailed configuration.
+Use `topic.send(..)` for raw publication. Use `publish()` and `publish_batch()` for typed builders. Use `topic.producer()` for a persistent producer with batching, retries, topology discovery, and routing. `topic.batching()` adds governed batches that flush by size or time. `contract(..)` sends a directed task, and `workflow(name)` runs steps in dependency order, each routed to an agent with `step(label, router, build)` or run in process with `step_local(label, run)`, and resumes a stopped run under its `run_id` ([recovery](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md#workflows-and-child-sessions)). Apache Iggy builders and the client remain available for detailed configuration.
 
 ## Consumer filters
 
@@ -448,7 +469,7 @@ async fn main() -> Result<(), LaserError> {
 }
 ```
 
-Use `group.create().build().await` for a plain group, and `group.filter().configure(name, filter).await` to configure it afterward. The name is the caller's label for the group's own filter: it follows the saved filter name rule (1 to 128 bytes of ASCII letters, digits, `.`, `_` and `-`), need not be unique, and the same digest configured under another name renames it. `group.filter().summary()` returns that filter's catalog row with its name and owning group, or `None`, and `group.filter().delete()` removes it, bound or released. The advanced `group.reader()?.build().await` also resolves the group's policy and accepts an unbound group. `next_page` and `ack_page` handle its batches, while `ack_through` stores a checkpoint inside a page. `CompiledFilter`, with the optional `filters` feature, runs the evaluator locally. Fault, foreign-codec and type-mismatch policies decide whether an unevaluable record stops the read, is dropped or is delivered with `evaluated == false`. Under the default `stop` fault policy the read fails with `LaserError::FilterFault` naming the partition and the record's offset, and `reader.skip(partition_id, offset)` or `consumer.skip(partition_id, offset)` passes that record with a fenced acknowledgment once the records before it are handled, see [client behavior](../docs/client-behavior.md#consumers-and-polling).
+Use `group.create().build().await` for a plain group, and `group.filter().configure(name, filter).await` to configure it afterward. The name is the caller's label for the group's own filter: it follows the saved filter name rule (1 to 128 bytes of ASCII letters, digits, `.`, `_` and `-`), need not be unique, and the same digest configured under another name renames it. `group.filter().summary()` returns that filter's catalog row with its name and owning group, or `None`, and `group.filter().delete()` removes it, bound or released. The advanced `group.reader()?.build().await` also resolves the group's policy and accepts an unbound group. `next_page` and `ack_page` handle its batches, while `ack_through` stores a checkpoint inside a page. `CompiledFilter`, with the optional `filters` feature, runs the evaluator locally. Fault, foreign-codec and type-mismatch policies decide whether an unevaluable record stops the read, is dropped or is delivered with `evaluated == false`. Under the default `stop` fault policy the read fails with `LaserError::FilterFault` naming the partition and the record's offset, and `reader.skip(partition_id, offset)` or `consumer.skip(partition_id, offset)` passes that record with a fenced acknowledgment once the records before it are handled, see [client behavior](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md#consumers-and-polling).
 
 **A normal consumer's `batch_length(100)` examines at most 100 source records per partition request and returns zero to 100 matches.** The iterator continues through empty selections without sleeping until it reaches visible data's end. Once a whole round finds nothing new, it waits on the server for the next record, up to the consumer's `max_wait`, when the server announces filtered waits (`Capabilities.filters.max_wait`). The advanced reader has separate `count` and `max_examined` limits for match-oriented scans and its own `max_wait`, 5 seconds by default. A reader holds one wait per serving node, one per slice of at most 1,024 partitions on a node that serves more, and cancels the others as soon as one answers, when its assignment changes, and when it closes or is dropped.
 
@@ -464,7 +485,7 @@ For an application checkpoint inside a filtered page, call `reader.ack_through(r
 
 ## Features
 
-- `default = ["streaming", "provenance"]`
+- `default = ["agent", "kv", "provenance", "streaming"]`. A program that only streams trims the build with `default-features = false, features = ["streaming"]`.
 - `streaming`, the open Apache Iggy foundation: `Laser`, streams, topics, direct producers, live partition and consumer-group streams, server offsets, raw and typed publish, batches, explicit-offset cursors, and JSON/CBOR/MessagePack codecs. The SDK uses Iggy's native VSR transport. Managed reads use the non-replicated extension path, and managed authorization writes use dedicated replicated operation codes.
 - `provenance`, wire contract + provenance encoding/decoding
 - `agent`, sessions, reliable consumer, `Agent::builder`, context, memory, state, contracts, workflows, and the `ActionGovernor` effect-boundary policy hook
@@ -502,7 +523,7 @@ tracing::subscriber::set_global_default(
 
 ## Connect and publish limits
 
-`Laser::connect` gives up after 30 seconds. The budget covers the dial over TCP, QUIC or WebSocket, the TLS handshake, the login, and the capability probe, and an expired budget returns `LaserError::Timeout` naming the stage that stalled. Each publish attempt times out after 60 seconds and is retried three times, with delays that start at 250 milliseconds, double after each failure, and stop growing at 30 seconds, each drawn at random from the upper half of that delay. `LaserBuilder::connect_timeout`, `publish_timeout`, `publish_max_retries`, and `publish_retry_backoff` change these limits and override `LASER_CONNECT_TIMEOUT_MS` and the `LASER_PUBLISH_*` variables. A publish that gives up returns `LaserError::PublishFailed` with the committed ranges and the unconfirmed records. `laser.scratch_stream(prefix).await?` creates a stream named `{prefix}-` and eight lowercase hex characters for one run, refuses a name that already exists, and returns a `ScratchStream` whose `laser()` has it as the default stream. `ScratchStream::delete` removes it and does nothing for a stream already gone. Dropping the handle also deletes it, best effort, so await `delete` for a guaranteed cleanup. `stream(name).delete()` removes a stream you no longer need, and `Laser::close` ends the shared connection. `Laser::connection_events().await` returns a stream of `ConnectionEvent` values that reports when the connection is connected, disconnected, signed in, signed out, and shut down. See [connection events](../docs/client-behavior.md#connection-events). `Laser::streams`, `Stream::get`, `Stream::exists`, and `Stream::topics` return `StreamInfo` and `TopicInfo` values. `Topic::get`, `exists`, `delete`, `partitions`, `add_partitions`, `delete_partitions`, and `consumer_groups` read and change one topic, and `ConsumerGroup::delete` removes a group. `Stream::rename`, `Topic::update` with `UpdateTopicOptions`, and `Topic::delete_segments` rename streams and change topic settings. `get` and `exists` read a missing stream or topic as absent, and `topics`, `partitions`, and `consumer_groups` fail with an error that `LaserError::is_stream_or_topic_not_found` recognizes. `Laser::users`, `Laser::user` (`User::get`, `exists`, `create`, `update`, `set_permissions`, `change_password`, `delete`), `Laser::personal_access_tokens`, `Laser::personal_access_token`, `Laser::ping`, `Laser::stats`, `Laser::me`, `Laser::clients`, `Laser::client_info`, `Laser::cluster`, `Laser::snapshot`, `Laser::describe_options`, and `Laser::metadata_changes` live in the `server` module and run under the server's own permission checks. See [server administration](../docs/client-behavior.md#server-administration). See [connect timeout and cleanup](../docs/connect-timeout.md) and [publish recovery](../docs/publish-recovery.md).
+`Laser::connect` gives up after 30 seconds. The budget covers the dial over TCP, QUIC or WebSocket, the TLS handshake, the login, and the capability probe, and an expired budget returns `LaserError::Timeout` naming the stage that stalled. Each publish attempt times out after 60 seconds and is retried three times, with delays that start at 250 milliseconds, double after each failure, and stop growing at 30 seconds, each drawn at random from the upper half of that delay. `LaserBuilder::connect_timeout`, `publish_timeout`, `publish_max_retries`, and `publish_retry_backoff` change these limits and override `LASER_CONNECT_TIMEOUT_MS` and the `LASER_PUBLISH_*` variables. A publish that gives up returns `LaserError::PublishFailed` with the committed ranges and the unconfirmed records. `laser.scratch_stream(prefix).await?` creates a stream named `{prefix}-` and eight lowercase hex characters for one run, refuses a name that already exists, and returns a `ScratchStream` whose `laser()` has it as the default stream. `ScratchStream::delete` removes it and does nothing for a stream already gone. Dropping the handle also deletes it, best effort, so await `delete` for a guaranteed cleanup. `stream(name).delete()` removes a stream you no longer need, and `Laser::close` ends the shared connection. `Laser::connection_events().await` returns a stream of `ConnectionEvent` values that reports when the connection is connected, disconnected, signed in, signed out, and shut down. See [connection events](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md#connection-events). `Laser::streams`, `Stream::get`, `Stream::exists`, and `Stream::topics` return `StreamInfo` and `TopicInfo` values. `Topic::get`, `exists`, `delete`, `partitions`, `add_partitions`, `delete_partitions`, and `consumer_groups` read and change one topic, and `ConsumerGroup::delete` removes a group. `Stream::rename`, `Topic::update` with `UpdateTopicOptions`, and `Topic::delete_segments` rename streams and change topic settings. `get` and `exists` read a missing stream or topic as absent, and `topics`, `partitions`, and `consumer_groups` fail with an error that `LaserError::is_stream_or_topic_not_found` recognizes. `Laser::users`, `Laser::user` (`User::get`, `exists`, `create`, `update`, `set_permissions`, `change_password`, `delete`), `Laser::personal_access_tokens`, `Laser::personal_access_token`, `Laser::ping`, `Laser::stats`, `Laser::me`, `Laser::clients`, `Laser::client_info`, `Laser::cluster`, `Laser::snapshot`, `Laser::describe_options`, and `Laser::metadata_changes` live in the `server` module and run under the server's own permission checks. See [server administration](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md#server-administration). See [connect timeout and cleanup](https://github.com/laserdata/laser-sdk/blob/main/docs/connect-timeout.md) and [publish recovery](https://github.com/laserdata/laser-sdk/blob/main/docs/publish-recovery.md).
 
 ## Documentation
 
@@ -516,7 +537,7 @@ Apache and Apache Iggy are trademarks of the Apache Software Foundation. Use of 
 
 ## Materialization and operational SQL
 
-Materialization setup is available in Rust, Python, and TypeScript through `topic.materialize().apply()`. It registers a whole-record projection by default. A typed projection selects extracted fields. Reuse the setup operation identity after an uncertain response. The resulting handle reports binding status and waits against a captured source target. Readiness and complete historical coverage are separate results. A wait also ends early as failed, blocked or not found, and `topic.materialization(projection_id)` returns the handle again in a later process, see [client behavior](../docs/client-behavior.md#materialization-and-operational-sql).
+Materialization setup is available in Rust, Python, and TypeScript through `topic.materialize().apply()`. It registers a whole-record projection by default. A typed projection selects extracted fields. Reuse the setup operation identity after an uncertain response. The resulting handle reports binding status and waits against a captured source target. Readiness and complete historical coverage are separate results. A wait also ends early as failed, blocked or not found, and `topic.materialization(projection_id)` returns the handle again in a later process, see [client behavior](https://github.com/laserdata/laser-sdk/blob/main/docs/client-behavior.md#materialization-and-operational-sql).
 
 Projection history defaults to append. Keyed history selects a typed header key or a payload JSON pointer and can name a delete header. Without one, a keyed view never deletes a key. A key stays in one partition per topic incarnation. Older updates cannot replace a newer value or restore a deleted value. Keyed history does not claim complete append history. Projection and binding history cannot change in place.
 

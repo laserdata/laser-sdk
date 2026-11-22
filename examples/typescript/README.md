@@ -4,12 +4,12 @@ The TypeScript examples cover the Rust and Python catalog: two standalone progra
 
 ## Standalone programs
 
-Each imports only `@laserdata/laser-sdk`, reads `LASER_CONNECTION_STRING` through `Laser.connectEnv()`, works on a scratch stream that it deletes at the end, and prints its result as JSON, so it runs when copied alone into any project.
+Each imports only `@laserdata/laser-sdk`, reads `LASER_CONNECTION_STRING`, and prints its result as JSON, so it runs when copied alone into any project. `workflow` runs on the stream named by `LASER_STREAM`, or on a stream named `pipeline` after the workflow, and keeps it after the run so the run can be resumed. `memory-correction` works on a scratch stream that it deletes at the end.
 
 | Example | What it shows | Needs Cloud? |
 | --- | --- | --- |
-| [`workflow`](src/workflow/README.md) | Three local workflow steps, journaled and resumable, with the run's status, completed steps, and outputs | no |
-| [`memory-correction`](src/memory-correction/README.md) | Remember two facts for a user, correct one with `supersede` in a later conversation, recall the current facts ranked by the question | no |
+| [`workflow`](src/workflow/README.md) | Three plain functions as steps with `step` and `workflow`, journaled and resumable, with the run's status, completed steps, and value | no |
+| [`memory-correction`](src/memory-correction/README.md) | Remember three facts for a user, correct one with `supersede` in a later conversation, recall the current facts ranked by the question | no |
 
 ```sh
 LASER_CONNECTION_STRING='<connection string>' npm run example:workflow

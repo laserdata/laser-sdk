@@ -76,8 +76,9 @@ pub enum ResultCode {
     /// identity could apply the change a second time.
     Pending,
     /// The node could not reach its managed backend, or the backend did not
-    /// answer in time. The request may still apply, so a mutation repeats
-    /// only under the same operation identity, on this node or another one.
+    /// answer in time. A node still replaying its logs after a restart answers
+    /// it too. The request may still apply, so a mutation repeats only under
+    /// the same operation identity, on this node or another one.
     BackendUnavailable,
     /// A code from a newer peer this build does not name. Decodes and re-encodes
     /// byte-for-byte so an old build relays it rather than failing. Only a value
@@ -223,8 +224,9 @@ impl ResultCode {
     }
 
     /// Whether the node could not reach its managed backend, or the backend
-    /// did not answer in time. The request may still apply. A client
-    /// repeats a mutation under the same operation identity, and may send it
+    /// did not answer in time, as a node still replaying its logs after a
+    /// restart does. The request may still apply. A client repeats a mutation
+    /// under the same operation identity, repeats a read, and may send either
     /// to another node. Unlike [`Unavailable`](Self::Unavailable), which a
     /// busy node or an unreachable destination answers, this one names the
     /// node itself as the problem.

@@ -1,7 +1,7 @@
 use crate::capabilities::{Capabilities, HelloOutcome};
 use crate::connect_options::{ConnectOptions, connect_before};
 use crate::error::{LaserError, TransportError};
-use crate::nodes::{Answered, Nodes, Target};
+use crate::nodes::{Answered, Nodes, Target, Walk};
 pub use crate::publish_options::PublishOptions;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -30,8 +30,9 @@ type SendFuture<'a> =
     std::pin::Pin<Box<dyn Future<Output = Result<SendMessagesResponse, IggyError>> + Send + 'a>>;
 
 /// How long a managed mutation keeps repeating its frame while its outcome is
-/// unknown, the shared client contract deadline.
-pub(crate) use crate::retry::{MANAGED_ATTEMPT_FIRST, MANAGED_MUTATION_DEADLINE};
+/// unknown, and a managed read every node refused its walk, the shared client
+/// contract deadline.
+pub(crate) use crate::retry::{MANAGED_ATTEMPT_FIRST, MANAGED_DEADLINE};
 
 /// What the attempts of one managed mutation know about its outcome. An
 /// attempt whose outcome is unknown makes every later refusal ambiguous too,
@@ -423,23 +424,44 @@ impl Laser {
             .await
     }
 
-    /// Connect from the environment: `LASER_CONNECTION_STRING` (the whole
+    /// Await it for a connected `Laser`: `let laser =
+    /// Laser::connect_env().await?` reads `LASER_CONNECTION_STRING` (the whole
     /// iggy connection string, exactly what [`connect`](Self::connect) takes)
     /// plus the optional `LASER_STREAM` pinning the default stream. The same
     /// two variables every deployment guide and the example crate already
     /// use, so a program moves between local, staging, and LaserData Cloud
-    /// with no code change. Missing `LASER_CONNECTION_STRING` is a typed
+    /// with no code change. An empty variable counts as unset. A missing or
+    /// empty `LASER_CONNECTION_STRING` is a typed
     /// [`Config`](LaserError::Config) error naming the variable.
     pub async fn connect_env() -> Result<Self, LaserError> {
-        let connection = std::env::var("LASER_CONNECTION_STRING")
-            .map_err(|_| LaserError::Config("LASER_CONNECTION_STRING is not set"))?;
-        match std::env::var("LASER_STREAM") {
-            Ok(stream) => Self::connect_with_stream(&connection, &stream).await,
-            Err(_) => Self::connect(&connection).await,
+        Self::connect_resolved(env_connection(|name| std::env::var(name).ok(), None)?).await
+    }
+
+    /// Await it for a connected `Laser` whose default stream is `stream`: `let
+    /// laser = Laser::connect_env_with_stream("orders").await?` reads
+    /// `LASER_CONNECTION_STRING` like [`connect_env`](Self::connect_env), and
+    /// `stream` wins over `LASER_STREAM`. For a stream deleted at the end of
+    /// the run use [`scratch_stream`](Self::scratch_stream) instead.
+    pub async fn connect_env_with_stream(stream: &str) -> Result<Self, LaserError> {
+        Self::connect_resolved(env_connection(
+            |name| std::env::var(name).ok(),
+            Some(stream),
+        )?)
+        .await
+    }
+
+    async fn connect_resolved(
+        (connection, stream): (String, Option<String>),
+    ) -> Result<Self, LaserError> {
+        match stream {
+            Some(stream) => Self::connect_with_stream(&connection, &stream).await,
+            None => Self::connect(&connection).await,
         }
     }
 
-    /// Connect to Apache Iggy container at `iggy:iggy@127.0.0.1:8090`.
+    /// Await it for a `Laser` connected to a server you started on this
+    /// machine, at `iggy:iggy@127.0.0.1:8090`. When `LASER_CONNECTION_STRING`
+    /// is set, call [`connect_env`](Self::connect_env) instead.
     pub async fn local() -> Result<Self, LaserError> {
         Self::connect("iggy:iggy@127.0.0.1:8090").await
     }
@@ -1314,14 +1336,41 @@ impl Laser {
     /// perspective. Idempotent writes carry a stable operation identity so
     /// the managed backend can append them to its mutation topics, see
     /// [`send_managed_mutation`](Self::send_managed_mutation).
-    #[tracing::instrument(target = "laser", level = "debug", skip_all, fields(code = code, operation = "managed"))]
+    /// A read every node refused waits on the managed backoff and walks the
+    /// roster again until it is served or [`MANAGED_DEADLINE`] passes.
+    #[cfg_attr(
+        not(any(
+            feature = "filters",
+            feature = "fork",
+            feature = "graph",
+            feature = "kv",
+            feature = "projections",
+            feature = "query",
+            feature = "rbac"
+        )),
+        allow(dead_code)
+    )]
     pub(crate) async fn send_raw_with_response(
         &self,
         code: u32,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, LaserError> {
+        self.send_raw_walking(code, payload, Walk::UntilServed)
+            .await
+    }
+
+    /// [`send_raw_with_response`](Self::send_raw_with_response) with the walk
+    /// a read takes while every node refuses it. [`Walk::Once`] is for a caller
+    /// that answers a refusal itself.
+    #[tracing::instrument(target = "laser", level = "debug", skip_all, fields(code = code, operation = "managed"))]
+    pub(crate) async fn send_raw_walking(
+        &self,
+        code: u32,
+        payload: Vec<u8>,
+        walk: Walk,
+    ) -> Result<Vec<u8>, LaserError> {
         Ok(self
-            .send_managed_to(code, payload, Target::of_code(code))
+            .send_managed_walking(code, payload, Target::of_code(code), walk)
             .await?
             .0)
     }
@@ -1335,13 +1384,27 @@ impl Laser {
         payload: Vec<u8>,
         target: Target,
     ) -> Result<(Vec<u8>, Option<u8>), LaserError> {
+        self.send_managed_walking(code, payload, target, Walk::UntilServed)
+            .await
+    }
+
+    /// [`send_managed_to`](Self::send_managed_to) with the walk a read takes
+    /// while every node refuses it. A mutation repeats under its own deadline
+    /// and ignores `walk`.
+    pub(crate) async fn send_managed_walking(
+        &self,
+        code: u32,
+        payload: Vec<u8>,
+        target: Target,
+        walk: Walk,
+    ) -> Result<(Vec<u8>, Option<u8>), LaserError> {
         self.ensure_scopable(code)?;
         if !laser_wire::codes::is_idempotent_managed_request(code) {
             let frame = bytes::Bytes::from(self.read_frame(code, &payload)?);
             let answered = self
                 .inner
                 .nodes
-                .send(&self.client(), code, frame, target)
+                .read(&self.client(), code, frame, target, walk)
                 .await?;
             return Ok((self.take_positioned(&answered), answered.replica));
         }
@@ -1399,11 +1462,11 @@ impl Laser {
     /// outcome to a repeat. A `Pending` reply or a transport failure after the
     /// request may have left leaves the outcome unknown, so the same frame is
     /// sent again with jittered backoff, and a refusal after that stays
-    /// ambiguous. Each attempt is bounded from [`MANAGED_ATTEMPT_FIRST`] up,
-    /// within the one [`MANAGED_MUTATION_DEADLINE`] that roster reads,
-    /// reconnects, attempts and backoff share. When the deadline passes first,
-    /// the caller gets [`LaserError::AmbiguousMutation`] naming the identity:
-    /// the mutation may still apply.
+    /// ambiguous. Each attempt walks the roster once and is bounded from
+    /// [`MANAGED_ATTEMPT_FIRST`] up, within the one [`MANAGED_DEADLINE`] that
+    /// roster reads, reconnects, attempts and backoff share. When the deadline
+    /// passes first, the caller gets [`LaserError::AmbiguousMutation`] naming
+    /// the identity: the mutation may still apply.
     async fn send_managed_mutation(
         &self,
         code: u32,
@@ -1411,8 +1474,8 @@ impl Laser {
         frame: Vec<u8>,
         target: Target,
     ) -> Result<(Vec<u8>, Option<u8>), LaserError> {
-        let deadline = tokio::time::Instant::now() + MANAGED_MUTATION_DEADLINE;
-        let mut delay = crate::retry::MANAGED_MUTATION.base;
+        let deadline = tokio::time::Instant::now() + MANAGED_DEADLINE;
+        let mut delay = crate::retry::MANAGED_RETRY.base;
         let mut bound = MANAGED_ATTEMPT_FIRST;
         let mut attempts = MutationAttempts::for_code(code);
         loop {
@@ -1454,7 +1517,7 @@ impl Laser {
                     operation_id: Some(operation_id),
                     message: format!(
                         "operation {operation_id:032x} outcome is still unknown after {}s: {unknown}",
-                        MANAGED_MUTATION_DEADLINE.as_secs()
+                        MANAGED_DEADLINE.as_secs()
                     ),
                 });
             }
@@ -1466,9 +1529,7 @@ impl Laser {
                 "managed mutation outcome unknown, repeating it under the same identity"
             );
             sleep(wait).await;
-            delay = delay
-                .saturating_mul(2)
-                .min(crate::retry::MANAGED_MUTATION.max);
+            delay = delay.saturating_mul(2).min(crate::retry::MANAGED_RETRY.max);
             bound = bound.saturating_mul(2);
         }
     }
@@ -2510,6 +2571,9 @@ mod announcement_tests {
     }
 }
 
+const CONNECTION_STRING_VARIABLE: &str = "LASER_CONNECTION_STRING";
+pub(crate) const STREAM_VARIABLE: &str = "LASER_STREAM";
+
 // Apache Iggy's default ports. A connection string or address may omit the port.
 const DEFAULT_TCP_PORT: u16 = 8090;
 const DEFAULT_QUIC_PORT: u16 = 8080;
@@ -2753,6 +2817,19 @@ fn placeholder_login(normalized: &str) -> Result<(Userinfo, String), LaserError>
         decode_userinfo(userinfo)?,
         format!("{scheme}laser@{}", &rest[authority..]),
     ))
+}
+
+// The connection string and default stream `connect_env` dials. An explicit
+// stream wins over `LASER_STREAM`, and an empty variable counts as unset.
+fn env_connection(
+    read: impl Fn(&str) -> Option<String>,
+    stream: Option<&str>,
+) -> Result<(String, Option<String>), LaserError> {
+    let read = |name: &str| read(name).filter(|value| !value.is_empty());
+    let connection = read(CONNECTION_STRING_VARIABLE)
+        .ok_or(LaserError::Config("LASER_CONNECTION_STRING is not set"))?;
+    let stream = stream.map(str::to_owned).or_else(|| read(STREAM_VARIABLE));
+    Ok((connection, stream))
 }
 
 // Split off the scheme and the transport it names. A string with no scheme
@@ -5151,6 +5228,66 @@ mod mutation_attempt_tests {
                 .settle(Attempt::Answered(applied.clone()))
                 .expect("a durable outcome resolves it"),
             Some(applied)
+        );
+    }
+}
+
+#[cfg(test)]
+mod connect_env_tests {
+    use super::env_connection;
+    use crate::error::LaserError;
+    use std::collections::HashMap;
+
+    const CONNECTION_STRING: &str = "iggy:iggy@127.0.0.1:8090";
+
+    #[test]
+    fn given_a_stream_when_connecting_from_env_then_should_pin_it_over_laser_stream() {
+        let variables = HashMap::from([
+            ("LASER_CONNECTION_STRING", CONNECTION_STRING),
+            ("LASER_STREAM", "from-env"),
+        ]);
+        let read = |name: &str| variables.get(name).map(|value| (*value).to_owned());
+
+        assert_eq!(
+            env_connection(read, Some("picked")).expect("a connection string is set"),
+            (CONNECTION_STRING.to_owned(), Some("picked".to_owned()))
+        );
+        assert_eq!(
+            env_connection(read, None).expect("a connection string is set"),
+            (CONNECTION_STRING.to_owned(), Some("from-env".to_owned()))
+        );
+    }
+
+    #[test]
+    fn given_no_connection_string_when_connecting_from_env_with_a_stream_then_should_raise_config_error()
+     {
+        assert!(matches!(
+            env_connection(|_| None, Some("picked")),
+            Err(LaserError::Config("LASER_CONNECTION_STRING is not set"))
+        ));
+    }
+
+    #[test]
+    fn given_an_empty_connection_string_when_connecting_from_env_then_should_raise_config_error() {
+        let read = |name: &str| (name == "LASER_CONNECTION_STRING").then(String::new);
+
+        assert!(matches!(
+            env_connection(read, None),
+            Err(LaserError::Config("LASER_CONNECTION_STRING is not set"))
+        ));
+    }
+
+    #[test]
+    fn given_an_empty_stream_when_connecting_from_env_then_should_leave_no_default_stream() {
+        let variables = HashMap::from([
+            ("LASER_CONNECTION_STRING", CONNECTION_STRING),
+            ("LASER_STREAM", ""),
+        ]);
+        let read = |name: &str| variables.get(name).map(|value| (*value).to_owned());
+
+        assert_eq!(
+            env_connection(read, None).expect("a connection string is set"),
+            (CONNECTION_STRING.to_owned(), None)
         );
     }
 }

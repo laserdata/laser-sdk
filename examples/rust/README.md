@@ -74,12 +74,12 @@ Each example uses `laser-<example>-rust` unless `LASER_STREAM` supplies a name, 
 
 ## Copy a whole program
 
-`workflow` and `memory-correction` use only `laser-sdk`, `tokio`, `serde` and `serde_json`, with no helper from this crate, so each `main.rs` runs when copied into a new project. Each reads `LASER_CONNECTION_STRING` through `Laser::connect_env()`, works in a scratch stream, and deletes it at the end. A new project adds `cargo add laser-sdk --features agent,kv`, `cargo add tokio --features macros,rt-multi-thread`, `cargo add serde --features derive`, and `cargo add serde_json`.
+`workflow` and `memory-correction` use only `laser-sdk`, `tokio` and `serde_json`, plus `serde` for the memory program, with no helper from this crate, so each `main.rs` runs when copied into a new project. Each reads `LASER_CONNECTION_STRING` through `Laser::connect_env()`. `workflow` runs on the stream named by `LASER_STREAM`, or on a stream named `pipeline` after the workflow, and keeps it after the run so the run can be resumed. `memory-correction` works in a scratch stream and deletes it at the end. A new project adds `cargo add laser-sdk`, `cargo add tokio --features macros,rt-multi-thread,time`, `cargo add serde_json`, and `cargo add serde --features derive`. A program that only streams trims the build with `default-features = false, features = ["streaming"]`.
 
 | binary | shows | run |
 | --- | --- | --- |
-| [`workflow`](src/workflow/README.md) | three in-process steps, journaled and resumable, with the outcome printed as JSON | `cargo run --example workflow` |
-| [`memory-correction`](src/memory-correction/README.md) | two facts for one user, a `supersede` in a later conversation, and a recall of the current facts | `cargo run --example memory-correction` |
+| [`workflow`](src/workflow/README.md) | three steps in an async closure with `run_with`, journaled and resumable, with the outcome printed as JSON | `cargo run --example workflow` |
+| [`memory-correction`](src/memory-correction/README.md) | three facts for one user, a `supersede` in a later conversation, and a recall of the current facts printed as JSON | `cargo run --example memory-correction` |
 
 ## Primitives: start here
 

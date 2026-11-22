@@ -4,11 +4,13 @@ use iggy::prelude::{StreamClient, StreamCreateOptions};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 impl Laser {
-    /// Create a uniquely named stream for one program run, `{prefix}-` and
-    /// eight lowercase hex characters, and return it with a handle whose
-    /// default stream it is. A stream of that name that already exists is
-    /// refused, never reused. Call [`ScratchStream::delete`] when the run
-    /// ends. Dropping the handle deletes it too, best effort.
+    /// Await it for a uniquely named stream for one program run, `{prefix}-`
+    /// and eight lowercase hex characters, with a handle whose default stream
+    /// it is ([`ScratchStream::laser`]). A stream of that name that already
+    /// exists is refused, never reused. Call [`ScratchStream::delete`] when the
+    /// run ends. Dropping the handle deletes it too, best effort. Use a named
+    /// stream (`LASER_STREAM` or [`with_default_stream`](Laser::with_default_stream))
+    /// to keep what the program writes.
     pub async fn scratch_stream(
         &self,
         prefix: impl AsRef<str>,

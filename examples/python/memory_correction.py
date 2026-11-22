@@ -1,38 +1,37 @@
-"""memory_correction: replace a fact for one user, then recall the current facts.
-
-The first conversation stores two facts about a user. A later conversation
-corrects one of them with `supersede`, which remembers the new fact and forgets
-the old one in every conversation. Recall for the user reads every conversation
-and returns the correction at once. It copies alone: it imports only the SDK.
-
-Recall reads the managed memory view on LaserData Cloud and Laser Stack, and
-folds the memory topic in process on Apache Iggy, which serves no view.
-
-Run it:
-    LASER_CONNECTION_STRING='<connection string>' python3 memory_correction.py
-
-Docs: https://docs.laserdata.com/laser-sdk/memory
-"""
-
+# python -m pip install laser-sdk
+# Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
 import asyncio
 import json
 
-from laser_sdk import Laser, new_conversation_id
+import laser_sdk as ls
+
+USER = "user-42"
+QUERY = "Where does the user live, and what should I know before booking dinner?"
 
 
-async def main() -> None:
-    async with await Laser.connect_env() as laser:
-        async with laser.scratch_stream("memory-demo") as scratch:
+async def main():
+    async with await ls.Laser.connect_env() as root:
+        async with root.scratch_stream("memory") as scratch:
             memory = scratch.laser.memory("assistant")
-            first = new_conversation_id()
-            home = await memory.remember("Sam lives in Berlin", user="sam", conversation=first)
-            await memory.remember("Sam is allergic to peanuts", user="sam", conversation=first)
-            await memory.supersede(
-                home, "Sam lives in Amsterdam", user="sam", conversation=new_conversation_id()
+
+            # Conversation 1: the user shares three facts.
+            first = ls.new_conversation_id()
+            city = await memory.remember("Lives in Gdansk", conversation=first, user=USER)
+            await memory.remember("Allergic to peanuts", conversation=first, user=USER)
+            await memory.remember("Prefers a window seat", conversation=first, user=USER)
+
+            # Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+            second = ls.new_conversation_id()
+            await memory.supersede(city, "Lives in Lisbon", conversation=second, user=USER)
+
+            # Recall for the user across every conversation.
+            facts = await memory.recall(user=USER, semantic=QUERY, limit=10)
+            print(
+                json.dumps(
+                    {"user": USER, "query": QUERY, "facts": [fact.text() for fact in facts]},
+                    indent=2,
+                )
             )
-            facts = await memory.recall(user="sam", semantic="where does Sam live")
-    print(json.dumps([item.text() for item in facts], indent=2))
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())

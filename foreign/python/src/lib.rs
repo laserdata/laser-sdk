@@ -51,6 +51,7 @@ mod transport;
 mod typed;
 mod watch;
 mod workflow;
+mod workflow_function;
 
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
@@ -62,6 +63,84 @@ pub use errors::exception_stub;
 
 // A debug build overflows Tokio's 2 MiB worker stack on a routed workflow compensation.
 const RUNTIME_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+// `help(laser_sdk)` and `laser_sdk.__doc__` show it, and the stub carries it.
+const PACKAGE_DOC: &str = r#"Laser SDK: durable workflows, long-term agent memory and sessions on one log, over Apache Iggy.
+
+Connect with the connection string in LASER_CONNECTION_STRING. With that
+variable set, a program needs no Docker and no local server.
+
+Workflow. Decorate plain functions with @ls.step and @ls.workflow. A step takes
+and returns what JSON holds. The run connects by itself, closes its connection
+when it ends, and uses LASER_STREAM or a stream named after the workflow, which
+stays after the run. `run()` returns a WorkflowOutcome: run_id, status
+("completed"), completed_steps in completion order, value (what the workflow
+function returned), outputs (label to bytes), json(label), text(label).
+`resume(run_id)` returns the recorded value of a finished step without calling
+it again. Laser.workflow(name).step(...) is the builder for steps routed to
+agents, verifiers, compensation and budgets.
+
+    import json
+    import laser_sdk as ls
+
+    @ls.step
+    def ingest():
+        return "frames from sat-7"
+
+    @ls.step
+    def analyze(frames):
+        return f"analyzed {frames}"
+
+    @ls.workflow
+    def pipeline():
+        return analyze(ingest())
+
+    run = pipeline.run()
+    print(json.dumps({"status": run.status, "steps": run.completed_steps, "report": run.value}))
+
+Memory and sessions run on a client. Every call that reaches the server returns
+an awaitable, so await it. `memory(...)` and `sessions(...)` return at once. A
+scratch stream is deleted when its block ends, so a second run prints the same:
+
+    import asyncio, json
+    import laser_sdk as ls
+
+    async def main():
+        async with await ls.Laser.connect_env() as root:
+            async with root.scratch_stream("demo") as scratch:
+                laser = scratch.laser
+                ...  # one of the programs below
+
+    asyncio.run(main())
+
+Without a scratch stream, pick one when connecting, `ls.Laser.connect_env(stream="telemetry")`,
+or a call that needs a default stream raises NoStreamError.
+
+Memory. remember returns the fact's id. supersede stores a correction and
+forgets the old fact in every conversation. recall returns a list of
+MemoryItem (item.text(), item.id), ranked by the words they share with
+`semantic`, newest first among equals:
+
+    memory = laser.memory("assistant")
+    city = await memory.remember("Lives in Gdansk", conversation=ls.new_conversation_id(), user="user-42")
+    await memory.supersede(city, "Lives in Lisbon", conversation=ls.new_conversation_id(), user="user-42")
+    facts = await memory.recall(user="user-42", semantic="Where does the user live?", limit=10)
+    print(json.dumps([fact.text() for fact in facts]))
+
+Session. A session records model calls, tool calls and state on the log:
+
+    sessions = laser.sessions()
+    await sessions.bootstrap()
+    async with sessions.start().agent("triage") as session:
+        tool = await session.tool("read_metrics", {"host": "node-7"})
+        await tool.complete("cache hit rate 41%")
+
+Docs: https://docs.laserdata.com/laser-sdk
+Context7: https://context7.com/laserdata/laser-sdk
+
+Install it and print this summary:
+
+    python -m pip install laser-sdk && python -c "import laser_sdk; print(laser_sdk.__doc__)""#;
 
 // The Iggy producer warns that its client has been shut down whenever a Laser
 // closes, because every cached producer watches the client it publishes
@@ -124,6 +203,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
         .thread_stack_size(RUNTIME_THREAD_STACK_BYTES);
     async_runtime::init(runtime);
     errors::register(py, module)?;
+    module.add("__doc__", PACKAGE_DOC)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     client::register_constants(module)?;
     module.add_class::<client::PyLaser>()?;
@@ -371,6 +451,10 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<workflow::PyWorkflowOutcome>()?;
     module.add_class::<workflow::PyWorkflow>()?;
     module.add_class::<workflow::PyWorkflowBudget>()?;
+    module.add_class::<workflow_function::PyStep>()?;
+    module.add_class::<workflow_function::PyWorkflowFunction>()?;
+    module.add_function(wrap_pyfunction!(workflow_function::step, module)?)?;
+    module.add_function(wrap_pyfunction!(workflow_function::workflow, module)?)?;
     module.add_class::<rbac::PyGrant>()?;
     module.add_class::<rbac::PyRole>()?;
     module.add_class::<rbac::PyResourcePattern>()?;
@@ -690,6 +774,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 define_stub_info_gatherer!(stub_info);
+pyo3_stub_gen::module_doc!("laser_sdk", "{}", PACKAGE_DOC);
 
 #[cfg(test)]
 mod tests {

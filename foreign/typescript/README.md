@@ -4,60 +4,67 @@ This package provides the native TypeScript Laser SDK for Apache Iggy. [LaserDat
 
 This package needs Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> This source tree is the `0.10.2` release. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+> This source tree is the `0.11.0` release. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 ## Start here
 
-In a new directory, run `npm init -y && npm pkg set type=module && npm install @laserdata/laser-sdk tsx`, set `LASER_CONNECTION_STRING`, save either program as `main.ts`, and run it with `npx tsx main.ts`. The programs use top-level `await`, so the project must be an ES module. Each one creates a scratch stream with a unique name, prints its result as JSON, and deletes the stream when it ends.
+In a new directory, run `npm install @laserdata/laser-sdk tsx`, save either program as `main.mts`, and run it with `npx tsx main.mts`. With `LASER_CONNECTION_STRING` set, a program needs no Docker and no local server. Then there is no server to start. Each one prints its result as JSON. The workflow runs on the stream named by `LASER_STREAM`, or on a stream named after the workflow, and keeps that stream after the run so the run can be resumed. The memory program creates a scratch stream with a unique name and deletes it when it ends. To keep what the memory program writes, connect with `Laser.connectEnvWithStream(name)` or call `withDefaultStream(name)` instead of opening a scratch stream. The guides are at [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk) and on [Context7](https://context7.com/laserdata/laser-sdk).
 
-A durable workflow of three steps whose bodies run in this process. The run journals every completed step and creates the agent topics it needs, so it needs no `bootstrap`, agent, or handler. `.runId(outcome.runId)` on the same workflow resumes the run and skips every recorded step:
+A durable workflow of three plain functions. `step(name, fn)` makes a function a step, `workflow(name, fn)` makes a function a workflow, and the workflow calls its steps in ordinary code. `pipeline.run()` connects, runs the function, closes the connection, and resolves to the `WorkflowOutcome`. Calling `pipeline()` resolves to the function's value instead. A step takes and returns what JSON holds. Each completed step is journaled, so `pipeline.resume(runId)` returns the recorded value without running that step again, and it must call the same steps in the same order. A step name holding `#` is refused, because the journal numbers repeated calls with it. For steps routed to agents, verifiers, compensation and budgets, use the builder, `laser.workflow(name).step(...)`, with `stepLocal` for its in-process steps.
 
 ```ts
-import { Laser } from "@laserdata/laser-sdk"
+// npm install @laserdata/laser-sdk tsx
+// Run with: npx tsx main.mts
+// Needs only LASER_CONNECTION_STRING. No server to start when it is set.
+import { setTimeout as sleep } from "node:timers/promises"
+import { step, workflow } from "@laserdata/laser-sdk"
 
-await using laser = await Laser.connectEnv()
-await using scratch = await laser.scratchStream("workflow-demo")
-const outcome = await scratch.laser
-  .workflow("job-runner")
-  .stepLocal("create", () => "job-42")
-  .stepLocal(
-    "process",
-    ({ outputs }) => `processed ${new TextDecoder().decode(outputs.get("create"))}`
-  )
-  .after("create")
-  .stepLocal("finish", () => "completed")
-  .after("process")
-  .run()
-const report = {
-  runId: outcome.runId.toString(),
-  status: outcome.status,
-  completedSteps: outcome.completedSteps,
-  outputs: Object.fromEntries(outcome.completedSteps.map((label) => [label, outcome.text(label)]))
-}
-console.log(JSON.stringify(report, null, 2))
+const ingest = step("ingest", () => "frames from sat-7")
+const analyze = step("analyze", async (frames: string) => {
+  await sleep(1000)
+  return `analyzed ${frames}`
+})
+const report = step("report", (analysis: string) => `report on ${analysis}`)
+
+const pipeline = workflow("pipeline", async () => report(await analyze(await ingest())))
+
+const run = await pipeline.run()
+console.log(JSON.stringify({ status: run.status, steps: run.completedSteps, report: run.value }))
 ```
 
-A memory correction for one user. `supersede` remembers the new fact and forgets the old one in every conversation. Recall waits until the memory view shows this connection's own writes and ranks every fact of the user by the words it shares with the question:
+It prints `{"status":"completed","steps":["ingest","analyze","report"],"report":"report on analyzed frames from sat-7"}`. The `WorkflowOutcome` also carries `runId`, `value` (what the workflow function returned), `outputs`, each step's output by label as bytes, `json(label)`, and `text(label)`. A step that throws ends the run as failed and the same error reaches the caller, with no outcome to read the run ID from, so a caller that wants to resume a failed run names the run ID first with `pipeline.resume(runId)`. The completed steps stay journaled, so that resume runs the failed step and what follows it.
+
+A memory correction for one user. `supersede` remembers the new fact and forgets the old one in every conversation. Recall waits until the memory view shows this connection's own writes and ranks every fact of the user by the words it shares with the question, newest first among equals:
 
 ```ts
+// npm install @laserdata/laser-sdk tsx
+// Run with: npx tsx main.mts
+// Needs only LASER_CONNECTION_STRING, which connectEnv() reads. No server to start when it is set.
 import { ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
 
-await using laser = await Laser.connectEnv()
-await using scratch = await laser.scratchStream("memory-demo")
+const user = "user-42"
+const query = "Where does the user live, and what should I know before booking dinner?"
+
+await using root = await Laser.connectEnv()
+await using scratch = await root.scratchStream("memory")
 const memory = scratch.laser.memory("assistant")
+
+// Conversation 1: the user shares three facts.
 const first = ConversationId.new()
-const home = await memory.remember("Sam lives in Berlin").scope(first).user("sam").send()
-await memory.remember("Sam is allergic to peanuts").scope(first).user("sam").send()
-await memory
-  .supersede(home, "Sam lives in Amsterdam")
-  .scope(ConversationId.new())
-  .user("sam")
-  .send()
-const facts = await memory.recall().user("sam").semantic("where does Sam live").fetch()
-console.log(JSON.stringify(facts.map(memoryItemText), null, 2))
+const city = await memory.remember("Lives in Gdansk").scope(first).user(user).send()
+await memory.remember("Allergic to peanuts").scope(first).user(user).send()
+await memory.remember("Prefers a window seat").scope(first).user(user).send()
+
+// Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+const second = ConversationId.new()
+await memory.supersede(city, "Lives in Lisbon").scope(second).user(user).send()
+
+// Recall for the user across every conversation.
+const facts = await memory.recall().user(user).semantic(query).limit(10).fetch()
+console.log(JSON.stringify({ user, query, facts: facts.map(memoryItemText) }, null, 2))
 ```
 
-Both programs run against plain Apache Iggy, Laser Stack, and LaserData Cloud: a deployment that serves no managed memory view folds the memory topic in process for the same recall. Both programs are the standalone [`workflow`](../../examples/typescript/src/workflow/main.ts) and [`memory-correction`](../../examples/typescript/src/memory-correction/main.ts) examples.
+It prints `{"user": "user-42", "query": "Where does the user live, and what should I know before booking dinner?", "facts": ["Lives in Lisbon", "Prefers a window seat", "Allergic to peanuts"]}`. Gdansk is gone. Both programs run against plain Apache Iggy, Laser Stack, and LaserData Cloud: a deployment that serves no managed memory view folds the memory topic in process for the same recall. Both programs are the standalone [`workflow`](../../examples/typescript/src/workflow/main.ts) and [`memory-correction`](../../examples/typescript/src/memory-correction/main.ts) examples.
 
 **Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.com/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 

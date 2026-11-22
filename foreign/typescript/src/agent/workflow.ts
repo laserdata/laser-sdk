@@ -1,3 +1,6 @@
+import { AsyncLocalStorage } from "node:async_hooks"
+import { sha256 } from "@noble/hashes/sha2.js"
+import { bytesToHex } from "@noble/hashes/utils.js"
 import { breachError, exceededBreach } from "./budget.js"
 import { decodeUtf8, ownedBytes, utf8, type BytesLike } from "../client/bytes.js"
 import { throwIfAborted } from "../client/call-options.js"
@@ -42,6 +45,12 @@ export const WORKFLOW_FENCE_NAMESPACE = "agdx.workflow.fence"
 // a crashed run left behind instead of failing the step.
 const WORKFLOW_LEASE_TTL_MS = 15_000
 const LEASE_RETRY_INTERVAL_MS = 500
+const CURRENT_RUN = new AsyncLocalStorage<WorkflowRun>()
+const STEP_CALL_SEPARATOR = "#"
+const STEP_INPUT_DIGEST_CHARS = 32
+const STEP_SETTLE_GRACE_MS = 5_000
+const LASER_STREAM_VARIABLE = "LASER_STREAM"
+const MAX_STREAM_NAME_BYTES = 255
 
 export class WorkflowBudget {
   /** @internal */
@@ -82,14 +91,28 @@ export class WorkflowBudget {
 }
 
 export interface StepContext {
+  /** Every earlier step's output by label, as bytes. */
   readonly outputs: ReadonlyMap<string, Uint8Array>
 }
 
 /** A step body: a routed step's command payload, or a local step's output.
- * Text becomes its UTF-8 bytes. */
+ * A plain function or an async function, returning a string or bytes
+ * directly or as a promise. Text becomes its UTF-8 bytes. */
 export type StepFn = (context: StepContext) => BytesLike | string | Promise<BytesLike | string>
 export type Verifier = (output: Uint8Array) => boolean | Promise<boolean>
 export type OnTimeout = "fail" | "reassign"
+
+// A completed step of a replayed journal, with its call number and the digest of its arguments.
+interface RecordedStep {
+  readonly label: string
+  readonly input: string | undefined
+  readonly output: Uint8Array
+}
+
+// What a run knows about a step call: the record it answers from, or the label it is due under.
+type StepCall =
+  | { readonly kind: "recorded"; readonly label: string; readonly output: Uint8Array }
+  | { readonly kind: "due"; readonly label: string; readonly call: number }
 
 // A step without a target runs its body in process.
 interface Step {
@@ -109,15 +132,51 @@ interface Step {
  * completion order (a resumed run's journaled steps first), the run session's
  * end status, and the run id. A failed, canceled, or over-budget run throws
  * instead, so `status` reads `completed`. */
-export interface WorkflowOutcome {
+export interface WorkflowOutcome<Value = undefined> {
+  /** The workflow function's return value, `undefined` for a builder run. */
+  readonly value: Value
+  /** Each completed step's output by label, as bytes. */
   readonly outputs: ReadonlyMap<string, Uint8Array>
+  /** The completed step labels, in completion order. */
   readonly completedSteps: readonly string[]
+  /** The run's end status, `completed` for a returned outcome. */
   readonly status: SessionStatus
+  /** The run id, which resumes the same run when passed to `Workflow.runId`. */
   readonly runId: ConversationId
   /** The output of step `label` as UTF-8 text, invalid sequences replaced,
    * or `undefined` for a label that did not complete. */
   text(label: string): string | undefined
+  /** The output of step `label` decoded as JSON, or `undefined` for a label
+   * that did not complete. */
+  json(label: string): unknown
 }
+
+/** What a value of type `T` reads as after a JSON round trip. */
+export type JsonRoundTrip<T> = unknown extends T
+  ? T
+  : T extends string | number | boolean | null
+    ? T
+    : T extends { toJSON(): infer Json }
+      ? JsonRoundTrip<Json>
+      : T extends readonly unknown[]
+        ? {
+            -readonly [Index in keyof T]: undefined extends T[Index]
+              ? JsonRoundTrip<Exclude<T[Index], undefined>> | null
+              : JsonRoundTrip<T[Index]>
+          }
+        : T extends bigint | symbol | undefined | ((...args: never[]) => unknown)
+          ? never
+          : T extends ReadonlyMap<unknown, unknown> | ReadonlySet<unknown> | ArrayBufferView
+            ? never
+            : {
+                -readonly [Key in keyof T as undefined extends T[Key] ? never : Key]: JsonRoundTrip<
+                  T[Key]
+                >
+              } & {
+                -readonly [
+                  Key in keyof T as undefined extends T[Key] ? Key : never
+                ]?: JsonRoundTrip<Exclude<T[Key], undefined>>
+              }
 
 /** One workflow-journal record, keyed on the log by the run id. The encoding
  * matches the Rust engine, so either client resumes a run the other started.
@@ -135,6 +194,7 @@ export type JournalEntry =
       readonly label: string
       readonly output: Uint8Array
       readonly agents: readonly string[]
+      readonly input?: string
     }
   | { readonly kind: "stepCompensated"; readonly label: string }
 
@@ -151,6 +211,7 @@ export interface Journal {
   readonly started: boolean
   readonly records: number
   readonly outputs: Map<string, Uint8Array>
+  readonly inputs: Map<string, string>
   readonly agents: Map<string, readonly AgentId[]>
   readonly inFlight: Map<string, InFlight>
   readonly attempts: Map<string, number>
@@ -211,6 +272,7 @@ export function decodeJournalEntry(payload: Uint8Array): JournalEntry {
     return { kind: "stepCompensated", label: field.requiredString(compensated, "label", context) }
   }
   const completed = field.requiredMap(outer, "StepCompleted", context)
+  const input = completed.get("input")
   return {
     kind: "stepCompleted",
     label: field.requiredString(completed, "label", context),
@@ -218,7 +280,8 @@ export function decodeJournalEntry(payload: Uint8Array): JournalEntry {
     agents: field.requiredArray(completed, "agents", context, (item) => {
       if (typeof item !== "string") throw new InvalidError(`${context} agent must be a string`)
       return item
-    })
+    }),
+    ...(typeof input === "string" ? { input } : {})
   }
 }
 
@@ -248,7 +311,8 @@ export function encodeJournalEntry(entry: JournalEntry): Uint8Array {
             new Map<string, unknown>([
               ["label", entry.label],
               ["output", entry.output],
-              ["agents", [...entry.agents]]
+              ["agents", [...entry.agents]],
+              ...(entry.input === undefined ? [] : [["input", entry.input] as const])
             ])
           ]
         ])
@@ -264,6 +328,7 @@ export function foldJournal(entries: Iterable<JournalEntry>): Journal {
   let started = false
   let records = 0
   const outputs = new Map<string, Uint8Array>()
+  const inputs = new Map<string, string>()
   const agents = new Map<string, readonly AgentId[]>()
   const inFlight = new Map<string, InFlight>()
   const attempts = new Map<string, number>()
@@ -290,15 +355,18 @@ export function foldJournal(entries: Iterable<JournalEntry>): Journal {
           })
         )
         outputs.set(entry.label, entry.output)
+        if (entry.input === undefined) inputs.delete(entry.label)
+        else inputs.set(entry.label, entry.input)
         break
       case "stepCompensated":
         inFlight.delete(entry.label)
         agents.delete(entry.label)
         outputs.delete(entry.label)
+        inputs.delete(entry.label)
         break
     }
   }
-  return { started, records, outputs, agents, inFlight, attempts }
+  return { started, records, outputs, inputs, agents, inFlight, attempts }
 }
 
 // Rust writes a byte field as an array of integers, TypeScript as a byte
@@ -373,6 +441,28 @@ export function topologicalOrder(
   return order
 }
 
+/** A journaled workflow from `laser.workflow(name)`, returned at once. Chain
+ * `stepLocal` or `step` calls, then await `run()` for a `WorkflowOutcome`:
+ *
+ * ```ts
+ * const outcome = await laser
+ *   .workflow("pipeline")
+ *   .stepLocal("ingest", () => "frames from sat-7")
+ *   .stepLocal("analyze", async ({ outputs }) => {
+ *     await new Promise((resolve) => setTimeout(resolve, 1000))
+ *     return `analyzed ${new TextDecoder().decode(outputs.get("ingest"))}`
+ *   })
+ *   .after("ingest")
+ *   .run()
+ * console.log(outcome.status, outcome.completedSteps, outcome.text("analyze"))
+ * ```
+ *
+ * A step's body is a plain function or an async function. It gets the
+ * earlier outputs by label as bytes and returns a string or bytes. Steps run
+ * in the order `after` declares, a routed step sends its task to an agent
+ * instead, and each step can carry a verifier panel, exclusivity (a fenced
+ * at-most-once effect), an on-timeout policy, and a compensation (the saga
+ * rollback). `budget` caps the run. */
 export class Workflow {
   private budgetValue = WorkflowBudget.unlimited()
   private route: InboxRoute = ADVERTISED_INBOX_ROUTE
@@ -380,7 +470,7 @@ export class Workflow {
   private readonly steps: Step[] = []
 
   private constructor(
-    private readonly laser: Laser,
+    private laser: Laser,
     private readonly name: string
   ) {}
 
@@ -427,7 +517,11 @@ export class Workflow {
   }
 
   /** Add a step whose body `run` runs in this process: its result is the
-   * step output, journaled like a routed step's reply, so a resumed run skips
+   * step output, so the step needs no agent. `run` is a plain function or an
+   * async function, gets `{ outputs }` with every earlier step's output by
+   * label as bytes, and returns a string or bytes, directly or as a promise.
+   * `WorkflowOutcome.text(label)` decodes one output. The output is
+   * journaled like a routed step's reply, so a resumed run skips
    * it once recorded and runs it again when it stopped before its record. It
    * runs inside the step deadline, a compensation of it runs in process too,
    * and it cannot be exclusive. */
@@ -445,7 +539,9 @@ export class Workflow {
     return StepHandle.create(this, step)
   }
 
-  /** Run the workflow to completion, returning each step's output. A step
+  /** Await it to run the workflow to completion: it resolves to a
+   * `WorkflowOutcome` with `runId`, `status` (`completed`), `completedSteps`
+   * in completion order, `outputs` (label to bytes), and `text(label)`. A step
    * that does not complete throws `StepFailedError` after the compensations
    * of the steps with an effect ran in reverse. A misconfigured workflow (a
    * duplicate label, a broadcast step, an exclusive all-capable step,
@@ -469,48 +565,131 @@ export class Workflow {
     const runId = this.resumeId ?? ConversationId.new()
     this.resumeId = runId
     const journal = await this.replay(runId, resumed)
-    const tokens = this.budgetValue.tokenLimit
-    // A run id the caller named may name a run that already ended completed
-    // or failed, which a resume reopens. A canceled run stays ended.
-    const open = (): Promise<{ readonly session: Session; readonly lease: SessionLease }> => {
-      let builder = this.laser.sessions().start().withId(runId).agent(source)
-      if (tokens !== undefined) builder = builder.budget({ tokens })
-      return resumed ? builder.resume() : builder.begin()
-    }
-    let begun: { readonly session: Session; readonly lease: SessionLease }
-    try {
-      begun = await open()
-    } catch (error) {
-      // A stream without agent topics gets them with the bootstrap defaults.
-      if (!isMissingLane(error)) throw error
-      await this.laser.bootstrap()
-      begun = await open()
-    }
-    const { session, lease } = begun
+    const { session, lease } = await this.openSession(source, runId, resumed)
     try {
       let outcome: WorkflowOutcome
       try {
         outcome = await this.execute(source, order, runId, session, journal, options.signal)
       } catch (error) {
-        try {
-          if (error instanceof CancelledError) await session.cancel()
-          else if (error instanceof BudgetExceededError) {
-            await session.failOverBudget(exceededBreach(error.ceiling, error.spent))
-          } else
-            await session.fail({
-              code: { kind: "known", name: "Internal" },
-              message: error instanceof Error ? error.message : String(error),
-              retryable: error instanceof StepFailedError && error.reason === "timed_out"
-            })
-        } catch {
-          // The run's error wins over a lifecycle error.
-        }
+        await endFailed(session, error)
         throw error
       }
       await session.end()
       return outcome
     } finally {
       lease.release()
+    }
+  }
+
+  /** Run `body` as this workflow and resolve to its outcome, with `value` set
+   * to what `body` returned. Without a default stream on the client the run
+   * uses `LASER_STREAM`, else a stream named after the workflow. */
+  async runWith<Result>(
+    body: (run: WorkflowRun) => Result,
+    options: { readonly signal?: AbortSignal } = {}
+  ): Promise<WorkflowOutcome<Awaited<Result>>> {
+    throwIfAborted(options.signal, "workflow run")
+    if (this.steps.length > 0) {
+      throw new InvalidError(
+        `workflow \`${this.name}\` declares builder steps, so it cannot run a body: use the builder steps or runWith, not both`
+      )
+    }
+    this.laser = this.streamClient()
+    const source = AgentId.new(this.name)
+    const resumed = this.resumeId !== undefined
+    const runId = this.resumeId ?? ConversationId.new()
+    this.resumeId = runId
+    const journal = await this.replay(runId, resumed)
+    const { session, lease } = await this.openSession(source, runId, resumed)
+    try {
+      const started = performance.now()
+      const cancelRequests = new WeakSet<CancelledError>()
+      let invocations = 0
+      const run = WorkflowRun.create(
+        runId,
+        journal.outputs,
+        journal.inputs,
+        async () => {
+          throwIfAborted(options.signal, "workflow run")
+          try {
+            await this.boundary(session, runId, started, undefined)
+          } catch (error) {
+            if (error instanceof CancelledError) cancelRequests.add(error)
+            throw error
+          }
+          invocations += 1
+          this.checkBudget(invocations, 0n, started)
+        },
+        (label, input, output) =>
+          this.record(runId, {
+            kind: "stepCompleted",
+            label,
+            output,
+            agents: [],
+            ...(input === undefined ? {} : { input })
+          })
+      )
+      let value: Awaited<Result>
+      try {
+        if (!journal.started) {
+          await this.record(runId, { kind: "runStarted", workflow: this.name })
+        }
+        value = await CURRENT_RUN.run(run, () => body(run))
+        await run.settle()
+      } catch (error) {
+        // Decided before the settle. An aborted run writes no terminal state, as a stopped
+        // process, so a resume continues it.
+        const aborted =
+          options.signal?.aborted === true ||
+          (error instanceof CancelledError && !cancelRequests.has(error) && run.stepAborted(error))
+        await run.settle()
+        if (!aborted) await endFailed(session, error)
+        throw error
+      }
+      await session.end()
+      return workflowOutcome(runId, new Map(journal.outputs), value)
+    } finally {
+      lease.release()
+    }
+  }
+
+  // The client's default stream, `LASER_STREAM`, then the workflow's own name.
+  private streamClient(): Laser {
+    if (this.laser.defaultStream !== undefined) return this.laser
+    const configured = process.env[LASER_STREAM_VARIABLE]
+    if (configured !== undefined && configured.length > 0) {
+      return this.laser.withDefaultStream(configured)
+    }
+    const nameBytes = utf8(this.name).byteLength
+    if (nameBytes === 0 || nameBytes > MAX_STREAM_NAME_BYTES) {
+      throw new InvalidError(
+        `workflow name \`${this.name}\` cannot name a stream: set ${LASER_STREAM_VARIABLE}, pass the stream option, or give the client a default stream`
+      )
+    }
+    return this.laser.withDefaultStream(this.name)
+  }
+
+  // The run session, new or reopened. A run id the caller named may name a run
+  // that already ended completed or failed, which a resume reopens. A canceled
+  // run stays ended.
+  private async openSession(
+    source: AgentId,
+    runId: ConversationId,
+    resumed: boolean
+  ): Promise<{ readonly session: Session; readonly lease: SessionLease }> {
+    const tokens = this.budgetValue.tokenLimit
+    const open = (): Promise<{ readonly session: Session; readonly lease: SessionLease }> => {
+      let builder = this.laser.sessions().start().withId(runId).agent(source)
+      if (tokens !== undefined) builder = builder.budget({ tokens })
+      return resumed ? builder.resume() : builder.begin()
+    }
+    try {
+      return await open()
+    } catch (error) {
+      // A stream without agent topics gets them with the bootstrap defaults.
+      if (!isMissingLane(error)) throw error
+      await this.laser.bootstrap()
+      return open()
     }
   }
 
@@ -605,18 +784,7 @@ export class Workflow {
         throw error
       }
     }
-    // A label enters `outputs` once, when its step completes, so key order is
-    // completion order.
-    return {
-      outputs,
-      completedSteps: [...outputs.keys()],
-      status: "completed",
-      runId,
-      text: (label) => {
-        const output = outputs.get(label)
-        return output === undefined ? undefined : decodeUtf8(output)
-      }
-    }
+    return workflowOutcome(runId, outputs, undefined)
   }
 
   // The step-boundary checks: an aborted signal or a cancel request, a run
@@ -1253,6 +1421,328 @@ export class StepHandle {
 
   run(options: { readonly signal?: AbortSignal } = {}): Promise<WorkflowOutcome> {
     return this.owner.run(options)
+  }
+}
+
+/** One run of a workflow body, handed to the body of `Workflow.runWith`. */
+export class WorkflowRun {
+  private readonly unclaimed: Map<string, RecordedStep[]>
+  private readonly attempting = new Set<string>()
+  // The lowest call number of each step name that may still be free.
+  private readonly nextCall = new Map<string, number>()
+  private readonly running: Promise<unknown>[] = []
+  private readonly recording: Promise<void>[] = []
+  private readonly abortedSteps = new WeakSet<CancelledError>()
+  private ended = false
+  private closed = false
+
+  private constructor(
+    /** The run id, which resumes the same run when passed to `Workflow.runId`. */
+    readonly runId: ConversationId,
+    private readonly outputs: Map<string, Uint8Array>,
+    inputs: ReadonlyMap<string, string>,
+    private readonly checkpoint: () => Promise<void>,
+    private readonly journal: (
+      label: string,
+      input: string | undefined,
+      output: Uint8Array
+    ) => Promise<void>
+  ) {
+    this.unclaimed = recordedSteps(outputs, inputs)
+  }
+
+  /** @internal */
+  static create(
+    runId: ConversationId,
+    outputs: Map<string, Uint8Array>,
+    inputs: ReadonlyMap<string, string>,
+    checkpoint: () => Promise<void>,
+    journal: (label: string, input: string | undefined, output: Uint8Array) => Promise<void>
+  ): WorkflowRun {
+    return new WorkflowRun(runId, outputs, inputs, checkpoint, journal)
+  }
+
+  /** Run `fn` as the step `label` and resolve to its value after a JSON round
+   * trip. */
+  step<Result>(
+    label: string,
+    fn: () => Result,
+    options: { readonly signal?: AbortSignal } = {}
+  ): Promise<JsonRoundTrip<Awaited<Result>>> {
+    return this.track(this.attempt(label, undefined, fn, options.signal))
+  }
+
+  /** Run `fn` as a call of the step `label` identified by its arguments.
+   * @internal */
+  callStep<Result>(
+    label: string,
+    args: readonly unknown[],
+    fn: () => Result
+  ): Promise<JsonRoundTrip<Awaited<Result>>> {
+    return this.track(this.attempt(label, argumentsDigest(args), fn, undefined))
+  }
+
+  /** Refuse new steps, give the ones still running a bounded time to finish,
+   * then wait for the records already being written.
+   * @internal */
+  async settle(): Promise<void> {
+    this.ended = true
+    const grace = renewalTick(STEP_SETTLE_GRACE_MS)
+    await Promise.race([Promise.allSettled(this.running), grace.promise])
+    grace.cancel()
+    this.closed = true
+    await Promise.allSettled(this.recording)
+  }
+
+  /** Whether `error` stopped a step whose own signal aborted.
+   * @internal */
+  stepAborted(error: CancelledError): boolean {
+    return this.abortedSteps.has(error)
+  }
+
+  private track<Value>(running: Promise<Value>): Promise<Value> {
+    this.running.push(running)
+    return running
+  }
+
+  private async attempt<Result>(
+    name: string,
+    input: string | undefined,
+    fn: () => Result,
+    signal: AbortSignal | undefined
+  ): Promise<JsonRoundTrip<Awaited<Result>>> {
+    try {
+      return await this.runAttempt(name, input, fn, signal)
+    } catch (error) {
+      if (signal?.aborted === true && error instanceof CancelledError) {
+        this.abortedSteps.add(error)
+      }
+      throw error
+    }
+  }
+
+  // Runs synchronously up to the first await, so call order decides the labels.
+  private async runAttempt<Result>(
+    name: string,
+    input: string | undefined,
+    fn: () => Result,
+    signal: AbortSignal | undefined
+  ): Promise<JsonRoundTrip<Awaited<Result>>> {
+    if (name.includes(STEP_CALL_SEPARATOR)) {
+      throw new InvalidError(
+        `workflow step name \`${name}\` cannot contain \`${STEP_CALL_SEPARATOR}\`, the journal numbers repeated calls with it`
+      )
+    }
+    if (this.ended) {
+      throw new InvalidError(`step \`${name}\` was called after its workflow run ended`)
+    }
+    throwIfAborted(signal, "workflow step")
+    const stepCall = this.claim(name, input)
+    if (stepCall.kind === "recorded") {
+      return decodedOutput(stepCall.label, stepCall.output) as JsonRoundTrip<Awaited<Result>>
+    }
+    const { label, call } = stepCall
+    this.attempting.add(label)
+    try {
+      await this.checkpoint()
+      const encoded = encodedStepValue(name, await fn())
+      if (this.closed) {
+        throw new InvalidError(`step \`${name}\` finished after its workflow run ended`)
+      }
+      const recorded = this.journal(label, input, encoded).then(() => {
+        this.outputs.set(label, encoded)
+      })
+      this.recording.push(recorded)
+      await recorded
+      return decodedOutput(label, encoded) as JsonRoundTrip<Awaited<Result>>
+    } finally {
+      this.attempting.delete(label)
+      // A failed attempt gives its label back.
+      if (!this.outputs.has(label)) {
+        this.nextCall.set(name, Math.min(this.nextCall.get(name) ?? call, call))
+      }
+    }
+  }
+
+  // Equal arguments first. Else the labels `name`, `name#2`, `name#3` in
+  // order, up to the first that holds an unclaimed record where a side has no
+  // digest, which the call claims, or that is free, under which it is due.
+  private claim(name: string, input: string | undefined): StepCall {
+    const entries = this.unclaimed.get(name) ?? []
+    let recorded = input === undefined ? undefined : entries.find((entry) => entry.input === input)
+    if (recorded === undefined) {
+      recorded = entries.find((entry) => entry.input === undefined || input === undefined)
+      let call = this.nextCall.get(name) ?? 1
+      for (; ; call += 1) {
+        const label = call === 1 ? name : `${name}${STEP_CALL_SEPARATOR}${String(call)}`
+        if (recorded !== undefined && compareCallLabels(recorded.label, label) <= 0) break
+        if (this.outputs.has(label) || this.attempting.has(label)) continue
+        this.nextCall.set(name, call + 1)
+        return { kind: "due", label, call }
+      }
+      this.nextCall.set(name, call)
+    }
+    entries.splice(entries.indexOf(recorded), 1)
+    return { kind: "recorded", label: recorded.label, output: recorded.output }
+  }
+}
+
+/** The run the calling code executes in, if any.
+ * @internal */
+export function currentWorkflowRun(): WorkflowRun | undefined {
+  return CURRENT_RUN.getStore()
+}
+
+// The journal's completed steps per step name, each name's entries in call order.
+function recordedSteps(
+  outputs: ReadonlyMap<string, Uint8Array>,
+  inputs: ReadonlyMap<string, string>
+): Map<string, RecordedStep[]> {
+  const recorded = new Map<string, RecordedStep[]>()
+  for (const [label, output] of outputs) {
+    const separator = label.lastIndexOf(STEP_CALL_SEPARATOR)
+    const digits = label.slice(separator + 1)
+    const numbered = separator >= 0 && digits !== "1" && /^[1-9][0-9]*$/u.test(digits)
+    const name = numbered ? label.slice(0, separator) : label
+    const entries = recorded.get(name) ?? []
+    entries.push({ label, output, input: inputs.get(label) })
+    recorded.set(name, entries)
+  }
+  for (const entries of recorded.values()) {
+    entries.sort((first, second) => compareCallLabels(first.label, second.label))
+  }
+  return recorded
+}
+
+// For one step name, decimal suffixes sort by length, then lexically.
+function compareCallLabels(first: string, second: string): number {
+  if (first.length !== second.length) return first.length - second.length
+  if (first === second) return 0
+  return first < second ? -1 : 1
+}
+
+// Arguments that are not plain JSON data leave the call without a digest, so it matches by order.
+function argumentsDigest(args: readonly unknown[]): string | undefined {
+  try {
+    const canonical = canonicalJson(JSON.parse(JSON.stringify(args, plainJsonData)) as unknown)
+    return bytesToHex(sha256(utf8(canonical))).slice(0, STEP_INPUT_DIGEST_CHARS)
+  } catch {
+    return undefined
+  }
+}
+
+// JSON writes these as null or as another shape, which is another argument. An object drops a
+// property JSON cannot hold, so only an array refuses one.
+function plainJsonData(this: unknown, _key: string, value: unknown): unknown {
+  const absent = value === undefined || typeof value === "function" || typeof value === "symbol"
+  const prototype: unknown =
+    typeof value === "object" && value !== null && !Array.isArray(value)
+      ? Object.getPrototypeOf(value)
+      : null
+  if (
+    (absent && Array.isArray(this)) ||
+    (typeof value === "number" && !Number.isFinite(value)) ||
+    (prototype !== null && prototype !== Object.prototype)
+  ) {
+    throw new InvalidError("arguments that are not plain JSON data have no digest")
+  }
+  return value
+}
+
+// Keys sort by code point and a whole number is written as its digits, so every
+// client hashes equal arguments to the same digest.
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${(value as readonly unknown[]).map((item) => canonicalJson(item)).join(",")}]`
+  }
+  if (typeof value === "number" && Number.isInteger(value)) return BigInt(value).toString()
+  if (typeof value !== "object" || value === null) return JSON.stringify(value)
+  const entries = Object.entries(value).sort(([first], [second]) =>
+    Buffer.compare(Buffer.from(first), Buffer.from(second))
+  )
+  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`
+}
+
+async function endFailed(session: Session, error: unknown): Promise<void> {
+  try {
+    if (error instanceof CancelledError) await session.cancel()
+    else if (error instanceof BudgetExceededError) {
+      await session.failOverBudget(exceededBreach(error.ceiling, error.spent))
+    } else
+      await session.fail({
+        code: { kind: "known", name: "Internal" },
+        message: error instanceof Error ? error.message : String(error),
+        retryable: error instanceof StepFailedError && error.reason === "timed_out"
+      })
+  } catch {
+    // The run's error wins over a lifecycle error.
+  }
+}
+
+// A label enters `outputs` once, when its step completes, so key order is
+// completion order.
+function workflowOutcome<Value>(
+  runId: ConversationId,
+  outputs: ReadonlyMap<string, Uint8Array>,
+  value: Value
+): WorkflowOutcome<Value> {
+  return {
+    value,
+    outputs,
+    completedSteps: [...outputs.keys()],
+    status: "completed",
+    runId,
+    text: (label) => {
+      const output = outputs.get(label)
+      return output === undefined ? undefined : decodeUtf8(output)
+    },
+    json: (label) => {
+      const output = outputs.get(label)
+      return output === undefined ? undefined : decodedOutput(label, output)
+    }
+  }
+}
+
+// `JSON.stringify` drops or rewrites these without a word, so each is refused.
+function encodedStepValue(label: string, value: unknown): Uint8Array {
+  const refused = (kind: string): InvalidError =>
+    new InvalidError(
+      `step \`${label}\` returned a value JSON cannot hold (${kind}). Return an object, array, string, number, boolean or null`
+    )
+  let encoded: unknown
+  try {
+    encoded = JSON.stringify(value, (_key, item: unknown) => {
+      const kind = unholdableKind(item)
+      if (kind !== undefined) throw refused(kind)
+      return item
+    })
+  } catch (error) {
+    if (error instanceof TypeError && error.message.includes("circular")) {
+      throw refused("a circular structure")
+    }
+    throw error
+  }
+  if (typeof encoded !== "string") throw refused("undefined")
+  return utf8(encoded)
+}
+
+function unholdableKind(item: unknown): string | undefined {
+  if (typeof item === "bigint") return "a bigint"
+  if (typeof item === "function") return "a function"
+  if (typeof item === "symbol") return "a symbol"
+  if (typeof item === "number" && !Number.isFinite(item)) return "a number that is not finite"
+  if (item instanceof Map) return "a Map"
+  if (item instanceof Set) return "a Set"
+  return ArrayBuffer.isView(item) ? "a byte array" : undefined
+}
+
+function decodedOutput(label: string, output: Uint8Array): unknown {
+  try {
+    return JSON.parse(decodeUtf8(output))
+  } catch (error) {
+    throw new InvalidError(`step \`${label}\` has an output that is not JSON`, undefined, {
+      cause: error
+    })
   }
 }
 

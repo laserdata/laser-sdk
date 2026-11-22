@@ -38,7 +38,7 @@ export class ConversationId {
     try {
       return new ConversationId(crockfordDecode(text))
     } catch {
-      throw IdError.invalidUlid(text)
+      throw IdError.invalidConversationId(text)
     }
   }
 

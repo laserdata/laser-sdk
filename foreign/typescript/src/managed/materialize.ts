@@ -269,12 +269,19 @@ export class Materialization {
       left.source.topic === right.source.topic
     while (Date.now() < deadline) {
       let timer: ReturnType<typeof setTimeout> | undefined
+      // A read the timeout abandons stops waiting out a roster that refuses it.
+      const abandoned = new AbortController()
+      const signal =
+        options.signal === undefined
+          ? abandoned.signal
+          : AbortSignal.any([abandoned.signal, options.signal])
       const statuses = await Promise.race([
-        this.status(options),
+        this.status({ signal }),
         new Promise<typeof timedOut>((resolve) => {
           timer = setTimeout(
             () => {
               resolve(timedOut)
+              abandoned.abort()
             },
             Math.min(deadline - Date.now(), 2_147_483_647)
           )

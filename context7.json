@@ -1,5 +1,7 @@
 {
   "$schema": "https://context7.com/schema/context7.json",
+  "url": "https://context7.com/laserdata/laser-sdk",
+  "public_key": "pk_4SsXXbwEyFNv9vG1fgq7M",
   "projectTitle": "Laser SDK",
   "description": "Laser SDK: agent memory, durable workflows, sessions and messaging on Apache Iggy, with matching Rust, Python and TypeScript clients.",
   "folders": [
@@ -27,13 +29,26 @@
     "CHANGELOG.md"
   ],
   "rules": [
+    "With LASER_CONNECTION_STRING set, a program needs no Docker and no local server. echo \"${LASER_CONNECTION_STRING:+configured}\" shows whether it is set.",
     "Never print or log the connection string or its password. Read it from LASER_CONNECTION_STRING inside the program.",
-    "Connect with Laser.connect_env() in Python, Laser.connectEnv() in TypeScript or Laser::connect_env() in Rust, which read the connection string from LASER_CONNECTION_STRING. A LaserData API key is not a connection string: copy the connection string from the deployment's Credentials tab in the Console.",
-    "Python installs with pip install laser-sdk and imports laser_sdk. TypeScript installs @laserdata/laser-sdk. Rust adds laser-sdk with the agent and kv features, plus tokio, serde and serde_json.",
-    "Start from the two complete programs at the top of each README: a three-step workflow of in-process steps that prints its outcome as JSON (step(label, run=...) in Python, stepLocal(label, run) in TypeScript, step_local(label, run) in Rust), and a memory correction for one user with memory.supersede(old_id, new_fact) followed by a recall that prints the current facts. The examples folder holds them as workflow and memory-correction (workflow.py and memory_correction.py in Python).",
-    "Work in a scratch stream and clean it up at the end: async with laser.scratch_stream(prefix) as scratch in Python, await using scratch = await laser.scratchStream(prefix) in TypeScript, laser.scratch_stream(prefix) then scratch.delete() in Rust. To keep what the program writes, use a named stream instead, through LASER_STREAM or with_default_stream(name).",
-    "A workflow run and the first memory write create their stream and topics, so they need no bootstrap call. Correct a remembered fact with supersede, which forgets the old fact in every conversation. A default recall reads the writes the same connection made.",
-    "Use the SDK's own workflow, memory and session APIs for durable results. A local list, dict or plain function is not durable.",
+    "Connect with Laser.connect_env() in Python, Laser.connectEnv() in TypeScript or Laser::connect_env() in Rust. Each reads the connection string from LASER_CONNECTION_STRING.",
+    "A LaserData API key is not a connection string. Copy the connection string from the deployment's Credentials tab in the Console.",
+    "Python installs with python -m pip install laser-sdk and imports laser_sdk. TypeScript installs @laserdata/laser-sdk and runs with npx tsx.",
+    "Rust adds laser-sdk with a plain cargo add laser-sdk, tokio with macros, rt-multi-thread and time, serde_json, and serde with derive for the memory program.",
+    "Start from the two complete programs at the top of each README. The examples folder holds them as workflow and memory-correction (workflow.py and memory_correction.py in Python).",
+    "A workflow is plain functions: @ls.step and @ls.workflow in Python, step(name, fn) and workflow(name, fn) in TypeScript, laser.workflow(name).run_with(async |run| ...) with run.step(label, body) in Rust.",
+    "A step takes and returns what JSON holds. pipeline.run() returns the outcome, resume(run_id) returns recorded values without running those steps again. The stream is LASER_STREAM or the workflow's name, and it stays after the run.",
+    "WorkflowOutcome carries run_id, status (completed), completed_steps in completion order, value, outputs by label as bytes, json(label) and text(label). A step that raises fails the run and the same error reaches the caller.",
+    "For steps routed to agents, verifiers, compensation and budgets use the builder Laser.workflow(name).step(...), with step_local in Rust and stepLocal in TypeScript for in-process steps.",
+    "On a Python client memory(namespace), workflow(name) and sessions() return at once. Await connect_env(), memory_topic(...), remember, supersede, recall, forget and the builder's run().",
+    "The memory program corrects a fact for one user with memory.supersede(old_id, new_fact), then recalls and prints the current facts.",
+    "Work in a scratch stream that is deleted at the end: async with laser.scratch_stream(prefix) as scratch in Python, await using scratch = await laser.scratchStream(prefix) in TypeScript.",
+    "In Rust call laser.scratch_stream(prefix), then scratch.delete(). To keep what the program writes, name a stream: LASER_STREAM, with_default_stream(name), or connect_env(stream=name).",
+    "The stream option of connect_env is Laser.connect_env(stream=name) in Python, Laser.connectEnvWithStream(name) in TypeScript and Laser::connect_env_with_stream(name) in Rust. It wins over LASER_STREAM.",
+    "A workflow run and the first memory write create their stream and topics, so they need no bootstrap call.",
+    "Correct a remembered fact with supersede, which forgets the old fact in every conversation. A default recall reads the writes the same connection made.",
+    "recall returns MemoryItem objects newest first (item.text() in Python and Rust, memoryItemText(item) in TypeScript). A semantic query ranks every fact by the words it shares with the query and drops none.",
+    "Use the SDK's own workflow, memory and session APIs for durable results. A local list, a dict or an undecorated function is not durable.",
     "A LaserData Cloud deployment admits a Laser SDK connection only from an address its access rules allow over TCP."
   ]
 }

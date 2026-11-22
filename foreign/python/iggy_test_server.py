@@ -1,3 +1,4 @@
+import errno
 import functools
 import json
 import os
@@ -16,6 +17,12 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 TEST_SUPPORT_BINARIES = ("laser-test-catalog", "laser-test-routes")
 TEST_SUPPORT_BUILD = "cargo build -p laser-test-support --bins"
+UNANSWERED_BINDING_READS = "LASER_TEST_CATALOG_UNANSWERED_BINDING_READS"
+# A reserved port is released before the server binds it, so another process can take it in
+# between. The server then exits at startup, and a fresh port on the next attempt starts it.
+STARTUP_ATTEMPTS = 5
+# The server reports a taken port as `CannotBindToSocket` and drops the OS error.
+PORT_TAKEN = "Cannot bind to socket"
 RESOLVER = REPOSITORY_ROOT / "scripts" / "resolve-test-iggy-server.sh"
 
 
@@ -60,6 +67,16 @@ class IggyTestServer:
             timeout=310,
         )
         binary = resolved.stdout.strip()
+        attempt = 1
+        while True:
+            try:
+                return self._start_once(binary)
+            except RuntimeError as error:
+                if attempt >= STARTUP_ATTEMPTS or PORT_TAKEN not in str(error):
+                    raise
+                attempt += 1
+
+    def _start_once(self, binary):
         self._temporary = tempfile.TemporaryDirectory(prefix="laser-iggy-", dir=_data_root())
         data_path = Path(self._temporary.name)
         self._port = _free_port()
@@ -147,7 +164,9 @@ def free_tcp_port():
 
 
 class IggyTestCluster:
-    def __init__(self):
+    def __init__(self, reserve=None):
+        """`reserve` hands out the ports for a count, asked again when a node finds one taken."""
+        self._reserve = free_ports if reserve is None else reserve
         self._binary = None
         self._temporaries = []
         self._logs = []
@@ -172,7 +191,21 @@ class IggyTestCluster:
             [RESOLVER], check=True, capture_output=True, text=True, timeout=310
         )
         self._binary = resolved.stdout.strip()
-        ports = _free_ports(10)
+        attempt = 1
+        while True:
+            try:
+                return self._start_once()
+            except (RuntimeError, OSError) as error:
+                taken = PORT_TAKEN in str(error) or (
+                    isinstance(error, OSError) and error.errno == errno.EADDRINUSE
+                )
+                if attempt >= STARTUP_ATTEMPTS or not taken:
+                    raise
+                attempt += 1
+
+    # Every node names every port, so a taken one starts the whole cluster again on a fresh set.
+    def _start_once(self):
+        ports = self._reserve(10)
         self._tcp_ports = ports[:3]
         self._replica_ports = ports[3:6]
         self._http_ports = ports[6:9]
@@ -202,8 +235,21 @@ class IggyTestCluster:
         self._stop_process(replica_id)
 
     def start_node(self, replica_id):
-        self._spawn(replica_id)
-        self._wait_for_mesh(replica_id)
+        """Start a stopped node on the address its peers know, waiting for its ports when
+        another process holds one."""
+        attempt = 1
+        while True:
+            self._spawn(replica_id)
+            try:
+                self._wait_for_mesh(replica_id)
+                return
+            except RuntimeError as error:
+                if attempt >= STARTUP_ATTEMPTS or PORT_TAKEN not in str(error):
+                    raise
+                attempt += 1
+                self._stop_process(replica_id)
+                _wait_for_free_port(self._tcp_ports[replica_id])
+                _wait_for_free_port(self._replica_ports[replica_id])
 
     def route_endpoint_to(self, replica_id):
         self._proxy_target = self._tcp_ports[replica_id]
@@ -394,10 +440,13 @@ class IggyTestCluster:
 
 
 class StandInCatalog:
-    """The laser-test-catalog binary: one socket per node over one shared catalog state."""
+    """The laser-test-catalog binary: one socket per node over one shared catalog state. The
+    first `unanswered_binding_reads` binding reads go unanswered, as a backend that does not
+    answer."""
 
-    def __init__(self, nodes=3):
+    def __init__(self, nodes=3, unanswered_binding_reads=0):
         self._nodes = nodes
+        self._unanswered_binding_reads = unanswered_binding_reads
         self._directory = None
         self._log = None
         self._process = None
@@ -407,11 +456,14 @@ class StandInCatalog:
         self._directory = tempfile.TemporaryDirectory(prefix="laser-catalog-", dir=_data_root())
         directory = Path(self._directory.name)
         self._log = (directory / "catalog.log").open("w")
+        environment = os.environ.copy()
+        environment[UNANSWERED_BINDING_READS] = str(self._unanswered_binding_reads)
         self._process = subprocess.Popen(
             [binary, *(str(self.socket(node)) for node in range(self._nodes))],
             stdout=subprocess.PIPE,
             stderr=self._log,
             text=True,
+            env=environment,
         )
         try:
             readable, _, _ = select.select([self._process.stdout], [], [], 30)
@@ -510,7 +562,19 @@ def _test_support_binary(name):
     return _test_support_binaries()[name]
 
 
-def _free_ports(count):
+def _wait_for_free_port(port):
+    """Return once `port` can be bound again or 30 s passed."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+                return
+            except OSError:
+                time.sleep(0.05)
+
+
+def free_ports(count):
     listeners = []
     try:
         for _ in range(count):

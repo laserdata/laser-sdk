@@ -80,18 +80,20 @@ const FILTER_FIELDS: [(&str, &str); 7] = [
 
 // The variant words an `IdError` and a `ProvenanceError` carry as `kind`,
 // each also a class constant so a handler can compare without a literal.
-const ID_KINDS: [(&str, &str); 5] = [
+const ID_KINDS: [(&str, &str); 6] = [
     ("EMPTY", "empty"),
     ("TOO_LONG", "too_long"),
     ("INVALID_CHAR", "invalid_char"),
+    ("INVALID_CONVERSATION_ID", "invalid_conversation_id"),
     ("INVALID_ULID", "invalid_ulid"),
     ("INVALID_MESSAGE_ID", "invalid_message_id"),
 ];
-const ID_FIELDS: [(&str, &str); 6] = [
+const ID_FIELDS: [(&str, &str); 7] = [
     ("kind", "builtins.str | None"),
     ("EMPTY", "typing.ClassVar[builtins.str]"),
     ("TOO_LONG", "typing.ClassVar[builtins.str]"),
     ("INVALID_CHAR", "typing.ClassVar[builtins.str]"),
+    ("INVALID_CONVERSATION_ID", "typing.ClassVar[builtins.str]"),
     ("INVALID_ULID", "typing.ClassVar[builtins.str]"),
     ("INVALID_MESSAGE_ID", "typing.ClassVar[builtins.str]"),
 ];
@@ -141,8 +143,9 @@ create_exception!(
     laser_sdk,
     NoStreamError,
     ConfigError,
-    "A convenience call needed a default stream and none was set. Connect with \
-     `stream=` or call `with_default_stream`."
+    "A convenience call needed a default stream and none was set. Work in a \
+     scratch stream with `scratch_stream(prefix)`, or pick one with \
+     `with_default_stream(name)` or `Laser.connect_env(stream=name)`."
 );
 create_exception!(
     laser_sdk,
@@ -1323,8 +1326,18 @@ fn message_of(err: &SdkError) -> String {
             }
             _ => err.to_string(),
         },
+        SdkError::Id(laser_sdk::types::IdError::InvalidConversationId(text)) => {
+            invalid_conversation_id(text)
+        }
         _ => err.to_string(),
     }
+}
+
+// The Rust text names `ConversationId::new()`, which Python spells as a function.
+pub(crate) fn invalid_conversation_id(text: &str) -> String {
+    format!(
+        "invalid conversation id `{text}`: a conversation id is a ULID, make one with new_conversation_id()"
+    )
 }
 
 // The variant's own fields, and the original failure as `__cause__` for a
@@ -1661,6 +1674,7 @@ fn id_kind(error: &laser_sdk::types::IdError) -> &'static str {
         Id::Empty => "empty",
         Id::TooLong { .. } => "too_long",
         Id::InvalidChar(_) => "invalid_char",
+        Id::InvalidConversationId(_) => "invalid_conversation_id",
         Id::InvalidUlid(_) => "invalid_ulid",
         Id::InvalidMessageId(_) => "invalid_message_id",
     }

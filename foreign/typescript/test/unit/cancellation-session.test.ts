@@ -601,6 +601,45 @@ void test("given_a_memory_write_waiting_out_its_retry_delay_when_the_signal_abor
   assert.deepEqual(late, [], "no memory write starts an attempt after the abort")
 })
 
+void test("given_a_memory_read_every_node_refuses_when_the_signal_aborts_during_the_backoff_then_should_end_the_read", async () => {
+  const scope = { conversation: ConversationId.new() }
+  const reads: readonly (readonly [
+    string,
+    (memory: MemoryHandle, signal: AbortSignal) => Promise<unknown>
+  ])[] = [
+    ["MemoryHandle.recall", (memory, signal) => memory.recall(scope, {}, { signal })],
+    [
+      "RecallBuilder.fetch",
+      (memory, signal) => memory.recall(scope.conversation).fetch({ signal })
+    ],
+    ["MemoryHandle.fetch", (memory, signal) => memory.fetch("key", { signal })],
+    ["MemoryHandle.consolidate", (memory, signal) => memory.consolidate(scope, 1, { signal })]
+  ]
+  for (const [name, read] of reads) {
+    const roster = refusingRoster()
+    const root = await Laser.builder()
+      .client(roster.client)
+      .capabilities({
+        ...OPEN_CAPABILITIES,
+        managed: true,
+        kv: { ...OPEN_CAPABILITIES.kv, available: true }
+      })
+      .connect()
+    try {
+      const controller = new AbortController()
+      const reading = read(root.withDefaultStream("agents").memory("notes"), controller.signal)
+      for (let turn = 0; roster.sent() === 0 && turn < 400; turn += 1) await pause(1)
+      assert.equal(roster.sent(), 1, `${name} reads the one node, which refuses`)
+      controller.abort()
+      await assert.rejects(reading, CancelledError, name)
+      await pause(300)
+      assert.equal(roster.sent(), 1, `${name} walks the roster no more after the abort`)
+    } finally {
+      await root.close()
+    }
+  }
+})
+
 interface Lane {
   readonly laser: Laser
   readonly sent: AgentEnvelope[]
@@ -823,4 +862,31 @@ async function until(condition: () => boolean): Promise<void> {
 
 function pause(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// A client of one node that refuses every managed read for want of its
+// backend, counting the reads it was sent.
+function refusingRoster(): { readonly client: IggyClient; readonly sent: () => number } {
+  let sent = 0
+  const refusal = Buffer.from(
+    encodeNamed(
+      new Map([
+        ["code", "backend_unavailable"],
+        ["message", "replaying its logs"]
+      ])
+    )
+  )
+  const client = {
+    clientProvider: () => Promise.resolve({ protocol: "vsr" }),
+    sendBinaryRequestToReplica: () => {
+      sent += 1
+      return Promise.resolve(refusal)
+    },
+    cluster: {
+      getClusterMetadata: () =>
+        Promise.resolve({ name: "orbit", nodes: [{ replicaId: 0, name: "node-0" }] })
+    },
+    destroy: () => Promise.resolve()
+  } as unknown as IggyClient
+  return { client, sent: () => sent }
 }

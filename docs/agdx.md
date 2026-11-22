@@ -318,7 +318,7 @@ eventual  read_your_writes
 | stale_generation | 17 | 409 | the requested backend or stream generation is no longer current |
 | target_unavailable | 18 | 503 | the resolved target is not ready to serve the request |
 | pending | 19 | 503 | the mutation was accepted but its outcome is not known yet, repeat it only with the same operation identity |
-| backend_unavailable | 20 | 503 | the streaming server could not reach its managed backend, or the backend did not answer in time. The request may still apply, so repeat a mutation only with the same operation identity, on this node or another |
+| backend_unavailable | 20 | 503 | the streaming server could not reach its managed backend, or the backend did not answer in time. A node still replaying its logs after a restart answers it too. The request may still apply, so repeat a mutation only with the same operation identity, on this node or another |
 
 An unknown result code decodes as `unrecognized(code)` and retains its original bytes when re-encoded. Each binding defines how to carry the logical result. HTTP uses the status mapping in B4.
 
@@ -664,7 +664,7 @@ Each stream has its own writer schema registry, and a schema command without a s
 
 A record stamped with an `agdx.ref` outside a binding's allowed projections falls back to the binding's default projection, and is skipped when there is none. Registering a projection again under its id with another kind or another history, a keyed history with another delete header or none included, answers `conflict`, and an `ApplyBinding` that names a projection that is not registered answers `not_found`.
 
-`AcceptGap`, `SkipRecord` and `SourceRetained` are appended only by the managed backend and are never forwarded from a client. A held record is released by applying the binding again with `invalid_records: dead_letter`, which skips it to the dead-letter topic, and a blocked history gap by an operator accepting it. `SourceRetained { source, partition_id, topic_created_at_micros, first_offset }` records the first offset one source partition incarnation still retains, `u64::MAX` when the incarnation is gone. The control fold then drops the record skips below that offset and the accepted gaps that end below it, because no record they cover can be read again.
+`AcceptGap`, `SkipRecord` and `SourceRetained` are appended only by the managed backend and are never forwarded from a client. A held record is released by applying the binding again with `invalid_records: dead_letter`, which skips it to the dead-letter topic, and a blocked history gap by an operator accepting it. A `RecordSkip` `target` names the operational index or graph the record failed to reach. A target can also name a fold of the managed backend, written `fold:<surface>` with the surfaces `memory`, `session`, `kv`, `fork` and `graph`, which releases one record that fold's store refuses. `SourceRetained { source, partition_id, topic_created_at_micros, first_offset }` records the first offset one source partition incarnation still retains, `u64::MAX` when the incarnation is gone. The control fold then drops the record skips below that offset and the accepted gaps that end below it, because no record they cover can be read again.
 
 ### A11.3 The query IR
 

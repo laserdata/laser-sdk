@@ -3,7 +3,7 @@ use crate::blob::PyBlobStore;
 use crate::client::PyLaser;
 use crate::context::read_topics;
 use crate::convert::{duration_ms, json_to_py, payload_bytes, py_to_de, py_to_json, ser_to_py};
-use crate::errors::{CodecError, InvalidError, to_pyerr};
+use crate::errors::{CodecError, InvalidError, invalid_conversation_id, to_pyerr};
 use crate::memory::PyMemoryItem;
 use crate::session::PyCheckpoint;
 use crate::sign::{PyKeyRegistry, PySigningKey, envelope_of, signature_context};
@@ -595,7 +595,7 @@ fn record_id(value: &str) -> PyResult<RecordId> {
 fn conversation_id(value: &str) -> PyResult<ConversationId> {
     value
         .parse::<ConversationId>()
-        .map_err(|error| crate::errors::InvalidError::new_err(error.to_string()))
+        .map_err(|_| crate::errors::InvalidError::new_err(invalid_conversation_id(value)))
 }
 
 fn agent_id(value: &str) -> PyResult<AgentId> {

@@ -56,10 +56,17 @@ impl TestIggyCluster {
 
     /// [`start_with`](Self::start_with) on `size` nodes.
     pub async fn start_sized(size: usize, env: impl Fn(usize) -> Vec<(String, String)>) -> Self {
+        Self::start_reserving(size, env, free_host_ports).await
+    }
+
+    /// [`start_sized`](Self::start_sized) on ports from `reserve`, asked again when a node finds one taken.
+    pub async fn start_reserving(
+        size: usize,
+        env: impl Fn(usize) -> Vec<(String, String)>,
+        mut reserve: impl FnMut(usize) -> Vec<u16>,
+    ) -> Self {
         let binary = resolve_server_binary();
         let node_env: Vec<Vec<(String, String)>> = (0..size).map(env).collect();
-        let mut tcp_ports = free_host_ports(size * 2);
-        let replica_ports = tcp_ports.split_off(size);
         // Bound at once, so no other process takes the port in between.
         let proxy = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -68,28 +75,46 @@ impl TestIggyCluster {
             .local_addr()
             .expect("stable cluster endpoint address")
             .port();
+        let mut attempt = 1;
+        let (nodes, tcp_ports, replica_ports) = loop {
+            let mut tcp_ports = reserve(size * 2);
+            let replica_ports = tcp_ports.split_off(size);
+            let mut nodes = Vec::with_capacity(size);
+            for (replica_id, env) in node_env.iter().enumerate() {
+                let data_dir =
+                    tempfile::tempdir_in(data_root()).expect("cluster node data directory");
+                let log_path = data_dir.path().join("test-server.log");
+                let child = spawn_cluster_node(
+                    &binary,
+                    data_dir.path(),
+                    &log_path,
+                    replica_id,
+                    &tcp_ports,
+                    &replica_ports,
+                    env,
+                );
+                nodes.push(ClusterNodeProcess {
+                    child,
+                    data_dir,
+                    log_path,
+                });
+            }
+            match wait_for_mesh(&mut nodes, None).await {
+                Ok(()) => break (nodes, tcp_ports, replica_ports),
+                // Every node names every port, so the whole cluster starts again on a fresh set.
+                Err(logs)
+                    if attempt < STARTUP_ATTEMPTS && logs.contains("Cannot bind to socket") =>
+                {
+                    attempt += 1;
+                }
+                Err(logs) => panic!(
+                    "Iggy cluster node exited during startup on attempt {attempt}, node logs:\n{logs}"
+                ),
+            }
+        };
         let proxy_target = Arc::new(AtomicU16::new(tcp_ports[0]));
         let proxy_task = spawn_stable_proxy(proxy, proxy_target.clone());
-        let mut nodes = Vec::with_capacity(CLUSTER_SIZE);
-        for (replica_id, env) in node_env.iter().enumerate() {
-            let data_dir = tempfile::tempdir_in(data_root()).expect("cluster node data directory");
-            let log_path = data_dir.path().join("test-server.log");
-            let child = spawn_cluster_node(
-                &binary,
-                data_dir.path(),
-                &log_path,
-                replica_id,
-                &tcp_ports,
-                &replica_ports,
-                env,
-            );
-            nodes.push(ClusterNodeProcess {
-                child,
-                data_dir,
-                log_path,
-            });
-        }
-        let cluster = Self {
+        Self {
             binary,
             nodes,
             tcp_ports,
@@ -98,9 +123,7 @@ impl TestIggyCluster {
             proxy_target,
             proxy_task,
             node_env,
-        };
-        cluster.wait_for_mesh(None).await;
-        cluster
+        }
     }
 
     pub fn endpoint(&self) -> String {
@@ -142,17 +165,33 @@ impl TestIggyCluster {
     }
 
     pub async fn start_node(&mut self, replica_id: usize) {
-        let node = self.nodes.get_mut(replica_id).expect("cluster node");
-        node.child = spawn_cluster_node(
-            &self.binary,
-            node.data_dir.path(),
-            &node.log_path,
-            replica_id,
-            &self.tcp_ports,
-            &self.replica_ports,
-            &self.node_env[replica_id],
-        );
-        self.wait_for_mesh(Some(replica_id)).await;
+        let mut attempt = 1;
+        loop {
+            let node = self.nodes.get_mut(replica_id).expect("cluster node");
+            node.child = spawn_cluster_node(
+                &self.binary,
+                node.data_dir.path(),
+                &node.log_path,
+                replica_id,
+                &self.tcp_ports,
+                &self.replica_ports,
+                &self.node_env[replica_id],
+            );
+            match wait_for_mesh(&mut self.nodes, Some(replica_id)).await {
+                Ok(()) => return,
+                // The node returns on the address its peers know, so it waits for that port.
+                Err(logs)
+                    if attempt < STARTUP_ATTEMPTS && logs.contains("Cannot bind to socket") =>
+                {
+                    attempt += 1;
+                    wait_for_free_port(self.tcp_ports[replica_id]).await;
+                    wait_for_free_port(self.replica_ports[replica_id]).await;
+                }
+                Err(logs) => panic!(
+                    "Iggy cluster node {replica_id} exited during restart on attempt {attempt}, node logs:\n{logs}"
+                ),
+            }
+        }
     }
 
     pub async fn restart_node(&mut self, replica_id: usize) {
@@ -180,49 +219,6 @@ impl TestIggyCluster {
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-    }
-
-    // The nodes inherit the environment, so a `RUST_LOG` that silences the
-    // server's info lines never shows the marker.
-    async fn wait_for_mesh(&self, node: Option<usize>) {
-        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
-        loop {
-            let ready = match node {
-                Some(replica_id) => {
-                    log_contains(&self.nodes[replica_id].log_path, "replica mesh complete")
-                }
-                None => self
-                    .nodes
-                    .iter()
-                    .all(|process| log_contains(&process.log_path, "replica mesh complete")),
-            };
-            if ready {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "Iggy cluster did not form its replica mesh before the deadline, node logs:\n{}",
-                self.log_tails()
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-}
-
-impl TestIggyCluster {
-    // The last lines of each node's log, for a failure message.
-    fn log_tails(&self) -> String {
-        self.nodes
-            .iter()
-            .enumerate()
-            .map(|(replica_id, node)| {
-                let log = std::fs::read_to_string(&node.log_path).unwrap_or_default();
-                let lines: Vec<&str> = log.lines().collect();
-                let tail = lines[lines.len().saturating_sub(40)..].join("\n");
-                format!("node {replica_id}:\n{tail}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 }
 
@@ -338,14 +334,25 @@ impl TestIggy {
     }
 
     pub async fn restart(&self) {
-        {
-            let mut child = self.child.lock().expect("lock Iggy test process");
-            child.kill().expect("kill Iggy test process");
-            child.wait().expect("reap Iggy test process");
-            *child = spawn_server(&self.binary, self.data_dir.path(), self.tcp_port, &self.env);
-        }
-        if let Err(log) = self.wait_until_ready().await {
-            panic!("Iggy test server exited during restart, log:\n{log}");
+        let mut attempt = 1;
+        loop {
+            {
+                let mut child = self.child.lock().expect("lock Iggy test process");
+                child.kill().expect("kill Iggy test process");
+                child.wait().expect("reap Iggy test process");
+                *child = spawn_server(&self.binary, self.data_dir.path(), self.tcp_port, &self.env);
+            }
+            match self.wait_until_ready().await {
+                Ok(()) => return,
+                // The server returns on the port its clients know, so it waits for that port.
+                Err(log) if attempt < STARTUP_ATTEMPTS && log.contains("Cannot bind to socket") => {
+                    attempt += 1;
+                    wait_for_free_port(self.tcp_port).await;
+                }
+                Err(log) => panic!(
+                    "Iggy test server exited during restart on attempt {attempt}, log:\n{log}"
+                ),
+            }
         }
     }
 
@@ -546,6 +553,72 @@ fn spawn_cluster_node(
     OwnedServer::new(command.spawn().expect("spawn Iggy cluster node"))
 }
 
+// The nodes inherit the environment, so a `RUST_LOG` that silences the
+// server's info lines never shows the marker. `Err` carries the node logs
+// when a watched node exited before its mesh formed.
+async fn wait_for_mesh(
+    nodes: &mut [ClusterNodeProcess],
+    node: Option<usize>,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let (ready, exited) = {
+            let watched = match node {
+                Some(replica_id) => &mut nodes[replica_id..=replica_id],
+                None => &mut nodes[..],
+            };
+            let ready = watched
+                .iter()
+                .all(|process| log_contains(&process.log_path, "replica mesh complete"));
+            let exited = watched.iter_mut().any(|process| {
+                process
+                    .child
+                    .try_wait()
+                    .expect("inspect cluster node")
+                    .is_some()
+            });
+            (ready, exited)
+        };
+        if ready {
+            return Ok(());
+        }
+        if exited {
+            return Err(log_tails(nodes));
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Iggy cluster did not form its replica mesh before the deadline, node logs:\n{}",
+            log_tails(nodes)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+// The last lines of each node's log, for a failure message.
+fn log_tails(nodes: &[ClusterNodeProcess]) -> String {
+    nodes
+        .iter()
+        .enumerate()
+        .map(|(replica_id, node)| {
+            let log = std::fs::read_to_string(&node.log_path).unwrap_or_default();
+            let lines: Vec<&str> = log.lines().collect();
+            let tail = lines[lines.len().saturating_sub(40)..].join("\n");
+            format!("node {replica_id}:\n{tail}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// Returns once `port` can be bound again or the startup time is spent.
+async fn wait_for_free_port(port: u16) {
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    while std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn log_contains(path: &Path, marker: &str) -> bool {
     std::fs::read_to_string(path).is_ok_and(|content| content.contains(marker))
 }
@@ -647,7 +720,7 @@ fn free_host_port() -> u16 {
         .port()
 }
 
-fn free_host_ports(count: usize) -> Vec<u16> {
+pub fn free_host_ports(count: usize) -> Vec<u16> {
     let listeners = (0..count)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("reserve host port"))
         .collect::<Vec<_>>();

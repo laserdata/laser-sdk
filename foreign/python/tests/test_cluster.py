@@ -1,10 +1,12 @@
 import asyncio
+import socket
+import threading
 import time
 import uuid
 
 import laser_sdk as ls
 import pytest
-from iggy_test_server import IggyTestCluster
+from iggy_test_server import IggyTestCluster, free_ports
 
 # A test settles the primaries, restarts nodes and fails over, so the 60 s
 # default is too short.
@@ -465,3 +467,54 @@ async def _wait_until(condition, failure, timeout=90):
     while not condition():
         assert asyncio.get_running_loop().time() < deadline, failure
         await asyncio.sleep(0.05)
+
+
+# A reserved port is free until its node binds it, and any process can take it in between.
+async def test_given_a_reserved_cluster_port_taken_before_a_node_binds_when_starting_then_should_start_on_fresh_ports():  # noqa: E501
+    reservations = []
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen()
+        held_port = holder.getsockname()[1]
+
+        def reserve(count):
+            ports = free_ports(count)
+            if not reservations:
+                ports[0] = held_port
+            reservations.append(ports)
+            return ports
+
+        cluster = await asyncio.to_thread(lambda: IggyTestCluster(reserve=reserve).start())
+        try:
+            assert len(reservations) > 1, "the cluster reserved ports again"
+            assert reservations[-1][0] != held_port
+            await asyncio.to_thread(cluster.leader_and_follower)
+        finally:
+            await asyncio.to_thread(cluster.stop)
+
+
+# A stopped node comes back on the address its peers know, so it cannot move to another port.
+async def test_given_a_stopped_node_whose_port_is_taken_when_starting_it_again_then_should_rejoin_once_the_port_is_free():  # noqa: E501
+    reservations = []
+
+    def reserve(count):
+        reservations.append(free_ports(count))
+        return reservations[-1]
+
+    cluster = await asyncio.to_thread(lambda: IggyTestCluster(reserve=reserve).start())
+    try:
+        _, follower = await asyncio.to_thread(cluster.leader_and_follower)
+        await asyncio.to_thread(cluster.stop_node, follower)
+        holder = socket.socket()
+        # The first ports of a reservation are the nodes' client ports, by replica id.
+        holder.bind(("127.0.0.1", reservations[-1][follower]))
+        holder.listen()
+        release = threading.Timer(1, holder.close)
+        release.start()
+
+        await asyncio.to_thread(cluster.start_node, follower)
+
+        release.join()
+        await asyncio.to_thread(cluster.leader_and_follower, follower)
+    finally:
+        await asyncio.to_thread(cluster.stop)

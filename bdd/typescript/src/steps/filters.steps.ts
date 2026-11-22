@@ -168,6 +168,13 @@ Then(
   },
 );
 
+Then("the group reads back its saved binding after three refusals", async function (this: LaserWorld) {
+  const group = this.requireLaser().topic(TOPIC).consumerGroup("anomaly-desk");
+  const info = await group.create({ filter: safeMode(), filterName: "safe-mode" });
+  assert.ok(info.filter);
+  assert.deepEqual(await group.filter().get(), info.filter);
+});
+
 Given("a fresh fleet change feed", async function (this: LaserWorld) {
   await this.connect();
   const topic = this.requireLaser().topic(TOPIC);

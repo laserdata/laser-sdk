@@ -1,7 +1,7 @@
 use crate::error::{LaserError, TransportError, decode_managed_reply};
 use crate::iggy::prelude::Identifier;
 use crate::laser::Laser;
-use crate::nodes::{Target, is_route_stale, partition_primary};
+use crate::nodes::{Target, Walk, is_route_stale, partition_primary};
 use crate::retry::{
     FILTER_MUTATION_ATTEMPTS as MUTATION_ATTEMPTS,
     FILTER_MUTATION_BACKOFF as MUTATION_RETRY_BACKOFF,
@@ -219,13 +219,17 @@ impl Filters<'_> {
     }
 
     /// The recorded outcome of a mutation. `NotFound` until the catalog has
-    /// applied it.
+    /// applied it. The outcome wait paces its own repeats, so a refusal from
+    /// every node comes back after one walk.
     pub async fn operation(&self, operation_id: u128) -> Result<FilterMutationOutcome, LaserError> {
         let request = GetFilterOperation {
             v: FILTER_OP_VERSION,
             operation_id,
         };
-        match self.catalog(AGDX_FILTER_OPERATION_CODE, &request).await? {
+        match self
+            .catalog_walking(AGDX_FILTER_OPERATION_CODE, &request, Walk::Once)
+            .await?
+        {
             FilterCatalogOutcome::Mutation(outcome) => checked_outcome(operation_id, outcome),
             _ => Err(unexpected("operation")),
         }
@@ -353,7 +357,10 @@ impl Filters<'_> {
             mutation,
         };
         request.validate()?;
-        match self.catalog(AGDX_FILTER_MUTATE_CODE, &request).await? {
+        match self
+            .catalog_walking(AGDX_FILTER_MUTATE_CODE, &request, Walk::Once)
+            .await?
+        {
             FilterCatalogOutcome::Mutation(outcome) => checked_outcome(operation_id, outcome),
             _ => Err(unexpected("mutate")),
         }
@@ -482,10 +489,21 @@ impl Filters<'_> {
         code: u32,
         request: &impl Serialize,
     ) -> Result<FilterCatalogOutcome, LaserError> {
+        self.catalog_walking(code, request, Walk::UntilServed).await
+    }
+
+    // A mutation, and an outcome poll that paces its own repeats, walk the
+    // roster once.
+    async fn catalog_walking(
+        &self,
+        code: u32,
+        request: &impl Serialize,
+        walk: Walk,
+    ) -> Result<FilterCatalogOutcome, LaserError> {
         self.catalog_capabilities().await?;
         let payload = encode_named(request)
             .map_err(|error| LaserError::Codec(format!("encode filter request: {error}")))?;
-        let reply = self.laser.send_raw_with_response(code, payload).await?;
+        let reply = self.laser.send_raw_walking(code, payload, walk).await?;
         match decode_managed_reply::<FilterCatalogReply>(&reply)? {
             FilterCatalogReply::Ok(outcome) => Ok(*outcome),
             FilterCatalogReply::Err(error) => Err(error.into()),

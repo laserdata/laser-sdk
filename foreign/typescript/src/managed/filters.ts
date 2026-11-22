@@ -2,8 +2,8 @@ import {
   FILTER_MUTATION_ATTEMPTS,
   FILTER_MUTATION_BACKOFF_MS,
   FILTER_OUTCOME_WAIT_MS,
-  MANAGED_MUTATION,
-  MANAGED_MUTATION_DEADLINE_MS,
+  MANAGED_DEADLINE_MS,
+  MANAGED_RETRY,
   backoffDelay
 } from "../retry.js"
 import { BARE_SCOPE, type ResourceScope } from "../client/resource-scope.js"
@@ -32,6 +32,7 @@ import {
   type CoordinatorConnection,
   type HeaderFault,
   type LaserTransport,
+  type ManagedSendOptions,
   type ManagedTarget,
   POLLED_HEAD_BYTES,
   type PolledMessage,
@@ -262,6 +263,10 @@ export interface CatalogPageOptions {
   readonly results?: number
 }
 
+// How a catalog read of the reader's own guard ends its wait for a roster that
+// refused it: the call's signal and the page's deadline.
+type CatalogReadOptions = Pick<ManagedSendOptions, "signal" | "walk">
+
 /** A group mutation's binding with the control-log position the fold applied it at. */
 export interface ConfiguredGroup {
   readonly binding: FilterBinding
@@ -307,7 +312,8 @@ export class Filters {
   async test(
     filter: FilterRef,
     payload: Uint8Array | string,
-    headers: readonly FilterHeader[] = []
+    headers: readonly FilterHeader[] = [],
+    options: CallOptions = {}
   ): Promise<FilterTestResult> {
     const request = {
       v: FILTER_OP_VERSION,
@@ -316,7 +322,7 @@ export class Filters {
       headers
     }
     validateFilterTestRequest(request)
-    const outcome = await this.native(FilterTestCommand, request)
+    const outcome = await this.native(FilterTestCommand, request, undefined, options)
     if (outcome.kind === "tested") return outcome.result
     throw unexpected("test")
   }
@@ -327,7 +333,7 @@ export class Filters {
     topic: string,
     partitionId: number,
     filter: FilterRef,
-    options: FilterPreviewOptions = {}
+    options: FilterPreviewOptions & CallOptions = {}
   ): Promise<FilterPreview> {
     const request = {
       v: FILTER_OP_VERSION,
@@ -343,19 +349,22 @@ export class Filters {
     const target = await this.partitionTarget(stream, topic, partitionId)
     let outcome: FilterOutcome
     try {
-      outcome = await this.native(FilterPreviewCommand, request, target)
+      outcome = await this.native(FilterPreviewCommand, request, target, options)
     } catch (error) {
       // A preview the partition's primary no longer takes goes to the
       // caller's node, which serves it from its own copy.
       if (target.kind === "caller" || !isRouteStale(error)) throw error
-      outcome = await this.native(FilterPreviewCommand, request, { kind: "caller" })
+      outcome = await this.native(FilterPreviewCommand, request, { kind: "caller" }, options)
     }
     if (outcome.kind === "preview") return outcome.preview
     throw unexpected("preview")
   }
 
   /** One page of a filter's revisions, newest first. */
-  async revisions(filterId: number, options: CatalogPageOptions = {}): Promise<FilterRevisionPage> {
+  async revisions(
+    filterId: number,
+    options: CatalogPageOptions & CatalogReadOptions = {}
+  ): Promise<FilterRevisionPage> {
     const request = {
       v: FILTER_OP_VERSION,
       filterId,
@@ -363,7 +372,10 @@ export class Filters {
       results: options.results ?? DEFAULT_PAGE_RESULTS
     }
     validateCatalogPage(request.page, request.results)
-    const outcome = await this.catalog(ListFilterRevisionsCommand, request)
+    const outcome = await this.catalog(ListFilterRevisionsCommand, request, {
+      signal: options.signal,
+      ...(options.walk === undefined ? {} : { walk: options.walk })
+    })
     if (outcome.kind === "revisions") return outcome.page
     throw unexpected("revisions")
   }
@@ -374,10 +386,13 @@ export class Filters {
    *
    * @internal
    */
-  async owned(owner: FilterGroupIdentity): Promise<FilterSummary | undefined> {
+  async owned(
+    owner: FilterGroupIdentity,
+    options: CallOptions = {}
+  ): Promise<FilterSummary | undefined> {
     const request: ListFilters = { v: FILTER_OP_VERSION, owner, page: 1, results: 1 }
     validateListFilters(request)
-    const outcome = await this.catalog(ListFiltersCommand, request)
+    const outcome = await this.catalog(ListFiltersCommand, request, { signal: options.signal })
     if (outcome.kind !== "filters") throw unexpected("filters")
     return outcome.page.items.find(
       (summary) => summary.owner !== undefined && sameGroupIdentity(summary.owner.identity, owner)
@@ -399,20 +414,25 @@ export class Filters {
   }
 
   /** The binding of one consumer group. Throws with reason `not_found` when it is unbound. */
-  async binding(group: FilterGroupRef): Promise<FilterBinding> {
+  async binding(group: FilterGroupRef, options: CallOptions = {}): Promise<FilterBinding> {
     validateFilterGroupRef(group)
-    const outcome = await this.catalog(GetFilterBindingCommand, { v: FILTER_OP_VERSION, group })
+    const outcome = await this.catalog(
+      GetFilterBindingCommand,
+      { v: FILTER_OP_VERSION, group },
+      { signal: options.signal }
+    )
     if (outcome.kind === "binding") return outcome.binding
     throw unexpected("binding")
   }
 
   /** One page of bindings, optionally narrowed to one filter, one stream, or one stream and topic. */
   async bindings(
-    options: CatalogPageOptions & {
-      readonly filterId?: number
-      readonly stream?: string
-      readonly topic?: string
-    } = {}
+    options: CatalogPageOptions &
+      CatalogReadOptions & {
+        readonly filterId?: number
+        readonly stream?: string
+        readonly topic?: string
+      } = {}
   ): Promise<FilterBindingPage> {
     const request = {
       v: FILTER_OP_VERSION,
@@ -423,17 +443,23 @@ export class Filters {
       results: options.results ?? DEFAULT_PAGE_RESULTS
     }
     validateCatalogPage(request.page, request.results)
-    const outcome = await this.catalog(ListFilterBindingsCommand, request)
+    const outcome = await this.catalog(ListFilterBindingsCommand, request, {
+      signal: options.signal,
+      ...(options.walk === undefined ? {} : { walk: options.walk })
+    })
     if (outcome.kind === "bindings") return outcome.page
     throw unexpected("bindings")
   }
 
-  /** The recorded outcome of a mutation. Throws with reason `not_found` until the catalog applies it. */
+  /** The recorded outcome of a mutation. Throws with reason `not_found` until
+   * the catalog applies it. The outcome wait paces its own repeats, so a
+   * refusal from every node comes back after one walk. */
   async operation(operationId: bigint): Promise<FilterMutationOutcome> {
-    const outcome = await this.catalog(FilterOperationCommand, {
-      v: FILTER_OP_VERSION,
-      operationId
-    })
+    const outcome = await this.catalog(
+      FilterOperationCommand,
+      { v: FILTER_OP_VERSION, operationId },
+      { walk: { kind: "once" } }
+    )
     if (outcome.kind === "mutation") return checkedMutationOutcome(operationId, outcome.outcome)
     throw unexpected("operation")
   }
@@ -506,7 +532,7 @@ export class Filters {
   async mutate(operationId: bigint, mutation: FilterMutation): Promise<FilterMutationOutcome> {
     const request = { v: FILTER_OP_VERSION, operationId, mutation }
     validateFilterMutationRequest(request)
-    const outcome = await this.catalog(FilterMutateCommand, request)
+    const outcome = await this.catalog(FilterMutateCommand, request, { walk: { kind: "once" } })
     if (outcome.kind === "mutation") return checkedMutationOutcome(operationId, outcome.outcome)
     throw unexpected("mutate")
   }
@@ -580,14 +606,15 @@ export class Filters {
   private async native<Request>(
     command: Parameters<typeof executeManaged<Request, FilterReply>>[2],
     request: Request,
-    target?: ManagedTarget
+    target?: ManagedTarget,
+    options: CallOptions = {}
   ): Promise<FilterOutcome> {
     const reply = await executeManaged(
       this.transport,
       await this.capabilities(),
       command,
       request,
-      target === undefined ? undefined : { target }
+      { ...(target === undefined ? {} : { target }), signal: options.signal }
     )
     if (reply.kind === "ok") return reply.outcome
     throw filterError(reply.error)
@@ -614,9 +641,16 @@ export class Filters {
 
   private async catalog<Request>(
     command: Parameters<typeof executeManaged<Request, FilterCatalogReply>>[2],
-    request: Request
+    request: Request,
+    options?: ManagedSendOptions
   ): Promise<FilterCatalogOutcome> {
-    const reply = await executeManaged(this.transport, await this.capabilities(), command, request)
+    const reply = await executeManaged(
+      this.transport,
+      await this.capabilities(),
+      command,
+      request,
+      options
+    )
     if (reply.kind === "ok") return reply.outcome
     throw filterError(reply.error)
   }
@@ -1010,7 +1044,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   tryNextPage(options: CallOptions = {}): Promise<MatchedPage | undefined> {
     return this.exclusive(options.signal, "filtered page", async () => {
       for (;;) {
-        const round = await this.round()
+        const round = await this.round({ signal: options.signal })
         if (round.kind === "page") return round.page
         if (round.kind === "idle") return undefined
       }
@@ -1020,7 +1054,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   /** One bounded round without an idle wait. The flag means unmatched work remains. */
   readRound(options: CallOptions = {}): Promise<readonly [MatchedPage | undefined, boolean]> {
     return this.exclusive(options.signal, "filtered round", async () => {
-      const round = await this.round()
+      const round = await this.round({ signal: options.signal })
       return [round.kind === "page" ? round.page : undefined, round.kind === "busy"] as const
     })
   }
@@ -1327,12 +1361,23 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   ): Promise<MatchedPage> {
     const deadline =
       options.timeoutMs === undefined ? undefined : performance.now() + options.timeoutMs
+    const guardRead: CatalogReadOptions = {
+      signal: options.signal,
+      ...(options.timeoutMs === undefined
+        ? {}
+        : {
+            walk: {
+              kind: "until",
+              deadline: Date.now() + Math.min(options.timeoutMs, MANAGED_DEADLINE_MS)
+            }
+          })
+    }
     // Timers count whole milliseconds, so a wait that ran out the time left
     // ends the call even when `performance.now()` is a fraction short of it.
     let expired = false
     for (;;) {
       throwIfAborted(options.signal, "filtered page")
-      const round = await this.round()
+      const round = await this.round(guardRead)
       if (round.kind === "page") return round.page
       const remainingMs = deadline === undefined ? undefined : deadline - performance.now()
       if (expired || (remainingMs !== undefined && remainingMs <= 0)) {
@@ -1347,7 +1392,9 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   // last round stopped. A failing partition is deferred and the rest still
   // read, so one partition never starves the others, and its error reaches
   // the caller at most once per idle interval.
-  private async round(): Promise<
+  private async round(
+    guardRead: CatalogReadOptions
+  ): Promise<
     { readonly kind: "page"; readonly page: MatchedPage } | { readonly kind: "busy" | "idle" }
   > {
     this.requireOpen()
@@ -1375,7 +1422,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       if (only !== undefined && !only.has(partitionId)) continue
       if (this.progress.get(partitionId)?.waiting(now) === true) continue
       try {
-        const read = await this.read(partitionId)
+        const read = await this.read(partitionId, guardRead)
         if (read.kind === "page") {
           this.cursor = index + 1
           this.deferredError = failure
@@ -1402,7 +1449,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     return { kind: busy ? "busy" : "idle" }
   }
 
-  private async read(partitionId: number): Promise<Read> {
+  private async read(partitionId: number, guardRead: CatalogReadOptions): Promise<Read> {
     const progress = this.partitionProgress(partitionId)
     if (progress.inFlight >= (this.settings.maxUnackedPages ?? DEFAULT_MAX_UNACKED_PAGES))
       return { kind: "saturated" }
@@ -1486,8 +1533,9 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       if (this.settings.guardEnabled && this.guard === undefined) {
         this.guard = await compileGuard(
           this.settings.transport,
-          await boundDefinition(this.settings.filters, request.source, page),
-          this.settings.filters.schemaStream()
+          await boundDefinition(this.settings.filters, request.source, page, guardRead),
+          this.settings.filters.schemaStream(),
+          guardRead
         )
       }
       if (this.guard !== undefined) {
@@ -1567,18 +1615,18 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     if (this.settings.guardEnabled) this.guard = undefined
   }
 
-  // Store the completed prefix like `flush`, again on the managed mutation
+  // Store the completed prefix like `flush`, again on the managed retry
   // backoff while a failover leaves the partition without a primary that takes
   // it. Each repeat sends the same target, never past what was delivered.
   private async store(partitionId: number): Promise<void> {
-    const deadline = performance.now() + MANAGED_MUTATION_DEADLINE_MS
+    const deadline = performance.now() + MANAGED_DEADLINE_MS
     for (let attempt = 1; ; attempt += 1) {
       try {
         await this.flush(partitionId)
         return
       } catch (error) {
         if (!isRouteMoved(error) || performance.now() >= deadline) throw error
-        await sleep(backoffDelay(MANAGED_MUTATION, attempt))
+        await sleep(backoffDelay(MANAGED_RETRY, attempt))
       }
     }
   }
@@ -2359,16 +2407,14 @@ function sharedCoordinator(transport: FilterTransport): CoordinatorConnection {
     throw new ConfigError(`this transport cannot ${verb}, which a group reader needs`)
   }
   return {
-    send: (code, payload) => transport.sendManaged(code, payload),
+    send: (code, payload) => transport.sendManaged(code, payload, { walk: { kind: "once" } }),
     sendManagedTo: (code, payload, target, options) =>
       transport.sendManagedTo === undefined
         ? missing("send a managed request to a chosen node")
-        : transport.sendManagedTo(
-            code,
-            payload,
-            target,
-            options?.deadline === undefined ? undefined : { deadline: options.deadline }
-          ),
+        : transport.sendManagedTo(code, payload, target, {
+            walk: { kind: "once" },
+            ...(options?.deadline === undefined ? {} : { deadline: options.deadline })
+          }),
     partitionPrimary: (streamId, topicId, partitionId) =>
       transport.partitionPrimary === undefined
         ? missing("look a partition route up")
@@ -2776,7 +2822,8 @@ function filterHeaders(headers: ReadonlyMap<string, HeaderValue>): FilterHeader[
 async function compileGuard(
   transport: FilterTransport,
   filter: ConsumerFilter,
-  defaultSchemaStream: string | undefined
+  defaultSchemaStream: string | undefined,
+  guardRead: CatalogReadOptions
 ): Promise<CompiledFilter> {
   const schemaStream = filter.schemaStream ?? defaultSchemaStream
   const schemas: SchemaDef[] = []
@@ -2789,7 +2836,8 @@ async function compileGuard(
           id,
           ...(schemaStream !== undefined ? { stream: schemaStream } : {})
         })
-      )
+      ),
+      guardRead
     )
     const reply = decodeBrowseReply(decodeOne(bytes, "writer schema"), "writer schema")
     if (reply.kind === "err")
@@ -2811,7 +2859,8 @@ async function compileGuard(
 async function boundDefinition(
   filters: Filters,
   requested: FilterSource,
-  page: FilteredPage
+  page: FilteredPage,
+  guardRead: CatalogReadOptions
 ): Promise<ConsumerFilter> {
   const source = page.generation
   for (let pageNumber = 1; ; pageNumber += 1) {
@@ -2819,7 +2868,8 @@ async function boundDefinition(
       stream: requested.stream,
       topic: requested.topic,
       page: pageNumber,
-      results: MAX_FILTER_CATALOG_PAGE
+      results: MAX_FILTER_CATALOG_PAGE,
+      ...guardRead
     })
     const binding = bindings.items.find(
       ({ identity }) =>
@@ -2832,11 +2882,11 @@ async function boundDefinition(
     if (binding !== undefined) {
       if (page.policy.digest === undefined || !sameBytes(binding.digest, page.policy.digest))
         throw new ProtocolError("served policy differs from the group's catalog binding")
-      return definition(filters, {
-        kind: "revision",
-        filterId: binding.filterId,
-        revision: binding.revision
-      })
+      return definition(
+        filters,
+        { kind: "revision", filterId: binding.filterId, revision: binding.revision },
+        guardRead
+      )
     }
     if (pageNumber >= bindings.totalPages)
       throw filterError({
@@ -2847,13 +2897,21 @@ async function boundDefinition(
   }
 }
 
-async function definition(filters: Filters, filter: FilterRef): Promise<ConsumerFilter> {
+async function definition(
+  filters: Filters,
+  filter: FilterRef,
+  guardRead: CatalogReadOptions
+): Promise<ConsumerFilter> {
   if (filter.kind === "inline") return filter.filter
   if (filter.kind === "bound" || filter.kind === "group")
     throw new ConfigError("resolve a group guard from the served page")
   const { filterId, revision } = filter
   for (let page = 1; ; page += 1) {
-    const revisions = await filters.revisions(filterId, { page, results: MAX_FILTER_CATALOG_PAGE })
+    const revisions = await filters.revisions(filterId, {
+      page,
+      results: MAX_FILTER_CATALOG_PAGE,
+      ...guardRead
+    })
     const found = revisions.items.find((info) => info.revision === revision)
     if (found !== undefined) return found.filter
     if (page >= revisions.totalPages) {

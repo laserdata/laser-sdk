@@ -13,7 +13,7 @@ import { type IggyClient, acceptStage, missingTopic } from "../../src/iggy/apach
 import { AgentId } from "../../src/types/ids.js"
 
 const NO_STREAM_HINT =
-  "pass a stream, or set a default stream when connecting (stream option) or with withDefaultStream"
+  "work in a scratch stream with scratchStream(prefix), or pick one with withDefaultStream(name)"
 const MISSING_TOPIC_HINT =
   "the topic does not exist: create the agent topics with bootstrap, or a memory topic with memoryTopic"
 const NO_INBOX_HINT =

@@ -1,7 +1,8 @@
 import {
   MANAGED_ATTEMPT_FIRST_MS,
-  MANAGED_MUTATION,
-  MANAGED_MUTATION_DEADLINE_MS,
+  MANAGED_DEADLINE_MS,
+  MANAGED_RETRY,
+  backoffDelay,
   jittered
 } from "../retry.js"
 import { JOIN_GROUP } from "apache-iggy/dist/wire/consumer-group/join-group.command.js"
@@ -94,6 +95,12 @@ import {
   AGDX_AUTHZ_DELETE_ROLE_CODE,
   AGDX_BATCH_CODE,
   AGDX_COMMAND_BASE,
+  AGDX_FILTER_OPERATION_CODE,
+  AGDX_GET_FILTER_BINDING_CODE,
+  AGDX_GET_FILTER_CODE,
+  AGDX_LIST_FILTER_BINDINGS_CODE,
+  AGDX_LIST_FILTER_REVISIONS_CODE,
+  AGDX_LIST_FILTERS_CODE,
   isBarrierRead,
   isIdempotentManagedRequest
 } from "../wire/codes.js"
@@ -181,6 +188,17 @@ const STRING_IDENTIFIER = 2
 // Server replies a later attempt can clear: a write the cluster did not
 // commit or admit, and a partition the node could not read yet.
 const TRANSIENT_SERVER_CODES: ReadonlySet<number> = new Set([57, 58, 3004, 10002])
+// The filter catalog reads, which the streaming server refuses as
+// `catalog_unavailable` when it cannot reach its managed backend, as Rust
+// `is_filter_catalog_read`.
+const FILTER_CATALOG_READS: ReadonlySet<number> = new Set([
+  AGDX_GET_FILTER_CODE,
+  AGDX_LIST_FILTERS_CODE,
+  AGDX_LIST_FILTER_REVISIONS_CODE,
+  AGDX_GET_FILTER_BINDING_CODE,
+  AGDX_LIST_FILTER_BINDINGS_CODE,
+  AGDX_FILTER_OPERATION_CODE
+])
 const PARTITION_NOT_FOUND = 3007
 // A topic's cached partition count is read again once this old, so keyed and
 // balanced publishes reach partitions added since.
@@ -314,6 +332,18 @@ export type ManagedTarget =
   /** One replica, by the id cluster metadata names it with. */
   | { readonly kind: "replica"; readonly replica: number }
 
+/** How a request to the caller's node answers a roster whose every node
+ * refused it for want of its managed backend or with a lost link, as Rust
+ * `nodes::Walk`. */
+export type ManagedWalk =
+  /** Walk the roster once and return the last refusal, for a caller that
+   * answers a refusal itself. */
+  | { readonly kind: "once" }
+  /** Wait on the managed backoff and walk the roster again until the request
+   * is served or `deadline`, an epoch time in milliseconds, passes, then
+   * return the last refusal. */
+  | { readonly kind: "until"; readonly deadline: number }
+
 /** A managed reply and the replica that sent it, absent when the metadata primary answered. */
 export interface ManagedAnswer {
   /** The reply, opened from the positioned envelope a managed node may wrap it in. */
@@ -331,6 +361,11 @@ export interface ManagedSendOptions {
   /** When the call gives up, as an epoch time in milliseconds, for a request
    * the server may hold. Defaults to the client's 30 second call bound. */
   readonly deadline?: number
+  /** How a read walks the roster while every node refuses it. Defaults to
+   * walking again until `deadline`, or `MANAGED_DEADLINE_MS` without one. */
+  readonly walk?: ManagedWalk
+  /** Ends a read's wait for a roster that refused it. */
+  readonly signal?: AbortSignal | undefined
   /** Overrides the mutation deadline, for tests.
    * @internal */
   readonly mutationDeadlineMs?: number
@@ -1767,8 +1802,8 @@ async function connectWithRetry(
 }
 
 /** How long a managed mutation repeats its frame while its outcome is unknown,
- * as Rust `MANAGED_MUTATION_DEADLINE`. */
-export { MANAGED_MUTATION_DEADLINE_MS }
+ * and a managed read every node refused its walk, as Rust `MANAGED_DEADLINE`. */
+export { MANAGED_DEADLINE_MS }
 
 /** Where `code` goes when nothing more specific names its node, as Rust
  * `Target::of_code`. A standard Iggy command keeps the client's own routing,
@@ -1830,15 +1865,15 @@ export class Nodes {
   private roster: readonly number[] = []
   // Failed links so far, each one moves the caller to the next node.
   private moved = 0n
-  // The node each recent query ran on, newest last.
 
   constructor(private readonly callerKey: bigint = callerKeyOf()) {}
 
   /**
    * Sends `code` to `target`. A request to the caller's node moves on to the
-   * next node after a failed link, at most once per node, and reads the roster
-   * again once when a replica id is no longer in it. A request to a named
-   * replica is sent there only.
+   * next node after a failed link, at most once per node, reads the roster
+   * again once when a replica id is no longer in it, and returns the last
+   * refusal when every node refused it. A request to a named replica is sent
+   * there only.
    */
   async send(
     run: Runner,
@@ -1873,6 +1908,39 @@ export class Nodes {
         )
       case "caller":
         return this.sendToCaller(run, code, buffer, deadline, written)
+    }
+  }
+
+  /**
+   * `send` for a managed read, as Rust `Nodes::read`. A read every node of the
+   * roster refused walks the roster again as `walk` allows, each walk after
+   * the first behind the next jittered step of the managed backoff. A wait
+   * that would end past the deadline returns the last refusal instead, and an
+   * aborted `signal` ends the wait with `CancelledError`.
+   */
+  async read(
+    run: Runner,
+    code: number,
+    payload: Uint8Array,
+    target: ManagedTarget,
+    walk: ManagedWalk,
+    options: { readonly deadline?: number; readonly signal?: AbortSignal | undefined } = {}
+  ): Promise<ManagedAnswer> {
+    if (target.kind !== "caller" || walk.kind === "once")
+      return this.send(run, code, payload, target, options.deadline)
+    const buffer = toNodeBuffer(payload)
+    for (let walks = 1; ; walks += 1) {
+      const wait = backoffDelay(MANAGED_RETRY, walks)
+      try {
+        const answer = await this.sendToCaller(run, code, buffer, options.deadline, {
+          written: false
+        })
+        if (!backendRefused(code, answer.reply) || !(await walksAgain(walk, wait, options.signal)))
+          return answer
+      } catch (error) {
+        if (!isTransientFailure(error) || !(await walksAgain(walk, wait, options.signal)))
+          throw error
+      }
     }
   }
 
@@ -1927,7 +1995,7 @@ export class Nodes {
         )
         written.written = true
         const answer = openAnswer(reply, replica)
-        if (backendUnavailable(answer.reply)) {
+        if (backendRefused(code, answer.reply)) {
           this.failed(replica)
           failedLinks += 1
           if (walksOn(failedLinks, nodes, deadline)) continue
@@ -1961,6 +2029,18 @@ function walksOn(failedLinks: number, nodes: number, deadline: number | undefine
   return failedLinks < nodes && (deadline === undefined || Date.now() < deadline)
 }
 
+// Whether a read every node refused walks the roster again after `wait`, which
+// must end before the read's deadline, as Rust `walks_again`.
+async function walksAgain(
+  walk: ManagedWalk,
+  wait: number,
+  signal: AbortSignal | undefined
+): Promise<boolean> {
+  if (walk.kind !== "until" || Date.now() + wait >= walk.deadline) return false
+  await delay(wait, signal, "managed read")
+  return Date.now() < walk.deadline
+}
+
 // A raw command bounded by the caller's deadline instead of the client's
 // default call bound, for a request the server may hold.
 async function sendWithin(
@@ -1988,6 +2068,21 @@ export function backendUnavailable(reply: Uint8Array): boolean {
       value.get("code") === "backend_unavailable" &&
       typeof value.get("message") === "string"
     )
+  } catch {
+    return false
+  }
+}
+
+// Whether a node refused `code` for want of its managed backend, as Rust
+// `backend_refused`: `BackendUnavailable`, or for a filter catalog read
+// `catalog_unavailable`, the form the streaming server gives that refusal there.
+function backendRefused(code: number, reply: Uint8Array): boolean {
+  if (backendUnavailable(reply)) return true
+  if (!FILTER_CATALOG_READS.has(code)) return false
+  try {
+    const value: unknown = decodeOne(reply, "FilterCatalogReply")
+    const error: unknown = value instanceof Map ? value.get("err") : undefined
+    return error instanceof Map && error.get("reason") === "catalog_unavailable"
   } catch {
     return false
   }
@@ -2502,8 +2597,9 @@ export class ApacheIggyTransport implements LaserTransport {
 
   /**
    * Sends managed command `code` to `target` and names the replica that
-   * answered, as Rust `send_managed_to`. A read goes in its read frame, a
-   * mutation repeats its frame until its outcome is known.
+   * answered, as Rust `send_managed_walking`. A read goes in its read frame and
+   * walks the roster again as `options.walk` allows while every node refuses
+   * it, a mutation repeats its frame until its outcome is known.
    */
   async sendManagedTo(
     code: number,
@@ -2512,12 +2608,17 @@ export class ApacheIggyTransport implements LaserTransport {
     options?: ManagedSendOptions
   ): Promise<ManagedAnswer> {
     if (!isIdempotentManagedRequest(code)) {
-      const answer = await this.nodes.send(
+      const deadline = options?.deadline
+      const answer = await this.nodes.read(
         this.runner(options),
         code,
         this.readFrame(code, payload),
         target,
-        options?.deadline
+        options?.walk ?? { kind: "until", deadline: deadline ?? Date.now() + MANAGED_DEADLINE_MS },
+        {
+          ...(deadline !== undefined ? { deadline } : {}),
+          signal: options?.signal
+        }
       )
       return { ...answer, reply: this.takePositioned(answer) }
     }
@@ -2539,9 +2640,9 @@ export class ApacheIggyTransport implements LaserTransport {
    * `send_managed_mutation`. The frame and its operation identity never change
    * between attempts, so the server applies the mutation at most once. A
    * `Pending` reply or a retryable transport failure repeats the same frame with
-   * jittered backoff. Past the deadline the caller gets
-   * `AmbiguousMutationError` naming the identity, because the mutation may
-   * still apply.
+   * jittered backoff, and each attempt walks the roster once. Past the
+   * deadline the caller gets `AmbiguousMutationError` naming the identity,
+   * because the mutation may still apply.
    */
   private async sendManagedMutation(
     code: number,
@@ -2550,10 +2651,10 @@ export class ApacheIggyTransport implements LaserTransport {
     target: ManagedTarget,
     options?: ManagedSendOptions
   ): Promise<ManagedAnswer> {
-    const deadlineMs = options?.mutationDeadlineMs ?? MANAGED_MUTATION_DEADLINE_MS
+    const deadlineMs = options?.mutationDeadlineMs ?? MANAGED_DEADLINE_MS
     const deadline = Date.now() + deadlineMs
     const identity = operationId.toString(16).padStart(32, "0")
-    let delay = MANAGED_MUTATION.baseMs
+    let delay = MANAGED_RETRY.baseMs
     let bound = MANAGED_ATTEMPT_FIRST_MS
     const attempts = new MutationAttempts(code === AGDX_BATCH_CODE)
     for (;;) {
@@ -2602,7 +2703,7 @@ export class ApacheIggyTransport implements LaserTransport {
         )
       }
       await new Promise((resolve) => setTimeout(resolve, wait))
-      delay = Math.min(delay * 2, MANAGED_MUTATION.maxMs)
+      delay = Math.min(delay * 2, MANAGED_RETRY.maxMs)
       bound *= 2
     }
   }

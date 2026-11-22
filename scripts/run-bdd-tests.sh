@@ -3,12 +3,16 @@
 # Apache Iggy. Every runner starts the versioned native server unless
 # LASER_TEST_IGGY_SERVER or an external LASER_BDD_ADDR is provided.
 #
-# Usage: scripts/run-bdd-tests.sh [language]
+# Usage: scripts/run-bdd-tests.sh [language] [--recovering-catalog]
 #   language: rust | python | typescript | go   (rust is the default)
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 language="${1:-rust}"
+
+if [[ "${2:-}" == "--recovering-catalog" ]]; then
+  exec python3 "$repo_root/scripts/run-with-recovering-catalog.py" "$repo_root/scripts/run-bdd-tests.sh" "$language"
+fi
 
 case "$language" in
   rust)

@@ -1,4 +1,4 @@
-use crate::test_iggy::{TestIggy, TestIggyCluster};
+use crate::test_iggy::{TestIggy, TestIggyCluster, free_host_ports};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -83,17 +83,6 @@ async fn given_three_node_cluster_when_follower_and_leader_restart_then_same_sdk
     );
 }
 
-async fn wait_for_progress(counter: &AtomicU64, expected: u64, phase: &str) {
-    let deadline = Instant::now() + Duration::from_secs(90);
-    while counter.load(Ordering::Acquire) < expected {
-        assert!(
-            Instant::now() < deadline,
-            "streaming did not resume after {phase}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 // The SDK claims resilience through Iggy SDK auto-reconnect. This is the
 // demonstration: a publish warms the producer cache, the server restarts under
 // the same mapped port (every connection dies), and the SAME `Laser` publishes
@@ -168,4 +157,66 @@ async fn given_a_server_restart_when_reusing_the_same_client_then_should_publish
         payloads.contains(&b"after-restart".to_vec()),
         "the post-restart publish reads back through the same client"
     );
+}
+
+// A reserved port is free until its node binds it, and any process can take it in between.
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_reserved_cluster_port_taken_before_a_node_binds_when_starting_then_should_start_on_fresh_ports()
+ {
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold one port");
+    let held_port = holder.local_addr().expect("held port address").port();
+    let mut reservations = 0;
+
+    let cluster = TestIggyCluster::start_reserving(
+        3,
+        |_| Vec::new(),
+        |count| {
+            reservations += 1;
+            let mut ports = free_host_ports(count);
+            if reservations == 1 {
+                ports[0] = held_port;
+            }
+            ports
+        },
+    )
+    .await;
+
+    assert!(reservations > 1, "the cluster reserved ports again");
+    assert_ne!(cluster.node_endpoint(0), format!("127.0.0.1:{held_port}"));
+    cluster.leader(0).await;
+}
+
+// A stopped node comes back on the address its peers know, so it cannot move to another port.
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_stopped_node_whose_port_is_taken_when_starting_it_again_then_should_rejoin_once_the_port_is_free()
+ {
+    let mut cluster = TestIggyCluster::start().await;
+    let leader = cluster.leader(0).await;
+    let follower = (0..3).find(|node| *node != leader).expect("follower");
+    cluster.stop_node(follower);
+    let holder = tokio::net::TcpListener::bind(cluster.node_endpoint(follower))
+        .await
+        .expect("take the stopped node's port");
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(holder);
+    });
+
+    cluster.start_node(follower).await;
+
+    release.await.expect("the port holder finishes");
+    cluster.leader(follower).await;
+}
+
+async fn wait_for_progress(counter: &AtomicU64, expected: u64, phase: &str) {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while counter.load(Ordering::Acquire) < expected {
+        assert!(
+            Instant::now() < deadline,
+            "streaming did not resume after {phase}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

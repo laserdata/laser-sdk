@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "laser-sdk"
-description = "LaserData SDK over Apache Iggy: typed streaming, operational query, materialization, key-value state, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
+description = "Durable workflows and long-term memory for AI agents, with sessions, key-value state, operational query and typed streaming on Apache Iggy."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
@@ -22,7 +22,9 @@ dynamic = ["version"]
 
 [project.urls]
 Homepage = "https://laserdata.com"
+Documentation = "https://docs.laserdata.com/laser-sdk"
 Repository = "https://github.com/laserdata/laser-sdk"
+Issues = "https://github.com/laserdata/laser-sdk/issues"
 
 [project.optional-dependencies]
 examples = ["protobuf>=5,<8", "cbor2>=5,<7"]

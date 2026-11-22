@@ -29,7 +29,7 @@ export function agentMessage(payload: BytesLike, provenance: Provenance): AgentM
 
 // Warning: (ae-forgotten-export) The symbol "StateStore" needs to be exported by the entry point testing.d.ts
 //
-// @public (undocumented)
+// @public
 export class InMemoryStore implements StateStore {
     // (undocumented)
     delete(key: string): Promise<void>;

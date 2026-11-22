@@ -19,6 +19,10 @@ pub enum IdError {
     TooLong { got: usize, max: usize },
     #[error("identifier contains invalid character `{0}`")]
     InvalidChar(char),
+    #[error(
+        "invalid conversation id `{0}`: a conversation id is a ULID, make one with ConversationId::new()"
+    )]
+    InvalidConversationId(String),
     #[error("invalid ULID `{0}`")]
     InvalidUlid(String),
     #[error("invalid message id `{0}`, expected `<partition_id>:<offset>`")]
@@ -76,7 +80,7 @@ impl FromStr for ConversationId {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ulid::from_string(s)
             .map(Self)
-            .map_err(|_| IdError::InvalidUlid(s.to_owned()))
+            .map_err(|_| IdError::InvalidConversationId(s.to_owned()))
     }
 }
 
@@ -410,11 +414,16 @@ mod tests {
     }
 
     #[test]
-    fn given_an_invalid_string_when_parsing_a_conversation_id_then_should_error() {
-        assert!(matches!(
-            "not-a-ulid".parse::<ConversationId>(),
-            Err(IdError::InvalidUlid(_))
-        ));
+    fn given_a_malformed_conversation_id_when_parsed_then_should_name_the_call_that_makes_one() {
+        let error = "conv-1"
+            .parse::<ConversationId>()
+            .expect_err("a name is not a conversation id");
+
+        assert_eq!(error, IdError::InvalidConversationId("conv-1".to_owned()));
+        assert_eq!(
+            error.to_string(),
+            "invalid conversation id `conv-1`: a conversation id is a ULID, make one with ConversationId::new()"
+        );
     }
 
     #[test]

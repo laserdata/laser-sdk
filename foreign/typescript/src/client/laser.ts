@@ -625,7 +625,9 @@ function metadataActionFields(envelope: AgentEnvelope): {
 async function probeCapabilities(transport: ManagedTransport): Promise<Capabilities> {
   let reply: Uint8Array
   try {
-    reply = await transport.sendManaged(AGDX_HELLO_CODE, new Uint8Array())
+    reply = await transport.sendManaged(AGDX_HELLO_CODE, new Uint8Array(), {
+      walk: { kind: "once" }
+    })
   } catch (error) {
     return {
       ...OPEN_CAPABILITIES,
@@ -659,7 +661,23 @@ async function connectUnless(
   }
 }
 
-/** Owns one Apache Iggy connection and addresses every stream available through it. */
+function envConnectionString(env: Readonly<Record<string, string | undefined>>): string {
+  const connectionString = env["LASER_CONNECTION_STRING"]
+  if (connectionString === undefined || connectionString.length === 0) {
+    throw new ConfigError("LASER_CONNECTION_STRING is not set")
+  }
+  return connectionString
+}
+
+/** Owns one Apache Iggy connection and addresses every stream available
+ * through it. Start with `await using root = await Laser.connectEnv()` (the
+ * connection string in `LASER_CONNECTION_STRING`) and
+ * `await using scratch = await root.scratchStream(prefix)` (a stream deleted
+ * when the scope ends).
+ * On `scratch.laser` the task entry points return at once: `workflow(name)`
+ * (steps in this process, then `await run()`), `memory(namespace)`
+ * (`remember`, `supersede`, `recall`, each ending in an awaited `send()` or
+ * `fetch()`), and `sessions()` (model calls, tool calls and state). */
 export class Laser implements AsyncDisposable {
   private constructor(
     private readonly transport: LaserTransport,
@@ -888,20 +906,38 @@ export class Laser implements AsyncDisposable {
     return connectUnless(options.signal, (signal) => Laser.open(connectionString, stream, signal))
   }
 
+  /** Await it for a connected `Laser`:
+   * `await using laser = await Laser.connectEnv()` reads `LASER_CONNECTION_STRING` (required, else
+   * `ConfigError`) and an optional `LASER_STREAM` default stream, an empty
+   * value counting as unset, and closes the connection when the scope ends.
+   * The timeout and publish variables apply as on `connect`. */
   static async connectEnv(
     env: Readonly<Record<string, string | undefined>> = process.env,
     options: CallOptions = {}
   ): Promise<Laser> {
-    const connectionString = env["LASER_CONNECTION_STRING"]
-    if (connectionString === undefined || connectionString.length === 0) {
-      throw new ConfigError("LASER_CONNECTION_STRING is not set")
-    }
+    const connectionString = envConnectionString(env)
     const stream = env["LASER_STREAM"]
     return stream === undefined || stream.length === 0
       ? Laser.connect(connectionString, options)
       : Laser.connectWithStream(connectionString, stream, options)
   }
 
+  /** Await it for a connected `Laser` whose default stream is `stream`:
+   * `await using laser = await Laser.connectEnvWithStream("orders")` reads
+   * `LASER_CONNECTION_STRING` like `connectEnv`, and `stream` wins over
+   * `LASER_STREAM`. For a stream deleted at the end of the run use
+   * `scratchStream` instead. */
+  static async connectEnvWithStream(
+    stream: string,
+    env: Readonly<Record<string, string | undefined>> = process.env,
+    options: CallOptions = {}
+  ): Promise<Laser> {
+    return Laser.connectWithStream(envConnectionString(env), stream, options)
+  }
+
+  /** Await it for a `Laser` connected to a server you started on this
+   * machine, at `iggy:iggy@127.0.0.1:8090`. When `LASER_CONNECTION_STRING`
+   * is set, call `connectEnv()` instead. */
   static local(options: CallOptions = {}): Promise<Laser> {
     return Laser.connect(LOCAL_CONNECTION_STRING, options)
   }
@@ -1440,9 +1476,11 @@ export class Laser implements AsyncDisposable {
     return abortable(list(), options.signal, "stream listing")
   }
 
-  /** Creates a stream named `{prefix}-{8 lowercase hex}` and returns it with a
-   * view whose default stream it is. `await using` deletes it when the scope
-   * ends. */
+  /** Await it for a stream named `{prefix}-{8 lowercase hex}`, created for
+   * one program run, with a view whose default stream it is
+   * (`scratch.laser`). `await using` deletes it when the scope ends. Use a
+   * named stream (`LASER_STREAM` or `withDefaultStream`) to keep what the
+   * program writes. */
   scratchStream(prefix: string, options: CallOptions = {}): Promise<ScratchStream> {
     return ScratchStream.open(this, prefix, options)
   }
@@ -1497,6 +1535,10 @@ export class Laser implements AsyncDisposable {
     return ContractBuilder.create(this, router)
   }
 
+  /** A `Workflow` named `name` (also the orchestrator identity it dispatches
+   * as), returned at once. Chain `stepLocal` or `step` calls, then await
+   * `run()`. A local step needs no agent, and the run creates its topics, so
+   * it needs no `bootstrap`. */
   workflow(name: string): Workflow {
     return Workflow.create(this, name)
   }
@@ -1602,16 +1644,29 @@ export class Laser implements AsyncDisposable {
     return Sessions.create(this, config)
   }
 
+  /** Agent memory in `namespace` on the stream's `agent.memory` topic,
+   * returned at once without `await`: `const memory = laser.memory("assistant")`.
+   * `remember` publishes to the memory topic and creates it on the first
+   * write, `supersede` corrects a fact, `forget` appends a tombstone, and a
+   * deployment materializes the topic into the versioned key-value read view.
+   * Default `recall` reads that view where the deployment serves one and
+   * folds the topic in process elsewhere, so the same program runs on plain
+   * Apache Iggy. */
   memory(namespace: string): MemoryHandle {
     return this.memoryWith(namespace, MemoryBackend.Auto)
   }
 
-  /** Opens durable memory on an existing caller-named topic. */
+  /** Opens durable memory on an existing caller-named topic, returned at
+   * once without `await`. */
   memoryOnTopic(topic: string, stream?: string): MemoryHandle {
     return MemoryHandle.logTopic(this, topic, stream)
   }
 
-  /** Configures a durable memory topic before opening it. */
+  /** A `MemoryTopicBuilder` for memory on `topic`, not the handle: chain
+   * `stream`, `partitions`, `ttl` or `noExpiry`, then await `build()`, which
+   * creates the topic when missing and resolves to the handle. The message
+   * expiry defaults to thirty days. `memory(namespace)` needs no build and
+   * creates the default topic on its first write. */
   memoryTopic(topic: string): MemoryTopicBuilder {
     return MemoryTopicBuilder.create(this, topic)
   }
@@ -2171,7 +2226,7 @@ export class Laser implements AsyncDisposable {
         AGDX_SET_CLIENT_METADATA_CODE,
         payload,
         target,
-        { deadline: Date.now() + PRESENCE_ATTEMPT_MS }
+        { deadline: Date.now() + PRESENCE_ATTEMPT_MS, walk: { kind: "once" } }
       )
       return answer.replica
     } catch (error) {
@@ -2688,13 +2743,15 @@ export class Laser implements AsyncDisposable {
         { surface: "query", feature: "consistency" }
       )
     }
+    // A query every node refused walks the roster again until its deadline,
+    // so the last refusal comes back before the reply wait ends.
     const reply = await sendQueryUntil(query.deadlineMicros, () =>
       executeManaged(
         this.managedTransport(),
         capabilities,
         QueryCommand,
         { v: QUERY_OP_VERSION, query },
-        { signal }
+        { signal, walk: { kind: "until", deadline: Number(query.deadlineMicros / 1000n) } }
       )
     )
     if (reply.kind === "ok") {

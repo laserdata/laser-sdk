@@ -1,8 +1,8 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import type { Client as IggyClient } from "apache-iggy"
-import { AmbiguousMutationError, TransportError } from "../../src/client/errors.js"
-import { encodeNamed } from "../../src/wire/cbor.js"
+import { AmbiguousMutationError, CancelledError, TransportError } from "../../src/client/errors.js"
+import { decodeOne, encodeNamed } from "../../src/wire/cbor.js"
 import {
   ApacheIggyTransport,
   Nodes,
@@ -14,9 +14,14 @@ import {
   AGDX_AUTHZ_DEFINE_ROLE_CODE,
   AGDX_AUTHZ_DELETE_ROLE_CODE,
   AGDX_AUTHZ_WHOAMI_CODE,
+  AGDX_FILTER_MUTATE_CODE,
+  AGDX_FILTERED_POLL_CODE,
+  AGDX_GET_FILTER_BINDING_CODE,
   AGDX_KV_GET_CODE,
+  AGDX_KV_SET_CODE,
   AGDX_QUERY_CODE
 } from "../../src/wire/codes.js"
+import { encodeFilterCatalogReply } from "../../src/wire/filter.js"
 
 const GET_STREAM_CODE = 200
 const TRANSIENT_NOT_COMMITTED = 57
@@ -78,6 +83,30 @@ function cluster(
 
 function refusal(errorCode: number): Error {
   return Object.assign(new Error(`refused with ${String(errorCode)}`), { errorCode })
+}
+
+function backendUnavailableReply(message: string): Uint8Array {
+  return encodeNamed(
+    new Map([
+      ["code", "backend_unavailable"],
+      ["message", message]
+    ])
+  )
+}
+
+// The refusal the streaming server gives a filter catalog read when it cannot
+// reach its managed backend.
+function catalogUnavailableReply(): Uint8Array {
+  return encodeNamed(
+    encodeFilterCatalogReply({
+      kind: "err",
+      error: {
+        code: { kind: "known", name: "Unavailable" },
+        reason: "catalog_unavailable",
+        message: "the managed backend did not answer"
+      }
+    })
+  )
 }
 
 void test("given_a_roster_when_picking_then_should_keep_one_node_per_caller_key", () => {
@@ -224,6 +253,186 @@ void test("given_every_backend_unavailable_when_sending_then_should_return_the_l
   )
 })
 
+void test("given_one_node_that_refuses_then_serves_when_reading_then_should_return_the_served_reply", async () => {
+  const { client, sent } = cluster([0], (_replica, attempt) =>
+    attempt === 0 ? backendUnavailableReply("replaying its logs") : undefined
+  )
+  const answer = await new Nodes(0n).read(
+    (operation) => operation(client),
+    AGDX_KV_GET_CODE,
+    OK,
+    { kind: "caller" },
+    { kind: "until", deadline: Date.now() + 5_000 }
+  )
+  assert.deepEqual(answer.reply, OK)
+  assert.equal(sent.length, 2, "the refused node is asked again")
+})
+
+void test("given_every_node_refusing_past_the_deadline_when_reading_then_should_return_the_last_refusal", async () => {
+  const { client, sent } = cluster([0, 1], (_replica, attempt) =>
+    backendUnavailableReply(`refusal ${String(attempt)}`)
+  )
+  const started = Date.now()
+  const answer = await new Nodes(0n).read(
+    (operation) => operation(client),
+    AGDX_KV_GET_CODE,
+    OK,
+    { kind: "caller" },
+    { kind: "until", deadline: started + 300 }
+  )
+  const last = decodeOne(answer.reply, "CommandError")
+  assert.ok(last instanceof Map)
+  assert.equal(last.get("code"), "backend_unavailable")
+  assert.ok(sent.length > 2, "the roster is walked again before the deadline")
+  assert.equal(last.get("message"), `refusal ${String(sent.length - 1)}`, "the last refusal")
+  assert.ok(Date.now() - started < 2_000, "the deadline ends the wait")
+})
+
+void test("given_a_retry_timer_that_wakes_after_the_read_deadline_when_resumed_then_should_return_the_last_refusal", async (context) => {
+  let now = 0
+  const deadline = 250
+  context.mock.method(Date, "now", () => now)
+  const refused = backendUnavailableReply("replaying its logs")
+  const { client, sent } = cluster([0], (_replica, attempt) => {
+    if (attempt > 0) return OK
+    setTimeout(() => {
+      now = deadline
+    }, 0)
+    return refused
+  })
+
+  const answer = await new Nodes(0n).read(
+    (operation) => operation(client),
+    AGDX_KV_GET_CODE,
+    OK,
+    { kind: "caller" },
+    { kind: "until", deadline }
+  )
+
+  assert.deepEqual(answer.reply, refused)
+  assert.equal(sent.length, 1)
+})
+
+void test("given_a_wait_that_would_end_at_the_read_deadline_when_deciding_then_should_not_walk_again", async (context) => {
+  context.mock.method(Date, "now", () => 0)
+  context.mock.method(Math, "random", () => 0)
+  const refused = backendUnavailableReply("replaying its logs")
+  for (const deadline of [50, 51]) {
+    const { client, sent } = cluster([0], (_replica, attempt) => (attempt === 0 ? refused : OK))
+    const answer = await new Nodes(0n).read(
+      (operation) => operation(client),
+      AGDX_KV_GET_CODE,
+      OK,
+      { kind: "caller" },
+      { kind: "until", deadline }
+    )
+    assert.deepEqual(answer.reply, deadline === 50 ? refused : OK)
+    assert.equal(sent.length, deadline === 50 ? 1 : 2)
+  }
+})
+
+void test("given_every_node_refusing_when_reading_then_should_back_off_longer_before_each_walk", async () => {
+  const { client, sent } = cluster([0], () => backendUnavailableReply("down"))
+  await new Nodes(0n).read(
+    (operation) => operation(client),
+    AGDX_KV_GET_CODE,
+    OK,
+    { kind: "caller" },
+    { kind: "until", deadline: Date.now() + 2_000 }
+  )
+  // Waits of at least 50, 100, 200, 400 and 800 ms leave room for six walks in two seconds.
+  assert.ok(sent.length <= 6, `${String(sent.length)} walks in two seconds`)
+})
+
+void test("given_every_node_losing_its_link_when_reading_then_should_walk_again_until_served", async () => {
+  const { client } = cluster([0, 1], (_replica, attempt) =>
+    attempt < 2 ? new TransportError("the link dropped", true) : undefined
+  )
+  const answer = await new Nodes(0n).read(
+    (operation) => operation(client),
+    AGDX_KV_GET_CODE,
+    OK,
+    { kind: "caller" },
+    { kind: "until", deadline: Date.now() + 5_000 }
+  )
+  assert.deepEqual(answer.reply, OK)
+})
+
+void test("given_a_filter_catalog_read_every_node_refuses_as_catalog_unavailable_when_reading_then_should_walk_again_until_served", async () => {
+  const { client, sent } = cluster([0, 1], (_replica, attempt) =>
+    attempt < 2 ? catalogUnavailableReply() : undefined
+  )
+  const answer = await new Nodes(0n).read(
+    (operation) => operation(client),
+    AGDX_GET_FILTER_BINDING_CODE,
+    OK,
+    { kind: "caller" },
+    { kind: "until", deadline: Date.now() + 5_000 }
+  )
+  assert.deepEqual(answer.reply, OK)
+  assert.equal(sent.length, 3, "both nodes are asked, then asked again")
+})
+
+void test("given_catalog_unavailable_for_a_mutation_or_another_surface_when_walked_then_should_return_it_after_one_attempt", async () => {
+  for (const code of [AGDX_FILTER_MUTATE_CODE, AGDX_FILTERED_POLL_CODE]) {
+    const { client, sent } = cluster([0, 1, 2], () => catalogUnavailableReply())
+    const answer = await new Nodes(0n).read(
+      (operation) => operation(client),
+      code,
+      OK,
+      { kind: "caller" },
+      { kind: "until", deadline: Date.now() + 5_000 }
+    )
+    assert.deepEqual(answer.reply, catalogUnavailableReply())
+    assert.equal(sent.length, 1, `command ${String(code)} is not moved or repeated`)
+  }
+})
+
+void test("given_a_mutation_attempt_when_every_node_refuses_then_should_walk_once", async () => {
+  const down = backendUnavailableReply("down")
+  const { client, sent } = cluster([0, 1, 2], () => down)
+  const answer = await new Nodes(0n).send(
+    (operation) => operation(client),
+    AGDX_KV_SET_CODE,
+    OK,
+    { kind: "caller" },
+    Date.now() + 5_000
+  )
+  assert.deepEqual(answer.reply, down)
+  assert.equal(sent.length, 3, "one attempt per node, the mutation loop repeats")
+})
+
+void test("given_an_aborted_signal_when_a_read_waits_out_a_refusal_then_should_stop_with_cancelled", async () => {
+  const { client, sent } = cluster([0], () => backendUnavailableReply("replaying its logs"))
+  const controller = new AbortController()
+  const started = Date.now()
+  const reading = new Nodes(0n).read(
+    (operation) => operation(client),
+    AGDX_KV_GET_CODE,
+    OK,
+    { kind: "caller" },
+    { kind: "until", deadline: started + 5_000 },
+    { signal: controller.signal }
+  )
+  setTimeout(() => {
+    controller.abort()
+  }, 20)
+  await assert.rejects(reading, CancelledError)
+  const walks = sent.length
+  assert.ok(Date.now() - started < 1_000, "the abort ends the wait")
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert.equal(sent.length, walks, "no walk after the abort")
+})
+
+void test("given_a_read_without_its_own_deadline_when_its_node_refuses_once_then_should_walk_again_until_served", async () => {
+  const { client, sent } = cluster([0], (_replica, attempt) =>
+    attempt === 0 ? backendUnavailableReply("replaying its logs") : undefined
+  )
+  const transport = await ApacheIggyTransport.fromClient(client)
+  assert.deepEqual(await transport.sendManaged(AGDX_KV_GET_CODE, new Uint8Array([1])), OK)
+  assert.equal(sent.length, 2)
+})
+
 void test("given_pending_or_unavailable_when_sending_then_should_keep_the_caller_node", async () => {
   for (const code of ["pending", "unavailable", "forbidden"]) {
     const reply = encodeNamed(
@@ -243,10 +452,13 @@ void test("given_pending_or_unavailable_when_sending_then_should_keep_the_caller
   }
 })
 
-void test("given_every_node_lost_when_a_managed_read_is_sent_then_should_try_each_once_and_fail", async () => {
+void test("given_every_node_lost_when_a_managed_read_walks_once_then_should_try_each_once_and_fail", async () => {
   const { client, sent } = cluster([0, 1, 2], () => refusal(TRANSIENT_NOT_ACCEPTED))
   const transport = await ApacheIggyTransport.fromClient(client)
-  await assert.rejects(transport.sendManaged(AGDX_KV_GET_CODE, new Uint8Array([1])), TransportError)
+  await assert.rejects(
+    transport.sendManaged(AGDX_KV_GET_CODE, new Uint8Array([1]), { walk: { kind: "once" } }),
+    TransportError
+  )
   assert.deepEqual(
     [...new Set(sent.map((request) => request.replica))].sort(),
     [0, 1, 2],

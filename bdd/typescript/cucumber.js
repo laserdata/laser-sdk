@@ -4,6 +4,7 @@
 export default {
   paths: ["../scenarios/**/*.feature"],
   tags: [
+    process.env.LASER_BDD_RECOVERING_CATALOG ? "@recovering_catalog" : "not @recovering_catalog",
     process.env.LASER_BDD_MANAGED ? "not @unmanaged" : "not @managed",
     process.env.LASER_BDD_SQL_BACKEND ? undefined : "not @remote_sql"
   ]

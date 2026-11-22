@@ -48,6 +48,10 @@ const MISSING_EMBEDDER: Embedder = {
 // the seam `MemoryHandle.embedder` configures through.
 export const WITH_EMBEDDER = Symbol("laser.internal.with-embedder")
 
+/** Keeps facts in this process only and loses them when the program exits.
+ * The durable memory on the log is `laser.memory(namespace)`. A semantic
+ * `Memory` backend: embeds payloads on `remember` and ranks `recall` by
+ * cosine similarity to `query.semantic`. */
 export class VectorMemory implements Memory {
   private readonly items: VectorEntry[] = []
 

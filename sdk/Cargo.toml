@@ -4,7 +4,9 @@ description = "LaserData SDK over Apache Iggy: typed streaming, operational quer
 categories = ["asynchronous", "network-programming"]
 keywords = ["iggy", "agents", "streaming", "provenance", "messaging"]
 readme = "README.md"
+documentation.workspace = true
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
@@ -14,7 +16,7 @@ version.workspace = true
 all-features = true
 
 [features]
-default = ["provenance", "streaming"]
+default = ["agent", "kv", "provenance", "streaming"]
 # The A2A bridge ADAPTER: map A2A JSON-RPC methods onto agent topics and drive the
 # task lifecycle (submit / task / cancel / card). Transport-agnostic, no HTTP deps.
 a2a-bridge = ["agent", "dep:serde_json"]

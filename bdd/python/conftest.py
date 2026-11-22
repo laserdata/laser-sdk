@@ -27,11 +27,13 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
+    recovering_catalog = bool(os.environ.get("LASER_BDD_RECOVERING_CATALOG"))
     managed = bool(os.environ.get("LASER_BDD_MANAGED"))
     remote_sql = bool(os.environ.get("LASER_BDD_SQL_BACKEND"))
     for item in items:
         if (
-            (managed and "unmanaged" in item.keywords)
+            (recovering_catalog != ("recovering_catalog" in item.keywords))
+            or (managed and "unmanaged" in item.keywords)
             or (not managed and "managed" in item.keywords)
             or (not remote_sql and "remote_sql" in item.keywords)
         ):

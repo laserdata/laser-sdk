@@ -2,12 +2,13 @@ use crate::agent::budget::BudgetBreach;
 use crate::agent::contract::Contract;
 use crate::agent::ctx::GatherPolicy;
 use crate::agent::router::{CapabilitySelector, InboxRoute, Router};
+use crate::agent::step_value::{decode_step_output, step_output, workflow_value};
 use crate::agent::{Session, SessionLease, TopicRetention};
 use crate::context::{ContextAssembler, LastN};
 use crate::error::LaserError;
 #[cfg(feature = "kv")]
 use crate::kv::{KV_LEASE_OP_VERSION, Kv, KvError, KvLeaseRenew, LeaseGuard};
-use crate::laser::Laser;
+use crate::laser::{Laser, STREAM_VARIABLE};
 use crate::provenance::{AgentTopic, Provenance};
 use crate::types::{AgentId, ConversationId};
 use iggy::prelude::{
@@ -16,9 +17,13 @@ use iggy::prelude::{
 use laser_wire::agent::{CorrelationId, IdempotencyKey, SessionStatus};
 use laser_wire::framing::{decode_named, encode_named};
 use laser_wire::result::ResultCode;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 /// The key-value namespace holding the workflow run's fenced lease, the
@@ -40,6 +45,14 @@ const LEASE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// The completion deadline of a step that sets none with
 /// [`StepHandle::deadline`].
 const DEFAULT_STEP_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a workflow function's run waits at its end for the bodies of steps
+/// still in flight. A step whose body finishes later runs again on a resume.
+const STEP_SETTLE_GRACE: Duration = Duration::from_secs(5);
+
+/// Separates a step's name from the number of a repeated call in its journal
+/// label.
+const STEP_CALL_SEPARATOR: char = '#';
 
 /// The least wall-clock a step is worth dispatching with. A budget with less than
 /// this remaining is treated as spent, so the workflow breaches as a budget
@@ -69,6 +82,9 @@ enum WorkflowJournalEntry {
         label: String,
         output: Vec<u8>,
         agents: Vec<String>,
+        // A digest of the arguments of a workflow function's step call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<String>,
     },
     StepCompensated {
         label: String,
@@ -119,15 +135,34 @@ impl WorkflowBudget {
 /// The prior steps' outputs, by label, handed to a [`StepFn`] so it can build this
 /// step's payload from what came before.
 pub struct StepContext<'a> {
+    /// Every earlier step's output by label, as bytes.
     pub outputs: &'a BTreeMap<String, Vec<u8>>,
 }
 
-/// Builds a step's task payload from the outputs of the steps before it. Async
-/// and fallible, so a step that must call a model or a service to build its input
-/// can, and a build failure fails the step rather than panicking. A plain
-/// synchronous closure `Fn(&StepContext) -> Vec<u8>` still is a `StepFn` (the
-/// blanket impl wraps it), so the common step stays a one-line closure. A build
-/// is bounded by the step deadline.
+/// Builds a step's task payload, or a local step's output, from the outputs of
+/// the steps before it. Async and fallible, so a step that must call a model
+/// or a service, or wait, can, and a build failure fails the step rather than
+/// panicking. A plain synchronous closure `Fn(&StepContext) -> Vec<u8>` still
+/// is a `StepFn` (the blanket impl wraps it), so the common step stays a
+/// one-line closure. A closure cannot await, so a step that awaits is a type
+/// implementing `StepFn` (with `cargo add async-trait`), passed in place of
+/// the closure. A build is bounded by the step deadline.
+///
+/// ```
+/// use laser_sdk::prelude::*;
+/// use std::time::Duration;
+///
+/// struct Analyze;
+///
+/// #[async_trait::async_trait]
+/// impl StepFn for Analyze {
+///     async fn build(&self, context: &StepContext<'_>) -> Result<Vec<u8>, LaserError> {
+///         let ingested = context.outputs.get("ingest").cloned().unwrap_or_default();
+///         tokio::time::sleep(Duration::from_secs(1)).await;
+///         Ok([b"analyzed ".to_vec(), ingested].concat())
+///     }
+/// }
+/// ```
 #[async_trait::async_trait]
 pub trait StepFn: Send + Sync {
     async fn build(&self, ctx: &StepContext<'_>) -> Result<Vec<u8>, LaserError>;
@@ -306,7 +341,11 @@ impl Workflow {
 
     /// Add a step `label` whose body `run` runs in this process: it gets the
     /// prior outputs and its result is the step output, so the step needs no
-    /// agent. Its completion is journaled like a routed step, so a resumed run
+    /// agent. `run` is a closure `|context: &StepContext<'_>| -> Vec<u8>`, or a
+    /// type implementing [`StepFn`] for a step that awaits. `context.outputs`
+    /// holds every earlier step's output by label as bytes, and
+    /// [`WorkflowOutcome::text`] decodes one. Its completion is journaled like
+    /// a routed step, so a resumed run
     /// keeps the recorded output instead of running it again, and a step that
     /// stopped before its completion record runs again. A local step cannot be
     /// exclusive. Its compensation runs in process too.
@@ -334,7 +373,10 @@ impl Workflow {
         }
     }
 
-    /// Run the workflow to completion, returning each step's output. Steps run in
+    /// Await it to run the workflow to completion: it returns a
+    /// [`WorkflowOutcome`] with `run_id`, `status` (`Completed`),
+    /// `completed_steps` in completion order, `outputs` (label to bytes), and
+    /// `text(label)`. Steps run in
     /// dependency order. A step that does not complete fails the workflow with
     /// [`LaserError::StepFailed`] after running the compensations of the steps
     /// with an effect in reverse (the saga rollback). A misconfigured workflow
@@ -357,12 +399,7 @@ impl Workflow {
     /// the run resumable by its id.
     #[tracing::instrument(target = "laser", level = "info", skip_all, fields(agent = %self.name, operation = "workflow"))]
     pub async fn run(mut self) -> Result<WorkflowOutcome, LaserError> {
-        let source: AgentId = self.name.parse().map_err(|_| {
-            LaserError::Invalid(format!(
-                "workflow name `{}` is not a valid agent id",
-                self.name
-            ))
-        })?;
+        let source = self.source()?;
         let order = self.validate()?;
         let resumed = self.run_id.is_some();
         let run_id = self.run_id.unwrap_or_default();
@@ -371,31 +408,109 @@ impl Workflow {
         let result = self
             .execute(&session, &source, &order, run_id, journal)
             .await;
-        let ended = match &result {
-            Ok(_) => session.end().await,
-            Err(LaserError::Cancelled { .. }) => session.cancel().await,
-            Err(LaserError::BudgetExceeded { ceiling, spent }) => {
-                session
-                    .fail_over_budget(&BudgetBreach::exceeded(*ceiling, *spent))
-                    .await
-            }
-            Err(error) => {
-                session
-                    .fail(laser_wire::agent::AgentErrorBody {
-                        code: laser_wire::agent::AgentErrorCode::Internal,
-                        message: Some(error.to_string()),
-                        retryable: error.is_retryable(),
-                        detail: None,
-                    })
-                    .await
-            }
-        };
+        let ended = end_session(&session, &result).await;
         drop(lease);
         match (result, ended) {
             (Ok(outcome), Ok(())) => Ok(outcome),
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }
+    }
+
+    /// Run `body` as the workflow: each [`WorkflowRun::step`] it calls is
+    /// journaled, so a run resumed with [`run_id`](Self::run_id) returns a
+    /// recorded step's value without running it again. The body's value, as
+    /// JSON, is [`WorkflowOutcome::value`]. A body that returns an error fails
+    /// the run with that error and the completed steps stay journaled. With no
+    /// default stream on the client the run uses `LASER_STREAM`, else a stream
+    /// named after the workflow, and creates it when it is missing.
+    ///
+    /// ```no_run
+    /// use laser_sdk::prelude::*;
+    ///
+    /// # async fn demo(laser: Laser) -> Result<(), LaserError> {
+    /// let outcome = laser
+    ///     .workflow("pipeline")
+    ///     .run_with(async |run| {
+    ///         let frames: u32 = run.step("ingest", async || Ok(12)).await?;
+    ///         run.step("report", async || Ok(format!("{frames} frames from sat-7")))
+    ///             .await
+    ///     })
+    ///     .await?;
+    /// println!("{:?}", outcome.completed_steps);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn run_with<T, F>(self, body: F) -> Result<WorkflowOutcome, LaserError>
+    where
+        T: Serialize,
+        F: AsyncFnOnce(&WorkflowRun) -> Result<T, LaserError>,
+    {
+        let run = self.start().await?;
+        let result = body(&run)
+            .await
+            .and_then(|value| workflow_value(&run.workflow.name, &value).map(Some));
+        run.finish(result).await
+    }
+
+    /// Open a run the caller drives step by step, for a step body that is not
+    /// a Rust future. [`run_with`](Self::run_with) is this with the steps in a
+    /// closure. End it with [`WorkflowRun::finish`].
+    #[tracing::instrument(target = "laser", level = "info", skip_all, fields(agent = %self.name, operation = "workflow"))]
+    pub async fn start(mut self) -> Result<WorkflowRun, LaserError> {
+        let source = self.source()?;
+        if self.laser.default_stream().is_none() {
+            let stream = std::env::var(STREAM_VARIABLE)
+                .ok()
+                .filter(|stream| !stream.is_empty())
+                .unwrap_or_else(|| self.name.clone());
+            Identifier::named(&stream).map_err(|_| {
+                LaserError::Invalid(format!(
+                    "workflow stream `{stream}` is not a valid stream name: set LASER_STREAM or give the client a default stream"
+                ))
+            })?;
+            self.laser = self.laser.with_default_stream(stream);
+        }
+        let resumed = self.run_id.is_some();
+        let run_id = self.run_id.unwrap_or_default();
+        self.run_id = Some(run_id);
+        let (journal, session, lease) = self.open(&source, run_id, resumed).await?;
+        let recorded = if journal.started {
+            Ok(())
+        } else {
+            self.record(
+                run_id,
+                &WorkflowJournalEntry::RunStarted {
+                    workflow: self.name.clone(),
+                },
+            )
+            .await
+        };
+        if let Err(error) = recorded {
+            let failed = Err(error);
+            if let Err(ended) = end_session(&session, &failed).await {
+                tracing::warn!(run = %run_id, error = %ended, "Ending workflow run {run_id} failed after its start record was refused");
+            }
+            return failed;
+        }
+        Ok(WorkflowRun {
+            workflow: self,
+            run_id,
+            session,
+            lease: Mutex::new(Some(lease)),
+            started: Instant::now(),
+            state: Mutex::new(RunState::resumed(journal)),
+        })
+    }
+
+    // The orchestrator identity the run dispatches as.
+    fn source(&self) -> Result<AgentId, LaserError> {
+        self.name.parse().map_err(|_| {
+            LaserError::Invalid(format!(
+                "workflow name `{}` is not a valid agent id",
+                self.name
+            ))
+        })
     }
 
     // Start the run, after bootstrapping a stream without the run's topics
@@ -407,20 +522,20 @@ impl Workflow {
         run_id: ConversationId,
         resumed: bool,
     ) -> Result<(Journal, Session, SessionLease), LaserError> {
-        match self.start(source, run_id, resumed).await {
+        match self.open_session(source, run_id, resumed).await {
             Ok(started) => Ok(started),
             Err(error) => {
                 if !self.run_topics_missing().await? {
                     return Err(error);
                 }
                 self.laser.bootstrap(1, TopicRetention::default()).await?;
-                self.start(source, run_id, resumed).await
+                self.open_session(source, run_id, resumed).await
             }
         }
     }
 
     // Replay the run's journal and open its root session.
-    async fn start(
+    async fn open_session(
         &self,
         source: &AgentId,
         run_id: ConversationId,
@@ -624,6 +739,7 @@ impl Workflow {
             run_id,
             completed_steps: completed,
             status: SessionStatus::Completed,
+            value: None,
         })
     }
 
@@ -1086,6 +1202,7 @@ impl Workflow {
                         label: step.label.clone(),
                         output: output.clone(),
                         agents: agents.iter().map(ToString::to_string).collect(),
+                        input: None,
                     },
                 )
                 .await
@@ -1437,10 +1554,17 @@ impl StepHandle {
 /// is an error. Pass the run id to [`Workflow::run_id`] to resume the same run.
 #[derive(Debug)]
 pub struct WorkflowOutcome {
+    /// Each completed step's output by label, as bytes.
     pub outputs: BTreeMap<String, Vec<u8>>,
+    /// The run id, which resumes the same run when passed to [`Workflow::run_id`].
     pub run_id: ConversationId,
+    /// The completed step labels, in completion order.
     pub completed_steps: Vec<String>,
+    /// The run's end status, `Completed` for a returned outcome.
     pub status: SessionStatus,
+    /// The JSON of the value a [`Workflow::run_with`] body returned, `None`
+    /// for a run of declared steps. Never journaled.
+    pub value: Option<Vec<u8>>,
 }
 
 impl WorkflowOutcome {
@@ -1451,12 +1575,407 @@ impl WorkflowOutcome {
             .get(label)
             .map(|output| String::from_utf8_lossy(output).into_owned())
     }
+
+    /// The output of step `label` decoded as JSON, or `None` when no completed
+    /// step has that label.
+    pub fn json<T: DeserializeOwned>(&self, label: &str) -> Result<Option<T>, LaserError> {
+        self.outputs
+            .get(label)
+            .map(|output| decode_step_output(label, output))
+            .transpose()
+    }
+}
+
+/// What the journal knows about a step call, from [`WorkflowRun::begin_step`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepCall {
+    /// The step completed earlier in this run, with this output.
+    Recorded(Vec<u8>),
+    /// The step has to run. Pass this journal label to
+    /// [`WorkflowRun::complete_step`], or to [`WorkflowRun::abandon_step`] when
+    /// its body failed.
+    Due(String),
+}
+
+/// A workflow run whose steps the caller's own code calls, from
+/// [`Workflow::run_with`] or [`Workflow::start`]. Steps may run concurrently.
+pub struct WorkflowRun {
+    workflow: Workflow,
+    run_id: ConversationId,
+    session: Session,
+    lease: Mutex<Option<SessionLease>>,
+    started: Instant,
+    state: Mutex<RunState>,
+}
+
+// Within one name, sorting by label length and then text orders every decimal suffix.
+type RecordedCalls = BTreeMap<(usize, String), Option<String>>;
+
+#[derive(Default)]
+struct RunState {
+    outputs: BTreeMap<String, Vec<u8>>,
+    completed: Vec<String>,
+    // Calls recorded before this run opened that no call has answered from
+    // yet, by step name and call number, with their argument digest.
+    unclaimed: BTreeMap<String, RecordedCalls>,
+    // Due calls, by journal label, with their argument digest.
+    in_flight: BTreeMap<String, Option<String>>,
+    // The lowest call number of each step name that may still be free.
+    next_call: BTreeMap<String, usize>,
+    invocations: u32,
+    // No new step starts once the body has ended.
+    closing: bool,
+    // No step record starts once the run has ended.
+    finished: bool,
+    // Step records being written.
+    recording: usize,
+    // Wakes the end of the run when a due call settles or a record ends.
+    unsettled: watch::Sender<Unsettled>,
+}
+
+impl RunState {
+    fn resumed(journal: Journal) -> Self {
+        let mut unclaimed: BTreeMap<String, RecordedCalls> = BTreeMap::new();
+        for journal_label in journal.outputs.keys() {
+            let (name, _) = label_call(journal_label);
+            unclaimed.entry(name.to_owned()).or_default().insert(
+                (journal_label.len(), journal_label.clone()),
+                journal.inputs.get(journal_label).cloned(),
+            );
+        }
+        Self {
+            unclaimed,
+            outputs: journal.outputs,
+            completed: journal.completed,
+            ..Self::default()
+        }
+    }
+
+    // Answers a call of step `name` from its record, or names the journal
+    // label the call is due under. A record made with equal arguments answers
+    // first. Failing that the call walks `name`, `name#2`, `name#3` and stops
+    // at the first record where either side has no digest, or at a free label.
+    fn begin_call(&mut self, name: &str, input: Option<String>) -> StepCall {
+        let same = input
+            .as_deref()
+            .and_then(|input| self.unclaimed_call(name, |recorded| recorded == Some(input)));
+        let recorded = match same {
+            Some(recorded) => recorded,
+            None => {
+                let undigested =
+                    self.unclaimed_call(name, |recorded| recorded.is_none() || input.is_none());
+                let mut call = self.next_call.get(name).copied().unwrap_or(1);
+                loop {
+                    let label = journal_label(name, call);
+                    let candidate = (label.len(), label);
+                    if let Some(recorded) = &undigested
+                        && recorded <= &candidate
+                    {
+                        self.next_call.insert(name.to_owned(), call);
+                        break recorded.clone();
+                    }
+                    let (_, journal_label) = candidate;
+                    if !self.outputs.contains_key(&journal_label)
+                        && !self.in_flight.contains_key(&journal_label)
+                    {
+                        self.next_call.insert(name.to_owned(), call + 1);
+                        self.in_flight.insert(journal_label.clone(), input);
+                        self.publish();
+                        return StepCall::Due(journal_label);
+                    }
+                    call += 1;
+                }
+            }
+        };
+        if let Some(records) = self.unclaimed.get_mut(name) {
+            records.remove(&recorded);
+        }
+        let output = self.outputs.get(&recorded.1);
+        StepCall::Recorded(output.cloned().unwrap_or_default())
+    }
+
+    // The lowest unclaimed recorded call of `name` whose digest `matches`.
+    fn unclaimed_call(
+        &self,
+        name: &str,
+        matches: impl Fn(Option<&str>) -> bool,
+    ) -> Option<(usize, String)> {
+        self.unclaimed
+            .get(name)?
+            .iter()
+            .find(|(_, recorded)| matches(recorded.as_deref()))
+            .map(|(call, _)| call.clone())
+    }
+
+    // Gives up a due call, so its label is free again for the next call of
+    // its step.
+    fn abandon(&mut self, journal_label: &str) {
+        if self.in_flight.remove(journal_label).is_none() {
+            return;
+        }
+        let (name, number) = label_call(journal_label);
+        if let Ok(number) = number.parse::<usize>() {
+            let next = self.next_call.entry(name.to_owned()).or_insert(number);
+            *next = (*next).min(number);
+        }
+        self.publish();
+    }
+
+    // Whether a step record may start. The end of the run waits for one that
+    // did.
+    fn start_record(&mut self) -> bool {
+        if self.finished {
+            return false;
+        }
+        self.recording += 1;
+        self.publish();
+        true
+    }
+
+    fn end_record(&mut self) {
+        self.recording = self.recording.saturating_sub(1);
+        self.publish();
+    }
+
+    // The due call `journal_label` reached the journal with `output`.
+    fn recorded(&mut self, journal_label: &str, output: Vec<u8>) {
+        self.outputs.insert(journal_label.to_owned(), output);
+        self.completed.push(journal_label.to_owned());
+        self.in_flight.remove(journal_label);
+        self.publish();
+    }
+
+    fn publish(&self) {
+        self.unsettled.send_replace(Unsettled {
+            calls: self.in_flight.len(),
+            records: self.recording,
+        });
+    }
+}
+
+// What the end of a run waits for: the due calls, then the step records being
+// written.
+#[derive(Clone, Copy, Default)]
+struct Unsettled {
+    calls: usize,
+    records: usize,
+}
+
+// Releases a due call whose future was dropped or whose body failed.
+struct DueStep<'run> {
+    run: &'run WorkflowRun,
+    journal_label: String,
+}
+
+impl Drop for DueStep<'_> {
+    fn drop(&mut self) {
+        self.run.abandon_step(&self.journal_label);
+    }
+}
+
+// Ends the count of a step record, also when the future writing it is dropped.
+struct Recording<'run> {
+    run: &'run WorkflowRun,
+}
+
+impl Drop for Recording<'_> {
+    fn drop(&mut self) {
+        self.run.state().end_record();
+    }
+}
+
+impl WorkflowRun {
+    /// The run id, which resumes this run when passed to [`Workflow::run_id`].
+    pub fn run_id(&self) -> ConversationId {
+        self.run_id
+    }
+
+    /// Run `body` as the step `label` and return its value. A step this run
+    /// already recorded returns the recorded value and `body` does not run.
+    /// The value is stored as JSON and returned as JSON reads it back, so a
+    /// fresh run and a resumed one see one value. The second call of a label
+    /// in one run is journaled as `label#2`, the third as `label#3`, and a call
+    /// whose body failed gives its label back to a retry. A call takes the
+    /// first of those labels no earlier call of this run took: it returns the
+    /// record that label holds, or runs when the label holds none. So
+    /// concurrent branches whose order can change between runs use a label of
+    /// their own.
+    pub async fn step<T, F>(&self, label: &str, body: F) -> Result<T, LaserError>
+    where
+        T: Serialize + DeserializeOwned,
+        F: AsyncFnOnce() -> Result<T, LaserError>,
+    {
+        let journal_label = match self.begin_step(label, None)? {
+            StepCall::Recorded(output) => return decode_step_output(label, &output),
+            StepCall::Due(journal_label) => journal_label,
+        };
+        let due = DueStep {
+            run: self,
+            journal_label,
+        };
+        self.checkpoint().await?;
+        let value = body().await?;
+        let output = step_output(label, &value)?;
+        let decoded = decode_step_output(label, &output)?;
+        self.complete_step(&due.journal_label, output).await?;
+        Ok(decoded)
+    }
+
+    /// Count one call of the step `label` and say whether it is recorded. Runs
+    /// before anything awaits, so call order fixes the journal labels. `input`
+    /// holds the canonical JSON of the call's arguments when it has any. A call
+    /// with an `input` first answers from the unclaimed record made with an
+    /// equal one, lowest call number first. Failing that, and for a call
+    /// without an `input`, the call walks the labels `label`, `label#2`,
+    /// `label#3` in order and stops at the first that holds an unclaimed
+    /// record where the call or the record has no `input`, which answers it,
+    /// or that is free, under which it is due. A record made with another
+    /// `input` does not answer the call, so concurrent branches get their own
+    /// values back whatever order they run in. A record answers one call per
+    /// run. A label holding `#` is refused, the journal numbers repeated calls
+    /// with it, and so is a call after the body of the run has ended.
+    pub fn begin_step(&self, label: &str, input: Option<&[u8]>) -> Result<StepCall, LaserError> {
+        if label.contains(STEP_CALL_SEPARATOR) {
+            return Err(LaserError::Invalid(format!(
+                "workflow step name `{label}` cannot contain `{STEP_CALL_SEPARATOR}`, the journal numbers repeated calls with it"
+            )));
+        }
+        let digest = input.map(input_digest);
+        let mut state = self.state();
+        if state.closing {
+            return Err(LaserError::Invalid(format!(
+                "workflow run `{}` has ended, so step `{label}` cannot start",
+                self.run_id
+            )));
+        }
+        Ok(state.begin_call(label, digest))
+    }
+
+    /// The check between steps: a cancel request returns
+    /// [`LaserError::Cancelled`] and a breached budget
+    /// [`LaserError::BudgetExceeded`].
+    pub async fn checkpoint(&self) -> Result<(), LaserError> {
+        self.workflow
+            .boundary(&self.session, self.run_id, self.started)
+            .await?;
+        let invocations = {
+            let mut state = self.state();
+            state.invocations += 1;
+            state.invocations
+        };
+        self.workflow.check_budget(invocations, 0, self.started)
+    }
+
+    /// Journal `output` as the result of the step call [`begin_step`](Self::begin_step)
+    /// answered with this journal label. Refused once the run has ended, so
+    /// a resume runs that step again.
+    pub async fn complete_step(
+        &self,
+        journal_label: &str,
+        output: Vec<u8>,
+    ) -> Result<(), LaserError> {
+        let input = {
+            let mut state = self.state();
+            if !state.start_record() {
+                return Err(LaserError::Invalid(format!(
+                    "workflow run `{}` has ended, so step `{journal_label}` is not recorded",
+                    self.run_id
+                )));
+            }
+            state.in_flight.get(journal_label).cloned().flatten()
+        };
+        let _recording = Recording { run: self };
+        self.workflow
+            .record(
+                self.run_id,
+                &WorkflowJournalEntry::StepCompleted {
+                    label: journal_label.to_owned(),
+                    output: output.clone(),
+                    agents: Vec::new(),
+                    input,
+                },
+            )
+            .await?;
+        self.state().recorded(journal_label, output);
+        Ok(())
+    }
+
+    /// Give up the due call with this journal label because its body failed, so
+    /// a retry takes the label again. Does nothing for a recorded call.
+    pub fn abandon_step(&self, journal_label: &str) {
+        self.state().abandon(journal_label);
+    }
+
+    /// Refuse every step call from now on, for a caller whose body ended before [`finish`](Self::finish) runs.
+    pub fn refuse_new_steps(&self) {
+        self.state().closing = true;
+    }
+
+    /// End the run from `result`, the JSON of its value or the error that
+    /// stopped it, and return the outcome or that error. Steps still running
+    /// get a few seconds to finish first, and a step record already being
+    /// written is waited for, so the run's end is its last record.
+    pub async fn finish(
+        &self,
+        result: Result<Option<Vec<u8>>, LaserError>,
+    ) -> Result<WorkflowOutcome, LaserError> {
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(lease) = lease else {
+            return Err(LaserError::Invalid(format!(
+                "workflow run `{}` has already finished",
+                self.run_id
+            )));
+        };
+        settle(&self.state, STEP_SETTLE_GRACE).await;
+        let ended = end_session(&self.session, &result).await;
+        drop(lease);
+        let value = match (result, ended) {
+            (Ok(value), Ok(())) => value,
+            (Ok(_), Err(error)) | (Err(error), _) => return Err(error),
+        };
+        let state = self.state();
+        Ok(WorkflowOutcome {
+            outputs: state.outputs.clone(),
+            run_id: self.run_id,
+            completed_steps: state.completed.clone(),
+            status: SessionStatus::Completed,
+            value,
+        })
+    }
+
+    /// Stop the run at once and leave it open, for a caller that was cancelled
+    /// or interrupted. The run stays resumable by its id, as when the future of
+    /// [`Workflow::run`] is dropped.
+    pub fn release(&self) {
+        {
+            let mut state = self.state();
+            state.closing = true;
+            state.finished = true;
+        }
+        drop(
+            self.lease
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+
+    fn state(&self) -> MutexGuard<'_, RunState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl Laser {
-    /// Open a [`Workflow`] named `name` (also the orchestrator identity it
-    /// dispatches as). Describe it with fluent [`step`](Workflow::step) calls, then
-    /// [`run`](Workflow::run).
+    /// A [`Workflow`] named `name` (also the orchestrator identity it
+    /// dispatches as), returned at once. Run plain code with
+    /// [`run_with`](Workflow::run_with), or describe steps with fluent
+    /// [`step_local`](Workflow::step_local) or [`step`](Workflow::step) calls
+    /// and await [`run`](Workflow::run). A local step needs no agent, and the
+    /// run creates its topics, so it needs no `bootstrap`.
     pub fn workflow(&self, name: &str) -> Workflow {
         Workflow {
             laser: self.clone(),
@@ -1477,6 +1996,7 @@ struct Journal {
     started: bool,
     records: usize,
     outputs: BTreeMap<String, Vec<u8>>,
+    inputs: BTreeMap<String, String>,
     completed: Vec<String>,
     agents: BTreeMap<String, Vec<AgentId>>,
     in_flight: BTreeMap<String, InFlight>,
@@ -1509,8 +2029,13 @@ impl Journal {
                     label,
                     output,
                     agents,
+                    input,
                 } => {
                     journal.in_flight.remove(&label);
+                    match input {
+                        Some(input) => journal.inputs.insert(label.clone(), input),
+                        None => journal.inputs.remove(&label),
+                    };
                     if !journal.completed.contains(&label) {
                         journal.completed.push(label.clone());
                     }
@@ -1528,11 +2053,88 @@ impl Journal {
                     journal.in_flight.remove(&label);
                     journal.agents.remove(&label);
                     journal.outputs.remove(&label);
+                    journal.inputs.remove(&label);
                 }
             }
         }
         journal
     }
+}
+
+// End the run's root session the way its result says.
+async fn end_session<T>(
+    session: &Session,
+    result: &Result<T, LaserError>,
+) -> Result<(), LaserError> {
+    match result {
+        Ok(_) => session.end().await,
+        Err(LaserError::Cancelled { .. }) => session.cancel().await,
+        Err(LaserError::BudgetExceeded { ceiling, spent }) => {
+            session
+                .fail_over_budget(&BudgetBreach::exceeded(*ceiling, *spent))
+                .await
+        }
+        Err(error) => {
+            session
+                .fail(laser_wire::agent::AgentErrorBody {
+                    code: laser_wire::agent::AgentErrorCode::Internal,
+                    message: Some(error.to_string()),
+                    retryable: error.is_retryable(),
+                    detail: None,
+                })
+                .await
+        }
+    }
+}
+
+// Ends a run's steps: no new step, at most `grace` for the due calls, no new
+// record, then every record already being written.
+async fn settle(state: &Mutex<RunState>, grace: Duration) {
+    let mut unsettled = {
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.closing = true;
+        state.unsettled.subscribe()
+    };
+    // A step whose body outlasts the grace is refused and runs again on a resume.
+    let _ = tokio::time::timeout(grace, unsettled.wait_for(|unsettled| unsettled.calls == 0)).await;
+    state
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .finished = true;
+    // An append has the client's own timeout, so this wait needs no bound.
+    let _ = unsettled.wait_for(|unsettled| unsettled.records == 0).await;
+}
+
+// The journal label of the `number`th call of the step `label`.
+fn journal_label(label: &str, number: usize) -> String {
+    match number {
+        1 => label.to_owned(),
+        number => format!("{label}{STEP_CALL_SEPARATOR}{number}"),
+    }
+}
+
+// The step name and the call number a journal label holds. Only the canonical
+// decimal text of a whole number above 1 after the last separator numbers a
+// call. Any other label is a name of its own.
+fn label_call(journal_label: &str) -> (&str, &str) {
+    journal_label
+        .rsplit_once(STEP_CALL_SEPARATOR)
+        .filter(|(_, digits)| {
+            !digits.is_empty()
+                && !digits.starts_with('0')
+                && *digits != "1"
+                && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .unwrap_or((journal_label, "1"))
+}
+
+// The clients digest the same canonical JSON, so a run resumes across them.
+fn input_digest(input: &[u8]) -> String {
+    let digest = Sha256::digest(input);
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 // A dispatch the journal holds without an outcome.
@@ -1727,6 +2329,7 @@ fn topological_order(steps: &[Step]) -> Result<Vec<usize>, LaserError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn given_a_linear_chain_when_ordered_then_should_follow_the_dependencies() {
@@ -2063,6 +2666,216 @@ mod tests {
         assert!(WORKFLOW_LEASE_TTL < DEFAULT_STEP_DEADLINE);
     }
 
+    #[test]
+    fn given_journal_labels_when_parsed_then_should_number_only_a_whole_number_above_one() {
+        assert_eq!(label_call("scan"), ("scan", "1"));
+        assert_eq!(label_call("scan#2"), ("scan", "2"));
+        assert_eq!(label_call("scan#x"), ("scan#x", "1"));
+        assert_eq!(label_call("scan#1"), ("scan#1", "1"));
+        assert_eq!(label_call("a#b#3"), ("a#b", "3"));
+        assert_eq!(label_call("scan#02"), ("scan#02", "1"));
+        assert_eq!(label_call("scan#+2"), ("scan#+2", "1"));
+        assert_eq!(label_call("#2"), ("", "2"));
+    }
+
+    #[test]
+    fn given_large_recorded_call_numbers_when_arguments_match_then_should_claim_in_numeric_order() {
+        let mut state = RunState::resumed(Journal::fold([
+            step_call("scan#100000000000000000000", b"3", Some("same")),
+            step_call("scan#99999999999999999999", b"2", Some("same")),
+            step_call("scan#4294967296", b"1", Some("same")),
+        ]));
+        for expected in [b"1", b"2", b"3"] {
+            assert_eq!(
+                state.begin_call("scan", Some("same".to_owned())),
+                StepCall::Recorded(expected.to_vec())
+            );
+        }
+        assert_eq!(
+            state.begin_call("scan", None),
+            StepCall::Due("scan".to_owned())
+        );
+    }
+
+    #[test]
+    fn given_a_failed_first_call_beside_a_recorded_second_when_resumed_then_should_run_the_first_and_answer_the_second()
+     {
+        for (first, second) in [(None, None), (Some("band-1"), Some("band-2"))] {
+            let mut state = RunState::resumed(Journal::fold([step_call("downlink#2", b"2", None)]));
+            assert_eq!(
+                state.begin_call("downlink", first.map(str::to_owned)),
+                StepCall::Due("downlink".to_owned())
+            );
+            assert_eq!(
+                state.begin_call("downlink", second.map(str::to_owned)),
+                StepCall::Recorded(b"2".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn given_records_with_and_without_digests_when_a_call_finds_no_equal_digest_then_should_claim_only_one_without()
+     {
+        let mut state = RunState::resumed(Journal::fold([
+            step_call("scan", b"1", Some("band-1")),
+            step_call("scan#2", b"2", None),
+            step_call("scan#3", b"3", Some("band-3")),
+        ]));
+        assert_eq!(
+            state.begin_call("scan", Some("band-9".to_owned())),
+            StepCall::Recorded(b"2".to_vec())
+        );
+        assert_eq!(
+            state.begin_call("scan", Some("band-9".to_owned())),
+            StepCall::Due("scan#4".to_owned())
+        );
+        assert_eq!(
+            state.begin_call("scan", None),
+            StepCall::Recorded(b"1".to_vec())
+        );
+    }
+
+    #[test]
+    fn given_the_second_of_three_calls_failed_when_retried_then_should_take_its_label_again() {
+        let mut state = RunState::default();
+        for label in ["scan", "scan#2", "scan#3"] {
+            assert_eq!(
+                state.begin_call("scan", None),
+                StepCall::Due(label.to_owned())
+            );
+        }
+        state.abandon("scan#2");
+        assert_eq!(
+            state.begin_call("scan", None),
+            StepCall::Due("scan#2".to_owned())
+        );
+        assert_eq!(
+            state.begin_call("scan", None),
+            StepCall::Due("scan#4".to_owned())
+        );
+    }
+
+    #[test]
+    fn given_records_with_equal_arguments_when_called_then_should_answer_the_lowest_call_first() {
+        let mut state = RunState::resumed(Journal::fold([
+            step_call("scan", b"1", Some("band-1")),
+            step_call("scan#2", b"2", Some("band-2")),
+            step_call("scan#3", b"3", Some("band-2")),
+        ]));
+        for (input, output) in [("band-2", b"2"), ("band-2", b"3"), ("band-1", b"1")] {
+            assert_eq!(
+                state.begin_call("scan", Some(input.to_owned())),
+                StepCall::Recorded(output.to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn given_three_recorded_calls_when_resumed_in_order_then_should_answer_each_and_run_the_fourth()
+    {
+        let mut state = RunState::resumed(Journal::fold([
+            step_call("scan", b"1", None),
+            step_call("scan#2", b"2", None),
+            step_call("scan#3", b"3", None),
+        ]));
+        for output in [b"1", b"2", b"3"] {
+            assert_eq!(
+                state.begin_call("scan", None),
+                StepCall::Recorded(output.to_vec())
+            );
+        }
+        assert_eq!(
+            state.begin_call("scan", None),
+            StepCall::Due("scan#4".to_owned())
+        );
+    }
+
+    #[test]
+    fn given_a_claimed_record_when_its_step_is_called_again_then_should_not_answer_twice() {
+        let mut state = RunState::resumed(Journal::fold([step_call("scan", b"1", Some("band-1"))]));
+        assert_eq!(
+            state.begin_call("scan", Some("band-1".to_owned())),
+            StepCall::Recorded(b"1".to_vec())
+        );
+        assert_eq!(
+            state.begin_call("scan", Some("band-1".to_owned())),
+            StepCall::Due("scan#2".to_owned())
+        );
+        assert_eq!(
+            state.begin_call("scan", None),
+            StepCall::Due("scan#3".to_owned())
+        );
+    }
+
+    #[test]
+    fn given_a_call_recorded_in_this_run_when_its_step_is_called_again_then_should_run_under_the_next_label()
+     {
+        let mut state = RunState::default();
+        assert_eq!(
+            state.begin_call("scan", None),
+            StepCall::Due("scan".to_owned())
+        );
+        state.recorded("scan", b"1".to_vec());
+        assert_eq!(
+            state.begin_call("scan", None),
+            StepCall::Due("scan#2".to_owned())
+        );
+        assert_eq!(state.completed, ["scan"]);
+    }
+
+    #[tokio::test]
+    async fn given_a_step_record_being_written_when_the_grace_ends_then_should_end_the_run_after_it()
+     {
+        let state = Mutex::new(RunState::default());
+        let call = state
+            .lock()
+            .expect("the state lock")
+            .begin_call("downlink", None);
+        assert_eq!(call, StepCall::Due("downlink".to_owned()));
+        assert!(state.lock().expect("the state lock").start_record());
+        let settled = AtomicBool::new(false);
+        let settling = async {
+            settle(&state, Duration::ZERO).await;
+            settled.store(true, Ordering::SeqCst);
+        };
+        let writing = async {
+            while !state.lock().expect("the state lock").finished {
+                tokio::task::yield_now().await;
+            }
+            assert!(!settled.load(Ordering::SeqCst));
+            let mut state = state.lock().expect("the state lock");
+            assert!(!state.start_record());
+            state.recorded("downlink", b"1".to_vec());
+            state.end_record();
+        };
+
+        tokio::join!(settling, writing);
+
+        assert!(settled.load(Ordering::SeqCst));
+        assert_eq!(
+            state.lock().expect("the state lock").completed,
+            ["downlink"]
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_step_body_that_outlasts_the_grace_when_the_run_ends_then_should_refuse_its_record()
+     {
+        let state = Mutex::new(RunState::default());
+        let call = state
+            .lock()
+            .expect("the state lock")
+            .begin_call("downlink", None);
+        assert_eq!(call, StepCall::Due("downlink".to_owned()));
+
+        settle(&state, Duration::ZERO).await;
+
+        let mut state = state.lock().expect("the state lock");
+        assert!(state.closing);
+        assert!(!state.start_record());
+        assert!(state.completed.is_empty());
+    }
+
     fn step(label: &str, after: &[&str]) -> Step {
         Step {
             label: label.to_owned(),
@@ -2102,6 +2915,16 @@ mod tests {
             label: label.to_owned(),
             output: output.to_vec(),
             agents: vec!["worker".to_owned()],
+            input: None,
+        }
+    }
+
+    fn step_call(label: &str, output: &[u8], input: Option<&str>) -> WorkflowJournalEntry {
+        WorkflowJournalEntry::StepCompleted {
+            label: label.to_owned(),
+            output: output.to_vec(),
+            agents: Vec::new(),
+            input: input.map(str::to_owned),
         }
     }
 }

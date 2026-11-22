@@ -152,7 +152,7 @@ void test("given_a_stale_or_unavailable_session_index_when_reading_the_budget_th
   )
   const lens = (failure: Error) =>
     Object.assign(Sessions.create(laser).open(SdkConversationId.parse(SESSION.toString())), {
-      status: () => Promise.reject(failure),
+      indexInfo: () => Promise.reject(failure),
       laneRecords: () => Promise.resolve(lane)
     })
   for (const failure of [
