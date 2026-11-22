@@ -2,6 +2,7 @@ package laser
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
@@ -357,6 +358,271 @@ func (agent *AgentCtx) ReplyProvenance() *Provenance {
 		provenance.Agent = &author
 	}
 	return provenance
+}
+
+// GatherPolicy decides when a fan-out is done.
+//
+// It is a type rather than a count because the three answers are different
+// questions: every branch, enough of them, or whatever arrived in time.
+type GatherPolicy struct {
+	kind   gatherKind
+	quorum int
+}
+
+type gatherKind int
+
+const (
+	gatherAll gatherKind = iota
+	gatherQuorum
+	gatherBestEffort
+)
+
+// GatherAll waits for every branch, each already bounded by the fan-out's
+// deadline.
+func GatherAll() GatherPolicy { return GatherPolicy{kind: gatherAll} }
+
+// GatherQuorum stops as soon as this many branches have answered, cancelling
+// the rest. It is what a caller wanting a second opinion rather than every
+// opinion asks for.
+func GatherQuorum(successes int) GatherPolicy {
+	return GatherPolicy{kind: gatherQuorum, quorum: successes}
+}
+
+// GatherBestEffort takes whatever has landed when the deadline passes.
+func GatherBestEffort() GatherPolicy { return GatherPolicy{kind: gatherBestEffort} }
+
+// Validate refuses a policy that cannot be met.
+//
+// A quorum of none would be met before a single branch ran, which reads as
+// success and means nothing was asked.
+func (policy GatherPolicy) Validate() error {
+	if policy.kind == gatherQuorum && policy.quorum < 1 {
+		return &InvalidError{Reason: "a gather quorum must be at least one"}
+	}
+	return nil
+}
+
+// Satisfied reports whether this many answers out of this many branches meet
+// the policy.
+func (policy GatherPolicy) Satisfied(successes, branches int) bool {
+	switch policy.kind {
+	case gatherQuorum:
+		return successes >= policy.quorum
+	case gatherBestEffort:
+		return successes > 0
+	default:
+		return successes == branches
+	}
+}
+
+// GatheredReply is one agent's answer, kept with the agent that gave it so a
+// caller can tell which result came from where rather than holding a bag of
+// bodies.
+type GatheredReply struct {
+	Agent wire.AgentID
+	Reply *AgdxMessage
+}
+
+// GatheredFailure is one branch that did not answer, with its cause.
+type GatheredFailure struct {
+	Agent wire.AgentID
+	Err   error
+}
+
+// Gather is what a fan-out collected.
+//
+// Failures are reported rather than dropped, so a dead or slow agent is
+// visible instead of being mistaken for one that had nothing to say.
+type Gather struct {
+	// OK are the agents that answered, each with its answer.
+	OK []GatheredReply
+	// Failures are the branches that did not answer, each with why.
+	Failures []GatheredFailure
+	// Cancelled are the agents still working when the policy ended the
+	// gather, because enough others had answered or the deadline passed.
+	Cancelled []wire.AgentID
+	// Satisfied reports whether the gather met its policy.
+	Satisfied bool
+}
+
+// Replies are the answers alone, for a caller that does not need to know
+// which agent gave which.
+func (gather *Gather) Replies() []*AgdxMessage {
+	replies := make([]*AgdxMessage, 0, len(gather.OK))
+	for _, answered := range gather.OK {
+		replies = append(replies, answered.Reply)
+	}
+	return replies
+}
+
+// FanOut asks every agent that advertises a skill, and gathers the answers.
+//
+// Each branch is its own sub-conversation addressed to one agent, so the
+// answers never cross and each can be traced back to the work that asked.
+// Every branch carries the deadline, so an agent that picks its branch up too
+// late drops it rather than working past the gather that was waiting for it.
+//
+// The answers are matched by the loop already reading this agent's topic,
+// which is why the branches go out on that topic: a reply anywhere else has
+// no reader here.
+func (agent *AgentCtx) FanOut(
+	ctx context.Context, request FanOutRequest,
+) (*Gather, error) {
+	if err := request.Policy.Validate(); err != nil {
+		return nil, err
+	}
+	if agent.runtime.identity.IsZero() {
+		return nil, &InvalidError{Reason: "an agent that fans out needs an " +
+			"identity, because every branch names its author"}
+	}
+	if request.Registry == nil {
+		return nil, &InvalidError{Reason: "fanning out by skill needs a " +
+			"registry to resolve it against"}
+	}
+	deadline := request.Deadline
+	if deadline <= 0 {
+		deadline = DefaultRequestTimeout
+	}
+	targets, err := AllCapable(request.Skill, request.Routing).
+		ResolveTargets(request.Registry, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	return agent.gather(ctx, targets, request, deadline), nil
+}
+
+// FanOutRequest is one fan-out.
+type FanOutRequest struct {
+	// Skill is what every branch's target must advertise.
+	Skill string
+	// Routing ranks the capable agents. It does not narrow them: a fan-out
+	// asks all of them.
+	Routing RoutePolicy
+	// Registry is where the capable agents are resolved from.
+	Registry *AgentRegistry
+	// Payload is the body every branch carries.
+	Payload []byte
+	// Policy decides when the gather is done.
+	Policy GatherPolicy
+	// Deadline bounds every branch and the gather. Zero takes
+	// DefaultRequestTimeout.
+	Deadline time.Duration
+}
+
+// branchOutcome is one finished branch.
+type branchOutcome struct {
+	agent wire.AgentID
+	reply *AgdxMessage
+	err   error
+}
+
+// gather runs every branch and collects them under the policy.
+func (agent *AgentCtx) gather(
+	ctx context.Context, targets []wire.AgentID,
+	request FanOutRequest, deadline time.Duration,
+) *Gather {
+	// Cancelling this context stops the branches the policy did not wait
+	// for, rather than leaving them to run on past a gather nobody reads.
+	branching, stop := context.WithCancel(ctx)
+	defer stop()
+	outcomes := make(chan branchOutcome, len(targets))
+	running := map[wire.AgentID]bool{}
+	for _, target := range targets {
+		running[target] = true
+		go func(target wire.AgentID) {
+			reply, err := agent.branch(
+				branching, target, request.Payload, deadline)
+			outcomes <- branchOutcome{agent: target, reply: reply, err: err}
+		}(target)
+	}
+
+	gathered := &Gather{}
+	successes := 0
+	wallClock := time.NewTimer(deadline)
+	defer wallClock.Stop()
+	for len(running) > 0 {
+		var finished branchOutcome
+		select {
+		case finished = <-outcomes:
+		case <-wallClock.C:
+			if request.Policy.kind != gatherBestEffort {
+				// Every branch is bounded by its own deadline, so the others
+				// end on their own rather than being cut short here.
+				wallClock.Stop()
+				continue
+			}
+			stop()
+			gathered.Cancelled = remaining(running)
+			running = nil
+			continue
+		}
+		delete(running, finished.agent)
+		if finished.err != nil {
+			gathered.Failures = append(gathered.Failures,
+				GatheredFailure{Agent: finished.agent, Err: finished.err})
+			continue
+		}
+		successes++
+		gathered.OK = append(gathered.OK,
+			GatheredReply{Agent: finished.agent, Reply: finished.reply})
+		if request.Policy.kind == gatherQuorum && successes >= request.Policy.quorum {
+			stop()
+			gathered.Cancelled = remaining(running)
+			break
+		}
+	}
+	gathered.Satisfied = request.Policy.Satisfied(successes, len(targets))
+	return gathered
+}
+
+// remaining is the agents whose branches were still running, in a stable
+// order so a caller reading two gathers can compare them.
+func remaining(running map[wire.AgentID]bool) []wire.AgentID {
+	agents := make([]wire.AgentID, 0, len(running))
+	for target := range running {
+		agents = append(agents, target)
+	}
+	sort.Slice(agents, func(first, second int) bool {
+		return agents[first].String() < agents[second].String()
+	})
+	return agents
+}
+
+// branch asks one agent, in a sub-conversation of its own.
+//
+// The wait is registered before the ask leaves, because the answer cannot
+// exist until it does. The branch carries its own correlation, so two agents
+// answering at once never cross.
+func (agent *AgentCtx) branch(
+	ctx context.Context, target wire.AgentID,
+	payload []byte, deadline time.Duration,
+) (*AgdxMessage, error) {
+	child := agent.runtime.laser.SpawnSubconversation(
+		agent.message.Record.Provenance, agent.runtime.identity)
+	correlation := wire.CorrelationID{ID: wire.IDFromBytes(NewOperationID())}
+	ticket, err := agent.runtime.replies.Subscribe(correlation, ExpectedReply{
+		Session: child.Conversation, Requester: agent.runtime.identity,
+	})
+	if err != nil {
+		return nil, err
+	}
+	producer := agent.runtime.laser.AgdxOn(agent.runtime.stream,
+		agent.runtime.topic, agent.runtime.identity, child.Conversation)
+	producer.parent, producer.root = child.ParentConversation, child.RootConversation
+	receipt, err := producer.Command(correlation, payload).
+		WithTarget(target).
+		WithDeadline(time.Now().Add(deadline)).
+		Send(ctx)
+	if err != nil {
+		// The wait is released here rather than left for the deadline: a
+		// branch that never left should not hold a correlation.
+		ticket.Close()
+		return nil, err
+	}
+	// The answer names the ask it answers, so a reply belonging to another
+	// exchange on this correlation is refused.
+	ticket.Expect(receipt.Record)
+	return ticket.Await(ctx, deadline)
 }
 
 // NoRespondTopicError reports a handler that tried to answer without a reply

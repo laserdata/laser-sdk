@@ -823,6 +823,307 @@ func awaitPrompt(server *runtimeServer) (wire.CorrelationID, bool) {
 	return wire.CorrelationID{}, false
 }
 
+// fanOutRegistry is a registry of agents advertising one skill.
+func fanOutRegistry(t *testing.T, names ...string) *laser.AgentRegistry {
+	t.Helper()
+	registry := laser.NewAgentRegistry()
+	for _, name := range names {
+		registry.Observe(agentID(t, name),
+			cardFor("review", nil, nil, nil, nil), time.Now())
+	}
+	return registry
+}
+
+// answerBranches answers the fan-out's asks as the agents they addressed, so
+// the gather under test sees real replies arriving through the loop.
+//
+// Branches it should not answer are named in silent, which is how a test
+// shows a gather ending without them.
+func answerBranches(
+	t *testing.T, server *runtimeServer, runtime *laser.AgentRuntime,
+	expected int, silent map[string]bool,
+) {
+	t.Helper()
+	answered := map[string]bool{}
+	deadline := time.Now().Add(3 * time.Second)
+	for len(answered) < expected && time.Now().Before(deadline) {
+		for _, message := range server.on(wire.AgentSessions) {
+			var ask wire.AgentEnvelope
+			if err := wire.Unmarshal(message.Payload, &ask); err != nil {
+				continue
+			}
+			if ask.Kind != wire.KindCommand || ask.Target == nil ||
+				ask.Correlation == nil {
+				continue
+			}
+			target := ask.Target.String()
+			if answered[target] || silent[target] {
+				continue
+			}
+			answered[target] = true
+			reply := delivered(t, 0, 2, func(agdx *laser.Agdx) *laser.AgdxSend {
+				return agdx.Respond(*ask.Correlation, []byte("from "+target)).
+					WithTarget(agentID(t, "executor"))
+			})
+			message, err := laser.OpenAgdx(reply)
+			if err != nil {
+				continue
+			}
+			// The branch is its own conversation, and only a reply in it
+			// answers the waiter that opened it.
+			message.Envelope.Conversation = ask.Conversation
+			message.Envelope.Source = *ask.Target
+			message.Record.Provenance = laser.ProvenanceFromEnvelope(&message.Envelope)
+			runtime.Replies().Deliver(message)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// Every capable agent is asked in a branch of its own, and every answer comes
+// back attributed, so a caller can tell which agent said what.
+func TestGivenSeveralCapableAgentsWhenFannedOutThenShouldGatherEveryAnswer(t *testing.T) {
+	server := newRuntimeServer()
+	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{})
+	record := commandFor(t, 1, 2)
+	var gathered *laser.Gather
+	var fanErr error
+
+	handler := laser.HandlerFunc(func(
+		ctx context.Context, _ *laser.AgentMessage, agent *laser.AgentCtx,
+	) error {
+		go answerBranches(t, server, runtime, 2, nil)
+		gathered, fanErr = agent.FanOut(ctx, laser.FanOutRequest{
+			Skill:    "review",
+			Registry: fanOutRegistry(t, "alice", "bob"),
+			Payload:  []byte("check this"),
+			Policy:   laser.GatherAll(),
+			Deadline: 3 * time.Second,
+		})
+		return nil
+	})
+
+	if err := runUntilDrained(t, runtime, sourceOf(record), handler); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if fanErr != nil {
+		t.Fatalf("fan out: %v", fanErr)
+	}
+	if len(gathered.OK) != 2 {
+		t.Fatalf("want both answers, got %d with %d failures",
+			len(gathered.OK), len(gathered.Failures))
+	}
+	if !gathered.Satisfied {
+		t.Error("every branch answered, so the policy is met")
+	}
+	answers := map[string]string{}
+	for _, answered := range gathered.OK {
+		answers[answered.Agent.String()] = string(answered.Reply.Envelope.Body)
+	}
+	if answers["alice"] != "from alice" || answers["bob"] != "from bob" {
+		t.Errorf("want each answer attributed to its agent, got %v", answers)
+	}
+}
+
+// Each branch is a conversation of its own, linked back to the work that
+// asked, so two agents answering at once never cross.
+func TestGivenAFanOutWhenAskingThenShouldGiveEachBranchItsOwnConversation(t *testing.T) {
+	server := newRuntimeServer()
+	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{})
+	record := commandFor(t, 1, 2)
+
+	handler := laser.HandlerFunc(func(
+		ctx context.Context, _ *laser.AgentMessage, agent *laser.AgentCtx,
+	) error {
+		go answerBranches(t, server, runtime, 2, nil)
+		_, err := agent.FanOut(ctx, laser.FanOutRequest{
+			Skill:    "review",
+			Registry: fanOutRegistry(t, "alice", "bob"),
+			Payload:  []byte("check this"),
+			Policy:   laser.GatherAll(),
+			Deadline: 3 * time.Second,
+		})
+		return err
+	})
+
+	if err := runUntilDrained(t, runtime, sourceOf(record), handler); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	branches := map[wire.ConversationID]bool{}
+	for _, ask := range envelopesOn(t, server, wire.AgentSessions) {
+		if ask.Kind != wire.KindCommand || ask.Target == nil {
+			continue
+		}
+		branches[ask.Conversation] = true
+		if ask.Conversation == conversation(1) {
+			t.Error("a branch must not run in the conversation that asked")
+		}
+		if ask.Parent == nil || *ask.Parent != conversation(1) {
+			t.Errorf("want the asking conversation as the parent, got %v", ask.Parent)
+		}
+		if ask.Root == nil {
+			t.Error("want the tree's root carried, or a deep branch cannot be traced")
+		}
+		if ask.DeadlineMicros == nil {
+			t.Error("want the branch to expire, or a late agent works past the gather")
+		}
+	}
+	if len(branches) != 2 {
+		t.Errorf("want one conversation per branch, got %d", len(branches))
+	}
+}
+
+// A quorum stops the gather as soon as enough have answered, and the rest are
+// reported as cancelled rather than silently dropped.
+func TestGivenAMetQuorumWhenGatheringThenShouldCancelAndReportTheRest(t *testing.T) {
+	server := newRuntimeServer()
+	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{})
+	record := commandFor(t, 1, 2)
+	var gathered *laser.Gather
+
+	handler := laser.HandlerFunc(func(
+		ctx context.Context, _ *laser.AgentMessage, agent *laser.AgentCtx,
+	) error {
+		// Only alice answers, so the quorum of one is met while bob is
+		// still out.
+		go answerBranches(t, server, runtime, 1, map[string]bool{"bob": true})
+		var err error
+		gathered, err = agent.FanOut(ctx, laser.FanOutRequest{
+			Skill:    "review",
+			Registry: fanOutRegistry(t, "alice", "bob"),
+			Payload:  []byte("check this"),
+			Policy:   laser.GatherQuorum(1),
+			Deadline: 3 * time.Second,
+		})
+		return err
+	})
+
+	if err := runUntilDrained(t, runtime, sourceOf(record), handler); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if len(gathered.OK) != 1 || gathered.OK[0].Agent != agentID(t, "alice") {
+		t.Fatalf("want alice's answer alone, got %d", len(gathered.OK))
+	}
+	if !gathered.Satisfied {
+		t.Error("the quorum was met")
+	}
+	if len(gathered.Cancelled) != 1 || gathered.Cancelled[0] != agentID(t, "bob") {
+		t.Errorf("want the unfinished branch reported, got %v", gathered.Cancelled)
+	}
+}
+
+// A branch nobody answered is a failure with its cause, so a dead agent is
+// visible rather than mistaken for one that had nothing to say.
+func TestGivenAnAgentThatNeverAnswersWhenGatheringThenShouldReportTheBranchFailed(t *testing.T) {
+	server := newRuntimeServer()
+	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{})
+	record := commandFor(t, 1, 2)
+	var gathered *laser.Gather
+
+	handler := laser.HandlerFunc(func(
+		ctx context.Context, _ *laser.AgentMessage, agent *laser.AgentCtx,
+	) error {
+		var err error
+		gathered, err = agent.FanOut(ctx, laser.FanOutRequest{
+			Skill:    "review",
+			Registry: fanOutRegistry(t, "alice"),
+			Payload:  []byte("check this"),
+			Policy:   laser.GatherAll(),
+			Deadline: 40 * time.Millisecond,
+		})
+		return err
+	})
+
+	if err := runUntilDrained(t, runtime, sourceOf(record), handler); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if len(gathered.OK) != 0 {
+		t.Fatalf("nobody answered, so there is nothing to gather")
+	}
+	if len(gathered.Failures) != 1 ||
+		gathered.Failures[0].Agent != agentID(t, "alice") {
+		t.Fatalf("want the silent branch reported, got %v", gathered.Failures)
+	}
+	if gathered.Failures[0].Err == nil {
+		t.Error("want why the branch did not answer")
+	}
+	if gathered.Satisfied {
+		t.Error("a gather nobody answered does not meet require-all")
+	}
+}
+
+// A quorum of none would be met before a single branch ran, which reads as
+// success and means nothing was asked.
+func TestGivenAQuorumOfNoneWhenFanningOutThenShouldRefuseBeforeAsking(t *testing.T) {
+	server := newRuntimeServer()
+	record := commandFor(t, 1, 2)
+
+	err := handledThrough(t, server, laser.RuntimeOptions{}, record,
+		func(ctx context.Context, agent *laser.AgentCtx) error {
+			_, err := agent.FanOut(ctx, laser.FanOutRequest{
+				Skill:    "review",
+				Registry: fanOutRegistry(t, "alice"),
+				Policy:   laser.GatherQuorum(0),
+				Deadline: time.Second,
+			})
+			return err
+		})
+
+	var invalid *laser.InvalidError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("want the fan-out refused, got %v", err)
+	}
+	if len(server.on(wire.AgentSessions)) != 0 {
+		t.Error("a refused fan-out must not ask anybody")
+	}
+}
+
+// Nobody advertising the skill is an infrastructure failure rather than an
+// empty gather, because a caller that asked for a skill got no opinion at all.
+func TestGivenNoCapableAgentWhenFanningOutThenShouldReportIt(t *testing.T) {
+	server := newRuntimeServer()
+	record := commandFor(t, 1, 2)
+
+	err := handledThrough(t, server, laser.RuntimeOptions{}, record,
+		func(ctx context.Context, agent *laser.AgentCtx) error {
+			_, err := agent.FanOut(ctx, laser.FanOutRequest{
+				Skill:    "nobody-does-this",
+				Registry: fanOutRegistry(t, "alice"),
+				Policy:   laser.GatherAll(),
+				Deadline: time.Second,
+			})
+			return err
+		})
+
+	var capable *laser.NoCapableAgentError
+	if !errors.As(err, &capable) {
+		t.Fatalf("want no capable agent reported, got %v", err)
+	}
+}
+
+// Each policy answers its own question, so the thresholds are not
+// interchangeable.
+func TestGivenEachGatherPolicyWhenCheckedThenShouldApplyItsOwnThreshold(t *testing.T) {
+	if !laser.GatherAll().Satisfied(3, 3) || laser.GatherAll().Satisfied(2, 3) {
+		t.Error("require-all wants every branch")
+	}
+	if !laser.GatherQuorum(2).Satisfied(2, 3) ||
+		laser.GatherQuorum(2).Satisfied(1, 3) {
+		t.Error("a quorum wants enough of them")
+	}
+	if laser.GatherQuorum(5).Satisfied(3, 3) {
+		t.Error("a quorum nobody can reach is never met")
+	}
+	if !laser.GatherBestEffort().Satisfied(1, 3) ||
+		laser.GatherBestEffort().Satisfied(0, 3) {
+		t.Error("best effort wants at least one")
+	}
+}
+
 // plainRecord builds a record produced by a plain agent send, which carries a
 // spine and no envelope.
 func plainRecord(
