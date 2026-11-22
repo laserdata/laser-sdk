@@ -107,6 +107,7 @@ The check reads the raw operations from the client sources. Rust has 74 operatio
 ### The Go client
 
 The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 56 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
+The three it does not serve are blocked rather than unwritten. `producer.idempotent` and `producer.sharding` are the Rust client's passthrough to the Apache Iggy Rust SDK's high-level producer: the Go SDK exposes neither the producer-id protocol nor a background sharded sender, so there is nothing to pass through, and a batcher of this client's own would be a different feature wearing the same row. `bridge.http` needs a bridge to serve, and Go has the A2A and MCP value mappings and the browser origin guard but not the task-lifecycle adapters the HTTP surface is a shell around.
 
 A capability it does not wrap is still reachable: `Laser.Client` hands out the underlying Apache Iggy client, exactly as `Laser::client` does in Rust.
 

@@ -19,7 +19,16 @@ mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
 
 It is not published yet. [docs/parity.md](../../docs/parity.md) lists its
 standing on each capability in its own section, and `bdd/go/` runs the shared
-behavior scenarios it covers. The handle hands out the underlying Iggy client
+behavior scenarios it covers.
+
+Three of the raw capabilities are blocked rather than unwritten.
+`producer.idempotent` and `producer.sharding` are the Rust client's
+passthrough to the Apache Iggy Rust SDK's high-level producer, and the Go SDK
+has neither the producer-id protocol nor a background sharded sender: a
+batcher of this client's own would be a different feature under the same
+name. `bridge.http` needs a bridge to serve, and what is here is the A2A and
+MCP value mappings and the browser origin guard rather than the task
+lifecycle an HTTP surface would be a shell around. The handle hands out the underlying Iggy client
 for anything beyond what it serves. Use the [Rust](../../sdk/README.md),
 [Python](../python/README.md), or [TypeScript](../typescript/README.md)
 clients for anything this one does not cover yet.
