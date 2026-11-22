@@ -480,6 +480,28 @@ Filtered delivery is served by the streaming server, so it is gated on the
 native capability. The saved catalog needs a managed backend and is gated
 separately: a deployment can filter without saving anything.
 
+## A group and its own filter
+
+A filter belongs to the consumer group that runs it, and
+`topic.ConsumerGroup(name)` is the handle on that group. `Selector` addresses
+it the way a filtered read does, by name for a named handle and by id for a
+numeric one, because the server resolves either and resolving a number here
+would cost a round trip on every read. `Filters` hands back the
+match-oriented reader, and `Consumer` joins the group as one load-balanced
+member. Apache Iggy identifies a member by the client connection, so two
+consumers opened on one connected client join as a single member and are each
+handed every partition: a second member needs its own connection, and a
+numeric handle cannot join at all.
+
+`Filter` reaches the group's own policy. `Configure` sets it, and `Get`,
+`Summary`, `Revisions`, `SetRevisionEnabled`, `Preview`, `Test`, `Release` and
+`Delete` act on it. Each one resolves the binding first and refuses an unbound
+group by saying so, rather than acting on whichever filter happens to come
+first in the catalog: the group's filter is found by its owner identity, never
+by its name, so the same policy saved under a new name is a rename rather than
+a second filter. An unbound group receives every record, which is a supported
+way to run one rather than a misconfiguration.
+
 ## The saved-filter catalog
 
 `Laser.FilterCatalog()` administers the saved filters and the groups bound to
@@ -1579,15 +1601,21 @@ dead-letter topic, because something produced them and a human needs to see
 what.
 
 `laser.AgentCtx` is what a handler is given: `Respond`, `ReplyOn`, `Send`,
-`Request`, `Session`, `SpawnSubconversation` and the pending control book. A
-reply echoes its request's correlation, and a request that carries none
-becomes its own correlation, so a conversation can always be followed back to
-the record that started it.
+`Request`, `Session`, `SpawnSubconversation`, `FanOut` and the pending control
+book. A reply echoes its request's correlation, and a request that carries
+none becomes its own correlation, so a conversation can always be followed
+back to the record that started it.
 
-`AgentCtx` does NOT yet have its own tests. The runtime around it is covered,
-and the context type is exercised through that, but its own edges (the reply
-provenance rules, a refused respond topic, spawning a subconversation) are
-not yet pinned directly.
+`FanOut` asks every capable agent at once, each branch in its own
+conversation, and gathers what answers under a `GatherPolicy`. The policy is a
+type rather than a count because the three answers are different questions:
+`GatherAll` waits for every branch, `GatherQuorum` stops and cancels the rest
+as soon as enough have answered, and `GatherBestEffort` takes whatever landed
+by the deadline. A quorum of none is refused before anything is asked, since
+it would be met before a single branch ran. A branch that never answers comes
+back as a `GatheredFailure` with its cause rather than going missing, and each
+`GatheredReply` keeps the agent that gave it, so a caller can tell which
+result came from where.
 
 
 ## Dependencies

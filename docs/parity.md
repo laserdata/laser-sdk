@@ -105,7 +105,7 @@ The check reads the raw operations from the client sources. Rust has 74 operatio
 
 ### The Go client
 
-The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 45 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
+The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 48 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
 
 A capability it does not wrap is still reachable: `Laser.Client` hands out the underlying Apache Iggy client, exactly as `Laser::client` does in Rust.
 
@@ -130,10 +130,10 @@ A capability it does not wrap is still reachable: `Laser.Client` hands out the u
 | `partition.delete` | `Topic.DeletePartitions` |
 | `segment.delete` | `Topic.DeleteSegments` |
 | `consumer_group.list` | `Topic.ConsumerGroups` |
-| `consumer_group.get` | MISSING |
-| `consumer_group.create` | MISSING |
-| `consumer_group.delete` | MISSING |
-| `consumer_group.join` | `Topic.ConsumerGroup` |
+| `consumer_group.get` | `ConsumerGroup.Info` |
+| `consumer_group.create` | `ConsumerGroup.Create` |
+| `consumer_group.delete` | `ConsumerGroup.Delete` |
+| `consumer_group.join` | `ConsumerGroup.Consumer` |
 | `consumer_offset.get` | MISSING |
 | `consumer_offset.store` | MISSING |
 | `consumer_offset.commit` | `Consumer.Commit + Consumer.Mark` |
@@ -190,7 +190,7 @@ Beyond the raw capabilities, the Go client serves these managed and agent surfac
 | Context assembly | laser.Assemble with LastN, RoleFilter, TokenBudget and Chain |
 | Typed records | laser.TypedJSON, laser.TypedCBOR and laser.TypedWith |
 | Bridges | bridges: the A2A, MCP and AG-UI value mappings, the bridge hop loop guard, and the HTTP origin check |
-| Consumer filters | Topic.Filters: filtered reads with page validation, acknowledgment through the safe offset, previews and record tests |
+| Consumer filters | Topic.Filters: filtered reads with page validation, acknowledgment through the safe offset, previews and record tests, and Topic.ConsumerGroup(name) for the group that owns a policy: Selector, Filters for the match-oriented reader, Consumer for a load-balanced member, and Filter for the group's own summary, revisions, preview, test, release and delete |
 | Filter catalog | Laser.FilterCatalog: register, revise, describe, pause, archive, drop, bind, unbind, release, configure a group, and read filters, revisions, bindings and operation outcomes |
 | Retry schedule | laser.Backoff and the shared schedule pinned to sdk/tests/fixtures/retry-table.json |
 | Action governance | Laser.WithGovernor: the pre-effect hook over publishes, AGDX verbs, requests and memory writes, observe and enforce modes, chained policy evidence on the audit topic, and laser.QuorumGovernor |
@@ -223,7 +223,7 @@ Beyond the raw capabilities, the Go client serves these managed and agent surfac
 | Cluster routing | the managed band keeps to one node picked by a random caller key, walks to the next on a failed link or an unreachable backend, rereads a stale roster once, and sends the replicated authorization writes to the metadata primary |
 | Scratch streams | Laser.ScratchStream: a uniquely named stream for one program run, refusing a name already taken rather than reusing it, with an idempotent delete that stays retryable after a failure |
 | Server administration | Laser.Users and User.Get, Exists, Create, Update, SetPermissions, ChangePassword and Delete, Laser.PersonalAccessTokens with Create and Delete, and Laser.Ping, Stats, Me, Clients, ClientInfo, Cluster, Snapshot and DescribeOptions |
-| Agent runtime | laser.AgentRuntime: one reliable loop over an agent's records, with the gate order, dead-letter on an undecodable spine, retry, panic recovery and a shutdown grace, plus laser.AgentCtx for replying, sending, requesting and spawning a subconversation |
+| Agent runtime | laser.AgentRuntime: one reliable loop over an agent's records, with the gate order, dead-letter on an undecodable spine, retry, panic recovery and a shutdown grace, plus laser.AgentCtx for replying, sending, requesting, spawning a subconversation and fanning out to every capable agent under a GatherPolicy of all, quorum or best effort |
 | Client encryption | laser.AES256GCM: Apache Iggy's AES-256-GCM record format, refusing any key that is not 32 bytes and reporting a ciphertext it cannot open as Apache Iggy error 72, with the ciphertexts the Rust and Node clients sealed pinned as vectors |
 
 An omitted row that reaches the raw client, or a method that does more than convert a value, names the capabilities a caller reaches through it. The check fails when such a row names none.

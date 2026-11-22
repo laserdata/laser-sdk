@@ -16,6 +16,7 @@ Load the SDK overview first. The public hierarchy is `Laser → stream → topic
 - `wire/src/filter/` defines policies, codecs, requests, replies, revisions and durable operation results. `read.rs` includes automatic group execution, scan ceilings, source history and policy generations.
 - `foreign/python/src/consumer_group.rs`, `filters.rs` and `transport.rs` bind the same behavior through Rust. Regenerate the Python stubs.
 - `foreign/typescript/src/stream/consumer-group.ts`, `consumer.ts`, `managed/filters.ts` and the wire modules implement the native TypeScript peer. Regenerate both API reports.
+- `foreign/go/laser/consumer_group.go`, `filters.go`, `filter_catalog.go` and `filter_progress.go` are the in-progress Go peer: the group handle (`Selector`, `Filters`, `Consumer`), the group's own filter verbs, filtered reads and the acknowledgment bookkeeping. It runs the same evaluator and codec corpora.
 
 ## Invariants
 
