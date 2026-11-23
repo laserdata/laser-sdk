@@ -1202,3 +1202,37 @@ func hex64(value uint64) string {
 	}
 	return string(spelled)
 }
+
+// OpenAgdxMessage decodes one record into the message a handler would see,
+// for a reader outside the runtime that replays records of its own.
+//
+// It is the runtime's own decode without the dead-lettering: a caller
+// replaying the log is reading history rather than taking delivery of work,
+// so a record it cannot read is an error to report rather than a failure to
+// redrive. A record that carries no envelope comes back with none, which is
+// the normal shape of a plain send.
+func OpenAgdxMessage(record *Record) (*AgentMessage, error) {
+	stamp, err := envelopeStamp(record)
+	if err != nil {
+		return nil, err
+	}
+	message := &AgentMessage{Record: record, ContentType: stamp.contentType}
+	if !stamp.present {
+		return message, nil
+	}
+	if stamp.version != wire.AgentOpVersion {
+		return nil, &InvalidError{
+			Reason: "the record carries agent envelope version " +
+				itoa(int(stamp.version)) + ", and this client speaks " +
+				itoa(int(wire.AgentOpVersion))}
+	}
+	var envelope wire.AgentEnvelope
+	if err := wire.Unmarshal(record.Payload(), &envelope); err != nil {
+		return nil, &CodecError{Reason: "decode the agent envelope", Cause: err}
+	}
+	if err := envelope.Validate(); err != nil {
+		return nil, &InvalidError{Reason: "agent envelope: " + err.Error()}
+	}
+	message.Envelope = &envelope
+	return message, nil
+}

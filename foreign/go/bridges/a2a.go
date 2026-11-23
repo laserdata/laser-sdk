@@ -16,13 +16,20 @@ import (
 // A2AMethod is a JSON-RPC method the A2A edge serves.
 type A2AMethod string
 
+// The v1.0 method names, which are the spellings an A2A client sends. They
+// are the protocol's own vocabulary rather than this client's, so they are
+// written out here and must match the Rust and TypeScript bridges exactly.
 const (
 	// A2AMessageSend submits work and answers with the task it created.
-	A2AMessageSend A2AMethod = "message/send"
+	A2AMessageSend A2AMethod = "SendMessage"
+	// A2AMessageStream is the streaming submit, which this bridge does not
+	// serve: AGDX chunk channels ride the log rather than SSE, and the card
+	// advertises no streaming.
+	A2AMessageStream A2AMethod = "SendStreamingMessage"
 	// A2ATasksGet looks a task up by id.
-	A2ATasksGet A2AMethod = "tasks/get"
+	A2ATasksGet A2AMethod = "GetTask"
 	// A2ATasksCancel asks for a task to stop.
-	A2ATasksCancel A2AMethod = "tasks/cancel"
+	A2ATasksCancel A2AMethod = "CancelTask"
 )
 
 // A2APart is one piece of a message or artifact, carrying text.

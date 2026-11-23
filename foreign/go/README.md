@@ -1435,6 +1435,41 @@ against vectors the Rust client printed, in both the CBOR and the JSON form.
 and nothing more: the log stays the source of truth, so a task survives a
 bridge restart and remains replayable.
 
+`NewA2ABridge(laser, source, requestTopic, replyTopic)` is the A2A task
+adapter. `Submit` publishes the params as a typed AGDX command on a fresh
+conversation, carrying the foreign request byte-identical so an agent reads
+exactly what the A2A client sent. The task's identity is that conversation
+and its correlation is derived from it, which is what makes `Task` and
+`Cancel` stateless: a bridge holding no table answers for a task it is handed
+the id of, including one another process submitted.
+
+`Task` replays the log forward from the time the id was minted, less five
+minutes of clock slack, over at most 32 passes per partition. A task nothing
+answered yet is working; one whose scan could not reach the end of the topic
+is unspecified rather than working, because the answer may already be there
+and "working" would be a claim the scan did not check. `Cancel` writes the
+canceled terminal for a task still in progress and refuses one that already
+ended: a terminal state is a fact on the log, and a second one after it would
+make the task read differently depending on which record a reader saw last.
+
+With `WithVerifier` only a signature the registry accepts settles a task, and
+only from the agent the command addressed or from the bridge's own cancel. An
+unaddressed command is a broadcast, so any enrolled signer counts for it.
+Without a verifier every answer counts, which is right for a trusted lane and
+wrong for a shared one.
+
+`HandleRPC` answers a JSON-RPC call without any HTTP around it, so the shell
+that serves it is a shell. A message naming a live task continues it in its
+own conversation addressed to the agent it already went to, rather than
+starting a second task nobody connected to the first. `SendStreamingMessage`
+answers unsupported rather than unknown, because the card advertises no
+streaming: AGDX chunk channels ride the log, not SSE. `Card` renders the v1.0
+discovery document and is refused until `WithPublicURL` names the endpoint.
+
+Not ported yet: the task-binding MAC that scopes an id to one caller, the
+caller principal, and `submit_in` for child sessions. There is no HTTP router
+over `HandleRPC` and no MCP adapter.
+
 A2A task states map both ways, and a word outside the vocabulary is refused
 rather than guessed, since an edge sending one is speaking a protocol this
 bridge does not implement. A paused task reads as working, because A2A has no
