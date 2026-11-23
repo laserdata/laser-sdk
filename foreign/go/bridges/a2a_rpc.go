@@ -72,7 +72,13 @@ func faultOf(code int, message string) *a2aFault {
 func (bridge *A2ABridge) HandleRPC(
 	ctx context.Context, request []byte,
 ) JSONRPCResponse {
-	id, result, fault := bridge.dispatch(ctx, request)
+	return bridge.handleRPCFor(ctx, request, "")
+}
+
+func (bridge *A2ABridge) handleRPCFor(
+	ctx context.Context, request []byte, caller string,
+) JSONRPCResponse {
+	id, result, fault := bridge.dispatch(ctx, request, caller)
 	answer := JSONRPCResponse{JSONRPC: JSONRPCVersion, ID: id}
 	if fault != nil {
 		answer.Error = &JSONRPCError{Code: fault.code, Message: fault.message}
@@ -85,7 +91,7 @@ func (bridge *A2ABridge) HandleRPC(
 // dispatch runs one call, returning its id, its result and the fault that
 // replaced it.
 func (bridge *A2ABridge) dispatch(
-	ctx context.Context, request []byte,
+	ctx context.Context, request []byte, caller string,
 ) (json.RawMessage, any, *a2aFault) {
 	// The id is read first and separately, so a request this bridge refuses
 	// is still answered under the id its caller used.
@@ -106,7 +112,7 @@ func (bridge *A2ABridge) dispatch(
 	}
 	switch A2AMethod(envelope.Method) {
 	case A2AMessageSend:
-		task, fault := bridge.sendMessage(ctx, params)
+		task, fault := bridge.sendMessage(ctx, params, caller)
 		if fault != nil {
 			return id, nil, fault
 		}
@@ -114,7 +120,7 @@ func (bridge *A2ABridge) dispatch(
 	case A2AMessageStream:
 		return id, nil, faultOf(CodeUnsupportedOperation, "streaming is not supported")
 	case A2ATasksGet, A2ATasksCancel:
-		task, fault := bridge.taskCall(ctx, A2AMethod(envelope.Method), params)
+		task, fault := bridge.taskCall(ctx, A2AMethod(envelope.Method), params, caller)
 		if fault != nil {
 			return id, nil, fault
 		}
@@ -127,7 +133,7 @@ func (bridge *A2ABridge) dispatch(
 // taskCall serves GetTask and CancelTask, which differ only in what they do
 // once the task is read.
 func (bridge *A2ABridge) taskCall(
-	ctx context.Context, method A2AMethod, params json.RawMessage,
+	ctx context.Context, method A2AMethod, params json.RawMessage, caller string,
 ) (*A2ATask, *a2aFault) {
 	var named struct {
 		ID string `json:"id"`
@@ -135,9 +141,10 @@ func (bridge *A2ABridge) taskCall(
 	if err := json.Unmarshal(params, &named); err != nil || named.ID == "" {
 		return nil, faultOf(CodeInvalidParams, "invalid params")
 	}
-	conversation, err := openTask(named.ID)
+	conversation, err := bridge.openTaskID(ctx, named.ID, caller)
 	if err != nil {
-		// An id this bridge cannot open names no task it can answer for.
+		// An id this caller cannot open names no task it can answer for,
+		// which is what keeps one caller's ids useless to another.
 		return nil, faultOf(CodeTaskNotFound, "task not found")
 	}
 	view, err := bridge.view(ctx, conversation, named.ID)
@@ -166,7 +173,7 @@ func (bridge *A2ABridge) taskCall(
 // and the original target, so the agent already handling it sees the
 // continuation rather than a second task nobody connected to the first.
 func (bridge *A2ABridge) sendMessage(
-	ctx context.Context, params json.RawMessage,
+	ctx context.Context, params json.RawMessage, caller string,
 ) (*A2ATask, *a2aFault) {
 	var call struct {
 		Message  json.RawMessage `json:"message"`
@@ -193,20 +200,20 @@ func (bridge *A2ABridge) sendMessage(
 		return nil, faultOf(CodeInvalidParams, "invalid params")
 	}
 	if named.TaskID == nil {
-		task, err := bridge.submit(ctx, params, bridge.target, hops)
+		task, err := bridge.submitFor(ctx, params, bridge.target, hops, caller)
 		if err != nil {
 			return nil, internalFault(err)
 		}
 		return task, nil
 	}
-	return bridge.continueTask(ctx, *named.TaskID, params, hops)
+	return bridge.continueTask(ctx, *named.TaskID, params, hops, caller)
 }
 
 // continueTask adds a message to a task already running.
 func (bridge *A2ABridge) continueTask(
-	ctx context.Context, id string, params json.RawMessage, hops []string,
+	ctx context.Context, id string, params json.RawMessage, hops []string, caller string,
 ) (*A2ATask, *a2aFault) {
-	conversation, err := openTask(id)
+	conversation, err := bridge.openTaskID(ctx, id, caller)
 	if err != nil {
 		return nil, faultOf(CodeTaskNotFound, "task not found")
 	}

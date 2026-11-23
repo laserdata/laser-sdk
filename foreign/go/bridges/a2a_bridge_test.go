@@ -54,6 +54,16 @@ func (log *bridgeLog) SendMessages(
 	return &iggcon.SendMessagesResponse{}, nil
 }
 
+// GetStream answers the bridge's stream, whose creation time a bound task
+// id is tied to.
+func (log *bridgeLog) GetStream(
+	_ context.Context, _ iggcon.Identifier,
+) (*iggcon.StreamDetails, error) {
+	return &iggcon.StreamDetails{
+		Stream: iggcon.Stream{Name: "agents", CreatedAt: 1_700_000_000_000_000},
+	}, nil
+}
+
 func (log *bridgeLog) GetTopic(
 	_ context.Context, _, _ iggcon.Identifier,
 ) (*iggcon.TopicDetails, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -44,6 +45,12 @@ type A2ABridge struct {
 	signingKey   *laser.SigningKey
 	verifier     *laser.KeyRegistry
 	hops         []string
+	binding      *taskBinding
+	// allowedOrigins and callerFrom belong to the HTTP shell: the browser
+	// origins the JSON-RPC endpoint serves, and how a request names its
+	// authenticated caller.
+	allowedOrigins []string
+	callerFrom     func(*http.Request) (string, error)
 }
 
 // NewA2ABridge opens a bridge publishing commands on requestTopic and
@@ -177,15 +184,30 @@ func (bridge *A2ABridge) SubmitWithHops(
 func (bridge *A2ABridge) submit(
 	ctx context.Context, paramsJSON []byte, target *wire.AgentID, hops []string,
 ) (*A2ATask, error) {
+	return bridge.submitFor(ctx, paramsJSON, target, hops, "")
+}
+
+// submitFor publishes a task owned by caller, empty for an unbound bridge.
+//
+// The id is minted before the command is published, so a binding that cannot
+// be made leaves nothing on the log for an id nobody can open.
+func (bridge *A2ABridge) submitFor(
+	ctx context.Context, paramsJSON []byte, target *wire.AgentID,
+	hops []string, caller string,
+) (*A2ATask, error) {
 	if len(paramsJSON) == 0 {
 		return nil, &BridgeError{Reason: "the A2A params must not be empty"}
 	}
 	task := laser.NewConversationID()
+	id, err := bridge.mintTaskID(ctx, task, caller)
+	if err != nil {
+		return nil, err
+	}
 	if err := bridge.publishCommand(ctx, task, paramsJSON, target, hops); err != nil {
 		return nil, err
 	}
 	return &A2ATask{
-		ID:        task.String(),
+		ID:        id,
 		ContextID: ContextIDOf(paramsJSON, task),
 		Status:    A2ATaskStatus{State: a2aSubmitted},
 	}, nil
@@ -221,7 +243,13 @@ func (bridge *A2ABridge) publishCommand(
 // already be there, and saying "working" would be a claim the scan did not
 // check. An id this bridge published no command for is refused.
 func (bridge *A2ABridge) Task(ctx context.Context, id string) (*A2ATask, error) {
-	conversation, err := openTask(id)
+	return bridge.taskFor(ctx, id, "")
+}
+
+func (bridge *A2ABridge) taskFor(
+	ctx context.Context, id, caller string,
+) (*A2ATask, error) {
+	conversation, err := bridge.openTaskID(ctx, id, caller)
 	if err != nil {
 		return nil, err
 	}
@@ -241,7 +269,15 @@ func (bridge *A2ABridge) Task(ctx context.Context, id string) (*A2ATask, error) 
 // state is a fact on the log, and a second one after it would make the task
 // read differently depending on which record a reader saw last.
 func (bridge *A2ABridge) Cancel(ctx context.Context, id string) (*A2ATask, error) {
-	conversation, err := openTask(id)
+	return bridge.cancelFor(ctx, id, "")
+}
+
+func (bridge *A2ABridge) cancelFor(
+	ctx context.Context, id, caller string,
+) (*A2ATask, error) {
+	// Opened before anything is published, so an id this caller cannot open
+	// has no effect at all.
+	conversation, err := bridge.openTaskID(ctx, id, caller)
 	if err != nil {
 		return nil, err
 	}

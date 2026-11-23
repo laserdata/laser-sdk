@@ -1466,9 +1466,29 @@ answers unsupported rather than unknown, because the card advertises no
 streaming: AGDX chunk channels ride the log, not SSE. `Card` renders the v1.0
 discovery document and is refused until `WithPublicURL` names the endpoint.
 
-Not ported yet: the task-binding MAC that scopes an id to one caller, the
-caller principal, and `submit_in` for child sessions. There is no HTTP router
-over `HandleRPC` and no MCP adapter.
+`WithTaskBinding(key, ttl)` scopes every task id to the caller that created
+it. Without it a task id is a bare conversation, and anyone who learns or
+guesses one can read and cancel that task: the log is the authority on what
+happened and has no opinion on who may ask. A bound id is
+`<task>.<expiry>.<mac>`, keyed BLAKE3 over the caller, the stream's creation
+time and the task, so an id that is not this caller's, has expired, or was
+minted on an earlier incarnation of the stream reads as a task that does not
+exist rather than as a refusal that confirms it. `bridge.Caller(principal)`
+names who is asking, and a bound bridge called without one refuses rather
+than minting an id nobody could open.
+
+`Handler()` serves the bridge over HTTP: the JSON-RPC endpoint at `POST /`
+and the card at `/.well-known/agent-card.json`. It is a shell over `HandleRPC`
+and `Card`, so serving the bridge another way answers identically. The
+endpoint is guarded by `WithAllowedOrigins` and names its caller through
+`WithCallerFrom`, whose error is a 401 rather than an unauthenticated call. A
+non-JSON content type is 415, a body over 2 MiB is 413, a body that is not
+JSON is 400, and a wrong method is 405 with what is allowed. The card path is
+public discovery and unguarded: a client has to read it before it can be an
+allowed origin.
+
+Not ported yet: `submit_in` for child sessions, the detached JWS card
+signature, and the MCP task adapter, so `Handler` serves A2A alone.
 
 A2A task states map both ways, and a word outside the vocabulary is refused
 rather than guessed, since an edge sending one is speaking a protocol this
