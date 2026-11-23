@@ -3,7 +3,7 @@
   "url": "https://context7.com/laserdata/laser-sdk",
   "public_key": "pk_4SsXXbwEyFNv9vG1fgq7M",
   "projectTitle": "Laser SDK",
-  "description": "Laser SDK: agent memory, durable workflows, sessions and messaging on Apache Iggy, with matching Rust, Python and TypeScript clients.",
+  "description": "Laser SDK lets agents and services exchange messages, share state and memory, and keep a durable, replayable record of every session, on one log. It has clients for Rust, Python and TypeScript, plus the laser-wire contract crate, and runs on Apache Iggy.",
   "folders": [
     "docs",
     "sdk",
