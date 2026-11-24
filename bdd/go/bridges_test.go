@@ -10,6 +10,7 @@ import (
 
 	bdd "github.com/laserdata/laser-sdk/bdd/go"
 	"github.com/laserdata/laser-sdk/foreign/go/bridges"
+	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
@@ -27,14 +28,6 @@ var bridgesPlan = map[string]string{
 	// yet to run a responder under, the gap session.feature's own plan names.
 	"Addressed bridge calls and input requests reach only their addressee":  "needs an agent consuming the lane",
 	"A finished A2A task refuses a cancel and an unknown task is not found": "needs an agent consuming the lane",
-
-	// Both need a reader that frames a whole conversation's chunk stream into
-	// AG-UI runs. bridges.EventsFor and AgUiStream render one envelope at a
-	// time and do not synthesize the RUN_STARTED/RUN_FINISHED around a chunk
-	// stream the way Rust and TypeScript's agui_events does, so there is
-	// nothing yet to call for these two.
-	"A chunked chat renders a complete AG-UI stream":     "needs an agui_events reader over the conversation",
-	"A long chunked chat renders from its opening chunk": "needs an agui_events reader over the conversation",
 }
 
 func bridgesStep(ctx context.Context, state *world, step bdd.Step) error {
@@ -81,6 +74,18 @@ func bridgesStep(ctx context.Context, state *world, step bdd.Step) error {
 
 	case strings.HasPrefix(text, "the reconstructed AG-UI count is"):
 		return checkReconstructedCount(state, step)
+
+	case strings.HasPrefix(text, "I stream chat chunks "):
+		return streamChatChunksStep(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "I stream ") && strings.HasSuffix(text, "chat chunks"):
+		return streamManyChatChunksStep(ctx, state, step)
+
+	case text == "AG-UI renders the chat lifecycle in order":
+		return checkChatLifecycle(state)
+
+	case strings.HasPrefix(text, "AG-UI renders one run with"):
+		return checkLongChatLifecycle(state, step)
 
 	default:
 		return fmt.Errorf("this runner does not implement the step")
@@ -350,6 +355,127 @@ func checkReconstructedCount(state *world, step bdd.Step) error {
 	got, _ := state.get("reconstructedState")
 	if want := fmt.Sprintf(`{"count":%d}`, counts[0]); got != want {
 		return fmt.Errorf("want %s, got %v", want, got)
+	}
+	return nil
+}
+
+func streamChatChunksStep(ctx context.Context, state *world, arguments []string) error {
+	if len(arguments) < 2 {
+		return fmt.Errorf("want two chunks, got %v", arguments)
+	}
+	return streamChatChunksAndRecord(ctx, state, arguments)
+}
+
+func streamManyChatChunksStep(ctx context.Context, state *world, step bdd.Step) error {
+	counts := numbersOf(step)
+	if len(counts) != 1 {
+		return fmt.Errorf("want one chunk count, got %v", counts)
+	}
+	chunks := make([]string, counts[0])
+	for index := range chunks {
+		chunks[index] = fmt.Sprintf("chunk %d ", index)
+	}
+	return streamChatChunksAndRecord(ctx, state, chunks)
+}
+
+// streamChatChunksAndRecord writes a chat chunk stream (the opening chunk
+// carrying the purpose, the rest plain, the last carrying Last and a finish
+// reason), then polls AgUiEvents until the stream's end is visible there too:
+// an append is acknowledged before every reader sees it, so one read racing
+// the writes is expected rather than a failure.
+func streamChatChunksAndRecord(ctx context.Context, state *world, chunks []string) error {
+	source, err := bridgeAgent("assistant")
+	if err != nil {
+		return err
+	}
+	correlation := wire.CorrelationID{ID: wire.IDFromBytes(laser.NewOperationID())}
+	channel := wire.ChannelID{ID: wire.IDFromBytes(laser.NewOperationID())}
+	agdx := state.client.Agdx(source, state.conversation)
+	for sequence, body := range chunks {
+		send := agdx.Chunk(correlation, channel, uint64(sequence), []byte(body))
+		if sequence == 0 {
+			send = send.WithOperation(wire.OperationChat)
+		}
+		if _, err := send.Send(ctx); err != nil {
+			return fmt.Errorf("send chunk %d: %w", sequence, err)
+		}
+	}
+	finisher := agdx.Chunk(correlation, channel, uint64(len(chunks)), nil).
+		Last().WithFinishReason("stop")
+	if _, err := finisher.Send(ctx); err != nil {
+		return fmt.Errorf("finish the stream: %w", err)
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		events, err := bridges.AgUiEvents(ctx, state.client, state.conversation, wire.AgentSessions)
+		if err == nil {
+			kinds := kindsOf(events)
+			if containsKind(kinds, bridges.TextMessageEnd) {
+				state.put("aguiEventKinds", kinds)
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("chat events did not become visible")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func kindsOf(events []bridges.AgUiEvent) []bridges.AgUiEventKind {
+	kinds := make([]bridges.AgUiEventKind, len(events))
+	for index, event := range events {
+		kinds[index] = event.Type
+	}
+	return kinds
+}
+
+func containsKind(kinds []bridges.AgUiEventKind, want bridges.AgUiEventKind) bool {
+	return slices.Contains(kinds, want)
+}
+
+func checkChatLifecycle(state *world) error {
+	gotAny, _ := state.get("aguiEventKinds")
+	got, _ := gotAny.([]bridges.AgUiEventKind)
+	want := []bridges.AgUiEventKind{
+		bridges.RunStarted, bridges.TextMessageStart, bridges.TextMessageContent,
+		bridges.TextMessageContent, bridges.TextMessageEnd, bridges.RunFinished,
+	}
+	if !slices.Equal(got, want) {
+		return fmt.Errorf("want %v, got %v", want, got)
+	}
+	return nil
+}
+
+func checkLongChatLifecycle(state *world, step bdd.Step) error {
+	counts := numbersOf(step)
+	if len(counts) != 1 {
+		return fmt.Errorf("want one count, got %v", counts)
+	}
+	gotAny, _ := state.get("aguiEventKinds")
+	got, _ := gotAny.([]bridges.AgUiEventKind)
+	if len(got) < 2 || got[0] != bridges.RunStarted || got[1] != bridges.TextMessageStart {
+		return fmt.Errorf("want the run opened from its first chunk, got %v", got)
+	}
+	contentCount := 0
+	for _, kind := range got {
+		if kind == bridges.TextMessageContent {
+			contentCount++
+		}
+	}
+	if uint64(contentCount) != counts[0] {
+		return fmt.Errorf("want %d text contents, got %d", counts[0], contentCount)
+	}
+	if n := len(got); n < 2 || got[n-2] != bridges.TextMessageEnd || got[n-1] != bridges.RunFinished {
+		return fmt.Errorf("want the run closed at the end, got %v", got)
 	}
 	return nil
 }
