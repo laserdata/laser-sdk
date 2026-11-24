@@ -14,21 +14,19 @@ router, request and reply, memory, context assembly, fold snapshots, the per-con
 context, edge authorization, the agent topology bootstrap, dead-letter redrives, chunk
 stream reassembly, the projection, binding
 and writer-schema registries, materialization, the change feed, a batching producer with the shared publish
-recovery schedule, record signing with its key registry, action governance with its approval gate, and the bridge value
-mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
+recovery schedule, record signing with its key registry, action governance with its approval gate, and the A2A and MCP
+bridges with the AG-UI value mappings. All of it rides the Apache Iggy Go SDK's TCP transport.
 
 It is not published yet. [docs/parity.md](../../docs/parity.md) lists its
 standing on each capability in its own section, and `bdd/go/` runs the shared
 behavior scenarios it covers.
 
-Three of the raw capabilities are blocked rather than unwritten.
+Two of the raw capabilities are blocked rather than unwritten.
 `producer.idempotent` and `producer.sharding` are the Rust client's
 passthrough to the Apache Iggy Rust SDK's high-level producer, and the Go SDK
 has neither the producer-id protocol nor a background sharded sender: a
 batcher of this client's own would be a different feature under the same
-name. `bridge.http` needs a bridge to serve, and what is here is the A2A and
-MCP value mappings and the browser origin guard rather than the task
-lifecycle an HTTP surface would be a shell around. The handle hands out the underlying Iggy client
+name. The handle hands out the underlying Iggy client
 for anything beyond what it serves. Use the [Rust](../../sdk/README.md),
 [Python](../python/README.md), or [TypeScript](../typescript/README.md)
 clients for anything this one does not cover yet.

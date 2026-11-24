@@ -107,7 +107,7 @@ The check reads the raw operations from the client sources. Rust has 74 operatio
 ### The Go client
 
 The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves 57 of the 59 raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.
-The two it does not serve are blocked rather than unwritten. `producer.idempotent` and `producer.sharding` are the Rust client's passthrough to the Apache Iggy Rust SDK's high-level producer: the Go SDK exposes neither the producer-id protocol nor a background sharded sender, so there is nothing to pass through, and a batcher of this client's own would be a different feature wearing the same row. `producer.idempotent` and `producer.sharding` are the two, and the Go client serves the rest. MCP has no task adapter yet, so `A2ABridge.Handler` serves the A2A bridge alone.
+The two it does not serve are blocked rather than unwritten. `producer.idempotent` and `producer.sharding` are the Rust client's passthrough to the Apache Iggy Rust SDK's high-level producer: the Go SDK exposes neither the producer-id protocol nor a background sharded sender, so there is nothing to pass through, and a batcher of this client's own would be a different feature wearing the same row. `producer.idempotent` and `producer.sharding` are the two, and the Go client serves the rest, including both the A2A and MCP bridges served over HTTP.
 
 A capability it does not wrap is still reachable: `Laser.Client` hands out the underlying Apache Iggy client, exactly as `Laser::client` does in Rust.
 
@@ -151,8 +151,8 @@ A capability it does not wrap is still reachable: `Laser.Client` hands out the u
 | `publish.failure` | `laser.PublishFailure: the confirmations that arrived and the records without one` |
 | `error.code` | `TransportError.IggyErrorCode` |
 | `agent.topic_names` | `wire.AgentSessions and the other wire topic constants` |
-| `bridge.rpc` | `bridges.TaskFromEnvelope + bridges.ToolResultFromEnvelope (mapping only, no server)` |
-| `bridge.http` | `A2ABridge.Handler` |
+| `bridge.rpc` | `A2ABridge.HandleRPC + MCPBridge.HandleRPC` |
+| `bridge.http` | `A2ABridge.Handler + MCPBridge.Handler` |
 | `user.list` | `Laser.Users` |
 | `user.get` | `User.Get + User.Exists` |
 | `user.create` | `User.Create` |
@@ -191,7 +191,7 @@ Beyond the raw capabilities, the Go client serves these managed and agent surfac
 | Memory | Laser.Memory: remember, forget, improve, plus laser.Rank and laser.ToContextBlock |
 | Context assembly | laser.Assemble with LastN, RoleFilter, TokenBudget and Chain |
 | Typed records | laser.TypedJSON, laser.TypedCBOR and laser.TypedWith |
-| Bridges | bridges: the A2A task adapter (NewA2ABridge with Submit, SubmitTo, SubmitWithHops, Task, Cancel, Card and the HandleRPC JSON-RPC dispatch, stateless over the log), A2ABridge.Handler serving it over HTTP behind the browser origin guard with a caller hook, WithTaskBinding scoping a task id to its caller, the MCP and AG-UI value mappings, and the bridge hop loop guard |
+| Bridges | bridges: the A2A task adapter (NewA2ABridge with Submit, SubmitTo, SubmitWithHops, Task, Cancel, Card and the HandleRPC JSON-RPC dispatch, stateless over the log), A2ABridge.Handler serving it over HTTP behind the browser origin guard with a caller hook, WithTaskBinding scoping a task id to its caller, the MCP tool-call adapter (NewMCPBridge with CallTool, CallToolTo, CallToolWithHops, Initialize, ListTools, ListResources, ReadResource, ListPrompts, GetPrompt and the HandleRPC JSON-RPC dispatch, a live bounded wait for the correlated reply rather than a replay), MCPBridge.Handler serving it over HTTP behind the same origin guard and the MCP-Protocol-Version header check, the AG-UI value mappings, and the bridge hop loop guard |
 | Consumer filters | Topic.Filters: filtered reads with page validation, acknowledgment through the safe offset, previews and record tests, and Topic.ConsumerGroup(name) for the group that owns a policy: Selector, Filters for the match-oriented reader, Consumer for a load-balanced member, and Filter for the group's own summary, revisions, preview, test, release and delete |
 | Filter catalog | Laser.FilterCatalog: register, revise, describe, pause, archive, drop, bind, unbind, release, configure a group, and read filters, revisions, bindings and operation outcomes |
 | Retry schedule | laser.Backoff and the shared schedule pinned to sdk/tests/fixtures/retry-table.json, driving the managed read walk and the mutation repeat: a mutation whose outcome is unknown goes again under its identity on bounded attempts until ManagedDeadline, then reports AmbiguousMutationError |
