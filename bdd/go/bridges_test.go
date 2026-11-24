@@ -16,18 +16,10 @@ import (
 
 // TestGivenTheSharedBridgeScenariosWhenRunThenShouldHold runs the external
 // protocol feature: the hop guard, the A2A task lifecycle, the AG-UI state
-// documents, and addressed dispatch between bridges and responding agents.
+// documents and chunk stream, and addressed dispatch between bridges and
+// responding agents.
 func TestGivenTheSharedBridgeScenariosWhenRunThenShouldHold(t *testing.T) {
-	runFeaturePlanned(t, "bridges.feature", 2*time.Minute, bridgesStep, bridgesPlan)
-}
-
-// bridgesPlan names the scenarios this runner does not cover yet, and why.
-var bridgesPlan = map[string]string{
-	// Both need an agent actually consuming the lane: the Go client has the
-	// AGDX gates (sdk/src/agent.rs's Agent) but no handler-dispatch runtime
-	// yet to run a responder under, the gap session.feature's own plan names.
-	"Addressed bridge calls and input requests reach only their addressee":  "needs an agent consuming the lane",
-	"A finished A2A task refuses a cancel and an unknown task is not found": "needs an agent consuming the lane",
+	runFeature(t, "bridges.feature", 2*time.Minute, bridgesStep)
 }
 
 func bridgesStep(ctx context.Context, state *world, step bdd.Step) error {
@@ -86,6 +78,42 @@ func bridgesStep(ctx context.Context, state *world, step bdd.Step) error {
 
 	case strings.HasPrefix(text, "AG-UI renders one run with"):
 		return checkLongChatLifecycle(state, step)
+
+	case strings.HasPrefix(text, "responders \"") && strings.Contains(text, "answer every command with their own name"):
+		return spawnResponderPair(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "responder \"") && strings.Contains(text, "answers A2A tasks and input requests with its own name"):
+		return spawnResponderStep(ctx, state, arguments, []string{wire.OperationChat, wire.OperationInputRequest})
+
+	case strings.HasPrefix(text, "responder \"") && strings.Contains(text, "answers every command with its own name"):
+		return spawnResponderStep(ctx, state, arguments, nil)
+
+	case strings.HasPrefix(text, "responder \"") && strings.Contains(text, "answered exactly"):
+		return checkResponderAnswered(state, arguments)
+
+	case strings.HasPrefix(text, "I submit an A2A task to"):
+		return submitA2ATaskTo(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "the A2A task completes with"):
+		return checkA2ATaskCompletesWith(ctx, state, arguments)
+
+	case text == "canceling the A2A task is refused":
+		return checkA2ACancelRefused(ctx, state)
+
+	case text == "an A2A task that was never submitted is not found":
+		return checkUnknownA2ATaskNotFound(ctx, state)
+
+	case strings.HasPrefix(text, "I call the MCP tool "):
+		return callMCPToolOn(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "the MCP tool result is"):
+		return checkMCPToolResult(state, arguments)
+
+	case strings.HasPrefix(text, "I request input from"):
+		return requestInputFrom(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "the input decision is"):
+		return checkInputDecision(state, arguments)
 
 	default:
 		return fmt.Errorf("this runner does not implement the step")
