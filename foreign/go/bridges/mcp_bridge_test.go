@@ -24,6 +24,9 @@ func mcpBridgeOver(t *testing.T, log iggcon.Client) *bridges.MCPBridge {
 type replyingLog struct {
 	bridgeLog
 	source wire.AgentID
+	// errorReply answers with a tool error (KindError) instead of a
+	// response, for testing the failure path.
+	errorReply bool
 }
 
 func (log *replyingLog) SendMessages(
@@ -39,9 +42,13 @@ func (log *replyingLog) SendMessages(
 		if err := wire.Unmarshal(message.Payload, &command); err != nil || command.Correlation == nil {
 			continue
 		}
+		replyKind := wire.KindResponse
+		if log.errorReply {
+			replyKind = wire.KindError
+		}
 		replyRecord := wire.RecordID{ID: wire.IDFromBytes(laser.NewOperationID())}
 		reply := wire.AgentEnvelope{
-			Kind:         wire.KindResponse,
+			Kind:         replyKind,
 			Record:       &replyRecord,
 			Conversation: command.Conversation,
 			Source:       log.source,
@@ -107,6 +114,103 @@ func TestGivenAnAdvertisedToolWhenCalledThenShouldPublishParamsByteIdentical(t *
 	}
 	if command.Tool == nil || *command.Tool != "search" {
 		t.Errorf("want the tool named, got %v", command.Tool)
+	}
+}
+
+func TestGivenAncestryWhenCalledAsAChildThenShouldEndItCompletedOnSuccess(t *testing.T) {
+	log := &replyingLog{source: agent(t, "worker")}
+	bridge := withTool(t, mcpBridgeOver(t, log), "search")
+	parent, root := laser.NewConversationID(), laser.NewConversationID()
+	params := []byte(`{"name":"search","arguments":{"q":"laser"}}`)
+
+	result, err := bridge.CallToolIn(context.Background(), parent, root, "search", params)
+	if err != nil {
+		t.Fatalf("call tool in: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("want a successful result, got %+v", result)
+	}
+
+	stored := log.stored()
+	if len(stored) < 3 {
+		t.Fatalf("want a start, a command, a reply and an end, got %d", len(stored))
+	}
+	var start wire.AgentEnvelope
+	if err := wire.Unmarshal(stored[0].Payload, &start); err != nil {
+		t.Fatalf("decode the start: %v", err)
+	}
+	if start.TaskState == nil || *start.TaskState != wire.TaskSubmitted {
+		t.Errorf("want a submitted session status, got %v", start.TaskState)
+	}
+	if start.Parent == nil || *start.Parent != parent ||
+		start.Root == nil || *start.Root != root {
+		t.Errorf("want the start to carry the ancestry, got parent=%v root=%v",
+			start.Parent, start.Root)
+	}
+
+	var command wire.AgentEnvelope
+	if err := wire.Unmarshal(stored[1].Payload, &command); err != nil {
+		t.Fatalf("decode the command: %v", err)
+	}
+	if command.Parent == nil || *command.Parent != parent ||
+		command.Root == nil || *command.Root != root {
+		t.Errorf("want the command to carry the ancestry, got parent=%v root=%v",
+			command.Parent, command.Root)
+	}
+
+	ended := stored[len(stored)-1]
+	var end wire.AgentEnvelope
+	if err := wire.Unmarshal(ended.Payload, &end); err != nil {
+		t.Fatalf("decode the end: %v", err)
+	}
+	if end.TaskState == nil || *end.TaskState != wire.TaskCompleted {
+		t.Errorf("want the child ended completed, got %v", end.TaskState)
+	}
+}
+
+func TestGivenAToolErrorWhenCalledAsAChildThenShouldEndItFailed(t *testing.T) {
+	log := &replyingLog{source: agent(t, "worker"), errorReply: true}
+	bridge := withTool(t, mcpBridgeOver(t, log), "search")
+	parent, root := laser.NewConversationID(), laser.NewConversationID()
+
+	result, err := bridge.CallToolIn(
+		context.Background(), parent, root, "search", []byte(`{"name":"search"}`))
+	if err != nil {
+		t.Fatalf("call tool in: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("want the tool's own error reported, got %+v", result)
+	}
+
+	stored := log.stored()
+	ended := stored[len(stored)-1]
+	var end wire.AgentEnvelope
+	if err := wire.Unmarshal(ended.Payload, &end); err != nil {
+		t.Fatalf("decode the end: %v", err)
+	}
+	if end.TaskState == nil || *end.TaskState != wire.TaskFailed {
+		t.Errorf("want the child ended failed, got %v", end.TaskState)
+	}
+}
+
+func TestGivenATargetWhenCalledAsAChildThenShouldAddressOnlyThatAgent(t *testing.T) {
+	log := &replyingLog{source: agent(t, "worker")}
+	bridge := withTool(t, mcpBridgeOver(t, log), "search")
+	parent, root := laser.NewConversationID(), laser.NewConversationID()
+	target := agent(t, "worker")
+
+	if _, err := bridge.CallToolInTo(
+		context.Background(), target, parent, root, "search", []byte(`{"name":"search"}`),
+	); err != nil {
+		t.Fatalf("call tool in to: %v", err)
+	}
+
+	var command wire.AgentEnvelope
+	if err := wire.Unmarshal(log.stored()[1].Payload, &command); err != nil {
+		t.Fatalf("decode the command: %v", err)
+	}
+	if command.Target == nil || *command.Target != target {
+		t.Errorf("want the command addressed to the target, got %v", command.Target)
 	}
 }
 

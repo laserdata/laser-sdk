@@ -234,7 +234,7 @@ func (bridge *A2ABridge) continueTask(
 	if view.command != nil && view.command.Target != nil {
 		target = view.command.Target
 	}
-	if err := bridge.publishCommand(ctx, conversation, params, target, hops); err != nil {
+	if err := bridge.publishCommand(ctx, conversation, params, target, hops, nil, nil); err != nil {
 		return nil, internalFault(err)
 	}
 	return &A2ATask{ID: id, ContextID: view.task.ContextID,

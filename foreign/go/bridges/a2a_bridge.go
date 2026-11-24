@@ -191,15 +191,55 @@ func (bridge *A2ABridge) submitFor(
 	ctx context.Context, paramsJSON []byte, target *wire.AgentID,
 	hops []string, caller string,
 ) (*A2ATask, error) {
+	return bridge.submitAddressed(ctx, paramsJSON, target, hops, caller, nil, nil)
+}
+
+// SubmitIn submits a task as a child session of parent, in the tree rooted at
+// root: the task's submitted start lands on agent.sessions with the ancestry
+// before the command, and the command carries it too. The agent that
+// handles the task ends the child. The command is addressed like Submit.
+func (bridge *A2ABridge) SubmitIn(
+	ctx context.Context, parent, root wire.ConversationID, paramsJSON []byte,
+) (*A2ATask, error) {
+	return bridge.submitAddressed(
+		ctx, paramsJSON, bridge.target, bridge.hops, "", &parent, &root)
+}
+
+// SubmitInTo is SubmitIn addressed to target.
+func (bridge *A2ABridge) SubmitInTo(
+	ctx context.Context, target wire.AgentID, parent, root wire.ConversationID,
+	paramsJSON []byte,
+) (*A2ATask, error) {
+	return bridge.submitAddressed(
+		ctx, paramsJSON, &target, bridge.hops, "", &parent, &root)
+}
+
+// submitAddressed is Submit's common path. ancestry is nil for a task that
+// opens no child session.
+func (bridge *A2ABridge) submitAddressed(
+	ctx context.Context, paramsJSON []byte, target *wire.AgentID,
+	hops []string, caller string, parent, root *wire.ConversationID,
+) (*A2ATask, error) {
 	if len(paramsJSON) == 0 {
 		return nil, &BridgeError{Reason: "the A2A params must not be empty"}
 	}
 	task := laser.NewConversationID()
+	// Minted before anything is published, so an unbound caller on a binding
+	// bridge publishes nothing.
 	id, err := bridge.mintTaskID(ctx, task, caller)
 	if err != nil {
 		return nil, err
 	}
-	if err := bridge.publishCommand(ctx, task, paramsJSON, target, hops); err != nil {
+	if parent != nil && root != nil {
+		if _, err := bridge.laser.Sessions().OpenChild(
+			ctx, task, bridge.source, bridge.source, *parent, *root,
+		); err != nil {
+			return nil, err
+		}
+	}
+	if err := bridge.publishCommand(
+		ctx, task, paramsJSON, target, hops, parent, root,
+	); err != nil {
 		return nil, err
 	}
 	return &A2ATask{
@@ -211,10 +251,14 @@ func (bridge *A2ABridge) submitFor(
 
 func (bridge *A2ABridge) publishCommand(
 	ctx context.Context, task wire.ConversationID, body []byte,
-	target *wire.AgentID, hops []string,
+	target *wire.AgentID, hops []string, parent, root *wire.ConversationID,
 ) error {
-	send := bridge.laser.
-		AgdxOn(bridge.laser.DefaultStream(), bridge.requestTopic, bridge.source, task).
+	producer := bridge.laser.
+		AgdxOn(bridge.laser.DefaultStream(), bridge.requestTopic, bridge.source, task)
+	if parent != nil && root != nil {
+		producer = producer.WithAncestry(*parent, *root)
+	}
+	send := producer.
 		Command(correlationOf(task), body).
 		WithOperation(wire.OperationChat).
 		ContentType(wire.ContentJSON).

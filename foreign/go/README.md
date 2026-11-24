@@ -3,6 +3,12 @@
 The Go client for [LaserData](https://laserdata.com), a native port of the
 `laser-wire` contract.
 
+**[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) is the authoritative,
+source-verified tracker of what is implemented, partial, missing, or blocked.**
+Read it before this file for anything beyond the wire contract and streaming
+layer: the agent-orchestration layer is the least complete part of this
+client, and this README does not restate its detail.
+
 **This client is in progress.** The wire contract is complete and pinned
 against the shared corpus, and the client is built on it: `Connect`, the shared
 connection string grammar, TLS resolution, the connect-time capability
@@ -99,6 +105,31 @@ A refusal arrives as a `KvError` carrying the contract's own classification, so
 `Retryable` and `Conflict` tell a momentary outage from a precondition that
 will never hold. Keys are arbitrary bytes, so every read hands back a `[]byte`
 rather than a string.
+
+`Kv.Lease(ctx, key, holder, ttl)` acquires a revocable, bounded-TTL
+distributed lock, returning the fencing token to present on protected
+mutations and the TTL the store actually granted (which may be shorter than
+asked, never longer). A live lease is a `*KvError` of `Kind`
+`wire.KvLeaseHeld`, naming the holder's expiry; `TryLease` answers `(nil,
+nil)` instead of failing. `RenewLease` extends a held lease without
+changing its token; `ReleaseLease` ends one early. `LeaseGuard` wraps the
+three around one acquired lease (`.Renew`/`.Release`/`.Held`) — unlike
+Rust's `LeaseGuard`, nothing releases it automatically if a caller forgets:
+Go has no destructor to hook a background cleanup to, so a dropped guard
+leaves the key held until its TTL lapses.
+
+`Kv.CasFenced(key, fenceNamespace, fenceKey, fenceToken)` is a compare-and-
+swap gated, in the same backend transaction, on a live lease at
+`(fenceNamespace, fenceKey)` still at `fenceToken`: the at-most-one-
+effective-writer guarantee for an exclusive effect, rejecting a zombie
+holder at an older token (or one whose lease expired or was released)
+before another holder can act. Both require the deployment's `kv_fenced_leases`
+capability, refused client-side before anything is sent when it is not
+advertised. Neither retries an ambiguous outcome (a network failure after
+send but before reply) the way Rust's does — no Go key-value operation does
+that yet, lease and fenced-CAS included, so an ambiguous send surfaces as a
+plain transport error here, the same as `Set` or a plain compare-and-swap
+already do.
 
 ## Authorization
 
@@ -425,6 +456,125 @@ requests and the rest of the traffic.
 
 `Laser.DeadLetter` publishes a record the gates turned away, keeping the
 payload so the work can be replayed and naming where the original sat.
+
+## Contract
+
+`Laser.Contract(router, topic)` opens a `ContractBuilder`: a directed request
+to one agent, bundling resolution, a deadline, and an optional consumption
+expiry into one call. `From`, `Payload`, `Deadline`, and `Send` are the usual
+path; `Registry` supplies the `AgentRegistry` a capability route (`ToCapable`,
+`Sticky`, `WithScorer`) resolves against, the same caller-supplied registry
+`AgentCtx.FanOut` already takes — a `To` route needs none. `router` must
+resolve to exactly one target: `Broadcast`/`AllCapable` are refused at `Send`.
+
+Unlike `Requester`, `Send` drives its own wait: it polls the reply topic live
+rather than requiring a caller already reading it and feeding a `ReplyHub`,
+so a contract is usable standalone by an orchestrator with no running
+consumer of its own, the same shape the MCP bridge's tool-call wait already
+uses. It does not resolve a separate per-agent inbox topic the way Rust's
+`InboxRoute` does: Go's registry carries no such address, so the command
+publishes and the reply is awaited on the one `topic` named at `Contract`.
+
+`Send` settles in one of four `ContractState`s: `ContractCompleted` (a
+non-error reply), `ContractFailed` (a terminal error reply),
+`ContractNotConsumed` (the target's reliable consumer read the command past
+its own `ExpireIfNotConsumed` expiry and dropped it before any handler ran —
+reported only on that answer, which a target whose `RuntimeOptions` name a
+`RespondOn` topic sends), or `ContractTimedOut` (nothing landed within
+`Deadline`). `Fence` stamps a fence token; `Conversation` pins the
+conversation a fenced, re-dispatchable task must reuse across attempts.
+
+`Parent(parent, root)` runs the contract as a child session: `Send` writes
+the child's submitted start on `agent.sessions` with the ancestry before the
+command, stamps the ancestry on the command, and ends the child by the
+outcome — completed on a reply, failed otherwise, including a command that
+failed to publish.
+
+## Scatter
+
+`Laser.ScatterReport(ctx, ScatterRequest)` dispatches a `Contract` to every
+agent advertising `Skill` (via `AllCapable`, over the same caller-supplied
+`Registry` `Contract.Registry` and `AgentCtx.FanOut`'s `FanOutRequest.Registry`
+already take), concurrently, and gathers the branches under `Policy` within
+`Deadline` the same way `AgentCtx.FanOut`'s own gather loop does: one
+goroutine per target, a quorum stops the rest, best-effort takes whatever
+landed by the wall clock, and the branches still running when the gather
+stops come back as `Cancelled`. `NoCapableAgentError` when nothing advertises
+the skill at all; `GatherQuorum(0)` is refused before any read.
+
+`ScatterReport` keeps every branch's own outcome, attributed to its agent, so
+an all-failed scatter reads as a report of failures rather than an empty
+success: `ScatterOutcome.Contract` is set (`Completed`/`Failed`/
+`NotConsumed`/`TimedOut`, exactly as `Contract.Send` classifies it) for a
+branch that finished, and `.Err` instead only for one that could not run at
+all — an infrastructure or send failure, never a non-completing terminal.
+`Completed()`/`Failures()` filter each. `Satisfied` reports whether the
+policy was met: `GatherAll` needs every branch to have *completed*, not
+merely finished, so one failed branch among otherwise-successful ones reads
+as unsatisfied even though nothing timed out or was cancelled.
+
+`Laser.Scatter(ctx, ScatterRequest)` is a convenience over `ScatterReport`
+for a caller who only wants the completed reply bodies, dropping agent
+attribution and every other outcome.
+
+## Workflow
+
+`Laser.Workflow(source, topic)` opens a journalled directed-acyclic
+workflow over `Contract` and `Scatter`: `.Step(label, router, run)` adds a
+step that dispatches to one agent (or, under `AllCapable`, to every agent
+advertising a skill, joining their completed replies with `\n`);
+`.StepLocal(label, run)` adds one whose body runs in this process, needing
+no agent. Both return a `*StepHandle` to refine the step —
+`.After(label)` (a dependency), `.VerifyWith(verifier)`, `.Deadline(d)` —
+before the next `.Step`/`.StepLocal` or `.Run(ctx)`. `run` and `verifier`
+are plain `func` values (`StepFunc`/`StepVerifier`); Go has no need of
+Rust's trait-plus-blanket-impl-over-closures dance for this. `.Budget(WorkflowBudget)`
+caps tokens, wall-clock time, and invocations; `.Registry(*AgentRegistry)`
+is where an `AllCapable` step's agents are resolved from, the same
+caller-supplied registry `Contract` and `AgentCtx.FanOut` already take.
+
+`Run` runs the steps in dependency order (Kahn's algorithm; a duplicate
+label, a broadcast step, or a dependency cycle is refused before anything
+is written) to a `*WorkflowOutcome`: `Outputs` by label, `RunID`,
+`CompletedSteps` in completion order, and `.Text(label)`. The run is a
+session on `agent.sessions` whose id is the run id; every directed or
+all-capable step is a child session of it for free, since it dispatches
+through `Contract.Parent`/`Scatter`. A step that does not complete fails the
+run with a `StepFailedError` naming why (`StepTimedOut`/`StepFailed`/
+`StepNotConsumed`/`StepUnverified`/`StepNoCompletion`); a budget breach is a
+`BudgetExceededError`, ended the same way a session budget breach already
+is (`Session.FailOverBudget`).
+
+`.RunID(runID)` resumes an earlier run (from `WorkflowOutcome.RunID`, or one
+derived for a task): `Run` replays the run's whole journal
+(`agent.workflow_journal`, folded start to finish, never a window — a
+non-empty journal missing its start is a `JournalTruncatedError`), skips
+every step already recorded complete, and for one dispatched but not yet
+answered, looks for the reply at the positions journaled before that
+dispatch rather than resending blind — and resends (under the same derived
+idempotency key, so a duplicate is harmless) only when nothing is there yet.
+
+`StepHandle.CompensateWith(run)` gives a step the saga rollback: if a later
+step fails, every earlier step with a compensation (and an effect — a
+directed or all-capable step that reached a reply, even one a verifier then
+rejected, or a local step, whose build always counts as its own effect) is
+undone in reverse completion order. A directed or all-capable step's
+compensation is sent as a fresh `Contract` to the exact agent(s) that ran
+the original (not a fresh capability resolution); a local step's
+compensation runs in process when it builds — the build itself is the undo,
+nothing is dispatched anywhere. A completed compensation is journaled
+(`StepCompensated`), so a resume reruns the undone step rather than reading
+it as still done; one that does not complete is left unjournaled and the
+rollback continues, never overriding the original failure.
+
+Not yet ported: exclusive (fenced, at-most-once) steps and
+`OnTimeout(Reassign)`, and the "plain code" `run_with`/`WorkflowRun` form
+where the caller's own async body is the workflow, stepping through
+`begin_step`/`complete_step` itself. Each is a self-contained future slice;
+see `foreign/go/IMPLEMENTATION_STATUS.md`. The workflow journal's own
+encoding is this package's CBOR codec, not a laser-wire fixture-pinned
+shape, so a run this client starts resumes on another Go client but not,
+today, on the Rust, Python, or TypeScript SDKs.
 
 ## Memory
 
@@ -1485,8 +1635,15 @@ JSON is 400, and a wrong method is 405 with what is allowed. The card path is
 public discovery and unguarded: a client has to read it before it can be an
 allowed origin.
 
-Not ported yet: `submit_in` for child sessions, the detached JWS card
-signature, and the MCP task adapter, so `Handler` serves A2A alone.
+`SubmitIn`/`SubmitInTo` submit a task as a child session of a parent, in the
+tree rooted at root: the child's submitted start lands on `agent.sessions`
+with the ancestry before the command, and the command carries it too. The
+handling agent ends the child. `MCPBridge.CallToolIn`/`CallToolInTo` are the
+MCP peer, and end the child themselves: completed on a tool result, failed on
+a tool error.
+
+Not ported yet: the detached JWS card signature and the MCP task adapter, so
+`Handler` serves A2A alone.
 
 A2A task states map both ways, and a word outside the vocabulary is refused
 rather than guessed, since an edge sending one is speaking a protocol this

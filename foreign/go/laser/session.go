@@ -194,6 +194,11 @@ type Session struct {
 	conversation wire.ConversationID
 	label        string
 	agent        *wire.AgentID
+	// parent and root place this session in its tree. Set together by
+	// WithAncestry, so every record this handle (or one derived from it)
+	// writes carries the ancestry, not only the start.
+	parent *wire.ConversationID
+	root   *wire.ConversationID
 	// state is the revision this handle's state writes continue from, shared
 	// with every handle derived from it so their writes land in order.
 	state *stateCursor
@@ -377,6 +382,14 @@ func (session *Session) As(agent wire.AgentID) *Session {
 	return &narrowed
 }
 
+// WithAncestry places this session in the tree rooted at root, under parent,
+// so a reader can walk a child session back to the exchange that spawned it.
+func (session *Session) WithAncestry(parent, root wire.ConversationID) *Session {
+	narrowed := *session
+	narrowed.parent, narrowed.root = &parent, &root
+	return &narrowed
+}
+
 // Reference is the session as another surface names it, for linking a memory
 // or a graph fact back to the session that produced it.
 func (session *Session) Reference() wire.SessionRef {
@@ -403,8 +416,12 @@ func (session *Session) Agdx() (*Agdx, error) {
 		return nil, &InvalidError{Reason: "a session writes as an agent: " +
 			"name one with Session.As before writing"}
 	}
-	return session.laser.AgdxOn(session.config.Stream, wire.AgentSessions,
-		*session.agent, session.conversation), nil
+	agdx := session.laser.AgdxOn(session.config.Stream, wire.AgentSessions,
+		*session.agent, session.conversation)
+	if session.parent != nil {
+		agdx = agdx.WithAncestry(*session.parent, *session.root)
+	}
+	return agdx, nil
 }
 
 // beginnable refuses a session that already ended, unless the caller asked

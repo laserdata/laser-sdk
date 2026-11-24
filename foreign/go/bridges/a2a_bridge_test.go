@@ -141,6 +141,84 @@ func TestGivenParamsWhenSubmittedThenShouldPublishThemByteIdentical(t *testing.T
 	}
 }
 
+func TestGivenAncestryWhenSubmittedAsAChildThenShouldWriteTheStartBeforeTheCommand(t *testing.T) {
+	log := &bridgeLog{}
+	bridge := bridgeOver(t, log)
+	parent, root := laser.NewConversationID(), laser.NewConversationID()
+
+	task, err := bridge.SubmitIn(context.Background(), parent, root, []byte(sendParams))
+	if err != nil {
+		t.Fatalf("submit in: %v", err)
+	}
+
+	stored := log.stored()
+	if len(stored) != 2 {
+		t.Fatalf("want a session start and a command, got %d", len(stored))
+	}
+	var start wire.AgentEnvelope
+	if err := wire.Unmarshal(stored[0].Payload, &start); err != nil {
+		t.Fatalf("decode the start: %v", err)
+	}
+	if start.Kind != wire.KindStatus ||
+		start.TaskState == nil || *start.TaskState != wire.TaskSubmitted {
+		t.Errorf("want a submitted session status, got %q state=%v", start.Kind, start.TaskState)
+	}
+	if start.Parent == nil || *start.Parent != parent ||
+		start.Root == nil || *start.Root != root {
+		t.Errorf("want the start to carry the ancestry, got parent=%v root=%v",
+			start.Parent, start.Root)
+	}
+	var body wire.SessionStart
+	if err := wire.Unmarshal(start.Body, &body); err != nil {
+		t.Fatalf("decode the session start body: %v", err)
+	}
+	if body.Parent == nil || *body.Parent != parent ||
+		body.Root == nil || *body.Root != root {
+		t.Errorf("want the session start body to carry the ancestry, got %+v", body)
+	}
+
+	var command wire.AgentEnvelope
+	if err := wire.Unmarshal(stored[1].Payload, &command); err != nil {
+		t.Fatalf("decode the command: %v", err)
+	}
+	if command.Kind != wire.KindCommand {
+		t.Errorf("want a command, got %q", command.Kind)
+	}
+	if command.Parent == nil || *command.Parent != parent ||
+		command.Root == nil || *command.Root != root {
+		t.Errorf("want the command to carry the ancestry, got parent=%v root=%v",
+			command.Parent, command.Root)
+	}
+	if string(command.Body) != sendParams {
+		t.Errorf("want the params byte-identical, got %q", command.Body)
+	}
+	if task.Status.State != "TASK_STATE_SUBMITTED" {
+		t.Errorf("want a submitted task, got %q", task.Status.State)
+	}
+}
+
+func TestGivenATargetWhenSubmittedInAChildThenShouldAddressOnlyThatAgent(t *testing.T) {
+	log := &bridgeLog{}
+	bridge := bridgeOver(t, log)
+	parent, root := laser.NewConversationID(), laser.NewConversationID()
+	target := agent(t, "worker")
+
+	if _, err := bridge.SubmitInTo(
+		context.Background(), target, parent, root, []byte(sendParams),
+	); err != nil {
+		t.Fatalf("submit in to: %v", err)
+	}
+
+	stored := log.stored()
+	var command wire.AgentEnvelope
+	if err := wire.Unmarshal(stored[len(stored)-1].Payload, &command); err != nil {
+		t.Fatalf("decode the command: %v", err)
+	}
+	if command.Target == nil || *command.Target != target {
+		t.Errorf("want the command addressed to the target, got %v", command.Target)
+	}
+}
+
 func TestGivenNoAnswerYetWhenTheTaskIsReadThenShouldReportItWorking(t *testing.T) {
 	log := &bridgeLog{}
 	bridge := bridgeOver(t, log)

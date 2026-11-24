@@ -339,18 +339,91 @@ func (bridge *MCPBridge) callToolAddressed(
 	return &result, nil
 }
 
+// CallToolIn maps tools/call onto an AGDX command as a child session of
+// parent, in the tree rooted at root: the call's submitted start lands on
+// agent.sessions with the ancestry before the command, and the child ends by
+// the result, completed on a tool result and failed on a tool error. The
+// command is addressed to every agent, like CallTool.
+func (bridge *MCPBridge) CallToolIn(
+	ctx context.Context, parent, root wire.ConversationID,
+	name string, paramsJSON []byte,
+) (*MCPToolResult, error) {
+	return bridge.callToolInAddressed(ctx, bridge.target, parent, root, name, paramsJSON)
+}
+
+// CallToolInTo is CallToolIn addressed to target.
+func (bridge *MCPBridge) CallToolInTo(
+	ctx context.Context, target wire.AgentID, parent, root wire.ConversationID,
+	name string, paramsJSON []byte,
+) (*MCPToolResult, error) {
+	return bridge.callToolInAddressed(ctx, &target, parent, root, name, paramsJSON)
+}
+
+func (bridge *MCPBridge) callToolInAddressed(
+	ctx context.Context, target *wire.AgentID, parent, root wire.ConversationID,
+	name string, paramsJSON []byte,
+) (*MCPToolResult, error) {
+	conversation := laser.NewConversationID()
+	child, err := bridge.laser.Sessions().OpenChild(
+		ctx, conversation, bridge.source, bridge.source, parent, root)
+	if err != nil {
+		return nil, err
+	}
+	envelope, callErr := bridge.sendToolCallOn(
+		ctx, conversation, target, &parent, &root, bridge.hops, name, paramsJSON)
+	var endErr error
+	switch {
+	case callErr != nil:
+		_, endErr = child.Fail(ctx, toolFailure(callErr.Error()))
+	case envelope.Kind == wire.KindError:
+		_, endErr = child.Fail(ctx, toolFailure("the tool returned an error"))
+	default:
+		_, endErr = child.Complete(ctx, "")
+	}
+	if callErr != nil {
+		return nil, callErr
+	}
+	if endErr != nil {
+		return nil, endErr
+	}
+	result := ToolResultFromEnvelope(envelope)
+	return &result, nil
+}
+
+// toolFailure is the structured error a child session ends with when a tool
+// call cannot be completed.
+func toolFailure(message string) wire.AgentErrorBody {
+	return wire.AgentErrorBody{
+		Code: wire.ErrorInternal, Message: &message, Retryable: false,
+	}
+}
+
 // sendToolCall publishes one tool call command and awaits its correlated
 // terminal on the reply topic.
 func (bridge *MCPBridge) sendToolCall(
 	ctx context.Context, target *wire.AgentID, hops []string,
 	name string, paramsJSON []byte,
 ) (*wire.AgentEnvelope, error) {
-	conversation := laser.NewConversationID()
+	return bridge.sendToolCallOn(
+		ctx, laser.NewConversationID(), target, nil, nil, hops, name, paramsJSON)
+}
+
+// sendToolCallOn is sendToolCall's common path, on an already-minted
+// conversation and an optional ancestry stamped onto the command.
+func (bridge *MCPBridge) sendToolCallOn(
+	ctx context.Context, conversation wire.ConversationID, target *wire.AgentID,
+	parent, root *wire.ConversationID, hops []string,
+	name string, paramsJSON []byte,
+) (*wire.AgentEnvelope, error) {
 	correlation := wire.CorrelationID{ID: conversation.ID}
 	deadline := time.Now().Add(bridge.timeout)
 
-	send := bridge.laser.
-		AgdxOn(bridge.laser.DefaultStream(), bridge.toolTopic, bridge.source, conversation).
+	producer := bridge.laser.
+		AgdxOn(bridge.laser.DefaultStream(), bridge.toolTopic, bridge.source, conversation)
+	if parent != nil && root != nil {
+		producer = producer.WithAncestry(*parent, *root)
+	}
+	send := producer.
 		Command(correlation, paramsJSON).
 		WithTool(name).
 		ContentType(wire.ContentJSON).

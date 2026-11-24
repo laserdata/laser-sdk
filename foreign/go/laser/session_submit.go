@@ -196,6 +196,49 @@ func (builder *SubmitBuilder) Send(ctx context.Context) (*Submitted, error) {
 	return &Submitted{Session: session, Correlation: correlation}, nil
 }
 
+// OpenChild opens conversation as a child session of parent, in the tree
+// rooted at root, writing as source and addressed to target: the submitted
+// start lands on agent.sessions with the ancestry before the caller publishes
+// the command that does the same work. The handling agent progresses and
+// ends it; a caller that never hands the work off is responsible for ending
+// it itself.
+//
+// The returned handle carries the ancestry, so Complete, Fail, and every
+// other write through it (or a handle derived from it) stays attributed to
+// the same tree as the start.
+func (sessions *Sessions) OpenChild(
+	ctx context.Context, conversation wire.ConversationID, source, target wire.AgentID,
+	parent, root wire.ConversationID,
+) (*Session, error) {
+	session := sessions.Open(conversation, "").As(source).WithAncestry(parent, root)
+	start := wire.SessionStart{
+		Agent:  target,
+		SDK:    sessions.config.SDK,
+		Parent: &parent,
+		Root:   &root,
+	}
+	if sessions.config.IdleTimeout > 0 {
+		micros := uint64(sessions.config.IdleTimeout.Microseconds())
+		start.IdleTimeoutMicros = &micros
+	}
+	lane, err := session.Agdx()
+	if err != nil {
+		return nil, err
+	}
+	body, err := wire.Marshal(start)
+	if err != nil {
+		return nil, &CodecError{Reason: "encode the child session start", Cause: err}
+	}
+	if _, err := lane.Status(wire.OperationSession).
+		WithTaskState(wire.TaskSubmitted).
+		Body(body).
+		ContentType(wire.ContentCBOR).
+		Send(ctx); err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
 // EndedAs is the terminal status this session reached, empty while it is
 // still open.
 //

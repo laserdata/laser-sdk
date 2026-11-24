@@ -8,6 +8,7 @@ import (
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
@@ -24,6 +25,24 @@ type runtimeServer struct {
 	refuse       string
 	refuseAlways bool
 	refused      int
+
+	// partitions is how many partitions GetTopic reports, for every topic:
+	// the fake does not distinguish them. Zero (every test but WarmDedup's
+	// own) reads as no partitions, so GetTopic's existing behavior for every
+	// other test is unchanged.
+	partitions uint32
+	// history is per-topic, per-partition committed records and the
+	// consumer group's own stored offset, for WarmDedup tests: what a
+	// restart's refill would read back, independent of sent, which only
+	// tracks what this runtime itself published.
+	history map[string]*warmHistory
+}
+
+// warmHistory is one topic's per-partition records and the consumer group's
+// own stored offset there.
+type warmHistory struct {
+	records map[uint32][]iggcon.IggyMessage
+	stored  map[uint32]uint64
 }
 
 func newRuntimeServer() *runtimeServer {
@@ -45,7 +64,88 @@ func (server *runtimeServer) GetTopic(
 ) (*iggcon.TopicDetails, error) {
 	details := &iggcon.TopicDetails{}
 	details.Id = 3
+	server.mutex.Lock()
+	details.PartitionsCount = server.partitions
+	server.mutex.Unlock()
 	return details, nil
+}
+
+// seedHistory records stored as the committed offset for partition of topic,
+// and the records a WarmDedup refill would find there, for a test to seed
+// what GetConsumerOffset and PollMessages answer.
+func (server *runtimeServer) seedHistory(
+	topic string, partition uint32, stored uint64, records ...iggcon.IggyMessage,
+) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	if server.history == nil {
+		server.history = map[string]*warmHistory{}
+	}
+	entry := server.history[topic]
+	if entry == nil {
+		entry = &warmHistory{records: map[uint32][]iggcon.IggyMessage{}, stored: map[uint32]uint64{}}
+		server.history[topic] = entry
+	}
+	entry.records[partition] = append(entry.records[partition], records...)
+	entry.stored[partition] = stored
+}
+
+func (server *runtimeServer) GetConsumerOffset(
+	_ context.Context, _ iggcon.Consumer, _, topicID iggcon.Identifier, partition *uint32,
+) (*iggcon.ConsumerOffsetInfo, error) {
+	name, _ := topicID.String()
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	entry := server.history[name]
+	if entry == nil || partition == nil {
+		return nil, ierror.ConsumerOffsetNotFound{}
+	}
+	stored, ok := entry.stored[*partition]
+	if !ok {
+		return nil, ierror.ConsumerOffsetNotFound{}
+	}
+	return &iggcon.ConsumerOffsetInfo{StoredOffset: stored, CurrentOffset: stored}, nil
+}
+
+func (server *runtimeServer) PollMessages(
+	_ context.Context, _, topicID iggcon.Identifier, partition uint32,
+	_ iggcon.Consumer, strategy iggcon.PollingStrategy, options iggcon.PollOptions,
+) (*iggcon.PolledMessage, error) {
+	name, _ := topicID.String()
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	entry := server.history[name]
+	if entry == nil {
+		return &iggcon.PolledMessage{}, nil
+	}
+	records := entry.records[partition]
+	start := len(records)
+	switch strategy.Kind {
+	case iggcon.POLLING_OFFSET:
+		for index, message := range records {
+			if message.Header.Offset >= strategy.Value {
+				start = index
+				break
+			}
+		}
+	case iggcon.POLLING_FIRST:
+		start = 0
+	case iggcon.POLLING_TIMESTAMP:
+		for index, message := range records {
+			if message.Header.Timestamp >= strategy.Value {
+				start = index
+				break
+			}
+		}
+	}
+	if start >= len(records) {
+		return &iggcon.PolledMessage{}, nil
+	}
+	end := len(records)
+	if options.Count > 0 && start+int(options.Count) < end {
+		end = start + int(options.Count)
+	}
+	return &iggcon.PolledMessage{Messages: append([]iggcon.IggyMessage(nil), records[start:end]...)}, nil
 }
 
 func (server *runtimeServer) SendMessages(

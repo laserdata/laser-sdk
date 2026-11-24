@@ -218,6 +218,23 @@ type RuntimeOptions struct {
 	Sessions *Sessions
 	// Observer watches what the runtime did with each record.
 	Observer RuntimeObserver
+	// Concurrency is how message handling is scheduled across this agent's
+	// assigned partitions. The zero value is Serial.
+	Concurrency ConcurrencyPolicy
+	// Group is the Iggy consumer group this runtime's records are assigned
+	// through. AgentRuntime never joins it itself -- Run reads whatever
+	// RecordSource it is handed -- so nothing here needs it except WarmDedup,
+	// which reads this group's own committed offsets per partition to decide
+	// what already counts as handled. Leave it empty when WarmDedup is off.
+	Group string
+	// WarmDedup replays each assigned partition's recent history into the
+	// dedup window once, before Run starts reading, so a restart does not
+	// reprocess duplicates still inside the window. Needs Group. Off by
+	// default, matching Rust's ReliableConsumer.
+	WarmDedup bool
+	// WarmDedupPolicy decides which committed records refill the window when
+	// WarmDedup is set. The zero value is WarmDedupDeadLetters.
+	WarmDedupPolicy WarmDedupPolicy
 }
 
 // AgentRuntime is the reliable consumer: it reads a topic, decodes and gates
@@ -244,10 +261,15 @@ type AgentRuntime struct {
 	onDeadLetter DeadLetterSink
 	observer     RuntimeObserver
 
-	budget   *BudgetGate
-	control  *ControlBook
-	sessions *Sessions
-	replies  *ReplyHub
+	budget      *BudgetGate
+	control     *ControlBook
+	sessions    *Sessions
+	replies     *ReplyHub
+	concurrency ConcurrencyPolicy
+
+	group           string
+	warmDedup       bool
+	warmDedupPolicy WarmDedupPolicy
 
 	// source names the stream and topic the runtime reads, resolved once at
 	// start so every capsule can locate its poison record without a round
@@ -273,6 +295,10 @@ func (laser *Laser) AgentRuntime(
 		return nil, &InvalidError{Reason: "acknowledging a pickup needs RespondOn, " +
 			"the topic the acknowledgment is sent on"}
 	}
+	if options.WarmDedup && options.Group == "" {
+		return nil, &InvalidError{Reason: "warm dedup needs the consumer group name to " +
+			"read its committed offsets: set RuntimeOptions.Group"}
+	}
 	stream := options.Stream
 	if stream == "" {
 		stream = laser.defaultStream
@@ -297,24 +323,28 @@ func (laser *Laser) AgentRuntime(
 		grace = DefaultShutdownGrace
 	}
 	return &AgentRuntime{
-		laser:        laser,
-		agent:        agent,
-		identity:     agent.Identity(),
-		topic:        options.Topic,
-		stream:       stream,
-		respondOn:    options.RespondOn,
-		handled:      handled,
-		retry:        options.Retry.withDefaults(),
-		ackOnPickup:  options.AckOnPickup,
-		grace:        grace,
-		middleware:   options.Middleware,
-		onDeadLetter: options.OnDeadLetter,
-		observer:     options.Observer,
-		budget:       options.Budget,
-		control:      control,
-		sessions:     sessions,
-		replies:      NewReplyHub(),
-		batches:      map[uint32]uint64{},
+		laser:           laser,
+		agent:           agent,
+		identity:        agent.Identity(),
+		topic:           options.Topic,
+		stream:          stream,
+		respondOn:       options.RespondOn,
+		handled:         handled,
+		retry:           options.Retry.withDefaults(),
+		ackOnPickup:     options.AckOnPickup,
+		grace:           grace,
+		middleware:      options.Middleware,
+		onDeadLetter:    options.OnDeadLetter,
+		observer:        options.Observer,
+		budget:          options.Budget,
+		control:         control,
+		sessions:        sessions,
+		replies:         NewReplyHub(),
+		batches:         map[uint32]uint64{},
+		concurrency:     options.Concurrency,
+		group:           options.Group,
+		warmDedup:       options.WarmDedup,
+		warmDedupPolicy: options.WarmDedupPolicy,
 	}, nil
 }
 
@@ -348,6 +378,12 @@ func (runtime *AgentRuntime) Run(
 	}
 	if handler == nil {
 		return &InvalidError{Reason: "an agent runtime hands work to a handler, so it needs one"}
+	}
+	if err := runtime.warmUpDedup(ctx); err != nil {
+		return err
+	}
+	if runtime.concurrency.isSerialPerPartition() {
+		return runtime.runPerPartition(ctx, source, handler, runtime.concurrency.maxPartitions)
 	}
 	work, release := runtime.workContext(ctx)
 	defer release()
@@ -469,6 +505,9 @@ func (runtime *AgentRuntime) deliver(
 		return runtime.deadLetter(ctx, message, decision.Reason, 0, decision.Detail)
 	}
 	runtime.acknowledgePickup(ctx, message)
+	if lease := runtime.pickUpSubmitted(ctx, message); lease != nil {
+		defer lease.Release()
+	}
 	return runtime.handle(ctx, message, handler)
 }
 
@@ -680,6 +719,46 @@ func (runtime *AgentRuntime) acknowledgePickup(ctx context.Context, message *Age
 	if _, err := send.Send(ctx); err != nil {
 		runtime.failed(message, err)
 	}
+}
+
+// pickUpSubmitted marks a submitted session's first command as working and
+// takes a lease that keeps it in this process's heartbeat while the handler
+// runs, so a caller can tell a submitted command that was picked up from one
+// that is still waiting or expired unconsumed. A session that was not
+// submitted, or any failure along the way, is not fatal to handling the
+// record: the command survived every gate, so a status nobody is required to
+// read must not hold up the work it is attached to.
+//
+// Ported from pick_up_submitted in sdk/src/agent/consumer.rs. Rust derives its
+// lease's heartbeat interval from the session's own idle timeout; Go's
+// LeaseSession already has a sensible default for an unnamed interval, so
+// this takes that default rather than re-deriving one.
+func (runtime *AgentRuntime) pickUpSubmitted(
+	ctx context.Context, message *AgentMessage,
+) *SessionLease {
+	if runtime.identity.IsZero() {
+		return nil
+	}
+	envelope := message.Envelope
+	if envelope == nil || envelope.Kind != wire.KindCommand {
+		return nil
+	}
+	submitted, present := envelope.Metadata[wire.MetadataSubmitted]
+	if !present || submitted.Kind != wire.ValueBool || !submitted.Bool {
+		return nil
+	}
+	session := runtime.sessions.Open(message.Conversation(), "").As(runtime.identity)
+	identity := runtime.identity
+	if _, err := session.Progress(ctx, wire.SessionTransition{Actor: &identity}); err != nil {
+		runtime.failed(message, err)
+		return nil
+	}
+	lease, err := runtime.laser.LeaseSession(ctx, message.Conversation(), runtime.identity, 0)
+	if err != nil {
+		runtime.failed(message, err)
+		return nil
+	}
+	return lease
 }
 
 // answering opens the producer that answers one envelope, carrying its
