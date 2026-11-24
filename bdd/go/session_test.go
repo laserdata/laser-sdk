@@ -17,28 +17,7 @@ import (
 // session feature: the lifecycle, the model and tool records, and the state
 // document, all as typed records on the session lane.
 func TestGivenTheSharedSessionScenariosWhenRunThenShouldHold(t *testing.T) {
-	runFeaturePlanned(t, "session.feature", 2*time.Minute, sessionStep, sessionPlan)
-}
-
-// sessionPlan names every scenario of this feature the runner does not yet
-// run, and why.
-//
-// It is written out rather than left implicit so the gap is countable: a
-// scenario missing from here and missing a step implementation fails, which is
-// the point. "needs an agent consuming the lane" marks the ones waiting on the
-// agent consumer runtime; the rest is runner work still to do.
-var sessionPlan = map[string]string{
-	"A stale handle's end leaves the newer state document in place":                                       "this runner has not written the second-handle state steps",
-	"A stale handle's state snapshot is refused as a stale session":                                       "this runner has not written the second-handle state steps",
-	"A stale handle's next delta leaves the newer state document in place":                                "this runner has not written the second-handle state steps",
-	"A declared partition layout routes commands to the addressee and replies to the requester":           "this runner has not written the declared layout steps",
-	"A declared topic layout routes commands and replies to the agents' own topics":                       "this runner has not written the declared layout steps",
-	"A terminal verb after a refused publish re-sends the latched record and a different verb is refused": "this runner has not written the refusing policy steps",
-	"A refused state snapshot remains pending for the end retry":                                          "this runner has not written the refusing policy steps",
-	"Heartbeats stop when the last lease drops":                                                           "this runner has not written the heartbeat steps",
-	"Heartbeat batches never mix sessions of two streams":                                                 "this runner has not written the heartbeat steps",
-	"The context manifest lists the source address of every fragment":                                     "this runner has not written the context manifest steps",
-	"Concurrent terminal calls from clones of one session write one latched state":                        "this runner has not written the concurrent clone steps",
+	runFeature(t, "session.feature", 2*time.Minute, sessionStep)
 }
 
 func sessionStep(ctx context.Context, state *world, step bdd.Step) error {
@@ -52,6 +31,9 @@ func sessionStep(ctx context.Context, state *world, step bdd.Step) error {
 	switch {
 	case strings.HasPrefix(text, "agent ") && strings.Contains(text, " resumes the session "):
 		return resumeSession(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "agent ") && strings.Contains(text, " on this stream and the session "):
+		return startOnTwoStreams(ctx, state, arguments)
 
 	case strings.HasPrefix(text, "agent ") && strings.Contains(text, " starts the session "):
 		return startSession(ctx, state, text, arguments)
@@ -101,11 +83,101 @@ func sessionStep(ctx context.Context, state *world, step bdd.Step) error {
 	case strings.HasPrefix(text, "no heartbeat is published"):
 		return checkNoHeartbeat(ctx, state, step)
 
-	case text == "the session ends" || text == "I end the session":
+	case text == "the session ends":
 		return endSession(ctx, state)
+
+	case text == "I end the session":
+		return endSessionCaptured(ctx, state)
 
 	case text == "I cancel the session":
 		return cancelSession(ctx, state)
+
+	case text == "the send is rejected by policy":
+		return checkRejectedByPolicy(state)
+
+	case text == "session publishes pass through a policy that can refuse them":
+		return installRefusingPolicy(state)
+
+	case text == "the policy refuses the next session status publish":
+		return refuseNextStatusPublish(state)
+
+	case text == "the policy refuses the next state snapshot publish":
+		return refuseNextSnapshotPublish(state)
+
+	case text == "I write a state snapshot":
+		return writeStateSnapshotCaptured(ctx, state)
+
+	case strings.HasPrefix(text, "every terminal record on the lane carries"):
+		return checkOneTerminalRecordID(ctx, state)
+
+	case strings.HasPrefix(text, "the agents use a declared partition layout with"):
+		return declaredPartitionLayoutStep(step, state, arguments)
+
+	case strings.HasPrefix(text, "the agents use a declared topic layout with"):
+		return declaredTopicLayoutStep(ctx, state, arguments)
+
+	case strings.Contains(text, "sends a command to") && strings.Contains(text, "replies"):
+		return routedExchange(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "the command landed on partition"):
+		return checkRoutedPartitions(state, step)
+
+	case strings.HasPrefix(text, "the topic \"") && strings.Contains(text, "holds the command"):
+		return checkTopicHoldsCommand(ctx, state, arguments)
+
+	case text == "the session lane holds neither":
+		return checkSessionLaneHoldsNeither(ctx, state)
+
+	case strings.HasPrefix(text, "agent ") && strings.Contains(text, "opens a second handle"):
+		return openSecondHandle(state, arguments)
+
+	case strings.HasPrefix(text, "the second handle's state sets"):
+		return secondStateSetStep(ctx, state, text, arguments)
+
+	case strings.HasPrefix(text, "the second handle's state is replaced with"):
+		return secondStateReplace(ctx, state, text)
+
+	case text == "the second handle ends the session":
+		return secondHandleEnds(ctx, state)
+
+	case text == "the second handle writes a state snapshot":
+		return secondHandleSnapshot(ctx, state)
+
+	case text == "the second handle's snapshot is refused as a stale session":
+		return checkSecondSnapshotStale(state)
+
+	case strings.HasPrefix(text, "the session state is replaced with"):
+		return stateReplace(ctx, state, text)
+
+	case strings.HasPrefix(text, "the folded session state is "):
+		return foldedDocumentIs(ctx, state, step)
+
+	case strings.HasPrefix(text, "agent ") && strings.Contains(text, " starts the sessions "):
+		return startTwoSessions(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "a heartbeat lists the sessions"):
+		return checkHeartbeatLists(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "the lease on the session"):
+		return releaseLease(state, arguments)
+
+	case text == "the heartbeats stop":
+		return checkHeartbeatsStop(ctx, state)
+
+	case text == "a second stream bootstrapped for sessions on the same connection":
+		return secondStreamSameConnection(ctx, state)
+
+	case text == "the heartbeats of each stream list only that stream's session":
+		return checkHeartbeatsPerStream(ctx, state)
+
+	case strings.Contains(text, "clones of the session end it while"):
+		return racingClones(ctx, state, step)
+
+	case text == "the calls of one verb all succeed and the calls of the other all fail as invalid":
+		return checkOneVerbWins(state)
+
+	case strings.HasPrefix(text, "the lane holds"):
+		return checkWinnerOnLane(ctx, state, step)
 
 	case strings.HasPrefix(text, "the session lane shows"):
 		return laneShows(ctx, state, text, arguments)
@@ -155,6 +227,9 @@ func sessionStep(ctx context.Context, state *world, step bdd.Step) error {
 
 	case strings.HasPrefix(text, "the context assembled from the session reads"):
 		return assembledReads(ctx, state, arguments)
+
+	case text == "the context manifest lists the address of every assembled fragment":
+		return checkManifestAddresses(ctx, state)
 
 	case strings.HasPrefix(text, "I take a session checkpoint after"):
 		counts := numbersOf(step)
@@ -566,7 +641,7 @@ func recordModelCall(
 		return err
 	}
 	if strings.Contains(text, "with the context assembled") {
-		return blocked("this runner has not written the context manifest steps")
+		return recordModelCallAssembled(ctx, state, session, text, arguments)
 	}
 	// The request carries a secret the client is expected to drop before it
 	// reaches the log, which is the whole point of the scenario.
@@ -657,20 +732,18 @@ func setState(
 	if err != nil {
 		return err
 	}
-	var value any
-	switch {
-	case len(arguments) == 2:
-		value = arguments[1]
-	case strings.HasSuffix(text, "false"):
-		value = false
-	case strings.HasSuffix(text, "true"):
-		value = true
-	default:
-		numbers := numbersOf(bdd.Step{Text: text})
-		if len(numbers) != 1 {
-			return fmt.Errorf("the step names no value this runner reads: %q", text)
-		}
-		value = int64(numbers[0])
+	return setStateOn(ctx, session, text, arguments)
+}
+
+// setStateOn sets one key on session to the value a "state sets" step names,
+// factored out so a second handle's own version of the step reads the same
+// value shapes.
+func setStateOn(
+	ctx context.Context, session *laser.Session, text string, arguments []string,
+) error {
+	value, err := valueFromStep(text, arguments)
+	if err != nil {
+		return err
 	}
 	document, err := dynOf(value)
 	if err != nil {
@@ -678,6 +751,25 @@ func setState(
 	}
 	_, err = session.State().Set(ctx, arguments[0], document)
 	return err
+}
+
+// valueFromStep reads the value a "state sets ... to ..." step names: a
+// quoted string, the bare words true/false, or a bare number.
+func valueFromStep(text string, arguments []string) (any, error) {
+	switch {
+	case len(arguments) == 2:
+		return arguments[1], nil
+	case strings.HasSuffix(text, "false"):
+		return false, nil
+	case strings.HasSuffix(text, "true"):
+		return true, nil
+	default:
+		numbers := numbersOf(bdd.Step{Text: text})
+		if len(numbers) != 1 {
+			return nil, fmt.Errorf("the step names no value this runner reads: %q", text)
+		}
+		return int64(numbers[0]), nil
+	}
 }
 
 // foldedState reads the state document back off the lane and checks the
