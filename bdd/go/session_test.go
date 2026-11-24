@@ -56,6 +56,9 @@ func sessionStep(ctx context.Context, state *world, step bdd.Step) error {
 	arguments := argumentsOf(step)
 
 	switch {
+	case strings.HasPrefix(text, "agent ") && strings.Contains(text, " resumes the session "):
+		return resumeSession(ctx, state, arguments)
+
 	case strings.HasPrefix(text, "agent ") && strings.Contains(text, " starts the session "):
 		return startSession(ctx, state, text, arguments)
 
@@ -174,6 +177,29 @@ func startSession(
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	state.put("session", session)
+	state.conversation = session.Conversation()
+	return nil
+}
+
+// resumeSession reopens a session that already ended.
+//
+// Resuming is asked for explicitly rather than inferred from the state,
+// because a session that ended is meant to stay ended: reopening it on the
+// strength of a second Begin would make an accidental repeat look like a
+// decision.
+func resumeSession(ctx context.Context, state *world, arguments []string) error {
+	if len(arguments) < 2 {
+		return fmt.Errorf("want an agent and a label, got %v", arguments)
+	}
+	agent, err := wire.NewAgentID(arguments[0])
+	if err != nil {
+		return err
+	}
+	session := state.client.Sessions().Create(arguments[1]).As(agent).Resume()
+	if _, err := session.Begin(ctx); err != nil {
 		return err
 	}
 	state.put("session", session)
