@@ -28,12 +28,6 @@ func TestGivenTheSharedSessionScenariosWhenRunThenShouldHold(t *testing.T) {
 // the point. "needs an agent consuming the lane" marks the ones waiting on the
 // agent consumer runtime; the rest is runner work still to do.
 var sessionPlan = map[string]string{
-	"A submitted session is picked up and completed by its agent":                     "needs an agent consuming the lane",
-	"Two agents on one partition never handle each other's records":                   "needs an agent consuming the lane",
-	"A control request written on the session lane is never applied":                  "needs an agent consuming the lane",
-	"A model call and a tool call the session recorded never reach its agent as work": "needs an agent consuming the lane",
-	"A session lens never starts a heartbeat":                                         "needs an agent consuming the lane",
-
 	"A stale handle's end leaves the newer state document in place":                                       "this runner has not written the second-handle state steps",
 	"A stale handle's state snapshot is refused as a stale session":                                       "this runner has not written the second-handle state steps",
 	"A stale handle's next delta leaves the newer state document in place":                                "this runner has not written the second-handle state steps",
@@ -64,6 +58,48 @@ func sessionStep(ctx context.Context, state *world, step bdd.Step) error {
 
 	case strings.HasPrefix(text, "agent ") && strings.Contains(text, " runs the session "):
 		return runFailingSession(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "agent ") && strings.Contains(text, " opens the session "):
+		return opensSessionLens(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "agent ") && strings.Contains(text, "ends every session it handles"):
+		return endsEverySessionStep(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "agent ") && strings.Contains(text, "handled exactly"):
+		return checkHandledExactly(state, arguments)
+
+	case strings.HasPrefix(text, "agent ") && strings.Contains(text, "sees no pending pause or cancel"):
+		return checkNoPendingControl(state, arguments)
+
+	case strings.HasPrefix(text, "agents \"") && strings.Contains(text, "each record the commands they handle"):
+		return spawnRecordingAgentPair(ctx, state, arguments)
+
+	case strings.Contains(text, "submits a session to agent"):
+		return submitSessionTo(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "the submitted session starts as"):
+		return checkSubmittedReaches(ctx, state, arguments)
+
+	case text == "a fresh stream bootstrapped for sessions in the single-partition layout":
+		return singlePartitionLayoutStream(ctx, state)
+
+	case strings.Contains(text, "in separate sessions"):
+		return sendSeparateSessions(ctx, state, arguments)
+
+	case text == "every command landed on the same partition":
+		return checkSamePartition(state)
+
+	case strings.Contains(text, "writes the control requests"):
+		return misplacedControl(ctx, state, arguments)
+
+	case strings.Contains(text, "sends work to agent"):
+		return sendWorkToAgent(ctx, state, arguments)
+
+	case strings.HasPrefix(text, "sessions publish heartbeats every"):
+		return heartbeatEvery(step, state)
+
+	case strings.HasPrefix(text, "no heartbeat is published"):
+		return checkNoHeartbeat(ctx, state, step)
 
 	case text == "the session ends" || text == "I end the session":
 		return endSession(ctx, state)
@@ -433,25 +469,7 @@ func laneDisplays(ctx context.Context, state *world) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	records, err := state.replay(ctx, wire.AgentSessions)
-	if err != nil {
-		return nil, err
-	}
-	var displays []string
-	for _, record := range records {
-		message, err := laser.OpenAgdx(record)
-		if err != nil {
-			// A record of another shape on the lane is not this session's.
-			continue
-		}
-		if message.Envelope.Conversation != session.Conversation() {
-			continue
-		}
-		envelope := message.Envelope
-		displays = append(displays, string(wire.DisplayTypeOf(
-			wire.EnvelopeRecord(&envelope), wire.AgentSessions)))
-	}
-	return displays, nil
+	return laneDisplaysFor(ctx, state, session.Conversation())
 }
 
 // failureMessage reads the error the session ended with off its own record,
