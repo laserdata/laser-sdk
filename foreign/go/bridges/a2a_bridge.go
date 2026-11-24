@@ -134,16 +134,12 @@ func (bridge *A2ABridge) WithVerifier(registry *laser.KeyRegistry) *A2ABridge {
 // bridges, for the whole bridge. A path that already holds this bridge is a
 // loop and is refused here rather than at the first publish.
 func (bridge *A2ABridge) WithBridgeHops(previous []string) (*A2ABridge, error) {
-	hops, err := CallHops(nil, previous)
-	if err != nil {
-		return nil, err
-	}
-	entered, err := EnterBridge(bridge.source.String(), hops)
+	hops, err := CallHops(bridge.hops, previous)
 	if err != nil {
 		return nil, err
 	}
 	derived := *bridge
-	derived.hops = entered
+	derived.hops = hops
 	return &derived, nil
 }
 

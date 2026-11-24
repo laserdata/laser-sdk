@@ -255,6 +255,16 @@ func TestGivenACanceledTaskWhenReadThenShouldReportItCanceled(t *testing.T) {
 	}
 }
 
+func TestGivenANewA2ABridgeWhenHopsAreContinuedThenShouldExtendItsOwnPath(t *testing.T) {
+	bridge, err := bridgeOver(t, &bridgeLog{}).WithBridgeHops([]string{"mcp-edge"})
+	if err != nil {
+		t.Fatalf("with bridge hops: %v", err)
+	}
+	if _, err := bridge.WithBridgeHops([]string{"edge"}); err == nil {
+		t.Error("a path already holding this bridge must be refused")
+	}
+}
+
 func TestGivenNoPublicURLWhenTheCardIsAskedForThenShouldRefuseIt(t *testing.T) {
 	bridge := bridgeOver(t, &bridgeLog{})
 
