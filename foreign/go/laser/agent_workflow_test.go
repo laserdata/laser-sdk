@@ -11,6 +11,7 @@ import (
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
@@ -31,6 +32,17 @@ type workflowServer struct {
 	replyBody   []byte
 	replySource wire.AgentID
 	silent      map[string]bool
+	// answerOn, when set, pushes every auto-reply to that topic instead of
+	// the one the command arrived on, which is what a step addressed to an
+	// agent's own inbox but answering on the workflow's topic looks like.
+	answerOn string
+
+	// missingUntilBootstrapped, when set, makes GetTopic report every agent
+	// topic absent until CreateTopic is called, proving Workflow.open's own
+	// bootstrap-on-missing-topics fallback rather than a GetTopic that is
+	// always found.
+	missingUntilBootstrapped bool
+	bootstrapped             bool
 }
 
 func newWorkflowServer() *workflowServer {
@@ -43,9 +55,34 @@ func (server *workflowServer) Connect(context.Context) error { return nil }
 func (server *workflowServer) GetTopic(
 	_ context.Context, _, _ iggcon.Identifier,
 ) (*iggcon.TopicDetails, error) {
+	server.mutex.Lock()
+	missing := server.missingUntilBootstrapped && !server.bootstrapped
+	server.mutex.Unlock()
+	if missing {
+		return nil, ierror.TopicNameNotFound{}
+	}
 	details := &iggcon.TopicDetails{}
 	details.PartitionsCount = 1
 	return details, nil
+}
+
+// GetStream reports the stream as already there, so Bootstrap's own
+// Stream.Ensure never needs CreateStream.
+func (server *workflowServer) GetStream(
+	_ context.Context, _ iggcon.Identifier,
+) (*iggcon.StreamDetails, error) {
+	return laneStream(), nil
+}
+
+// CreateTopic answers Bootstrap's own topic creation, flipping GetTopic from
+// missing to found from here on.
+func (server *workflowServer) CreateTopic(
+	_ context.Context, _ iggcon.Identifier, _ string, _ *iggcon.TopicOptions,
+) (*iggcon.TopicDetails, error) {
+	server.mutex.Lock()
+	server.bootstrapped = true
+	server.mutex.Unlock()
+	return &iggcon.TopicDetails{}, nil
 }
 
 func (server *workflowServer) push(topic string, message iggcon.IggyMessage) {
@@ -59,6 +96,12 @@ func (server *workflowServer) SendMessages(
 	_ context.Context, _, topicID iggcon.Identifier,
 	_ iggcon.Partitioning, messages []iggcon.IggyMessage,
 ) (*iggcon.SendMessagesResponse, error) {
+	server.mutex.Lock()
+	missing := server.missingUntilBootstrapped && !server.bootstrapped
+	server.mutex.Unlock()
+	if missing {
+		return nil, ierror.TopicNameNotFound{}
+	}
 	name, _ := topicID.String()
 	for index := range messages {
 		server.push(name, messages[index])
@@ -101,7 +144,11 @@ func (server *workflowServer) SendMessages(
 		if err != nil {
 			continue
 		}
-		server.push(name, replyMessage)
+		answerOn := name
+		if server.answerOn != "" {
+			answerOn = server.answerOn
+		}
+		server.push(answerOn, replyMessage)
 	}
 	return &iggcon.SendMessagesResponse{}, nil
 }
@@ -450,5 +497,205 @@ func TestGivenAResumedRunAfterCompensationWhenRunAgainThenShouldRerunTheCompensa
 	}
 	if _, ok := outcome.Text("reserve"); !ok {
 		t.Error("want reserve present in the resumed outcome")
+	}
+}
+
+// TestGivenAFreshStreamWithNoAgentTopicsWhenALocalWorkflowRunsThenShouldBootstrapThemFirst
+// proves Workflow.open's own fallback: a local-steps-only run needs no
+// caller-made Bootstrap call, matching workflow_local.feature's own premise
+// ("The first run on a stream without agent topics creates them").
+func TestGivenAFreshStreamWithNoAgentTopicsWhenALocalWorkflowRunsThenShouldBootstrapThemFirst(t *testing.T) {
+	server := newWorkflowServer()
+	server.missingUntilBootstrapped = true
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+	source := agentID(t, "jobs")
+
+	outcome, err := handle.Workflow(source, "agent.sessions").
+		StepLocal("generate", func(context.Context, map[string][]byte) ([]byte, error) {
+			return []byte("generate done in process"), nil
+		}).
+		Run(context.Background())
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !server.bootstrapped {
+		t.Error("want the missing topics to have been bootstrapped before the run wrote anything")
+	}
+	if text, ok := outcome.Text("generate"); !ok || text != "generate done in process" {
+		t.Fatalf("want step output `generate done in process`, got %q (ok=%v)", text, ok)
+	}
+}
+
+// A rollback is at least as sensitive as the work it undoes, so a step that
+// would only run as an authenticated principal must not be undone by
+// whoever currently holds the agent's name.
+func TestGivenAPrincipalBoundStepWhenCompensatedThenShouldKeepThePrincipal(t *testing.T) {
+	worker := agentID(t, "worker")
+	route := laser.ToPrincipal(agentID(t, "planner"), laser.PrincipalID(7))
+
+	compensation := laser.CompensationRouteForTest(route, worker)
+	if compensation.Kind != laser.RouteToPrincipal {
+		t.Fatalf("want a principal-bound compensation, got kind %v", compensation.Kind)
+	}
+	if compensation.Agent != worker {
+		t.Errorf("want the agent that ran the step, got %q", compensation.Agent)
+	}
+	if compensation.Principal == nil || *compensation.Principal != laser.PrincipalID(7) {
+		t.Errorf("want the step's own principal kept, got %v", compensation.Principal)
+	}
+
+	// A capability route's principal is carried the same way, since the
+	// requirement came from the caller, not from how the agent was named.
+	capable := laser.ToCapable("settle", laser.RouteAny).WithPrincipal(laser.PrincipalID(9))
+	if kept := laser.CompensationRouteForTest(capable, worker).Principal; kept == nil ||
+		*kept != laser.PrincipalID(9) {
+		t.Errorf("want a capability route's principal kept, got %v", kept)
+	}
+
+	// An unbound step compensates as a plain directed route, with no
+	// requirement invented that the original never had.
+	plain := laser.CompensationRouteForTest(laser.To(agentID(t, "planner")), worker)
+	if plain.Kind != laser.RouteTo || plain.Principal != nil {
+		t.Errorf("want a plain directed compensation, got kind %v principal %v",
+			plain.Kind, plain.Principal)
+	}
+}
+
+// A workflow can address each step to the agent's own inbox while its
+// answers still come back to the topic the workflow owns.
+func TestGivenAnAdvertisedInboxWhenAStepRunsThenShouldAddressTheAgentAndAnswerOnTheWorkflowTopic(t *testing.T) {
+	registry, _ := seedPresence(t, []wire.ClientMetadata{
+		advertised(t, "worker", "worker-inbox", principalOf(1)),
+	})
+	server := newWorkflowServer()
+	server.replyKind = wire.KindResponse
+	server.replyBody = []byte("done")
+	server.replySource = agentID(t, "worker")
+	// The step's target answers on the workflow's own topic, which is where
+	// the contract now awaits it.
+	server.answerOn = "agent.sessions"
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+
+	outcome, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+		Registry(registry).
+		InboxRoute(laser.AdvertisedInbox()).
+		Step("settle", laser.To(agentID(t, "worker")),
+			func(context.Context, map[string][]byte) ([]byte, error) {
+				return []byte("go"), nil
+			}).
+		Run(context.Background())
+	if err != nil {
+		t.Fatalf("run the workflow: %v", err)
+	}
+	if len(outcome.CompletedSteps) != 1 || outcome.CompletedSteps[0] != "settle" {
+		t.Fatalf("want the step completed, got %v", outcome.CompletedSteps)
+	}
+
+	// The command went to the agent's own inbox, not the workflow topic.
+	commands := 0
+	for _, message := range server.on("worker-inbox") {
+		var envelope wire.AgentEnvelope
+		if err := wire.Unmarshal(message.Payload, &envelope); err != nil {
+			continue
+		}
+		if envelope.Kind == wire.KindCommand {
+			commands++
+		}
+	}
+	if commands != 1 {
+		t.Errorf("want the step's command on the advertised inbox, got %d", commands)
+	}
+	// The journal records the workflow topic's tail as the dispatch point,
+	// so a resumed run scans where the answers actually land. If the reply
+	// topic followed the command's inbox, those offsets would name another
+	// topic entirely.
+	if len(server.on("agent.workflow_journal")) == 0 {
+		t.Error("want journal records written")
+	}
+}
+
+// A run's root session must heartbeat while the run is working, or a
+// deployment reads a live run as an abandoned one once its lease expires.
+func TestGivenADeclaredStepsRunWhenRunningThenShouldHoldItsLeaseUntilItEnds(t *testing.T) {
+	server := newWorkflowServer()
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+
+	heldDuringRun := -1
+	outcome, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+		StepLocal("work", func(context.Context, map[string][]byte) ([]byte, error) {
+			heldDuringRun = handle.Leases().Held()
+			return []byte("done"), nil
+		}).
+		Run(context.Background())
+	if err != nil {
+		t.Fatalf("run the workflow: %v", err)
+	}
+	if len(outcome.CompletedSteps) != 1 {
+		t.Fatalf("want the step completed, got %v", outcome.CompletedSteps)
+	}
+	if heldDuringRun != 1 {
+		t.Errorf("want the run's lease held while a step runs, got %d", heldDuringRun)
+	}
+	if held := handle.Leases().Held(); held != 0 {
+		t.Errorf("want the lease released once the run ended, got %d", held)
+	}
+}
+
+// The plain-code form holds its lease across every step the caller drives,
+// and gives it up when the run is finished.
+func TestGivenAPlainCodeRunWhenFinishedThenShouldHoldItsLeaseUntilThen(t *testing.T) {
+	server := newWorkflowServer()
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+
+	run, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+		Start(context.Background())
+	if err != nil {
+		t.Fatalf("start the run: %v", err)
+	}
+	if held := handle.Leases().Held(); held != 1 {
+		t.Fatalf("want the lease held while the run is open, got %d", held)
+	}
+
+	if _, err := run.Finish(context.Background(), nil, nil); err != nil {
+		t.Fatalf("finish the run: %v", err)
+	}
+	if held := handle.Leases().Held(); held != 0 {
+		t.Errorf("want the lease released once finished, got %d", held)
+	}
+
+	// Finishing twice is still refused, and the second attempt has no lease
+	// left to drop.
+	if _, err := run.Finish(context.Background(), nil, nil); err == nil {
+		t.Error("want a second Finish refused")
+	}
+	if held := handle.Leases().Held(); held != 0 {
+		t.Errorf("want no lease after a refused second Finish, got %d", held)
+	}
+}
+
+// Releasing leaves the run open and resumable but gives the lease up, so an
+// interrupted caller stops claiming a session it is no longer driving.
+func TestGivenAReleasedRunWhenFinishedLaterThenShouldRefuseAndHoldNoLease(t *testing.T) {
+	server := newWorkflowServer()
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+
+	run, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+		Start(context.Background())
+	if err != nil {
+		t.Fatalf("start the run: %v", err)
+	}
+	run.Release()
+	if held := handle.Leases().Held(); held != 0 {
+		t.Errorf("want the lease released, got %d", held)
+	}
+	// Release ends the run for this process, so an ending record must not
+	// be written afterwards for a run nobody is driving.
+	if _, err := run.Finish(context.Background(), nil, nil); err == nil {
+		t.Error("want Finish after Release refused")
+	}
+	// Releasing twice is a no-op rather than dropping somebody else's lease.
+	run.Release()
+	if held := handle.Leases().Held(); held != 0 {
+		t.Errorf("want no lease after a second Release, got %d", held)
 	}
 }

@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	examples "github.com/laserdata/laser-sdk/examples/go"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
@@ -17,6 +18,12 @@ import (
 func main() { examples.Run("memory", run) }
 
 func run(ctx context.Context, client *laser.Laser) error {
+	examples.Phase("bootstrap the agent topology")
+	if err := client.Bootstrap(ctx, examples.Partitions, laser.ExpireAfter(time.Hour)); err != nil {
+		return fmt.Errorf("bootstrap: %w", err)
+	}
+	fmt.Println("stream and agent topics ready")
+
 	memory := client.Memory("prefs").For(laser.MemoryScope{User: "ana"})
 
 	examples.Phase("remember a few things about one user")

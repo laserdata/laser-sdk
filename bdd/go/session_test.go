@@ -242,11 +242,10 @@ func sessionStep(ctx context.Context, state *world, step bdd.Step) error {
 		return sinceCheckpoint(ctx, state, arguments)
 
 	case strings.HasPrefix(text, "the last record at the checkpoint is"):
-		return blocked("the Go client cannot read up to a checkpoint: " +
-			"ContextScope has Checkpoint and FetchSince but no fetch-at, " +
-			"where the Rust reference has turns_at(checkpoint) beside " +
-			"turns_since (sdk/src/agent/session.rs:1296), so there is no way " +
-			"to ask what the lane held at the moment the checkpoint was taken")
+		// Plan-skipped once for want of a read up to a checkpoint. The claim
+		// was re-checked against the source: ContextScope.FetchUntil is the
+		// complement of FetchSince and does exactly this.
+		return atCheckpoint(ctx, state, arguments)
 
 	case strings.HasPrefix(text, "the session remembers"):
 		return rememberThroughSession(ctx, state, arguments)
@@ -282,7 +281,10 @@ func startSession(
 	// reopen, so the failure is kept rather than returned.
 	again := strings.HasSuffix(text, " again")
 	session := state.client.Sessions().Create(arguments[1]).As(agent)
-	_, err = session.Begin(ctx)
+	_, lease, err := session.Begin(ctx)
+	if lease != nil {
+		lease.Release()
+	}
 	if again {
 		state.failure = err
 		return nil
@@ -310,7 +312,11 @@ func resumeSession(ctx context.Context, state *world, arguments []string) error 
 		return err
 	}
 	session := state.client.Sessions().Create(arguments[1]).As(agent).Resume()
-	if _, err := session.Begin(ctx); err != nil {
+	_, lease, err := session.Begin(ctx)
+	if lease != nil {
+		lease.Release()
+	}
+	if err != nil {
 		return err
 	}
 	state.put("session", session)
@@ -329,7 +335,11 @@ func runFailingSession(
 		return err
 	}
 	session := state.client.Sessions().Create(arguments[1]).As(agent)
-	if _, err := session.Begin(ctx); err != nil {
+	_, lease, err := session.Begin(ctx)
+	if lease != nil {
+		lease.Release()
+	}
+	if err != nil {
 		return err
 	}
 	state.put("session", session)

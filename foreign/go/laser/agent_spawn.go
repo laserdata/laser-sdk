@@ -2,9 +2,20 @@ package laser
 
 import (
 	"context"
+	"time"
 
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
+
+// DefaultCardRefresh is how often a spawned agent's capability card is
+// republished and its live presence re-advertised when SpawnOptions.
+// CardRefresh is zero. Matches Rust's Agent::builder default session
+// heartbeat, which the capability card's ttl is also derived from.
+const DefaultCardRefresh = 60 * time.Second
+
+// cardTTLHeartbeats is how many refreshes a spawned agent's card stays fresh
+// for, so one missed refresh does not read a live agent as dead.
+const cardTTLHeartbeats = 3
 
 // SpawnOptions configures a spawned agent: the identity gates (AgentOptions),
 // the reliable-consumer behavior (RuntimeOptions), and how it joins the
@@ -25,6 +36,39 @@ type SpawnOptions struct {
 	// position, auto-commit, encryption. The zero value takes every
 	// ConsumerOptions default.
 	Consumer ConsumerOptions
+	// Capabilities is what this agent serves. When non-empty, SpawnAgent
+	// publishes a capability card to the registry (so capability routing can
+	// discover it) and advertises options.Topic as this agent's live presence
+	// (so a fan-out resolves where to send it work), refreshing both every
+	// CardRefresh until the agent stops, when it withdraws both. Empty means
+	// a private agent that does not advertise, the prior behavior.
+	Capabilities []wire.CapabilityDescriptor
+	// CardRefresh is how often the card and presence are refreshed, and
+	// (times cardTTLHeartbeats) how long the card stays fresh. Zero takes
+	// DefaultCardRefresh. Only read when Capabilities is non-empty.
+	CardRefresh time.Duration
+	// Governor, when set, re-scopes this agent's Laser with Governor and
+	// GovernorMode before anything else in SpawnAgent runs, so every effect
+	// the spawned handler's AgentCtx sends (publishes, AGDX verbs, memory
+	// writes) runs the governor first. Equivalent to calling
+	// Laser.WithGovernor yourself before SpawnAgent, but scoped to this one
+	// agent rather than replacing the governor on the handle the caller
+	// keeps.
+	Governor ActionGovernor
+	// GovernorMode is read only when Governor is set.
+	GovernorMode GovernorMode
+	// GovernorRetention overrides the governed handle's chain-head budget.
+	// Nil takes DefaultGovernorRetention. Only read when Governor is set.
+	GovernorRetention *GovernorRetention
+	// ConsolidateEvery and Consolidator run Consolidator.Consolidate every
+	// *ConsolidateEvery, off the handler loop (its own goroutine, stopped
+	// with the agent), scoped to just this agent's own memory. Both must be
+	// given for the tick to exist: either nil means no background
+	// consolidation, ever. A zero *ConsolidateEvery fails SpawnAgent with an
+	// InvalidError instead of starting, regardless of whether Consolidator
+	// is set.
+	ConsolidateEvery *time.Duration
+	Consolidator     Consolidator
 }
 
 // AgentHandle owns a spawned agent's background consumer.
@@ -117,9 +161,13 @@ func (handle *AgentHandle) Abort() {
 // source is expected to already be open (a consumer group member that has
 // joined, or any other RecordSource ready to read), so this carries no
 // network call of its own: it is the lifecycle wiring alone, which is what
-// keeps it testable against a fake source without a server.
+// keeps it testable against a fake source without a server. advertisement
+// and consolidation, when non-nil, are stopped once the consumer ends,
+// before the handle reports done, so Join and Shutdown never return before
+// the cleanup they promise.
 func startAgentHandle(
 	identity wire.AgentID, runtime *AgentRuntime, source RecordSource, handler AgentHandler,
+	advertisement *agentAdvertisement, consolidation *agentConsolidation,
 ) *AgentHandle {
 	ctx, cancel := context.WithCancel(context.Background())
 	handle := &AgentHandle{
@@ -131,9 +179,30 @@ func startAgentHandle(
 	go func() {
 		close(handle.ready)
 		handle.result = runtime.Run(ctx, source, handler)
+		if consolidation != nil {
+			consolidation.abort()
+		}
+		if advertisement != nil {
+			advertisement.withdraw()
+		}
 		close(handle.done)
 	}()
 	return handle
+}
+
+// spawnGoverned re-scopes laser under options.Governor/options.GovernorMode
+// when set, defaulting GovernorRetention when the caller left it nil, so
+// every effect the spawned agent's AgentCtx runs is governed from the first
+// one. Returns laser unchanged when options.Governor is nil.
+func spawnGoverned(laser *Laser, options SpawnOptions) *Laser {
+	if options.Governor == nil {
+		return laser
+	}
+	retention := DefaultGovernorRetention()
+	if options.GovernorRetention != nil {
+		retention = *options.GovernorRetention
+	}
+	return laser.WithGovernorRetention(options.Governor, options.GovernorMode, retention)
 }
 
 // SpawnAgent opens identity's reliable consumer on its own goroutine, joining
@@ -156,6 +225,10 @@ func (laser *Laser) SpawnAgent(
 	if options.Topic == "" {
 		return nil, &InvalidError{Reason: "a spawned agent needs the topic to listen on"}
 	}
+	if options.ConsolidateEvery != nil && *options.ConsolidateEvery <= 0 {
+		return nil, &InvalidError{Reason: "consolidate_every must be greater than zero"}
+	}
+	laser = spawnGoverned(laser, options)
 	agent := laser.Agent(identity, options.AgentOptions)
 	runtime, err := laser.AgentRuntime(agent, options.RuntimeOptions)
 	if err != nil {
@@ -172,10 +245,22 @@ func (laser *Laser) SpawnAgent(
 	if group == "" {
 		group = identity.String()
 	}
-	source, err := laser.Stream(stream).Topic(options.Topic).
-		ConsumerGroup(ctx, group, options.Consumer)
+	// Advertised before the group join, so a presence conflict (two agents
+	// sharing this connection) fails fast without joining a consumer group
+	// this call is about to discard anyway.
+	advertisement, err := startAdvertisement(
+		ctx, laser, identity, options.Topic, options.Capabilities, options.CardRefresh)
 	if err != nil {
 		return nil, err
 	}
-	return startAgentHandle(identity, runtime, source, handler), nil
+	source, err := laser.Stream(stream).Topic(options.Topic).
+		ConsumerGroup(ctx, group, options.Consumer)
+	if err != nil {
+		if advertisement != nil {
+			advertisement.withdraw()
+		}
+		return nil, err
+	}
+	consolidation := startConsolidation(identity, options.ConsolidateEvery, options.Consolidator)
+	return startAgentHandle(identity, runtime, source, handler, advertisement, consolidation), nil
 }

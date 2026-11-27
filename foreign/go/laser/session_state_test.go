@@ -47,7 +47,7 @@ func (server *stateServer) Close() error { return nil }
 func (server *stateServer) GetStream(
 	_ context.Context, _ iggcon.Identifier,
 ) (*iggcon.StreamDetails, error) {
-	return &iggcon.StreamDetails{}, nil
+	return laneStream(), nil
 }
 
 func (server *stateServer) GetTopic(

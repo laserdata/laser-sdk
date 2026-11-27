@@ -68,6 +68,15 @@ type ConsumerOptions struct {
 	// key, for a topic published under the same one. Nil reads records as
 	// they are stored.
 	Encryption *Encryption
+	// SkipGroupCreate joins a consumer group without creating it when it is
+	// absent, so a member refuses rather than bringing a group into being.
+	//
+	// The default creates it, matching the Rust client's own `create_group`
+	// default: a server holds no group until someone makes one, so a join
+	// that never created would answer "consumer group not found" and leave
+	// every caller to create it first. Set this where only an operator may
+	// define the group.
+	SkipGroupCreate bool
 }
 
 // PollOptions renders the read limits a consumer opened with these options
@@ -150,6 +159,14 @@ func (topic *Topic) ConsumerGroup(
 	identifier, err := iggcon.NewIdentifier(group)
 	if err != nil {
 		return nil, &InvalidError{Reason: "consumer group name: " + err.Error()}
+	}
+	// Created when absent, then joined, unless the caller opted out. A
+	// group that already exists is the outcome asked for, so this is
+	// idempotent.
+	if !options.SkipGroupCreate {
+		if err := topic.Group(group).EnsureNative(ctx); err != nil {
+			return nil, err
+		}
 	}
 	return topic.openConsumer(ctx, iggcon.NewGroupConsumer(identifier), options)
 }

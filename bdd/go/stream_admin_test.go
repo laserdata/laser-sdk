@@ -102,12 +102,40 @@ func streamAdminStep(ctx context.Context, state *world, step bdd.Step) error {
 	case strings.HasPrefix(text, "a second delete of topic"):
 		return deleteTopic(ctx, state, arguments, false)
 
-	case strings.Contains(text, "consumer group"):
-		// Listing a topic's groups is served, but creating and deleting one
-		// is not, and this feature's own narrative is that every client does
-		// all of it "through the SDK alone".
-		return blocked("the Go client creates and deletes no consumer group: " +
-			"Topic.ConsumerGroup only joins one, and there is no delete")
+	// Creating, listing and deleting a consumer group. Plan-skipped once for
+	// want of create and delete; both have since shipped
+	// (ConsumerGroup.EnsureNative and ConsumerGroup.Delete), so the claim was
+	// re-checked against the source and the steps written.
+	case strings.HasPrefix(text, "I create consumer group"):
+		if len(arguments) != 2 {
+			return fmt.Errorf("want a group and a topic, got %v", arguments)
+		}
+		return adminTopic(state, arguments[1]).Group(arguments[0]).EnsureNative(ctx)
+
+	case strings.HasPrefix(text, "I delete consumer group"):
+		if len(arguments) != 2 {
+			return fmt.Errorf("want a group and a topic, got %v", arguments)
+		}
+		deleted, err := adminTopic(state, arguments[1]).Group(arguments[0]).Delete(ctx)
+		if err != nil {
+			return err
+		}
+		if !deleted {
+			return fmt.Errorf("the delete reported the group was already gone")
+		}
+		return nil
+
+	case strings.Contains(text, "lists no consumer groups"):
+		if len(arguments) != 1 {
+			return fmt.Errorf("want a topic, got %v", arguments)
+		}
+		return groupsListed(ctx, state, arguments[0], "")
+
+	case strings.Contains(text, "lists consumer group"):
+		if len(arguments) != 2 {
+			return fmt.Errorf("want a topic and a group, got %v", arguments)
+		}
+		return groupsListed(ctx, state, arguments[0], arguments[1])
 
 	default:
 		return fmt.Errorf("this runner does not implement the step")
@@ -267,4 +295,31 @@ func topicAbsent(ctx context.Context, state *world, arguments []string) error {
 		return fmt.Errorf("the deleted topic still reads back")
 	}
 	return nil
+}
+
+// groupsListed asserts what a topic's consumer-group listing holds: the one
+// group named, or none at all when wanted is empty.
+func groupsListed(ctx context.Context, state *world, topic, wanted string) error {
+	groups, err := adminTopic(state, topic).ConsumerGroups(ctx)
+	if err != nil {
+		return err
+	}
+	names := make([]string, 0, len(groups))
+	for _, group := range groups {
+		names = append(names, group.Name)
+	}
+	if wanted == "" {
+		if len(names) != 0 {
+			return fmt.Errorf("want topic %q to list no consumer groups, got %v",
+				topic, names)
+		}
+		return nil
+	}
+	for _, name := range names {
+		if name == wanted {
+			return nil
+		}
+	}
+	return fmt.Errorf("want topic %q to list consumer group %q, got %v",
+		topic, wanted, names)
 }

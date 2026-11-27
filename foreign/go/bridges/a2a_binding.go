@@ -218,6 +218,49 @@ func (caller *A2ACaller) Submit(
 		ctx, paramsJSON, caller.bridge.target, caller.bridge.hops, caller.principal)
 }
 
+// SubmitTo addresses one task owned by this caller to one agent, overriding
+// the bridge's own WithTarget.
+func (caller *A2ACaller) SubmitTo(
+	ctx context.Context, target wire.AgentID, paramsJSON []byte,
+) (*A2ATask, error) {
+	return caller.bridge.submitAddressed(
+		ctx, paramsJSON, &target, caller.bridge.hops, caller.principal, nil, nil)
+}
+
+// SubmitWithHops submits work owned by this caller that already crossed
+// other bridges, carrying its hop path with this bridge appended.
+func (caller *A2ACaller) SubmitWithHops(
+	ctx context.Context, previous []string, target *wire.AgentID, paramsJSON []byte,
+) (*A2ATask, error) {
+	hops, err := CallHops(caller.bridge.hops, previous)
+	if err != nil {
+		return nil, err
+	}
+	if target == nil {
+		target = caller.bridge.target
+	}
+	return caller.bridge.submitAddressed(
+		ctx, paramsJSON, target, hops, caller.principal, nil, nil)
+}
+
+// SubmitIn submits a task owned by this caller as a child session of parent,
+// in the tree rooted at root. The command is addressed like Submit.
+func (caller *A2ACaller) SubmitIn(
+	ctx context.Context, parent, root wire.ConversationID, paramsJSON []byte,
+) (*A2ATask, error) {
+	return caller.bridge.submitAddressed(ctx, paramsJSON,
+		caller.bridge.target, caller.bridge.hops, caller.principal, &parent, &root)
+}
+
+// SubmitInTo is SubmitIn addressed to target.
+func (caller *A2ACaller) SubmitInTo(
+	ctx context.Context, target wire.AgentID, parent, root wire.ConversationID,
+	paramsJSON []byte,
+) (*A2ATask, error) {
+	return caller.bridge.submitAddressed(ctx, paramsJSON,
+		&target, caller.bridge.hops, caller.principal, &parent, &root)
+}
+
 // Task and Cancel act on a task of this caller's. An id belonging to another
 // caller reads as one that does not exist.
 func (caller *A2ACaller) Task(ctx context.Context, id string) (*A2ATask, error) {

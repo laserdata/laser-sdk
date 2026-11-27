@@ -22,9 +22,23 @@ type consumerServer struct {
 	mutex  sync.Mutex
 	joined string
 	stored []iggcon.ConsumerPosition
+	// created is the consumer groups the client asked the server to make,
+	// so a test can see that joining a group creates it when absent.
+	created []string
 }
 
 func (server *consumerServer) Close() error { return nil }
+
+// CreateConsumerGroup records the create a join performs when the group may
+// not be there yet.
+func (server *consumerServer) CreateConsumerGroup(
+	_ context.Context, _, _ iggcon.Identifier, name string,
+) (*iggcon.ConsumerGroupDetails, error) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	server.created = append(server.created, name)
+	return &iggcon.ConsumerGroupDetails{}, nil
+}
 
 func (server *consumerServer) FetchMessages(
 	_ context.Context, _, _ iggcon.Identifier, _ iggcon.Consumer,
@@ -439,5 +453,38 @@ func TestGivenNoStoredOffsetWhenDeletedThenShouldReadAsAlreadyGone(t *testing.T)
 	// what lets a cleanup run twice without being special-cased.
 	if err := consumer.DeleteOffset(context.Background(), nil); err != nil {
 		t.Fatalf("want absence read as done, got %v", err)
+	}
+}
+
+// A server holds no consumer group until someone makes one, so joining has
+// to create it: a join that only joined answered "consumer group not found"
+// against a real deployment, which no in-process fake ever showed.
+func TestGivenAnAbsentConsumerGroupWhenJoinedThenShouldCreateItFirst(t *testing.T) {
+	server := &consumerServer{}
+	handle := streamHandle(server, laser.Options{DefaultStream: "agents"})
+
+	if _, err := handle.Stream("agents").Topic("jobs").
+		ConsumerGroup(context.Background(), "workers", laser.ConsumerOptions{}); err != nil {
+		t.Fatalf("join the group: %v", err)
+	}
+	if len(server.created) != 1 || server.created[0] != "workers" {
+		t.Errorf("want the group created before joining, got %v", server.created)
+	}
+}
+
+// Where only an operator may define the group, a member joins without
+// bringing one into being.
+func TestGivenSkipGroupCreateWhenJoinedThenShouldNotCreateIt(t *testing.T) {
+	server := &consumerServer{}
+	handle := streamHandle(server, laser.Options{DefaultStream: "agents"})
+
+	if _, err := handle.Stream("agents").Topic("jobs").
+		ConsumerGroup(context.Background(), "workers", laser.ConsumerOptions{
+			SkipGroupCreate: true,
+		}); err != nil {
+		t.Fatalf("join the group: %v", err)
+	}
+	if len(server.created) != 0 {
+		t.Errorf("want no group created, got %v", server.created)
 	}
 }

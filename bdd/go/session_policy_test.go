@@ -515,9 +515,13 @@ func foldedDocumentIs(ctx context.Context, state *world, step bdd.Step) error {
 
 // --- heartbeats and leases ---
 
-// startLeasedSession starts a labeled session and takes an explicit lease on
-// it: the Go client splits what Rust's begin() bundles, since Session.Begin
-// writes no lease of its own.
+// startLeasedSession starts a labeled session and takes an explicit lease at
+// this test's own configured interval. Session.Begin now bundles a lease of
+// its own too, but always at LeaseSession's default interval, which these
+// heartbeat-timing scenarios cannot use -- it is released immediately so
+// exactly one lease (this call's own) ever holds this session, which is what
+// lets a scenario track "the last lease" precisely by releasing the one it
+// was handed.
 func startLeasedSession(
 	ctx context.Context, client *laser.Laser, sessions *laser.Sessions,
 	interval time.Duration, owner, label string,
@@ -527,8 +531,12 @@ func startLeasedSession(
 		return wire.ConversationID{}, nil, err
 	}
 	session := sessions.Create(label).As(agentID)
-	if _, err := session.Begin(ctx); err != nil {
+	_, begun, err := session.Begin(ctx)
+	if err != nil {
 		return wire.ConversationID{}, nil, err
+	}
+	if begun != nil {
+		begun.Release()
 	}
 	conversation := session.Conversation()
 	lease, err := client.LeaseSession(ctx, conversation, agentID, interval)
@@ -796,6 +804,13 @@ func checkHeartbeatsPerStream(ctx context.Context, state *world) error {
 // record into a message fragment addressed by its exact log position: what a
 // caller builds by hand today, since the Go client has no Session.Assemble of
 // its own yet to do it.
+//
+// Fetches exactly want records (LastN(want)), not an arbitrarily large bound:
+// the session's own start record always rides the same lane and is older
+// than anything a scenario records afterward, so a loose bound (bigger than
+// want) counts it as one of the "records" too -- the fetch itself has to keep
+// only the newest want, not merely wait for a count that a looser read would
+// never report.
 func buildAssembledContext(
 	ctx context.Context, state *world, session *laser.Session, want int,
 ) (*laser.AssembledContext, error) {
@@ -804,7 +819,7 @@ func buildAssembledContext(
 	for {
 		var err error
 		messages, err = state.client.Context(session.Conversation()).
-			Fetch(ctx, []string{wire.AgentSessions}, 100, 0)
+			Fetch(ctx, []string{wire.AgentSessions}, want, 0)
 		if err == nil && len(messages) == want {
 			break
 		}

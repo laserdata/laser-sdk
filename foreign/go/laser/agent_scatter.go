@@ -29,6 +29,15 @@ type ScatterRequest struct {
 	// Deadline bounds every branch's Contract and the gather. Zero takes
 	// DefaultContractDeadline.
 	Deadline time.Duration
+	// Verifier, when set, is armed on every branch's Contract: a branch does
+	// not complete on an unsigned or wrong-signer reply, the same gate
+	// Contract.Verifier gives a single directed send.
+	Verifier *KeyRegistry
+	// Inbox decides how each branch resolves its own target to a topic. Nil
+	// keeps Topic for every branch, which is this client's default; an
+	// AdvertisedInbox() sends each branch to that agent's own inbox, so a
+	// scatter reaches agents that share no topic.
+	Inbox *InboxRoute
 }
 
 // ScatterOutcome is one agent's outcome in a ScatterReport.
@@ -147,11 +156,21 @@ func (laser *Laser) ScatterReport(
 	for _, target := range targets {
 		running[target] = true
 		go func(target wire.AgentID) {
-			contract, err := laser.Contract(To(target), request.Topic).
+			branch := laser.Contract(To(target), request.Topic).
 				From(request.From).
 				Payload(request.Payload).
-				Deadline(deadline).
-				Send(branching)
+				Registry(request.Registry).
+				Deadline(deadline)
+			if request.Inbox != nil {
+				// The caller watches the topic it named, so that is where
+				// every branch answers even when its command went to the
+				// agent's own inbox.
+				branch = branch.InboxRoute(*request.Inbox).ReplyOn(request.Topic)
+			}
+			if request.Verifier != nil {
+				branch = branch.Verifier(request.Verifier)
+			}
+			contract, err := branch.Send(branching)
 			outcomes <- scatterBranch{agent: target, contract: contract, err: err}
 		}(target)
 	}

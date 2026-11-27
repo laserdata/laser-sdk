@@ -202,6 +202,50 @@ func TestGivenAZeroQuorumWhenScatteredThenShouldRefuseBeforeAnyRead(t *testing.T
 	}
 }
 
+func TestGivenAVerifierWhenScatteredThenShouldOnlyCompleteBranchesSignedByTheirOwnTarget(t *testing.T) {
+	key, err := laser.GenerateSigningKey()
+	if err != nil {
+		t.Fatalf("generate a signing key: %v", err)
+	}
+	keys := laser.NewKeyRegistry()
+	// Enrolled as worker-a only: worker-b's branch expects a reply signed as
+	// "worker-b", so the same key answering on its behalf still fails that
+	// branch's own ExpectedSigner check.
+	keys.Enroll("worker-a", key.VerifyingKey())
+	server := &contractServer{
+		repliesByTarget: map[string]contractReply{
+			"worker-a": {kind: wire.KindResponse, body: []byte("a"), source: agentID(t, "worker-a")},
+			"worker-b": {kind: wire.KindResponse, body: []byte("b"), source: agentID(t, "worker-b")},
+		},
+		replyKey: key,
+	}
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+	registry := registryWith(t, time.Now(), map[string]wire.AgentCard{
+		"worker-a": cardFor("review", nil, nil, nil, nil),
+		"worker-b": cardFor("review", nil, nil, nil, nil),
+	})
+
+	report, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{
+		Skill: "review", Routing: laser.RouteAny, Registry: registry,
+		From: agentID(t, "orchestrator"), Topic: "agent.sessions",
+		Payload: []byte(`{"task":"run"}`), Policy: laser.GatherBestEffort(),
+		Deadline: 300 * time.Millisecond, Verifier: keys,
+	})
+	if err != nil {
+		t.Fatalf("scatter: %v", err)
+	}
+	completed := report.Completed()
+	if len(completed) != 1 || completed[0].Agent.String() != "worker-a" {
+		t.Fatalf("want only worker-a's branch (signed as its own expected principal) to complete, got %+v",
+			completed)
+	}
+	if completed[0].Contract.Reply.VerifiedPrincipal == nil ||
+		*completed[0].Contract.Reply.VerifiedPrincipal != "worker-a" {
+		t.Errorf("want the verified principal on the completed branch's reply, got %v",
+			completed[0].Contract.Reply.VerifiedPrincipal)
+	}
+}
+
 func TestGivenACompletedScatterWhenScatterCollectsThenShouldReturnOnlyCompletedBodies(t *testing.T) {
 	message := "the task failed"
 	body, err := wire.Marshal(wire.AgentErrorBody{Code: wire.ErrorInternal, Message: &message})
@@ -231,5 +275,48 @@ func TestGivenACompletedScatterWhenScatterCollectsThenShouldReturnOnlyCompletedB
 	}
 	if len(replies) != 1 || string(replies[0]) != "a" {
 		t.Fatalf("want only the completed branch's body, got %v", replies)
+	}
+}
+
+// A scatter can reach agents that share no topic: each branch's command goes
+// to that agent's own inbox, while every answer comes back to the topic the
+// caller named and watches.
+func TestGivenAnAdvertisedInboxWhenScatteredThenShouldAddressEachAgentsOwnTopic(t *testing.T) {
+	now := time.Now()
+	registry, _ := seedPresence(t, []wire.ClientMetadata{
+		advertised(t, "alpha", "alpha-inbox", principalOf(1)),
+		advertised(t, "beta", "beta-inbox", principalOf(1)),
+	})
+	registry.Observe(agentID(t, "alpha"), cardFor("settle", nil, nil, nil, nil), now)
+	registry.Observe(agentID(t, "beta"), cardFor("settle", nil, nil, nil, nil), now)
+	server := &contractServer{
+		replyKind: wire.KindResponse, replyBody: []byte("done"),
+		replySource: agentID(t, "alpha"),
+		answerOn:    "agent.sessions",
+	}
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+
+	advertisedRoute := laser.AdvertisedInbox()
+	report, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{
+		Skill:    "settle",
+		Registry: registry,
+		From:     agentID(t, "orchestrator"),
+		Topic:    "agent.sessions",
+		Payload:  []byte(`{"task":"settle"}`),
+		Policy:   laser.GatherAll(),
+		Inbox:    &advertisedRoute,
+		Deadline: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("scatter: %v", err)
+	}
+	if len(report.Completed()) != 2 {
+		t.Fatalf("want both branches completed, got %d of %d outcomes",
+			len(report.Completed()), len(report.Outcomes))
+	}
+	for _, topic := range []string{"alpha-inbox", "beta-inbox"} {
+		if len(server.storedOn(topic)) == 0 {
+			t.Errorf("want a command addressed to %s", topic)
+		}
 	}
 }

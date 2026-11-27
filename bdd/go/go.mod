@@ -2,10 +2,12 @@ module github.com/laserdata/laser-sdk/bdd/go
 
 go 1.25.0
 
-require github.com/laserdata/laser-sdk/foreign/go v0.0.0
+require (
+	github.com/apache/iggy/foreign/go v0.10.0
+	github.com/laserdata/laser-sdk/foreign/go v0.0.0
+)
 
 require (
-	github.com/apache/iggy/foreign/go v0.10.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.20.3 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect

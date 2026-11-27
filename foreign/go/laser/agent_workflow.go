@@ -2,6 +2,7 @@ package laser
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -20,6 +21,22 @@ type StepFunc func(ctx context.Context, outputs map[string][]byte) ([]byte, erro
 // StepVerifier checks a step's reply before it counts as done. A false
 // verdict fails the step StepUnverified. Bounded by the step's own deadline.
 type StepVerifier func(ctx context.Context, output []byte) (bool, error)
+
+// OnTimeout is how a step responds to its contract timing out without a
+// terminal reply.
+type OnTimeout int
+
+const (
+	// OnTimeoutFail fails the step and runs compensations (the default).
+	OnTimeoutFail OnTimeout = iota
+	// OnTimeoutReassign hands the task to a fresh holder after releasing the
+	// timed-out assignment's lease, preferring a capable agent other than the
+	// ones that timed out and reusing one of them only when no other is
+	// capable. The fresh acquisition bumps the fence and gates the old
+	// holder out at the sink. Needs an exclusive step so reassignment cannot
+	// double-commit.
+	OnTimeoutReassign
+)
 
 // StepFailure is why a workflow step did not complete, carried by
 // StepFailedError.
@@ -127,13 +144,16 @@ func (budget WorkflowBudget) WithInvocations(invocations uint32) WorkflowBudget 
 
 // workflowStep is one declared step.
 type workflowStep struct {
-	label      string
-	router     *Router // nil runs the step body in this process.
-	run        StepFunc
-	after      []string
-	verifier   StepVerifier
-	deadline   time.Duration
-	compensate StepFunc // nil: this step is not rolled back on a later failure.
+	label          string
+	router         *Router // nil runs the step body in this process.
+	run            StepFunc
+	after          []string
+	verifier       StepVerifier
+	deadline       time.Duration
+	compensate     StepFunc // nil: this step is not rolled back on a later failure.
+	exclusive      bool
+	fenceNamespace string // empty: the SDK-owned default (workflowFenceNamespace).
+	onTimeout      OnTimeout
 }
 
 // Workflow is a journalled directed-acyclic workflow over Contract and
@@ -150,10 +170,9 @@ type workflowStep struct {
 // on every chained call would be worse than the shared, explicit mutation
 // used here.
 //
-// Not yet ported: exclusive (fenced, at-most-once) steps and
-// OnTimeout(Reassign), and the "plain code" run_with/WorkflowRun form where
-// the caller's own async body is the workflow. Both are self-contained
-// future slices; see foreign/go/IMPLEMENTATION_STATUS.md.
+// Not yet ported: the "plain code" run_with/WorkflowRun form where the
+// caller's own async body is the workflow. A self-contained future slice;
+// see foreign/go/IMPLEMENTATION_STATUS.md.
 type Workflow struct {
 	laser    *Laser
 	name     string
@@ -163,6 +182,9 @@ type Workflow struct {
 	budget   WorkflowBudget
 	runID    *wire.ConversationID
 	steps    []workflowStep
+	// inbox is how each step resolves its target to a topic. Nil keeps the
+	// topic named at Laser.Workflow.
+	inbox *InboxRoute
 }
 
 // Workflow opens a workflow dispatching as source, publishing and awaiting
@@ -180,6 +202,26 @@ func (workflow *Workflow) Budget(budget WorkflowBudget) *Workflow {
 
 // Registry is where an all-capable step's agents are resolved from.
 // Unneeded for a workflow with only directed/local steps.
+// InboxRoute decides how each step resolves its target to a topic.
+//
+// The default is a fixed route to the topic named at Laser.Workflow, the
+// same default Laser.Contract keeps and for the same reason: a deployment
+// that serves no presence has no advertised inbox to resolve, and moving
+// the default would re-address every existing workflow's traffic. Pass
+// AdvertisedInbox() to send each step to the agent's own inbox.
+func (workflow *Workflow) InboxRoute(route InboxRoute) *Workflow {
+	workflow.inbox = &route
+	return workflow
+}
+
+// inboxRoute is the route this workflow's steps address by.
+func (workflow *Workflow) inboxRoute() InboxRoute {
+	if workflow.inbox != nil {
+		return *workflow.inbox
+	}
+	return FixedInbox(workflow.topic)
+}
+
 func (workflow *Workflow) Registry(registry *AgentRegistry) *Workflow {
 	workflow.registry = registry
 	return workflow
@@ -237,6 +279,36 @@ func (handle *StepHandle) VerifyWith(verifier StepVerifier) *StepHandle {
 	return handle
 }
 
+// Exclusive opts this step into the lease and fence (an exclusive,
+// at-most-once effect): the engine claims a fenced lease before dispatching,
+// renews it while the contract is in flight, and releases it on every exit.
+// Needs a directed step (To/ToCapable); a local step runs in process and an
+// all-capable one has no single target to fence.
+func (handle *StepHandle) Exclusive() *StepHandle {
+	handle.workflow.steps[handle.index].exclusive = true
+	return handle
+}
+
+// ExclusiveIn is Exclusive, whose lease and fence sequence live in namespace
+// instead of the SDK-owned default. Use the same namespace for the handler's
+// Kv.CasFenced commit and pass the run id as its fence key, so the external
+// effect and the workflow reassignment validate one fence sequence
+// atomically.
+func (handle *StepHandle) ExclusiveIn(namespace string) *StepHandle {
+	step := &handle.workflow.steps[handle.index]
+	step.exclusive = true
+	step.fenceNamespace = namespace
+	return handle
+}
+
+// OnTimeout sets what the step does when its contract times out (default
+// OnTimeoutFail). OnTimeoutReassign hands the task to a fresh holder with a
+// bumped fence, and requires Exclusive.
+func (handle *StepHandle) OnTimeout(onTimeout OnTimeout) *StepHandle {
+	handle.workflow.steps[handle.index].onTimeout = onTimeout
+	return handle
+}
+
 // Deadline bounds the step's build, dispatch, verification, and completion
 // record (default 30s), never past the workflow's own wall-clock budget.
 // The command carries it, so a target that picks the task up later drops
@@ -273,16 +345,19 @@ func (handle *StepHandle) Run(ctx context.Context) (*WorkflowOutcome, error) {
 	return handle.workflow.Run(ctx)
 }
 
-// WorkflowOutcome is the result of a completed Workflow.Run: each step's
-// output by label, the run id, the labels of the completed steps in
-// completion order, and the run's end status (Completed for every returned
-// outcome, since a failed run is an error). Pass RunID to Workflow.RunID to
-// resume the same run.
+// WorkflowOutcome is the result of a completed Workflow.Run (or WorkflowRun.
+// Finish/RunWith): each declared step's output by label, the run id, the
+// labels of the completed steps in completion order, and the run's end
+// status (Completed for every returned outcome, since a failed run is an
+// error). Pass RunID to Workflow.RunID to resume the same run.
 type WorkflowOutcome struct {
 	Outputs        map[string][]byte
 	RunID          wire.ConversationID
 	CompletedSteps []string
 	Status         wire.SessionStatus
+	// Value is the JSON of the value a RunWith body returned, nil for a
+	// Workflow.Run of declared steps. Never journaled.
+	Value []byte
 }
 
 // Text is the output of step label as text (invalid UTF-8 replaced), or
@@ -293,6 +368,33 @@ func (outcome *WorkflowOutcome) Text(label string) (string, bool) {
 		return "", false
 	}
 	return string(output), true
+}
+
+// JSON decodes step label's output into target, or (false, nil) when no
+// completed step has that label.
+func (outcome *WorkflowOutcome) JSON(label string, target any) (bool, error) {
+	output, has := outcome.Outputs[label]
+	if !has {
+		return false, nil
+	}
+	if err := json.Unmarshal(output, target); err != nil {
+		return true, &CodecError{Reason: fmt.Sprintf(
+			"the output of workflow step `%s` does not decode as the JSON asked for", label), Cause: err}
+	}
+	return true, nil
+}
+
+// WorkflowValue decodes a RunWith outcome's own returned value.
+func WorkflowValue[T any](outcome *WorkflowOutcome) (T, error) {
+	var value T
+	if outcome.Value == nil {
+		return value, &InvalidError{Reason: "the workflow outcome carries no value: it is not a RunWith run"}
+	}
+	if err := json.Unmarshal(outcome.Value, &value); err != nil {
+		return value, &CodecError{Reason: "the workflow's returned value does not decode " +
+			"as the JSON asked for", Cause: err}
+	}
+	return value, nil
 }
 
 // Run runs the workflow's steps in dependency order to completion, or
@@ -316,36 +418,18 @@ func (workflow *Workflow) Run(ctx context.Context) (*WorkflowOutcome, error) {
 		runID = *workflow.runID
 	}
 
-	journal, err := workflow.replay(ctx, runID, resumed)
+	journal, session, lease, err := workflow.open(ctx, runID, resumed)
 	if err != nil {
 		return nil, err
 	}
-	session := workflow.laser.Sessions().Open(runID, "").As(workflow.source)
-	if resumed {
-		session = session.Resume()
-	}
-	if _, err := session.Begin(ctx); err != nil {
-		return nil, err
+	// Released after the session's own ending record, so the run holds its
+	// lease for exactly as long as it is working.
+	if lease != nil {
+		defer lease.Release()
 	}
 
 	outcome, runErr := workflow.execute(ctx, runID, order, journal)
-
-	var endErr error
-	switch typed := runErr.(type) {
-	case nil:
-		_, endErr = session.Complete(ctx, "")
-	case *BudgetExceededError:
-		_, endErr = session.FailOverBudget(ctx, typed.Breach)
-	default:
-		message := runErr.Error()
-		retryable := false
-		if failed, ok := runErr.(*StepFailedError); ok {
-			retryable = failed.Retryable()
-		}
-		_, endErr = session.Fail(ctx, wire.AgentErrorBody{
-			Code: wire.ErrorInternal, Message: &message, Retryable: retryable,
-		})
-	}
+	endErr := endWorkflowSession(ctx, session, runErr)
 	if runErr != nil {
 		return nil, runErr
 	}
@@ -355,10 +439,36 @@ func (workflow *Workflow) Run(ctx context.Context) (*WorkflowOutcome, error) {
 	return outcome, nil
 }
 
+// endWorkflowSession ends a run's root session the way runErr says: Complete
+// on success, FailOverBudget on a BudgetExceededError, Fail otherwise.
+// Shared by Workflow.Run (declared steps) and WorkflowRun.Finish (the plain
+// code form).
+func endWorkflowSession(ctx context.Context, session *Session, runErr error) error {
+	switch typed := runErr.(type) {
+	case nil:
+		_, err := session.Complete(ctx, "")
+		return err
+	case *BudgetExceededError:
+		_, err := session.FailOverBudget(ctx, typed.Breach)
+		return err
+	default:
+		message := runErr.Error()
+		retryable := false
+		if failed, ok := runErr.(*StepFailedError); ok {
+			retryable = failed.Retryable()
+		}
+		_, err := session.Fail(ctx, wire.AgentErrorBody{
+			Code: wire.ErrorInternal, Message: &message, Retryable: retryable,
+		})
+		return err
+	}
+}
+
 // validate checks every configuration error before the run writes anything,
 // and orders the steps by their declared dependencies.
 func (workflow *Workflow) validate() ([]int, error) {
 	labels := make(map[string]bool, len(workflow.steps))
+	anyExclusive := false
 	for _, step := range workflow.steps {
 		if labels[step.label] {
 			return nil, &InvalidError{
@@ -369,8 +479,108 @@ func (workflow *Workflow) validate() ([]int, error) {
 			return nil, &InvalidError{
 				Reason: "a broadcast workflow step has no gather target"}
 		}
+		// Only a directed step can be exclusive (a scatter has no single
+		// target to fence), and reassign-on-timeout needs an exclusive step,
+		// since the fence is what makes handing the task to a fresh holder
+		// safe from the timed-out one double-executing.
+		if step.router == nil && (step.exclusive || step.onTimeout == OnTimeoutReassign) {
+			return nil, &InvalidError{
+				Reason: "a local step runs in process, so it cannot be exclusive"}
+		}
+		if step.exclusive && step.router != nil && step.router.Kind == RouteAllCapable {
+			return nil, &InvalidError{
+				Reason: "an exclusive step must be directed (to / to_capable)"}
+		}
+		if !step.exclusive && step.onTimeout == OnTimeoutReassign {
+			return nil, &InvalidError{Reason: "on_timeout(Reassign) needs an exclusive " +
+				"step, so the reassignment bumps the fence and the timed-out holder is gated out"}
+		}
+		if step.exclusive {
+			anyExclusive = true
+		}
+	}
+	if anyExclusive {
+		if err := workflow.requireFencedLeases(); err != nil {
+			return nil, err
+		}
 	}
 	return topologicalWorkflowOrder(workflow.steps)
+}
+
+// requireFencedLeases refuses a workflow with an exclusive step against a
+// deployment that cannot serve the managed key-value store's fenced-lease
+// contract, before anything runs.
+func (workflow *Workflow) requireFencedLeases() error {
+	if workflow.laser.capabilities.Kv.FencedLeases {
+		return nil
+	}
+	return &UnsupportedError{Surface: "an exclusive workflow step (the managed fenced-lease contract)"}
+}
+
+// defaultWorkflowTopicRetention is the retention a workflow's own fallback
+// bootstrap creates agent.sessions and agent.workflow_journal under, matching
+// Rust's TopicRetention::default() (one day).
+const defaultWorkflowTopicRetention = 24 * time.Hour
+
+// open replays the run's journal and begins its root session, bootstrapping
+// the stream's agent topology first when the run's own topics are missing —
+// so a workflow of local steps needs no agent and no caller-made Bootstrap
+// call, mirroring Rust's own open()/run_topics_missing().
+func (workflow *Workflow) open(
+	ctx context.Context, runID wire.ConversationID, resumed bool,
+) (workflowJournal, *Session, *SessionLease, error) {
+	journal, session, lease, err := workflow.openSession(ctx, runID, resumed)
+	if err == nil {
+		return journal, session, lease, nil
+	}
+	missing, missingErr := workflow.topicsMissing(ctx)
+	if missingErr != nil || !missing {
+		return workflowJournal{}, nil, nil, err
+	}
+	if bootstrapErr := workflow.laser.Bootstrap(
+		ctx, 1, ExpireAfter(defaultWorkflowTopicRetention),
+	); bootstrapErr != nil {
+		return workflowJournal{}, nil, nil, err
+	}
+	return workflow.openSession(ctx, runID, resumed)
+}
+
+// openSession replays the run's journal and begins its root session, with no
+// bootstrap fallback.
+func (workflow *Workflow) openSession(
+	ctx context.Context, runID wire.ConversationID, resumed bool,
+) (workflowJournal, *Session, *SessionLease, error) {
+	journal, err := workflow.replay(ctx, runID, resumed)
+	if err != nil {
+		return workflowJournal{}, nil, nil, err
+	}
+	session := workflow.laser.Sessions().Open(runID, "").As(workflow.source)
+	if resumed {
+		session = session.Resume()
+	}
+	// The lease is held for the life of the run and released when it ends,
+	// so the run's session heartbeats while it is working. A run that stops
+	// without releasing would otherwise look alive until its lease expired.
+	_, lease, err := session.Begin(ctx)
+	if err != nil {
+		return workflowJournal{}, nil, nil, err
+	}
+	return journal, session, lease, nil
+}
+
+// topicsMissing reports whether the stream lacks a topic the run writes.
+func (workflow *Workflow) topicsMissing(ctx context.Context) (bool, error) {
+	stream := workflow.laser.Stream(workflow.laser.defaultStream)
+	for _, topic := range [...]string{wire.AgentSessions, wire.AgentJournal} {
+		exists, err := stream.Topic(topic).Exists(ctx)
+		if err != nil {
+			return false, err
+		}
+		if !exists {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // topologicalWorkflowOrder orders the steps so every step follows its after
@@ -594,6 +804,8 @@ func (workflow *Workflow) runCompensation(
 			From(workflow.source).
 			Payload(payload).
 			Registry(workflow.registry).
+			InboxRoute(workflow.inboxRoute()).
+			ReplyOn(workflow.topic).
 			Conversation(conversation).
 			Parent(runID, runID).
 			Deadline(time.Until(deadlineAt)).
@@ -609,7 +821,15 @@ func (workflow *Workflow) runCompensation(
 // router a step's own targeting would have resolved, for the rollback to
 // address the agent that actually ran the original step rather than
 // whichever one a fresh capability resolution might now pick.
+//
+// It keeps the principal the step's own route required. A rollback is at
+// least as sensitive as the work it undoes, so a step that would only run as
+// an authenticated principal must not be undone by whoever currently holds
+// the agent's name.
 func compensationRoute(router Router, agent wire.AgentID) Router {
+	if principal := router.RequiredPrincipal(); principal != nil {
+		return ToPrincipal(agent, *principal)
+	}
 	return To(agent)
 }
 
@@ -690,6 +910,8 @@ func (workflow *Workflow) runStep(
 		return output, tokens, []wire.AgentID{}, err
 	case step.router.Kind == RouteAllCapable:
 		return workflow.runAllCapable(ctx, runID, step, payload, attempt, deadlineAt)
+	case step.exclusive:
+		return workflow.runExclusive(ctx, runID, step, payload, attempt, started, deadlineAt)
 	default:
 		return workflow.runDirected(ctx, runID, step, payload, attempt, deadlineAt)
 	}
@@ -712,6 +934,12 @@ func (workflow *Workflow) runDirected(
 		From(workflow.source).
 		Payload(payload).
 		Registry(workflow.registry).
+		InboxRoute(workflow.inboxRoute()).
+		// The reply comes back to the workflow's own topic whatever the
+		// command's inbox route was. The journal records this topic's tail
+		// as a step's dispatch point, so a resumed run would scan the wrong
+		// offsets if an advertised inbox moved the answers elsewhere.
+		ReplyOn(workflow.topic).
 		Conversation(dispatch.conversation).
 		Parent(runID, runID).
 		Correlation(dispatch.correlation).

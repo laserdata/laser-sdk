@@ -32,10 +32,14 @@ case "$language" in
     npm test
     ;;
   go)
-    # The Go runner skips rather than passing when it reaches no deployment, so
-    # a run that found no server is visibly a skip and never read as evidence.
+    # Through the same helper as the TypeScript runner, so this honours the
+    # header's promise above: it starts the pinned native server unless
+    # LASER_TEST_IGGY_SERVER or an external endpoint is already configured.
+    # Without it the Go runner reaches no deployment and skips -- visibly, so
+    # a run that found no server is never read as evidence, but it proves
+    # nothing either.
     cd "$repo_root/bdd/go"
-    go test ./... -count=1 -v
+    node "$repo_root/scripts/run-with-test-iggy.mjs" go test ./... -count=1 -v
     ;;
   *)
     echo "no runner for language: $language" >&2

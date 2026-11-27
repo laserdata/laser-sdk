@@ -72,6 +72,15 @@ type AgentRegistry struct {
 	mutex       sync.RWMutex
 	cards       map[wire.AgentID]RegisteredCard
 	quarantined map[wire.AgentID]struct{}
+	// presence is live connection truth, keyed by the agent id each
+	// connection claims, seeded by RefreshPresence. It is deliberately
+	// separate from cards: a card is durable, replayable capability that
+	// outlives a brief disconnect, where presence vanishes with the
+	// connection and answers where to send work right now.
+	presence map[wire.AgentID]presenceEntry
+	// presenceReadAt is when the connection table was last paged, so a
+	// refresh within PresenceTTL reuses what is held.
+	presenceReadAt time.Time
 }
 
 // NewAgentRegistry opens an empty registry.
@@ -79,6 +88,7 @@ func NewAgentRegistry() *AgentRegistry {
 	return &AgentRegistry{
 		cards:       map[wire.AgentID]RegisteredCard{},
 		quarantined: map[wire.AgentID]struct{}{},
+		presence:    map[wire.AgentID]presenceEntry{},
 	}
 }
 

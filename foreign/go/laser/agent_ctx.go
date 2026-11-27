@@ -17,11 +17,18 @@ import (
 type AgentCtx struct {
 	runtime *AgentRuntime
 	message *AgentMessage
+	// approval carries an approval gate's parking both ways: what a replay
+	// resumes the gate with, and what the gate left for the runtime to park
+	// on. nil where the runtime cannot park, which leaves the gate waiting
+	// in place.
+	approval *approvalSlot
 }
 
 // contextFor opens the handler context of one message.
 func (runtime *AgentRuntime) contextFor(message *AgentMessage) *AgentCtx {
-	return &AgentCtx{runtime: runtime, message: message}
+	return &AgentCtx{
+		runtime: runtime, message: message, approval: runtime.approvalSlot(nil),
+	}
 }
 
 // Laser is the connection, for everything the helpers here do not cover.
@@ -102,6 +109,9 @@ func (agent *AgentCtx) respondOn(
 			at := agent.RequestAt()
 			send = send.WithCause(*envelope.Record, &at)
 		}
+		if agent.runtime.signingKey != nil {
+			send = send.Signed(agent.runtime.signingKey)
+		}
 		_, err := send.Send(ctx)
 		return err
 	}
@@ -153,10 +163,16 @@ func (agent *AgentCtx) RespondInput(
 // and sent to nobody but the approver, so it is refused rather than waited
 // past.
 //
-// Waiting in place is the whole of this gate: the Rust client can instead park
-// the work and replay the handler once the decision lands, which frees the
-// consumer for the session's other work. That runtime is not ported, so a gate
-// held open holds its handler open.
+// Under a runtime that can park (RuntimeOptions.EnforceControl, consuming the
+// topic the decision comes back on) the gate does not wait at all: the prompt
+// goes out, the record is parked on the session lane, and the handler is
+// replayed with the decision once it lands or the deadline passes. That frees
+// the consumer for other sessions' work instead of holding it for however
+// long a human takes. The handler then runs again from the top, so everything
+// it did before the gate happens twice and has to be idempotent.
+//
+// Without such a runtime the gate waits in place, which is what it has always
+// done, and a gate held open holds its handler open.
 func (agent *AgentCtx) ApprovalGate(
 	ctx context.Context, approver wire.AgentID, prompt []byte, timeout time.Duration,
 ) (*ApprovalGrant, error) {
@@ -171,6 +187,18 @@ func (agent *AgentCtx) ApprovalGate(
 		timeout = DefaultRequestTimeout
 	}
 	conversation := agent.message.Conversation()
+	// A replay the runtime started with a decision answers from it rather
+	// than prompting a second time for an approval already given.
+	if resume := agent.approval.takeResume(); resume != nil {
+		return resumedGrant(approver, conversation, resume)
+	}
+	// Parking is only possible where this runtime will actually read the
+	// decision: it resumes from a reply on the topic it consumes, so a gate
+	// answered anywhere else has to wait in place or nothing would ever
+	// hand the record back.
+	if agent.approval.parksOn(agent.runtime.topic) {
+		return nil, agent.parkedGate(ctx, approver, prompt, timeout)
+	}
 	interrupt := wire.CorrelationID{ID: wire.IDFromBytes(NewOperationID())}
 	ticket, err := agent.runtime.replies.Subscribe(interrupt, ExpectedReply{
 		Session: conversation, Requester: agent.runtime.identity,
@@ -196,6 +224,84 @@ func (agent *AgentCtx) ApprovalGate(
 	// A refusal is a decision too, and it is not a grant. Turning one into a
 	// grant would let the work the gate exists to hold go ahead on the
 	// strength of the approver having said no.
+	if reply.Envelope.Kind == wire.KindError {
+		return nil, &ApprovalRefusedError{
+			Approver: approver, Reason: refusalReason(reply.Envelope.Body)}
+	}
+	return GrantFrom(approver, conversation, reply)
+}
+
+// parkedGate prompts the approver and defers, leaving the runtime to park the
+// record. It always returns an error: deferring is not a failure, and
+// PolicyDeferredError is how the runtime is told which it is.
+func (agent *AgentCtx) parkedGate(
+	ctx context.Context, approver wire.AgentID, prompt []byte, timeout time.Duration,
+) error {
+	at := agent.RequestAt()
+	// Derived from the handled record, not minted: the process that reads
+	// the decision may not be the one that asked, and it has to be able to
+	// tell which parked record the reply answers from the reply alone.
+	correlation := approvalCorrelation(at)
+	deadline := time.Now().Add(timeout)
+
+	producer := agent.runtime.laser.AgdxOn(agent.runtime.stream,
+		agent.runtime.topic, agent.runtime.identity, agent.message.Conversation())
+	// The status goes first, so a reader of the session's timeline sees it
+	// waiting even if the prompt itself does not land.
+	if _, err := producer.TaskStatus(
+		correlation, wire.TaskInputRequired).Send(ctx); err != nil {
+		return err
+	}
+	receipt, err := producer.Command(correlation, prompt).
+		WithOperation(wire.OperationInputRequest).
+		WithTarget(approver).
+		WithDeadline(deadline).
+		Send(ctx)
+	if err != nil {
+		return err
+	}
+	agent.approval.raise(approvalInterrupt{
+		prompt:         promptPosition(at, receipt),
+		deadlineMicros: uint64(deadline.UnixMicro()),
+	})
+	return &PolicyDeferredError{
+		Reason:   "awaiting the approval of " + approver.String(),
+		Deferrer: DeferredByApproval,
+	}
+}
+
+// promptPosition is where the prompt landed, falling back to the handled
+// record's own placement for whatever the confirmation did not say.
+func promptPosition(at wire.LogPosition, receipt *AgdxReceipt) wire.LogPosition {
+	prompt := wire.LogPosition{
+		StreamID: at.StreamID, TopicID: at.TopicID, PartitionID: at.PartitionID,
+	}
+	if receipt == nil || receipt.Response == nil ||
+		len(receipt.Response.Confirmations) == 0 {
+		return prompt
+	}
+	confirmed := receipt.Response.Confirmations[0]
+	prompt.PartitionID = confirmed.PartitionId
+	prompt.Offset = confirmed.BaseOffset
+	return prompt
+}
+
+// resumedGrant is the answer a replayed gate gives, from what the runtime
+// resumed it with.
+func resumedGrant(
+	approver wire.AgentID, conversation wire.ConversationID, resume *approvalResume,
+) (*ApprovalGrant, error) {
+	if resume.decided == nil {
+		return nil, &ApprovalExpiredError{Approver: approver}
+	}
+	reply := resume.decided
+	if reply.Envelope.Source != approver {
+		return nil, &InvalidError{Reason: "the decision on this approval came " +
+			"from " + reply.Envelope.Source.String() + " rather than from " +
+			approver.String() + ", so it decides nothing"}
+	}
+	// A refusal is a decision too, and it is not a grant, exactly as on the
+	// waiting path.
 	if reply.Envelope.Kind == wire.KindError {
 		return nil, &ApprovalRefusedError{
 			Approver: approver, Reason: refusalReason(reply.Envelope.Body)}

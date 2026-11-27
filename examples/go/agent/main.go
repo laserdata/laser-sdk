@@ -28,12 +28,29 @@ func run(ctx context.Context, client *laser.Laser) error {
 		return err
 	}
 
+	examples.Phase("bootstrap the agent topology")
+	// Sessions.Bootstrap, not the plain Laser.Bootstrap: this example opens a
+	// session, so the stream also needs registering as a session source on a
+	// deployment that indexes them (a no-op, Registered: false, on one that
+	// does not -- plain Apache Iggy here). Skipping that step still creates
+	// working topics, but a managed deployment's own session-index reads
+	// (and its Console) have nothing to serve for a session on a stream that
+	// was never registered.
+	bootstrapped, err := client.Sessions().Bootstrap(ctx, examples.Partitions, laser.ExpireAfter(time.Hour))
+	if err != nil {
+		return fmt.Errorf("bootstrap: %w", err)
+	}
+	fmt.Printf("stream and agent topics ready, registered as a session source: %v\n",
+		bootstrapped.Registered)
+
 	examples.Phase("open a session")
 	session := client.Sessions().Create("nightly-report").As(planner)
 	fmt.Printf("session %s\n", session.Conversation())
-	if _, err := session.Begin(ctx); err != nil {
+	_, lease, err := session.Begin(ctx)
+	if err != nil {
 		return fmt.Errorf("begin: %w", err)
 	}
+	defer lease.Release()
 
 	examples.Phase("the planner asks the executor to do something")
 	agdx := client.Agdx(planner, session.Conversation())

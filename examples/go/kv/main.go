@@ -28,6 +28,13 @@ func run(ctx context.Context, client *laser.Laser) error {
 	if err := examples.RequireManaged(client, "the key-value store"); err != nil {
 		return err
 	}
+
+	examples.Phase("ensure the stream exists")
+	if err := client.Stream(client.DefaultStream()).Ensure(ctx); err != nil {
+		return fmt.Errorf("ensure stream: %w", err)
+	}
+	fmt.Println("stream ready")
+
 	store := client.Kv(namespace)
 
 	examples.Phase("write a value with a lifetime")

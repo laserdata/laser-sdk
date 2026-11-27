@@ -49,7 +49,7 @@ func (server *streamServer) GetStream(
 ) (*iggcon.StreamDetails, error) {
 	server.record("get-stream")
 	if server.streamExists {
-		return &iggcon.StreamDetails{}, nil
+		return laneStream(), nil
 	}
 	return nil, ierror.StreamNameNotFound{}
 }
@@ -492,4 +492,34 @@ func (clusterOfOne) GetClusterMetadata(
 	_ context.Context,
 ) (*iggcon.ClusterMetadata, error) {
 	return &iggcon.ClusterMetadata{Nodes: []iggcon.ClusterNode{{ReplicaID: 0}}}, nil
+}
+
+// GetStream answers with one healthy, unchanging session lane.
+//
+// Session writes check the lane's identity before every send, so a fake that
+// cannot answer this refuses them all. The values are fixed rather than
+// generated: an identity that changed between two reads is exactly what the
+// guard refuses, so a fake that answered differently each time would fail
+// every session test for a reason that has nothing to do with the test. A
+// fake with its own GetStream overrides this one.
+func (clusterOfOne) GetStream(
+	_ context.Context, _ iggcon.Identifier,
+) (*iggcon.StreamDetails, error) {
+	return laneStream(), nil
+}
+
+// laneStream is one healthy, unchanging session lane, for any fake that has
+// to answer the lane-identity check a session write makes.
+//
+// The values are fixed rather than generated: an identity that differed
+// between two reads is exactly what the guard refuses, so a fake answering
+// differently each time would fail every session test for a reason that has
+// nothing to do with the test.
+func laneStream() *iggcon.StreamDetails {
+	return &iggcon.StreamDetails{
+		Stream: iggcon.Stream{Id: 1, Name: "agents", CreatedAt: 1},
+		Topics: []iggcon.Topic{{
+			Id: 1, Name: wire.AgentSessions, CreatedAt: 1, PartitionsCount: 1,
+		}},
+	}
 }

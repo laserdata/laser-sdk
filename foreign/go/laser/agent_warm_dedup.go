@@ -142,7 +142,7 @@ func (runtime *AgentRuntime) warmDedupWindow(ctx context.Context) error {
 				break
 			}
 			for _, message := range messages {
-				if seed, ok := decodeWarmSeed(message, partition, runtime.identity); ok {
+				if seed, ok := decodeWarmSeed(message, partition, runtime.identity, runtime.verifier); ok {
 					seeds = append(seeds, seed)
 				}
 			}
@@ -163,7 +163,7 @@ func (runtime *AgentRuntime) warmDedupWindow(ctx context.Context) error {
 
 	var expired map[warmDedupPosition]struct{}
 	if runtime.warmDedupPolicy == WarmDedupDeadLetters && oldestWithDeadline != nil &&
-		runtime.source.StreamID != 0 && runtime.source.TopicID != 0 {
+		runtime.sourceResolved {
 		since := oldestWithDeadline.Add(-deadLetterClockMargin)
 		// A scan that could not be trusted (too many to bound, retention
 		// already past since, or a transport failure) leaves expired nil:
@@ -225,11 +225,14 @@ func warmDrainRange(
 }
 
 // decodeWarmSeed decodes message into a warmDedupSeed, when it carries a
-// usable dedup key and is not addressed to an agent other than identity. A
-// record with no usable key (no spine, or no idempotency key) is left out:
-// there is nothing for it to refill.
+// usable dedup key, is not addressed to an agent other than identity, and (if
+// verifier is set) verifies. A record with no usable key (no spine, or no
+// idempotency key) is left out: there is nothing for it to refill. A verifier
+// configured but not satisfied also leaves it out, the same as the main
+// dispatch gate: a record that would be dead-lettered on delivery must not
+// quietly refill the window as if it had been handled.
 func decodeWarmSeed(
-	message iggcon.IggyMessage, partition uint32, identity wire.AgentID,
+	message iggcon.IggyMessage, partition uint32, identity wire.AgentID, verifier *KeyRegistry,
 ) (warmDedupSeed, bool) {
 	record, err := OpenRecord(message)
 	if err != nil || record.Provenance == nil {
@@ -237,6 +240,9 @@ func decodeWarmSeed(
 	}
 	if target := record.Provenance.TargetAgent; target != nil && !identity.IsZero() &&
 		*target != identity {
+		return warmDedupSeed{}, false
+	}
+	if !warmSeedVerified(record, verifier) {
 		return warmDedupSeed{}, false
 	}
 	key := DedupKey(record.Provenance)
@@ -250,6 +256,31 @@ func decodeWarmSeed(
 		appendedAt: time.UnixMicro(int64(message.Header.Timestamp)),
 		deadline:   record.Provenance.DeadlineAt,
 	}, true
+}
+
+// warmSeedVerified reports whether record passes verifier, true when no
+// verifier is configured at all. A record with no agent envelope (a plain
+// send), or whose envelope no longer decodes, fails a configured verifier:
+// there is nothing for it to verify, and the main dispatch gate would
+// dead-letter it on delivery for the same reason.
+func warmSeedVerified(record *Record, verifier *KeyRegistry) bool {
+	if verifier == nil {
+		return true
+	}
+	stamp, err := envelopeStamp(record)
+	if err != nil || !stamp.present {
+		return false
+	}
+	var envelope wire.AgentEnvelope
+	if err := wire.Unmarshal(record.Payload(), &envelope); err != nil {
+		return false
+	}
+	observed := wire.SignatureContext{AgentVersion: &stamp.version}
+	if code, named := stamp.contentType.Code(); named {
+		observed.ContentType = &code
+	}
+	_, err = verifier.VerifyObservedAt(envelope, observed, record.Message.Header.Timestamp)
+	return err == nil
 }
 
 // expiredDeadLetters finds the position of every copy this runtime's topic's

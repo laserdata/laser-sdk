@@ -188,9 +188,11 @@ func callManaged(ctx context.Context, state *world, surface string) error {
 	case "session read":
 		_, state.failure = client.Sessions().Get(ctx, laser.NewConversationID())
 	case "lease acquisition":
-		return blocked("the Go client has no managed key-value lease: " +
-			"Laser.Leases is the session lease registry, and there is no " +
-			"Kv lease acquire to refuse")
+		// Kv.Lease is the managed lease acquire. This step was plan-skipped
+		// for want of it, and stayed skipped after it shipped: the claim
+		// was checked again and is no longer true.
+		_, state.failure = client.Kv("locks").
+			Lease(ctx, []byte("a-key"), "holder", time.Minute)
 	case "batch":
 		return blocked("the Go client has no managed batch surface: " +
 			"Topic.Batch is a plain multi-record publish, not the batch command")
@@ -207,10 +209,12 @@ func unifiedCode(state *world) error {
 	}
 	var carrier coded
 	if !errors.As(state.failure, &carrier) {
-		return blocked("the Go client projects no unified result code onto an " +
-			"unsupported refusal: ResultCode() is defined on CommandFailure, " +
-			"EdgeDenial, FilterError and SessionError only, so there is no way " +
-			"to ask UnsupportedError for its code")
+		// UnsupportedError, CommandFailure, EdgeDenial, FilterError,
+		// SessionError and StaleLaneError all answer a code. A refusal that
+		// answers none is a gap in whichever error type this surface
+		// raised, named here rather than passed over.
+		return blocked(fmt.Sprintf("this refusal projects no unified result "+
+			"code: %T has no ResultCode method", state.failure))
 	}
 	if got := carrier.ResultCode(); got != wire.ResultUnsupported {
 		return fmt.Errorf("want the unsupported code, got %v", got)

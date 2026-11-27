@@ -22,6 +22,18 @@ type Agdx struct {
 	conversation wire.ConversationID
 	parent       *wire.ConversationID
 	root         *wire.ConversationID
+	// lane, when set, pins the session lane these records ride. A session
+	// hands its own guard down so every lifecycle and state write it makes
+	// is checked; a plain Agdx opened off Laser has none and is unguarded,
+	// which is what the agent messaging surface has always been.
+	lane *laneGuard
+}
+
+// withLaneGuard pins this builder's sends to one session lane incarnation.
+func (agdx *Agdx) withLaneGuard(guard *laneGuard) *Agdx {
+	copied := *agdx
+	copied.lane = guard
+	return &copied
 }
 
 // Agdx opens the agent messaging surface for one conversation, authored by one
@@ -481,6 +493,21 @@ func (send *AgdxSend) Send(ctx context.Context) (*AgdxReceipt, error) {
 		layout, name, send.envelope.Kind, send.envelope.Target); moved != "" {
 		name = moved
 	}
+	// The lane this record would ride has to still be the one this handle
+	// was pinned to. Checked here, at the send, rather than when the handle
+	// was built: a retained handle's lane can be replaced at any point in
+	// between, and the write is the first moment it matters.
+	//
+	// Only for a record that actually rides the lane. A per-agent topic
+	// destination is addressed work that was moved off it, and is no more
+	// the session lane than any other topic.
+	if send.agdx.lane != nil && name == send.agdx.topic {
+		if _, err := send.agdx.lane.check(ctx, send.agdx.laser,
+			send.agdx.stream, send.agdx.topic,
+			send.envelope.Conversation); err != nil {
+			return nil, err
+		}
+	}
 	topic := send.agdx.laser.Stream(send.agdx.stream).Topic(name)
 	var response *iggcon.SendMessagesResponse
 	if partition, declared := declaredPartition(
@@ -608,6 +635,12 @@ func mergeHeaders(block, spine []iggcon.HeaderEntry) []iggcon.HeaderEntry {
 type AgdxMessage struct {
 	Envelope wire.AgentEnvelope
 	Record   *Record
+	// VerifiedPrincipal is the enrolled principal this message's signature
+	// verified as, set only when a ReplyHub (or a Contract) was armed with a
+	// KeyRegistry and the reply held up against it. Nil means either no
+	// verifier was configured or (impossible to reach a waiter without one)
+	// the message was refused.
+	VerifiedPrincipal *string
 }
 
 // OpenAgdx reads an agent envelope off a record.

@@ -184,6 +184,7 @@ func (sessions *Sessions) Open(conversation wire.ConversationID, label string) *
 		label:        label,
 		state:        &stateCursor{},
 		terminal:     &terminalLatch{},
+		lane:         sessions.lane,
 	}
 }
 
@@ -214,6 +215,11 @@ type Session struct {
 	// fresh marks a session whose conversation was minted here, which cannot
 	// already have ended.
 	fresh bool
+	// lane pins the lane incarnation this handle writes to, shared with the
+	// Sessions it came from and with every handle derived from it. A handle
+	// retained across a recreated stream or topic refuses its writes rather
+	// than appending to the replacement.
+	lane *laneGuard
 	// resume lets Begin reopen a session that ended, which it otherwise
 	// refuses.
 	resume bool
@@ -421,6 +427,9 @@ func (session *Session) Agdx() (*Agdx, error) {
 	if session.parent != nil {
 		agdx = agdx.WithAncestry(*session.parent, *session.root)
 	}
+	if session.lane != nil {
+		agdx = agdx.withLaneGuard(session.lane)
+	}
 	return agdx, nil
 }
 
@@ -461,17 +470,27 @@ func (session *Session) Resume() *Session {
 	return &resumed
 }
 
-// Begin writes the session's start record, opening it on the log.
+// Begin writes the session's start record, opening it on the log, and takes
+// a lease that keeps the session listed in this process's heartbeat --
+// Release it (or defer it) when the process stops working on the session.
+// Rust's `begin()`/`resume()` return `(Session, SessionLease)` together for
+// the same reason: heartbeats do not "just work" unless a lease is taken,
+// and the session that was just begun is the one call site that always wants
+// one.
+//
+// A lease failure after a successful start is reported as the error, but the
+// receipt is still returned: the session did begin, and a caller that wants
+// the lease anyway can take one itself with Laser.LeaseSession.
 //
 // The ancestry a session carries is the envelope's, so a sub-session records
 // the exchange it was spawned from and a reader can walk the tree.
-func (session *Session) Begin(ctx context.Context) (*AgdxReceipt, error) {
+func (session *Session) Begin(ctx context.Context) (*AgdxReceipt, *SessionLease, error) {
 	agdx, err := session.Agdx()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := session.beginnable(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	start := wire.SessionStart{
 		Agent: *session.agent,
@@ -489,7 +508,21 @@ func (session *Session) Begin(ctx context.Context) (*AgdxReceipt, error) {
 		micros := uint64(session.config.IdleTimeout.Microseconds())
 		start.IdleTimeoutMicros = &micros
 	}
-	return agdx.SessionStarted(start).Send(ctx)
+	receipt, err := agdx.SessionStarted(start).Send(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	// One deliberate simplification versus Rust: Rust derives the lease's
+	// heartbeat interval from config.heartbeat.min(idle_timeout / 5); Go's
+	// SessionConfig has no heartbeat field to derive from, so this takes
+	// LeaseSession's own existing default (passing 0) rather than inventing
+	// new config surface for one call site -- the same simplification
+	// AgentRuntime.pickUpSubmitted's own lease call already makes.
+	lease, err := session.laser.LeaseSession(ctx, session.conversation, *session.agent, 0)
+	if err != nil {
+		return receipt, nil, err
+	}
+	return receipt, lease, nil
 }
 
 // Progress records the session moving along.

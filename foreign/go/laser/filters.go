@@ -45,10 +45,16 @@ func (filters *Filters) execute(
 	if !filters.laser.capabilities.Filters.Native {
 		return nil, &UnsupportedError{Surface: "server-side consumer filters"}
 	}
-	if err := filters.laser.requireOpVersion("consumer filters", wire.FilterOpVersion,
-		func(versions wire.OpVersions) uint32 { return versions.Filter }); err != nil {
-		return nil, err
-	}
+	// Native filtering is gated on the native capability alone, as Rust's
+	// own native path is (sdk/src/filters/client.rs). It used to also
+	// require the *catalog's* op version here, which is a different
+	// surface: OpVersions.Filter describes the saved-filter catalog, and
+	// the contract says zero there means saved filters and group bindings
+	// are not served -- it says nothing about native filtering. So a
+	// deployment that serves native filters without a catalog had this
+	// client advertise Filters.Native and then refuse every filtered poll
+	// with "served at op version 0, but this client speaks 1". The catalog
+	// keeps that requirement where it belongs, in FilterCatalog.execute.
 	if filters.source.Stream == "" {
 		return nil, errNoStream()
 	}

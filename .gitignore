@@ -19,6 +19,12 @@ __pycache__/
 *.so
 foreign/python/dist/
 
+# Go examples. `go build ./...` in examples/go drops a binary beside each
+# main package, named after its directory, and they are ~12MB each.
+examples/go/agent/agent
+examples/go/kv/kv
+examples/go/memory/memory
+
 # TypeScript SDK, BDD runner, and examples
 foreign/typescript/node_modules/
 foreign/typescript/dist/

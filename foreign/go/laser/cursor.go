@@ -84,6 +84,67 @@ func (cursor *Cursor) Offsets() []uint64 {
 	return append([]uint64(nil), cursor.offsets...)
 }
 
+// SeekToWindow anchors this cursor's starting offset, per partition, to the
+// newest window records of the topic's current tail rather than the head --
+// so a bounded Poll immediately after reads the most recent history, not the
+// oldest window of a long-lived topic.
+//
+// Ported from Rust's tail_anchored_offset (sdk/src/poll.rs:118-142), which
+// context assembly uses so a reader wanting the latest records (context
+// assembly, a LastN policy) is never handed the oldest MaxDrainRecords of a
+// partition and left to filter those -- that would return the wrong records
+// entirely once a partition outgrows the window. Never widens a starting
+// offset the caller already set with FromOffsets, only narrows it toward the
+// tail when the window would start later than that.
+func (cursor *Cursor) SeekToWindow(ctx context.Context, window uint64) error {
+	client, err := cursor.topic.laser.connected()
+	if err != nil {
+		return err
+	}
+	streamID, topicID, err := cursor.topic.identifiers()
+	if err != nil {
+		return err
+	}
+	details, err := client.GetTopic(ctx, streamID, topicID)
+	if err != nil {
+		if isMissingResource(err) {
+			return nil
+		}
+		return &TransportError{Reason: "read the topic", Cause: err}
+	}
+	if details == nil {
+		return nil
+	}
+	partitions := boundedPartitions(details.PartitionsCount)
+	for uint32(len(cursor.offsets)) < partitions {
+		cursor.offsets = append(cursor.offsets, 0)
+	}
+	options := iggcon.DefaultPollOptions()
+	options.Count = 1
+	for partition := uint32(0); partition < partitions; partition++ {
+		polled, err := client.PollMessages(ctx, streamID, topicID, partition,
+			cursor.consumer, iggcon.LastPollingStrategy(), options)
+		if err != nil {
+			if isMissingResource(err) {
+				continue
+			}
+			return &TransportError{Reason: "read the partition tail", Cause: err}
+		}
+		if polled == nil || len(polled.Messages) == 0 {
+			continue
+		}
+		tail := polled.Messages[len(polled.Messages)-1].Header.Offset
+		windowStart := uint64(0)
+		if tail+1 > window {
+			windowStart = tail + 1 - window
+		}
+		if windowStart > cursor.offsets[partition] {
+			cursor.offsets[partition] = windowStart
+		}
+	}
+	return nil
+}
+
 // Poll drains everything appended since the last poll and advances the cursor.
 //
 // Records come back ordered by the server's own timestamp, then partition and

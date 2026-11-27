@@ -29,7 +29,7 @@ func (server *controlServer) Close() error { return nil }
 func (server *controlServer) GetStream(
 	_ context.Context, _ iggcon.Identifier,
 ) (*iggcon.StreamDetails, error) {
-	return &iggcon.StreamDetails{}, nil
+	return laneStream(), nil
 }
 
 func (server *controlServer) GetTopic(
@@ -43,7 +43,7 @@ func (server *controlServer) GetTopic(
 
 func (server *controlServer) PollMessages(
 	_ context.Context, _, topicID iggcon.Identifier, _ uint32,
-	_ iggcon.Consumer, _ iggcon.PollingStrategy, _ iggcon.PollOptions,
+	_ iggcon.Consumer, strategy iggcon.PollingStrategy, _ iggcon.PollOptions,
 ) (*iggcon.PolledMessage, error) {
 	name, err := topicID.String()
 	if err != nil {
@@ -51,6 +51,20 @@ func (server *controlServer) PollMessages(
 	}
 	server.mutex.Lock()
 	defer server.mutex.Unlock()
+	// A tail peek (SeekToWindow's own poll, ahead of the real drain) must not
+	// consume what it only looked at: every other strategy here is the
+	// one-shot "dump the lane and clear it" read this fake has always been,
+	// which a second, real peek immediately after would otherwise starve.
+	if strategy.Kind == iggcon.POLLING_LAST {
+		held := server.declared[name]
+		if held == nil {
+			held = server.lane
+		}
+		if len(held) == 0 {
+			return &iggcon.PolledMessage{}, nil
+		}
+		return &iggcon.PolledMessage{Messages: held[len(held)-1:]}, nil
+	}
 	if held, moved := server.declared[name]; moved {
 		server.declared[name] = nil
 		return &iggcon.PolledMessage{Messages: held}, nil

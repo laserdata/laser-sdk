@@ -24,6 +24,12 @@ type ExpectedReply struct {
 	Requester wire.AgentID
 	// Command is the record the reply must answer, when the waiter knows it.
 	Command *wire.RecordID
+	// ExpectedSigner is the principal the reply must verify as, checked only
+	// when the hub holding this expectation has a KeyRegistry configured.
+	// Empty accepts a reply from any principal the registry verifies, which
+	// is what a non-directed (capability or group) request has no better
+	// answer for.
+	ExpectedSigner string
 }
 
 // Accepts reports whether a message answers this request.
@@ -79,8 +85,9 @@ func (expected ExpectedReply) Acknowledges(message *AgdxMessage) bool {
 // One hub reads a reply topic once for every waiter, so a hundred concurrent
 // requests share one read rather than each scanning the topic.
 type ReplyHub struct {
-	mutex   sync.Mutex
-	waiters map[wire.CorrelationID]*replyWaiter
+	mutex    sync.Mutex
+	waiters  map[wire.CorrelationID]*replyWaiter
+	verifier *KeyRegistry
 }
 
 type replyWaiter struct {
@@ -96,7 +103,31 @@ type replyWaiter struct {
 
 // NewReplyHub opens a hub with nobody waiting.
 func NewReplyHub() *ReplyHub {
-	return &ReplyHub{waiters: map[wire.CorrelationID]*replyWaiter{}}
+	return NewVerifiedReplyHub(nil)
+}
+
+// NewVerifiedReplyHub opens a hub that requires every reply it delivers to
+// verify against verifier before it can resolve a wait.
+//
+// With a verifier set, Deliver silently drops an unsigned, unverifiable, or
+// wrong-signer reply instead of resolving a correlated wait with it: per the
+// AGDX contract, an absent principal on an accepted outcome means no verifier
+// was configured, never a failed check that was let through anyway. A nil
+// verifier is the same as NewReplyHub: no gate at all.
+func NewVerifiedReplyHub(verifier *KeyRegistry) *ReplyHub {
+	return &ReplyHub{waiters: map[wire.CorrelationID]*replyWaiter{}, verifier: verifier}
+}
+
+// SetVerifier arms (or disarms, with nil) this hub's reply verification.
+//
+// Meant to be called before the hub starts serving concurrent requests: it
+// takes the same lock Deliver and Subscribe do, but changing the gate out
+// from under requests already in flight is not a scenario this hub tries to
+// make safe in any stronger sense than "no data race."
+func (hub *ReplyHub) SetVerifier(verifier *KeyRegistry) {
+	hub.mutex.Lock()
+	defer hub.mutex.Unlock()
+	hub.verifier = verifier
 }
 
 // Ticket is one registered wait.
@@ -144,12 +175,26 @@ func (hub *ReplyHub) Deliver(message *AgdxMessage) bool {
 	hub.mutex.Lock()
 	waiter, waiting := hub.waiters[*message.Envelope.Correlation]
 	var expected ExpectedReply
+	verifier := hub.verifier
 	if waiting {
 		expected = waiter.expected
 	}
 	hub.mutex.Unlock()
 	if !waiting {
 		return false
+	}
+
+	// Verification gates everything this message could be, acknowledgment or
+	// answer alike, before either is considered: a forged acknowledgment is as
+	// much a forgery as a forged answer. A message that fails is left alone,
+	// the same as one nobody is waiting for -- the waiter's deadline is what
+	// ends the wait, not an error a forger gets to trigger.
+	if verifier != nil {
+		principal, ok := verifyReplySignature(verifier, message)
+		if !ok || (expected.ExpectedSigner != "" && principal != expected.ExpectedSigner) {
+			return false
+		}
+		message.VerifiedPrincipal = &principal
 	}
 
 	if expected.Acknowledges(message) {
@@ -256,3 +301,27 @@ func (e *TimeoutError) Error() string {
 // Timeout marks this as a deadline rather than a fault, so a caller can retry
 // on it without matching the type.
 func (e *TimeoutError) Timeout() bool { return true }
+
+// verifyReplySignature checks message against verifier, the same way
+// AgentRuntime.verifySignature checks incoming work, but for a reply a caller
+// is waiting on: no replay window, since a hub resolves at most one waiter
+// per correlation and discards the rest on its own.
+func verifyReplySignature(verifier *KeyRegistry, message *AgdxMessage) (string, bool) {
+	if message.Record == nil {
+		return "", false
+	}
+	stamp, err := envelopeStamp(message.Record)
+	if err != nil || !stamp.present {
+		return "", false
+	}
+	observed := wire.SignatureContext{AgentVersion: &stamp.version}
+	if code, named := stamp.contentType.Code(); named {
+		observed.ContentType = &code
+	}
+	verified, err := verifier.VerifyObservedAt(
+		message.Envelope, observed, message.Record.Message.Header.Timestamp)
+	if err != nil {
+		return "", false
+	}
+	return verified.Principal, true
+}

@@ -2,6 +2,7 @@ package bdd_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	bdd "github.com/laserdata/laser-sdk/bdd/go"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
+	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
 // TestGivenTheSharedDefaultScenariosWhenRunThenShouldHold runs the defaults
@@ -50,11 +52,17 @@ func defaultsStep(ctx context.Context, state *world, step bdd.Step) error {
 	case text == "the error names the call that sets a default stream":
 		return namesDefaultStreamCall(state)
 
-	case strings.HasPrefix(text, "the workflow "),
-		text == "the error names the agent capabilities and the fixed inbox route":
-		return blocked("the Go client has no workflow engine: there is no " +
-			"Workflow type and no journal, so a workflow step has nothing to " +
-			"run and no error to name the two fixes")
+	case strings.HasPrefix(text, "the workflow "):
+		// Plan-skipped once for want of a workflow engine. That claim was
+		// checked again and is no longer true: laser.Workflow, the journal
+		// and the advertised inbox route all exist now.
+		if len(arguments) != 3 {
+			return fmt.Errorf("want a run, a step and an agent, got %v", arguments)
+		}
+		return runStepWithoutInbox(ctx, state, arguments[0], arguments[1], arguments[2])
+
+	case text == "the error names the agent capabilities and the fixed inbox route":
+		return namesBothInboxFixes(state)
 
 	default:
 		return fmt.Errorf("this runner does not implement the step")
@@ -114,6 +122,59 @@ func namesDefaultStreamCall(state *world) error {
 	for _, named := range []string{"DefaultStream", "Stream(name).Topic(name)"} {
 		if !strings.Contains(reason, named) {
 			return fmt.Errorf("want the error to name %q, got %q", named, reason)
+		}
+	}
+	return nil
+}
+
+// runStepWithoutInbox runs a one-step workflow addressed to an agent nobody
+// started, through the advertised inbox route, and keeps the refusal.
+//
+// The advertised route is the point: it resolves an agent's inbox from the
+// capabilities that agent advertised, and an agent that never ran advertised
+// none, so there is nowhere to address the step.
+func runStepWithoutInbox(
+	ctx context.Context, state *world, run, step, target string,
+) error {
+	source, err := bridgeAgent("planner")
+	if err != nil {
+		return err
+	}
+	absent, err := bridgeAgent(target)
+	if err != nil {
+		return err
+	}
+	workflow := state.client.
+		Workflow(source, wire.AgentSessions).
+		InboxRoute(laser.AdvertisedInbox())
+	workflow.Step(step, laser.To(absent),
+		func(ctx context.Context, outputs map[string][]byte) ([]byte, error) {
+			return []byte(run), nil
+		})
+	_, state.failure = workflow.Run(ctx)
+	if state.failure == nil {
+		return fmt.Errorf("want a step to an agent with no inbox refused, it ran")
+	}
+	return nil
+}
+
+// namesBothInboxFixes asserts the refusal points at both ways out, rather
+// than only saying the inbox is missing.
+func namesBothInboxFixes(state *world) error {
+	if state.failure == nil {
+		return fmt.Errorf("no call failed")
+	}
+	var missing *laser.NoInboxError
+	if !errors.As(state.failure, &missing) {
+		return fmt.Errorf("want a no-inbox refusal, got %T: %v",
+			state.failure, state.failure)
+	}
+	said := missing.Error()
+	// Both fixes: advertise an inbox by starting the agent with
+	// capabilities, or name a fixed one on the route.
+	for _, fix := range []string{"capabilities", "FixedInbox"} {
+		if !strings.Contains(said, fix) {
+			return fmt.Errorf("want the refusal to name %q, got %q", fix, said)
 		}
 	}
 	return nil

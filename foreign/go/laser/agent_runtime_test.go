@@ -36,6 +36,43 @@ type runtimeServer struct {
 	// restart's refill would read back, independent of sent, which only
 	// tracks what this runtime itself published.
 	history map[string]*warmHistory
+	// createdAt is the topic generation GetTopic reports.
+	createdAt uint64
+	// streamID and topicID are the numeric ids the server reports. They
+	// default to 7 and 3, and a test sets them to 0 to stand for the first
+	// stream and topic a real deployment creates, whose ids are genuinely
+	// zero.
+	streamID uint32
+	topicID  uint32
+	// numeric maps a topic's numeric id back to its name, so a read that
+	// addresses a topic by id (which is what a source reference carries)
+	// finds the history seeded under its name. A real server resolves both
+	// forms; this fake keys everything by name.
+	numeric map[uint32]string
+}
+
+// aliasNumeric makes reads addressed to topic id resolve to topic's history.
+func (server *runtimeServer) aliasNumeric(id uint32, topic string) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	if server.numeric == nil {
+		server.numeric = map[uint32]string{}
+	}
+	server.numeric[id] = topic
+}
+
+// topicNameOf resolves either identifier form to the name history is under.
+func (server *runtimeServer) topicNameOf(topicID iggcon.Identifier) string {
+	if name, err := topicID.String(); err == nil {
+		return name
+	}
+	id, err := topicID.Uint32()
+	if err != nil {
+		return ""
+	}
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	return server.numeric[id]
 }
 
 // warmHistory is one topic's per-partition records and the consumer group's
@@ -46,7 +83,9 @@ type warmHistory struct {
 }
 
 func newRuntimeServer() *runtimeServer {
-	return &runtimeServer{sent: map[string][]iggcon.IggyMessage{}}
+	return &runtimeServer{
+		sent: map[string][]iggcon.IggyMessage{}, streamID: 7, topicID: 3,
+	}
 }
 
 func (server *runtimeServer) Close() error { return nil }
@@ -54,8 +93,10 @@ func (server *runtimeServer) Close() error { return nil }
 func (server *runtimeServer) GetStream(
 	_ context.Context, _ iggcon.Identifier,
 ) (*iggcon.StreamDetails, error) {
-	details := &iggcon.StreamDetails{}
-	details.Id = 7
+	details := laneStream()
+	server.mutex.Lock()
+	details.Id = server.streamID
+	server.mutex.Unlock()
 	return details, nil
 }
 
@@ -63,9 +104,13 @@ func (server *runtimeServer) GetTopic(
 	_ context.Context, _, _ iggcon.Identifier,
 ) (*iggcon.TopicDetails, error) {
 	details := &iggcon.TopicDetails{}
-	details.Id = 3
 	server.mutex.Lock()
+	details.Id = server.topicID
 	details.PartitionsCount = server.partitions
+	// The topic's generation, which a source reference records so a record
+	// cannot be read back out of a topic that was recreated since. Zero for
+	// every test that does not care.
+	details.CreatedAt = server.createdAt
 	server.mutex.Unlock()
 	return details, nil
 }
@@ -111,7 +156,7 @@ func (server *runtimeServer) PollMessages(
 	_ context.Context, _, topicID iggcon.Identifier, partition uint32,
 	_ iggcon.Consumer, strategy iggcon.PollingStrategy, options iggcon.PollOptions,
 ) (*iggcon.PolledMessage, error) {
-	name, _ := topicID.String()
+	name := server.topicNameOf(topicID)
 	server.mutex.Lock()
 	defer server.mutex.Unlock()
 	entry := server.history[name]
@@ -198,6 +243,11 @@ type queuedSource struct {
 	commitErr error
 	drained   chan struct{}
 	once      sync.Once
+	// beforeNext runs before each record is handed over, with the index of
+	// the record about to be read. It is how a test makes something happen
+	// between two records -- an operator's resume landing mid-run, say --
+	// without racing the loop. Nil for every test that needs no such hook.
+	beforeNext func(index int)
 }
 
 func sourceOf(records ...*laser.Record) *queuedSource {
@@ -212,8 +262,13 @@ func (source *queuedSource) Next(ctx context.Context) (*laser.Record, error) {
 	source.mutex.Lock()
 	if source.index < len(source.steps) {
 		next := source.steps[source.index]
+		at := source.index
 		source.index++
+		hook := source.beforeNext
 		source.mutex.Unlock()
+		if hook != nil {
+			hook(at)
+		}
 		return next.record, next.err
 	}
 	source.mutex.Unlock()

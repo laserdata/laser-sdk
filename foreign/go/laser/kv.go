@@ -127,6 +127,36 @@ func (kv *Kv) GetEntry(ctx context.Context, key []byte) (*wire.KvEntry, error) {
 	return outcome.Entry, nil
 }
 
+// GetEntryAtLeast reads the entry at key once the store has applied at least
+// position, rather than reading whatever the serving replica holds now.
+//
+// This is what makes a handover safe. A lease grant carries the position its
+// own write reached, so the next holder reading at that position sees the
+// previous holder's work instead of racing it: a plain Get can land on a
+// replica that has not applied it yet and answer "absent" for a key that was
+// certainly written. Ported from Rust's Kv::get_entry_at_least; the wire has
+// carried the bound (KvGet.MinPosition) all along.
+//
+// nil when the key is absent or expired, as with GetEntry.
+func (kv *Kv) GetEntryAtLeast(
+	ctx context.Context, key []byte, position wire.MutationPosition,
+) (*wire.KvEntry, error) {
+	if err := validatedKey(key); err != nil {
+		return nil, err
+	}
+	outcome, err := kv.execute(ctx, wire.AgdxKvGetCode, wire.KvGet{
+		V: wire.KvOpVersion, Namespace: kv.ResourceNamespace(), Key: key,
+		MinPosition: &position,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if outcome.Kind != wire.KvValue {
+		return nil, unexpectedKvOutcome("get", outcome.Kind)
+	}
+	return outcome.Entry, nil
+}
+
 // Revalidation is the answer to a conditional read.
 type Revalidation struct {
 	// NotModified is true when the live version still matched, so the body was

@@ -30,7 +30,7 @@ func TestGivenAnEndedSessionWhenBegunAgainThenShouldRefuseIt(t *testing.T) {
 	session := endedSession(t, server, wire.TaskCompleted)
 	before := server.written()
 
-	_, err := session.Begin(context.Background())
+	_, _, err := session.Begin(context.Background())
 	var ended *laser.SessionEndedError
 	if !errors.As(err, &ended) {
 		t.Fatalf("want a SessionEndedError, got %T: %v", err, err)
@@ -50,7 +50,7 @@ func TestGivenAnEndedSessionWhenResumedThenShouldBeginAgain(t *testing.T) {
 	session := endedSession(t, server, wire.TaskCompleted)
 	before := server.written()
 
-	if _, err := session.Resume().Begin(context.Background()); err != nil {
+	if _, _, err := session.Resume().Begin(context.Background()); err != nil {
 		t.Fatalf("a completed session resumes on request: %v", err)
 	}
 	if server.written() != before+1 {
@@ -63,7 +63,7 @@ func TestGivenACanceledSessionWhenResumedThenShouldStillRefuseIt(t *testing.T) {
 	server := &stateServer{}
 	session := endedSession(t, server, wire.TaskCanceled)
 
-	_, err := session.Resume().Begin(context.Background())
+	_, _, err := session.Resume().Begin(context.Background())
 	var ended *laser.SessionEndedError
 	if !errors.As(err, &ended) {
 		t.Fatalf("want a SessionEndedError, got %T: %v", err, err)
@@ -80,7 +80,7 @@ func TestGivenAFreshSessionWhenBegunThenShouldNotReadTheLane(t *testing.T) {
 	sessions := submitSessions(t, server)
 	session := sessions.Start().As(agentID(t, "planner"))
 
-	if _, err := session.Begin(context.Background()); err != nil {
+	if _, _, err := session.Begin(context.Background()); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// A conversation minted here cannot have ended, so paying for a lane read

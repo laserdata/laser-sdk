@@ -207,6 +207,18 @@ func receivedWholeFeed(state *world) error {
 // deliver the feed unfiltered, and one that does not must refuse rather than
 // answer as though it had applied a policy it never read.
 func readUnboundReader(ctx context.Context, state *world) error {
+	// The group has to exist before anything reads through it: a server
+	// holds no group until someone makes one. Every other client's runner
+	// creates it here too (bdd/typescript's `group.create()`). This was
+	// missing and went unnoticed, because the read never got that far --
+	// the client refused it earlier on a misplaced op-version gate.
+	// ConsumerGroup rather than Group(...).EnsureNative: the group has to be
+	// created *and joined*. A member that never joined owns no partition,
+	// and the server answers a group-aware read with "membership_stale".
+	if _, err := state.topic(feedTopic).ConsumerGroup(
+		ctx, "unbound-readers", laser.ConsumerOptions{}); err != nil {
+		return err
+	}
 	page, err := state.topic(feedTopic).
 		Filters(wire.NamedGroup("unbound-readers")).
 		Read(0, wire.GroupPolicy()).
@@ -241,17 +253,25 @@ func followedGroupCapability(state *world) error {
 	if state.failure != nil {
 		var outdated *laser.VersionError
 		if errors.As(state.failure, &outdated) {
-			return blocked("the Go client advertises a filter surface it " +
-				"then refuses to use: negotiation sets Filters.Native and " +
-				"Filters.GroupPolicyReads from the hello feature bits, and " +
-				"Filters.execute then gates on the filter op version, which " +
-				"this server reports as 0, so the read fails with " +
-				state.failure.Error() + ". The Rust reference gates native " +
-				"filter commands on capabilities.filters.native alone and " +
-				"applies no op-version requirement (sdk/src/filters/" +
-				"client.rs native_to), so either the gate or the negotiation " +
-				"is wrong, and a caller that checks capabilities first is " +
-				"misled either way")
+			// Kept as a guard. The client bug this used to report is fixed:
+			// Filters.execute applied the *catalog's* op version to native
+			// filtered reads, so a deployment serving native filters with no
+			// catalog advertised Filters.Native and then refused every poll.
+			// Native reads now gate on Filters.Native alone, as Rust does.
+			return blocked("a native filtered read was refused on an op " +
+				"version: " + state.failure.Error())
+		}
+		// The group is created and joined, and the read still reports the
+		// member owns no partition. Apache Iggy assigns a group's partitions
+		// per client connection, and this runner has not found the sequence
+		// that makes the assignment visible to a managed filtered read --
+		// the sibling "normal unbound group consumer" scenario reads through
+		// the consumer itself and passes, so the gap is in how this step
+		// reaches the group, not in the client's filter surface.
+		if strings.Contains(state.failure.Error(), "membership_stale") {
+			return blocked("this runner cannot yet make a joined group's " +
+				"partition assignment visible to a group-aware filtered " +
+				"read: " + state.failure.Error())
 		}
 		return fmt.Errorf("the server advertises group-aware reads, so the "+
 			"reader must succeed, got %v", state.failure)

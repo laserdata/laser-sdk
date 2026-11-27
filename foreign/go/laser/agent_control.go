@@ -223,11 +223,11 @@ func (entry *controlEntry) withConflict() PendingControl {
 
 // ControlBook is the control state of the sessions one process has seen.
 //
-// The Rust client drives this from its own runtime: a bounded read of
-// agent.control at startup loads it, and a follower keeps it current. That
-// runtime is not ported here, so a caller that reads agent.control feeds this
-// book itself with Load and Observe. The folding rules are the same either
-// way, which is what lets a Go process and a Rust one agree about whether a
+// A runtime opened with RuntimeOptions.EnforceControl follows agent.control
+// itself and keeps this book current; otherwise a caller that reads the
+// topic feeds it with Load and Observe. The folding rules are the same
+// either way, which is what lets a Go process and a Rust one agree about
+// whether a
 // session is paused.
 type ControlBook struct {
 	mutex   sync.Mutex
@@ -347,6 +347,66 @@ func (book *ControlBook) Pending(
 	default:
 		return PendingControl{}, book.loaded
 	}
+}
+
+// PausedAt is where the pause in force for this session was requested, and
+// false when none is.
+//
+// A parked record names the request that held it, so a reader can tell one
+// pause's held work from the next one's.
+func (book *ControlBook) PausedAt(
+	conversation wire.ConversationID,
+) (ControlPosition, bool) {
+	book.mutex.Lock()
+	defer book.mutex.Unlock()
+	entry, known := book.entries[conversation]
+	if !known || entry.state.pause == nil {
+		return ControlPosition{}, false
+	}
+	return entry.state.pause.at, true
+}
+
+// ControlAck is a control request a role acknowledges on the session lane:
+// where it sits on agent.control, and the record that carries it.
+type ControlAck struct {
+	At     ControlPosition
+	Record *wire.RecordID
+	// Named reports that the request names this agent, either by addressing
+	// it or by listing it among the participants a pause waits for.
+	Named bool
+}
+
+// PauseAck is the pause in force for this session, and false when none is.
+func (book *ControlBook) PauseAck(
+	conversation wire.ConversationID,
+) (ControlAck, bool) {
+	return book.ack(conversation, true)
+}
+
+// ResumeAck is the latest resume for this session, and false when none is.
+func (book *ControlBook) ResumeAck(
+	conversation wire.ConversationID,
+) (ControlAck, bool) {
+	return book.ack(conversation, false)
+}
+
+func (book *ControlBook) ack(
+	conversation wire.ConversationID, paused bool,
+) (ControlAck, bool) {
+	book.mutex.Lock()
+	defer book.mutex.Unlock()
+	entry, known := book.entries[conversation]
+	if !known {
+		return ControlAck{}, false
+	}
+	placed := entry.state.resume
+	if paused {
+		placed = entry.state.pause
+	}
+	if placed == nil {
+		return ControlAck{}, false
+	}
+	return ControlAck{At: placed.at, Record: placed.record, Named: placed.named}, true
 }
 
 // HasPauseHistory reports whether any session has a pause or resume request,

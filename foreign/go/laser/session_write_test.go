@@ -149,7 +149,7 @@ func TestGivenNoAgentWhenBeginningASessionThenShouldRefuseWithTheRemedy(t *testi
 	session := streamHandle(server, laser.Options{DefaultStream: "agents"}).
 		Sessions().Create("nightly")
 
-	_, err := session.Begin(context.Background())
+	_, _, err := session.Begin(context.Background())
 
 	var invalid *laser.InvalidError
 	if !errors.As(err, &invalid) {
@@ -164,7 +164,7 @@ func TestGivenNoAgentWhenBeginningASessionThenShouldRefuseWithTheRemedy(t *testi
 }
 
 func TestGivenASessionWhenBegunThenShouldWriteItsStartRecord(t *testing.T) {
-	server := &streamServer{}
+	server := &streamServer{streamExists: true}
 	sessions := streamHandle(server, laser.Options{DefaultStream: "agents"}).
 		SessionsWith(laser.SessionConfig{
 			Namespace:   "support",
@@ -172,7 +172,7 @@ func TestGivenASessionWhenBegunThenShouldWriteItsStartRecord(t *testing.T) {
 		})
 	session := sessions.Create("nightly").As(agentID(t, "planner"))
 
-	if _, err := session.Begin(context.Background()); err != nil {
+	if _, _, err := session.Begin(context.Background()); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 
@@ -219,7 +219,8 @@ func TestGivenASessionWhenBegunThenShouldWriteItsStartRecord(t *testing.T) {
 }
 
 func TestGivenASessionWhenCompletedThenShouldCloseItTerminally(t *testing.T) {
-	server := &streamServer{}
+	// The lane has to exist: a session write checks its identity first.
+	server := &streamServer{streamExists: true}
 	session := streamHandle(server, laser.Options{DefaultStream: "agents"}).
 		Sessions().Create("nightly").As(agentID(t, "planner"))
 
@@ -245,7 +246,7 @@ func TestGivenASessionWhenCompletedThenShouldCloseItTerminally(t *testing.T) {
 
 // A reader needs to see why a session ended, not only that it stopped.
 func TestGivenAFailedSessionWhenClosedThenShouldCarryTheError(t *testing.T) {
-	server := &streamServer{}
+	server := &streamServer{streamExists: true}
 	session := streamHandle(server, laser.Options{DefaultStream: "agents"}).
 		Sessions().Create("nightly").As(agentID(t, "planner"))
 

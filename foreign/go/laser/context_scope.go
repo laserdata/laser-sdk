@@ -86,6 +86,14 @@ func (scope *ContextScope) read(
 	if err != nil {
 		return nil, err
 	}
+	// Context assembly wants the newest history of a long-lived conversation,
+	// not whatever the oldest MaxDrainRecords of the partition happen to be:
+	// a partition shared with other traffic (or just long-lived) commonly
+	// outgrows that bound, and an unanchored read would silently return
+	// stale records while missing the recent ones a caller actually wants.
+	if err := cursor.SeekToWindow(ctx, MaxDrainRecords); err != nil {
+		return nil, err
+	}
 	return cursor.Poll(ctx)
 }
 
@@ -217,6 +225,60 @@ func (scope *ContextScope) FetchSince(
 		assembler.Add(topic, records...)
 	}
 	return assembler.Messages(), nil
+}
+
+// FetchUntil reads this conversation's history up to a checkpoint and stops
+// there, so a fold sees exactly the moment the checkpoint names however much
+// has been appended since.
+//
+// The complement of FetchSince: one resumes after a point, the other
+// reproduces everything before it, and a caller rebuilding a past state
+// needs the second.
+func (scope *ContextScope) FetchUntil(
+	ctx context.Context, checkpoint *ContextCheckpoint,
+	topics []string, policy ContextPolicy,
+) ([]ContextMessage, error) {
+	assembler := Assemble(scope.conversation).WithPolicy(policy)
+	for _, topic := range topics {
+		records, err := scope.read(ctx, topic)
+		if err != nil {
+			return nil, err
+		}
+		assembler.Add(topic, before(records, checkpointOffsets(checkpoint, topic))...)
+	}
+	return assembler.Messages(), nil
+}
+
+// checkpointOffsets is a checkpoint's next-offset per partition for one
+// topic, or nil when it names none.
+func checkpointOffsets(checkpoint *ContextCheckpoint, topic string) []uint64 {
+	if checkpoint == nil {
+		return nil
+	}
+	return checkpoint.Offsets[topic]
+}
+
+// before keeps the records that sit at or before a checkpoint's per-partition
+// position.
+//
+// A partition the checkpoint does not name had nothing in it when the
+// checkpoint was taken, so everything there arrived afterwards and none of it
+// belongs to the moment being reproduced.
+func before(records []*Record, offsets []uint64) []*Record {
+	if offsets == nil {
+		return records
+	}
+	kept := make([]*Record, 0, len(records))
+	for _, record := range records {
+		partition := int(record.PartitionID)
+		if partition >= len(offsets) {
+			continue
+		}
+		if record.Offset() < offsets[partition] {
+			kept = append(kept, record)
+		}
+	}
+	return kept
 }
 
 // boundedPolicy is the last n messages, trimmed to a token budget when one is

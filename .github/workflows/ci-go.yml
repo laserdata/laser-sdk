@@ -33,6 +33,7 @@ jobs:
         working-directory: ${{ github.workspace }}
     outputs:
       run_ci: ${{ steps.decide.outputs.run_ci }}
+      server_tests: ${{ steps.decide.outputs.server_tests }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -43,21 +44,37 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           EVENT_NAME: ${{ github.event_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           run_ci=run
-          if [[ "${GITHUB_REF}" != refs/tags/* ]] &&
-            [[ "${EVENT_NAME}" == "pull_request" || "${EVENT_NAME}" == "push" ]] &&
-            git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-            meaningful_paths="$(
-              git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" |
-                grep -E '^foreign/go/|^examples/go/|^bdd/go/|^wire/src/|^wire/fixtures/|^\.github/workflows/ci-go\.yml$|^scripts/check-parity\.py$' || true
-            )"
-            if [[ -z "${meaningful_paths}" ]]; then
-              run_ci=skip
+          server_tests=run
+          if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            # A change that pins a server release before it is published
+            # carries [wire-break] for a breaking wire change or
+            # [skip-server] for a compatible one. Only bdd-go resolves that
+            # release, so only bdd-go steps aside; every other gate runs.
+            for text in "${PR_TITLE}" "${PR_BODY}" "${COMMIT_MESSAGE}"; do
+              if [[ "${text}" == *"[wire-break]"* || "${text}" == *"[skip-server]"* ]]; then
+                server_tests=skip
+              fi
+            done
+
+            if [[ "${EVENT_NAME}" == "pull_request" || "${EVENT_NAME}" == "push" ]] &&
+              git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+              meaningful_paths="$(
+                git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" |
+                  grep -E '^foreign/go/|^examples/go/|^bdd/go/|^wire/src/|^wire/fixtures/|^\.github/workflows/ci-go\.yml$|^scripts/check-parity\.py$|^scripts/run-with-test-iggy\.mjs$|^scripts/resolve-test-iggy-server\.sh$' || true
+              )"
+              if [[ -z "${meaningful_paths}" ]]; then
+                run_ci=skip
+              fi
             fi
           fi
-          echo "Go CI: ${run_ci}"
+          echo "Go CI: ${run_ci}, server-backed scenarios: ${server_tests}"
           echo "run_ci=${run_ci}" >> "${GITHUB_OUTPUT}"
+          echo "server_tests=${server_tests}" >> "${GITHUB_OUTPUT}"
 
   quality:
     name: quality
@@ -100,6 +117,14 @@ jobs:
               fi
               go vet ./...
               go build ./...
+              # Tidiness is checked here too, not only for foreign/go. These
+              # are separate modules with their own requirements, and an
+              # import added to one of them leaves its go.mod stale without
+              # the client's own ever noticing -- which is exactly how
+              # bdd/go came to carry iggy as indirect while importing it
+              # directly.
+              go mod tidy
+              git diff --exit-code -- go.mod go.sum
               go test ./... -count=1
             )
           done
@@ -138,6 +163,45 @@ jobs:
           cache-dependency-path: foreign/go/go.sum
       - run: go test ./... -race -count=1
 
+  # Cross-SDK BDD conformance: the Go runner executes the shared Gherkin
+  # scenarios against the pinned Iggy release, through the same helper the
+  # TypeScript runner uses. scripts/run-with-test-iggy.mjs resolves the
+  # release scripts/resolve-test-iggy-server.sh pins, starts one on a free
+  # port, exports LASER_CONNECTION_STRING for the child, and tears it down --
+  # so Go tests the same server version as every other SDK rather than a
+  # server of its own.
+  #
+  # Every job above proves the client against in-process fakes, which cannot
+  # see whether a real server accepts what the client sends. The first live
+  # run of bdd/go found three real bugs the whole hermetic suite was blind
+  # to, one of which -- Topic.ConsumerGroup never creating the group -- made
+  # Laser.SpawnAgent unusable against any real deployment.
+  #
+  # The @managed scenarios still skip here: they need a managed LaserData
+  # deployment that folds the managed surfaces, and the pinned release is
+  # open Apache Iggy.
+  bdd-go:
+    name: bdd-go
+    needs: [flags, quality]
+    if: needs.flags.outputs.run_ci == 'run' && needs.flags.outputs.server_tests == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: foreign/go/go.mod
+          cache-dependency-path: bdd/go/go.sum
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22.14.0"
+      - name: Install Iggy runtime dependencies
+        working-directory: ${{ github.workspace }}
+        run: scripts/ci/apt-install.sh libhwloc15
+      - name: BDD scenarios (Go runner)
+        working-directory: bdd/go
+        run: node ../../scripts/run-with-test-iggy.mjs go test ./... -count=1
+
   ci-go-complete:
     name: ci-go-complete
     if: always()
@@ -146,6 +210,7 @@ jobs:
       - quality
       - unit
       - race
+      - bdd-go
     runs-on: ubuntu-latest
     steps:
       - name: Verify every job succeeded

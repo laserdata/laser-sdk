@@ -9,13 +9,11 @@ import (
 
 // workflowJournalKind discriminates a workflowJournalEntry.
 //
-// This shape is SDK-internal, not a laser-wire type, so it is encoded with
-// this package's own CBOR codec (wire.Marshal/wire.Unmarshal) rather than
-// the wire fixture corpus's pinned shapes. A run this client starts can be
-// resumed by another Go client, but not, as things stand, by the Rust,
-// Python, or TypeScript SDKs, whose own journal entry carries a different
-// (externally-tagged) encoding — a known, narrower-than-Rust gap, not an
-// oversight.
+// The struct is this client's own shape, a flat record with a discriminator,
+// which is the natural Go form. What goes on the log is not: see
+// agent_workflow_journal_codec.go, which writes the externally tagged shape
+// every client reads, pinned against the Rust client's own bytes. A run
+// started on any client resumes on any other.
 type workflowJournalKind uint8
 
 const (
@@ -38,6 +36,11 @@ type workflowJournalEntry struct {
 	ReplyFrom []uint64            `cbor:"reply_from,omitempty"`
 	Output    []byte              `cbor:"output,omitempty"`
 	Agents    []string            `cbor:"agents,omitempty"`
+	// Input is the digest of a WorkflowRun step call's arguments, set only by
+	// the "plain code" form (RunStep/WorkflowRun.CompleteStep); a declared
+	// step (StepHandle) never sets it. Empty means no digest, which is safe
+	// because a real digest (inputDigest) is never the empty string.
+	Input string `cbor:"input,omitempty"`
 }
 
 // workflowInFlight is a dispatch the journal holds without an outcome.
@@ -55,6 +58,10 @@ type workflowJournal struct {
 	agents    map[string][]wire.AgentID
 	inFlight  map[string]workflowInFlight
 	attempts  map[string]uint32
+	// inputs is a completed step's own call-argument digest, by journal
+	// label, for the "plain code" form's own resume matching
+	// (runState.resumed). A declared step never has an entry here.
+	inputs map[string]string
 }
 
 func newWorkflowJournal() workflowJournal {
@@ -63,6 +70,7 @@ func newWorkflowJournal() workflowJournal {
 		agents:   map[string][]wire.AgentID{},
 		inFlight: map[string]workflowInFlight{},
 		attempts: map[string]uint32{},
+		inputs:   map[string]string{},
 	}
 }
 
@@ -102,6 +110,11 @@ func foldWorkflowJournal(entries []workflowJournalEntry) workflowJournal {
 			}
 			journal.agents[entry.Label] = agents
 			journal.outputs[entry.Label] = entry.Output
+			if entry.Input != "" {
+				journal.inputs[entry.Label] = entry.Input
+			} else {
+				delete(journal.inputs, entry.Label)
+			}
 		case journalStepCompensated:
 			for index, label := range journal.completed {
 				if label == entry.Label {
@@ -112,6 +125,7 @@ func foldWorkflowJournal(entries []workflowJournalEntry) workflowJournal {
 			delete(journal.inFlight, entry.Label)
 			delete(journal.agents, entry.Label)
 			delete(journal.outputs, entry.Label)
+			delete(journal.inputs, entry.Label)
 		}
 	}
 	return journal

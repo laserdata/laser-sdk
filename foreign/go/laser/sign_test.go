@@ -317,6 +317,34 @@ func TestGivenARewrittenContextWhenVerifiedThenShouldRefuseIt(t *testing.T) {
 	}
 }
 
+// A consumer reconstructs the observed context from a record's own headers,
+// in its own freshly allocated *uint8/*uint32 pointers, entirely separate
+// from whatever pointers the producer signed under. Equal values in
+// different allocations must still verify: a plain struct "!=" would compare
+// those pointers as addresses and always see them as different, which would
+// make every real verification fail regardless of the bytes.
+func TestGivenAnIndependentlyReconstructedMatchingContextWhenVerifiedThenShouldHold(t *testing.T) {
+	key, _ := laser.GenerateSigningKey()
+	registry := laser.NewKeyRegistry()
+	registry.Enroll("user-7", key.VerifyingKey())
+	envelope := signedEnvelope(t)
+	signedJSON, signedVersion := uint8(1), uint32(wire.AgentOpVersion)
+	signature, err := key.SignWithContext(
+		envelope, wire.SignatureContext{ContentType: &signedJSON, AgentVersion: &signedVersion})
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	envelope.Signature = signature
+
+	// A new allocation per field, deliberately not the signer's own pointers,
+	// the way decoding a record's headers independently would produce them.
+	observedJSON, observedVersion := uint8(1), uint32(wire.AgentOpVersion)
+	observed := wire.SignatureContext{ContentType: &observedJSON, AgentVersion: &observedVersion}
+	if _, err := registry.VerifyObservedAt(envelope, observed, 1); err != nil {
+		t.Errorf("an independently reconstructed but matching context must verify: %v", err)
+	}
+}
+
 // A signed record's claim about whom it acted for rides inside the signed
 // span, so a signer cannot forge it and an intermediary cannot rewrite it.
 func TestGivenADelegatedEnvelopeWhenVerifiedThenShouldNameBothPrincipals(t *testing.T) {

@@ -13,6 +13,10 @@ import (
 type Sessions struct {
 	laser  *Laser
 	config SessionConfig
+	// lane is the lane-identity pin every session opened from this factory
+	// shares. A new factory gets a new pin, which is what lets a caller
+	// recover from a replaced lane by opening a fresh one.
+	lane *laneGuard
 }
 
 // Sessions opens the session surface of the handle's default stream, under the
@@ -40,7 +44,7 @@ func (laser *Laser) SessionsWith(config SessionConfig) *Sessions {
 	if resolved.Layout.Kind() != LayoutShared {
 		scoped.declareLayout(resolved.Stream, resolved.Layout)
 	}
-	return &Sessions{laser: scoped, config: resolved}
+	return &Sessions{laser: scoped, config: resolved, lane: &laneGuard{}}
 }
 
 // Stream is the stream these sessions ride.

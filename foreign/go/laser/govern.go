@@ -429,11 +429,36 @@ func (e *StepUpRequiredError) Error() string {
 	return "the governor requires an approval granting " + e.Scope
 }
 
-// PolicyDeferredError reports work the governor held for later. The identical
-// effect may succeed once the condition that deferred it has passed.
-type PolicyDeferredError struct{ Reason string }
+// PolicyDeferredError reports work held for later. The identical effect may
+// succeed once the condition that deferred it has passed.
+//
+// Raised by the governor, and by a parked approval gate: there the record is
+// parked rather than lost, and the runtime hands it back to the handler once
+// the approver decides or the deadline passes. The handler then runs again
+// from the top, so whatever it did before the gate happens twice and has to
+// be idempotent.
+type PolicyDeferredError struct {
+	Reason string
+	// Deferrer names what held the work, so a caller can tell a governor's
+	// decision from an approval the runtime is waiting on.
+	Deferrer DeferralSource
+}
+
+// DeferralSource is what held a deferred action.
+type DeferralSource uint8
+
+const (
+	// DeferredByGovernor is an action a policy held for later. The default,
+	// so an error built without naming a source reads as it always did.
+	DeferredByGovernor DeferralSource = iota
+	// DeferredByApproval is a handler parked on an approval gate.
+	DeferredByApproval
+)
 
 func (e *PolicyDeferredError) Error() string {
+	if e.Deferrer == DeferredByApproval {
+		return "parked awaiting an approval: " + e.Reason
+	}
 	return "the governor deferred this action: " + e.Reason
 }
 

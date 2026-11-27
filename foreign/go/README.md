@@ -194,6 +194,17 @@ which is what lets a projector replay without the graph growing.
 stream, and `SessionsIn(stream)` for another. `Get`, `List`, `Events`, `State`,
 `Links`, `Sources` and `Changes` cover it.
 
+`Laser.ReadAt(ctx, wire.SourceRef)` reads the one log record a reference
+names, for a caller holding a `Sources` entry and wanting the record behind
+it. It is a `Laser` method rather than a `Session` one, matching Rust, since
+a reference carries its own stream and topic and needs no session to resolve
+against. The topic's id, generation and name are snapshotted before the poll
+and again after, so a topic recreated mid-read reads as gone rather than
+returning a record presented as something it is not. A stale reference
+answers `nil, nil` rather than an error: holding one from earlier is an
+ordinary thing, not a fault. Only a message reference names a log record; a
+kv or memory reference is refused.
+
 Every request names its stream first, because the index is per stream: a
 session id alone does not say which index to look in. The stream is sent as
 given rather than scoped, since it is a stream name and not a managed resource
@@ -457,6 +468,17 @@ requests and the rest of the traffic.
 `Laser.DeadLetter` publishes a record the gates turned away, keeping the
 payload so the work can be replayed and naming where the original sat.
 
+`Requester.Verifier(*KeyRegistry)` arms a hub against forged replies: with one
+set, `Deliver` drops (silently, the same as a message nobody is waiting for)
+a reply that is unsigned, does not verify, or verifies as a principal other
+than the addressed target, and stamps the verified principal on
+`AgdxMessage.VerifiedPrincipal` on one that holds up. A broadcast request
+(no `Target`) accepts any principal the registry verifies, since no
+particular agent was ever the expected answerer. An agent's own internal hub
+(`AgentCtx.Request`, `ApprovalGate`) is armed automatically from
+`RuntimeOptions.Verifier` — the same registry gating that agent's incoming
+work also gates the replies it waits on.
+
 ## Contract
 
 `Laser.Contract(router, topic)` opens a `ContractBuilder`: a directed request
@@ -490,6 +512,13 @@ command, stamps the ancestry on the command, and ends the child by the
 outcome — completed on a reply, failed otherwise, including a command that
 failed to publish.
 
+`Verifier(*KeyRegistry)` holds the contract open past an unsigned or
+wrong-signer reply rather than completing on it: the resolved target is
+always the expected signer (Go's `Router` has no principal-bound route to
+prefer instead), and a candidate that does not verify is left for the poll
+to keep looking, the same as if nothing had arrived, until one verifies or
+`Deadline` reports `ContractTimedOut`.
+
 ## Scatter
 
 `Laser.ScatterReport(ctx, ScatterRequest)` dispatches a `Contract` to every
@@ -512,6 +541,75 @@ all — an infrastructure or send failure, never a non-completing terminal.
 policy was met: `GatherAll` needs every branch to have *completed*, not
 merely finished, so one failed branch among otherwise-successful ones reads
 as unsatisfied even though nothing timed out or was cancelled.
+
+## One reader per reply topic
+
+A contract waits for its answer on a shared dispatcher, opened on first use
+and keyed by stream and reply topic. Ten concurrent contracts on one topic
+read it once between them, where a poll per waiter would scan the same
+records ten times. A scatter over ten agents is the ordinary case.
+
+The wait is registered **before** the command is sent. The reply cannot
+exist until the command does, but it can land before the caller starts
+listening, and a dispatcher that only subscribed afterwards would miss it.
+
+Two consequences worth knowing:
+
+- `Laser.Close()` stops the dispatchers. Go has no destructor to end them
+  the way Rust's last-clone drop does, so a handle that is never closed
+  leaves one poller per reply topic running for the life of the process —
+  the same bargain `AgentHandle` makes, and the same fix.
+- A contract that arms its own `Verifier` keeps a private poll instead of
+  joining the shared dispatcher. A hub's verifier covers every waiter on
+  that topic, so one caller's key registry must not silently become every
+  caller's. Rust puts the verifier on the connection and so has one answer
+  for the whole topic; this client takes it per contract, and this is what
+  that costs.
+
+A waiter's deadline is also extended whenever the target acknowledges that
+it is working, so the deadline bounds an answer that never comes rather than
+a handler that is slow.
+
+## Where a command is addressed
+
+`Laser.Contract(router, topic)` sends to the topic it names, and awaits the
+answer there. Two builders change that.
+
+`InboxRoute(AdvertisedInbox())` addresses the command to the inbox the
+resolved target advertises in its own live presence, instead of a shared
+name. The substrate has no well-known inbox on purpose: a real deployment
+scopes each user to its own stream and each workflow to its own topic, and a
+topic may be created for one process and dropped when it is done. An agent
+that advertises no inbox is a `NoInboxError` rather than a guess — inventing
+a destination delivers work somewhere nobody consumes. Under an advertised
+route a capability pick only considers agents that advertise an inbox, so an
+unreachable agent never wins the pick and then fails the send; a route that
+names one agent directly is still resolved, since the caller named it.
+
+`FixedInbox(topic)` is the explicit escape hatch, honored ahead of presence,
+for a caller who already owns one topic every participant joined. It is also
+the **default**, bound to the topic named at `Contract`. Rust defaults to
+the advertised inbox instead; this client keeps the fixed default
+deliberately, because moving it would re-address every existing caller's
+traffic and would fail outright against a deployment that serves no
+presence, such as Apache Iggy.
+
+`ReplyOn(topic)` awaits the answer somewhere other than where the command
+went. The two are the same by default, since a target answering in place
+replies where it was addressed. They differ when work goes to an agent's own
+inbox but the answer belongs on a topic the caller already watches.
+
+`Workflow.InboxRoute` and `ScatterRequest.Inbox` carry the same route into
+every step and branch. Both pin their replies to the topic the caller named
+rather than following the command: a workflow's journal records that topic's
+tail as each step's dispatch point, so a resumed run would scan the wrong
+offsets if an advertised inbox moved the answers elsewhere.
+
+`ScatterRequest.Verifier(*KeyRegistry)` arms each branch's own contract, and
+the expected signer is the branch's own resolved target rather than one
+principal for the whole scatter: a reply signed by an enrolled key that is
+not the agent that branch was sent to does not complete that branch. A skill
+served by several agents is exactly where a global check would be too loose.
 
 `Laser.Scatter(ctx, ScatterRequest)` is a convenience over `ScatterReport`
 for a caller who only wants the completed reply bodies, dropping agent
@@ -536,7 +634,10 @@ caller-supplied registry `Contract` and `AgentCtx.FanOut` already take.
 `Run` runs the steps in dependency order (Kahn's algorithm; a duplicate
 label, a broadcast step, or a dependency cycle is refused before anything
 is written) to a `*WorkflowOutcome`: `Outputs` by label, `RunID`,
-`CompletedSteps` in completion order, and `.Text(label)`. The run is a
+`CompletedSteps` in completion order, and `.Text(label)`. A run on a stream
+without `agent.sessions`/`agent.workflow_journal` bootstraps them with the
+defaults (a day's retention) before retrying, so a workflow of only local
+steps needs no agent and no caller-made `Bootstrap` call. The run is a
 session on `agent.sessions` whose id is the run id; every directed or
 all-capable step is a child session of it for free, since it dispatches
 through `Contract.Parent`/`Scatter`. A step that does not complete fails the
@@ -567,14 +668,127 @@ nothing is dispatched anywhere. A completed compensation is journaled
 it as still done; one that does not complete is left unjournaled and the
 rollback continues, never overriding the original failure.
 
-Not yet ported: exclusive (fenced, at-most-once) steps and
-`OnTimeout(Reassign)`, and the "plain code" `run_with`/`WorkflowRun` form
-where the caller's own async body is the workflow, stepping through
-`begin_step`/`complete_step` itself. Each is a self-contained future slice;
-see `foreign/go/IMPLEMENTATION_STATUS.md`. The workflow journal's own
-encoding is this package's CBOR codec, not a laser-wire fixture-pinned
-shape, so a run this client starts resumes on another Go client but not,
-today, on the Rust, Python, or TypeScript SDKs.
+`StepHandle.Exclusive()` (or `.ExclusiveIn(namespace)` to share a fence
+sequence with the handler's own `Kv.CasFenced` commit) opts a directed step
+into a fenced, at-most-once effect: the engine claims a lease
+(`Kv.LeaseGuard`) before dispatching, stamps its token on the command's
+`agdx.fence` header, renews the lease at half its TTL while the contract is
+in flight, and releases it on every exit. `.OnTimeout(OnTimeoutReassign)`
+(needs `Exclusive`) hands a timed-out attempt to a fresh holder — preferring
+a capable agent other than the ones that already timed out
+(`ContractBuilder.Excluding`), reusing one of them only when no other is
+capable — whose fresh lease acquisition bumps the fence and gates the stale
+holder out. A local step cannot be exclusive, and an all-capable step cannot
+either (no single target to fence); both are refused by `Run` before
+anything is written, as is `OnTimeout(Reassign)` on a non-exclusive step and
+an exclusive step against a deployment without the managed fenced-lease
+capability. Unlike Rust's `Kv::lease`/`cas_fenced` (a dedicated coordination
+client that retries an ambiguous send under its own operation identity),
+Go's lease/renew calls take the plain managed round trip every other `Kv`
+operation already uses — see `laser/kv_lease.go`'s own note.
+
+`Workflow.Start(ctx)` opens a `*WorkflowRun` for the "plain code" form: the
+caller's own code is the workflow, calling the free generic function
+`laser.RunStep[T](ctx, run, label, body)` inline rather than declaring steps
+up front (Go has no generic methods, so `RunStep`/`RunWith` cannot be
+`WorkflowRun`/`Workflow` methods — a type parameter can only live on the type
+itself, and one run serves steps of many different `T`s). `laser.RunWith[T]`
+wraps `Start`+body+`Finish` into one call, matching `WorkflowOutcome.Value`
+(read back with `WorkflowValue[T]`) to the body's own JSON-encoded return
+value. A step run already recorded returns its recorded value without
+running again; the second call of one label in a run is journaled as
+`label#2`, the third as `label#3`, and a call whose body failed gives its
+label back to a retry — so concurrent branches whose order can change
+between runs should use a label of their own. The lower-level primitives
+(`BeginStep`/`Checkpoint`/`CompleteStep`/`AbandonStep`/`RefuseNewSteps`/
+`Finish`/`Release`) are all exported too, for a step body that is not a
+single Go closure. This form shares the exact same journal entry kinds the
+declared-steps form writes (one additive field, the call's own argument
+digest), so everything below about the journal's encoding applies to it
+unchanged.
+
+A run holds a session lease for exactly as long as it is working. The lease
+is taken when the run's root session begins and released after its ending
+record, so a deployment can tell a run that is still going from one that
+stopped: without the heartbeat a live run would read as abandoned the
+moment its lease expired.
+
+`Release` gives the lease up and leaves the run open and resumable by its
+id, for a caller that was cancelled or interrupted. It ends the run as far
+as this process is concerned, so a `Finish` afterwards is refused rather
+than writing an ending record for a run nobody is driving. Whichever of the
+two comes first takes the lease, and the second is a no-op, so the two can
+never both end one run.
+
+The workflow journal's encoding is the same across clients: an externally
+tagged enum, one CBOR map from the variant's name to its fields, pinned in
+`agent_workflow_journal_codec_test.go` against bytes the Rust client itself
+produced. A run this client starts resumes on another client, and one
+another client started resumes here. A variant this client does not know is
+refused rather than skipped, because folding a history only partly
+understood would resume a run from a state nobody wrote.
+
+One detail worth knowing if you read the bytes: a step's output rides as a
+CBOR **array of integers**, not a byte string, because that is how the other
+clients' `Vec<u8>` serialises.
+
+## Semantic memory
+
+`laser.NewVectorMemory(embedder)` keeps facts in this process and ranks
+recall by how close their embeddings are to the query's, so a recall finds
+what a question means rather than which words it used. It loses everything
+when the program exits; the durable memory is `Laser.Memory(namespace)`,
+which writes to the log.
+
+`Embedder`, `Reranker` and `Summarizer` are seams, not implementations. The
+client ships no model and never will: an embedding API, a local model or a
+hosted service lives in application code, and these three interfaces are the
+boundary. `NoSummarizer` is the do-nothing summarizer, so "no summarizer" is
+a value rather than a nil check at every call site.
+
+`RecallSemantic` ranks by cosine similarity alone, `RecallKeyword` by
+lexical overlap alone, and `RecallHybrid` fuses them. `RecallAuto` routes
+from what the backend has: a query with an embedder behind it is hybrid, a
+query without one is keyword, and no query at all is the most recent items.
+
+The fusion is reciprocal rank: each item scores the sum of `1/(60 + rank)`
+over the signals that surfaced it, so two signals agreeing outranks one
+signal's confident top hit. Every contributing signal stays on the item as a
+`RecallSignal`, so a caller can see *why* something was recalled rather than
+only that it was.
+
+Feedback is added to the fused score rather than fused as a third signal.
+As one more reciprocal-rank vote it could never outweigh two signals
+agreeing, so an agent saying "this one was useful" would change nothing —
+the opposite of the point. This is also what the durable memory already
+does, and what the contract specifies: every strategy except recent ranks by
+the folded weight first.
+
+`VectorMemory.WithReranker(reranker)` puts a second, more expensive pass
+over the candidates a cheap signal proposed. A recall with no query is
+handed back untouched: there is nothing to rank against, and asking anyway
+would invent an ordering.
+
+## Rebuilding state from the log
+
+`laser.LoadConversationState(ctx, laser, conversation, topics, bound,
+initial, fold)` folds a conversation's logged messages back into state,
+which is event sourcing over the log. A free function rather than a method,
+because Go has no generic methods and the state type is the caller's.
+
+The bound is explicit, because the three readings of "the history" are
+different jobs: `FullReplay()` rebuilds everything, `LastReplay(n)` keeps
+the newest turns, `ReplayAfter(checkpoint)` catches up on what is new, and
+`ReplayUntil(checkpoint)` reproduces a moment exactly however much has been
+appended since. A bound that needs a checkpoint and was given none is
+refused rather than quietly becoming a full replay.
+
+`laser.WithMemory(handler, memory).AutoRemember(kind)` wraps a handler so
+each turn it handles is remembered under its own conversation. Wrapping
+alone changes nothing until a kind names what to store the turn as. A failed
+memory write does not fail the turn: the message was already handled, and a
+retry would repeat the handler's own effects, so a memory that could not be
+written is dropped rather than turned into a redelivery.
 
 ## Memory
 
@@ -639,7 +853,8 @@ rather than an implementation detail.
 
 Three rules decide what a session will and will not write, and all three
 exist because a session is addressed by a derived id, so the same label
-reaches the same session on every run.
+reaches the same session on every run. A fourth is about the lane rather
+than the id, and is described under "A handle is bound to one lane" below.
 
 **A session that ended refuses to begin again.** Beginning one would append a
 second start under an id a reader has already seen close. `Resume` opens it
@@ -906,6 +1121,36 @@ out: there is nothing there that will ever become ready. A backend the
 deployment observes as degraded is not ready however it describes itself,
 because the observation is the more reliable half.
 
+## A handle is bound to one lane
+
+A session handle pins the lane it first wrote to -- the stream and topic it
+rides, each by creation time rather than by name or numeric id, together
+with the topic's partition count -- and refuses every later write if any of
+that has changed. The refusal is a `*laser.StaleLaneError`, and the record
+never reaches the log.
+
+This is about a stream or topic that was deleted and created again. The
+replacement takes the same name and can take the same numeric id, so a
+handle retained across the gap would append to it and look successful, while
+a reader of the recovered lane would never see those records as part of the
+session they belong to. The partition count is pinned for the same reason in
+a different disguise: a record's partition is chosen by hashing over the
+count, so changing it scatters one session's history across partitions.
+
+Recover by opening a fresh handle. The pin is shared by a `Sessions` and
+every session opened from it, so a new `Sessions` re-reads the lane and
+writes against whatever is there now, while any handle retained from before
+keeps refusing. Nothing clears a pin in place, because a handle that quietly
+re-pinned would be the bug this prevents.
+
+Where a deployment folds sessions, the handle also checks once that the lane
+it writes to is the session source the deployment has registered, and
+refuses if they disagree: a lane that is healthy in itself but is not the
+registered one would take writes that no aggregate read ever returns.
+
+Addressed work that a per-agent topic layout moves off the lane is not
+checked. It is no more the session lane than any other topic.
+
 ## Session layout
 
 `SessionConfig.Layout` decides where a stream's agents put their work, and
@@ -952,6 +1197,17 @@ is caught. That guard is not ported here yet.
 on a session is held, the process lists it in a heartbeat on
 `agent.heartbeats`, which is how a deployment tells a session somebody is
 still working on from one whose process died.
+
+`Session.Begin`/a resumed `Session.Resume().Begin` take one of these leases
+automatically and return it alongside the start record's receipt:
+`(*AgdxReceipt, *SessionLease, error)`. A lease failure after a successful
+start is reported as the error, but the receipt is still returned — the
+session did begin. `defer lease.Release()` right after `Begin` is the shape
+that gets it right, the same as taking one directly. One deliberate
+simplification versus Rust: Rust derives the lease's heartbeat interval from
+`config.heartbeat.min(idle_timeout / 5)`; Go's `SessionConfig` has no
+`heartbeat` field, so `Begin` takes `LeaseSession`'s own default interval
+instead of inventing new config surface for it.
 
 Go has no destructor, so `Release` is the whole protocol and
 `defer lease.Release()` is the shape that gets it right. A lease never
@@ -1168,11 +1424,62 @@ as having no requests. Live requests that arrive while that history is being
 read are held and replayed on top of the fold, since applying a resume to
 nothing would report it as though no pause preceded it.
 
-The Rust client drives all of this from its own runtime, which reads
-`agent.control` at startup and follows it. That runtime is not ported here, so
-a caller reading the topic feeds the book itself. The folding rules are the
-same either way, which is what lets a Go process and a Rust one agree about
-whether a session is paused.
+`RuntimeOptions.EnforceControl` makes a pause binding rather than advisory.
+With it the runtime follows `agent.control` itself and gates every work
+record on its session's state: a paused session's work is written to the
+session lane as a parked record, then committed, and never reaches the
+handler. A resume hands the held records back, oldest source first, before
+any new work for that session. Without it a handler polls
+`AgentCtx.PendingControl` and decides for itself, which is what this client
+has always done and remains the default.
+
+The gate reads live state, so the follower loads the topic's history before
+reporting the book live. Until then the book cannot tell "not paused" from
+"not read yet", and a gate acting on that difference is exactly how a paused
+session's work gets through.
+
+Parking is keyed by the source position, not the record id, so a record
+redelivered after a crash between its parking and its commit is already held
+rather than held twice. A held record whose source expired, or whose topic
+was recreated, cannot be replayed; it stays listed as held rather than being
+quietly forgotten.
+
+`Session.Parked(ctx)` folds the lane into what is still being held and by
+whom: a parked record adds held work and an unparked one takes it away.
+Two roles holding one record are two pieces of held work, so one role's
+resume does not clear the other's, and a parking record that will not decode
+makes the account incomplete rather than silently short.
+
+Held work is rebuilt from the lane when the runtime starts, so a process
+that restarts finds what an earlier one parked and hands it back on resume.
+The scan runs only once some session has a pause history at all, so a
+deployment that never pauses pays a book read rather than a lane read. Only
+this role's own parkings are taken: another role's held work is that role's
+to replay, and a record already written off the lane is done whichever order
+the two records come back in.
+
+A role acknowledges the control request it is acting on, on the session
+lane, carrying the position of the request it answers. That is what lets an
+operator see which agents actually stopped rather than only that a pause was
+asked for, and tell this pause's acknowledgment from the next one's. One
+request is acknowledged once however many records arrive. A resume is
+acknowledged only by a role that acknowledged the pause: an agent that never
+stopped has nothing to say it has started again.
+
+Held work is also rebuilt when this member starts reading a partition it has
+not read before, since another member may have parked work for a session it
+now reads. Go's runtime is not handed its consumer-group assignment, so the
+partitions records arrive from stand in for it: that fires later than Rust's
+(on the new partition's first record rather than at the rebalance) and not
+at all for a partition that is assigned and then stays silent.
+
+What this does not yet do, and Rust does: park a record on an approval.
+Go's `ApprovalGate` is a blocking wait inside the handler rather than an
+interrupt the runtime observes, so there is no point at which the runtime
+could park the record.
+
+The folding rules are the same in every client, which is what lets a Go
+process and a Rust one agree about whether a session is paused.
 
 `Sessions.Control` is the write side. An operator names itself with
 `AsOperator`, which is required: a control record nobody signed for is a
@@ -1522,6 +1829,16 @@ names who said what. Nothing here reaches a durable log: it is an in-process
 combinator, not the crash-safe propose, vote and commit lifecycle a durable
 version would need.
 
+`laser.NewSwappableGovernor(initial)` is itself a governor whose policy can
+be replaced while the client runs: `Swap` installs the next one and returns
+the one it replaced, `Current` reads it. A swap binds from the next `Decide`
+onward. A decision already in flight finishes under the policy it read, and
+nothing already evaluated is reinterpreted -- the same non-retroactive rule
+a durable intent's policy version gives, so an audit trail stays readable
+against the policy that was actually in force when each entry was written.
+Go has no `RwLock<T>` type as such; a `sync.RWMutex` over a stored interface
+value is the idiomatic equivalent of what Rust wraps.
+
 ## Approvals
 
 `Requester.ApprovalGate` asks a named approver and waits for the answer. The
@@ -1536,10 +1853,24 @@ another conversation approves nothing, because an approval given for one piece
 of work is not an approval for another. The step-up is still recorded with its
 scope: the approval answered it, it did not make it disappear.
 
-Waiting in place is the whole of this gate. The Rust client can instead park
-the work and replay the handler once the decision lands, which frees the
-consumer for the session's other work. That runtime is not ported here, so a
-gate held open holds its caller open.
+Under an agent runtime that can park -- `RuntimeOptions.EnforceControl`, on
+the topic the decision comes back on -- `AgentCtx.ApprovalGate` does not wait.
+The prompt goes out, the record is held on the session lane, its offset
+commits, and the handler is replayed with the decision once it lands. The
+consumer is free for other sessions while the approver decides, instead of
+being held for however long a person takes.
+
+Three things follow from that, and a handler has to be written for them. It
+runs **again** from the top, so whatever it did before the gate happens twice
+and has to be idempotent. The session's **later work is held behind** the
+approval and runs after it, so the decision resumes the session as it left it.
+And an approval nobody answers **expires**: when the deadline passes the
+handler is replayed anyway, and the gate returns a `*laser.ApprovalExpiredError`
+for it to decide what an unanswered approval means for its own work.
+
+Everywhere else the gate waits in place, and a gate held open holds its caller
+open. That is what `Requester.ApprovalGate` does, and what `AgentCtx`'s does
+under a runtime with no pause gate.
 
 ## Durable intents
 
@@ -1935,6 +2266,166 @@ back as a `GatheredFailure` with its cause rather than going missing, and each
 `GatheredReply` keeps the agent that gave it, so a caller can tell which
 result came from where.
 
+
+## Who an agent really is
+
+An agent id is a claim. Any connection can advertise any id, so routing by
+name alone trusts whoever got there first. A principal is the identity the
+deployment authenticated at login, and binding the two is what stops a
+connection advertising somebody else's agent id from being handed that
+agent's work.
+
+`Laser.ClientMetadata()` is the discovery read behind that binding: the
+connections the deployment is holding and the opaque metadata each
+advertised, filtered by `WithMetadataOnly`, `Principal`, `Limit` and
+`After`. `Page` fetches one page; `All` walks every page on every node.
+Every node, because a connection lives on the one node it dialled, so a read
+answered by a single node would see only its share and report an agent
+connected elsewhere as absent. A cursor that does not advance is refused as
+a `ProtocolError` rather than paged forever.
+
+`AgentRegistry.RefreshPresence(ctx, laser)` folds that read into the
+registry, keyed by the agent id each connection claims and bound to the
+principal that connection authenticated as. `PrincipalFor`, `InboxFor` and
+`InboxForPrincipal` read it back. Presence is deliberately separate from the
+card fold: a card is durable, replayable capability that outlives a brief
+disconnect, where presence is live transport truth that vanishes with the
+connection and answers where to send work right now.
+
+Within `PresenceTTL` a refresh reuses what it holds instead of paging again,
+because paging the whole connection table is the dominant per-send cost and
+an inbox changes rarely. Apache Iggy keeps no connection metadata, so
+against it this folds nothing and routes fall through to the card's inbox; a
+deployment that never answered the hello and then refuses the read is read
+the same way, rather than failing a send over a surface nothing promised. A
+deployment that *did* answer the hello and then refuses is a real error,
+since that surface was promised.
+
+`laser.ToPrincipal(agent, principal)` routes to one agent only while its
+live presence is bound to that principal, and `Router.WithPrincipal` binds a
+capability route the same way, so discovery by skill cannot hand work to an
+agent that merely claims it. On a plain `To` route `WithPrincipal` becomes
+`ToPrincipal`, rather than leaving a requirement sitting in a field nothing
+reads. A broadcast names nobody to bind, so it ignores one.
+
+A bound route that resolves to an agent under the wrong principal reports a
+`RoutePrincipalMismatchError` naming both the expected and the actual, with
+the actual absent when the agent has no live presence at all — an agent that
+is not there and an agent that is there as somebody else are different
+problems. A capability route whose skill is served, but by nobody bound to
+the required principal, reports the same mismatch rather than
+`NoCapableAgentError`: one is fixed by provisioning an agent, the other by
+fixing an enrollment. A quarantine still outranks the check, since that is
+an operator's decision about the agent itself.
+
+`Router.RequiresPresence` says whether a route needs presence refreshed
+before it will resolve, and `RequiredPrincipal` names the identity it
+insisted on. `Contract` uses the second: under a verifier, a route that
+required a principal expects the reply to be signed by *that* principal
+rather than by the resolved target's name, which is what joins discovery to
+authorship. A route that insisted on who the agent is should not then settle
+for an answer signed by whoever holds the name.
+
+## Spawning an agent
+
+`Laser.SpawnAgent(ctx, SpawnOptions)` is the one call that joins a consumer
+group and starts the reliable consumer on its own goroutine, instead of a
+caller wiring `Laser.Agent`, `laser.NewAgentRuntime` and
+`Topic.ConsumerGroup` together by hand. `SpawnOptions` embeds `AgentOptions`
+and `RuntimeOptions` rather than restating them, because a plain struct
+literal is already how this package configures everything else.
+
+It returns an `AgentHandle`: `Ready` waits until the loop is running,
+`Shutdown` stops it and reports how it stopped, `Join` waits without
+stopping, `Abort` drops it. The group join happens before a handle is
+returned at all, so a publish after `SpawnAgent` returns is never racing the
+join. A handle that is simply dropped leaks its goroutine for the life of
+the process: Go has no `Drop` to catch that the way Rust does, which is why
+stopping is the caller's job and is documented as such rather than left to a
+finalizer that would not run.
+
+`Capabilities` makes the agent discoverable. When it is non-empty,
+`SpawnAgent` publishes a capability card to `agent.registry` and advertises
+the agent's topic as its live presence, refreshing both every `CardRefresh`
+(`DefaultCardRefresh`, 60s) and keeping the card fresh for three refreshes,
+so one missed beat does not read a live agent as dead. On any stop -- clean,
+cancelled or errored -- it marks every capability unavailable, republishes
+once more, and clears the presence, and it does all of that before `Join` or
+`Shutdown` returns, so the withdrawal a caller was promised has actually
+landed by the time it observes the stop. Empty capabilities is a private
+agent that advertises nothing, which is the behavior that predates this.
+
+Card and presence writes are best-effort and never surface as an agent
+error, matching Rust. Rust logs the failures; this client has no logging
+facility of its own, so they are dropped, the same treatment
+`LeaseRegistry`'s own heartbeats already get.
+
+`Laser.AdvertisePresence`/`ClearPresence`/`PublishCard` are the same surface
+for an agent not spawned through `SpawnAgent`. The first advertise pins the
+replica that answered it, and every later advertise or clear on that
+connection goes to the same one. One connection carries one agent identity: a
+second id is refused with `PresenceConflictError`, though re-advertising the
+same id is idempotent rather than a conflict.
+
+`Governor` re-scopes the agent's `Laser` before anything else in
+`SpawnAgent` runs -- before the runtime is built, before the group is
+joined, before the card is published -- so a governed agent's own card and
+presence writes are governed too, not just its handler's effects. It is
+`Laser.WithGovernor` scoped to one agent rather than to the handle the
+caller keeps. `GovernorMode` and `GovernorRetention` are read only when a
+governor is set.
+
+`ConsolidateEvery` and `Consolidator` run memory consolidation off the
+handler loop, on its own goroutine, scoped to this agent's own memory and
+bounded by the period itself. Both must be given: either one alone means no
+tick, ever. The first pass runs immediately rather than waiting out the
+first period, matching Rust, since Go's `time.Ticker` has no immediate first
+tick. `ConsolidateEvery` is a `*time.Duration` and not a plain one because
+Rust's `Option<Duration>` draws three states and the zero case is a caller
+error rather than a default: a zero or negative period fails `SpawnAgent`
+with an `InvalidError` instead of reaching `time.NewTicker` and panicking.
+Stopping the agent cancels the context each pass runs under, so a
+consolidator that respects cancellation returns at once mid-pass -- Go has
+no forcible task abort to stand in for Rust's.
+
+`RuntimeOptions.Verifier` and `SigningKey` are the agent-side signature
+gate. With a verifier configured, an unsigned or unverifiable record is
+dead-lettered as rejected before any other gate runs, and a record whose id
+already verified once is dropped silently rather than handled twice --
+anyone can replay captured bytes, and they verify again. The signature is
+checked against a context rebuilt from the record's own headers rather than
+anything the envelope claims about itself. With a signing key set, the
+agent's own answers are signed: `AgentCtx.Respond`, `RespondVia` and
+`RespondInput` all go through one function, as do pickup acknowledgments and
+dead-letter answers.
+
+## How a spawned agent schedules work
+
+`RuntimeOptions.Concurrency` decides how the loop handles what it is
+assigned. `SerialConcurrency()` is the zero value: one message at a time
+across every partition, fully ordered, where a slow or retrying message
+holds up everything. `SerialPerPartitionConcurrency(maxPartitions)` runs one
+lane per partition instead -- concurrent across partitions, still strictly
+in order within one -- so per-partition ordering and the committed prefix
+both hold, and retry backoff stays lane-local, where a poison message on one
+partition never stalls another. `maxPartitions` bounds the lanes: a record
+for an unassigned partition arriving at the cap retires an idle lane, or
+waits for one to go idle if every lane is busy.
+
+`RuntimeOptions.WarmDedup` replays each assigned partition's recent history
+into the dedup window at startup, so a restart does not re-handle what the
+group already committed. It needs `Group`, since the refill reads the
+group's stored offset to know what counts as handled; it reads that offset
+and never writes it. `WarmDedupPolicy` decides which committed records
+refill: `WarmDedupDeadLetters` (the zero value) leaves out a copy a
+deadline-exceeded dead letter names, reading the dead-letter topic to find
+them and falling back to `WarmDedupUnexpired` if they cannot all be read;
+`WarmDedupUnexpired` leaves out every copy whose deadline has passed without
+reading dead letters at all; `WarmDedupAll` refills everything, so a resend
+after an expiry is still recognized as a repeat. A record carrying no
+deadline refills its key under every policy. With a verifier configured, a
+committed record that would not verify is left out of the refill, the same
+way the live gate would dead-letter it.
 
 ## Dependencies
 

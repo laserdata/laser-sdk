@@ -69,6 +69,14 @@ func (laser *Laser) RequesterOn(stream, topic string, source wire.AgentID) *Requ
 	return requester
 }
 
+// Verifier arms this requester's replies against forged signers: with
+// verifier set, Request never settles on an unsigned, unverifiable, or
+// wrong-signer reply, waiting out its timeout instead.
+func (requester *Requester) Verifier(verifier *KeyRegistry) *Requester {
+	requester.hub.SetVerifier(verifier)
+	return requester
+}
+
 // Hub is the reply hub this requester waits on.
 //
 // A caller feeds it from whatever reads the reply topic, which is how one read
@@ -101,6 +109,12 @@ func (requester *Requester) Request(
 	}
 
 	expected := ExpectedReply{Session: conversation, Requester: requester.source}
+	if !options.Target.IsZero() {
+		// A directed request's answer is expected from the agent it was sent
+		// to; a broadcast's is not, since whichever group member picks the
+		// work up is the one who may answer it.
+		expected.ExpectedSigner = options.Target.String()
+	}
 	ticket, err := requester.hub.Subscribe(correlation, expected)
 	if err != nil {
 		return nil, err

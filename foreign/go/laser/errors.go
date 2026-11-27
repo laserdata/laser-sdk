@@ -9,8 +9,10 @@ package laser
 
 import (
 	"errors"
+	"strconv"
 
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
 // ConfigError reports a connection string, environment variable, or builder
@@ -102,6 +104,17 @@ func (e *UnsupportedError) Error() string {
 	return e.Surface + " need a managed backend, which this deployment does not have"
 }
 
+// ResultCode projects onto the shared unsupported code, which is what a
+// deployment that does serve the surface would answer for the same refusal.
+//
+// Without this a caller could not ask a refusal what it was in any uniform
+// way: every other refusal in this package answers a code, and this one
+// being the exception meant "the surface is not served" was the single
+// outcome that could only be read by matching the Go type.
+func (e *UnsupportedError) ResultCode() wire.ResultCode {
+	return wire.ResultUnsupported
+}
+
 // CodecError reports a value that could not be encoded or decoded, the Go form
 // of laser_sdk's LaserError::Codec.
 type CodecError struct {
@@ -117,6 +130,53 @@ func (e *CodecError) Error() string {
 }
 
 func (e *CodecError) Unwrap() error { return e.Cause }
+
+// NoInboxError reports an advertised inbox route that resolved an agent
+// which advertises no inbox topic, so there is nowhere to address it, the Go
+// form of laser_sdk's LaserError::NoInbox.
+//
+// It never falls back to a shared topic name: a destination nobody agreed to
+// consume is worse than a refusal a caller can act on.
+type NoInboxError struct{ Agent wire.AgentID }
+
+func (e *NoInboxError) Error() string {
+	return "agent has no advertised inbox: " + e.Agent.String() +
+		": start the agent with capabilities so it advertises its inbox, " +
+		"or give the contract a fixed inbox topic (FixedInbox)"
+}
+
+// RoutePrincipalMismatchError reports a route that selected an agent whose
+// live connection is not bound to the principal the caller required, the Go
+// form of laser_sdk's LaserError::RoutePrincipalMismatch.
+//
+// Actual is nil when the agent has no live presence at all, which is a
+// different fact from presence under the wrong principal and is reported as
+// such: one is an agent that is not there, the other is an agent that is
+// there as somebody else.
+type RoutePrincipalMismatchError struct {
+	Agent    wire.AgentID
+	Expected PrincipalID
+	Actual   *PrincipalID
+}
+
+func (e *RoutePrincipalMismatchError) Error() string {
+	actual := "none"
+	if e.Actual != nil {
+		actual = strconv.FormatUint(uint64(*e.Actual), 10)
+	}
+	return "agent " + e.Agent.String() + " is not bound to principal " +
+		strconv.FormatUint(uint64(e.Expected), 10) + " (actual: " + actual + ")"
+}
+
+// ProtocolError reports a deployment answering in a way the protocol does not
+// allow, the Go form of laser_sdk's LaserError::Protocol.
+//
+// It is distinct from CodecError, which is bytes that would not decode. These
+// bytes decoded; what they said was impossible, such as a page cursor that
+// does not advance.
+type ProtocolError struct{ Reason string }
+
+func (e *ProtocolError) Error() string { return e.Reason }
 
 // VersionError reports a surface whose advertised op version is not the one
 // this client pins, the Go form of a surface's typed Version error.
@@ -134,6 +194,21 @@ func (e *VersionError) Error() string {
 		", but this client speaks " + itoa(int(e.Pinned))
 }
 
+// PresenceConflictError reports that this connection already advertises
+// another agent's live presence, the Go form of laser_sdk's
+// LaserError::PresenceConflict. One physical connection may advertise one
+// logical agent: a second would overwrite connection metadata and steal the
+// first agent's route.
+type PresenceConflictError struct {
+	Advertised wire.AgentID
+	Requested  wire.AgentID
+}
+
+func (e *PresenceConflictError) Error() string {
+	return "connection already advertises agent " + e.Advertised.String() +
+		", cannot advertise " + e.Requested.String()
+}
+
 // NoProvenanceError reports a record that carries no agentic spine at all,
 // which is the normal case on a plain data topic.
 //
@@ -145,4 +220,23 @@ type NoProvenanceError struct{}
 
 func (e *NoProvenanceError) Error() string {
 	return "the record names no conversation, so it carries no provenance"
+}
+
+// StaleLaneError reports a session handle refused because the lane it was
+// pinned to is no longer the lane underneath it.
+//
+// A stream or topic that was deleted and created again takes the same name,
+// and can take the same numeric id, so a retained handle would otherwise
+// write to the replacement as though nothing had happened -- and its records
+// would be read back as part of a session that, on the lane the reader sees,
+// never had them. Recover by building a fresh handle, which pins the lane as
+// it is now.
+type StaleLaneError struct{ Reason string }
+
+func (e *StaleLaneError) Error() string { return "stale session lane: " + e.Reason }
+
+// ResultCode projects onto the shared stale-generation code, which is what
+// the server answers for the same condition.
+func (e *StaleLaneError) ResultCode() wire.ResultCode {
+	return wire.ResultStaleGeneration
 }

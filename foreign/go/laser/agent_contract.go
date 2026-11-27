@@ -2,6 +2,8 @@ package laser
 
 import (
 	"context"
+	"errors"
+	"strconv"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -101,6 +103,15 @@ type ContractBuilder struct {
 	correlation  *wire.CorrelationID
 	idempotency  *wire.IdempotencyKey
 	resumeFrom   []uint64
+	excluded     []wire.AgentID
+	verifier     *KeyRegistry
+	// inbox is where the command is addressed. Nil keeps the topic named at
+	// Laser.Contract, which is this client's own default rather than Rust's
+	// (Rust defaults to the advertised inbox); see InboxRoute for why.
+	inbox *InboxRoute
+	// replyTopic is where the answer is awaited. Empty keeps the command's
+	// own topic, which is where a target answering in place replies.
+	replyTopic string
 }
 
 // Contract opens a ContractBuilder addressed by router (one agent via To, or
@@ -112,6 +123,36 @@ func (laser *Laser) Contract(router Router, topic string) *ContractBuilder {
 		laser: laser, router: router, topic: topic,
 		deadline: DefaultContractDeadline,
 	}
+}
+
+// InboxRoute decides where the command is addressed.
+//
+// The default is a fixed route to the topic named at Laser.Contract, which
+// is what this client has always done. Rust defaults to AdvertisedInbox
+// instead; Go keeps the fixed default deliberately, because changing it
+// would re-address every existing caller's traffic and would fail outright
+// against a deployment that serves no presence, such as Apache Iggy. Pass
+// AdvertisedInbox() to opt in to per-agent addressing.
+//
+// Under an advertised route a capability pick only considers agents that
+// advertise an inbox, so an unreachable agent never wins the pick and then
+// fails the send.
+func (builder *ContractBuilder) InboxRoute(route InboxRoute) *ContractBuilder {
+	derived := *builder
+	derived.inbox = &route
+	return &derived
+}
+
+// ReplyOn awaits the answer on topic instead of the topic the command was
+// sent on.
+//
+// The two are the same by default, since a target answering in place replies
+// where it was addressed. They differ when the command goes to an agent's
+// own inbox but the answer belongs somewhere the caller already watches.
+func (builder *ContractBuilder) ReplyOn(topic string) *ContractBuilder {
+	derived := *builder
+	derived.replyTopic = topic
+	return &derived
 }
 
 // From names the agent the contract sends as. Required: the command is an
@@ -220,6 +261,27 @@ func (builder *ContractBuilder) ResumeFrom(positions []uint64) *ContractBuilder 
 	return &derived
 }
 
+// Excluding prefers a capability route's (ToCapable/Sticky/WithScorer) pick
+// outside agents, falling back to one of them only when no other agent is
+// capable. Unexported callers (the workflow engine's exclusive-step
+// reassignment) only: an ordinary send resolves against every capable agent.
+func (builder *ContractBuilder) Excluding(agents []wire.AgentID) *ContractBuilder {
+	derived := *builder
+	derived.excluded = agents
+	return &derived
+}
+
+// Verifier makes the contract's reply prove it came from the resolved
+// target: with verifier set, an unsigned, unverifiable, or wrong-signer
+// reply does not settle the contract. Send keeps waiting for one that does,
+// the same as if nothing had arrived yet, until its own deadline reports
+// ContractTimedOut.
+func (builder *ContractBuilder) Verifier(verifier *KeyRegistry) *ContractBuilder {
+	derived := *builder
+	derived.verifier = verifier
+	return &derived
+}
+
 // Send resolves the target, sends the command, and awaits the contract's
 // terminal state.
 func (builder *ContractBuilder) Send(ctx context.Context) (*Contract, error) {
@@ -232,7 +294,7 @@ func (builder *ContractBuilder) SendResolved(ctx context.Context) (wire.AgentID,
 	if builder.from.IsZero() {
 		return wire.AgentID{}, nil, &InvalidError{Reason: "a contract requires From(source agent id)"}
 	}
-	target, err := builder.resolve()
+	target, commandTopic, err := builder.resolve(ctx)
 	if err != nil {
 		return wire.AgentID{}, nil, err
 	}
@@ -253,7 +315,7 @@ func (builder *ContractBuilder) SendResolved(ctx context.Context) (wire.AgentID,
 		}
 	}
 
-	outcome, sendErr := builder.sendAndAwait(ctx, conversation, target)
+	outcome, sendErr := builder.sendAndAwait(ctx, conversation, target, commandTopic)
 
 	// End the child by the outcome before returning. A lifecycle record that
 	// fails to publish surfaces as the error, except when the contract itself
@@ -278,20 +340,60 @@ func (builder *ContractBuilder) SendResolved(ctx context.Context) (wire.AgentID,
 	return target, outcome, nil
 }
 
-// resolve names the one target this contract is directed to.
-func (builder *ContractBuilder) resolve() (wire.AgentID, error) {
+// resolve names the one target this contract is directed to, and the topic
+// its command is addressed to.
+func (builder *ContractBuilder) resolve(ctx context.Context) (wire.AgentID, string, error) {
 	if builder.router.Kind == RouteBroadcast || builder.router.Kind == RouteAllCapable {
-		return wire.AgentID{}, &InvalidError{Reason: "a contract is directed to " +
+		return wire.AgentID{}, "", &InvalidError{Reason: "a contract is directed to " +
 			"one agent, not a broadcast or all-capable route"}
 	}
-	targets, err := builder.router.ResolveTargets(builder.registry, time.Now())
+	inbox := builder.inboxRoute()
+	// Both the advertised inbox and a principal-bound route read live
+	// presence, so fold it first. RefreshPresence reuses what it holds
+	// within PresenceTTL, so this is a page of the connection table
+	// occasionally rather than on every send.
+	if builder.registry != nil &&
+		(inbox.Kind == InboxAdvertised || builder.router.RequiresPresence()) {
+		if _, err := builder.registry.RefreshPresence(ctx, builder.laser); err != nil {
+			return wire.AgentID{}, "", err
+		}
+	}
+	targets, err := builder.router.ResolveRoutable(
+		builder.registry, inbox, time.Now(), builder.excluded...)
 	if err != nil {
-		return wire.AgentID{}, err
+		return wire.AgentID{}, "", err
 	}
 	if len(targets) == 0 {
-		return wire.AgentID{}, &InvalidError{Reason: "the contract route resolved no target"}
+		return wire.AgentID{}, "", &InvalidError{Reason: "the contract route resolved no target"}
 	}
-	return targets[0], nil
+	target := targets[0]
+	advertised := ""
+	if builder.registry != nil {
+		advertised = builder.registry.InboxFor(target)
+	}
+	topic, err := inbox.Resolve(target, advertised)
+	if err != nil {
+		return wire.AgentID{}, "", err
+	}
+	return target, topic, nil
+}
+
+// inboxRoute is the route this contract addresses its command by, defaulting
+// to the topic named at Laser.Contract.
+func (builder *ContractBuilder) inboxRoute() InboxRoute {
+	if builder.inbox != nil {
+		return *builder.inbox
+	}
+	return FixedInbox(builder.topic)
+}
+
+// replyOn is where the answer is awaited, the command's own topic unless the
+// caller named another.
+func (builder *ContractBuilder) replyOn(commandTopic string) string {
+	if builder.replyTopic != "" {
+		return builder.replyTopic
+	}
+	return commandTopic
 }
 
 // sendAndAwait publishes the command and awaits its correlated terminal.
@@ -301,7 +403,9 @@ func (builder *ContractBuilder) resolve() (wire.AgentID, error) {
 // through to an (idempotent, when IdempotencyKey is also set) send.
 func (builder *ContractBuilder) sendAndAwait(
 	ctx context.Context, conversation wire.ConversationID, target wire.AgentID,
+	commandTopic string,
 ) (*Contract, error) {
+	replyTopic := builder.replyOn(commandTopic)
 	deadline := builder.deadline
 	if deadline <= 0 {
 		deadline = DefaultContractDeadline
@@ -314,12 +418,22 @@ func (builder *ContractBuilder) sendAndAwait(
 	if builder.correlation != nil {
 		correlation = *builder.correlation
 	}
-	expected := ExpectedReply{Session: conversation, Requester: builder.from}
+	// Under a verifier the reply's signer must be the route's authenticated
+	// principal when the route required one, and otherwise the resolved
+	// target's own enrolled identity. Preferring the principal is what joins
+	// discovery to authorship: a route that insisted on who the agent is
+	// should not then accept an answer signed by whoever holds the name.
+	expected := ExpectedReply{
+		Session: conversation, Requester: builder.from, ExpectedSigner: target.String(),
+	}
+	if principal := builder.router.RequiredPrincipal(); principal != nil {
+		expected.ExpectedSigner = strconv.FormatUint(uint64(*principal), 10)
+	}
 
 	if builder.resumeFrom != nil {
 		landed, err := builder.laser.awaitContractReply(
-			ctx, builder.laser.defaultStream, builder.topic, correlation,
-			builder.resumeFrom, expected, time.Now())
+			ctx, builder.laser.defaultStream, replyTopic, correlation,
+			builder.resumeFrom, expected, time.Now(), builder.verifier)
 		if err != nil {
 			return nil, err
 		}
@@ -328,8 +442,27 @@ func (builder *ContractBuilder) sendAndAwait(
 		}
 	}
 
+	// Subscribe to the shared dispatcher before sending, so an answer that
+	// lands between the send and the wait is never missed. A contract with
+	// its own verifier keeps the private poll below: the hub's verifier is
+	// per dispatcher, shared by every waiter on that topic, so one caller's
+	// key registry must not become every caller's.
+	var ticket *Ticket
+	if builder.verifier == nil {
+		hub, err := builder.laser.replyHubFor(
+			ctx, builder.laser.defaultStream, replyTopic)
+		if err != nil {
+			return nil, err
+		}
+		ticket, err = hub.Subscribe(correlation, expected)
+		if err != nil {
+			return nil, err
+		}
+		defer ticket.Close()
+	}
+
 	producer := builder.laser.AgdxOn(
-		builder.laser.defaultStream, builder.topic, builder.from, conversation)
+		builder.laser.defaultStream, commandTopic, builder.from, conversation)
 	if builder.parent != nil {
 		producer = producer.WithAncestry(*builder.parent, *builder.root)
 	}
@@ -351,9 +484,25 @@ func (builder *ContractBuilder) sendAndAwait(
 	}
 
 	expected.Command = &receipt.Record
+	if ticket != nil {
+		// Narrowed only now: the record id does not exist until the send,
+		// and the wait had to be registered before it.
+		ticket.Expect(receipt.Record)
+		message, err := ticket.Await(ctx, deadline)
+		if err != nil {
+			var timedOut *TimeoutError
+			if errors.As(err, &timedOut) {
+				return &Contract{State: ContractTimedOut}, nil
+			}
+			return nil, err
+		}
+		return classifyContract(message), nil
+	}
+
 	deadlineAt := time.Now().Add(deadline)
 	message, err := builder.laser.awaitContractReply(
-		ctx, builder.laser.defaultStream, builder.topic, correlation, nil, expected, deadlineAt)
+		ctx, builder.laser.defaultStream, replyTopic, correlation, nil, expected, deadlineAt,
+		builder.verifier)
 	if err != nil {
 		return nil, err
 	}
@@ -434,7 +583,7 @@ func contractFailureReason(state ContractState) string {
 // traffic, and usable without a caller already running a consumer loop on it.
 func (laser *Laser) awaitContractReply(
 	ctx context.Context, stream, topic string, correlation wire.CorrelationID,
-	startAt []uint64, expected ExpectedReply, deadline time.Time,
+	startAt []uint64, expected ExpectedReply, deadline time.Time, verifier *KeyRegistry,
 ) (*AgdxMessage, error) {
 	client := laser.Client()
 	if client == nil {
@@ -503,9 +652,21 @@ func (laser *Laser) awaitContractReply(
 					*message.Envelope.Correlation != correlation {
 					continue
 				}
-				if expected.Accepts(message) {
-					return message, nil
+				if !expected.Accepts(message) {
+					continue
 				}
+				if verifier != nil {
+					principal, ok := verifyReplySignature(verifier, message)
+					if !ok || (expected.ExpectedSigner != "" && principal != expected.ExpectedSigner) {
+						// An answer that does not hold up, or answers from
+						// somebody other than the resolved target, is left on
+						// the topic: the poll keeps looking for one that does,
+						// the same as if nothing had arrived yet.
+						continue
+					}
+					message.VerifiedPrincipal = &principal
+				}
+				return message, nil
 			}
 			last := polled.Messages[len(polled.Messages)-1]
 			cursors[partition] = iggcon.OffsetPollingStrategy(last.Header.Offset + 1)

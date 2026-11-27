@@ -14,7 +14,7 @@ import (
 func (server *scopeServer) GetStream(
 	_ context.Context, _ iggcon.Identifier,
 ) (*iggcon.StreamDetails, error) {
-	details := &iggcon.StreamDetails{}
+	details := laneStream()
 	details.Id = 7
 	return details, nil
 }

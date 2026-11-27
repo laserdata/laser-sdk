@@ -225,3 +225,65 @@ func TestGivenAPastDeadlineWithAMatchingDeadLetterWhenWarmDedupRunsUnderDeadLett
 		t.Error("want DeadLetters to leave out a record its own dead letter names as dropped")
 	}
 }
+
+// A deployment numbers its first stream and topic zero, so a source whose
+// ids are 0 is resolved, not missing.
+//
+// Treating 0 as "unresolved" skipped the dead-letter scan entirely against a
+// real server, and the DeadLetters policy silently did what Unexpired does:
+// it refilled on the deadline alone. Found by the first live BDD run, which
+// is the only place a zero id ever showed up.
+//
+// The record here has a deadline that has passed and **no** dead letter
+// naming it, which is the one shape where the two paths disagree: the scan
+// refills it (it ran, nothing dropped it), the fallback does not (its
+// deadline is past). A record a dead letter *does* name is left out either
+// way, so a test built on one proves nothing.
+func TestGivenZeroSourceIDsWhenWarmedThenShouldStillReadDeadLetters(t *testing.T) {
+	server := newRuntimeServer()
+	server.partitions = 1
+	// The first stream and topic of a fresh deployment.
+	server.streamID, server.topicID = 0, 0
+
+	past := time.Now().Add(-time.Hour)
+	key := idempotencyKey(t, "ran")
+	record := delivered(t, 0, 0, func(agdx *laser.Agdx) *laser.AgdxSend {
+		return agdx.Command(correlationID(1), []byte("ran")).
+			WithTarget(agentID(t, "executor")).
+			WithDeadline(past.Add(time.Minute)).
+			WithIdempotencyKey(key)
+	})
+	record.Message.Header.Timestamp = uint64(past.Add(-time.Minute).UnixMicro())
+	server.seedHistory(wire.AgentSessions, 0, 0, record.Message)
+
+	// A dead letter that names some *other* position, so the scan runs and
+	// finds this record un-dropped.
+	letter := wire.AgentDeadLetter{
+		Source: wire.LogPosition{StreamID: 0, TopicID: 0, PartitionID: 0, Offset: 99},
+		Reason: wire.DeadLetterDeadlineExceeded,
+	}
+	payload, err := wire.Marshal(letter)
+	if err != nil {
+		t.Fatalf("encode the dead letter: %v", err)
+	}
+	dlqMessage, err := iggcon.NewIggyMessage(payload)
+	if err != nil {
+		t.Fatalf("build the dead letter record: %v", err)
+	}
+	dlqMessage.Header.Offset = 0
+	dlqMessage.Header.Timestamp = uint64(past.UnixMicro())
+	server.seedHistory(wire.AgentDLQ, 0, 0, dlqMessage)
+
+	runtime := warmDedupRuntime(t, server, "executor-group", 10, laser.WarmDedupDeadLetters)
+	if err := laser.WarmUpDedupForTest(runtime, context.Background()); err != nil {
+		t.Fatalf("warm up: %v", err)
+	}
+
+	// Refilled, so a resend under the same key is suppressed. With the scan
+	// skipped it would fall back to the deadline alone and let the resend
+	// through.
+	dedup := laser.RuntimeAgentForTest(runtime).Dedup()
+	if dedup.Accept(laser.DedupKey(record.Provenance)) {
+		t.Error("want the dead-letter scan to refill a record no dead letter names")
+	}
+}

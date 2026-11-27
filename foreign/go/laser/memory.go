@@ -108,6 +108,25 @@ type MemoryScope struct {
 	Producer *wire.ProducerInfo
 }
 
+// ConsolidationReport is what one consolidation pass did: how many items it
+// summarized into fewer, reweighted, pruned, or derived as new items.
+type ConsolidationReport struct {
+	Summarized int
+	Reweighted int
+	Pruned     int
+	Derived    int
+}
+
+// Consolidator is a caller-supplied pass over one memory scope: summarize,
+// reweight, prune, or derive items. The SDK ships no concrete consolidator,
+// the same pluggable seam as the recall-side embedder: what consolidation
+// actually does (which model, which prompt, which pruning rule) is the
+// deployment's own business. Run periodically off an agent's handler loop
+// with SpawnOptions.ConsolidateEvery, scoped to just that agent's own memory.
+type Consolidator interface {
+	Consolidate(ctx context.Context, scope *MemoryScope) (ConsolidationReport, error)
+}
+
 // MemoryID is a remembered item's identity.
 type MemoryID struct{ wire.ID }
 
@@ -149,6 +168,9 @@ type MemoryItem struct {
 	Scope MemoryScope
 	// At is when the item was remembered.
 	At time.Time
+	// Signals are the signals that surfaced this item and their standing
+	// before fusion. Empty for an unranked or single-signal recall.
+	Signals []RecallSignal
 }
 
 // Text is the body as text, for an item remembered as one.
@@ -165,7 +187,34 @@ const (
 	RecallKeyword RecallStrategy = "keyword"
 	// RecallRecent returns the most recent items, ignoring any query.
 	RecallRecent RecallStrategy = "recent"
+	// RecallSemantic ranks by how close an item's embedding is to the
+	// query's, which finds what a question means rather than which words it
+	// used. It needs a backend with an embedder, such as VectorMemory.
+	RecallSemantic RecallStrategy = "semantic"
+	// RecallHybrid fuses every available signal into one ranking: semantic
+	// similarity, lexical overlap, and the feedback an agent gave. The
+	// multi-signal default for quality recall.
+	RecallHybrid RecallStrategy = "hybrid"
+	// RecallFeedback ranks by the weight an agent's own experience put on
+	// an item. It names a signal inside a fusion rather than a strategy a
+	// caller would usually ask for on its own.
+	RecallFeedback RecallStrategy = "feedback"
 )
+
+// RecallSignal is one signal's contribution to a recalled item: which
+// strategy surfaced it, where it ranked within that signal, and what that
+// signal scored it before fusion.
+//
+// It is what keeps a fused recall inspectable: a caller can see that an item
+// came top because two signals agreed rather than because one was confident.
+type RecallSignal struct {
+	// Strategy is the signal that produced the candidate.
+	Strategy RecallStrategy
+	// Rank is where it placed within that signal, 0 being best.
+	Rank int
+	// Score is that signal's own score, before fusion.
+	Score float64
+}
 
 // MemoryQuery is a recall request.
 type MemoryQuery struct {

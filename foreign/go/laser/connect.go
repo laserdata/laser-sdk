@@ -118,6 +118,14 @@ type connection struct {
 	// handles that disagreed about where an agent's work goes would split
 	// one agent's inbox across two topics.
 	layouts map[string]SessionLayout
+	// replyHubs is the shared reply dispatcher per (stream, reply topic),
+	// opened on first use. One reader per topic rather than one per waiter,
+	// so concurrent contracts on a topic read it once between them.
+	replyHubs map[replyHubKey]*replyDispatcher
+	// replyHubsOpened counts the dispatchers actually started, which is the
+	// number of pollers running over reply topics. It only ever grows, so a
+	// reused dispatcher is distinguishable from a replaced one.
+	replyHubsOpened int
 	// leases is where this connection's session leases are held, opened on
 	// first use. One registry per connection is what keeps a process to one
 	// heartbeat per stream.
@@ -132,6 +140,20 @@ type connection struct {
 	// linkState is the last transport transition reported, so a stream of
 	// failed calls reports one disconnect rather than one per call.
 	linkState ConnectionEvent
+	// presenceMutex serializes AdvertisePresence and ClearPresence on this
+	// connection, so one cannot overtake the other.
+	presenceMutex sync.Mutex
+	// advertisedAgent is the agent this connection currently advertises live
+	// presence for, nil until the first AdvertisePresence. One physical
+	// connection advertises one logical agent: a second would overwrite the
+	// first's connection metadata and steal its route.
+	advertisedAgent *wire.AgentID
+	// presencePin is the replica holding this connection's advertised
+	// presence. The first advertise pins it, and every later advertise or
+	// clear goes there, so a client whose managed requests moved to another
+	// node never leaves a stale presence behind or advertises a second one
+	// elsewhere.
+	presencePin *uint8
 }
 
 // unconnected stands in for the shared state of a handle that never
@@ -425,6 +447,7 @@ func (laser *Laser) Close() error {
 	err := client.Close()
 	laser.reportConnection(EventShutdown)
 	laser.closeWatchers()
+	laser.closeReplyHubs()
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return &TransportError{Reason: "close the connection", Cause: err}
 	}

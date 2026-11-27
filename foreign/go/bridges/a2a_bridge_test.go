@@ -59,8 +59,14 @@ func (log *bridgeLog) SendMessages(
 func (log *bridgeLog) GetStream(
 	_ context.Context, _ iggcon.Identifier,
 ) (*iggcon.StreamDetails, error) {
+	// The session topic is listed because a session write checks the lane's
+	// identity before it sends, and a stream with no agent.sessions reads as
+	// a lane that is not there.
 	return &iggcon.StreamDetails{
-		Stream: iggcon.Stream{Name: "agents", CreatedAt: 1_700_000_000_000_000},
+		Stream: iggcon.Stream{Id: 1, Name: "agents", CreatedAt: 1_700_000_000_000_000},
+		Topics: []iggcon.Topic{{
+			Id: 1, Name: wire.AgentSessions, CreatedAt: 1, PartitionsCount: 1,
+		}},
 	}, nil
 }
 

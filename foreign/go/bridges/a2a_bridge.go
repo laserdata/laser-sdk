@@ -493,11 +493,16 @@ func (bridge *A2ABridge) accepts(answer *taskAnswer, target string) bool {
 }
 
 // answerTerminal reports an answer that ends the task.
+//
+// Delegates to AnswerState rather than keeping its own, narrower rule: that
+// function already says a plain KindResponse with no explicit TaskState
+// completes the task (the Status a caller reading Task() sees), so this must
+// agree the same answer ends it -- a mismatch here let a finished task's
+// cancel through instead of refusing it, since an ordinary response (which
+// is what most agents send) was reported complete by one path and still
+// cancelable by the other.
 func answerTerminal(envelope *wire.AgentEnvelope) bool {
-	if envelope.TaskState != nil {
-		return envelope.TaskState.IsTerminal()
-	}
-	return envelope.Kind == wire.KindError
+	return AnswerState(envelope).IsTerminal()
 }
 
 var errNoStream = errors.New("an A2A bridge requires a default stream")

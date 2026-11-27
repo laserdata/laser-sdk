@@ -28,15 +28,48 @@ const scenarios = "../scenarios"
 // it would be read as evidence.
 func deployment(t *testing.T) string {
 	t.Helper()
-	address := os.Getenv("LASER_BDD_ADDR")
+	address := deploymentAddress()
 	if address == "" {
-		address = os.Getenv("LASER_CONNECTION_STRING")
-	}
-	if address == "" {
-		t.Skip("set LASER_BDD_ADDR or LASER_CONNECTION_STRING to run the " +
+		t.Skip("set LASER_CONNECTION_STRING (or run under " +
+			"scripts/run-with-test-iggy.mjs, which sets it) to run the " +
 			"conformance scenarios against a deployment")
 	}
 	return address
+}
+
+// deploymentAddress is the address the scenarios run against, empty when
+// none is configured. Unlike deployment, it never skips: a mostly-local
+// feature file (runLocalFeature) has no deployment for most of its
+// scenarios, but a handful of @managed ones still need "a running data
+// platform" to connect with, and a hardcoded empty address broke exactly
+// those -- found by the first run of this suite against a real managed
+// deployment, where materialization.feature's three managed scenarios all
+// failed with "connection string missing credentials" despite a real,
+// working deployment being configured.
+func deploymentAddress() string {
+	// The same precedence scripts/run-with-test-iggy.mjs reads, so a run
+	// driven by that helper reaches the server it actually started. The
+	// helper exports LASER_CONNECTION_STRING and LASER_BDD_URL for the
+	// child, and treats LASER_BDD_ADDR as a bare host:port it prepends
+	// credentials to -- so reading LASER_BDD_ADDR first, as this did, took
+	// the one value of the three that carries no credentials and failed
+	// against a server the helper had started correctly.
+	for _, name := range []string{
+		"LASER_CONNECTION_STRING", "LASER_BDD_URL", "LASER_BDD_ADDR",
+	} {
+		address := os.Getenv(name)
+		if address == "" {
+			continue
+		}
+		// A bare host:port gets the same default credentials the helper
+		// would have given it. An address that already names a user is
+		// left exactly as written.
+		if !strings.Contains(address, "@") {
+			address = "iggy:iggy@" + address
+		}
+		return address
+	}
+	return ""
 }
 
 // managed reports whether the scenarios tagged @managed may run.
@@ -160,7 +193,13 @@ func runLocalFeature(t *testing.T, file string, timeout time.Duration, run stepF
 	if len(feature.Scenarios) == 0 {
 		t.Fatalf("%s holds no scenarios, so this would pass vacuously", file)
 	}
-	runScenarios(t, feature, "", timeout, run)
+	// Most scenarios in a "local" feature need no deployment at all, but a
+	// handful may still be @managed and carry their own "Given a running
+	// data platform" step -- deploymentAddress (unlike deployment) reports
+	// empty rather than skipping the whole file when none is configured, so
+	// those scenarios connect when a deployment is there and fail openly,
+	// not cryptically, when it is not.
+	runScenarios(t, feature, deploymentAddress(), timeout, run)
 }
 
 func runScenarios(
@@ -171,6 +210,17 @@ func runScenarios(
 	runPlanned(t, feature, address, timeout, run, nil)
 }
 
+// featureHasTag reports whether the feature itself carries a tag, which
+// every scenario in it inherits.
+func featureHasTag(feature *bdd.Feature, tag string) bool {
+	for _, carried := range feature.Tags {
+		if carried == tag {
+			return true
+		}
+	}
+	return false
+}
+
 func runPlanned(
 	t *testing.T, feature *bdd.Feature, address string,
 	timeout time.Duration, run stepFunc, plan map[string]string,
@@ -178,16 +228,25 @@ func runPlanned(
 	t.Helper()
 	for _, scenario := range feature.Scenarios {
 		t.Run(scenario.Name, func(t *testing.T) {
-			if recoveringCatalog() || scenario.HasTag("@recovering_catalog") {
+			// A tag on the Feature covers every scenario in it, which is
+			// what Gherkin means by a feature-level tag. Reading only the
+			// scenario's own tags let a whole feature marked @managed run
+			// against a deployment that serves none, where it failed on the
+			// client's own "needs a managed backend" refusal rather than
+			// skipping.
+			tagged := func(tag string) bool {
+				return scenario.HasTag(tag) || featureHasTag(feature, tag)
+			}
+			if recoveringCatalog() || tagged("@recovering_catalog") {
 				if !recoveringCatalog() {
 					t.Skip("needs a catalog that refuses the first three " +
 						"binding reads: run with --recovering-catalog")
 				}
-				if !scenario.HasTag("@recovering_catalog") {
+				if !tagged("@recovering_catalog") {
 					t.Skip("a refusing catalog refuses this scenario too")
 				}
 			}
-			if scenario.HasTag("@managed") && !managed() {
+			if tagged("@managed") && !managed() {
 				t.Skip("needs a managed backend: set LASER_BDD_MANAGED=1")
 			}
 			if reason, planned := plan[scenario.Name]; planned {
@@ -281,7 +340,7 @@ func background(ctx context.Context, state *world, step bdd.Step) (bool, error) 
 		if err := state.freshStream(ctx); err != nil {
 			return true, err
 		}
-		return true, state.client.Bootstrap(ctx, 1, laser.ExpireAfter(24*time.Hour))
+		return true, state.bootstrapForSessions(ctx, 1)
 
 	case strings.HasPrefix(text, "a fresh stream bootstrapped with "):
 		counts := numbersOf(step)
@@ -291,8 +350,7 @@ func background(ctx context.Context, state *world, step bdd.Step) (bool, error) 
 		if err := state.freshStream(ctx); err != nil {
 			return true, err
 		}
-		return true, state.client.Bootstrap(
-			ctx, uint32(counts[0]), laser.ExpireAfter(24*time.Hour))
+		return true, state.bootstrapForSessions(ctx, uint32(counts[0]))
 	}
 	return false, nil
 }
@@ -333,6 +391,24 @@ func (state *world) freshStream(ctx context.Context) error {
 		}
 	})
 	return nil
+}
+
+// bootstrapForSessions creates the stream's agent topics and, on a
+// deployment that serves sessions, also registers the stream as a session
+// source.
+//
+// Sessions.Bootstrap is a strict superset of the plain Laser.Bootstrap this
+// used to call directly: the registration step is a no-op (Registered:
+// false, never an error) on a deployment with no session capability, so
+// calling it unconditionally is safe for every scenario that uses this
+// shared step, not only the ones that read a session back afterward. Found
+// by the first run of this suite against a real managed deployment: every
+// scenario that reads a session through the managed index (list/get/
+// events/state/links/sources/changes/watch) failed with "stream is not
+// registered for sessions" because this step never registered anything.
+func (state *world) bootstrapForSessions(ctx context.Context, partitions uint32) error {
+	_, err := state.client.Sessions().Bootstrap(ctx, partitions, laser.ExpireAfter(24*time.Hour))
+	return err
 }
 
 // topic reaches a topic of the scenario's own stream.

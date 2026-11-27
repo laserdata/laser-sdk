@@ -44,13 +44,13 @@ func (server *routingServer) Close() error { return nil }
 func (server *routingServer) GetStream(
 	_ context.Context, _ iggcon.Identifier,
 ) (*iggcon.StreamDetails, error) {
-	return &iggcon.StreamDetails{}, nil
+	return laneStream(), nil
 }
 
 func (server *routingServer) CreateStream(
 	_ context.Context, _ string, _ *iggcon.StreamOptions,
 ) (*iggcon.StreamDetails, error) {
-	return &iggcon.StreamDetails{}, nil
+	return laneStream(), nil
 }
 
 func (server *routingServer) GetTopic(

@@ -28,6 +28,15 @@ type budgetServer struct {
 func (server *budgetServer) SendBinaryRequest(
 	_ context.Context, code uint32, _ []byte,
 ) ([]byte, error) {
+	// A session write checks the registered lane against the source it is
+	// writing to, so this has to agree with laneStream.
+	if code == wire.AgdxSessionSourcesCode {
+		return wire.Marshal(wire.SessionReply{Outcome: &wire.SessionOutcome{
+			Kind: wire.SessionSourcesOutcome,
+			Sources: &wire.SessionSources{Lane: &wire.LaneIdentity{
+				TopicID: 1, Generation: 1, Partitions: 1}},
+		}})
+	}
 	if code != wire.AgdxSessionGetCode {
 		return nil, nil
 	}

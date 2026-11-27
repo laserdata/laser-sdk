@@ -40,6 +40,13 @@ type AgentMessage struct {
 	// ContentType is how Body is encoded, raw when the producer stamped
 	// nothing.
 	ContentType wire.ContentType
+	// VerifiedPrincipal is the enrolled principal this message's signature
+	// verified as, nil unless RuntimeOptions.Verifier is set and the message
+	// verified. A verified signature proves who authored the envelope, not
+	// that this is its first delivery: the consumer already drops a replayed
+	// signed record before the handler ever sees it, so a handler reading
+	// this never has to re-check for a replay itself.
+	VerifiedPrincipal *string
 }
 
 // Body is the task body whichever shape the message arrived in: the AGDX
@@ -211,8 +218,19 @@ type RuntimeOptions struct {
 	Budget *BudgetGate
 	// Control is the operator control a handler reads through its context.
 	// Nil opens an empty book, which reports nothing until a caller folds
-	// agent.control into it.
+	// agent.control into it, or until EnforceControl follows it.
 	Control *ControlBook
+	// EnforceControl makes an operator's pause binding rather than
+	// advisory: the runtime follows agent.control itself, and a paused
+	// session's work is durably parked on the session lane before its
+	// offset is committed, so nothing reaches the handler while the session
+	// is paused. A resume hands the held records back before new work.
+	//
+	// Off by default, because it changes what a handler sees and needs a
+	// deployment whose agent.control and agent.sessions topics exist. With
+	// it off a handler polls AgentCtx.PendingControl and decides itself,
+	// which is what this client has always done.
+	EnforceControl bool
 	// Sessions is the session surface a handler reads through its context.
 	// Nil opens the handle's default.
 	Sessions *Sessions
@@ -235,6 +253,22 @@ type RuntimeOptions struct {
 	// WarmDedupPolicy decides which committed records refill the window when
 	// WarmDedup is set. The zero value is WarmDedupDeadLetters.
 	WarmDedupPolicy WarmDedupPolicy
+	// Verifier, when set, makes signature verification mandatory: a record
+	// dispatched as this agent's work is dead-lettered before any other gate
+	// or the handler runs unless it carries a signature this registry
+	// verifies, and a replay of a previously verified record's exact bytes is
+	// dropped (not dead-lettered) rather than handled twice. Warm dedup also
+	// reads it, so a committed record that would not verify never refills
+	// the dedup window either. Nil (the default) verifies nothing, the prior
+	// behavior.
+	Verifier *KeyRegistry
+	// SigningKey, when set, signs every reply this agent's AgentCtx sends:
+	// AgentCtx.Respond/RespondVia/RespondInput's answer, the working status
+	// acknowledging a command's pickup, and the failure answering a
+	// dead-lettered command. A caller holding a verifier (and the contract
+	// path's signer binding) can then accept this agent's terminals and no
+	// one else's. Nil sends every reply unsigned, the prior behavior.
+	SigningKey *SigningKey
 }
 
 // AgentRuntime is the reliable consumer: it reads a topic, decodes and gates
@@ -263,6 +297,8 @@ type AgentRuntime struct {
 
 	budget      *BudgetGate
 	control     *ControlBook
+	pause       *sessionPause
+	follower    *controlFollower
 	sessions    *Sessions
 	replies     *ReplyHub
 	concurrency ConcurrencyPolicy
@@ -271,6 +307,17 @@ type AgentRuntime struct {
 	warmDedup       bool
 	warmDedupPolicy WarmDedupPolicy
 
+	verifier   *KeyRegistry
+	signingKey *SigningKey
+	// verifiedRecords remembers the record id of every message this runtime
+	// has already verified, so a replay of the exact same signed bytes is
+	// dropped rather than handled a second time. Only consulted when
+	// verifier is set.
+	verifiedRecords *Deduplicator
+
+	// sourceResolved reports that source's numeric ids were actually read
+	// back, which a zero id cannot say for itself: zero is a real id.
+	sourceResolved bool
 	// source names the stream and topic the runtime reads, resolved once at
 	// start so every capsule can locate its poison record without a round
 	// trip per failure.
@@ -322,30 +369,42 @@ func (laser *Laser) AgentRuntime(
 	if grace <= 0 {
 		grace = DefaultShutdownGrace
 	}
-	return &AgentRuntime{
-		laser:           laser,
-		agent:           agent,
-		identity:        agent.Identity(),
-		topic:           options.Topic,
-		stream:          stream,
-		respondOn:       options.RespondOn,
-		handled:         handled,
-		retry:           options.Retry.withDefaults(),
-		ackOnPickup:     options.AckOnPickup,
-		grace:           grace,
-		middleware:      options.Middleware,
-		onDeadLetter:    options.OnDeadLetter,
-		observer:        options.Observer,
-		budget:          options.Budget,
-		control:         control,
-		sessions:        sessions,
-		replies:         NewReplyHub(),
+	runtime := &AgentRuntime{
+		laser:        laser,
+		agent:        agent,
+		identity:     agent.Identity(),
+		topic:        options.Topic,
+		stream:       stream,
+		respondOn:    options.RespondOn,
+		handled:      handled,
+		retry:        options.Retry.withDefaults(),
+		ackOnPickup:  options.AckOnPickup,
+		grace:        grace,
+		middleware:   options.Middleware,
+		onDeadLetter: options.OnDeadLetter,
+		observer:     options.Observer,
+		budget:       options.Budget,
+		control:      control,
+		sessions:     sessions,
+		// The same verifier that gates incoming work also gates a reply to this
+		// agent's own outgoing request (AgentCtx.Request, ApprovalGate): both
+		// are "who may act in this agent's name," and a caller with one
+		// configured expects it enforced everywhere, not just on delivery.
+		replies:         NewVerifiedReplyHub(options.Verifier),
 		batches:         map[uint32]uint64{},
 		concurrency:     options.Concurrency,
 		group:           options.Group,
 		warmDedup:       options.WarmDedup,
 		warmDedupPolicy: options.WarmDedupPolicy,
-	}, nil
+		verifier:        options.Verifier,
+		signingKey:      options.SigningKey,
+		verifiedRecords: NewDeduplicator(DedupWindow),
+	}
+	if options.EnforceControl {
+		runtime.pause = newSessionPause(
+			laser, sessions, agent.Identity(), control, stream, options.Topic)
+	}
+	return runtime, nil
 }
 
 // Replies is the hub this runtime offers every reply it reads to, which is
@@ -381,6 +440,24 @@ func (runtime *AgentRuntime) Run(
 	}
 	if err := runtime.warmUpDedup(ctx); err != nil {
 		return err
+	}
+	// Started before the first record is read, and the book is reported
+	// live only once the history is loaded, so the gate never decides a
+	// session is unpaused merely because nothing has been read yet.
+	if runtime.pause != nil {
+		follower, err := followControl(
+			ctx, runtime.laser, runtime.control, runtime.identity)
+		if err != nil {
+			return err
+		}
+		runtime.follower = follower
+		defer follower.stop()
+		// A resume has to reach a session even when no further work
+		// arrives for it, so held work is reconciled on its own schedule
+		// rather than only when the next record turns up.
+		reconcile, stopReconcile := context.WithCancel(ctx)
+		defer stopReconcile()
+		go runtime.reconcileHeld(reconcile, handler)
 	}
 	if runtime.concurrency.isSerialPerPartition() {
 		return runtime.runPerPartition(ctx, source, handler, runtime.concurrency.maxPartitions)
@@ -487,9 +564,45 @@ func (runtime *AgentRuntime) deliver(
 			if agdx, carried := message.Agdx(); carried {
 				runtime.replies.Deliver(agdx)
 			}
+			// A decision on a parked approval also lands here, and the hub
+			// has no waiter for it: the handler that asked returned long
+			// ago, and may have been in another process entirely. This is
+			// what hands its record back.
+			if runtime.pause != nil {
+				if err := runtime.pause.resumeApproval(ctx, message, func(
+					ctx context.Context, held *Record, resume *approvalResume,
+				) (bool, error) {
+					return runtime.replayApproval(ctx, held, resume, handler)
+				}); err != nil {
+					return err
+				}
+			}
 		}
 		runtime.skipped(message, dispatch)
 		return nil
+	}
+	// Mandatory signature verification, before any other gate or the handler
+	// runs: the field is optional on the wire, so the only enforcement is
+	// this consumer refusing to act on an unsigned or unverified record once
+	// a verifier is configured.
+	if runtime.verifier != nil {
+		verified, replayed := runtime.verifySignature(message)
+		if verified == nil {
+			decision := Decision{
+				Verdict: DeadLetter, Reason: wire.DeadLetterRejected,
+				Detail: "signature verification failed",
+			}
+			runtime.dropped(message, decision)
+			return runtime.deadLetter(ctx, message, decision.Reason, 0, decision.Detail)
+		}
+		if replayed {
+			// A verified signature proves who authored the envelope, not
+			// that this is its first delivery: any writer on the topic can
+			// replay the captured bytes, and they verify again.
+			runtime.dropped(message, Decision{Verdict: Skip, Detail: "replayed signed record"})
+			return nil
+		}
+		message.VerifiedPrincipal = verified
 	}
 	if !runtime.admit(ctx, message) {
 		runtime.skipped(message, wire.DispatchObservational)
@@ -504,10 +617,65 @@ func (runtime *AgentRuntime) deliver(
 		runtime.dropped(message, decision)
 		return runtime.deadLetter(ctx, message, decision.Reason, 0, decision.Detail)
 	}
+	// The operator's own gate, last before the handler: a pause is about
+	// whether this work may run at all, which only makes sense once the
+	// record has passed every check that decides whether it is this agent's
+	// work in the first place.
+	if runtime.pause != nil {
+		decision, err := runtime.pause.hold(ctx, message, func(
+			ctx context.Context, held *Record,
+		) error {
+			return runtime.replayHeld(ctx, held, handler)
+		})
+		if err != nil {
+			return err
+		}
+		if decision == holdCommit {
+			runtime.skipped(message, wire.DispatchObservational)
+			return nil
+		}
+	}
 	runtime.acknowledgePickup(ctx, message)
 	if lease := runtime.pickUpSubmitted(ctx, message); lease != nil {
 		defer lease.Release()
 	}
+	return runtime.handle(ctx, message, handler)
+}
+
+// reconcileHeld hands back the work of sessions a resume reached while this
+// runtime was not reading anything for them.
+func (runtime *AgentRuntime) reconcileHeld(ctx context.Context, handler AgentHandler) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(controlFollowInterval):
+		}
+		runtime.pause.reconcile(ctx,
+			func(ctx context.Context, held *Record) error {
+				return runtime.replayHeld(ctx, held, handler)
+			},
+			func(ctx context.Context, held *Record, resume *approvalResume,
+			) (bool, error) {
+				return runtime.replayApproval(ctx, held, resume, handler)
+			})
+	}
+}
+
+// replayHeld hands one record a pause held back to the handler, after the
+// resume.
+//
+// It re-opens the record rather than keeping the decoded message from when
+// it was parked: the parking is durable and may outlive this process, so the
+// replay path has to work from the log alone.
+func (runtime *AgentRuntime) replayHeld(
+	ctx context.Context, record *Record, handler AgentHandler,
+) error {
+	message, opened, err := runtime.open(ctx, record)
+	if err != nil || !opened {
+		return err
+	}
+	runtime.acknowledgePickup(ctx, message)
 	return runtime.handle(ctx, message, handler)
 }
 
@@ -623,11 +791,24 @@ func (runtime *AgentRuntime) endBatch(record *Record) {
 func (runtime *AgentRuntime) handle(
 	ctx context.Context, message *AgentMessage, handler AgentHandler,
 ) error {
+	_, err := runtime.handleResumed(ctx, message, handler, nil)
+	return err
+}
+
+// handleResumed is handle, with the decision a parked approval gate is to be
+// answered with. It reports whether the handler parked (again) on an
+// approval, which is what tells a drain to stop rather than push past a
+// record that is still waiting.
+func (runtime *AgentRuntime) handleResumed(
+	ctx context.Context, message *AgentMessage, handler AgentHandler,
+	resume *approvalResume,
+) (bool, error) {
 	agentCtx := runtime.contextFor(message)
+	agentCtx.approval = runtime.approvalSlot(resume)
 	for _, middleware := range runtime.middleware {
 		settled, err := runtime.admitMiddleware(ctx, middleware, message)
 		if err != nil || settled {
-			return err
+			return false, err
 		}
 	}
 	var attempt uint32
@@ -637,21 +818,73 @@ func (runtime *AgentRuntime) handle(
 			middleware.AfterHandle(ctx, message, result, attempt+1)
 		}
 		if result == nil {
-			return nil
+			return false, nil
+		}
+		// Checked before the retry: a handler that stopped at an approval
+		// gate has not failed, and retrying it would prompt the approver
+		// again and again until the attempts ran out and the work was
+		// dead-lettered for waiting.
+		if parked, err := runtime.parkOnApproval(
+			ctx, message, agentCtx, result); parked {
+			return true, err
 		}
 		if !RetryableError(result) {
-			return runtime.deadLetter(ctx, message, wire.DeadLetterRejected,
+			return false, runtime.deadLetter(ctx, message, wire.DeadLetterRejected,
 				attempt+1, result.Error())
 		}
 		if attempt+1 >= runtime.retry.MaxAttempts {
-			return runtime.deadLetter(ctx, message, wire.DeadLetterRetryExhausted,
+			return false, runtime.deadLetter(ctx, message, wire.DeadLetterRetryExhausted,
 				attempt+1, result.Error())
 		}
 		if !sleepFor(ctx, runtime.retry.DelayFor(attempt)) {
-			return &ShutdownTimeoutError{Grace: runtime.grace}
+			return false, &ShutdownTimeoutError{Grace: runtime.grace}
 		}
 		attempt++
 	}
+}
+
+// approvalSlot is the parking channel one handler context gets.
+//
+// A runtime with no pause gate cannot park anything, and its slot names no
+// parking topic, which is what leaves an approval gate waiting in place.
+func (runtime *AgentRuntime) approvalSlot(resume *approvalResume) *approvalSlot {
+	slot := &approvalSlot{resume: resume}
+	if runtime.pause != nil {
+		slot.parkingTopic = runtime.topic
+	}
+	return slot
+}
+
+// parkOnApproval parks a record whose handler stopped at an approval gate,
+// reporting whether it took the record over.
+func (runtime *AgentRuntime) parkOnApproval(
+	ctx context.Context, message *AgentMessage, agentCtx *AgentCtx, result error,
+) (bool, error) {
+	var deferred *PolicyDeferredError
+	if !errors.As(result, &deferred) || deferred.Deferrer != DeferredByApproval {
+		return false, nil
+	}
+	interrupt := agentCtx.approval.takeInterrupt()
+	if interrupt == nil || runtime.pause == nil {
+		// The gate deferred without leaving a parking, so there is nothing
+		// to hand back later. Treated as an ordinary failure rather than
+		// silently dropping the record.
+		return false, nil
+	}
+	return true, runtime.pause.parkApproval(ctx, message, *interrupt)
+}
+
+// replayApproval hands a record parked on an approval back to its handler
+// with the decision, reporting whether it parked again.
+func (runtime *AgentRuntime) replayApproval(
+	ctx context.Context, record *Record, resume *approvalResume,
+	handler AgentHandler,
+) (bool, error) {
+	message, opened, err := runtime.open(ctx, record)
+	if err != nil || !opened {
+		return false, err
+	}
+	return runtime.handleResumed(ctx, message, handler, resume)
 }
 
 // admitMiddleware runs one middleware ahead of the handler, reporting whether
@@ -716,6 +949,9 @@ func (runtime *AgentRuntime) acknowledgePickup(ctx context.Context, message *Age
 	send := runtime.answering(envelope, runtime.respondOn).
 		TaskStatus(*envelope.Correlation, wire.TaskWorking).
 		WithTarget(envelope.Source)
+	if runtime.signingKey != nil {
+		send = send.Signed(runtime.signingKey)
+	}
 	if _, err := send.Send(ctx); err != nil {
 		runtime.failed(message, err)
 	}
@@ -759,6 +995,36 @@ func (runtime *AgentRuntime) pickUpSubmitted(
 		return nil
 	}
 	return lease
+}
+
+// verifySignature checks message against runtime.verifier, which the caller
+// has already confirmed is set. Returns the verified principal (nil when
+// unsigned or unverified) and whether a record carrying this id already
+// verified once before, in which case the principal is still returned
+// (non-nil) but the caller must treat it as a replay rather than fresh work.
+func (runtime *AgentRuntime) verifySignature(message *AgentMessage) (principal *string, replayed bool) {
+	if message.Envelope == nil {
+		return nil, false
+	}
+	stamp, err := envelopeStamp(message.Record)
+	if err != nil || !stamp.present {
+		return nil, false
+	}
+	observed := wire.SignatureContext{AgentVersion: &stamp.version}
+	if code, named := stamp.contentType.Code(); named {
+		observed.ContentType = &code
+	}
+	verified, err := runtime.verifier.VerifyObservedAt(
+		*message.Envelope, observed, message.Record.Message.Header.Timestamp)
+	if err != nil {
+		return nil, false
+	}
+	if record := message.Envelope.Record; record != nil {
+		if !runtime.verifiedRecords.Accept(record.String()) {
+			return &verified.Principal, true
+		}
+	}
+	return &verified.Principal, false
 }
 
 // answering opens the producer that answers one envelope, carrying its
@@ -835,12 +1101,21 @@ func (runtime *AgentRuntime) resolveSource(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	resolvedStream, resolvedTopic := false, false
 	if details, err := client.GetStream(ctx, streamID); err == nil && details != nil {
 		runtime.source.StreamID = details.Id
+		resolvedStream = true
 	}
 	if details, err := client.GetTopic(ctx, streamID, topicID); err == nil && details != nil {
 		runtime.source.TopicID = details.Id
+		resolvedTopic = true
 	}
+	// Tracked as a flag rather than inferred from the ids: a deployment
+	// numbers its first stream and topic **0**, so treating 0 as "unset"
+	// reads a legitimately resolved source as unresolved. That is what
+	// silently degraded the dead-letter warm-dedup policy to the
+	// deadline-only one against a real server.
+	runtime.sourceResolved = resolvedStream && resolvedTopic
 }
 
 // position is where a record sits, named fully enough for a redrive to find
@@ -1033,6 +1308,9 @@ func (runtime *AgentRuntime) answerDeadLetter(
 	if envelope.Record != nil {
 		at := runtime.position(message.Record)
 		send = send.WithCause(*envelope.Record, &at)
+	}
+	if runtime.signingKey != nil {
+		send = send.Signed(runtime.signingKey)
 	}
 	if _, err := send.Send(ctx); err != nil {
 		runtime.failed(message, err)

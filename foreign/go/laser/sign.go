@@ -314,11 +314,32 @@ func (registry *KeyRegistry) VerifyObservedAt(
 		return nil, &SignatureError{
 			Reason: "the signature does not bind the record headers"}
 	}
-	if *envelope.Signature.Context != observed {
+	if !signatureContextsEqual(*envelope.Signature.Context, observed) {
 		return nil, &SignatureError{
 			Reason: "the signature context differs from the record headers"}
 	}
 	return registry.check(envelope, &atMicros)
+}
+
+// signatureContextsEqual compares two contexts by the values their optional
+// fields point to, not by pointer identity.
+//
+// A plain "!=" on wire.SignatureContext compares its *uint8/*uint32 fields as
+// addresses, so two contexts built independently -- one at signing time, one
+// reconstructed from a record's own headers -- would always differ even
+// when they carry the same value, since they are never the same allocation.
+func signatureContextsEqual(first, second wire.SignatureContext) bool {
+	return equalPtr(first.ContentType, second.ContentType) &&
+		equalPtr(first.AgentVersion, second.AgentVersion)
+}
+
+// equalPtr compares two optional values: equal when both are nil, unequal
+// when only one is, and compared by value when both are set.
+func equalPtr[T comparable](first, second *T) bool {
+	if first == nil || second == nil {
+		return first == second
+	}
+	return *first == *second
 }
 
 func (registry *KeyRegistry) check(

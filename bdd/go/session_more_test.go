@@ -165,3 +165,38 @@ func rememberedProducer(
 		}
 	}
 }
+
+// atCheckpoint asserts what the lane held at the moment the checkpoint was
+// taken, which is the complement of sinceCheckpoint: one reproduces
+// everything before the point, the other resumes after it.
+func atCheckpoint(ctx context.Context, state *world, want []string) error {
+	if len(want) != 1 {
+		return fmt.Errorf("want one record body, got %v", want)
+	}
+	session, err := sessionOf(state)
+	if err != nil {
+		return err
+	}
+	value, found := state.get("checkpoint")
+	if !found {
+		return fmt.Errorf("the scenario took no checkpoint")
+	}
+	checkpoint := value.(*laser.ContextCheckpoint)
+	scope := state.client.Context(session.Conversation())
+	messages, err := scope.FetchUntil(
+		ctx, checkpoint, []string{wire.AgentSessions}, nil)
+	if err != nil {
+		return err
+	}
+	if len(messages) == 0 {
+		return fmt.Errorf("want %q at the checkpoint, the read held nothing", want[0])
+	}
+	// The last one, not the whole list: the checkpoint names a moment, and
+	// what the scenario asserts is the record that moment ended on.
+	last := string(messages[len(messages)-1].Body())
+	if last != want[0] {
+		return fmt.Errorf("want %q as the last record at the checkpoint, got %q",
+			want[0], last)
+	}
+	return nil
+}
