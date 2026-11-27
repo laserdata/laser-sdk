@@ -31,6 +31,13 @@ def workspace(rust="", wire="", stub="", report="", capabilities=(), retired=(),
         stack.enter_context(patch.dict(parity.OMISSION_CAPABILITIES, omissions or {}, clear=True))
         stack.enter_context(patch.dict(parity.CAPABILITY_SIGNOFFS, {}, clear=True))
         stack.enter_context(patch.object(parity, "CAPABILITIES", tuple(capabilities)))
+        # The Go table is keyed by capability, so a fake capability list needs a
+        # fake Go standing to match it: the two are one thing stated twice.
+        stack.enter_context(patch.dict(
+            parity.GO_CAPABILITIES,
+            {key: parity.MISSING for key, *_ in capabilities},
+            clear=True,
+        ))
         stack.enter_context(patch.object(parity, "RETIRED_RAW_CALLS", tuple(retired)))
         clients = {label: {"source": "fixture", "version": "1", "operations": sorted((raw or {}).get(label, ()))} for label in ("Rust", "TypeScript")}
         stack.enter_context(patch.object(parity, "raw_clients", lambda: (clients, [])))

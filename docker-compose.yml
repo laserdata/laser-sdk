@@ -1,12 +1,26 @@
 services:
   iggy:
-    image: docker.io/laserdatainc/iggy-server:0.0.1
+    # The repository publishes no semantic version tag: only latest, dev and
+    # edge, each with an arm64 and an amd64 variant. The 0.0.1 this file used
+    # to pin does not resolve at all, so `just up` could not start a server for
+    # anyone who did not already have that image cached. Reproducibility
+    # therefore rests on the digest below rather than on the tag, which moves.
+    # Current digest: sha256:5e03b80b514a6eafbaf59c6f2942480e883d858d896436aea3f324add7cb2a51
+    # which reports itself as Apache Iggy v0.10.3-ld.
+    image: docker.io/laserdatainc/iggy-server:latest
     container_name: laser-iggy
     restart: unless-stopped
     init: true
     environment:
       IGGY_TCP_ADDRESS: 0.0.0.0:8090
       IGGY_HTTP_ADDRESS: 0.0.0.0:3000
+      # Mandatory, and the server refuses to boot without it. Binding the
+      # wildcard says which interfaces this node accepts on, not where a client
+      # reaches it, so cluster metadata would carry no address for this node and
+      # the server stops rather than advertise nothing. The value must be a host
+      # with NO port: each transport's port comes from its own listener address,
+      # and a value carrying one is refused too. Do not remove this.
+      IGGY_NODE_ADVERTISED_ADDRESS: 127.0.0.1
       IGGY_ROOT_USERNAME: iggy
       IGGY_ROOT_PASSWORD: iggy
       IGGY_QUIC_ENABLED: "false"

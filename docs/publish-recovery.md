@@ -1,18 +1,18 @@
 # Publish timeouts and recovery
 
-Rust, Python, and TypeScript give each publish attempt a 60-second timeout and allow three additional attempts. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Each wait is drawn at random from the upper half of that delay, so clients that failed together do not retry together. A timeout limits how long an attempt can take. The transport can report a failure sooner.
+Rust, Python, TypeScript, and Go give each publish attempt a 60-second timeout and allow three additional attempts. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Each wait is drawn at random from the upper half of that delay, so clients that failed together do not retry together. A timeout limits how long an attempt can take. The transport can report a failure sooner.
 
 Each producer setup attempt and each send attempt uses the configured timeout. Reconnection before a retry uses time from that attempt. TypeScript spends at most half of that time on reconnection, which leaves time to send. After an attempt times out, Rust can use one additional timeout period to close the old connection and reconnect.
 
-| Configuration | Rust builder | Python `Laser.connect` | TypeScript builder | Environment variable | Default |
-| --- | --- | --- | --- | --- | --- |
-| Attempt timeout | `publish_timeout` | `publish_timeout_ms` | `publishTimeout` | `LASER_PUBLISH_TIMEOUT_MS` | `60000` |
-| Additional attempts | `publish_max_retries` | `publish_max_retries` | `publishMaxRetries` | `LASER_PUBLISH_MAX_RETRIES` | `3` |
-| Initial retry delay | `publish_retry_backoff` | `publish_retry_backoff_ms` | `publishRetryBackoff` | `LASER_PUBLISH_RETRY_BACKOFF_MS` | `250` |
+| Configuration | Rust builder | Python `Laser.connect` | TypeScript builder | Go `Options.Publish` | Environment variable | Default |
+| --- | --- | --- | --- | --- | --- | --- |
+| Attempt timeout | `publish_timeout` | `publish_timeout_ms` | `publishTimeout` | `PublishOptions.Timeout` | `LASER_PUBLISH_TIMEOUT_MS` | `60000` |
+| Additional attempts | `publish_max_retries` | `publish_max_retries` | `publishMaxRetries` | `PublishOptions.MaxRetries` | `LASER_PUBLISH_MAX_RETRIES` | `3` |
+| Initial retry delay | `publish_retry_backoff` | `publish_retry_backoff_ms` | `publishRetryBackoff` | `PublishOptions.RetryBackoff` | `LASER_PUBLISH_RETRY_BACKOFF_MS` | `250` |
 
 Explicit builder or connect configuration overrides the corresponding environment variable. To disable automatic resends, set retries to zero. Timeout and retry delay must be positive and at most 2147483647 milliseconds. Invalid configuration fails before connection.
 
-Environment defaults apply to normal connection builders and convenience connect methods. Rust `Laser::from_client` uses the built-in defaults because this wrapper cannot return an error. To configure a supplied Rust client, use `Laser::builder().client(client)`.
+Environment defaults apply to normal connection builders and convenience connect methods. Rust `Laser::from_client` and Go `laser.FromClient` use the built-in defaults because neither wrapper can return an error. In Go, a supplied client is configured by passing `Options.Publish`, and `Laser.WithPublishOptions` derives a handle with its own schedule. To configure a supplied Rust client, use `Laser::builder().client(client)`.
 
 ```rust
 use laser_sdk::prelude::*;

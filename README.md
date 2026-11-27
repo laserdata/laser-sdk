@@ -639,6 +639,7 @@ Connecting gives up after 30 seconds. Each publish attempt times out after 60 se
 | [`laser-sdk`](sdk/README.md) (`sdk/`) | the client and agent runtime, re-exporting the wire crate as `laser_sdk::wire`. |
 | [`foreign/python`](foreign/python/README.md) | the Python SDK, PyO3 bindings over the Rust crate. |
 | [`foreign/typescript`](foreign/typescript/README.md) | the native TypeScript SDK over Apache Iggy. |
+| [`foreign/go`](foreign/go/README.md) | the Go client, in progress. The wire contract is a complete native port, and the streaming, managed and agent surfaces have followed it, with its standing on each capability listed in its own section of [the parity matrix](docs/parity.md). |
 | [`examples`](examples/README.md) | Two standalone programs, `workflow` and `memory-correction`, run when copied alone. Nine focused examples cover `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, `context`, and `agent` in Rust, Python, and TypeScript. Nine larger examples cover streaming, event analytics, a fleet telemetry tape (`fleet-tape`), load generation, an incident desk (`incident-desk`), memory, interoperability, `orchestra`, and governance. |
 
 ## Benchmarks

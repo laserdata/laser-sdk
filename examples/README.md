@@ -11,6 +11,7 @@ Runnable examples of the Laser SDK, an open data-platform SDK over Apache Iggy. 
 
 ```
 examples/
+  go/        the Go examples (one module, one program per scenario) + their README
   rust/      the Rust examples (one crate, one binary per scenario) + their README
   python/    the Python examples (one script per scenario) + their README
   typescript/ the TypeScript examples (one entry point per scenario) + their README
