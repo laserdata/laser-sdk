@@ -151,6 +151,21 @@ func (laser *Laser) ScatterReport(
 	// for, rather than leaving them to run on past a gather nobody reads.
 	branching, stop := context.WithCancel(ctx)
 	defer stop()
+	wallClock := time.NewTimer(deadline)
+	defer wallClock.Stop()
+	// A best-effort branch must be stopped by this cancellation, not by its
+	// own Contract deadline: giving it the same duration races this timer
+	// against that one, and OS/scheduler jitter — not which fired "first" in
+	// code — decides the winner, so a losing branch reports itself as timed
+	// out in Outcomes instead of being cancelled here. Doubling it leaves
+	// cancellation as the only thing that can end a best-effort branch
+	// within this gather's own deadline. Every other policy relies on each
+	// branch's own deadline to end it (see the wallClock case below), so
+	// only best-effort gets the longer one.
+	branchDeadline := deadline
+	if request.Policy.kind == gatherBestEffort {
+		branchDeadline = 2 * deadline
+	}
 	outcomes := make(chan scatterBranch, len(targets))
 	running := map[wire.AgentID]bool{}
 	for _, target := range targets {
@@ -160,7 +175,7 @@ func (laser *Laser) ScatterReport(
 				From(request.From).
 				Payload(request.Payload).
 				Registry(request.Registry).
-				Deadline(deadline)
+				Deadline(branchDeadline)
 			if request.Inbox != nil {
 				// The caller watches the topic it named, so that is where
 				// every branch answers even when its command went to the
@@ -177,8 +192,6 @@ func (laser *Laser) ScatterReport(
 
 	report := &ScatterReport{}
 	successes := 0
-	wallClock := time.NewTimer(deadline)
-	defer wallClock.Stop()
 	for len(running) > 0 {
 		var finished scatterBranch
 		select {

@@ -631,21 +631,34 @@ func (agent *AgentCtx) gather(
 	// for, rather than leaving them to run on past a gather nobody reads.
 	branching, stop := context.WithCancel(ctx)
 	defer stop()
+	wallClock := time.NewTimer(deadline)
+	defer wallClock.Stop()
+	// A best-effort branch must be stopped by this cancellation, not by its
+	// own reply-wait deadline: giving it the same duration races this timer
+	// against that one, and OS/scheduler jitter — not which fired "first" in
+	// code — decides the winner, so a losing branch reports itself as a
+	// failure instead of being cancelled here. Doubling it leaves
+	// cancellation as the only thing that can end a best-effort branch
+	// within this gather's own deadline. Every other policy relies on each
+	// branch's own deadline to end it (see the wallClock case below), so
+	// only best-effort gets the longer one.
+	branchDeadline := deadline
+	if request.Policy.kind == gatherBestEffort {
+		branchDeadline = 2 * deadline
+	}
 	outcomes := make(chan branchOutcome, len(targets))
 	running := map[wire.AgentID]bool{}
 	for _, target := range targets {
 		running[target] = true
 		go func(target wire.AgentID) {
 			reply, err := agent.branch(
-				branching, target, request.Payload, deadline)
+				branching, target, request.Payload, branchDeadline)
 			outcomes <- branchOutcome{agent: target, reply: reply, err: err}
 		}(target)
 	}
 
 	gathered := &Gather{}
 	successes := 0
-	wallClock := time.NewTimer(deadline)
-	defer wallClock.Stop()
 	for len(running) > 0 {
 		var finished branchOutcome
 		select {

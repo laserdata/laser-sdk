@@ -152,8 +152,13 @@ func TestGivenADeadlineWhenSentThenShouldBeResolvedAtSendTime(t *testing.T) {
 	deadline := time.UnixMicro(int64(query.DeadlineMicros))
 	// The window has to exclude "now": a deadline that was not offset at all
 	// still sits between the two timestamps, so only a lower bound a whole
-	// minute out separates the two implementations.
-	if deadline.Before(before.Add(time.Minute)) {
+	// minute out separates the two implementations. The wire value is
+	// microsecond-granular (DeadlineMicros truncates), so the lower bound
+	// must be truncated the same way before comparing — otherwise a `before`
+	// whose own sub-microsecond remainder is nonzero (the common case) can
+	// outrun a deadline computed and truncated moments later, failing a
+	// correct implementation.
+	if deadline.Before(before.Truncate(time.Microsecond).Add(time.Minute)) {
 		t.Errorf("want a deadline at least a minute out, got %v past %v", deadline, before)
 	}
 	if deadline.After(after.Add(time.Minute)) {
