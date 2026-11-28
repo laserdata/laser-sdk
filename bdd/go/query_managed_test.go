@@ -34,11 +34,9 @@ type managedQueryFlow struct {
 	result *wire.QueryResult
 	// walked is every latency_ms an offset walk returned, in page order.
 	walked []int64
-	// frontier is the context a whole read reported, so a later step can
-	// check it did not move between pages.
-	frontier  []wire.QueryFrontier
-	hasFirst  bool
-	lastFront []wire.QueryFrontier
+	// frontierMoved is what a whole read reported about its pages, nil
+	// until one ran.
+	frontierMoved *bool
 }
 
 func managedQueryFlowOf(state *world) *managedQueryFlow {
@@ -105,13 +103,19 @@ func queryManagedStep(ctx context.Context, state *world, step bdd.Step) error {
 			return request.GroupBy(field).Count()
 		})
 
-	case strings.Contains(text, "is walked in pages of") ||
-		strings.Contains(text, "is read whole in pages of"):
+	case strings.Contains(text, "is walked in pages of"):
 		size, named := after(text, "in pages of ")
 		if len(arguments) != 1 || !named {
 			return fmt.Errorf("want an index and a page size in %q", text)
 		}
 		return walkPages(ctx, state, flow, arguments[0], int(size))
+
+	case strings.Contains(text, "is read whole in pages of"):
+		size, named := after(text, "in pages of ")
+		if len(arguments) != 1 || !named {
+			return fmt.Errorf("want an index and a page size in %q", text)
+		}
+		return readWhole(ctx, state, flow, arguments[0], int(size))
 
 	case strings.HasPrefix(text, "the materialized total is"):
 		wanted, named := after(text, "total is ")
@@ -151,9 +155,9 @@ func queryManagedStep(ctx context.Context, state *world, step bdd.Step) error {
 		return managedGroupCount(flow, arguments[0], int64(count))
 
 	case strings.HasPrefix(text, "the walk returns every latency_ms"):
-		from, _ := after(text, "from ")
+		from, starts := after(text, "from ")
 		to, named := after(text, " to ")
-		if !named {
+		if !starts || !named {
 			return fmt.Errorf("want a range in %q", text)
 		}
 		return walkCoveredRange(flow, int64(from), int64(to))
@@ -196,19 +200,15 @@ func seedMaterialized(
 	if err != nil {
 		return err
 	}
-	producer := topic.Batching().Build()
-	defer func() { _ = producer.Close(ctx) }()
+	batch := topic.PublishBatch()
 	for latency := 0; latency < count; latency++ {
 		status := "200"
 		if latency%4 == 0 {
 			status = "500"
 		}
-		body := fmt.Sprintf(`{"status":"%s","latency_ms":%d}`, status, latency)
-		if err := producer.Send(ctx, []byte(body), nil); err != nil {
-			return err
-		}
+		batch.AddJSON(map[string]any{"status": status, "latency_ms": latency})
 	}
-	if err := producer.Flush(ctx); err != nil {
+	if _, err := batch.Send(ctx); err != nil {
 		return err
 	}
 	wait, err := materialization.Wait(ctx, wire.ReadinessCaughtUp, materializeCatchUp)
@@ -242,7 +242,6 @@ func walkPages(
 ) error {
 	flow.index = index
 	flow.walked = nil
-	flow.hasFirst = false
 	for offset := uint64(0); ; offset += uint64(size) {
 		result, err := state.client.Query(index).
 			OrderAsc("latency_ms").
@@ -252,10 +251,6 @@ func walkPages(
 		if err != nil {
 			return err
 		}
-		if !flow.hasFirst {
-			flow.frontier, flow.hasFirst = result.Context.Frontier, true
-		}
-		flow.lastFront = result.Context.Frontier
 		if len(result.Rows) == 0 {
 			flow.result = result
 			return nil
@@ -418,60 +413,35 @@ func walkCoveredRange(flow *managedQueryFlow, from, to int64) error {
 	return nil
 }
 
-// frontierUnmoved asserts every page of a whole read was bound to one
-// frontier, which is what makes the pages one consistent view.
-func frontierUnmoved(flow *managedQueryFlow) error {
-	if !flow.hasFirst {
-		return fmt.Errorf("the scenario walked no pages")
+// readWhole collects every page of the index in one call, which also reports
+// whether the pages were served at one position.
+func readWhole(
+	ctx context.Context, state *world, flow *managedQueryFlow, index string, size int,
+) error {
+	flow.index = index
+	flow.walked = nil
+	whole, err := state.client.Query(index).OrderAsc("latency_ms").Limit(uint32(size)).FetchAll(ctx)
+	if err != nil {
+		return err
 	}
-	if len(flow.frontier) != len(flow.lastFront) {
-		return fmt.Errorf("want the frontier unmoved, got %d partitions then %d",
-			len(flow.frontier), len(flow.lastFront))
-	}
-	for index, first := range flow.frontier {
-		if !sameFrontier(first, flow.lastFront[index]) {
-			return fmt.Errorf("want the frontier unmoved, got %s then %s",
-				describeFrontier(first), describeFrontier(flow.lastFront[index]))
+	for _, row := range whole.Rows {
+		latency, numeric := row.ValueI64("latency_ms")
+		if !numeric {
+			return fmt.Errorf("latency_ms is not a number in %+v", row.Values)
 		}
+		flow.walked = append(flow.walked, latency)
 	}
+	flow.frontierMoved = &whole.FrontierMoved
 	return nil
 }
 
-// sameFrontier reports two frontier entries as the same position.
-//
-// Compared field by field rather than with ==, because TopicCreatedAtMicros
-// is a *uint64 and == on the struct compares the pointer, not the timestamp.
-// Two reads decode into two allocations, so a struct comparison called every
-// frontier "moved" however stable the position really was -- which is what
-// made this scenario look like the server was recreating the topic
-// mid-scenario.
-func sameFrontier(first, second wire.QueryFrontier) bool {
-	if first.Stream != second.Stream ||
-		first.Topic != second.Topic ||
-		first.PartitionID != second.PartitionID ||
-		first.AppliedOffset != second.AppliedOffset {
-		return false
+// frontierUnmoved asserts the whole read reported one frontier for every page.
+func frontierUnmoved(flow *managedQueryFlow) error {
+	if flow.frontierMoved == nil {
+		return fmt.Errorf("the scenario read no index whole")
 	}
-	switch {
-	case first.TopicCreatedAtMicros == nil && second.TopicCreatedAtMicros == nil:
-		return true
-	case first.TopicCreatedAtMicros == nil || second.TopicCreatedAtMicros == nil:
-		// One read knew the incarnation and the other did not, so the two
-		// offsets are not known to be comparable.
-		return false
-	default:
-		return *first.TopicCreatedAtMicros == *second.TopicCreatedAtMicros
+	if *flow.frontierMoved {
+		return fmt.Errorf("want the frontier unmoved, the whole read reports it moved")
 	}
-}
-
-// describeFrontier renders a frontier entry with its timestamp read through
-// the pointer, so a failure names the generation rather than an address.
-func describeFrontier(frontier wire.QueryFrontier) string {
-	generation := "none"
-	if frontier.TopicCreatedAtMicros != nil {
-		generation = fmt.Sprintf("%d", *frontier.TopicCreatedAtMicros)
-	}
-	return fmt.Sprintf("{stream:%s topic:%s partition:%d generation:%s applied:%d}",
-		frontier.Stream, frontier.Topic, frontier.PartitionID,
-		generation, frontier.AppliedOffset)
+	return nil
 }

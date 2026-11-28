@@ -144,7 +144,7 @@ func (request *MaterializeRequest) Apply(
 		return nil, errNoStream()
 	}
 	laser := request.topic.laser
-	if !laser.capabilities.Managed || !laser.capabilities.Materializations {
+	if !laser.Capabilities().Managed || !laser.Capabilities().Materializations {
 		return nil, &UnsupportedError{Surface: "materializations"}
 	}
 	scoped := laser.WithDefaultStream(stream)
@@ -306,7 +306,7 @@ func (materialization *Materialization) ProjectionID() string {
 func (materialization *Materialization) Status(
 	ctx context.Context,
 ) ([]wire.BindingStatus, bool, error) {
-	if !materialization.laser.capabilities.Materializations {
+	if !materialization.laser.Capabilities().Materializations {
 		return nil, false, &UnsupportedError{Surface: "materialization status"}
 	}
 	info, err := materialization.laser.Projections().read(

@@ -14,7 +14,7 @@ const readAtReader = "laser-read-at"
 // ReadAt reads the one record at names, checking that the topic still has
 // the generation the reference recorded both before and after the poll, and
 // that the returned record sits at the named offset. Nil, nil when the
-// record is gone or the topic was recreated mid-read -- not an error, since
+// record is gone or the topic was recreated mid-read. That is not an error, since
 // a stale reference is an ordinary thing for a caller holding one from
 // earlier to encounter. Only a message reference names a log record; any
 // other SourceRef kind is refused.

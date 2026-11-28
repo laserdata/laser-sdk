@@ -47,10 +47,9 @@ func (grant ApprovalGrant) Decision() []byte {
 // the grant. A reply from anyone but the named approver does not decide, so a
 // third party cannot answer an approval it was not asked for.
 //
-// Waiting in place is the whole of this gate: the Rust client can instead
-// park the work and replay the handler once the decision lands, which frees
-// the consumer for the session's other work. That runtime is not ported here,
-// so a gate held open holds its caller open.
+// This gate waits in place, so a gate held open holds its caller open. A
+// handler gates through AgentCtx.ApprovalGate, which parks the record and
+// replays the handler once the decision lands.
 func (requester *Requester) ApprovalGate(
 	ctx context.Context, approver wire.AgentID,
 	conversation wire.ConversationID, prompt []byte, timeout time.Duration,

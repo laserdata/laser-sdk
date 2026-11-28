@@ -324,7 +324,7 @@ func TestGivenAMemoryWriteWhenStampedThenShouldCarryTheScopeAsHeaders(t *testing
 	}
 
 	for key, want := range map[string]string{
-		wire.HeaderMemoryNamespace: "prefs",
+		wire.HeaderMemoryNamespace: "stream:agents/prefs",
 		wire.HeaderMemoryUser:      "ana",
 		wire.HeaderMemoryApp:       "support",
 		wire.HeaderConversationID:  session.String(),

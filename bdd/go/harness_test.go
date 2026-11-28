@@ -2,11 +2,11 @@ package bdd_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"testing"
@@ -139,23 +139,6 @@ type stepFunc func(ctx context.Context, state *world, step bdd.Step) error
 // open can make the next one pass.
 func runFeature(t *testing.T, file string, timeout time.Duration, run stepFunc) {
 	t.Helper()
-	runFeaturePlanned(t, file, timeout, run, nil)
-}
-
-// runFeaturePlanned runs a feature where some scenarios are knowingly not
-// covered yet.
-//
-// plan maps a scenario's name to why this runner does not run it, and those
-// scenarios report as skips naming that reason. It exists so a large feature
-// can be covered in slices without the uncovered ones either failing the gate
-// or, far worse, quietly reporting a pass: a scenario absent from the plan and
-// missing a step implementation still fails. Shrinking the plan to nothing is
-// the work.
-func runFeaturePlanned(
-	t *testing.T, file string, timeout time.Duration,
-	run stepFunc, plan map[string]string,
-) {
-	t.Helper()
 	address := deployment(t)
 	feature, err := bdd.ParseFeature(filepath.Join(scenarios, file))
 	if err != nil {
@@ -164,19 +147,7 @@ func runFeaturePlanned(
 	if len(feature.Scenarios) == 0 {
 		t.Fatalf("%s holds no scenarios, so this would pass vacuously", file)
 	}
-	// A plan entry naming a scenario this feature does not hold is stale, and
-	// would go on excusing a scenario that no longer exists.
-	named := map[string]bool{}
-	for _, scenario := range feature.Scenarios {
-		named[scenario.Name] = true
-	}
-	for name := range plan {
-		if !named[name] {
-			t.Fatalf("%s holds no scenario %q, so the plan entry is stale",
-				file, name)
-		}
-	}
-	runPlanned(t, feature, address, timeout, run, plan)
+	runScenarios(t, feature, address, timeout, run)
 }
 
 // runLocalFeature runs a feature whose steps reach no deployment.
@@ -202,14 +173,6 @@ func runLocalFeature(t *testing.T, file string, timeout time.Duration, run stepF
 	runScenarios(t, feature, deploymentAddress(), timeout, run)
 }
 
-func runScenarios(
-	t *testing.T, feature *bdd.Feature, address string,
-	timeout time.Duration, run stepFunc,
-) {
-	t.Helper()
-	runPlanned(t, feature, address, timeout, run, nil)
-}
-
 // featureHasTag reports whether the feature itself carries a tag, which
 // every scenario in it inherits.
 func featureHasTag(feature *bdd.Feature, tag string) bool {
@@ -221,9 +184,9 @@ func featureHasTag(feature *bdd.Feature, tag string) bool {
 	return false
 }
 
-func runPlanned(
+func runScenarios(
 	t *testing.T, feature *bdd.Feature, address string,
-	timeout time.Duration, run stepFunc, plan map[string]string,
+	timeout time.Duration, run stepFunc,
 ) {
 	t.Helper()
 	for _, scenario := range feature.Scenarios {
@@ -246,21 +209,20 @@ func runPlanned(
 					t.Skip("a refusing catalog refuses this scenario too")
 				}
 			}
+			if tagged("@unmanaged") && managed() {
+				t.Skip("requires a deployment without a managed backend")
+			}
+			if tagged("@remote_sql") && os.Getenv("LASER_BDD_SQL_BACKEND") == "" {
+				t.Skip("requires a declared SQL backend")
+			}
 			if tagged("@managed") && !managed() {
 				t.Skip("needs a managed backend: set LASER_BDD_MANAGED=1")
-			}
-			if reason, planned := plan[scenario.Name]; planned {
-				t.Skip(reason)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 			state := &world{t: t, address: address}
 			for _, step := range scenario.Steps {
-				err := run(ctx, state, step)
-				var missing *blockedError
-				if errors.As(err, &missing) {
-					t.Skipf("%s %s: %v", step.Keyword, step.Text, err)
-				}
+				err := runStep(ctx, state, step, run)
 				if err != nil {
 					t.Fatalf("%s %s: %v", step.Keyword, step.Text, err)
 				}
@@ -269,17 +231,16 @@ func runPlanned(
 	}
 }
 
-// blockedError says a step cannot be honoured by the Go client as it stands.
-//
-// It is reported as a skip naming what is missing rather than as a pass, so
-// the gap stays countable: a scenario quietly dropped from the runner would
-// read as one the client satisfies. The steps around it stay implemented, so
-// the scenario runs for real the moment the client closes the gap.
-type blockedError struct{ Reason string }
-
-func (e *blockedError) Error() string { return e.Reason }
-
-func blocked(reason string) error { return &blockedError{Reason: reason} }
+// runStep reports a binding that panics, on a reworded step for one, as that
+// step's error with its stack.
+func runStep(ctx context.Context, state *world, step bdd.Step, run stepFunc) (err error) {
+	defer func() {
+		if failure := recover(); failure != nil {
+			err = fmt.Errorf("the step binding panicked: %v\n%s", failure, debug.Stack())
+		}
+	}()
+	return run(ctx, state, step)
+}
 
 // quoted pulls the quoted arguments out of a step, which is how the shared
 // scenarios carry their values.

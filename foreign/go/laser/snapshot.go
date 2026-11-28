@@ -1,7 +1,9 @@
 package laser
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"strconv"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -329,6 +331,121 @@ func SnapshotPartitionKey(
 	conversation wire.ConversationID, fold string,
 ) string {
 	return conversation.String() + ":" + strconv.Itoa(len(fold)) + ":" + fold
+}
+
+// ResumeOffsets is where a fold resumes after snapshot: one past each partition's last folded offset.
+func ResumeOffsets(snapshot wire.FoldSnapshot) []wire.SnapshotOffset {
+	resumed := make([]wire.SnapshotOffset, 0, len(snapshot.AsOf))
+	for _, entry := range snapshot.AsOf {
+		next := entry.Offset
+		if next != ^uint64(0) {
+			next++
+		}
+		resumed = append(resumed, wire.NewSnapshotOffset(entry.TopicID, entry.TopicCreatedAtMicros, entry.PartitionID, next))
+	}
+	return resumed
+}
+
+// SnapshotFromCheckpoint builds a snapshot of state folded up to checkpoint. It records the
+// stream and every checkpointed topic by id and creation time, and leaves empty partitions out.
+func SnapshotFromCheckpoint(
+	ctx context.Context, laser *Laser, conversation wire.ConversationID, fold string,
+	checkpoint *ContextCheckpoint, state []byte,
+) (*wire.FoldSnapshot, error) {
+	if laser == nil || checkpoint == nil {
+		return nil, &InvalidError{Reason: "a snapshot needs a client and a checkpoint"}
+	}
+	if laser.defaultStream == "" {
+		return nil, errNoStream()
+	}
+	stream, err := laser.Stream(laser.defaultStream).Get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if stream == nil {
+		return nil, &InvalidError{Reason: "stream `" + laser.defaultStream + "` does not exist"}
+	}
+	var asOf []wire.SnapshotOffset
+	for topic, partitions := range checkpoint.Offsets {
+		details, err := laser.Topic(topic).Get(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if details == nil {
+			return nil, &InvalidError{Reason: "topic `" + topic + "` does not exist"}
+		}
+		for partition, next := range partitions {
+			if next > 0 {
+				asOf = append(asOf, wire.NewSnapshotOffset(details.ID, details.CreatedAtMicros, uint32(partition), next-1))
+			}
+		}
+	}
+	slices.SortFunc(asOf, func(left, right wire.SnapshotOffset) int {
+		return cmp.Or(cmp.Compare(left.TopicID, right.TopicID),
+			cmp.Compare(left.TopicCreatedAtMicros, right.TopicCreatedAtMicros),
+			cmp.Compare(left.PartitionID, right.PartitionID))
+	})
+	snapshot := &wire.FoldSnapshot{
+		Stream: laser.defaultStream, StreamID: stream.ID, StreamCreatedAtMicros: stream.CreatedAtMicros,
+		Conversation: conversation, Fold: fold, AsOf: asOf, State: state,
+	}
+	if err := snapshot.Validate(); err != nil {
+		return nil, &InvalidError{Reason: err.Error()}
+	}
+	return snapshot, nil
+}
+
+// CheckpointFromSnapshot is the checkpoint a fold resumes after snapshot from. It refuses a
+// snapshot whose stream or source topics were recreated since.
+func CheckpointFromSnapshot(
+	ctx context.Context, laser *Laser, snapshot wire.FoldSnapshot, topics []string,
+) (*ContextCheckpoint, error) {
+	if err := snapshot.Validate(); err != nil {
+		return nil, &InvalidError{Reason: err.Error()}
+	}
+	if laser == nil || laser.defaultStream == "" {
+		return nil, errNoStream()
+	}
+	if snapshot.Stream != laser.defaultStream {
+		return nil, &InvalidError{Reason: "snapshot stream does not match the client"}
+	}
+	stream, err := laser.Stream(laser.defaultStream).Get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if stream == nil {
+		return nil, &InvalidError{Reason: "snapshot stream no longer exists"}
+	}
+	if snapshot.StreamID != stream.ID || snapshot.StreamCreatedAtMicros != stream.CreatedAtMicros {
+		return nil, &InvalidError{Reason: "snapshot stream generation changed"}
+	}
+	type source struct {
+		topic      uint32
+		generation uint64
+	}
+	current := make(map[source]struct{}, len(topics))
+	checkpoint := &ContextCheckpoint{Offsets: make(map[string][]uint64, len(topics))}
+	for _, topic := range topics {
+		details, err := laser.Topic(topic).Get(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if details == nil {
+			return nil, &InvalidError{Reason: "snapshot source topic " + topic + " is missing"}
+		}
+		current[source{details.ID, details.CreatedAtMicros}] = struct{}{}
+		offsets := make([]uint64, boundedPartitions(details.PartitionsCount))
+		for partition := range offsets {
+			offsets[partition] = snapshot.ResumeOffset(details.ID, details.CreatedAtMicros, uint32(partition))
+		}
+		checkpoint.Offsets[topic] = offsets
+	}
+	for _, entry := range snapshot.AsOf {
+		if _, known := current[source{entry.TopicID, entry.TopicCreatedAtMicros}]; !known {
+			return nil, &InvalidError{Reason: "snapshot source topic generation changed"}
+		}
+	}
+	return checkpoint, nil
 }
 
 // validSnapshotIdentity refuses a snapshot that belongs to another store.

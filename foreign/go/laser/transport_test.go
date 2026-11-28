@@ -285,3 +285,33 @@ func TestGivenAWorldWritableCacheWhenInstallingThenShouldNarrowItFirst(t *testin
 		t.Errorf("an existing world-writable cache must be narrowed, got %#o", mode)
 	}
 }
+
+func TestGivenACachedSymlinkWhenLoweringTLSOptionsThenShouldInstallARegularFile(t *testing.T) {
+	home := cacheIn(t)
+	parsed, err := laser.ParseConnectionStringWithEnv("iggy://u:p@eu.laserdata.cloud", noEnv())
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := parsed.TCPSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := settings.TLSCAFile
+	target := filepath.Join(home, "other.pem")
+	if err := os.WriteFile(target, []byte(laser.LaserDataRootCA), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, err := parsed.TCPSettings(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("expected a regular CA file: %v, %v", info, err)
+	}
+}

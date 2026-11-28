@@ -28,6 +28,8 @@ type MemoryFold struct {
 	items     map[MemoryID]*foldedMemory
 	forgotten map[memoryTarget]uint64
 	feedback  map[memoryTarget]float32
+	// named is the latest body per named key, folded from the same topic.
+	named map[string][]byte
 }
 
 // foldedMemory is one remembered item with what the fold orders it by.
@@ -61,6 +63,7 @@ func NewMemoryFold(stream, namespace string) *MemoryFold {
 		items:     map[MemoryID]*foldedMemory{},
 		forgotten: map[memoryTarget]uint64{},
 		feedback:  map[memoryTarget]float32{},
+		named:     map[string][]byte{},
 	}
 }
 
@@ -140,6 +143,10 @@ func (fold *MemoryFold) absorb(record wire.MemoryRecord, origin memoryOrigin) {
 func (fold *MemoryFold) forget(record wire.MemoryRecord, at uint64) {
 	target, known := memoryTargetOf(record.Target, record.Conversation)
 	if !known {
+		if _, err := wire.ParseID(record.Target); err != nil {
+			// A target that is not a memory id is a named key.
+			delete(fold.named, record.Target)
+		}
 		return
 	}
 	// The item goes rather than being flagged, so a tombstoned body is not
@@ -161,8 +168,8 @@ func (fold *MemoryFold) forget(record wire.MemoryRecord, at uint64) {
 func (fold *MemoryFold) remember(record wire.MemoryRecord, origin memoryOrigin) {
 	id, err := wire.ParseID(record.ID)
 	if err != nil {
-		// An id that is not a memory id is a named key, which this client has
-		// no surface for, so it is not a recall item.
+		// An id that is not a memory id is a named key: point state, never a recall item.
+		fold.named[record.ID] = append([]byte(nil), record.Body...)
 		return
 	}
 	target := MemoryID{ID: id}

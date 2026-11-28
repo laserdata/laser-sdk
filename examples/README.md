@@ -23,17 +23,18 @@ Each SDK owns its connection security. The Rust SDK embeds the LaserData public 
 
 Two programs run when copied alone, with no helper from this directory. Each reads `LASER_CONNECTION_STRING`. The workflow runs on the stream named by `LASER_STREAM`, or on a stream named after the workflow, and keeps it after the run so the run can be resumed. The memory correction works in a scratch stream and deletes it at the end.
 
-| program | Rust | Python | TypeScript |
-| --- | --- | --- | --- |
-| A workflow of three plain functions, one sleeping for a second, that prints its outcome as JSON | [`rust/src/workflow/main.rs`](rust/src/workflow/main.rs) | [`python/workflow.py`](python/workflow.py) | [`typescript/src/workflow/main.ts`](typescript/src/workflow/main.ts) |
-| A memory correction for one user with `supersede`, then a recall of the current facts | [`rust/src/memory-correction/main.rs`](rust/src/memory-correction/main.rs) | [`python/memory_correction.py`](python/memory_correction.py) | [`typescript/src/memory-correction/main.ts`](typescript/src/memory-correction/main.ts) |
+| program | Rust | Python | TypeScript | Go |
+| --- | --- | --- | --- | --- |
+| A workflow of three plain functions, one sleeping for a second, that prints its outcome as JSON | [`rust/src/workflow/main.rs`](rust/src/workflow/main.rs) | [`python/workflow.py`](python/workflow.py) | [`typescript/src/workflow/main.ts`](typescript/src/workflow/main.ts) | [`go/workflow/main.go`](go/workflow/main.go) |
+| A memory correction for one user with `supersede`, then a recall of the current facts | [`rust/src/memory-correction/main.rs`](rust/src/memory-correction/main.rs) | [`python/memory_correction.py`](python/memory_correction.py) | [`typescript/src/memory-correction/main.ts`](typescript/src/memory-correction/main.ts) | [`go/memory-correction/main.go`](go/memory-correction/main.go) |
 
-The three languages print the same fields, and every README shows the programs verbatim. Both run on Apache Iggy, Laser Stack, and LaserData Cloud. The memory correction recalls through the managed memory view where the deployment serves one, and folds the memory topic in process on Apache Iggy.
+The four languages print the same fields, and the Rust, Python and TypeScript READMEs show their programs verbatim. Both run on Apache Iggy, Laser Stack, and LaserData Cloud. The memory correction recalls through the managed memory view where the deployment serves one, and folds the memory topic in process on Apache Iggy.
 
 ## Start here
 
-Start with the focused `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, `context`, and `agent` examples. Each has Rust, Python, and TypeScript versions with matching steps. They link to [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk) and to larger scenarios. `recall` is the focused memory example, while `memory` covers the larger scenario.
+Start with the focused `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, `context`, and `agent` examples. Each has Rust, Python, TypeScript, and Go versions. They link to [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk) and to larger scenarios. `recall` is the focused memory example, while `memory` covers the larger scenario.
 
+- Go: [`go/README.md`](go/README.md): one program per scenario, all 21, each naming the operations it exercises and the deployment it needs.
 - Rust: [`rust/README.md`](rust/README.md): the full catalogue (each tagged agentic vs generic and whether it needs a managed deployment), with a per-example `README.md` under `rust/src/<name>/`.
 - Python: [`python/README.md`](python/README.md): the Python ports, the same environment conventions, one runnable script per scenario.
 - TypeScript: [`typescript/README.md`](typescript/README.md): the native Node ports and package-level smoke tests.

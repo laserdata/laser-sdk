@@ -1,7 +1,9 @@
 package laser
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -13,13 +15,12 @@ import (
 // A builder error is carried rather than returned at each step, so a chain
 // reads as one expression and still reports the first thing that was wrong.
 type PublishRequest struct {
-	topic    *Topic
-	payload  []byte
-	headers  []iggcon.HeaderEntry
-	key      string
-	hasKey   bool
-	messages []iggcon.IggyMessage
-	err      error
+	topic   *Topic
+	payload []byte
+	headers []iggcon.HeaderEntry
+	key     string
+	hasKey  bool
+	err     error
 }
 
 // Publish begins a record on this topic.
@@ -47,8 +48,7 @@ func (request *PublishRequest) JSON(value any) *PublishRequest {
 	if err != nil {
 		return request.fail(&CodecError{Reason: "encode the payload as JSON", Cause: err})
 	}
-	request.payload = encoded
-	return request.Header(wire.HeaderContentType, string(wire.ContentJSON))
+	return request.RawBytes(encoded, wire.ContentJSON)
 }
 
 // CBOR encodes a value as the contract's CBOR and sends that as the body,
@@ -58,20 +58,82 @@ func (request *PublishRequest) CBOR(value any) *PublishRequest {
 	if err != nil {
 		return request.fail(&CodecError{Reason: "encode the payload as CBOR", Cause: err})
 	}
-	request.payload = encoded
-	return request.Header(wire.HeaderContentType, string(wire.ContentCBOR))
+	return request.RawBytes(encoded, wire.ContentCBOR)
+}
+
+// EncodeWith writes a body through a caller-supplied codec.
+func (request *PublishRequest) EncodeWith(codec wire.Codec, value any) *PublishRequest {
+	if codec == nil {
+		return request.fail(&InvalidError{Reason: "missing payload codec"})
+	}
+	encoded, err := codec.Encode(value)
+	compiled, registered := codec.(*CompiledSchema)
+	if err != nil {
+		if registered {
+			return request.fail(err)
+		}
+		return request.fail(&CodecError{Reason: "encode the record body", Cause: err})
+	}
+	request.RawBytes(encoded, codec.ContentType())
+	if registered {
+		request.SchemaID(compiled.id)
+	}
+	return request
+}
+
+// Msgpack encodes a MessagePack record.
+func (request *PublishRequest) Msgpack(value any) *PublishRequest {
+	return request.EncodeWith(wire.MsgpackCodec, value)
+}
+
+// BSON encodes a BSON document.
+func (request *PublishRequest) BSON(value any) *PublishRequest {
+	return request.EncodeWith(wire.BSONCodec, value)
+}
+
+// RawBytes sets the encoded body and its content type.
+func (request *PublishRequest) RawBytes(payload []byte, kind wire.ContentType) *PublishRequest {
+	request.payload = payload
+	return request.ContentType(kind)
+}
+
+// SchemaID stamps the registered writer schema id on this record.
+func (request *PublishRequest) SchemaID(id uint32) *PublishRequest {
+	return request.setHeader(wire.HeaderSchemaID, iggcon.HeaderValue{Kind: iggcon.Uint32, Value: binary.LittleEndian.AppendUint32(nil, id)})
+}
+
+// Avro encodes a value and stamps the compiled schema's id.
+func (request *PublishRequest) Avro(schema *CompiledSchema, value any) *PublishRequest {
+	if schema == nil {
+		return request.fail(&InvalidError{Reason: "Avro publish requires a compiled schema"})
+	}
+	encoded, err := schema.EncodeAvro(value)
+	if err != nil {
+		return request.fail(err)
+	}
+	return request.RawBytes(encoded, wire.ContentAvro).SchemaID(schema.id)
 }
 
 // Header adds one string user header.
 func (request *PublishRequest) Header(name, value string) *PublishRequest {
+	if reservedMetadata(name) {
+		return request.fail(&InvalidError{Reason: "metadata header " + name + " is reserved"})
+	}
+	return request.textHeader(name, value)
+}
+
+func (request *PublishRequest) setHeader(name string, value iggcon.HeaderValue) *PublishRequest {
 	key, err := iggcon.NewHeaderKeyString(name)
 	if err != nil {
 		return request.fail(&InvalidError{Reason: "header name " + name + ": " + err.Error()})
 	}
-	request.headers = append(request.headers, iggcon.HeaderEntry{
-		Key:   key,
-		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte(value)},
-	})
+	for i, entry := range request.headers {
+		if entry.Key.Kind == key.Kind && bytes.Equal(entry.Key.Value, key.Value) {
+			request.headers[i].Value = value
+			return request
+		}
+	}
+	request.headers = append(request.headers, iggcon.HeaderEntry{Key: key, Value: value})
 	return request
 }
 
@@ -104,16 +166,27 @@ func (request *PublishRequest) Key(key string) *PublishRequest {
 
 // Send appends the record and returns the server's confirmations.
 func (request *PublishRequest) Send(ctx context.Context) (*iggcon.SendMessagesResponse, error) {
+	message, err := request.message()
+	if err != nil {
+		return nil, err
+	}
+	return request.topic.governedSend(ctx, []iggcon.IggyMessage{message},
+		request.key, request.hasKey)
+}
+
+func (request *PublishRequest) message() (iggcon.IggyMessage, error) {
 	if request.err != nil {
-		return nil, request.err
+		return iggcon.IggyMessage{}, request.err
+	}
+	if err := validatePublishHeaders(request.headers); err != nil {
+		return iggcon.IggyMessage{}, err
 	}
 	message, err := iggcon.NewIggyMessage(request.payload,
 		iggcon.WithUserHeaders(request.headers))
 	if err != nil {
-		return nil, &InvalidError{Reason: "build the record: " + err.Error()}
+		return iggcon.IggyMessage{}, &InvalidError{Reason: "build the record: " + err.Error()}
 	}
-	return request.topic.governedSend(ctx, []iggcon.IggyMessage{message},
-		request.key, request.hasKey)
+	return message, nil
 }
 
 // Send appends one record with explicit headers, the path with nothing built
@@ -256,7 +329,7 @@ func (topic *Topic) publishOnce(
 // partition and whatever retention the server defaults to.
 //
 // The stream is never created here. A governed identity has no stream-wide
-// create right, and a stream is provisioned with its tenant, so publishing
+// create right, and a stream is provisioned with its deployment, so publishing
 // into a stream that does not exist is a mistake to report rather than
 // something to paper over.
 func (topic *Topic) createTopicForPublish(ctx context.Context) error {

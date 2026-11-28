@@ -212,6 +212,19 @@ func TextFromParams(paramsJSON []byte) string {
 	return strings.Join(texts, "")
 }
 
+// CommandFromMessageSend maps a message/send request onto its command envelope. The
+// original params JSON rides in the body untouched.
+func CommandFromMessageSend(
+	record wire.RecordID, conversation wire.ConversationID, source wire.AgentID,
+	correlation wire.CorrelationID, paramsJSON []byte,
+) wire.AgentEnvelope {
+	operation := wire.OperationChat
+	return wire.AgentEnvelope{
+		Kind: wire.KindCommand, Record: &record, Conversation: conversation, Source: source,
+		Correlation: &correlation, Operation: &operation, Body: append([]byte(nil), paramsJSON...),
+	}
+}
+
 // BridgeError reports a request a bridge cannot translate.
 //
 // It is kept distinct from a transport failure because the remedy differs:

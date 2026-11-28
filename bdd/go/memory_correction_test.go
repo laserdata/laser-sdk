@@ -84,29 +84,26 @@ func memoryCorrectionStep(ctx context.Context, state *world, step bdd.Step) erro
 		return memoryTopicExists(ctx, state)
 
 	case strings.HasPrefix(text, "a folded recall for the user returns"):
-		return foldedRecall(ctx, state, flow, laser.MemoryQuery{}, arguments)
+		return checkMemoryRecall(ctx, state, flow, laser.MemoryQuery{}, arguments, true)
 
 	case strings.HasPrefix(text, "a folded semantic recall for"):
 		if len(arguments) < 2 {
 			return fmt.Errorf("want a query and the expected facts, got %v", arguments)
 		}
-		return foldedRecall(ctx, state, flow, laser.MemoryQuery{
+		return checkMemoryRecall(ctx, state, flow, laser.MemoryQuery{
 			Query: arguments[0], Strategy: laser.RecallAuto,
-		}, arguments[1:])
+		}, arguments[1:], true)
 
 	case strings.HasPrefix(text, "a folded keyword recall for"):
 		if len(arguments) < 2 {
 			return fmt.Errorf("want a query and the expected facts, got %v", arguments)
 		}
-		return foldedRecall(ctx, state, flow, laser.MemoryQuery{
+		return checkMemoryRecall(ctx, state, flow, laser.MemoryQuery{
 			Query: arguments[0], Strategy: laser.RecallKeyword,
-		}, arguments[1:])
+		}, arguments[1:], true)
 
 	case strings.HasPrefix(text, "a recall for the user returns"):
-		// The managed form of the same assertion. This client folds the
-		// topic itself either way, so it reads the same, and the scenario
-		// is tagged @managed for the deployments that serve a read view.
-		return foldedRecall(ctx, state, flow, laser.MemoryQuery{}, arguments)
+		return checkMemoryRecall(ctx, state, flow, laser.MemoryQuery{}, arguments, false)
 
 	default:
 		return fmt.Errorf("this runner does not implement the step")
@@ -184,15 +181,19 @@ func memoryTopicExists(ctx context.Context, state *world) error {
 //
 // Scoped to the user alone, not to a conversation: the feature's point is
 // that a correction holds for the user everywhere.
-func foldedRecall(
+func checkMemoryRecall(
 	ctx context.Context, state *world, flow *correctionFlow,
-	query laser.MemoryQuery, expected []string,
+	query laser.MemoryQuery, expected []string, folded bool,
 ) error {
 	memory, err := memoryFor(state, flow, "")
 	if err != nil {
 		return err
 	}
-	items, err := memory.Recall(ctx, query)
+	recall := memory.Recall
+	if folded {
+		recall = memory.RecallFolded
+	}
+	items, err := recall(ctx, query)
 	if err != nil {
 		return err
 	}

@@ -50,6 +50,16 @@ type parkedRole struct {
 	// waiting for one. Only approval parkings appear here, so its keys are
 	// also what separates them from the records a pause holds.
 	approvalDeadlines map[parkingKey]uint64
+	resolvedPrompts   map[wire.LogPosition]bool
+	// terminal reports that this role ended the paused session canceled.
+	terminal bool
+}
+
+func (role *parkedRole) resolvePrompt(prompt wire.LogPosition) {
+	if role.resolvedPrompts == nil {
+		role.resolvedPrompts = make(map[wire.LogPosition]bool)
+	}
+	role.resolvedPrompts[prompt] = true
 }
 
 // sessionPause is the mandatory pause gate of one agent runtime.
@@ -59,11 +69,6 @@ type parkedRole struct {
 // before any new work for that session. This is what makes an operator's
 // pause binding rather than advisory: nothing reaches a handler while the
 // session is paused, whether or not the handler ever asks.
-//
-// What this does not yet do, and Rust does: rebuild its held work from the
-// log after a restart or a rebalance, park a record on an approval, or
-// acknowledge the pause and resume requests it takes part in on the lane.
-// Those are the next slice; see IMPLEMENTATION_STATUS.md.
 type sessionPause struct {
 	laser    *Laser
 	sessions *Sessions
@@ -87,6 +92,7 @@ type sessionPause struct {
 	// partitions are the ones records have arrived from, the observable
 	// half of this member's consumer-group assignment.
 	partitions map[uint32]struct{}
+	assigned   map[uint32]struct{}
 }
 
 // newSessionPause opens a gate over book.
@@ -173,45 +179,102 @@ func (pause *sessionPause) hold(
 		return holdCommit, nil
 	}
 
-	pending, known := pause.book.Pending(session)
-	if !known {
-		// The book cannot tell "not paused" from "not read yet", and acting
-		// on that difference is how a paused session's work gets through.
-		// A book that is not live is the un-ported state, where this gate
-		// is not in force at all.
-		return holdHandle, nil
-	}
-	if pending.PauseRequested {
-		if ack, named := pause.book.PauseAck(session); named {
-			// Acknowledged before the record is parked, so an operator
-			// watching the lane sees this role stop before it sees what it
-			// stopped holding.
-			if err := pause.acknowledge(ctx, session, wire.TaskPaused, ack); err != nil {
+	for {
+		pending, known := pause.book.Pending(session)
+		if !known {
+			// The book cannot tell "not paused" from "not read yet", and acting
+			// on that difference is how a paused session's work gets through.
+			// A book that is not live is the un-ported state, where this gate
+			// is not in force at all.
+			return holdHandle, nil
+		}
+		if pending.PauseRequested {
+			if ack, named := pause.book.PauseAck(session); named {
+				// Acknowledged before the record is parked, so an operator
+				// watching the lane sees this role stop before it sees what it
+				// stopped holding.
+				if err := pause.acknowledge(ctx, session, wire.TaskPaused, ack); err != nil {
+					return holdHandle, err
+				}
+			}
+			if pending.CancelRequested {
+				pause.cancelPaused(ctx, session, true)
+			}
+			if err := pause.park(ctx, session, message); err != nil {
+				return holdHandle, err
+			}
+			return holdCommit, nil
+		}
+		// A resume is acknowledged only by a role that acknowledged the pause:
+		// an agent that never stopped has nothing to say it has started again,
+		// and saying so would read as a participant the pause never had.
+		if !pending.CancelRequested {
+			if err := pause.acknowledgeResume(ctx, session); err != nil {
 				return holdHandle, err
 			}
 		}
-		if err := pause.park(ctx, session, message); err != nil {
+
+		key, addressed := pause.keyOf(ctx, message)
+		if addressed && pause.handledAlready(session, key) {
+			// Redelivered after a crash between the parking and the commit, and
+			// already handled through the parking.
+			return holdCommit, nil
+		}
+		if pending.CancelRequested {
+			// A canceled session's held records stay unprocessed.
+			return holdHandle, nil
+		}
+		// Unfiltered by assignment: this member is reading the session's work, so
+		// what it holds for the session runs first whatever partition it came from.
+		interrupted, err := pause.drain(ctx, session, false, replay)
+		if err != nil {
 			return holdHandle, err
 		}
-		return holdCommit, nil
+		if !interrupted {
+			return holdHandle, nil
+		}
+		// A pause or a cancel landed mid-drain, so the record is decided again.
 	}
-	// A resume is acknowledged only by a role that acknowledged the pause:
-	// an agent that never stopped has nothing to say it has started again,
-	// and saying so would read as a participant the pause never had.
-	if err := pause.acknowledgeResume(ctx, session); err != nil {
-		return holdHandle, err
-	}
+}
 
-	key, addressed := pause.keyOf(ctx, message)
-	if addressed && pause.role(session).handled[key] {
-		// Redelivered after a crash between the parking and the commit, and
-		// already handled through the parking.
-		return holdCommit, nil
+// involved reports whether this role acknowledged a request of the session or
+// holds work for it.
+func (pause *sessionPause) involved(session wire.ConversationID) bool {
+	held := pause.role(session)
+	pause.mutex.Lock()
+	defer pause.mutex.Unlock()
+	return held.ack != nil || len(held.parked) > 0
+}
+
+// cancelPaused ends a paused session canceled as this role, once.
+//
+// Best effort: a failed write is retried by the next record or reconcile.
+func (pause *sessionPause) cancelPaused(
+	ctx context.Context, session wire.ConversationID, named bool,
+) {
+	held := pause.role(session)
+	pause.mutex.Lock()
+	involved := held.ack != nil || len(held.parked) > 0
+	terminal := held.terminal
+	pause.mutex.Unlock()
+	if terminal || !(named || involved) {
+		return
 	}
-	if err := pause.drain(ctx, session, replay); err != nil {
-		return holdHandle, err
+	lens := pause.sessions.Open(session, "").As(pause.me)
+	if _, err := lens.End(ctx, wire.TaskCanceled, wire.SessionEnd{}); err != nil {
+		return
 	}
-	return holdHandle, nil
+	pause.mutex.Lock()
+	held.terminal = true
+	pause.mutex.Unlock()
+}
+
+// handledAlready reports whether this role already handled the record at key.
+func (pause *sessionPause) handledAlready(session wire.ConversationID, key parkingKey) bool {
+	held := pause.role(session)
+	pause.mutex.Lock()
+	defer pause.mutex.Unlock()
+	return held.handled[key]
 }
 
 // park writes the held record on the session lane and records it, so the
@@ -265,22 +328,25 @@ func (pause *sessionPause) park(
 // drain hands back every record this role is holding for the session,
 // oldest source first, and writes each one off the lane as it goes.
 //
-// It stops at the first record the session is paused again for, so a pause
-// that lands mid-drain holds the rest rather than pushing through.
+// It stops at the first record the session is paused again or canceled for,
+// reporting that it was interrupted, so a request that lands mid-drain holds
+// the rest rather than pushing through. With assignedOnly it leaves records
+// of partitions this member does not read to the member that does.
 func (pause *sessionPause) drain(
-	ctx context.Context, session wire.ConversationID, replay replayFunc,
-) error {
+	ctx context.Context, session wire.ConversationID, assignedOnly bool, replay replayFunc,
+) (bool, error) {
 	for {
-		key, parking, more := pause.nextHeld(session)
+		key, parking, more := pause.nextHeld(session, assignedOnly)
 		if !more {
-			return nil
+			return false, nil
 		}
-		if pending, known := pause.book.Pending(session); known && pending.PauseRequested {
-			return nil
+		if pending, known := pause.book.Pending(session); known &&
+			(pending.PauseRequested || pending.CancelRequested) {
+			return true, nil
 		}
 		record, found, err := pause.fetchSource(ctx, parking)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if !found {
 			// The source expired or its topic was recreated, so the work
@@ -291,11 +357,11 @@ func (pause *sessionPause) drain(
 		}
 		if replay != nil {
 			if err := replay(ctx, record); err != nil {
-				return err
+				return false, err
 			}
 		}
 		if err := pause.unpark(ctx, session, parking); err != nil {
-			return err
+			return false, err
 		}
 		pause.markHandled(session, key)
 	}
@@ -323,7 +389,7 @@ func (pause *sessionPause) unpark(
 
 // nextHeld is the oldest record still held for the session.
 func (pause *sessionPause) nextHeld(
-	session wire.ConversationID,
+	session wire.ConversationID, assignedOnly bool,
 ) (parkingKey, wire.SessionParking, bool) {
 	held := pause.role(session)
 	pause.mutex.Lock()
@@ -334,6 +400,12 @@ func (pause *sessionPause) nextHeld(
 		found   bool
 	)
 	for key, candidate := range held.parked {
+		if _, owned := pause.assigned[key.partition]; assignedOnly && pause.assigned != nil && !owned {
+			continue
+		}
+		if pause.isApprovalParking(candidate) && !held.resolvedPrompts[candidate.Request] {
+			continue
+		}
 		if !found || olderParking(key, oldest) {
 			oldest, parking, found = key, candidate, true
 		}
@@ -358,6 +430,9 @@ func (pause *sessionPause) markHandled(session wire.ConversationID, key parkingK
 	held := pause.role(session)
 	pause.mutex.Lock()
 	defer pause.mutex.Unlock()
+	if parking, ok := held.parked[key]; ok && pause.isApprovalParking(parking) {
+		held.resolvePrompt(parking.Request)
+	}
 	delete(held.parked, key)
 	held.handled[key] = true
 }
@@ -376,6 +451,17 @@ func (pause *sessionPause) markUnrecoverable(session wire.ConversationID, key pa
 func (pause *sessionPause) fetchSource(
 	ctx context.Context, parking wire.SessionParking,
 ) (*Record, bool, error) {
+	source := parking.Source.Message
+	if source == nil {
+		return nil, false, nil
+	}
+	ids, err := pause.topicIDs(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if source.Stream != ids.stream || source.Topic != ids.topic {
+		return nil, false, nil
+	}
 	message, err := pause.laser.ReadAt(ctx, parking.Source)
 	if err != nil {
 		return nil, false, err
@@ -493,9 +579,7 @@ func (pause *sessionPause) parkingOf(
 	}
 	parking := wire.SessionParking{Source: source, Role: pause.me}
 	if at, paused := pause.book.PausedAt(session); paused {
-		parking.Request = wire.LogPosition{
-			PartitionID: at.Partition, Offset: at.Offset,
-		}
+		parking.Request = pause.controlPosition(at)
 	}
 	return parking, nil
 }
@@ -590,10 +674,12 @@ func (pause *sessionPause) acknowledgeResume(
 }
 
 // controlPosition is where a control request sits, as a log position.
-//
-// The stream and topic ids are left zero: this client does not resolve
-// agent.control's numeric identity, and the partition and offset are what
-// identify a request within it.
 func (pause *sessionPause) controlPosition(at ControlPosition) wire.LogPosition {
-	return wire.LogPosition{PartitionID: at.Partition, Offset: at.Offset}
+	position := wire.LogPosition{PartitionID: at.Partition, Offset: at.Offset}
+	pause.book.mutex.Lock()
+	defer pause.book.mutex.Unlock()
+	if source := pause.book.controlSource; source != nil {
+		position.StreamID, position.TopicID = source.StreamID, source.TopicID
+	}
+	return position
 }

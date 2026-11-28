@@ -12,8 +12,8 @@ import (
 // The session steps added after the first slice: the context checkpoint and
 // the session's linked memory.
 
-// takeCheckpoint records where the lane stood once it holds the named number
-// of this session's records.
+// takeCheckpoint records where the session stood once it holds the named
+// number of records.
 //
 // The count is waited for rather than assumed, because a checkpoint taken
 // before the earlier records landed would be a checkpoint of a different
@@ -23,24 +23,23 @@ func takeCheckpoint(ctx context.Context, state *world, want int) error {
 	if err != nil {
 		return err
 	}
-	scope := state.client.Context(session.Conversation())
 	deadline := time.Now().Add(20 * time.Second)
 	for {
-		displays, err := laneDisplays(ctx, state)
+		checkpoint, err := session.Checkpoint(ctx)
 		if err != nil {
 			return err
 		}
-		if len(displays) == want {
-			checkpoint, err := scope.Checkpoint(ctx, []string{wire.AgentSessions})
-			if err != nil {
-				return err
-			}
+		seen, err := session.TurnsAt(ctx, checkpoint)
+		if err != nil {
+			return err
+		}
+		if len(seen) == want {
 			state.put("checkpoint", checkpoint)
 			return nil
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("want %d records before the checkpoint, got %d",
-				want, len(displays))
+				want, len(seen))
 		}
 		select {
 		case <-ctx.Done():
@@ -61,17 +60,15 @@ func sinceCheckpoint(ctx context.Context, state *world, want []string) error {
 		return fmt.Errorf("the scenario took no checkpoint")
 	}
 	checkpoint := value.(*laser.ContextCheckpoint)
-	scope := state.client.Context(session.Conversation())
 	deadline := time.Now().Add(20 * time.Second)
 	for {
-		messages, err := scope.FetchSince(
-			ctx, checkpoint, []string{wire.AgentSessions}, nil)
+		turns, err := session.TurnsSince(ctx, checkpoint)
 		if err != nil {
 			return err
 		}
 		var bodies []string
-		for _, message := range messages {
-			bodies = append(bodies, string(message.Body()))
+		for _, turn := range turns {
+			bodies = append(bodies, turn.Text())
 		}
 		if len(bodies) == len(want) {
 			for index, body := range want {
@@ -107,7 +104,7 @@ func rememberThroughSession(
 	if err := state.topic(wire.AgentMemory).Ensure(ctx, 1, nil); err != nil {
 		return err
 	}
-	_, err = session.Memory().Remember(
+	_, err = session.LinkedMemory().Remember(
 		ctx, laser.MemoryFact, []byte(arguments[0]))
 	return err
 }
@@ -140,14 +137,7 @@ func rememberedProducer(
 				continue
 			}
 			if item.Producer == nil {
-				// The record is there and names nobody, so nothing further is
-				// coming and the gap is named at once.
-				return blocked("a session's linked memory does not stamp its " +
-					"agent as producer: Session.Memory scopes the item to the " +
-					"conversation only, where the Rust reference stamps " +
-					"sdk:<agent> and the current record as origin " +
-					"(sdk/src/agent/session_ops.rs linked_memory), so a reader " +
-					"cannot tell which agent remembered an item")
+				return fmt.Errorf("linked memory item has no producer")
 			}
 			seen = append(seen, item.Producer.Name)
 			if item.Producer.Name == arguments[0] {
@@ -182,18 +172,16 @@ func atCheckpoint(ctx context.Context, state *world, want []string) error {
 		return fmt.Errorf("the scenario took no checkpoint")
 	}
 	checkpoint := value.(*laser.ContextCheckpoint)
-	scope := state.client.Context(session.Conversation())
-	messages, err := scope.FetchUntil(
-		ctx, checkpoint, []string{wire.AgentSessions}, nil)
+	turns, err := session.TurnsAt(ctx, checkpoint)
 	if err != nil {
 		return err
 	}
-	if len(messages) == 0 {
+	if len(turns) == 0 {
 		return fmt.Errorf("want %q at the checkpoint, the read held nothing", want[0])
 	}
 	// The last one, not the whole list: the checkpoint names a moment, and
 	// what the scenario asserts is the record that moment ended on.
-	last := string(messages[len(messages)-1].Body())
+	last := turns[len(turns)-1].Text()
 	if last != want[0] {
 		return fmt.Errorf("want %q as the last record at the checkpoint, got %q",
 			want[0], last)

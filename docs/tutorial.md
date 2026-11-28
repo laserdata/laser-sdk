@@ -22,7 +22,7 @@ Apache Iggy provides the log and transport. Laser Stack or LaserData Cloud adds 
 
 For ordinary streaming, use `topic.producer()`, `topic.consumer(..)`, and `topic.consumer_group(..).consumer()`. They provide batching, delays, retries, routing, groups, and automatic or explicit commits. The [`native-streaming`](../examples/rust/src/native-streaming/README.md) example demonstrates both commit modes. For detailed Iggy configuration, use `topic.iggy_producer()`, `topic.iggy_consumer_group(..)`, or `laser.client()`. Import matching Iggy types through `laser_sdk::iggy`.
 
-VSR is the only supported Rust, Python, and TypeScript transport. It requires no Cargo feature or TypeScript connection option. Standard commands, unknown managed codes, and dedicated replicated authorization operations all use the same client connection. The server remains authoritative for custom command classification.
+VSR is the only supported Rust, Python, TypeScript, and Go transport. It requires no Cargo feature, TypeScript connection option, or Go option. Standard commands, unknown managed codes, and dedicated replicated authorization operations all use the same client connection. The server remains authoritative for custom command classification.
 
 ---
 
@@ -516,7 +516,7 @@ The `agent` feature adds coordination to streaming. It supplies correlation, ret
 
 ### Sessions: one unit of work
 
-A session is one conversation with a recorded lifecycle. Its id is the conversation id, so every conversation read finds it. Bootstrap the agent topics once. `TopicRetention::default()` keeps records for one day, and Python `bootstrap()` and TypeScript `bootstrap()` default to one partition and that one-day retention. `agent.sessions` holds every session's records, so pass a retention that outlives your longest session, as below.
+A session is one conversation with a recorded lifecycle. Its id is the conversation id, so every conversation read finds it. Bootstrap the agent topics once. `TopicRetention::default()` keeps records for one day, and Python `bootstrap()` and TypeScript `bootstrap()` default to one partition and that one-day retention. Go `Bootstrap(ctx, partitions, retention)` takes both, with `laser.ExpireAfter(age)` for the retention. `agent.sessions` holds every session's records, so pass a retention that outlives your longest session, as below.
 
 ```rust
 use laser_sdk::agent::{ModelRequest, ModelResponse, TopicRetention};
@@ -745,9 +745,9 @@ match outcome {
 
 ### A workflow: dependency-ordered steps, panels, and exclusivity
 
-A workflow of steps that run in this process is a plain function that calls its steps: Rust `laser.workflow(name).run_with(body)` with `run.step(label, step_body)`, Python `@ls.step` and `@ls.workflow`, TypeScript `step(name, fn)` and `workflow(name, fn)`. A step takes and returns what JSON holds, and a resumed run returns the recorded values without running those steps again. The builder below is for steps routed to agents, verifier panels, compensation, budgets, and exclusive steps.
+A workflow of steps that run in this process is a plain function that calls its steps: Rust `laser.workflow(name).run_with(body)` with `run.step(label, step_body)`, Python `@ls.step` and `@ls.workflow`, TypeScript `step(name, fn)` and `workflow(name, fn)`, Go `laser.RunWith` with `laser.RunStep`. A step takes and returns what JSON holds, and a resumed run returns the recorded values without running those steps again. The builder below is for steps routed to agents, verifier panels, compensation, budgets, and exclusive steps.
 
-The workflow engine runs steps in dependency order and passes results between them. A routed step sends its task to an agent. `step_local(label, run)` (Python `step(label, run=..)`, TypeScript `stepLocal(label, run)`) runs the step's body in this process instead, journaled and resumable like a routed step, and the two mix in one workflow. A run that finds its stream or its topics missing creates them, so a workflow of local steps needs no `bootstrap` and no agent. An `all_capable` step sends work to every matching agent. Budgets limit work, and the journal supports recovery. `.exclusive()` acquires a lease in `WORKFLOW_FENCE_NAMESPACE` for stale-holder rejection.
+The workflow engine runs steps in dependency order and passes results between them. A routed step sends its task to an agent. `step_local(label, run)` (Python `step(label, run=..)`, TypeScript `stepLocal(label, run)`, Go `StepLocal(label, run)`) runs the step's body in this process instead, journaled and resumable like a routed step, and the two mix in one workflow. A run that finds its stream or its topics missing creates them, so a workflow of local steps needs no `bootstrap` and no agent. An `all_capable` step sends work to every matching agent. Budgets limit work, and the journal supports recovery. `.exclusive()` acquires a lease in `WORKFLOW_FENCE_NAMESPACE` for stale-holder rejection.
 
 For protected external state, use `.exclusive_in(namespace)`. In the handler, use `kv(target_namespace).cas_fenced(key, namespace, run_id, token)` with the recorded token and run ID. This binds the effect to the same live lease and fence counter. Renewal starts halfway through the granted lifetime and remains bounded by lease expiry and the workflow deadline.
 
@@ -795,7 +795,7 @@ laser.unquarantine("operator".parse()?, &"diag-alpha".parse()?).await?;
 
 Registry-topic permissions control publication. With `sign`, use `quarantine_signed` and `unquarantine_signed` for signed facts. A registry configured through `LaserBuilder::verifier(keys)` accepts those facts only with a valid operator signature. This adds a check above native topic permissions.
 
-The `orchestra` example runs all of this end to end (a directed contract, a scatter panel, health exclusion, and quarantine), in Rust (`cargo run --example orchestra`), Python (`python orchestra.py`), and TypeScript (`npm run example:orchestra`).
+The `orchestra` example runs all of this end to end (a directed contract, a scatter panel, health exclusion, and quarantine), in Rust (`cargo run --example orchestra`), Python (`python orchestra.py`), TypeScript (`npm run example:orchestra`), and Go (`go run ./orchestra`).
 
 ---
 
@@ -833,7 +833,7 @@ The setup can run separately from every consumer instance. The consumer needs no
 
 The name is the caller's label for the group's own filter. It follows the saved filter name rule and need not be unique. Use `group.filter().configure(name, filter)` for later setup, `summary()` to read the group's own filter row with its name and owner, and its `preview`, `test`, `revisions` and `set_revision_enabled` methods for diagnostics and administration. A group runs one policy for its lifetime, so the SDK offers no revision drafts of a group's own filter. Use another group for a different A/B policy.
 
-**The recorded CDC example saves 98.5% of payload transfer:** 4 of 240 records and 424 of 27,953 payload bytes. The example exists in Rust, Python and TypeScript. It demonstrates change evidence, numeric headers and JSON, CBOR, Avro and Protobuf policies.
+**The recorded CDC example saves 98.5% of payload transfer:** 4 of 240 records and 424 of 27,953 payload bytes. The example exists in Rust, Python, TypeScript and Go. It demonstrates change evidence, numeric headers and JSON, CBOR, Avro and Protobuf policies.
 
 This uses standard Iggy transport and native source reads through the optional group-aware command. Raw Iggy polling retains its standard behavior. Failed policy resolution never silently broadens a group read. Server CPU, memory and latency costs must be measured with the traffic savings.
 

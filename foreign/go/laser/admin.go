@@ -174,6 +174,7 @@ func (stream *Stream) Rename(ctx context.Context, name string) error {
 		ctx, identifier, iggcon.StreamUpdate{Name: &renamed}); err != nil {
 		return &TransportError{Reason: "rename the stream", Cause: err}
 	}
+	stream.laser.forgetStream(stream.name)
 	return nil
 }
 
@@ -246,6 +247,7 @@ func (topic *Topic) Update(ctx context.Context, options UpdateTopicOptions) erro
 	if err := client.UpdateTopic(ctx, streamID, topicID, update); err != nil {
 		return &TransportError{Reason: "update the topic", Cause: err}
 	}
+	topic.laser.forgetTopic(topic.stream, topic.name)
 	return nil
 }
 
@@ -301,6 +303,7 @@ func (topic *Topic) AddPartitions(ctx context.Context, count uint32) error {
 	if err := client.CreatePartitions(ctx, streamID, topicID, count); err != nil {
 		return &TransportError{Reason: "add the partitions", Cause: err}
 	}
+	topic.laser.forgetTopic(topic.stream, topic.name)
 	return nil
 }
 
@@ -314,6 +317,7 @@ func (topic *Topic) DeletePartitions(ctx context.Context, count uint32) error {
 	if err := client.DeletePartitions(ctx, streamID, topicID, count); err != nil {
 		return &TransportError{Reason: "delete the partitions", Cause: err}
 	}
+	topic.laser.forgetTopic(topic.stream, topic.name)
 	return nil
 }
 
@@ -351,6 +355,40 @@ func (topic *Topic) ConsumerGroups(ctx context.Context) ([]ConsumerGroupSummary,
 		})
 	}
 	return listed, nil
+}
+
+// SendCommand sends the command code with a raw payload and returns the raw
+// reply. The server checks the command's permissions, and the sign-in,
+// sign-out and session commands are refused before anything is sent.
+func (laser *Laser) SendCommand(ctx context.Context, code uint32, payload []byte) ([]byte, error) {
+	client, err := laser.connected()
+	if err != nil {
+		return nil, err
+	}
+	reply, err := client.SendBinaryRequest(ctx, code, payload)
+	if err != nil {
+		return nil, &TransportError{Reason: "send the command", Cause: err}
+	}
+	// The reply buffer belongs to the connection, which reuses it.
+	return append([]byte(nil), reply...), nil
+}
+
+// SendCommandToReplica sends the command code with a raw payload to one
+// replica, as Cluster numbers it, and returns that replica's own reply. Only a
+// command a node answers from its own state goes to a replica, and nothing is
+// retried on another one.
+func (laser *Laser) SendCommandToReplica(
+	ctx context.Context, code uint32, payload []byte, replica uint8,
+) ([]byte, error) {
+	client, err := laser.connected()
+	if err != nil {
+		return nil, err
+	}
+	reply, err := client.SendBinaryRequestToReplica(ctx, code, payload, replica)
+	if err != nil {
+		return nil, &TransportError{Reason: "send the command to the replica", Cause: err}
+	}
+	return append([]byte(nil), reply...), nil
 }
 
 // details reads this topic, nil when it or its stream is not there.

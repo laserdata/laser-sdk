@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"slices"
 	"strings"
 	"time"
 
@@ -80,9 +81,23 @@ func (laser *Laser) ensureScopable(code uint32) error {
 // surface sends it, so whichever node answers has applied at least what this
 // client wrote or read before.
 func (laser *Laser) SeenPositions() wire.AppliedFrontier {
-	laser.state().mutex.RLock()
-	defer laser.state().mutex.RUnlock()
-	return laser.state().frontier
+	state := laser.state()
+	state.mutex.RLock()
+	defer state.mutex.RUnlock()
+	snapshot := state.frontier
+	snapshot.Kv = copyPosition(snapshot.Kv)
+	snapshot.Fork = copyPosition(snapshot.Fork)
+	snapshot.Graph = copyPosition(snapshot.Graph)
+	snapshot.Sessions = slices.Clone(snapshot.Sessions)
+	return snapshot
+}
+
+func copyPosition(position *wire.MutationPosition) *wire.MutationPosition {
+	if position == nil {
+		return nil
+	}
+	snapshot := *position
+	return &snapshot
 }
 
 // SendManaged sends a managed command and returns the surface reply.
@@ -94,7 +109,7 @@ func (laser *Laser) SeenPositions() wire.AppliedFrontier {
 // A read every node refused for want of its managed backend waits on the
 // managed backoff and walks the roster again until it is served or
 // ManagedDeadline passes, then returns the same refusal it would have
-// returned at once. A mutation already repeated under its identity; a read
+// returned at once. A mutation already repeated under its identity. A read
 // has none, and on a single node, or on a cluster that restarted all at
 // once, the first refusal is one the deployment served a moment later.
 //
@@ -115,6 +130,22 @@ func (laser *Laser) SendManaged(
 func (laser *Laser) sendManagedWalking(
 	ctx context.Context, code uint32, payload []byte, w walk,
 ) ([]byte, error) {
+	if wire.IsBarrierRead(code) {
+		shared := laser.state()
+		shared.mutex.RLock()
+		read := wire.ManagedReadEnvelope{V: wire.ManagedRequestVersion, Read: payload}
+		if surface, ok := wire.PositionSurfaceOfCode(code); ok {
+			read.MinPosition = shared.frontier.Position(surface)
+		} else {
+			read.MinSessions = slices.Clone(shared.frontier.Sessions)
+		}
+		shared.mutex.RUnlock()
+		frame, err := wire.Marshal(read)
+		if err != nil {
+			return nil, &CodecError{Reason: "encode managed read", Cause: err}
+		}
+		return laser.sendManagedFrame(ctx, code, frame, w)
+	}
 	if !wire.IsIdempotentManagedRequest(code) {
 		return laser.sendManagedFrame(ctx, code, payload, w)
 	}
@@ -193,20 +224,16 @@ func (laser *Laser) nodes() *nodeRouter {
 	return shared.router
 }
 
-// openPositioned unwraps the envelope a managed node may answer in, folding
-// the frontier it carries into this client's running one.
-//
-// A surface reply that is not positioned is returned as it arrived. The
-// envelope refuses unknown fields, so a plain reply cannot be mistaken for one.
-func (laser *Laser) openPositioned(reply []byte) []byte {
-	var envelope wire.ManagedReplyEnvelope
-	if err := wire.Unmarshal(reply, &envelope); err != nil {
-		return reply
+func decodeManagedReply(raw []byte, reply any, reason string) error {
+	err := wire.Unmarshal(raw, reply)
+	if err == nil {
+		return nil
 	}
-	laser.state().mutex.Lock()
-	wire.MergeFrontier(&laser.state().frontier, envelope.Frontier)
-	laser.state().mutex.Unlock()
-	return envelope.Reply
+	var failure wire.CommandError
+	if wire.Unmarshal(raw, &failure) == nil && failure.Code != wire.ResultOk {
+		return &CommandFailure{Failure: failure}
+	}
+	return &CodecError{Reason: reason, Cause: err}
 }
 
 // NewOperationID mints the identity a managed write is applied under.

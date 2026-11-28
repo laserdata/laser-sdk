@@ -55,7 +55,7 @@ func (sessions *Sessions) Bootstrap(
 			return SessionBootstrap{}, err
 		}
 	}
-	if !sessions.laser.capabilities.Sessions {
+	if sessions.config.SkipSourceRegistration || !sessions.laser.Capabilities().Sessions {
 		return SessionBootstrap{}, nil
 	}
 	if err := sessions.laser.PublishControlIn(ctx, wire.ControlCommand{
@@ -75,7 +75,7 @@ func (sessions *Sessions) Bootstrap(
 // The index is dropped once the control record folds. A later Bootstrap
 // registers the stream again.
 func (sessions *Sessions) Unregister(ctx context.Context) error {
-	if !sessions.laser.capabilities.Sessions {
+	if !sessions.laser.Capabilities().Sessions {
 		return &UnsupportedError{Surface: "sessions"}
 	}
 	return sessions.laser.PublishControlIn(ctx, wire.ControlCommand{
@@ -94,7 +94,7 @@ func (sessions *Sessions) registrationVisible(ctx context.Context) bool {
 	deadline := time.Now().Add(sessions.laser.publishSchedule().Timeout)
 	for time.Now().Before(deadline) {
 		attempt, cancel := context.WithDeadline(ctx, deadline)
-		_, err := sessions.Changes(attempt, 0, 1)
+		_, err := sessions.changes(attempt, 0, 1, walkingOnce())
 		cancel()
 		switch {
 		case err == nil:

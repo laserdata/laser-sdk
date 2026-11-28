@@ -57,6 +57,9 @@ func CheckIn(
 		return nil, nil, err
 	}
 	capsule := wire.NewBodyRef(reference, size, digest)
+	if err := capsule.Validate(); err != nil {
+		return nil, nil, &InvalidError{Reason: "body reference: " + err.Error()}
+	}
 	encoded, err := wire.Marshal(capsule)
 	if err != nil {
 		return nil, nil, &CodecError{Reason: "encode the body reference", Cause: err}

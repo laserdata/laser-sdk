@@ -57,9 +57,16 @@ func (sessions *Sessions) Config() SessionConfig { return sessions.config }
 func (sessions *Sessions) Get(
 	ctx context.Context, id wire.ConversationID,
 ) (*wire.SessionInfo, error) {
-	outcome, err := sessions.read(ctx, wire.AgdxSessionGetCode, func(stream string) any {
+	return sessions.get(ctx, id, walkingUntilServed())
+}
+
+// get reads one session's summary under the given walk.
+func (sessions *Sessions) get(
+	ctx context.Context, id wire.ConversationID, w walk,
+) (*wire.SessionInfo, error) {
+	outcome, err := sessions.readWalking(ctx, wire.AgdxSessionGetCode, func(stream string) any {
 		return wire.SessionGetRequest{Stream: stream, ID: id}
-	})
+	}, w)
 	if err != nil {
 		return nil, err
 	}
@@ -74,9 +81,16 @@ func (sessions *Sessions) Get(
 func (sessions *Sessions) State(
 	ctx context.Context, id wire.ConversationID, historyLimit uint32,
 ) (*wire.SessionStateView, error) {
-	outcome, err := sessions.read(ctx, wire.AgdxSessionStateCode, func(stream string) any {
+	return sessions.stateView(ctx, id, historyLimit, walkingUntilServed())
+}
+
+// stateView reads a session's folded state document under the given walk.
+func (sessions *Sessions) stateView(
+	ctx context.Context, id wire.ConversationID, historyLimit uint32, w walk,
+) (*wire.SessionStateView, error) {
+	outcome, err := sessions.readWalking(ctx, wire.AgdxSessionStateCode, func(stream string) any {
 		return wire.SessionStateRequest{Stream: stream, ID: id, HistoryLimit: historyLimit}
-	})
+	}, w)
 	if err != nil {
 		return nil, err
 	}
@@ -141,9 +155,16 @@ func (sessions *Sessions) sources(
 func (sessions *Sessions) Changes(
 	ctx context.Context, page, results uint32,
 ) (*wire.SessionChanges, error) {
-	outcome, err := sessions.read(ctx, wire.AgdxSessionChangesCode, func(stream string) any {
+	return sessions.changes(ctx, page, results, walkingUntilServed())
+}
+
+// changes reads a page of the change feed under the given walk.
+func (sessions *Sessions) changes(
+	ctx context.Context, page, results uint32, w walk,
+) (*wire.SessionChanges, error) {
+	outcome, err := sessions.readWalking(ctx, wire.AgdxSessionChangesCode, func(stream string) any {
 		return wire.SessionChangesRequest{Stream: stream, Page: page, Results: results}
-	})
+	}, w)
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +319,14 @@ func (request *SessionEventsRequest) Fetch(
 func (sessions *Sessions) read(
 	ctx context.Context, code uint32, build func(stream string) any,
 ) (*wire.SessionOutcome, error) {
-	if !sessions.laser.capabilities.Managed || !sessions.laser.capabilities.Sessions {
+	return sessions.readWalking(ctx, code, build, walkingUntilServed())
+}
+
+// readWalking is read under the given walk, once for a caller that paces its own repeats.
+func (sessions *Sessions) readWalking(
+	ctx context.Context, code uint32, build func(stream string) any, w walk,
+) (*wire.SessionOutcome, error) {
+	if !sessions.laser.Capabilities().Managed || !sessions.laser.Capabilities().Sessions {
 		return nil, &UnsupportedError{Surface: "managed session reads"}
 	}
 	if sessions.config.Stream == "" {
@@ -309,13 +337,13 @@ func (sessions *Sessions) read(
 	if err != nil {
 		return nil, &CodecError{Reason: "encode session request", Cause: err}
 	}
-	raw, err := sessions.laser.SendManaged(ctx, code, payload)
+	raw, err := sessions.laser.sendManagedWalking(ctx, code, payload, w)
 	if err != nil {
 		return nil, err
 	}
 	var reply wire.SessionReply
-	if err := wire.Unmarshal(raw, &reply); err != nil {
-		return nil, &CodecError{Reason: "decode session reply", Cause: err}
+	if err := decodeManagedReply(raw, &reply, "decode session reply"); err != nil {
+		return nil, err
 	}
 	if !reply.IsOk() {
 		if reply.Err == nil {

@@ -2,6 +2,7 @@ package laser
 
 import (
 	"context"
+	"log/slog"
 )
 
 // Lifetime is how long a remembered fact lives.
@@ -52,7 +53,7 @@ func (handler *MemoryHandler) Lifetime(lifetime Lifetime) *MemoryHandler {
 //
 // A failed write does not fail the turn. The message was already handled, and
 // a retry would repeat the handler's own effects, so a memory that could not
-// be written is dropped rather than turned into a redelivery.
+// be written is reported as a warning rather than turned into a redelivery.
 func (handler *MemoryHandler) Handle(
 	ctx context.Context, message *AgentMessage, agent *AgentCtx,
 ) error {
@@ -73,8 +74,14 @@ func (handler *MemoryHandler) Handle(
 		identity := agent.Identity()
 		scope.Agent = &identity
 	}
-	// Dropped, not reported: see Handle's own note on why a failed write
-	// must not become a redelivery.
-	_, _ = handler.memory.For(scope).Remember(ctx, *handler.kind, message.Body())
+	// Warned about, not returned: a failed write must not become a redelivery.
+	if _, err := handler.memory.For(scope).Remember(ctx, *handler.kind, message.Body()); err != nil {
+		conversation := ""
+		if scope.Conversation != nil {
+			conversation = scope.Conversation.String()
+		}
+		slog.WarnContext(ctx, "Memory handler could not remember the turn of conversation "+conversation+": "+err.Error(),
+			"conversation_id", conversation, "error", err)
+	}
 	return nil
 }

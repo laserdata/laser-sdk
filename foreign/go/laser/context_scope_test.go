@@ -42,6 +42,21 @@ func (server *scopeServer) appendRecord(
 	t *testing.T, conversation wire.ConversationID, author, body string,
 ) {
 	t.Helper()
+	server.appendEnvelope(t, conversation, nil, author, body)
+}
+
+// appendChild puts one agent record of a subconversation rooted at parent on the feed.
+func (server *scopeServer) appendChild(
+	t *testing.T, conversation, parent wire.ConversationID, author, body string,
+) {
+	t.Helper()
+	server.appendEnvelope(t, conversation, &parent, author, body)
+}
+
+func (server *scopeServer) appendEnvelope(
+	t *testing.T, conversation wire.ConversationID, parent *wire.ConversationID, author, body string,
+) {
+	t.Helper()
 	source, err := wire.NewAgentID(author)
 	if err != nil {
 		t.Fatalf("agent id: %v", err)
@@ -50,6 +65,7 @@ func (server *scopeServer) appendRecord(
 	envelope := wire.AgentEnvelope{
 		Kind: wire.KindEvent, Record: &record,
 		Conversation: conversation, Source: source, Body: []byte(body),
+		Parent: parent, Root: parent,
 	}
 	encoded, err := wire.Marshal(envelope)
 	if err != nil {

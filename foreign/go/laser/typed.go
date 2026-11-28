@@ -66,13 +66,18 @@ func (typed *TypedTopic[T]) Topic() *Topic { return typed.topic }
 // Publish begins a record carrying an encoded body, with the content type
 // already stamped.
 func (typed *TypedTopic[T]) Publish(body T) *PublishRequest {
-	request := typed.topic.Publish()
-	encoded, err := typed.codec.Encode(body)
-	if err != nil {
-		return request.fail(&CodecError{Reason: "encode the record body", Cause: err})
+	return typed.topic.Publish().EncodeWith(typed.codec, body)
+}
+
+// PublishBatch begins a batch carrying every body encoded, with the content
+// type already stamped. A body that does not encode fails the send before any
+// record reaches the server.
+func (typed *TypedTopic[T]) PublishBatch(bodies []T) *BatchPublishRequest {
+	batch := typed.topic.PublishBatch()
+	for _, body := range bodies {
+		batch.AddRecord(typed.Publish(body))
 	}
-	return request.Payload(encoded).
-		Header(wire.HeaderContentType, string(typed.codec.ContentType()))
+	return batch
 }
 
 // TypedRecord is a record whose body decoded.

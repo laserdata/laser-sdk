@@ -1,0 +1,23 @@
+services:
+  iggy:
+    environment:
+      IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: 200 ms
+      IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT: 1s
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: managed
+      POSTGRES_USER: managed
+      POSTGRES_PASSWORD: managed
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "managed"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  plane:
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      LD_PLANE_BACKENDS: >-
+        [{"id":"postgres","kind":"postgres","dsn":"postgres://managed:managed@postgres:5432/managed","ssl_mode":"disable","serves":"kv,graph,sessions,folds,forks"}]

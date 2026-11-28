@@ -50,7 +50,7 @@ func (watch *Watch) FromEnd() *Watch {
 // polling a topic nothing writes to: a consumer waiting on silence looks
 // identical to one waiting on work that never comes.
 func (watch *Watch) Records(ctx context.Context) (*WatchReader, error) {
-	if !watch.laser.capabilities.Watch {
+	if !watch.laser.Capabilities().Watch {
 		return nil, &UnsupportedError{Surface: "the change feed"}
 	}
 	stream, topic := watch.laser.changeFeed()
@@ -84,10 +84,10 @@ const watchReaderName = "laser-watch"
 // scoped handle reads its own stream's rather than a shared one it may not
 // even be allowed to see.
 func (laser *Laser) changeFeed() (stream, topic string) {
-	if scoped := laser.resourceStream(); scoped != "" && laser.capabilities.StreamTenancy {
-		return wire.OpsStream, wire.StreamOpsTopic(scoped, wire.ChangesTopic)
+	if scoped := laser.resourceStream(); scoped != "" && laser.Capabilities().StreamTenancy {
+		return laser.OpsStream(), wire.StreamOpsTopic(scoped, wire.ChangesTopic)
 	}
-	return wire.OpsStream, wire.ChangesTopic
+	return laser.OpsStream(), laser.ChangesTopic()
 }
 
 // WatchedChange is one change record with its place on the feed.

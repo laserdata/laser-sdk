@@ -9,6 +9,7 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
+	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
 // cursorServer serves a fixed set of partitions, handing back the records at
@@ -19,6 +20,7 @@ type cursorServer struct {
 	byPartition map[uint32][]iggcon.IggyMessage
 	topicAbsent bool
 	polls       []uint64
+	pollErrAt   *uint32
 	maxCount    uint32
 }
 
@@ -37,6 +39,9 @@ func (server *cursorServer) PollMessages(
 	_ context.Context, _, _ iggcon.Identifier, partitionID uint32,
 	_ iggcon.Consumer, strategy iggcon.PollingStrategy, options iggcon.PollOptions,
 ) (*iggcon.PolledMessage, error) {
+	if server.pollErrAt != nil && partitionID == *server.pollErrAt {
+		return nil, errors.New("injected partition error")
+	}
 	server.polls = append(server.polls, strategy.Value)
 	if options.Count > server.maxCount {
 		server.maxCount = options.Count
@@ -290,5 +295,69 @@ func TestGivenARecordWithProvenanceWhenReplayedThenShouldReadItOff(t *testing.T)
 	}
 	if records[0].Provenance.Conversation != conversation(4) {
 		t.Errorf("want the conversation, got %v", records[0].Provenance.Conversation)
+	}
+}
+
+func TestGivenALaterPartitionFailureWhenRetryingThenShouldDeliverEarlierRecords(t *testing.T) {
+	second := uint32(1)
+	server := &cursorServer{partitions: 2, pollErrAt: &second,
+		byPartition: map[uint32][]iggcon.IggyMessage{0: {recordAt(t, 0, 10, "first")}}}
+	cursor, err := cursorHandle(server).Topic("events").Replay()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor.FromOffsets([]uint64{0, 0})
+	if _, err := cursor.Poll(context.Background()); err == nil {
+		t.Fatal("poll must surface partition failure")
+	}
+	server.pollErrAt = nil
+	records, err := cursor.Poll(context.Background())
+	if err != nil || len(records) != 1 || string(records[0].Payload()) != "first" {
+		t.Fatalf("retry returned %+v, %v", records, err)
+	}
+}
+
+func TestGivenARecordWithABrokenSpineWhenPolledThenShouldReportItOnceAndReadOn(t *testing.T) {
+	headers, err := (&laser.Provenance{Conversation: conversation(5)}).Headers()
+	if err != nil {
+		t.Fatalf("encode the spine: %v", err)
+	}
+	fence, err := iggcon.NewHeaderKeyString(wire.HeaderFence)
+	if err != nil {
+		t.Fatalf("header key: %v", err)
+	}
+	headers = append(headers, iggcon.HeaderEntry{
+		Key:   fence,
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("not a number")},
+	})
+	broken, err := iggcon.NewIggyMessage([]byte("broken"), iggcon.WithUserHeaders(headers))
+	if err != nil {
+		t.Fatalf("build a record: %v", err)
+	}
+	broken.Header.Offset, broken.Header.Timestamp = 1, 20
+	server := &cursorServer{
+		partitions: 1,
+		byPartition: map[uint32][]iggcon.IggyMessage{
+			0: {recordAt(t, 0, 10, "before"), broken, recordAt(t, 2, 30, "after")},
+		},
+	}
+	cursor, err := cursorHandle(server).Topic("inferences").Replay()
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	ctx := context.Background()
+
+	before, err := cursor.Poll(ctx)
+	if err != nil || len(before) != 1 || string(before[0].Payload()) != "before" {
+		t.Fatalf("want the record ahead of the broken one first, got %d records and %v", len(before), err)
+	}
+	_, err = cursor.Poll(ctx)
+	var unreadable *laser.UndecodableRecord
+	if !errors.As(err, &unreadable) || unreadable.PartitionID != 0 || unreadable.Message.Header.Offset != 1 {
+		t.Fatalf("want the broken record reported with its position, got %v", err)
+	}
+	after, err := cursor.Poll(ctx)
+	if err != nil || len(after) != 1 || string(after[0].Payload()) != "after" {
+		t.Fatalf("want the read to go on past the broken record, got %d records and %v", len(after), err)
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
@@ -16,6 +18,8 @@ import (
 type ContextScope struct {
 	laser        *Laser
 	conversation wire.ConversationID
+	// across makes every read also keep the conversation's subconversations.
+	across bool
 }
 
 // Context opens the working context of one conversation. It is free: the
@@ -27,6 +31,20 @@ func (laser *Laser) Context(conversation wire.ConversationID) *ContextScope {
 // Conversation is the conversation this scope covers.
 func (scope *ContextScope) Conversation() wire.ConversationID {
 	return scope.conversation
+}
+
+// AcrossSubconversations returns a scope whose reads also keep the subconversations rooted at this conversation.
+func (scope *ContextScope) AcrossSubconversations() *ContextScope {
+	widened := *scope
+	widened.across = true
+	return &widened
+}
+
+// assemble opens the assembler every read of this scope feeds.
+func (scope *ContextScope) assemble(policy ContextPolicy) *ContextAssembler {
+	assembler := Assemble(scope.conversation).WithPolicy(policy)
+	assembler.across = scope.across
+	return assembler
 }
 
 // Laser is the handle this scope reads and writes through.
@@ -62,13 +80,14 @@ func (scope *ContextScope) Fetch(
 func (scope *ContextScope) FetchWith(
 	ctx context.Context, topics []string, policy ContextPolicy,
 ) ([]ContextMessage, error) {
-	assembler := Assemble(scope.conversation).WithPolicy(policy)
+	assembler := scope.assemble(policy)
+	streamID := scope.streamID(ctx)
 	for _, topic := range topics {
-		records, err := scope.read(ctx, topic)
+		records, topicID, err := scope.readLocated(ctx, topic)
 		if err != nil {
 			return nil, err
 		}
-		assembler.Add(topic, records...)
+		assembler.addFrom(topic, streamID, topicID, records)
 	}
 	return assembler.Messages(), nil
 }
@@ -78,13 +97,21 @@ func (scope *ContextScope) FetchWith(
 func (scope *ContextScope) read(
 	ctx context.Context, topic string,
 ) ([]*Record, error) {
+	records, _, err := scope.readLocated(ctx, topic)
+	return records, err
+}
+
+// readLocated is read with the topic's numeric id beside the records.
+func (scope *ContextScope) readLocated(
+	ctx context.Context, topic string,
+) ([]*Record, uint32, error) {
 	if scope.laser.defaultStream == "" {
-		return nil, errNoStream()
+		return nil, 0, errNoStream()
 	}
 	cursor, err := scope.laser.Stream(scope.laser.defaultStream).
 		Topic(topic).ReplayAs(contextReaderName)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	// Context assembly wants the newest history of a long-lived conversation,
 	// not whatever the oldest MaxDrainRecords of the partition happen to be:
@@ -92,9 +119,27 @@ func (scope *ContextScope) read(
 	// outgrows that bound, and an unanchored read would silently return
 	// stale records while missing the recent ones a caller actually wants.
 	if err := cursor.SeekToWindow(ctx, MaxDrainRecords); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return cursor.Poll(ctx)
+	records, err := cursor.Poll(ctx)
+	return records, cursor.topicID, err
+}
+
+// streamID is the numeric id of the scope's stream, zero when it cannot be read.
+func (scope *ContextScope) streamID(ctx context.Context) uint32 {
+	client, err := scope.laser.connected()
+	if err != nil || scope.laser.defaultStream == "" {
+		return 0
+	}
+	identifier, err := iggcon.NewIdentifier(scope.laser.defaultStream)
+	if err != nil {
+		return 0
+	}
+	details, err := client.GetStream(ctx, identifier)
+	if err != nil || details == nil {
+		return 0
+	}
+	return details.Id
 }
 
 // contextReaderName is how a context read names itself to the server. The
@@ -151,6 +196,23 @@ func (scope *ContextScope) Memory(namespace string) *Memory {
 	})
 }
 
+// MemoryWith is Memory on an explicit backend.
+func (scope *ContextScope) MemoryWith(namespace string, backend MemoryBackend) (*Memory, error) {
+	memory, err := scope.laser.MemoryWith(namespace, backend)
+	if err != nil {
+		return nil, err
+	}
+	conversation := scope.conversation
+	return memory.For(MemoryScope{Stream: scope.laser.defaultStream, Conversation: &conversation}), nil
+}
+
+// StateWith rebuilds state seeded through a snapshot store: the newest snapshot's state, then only the records past it.
+func StateWith[S any](
+	ctx context.Context, scope *ContextScope, store SnapshotStore, topics []string, initial S, fold FoldFunc[S],
+) (S, error) {
+	return LoadConversationStateWith(ctx, scope.laser, store, scope.conversation, topics, initial, fold)
+}
+
 // Graph is a knowledge graph, reached from this scope for the common flow
 // where a task streams messages, keeps session memory, and resolves the
 // dependencies between them.
@@ -205,7 +267,8 @@ func (scope *ContextScope) FetchSince(
 	ctx context.Context, checkpoint *ContextCheckpoint,
 	topics []string, policy ContextPolicy,
 ) ([]ContextMessage, error) {
-	assembler := Assemble(scope.conversation).WithPolicy(policy)
+	assembler := scope.assemble(policy)
+	streamID := scope.streamID(ctx)
 	for _, topic := range topics {
 		if scope.laser.defaultStream == "" {
 			return nil, errNoStream()
@@ -222,7 +285,7 @@ func (scope *ContextScope) FetchSince(
 		if err != nil {
 			return nil, err
 		}
-		assembler.Add(topic, records...)
+		assembler.addFrom(topic, streamID, cursor.topicID, records)
 	}
 	return assembler.Messages(), nil
 }
@@ -238,13 +301,14 @@ func (scope *ContextScope) FetchUntil(
 	ctx context.Context, checkpoint *ContextCheckpoint,
 	topics []string, policy ContextPolicy,
 ) ([]ContextMessage, error) {
-	assembler := Assemble(scope.conversation).WithPolicy(policy)
+	assembler := scope.assemble(policy)
+	streamID := scope.streamID(ctx)
 	for _, topic := range topics {
-		records, err := scope.read(ctx, topic)
+		records, topicID, err := scope.readLocated(ctx, topic)
 		if err != nil {
 			return nil, err
 		}
-		assembler.Add(topic, before(records, checkpointOffsets(checkpoint, topic))...)
+		assembler.addFrom(topic, streamID, topicID, before(records, checkpointOffsets(checkpoint, topic)))
 	}
 	return assembler.Messages(), nil
 }

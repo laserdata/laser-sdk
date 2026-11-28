@@ -195,31 +195,43 @@ func (catalog *FilterCatalog) WaitingFor(wait time.Duration) *FilterCatalog {
 	return &copied
 }
 
-// execute sends one catalog command.
-func (catalog *FilterCatalog) execute(
-	ctx context.Context, code uint32, request any,
-) (*wire.FilterCatalogOutcome, error) {
-	if !catalog.laser.capabilities.Filters.Catalog {
-		return nil, &UnsupportedError{Surface: "the saved-filter catalog"}
+// requireServed refuses a deployment that does not serve the catalog at this op version.
+func (catalog *FilterCatalog) requireServed() error {
+	if !catalog.laser.Capabilities().Filters.Catalog {
+		return &UnsupportedError{Surface: "the saved-filter catalog"}
 	}
 	// A catalog serving another op version would answer a shape this client
 	// cannot read, and a mutation half-understood is worse than one refused.
-	if err := catalog.laser.requireOpVersion("the saved-filter catalog",
+	return catalog.laser.requireOpVersion("the saved-filter catalog",
 		wire.FilterOpVersion,
-		func(versions wire.OpVersions) uint32 { return versions.Filter }); err != nil {
+		func(versions wire.OpVersions) uint32 { return versions.Filter })
+}
+
+// execute sends one catalog command, walking the roster until it is served.
+func (catalog *FilterCatalog) execute(
+	ctx context.Context, code uint32, request any,
+) (*wire.FilterCatalogOutcome, error) {
+	return catalog.executeWalking(ctx, code, request, walkingUntilServed())
+}
+
+// executeWalking sends one catalog command under the given walk, once for a caller that paces its own repeats.
+func (catalog *FilterCatalog) executeWalking(
+	ctx context.Context, code uint32, request any, w walk,
+) (*wire.FilterCatalogOutcome, error) {
+	if err := catalog.requireServed(); err != nil {
 		return nil, err
 	}
 	payload, err := wire.Marshal(request)
 	if err != nil {
 		return nil, &CodecError{Reason: "encode catalog request", Cause: err}
 	}
-	raw, err := catalog.laser.SendManaged(ctx, code, payload)
+	raw, err := catalog.laser.sendManagedWalking(ctx, code, payload, w)
 	if err != nil {
 		return nil, err
 	}
 	var reply wire.FilterCatalogReply
-	if err := wire.Unmarshal(raw, &reply); err != nil {
-		return nil, &CodecError{Reason: "decode catalog reply", Cause: err}
+	if err := decodeManagedReply(raw, &reply, "decode catalog reply"); err != nil {
+		return nil, err
 	}
 	if !reply.IsOk() {
 		if reply.Err == nil {
@@ -319,8 +331,8 @@ func (catalog *FilterCatalog) waitForOutcome(
 			return outcome, nil
 		case err == nil:
 			// Still pending: the fold has not reached it.
-		case notYetRecorded(err):
-			// The fold has not recorded it at all yet.
+		case notYetRecorded(err), retryableFilterFailure(err):
+			// The fold has not recorded it yet, or the catalog is out of reach for now.
 		default:
 			return nil, err
 		}
@@ -418,10 +430,10 @@ func (catalog *FilterCatalog) MutateAs(
 	if operationID.IsZero() {
 		return nil, &InvalidError{Reason: "an operation id must be nonzero"}
 	}
-	outcome, err := catalog.execute(ctx, wire.AgdxFilterMutateCode,
+	outcome, err := catalog.executeWalking(ctx, wire.AgdxFilterMutateCode,
 		wire.FilterMutationRequest{
 			V: wire.FilterOpVersion, OperationID: operationID, Mutation: mutation,
-		})
+		}, walkingOnce())
 	if err != nil {
 		return nil, err
 	}
@@ -579,6 +591,7 @@ func (catalog *FilterCatalog) ReleaseBinding(
 func (catalog *FilterCatalog) ConfigureGroup(
 	ctx context.Context, group wire.FilterGroupRef, policy wire.GroupFilterSpec,
 ) (*wire.FilterBinding, *wire.CatalogPosition, error) {
+	policy.Filter = catalog.scopedFilter(policy.Filter)
 	return catalog.bound(ctx, "configure group", wire.ResultBound, wire.FilterMutation{
 		Kind: wire.MutateConfigureGroup, Group: &group, Policy: &policy,
 	})
@@ -590,6 +603,7 @@ func (catalog *FilterCatalog) ConfigureGroupAs(
 	ctx context.Context, operationID wire.U128, group wire.FilterGroupRef,
 	policy wire.GroupFilterSpec, expected wire.FilterGroupIdentity,
 ) (*wire.FilterBinding, *wire.CatalogPosition, error) {
+	policy.Filter = catalog.scopedFilter(policy.Filter)
 	applied, err := catalog.ApplyAs(ctx, operationID, wire.FilterMutation{
 		Kind: wire.MutateConfigureGroup, Group: &group,
 		Policy: &policy, ExpectedIdentity: &expected,
@@ -598,6 +612,14 @@ func (catalog *FilterCatalog) ConfigureGroupAs(
 		return nil, nil, err
 	}
 	return bindingOf("configure group", applied, wire.ResultBound)
+}
+
+// scopedFilter resolves a filter's writer schemas in the registry this handle registers schemas in, unless the caller named one.
+func (catalog *FilterCatalog) scopedFilter(filter wire.ConsumerFilter) wire.ConsumerFilter {
+	if stream := catalog.laser.resourceStream(); len(filter.SchemaRefs) > 0 && filter.SchemaStream == nil && stream != "" {
+		filter.SchemaStream = &stream
+	}
+	return filter
 }
 
 // bound sends a change whose result is a binding.
@@ -761,8 +783,8 @@ func (catalog *FilterCatalog) Bindings(
 func (catalog *FilterCatalog) Operation(
 	ctx context.Context, operationID wire.U128,
 ) (*wire.FilterMutationOutcome, error) {
-	outcome, err := catalog.execute(ctx, wire.AgdxFilterOperationCode,
-		wire.GetFilterOperation{V: wire.FilterOpVersion, OperationID: operationID})
+	outcome, err := catalog.executeWalking(ctx, wire.AgdxFilterOperationCode,
+		wire.GetFilterOperation{V: wire.FilterOpVersion, OperationID: operationID}, walkingOnce())
 	if err != nil {
 		return nil, err
 	}

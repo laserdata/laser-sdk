@@ -26,7 +26,7 @@ func TestGivenConcurrentContractsOnOneTopicWhenSentThenShouldShareOneDispatcher(
 		group.Add(1)
 		go func(slot int) {
 			defer group.Done()
-			contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+			contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 				From(agentID(t, "orchestrator")).
 				Payload([]byte(`{"task":"run"}`)).
 				Deadline(5 * time.Second).
@@ -64,7 +64,7 @@ func TestGivenTwoReplyTopicsWhenContractsSentThenShouldOpenADispatcherEach(t *te
 	defer handle.Close()
 
 	for _, topic := range []string{"replies-a", "replies-b"} {
-		contract, err := handle.Contract(laser.To(agentID(t, "worker")), topic).
+		contract, err := handle.Contract(laser.To(agentID(t, "worker")), topic).InboxRoute(laser.FixedInbox(topic)).
 			From(agentID(t, "orchestrator")).
 			Payload([]byte(`{"task":"run"}`)).
 			Deadline(5 * time.Second).
@@ -90,7 +90,7 @@ func TestGivenAnOpenDispatcherWhenTheHandleIsClosedThenShouldStopItsGoroutine(t 
 	}
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	if _, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	if _, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Deadline(5 * time.Second).
@@ -134,7 +134,7 @@ func TestGivenAVerifiedContractWhenSentThenShouldNotJoinTheSharedDispatcher(t *t
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 	defer handle.Close()
 
-	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Verifier(keys).
@@ -153,7 +153,7 @@ func TestGivenAVerifiedContractWhenSentThenShouldNotJoinTheSharedDispatcher(t *t
 
 // The wait is registered before the command is sent, so an answer that
 // lands between the two is taken rather than missed.
-func TestGivenAnAnswerThatLandsBeforeTheWaitBeginsThenShouldStillBeTaken(t *testing.T) {
+func TestGivenAnAnswerThatLandsBeforeTheWaitBeginsWhenAwaitedThenShouldStillBeTaken(t *testing.T) {
 	// contractServer answers inside SendMessages, synchronously, so the
 	// reply is already on the topic before Send returns. Nothing in the
 	// contract has started waiting at that point: only a subscription taken
@@ -165,7 +165,7 @@ func TestGivenAnAnswerThatLandsBeforeTheWaitBeginsThenShouldStillBeTaken(t *test
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 	defer handle.Close()
 
-	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Deadline(5 * time.Second).

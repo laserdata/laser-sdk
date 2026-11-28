@@ -497,7 +497,7 @@ func (bridge *A2ABridge) accepts(answer *taskAnswer, target string) bool {
 // Delegates to AnswerState rather than keeping its own, narrower rule: that
 // function already says a plain KindResponse with no explicit TaskState
 // completes the task (the Status a caller reading Task() sees), so this must
-// agree the same answer ends it -- a mismatch here let a finished task's
+// agree the same answer ends it. A mismatch here let a finished task's
 // cancel through instead of refusing it, since an ordinary response (which
 // is what most agents send) was reported complete by one path and still
 // cancelable by the other.

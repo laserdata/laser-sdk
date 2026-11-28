@@ -33,10 +33,20 @@ func (request BatchRequest) Validate() error {
 		return &InvalidError{Reason: fmt.Sprintf(
 			"batch holds %d ops, exceeds cap %d", len(request.Ops), MaxBatchOps)}
 	}
+	total := 0
 	for _, op := range request.Ops {
 		if op.Code == AgdxBatchCode {
 			return &InvalidError{Reason: "a batch must not nest another batch"}
 		}
+		if len(op.Payload) > MaxValueBytes {
+			return &InvalidError{Reason: fmt.Sprintf(
+				"batch op payload is %dB, exceeds cap %dB", len(op.Payload), MaxValueBytes)}
+		}
+		total += len(op.Payload)
+	}
+	if total > MaxFrameBytes {
+		return &InvalidError{Reason: fmt.Sprintf(
+			"batch total payload is %dB, exceeds cap %dB", total, MaxFrameBytes)}
 	}
 	return nil
 }
@@ -50,3 +60,7 @@ type BatchReply struct {
 	// Results are per-op reply frames, index-aligned with the request's ops.
 	Results [][]byte `cbor:"results"`
 }
+
+// RequiredFieldNames refuses a reply without its results, so a frame-level
+// error never reads as an empty batch.
+func (*BatchReply) RequiredFieldNames() []string { return []string{"results"} }

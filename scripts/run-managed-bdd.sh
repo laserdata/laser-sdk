@@ -7,7 +7,7 @@
 # scenarios. --doris runs the Doris all-in-one image on the host network.
 #
 # Usage: scripts/run-managed-bdd.sh [--postgres | --doris] [--release] <runner>...
-#   runner: rust | python | typescript | all | stack
+#   runner: rust | python | typescript | go | all | stack
 #   stack starts the stack, prints its address, and waits for Ctrl-C, so a
 #   measurement or a single runner can be pointed at it by hand.
 #
@@ -32,15 +32,15 @@ while (($#)); do
     --doris) doris=true ;;
     --release) profile=release ;;
     --) shift; runner_args=("$@"); break ;;
-    rust|python|py|typescript|ts|stack) runners+=("$1") ;;
-    all) runners+=(rust python typescript) ;;
+    rust|python|py|typescript|ts|go|stack) runners+=("$1") ;;
+    all) runners+=(rust python typescript go) ;;
     -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
 if ((${#runners[@]} == 0)); then
-  echo "name at least one runner: rust, python, typescript, all, or stack" >&2
+  echo "name at least one runner: rust, python, typescript, go, all, or stack" >&2
   exit 2
 fi
 
@@ -168,6 +168,13 @@ if [[ "$postgres" == true ]]; then
   backend_env+=("LD_PLANE_BACKENDS=$backends")
   export LASER_BDD_SQL_BACKEND=postgres
 fi
+doris_has_backend() {
+  docker exec "$doris_container" mysql -h127.0.0.1 -P9030 -uroot --batch -e "SHOW BACKENDS" |
+    awk -F '\t' 'NR == 1 { for (i=1; i<=NF; i++) if ($i == "Alive") alive=i }
+      NR > 1 && alive && tolower($alive) == "true" { ready=1 }
+      END { exit !ready }'
+}
+
 if [[ "$doris" == true ]]; then
   doris_container="laser-managed-bdd-doris-$$"
   # Backend storage on tmpfs keeps the frontend's capacity checks independent
@@ -177,6 +184,7 @@ if [[ "$doris" == true ]]; then
     apache/doris:doris-all-in-one-2.1.0 >/dev/null
   wait_until "Doris" 240 docker exec "$doris_container" \
     mysql -h127.0.0.1 -P9030 -uroot -e "CREATE DATABASE IF NOT EXISTS managed_bdd"
+  wait_until "a live Doris storage backend" 240 doris_has_backend
   backends="[{\"id\":\"doris\",\"kind\":\"velodb\",\"dsn\":\"mysql://root@127.0.0.1:9030/managed_bdd\",\"fe_http_url\":\"http://127.0.0.1:8030\",\"buckets\":1,\"replication_num\":1}]"
   backend_env+=("LD_PLANE_BACKENDS=$backends")
   export LASER_BDD_SQL_BACKEND=velodb
@@ -230,6 +238,9 @@ run_runner() {
         [[ -n "$skip" ]] || (cd "$repo_root/foreign/typescript" && npm run build)
         cd "$repo_root/bdd/typescript" && npm run build && npx cucumber-js --config cucumber.js "${runner_args[@]}"
       )
+      ;;
+    go)
+      (cd "$repo_root/bdd/go" && go test -count=1 "${runner_args[@]}" ./...)
       ;;
     stack)
       echo "press Ctrl-C to stop the stack" >&2

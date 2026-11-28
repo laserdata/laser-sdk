@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
-	"strconv"
-	"sync/atomic"
 )
 
 // certificateFileName is what the cached CA is called inside the cache
@@ -35,40 +33,29 @@ func restrictToOwner(dir string) error {
 	return nil
 }
 
-// attempt makes each scratch name unique within this process, so concurrent
-// installs never collide on it.
-var attempt atomic.Uint64
-
 // writeCertificate writes the bundled CA to a fresh owner-only file and then
 // renames it over the target. A reader never observes a partial certificate,
 // and a pre-planted file or symlink at the target is replaced rather than
 // followed.
 func writeCertificate(dir, path string) error {
-	temp := filepath.Join(dir, certificateFileName+"."+
-		strconv.Itoa(os.Getpid())+"."+strconv.FormatUint(attempt.Add(1), 10)+".tmp")
-	_ = os.Remove(temp)
-	// O_EXCL so an existing scratch file is never written through, and 0600 so
-	// the bytes are owner-only from the moment they exist.
-	file, err := os.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	file, err := os.CreateTemp(dir, certificateFileName+".*.tmp")
 	if err != nil {
 		return configError("create CA cert: " + err.Error())
 	}
+	temp := file.Name()
+	defer os.Remove(temp)
 	if _, err := file.WriteString(LaserDataRootCA); err != nil {
 		file.Close()
-		_ = os.Remove(temp)
 		return configError("write CA cert: " + err.Error())
 	}
 	if err := file.Sync(); err != nil {
 		file.Close()
-		_ = os.Remove(temp)
 		return configError("write CA cert: " + err.Error())
 	}
 	if err := file.Close(); err != nil {
-		_ = os.Remove(temp)
 		return configError("write CA cert: " + err.Error())
 	}
 	if err := os.Rename(temp, path); err != nil {
-		_ = os.Remove(temp)
 		return configError("install CA cert: " + err.Error())
 	}
 	return nil
@@ -82,13 +69,18 @@ func installCertificate(dir string) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", configError("create CA cache directory: " + err.Error())
 	}
+	info, err := os.Lstat(dir)
+	if err != nil || !info.IsDir() {
+		return "", configError("CA cache path must be a directory")
+	}
 	if err := restrictToOwner(dir); err != nil {
 		return "", err
 	}
 	path := filepath.Join(dir, certificateFileName)
-	if cached, err := os.ReadFile(path); err == nil &&
-		bytes.Equal(cached, []byte(LaserDataRootCA)) {
-		return path, nil
+	if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() && info.Size() == int64(len(LaserDataRootCA)) {
+		if cached, err := os.ReadFile(path); err == nil && bytes.Equal(cached, []byte(LaserDataRootCA)) {
+			return path, nil
+		}
 	}
 	if err := writeCertificate(dir, path); err != nil {
 		return "", err

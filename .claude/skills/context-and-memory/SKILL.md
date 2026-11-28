@@ -5,7 +5,7 @@ description: Reading the log back - `sdk/src/context.rs`, `sdk/src/cursor.rs`, `
 
 # Context and memory
 
-The TypeScript peer lives under `foreign/typescript/src/context*`, `conversation-state.ts`, `snapshot.ts`, and `memory/`.
+The TypeScript peer lives under `foreign/typescript/src/context*`, `conversation-state.ts`, `snapshot.ts`, and `memory/`. The Go peer is `foreign/go/laser/context.go`, `context_scope.go`, `conversation_state.go`, `snapshot.go` and the `memory*.go` files.
 
 These modules reconstruct state from the durable log: assemble an ordered window of a conversation, fold it into state, or recall scoped memory items. Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first. Repo rules in [AGENTS.md](../../../AGENTS.md).
 

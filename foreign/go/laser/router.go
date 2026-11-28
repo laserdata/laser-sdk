@@ -83,7 +83,7 @@ func To(agent wire.AgentID) Router {
 // ToPrincipal routes to one agent, but only while its live presence is bound
 // to principal.
 //
-// An agent id is a claim any connection can make; a principal is what the
+// An agent id is a claim any connection can make. A principal is what the
 // deployment authenticated. Binding the two is what stops a connection
 // advertising somebody else's agent id from being handed that agent's work,
 // so this is the directed route to use wherever the target's identity
@@ -100,7 +100,7 @@ func ToPrincipal(agent wire.AgentID, principal PrincipalID) Router {
 // agent that merely claims the name.
 //
 // On a directed route it is the same requirement, which is what ToPrincipal
-// builds; on a broadcast it is meaningless and ignored, since a broadcast
+// builds. On a broadcast it is meaningless and ignored, since a broadcast
 // names no agent to bind.
 func (router Router) WithPrincipal(principal PrincipalID) Router {
 	router.Principal = &principal
@@ -108,6 +108,16 @@ func (router Router) WithPrincipal(principal PrincipalID) Router {
 		router.Kind = RouteToPrincipal
 	}
 	return router
+}
+
+// needsRegistry reports whether resolving this route reads the agent registry.
+func (router Router) needsRegistry() bool {
+	switch router.Kind {
+	case RouteToPrincipal, RouteToCapable, RouteAllCapable:
+		return true
+	default:
+		return false
+	}
 }
 
 // RequiresPresence reports whether resolving this route needs live,
@@ -192,7 +202,7 @@ func (router Router) Apply(provenance *Provenance) {
 // is still picked rather than refusing when no other agent is capable (a
 // workflow reassignment reusing the agent that just timed out is better than
 // no agent at all). Only the workflow engine's own exclusive-step
-// reassignment passes it; every other caller omits it.
+// reassignment passes it. Every other caller omits it.
 func (router Router) ResolveTargets(
 	registry *AgentRegistry, now time.Time, avoid ...wire.AgentID,
 ) ([]wire.AgentID, error) {
@@ -218,8 +228,7 @@ func (router Router) resolveRoutable(
 	switch router.Kind {
 	case RouteTo, RouteToPrincipal:
 		if registry != nil && registry.Quarantined(router.Agent) {
-			return nil, &InvalidError{Reason: "agent " + router.Agent.String() +
-				" is quarantined, so work must not be routed to it"}
+			return nil, &QuarantinedError{Agent: router.Agent}
 		}
 		if router.Kind == RouteToPrincipal {
 			if registry == nil {

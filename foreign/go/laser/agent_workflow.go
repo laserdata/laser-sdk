@@ -3,7 +3,10 @@ package laser
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,6 +15,9 @@ import (
 
 // defaultStepDeadline bounds a step whose caller names none.
 const defaultStepDeadline = 30 * time.Second
+
+// stepBudgetFloor is the wall-clock budget a step needs left to be dispatched.
+const stepBudgetFloor = 100 * time.Millisecond
 
 // StepFunc builds a step's task payload, or a local step's output, from the
 // outputs of the steps before it. Bounded by the step's own deadline: a
@@ -62,15 +68,15 @@ const (
 func (reason StepFailure) String() string {
 	switch reason {
 	case StepTimedOut:
-		return "timed out"
+		return "timed_out"
 	case StepFailed:
 		return "failed"
 	case StepNotConsumed:
-		return "not consumed"
+		return "not_consumed"
 	case StepUnverified:
 		return "unverified"
 	case StepNoCompletion:
-		return "no completion"
+		return "no_completion"
 	default:
 		return "unknown"
 	}
@@ -78,6 +84,14 @@ func (reason StepFailure) String() string {
 
 // Retryable reports whether a later attempt of the same step can succeed.
 func (reason StepFailure) Retryable() bool { return reason == StepTimedOut }
+
+// CancelledError reports a run stopped at a step boundary by a cancel request, after its completed steps were compensated.
+type CancelledError struct {
+	// Run is the id of the cancelled run.
+	Run string
+}
+
+func (e *CancelledError) Error() string { return "run cancelled: " + e.Run }
 
 // StepFailedError reports a workflow step that did not complete.
 type StepFailedError struct {
@@ -89,8 +103,11 @@ type StepFailedError struct {
 }
 
 func (e *StepFailedError) Error() string {
-	return fmt.Sprintf("workflow run %s: step `%s` on %s %s (deadline %s)",
-		e.Run, e.Step, e.Target, e.Reason, e.Deadline)
+	text := "workflow run " + e.Run.String() + " step `" + e.Step + "` failed: " + e.Reason.String()
+	if e.Reason == StepTimedOut {
+		text += ", target " + e.Target + ", deadline " + strconv.FormatInt(e.Deadline.Milliseconds(), 10) + " ms"
+	}
+	return text
 }
 
 // Retryable reports whether a later attempt of the same step can succeed.
@@ -122,7 +139,7 @@ type WorkflowBudget struct {
 }
 
 // WithTokens caps the summed input-plus-output tokens across all step
-// replies. Only counts the usage a step's reply carries; a plain reply with
+// replies. Only counts the usage a step's reply carries. A plain reply with
 // no usage, and an all-capable step's scatter, count zero, so this ceiling
 // is advisory and bites only where handlers attach usage.
 func (budget WorkflowBudget) WithTokens(tokens uint64) WorkflowBudget {
@@ -169,10 +186,6 @@ type workflowStep struct {
 // copying the whole step slice (or sharing its backing array unsafely)
 // on every chained call would be worse than the shared, explicit mutation
 // used here.
-//
-// Not yet ported: the "plain code" run_with/WorkflowRun form where the
-// caller's own async body is the workflow. A self-contained future slice;
-// see foreign/go/IMPLEMENTATION_STATUS.md.
 type Workflow struct {
 	laser    *Laser
 	name     string
@@ -200,15 +213,8 @@ func (workflow *Workflow) Budget(budget WorkflowBudget) *Workflow {
 	return workflow
 }
 
-// Registry is where an all-capable step's agents are resolved from.
-// Unneeded for a workflow with only directed/local steps.
-// InboxRoute decides how each step resolves its target to a topic.
-//
-// The default is a fixed route to the topic named at Laser.Workflow, the
-// same default Laser.Contract keeps and for the same reason: a deployment
-// that serves no presence has no advertised inbox to resolve, and moving
-// the default would re-address every existing workflow's traffic. Pass
-// AdvertisedInbox() to send each step to the agent's own inbox.
+// InboxRoute selects the targets' advertised inboxes by default. Use
+// FixedInbox when every participant consumes a shared topic.
 func (workflow *Workflow) InboxRoute(route InboxRoute) *Workflow {
 	workflow.inbox = &route
 	return workflow
@@ -219,9 +225,10 @@ func (workflow *Workflow) inboxRoute() InboxRoute {
 	if workflow.inbox != nil {
 		return *workflow.inbox
 	}
-	return FixedInbox(workflow.topic)
+	return AdvertisedInbox()
 }
 
+// Registry is where the workflow's capability routes are resolved against.
 func (workflow *Workflow) Registry(registry *AgentRegistry) *Workflow {
 	workflow.registry = registry
 	return workflow
@@ -282,7 +289,7 @@ func (handle *StepHandle) VerifyWith(verifier StepVerifier) *StepHandle {
 // Exclusive opts this step into the lease and fence (an exclusive,
 // at-most-once effect): the engine claims a fenced lease before dispatching,
 // renews it while the contract is in flight, and releases it on every exit.
-// Needs a directed step (To/ToCapable); a local step runs in process and an
+// Needs a directed step (To/ToCapable). A local step runs in process and an
 // all-capable one has no single target to fence.
 func (handle *StepHandle) Exclusive() *StepHandle {
 	handle.workflow.steps[handle.index].exclusive = true
@@ -320,7 +327,7 @@ func (handle *StepHandle) Deadline(deadline time.Duration) *StepHandle {
 
 // CompensateWith provides the compensation to run if a later step fails
 // (the saga rollback): a directed or all-capable step's compensation is
-// sent as a fresh Contract to the agent(s) that ran the original step; a
+// sent as a fresh Contract to the agent(s) that ran the original step. A
 // local step's compensation runs in process when it builds (the build
 // itself is the undo). A completed compensation is journaled, so a resume
 // runs the undone step again.
@@ -428,7 +435,7 @@ func (workflow *Workflow) Run(ctx context.Context) (*WorkflowOutcome, error) {
 		defer lease.Release()
 	}
 
-	outcome, runErr := workflow.execute(ctx, runID, order, journal)
+	outcome, runErr := workflow.execute(ctx, session, runID, order, journal)
 	endErr := endWorkflowSession(ctx, session, runErr)
 	if runErr != nil {
 		return nil, runErr
@@ -440,13 +447,17 @@ func (workflow *Workflow) Run(ctx context.Context) (*WorkflowOutcome, error) {
 }
 
 // endWorkflowSession ends a run's root session the way runErr says: Complete
-// on success, FailOverBudget on a BudgetExceededError, Fail otherwise.
+// on success, canceled on a CancelledError, FailOverBudget on a
+// BudgetExceededError, Fail otherwise.
 // Shared by Workflow.Run (declared steps) and WorkflowRun.Finish (the plain
 // code form).
 func endWorkflowSession(ctx context.Context, session *Session, runErr error) error {
 	switch typed := runErr.(type) {
 	case nil:
 		_, err := session.Complete(ctx, "")
+		return err
+	case *CancelledError:
+		_, err := session.End(ctx, wire.TaskCanceled, wire.SessionEnd{})
 		return err
 	case *BudgetExceededError:
 		_, err := session.FailOverBudget(ctx, typed.Breach)
@@ -511,7 +522,7 @@ func (workflow *Workflow) validate() ([]int, error) {
 // deployment that cannot serve the managed key-value store's fenced-lease
 // contract, before anything runs.
 func (workflow *Workflow) requireFencedLeases() error {
-	if workflow.laser.capabilities.Kv.FencedLeases {
+	if workflow.laser.Capabilities().Kv.FencedLeases {
 		return nil
 	}
 	return &UnsupportedError{Surface: "an exclusive workflow step (the managed fenced-lease contract)"}
@@ -523,7 +534,7 @@ func (workflow *Workflow) requireFencedLeases() error {
 const defaultWorkflowTopicRetention = 24 * time.Hour
 
 // open replays the run's journal and begins its root session, bootstrapping
-// the stream's agent topology first when the run's own topics are missing —
+// the stream's agent topology first when the run's own topics are missing,
 // so a workflow of local steps needs no agent and no caller-made Bootstrap
 // call, mirroring Rust's own open()/run_topics_missing().
 func (workflow *Workflow) open(
@@ -555,6 +566,9 @@ func (workflow *Workflow) openSession(
 		return workflowJournal{}, nil, nil, err
 	}
 	session := workflow.laser.Sessions().Open(runID, "").As(workflow.source)
+	if tokens := workflow.budget.tokens; tokens != nil {
+		session = session.WithBudget(wire.Budget{Tokens: tokens})
+	}
 	if resumed {
 		session = session.Resume()
 	}
@@ -686,7 +700,7 @@ type workflowEffect struct {
 // execute is the engine body: steps in dependency order, compensating the
 // effects recorded so far (the saga rollback) before returning any failure.
 func (workflow *Workflow) execute(
-	ctx context.Context, runID wire.ConversationID, order []int, journal workflowJournal,
+	ctx context.Context, session *Session, runID wire.ConversationID, order []int, journal workflowJournal,
 ) (*WorkflowOutcome, error) {
 	started := time.Now()
 	if !journal.started {
@@ -714,8 +728,12 @@ func (workflow *Workflow) execute(
 		if _, done := outputs[step.label]; done {
 			continue
 		}
-		invocations++
-		if err := workflow.checkBudget(invocations, tokensSpent, started); err != nil {
+		err := workflow.boundary(ctx, session, runID, started)
+		if err == nil {
+			invocations++
+			err = workflow.checkBudget(invocations, tokensSpent, started)
+		}
+		if err != nil {
 			workflow.compensate(ctx, runID, effects, outputs)
 			return nil, err
 		}
@@ -749,14 +767,47 @@ func (workflow *Workflow) execute(
 	}, nil
 }
 
+// boundary is the check between steps: a cancel request, a run session over
+// its budget, and a wall-clock budget too spent to dispatch with.
+func (workflow *Workflow) boundary(
+	ctx context.Context, session *Session, runID wire.ConversationID, started time.Time,
+) error {
+	cancelled, err := session.CancelRequested(ctx)
+	if err != nil {
+		return err
+	}
+	if cancelled {
+		return &CancelledError{Run: runID.String()}
+	}
+	breach, over, err := session.BudgetBreach(ctx)
+	if err != nil {
+		return err
+	}
+	if over {
+		return &BudgetExceededError{Breach: breach}
+	}
+	if total := workflow.budget.wallClock; total != nil && *total-time.Since(started) < stepBudgetFloor {
+		return &BudgetExceededError{Breach: BudgetBreach{
+			Dimension: BudgetWallClock,
+			Ceiling:   uint64(total.Microseconds()), Spent: uint64(time.Since(started).Microseconds()),
+		}}
+	}
+	return nil
+}
+
 // compensate runs the compensations of the steps with an effect in reverse
 // order (the saga rollback), each to the agents that ran its step. A
 // compensation that completes is journaled, so a resume runs the undone
-// step again. One that does not is left unjournaled and the rollback goes
-// on; it never replaces the original error, which the caller already has.
+// step again. One that does not is left unjournaled, reported as a warning,
+// and the rollback goes on. It never replaces the original error, which the
+// caller already has. A run whose context ended stops at once without
+// compensating, so a resume continues it.
 func (workflow *Workflow) compensate(
 	ctx context.Context, runID wire.ConversationID, effects []workflowEffect, outputs map[string][]byte,
 ) {
+	if ctx.Err() != nil {
+		return
+	}
 	for cursor := len(effects) - 1; cursor >= 0; cursor-- {
 		effect := effects[cursor]
 		step := workflow.steps[effect.index]
@@ -766,15 +817,26 @@ func (workflow *Workflow) compensate(
 		deadlineAt := time.Now().Add(step.deadline)
 		buildCtx, cancel := context.WithDeadline(ctx, deadlineAt)
 		payload, err := step.compensate(buildCtx, outputs)
+		timedOut := buildCtx.Err() != nil && errors.Is(err, context.DeadlineExceeded)
 		cancel()
-		if err != nil {
+		if timedOut {
+			slog.WarnContext(ctx, "Building the compensation of workflow step "+step.label+" timed out",
+				"run", runID.String(), "step", step.label)
 			continue
 		}
-		undone := workflow.runCompensation(ctx, runID, step, effect.agents, payload, deadlineAt)
-		if undone {
-			_ = workflow.record(ctx, runID, workflowJournalEntry{
-				Kind: journalStepCompensated, Label: step.label,
-			})
+		if err != nil {
+			slog.WarnContext(ctx, "Building the compensation of workflow step "+step.label+" failed",
+				"run", runID.String(), "step", step.label, "error", err)
+			continue
+		}
+		if !workflow.runCompensation(ctx, runID, step, effect.agents, payload, deadlineAt) {
+			continue
+		}
+		if err := workflow.record(ctx, runID, workflowJournalEntry{
+			Kind: journalStepCompensated, Label: step.label,
+		}); err != nil {
+			slog.WarnContext(ctx, "Journaling the compensation of workflow step "+step.label+" failed",
+				"run", runID.String(), "step", step.label, "error", err)
 		}
 	}
 }
@@ -810,8 +872,15 @@ func (workflow *Workflow) runCompensation(
 			Parent(runID, runID).
 			Deadline(time.Until(deadlineAt)).
 			SendResolved(ctx)
-		if err != nil || contract.State != ContractCompleted {
+		switch {
+		case err != nil:
 			undone = false
+			slog.WarnContext(ctx, "Compensation of workflow step "+step.label+" failed",
+				"run", runID.String(), "step", step.label, "error", err)
+		case contract.State != ContractCompleted:
+			undone = false
+			slog.WarnContext(ctx, "Compensation of workflow step "+step.label+" did not complete",
+				"run", runID.String(), "step", step.label, "outcome", contract.State.String())
 		}
 	}
 	return undone
@@ -886,8 +955,8 @@ func (workflow *Workflow) stepFailedError(
 //
 // The returned agents is nil when the step produced no effect at all worth
 // compensating (the build failed, or a directed/all-capable dispatch never
-// reached a completing reply), and non-nil — empty for a local step, whose
-// build is its own effect — once it did, whether or not a later verifier
+// reached a completing reply), and non-nil (empty for a local step, whose
+// build is its own effect) once it did, whether or not a later verifier
 // then rejected it: the handler already ran.
 func (workflow *Workflow) runStep(
 	ctx context.Context, runID wire.ConversationID, step workflowStep,
@@ -960,7 +1029,7 @@ func (workflow *Workflow) runDirected(
 }
 
 // dispatchPoint is where the reply to this attempt lands at or after. A
-// fresh attempt journals the reply topic's tail before it sends; a resumed
+// fresh attempt journals the reply topic's tail before it sends. A resumed
 // one hands the journaled positions back for Contract.ResumeFrom.
 func (workflow *Workflow) dispatchPoint(
 	ctx context.Context, runID wire.ConversationID, step workflowStep, attempt workflowAttempt,
@@ -968,7 +1037,8 @@ func (workflow *Workflow) dispatchPoint(
 	if attempt.replyFrom != nil {
 		return attempt.replyFrom, nil
 	}
-	replyFrom, err := workflow.laser.ReplyPositions(ctx, workflow.topic)
+	replyFrom, err := workflow.laser.ReplyPositions(
+		ctx, workflow.laser.replyTopicFor(workflow.topic, workflow.source))
 	if err != nil {
 		return nil, err
 	}
@@ -1014,7 +1084,9 @@ func (workflow *Workflow) runAllCapable(
 			return nil, 0, nil, err
 		}
 	}
+	inbox := workflow.inboxRoute()
 	report, err := workflow.laser.ScatterReport(ctx, ScatterRequest{
+		Inbox: &inbox,
 		Skill: step.router.Skill, Routing: step.router.Policy, Registry: workflow.registry,
 		From: workflow.source, Topic: workflow.topic, Payload: payload,
 		Policy: GatherAll(), Deadline: time.Until(deadlineAt),

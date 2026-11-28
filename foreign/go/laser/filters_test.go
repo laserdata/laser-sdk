@@ -11,6 +11,7 @@ import (
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
@@ -34,6 +35,10 @@ func (server *filterServer) Close() error { return nil }
 func (server *filterServer) SendBinaryRequest(
 	_ context.Context, code uint32, payload []byte,
 ) ([]byte, error) {
+	if code == laser.PartitionRouteCodeForTest {
+		// Apache Iggy without partition routes refuses the lookup, so the request goes to the caller's node.
+		return nil, ierror.InvalidCommand{}
+	}
 	server.codes = append(server.codes, code)
 	server.requests = append(server.requests, payload)
 	if server.refusals > 0 {
@@ -1139,6 +1144,37 @@ func TestGivenALostReplyWhenTheOperationIsReadThenShouldNotReapply(t *testing.T)
 	decodeFilterRequest(t, server, 0, &request)
 	if request.OperationID != operation {
 		t.Error("want the operation named")
+	}
+}
+
+func TestGivenACatalogThatRefusesOnceWhenAChangeOrItsOutcomeIsSentThenShouldAskOnceAndReportTheRefusal(t *testing.T) {
+	operation := laser.NewOperationID()
+	served := &wire.FilterCatalogOutcome{Kind: wire.CatalogMutation, Mutation: &wire.FilterMutationOutcome{
+		V: wire.FilterOpVersion, OperationID: operation,
+		Status: wire.FilterMutationStatus{Kind: wire.StatusPending},
+	}}
+	sends := map[string]func(*laser.FilterCatalog) error{
+		"outcome read": func(catalog *laser.FilterCatalog) error {
+			_, err := catalog.Operation(context.Background(), operation)
+			return err
+		},
+		"change": func(catalog *laser.FilterCatalog) error {
+			_, err := catalog.MutateAs(context.Background(), operation, wire.FilterMutation{Kind: wire.MutateArchive, FilterID: 7})
+			return err
+		},
+	}
+	for name, send := range sends {
+		server := &filterServer{catalog: served, refusals: 1}
+
+		err := send(filterHandle(server, laser.Options{}).FilterCatalog())
+
+		var refused *laser.FilterError
+		if !errors.As(err, &refused) || refused.Failure.Reason != wire.ReasonCatalogUnavailable {
+			t.Errorf("%s: want the catalog refusal reported, got %v", name, err)
+		}
+		if len(server.codes) != 1 {
+			t.Errorf("%s: want one request, got %d", name, len(server.codes))
+		}
 	}
 }
 

@@ -166,14 +166,18 @@ func (laser *Laser) ensureRetained(
 // only visible by asking again, so a long-lived client that was told "no"
 // once is not told it forever.
 func (laser *Laser) RefreshCapabilities(ctx context.Context) Capabilities {
+	if laser.capabilityOverride {
+		return laser.capabilities
+	}
 	client, err := laser.connected()
 	if err != nil {
 		return laser.capabilities
 	}
-	refreshed := NegotiateCapabilities(ctx, client, laser.configured())
+	refreshed, announced := negotiateTopology(ctx, client, laser.configured())
 	laser.state().mutex.Lock()
 	laser.state().negotiated = &refreshed
 	laser.state().mutex.Unlock()
+	laser.adoptTopology(announced)
 	return refreshed
 }
 
@@ -194,6 +198,9 @@ func (laser *Laser) configured() Capabilities {
 // Negotiated is the most recent probe's answer, or the handle's own set when
 // nothing has re-probed.
 func (laser *Laser) Negotiated() Capabilities {
+	if laser.capabilityOverride {
+		return laser.capabilities
+	}
 	laser.state().mutex.RLock()
 	defer laser.state().mutex.RUnlock()
 	if laser.state().negotiated != nil {

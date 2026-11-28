@@ -100,7 +100,7 @@ func TestGivenAListedNameWhenLocalizedThenShouldStripOnlyThisHandlesPrefix(t *te
 // name contains one cannot be scoped to without addressing something else.
 func TestGivenAStreamWithASlashWhenSendingManagedThenShouldRefuseBeforeSending(t *testing.T) {
 	client := &managedClient{}
-	handle := managedHandle(client, laser.Options{DefaultStream: "tenant/agents"})
+	handle := managedHandle(client, laser.Options{DefaultStream: "fleet/agents"})
 
 	_, err := handle.SendManaged(context.Background(), wire.AgdxKvGetCode, []byte{1})
 
@@ -113,12 +113,12 @@ func TestGivenAStreamWithASlashWhenSendingManagedThenShouldRefuseBeforeSending(t
 	}
 }
 
-// A read is sent as the caller wrote it: there is no state to apply once.
-func TestGivenAManagedReadWhenSentThenShouldCarryThePayloadUnwrapped(t *testing.T) {
+// Queries have their own consistency contract.
+func TestGivenAManagedQueryWhenSentThenShouldCarryThePayloadUnwrapped(t *testing.T) {
 	client := &managedClient{reply: []byte{9, 9}}
 	handle := managedHandle(client, laser.Options{})
 
-	reply, err := handle.SendManaged(context.Background(), wire.AgdxKvGetCode, []byte{1, 2, 3})
+	reply, err := handle.SendManaged(context.Background(), wire.AgdxQueryCode, []byte{1, 2, 3})
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -128,8 +128,8 @@ func TestGivenAManagedReadWhenSentThenShouldCarryThePayloadUnwrapped(t *testing.
 	if string(client.lastBody) != "\x01\x02\x03" {
 		t.Errorf("a read must not be wrapped, got %v", client.lastBody)
 	}
-	if client.lastCode != wire.AgdxKvGetCode {
-		t.Errorf("want the kv get code, got %d", client.lastCode)
+	if client.lastCode != wire.AgdxQueryCode {
+		t.Errorf("want the query code, got %d", client.lastCode)
 	}
 }
 
@@ -353,4 +353,58 @@ func (client *concurrentClient) SendBinaryRequest(
 	_ context.Context, _ uint32, _ []byte,
 ) ([]byte, error) {
 	return client.reply, nil
+}
+
+func TestGivenPositionedReadsWhenRepeatedThenShouldSendOnlyTheSurfaceFrontier(t *testing.T) {
+	frontier := wire.AppliedFrontier{Kv: &wire.MutationPosition{Offset: 7}, Sessions: []wire.SessionPosition{{StreamID: 2, Topic: "sessions", Offset: 5}}}
+	reply, err := wire.Marshal(wire.ManagedReplyEnvelope{V: wire.ManagedRequestVersion, Frontier: frontier, Reply: []byte{1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &managedClient{reply: reply}
+	handle := managedHandle(client, laser.Options{})
+	for i, code := range []uint32{wire.AgdxKvGetCode, wire.AgdxKvScanCode, wire.AgdxSessionGetCode, wire.AgdxForkListCode} {
+		if _, err := handle.SendManaged(t.Context(), code, []byte{3}); err != nil {
+			t.Fatal(err)
+		}
+		var read wire.ManagedReadEnvelope
+		if err := wire.Unmarshal(client.lastBody, &read); err != nil {
+			t.Fatal(err)
+		}
+		if read.V != wire.ManagedRequestVersion || string(read.Read) != "\x03" {
+			t.Fatalf("invalid read frame: %+v", read)
+		}
+		if i == 1 {
+			if read.MinPosition == nil || *read.MinPosition != *frontier.Kv {
+				t.Fatalf("missing KV frontier: %+v", read)
+			}
+		} else if read.MinPosition != nil {
+			t.Fatalf("unexpected minimum: %+v", read)
+		}
+		if i == 2 {
+			if len(read.MinSessions) != 1 || read.MinSessions[0] != frontier.Sessions[0] {
+				t.Fatalf("missing sessions frontier: %+v", read)
+			}
+		} else if len(read.MinSessions) != 0 {
+			t.Fatalf("unexpected session frontier: %+v", read)
+		}
+		snapshot := handle.SeenPositions()
+		snapshot.Kv.Offset = 100
+		snapshot.Sessions[0].Offset = 100
+	}
+}
+
+func TestGivenARefusedKeyValueReadWhenReportedThenShouldNameAManagedCommand(t *testing.T) {
+	refusal, err := wire.Marshal(wire.NewCommandError(wire.ResultForbidden, "no grant"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := managedHandle(&managedClient{reply: refusal}, laser.Options{Capabilities: kvCapabilities()})
+
+	_, _, err = handle.Kv("ns").Get(context.Background(), []byte("k"))
+
+	var failure *laser.CommandFailure
+	if !errors.As(err, &failure) || failure.Error() != "managed command: "+wire.ResultForbidden.String()+": no grant" {
+		t.Fatalf("want the refusal named as a managed command, got %T: %v", err, err)
+	}
 }

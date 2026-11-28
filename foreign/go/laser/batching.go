@@ -47,9 +47,15 @@ type PublishFailure struct {
 }
 
 func (e *PublishFailure) Error() string {
-	return "publish to " + e.Stream + "/" + e.Topic + ": " +
-		itoa(len(e.Unconfirmed)) + " records unconfirmed: " + e.Cause.Error()
+	text := "publish failed to " + e.Stream + "/" + e.Topic + ": " + e.Cause.Error()
+	if IsStreamOrTopicNotFound(e.Cause) {
+		text += ": " + missingTopicFix
+	}
+	return text
 }
+
+// missingTopicFix names the calls that create a missing topic, wherever one is missing.
+const missingTopicFix = "the topic does not exist: create the agent topics with Bootstrap, or a memory topic with MemoryTopic"
 
 func (e *PublishFailure) Unwrap() error { return e.Cause }
 

@@ -8,6 +8,7 @@ import (
 
 	bdd "github.com/laserdata/laser-sdk/bdd/go"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
+	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
 // TestGivenTheSharedClientsScenariosWhenRunThenShouldHold runs the live
@@ -19,7 +20,7 @@ func TestGivenTheSharedClientsScenariosWhenRunThenShouldHold(t *testing.T) {
 
 // clientsFlow is the listing a scenario took and the user it narrowed to.
 type clientsFlow struct {
-	listed []laser.ClientInfo
+	listed []wire.ClientMetadata
 	user   *uint32
 }
 
@@ -42,7 +43,7 @@ func clientsStep(ctx context.Context, state *world, step bdd.Step) error {
 
 	switch {
 	case text == "I list every connected client":
-		listed, err := state.client.Clients(ctx)
+		listed, err := state.client.ClientMetadata().All(ctx)
 		if err != nil {
 			return err
 		}
@@ -63,28 +64,17 @@ func clientsStep(ctx context.Context, state *world, step bdd.Step) error {
 	}
 }
 
-// listClientsOfUser narrows the listing to the user this connection signed
-// in as, which is what "that user" refers back to.
+// listClientsOfUser asks the deployment for the connections of the user the
+// first listing held.
 func listClientsOfUser(ctx context.Context, state *world, flow *clientsFlow) error {
-	me, err := state.client.Me(ctx)
+	if flow.user == nil {
+		return fmt.Errorf("no listed connection named a user")
+	}
+	listed, err := state.client.ClientMetadata().Principal(laser.PrincipalID(*flow.user)).All(ctx)
 	if err != nil {
 		return err
 	}
-	if me == nil || me.UserID == nil {
-		return fmt.Errorf("want this connection signed in, got %+v", me)
-	}
-	flow.user = me.UserID
-	listed, err := state.client.Clients(ctx)
-	if err != nil {
-		return err
-	}
-	narrowed := make([]laser.ClientInfo, 0, len(listed))
-	for _, client := range listed {
-		if client.UserID != nil && *client.UserID == *me.UserID {
-			narrowed = append(narrowed, client)
-		}
-	}
-	flow.listed = narrowed
+	flow.listed = listed
 	return nil
 }
 
@@ -94,6 +84,7 @@ func listClientsOfUser(ctx context.Context, state *world, flow *clientsFlow) err
 func listingHoldsAuthenticated(flow *clientsFlow) error {
 	for _, client := range flow.listed {
 		if client.UserID != nil {
+			flow.user = client.UserID
 			return nil
 		}
 	}

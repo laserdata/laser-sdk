@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"sync"
 	"time"
 
@@ -79,8 +80,15 @@ func KeyIDOf(verifying ed25519.PublicKey) []byte {
 // seed is the secret: store it the way any secret is stored, and enroll only
 // the verifying key.
 type SigningKey struct {
-	private ed25519.PrivateKey
-	keyID   []byte
+	// private hands out the key from a closure, so no fmt verb reaches its bytes.
+	private   func() ed25519.PrivateKey
+	verifying ed25519.PublicKey
+	keyID     []byte
+}
+
+// Format prints the key by its key id under any verb, never the private key.
+func (key SigningKey) Format(state fmt.State, _ rune) {
+	fmt.Fprintf(state, "SigningKey(%x)", key.keyID)
 }
 
 // GenerateSigningKey mints a key from the operating system's random source.
@@ -100,21 +108,23 @@ func SigningKeyFromSeed(seed []byte) (*SigningKey, error) {
 			Reason: "an Ed25519 seed requires exactly 32 bytes"}
 	}
 	private := ed25519.NewKeyFromSeed(seed)
+	verifying := private.Public().(ed25519.PublicKey)
 	return &SigningKey{
-		private: private,
-		keyID:   KeyIDOf(private.Public().(ed25519.PublicKey)),
+		private:   func() ed25519.PrivateKey { return private },
+		verifying: verifying,
+		keyID:     KeyIDOf(verifying),
 	}, nil
 }
 
 // Seed is the secret this key rebuilds from.
-func (key *SigningKey) Seed() []byte { return bytes.Clone(key.private.Seed()) }
+func (key *SigningKey) Seed() []byte { return bytes.Clone(key.private().Seed()) }
 
 // KeyID is this key's identity, the one it stamps on every signature.
 func (key *SigningKey) KeyID() []byte { return bytes.Clone(key.keyID) }
 
 // VerifyingKey is the public key to enroll in a registry.
 func (key *SigningKey) VerifyingKey() ed25519.PublicKey {
-	return key.private.Public().(ed25519.PublicKey)
+	return bytes.Clone(key.verifying)
 }
 
 // Sign signs an envelope, covering the envelope body alone.
@@ -145,7 +155,7 @@ func (key *SigningKey) sign(
 	return &wire.Signature{
 		Scheme:  wire.SignatureSchemeEd25519,
 		KeyID:   bytes.Clone(key.keyID),
-		Bytes:   ed25519.Sign(key.private, input),
+		Bytes:   ed25519.Sign(key.private(), input),
 		Context: context,
 	}, nil
 }
@@ -325,8 +335,8 @@ func (registry *KeyRegistry) VerifyObservedAt(
 // fields point to, not by pointer identity.
 //
 // A plain "!=" on wire.SignatureContext compares its *uint8/*uint32 fields as
-// addresses, so two contexts built independently -- one at signing time, one
-// reconstructed from a record's own headers -- would always differ even
+// addresses, so two contexts built independently, one at signing time and one
+// reconstructed from a record's own headers, would always differ even
 // when they carry the same value, since they are never the same allocation.
 func signatureContextsEqual(first, second wire.SignatureContext) bool {
 	return equalPtr(first.ContentType, second.ContentType) &&

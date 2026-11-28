@@ -3,10 +3,12 @@ package laser_test
 import (
 	"context"
 
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
@@ -23,6 +25,8 @@ type budgetServer struct {
 	// reads counts the index reads, so a test can tell a cached verdict
 	// from one read again.
 	indexReads int
+	// unreachable makes the index answer that its backend is out of reach.
+	unreachable bool
 }
 
 func (server *budgetServer) SendBinaryRequest(
@@ -42,8 +46,11 @@ func (server *budgetServer) SendBinaryRequest(
 	}
 	server.indexMutex.Lock()
 	server.indexReads++
-	info, failure := server.info, server.failure
+	info, failure, unreachable := server.info, server.failure, server.unreachable
 	server.indexMutex.Unlock()
+	if unreachable {
+		return wire.Marshal(wire.NewCommandError(wire.ResultBackendUnavailable, "the backend is out of reach"))
+	}
 	reply := wire.SessionReply{Outcome: &wire.SessionOutcome{
 		Kind: wire.SessionInfoOutcome, Info: info}}
 	if info == nil {
@@ -476,6 +483,38 @@ func TestGivenASessionTheIndexShowsEndedWhenAdmittedThenShouldWriteNothing(t *te
 	}
 	if server.written() != 0 {
 		t.Fatalf("got %d records", server.written())
+	}
+}
+
+func TestGivenAnIndexWhoseBackendIsOutOfReachWhenTheBudgetIsCheckedThenShouldAskOnceAndFoldTheLane(t *testing.T) {
+	server := &budgetServer{unreachable: true}
+	session := budgetSession(t, server, true)
+	startWithBudget(t, server, server.session, uintOf(10), nil)
+	usageRecord(t, server, server.session, wire.TokenUsage{InputTokens: 11})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	over, err := session.OverBudget(ctx)
+
+	if err != nil || !over {
+		t.Fatalf("want the lane fold to answer over budget, got %v, %v", over, err)
+	}
+	if server.indexed() != 1 {
+		t.Fatalf("want one index read, got %d", server.indexed())
+	}
+}
+
+func TestGivenAnIndexWhoseBackendIsOutOfReachWhenAdmittingThenShouldAskOnce(t *testing.T) {
+	server := &budgetServer{unreachable: true}
+	session := budgetSession(t, server, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if !laser.NewBudgetGate().Admit(ctx, session, 0, 1) {
+		t.Fatal("an unreadable budget must not stop the work")
+	}
+	if server.indexed() != 1 {
+		t.Fatalf("want one index read, got %d", server.indexed())
 	}
 }
 

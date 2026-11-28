@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	bdd "github.com/laserdata/laser-sdk/bdd/go"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
@@ -84,7 +85,7 @@ func liveFilterStep(ctx context.Context, state *world, step bdd.Step) error {
 		return bindingAfterCatalogRefusals(ctx, state)
 
 	default:
-		return fmt.Errorf("this runner does not implement the step")
+		return managedFilterStep(ctx, state, step)
 	}
 }
 
@@ -124,8 +125,7 @@ func openFeed(ctx context.Context, state *world) error {
 }
 
 func listSavedFilters(ctx context.Context, state *world) error {
-	_, state.failure = state.client.FilterCatalog().
-		Filters(ctx, laser.FilterQuery{}, 1, 20)
+	_, state.failure = state.topic(feedTopic).Group("anomaly-desk").Filter().Revisions(ctx, 1, 10)
 	if state.failure == nil {
 		return fmt.Errorf("a server with no managed backend served the catalog")
 	}
@@ -137,17 +137,10 @@ func listSavedFilters(ctx context.Context, state *world) error {
 // Nothing filters it, so every record must arrive: a group with no policy
 // that quietly delivered a subset would be worse than one that refused.
 func readUnboundGroup(ctx context.Context, state *world) error {
-	consumer, err := state.topic(feedTopic).ConsumerGroup(
-		ctx, "unbound-consumers", laser.ConsumerOptions{})
+	first := iggcon.FirstPollingStrategy()
+	consumer, err := state.topic(feedTopic).Group("unbound-consumers").Consumer(
+		ctx, laser.ConsumerOptions{Start: &first, ManualCommit: true})
 	if err != nil {
-		if strings.Contains(err.Error(), "consumer group") &&
-			strings.Contains(err.Error(), "was not found") {
-			return blocked("the Go client cannot use a consumer group at " +
-				"all unless something else created it: Topic.ConsumerGroup " +
-				"only joins, and joining a group that does not exist fails " +
-				"with " + err.Error() + ". The TypeScript runner calls " +
-				"group.create() first, which Go has no equivalent of")
-		}
 		return err
 	}
 	defer func() {
@@ -207,31 +200,43 @@ func receivedWholeFeed(state *world) error {
 // deliver the feed unfiltered, and one that does not must refuse rather than
 // answer as though it had applied a policy it never read.
 func readUnboundReader(ctx context.Context, state *world) error {
-	// The group has to exist before anything reads through it: a server
-	// holds no group until someone makes one. Every other client's runner
-	// creates it here too (bdd/typescript's `group.create()`). This was
-	// missing and went unnoticed, because the read never got that far --
-	// the client refused it earlier on a misplaced op-version gate.
-	// ConsumerGroup rather than Group(...).EnsureNative: the group has to be
-	// created *and joined*. A member that never joined owns no partition,
-	// and the server answers a group-aware read with "membership_stale".
-	if _, err := state.topic(feedTopic).ConsumerGroup(
-		ctx, "unbound-readers", laser.ConsumerOptions{}); err != nil {
+	group := state.topic(feedTopic).Group("unbound-readers")
+	if _, err := group.Create().Build(ctx); err != nil {
 		return err
 	}
-	page, err := state.topic(feedTopic).
-		Filters(wire.NamedGroup("unbound-readers")).
-		Read(0, wire.GroupPolicy()).
-		Count(2).MaxExamined(2).
-		Fetch(ctx)
-	state.failure = err
-	if err == nil {
-		var delivered [][]byte
+	options := firstStart()
+	options.Count = 100
+	options.MaxExamined = 100
+	reader, err := group.OpenReaderWith(ctx, options)
+	if err != nil {
+		state.failure = err
+		return nil
+	}
+	defer reader.Close(ctx)
+	feed, found := state.get("feed")
+	if !found {
+		return fmt.Errorf("the feed was never published")
+	}
+	var delivered [][]byte
+	for len(delivered) < len(feed.([][]byte)) {
+		page, err := nextPage(ctx, reader)
+		if err != nil {
+			return err
+		}
+		if page.Page.Policy.Mode != wire.ModeUnfiltered {
+			return fmt.Errorf("an unbound group must read unfiltered, got mode %q", page.Page.Policy.Mode)
+		}
 		for _, record := range page.Records {
+			if record.Evaluation.Kind != laser.EvaluationUnfiltered {
+				return fmt.Errorf("record %d of an unbound group was evaluated", record.Offset())
+			}
 			delivered = append(delivered, record.Payload())
 		}
-		state.put("delivered", delivered)
+		if err := reader.Ack(ctx, page); err != nil {
+			return err
+		}
 	}
+	state.put("delivered", delivered)
 	return nil
 }
 
@@ -251,36 +256,10 @@ func followedGroupCapability(state *world) error {
 		return nil
 	}
 	if state.failure != nil {
-		var outdated *laser.VersionError
-		if errors.As(state.failure, &outdated) {
-			// Kept as a guard. The client bug this used to report is fixed:
-			// Filters.execute applied the *catalog's* op version to native
-			// filtered reads, so a deployment serving native filters with no
-			// catalog advertised Filters.Native and then refused every poll.
-			// Native reads now gate on Filters.Native alone, as Rust does.
-			return blocked("a native filtered read was refused on an op " +
-				"version: " + state.failure.Error())
-		}
-		// The group is created and joined, and the read still reports the
-		// member owns no partition. Apache Iggy assigns a group's partitions
-		// per client connection, and this runner has not found the sequence
-		// that makes the assignment visible to a managed filtered read --
-		// the sibling "normal unbound group consumer" scenario reads through
-		// the consumer itself and passes, so the gap is in how this step
-		// reaches the group, not in the client's filter surface.
-		if strings.Contains(state.failure.Error(), "membership_stale") {
-			return blocked("this runner cannot yet make a joined group's " +
-				"partition assignment visible to a group-aware filtered " +
-				"read: " + state.failure.Error())
-		}
 		return fmt.Errorf("the server advertises group-aware reads, so the "+
 			"reader must succeed, got %v", state.failure)
 	}
-	delivered, found := state.get("delivered")
-	if !found || len(delivered.([][]byte)) == 0 {
-		return fmt.Errorf("the advanced reader delivered nothing")
-	}
-	return nil
+	return receivedWholeFeed(state)
 }
 
 // bindingAfterCatalogRefusals configures a group policy and reads it back

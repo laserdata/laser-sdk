@@ -119,7 +119,7 @@ func namesDefaultStreamCall(state *world) error {
 		return fmt.Errorf("no publish failed")
 	}
 	reason := state.failure.Error()
-	for _, named := range []string{"DefaultStream", "Stream(name).Topic(name)"} {
+	for _, named := range []string{"ScratchStream(prefix)", "WithDefaultStream(name)"} {
 		if !strings.Contains(reason, named) {
 			return fmt.Errorf("want the error to name %q, got %q", named, reason)
 		}
@@ -145,8 +145,7 @@ func runStepWithoutInbox(
 		return err
 	}
 	workflow := state.client.
-		Workflow(source, wire.AgentSessions).
-		InboxRoute(laser.AdvertisedInbox())
+		Workflow(source, wire.AgentSessions)
 	workflow.Step(step, laser.To(absent),
 		func(ctx context.Context, outputs map[string][]byte) ([]byte, error) {
 			return []byte(run), nil

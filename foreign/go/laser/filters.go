@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 
 	iggyserde "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -16,9 +17,11 @@ import (
 // reader pays for the records it wanted rather than the whole topic. That is
 // the point of the feature: the saving is in what never leaves the server.
 type Filters struct {
-	laser    *Laser
-	source   wire.FilterSource
-	consumer wire.FilterConsumer
+	laser              *Laser
+	source             wire.FilterSource
+	consumer           wire.FilterConsumer
+	member             *GroupReader
+	minCatalogPosition *wire.CatalogPosition
 }
 
 // Filters opens the filter surface for a topic, following one consumer's
@@ -42,19 +45,10 @@ func (filters *Filters) Source() wire.FilterSource { return filters.source }
 func (filters *Filters) execute(
 	ctx context.Context, code uint32, request any,
 ) (*wire.FilterOutcome, error) {
-	if !filters.laser.capabilities.Filters.Native {
+	if !filters.laser.Capabilities().Filters.Native {
 		return nil, &UnsupportedError{Surface: "server-side consumer filters"}
 	}
-	// Native filtering is gated on the native capability alone, as Rust's
-	// own native path is (sdk/src/filters/client.rs). It used to also
-	// require the *catalog's* op version here, which is a different
-	// surface: OpVersions.Filter describes the saved-filter catalog, and
-	// the contract says zero there means saved filters and group bindings
-	// are not served -- it says nothing about native filtering. So a
-	// deployment that serves native filters without a catalog had this
-	// client advertise Filters.Native and then refuse every filtered poll
-	// with "served at op version 0, but this client speaks 1". The catalog
-	// keeps that requirement where it belongs, in FilterCatalog.execute.
+	// The catalog op version gates saved filters only, so a deployment without a catalog still serves native reads.
 	if filters.source.Stream == "" {
 		return nil, errNoStream()
 	}
@@ -62,13 +56,22 @@ func (filters *Filters) execute(
 	if err != nil {
 		return nil, &CodecError{Reason: "encode filter request", Cause: err}
 	}
-	raw, err := filters.laser.SendManaged(ctx, code, payload)
+	var raw []byte
+	partition, routed := routedPartition(request)
+	switch {
+	case !routed:
+		raw, err = filters.laser.SendManaged(ctx, code, payload)
+	case filters.member != nil && code != wire.AgdxFilterPreviewCode:
+		raw, err = filters.member.exchange(ctx, partition, code, payload)
+	default:
+		raw, err = filters.sendToPrimary(ctx, partition, code, payload)
+	}
 	if err != nil {
 		return nil, err
 	}
 	var reply wire.FilterReply
-	if err := wire.Unmarshal(raw, &reply); err != nil {
-		return nil, &CodecError{Reason: "decode filter reply", Cause: err}
+	if err := decodeManagedReply(raw, &reply, "decode filter reply"); err != nil {
+		return nil, err
 	}
 	if !reply.IsOk() {
 		if reply.Err == nil {
@@ -80,9 +83,51 @@ func (filters *Filters) execute(
 	return reply.Outcome, nil
 }
 
+// routedPartition is the partition a filter request reads or stores progress for, which decides the node it goes to.
+func routedPartition(request any) (uint32, bool) {
+	switch request := request.(type) {
+	case wire.FilteredPollRequest:
+		return request.PartitionID, true
+	case wire.FilteredAck:
+		return request.PartitionID, true
+	case wire.FilterPreviewRequest:
+		return request.PartitionID, true
+	default:
+		return 0, false
+	}
+}
+
+// sendToPrimary sends to the partition's primary when the route lookup answers, and to the caller's node otherwise or after the primary moved.
+func (filters *Filters) sendToPrimary(ctx context.Context, partition, code uint32, payload []byte) ([]byte, error) {
+	client, err := filters.laser.connected()
+	if err != nil {
+		return nil, err
+	}
+	stream, streamErr := iggcon.NewIdentifier(filters.source.Stream)
+	topic, topicErr := iggcon.NewIdentifier(filters.source.Topic)
+	if streamErr != nil || topicErr != nil {
+		return filters.laser.SendManaged(ctx, code, payload)
+	}
+	replica, err := partitionPrimary(ctx, client, stream, topic, partition)
+	if err != nil {
+		return filters.laser.SendManaged(ctx, code, payload)
+	}
+	routed, err := filters.laser.nodes().send(ctx, client, code, payload, replicaTarget(replica), walkingOnce())
+	if err != nil && isRouteStale(err) {
+		return filters.laser.SendManaged(ctx, code, payload)
+	}
+	filters.laser.reportLink(err)
+	if err != nil {
+		return nil, &TransportError{Reason: "managed command", Cause: err}
+	}
+	return routed.reply, nil
+}
+
 // MatchedPage is one page of records the filter selected, with everything a
 // reader needs to acknowledge it and ask for the next.
 type MatchedPage struct {
+	owner    *FilteredReadRequest
+	sequence uint64
 	// Page is the server's own reply, carrying the scan boundaries and the
 	// policy that ran.
 	Page wire.FilteredPage
@@ -133,6 +178,24 @@ type MatchedRecord struct {
 	PartitionID uint32
 	// Evaluation is why it is here.
 	Evaluation RecordEvaluation
+	page       *MatchedPage
+}
+
+// Page is the page a group reader delivered this record in, which its acknowledgment names. Nil for any other read.
+func (record MatchedRecord) Page() *MatchedPage { return record.page }
+
+// JSON decodes the record's payload as JSON into the value.
+func (record MatchedRecord) JSON(into any) error {
+	if err := json.Unmarshal(record.Message.Payload, into); err != nil {
+		return &CodecError{Reason: "decode the matched record as JSON", Cause: err}
+	}
+	return nil
+}
+
+// HeadersMalformed reports a header block that does not decode. The payload stays readable.
+func (record MatchedRecord) HeadersMalformed() bool {
+	_, sound := wire.DecodeRecordHeaders(record.Message.UserHeaders)
+	return !sound
 }
 
 // Offset is the record's position in its partition.
@@ -229,16 +292,28 @@ func (request *FilteredReadRequest) Fetch(ctx context.Context) (*MatchedPage, er
 	if request.err != nil {
 		return nil, request.err
 	}
+	member := request.filters.member
+	if member != nil {
+		member.progressMu.Lock()
+		progress := member.progress[request.partitionID]
+		saturated := progress != nil && progress.inFlight() >= member.maxUnacked
+		member.progressMu.Unlock()
+		if saturated {
+			return nil, &InvalidError{Reason: "partition " + itoa(int(request.partitionID)) + " has " +
+				itoa(member.maxUnacked) + " unacknowledged pages, commit or acknowledge delivered records before reading more"}
+		}
+	}
 	poll := wire.FilteredPollRequest{
-		V:             wire.FilterOpVersion,
-		Source:        request.filters.source,
-		PartitionID:   request.partitionID,
-		Consumer:      request.filters.consumer,
-		Filter:        request.filter,
-		Start:         request.start,
-		Count:         request.count,
-		MaxReplyBytes: request.maxBytes,
-		MaxExamined:   request.maxExamined,
+		V:                  wire.FilterOpVersion,
+		Source:             request.filters.source,
+		PartitionID:        request.partitionID,
+		Consumer:           request.filters.consumer,
+		Filter:             request.filter,
+		Start:              request.start,
+		Count:              request.count,
+		MaxReplyBytes:      request.maxBytes,
+		MaxExamined:        request.maxExamined,
+		MinCatalogPosition: request.filters.minCatalogPosition,
 	}
 	outcome, err := request.filters.execute(ctx, wire.AgdxFilteredPollCode, poll)
 	if err != nil {
@@ -254,10 +329,34 @@ func (request *FilteredReadRequest) Fetch(ctx context.Context) (*MatchedPage, er
 	}
 	// The scan continues from where this page stopped, so a caller that keeps
 	// fetching walks the partition rather than re-reading its head.
+	matched := &MatchedPage{Page: page, Records: records, PartitionID: request.partitionID}
+	if member != nil {
+		// A page the local guard refuses is never tracked, so it is read again.
+		if err := member.guardPage(ctx, page, records); err != nil {
+			return nil, err
+		}
+		offsets := make([]uint64, len(records))
+		for i := range records {
+			offsets[i] = records[i].Offset()
+			records[i].page = matched
+		}
+		// The lock covers the bookkeeping only, so partitions read concurrently.
+		member.progressMu.Lock()
+		progress := member.progress[request.partitionID]
+		if progress == nil {
+			progress = newPartitionProgress(request.start)
+			member.progress[request.partitionID] = progress
+		}
+		member.sequence++
+		matched.owner, matched.sequence = request, member.sequence
+		progress.record(member.sequence, page, offsets)
+		member.progressMu.Unlock()
+		if page.Examined > 0 {
+			member.readyUnconfirmed.Store(false)
+		}
+	}
 	request.start = page.NextStart(request.start)
-	return &MatchedPage{
-		Page: page, Records: records, PartitionID: request.partitionID,
-	}, nil
+	return matched, nil
 }
 
 // Each reads pages until the partition is exhausted or visit returns false.
@@ -594,6 +693,12 @@ func sameGroup(left, right *uint64) bool {
 // consumer no longer owns the partition, which is what stops a reader that
 // lost its assignment from storing progress another member has passed.
 func (filters *Filters) Ack(ctx context.Context, page *MatchedPage) error {
+	if page == nil {
+		return &InvalidError{Reason: "acknowledgment needs a filtered page"}
+	}
+	if filters.member != nil {
+		return filters.member.ack(ctx, page, nil)
+	}
 	if page.Page.SafeAckOffset == nil {
 		// Nothing was examined, so there is no progress to store. A reader
 		// acknowledging anyway would move its offset past records the server

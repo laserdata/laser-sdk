@@ -127,24 +127,55 @@ func (group *ConsumerGroup) Selector() wire.FilterConsumer {
 // An unbound group receives every record, which is a supported way to run one
 // rather than a misconfiguration.
 func (group *ConsumerGroup) Filters() *Filters {
-	return group.topic.Filters(group.Selector())
+	filters := group.topic.Filters(group.Selector())
+	filters.minCatalogPosition = group.configuredAt
+	return filters
 }
 
 // Consumer joins this group as one member, load balanced with the others.
 //
 // A member names no partitions of its own: the server assigns them and
-// rebalances as members come and go. Note that Apache Iggy identifies a member
-// by the client connection, so two consumers opened on one connected client
-// join as a single member and are each handed every partition. A second member
-// needs its own connection.
+// rebalances as members come and go. Apache Iggy identifies a member by the
+// client connection. On a server that resolves group policies each consumer
+// opened from a connection string joins on its own connection. On Apache Iggy,
+// or with FromClient, consumers share the client's connection and join as one
+// member, so a second member needs its own client.
 func (group *ConsumerGroup) Consumer(
 	ctx context.Context, options ConsumerOptions,
 ) (*Consumer, error) {
-	if !group.target.byName {
-		return nil, &InvalidError{Reason: "a consumer group is joined by name, " +
-			"address it with Topic.Group(name)"}
+	if len(options.Partitions) > 0 {
+		return nil, &InvalidError{Reason: "a consumer group member is assigned its partitions by the server, so it must not name its own"}
 	}
-	return group.topic.ConsumerGroup(ctx, group.target.name, options)
+	if group.topic.stream == "" {
+		return nil, errNoStream()
+	}
+	id, err := group.identifier()
+	if err != nil {
+		return nil, err
+	}
+	identity := iggcon.NewGroupConsumer(id)
+	caps := group.laser().Capabilities()
+	// A caller-supplied client was never probed, so the probe runs once here.
+	if !caps.Filters.GroupPolicyReads && caps.Hello == HelloUnknown {
+		caps = group.laser().RefreshCapabilities(ctx)
+	}
+	if !caps.Filters.GroupPolicyReads {
+		if caps.Filters.Native {
+			return nil, &UnsupportedError{Surface: "consumer group policy reads"}
+		}
+		if caps.Hello == HelloUnknown || caps.Hello == HelloFailed {
+			return nil, &TransportError{Reason: "could not establish consumer group policy capabilities", Cause: context.DeadlineExceeded}
+		}
+	}
+	if group.target.byName && !options.SkipGroupCreate {
+		if err := group.EnsureNative(ctx); err != nil {
+			return nil, err
+		}
+	}
+	if !caps.Filters.GroupPolicyReads {
+		return group.topic.openConsumer(ctx, identity, options)
+	}
+	return openPolicyConsumer(ctx, group, identity, options)
 }
 
 // EnsureNative creates the native group when it is absent and leaves an
@@ -200,7 +231,7 @@ func (group *ConsumerGroup) Info(ctx context.Context) (*ConsumerGroupInfo, error
 		MembersCount:    details.MembersCount,
 		Identity:        identity,
 	}
-	if !group.laser().capabilities.Filters.Catalog {
+	if !group.laser().Capabilities().Filters.Catalog {
 		return info, nil
 	}
 	binding, err := group.Filter().Get(ctx)
@@ -471,7 +502,7 @@ func (request *CreateConsumerGroup) Build(
 	ctx context.Context,
 ) (*ConsumerGroupInfo, error) {
 	group := request.group
-	if request.policy != nil && !group.laser().capabilities.Filters.Catalog {
+	if request.policy != nil && !group.laser().Capabilities().Filters.Catalog {
 		return nil, &InvalidError{Reason: "this deployment serves no filter " +
 			"catalog, so a consumer group cannot be given a policy here"}
 	}
@@ -507,7 +538,7 @@ func (request *CreateConsumerGroup) Build(
 			}
 		}
 		info.Filter = binding
-	case group.laser().capabilities.Filters.Catalog:
+	case group.laser().Capabilities().Filters.Catalog:
 		if info.Filter, err = group.Filter().Get(ctx); err != nil {
 			return nil, err
 		}
@@ -611,6 +642,9 @@ func (filter *GroupFilter) configureScopedAs(
 
 // Get is the active policy, nil for an unbound group.
 func (filter *GroupFilter) Get(ctx context.Context) (*wire.FilterBinding, error) {
+	if err := filter.group.laser().FilterCatalog().requireServed(); err != nil {
+		return nil, err
+	}
 	details, err := filter.group.native(ctx)
 	if err != nil {
 		return nil, err
@@ -650,7 +684,10 @@ func (filter *GroupFilter) active(ctx context.Context) (*wire.FilterBinding, err
 	if err != nil {
 		return nil, err
 	}
-
+	if binding == nil {
+		return nil, &FilterError{Failure: wire.NewFilterError(wire.ReasonNotFound,
+			"the consumer group has no filter policy")}
+	}
 	return binding, nil
 }
 
@@ -662,6 +699,9 @@ func (filter *GroupFilter) active(ctx context.Context) (*wire.FilterBinding, err
 // so a group recreated under the same name does not find the filter the
 // previous group owned.
 func (filter *GroupFilter) Summary(ctx context.Context) (*wire.FilterSummary, error) {
+	if err := filter.group.laser().FilterCatalog().requireServed(); err != nil {
+		return nil, err
+	}
 	details, err := filter.group.native(ctx)
 	if err != nil {
 		return nil, err

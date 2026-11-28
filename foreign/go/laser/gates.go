@@ -1,6 +1,7 @@
 package laser
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -108,6 +109,12 @@ func (gate *FenceGate) sweepLocked(now time.Time) {
 	}
 }
 
+// DedupStore decides whether a dedup key was seen before. A durable store plugs in here.
+type DedupStore interface {
+	// Observe records the key and reports whether it is new.
+	Observe(ctx context.Context, key string) bool
+}
+
 // Deduplicator remembers the operations a consumer has already handled, so a
 // redelivery is not applied twice.
 //
@@ -152,6 +159,11 @@ func (dedup *Deduplicator) Accept(key string) bool {
 		delete(dedup.seen, oldest)
 	}
 	return true
+}
+
+// Observe records the key and reports whether it is new, as Accept does.
+func (dedup *Deduplicator) Observe(_ context.Context, key string) bool {
+	return dedup.Accept(key)
 }
 
 // Remembered is how many keys the window currently holds.

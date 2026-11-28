@@ -81,6 +81,11 @@ type AgentRegistry struct {
 	// presenceReadAt is when the connection table was last paged, so a
 	// refresh within PresenceTTL reuses what is held.
 	presenceReadAt time.Time
+	// appliedFacts are the ids of the quarantine facts already folded, oldest first in appliedFactOrder.
+	appliedFacts     map[wire.RecordID]struct{}
+	appliedFactOrder []appliedFact
+	// verifier, when set, folds a quarantine fact only under an enrolled operator key.
+	verifier *KeyRegistry
 }
 
 // NewAgentRegistry opens an empty registry.
@@ -90,6 +95,14 @@ func NewAgentRegistry() *AgentRegistry {
 		quarantined: map[wire.AgentID]struct{}{},
 		presence:    map[wire.AgentID]presenceEntry{},
 	}
+}
+
+// Verifier makes the registry fold a quarantine or unquarantine fact only when an enrolled operator key signed it.
+func (registry *AgentRegistry) Verifier(verifier *KeyRegistry) *AgentRegistry {
+	registry.mutex.Lock()
+	defer registry.mutex.Unlock()
+	registry.verifier = verifier
+	return registry
 }
 
 // Observe records an agent's card, replacing whatever was held for it.
@@ -173,9 +186,15 @@ func (registry *AgentRegistry) Capable(skill string, now time.Time) []Registered
 // A record that is not a card is left alone, because the topic also carries
 // the quarantine facts an operator writes.
 func (registry *AgentRegistry) Refresh(ctx context.Context, cursor *Cursor) error {
+	_, err := registry.refresh(ctx, cursor)
+	return err
+}
+
+// refresh is Refresh, also reporting how many records the poll read.
+func (registry *AgentRegistry) refresh(ctx context.Context, cursor *Cursor) (int, error) {
 	records, err := cursor.Poll(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	for _, record := range records {
 		message, err := OpenAgdx(record)
@@ -186,7 +205,7 @@ func (registry *AgentRegistry) Refresh(ctx context.Context, cursor *Cursor) erro
 		}
 		registry.fold(message, record)
 	}
-	return nil
+	return len(records), nil
 }
 
 // fold applies one registry record.
@@ -211,28 +230,83 @@ func (registry *AgentRegistry) fold(message *AgdxMessage, record *Record) {
 			return
 		}
 		registry.Observe(envelope.Source, card, observed)
-	case wire.OperationQuarantine:
-		// A quarantine is bounded, so one that has lapsed is not applied: an
-		// operator who set it and moved on does not exclude an agent forever.
-		if lapsed(envelope, observed) {
+	case wire.OperationQuarantine, wire.OperationUnquarantine:
+		// A fact is about the agent its body names. Its source is the operator that wrote it.
+		agent, err := wire.NewAgentID(string(envelope.Body))
+		if err != nil || !registry.factAuthorized(envelope, record) ||
+			!registry.admitFact(envelope, record.Message.Header.Timestamp) {
 			return
 		}
-		registry.Quarantine(envelope.Source)
-	case wire.OperationUnquarantine:
-		registry.Release(envelope.Source)
+		if *envelope.Operation == wire.OperationQuarantine {
+			registry.Quarantine(agent)
+		} else {
+			registry.Release(agent)
+		}
 	}
 }
 
-// lapsed reports whether a bounded fact has passed its expiry.
-//
-// The fold reads the record's own append time rather than the local clock, so
-// replaying a log settles to the same registry however long afterwards it is
-// read.
-func lapsed(envelope wire.AgentEnvelope, observed time.Time) bool {
+// factAuthorized reports whether a fact may fold. Without a verifier the registry topic's write access is the gate.
+func (registry *AgentRegistry) factAuthorized(envelope wire.AgentEnvelope, record *Record) bool {
+	registry.mutex.RLock()
+	verifier := registry.verifier
+	registry.mutex.RUnlock()
+	if verifier == nil {
+		return true
+	}
+	stamp, err := envelopeStamp(record)
+	if err != nil || !stamp.present {
+		return false
+	}
+	observed := wire.SignatureContext{AgentVersion: &stamp.version}
+	if code, named := stamp.contentType.Code(); named {
+		observed.ContentType = &code
+	}
+	verified, err := verifier.VerifyObservedAt(envelope, observed, record.Message.Header.Timestamp)
+	return err == nil && verified.Kind == wire.KeyOperator
+}
+
+// appliedFactCapacity bounds the fact ids remembered to catch a verbatim replay.
+const appliedFactCapacity = 16384
+
+// appliedFact is one folded fact id with the append time it was folded at.
+type appliedFact struct {
+	record         wire.RecordID
+	observedMicros uint64
+}
+
+// admitFact reports whether a fact folds: appended inside its bounded validity by the record's own append time, and no replay of a folded one.
+func (registry *AgentRegistry) admitFact(envelope wire.AgentEnvelope, observedMicros uint64) bool {
 	if envelope.DeadlineMicros == nil {
 		return false
 	}
-	return observed.After(time.UnixMicro(int64(*envelope.DeadlineMicros)))
+	deadline := *envelope.DeadlineMicros
+	if observedMicros >= deadline || deadline-observedMicros > wire.MaxRegistryFactTTLMicros {
+		return false
+	}
+	registry.mutex.Lock()
+	defer registry.mutex.Unlock()
+	if envelope.Record != nil {
+		if _, replayed := registry.appliedFacts[*envelope.Record]; replayed {
+			return false
+		}
+		if registry.appliedFacts == nil {
+			registry.appliedFacts = map[wire.RecordID]struct{}{}
+		}
+		registry.appliedFacts[*envelope.Record] = struct{}{}
+		registry.appliedFactOrder = append(registry.appliedFactOrder,
+			appliedFact{record: *envelope.Record, observedMicros: observedMicros})
+	}
+	// An id is kept for as long as its fact could still be inside its validity.
+	cutoff := uint64(0)
+	if observedMicros > wire.MaxRegistryFactTTLMicros {
+		cutoff = observedMicros - wire.MaxRegistryFactTTLMicros
+	}
+	for len(registry.appliedFactOrder) > 0 && (len(registry.appliedFactOrder) > appliedFactCapacity ||
+		registry.appliedFactOrder[0].observedMicros < cutoff) {
+		delete(registry.appliedFacts, registry.appliedFactOrder[0].record)
+		registry.appliedFactOrder = registry.appliedFactOrder[1:]
+	}
+	return true
 }
 
 // Agents lists every agent holding a fresh card, quarantined or not, sorted by
@@ -252,4 +326,50 @@ func (registry *AgentRegistry) Agents(now time.Time) []RegisteredCard {
 		return live[first].Agent.String() < live[second].Agent.String()
 	})
 	return live
+}
+
+// Quarantine appends a quarantine fact to the registry topic as operator, so every registry that folds it stops routing to agent.
+func (laser *Laser) Quarantine(ctx context.Context, operator, agent wire.AgentID) error {
+	return laser.publishRegistryFact(ctx, wire.OperationQuarantine, operator, agent, nil)
+}
+
+// Unquarantine appends the fact that lifts a quarantine on agent and returns it to routing.
+func (laser *Laser) Unquarantine(ctx context.Context, operator, agent wire.AgentID) error {
+	return laser.publishRegistryFact(ctx, wire.OperationUnquarantine, operator, agent, nil)
+}
+
+// QuarantineSigned is Quarantine with the fact signed by the operator's key, for a registry that verifies operators.
+func (laser *Laser) QuarantineSigned(ctx context.Context, operator, agent wire.AgentID, key *SigningKey) error {
+	return laser.publishRegistryFact(ctx, wire.OperationQuarantine, operator, agent, key)
+}
+
+// UnquarantineSigned is Unquarantine with the fact signed by the operator's key.
+func (laser *Laser) UnquarantineSigned(ctx context.Context, operator, agent wire.AgentID, key *SigningKey) error {
+	return laser.publishRegistryFact(ctx, wire.OperationUnquarantine, operator, agent, key)
+}
+
+func (laser *Laser) publishRegistryFact(
+	ctx context.Context, operation string, operator, agent wire.AgentID, key *SigningKey,
+) error {
+	stream := laser.defaultStream
+	if stream == "" {
+		return errNoStream()
+	}
+	if agent.IsZero() {
+		return &InvalidError{Reason: "a registry fact must name the agent it is about"}
+	}
+	if err := laser.Stream(stream).Topic(wire.AgentRegistry).Ensure(ctx, 1, nil); err != nil {
+		return err
+	}
+	until := time.Now().Add(time.Duration(wire.RegistryFactTTLMicros) * time.Microsecond)
+	producer := laser.AgdxOn(stream, wire.AgentRegistry, operator, NewConversationID())
+	send := producer.Quarantine(until, []byte(agent.String()))
+	if operation == wire.OperationUnquarantine {
+		send = producer.Unquarantine(until, []byte(agent.String()))
+	}
+	if key != nil {
+		send = send.Signed(key)
+	}
+	_, err := send.Send(ctx)
+	return err
 }

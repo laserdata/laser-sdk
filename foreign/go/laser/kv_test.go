@@ -3,6 +3,7 @@ package laser_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -74,16 +75,27 @@ func kvHandle(server iggcon.Client, options laser.Options) *laser.Laser {
 // an empty payload rather than failing.
 func decodeRequest[T any](t *testing.T, server *kvServer, index int, target *T) {
 	t.Helper()
-	body := server.requests[index]
-	if wire.IsIdempotentManagedRequest(server.codes[index]) {
+	decodeManagedTestRequest(t, server.codes[index], server.requests[index], target)
+}
+
+func decodeManagedTestRequest(t *testing.T, code uint32, frame []byte, target any) {
+	t.Helper()
+	body := frame
+	if wire.IsIdempotentManagedRequest(code) {
 		var envelope wire.ManagedRequestEnvelope
-		if err := wire.Unmarshal(body, &envelope); err != nil {
-			t.Fatalf("decode the managed envelope of request %d: %v", index, err)
+		if err := wire.Unmarshal(frame, &envelope); err != nil {
+			t.Fatal(err)
 		}
 		body = envelope.Payload
+	} else if wire.IsBarrierRead(code) {
+		var envelope wire.ManagedReadEnvelope
+		if err := wire.Unmarshal(frame, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		body = envelope.Read
 	}
 	if err := wire.Unmarshal(body, target); err != nil {
-		t.Fatalf("decode request %d: %v", index, err)
+		t.Fatal(err)
 	}
 }
 
@@ -187,35 +199,34 @@ func TestGivenAWriteWithALifetimeWhenSentThenShouldCarryTheRelativeForm(t *testi
 	}
 }
 
-// The contract refuses a request carrying both forms, so the builder refuses
-// it first, where the error can name the call.
-func TestGivenAWriteWithBothExpiryFormsWhenSentThenShouldRefuseIt(t *testing.T) {
-	server := &kvServer{outcomes: []wire.KvOutcome{{Kind: wire.KvWritten}}}
+func TestGivenBothExpirySettersWhenSendingThenShouldUseTheLastSetter(t *testing.T) {
+	server := &kvServer{outcomes: []wire.KvOutcome{{Kind: wire.KvWritten}, {Kind: wire.KvWritten}}}
 	kv := kvHandle(server, laser.Options{}).Kv("ns")
+	at := time.Now().Add(time.Hour)
+	if err := kv.Set([]byte("a")).TTL(time.Minute).ExpiresAt(at).Send(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := kv.Set([]byte("b")).ExpiresAt(at).TTL(time.Minute).Send(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var first, second wire.KvSet
+	decodeRequest(t, server, 0, &first)
+	decodeRequest(t, server, 1, &second)
+	if first.TTLMicros != nil || first.ExpiresAtMicros == nil || *first.ExpiresAtMicros != uint64(at.UnixMicro()) ||
+		second.ExpiresAtMicros != nil || second.TTLMicros == nil || *second.TTLMicros != uint64(time.Minute.Microseconds()) {
+		t.Fatalf("unexpected expiry selections: %+v %+v", first, second)
+	}
+}
 
-	// Both orders are refused, or only whichever guard happens to run second
-	// is actually enforced.
-	writes := map[string]func() error{
-		"ttl then expiry": func() error {
-			return kv.Set([]byte("k")).Bytes([]byte("v")).
-				TTL(time.Minute).ExpiresAt(time.Now().Add(time.Hour)).Send(context.Background())
-		},
-		"expiry then ttl": func() error {
-			return kv.Set([]byte("k")).Bytes([]byte("v")).
-				ExpiresAt(time.Now().Add(time.Hour)).TTL(time.Minute).Send(context.Background())
-		},
-	}
-	for name, write := range writes {
-		t.Run(name, func(t *testing.T) {
-			err := write()
-			var invalid *laser.InvalidError
-			if !errors.As(err, &invalid) {
-				t.Fatalf("want an InvalidError, got %T: %v", err, err)
-			}
-		})
-	}
-	if len(server.codes) != 0 {
-		t.Error("a refused write must not reach the socket")
+func TestGivenMissingOrDroppedWritePreconditionsWhenSentThenShouldRefuseBeforeSending(t *testing.T) {
+	server := &kvServer{}
+	kv := kvHandle(server, laser.Options{Capabilities: fencedCapabilities()}).Kv("ns")
+	plain := kv.Set([]byte("a"))
+	plain.ExpectAbsent()
+	_, fenced := kv.CasFenced([]byte("a"), "locks", []byte("owner"), 1).Commit(context.Background())
+	var invalid *laser.InvalidError
+	if !errors.As(plain.Send(context.Background()), &invalid) || !errors.As(fenced, &invalid) || len(server.codes) != 0 {
+		t.Fatal("lost a write precondition")
 	}
 }
 
@@ -560,10 +571,11 @@ func TestGivenAnOutcomeForAnotherOperationWhenReadThenShouldRefuseIt(t *testing.
 }
 
 func TestGivenAnExpiryWhenSetThenShouldSendTheFormTheCallerChose(t *testing.T) {
-	relative := &kvServer{outcomes: []wire.KvOutcome{{Kind: wire.KvVersioned}}}
-	if err := kvHandle(relative, laser.Options{}).Kv("ns").
-		Expire(context.Background(), []byte("k"), time.Hour); err != nil {
-		t.Fatalf("expire: %v", err)
+	relative := &kvServer{outcomes: []wire.KvOutcome{{Kind: wire.KvVersioned, Version: 6}}}
+	version, err := kvHandle(relative, laser.Options{}).Kv("ns").
+		Expire(context.Background(), []byte("k"), time.Hour)
+	if err != nil || version != 6 {
+		t.Fatalf("expire: version %d, %v, want the entry's version 6", version, err)
 	}
 	var request wire.KvExpire
 	decodeRequest(t, relative, 0, &request)
@@ -573,14 +585,85 @@ func TestGivenAnExpiryWhenSetThenShouldSendTheFormTheCallerChose(t *testing.T) {
 
 	// A zero time clears the expiry, which is the only way to make an entry
 	// permanent again.
-	cleared := &kvServer{outcomes: []wire.KvOutcome{{Kind: wire.KvVersioned}}}
-	if err := kvHandle(cleared, laser.Options{}).Kv("ns").
-		ExpireAt(context.Background(), []byte("k"), time.Time{}); err != nil {
-		t.Fatalf("expire at: %v", err)
+	cleared := &kvServer{outcomes: []wire.KvOutcome{{Kind: wire.KvVersioned, Version: 7}}}
+	version, err = kvHandle(cleared, laser.Options{}).Kv("ns").
+		ExpireAt(context.Background(), []byte("k"), time.Time{})
+	if err != nil || version != 7 {
+		t.Fatalf("expire at: version %d, %v, want the entry's version 7", version, err)
 	}
 	var clearing wire.KvExpire
 	decodeRequest(t, cleared, 0, &clearing)
 	if clearing.TTLMicros != nil || clearing.ExpiresAtMicros != nil {
 		t.Errorf("clearing an expiry names neither form, got %+v", clearing)
+	}
+}
+
+func TestGivenAnExpiryBeforeTheEpochWhenSetInPlaceThenShouldRefuseBeforeSending(t *testing.T) {
+	server := &kvServer{outcomes: []wire.KvOutcome{{Kind: wire.KvVersioned}}}
+
+	_, err := kvHandle(server, laser.Options{}).Kv("ns").
+		ExpireAt(context.Background(), []byte("k"), time.Unix(-1, 0))
+
+	var invalid *laser.InvalidError
+	if !errors.As(err, &invalid) || len(server.codes) != 0 {
+		t.Fatalf("want an InvalidError before any send, got %T %v after %d sends", err, err, len(server.codes))
+	}
+}
+
+func TestGivenAConditionalWriteWhenGivenAnExpiryThenShouldCarryTheLastFormChosen(t *testing.T) {
+	server := &kvServer{outcomes: []wire.KvOutcome{{Kind: wire.KvCommitted, Version: 2}}}
+	kv := kvHandle(server, laser.Options{}).Kv("ns")
+	at := time.UnixMicro(1_900_000_000_000_000)
+
+	if _, err := kv.Set([]byte("a")).Bytes([]byte("v")).ExpectVersion(1).ExpiresAt(at).TTL(time.Minute).
+		Commit(context.Background()); err != nil {
+		t.Fatalf("commit with a ttl: %v", err)
+	}
+	if _, err := kv.Set([]byte("b")).Bytes([]byte("v")).ExpectAbsent().TTL(time.Minute).ExpiresAt(at).
+		Commit(context.Background()); err != nil {
+		t.Fatalf("commit with an absolute expiry: %v", err)
+	}
+
+	var relative, absolute wire.KvCas
+	decodeRequest(t, server, 0, &relative)
+	decodeRequest(t, server, 1, &absolute)
+	minute, instant := uint64(time.Minute.Microseconds()), uint64(at.UnixMicro())
+	wantRelative := wire.KvCas{V: wire.KvOpVersion, Namespace: "ns", Key: []byte("a"), Value: []byte("v"),
+		TTLMicros: &minute, Expect: wire.MatchVersion(1)}
+	wantAbsolute := wire.KvCas{V: wire.KvOpVersion, Namespace: "ns", Key: []byte("b"), Value: []byte("v"),
+		ExpiresAtMicros: &instant, Expect: wire.AbsentKey()}
+	if !reflect.DeepEqual(relative, wantRelative) || !reflect.DeepEqual(absolute, wantAbsolute) {
+		t.Fatalf("sent %+v and %+v, want %+v and %+v", relative, absolute, wantRelative, wantAbsolute)
+	}
+}
+
+func TestGivenLinkedKvWhenPatchingThenShouldSendTheVersionAndSession(t *testing.T) {
+	server := &kvServer{outcomes: []wire.KvOutcome{{Kind: wire.KvVersioned, Version: 4}}}
+	ref := wire.SessionRef{Stream: "jobs", Session: laser.NewConversationID()}
+	kv := kvHandle(server, laser.Options{DefaultStream: "jobs"}).Kv("locks").InSession(ref)
+	version, err := kv.PatchIfVersion(t.Context(), []byte("task"), []byte("{}"), 3)
+	if err != nil || version != 4 {
+		t.Fatalf("patch: %d, %v", version, err)
+	}
+	var got wire.KvPatch
+	decodeRequest(t, server, 0, &got)
+	if got.Namespace != "stream:jobs/locks" || got.IfMatch == nil || *got.IfMatch != 3 || got.Session == nil || *got.Session != ref || server.codes[0] != wire.AgdxKvPatchCode {
+		t.Fatalf("unexpected patch: %+v", got)
+	}
+}
+
+func TestGivenACopyOrMoveWhenSentThenShouldScopeTheDestination(t *testing.T) {
+	server := &kvServer{outcomes: []wire.KvOutcome{{Kind: wire.KvCommitted, Version: 7}}}
+	kv := kvHandle(server, laser.Options{DefaultStream: "jobs"}).Kv("queue")
+	for i, build := range []func([]byte, []byte) *laser.KvCopyRequest{kv.CopyTo, kv.MoveTo} {
+		version, err := build([]byte("a"), []byte("b")).IntoNamespace("done").Send(t.Context())
+		if err != nil || version != 7 {
+			t.Fatalf("transfer: %d, %v", version, err)
+		}
+		var got wire.KvCopy
+		decodeRequest(t, server, i, &got)
+		if got.ToNamespace == nil || *got.ToNamespace != "stream:jobs/done" || string(got.ToKey) != "b" || string(got.Key) != "a" || server.codes[i] != []uint32{wire.AgdxKvCopyCode, wire.AgdxKvMoveCode}[i] {
+			t.Fatalf("unexpected transfer: %+v", got)
+		}
 	}
 }

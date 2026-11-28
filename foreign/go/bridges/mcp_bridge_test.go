@@ -27,6 +27,8 @@ type replyingLog struct {
 	// errorReply answers with a tool error (KindError) instead of a
 	// response, for testing the failure path.
 	errorReply bool
+	// untargeted answers the way a worker's plain respond does, naming no target.
+	untargeted bool
 }
 
 func (log *replyingLog) SendMessages(
@@ -55,6 +57,9 @@ func (log *replyingLog) SendMessages(
 			Target:       &command.Source,
 			Correlation:  command.Correlation,
 			Body:         []byte("42"),
+		}
+		if log.untargeted {
+			reply.Target = nil
 		}
 		payload, err := wire.Marshal(&reply)
 		if err != nil {
@@ -211,6 +216,17 @@ func TestGivenATargetWhenCalledAsAChildThenShouldAddressOnlyThatAgent(t *testing
 	}
 	if command.Target == nil || *command.Target != target {
 		t.Errorf("want the command addressed to the target, got %v", command.Target)
+	}
+}
+
+func TestGivenAWorkerAnsweringWithoutATargetWhenCalledThenShouldTakeItsAnswer(t *testing.T) {
+	log := &replyingLog{source: agent(t, "worker"), untargeted: true}
+	bridge := withTool(t, mcpBridgeOver(t, log), "search")
+
+	result, err := bridge.CallTool(context.Background(), "search", []byte(`{"name":"search","arguments":{}}`))
+
+	if err != nil || result.IsError || len(result.Content) != 1 || result.Content[0].Text != "42" {
+		t.Fatalf("want the untargeted answer on the call's correlation taken, got %+v, %v", result, err)
 	}
 }
 

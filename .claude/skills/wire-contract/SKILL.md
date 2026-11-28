@@ -11,7 +11,7 @@ Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first. [docs/agdx.md](
 
 `laser-wire` owns data and pure validation. It has no I/O, clock, randomness, Apache Iggy client, or async runtime. The optional `http-client` feature adds an async client over a caller-injected runtime-agnostic transport and still supports `wasm32-unknown-unknown`.
 
-Rust is the executable source of wire truth. Python binds it. TypeScript implements it natively under `foreign/typescript/src/wire` and proves parity against the Rust fixture corpus.
+Rust is the executable source of wire truth. Python binds it. TypeScript implements it natively under `foreign/typescript/src/wire` and proves parity against the Rust fixture corpus. Go implements it natively under `foreign/go/wire`, and `foreign/go/wire/parity_test.go` checks its types against the Rust sources.
 
 The contract includes binary managed commands, JSON HTTP views, headers, topics, command codes, version negotiation, structured backend capabilities, result codes, and limits. Application behavior and backend execution do not belong in this crate.
 

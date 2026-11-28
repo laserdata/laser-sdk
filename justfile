@@ -49,8 +49,8 @@ parity-check:
   python3 -m unittest scripts/test_check_parity.py
   python3 scripts/check-parity.py
 
-# the Go client's gate set, the same one ci-go runs. It covers the three Go
-# modules: the client, the examples beside it, and the conformance runner.
+# the Go client's local gate set: formatting, vet, build and tests across the
+# three Go modules, the client, the examples beside it, and the conformance runner.
 go-check:
   cd foreign/go && test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
   cd foreign/go && go vet ./...
@@ -58,7 +58,7 @@ go-check:
   cd foreign/go && go test ./... -count=1
   cd foreign/go && go test ./... -race -count=1
   cd examples/go && test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
-  cd examples/go && go vet ./... && go build ./...
+  cd examples/go && go vet ./... && go build ./... && go test ./... -count=1
   cd bdd/go && test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
   cd bdd/go && go vet ./... && go test ./... -count=1
 
@@ -71,7 +71,7 @@ go-differential:
   cd foreign/go && LASER_GO_VECTORS={{justfile_directory()}}/target/go-vectors \
     go test ./wire -run Export -count=1
   LASER_GO_VECTORS={{justfile_directory()}}/target/go-vectors \
-    cargo test -p laser-wire --test go_differential
+    cargo test -p laser-wire --features cbor --test go_differential
 
 # integration tests against the released Laser Streams server
 test-it:

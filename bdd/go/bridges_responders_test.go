@@ -60,7 +60,7 @@ func (responder *bddResponder) handle(
 		label = "task"
 	}
 	responder.record(label)
-	return agent.Respond(ctx, []byte(responder.name))
+	return agent.RespondInput(ctx, wire.AgentSessions, []byte(responder.name))
 }
 
 // spawnResponderPair spawns both names of "responders X and Y answer every
@@ -288,9 +288,7 @@ func callMCPToolOn(ctx context.Context, state *world, arguments []string) error 
 	return nil
 }
 
-// requestInputFrom asks target for a decision and waits for its answer: a
-// command under the input_request operation, addressed to target, answered
-// as any correlated command is.
+// requestInputFrom asks target for a decision and waits for its answer.
 func requestInputFrom(ctx context.Context, state *world, arguments []string) error {
 	if len(arguments) < 1 {
 		return fmt.Errorf("want a target, got %v", arguments)
@@ -303,65 +301,13 @@ func requestInputFrom(ctx context.Context, state *world, arguments []string) err
 	if err != nil {
 		return err
 	}
-	conversation := laser.NewConversationID()
-	correlation := wire.CorrelationID{ID: wire.IDFromBytes(laser.NewOperationID())}
-	deadline := 15 * time.Second
-	_, err = state.client.Agdx(orchestrator, conversation).
-		Command(correlation, []byte("approve?")).
-		WithOperation(wire.OperationInputRequest).
-		WithTarget(target).
-		WithDeadline(time.Now().Add(deadline)).
-		Send(ctx)
+	decision, err := state.client.Agdx(orchestrator, laser.NewConversationID()).
+		RequestInputFrom(ctx, target, wire.AgentSessions, []byte("approve?"), 15*time.Second)
 	if err != nil {
 		return err
 	}
-	body, err := awaitAddressedReply(ctx, state, conversation, correlation, orchestrator, deadline)
-	if err != nil {
-		return err
-	}
-	state.put("inputDecision", string(body))
+	state.put("inputDecision", string(decision))
 	return nil
-}
-
-// awaitAddressedReply polls the conversation's context until the correlated
-// answer addressed to requester arrives, or timeout passes.
-func awaitAddressedReply(
-	ctx context.Context, state *world, conversation wire.ConversationID,
-	correlation wire.CorrelationID, requester wire.AgentID, timeout time.Duration,
-) ([]byte, error) {
-	deadline := time.Now().Add(timeout)
-	for {
-		messages, err := state.client.Context(conversation).Fetch(ctx, []string{wire.AgentSessions}, 100, 0)
-		if err == nil {
-			for _, message := range messages {
-				envelope := message.Envelope
-				if envelope == nil {
-					continue
-				}
-				if envelope.Kind != wire.KindResponse && envelope.Kind != wire.KindError {
-					continue
-				}
-				if envelope.Correlation == nil || envelope.Correlation.ID != correlation.ID {
-					continue
-				}
-				if envelope.Target == nil || *envelope.Target != requester {
-					continue
-				}
-				return envelope.Body, nil
-			}
-		}
-		if time.Now().After(deadline) {
-			if err != nil {
-				return nil, err
-			}
-			return nil, fmt.Errorf("no reply on correlation %s within %s", correlation, timeout)
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(25 * time.Millisecond):
-		}
-	}
 }
 
 func checkMCPToolResult(state *world, arguments []string) error {

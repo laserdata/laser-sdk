@@ -296,7 +296,8 @@ func parkingFor(t *testing.T, role string, offset uint64) wire.SessionParking {
 				Generation: &generation,
 			},
 		},
-		Role: agentID(t, role),
+		Request: wire.LogPosition{StreamID: 7, TopicID: 4},
+		Role:    agentID(t, role),
 	}
 }
 
@@ -335,7 +336,7 @@ func TestGivenHeldWorkFromAnEarlierProcessWhenResumedThenShouldRecoverAndReplayI
 	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{EnforceControl: true})
 	handler := &handling{}
 	// One new record for the same session is what brings the runtime to
-	// this session at all; the held work must go first.
+	// this session at all. The held work must go first.
 	source := sourceOf(workRecord(t, 42, "new work"))
 
 	if err := runUntilDrained(t, runtime, source, handler); err != nil {
@@ -490,7 +491,7 @@ func TestGivenANewPartitionWhenReadThenShouldRebuildHeldWorkAgain(t *testing.T) 
 
 	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{EnforceControl: true})
 	handler := &handling{}
-	// The first record settles this member's starting assignment; the
+	// The first record settles this member's starting assignment. The
 	// parking only appears on the lane afterwards, so only a re-read
 	// triggered by the second record's new partition can find it.
 	first := workRecord(t, 10, "own work")

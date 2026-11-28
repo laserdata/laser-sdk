@@ -5,6 +5,7 @@ import (
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
 // replyHubKey names one shared reply dispatcher: a topic on a stream.
@@ -12,10 +13,8 @@ type replyHubKey struct{ stream, topic string }
 
 // replyDispatcher is one shared ReplyHub and the goroutine feeding it.
 //
-// One reader per reply topic, rather than one per waiter: a caller running
-// ten concurrent contracts on a topic used to open ten polls over the same
-// records. They now read it once between them, which is the whole point of
-// the cache.
+// One reader per reply topic, rather than one per waiter, so ten concurrent
+// contracts on a topic read its records once between them.
 type replyDispatcher struct {
 	hub    *ReplyHub
 	cancel context.CancelFunc
@@ -98,7 +97,7 @@ func replyTopicPartitions(
 //
 // A read failure is not fatal. The dispatcher outlives any one waiter, so a
 // transient refusal must not tear it down and strand the waiters that are
-// still holding tickets; the next tick tries again, and a waiter whose reply
+// still holding tickets. The next tick tries again, and a waiter whose reply
 // never arrives is ended by its own deadline.
 func (dispatcher *replyDispatcher) run(
 	ctx context.Context, client iggcon.Client, stream, topic string, partitions uint32,
@@ -162,12 +161,48 @@ func (dispatcher *replyDispatcher) run(
 	}
 }
 
-// closeReplyHubs stops every shared dispatcher this connection opened.
+// forgetStream drops what this connection cached about a stream that was deleted or renamed.
+func (laser *Laser) forgetStream(stream string) {
+	shared := laser.state()
+	shared.mutex.Lock()
+	delete(shared.registries, stream)
+	var stopped []*replyDispatcher
+	for key, dispatcher := range shared.replyHubs {
+		if key.stream == stream {
+			stopped = append(stopped, dispatcher)
+			delete(shared.replyHubs, key)
+		}
+	}
+	shared.mutex.Unlock()
+	for _, dispatcher := range stopped {
+		dispatcher.cancel()
+	}
+}
+
+// forgetTopic drops what this connection cached about a topic that was deleted or changed.
+func (laser *Laser) forgetTopic(stream, topic string) {
+	key := replyHubKey{stream: stream, topic: topic}
+	shared := laser.state()
+	shared.mutex.Lock()
+	if topic == wire.AgentRegistry {
+		delete(shared.registries, stream)
+	}
+	dispatcher := shared.replyHubs[key]
+	delete(shared.replyHubs, key)
+	shared.mutex.Unlock()
+	if dispatcher != nil {
+		dispatcher.cancel()
+	}
+}
+
+// closeReplyHubs stops every shared dispatcher this connection opened, and
+// forgets the agent registries it shared.
 func (laser *Laser) closeReplyHubs() {
 	shared := laser.state()
 	shared.mutex.Lock()
 	dispatchers := shared.replyHubs
 	shared.replyHubs = nil
+	shared.registries = nil
 	shared.mutex.Unlock()
 	for _, dispatcher := range dispatchers {
 		dispatcher.cancel()

@@ -224,7 +224,7 @@ func (entry *controlEntry) withConflict() PendingControl {
 // ControlBook is the control state of the sessions one process has seen.
 //
 // A runtime opened with RuntimeOptions.EnforceControl follows agent.control
-// itself and keeps this book current; otherwise a caller that reads the
+// itself and keeps this book current. Otherwise a caller that reads the
 // topic feeds it with Load and Observe. The folding rules are the same
 // either way, which is what lets a Go process and a Rust one agree about
 // whether a
@@ -240,7 +240,11 @@ type ControlBook struct {
 	loaded bool
 	// partitions is the partition count of agent.control, zero while it is
 	// unknown.
-	partitions uint32
+	partitions    uint32
+	controlSource *wire.LogPosition
+	// truncated reports that the startup read covered only the newest records
+	// of some partition, so older requests may be missing.
+	truncated bool
 }
 
 // NewControlBook opens an empty book.
@@ -410,10 +414,14 @@ func (book *ControlBook) ack(
 }
 
 // HasPauseHistory reports whether any session has a pause or resume request,
-// so a caller knows whether there is held work to look for at all.
+// or the read of agent.control could not prove there is none, so a caller
+// knows whether there is held work to look for at all.
 func (book *ControlBook) HasPauseHistory() bool {
 	book.mutex.Lock()
 	defer book.mutex.Unlock()
+	if book.truncated {
+		return true
+	}
 	for _, entry := range book.entries {
 		if entry.state.pause != nil || entry.state.resume != nil {
 			return true

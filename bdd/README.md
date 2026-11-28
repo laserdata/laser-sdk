@@ -1,6 +1,6 @@
 # Cross-SDK conformance
 
-The shared tests compare Rust, Python, and TypeScript data encoding and behavior. The default suite does not require LaserData Cloud. A conforming implementation passes both groups below.
+The shared tests compare data encoding and behavior across Rust, Python, TypeScript, and Go. The default suite does not require LaserData Cloud. A conforming implementation passes both groups below.
 
 ## Layer 1: the wire (payload)
 
@@ -8,10 +8,7 @@ Reference files under `wire/fixtures/` define expected `.bin` and `.json` encodi
 
 ## Layer 2: behavior (actions)
 
-The Go runner under `bdd/go/` is in progress: it reads the same scenario files and implements the provenance feature. It skips rather than passing when it reaches no deployment, so a run that found no server is visibly a skip and is never read as evidence that the client conforms. Six of the shared features use a scenario outline it does not implement yet, and it refuses those rather than half-reading them.
-
-
-The Gherkin scenarios in `scenarios/` describe end-to-end behavior. Rust, Python, and TypeScript run against the versioned Apache Iggy server:
+The Gherkin scenarios in `scenarios/` describe end-to-end behavior. All four clients run the shared features against a versioned server. The Go runner expands scenario outlines and checks that every feature file has a runner. Scenarios select their deployment through the shared managed, unmanaged, remote SQL, and recovering-catalog tags.
 
 ```text
 bdd/
@@ -46,6 +43,7 @@ bdd/
 ├── rust/                              Rust reference runner (cucumber-rs)
 ├── python/                            Python runner (pytest-bdd), same scenarios
 ├── typescript/                        TypeScript runner (Cucumber), same scenarios
+├── go/                                Go runner (go test), same scenarios
 ├── docker-compose.yml                 shared server + per-language runner services
 └── README.md
 ```
@@ -56,7 +54,7 @@ Streaming, provenance, agent, bridge, session, and context window scenarios run 
 
 KV and forks use managed commands through `send_raw_with_response`. Apache Iggy without a managed backend rejects these calls. Reference files cover their bytes, and `kv_cas.feature` tests behavior through the reference engine in `bdd/rust/src/kv_engine.rs`. Full managed execution needs Laser Stack or LaserData Cloud. The default BDD suite uses Apache Iggy and local reference engines.
 
-`filters.feature` runs each SDK's own evaluator against named records, with no server. Rust and Python use the shared Rust evaluator, and TypeScript runs its port. The same cases live in `wire/fixtures/filter_eval_cases.json` for the unit suites. `filters_live.feature` needs a server that serves consumer filters, and checks that the saved-filter catalog is refused without a managed backend.
+`filters.feature` runs each SDK's own evaluator against named records, with no server. Rust and Python use the shared Rust evaluator, and TypeScript and Go each run their port. The same cases live in `wire/fixtures/filter_eval_cases.json` for the unit suites. `filters_live.feature` needs a server that serves consumer filters, and checks that the saved-filter catalog is refused without a managed backend.
 
 A new client must pass the shared reference files and applicable behavior scenarios.
 
@@ -66,7 +64,7 @@ A new client must pass the shared reference files and applicable behavior scenar
 just bdd                       # or: cd bdd/rust && cargo test
 ```
 
-All three runners resolve the versioned Iggy binary by default. Set `LASER_TEST_IGGY_SERVER=/path/to/iggy-server` for a local build, or `LASER_BDD_ADDR=host:port` for an already-running Iggy server.
+Every runner resolves the versioned Iggy binary by default. Set `LASER_TEST_IGGY_SERVER=/path/to/iggy-server` for a local build, or `LASER_BDD_ADDR=host:port` for an already-running Iggy server.
 
 The Python runner executes the complete scenario inventory:
 
@@ -74,12 +72,13 @@ The Python runner executes the complete scenario inventory:
 cd bdd/python && pytest -q     # needs the laser-sdk wheel installed
 ```
 
-It runs Iggy-backed scenarios against the shared server and uses the Python reference engines for transport-free managed semantics. Must-understand and injected-capability scenarios run in process in all three languages.
+It runs Iggy-backed scenarios against the shared server and uses the Python reference engines for transport-free managed semantics. Must-understand and injected-capability scenarios run in process in every language.
 
-The TypeScript runner loads every canonical feature and resolves every step before execution:
+Run the TypeScript or Go suite from the repository root.
 
 ```sh
 scripts/run-bdd-tests.sh typescript
+scripts/run-bdd-tests.sh go
 ```
 
 Set `LASER_BDD_URL` to a connection string or `LASER_BDD_ADDR` to `host:port` for an existing server. The supplied test scripts otherwise start the versioned native server. Query, KV, graph, and memory scenarios use reference engines. Iggy-backed steps use the public SDK API.
@@ -89,7 +88,7 @@ Set `LASER_BDD_URL` to a connection string or `LASER_BDD_ADDR` to `host:port` fo
 Scenarios tagged `@managed`, on the scenario or on its feature, need a server with a managed backend and run only when `LASER_BDD_MANAGED=1` is set. `managed_sessions.feature` is tagged `@sessions @managed` and reads the session index the backend folds. `scripts/run-managed-bdd.sh` builds Laser Streams and the managed backend from the source checkouts named by `LASER_IGGY_REPO` and `LASER_MANAGED_BACKEND_REPO`, starts them wired together as the backend's own end-to-end tests do, and runs the named runners against them:
 
 ```sh
-scripts/run-managed-bdd.sh all              # rust, python, and typescript
+scripts/run-managed-bdd.sh all              # Rust, Python, TypeScript, and Go
 scripts/run-managed-bdd.sh --postgres rust  # the backend stores sessions in Postgres (needs Docker)
 scripts/run-managed-bdd.sh stack            # start the stack and wait, for runs by hand
 ```

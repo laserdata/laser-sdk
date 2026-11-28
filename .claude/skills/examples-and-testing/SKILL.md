@@ -5,7 +5,7 @@ description: The example crate and the test harness - `examples/rust/` and `sdk/
 
 # Examples and testing
 
-TypeScript peers live under `examples/typescript`, `bdd/typescript`, and `foreign/typescript/test`. Release verification includes its packed package, real-Iggy integration, shared BDD, and example tests.
+TypeScript peers live under `examples/typescript`, `bdd/typescript`, and `foreign/typescript/test`. Release verification includes its packed package, real-Iggy integration, shared BDD, and example tests. Go peers live under `examples/go`, `bdd/go`, and the `_test.go` files of `foreign/go`, whose live tests carry the `integration` build tag.
 
 Examples demonstrate SDK behavior, and integration tests make assertions about it. Both use Apache Iggy. Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first and follow [AGENTS.md](../../../AGENTS.md).
 

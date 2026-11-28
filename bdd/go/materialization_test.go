@@ -54,6 +54,38 @@ func materializationStep(ctx context.Context, state *world, step bdd.Step) error
 	arguments := argumentsOf(step)
 
 	switch {
+	case text == "I materialize whole records twice under one operation identity", text == "I publish two arbitrary records to the materialized topic", text == "materialization reaches the captured source head":
+		return operationalSQLStep(ctx, state, step)
+	case text == "the materialized query returns both original bodies exactly once":
+		return originalBodies(ctx, state, sqlIndex, []string{"not-json", string([]byte{0, 255, 1, 2})})
+	case strings.HasPrefix(text, "I materialize keyed records"):
+		var deleteHeader *string
+		if text == "I materialize keyed records" {
+			header := "delete"
+			deleteHeader = &header
+		}
+		topic := state.topic("keyed_records")
+		if err := topic.Ensure(ctx, 1, nil); err != nil {
+			return err
+		}
+		projection := wire.Projection{ID: "keyed_records", Kind: wire.ProjectionRecord, ContentType: wire.ContentAny, History: wire.KeyedHistory(wire.HeaderProjectionKey("key"), deleteHeader)}
+		sqlFlowOf(state).materialization, err = topic.Materialize().Typed(projection).Apply(ctx)
+		return err
+	case strings.HasPrefix(text, "I publish keyed value"):
+		request := state.topic("keyed_records").Publish().Payload([]byte(arguments[0])).Header("key", "one")
+		if len(arguments) == 2 {
+			request.Header(arguments[1], "true")
+		}
+		_, err := request.Send(ctx)
+		return err
+	case text == "I delete the materialized key":
+		_, err := state.topic("keyed_records").Publish().Payload([]byte{0}).Header("key", "one").Header("delete", "true").Send(ctx)
+		return err
+	case strings.HasPrefix(text, "the keyed view contains only"), text == "the keyed view is empty":
+		if err := materializationCaughtUp(ctx, sqlFlowOf(state)); err != nil {
+			return err
+		}
+		return originalBodies(ctx, state, "keyed_records", arguments)
 	case strings.HasPrefix(text, "a realized binding with captured head"):
 		if len(counts) != 2 {
 			return fmt.Errorf("want a captured head and an applied offset, got %v",

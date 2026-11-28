@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"unicode/utf8"
 )
 
 // Major types, per RFC 8949 section 3.1.
@@ -121,7 +122,8 @@ var ErrTrailing = errors.New("cborform: trailing bytes after the CBOR value")
 
 // Decode reads exactly one data item from input and rejects trailing bytes.
 func Decode(input []byte) (Value, error) {
-	value, rest, err := decodeItem(input)
+	const maxDepth = 256 // Matches the Rust CBOR decoder.
+	value, rest, err := decodeItem(input, maxDepth)
 	if err != nil {
 		return nil, err
 	}
@@ -171,10 +173,14 @@ func head(input []byte) (major byte, ai byte, arg uint64, rest []byte, err error
 	}
 }
 
-func decodeItem(input []byte) (Value, []byte, error) {
+func decodeItem(input []byte, remainingDepth int) (Value, []byte, error) {
 	major, ai, arg, rest, err := head(input)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	if remainingDepth == 0 && (major == majorArray || major == majorMap || major == majorTag) {
+		return nil, nil, errors.New("cborform: nesting exceeds the decoder limit")
 	}
 
 	switch major {
@@ -204,18 +210,22 @@ func decodeItem(input []byte) (Value, []byte, error) {
 			copy(out, payload)
 			return out, rest, nil
 		}
+		if !utf8.Valid(payload) {
+			return nil, nil, errors.New("cborform: text must be valid UTF-8")
+		}
 		return Text(payload), rest, nil
 
 	case majorArray:
 		if ai == indefiniteAI {
 			return nil, nil, errors.New("cborform: indefinite length arrays are not used by the band")
 		}
-		// A hostile header can declare far more elements than follow, so grow
-		// on demand rather than preallocating from the declared count.
-		items := Array{}
+		if arg > uint64(len(rest)) {
+			return nil, nil, errors.New("cborform: truncated array")
+		}
+		items := make(Array, 0, min(arg, 64))
 		for i := uint64(0); i < arg; i++ {
 			var item Value
-			item, rest, err = decodeItem(rest)
+			item, rest, err = decodeItem(rest, remainingDepth-1)
 			if err != nil {
 				return nil, nil, fmt.Errorf("array element %d: %w", i, err)
 			}
@@ -227,14 +237,17 @@ func decodeItem(input []byte) (Value, []byte, error) {
 		if ai == indefiniteAI {
 			return nil, nil, errors.New("cborform: indefinite length maps are not used by the band")
 		}
-		entries := Map{}
+		if arg > uint64(len(rest)/2) {
+			return nil, nil, errors.New("cborform: truncated map")
+		}
+		entries := make(Map, 0, min(arg, 64))
 		for i := uint64(0); i < arg; i++ {
 			var key, value Value
-			key, rest, err = decodeItem(rest)
+			key, rest, err = decodeItem(rest, remainingDepth-1)
 			if err != nil {
 				return nil, nil, fmt.Errorf("map key %d: %w", i, err)
 			}
-			value, rest, err = decodeItem(rest)
+			value, rest, err = decodeItem(rest, remainingDepth-1)
 			if err != nil {
 				return nil, nil, fmt.Errorf("map value %d: %w", i, err)
 			}
@@ -246,7 +259,7 @@ func decodeItem(input []byte) (Value, []byte, error) {
 		if ai == indefiniteAI {
 			return nil, nil, errors.New("cborform: indefinite length is not valid for a tag")
 		}
-		content, rest, err := decodeItem(rest)
+		content, rest, err := decodeItem(rest, remainingDepth-1)
 		if err != nil {
 			return nil, nil, fmt.Errorf("tag %d content: %w", arg, err)
 		}
@@ -350,6 +363,9 @@ func encodeInto(dst []byte, value Value) ([]byte, error) {
 		// human-readable encoding only.
 		return encodeInto(dst, v.Binary)
 	case Text:
+		if !utf8.ValidString(string(v)) {
+			return nil, errors.New("cborform: text must be valid UTF-8")
+		}
 		dst = appendHead(dst, majorText, uint64(len(v)))
 		return append(dst, v...), nil
 	case Array:

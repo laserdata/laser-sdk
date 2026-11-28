@@ -16,111 +16,40 @@ import (
 // TestGivenTheSharedManagedSessionScenariosWhenRunThenShouldHold runs the
 // managed session index feature: a deployment that folds every registered
 // stream into a session index, read without scanning the log.
-//
-// This runner covers the layout and index-read core. The rest of the feature
-// is planned rather than implemented: each entry below names what that
-// scenario needs that this runner does not yet set up, and the harness
-// reports those as skips naming the reason. A scenario absent from the plan
-// and missing a step implementation still fails, so nothing here can pass
-// vacuously. Shrinking the plan is the work.
 func TestGivenTheSharedManagedSessionScenariosWhenRunThenShouldHold(t *testing.T) {
-	runFeaturePlanned(t, "managed_sessions.feature", 5*time.Minute, managedSessionStep,
-		map[string]string{
-			"A2A and MCP children roll up under their root": "" +
-				"needs the A2A and MCP bridges wired into the session tree read",
-			"A fan-out branch rolls up under its root": "" +
-				"needs a fan-out branch read back through the session tree",
-			"A resumed workflow run opens no phantom child": "" +
-				"needs the session tree read of a workflow run",
-			"A resumed workflow run never runs a completed step again": "" +
-				"needs a counting agent spawned against the managed stream",
-			"Untargeted low-altitude work reaches a filter-bound agent": "" +
-				"needs a filter-bound consumer group on the managed stream",
-			"A recalled memory item links to the session": "" +
-				"needs the memory-to-session link read",
-			"State history keeps old and new digests": "" +
-				"needs the state history read",
-			"A state write right after the session starts is accepted": "" +
-				"needs the state write path against the index",
-			"A graph node re-observed by a second session links to both": "" +
-				"needs the graph element's session links read",
-			"A key-value write inside a session appears under the session lens": "" +
-				"needs the session-scoped key-value lens read",
-			"A linked write right after bootstrap keeps its link": "" +
-				"needs the linked-write path against the index",
-			"A session reference naming another stream is refused at the edge": "" +
-				"needs the edge refusal of a cross-stream session reference",
-			"Heartbeats keep a quiet session live and never appear in its events": "" +
-				"needs a held lease heartbeating against the index",
-			"The change feed holds one row per fold batch and only its stream's sessions": "" +
-				"needs the session change feed read",
-			"Every read answers a finished session from the index": "" +
-				"needs every index read shape asserted against one finished session",
-			"A session list walk keeps its first page's bound while a session starts": "" +
-				"needs a paged list walk with a session starting mid-walk",
-			"The runtime ends a session over its budget instead of handling its work": "" +
-				"needs the budget gate wired to a runtime on the managed stream",
-			// These three are Scenario Outlines: ParseFeature expands each
-			// Examples row into its own scenario, named "<title> [<row
-			// values, in column order>]" (gherkin.go's (*outline).expand), not
-			// the bare title.
-			//
-			// All 14 skipped for want of a LaneGuard-equivalent. **That is no
-			// longer the reason**: the client capability shipped on
-			// 2026-11-27 as laser/session_lane.go (laneGuard, laneIdentity,
-			// the public laser.StaleLaneError), checked on every session
-			// lifecycle and state write. What is still missing is this
-			// runner's own steps -- retaining handles, changing the source's
-			// partition count or topic/stream generation, removing and
-			// re-registering the source -- none of which are written yet.
-			// Writing them is the remaining work; the client is ready for
-			// them.
-			"Retained handles refuse changed lane identity before writes [shared, partition count]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"Retained handles refuse changed lane identity before writes [shared, topic generation]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"Retained handles refuse changed lane identity before writes [per-agent topic, partition count]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"Retained handles refuse changed lane identity before writes [per-agent topic, topic generation]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"Retained handles refuse changed lane identity before writes [declared partitions, partition count]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"Retained handles refuse changed lane identity before writes [declared partitions, topic generation]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"Retained handles refuse changed lane identity before writes [single partition, partition count]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"Retained handles refuse changed lane identity before writes [single partition, topic generation]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"Retained handles refuse a recreated stream before writes [shared]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"Retained handles refuse a recreated stream before writes [per-agent topic]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"Retained handles refuse a recreated stream before writes [declared partitions]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"Retained handles refuse a recreated stream before writes [single partition]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"Exact record reads refuse a recreated source with reused addresses [topic generation]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"Exact record reads refuse a recreated source with reused addresses [stream generation]": "" +
-				"the client's lane guard exists; this runner has no steps for it yet (see the note above)",
-			"A heartbeat of a deleted stream's lease never counts in its replacement": "" +
-				"needs a lease held across a stream delete and recreate",
-			"A native lane writer needs no aggregate session read grant": "" +
-				"needs a restricted-grant client",
-		})
+	runFeature(t, "managed_sessions.feature", 5*time.Minute, managedSessionStep)
 }
 
 // managedSessionFlow is the session a scenario ran and the agents in it.
 type managedSessionFlow struct {
-	session *laser.Session
-	label   string
+	writer *laser.Laser
+
+	lease *laser.SessionLease
+	watch *laser.SessionWatch
+
+	session        *laser.Session
+	label          string
+	sessions       *laser.Sessions
+	config         laser.SessionConfig
+	partitions     uint32
+	byLabel        map[string]*laser.Session
+	retained       *laser.Session
+	retainedState  *laser.SessionState
+	retainedSource wire.SourceRef
+	firstPage      *wire.SessionPage
+	remembered     laser.MemoryID
+	second         *laser.Sessions
+	secondSession  *laser.Session
+	workflowRun    wire.ConversationID
+	worker         *managedWorker
+	children       []wire.ConversationID
 }
 
 func managedSessionFlowOf(state *world) *managedSessionFlow {
 	if existing, found := state.get("managed-sessions"); found {
 		return existing.(*managedSessionFlow)
 	}
-	flow := &managedSessionFlow{}
+	flow := &managedSessionFlow{byLabel: make(map[string]*laser.Session)}
 	state.put("managed-sessions", flow)
 	return flow
 }
@@ -135,7 +64,7 @@ func managedSessionStep(ctx context.Context, state *world, step bdd.Step) error 
 	arguments := argumentsOf(step)
 
 	switch {
-	case strings.HasPrefix(text, "a managed session stream in the"):
+	case strings.HasPrefix(text, "a managed session stream in the") || strings.HasPrefix(text, "a managed session stream whose agents heartbeat"):
 		return managedStreamInLayout(ctx, state, text)
 
 	case strings.Contains(text, "runs the session") &&
@@ -166,7 +95,7 @@ func managedSessionStep(ctx context.Context, state *world, step bdd.Step) error 
 		return seenSessionPositions(state)
 
 	default:
-		return fmt.Errorf("this runner does not implement the step")
+		return managedSessionIndexStep(ctx, state, flow, text, arguments)
 	}
 }
 
@@ -203,7 +132,12 @@ func managedStreamInLayout(ctx context.Context, state *world, text string) error
 	default:
 		layout = laser.SharedLayout()
 	}
-	sessions := state.client.SessionsWith(laser.SessionConfig{Layout: layout})
+	flow := managedSessionFlowOf(state)
+	flow.config = laser.SessionConfig{Layout: layout}
+	if seconds, ok := after(text, "heartbeat every "); ok {
+		flow.config.Heartbeat = time.Duration(seconds) * time.Second
+	}
+	sessions := state.client.SessionsWith(flow.config)
 	partitions := uint32(2)
 	if layout.Kind() == laser.LayoutSinglePartition {
 		partitions = 1
@@ -215,6 +149,7 @@ func managedStreamInLayout(ctx context.Context, state *world, text string) error
 	// fixed for exactly this once before; this feature has its own setup
 	// and kept the plain call, which only a managed deployment can show --
 	// open Iggy has no index to be unregistered with.
+	flow.sessions, flow.partitions = sessions, partitions
 	_, err = sessions.Bootstrap(ctx, partitions, laser.ExpireAfter(24*time.Hour))
 	return err
 }
@@ -236,7 +171,7 @@ func runAnsweredSession(
 	if err != nil {
 		return err
 	}
-	session := state.client.Sessions().Create(label).As(source)
+	session := flow.sessions.Create(label).As(source)
 	_, lease, err := session.Begin(ctx)
 	if err != nil {
 		return err

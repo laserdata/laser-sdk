@@ -282,7 +282,7 @@ func embeddingLiteral(embedding []float32) (string, error) {
 func (laser *Laser) executeFork(
 	ctx context.Context, code uint32, request any,
 ) (*wire.ForkOutcome, error) {
-	if !laser.capabilities.Managed || !laser.capabilities.Forks {
+	if !laser.Capabilities().Managed || !laser.Capabilities().Forks {
 		return nil, &UnsupportedError{Surface: "the fork surface"}
 	}
 	if err := laser.requireOpVersion("fork", wire.ForkOpVersion,
@@ -298,8 +298,8 @@ func (laser *Laser) executeFork(
 		return nil, err
 	}
 	var reply wire.ForkReply
-	if err := wire.Unmarshal(raw, &reply); err != nil {
-		return nil, &CodecError{Reason: "decode fork reply", Cause: err}
+	if err := decodeManagedReply(raw, &reply, "decode fork reply"); err != nil {
+		return nil, err
 	}
 	if !reply.IsOk() {
 		if reply.Err == nil {

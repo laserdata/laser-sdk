@@ -31,6 +31,8 @@ def workspace(rust="", wire="", stub="", report="", capabilities=(), retired=(),
         stack.enter_context(patch.dict(parity.OMISSION_CAPABILITIES, omissions or {}, clear=True))
         stack.enter_context(patch.dict(parity.CAPABILITY_SIGNOFFS, {}, clear=True))
         stack.enter_context(patch.object(parity, "CAPABILITIES", tuple(capabilities)))
+        # The surface rows name real Go declarations, which a throwaway repository lacks.
+        stack.enter_context(patch.object(parity, "GO_SURFACES", ()))
         # The Go table is keyed by capability, so a fake capability list needs a
         # fake Go standing to match it: the two are one thing stated twice.
         stack.enter_context(patch.dict(
@@ -828,6 +830,34 @@ class ComparisonTests(unittest.TestCase):
 
 
 class CapabilityTests(unittest.TestCase):
+    def test_go_capabilities_require_the_named_public_member(self):
+        caps = (("probe", "probe", (), (), "probe", "probe", "probe"),)
+        with workspace(capabilities=caps) as root:
+            package = root / "foreign/go/laser"
+            package.mkdir(parents=True)
+            (package / "client.go").write_text("package laser\ntype Probe struct{}\nfunc (p *Probe) Run() {}\n")
+            with patch.dict(parity.GO_CAPABILITIES, {"probe": "Probe.Run"}):
+                self.assertEqual([], parity.go_capability_problems())
+            with patch.dict(parity.GO_CAPABILITIES, {"probe": "Probe.Missing"}):
+                self.assertIn("Probe.Missing", parity.go_capability_problems()[0])
+
+    def test_go_surfaces_require_the_named_public_member(self):
+        with workspace() as root:
+            package = root / "foreign/go/laser"
+            package.mkdir(parents=True)
+            (package / "client.go").write_text(
+                "package laser\ntype Probe struct{}\nfunc (p *Probe) Run() {}\ntype Box[T any] struct{}\nfunc (b *Box[T]) Open() {}\nfunc NewProbe() {}\n"
+            )
+            helpers = root / "foreign/go/laser/lasertest"
+            helpers.mkdir()
+            (helpers / "lasertest.go").write_text("package lasertest\nfunc AgentMessage() {}\n")
+            with patch.object(parity, "GO_SURFACES", (("Probe", "Probe.Run, Box.Open, laser.NewProbe and lasertest.AgentMessage"),)):
+                self.assertEqual([], parity.go_capability_problems())
+            with patch.object(parity, "GO_SURFACES", (("Probe", "Probe.Run and Probe.Missing"),)):
+                self.assertEqual(
+                    ["Go surface `Probe` names missing declaration `Probe.Missing`"], parity.go_capability_problems()
+                )
+
     RUST = """
         pub struct Laser;
         impl Laser {

@@ -52,10 +52,17 @@ type outline struct {
 	columns []string
 	// rows is every example row gathered so far. An outline may carry more
 	// than one Examples block, and each row becomes its own scenario.
-	rows [][]string
+	rows        []exampleRow
+	exampleTags []string
 	// reading says whether the parser is inside an Examples table, so a row is
 	// only read where one belongs rather than anywhere a pipe appears.
 	reading bool
+}
+
+type exampleRow struct {
+	columns []string
+	values  []string
+	tags    []string
 }
 
 // ParseFeature reads a Gherkin file.
@@ -105,6 +112,8 @@ func ParseFeature(path string) (*Feature, error) {
 		case strings.HasPrefix(line, "|"):
 			if template != nil && template.reading {
 				template.row(cells(line))
+			} else {
+				return nil, &UnsupportedSyntaxError{Path: path, Line: line}
 			}
 
 		case strings.HasPrefix(line, "@"):
@@ -145,7 +154,7 @@ func ParseFeature(path string) (*Feature, error) {
 			// read again rather than inherited from the block before it.
 			template.columns = nil
 			template.reading = true
-			pending = nil
+			template.exampleTags, pending = pending, nil
 
 		case strings.HasPrefix(line, "Scenario:"):
 			if err := flush(); err != nil {
@@ -205,7 +214,7 @@ func (template *outline) row(values []string) {
 		template.columns = values
 		return
 	}
-	template.rows = append(template.rows, values)
+	template.rows = append(template.rows, exampleRow{columns: template.columns, values: values, tags: template.exampleTags})
 }
 
 // expand turns the template into one scenario per example row.
@@ -222,16 +231,16 @@ func (template *outline) expand(path string) ([]Scenario, error) {
 	}
 	scenarios := make([]Scenario, 0, len(template.rows))
 	for _, row := range template.rows {
-		if len(row) != len(template.columns) {
+		if len(row.values) != len(row.columns) {
 			return nil, &UnsupportedSyntaxError{
 				Path: path,
 				Line: "Examples: a row of " + template.name +
 					" does not match its header",
 			}
 		}
-		values := make(map[string]string, len(row))
-		for index, column := range template.columns {
-			values[column] = row[index]
+		values := make(map[string]string, len(row.values))
+		for index, column := range row.columns {
+			values[column] = row.values[index]
 		}
 		steps := make([]Step, 0, len(template.steps))
 		for _, step := range template.steps {
@@ -249,8 +258,8 @@ func (template *outline) expand(path string) ([]Scenario, error) {
 			// The row values are part of the name, so two rows of one outline
 			// never report under the same scenario, which would hide which of
 			// them failed.
-			Name:  fill(template.name, values) + " [" + strings.Join(row, ", ") + "]",
-			Tags:  append([]string(nil), template.tags...),
+			Name:  fill(template.name, values) + " [" + strings.Join(row.values, ", ") + "]",
+			Tags:  append(append([]string(nil), template.tags...), row.tags...),
 			Steps: steps,
 		})
 	}

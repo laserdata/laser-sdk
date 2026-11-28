@@ -171,6 +171,46 @@ func (state *SessionState) Get(ctx context.Context) (wire.SessionStateView, erro
 	return FoldSessionState(envelopes), nil
 }
 
+// ReconstructState reads a conversation's session state document, nil until a
+// state record exists.
+func (laser *Laser) ReconstructState(
+	ctx context.Context, conversation wire.ConversationID,
+) (*wire.DynValue, error) {
+	view, err := laser.Sessions().Open(conversation, "").State().currentView(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if view.Revision == 0 && !view.Complete {
+		return nil, nil
+	}
+	return &view.Document, nil
+}
+
+// currentView is the revision a writer continues from. The lane is read
+// straight from the log, so it is never behind the writes confirmed there.
+// The managed view is used only when the retained lane no longer holds the
+// document's baseline, and a session the index does not know keeps the fold.
+func (state *SessionState) currentView(ctx context.Context) (wire.SessionStateView, error) {
+	lane, err := state.Get(ctx)
+	if err != nil {
+		return wire.SessionStateView{}, err
+	}
+	session := state.session
+	capabilities := session.laser.Capabilities()
+	if lane.Complete || !capabilities.Managed || !capabilities.Sessions {
+		return lane, nil
+	}
+	sessions := &Sessions{laser: session.laser, config: session.config, lane: session.lane}
+	view, err := sessions.stateView(ctx, session.conversation, 0, walkingOnce())
+	if ctx.Err() != nil {
+		return wire.SessionStateView{}, ctx.Err()
+	}
+	if err != nil || view == nil || view.Revision < lane.Revision {
+		return lane, nil
+	}
+	return *view, nil
+}
+
 // writeDelta appends one delta and advances the cursor.
 //
 // The cursor lock is held across the publish, so the writes of one handle and
@@ -251,7 +291,7 @@ func (state *SessionState) seed(ctx context.Context, cursor *stateCursor) error 
 	if cursor.document != nil {
 		return nil
 	}
-	view, err := state.Get(ctx)
+	view, err := state.currentView(ctx)
 	if err != nil {
 		return err
 	}
@@ -286,7 +326,7 @@ func (state *SessionState) holdsCurrent(
 	if cursor.document == nil {
 		return true, state.seed(ctx, cursor)
 	}
-	view, err := state.Get(ctx)
+	view, err := state.currentView(ctx)
 	if err != nil {
 		return false, err
 	}

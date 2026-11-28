@@ -337,7 +337,7 @@ func skillRoutedStep(ctx context.Context, state *world, flow *workflowFlow, argu
 	if err != nil {
 		return err
 	}
-	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).
+	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).InboxRoute(laser.FixedInbox(wire.AgentSessions)).
 		Registry(registry).
 		Step(label, laser.ToCapable(skill, laser.RouteAny), routedBody(label)).
 		Run(ctx)
@@ -388,7 +388,7 @@ func threeRoutedSteps(ctx context.Context, state *world, flow *workflowFlow, arg
 		return err
 	}
 	first, second, secondAfter, third, thirdAfter := arguments[1], arguments[2], arguments[3], arguments[4], arguments[5]
-	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).
+	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).InboxRoute(laser.FixedInbox(wire.AgentSessions)).
 		Step(first, laser.To(target), routedBody(first)).
 		Step(second, laser.To(target), routedBody(second)).After(secondAfter).
 		Step(third, laser.To(target), routedBody(third)).After(thirdAfter).
@@ -410,7 +410,7 @@ func rejectedVerifierStep(ctx context.Context, state *world, flow *workflowFlow,
 		return err
 	}
 	label := arguments[1]
-	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).
+	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).InboxRoute(laser.FixedInbox(wire.AgentSessions)).
 		Step(label, laser.To(target), routedBody(label)).
 		VerifyWith(func(context.Context, []byte) (bool, error) { return false, nil }).
 		Run(ctx)
@@ -435,7 +435,7 @@ func compensatedSteps(ctx context.Context, state *world, flow *workflowFlow, arg
 		return err
 	}
 	first, second, third := arguments[1], arguments[2], arguments[4]
-	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).
+	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).InboxRoute(laser.FixedInbox(wire.AgentSessions)).
 		Step(first, laser.To(agent), routedBody(first)).CompensateWith(undoRoutedBody(first)).
 		Step(second, laser.To(agent), routedBody(second)).CompensateWith(undoRoutedBody(second)).
 		Step(third, laser.To(breaker), routedBody(third)).CompensateWith(undoRoutedBody(third)).
@@ -459,7 +459,7 @@ func silentStep(
 		return err
 	}
 	label := arguments[1]
-	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).
+	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).InboxRoute(laser.FixedInbox(wire.AgentSessions)).
 		Step(label, laser.To(target), routedBody(label)).
 		Deadline(time.Duration(deadlines[0]) * time.Millisecond).
 		Run(ctx)
@@ -498,7 +498,7 @@ func plainLocalSteps(ctx context.Context, state *world, flow *workflowFlow, argu
 		return err
 	}
 	first, second, third := arguments[1], arguments[2], arguments[3]
-	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).
+	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).InboxRoute(laser.FixedInbox(wire.AgentSessions)).
 		StepLocal(first, localBody(flow, first, false)).
 		StepLocal(second, localBody(flow, second, false)).
 		StepLocal(third, localBody(flow, third, false)).
@@ -517,7 +517,7 @@ func localStepsFailingOnce(ctx context.Context, state *world, flow *workflowFlow
 	}
 	first, second, third, failing := arguments[1], arguments[2], arguments[3], arguments[4]
 	flow.runID = laser.NewConversationID()
-	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).
+	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).InboxRoute(laser.FixedInbox(wire.AgentSessions)).
 		RunID(flow.runID).
 		StepLocal(first, localBody(flow, first, first == failing)).
 		StepLocal(second, localBody(flow, second, second == failing)).
@@ -535,7 +535,7 @@ func resumedLocalSteps(ctx context.Context, state *world, flow *workflowFlow, na
 	if err != nil {
 		return err
 	}
-	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).
+	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).InboxRoute(laser.FixedInbox(wire.AgentSessions)).
 		RunID(flow.runID).
 		StepLocal("generate", localBody(flow, "generate", false)).
 		StepLocal("process", localBody(flow, "process", false)).
@@ -554,7 +554,7 @@ func compensatedLocalSteps(ctx context.Context, state *world, flow *workflowFlow
 		return err
 	}
 	first, second, failing := arguments[1], arguments[2], arguments[3]
-	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).
+	outcome, runErr := state.client.Workflow(source, wire.AgentSessions).InboxRoute(laser.FixedInbox(wire.AgentSessions)).
 		StepLocal(first, localBody(flow, first, false)).CompensateWith(localUndo(flow, first)).
 		StepLocal(second, localBody(flow, second, false)).CompensateWith(localUndo(flow, second)).
 		StepLocal(failing, localBody(flow, failing, true)).

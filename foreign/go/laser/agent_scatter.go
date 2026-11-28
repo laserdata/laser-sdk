@@ -15,7 +15,7 @@ type ScatterRequest struct {
 	// Routing ranks the capable agents. It does not narrow them: a scatter
 	// asks all of them, the same contract as FanOutRequest.Routing.
 	Routing RoutePolicy
-	// Registry is where the capable agents are resolved from. Required.
+	// Registry is where the capable agents are resolved from. Nil reads the connection's shared registry.
 	Registry *AgentRegistry
 	// From names the agent every branch's contract sends as.
 	From wire.AgentID
@@ -33,10 +33,7 @@ type ScatterRequest struct {
 	// not complete on an unsigned or wrong-signer reply, the same gate
 	// Contract.Verifier gives a single directed send.
 	Verifier *KeyRegistry
-	// Inbox decides how each branch resolves its own target to a topic. Nil
-	// keeps Topic for every branch, which is this client's default; an
-	// AdvertisedInbox() sends each branch to that agent's own inbox, so a
-	// scatter reaches agents that share no topic.
+	// Inbox defaults to the resolved agent's advertised inbox.
 	Inbox *InboxRoute
 }
 
@@ -45,7 +42,7 @@ type ScatterOutcome struct {
 	// Agent is the agent this branch was contracted to.
 	Agent wire.AgentID
 	// Contract is the branch's terminal contract state. Completed, Failed,
-	// NotConsumed, and TimedOut are all a branch that finished; Err is set
+	// NotConsumed, and TimedOut are all a branch that finished. Err is set
 	// instead only when the branch itself could not run, an infrastructure
 	// or send failure.
 	Contract *Contract
@@ -131,8 +128,11 @@ func (laser *Laser) ScatterReport(
 		return nil, err
 	}
 	if request.Registry == nil {
-		return nil, &InvalidError{
-			Reason: "a scatter needs a registry to resolve its targets against"}
+		shared, err := laser.agentRegistry(ctx)
+		if err != nil {
+			return nil, err
+		}
+		request.Registry = shared
 	}
 	targets, err := AllCapable(request.Skill, request.Routing).
 		ResolveTargets(request.Registry, time.Now())
@@ -155,8 +155,8 @@ func (laser *Laser) ScatterReport(
 	defer wallClock.Stop()
 	// A best-effort branch must be stopped by this cancellation, not by its
 	// own Contract deadline: giving it the same duration races this timer
-	// against that one, and OS/scheduler jitter — not which fired "first" in
-	// code — decides the winner, so a losing branch reports itself as timed
+	// against that one, and OS/scheduler jitter, not which fired "first" in
+	// code, decides the winner, so a losing branch reports itself as timed
 	// out in Outcomes instead of being cancelled here. Doubling it leaves
 	// cancellation as the only thing that can end a best-effort branch
 	// within this gather's own deadline. Every other policy relies on each
@@ -175,12 +175,13 @@ func (laser *Laser) ScatterReport(
 				From(request.From).
 				Payload(request.Payload).
 				Registry(request.Registry).
+				ReplyOn(request.Topic).
 				Deadline(branchDeadline)
 			if request.Inbox != nil {
 				// The caller watches the topic it named, so that is where
 				// every branch answers even when its command went to the
 				// agent's own inbox.
-				branch = branch.InboxRoute(*request.Inbox).ReplyOn(request.Topic)
+				branch = branch.InboxRoute(*request.Inbox)
 			}
 			if request.Verifier != nil {
 				branch = branch.Verifier(request.Verifier)

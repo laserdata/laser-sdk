@@ -81,8 +81,10 @@ func dialLive(t *testing.T) *laser.Laser {
 
 	client, err := laser.ConnectWith(ctx, target, laser.Options{Timeout: liveConnectTimeout})
 	if err != nil {
-		t.Skipf("no reachable deployment at %s (%v): start one and set "+
-			"LASER_LIVE_CONNECTION_STRING to run the live suite", target, err)
+		if os.Getenv("LASER_LIVE_CONNECTION_STRING") != "" || os.Getenv("LASER_CONNECTION_STRING") != "" {
+			t.Fatalf("connect to configured live deployment: %v", err)
+		}
+		t.Skip("no local deployment, set LASER_LIVE_CONNECTION_STRING to run the live suite")
 	}
 	t.Cleanup(func() {
 		if err := client.Close(); err != nil {

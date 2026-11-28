@@ -2,13 +2,12 @@ package bdd_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 
 	bdd "github.com/laserdata/laser-sdk/bdd/go"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
@@ -30,11 +29,10 @@ type warmWorker struct {
 	mutex   sync.Mutex
 	handled []string
 
-	name    string
-	group   string
-	policy  laser.WarmDedupPolicy
-	stop    context.CancelFunc
-	stopped chan struct{}
+	name   string
+	group  string
+	policy laser.WarmDedupPolicy
+	handle *laser.AgentHandle
 	// handledBeforeRestart is what the first run handled, kept so the
 	// restarted run's own list is read on its own.
 	handledBeforeRestart []string
@@ -157,55 +155,45 @@ func warmPolicyOf(name string) (laser.WarmDedupPolicy, error) {
 	}
 }
 
-// runWarmWorker starts the agent loop under the worker's own group, which is
-// what a restart rejoins and what the refill reads the committed offsets of.
+// runWarmWorker spawns the agent under the worker's own group, which is what
+// a restart rejoins and what the refill reads the committed offsets of.
 func runWarmWorker(ctx context.Context, state *world, worker *warmWorker) error {
 	identity, err := bridgeAgent(worker.name)
 	if err != nil {
 		return err
 	}
-	gate := state.client.Agent(identity, laser.AgentOptions{})
-	runtime, err := state.client.AgentRuntime(gate, laser.RuntimeOptions{
-		Topic:           wire.AgentSessions,
-		RespondOn:       wire.AgentSessions,
-		Group:           worker.group,
-		WarmDedup:       true,
-		WarmDedupPolicy: worker.policy,
-	})
-	if err != nil {
-		return err
-	}
-	// A consumer *group*, not a standalone consumer named after the group:
-	// the refill reads the group's own stored offset, and a standalone
-	// consumer stores under a different key, so the refill would find
-	// nothing and suppress nothing however the policy was set. Auto-commit
-	// so there is a stored offset to refill from at all.
-	autoCommit := iggcon.DefaultAutoCommit()
-	autoCommit.Interval = 200 * time.Millisecond
-	source, err := state.topic(wire.AgentSessions).ConsumerGroup(
-		ctx, worker.group, laser.ConsumerOptions{AutoCommit: &autoCommit},
-	)
-	if err != nil {
-		return err
-	}
-	handler := laser.HandlerFunc(func(
+	handle, err := state.client.SpawnAgent(ctx, identity, laser.SpawnOptions{
+		RuntimeOptions: laser.RuntimeOptions{
+			Topic:           wire.AgentSessions,
+			RespondOn:       wire.AgentSessions,
+			Group:           worker.group,
+			WarmDedup:       true,
+			WarmDedupPolicy: worker.policy,
+		},
+	}, laser.HandlerFunc(func(
 		ctx context.Context, message *laser.AgentMessage, agent *laser.AgentCtx,
 	) error {
 		if key := message.Envelope.IdempotencyKey; key != nil {
 			worker.record(key.String())
 		}
 		return nil
+	}))
+	if err != nil {
+		return err
+	}
+	ready, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := handle.Ready(ready); err != nil {
+		return err
+	}
+	worker.handle = handle
+	state.t.Cleanup(func() {
+		shutdown, done := context.WithTimeout(context.Background(), 15*time.Second)
+		defer done()
+		if err := handle.Shutdown(shutdown); err != nil {
+			state.t.Errorf("warm worker did not release its group membership: %v", err)
+		}
 	})
-	running, cancel := context.WithCancel(ctx)
-	stopped := make(chan struct{})
-	worker.stop, worker.stopped = cancel, stopped
-	go func() {
-		defer close(stopped)
-		_ = runtime.Run(running, source, handler)
-	}()
-	// The loop has to be reading before the scenario sends, or the first
-	// commands race the join rather than testing the window.
-	time.Sleep(500 * time.Millisecond)
 	return nil
 }
 
@@ -288,6 +276,12 @@ func workerHandledKeys(state *world, expected []string, restarted bool) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	// A worker that already stopped explains an empty list better than the list does.
+	probe, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if stopped := worker.handle.Join(probe); !errors.Is(stopped, context.DeadlineExceeded) {
+		return fmt.Errorf("want the keys %v handled, got %v, the worker stopped with %v", expected, got, stopped)
+	}
 	return fmt.Errorf("want the keys %v handled, got %v", expected, got)
 }
 
@@ -310,11 +304,10 @@ func stopWorkerAndWait(ctx context.Context, state *world) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	worker.stop()
-	select {
-	case <-worker.stopped:
-	case <-time.After(30 * time.Second):
-		return fmt.Errorf("the warm-dedup worker did not stop")
+	shutdown, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := worker.handle.Shutdown(shutdown); err != nil {
+		return fmt.Errorf("the warm-dedup worker did not stop: %w", err)
 	}
 	// The scenario's own "due in 2 seconds" is what has to pass.
 	select {

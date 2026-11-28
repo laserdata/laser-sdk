@@ -23,7 +23,7 @@ The binary path is a managed Apache Iggy command. It does not use a request topi
 - `sdk/src/query/` owns the Rust query builder and command client.
 - `foreign/python/src/query.rs` binds the same Rust surface.
 - `foreign/typescript/src/wire/{query,schema,destination,arrow}.ts` implement the contract natively.
-- `foreign/typescript/src/managed/query.ts` and `src/client/laser.ts` own the TypeScript public builder and capability gates.
+- `foreign/typescript/src/managed/query.ts` and `src/client/laser.ts` own the TypeScript public builder and capability gates. Go owns its builder in `foreign/go/laser/query.go` and `query_rows.go` over `foreign/go/wire/query.go`.
 
 ## Query contract
 
@@ -77,4 +77,4 @@ An intentional wire change must update Rust fixtures, the TypeScript fixture man
 
 A zero row ceiling performs no query. Every page rejects a reply for another execution ID. Version skew keeps its typed error classification. See [client behavior](../../../docs/client-behavior.md).
 
-Materialization setup lives in `sdk/src/materialize.rs`, `foreign/python/src/materialize.rs`, and `foreign/typescript/src/managed/materialize.ts`. The shared scenarios are `bdd/scenarios/materialization.feature` and `bdd/scenarios/operational_sql.feature`. Keep append and keyed history, rejection policies, captured-target readiness, and explicit raw SQL dialects aligned in every client. Read `docs/client-behavior.md` from the repository root for the public contract.
+Materialization setup lives in `sdk/src/materialize.rs`, `foreign/python/src/materialize.rs`, `foreign/typescript/src/managed/materialize.ts`, and `foreign/go/laser/materialize.go`. The shared scenarios are `bdd/scenarios/materialization.feature` and `bdd/scenarios/operational_sql.feature`. Keep append and keyed history, rejection policies, captured-target readiness, and explicit raw SQL dialects aligned in every client. Read `docs/client-behavior.md` from the repository root for the public contract.

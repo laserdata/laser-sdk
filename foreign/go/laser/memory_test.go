@@ -153,7 +153,7 @@ func TestGivenARememberedItemWhenWrittenThenShouldRideTheMemoryTopic(t *testing.
 		t.Errorf("want the conversation as the key, got %q", server.sentPartitions.Value)
 	}
 	headers := sentHeaders(t, server)
-	if headers[wire.HeaderMemoryNamespace] != "support" {
+	if headers[wire.HeaderMemoryNamespace] != "stream:agents/support" {
 		t.Errorf("want the namespace stamped, got %q", headers[wire.HeaderMemoryNamespace])
 	}
 }

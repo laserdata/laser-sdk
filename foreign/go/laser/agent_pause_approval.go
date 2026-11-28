@@ -28,20 +28,24 @@ func (pause *sessionPause) parkApproval(
 		return &InvalidError{
 			Reason: "a record parked on an approval must belong to a session"}
 	}
-	key, parked, err := pause.parkAt(ctx, session, message, interrupt.prompt)
-	if err != nil || !parked {
+	key, _, err := pause.parkAt(ctx, session, message, interrupt.prompt)
+	if err != nil {
 		return err
 	}
 	// Only the record that actually prompted carries a deadline. The work
 	// held behind it rides the same prompt position but is waiting on this
-	// record, not on the approver.
+	// record, not on the approver. A record that prompts again while still
+	// parked takes the deadline of its newest prompt.
 	held := pause.role(session)
 	pause.mutex.Lock()
+	defer pause.mutex.Unlock()
+	if _, parked := held.parked[key]; !parked {
+		return nil
+	}
 	if held.approvalDeadlines == nil {
 		held.approvalDeadlines = map[parkingKey]uint64{}
 	}
 	held.approvalDeadlines[key] = interrupt.deadlineMicros
-	pause.mutex.Unlock()
 	return nil
 }
 
@@ -97,15 +101,17 @@ func (pause *sessionPause) parkAt(
 	return key, true, nil
 }
 
-// isApproval separates a record held for an approval from one held by a
-// pause.
+// isApprovalParking separates a record held for an approval from one held by
+// a pause.
 //
-// Both ride the same parking record; what differs is the request they name.
-// A pause names the control request that stopped the session, which carries
-// no stream or topic because the control position is read off the control
-// lane; an approval names where its prompt landed, which always does.
-func isApprovalParking(parking wire.SessionParking) bool {
-	return parking.Request.StreamID != 0 || parking.Request.TopicID != 0
+// Both ride the same parking record, and what differs is the request they
+// name. A pause names its control request on agent.control, and an approval
+// names where its prompt landed, which is any other topic.
+func (pause *sessionPause) isApprovalParking(parking wire.SessionParking) bool {
+	pause.book.mutex.Lock()
+	defer pause.book.mutex.Unlock()
+	source := pause.book.controlSource
+	return source == nil || parking.Request.StreamID != source.StreamID || parking.Request.TopicID != source.TopicID
 }
 
 // approvalOf is the record this session has parked on the approval that
@@ -121,7 +127,7 @@ func (pause *sessionPause) approvalOf(
 	pause.mutex.Lock()
 	defer pause.mutex.Unlock()
 	for key, parking := range held.parked {
-		if !isApprovalParking(parking) {
+		if !pause.isApprovalParking(parking) {
 			continue
 		}
 		if parking.Source.Message == nil {
@@ -165,10 +171,18 @@ func (pause *sessionPause) resumeApproval(
 	}
 	key, parking, parked := pause.approvalOf(session, correlation)
 	if !parked {
-		return nil
+		scan, err := pause.scanLane(ctx)
+		if err != nil {
+			return err
+		}
+		pause.merge(scan)
+		key, parking, parked = pause.approvalOf(session, correlation)
+		if !parked {
+			return nil
+		}
 	}
 	return pause.drainApproval(ctx, session, key, parking,
-		&approvalResume{decided: agdxOf(reply)}, replay)
+		&approvalResume{decided: agdxOf(reply)}, false, replay)
 }
 
 // approvalReplyOf reads the approval correlation a reply addressed to me
@@ -200,7 +214,7 @@ func agdxOf(reply *AgentMessage) *AgdxMessage {
 	if reply == nil || reply.Envelope == nil {
 		return nil
 	}
-	return &AgdxMessage{Record: reply.Record, Envelope: *reply.Envelope}
+	return &AgdxMessage{Record: reply.Record, Envelope: *reply.Envelope, VerifiedPrincipal: reply.VerifiedPrincipal}
 }
 
 // expireApprovals wakes every approval of the session whose deadline passed
@@ -214,6 +228,9 @@ func (pause *sessionPause) expireApprovals(
 	pause.mutex.Lock()
 	expired := make([]parkingKey, 0, len(held.approvalDeadlines))
 	for key, deadline := range held.approvalDeadlines {
+		if _, owned := pause.assigned[key.partition]; pause.assigned != nil && !owned {
+			continue
+		}
 		if _, stillParked := held.parked[key]; stillParked && deadline <= now {
 			expired = append(expired, key)
 		}
@@ -228,7 +245,7 @@ func (pause *sessionPause) expireApprovals(
 			continue
 		}
 		if err := pause.drainApproval(
-			ctx, session, key, parking, &approvalResume{}, replay); err != nil {
+			ctx, session, key, parking, &approvalResume{}, true, replay); err != nil {
 			return err
 		}
 	}
@@ -244,7 +261,7 @@ func (pause *sessionPause) expireApprovals(
 func (pause *sessionPause) drainApproval(
 	ctx context.Context, session wire.ConversationID,
 	key parkingKey, parking wire.SessionParking,
-	resume *approvalResume, replay approvalReplayFunc,
+	resume *approvalResume, assignedOnly bool, replay approvalReplayFunc,
 ) error {
 	record, found, err := pause.fetchSource(ctx, parking)
 	if err != nil {
@@ -253,10 +270,11 @@ func (pause *sessionPause) drainApproval(
 	if !found {
 		// The source expired or its topic was recreated, so the work cannot
 		// be handed back. Dropped from what this process holds, and left
-		// listed on the lane as held.
+		// listed on the lane as held. Its prompt is settled all the same, so
+		// the work held behind it is handed back below.
 		pause.forgetApproval(session, key)
-		pause.markUnrecoverable(session, key)
-		return nil
+		pause.resolveUnrecoverable(session, key, parking.Request)
+		return pause.drainBehind(ctx, session, assignedOnly, replay)
 	}
 	if replay != nil {
 		reparked, err := replay(ctx, record, resume)
@@ -264,9 +282,8 @@ func (pause *sessionPause) drainApproval(
 			return err
 		}
 		if reparked {
-			// The handler asked for another approval. The new parking has
-			// replaced this one, so only the old deadline is dropped.
-			pause.forgetApproval(session, key)
+			// The handler asked again. The record stays parked, and the new
+			// prompt already replaced its deadline.
 			return nil
 		}
 	}
@@ -275,17 +292,41 @@ func (pause *sessionPause) drainApproval(
 	}
 	pause.forgetApproval(session, key)
 	pause.markHandled(session, key)
+	return pause.drainBehind(ctx, session, assignedOnly, replay)
+}
 
-	// The session's other held work was behind this approval, so it runs now
-	// that the approval is answered. A pause takes precedence: an operator
-	// who stopped the session in the meantime meant it.
+// drainBehind hands back the work the session held behind a settled approval.
+//
+// A pause takes precedence: an operator who stopped the session in the
+// meantime meant it.
+func (pause *sessionPause) drainBehind(
+	ctx context.Context, session wire.ConversationID, assignedOnly bool,
+	replay approvalReplayFunc,
+) error {
 	if pending, known := pause.book.Pending(session); known && pending.PauseRequested {
 		return nil
 	}
-	return pause.drain(ctx, session, func(ctx context.Context, held *Record) error {
-		_, err := replay(ctx, held, nil)
-		return err
-	})
+	var handBack replayFunc
+	if replay != nil {
+		handBack = func(ctx context.Context, held *Record) error {
+			_, err := replay(ctx, held, nil)
+			return err
+		}
+	}
+	_, err := pause.drain(ctx, session, assignedOnly, handBack)
+	return err
+}
+
+// resolveUnrecoverable drops an approval record that can no longer be read
+// back and settles its prompt, so it stops holding the work behind it.
+func (pause *sessionPause) resolveUnrecoverable(
+	session wire.ConversationID, key parkingKey, prompt wire.LogPosition,
+) {
+	held := pause.role(session)
+	pause.mutex.Lock()
+	defer pause.mutex.Unlock()
+	held.resolvePrompt(prompt)
+	delete(held.parked, key)
 }
 
 // forgetApproval drops the deadline of an approval that is no longer held.
@@ -309,11 +350,8 @@ func (pause *sessionPause) awaitingApproval(
 	held := pause.role(session)
 	pause.mutex.Lock()
 	defer pause.mutex.Unlock()
-	for key, parking := range held.parked {
-		if !isApprovalParking(parking) {
-			continue
-		}
-		if _, waiting := held.approvalDeadlines[key]; waiting {
+	for _, parking := range held.parked {
+		if pause.isApprovalParking(parking) && !held.resolvedPrompts[parking.Request] {
 			return parking.Request, true
 		}
 	}

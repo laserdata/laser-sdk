@@ -204,7 +204,7 @@ func (laser *Laser) AuthzHistory(
 func (laser *Laser) executeAuthz(
 	ctx context.Context, code uint32, request any,
 ) (*wire.AuthzReply, error) {
-	if !laser.capabilities.Authz {
+	if !laser.Capabilities().Authz {
 		return nil, &UnsupportedError{Surface: "the authorization surface"}
 	}
 	if err := laser.requireOpVersion("authorization", wire.AuthzOpVersion,
@@ -220,8 +220,8 @@ func (laser *Laser) executeAuthz(
 		return nil, err
 	}
 	var reply wire.AuthzReply
-	if err := wire.Unmarshal(raw, &reply); err != nil {
-		return nil, &CodecError{Reason: "decode authorization reply", Cause: err}
+	if err := decodeManagedReply(raw, &reply, "decode authorization reply"); err != nil {
+		return nil, err
 	}
 	if reply.Kind == wire.AuthzErr {
 		if reply.Err == nil {

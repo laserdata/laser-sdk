@@ -176,6 +176,30 @@ func TestGivenAFilterCatalogReadRefusedAsCatalogUnavailableWhenReadingThenShould
 	}
 }
 
+func TestGivenACatalogReadOneNodeRefusesWhenWalkedOnceThenShouldMoveToTheNextNode(t *testing.T) {
+	refusal, err := wire.Marshal(wire.FilterReply{Err: &wire.FilterError{
+		Code:    wire.ResultUnavailable,
+		Reason:  wire.ReasonCatalogUnavailable,
+		Message: "the catalog cannot reach its backend",
+	}})
+	if err != nil {
+		t.Fatalf("encode the catalog refusal: %v", err)
+	}
+	served := []byte("served")
+	cluster := &scriptedCluster{answers: answers(replying(refusal), replying(served))}
+	router := routerOver(0, 1)
+
+	walked, walkErr := router.walkCallerUntil(context.Background(), cluster,
+		wire.AgdxGetFilterCode, nil, walkingOnce())
+
+	if walkErr != nil || string(walked.reply) != string(served) {
+		t.Fatalf("want the next node's reply inside one walk, got %q, %v", walked.reply, walkErr)
+	}
+	if cluster.attempts != 2 {
+		t.Fatalf("want one attempt per node, got %d", cluster.attempts)
+	}
+}
+
 func TestGivenACatalogRefusalOnAnotherSurfaceWhenWalkedThenShouldReturnItAtOnce(t *testing.T) {
 	refusal, err := wire.Marshal(wire.FilterReply{Err: &wire.FilterError{
 		Code:    wire.ResultUnavailable,

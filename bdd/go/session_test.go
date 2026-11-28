@@ -51,7 +51,7 @@ func sessionStep(ctx context.Context, state *world, step bdd.Step) error {
 		return checkHandledExactly(state, arguments)
 
 	case strings.HasPrefix(text, "agent ") && strings.Contains(text, "sees no pending pause or cancel"):
-		return checkNoPendingControl(state, arguments)
+		return checkNoPendingControl(ctx, state, arguments)
 
 	case strings.HasPrefix(text, "agents \"") && strings.Contains(text, "each record the commands they handle"):
 		return spawnRecordingAgentPair(ctx, state, arguments)
@@ -336,19 +336,17 @@ func runFailingSession(
 	}
 	session := state.client.Sessions().Create(arguments[1]).As(agent)
 	_, lease, err := session.Begin(ctx)
-	if lease != nil {
-		lease.Release()
-	}
 	if err != nil {
 		return err
 	}
 	state.put("session", session)
 	state.conversation = session.Conversation()
-	message := arguments[2]
-	_, err = session.Fail(ctx, wire.AgentErrorBody{
-		Code: wire.ErrorInternal, Message: &message,
-	})
-	return err
+	failure := errors.New(arguments[2])
+	err = session.Run(ctx, lease, func(context.Context, *laser.Session) error { return failure })
+	if !errors.Is(err, failure) {
+		return fmt.Errorf("want the work error returned, got %v", err)
+	}
+	return nil
 }
 
 func endSession(ctx context.Context, state *world) error {
@@ -378,22 +376,13 @@ func cancelSession(ctx context.Context, state *world) error {
 		return err
 	}
 	_, state.failure = session.End(ctx, wire.TaskCanceled, wire.SessionEnd{})
-	ended, _ := state.get("ended")
-	if count, _ := ended.(int); count > 0 && state.failure == nil {
-		return blocked("the Go session has no terminal latch: Session.End " +
-			"publishes whatever verb it is given, so a cancel after a " +
-			"completed end is written rather than refused as invalid")
-	}
 	return nil
 }
 
 func endedRefusal(state *world, text string) error {
 	var ended *laser.SessionEndedError
 	if !errors.As(state.failure, &ended) {
-		return blocked("the Go client does not refuse a start on a session " +
-			"that already ended: Session.Begin writes the start record " +
-			"unconditionally, with no SessionEndedError and no resume, so " +
-			"this scenario has nothing to refuse it")
+		return fmt.Errorf("expected SessionEndedError, got %v", state.failure)
 	}
 	want := strings.TrimPrefix(text, "the call fails as a session that ended ")
 	if string(ended.Status) != want {
@@ -427,26 +416,13 @@ func laneCounts(ctx context.Context, state *world, display string, want int) err
 			return err
 		}
 		seen := 0
-		ended := false
 		for _, shown := range got {
 			if shown == display {
 				seen++
 			}
-			if terminalDisplay(shown) {
-				ended = true
-			}
 		}
 		if seen >= want {
 			return nil
-		}
-		if ended && seen == want-1 && display == string(wire.DisplayStateUpdated) {
-			return blocked("the Go session writes no state snapshot when it " +
-				"ends: Session.Complete goes straight to the terminal record, " +
-				"where the Rust reference snapshots state changed since the " +
-				"last one first, so a reader cannot start from the final " +
-				"document. The lane holds " + fmt.Sprint(seen) +
-				" state.updated records where the scenario wants " +
-				fmt.Sprint(want))
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("want %d %q records, the lane shows %v",
@@ -494,15 +470,6 @@ func laneHolds(
 		if matchesLane(got, want, ordered) {
 			return nil
 		}
-		// A lane that matches once a submitted record is read as a start is
-		// not a timing problem, so it is named at once rather than waited out.
-		if matchesLane(asStarts(got), want, ordered) {
-			return blocked("the Go client writes a session start as the task " +
-				"state submitted, so the lane reads session.submitted where " +
-				"every other client reads session.started: Agdx.SessionStarted " +
-				"stamps TaskSubmitted, where the Rust reference stamps " +
-				"TaskState::Working. The lane otherwise matched exactly")
-		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("want the lane to show %v, it shows %v", want, got)
 		}
@@ -512,19 +479,6 @@ func laneHolds(
 		case <-time.After(150 * time.Millisecond):
 		}
 	}
-}
-
-// asStarts reads a submitted record as the start it was meant to be, which is
-// how the one divergence is told apart from any other difference.
-func asStarts(displays []string) []string {
-	read := make([]string, 0, len(displays))
-	for _, display := range displays {
-		if display == string(wire.DisplaySessionSubmitted) {
-			display = string(wire.DisplaySessionStarted)
-		}
-		read = append(read, display)
-	}
-	return read
 }
 
 func matchesLane(got, want []string, ordered bool) bool {
@@ -632,11 +586,16 @@ func recordMessage(ctx context.Context, state *world, arguments []string) error 
 	if err != nil {
 		return err
 	}
-	agdx, err := session.Agdx()
-	if err != nil {
-		return err
+	source, declared := session.Agent()
+	if !declared {
+		return fmt.Errorf("the session has no agent")
 	}
-	_, err = agdx.Emit([]byte(arguments[0])).Send(ctx)
+	record := wire.RecordID{ID: wire.IDFromBytes(laser.NewOperationID())}
+	operation := "note"
+	_, err = session.Append(ctx, wire.AgentEnvelope{
+		Kind: wire.KindEvent, Record: &record, Conversation: session.Conversation(),
+		Source: source, Operation: &operation, Body: []byte(arguments[0]),
+	})
 	return err
 }
 

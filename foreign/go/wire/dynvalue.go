@@ -19,6 +19,19 @@ type DynValue struct {
 // NewDynValue wraps an already-decoded value.
 func NewDynValue(item cborform.Value) DynValue { return DynValue{item: item} }
 
+// DynValueOf turns a Go value into a document, as Marshal encodes it.
+func DynValueOf(value any) (DynValue, error) {
+	encoded, err := Marshal(value)
+	if err != nil {
+		return DynValue{}, err
+	}
+	var document DynValue
+	if err := Unmarshal(encoded, &document); err != nil {
+		return DynValue{}, err
+	}
+	return document, nil
+}
+
 // IsZero reports an absent document.
 func (value DynValue) IsZero() bool { return value.item == nil }
 

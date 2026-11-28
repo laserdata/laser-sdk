@@ -3,8 +3,12 @@ package laser
 import (
 	"context"
 	"errors"
+	"math"
 	"sync"
 )
+
+// maxLaneQueue caps one lane's own queue, whatever the shared record bound allows.
+const maxLaneQueue = 1 << 16
 
 // ConcurrencyPolicy is how AgentRuntime.Run schedules message handling across
 // the partitions this agent is assigned.
@@ -46,33 +50,89 @@ func (policy ConcurrencyPolicy) isSerialPerPartition() bool { return policy.perP
 // a commit failure: that is a stop, not a failure to report.
 var errCleanStop = errors.New("agent runtime: clean stop")
 
+// DefaultMaxQueuedRecords bounds the records held across partition lanes.
+const DefaultMaxQueuedRecords = 4096
+
+// DefaultMaxQueuedBytes bounds the payload and header bytes held across partition lanes.
+const DefaultMaxQueuedBytes = 64 * 1024 * 1024
+
+// laneLimits bounds what the per-partition scheduler holds between the poll and the handlers.
+type laneLimits struct {
+	records int
+	bytes   int
+}
+
+func laneLimitsOf(records, bytes int) laneLimits {
+	if records <= 0 {
+		records = DefaultMaxQueuedRecords
+	}
+	if bytes <= 0 {
+		bytes = DefaultMaxQueuedBytes
+	}
+	return laneLimits{records: min(records, math.MaxUint32), bytes: min(bytes, math.MaxUint32)}
+}
+
+// laneBudget is a counting bound shared by every lane: acquire waits for room, release returns it.
+type laneBudget struct {
+	mutex     sync.Mutex
+	available int
+	changed   chan struct{}
+}
+
+func newLaneBudget(capacity int) *laneBudget {
+	return &laneBudget{available: capacity, changed: make(chan struct{}, 1)}
+}
+
+func (budget *laneBudget) tryAcquire(amount int) bool {
+	budget.mutex.Lock()
+	defer budget.mutex.Unlock()
+	if budget.available < amount {
+		return false
+	}
+	budget.available -= amount
+	return true
+}
+
+func (budget *laneBudget) release(amount int) {
+	budget.mutex.Lock()
+	budget.available += amount
+	budget.mutex.Unlock()
+	signal(budget.changed)
+}
+
 // partitionLane is one partition's serial queue of records.
 //
-// busy is read by the routing loop and written by the commit loop, the two
-// goroutines that both need to know it, so it carries its own lock; nothing
-// else on a lane is touched by more than one goroutine; the routing loop owns
-// the lanes map and queue/exited lifecycle, the lane's own goroutine owns
+// held is read by the routing loop and written by the commit loop, the two
+// goroutines that both need to know it, so it carries its own lock. Nothing
+// else on a lane is touched by more than one goroutine. The routing loop owns
+// the lanes map and queue and exited lifecycle, the lane's own goroutine owns
 // reading queue and calling deliver, and the commit loop owns calling Commit
 // and reporting fatal failures.
 type partitionLane struct {
 	partition uint32
-	queue     chan *Record
+	queue     chan queuedRecord
 	exited    chan struct{}
 
 	mutex sync.Mutex
-	busy  bool
+	held  int
 }
 
-func (lane *partitionLane) setBusy(busy bool) {
+// queuedRecord is a record waiting in a lane with the bytes it holds of the byte bound.
+type queuedRecord struct {
+	record *Record
+	bytes  int
+}
+
+func (lane *partitionLane) hold(records int) {
 	lane.mutex.Lock()
-	lane.busy = busy
+	lane.held += records
 	lane.mutex.Unlock()
 }
 
 func (lane *partitionLane) isBusy() bool {
 	lane.mutex.Lock()
 	defer lane.mutex.Unlock()
-	return lane.busy
+	return lane.held > 0
 }
 
 // laneCompletion is what a lane reports once it has handled one record: the
@@ -106,7 +166,7 @@ func signal(ch chan struct{}) {
 // is what keeps a quiet topic from holding a finished lane's commit hostage
 // to the next poll wait.
 func (runtime *AgentRuntime) runPerPartition(
-	ctx context.Context, source RecordSource, handler AgentHandler, maxPartitions int,
+	ctx context.Context, source RecordSource, handler AgentHandler, maxPartitions int, limits laneLimits,
 ) error {
 	if source == nil {
 		return &InvalidError{Reason: "an agent runtime reads from a source, so it needs one"}
@@ -116,9 +176,10 @@ func (runtime *AgentRuntime) runPerPartition(
 	}
 	work, release := runtime.workContext(ctx)
 	defer release()
-	runtime.resolveSource(ctx)
 
 	lanes := map[uint32]*partitionLane{}
+	recordBudget := newLaneBudget(limits.records)
+	byteBudget := newLaneBudget(limits.bytes)
 	// Buffered to the lane cap: a lane holds at most one outstanding
 	// completion (it does not pull its next queued record until the last
 	// one's completion is sent), so this can never fill up and block a lane
@@ -148,16 +209,40 @@ func (runtime *AgentRuntime) runPerPartition(
 	}()
 
 	openLane := func(partition uint32) *partitionLane {
-		lane := &partitionLane{partition: partition, queue: make(chan *Record, 1), exited: make(chan struct{})}
+		lane := &partitionLane{
+			partition: partition, queue: make(chan queuedRecord, min(limits.records, maxLaneQueue)),
+			exited: make(chan struct{}),
+		}
 		lanes[partition] = lane
 		go func() {
 			defer close(lane.exited)
-			for record := range lane.queue {
-				err := runtime.deliver(work, record, handler)
-				completions <- laneCompletion{lane: lane, record: record, err: err}
+			for queued := range lane.queue {
+				// Past the shutdown grace a queued record stays unhandled and uncommitted, so it is read again.
+				if work.Err() != nil {
+					continue
+				}
+				err := runtime.deliver(work, queued.record, handler)
+				recordBudget.release(1)
+				byteBudget.release(queued.bytes)
+				completions <- laneCompletion{lane: lane, record: queued.record, err: err}
 			}
 		}()
 		return lane
+	}
+
+	// reserve waits for room under the record and byte bounds, so a slow lane
+	// stops the poll once the bounds fill and never before.
+	reserve := func(budget *laneBudget, amount int) error {
+		for !budget.tryAcquire(amount) {
+			select {
+			case err := <-fatal:
+				return err
+			case <-budget.changed:
+			case <-ctx.Done():
+				return errCleanStop
+			}
+		}
+		return nil
 	}
 
 	// route finds or opens the lane for record, waiting out the cap on the
@@ -265,8 +350,25 @@ func (runtime *AgentRuntime) runPerPartition(
 				}
 				return err
 			}
-			lane.setBusy(true)
-			lane.queue <- outcome.record
+			held := min(max(len(outcome.record.Message.Payload)+len(outcome.record.Message.UserHeaders), 1), limits.bytes)
+			err = reserve(recordBudget, 1)
+			if err == nil {
+				err = reserve(byteBudget, held)
+			}
+			if err != nil {
+				if errors.Is(err, errCleanStop) {
+					return nil
+				}
+				return err
+			}
+			lane.hold(1)
+			select {
+			case lane.queue <- queuedRecord{record: outcome.record, bytes: held}:
+			case err := <-fatal:
+				return err
+			case <-ctx.Done():
+				return nil
+			}
 			askNext <- struct{}{}
 		}
 	}
@@ -275,7 +377,7 @@ func (runtime *AgentRuntime) runPerPartition(
 // commitLoop is the sole owner of source.Commit and of clearing a lane's busy
 // flag once its record is settled, so per-partition commit order holds
 // without the routing loop ever touching either. A handling failure or an
-// unrecoverable commit failure is reported on fatal (at most once; the
+// unrecoverable commit failure is reported on fatal (at most once, since the
 // routing loop is the only reader and only needs the first) and ends this
 // loop's own processing, but it keeps draining completions already queued
 // once stopCommit closes, so a lane that finished before the fatal reason
@@ -295,7 +397,7 @@ func (runtime *AgentRuntime) commitLoop(
 	}
 	settle := func(completion laneCompletion) {
 		defer func() {
-			completion.lane.setBusy(false)
+			completion.lane.hold(-1)
 			signal(freed)
 		}()
 		if completion.err != nil {

@@ -5,7 +5,7 @@ description: The provenance runtime - `sdk/src/provenance/` and `sdk/src/types/i
 
 # Provenance - the wire contract
 
-The TypeScript peer lives under `foreign/typescript/src/provenance` and uses the shared dictionary from `src/wire/headers.ts`.
+The TypeScript peer lives under `foreign/typescript/src/provenance` and uses the shared dictionary from `src/wire/headers.ts`. The Go peer is `foreign/go/laser/provenance.go` over `foreign/go/wire/headers.go`.
 
 `provenance/` defines recorded metadata. Header renaming or encoding changes affect records already stored on the log. Coordinate intentional changes across every client and consumer.
 

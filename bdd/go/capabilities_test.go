@@ -194,8 +194,7 @@ func callManaged(ctx context.Context, state *world, surface string) error {
 		_, state.failure = client.Kv("locks").
 			Lease(ctx, []byte("a-key"), "holder", time.Minute)
 	case "batch":
-		return blocked("the Go client has no managed batch surface: " +
-			"Topic.Batch is a plain multi-record publish, not the batch command")
+		_, state.failure = client.ExecuteBatch(ctx, []wire.BatchItem{{Code: wire.AgdxKvGetCode}})
 	default:
 		return fmt.Errorf("this runner does not reach the %q surface", surface)
 	}
@@ -209,12 +208,7 @@ func unifiedCode(state *world) error {
 	}
 	var carrier coded
 	if !errors.As(state.failure, &carrier) {
-		// UnsupportedError, CommandFailure, EdgeDenial, FilterError,
-		// SessionError and StaleLaneError all answer a code. A refusal that
-		// answers none is a gap in whichever error type this surface
-		// raised, named here rather than passed over.
-		return blocked(fmt.Sprintf("this refusal projects no unified result "+
-			"code: %T has no ResultCode method", state.failure))
+		return fmt.Errorf("expected a unified result code, got %T", state.failure)
 	}
 	if got := carrier.ResultCode(); got != wire.ResultUnsupported {
 		return fmt.Errorf("want the unsupported code, got %v", got)

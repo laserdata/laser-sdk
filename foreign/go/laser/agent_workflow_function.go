@@ -454,13 +454,12 @@ func (run *WorkflowRun) BeginStep(label string, input []byte) (StepCallResult, e
 	return run.state.beginCallLocked(label, digest), nil
 }
 
-// Checkpoint is the check between steps: a breached workflow budget fails
-// with a BudgetExceededError. Unlike the declared-steps engine's own
-// per-step boundary check, this (like Rust's) tracks no token spend of its
-// own; a session cancel/over-budget check is not ported here either, the
-// same documented gap the declared-steps engine's own boundary check
-// carries (see Workflow.execute).
+// Checkpoint is the check between steps: a cancel request fails with a
+// CancelledError and a breached budget with a BudgetExceededError.
 func (run *WorkflowRun) Checkpoint(ctx context.Context) error {
+	if err := run.workflow.boundary(ctx, run.session, run.runID, run.started); err != nil {
+		return err
+	}
 	run.state.mutex.Lock()
 	run.state.invocations++
 	invocations := run.state.invocations

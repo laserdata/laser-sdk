@@ -269,22 +269,32 @@ func misplacedControl(ctx context.Context, state *world, arguments []string) err
 	return nil
 }
 
-func checkNoPendingControl(state *world, arguments []string) error {
+func checkNoPendingControl(ctx context.Context, state *world, arguments []string) error {
 	if len(arguments) != 1 {
 		return fmt.Errorf("want an agent, got %v", arguments)
 	}
-	bookAny, found := state.get("control:" + arguments[0])
-	book, ok := bookAny.(*laser.ControlBook)
-	if !found || !ok {
-		return fmt.Errorf("no agent %q running to check control against", arguments[0])
+	agent, err := wire.NewAgentID(arguments[0])
+	if err != nil {
+		return err
 	}
 	session, err := sessionOf(state)
 	if err != nil {
 		return err
 	}
-	pending, _ := book.Pending(session.Conversation())
+	lens := state.client.SessionsWith(session.Config()).Open(session.Conversation(), "").As(agent)
+	pending, err := lens.PendingControl(ctx)
+	if err != nil {
+		return err
+	}
 	if pending.PauseRequested || pending.CancelRequested {
 		return fmt.Errorf("want no pending control, a misplaced write applied: %+v", pending)
+	}
+	canceled, err := lens.CancelRequested(ctx)
+	if err != nil {
+		return err
+	}
+	if canceled {
+		return fmt.Errorf("want no cancel requested, a misplaced write applied")
 	}
 	return nil
 }

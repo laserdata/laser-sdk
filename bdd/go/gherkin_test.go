@@ -1,8 +1,12 @@
 package bdd_test
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -258,6 +262,53 @@ func TestGivenTheSharedScenariosWhenParsedThenShouldAllRead(t *testing.T) {
 	t.Logf("read %d shared feature files", read)
 }
 
+// Each shared feature must have a Go runner, including newly added files.
+func TestGivenTheSharedFeaturesWhenRunnersAreListedThenEachShouldHaveOneRunner(t *testing.T) {
+	files, err := filepath.Glob("*_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runners := map[string]int{}
+	for _, path := range files {
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok || len(call.Args) < 2 {
+				return true
+			}
+			name, ok := call.Fun.(*ast.Ident)
+			if !ok || (name.Name != "runFeature" && name.Name != "runLocalFeature") {
+				return true
+			}
+			if literal, ok := call.Args[1].(*ast.BasicLit); ok && literal.Kind == token.STRING {
+				path, err := strconv.Unquote(literal.Value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				runners[path]++
+			}
+			return true
+		})
+	}
+	features, err := filepath.Glob(filepath.Join(scenarios, "*.feature"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range features {
+		name := filepath.Base(path)
+		if runners[name] != 1 {
+			t.Errorf("%s has %d Go runners", name, runners[name])
+		}
+		delete(runners, name)
+	}
+	for name := range runners {
+		t.Errorf("Go runner refers to missing feature %s", name)
+	}
+}
+
 // An outline in the shared set must come back as its rows. Reading the file
 // without failing proves nothing on its own, because a parser that dropped
 // every outline would read it just as quietly.
@@ -282,5 +333,27 @@ func TestGivenTheSharedOutlinesWhenParsedThenShouldComeBackAsRows(t *testing.T) 
 				t.Errorf("%s: a placeholder survived into %q", scenario.Name, step.Text)
 			}
 		}
+	}
+}
+
+func TestGivenTaggedExamplesWhenColumnsMoveThenShouldBindEachBlock(t *testing.T) {
+	feature, err := bdd.ParseFeature(write(t, `
+Feature: Inputs
+  Scenario Outline: Use both
+    Then <a> <b>
+    Examples:
+      | a | b |
+      | x | y |
+    @managed
+    Examples:
+      | b | a |
+      | p | q |
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, second := feature.Scenarios[0], feature.Scenarios[1]
+	if first.Steps[0].Text != "x y" || first.HasTag("@managed") || second.Steps[0].Text != "q p" || !second.HasTag("@managed") {
+		t.Fatalf("incorrect expansion: %+v", feature.Scenarios)
 	}
 }

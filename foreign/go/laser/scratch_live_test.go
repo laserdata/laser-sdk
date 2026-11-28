@@ -118,13 +118,13 @@ func TestGivenTwoScratchStreamsWhenCreatedThenShouldNotCollide(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create the first scratch stream: %v", err)
 	}
-	defer closeScratch(t, first)
+	t.Cleanup(func() { closeScratch(t, first) })
 
 	second, err := client.ScratchStream(ctx, prefix)
 	if err != nil {
 		t.Fatalf("create the second scratch stream: %v", err)
 	}
-	defer closeScratch(t, second)
+	t.Cleanup(func() { closeScratch(t, second) })
 
 	if first.Name() == second.Name() {
 		t.Fatalf("two scratch streams took the same name %q, so one run would "+

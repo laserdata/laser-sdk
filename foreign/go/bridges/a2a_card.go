@@ -1,6 +1,11 @@
 package bridges
 
-import "github.com/laserdata/laser-sdk/foreign/go/wire"
+import (
+	"encoding/json"
+
+	"github.com/laserdata/laser-sdk/foreign/go/laser"
+	"github.com/laserdata/laser-sdk/foreign/go/wire"
+)
 
 // A2AProtocolVersion is the A2A protocol version this bridge's card declares.
 const A2AProtocolVersion = "1.0"
@@ -39,11 +44,24 @@ type AgentInterface struct {
 // AgentCardSignature is one RFC 7515 JWS over the card, detached: the payload
 // is the canonicalized card without its signatures, which the verifier
 // rebuilds.
-type AgentCardSignature struct {
-	// Protected is the base64url-encoded protected JWS header, carrying alg.
-	Protected string `json:"protected"`
-	// Signature is the base64url-encoded signature.
-	Signature string `json:"signature"`
+type AgentCardSignature = laser.AgentCardSignature
+
+// SignedCard returns the discovery card with a detached Ed25519 signature.
+func (bridge *A2ABridge) SignedCard(key *laser.SigningKey) (*AgentCard, error) {
+	card, err := bridge.Card()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(card)
+	if err != nil {
+		return nil, err
+	}
+	signature, err := laser.SignCardValue(key, raw)
+	if err != nil {
+		return nil, err
+	}
+	card.Signatures = []AgentCardSignature{*signature}
+	return card, nil
 }
 
 // AgentCardCapabilities are the A2A capability flags of a card.

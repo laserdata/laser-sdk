@@ -3,7 +3,9 @@ package laser_test
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -32,6 +34,38 @@ func TestGivenAHandleWhenTheLoopStartsThenShouldReportReady(t *testing.T) {
 	}
 }
 
+func TestGivenAnIdleSourceWhenAwaitingReadyThenShouldWaitForStartup(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		server := &blockedStartupServer{runtimeServer: newRuntimeServer(), resume: make(chan struct{})}
+		runtime := runtimeFor(t, server, "worker", laser.RuntimeOptions{})
+		source := sourceOf()
+		handle := laser.StartAgentHandleForTest(agentID(t, "worker"), runtime, source, &handling{})
+		defer func() { _ = handle.Shutdown(context.Background()) }()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		ready := make(chan error, 1)
+		go func() { ready <- handle.Ready(ctx) }()
+
+		synctest.Wait()
+		select {
+		case err := <-ready:
+			t.Fatalf("Ready returned during source lookup: %v", err)
+		default:
+		}
+
+		close(server.resume)
+		if err := <-ready; err != nil {
+			t.Fatalf("Ready on an idle source after startup: %v", err)
+		}
+		synctest.Wait()
+		select {
+		case <-source.drained:
+		default:
+			t.Fatal("the ready agent never polled its source")
+		}
+	})
+}
+
 func TestGivenARunningAgentWhenShutdownThenShouldStopAndJoinCleanly(t *testing.T) {
 	runtime := lifecycleRuntime(t)
 	source := sourceOf()
@@ -47,6 +81,45 @@ func TestGivenARunningAgentWhenShutdownThenShouldStopAndJoinCleanly(t *testing.T
 	}
 }
 
+func TestGivenARunningAgentWhenShutdownThenShouldCloseItsSourceBeforeReportingDone(t *testing.T) {
+	runtime := lifecycleRuntime(t)
+	source := &closingSource{queuedSource: sourceOf()}
+	handle := laser.StartAgentHandleForTest(agentID(t, "worker"), runtime, source, &handling{})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := handle.Ready(ctx); err != nil {
+		t.Fatalf("ready: %v", err)
+	}
+
+	if err := handle.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	if closed := source.closed.Load(); closed != 1 {
+		t.Errorf("want the source closed once so its group membership is left, got %d", closed)
+	}
+}
+
+func TestGivenARunningAgentWhenAbortedThenShouldCloseItsSource(t *testing.T) {
+	runtime := lifecycleRuntime(t)
+	source := &closingSource{queuedSource: sourceOf()}
+	handle := laser.StartAgentHandleForTest(agentID(t, "worker"), runtime, source, &handling{})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := handle.Ready(ctx); err != nil {
+		t.Fatalf("ready: %v", err)
+	}
+
+	handle.Abort()
+	if err := handle.Join(ctx); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+
+	if closed := source.closed.Load(); closed != 1 {
+		t.Errorf("want the source closed after an abort, got %d", closed)
+	}
+}
+
 func TestGivenAStoppedAgentWhenReadyIsCalledAgainThenShouldReportTheSameOutcome(t *testing.T) {
 	runtime := lifecycleRuntime(t)
 	source := sourceOf()
@@ -57,8 +130,7 @@ func TestGivenAStoppedAgentWhenReadyIsCalledAgainThenShouldReportTheSameOutcome(
 	if err := handle.Shutdown(ctx); err != nil {
 		t.Fatalf("shutdown: %v", err)
 	}
-	// Ready is idempotent: a caller that calls it after the agent already
-	// stopped sees the same outcome Join would, not a hang or a panic.
+	// A stop that was asked for is honoured only after readiness is reported.
 	if err := handle.Ready(ctx); err != nil {
 		t.Fatalf("want ready to report the clean stop, got %v", err)
 	}
@@ -101,10 +173,8 @@ func (source *failingSource) Commit(context.Context, iggcon.Checkpoint) error {
 	return nil
 }
 
-// A source whose very first read fails races Ready against the goroutine
-// actually reaching that read: Ready may see only that the loop started, not
-// that it then failed. Join has no such race, since it only ever reads the
-// run's final result.
+// An agent whose first read fails was polling, so Ready reports it ready and
+// Join reports the failure.
 //
 // The failure must be one RetryableError reports false for: a plain error
 // retries inside the consumer's own failure budget rather than ending the
@@ -121,10 +191,8 @@ func TestGivenASourceThatFailsAtOnceWhenJoinedThenShouldReportItsError(t *testin
 	if err := handle.Join(ctx); !errors.As(err, &invalid) {
 		t.Fatalf("want Join to report the run's own error, got %v", err)
 	}
-	// Ready is safe to call after the agent already stopped: it reports the
-	// same outcome rather than hanging on a loop that will never start.
-	if err := handle.Ready(ctx); !errors.As(err, &invalid) {
-		t.Fatalf("want Ready to report the same error once it is settled, got %v", err)
+	if err := handle.Ready(ctx); err != nil {
+		t.Fatalf("want an agent that reached its first read reported ready, got %v", err)
 	}
 }
 
@@ -175,16 +243,6 @@ func TestGivenNoHandlerWhenSpawnedThenShouldRefuseBeforeJoiningAnything(t *testi
 	}
 }
 
-func TestGivenNoTopicWhenSpawnedThenShouldRefuseBeforeJoiningAnything(t *testing.T) {
-	handle := laser.FromClient(newRuntimeServer(), laser.Options{DefaultStream: "agents"})
-	_, err := handle.SpawnAgent(
-		context.Background(), agentID(t, "worker"), laser.SpawnOptions{}, &handling{})
-	var invalid *laser.InvalidError
-	if !errors.As(err, &invalid) {
-		t.Fatalf("want an invalid refusal for no topic, got %v", err)
-	}
-}
-
 func TestGivenNoDefaultStreamWhenSpawnedThenShouldRefuseBeforeJoiningAnything(t *testing.T) {
 	handle := laser.FromClient(newRuntimeServer(), laser.Options{})
 	_, err := handle.SpawnAgent(context.Background(), agentID(t, "worker"), laser.SpawnOptions{
@@ -193,4 +251,29 @@ func TestGivenNoDefaultStreamWhenSpawnedThenShouldRefuseBeforeJoiningAnything(t 
 	if err == nil {
 		t.Fatal("want a refusal for no default stream and none named")
 	}
+}
+
+type blockedStartupServer struct {
+	*runtimeServer
+	resume chan struct{}
+}
+
+func (server *blockedStartupServer) GetStream(ctx context.Context, id iggcon.Identifier) (*iggcon.StreamDetails, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-server.resume:
+		return server.runtimeServer.GetStream(ctx, id)
+	}
+}
+
+// closingSource is a source that counts its closes.
+type closingSource struct {
+	*queuedSource
+	closed atomic.Int32
+}
+
+func (source *closingSource) Close(context.Context) error {
+	source.closed.Add(1)
+	return nil
 }

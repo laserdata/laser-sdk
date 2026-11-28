@@ -53,17 +53,7 @@ func forkHandle(server iggcon.Client, options laser.Options) *laser.Laser {
 
 func decodeForkRequest[T any](t *testing.T, server *forkServer, index int, target *T) {
 	t.Helper()
-	body := server.requests[index]
-	if wire.IsIdempotentManagedRequest(server.codes[index]) {
-		var envelope wire.ManagedRequestEnvelope
-		if err := wire.Unmarshal(body, &envelope); err != nil {
-			t.Fatalf("decode the managed envelope of request %d: %v", index, err)
-		}
-		body = envelope.Payload
-	}
-	if err := wire.Unmarshal(body, target); err != nil {
-		t.Fatalf("decode request %d: %v", index, err)
-	}
+	decodeManagedTestRequest(t, server.codes[index], server.requests[index], target)
 }
 
 // A fork is continuous unless the caller freezes it, because a branch that

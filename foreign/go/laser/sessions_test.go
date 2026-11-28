@@ -52,9 +52,7 @@ func sessionHandle(server iggcon.Client, options laser.Options) *laser.Laser {
 
 func decodeSessionRequest[T any](t *testing.T, server *sessionServer, index int, target *T) {
 	t.Helper()
-	if err := wire.Unmarshal(server.requests[index], target); err != nil {
-		t.Fatalf("decode request %d: %v", index, err)
-	}
+	decodeManagedTestRequest(t, server.codes[index], server.requests[index], target)
 }
 
 func conversation(marker byte) wire.ConversationID {

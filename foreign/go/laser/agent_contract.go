@@ -83,11 +83,7 @@ type Contract struct {
 // Unlike Requester, Send drives its own wait rather than requiring a caller
 // to already be reading the reply topic and feeding a ReplyHub: a contract is
 // meant to be usable standalone, by an orchestrator with no running consumer
-// of its own. It does not resolve a separate per-agent inbox topic the way
-// Rust's InboxRoute does: Go's agent registry carries no such address, so the
-// command is published and the reply awaited on the one topic named at
-// Laser.Contract, the same single-lane shape Requester and the MCP bridge's
-// tool-call wait already use.
+// of its own. By default it discovers the target's advertised inbox.
 type ContractBuilder struct {
 	laser        *Laser
 	router       Router
@@ -105,19 +101,18 @@ type ContractBuilder struct {
 	resumeFrom   []uint64
 	excluded     []wire.AgentID
 	verifier     *KeyRegistry
-	// inbox is where the command is addressed. Nil keeps the topic named at
-	// Laser.Contract, which is this client's own default rather than Rust's
-	// (Rust defaults to the advertised inbox); see InboxRoute for why.
+	// inbox is where the command is addressed. Nil is the advertised inbox.
 	inbox *InboxRoute
-	// replyTopic is where the answer is awaited. Empty keeps the command's
-	// own topic, which is where a target answering in place replies.
+	// replyTopic is where the answer is awaited. Empty keeps the topic named
+	// at Laser.Contract.
 	replyTopic string
 }
 
 // Contract opens a ContractBuilder addressed by router (one agent via To, or
-// one capability via ToCapable/Sticky/WithScorer), publishing the command and
-// awaiting its reply on topic. A broadcast or all-capable route is refused at
-// send time, since a contract is directed to exactly one target.
+// one capability via ToCapable/Sticky/WithScorer), awaiting its reply on
+// topic. The command goes to the target's advertised inbox unless InboxRoute
+// names another. A broadcast or all-capable route is refused at send time,
+// since a contract is directed to exactly one target.
 func (laser *Laser) Contract(router Router, topic string) *ContractBuilder {
 	return &ContractBuilder{
 		laser: laser, router: router, topic: topic,
@@ -127,12 +122,7 @@ func (laser *Laser) Contract(router Router, topic string) *ContractBuilder {
 
 // InboxRoute decides where the command is addressed.
 //
-// The default is a fixed route to the topic named at Laser.Contract, which
-// is what this client has always done. Rust defaults to AdvertisedInbox
-// instead; Go keeps the fixed default deliberately, because changing it
-// would re-address every existing caller's traffic and would fail outright
-// against a deployment that serves no presence, such as Apache Iggy. Pass
-// AdvertisedInbox() to opt in to per-agent addressing.
+// AdvertisedInbox is the default. Use FixedInbox when every agent shares a known topic.
 //
 // Under an advertised route a capability pick only considers agents that
 // advertise an inbox, so an unreachable agent never wins the pick and then
@@ -143,12 +133,8 @@ func (builder *ContractBuilder) InboxRoute(route InboxRoute) *ContractBuilder {
 	return &derived
 }
 
-// ReplyOn awaits the answer on topic instead of the topic the command was
-// sent on.
-//
-// The two are the same by default, since a target answering in place replies
-// where it was addressed. They differ when the command goes to an agent's
-// own inbox but the answer belongs somewhere the caller already watches.
+// ReplyOn awaits the answer on topic instead of the topic named at
+// Laser.Contract.
 func (builder *ContractBuilder) ReplyOn(topic string) *ContractBuilder {
 	derived := *builder
 	derived.replyTopic = topic
@@ -252,7 +238,7 @@ func (builder *ContractBuilder) IdempotencyKey(key wire.IdempotencyKey) *Contrac
 // ResumeFrom looks for a terminal already landed at or after positions (one
 // offset per reply-topic partition, as Laser.ReplyPositions reports) before
 // sending anything. A terminal found there settles the contract without a
-// new send; finding none still sends the command (idempotently, when
+// new send. Finding none still sends the command (idempotently, when
 // IdempotencyKey is also set) and waits fresh, since a resumed caller cannot
 // tell "never sent" from "sent, no reply yet" without trying again.
 func (builder *ContractBuilder) ResumeFrom(positions []uint64) *ContractBuilder {
@@ -348,18 +334,26 @@ func (builder *ContractBuilder) resolve(ctx context.Context) (wire.AgentID, stri
 			"one agent, not a broadcast or all-capable route"}
 	}
 	inbox := builder.inboxRoute()
+	registry := builder.registry
+	if registry == nil && (inbox.Kind == InboxAdvertised || builder.router.needsRegistry()) {
+		shared, err := builder.laser.agentRegistry(ctx)
+		if err != nil {
+			return wire.AgentID{}, "", err
+		}
+		registry = shared
+	}
 	// Both the advertised inbox and a principal-bound route read live
 	// presence, so fold it first. RefreshPresence reuses what it holds
 	// within PresenceTTL, so this is a page of the connection table
 	// occasionally rather than on every send.
-	if builder.registry != nil &&
+	if registry != nil &&
 		(inbox.Kind == InboxAdvertised || builder.router.RequiresPresence()) {
-		if _, err := builder.registry.RefreshPresence(ctx, builder.laser); err != nil {
+		if _, err := registry.RefreshPresence(ctx, builder.laser); err != nil {
 			return wire.AgentID{}, "", err
 		}
 	}
 	targets, err := builder.router.ResolveRoutable(
-		builder.registry, inbox, time.Now(), builder.excluded...)
+		registry, inbox, time.Now(), builder.excluded...)
 	if err != nil {
 		return wire.AgentID{}, "", err
 	}
@@ -368,8 +362,8 @@ func (builder *ContractBuilder) resolve(ctx context.Context) (wire.AgentID, stri
 	}
 	target := targets[0]
 	advertised := ""
-	if builder.registry != nil {
-		advertised = builder.registry.InboxFor(target)
+	if registry != nil {
+		advertised = registry.InboxFor(target)
 	}
 	topic, err := inbox.Resolve(target, advertised)
 	if err != nil {
@@ -378,34 +372,49 @@ func (builder *ContractBuilder) resolve(ctx context.Context) (wire.AgentID, stri
 	return target, topic, nil
 }
 
-// inboxRoute is the route this contract addresses its command by, defaulting
-// to the topic named at Laser.Contract.
+// inboxRoute is the route this contract uses to address its command.
 func (builder *ContractBuilder) inboxRoute() InboxRoute {
 	if builder.inbox != nil {
 		return *builder.inbox
 	}
-	return FixedInbox(builder.topic)
+	return AdvertisedInbox()
 }
 
-// replyOn is where the answer is awaited, the command's own topic unless the
-// caller named another.
-func (builder *ContractBuilder) replyOn(commandTopic string) string {
-	if builder.replyTopic != "" {
-		return builder.replyTopic
+// replyOn is where the answer is awaited: the topic ReplyOn named, else the
+// contract's own topic, and on the lane the requester's declared topic.
+func (builder *ContractBuilder) replyOn() string {
+	topic := builder.replyTopic
+	if topic == "" {
+		topic = builder.topic
 	}
-	return commandTopic
+	if topic == "" {
+		topic = wire.AgentSessions
+	}
+	return builder.laser.replyTopicFor(topic, builder.from)
+}
+
+// replyTopicFor is where a reply addressed to requester on topic lands: the
+// requester's declared topic for the lane under a per-agent topic layout, and
+// topic itself otherwise.
+func (laser *Laser) replyTopicFor(topic string, requester wire.AgentID) string {
+	if topic == wire.AgentSessions {
+		if declared := laser.DeclaredTopic(requester); declared != "" {
+			return declared
+		}
+	}
+	return topic
 }
 
 // sendAndAwait publishes the command and awaits its correlated terminal.
 //
 // When ResumeFrom named positions, a terminal already landed there settles
-// the contract without sending anything; only finding none there falls
+// the contract without sending anything. Only finding none there falls
 // through to an (idempotent, when IdempotencyKey is also set) send.
 func (builder *ContractBuilder) sendAndAwait(
 	ctx context.Context, conversation wire.ConversationID, target wire.AgentID,
 	commandTopic string,
 ) (*Contract, error) {
-	replyTopic := builder.replyOn(commandTopic)
+	replyTopic := builder.replyOn()
 	deadline := builder.deadline
 	if deadline <= 0 {
 		deadline = DefaultContractDeadline
@@ -644,7 +653,7 @@ func (laser *Laser) awaitContractReply(
 				if err != nil {
 					continue
 				}
-				// The correlation is the exchange's identity; Accepts alone
+				// The correlation is the exchange's identity. Accepts alone
 				// checks only the session, kind, cause and addressee, which a
 				// reply on an unrelated correlation of the same conversation
 				// can still satisfy.

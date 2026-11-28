@@ -20,6 +20,7 @@ concurrency:
 
 defaults:
   run:
+    shell: bash
     working-directory: foreign/go
 
 jobs:
@@ -65,7 +66,7 @@ jobs:
               git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
               meaningful_paths="$(
                 git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" |
-                  grep -E '^foreign/go/|^examples/go/|^bdd/go/|^wire/src/|^wire/fixtures/|^\.github/workflows/ci-go\.yml$|^scripts/check-parity\.py$|^scripts/run-with-test-iggy\.mjs$|^scripts/resolve-test-iggy-server\.sh$' || true
+                  grep -E '^foreign/go/|^examples/go/|^bdd/(go|scenarios)/|^wire/|^sdk/|^scripts/interop/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^justfile$|^README\.md$|^\.github/workflows/ci-go\.yml$|^scripts/check-parity\.py$|^scripts/run-with-test-iggy\.mjs$|^scripts/resolve-test-iggy-server\.sh$|^scripts/run-(bdd-tests|managed-bdd)\.sh$|^scripts/run-with-recovering-catalog\.py$|^foreign/python/iggy_test_server\.py$|^scripts/ci/apt-install\.sh$|^scripts/ci/go-managed\.compose\.yaml$|^scripts/ci/go-bdd-coverage\.py$' || true
               )"
               if [[ -z "${meaningful_paths}" ]]; then
                 run_ci=skip
@@ -85,8 +86,29 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
-          go-version-file: foreign/go/go.mod
+          go-version: stable
           cache-dependency-path: foreign/go/go.sum
+      - name: Verify the module release version
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import pathlib
+          import re
+          import tomllib
+
+          version = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
+          source = pathlib.Path("foreign/go/laser/version.go").read_text()
+          if not re.search(rf'^const ClientVersion = "{re.escape(version)}"$', source, re.MULTILINE):
+              raise SystemExit("Go ClientVersion must equal the workspace version " + version)
+          if os.environ["GITHUB_REF_TYPE"] == "tag" and os.environ["GITHUB_REF_NAME"] != "go-v" + version:
+              raise SystemExit("Go release tag must be go-v" + version)
+          PYTHON
+      - name: Parity matrix
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 -m unittest scripts/test_check_parity.py
+          python3 scripts/check-parity.py
       - name: Formatting
         run: |
           unformatted="$(gofmt -l .)"
@@ -129,8 +151,34 @@ jobs:
             )
           done
 
-  # The minimum the module declares, and the current release. A client is
-  # consumed by applications on both.
+      - name: Build the README program as an external module consumer
+        working-directory: ${{ github.workspace }}
+        run: |
+          module=github.com/laserdata/laser-sdk/foreign/go
+          version="v$(sed -n 's/^const ClientVersion = "\(.*\)"$/\1/p' foreign/go/laser/version.go)"
+          proxy="$RUNNER_TEMP/laser-proxy"
+          package_dir="$proxy/$module/@v"
+          consumer="$RUNNER_TEMP/laser-consumer"
+          mkdir -p "$package_dir" "$consumer"
+          git archive --format=zip --prefix="$module@$version/" -o "$package_dir/$version.zip" HEAD:foreign/go
+          cp foreign/go/go.mod "$package_dir/$version.mod"
+          jq -n --arg version "$version" --arg time "$(git show -s --format=%cI HEAD)" \
+            '{Version: $version, Time: $time}' > "$package_dir/$version.info"
+          awk '/^```go$/ {copy=1; next} /^```$/ {copy=0} copy' README.md > "$consumer/main.go"
+          cd "$consumer"
+          go mod init example.org/consumer
+          module_cache="$(go env GOMODCACHE)"
+          upstream_proxy="$(go env GOPROXY)"
+          # Go keys compiled packages of a module by its version, so a restored
+          # build cache would serve an older build of this same version.
+          export GOMODCACHE="$RUNNER_TEMP/laser-consumer-modules" GONOSUMDB="$module"
+          export GOCACHE="$RUNNER_TEMP/laser-consumer-build"
+          export GOPROXY="file://$proxy,file://$module_cache/cache/download,$upstream_proxy"
+          go get "$module@$version"
+          go build -mod=mod .
+
+  # The minimum the module declares, the previous stable release and the
+  # current one. A client is consumed by applications on all three.
   unit:
     name: unit-go-${{ matrix.go }}
     needs: quality
@@ -138,8 +186,9 @@ jobs:
       fail-fast: false
       matrix:
         go:
-          - "1.25"
-          - "1.26"
+          - "1.25.0"
+          - oldstable
+          - stable
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -147,7 +196,12 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           cache-dependency-path: foreign/go/go.sum
-      - run: go test ./... -count=1
+      - name: Test all modules at this Go version
+        working-directory: ${{ github.workspace }}
+        run: |
+          for module in foreign/go examples/go bdd/go; do
+            (cd "$module" && go test ./... -count=1)
+          done
 
   # The contract is pinned by shared corpora that several goroutines may
   # evaluate at once, so the suite runs under the race detector too.
@@ -159,9 +213,47 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
-          go-version-file: foreign/go/go.mod
+          go-version: stable
           cache-dependency-path: foreign/go/go.sum
       - run: go test ./... -race -count=1
+      - run: go test ./internal/cborform -run=^$ -fuzz=^FuzzDecode$ -fuzztime=15s
+
+  wire-differential:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: foreign/go/go.sum
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Compare Go wire vectors with Rust
+        env:
+          LASER_GO_VECTORS: ${{ runner.temp }}/go-vectors
+        run: |
+          mkdir -p "$LASER_GO_VECTORS"
+          go test ./wire -run Export -count=1
+          cargo test --locked -p laser-wire --features cbor --test go_differential
+
+  vulnerabilities:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: foreign/go/go.sum
+      - name: Check reachable vulnerabilities across modules
+        working-directory: ${{ github.workspace }}
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
+          for module in foreign/go examples/go bdd/go; do
+            (cd "$module" && govulncheck -test ./...)
+          done
 
   # Cross-SDK BDD conformance: the Go runner executes the shared Gherkin
   # scenarios against the pinned Iggy release, through the same helper the
@@ -185,22 +277,154 @@ jobs:
     needs: [flags, quality]
     if: needs.flags.outputs.run_ci == 'run' && needs.flags.outputs.server_tests == 'run'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
-          go-version-file: foreign/go/go.mod
+          go-version: stable
           cache-dependency-path: bdd/go/go.sum
       - uses: actions/setup-node@v7
         with:
           node-version: "22.14.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: scripts/interop
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install Iggy runtime dependencies
         working-directory: ${{ github.workspace }}
         run: scripts/ci/apt-install.sh libhwloc15
       - name: BDD scenarios (Go runner)
         working-directory: bdd/go
         run: node ../../scripts/run-with-test-iggy.mjs go test ./... -count=1
+      - name: Read from a recovering catalog
+        working-directory: bdd/go
+        run: |
+          python3 ../../scripts/run-with-recovering-catalog.py go test ./... -count=1 -json |
+            python3 ../../scripts/ci/go-bdd-coverage.py record "$RUNNER_TEMP/recovering.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: go-bdd-recovering
+          path: ${{ runner.temp }}/recovering.json
+      - name: Live streaming and Rust interoperability
+        run: node ../../scripts/run-with-test-iggy.mjs go test -tags integration ./laser -count=1 -timeout=20m
+
+  managed:
+    name: managed Go scenarios
+    needs: [flags, quality]
+    if: needs.flags.outputs.server_tests == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      COMPOSE_PROJECT_NAME: laser-go-ci
+      LASER_BIND_ADDRESS: 127.0.0.1
+      LASER_IGGY_PORT: "8090"
+      LASER_IGGY_USERNAME: iggy
+      LASER_IGGY_PASSWORD: iggy
+      LASER_PLANE_INTERNAL_API_TOKEN: local-go-ci
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: laserdata/laser-stack
+          path: .laser-stack
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: bdd/go/go.sum
+      # The managed backend refuses a volume whose filesystem disables write
+      # barriers, and the hosted runner disk under Docker's data root is
+      # mounted `nobarrier`.
+      - name: Enable write barriers for Docker volumes
+        working-directory: ${{ github.workspace }}
+        run: |
+          docker_root="$(docker info --format '{{.DockerRootDir}}')"
+          mount_point="$(findmnt --noheadings --output TARGET --target "${docker_root}")"
+          sudo mount -o remount,barrier "${mount_point}"
+          options="$(findmnt --noheadings --output OPTIONS --target "${docker_root}")"
+          echo "${mount_point}: ${options}"
+          if [[ ",${options}," == *,nobarrier,* || ",${options}," == *,barrier=0,* ]]; then
+            echo "write barriers are still disabled on ${mount_point}" >&2
+            exit 1
+          fi
+      - name: Start Laser Stack
+        id: stack
+        working-directory: .laser-stack
+        run: |
+          cp ../scripts/ci/go-managed.compose.yaml compose.override.yaml
+          ./scripts/up
+      - name: Verify the stack runs the pinned server
+        working-directory: ${{ github.workspace }}
+        run: |
+          pinned="$(scripts/resolve-test-iggy-server.sh --version)"
+          container="$(docker compose --project-directory .laser-stack ps -q iggy)"
+          image="$(docker inspect --format '{{.Image}}' "${container}")"
+          running="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "${image}")"
+          if [[ "${running}" != "${pinned}" ]]; then
+            echo "Laser Stack runs Iggy ${running}, the test pin is ${pinned}" >&2
+            exit 1
+          fi
+      - name: Run managed conformance
+        working-directory: bdd/go
+        env:
+          LASER_BDD_ADDR: 127.0.0.1:8090
+          LASER_BDD_MANAGED: "1"
+          LASER_BDD_SQL_BACKEND: postgres
+        run: |
+          go test ./... -count=1 -timeout=25m -json |
+            python3 ../../scripts/ci/go-bdd-coverage.py record "$RUNNER_TEMP/managed.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: go-bdd-managed
+          path: ${{ runner.temp }}/managed.json
+      - name: Stop Laser Stack
+        if: always() && steps.stack.outcome == 'success'
+        working-directory: .laser-stack
+        run: ./scripts/down
+
+  upstream:
+    name: upstream Apache Iggy
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      iggy:
+        image: apache/iggy:0.10.0
+        ports:
+          - 8090:8090
+        env:
+          IGGY_ROOT_USERNAME: iggy
+          IGGY_ROOT_PASSWORD: iggy
+          IGGY_TCP_ADDRESS: 0.0.0.0:8090
+          IGGY_NODE_ADVERTISED_ADDRESS: 127.0.0.1
+          IGGY_SHARDING_CPU_ALLOCATION: "2"
+          IGGY_SHARDING_PIN_CORES: "false"
+          IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: 200 ms
+          IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT: 1s
+        options: >-
+          --security-opt seccomp=unconfined
+          --health-cmd "bash -c '</dev/tcp/127.0.0.1/8090'"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: bdd/go/go.sum
+      - name: BDD against the original server
+        working-directory: bdd/go
+        env:
+          LASER_BDD_ADDR: 127.0.0.1:8090
+        run: |
+          go test ./... -count=1 -json |
+            python3 ../../scripts/ci/go-bdd-coverage.py record "$RUNNER_TEMP/upstream.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: go-bdd-upstream
+          path: ${{ runner.temp }}/upstream.json
 
   ci-go-complete:
     name: ci-go-complete
@@ -211,9 +435,50 @@ jobs:
       - unit
       - race
       - bdd-go
+      - wire-differential
+      - vulnerabilities
+      - upstream
+      - managed
     runs-on: ubuntu-latest
     steps:
       - name: Verify every job succeeded
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: exit 1
         working-directory: ${{ github.workspace }}
+      - uses: actions/checkout@v7
+        if: needs.flags.outputs.run_ci == 'run' && needs.flags.outputs.server_tests == 'run'
+      - uses: actions/download-artifact@v8
+        if: needs.flags.outputs.run_ci == 'run' && needs.flags.outputs.server_tests == 'run'
+        with:
+          pattern: go-bdd-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/go-bdd
+      - name: Require a passing deployment for every shared scenario
+        if: needs.flags.outputs.run_ci == 'run' && needs.flags.outputs.server_tests == 'run'
+        working-directory: ${{ github.workspace }}
+        run: python3 scripts/ci/go-bdd-coverage.py check "$RUNNER_TEMP"/go-bdd/{upstream,managed,recovering}.json
+
+  publish:
+    name: publish Go module tag
+    needs: [quality, unit, race, wire-differential, vulnerabilities, bdd-go, upstream, managed, ci-go-complete]
+    if: startsWith(github.ref, 'refs/tags/go-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Publish the version Go resolves for the submodule
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          module_tag="foreign/go/${GITHUB_REF_NAME#go-}"
+          revision="$(git rev-parse HEAD)"
+          if ! gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${module_tag}" -f "sha=${revision}"; then
+            existing="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${module_tag}" --jq .sha)"
+            if [[ "${existing}" != "${revision}" ]]; then
+              echo "${module_tag} already points to a different revision" >&2
+              exit 1
+            fi
+          fi

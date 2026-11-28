@@ -22,9 +22,8 @@ const (
 // ciphertext. Every Laser client and Apache Iggy's own encryptor read each
 // other's records.
 type Encryption struct {
-	// Holding the sealed AEAD rather than the key means the key is never a
-	// field anything can reach or print.
-	aead cipher.AEAD
+	// aead hands out the cipher from a closure, so no fmt verb reaches its round keys.
+	aead func() cipher.AEAD
 }
 
 // AES256GCM builds an encryption from a 32-byte key. Any other key length is
@@ -44,7 +43,7 @@ func AES256GCM(key []byte) (*Encryption, error) {
 	if err != nil {
 		return nil, &InvalidError{Reason: "an AES-256-GCM key: " + err.Error()}
 	}
-	return &Encryption{aead: aead}, nil
+	return &Encryption{aead: func() cipher.AEAD { return aead }}, nil
 }
 
 // Encrypt seals plaintext under a fresh nonce.
@@ -58,7 +57,7 @@ func (encryption *Encryption) Encrypt(plaintext []byte) ([]byte, error) {
 	}
 	// Seal appends the tag to the ciphertext, which is the layout the other
 	// clients write, so the nonce prefix is all this has to add.
-	return encryption.aead.Seal(nonce, nonce, plaintext, nil), nil
+	return encryption.aead().Seal(nonce, nonce, plaintext, nil), nil
 }
 
 // Decrypt opens what Encrypt sealed. A ciphertext that is short, altered, or
@@ -68,7 +67,7 @@ func (encryption *Encryption) Decrypt(ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) < gcmNonceBytes+gcmTagBytes {
 		return nil, cannotDecrypt()
 	}
-	plaintext, err := encryption.aead.Open(
+	plaintext, err := encryption.aead().Open(
 		nil, ciphertext[:gcmNonceBytes], ciphertext[gcmNonceBytes:], nil)
 	if err != nil {
 		// The underlying failure is deliberately dropped: it distinguishes a
