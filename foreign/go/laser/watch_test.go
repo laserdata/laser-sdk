@@ -26,6 +26,7 @@ type feedServer struct {
 	missing bool
 	polls   int
 	topics  []string
+	streams []string
 }
 
 func newFeed(partitions uint32) *feedServer {
@@ -56,7 +57,7 @@ func (server *feedServer) append(partition uint32, payload []byte) {
 	server.records[partition] = append(server.records[partition], message)
 }
 
-// restamp replaces the broker timestamps of a partition's records, so a test
+// restamp replaces the server timestamps of a partition's records, so a test
 // can model a clock that did not advance monotonically.
 func (server *feedServer) restamp(partition uint32, timestamps []uint64) {
 	server.guard.Lock()
@@ -83,7 +84,7 @@ func (server *feedServer) expireBelow(partition uint32, offset uint64) {
 }
 
 func (server *feedServer) GetTopic(
-	ctx context.Context, _ iggcon.Identifier, topic iggcon.Identifier,
+	ctx context.Context, stream iggcon.Identifier, topic iggcon.Identifier,
 ) (*iggcon.TopicDetails, error) {
 	// A real client stops on a cancelled caller, so the fake does too.
 	if err := ctx.Err(); err != nil {
@@ -93,16 +94,24 @@ func (server *feedServer) GetTopic(
 	if err != nil {
 		return nil, err
 	}
+	on, err := stream.String()
+	if err != nil {
+		return nil, err
+	}
 	server.guard.Lock()
 	defer server.guard.Unlock()
 	server.topics = append(server.topics, named)
+	server.streams = append(server.streams, on)
 	if server.missing {
 		return nil, nil
 	}
 	return &iggcon.TopicDetails{
-		Topic: iggcon.Topic{PartitionsCount: server.partitions},
+		Topic: iggcon.Topic{Id: feedTopicID, PartitionsCount: server.partitions},
 	}, nil
 }
+
+// feedTopicID is the numeric id the feed fake gives every topic.
+const feedTopicID uint32 = 3
 
 func (server *feedServer) PollMessages(
 	ctx context.Context, _ iggcon.Identifier, _ iggcon.Identifier, partition uint32,
@@ -141,6 +150,13 @@ func (server *feedServer) visited() []string {
 	server.guard.Lock()
 	defer server.guard.Unlock()
 	return append([]string(nil), server.topics...)
+}
+
+// visitedStreams is the stream of every topic the reader looked up.
+func (server *feedServer) visitedStreams() []string {
+	server.guard.Lock()
+	defer server.guard.Unlock()
+	return append([]string(nil), server.streams...)
 }
 
 func watchCapabilities() *laser.Capabilities {
@@ -342,7 +358,7 @@ func TestGivenAnEmptiedPartitionAtTheEndWhenItFillsThenShouldMissNothing(t *test
 // Seeding a reader with stored offsets replaces where it starts, so a
 // partition it had anchored at the end is measured from the stored offset
 // instead.
-func TestGivenStoredOffsetsAfterStartingAtTheEndThenShouldMeasureFromThem(t *testing.T) {
+func TestGivenStoredOffsetsAfterStartingAtTheEndWhenResumedThenShouldMeasureFromThem(t *testing.T) {
 	server := newFeed(1)
 	server.expireBelow(0, 3)
 	reader, err := watchHandle(server, laser.Options{}).Watch().
@@ -537,6 +553,40 @@ func TestGivenStreamTenancyWhenWatchingThenShouldReadItsOwnFeedTopic(t *testing.
 	}
 }
 
+func TestGivenAnOverriddenOpsStreamAndChangesTopicWhenWatchingThenShouldReadTheFeedThere(t *testing.T) {
+	server := newFeed(1)
+	handle := watchHandle(server, laser.Options{OpsStream: "acme-ops"}).WithChangesTopic("acme-changes")
+
+	if _, err := handle.Watch().FromEnd().Records(context.Background()); err != nil {
+		t.Fatalf("records: %v", err)
+	}
+
+	got := [2]string{server.visitedStreams()[0], server.visited()[0]}
+	want := [2]string{"acme-ops", "acme-changes"}
+	if got != want {
+		t.Errorf("want the feed read on %v, got %v", want, got)
+	}
+}
+
+func TestGivenStreamTenancyAndAnOverriddenTopologyWhenWatchingThenShouldReadTheStreamTopicOnTheOverriddenOpsStream(t *testing.T) {
+	capabilities := watchCapabilities()
+	capabilities.StreamTenancy = true
+	server := newFeed(1)
+	handle := watchHandle(server, laser.Options{
+		Capabilities: capabilities, OpsStream: "acme-ops", ChangesTopic: "acme-changes",
+	})
+
+	if _, err := handle.Watch().FromEnd().Records(context.Background()); err != nil {
+		t.Fatalf("records: %v", err)
+	}
+
+	got := [2]string{server.visitedStreams()[0], server.visited()[0]}
+	want := [2]string{"acme-ops", wire.StreamOpsTopic("agents", wire.ChangesTopic)}
+	if got != want {
+		t.Errorf("want the feed read on %v, got %v", want, got)
+	}
+}
+
 // A feed nobody has written to yet is not an error: a reader started before
 // its writer starts at zero, which is both the end and the beginning.
 func TestGivenAFeedThatDoesNotExistWhenWatchingThenShouldStartAtZero(t *testing.T) {
@@ -692,7 +742,7 @@ func TestGivenUnorderedTimestampsWhenAStopRewindsThenShouldTakeTheEarliest(t *te
 		server.append(0, changeBytes(t, "stream:agents/readings",
 			uint64(offset), wire.ChangeOpVersion))
 	}
-	// The broker's clock went backwards across the batch, so feed order and
+	// The server's clock went backwards across the batch, so feed order and
 	// offset order disagree.
 	server.restamp(0, []uint64{3, 2, 1})
 	reader, err := watchHandle(server, laser.Options{}).Watch().

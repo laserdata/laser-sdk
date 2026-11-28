@@ -117,12 +117,8 @@ type ConsolidationReport struct {
 	Derived    int
 }
 
-// Consolidator is a caller-supplied pass over one memory scope: summarize,
-// reweight, prune, or derive items. The SDK ships no concrete consolidator,
-// the same pluggable seam as the recall-side embedder: what consolidation
-// actually does (which model, which prompt, which pruning rule) is the
-// deployment's own business. Run periodically off an agent's handler loop
-// with SpawnOptions.ConsolidateEvery, scoped to just that agent's own memory.
+// Consolidator runs a memory maintenance pass. SpawnOptions.ConsolidateEvery
+// runs the pass over the agent's scope on a background goroutine.
 type Consolidator interface {
 	Consolidate(ctx context.Context, scope *MemoryScope) (ConsolidationReport, error)
 }
@@ -166,10 +162,12 @@ type MemoryItem struct {
 	Score float64
 	// Scope is what the item was stored under.
 	Scope MemoryScope
+	// Source identifies the record that produced this item in the managed view.
+	Source *wire.SourceRef
 	// At is when the item was remembered.
 	At time.Time
 	// Signals are the signals that surfaced this item and their standing
-	// before fusion. Empty for an unranked or single-signal recall.
+	// before fusion. Empty for an unranked recall.
 	Signals []RecallSignal
 }
 
@@ -181,7 +179,8 @@ type RecallStrategy string
 
 const (
 	// RecallAuto lets the backend route from what it has: a query ranks by
-	// overlap, no query returns the most recent. The default.
+	// overlap, no query returns the most recent. The default. It also labels
+	// the feedback signal of a ranked recall.
 	RecallAuto RecallStrategy = "auto"
 	// RecallKeyword keeps only items sharing a word with the query.
 	RecallKeyword RecallStrategy = "keyword"
@@ -191,15 +190,28 @@ const (
 	// query's, which finds what a question means rather than which words it
 	// used. It needs a backend with an embedder, such as VectorMemory.
 	RecallSemantic RecallStrategy = "semantic"
+	// RecallGraph traverses the knowledge graph from the query seed. The log
+	// keeps only items sharing a word with the query.
+	RecallGraph RecallStrategy = "graph"
+	// RecallTemporal returns items inside the time range, most recent first.
+	// The log keeps only items sharing a word with the query.
+	RecallTemporal RecallStrategy = "temporal"
 	// RecallHybrid fuses every available signal into one ranking: semantic
 	// similarity, lexical overlap, and the feedback an agent gave. The
 	// multi-signal default for quality recall.
 	RecallHybrid RecallStrategy = "hybrid"
-	// RecallFeedback ranks by the weight an agent's own experience put on
-	// an item. It names a signal inside a fusion rather than a strategy a
-	// caller would usually ask for on its own.
-	RecallFeedback RecallStrategy = "feedback"
 )
+
+// validate refuses a strategy word no backend knows.
+func (strategy RecallStrategy) validate() error {
+	switch strategy {
+	case "", RecallAuto, RecallRecent, RecallSemantic, RecallKeyword, RecallGraph, RecallTemporal, RecallHybrid:
+		return nil
+	default:
+		return &InvalidError{Reason: "unknown recall strategy '" + string(strategy) +
+			"': use one of auto, recent, semantic, keyword, graph, temporal, hybrid"}
+	}
+}
 
 // RecallSignal is one signal's contribution to a recalled item: which
 // strategy surfaced it, where it ranked within that signal, and what that
@@ -262,18 +274,27 @@ type Memory struct {
 	// handle narrowed off this one, because narrowing changes which items a
 	// recall returns and not which topic they were read from.
 	reader *memoryReader
+	// vector and custom replace the log as the store when set.
+	vector *VectorMemory
+	custom CustomMemory
+	// reranker reorders what a recall with a query returns.
+	reranker Reranker
 }
 
 // Memory opens the memory surface for a namespace on the handle's default
 // stream.
 func (laser *Laser) Memory(namespace string) *Memory {
+	return laser.logMemory(namespace, wire.AgentMemory)
+}
+
+func (laser *Laser) logMemory(namespace, topic string) *Memory {
 	return &Memory{
 		laser:     laser,
 		namespace: namespace,
 		stream:    laser.defaultStream,
-		topic:     wire.AgentMemory,
+		topic:     topic,
 		scope:     MemoryScope{Stream: laser.defaultStream},
-		reader:    newMemoryReader(laser.defaultStream, namespace),
+		reader:    newMemoryReader(laser.defaultStream, laser.ResourceName(namespace)),
 	}
 }
 
@@ -301,14 +322,33 @@ func (memory *Memory) For(scope MemoryScope) *Memory {
 func (memory *Memory) Remember(
 	ctx context.Context, kind MemoryKind, body []byte,
 ) (MemoryID, error) {
+	if memory.custom != nil {
+		return memory.custom.Remember(ctx, memory.scope, body)
+	}
 	id := ContentMemoryID(memory.scope, kind, body)
-	record := wire.RememberItem(id.String(), string(kind), body)
-	record.Origin = memory.scope.Origin
-	record.Producer = memory.scope.Producer
-	if err := memory.write(ctx, record); err != nil {
+	if err := memory.Append(ctx, id, kind, body); err != nil {
 		return MemoryID{}, err
 	}
 	return id, nil
+}
+
+// Append writes a memory item under a caller-supplied identity.
+func (memory *Memory) Append(ctx context.Context, id MemoryID, kind MemoryKind, body []byte) error {
+	switch {
+	case memory.custom != nil:
+		if appender, typed := memory.custom.(MemoryAppender); typed {
+			_, err := appender.Append(ctx, memory.scope, id, kind, body)
+			return err
+		}
+		_, err := memory.custom.Remember(ctx, memory.scope, body)
+		return err
+	case memory.vector != nil:
+		return memory.vector.append(ctx, memory.scope, id, kind, body)
+	}
+	record := wire.RememberItem(id.String(), string(kind), body)
+	record.Origin = memory.scope.Origin
+	record.Producer = memory.scope.Producer
+	return memory.write(ctx, record)
 }
 
 // Forget writes a tombstone removing an item from recall.
@@ -316,6 +356,12 @@ func (memory *Memory) Remember(
 // The item stays on the log, because the log is the audit: forgetting changes
 // what is recalled rather than erasing what happened.
 func (memory *Memory) Forget(ctx context.Context, target MemoryID) error {
+	switch {
+	case memory.custom != nil:
+		return memory.custom.Forget(ctx, memory.scope, target)
+	case memory.vector != nil:
+		return memory.vector.forget(ctx, memory.scope, target)
+	}
 	record := wire.ForgetItem(target.String())
 	if memory.scope.Conversation != nil {
 		conversation := memory.scope.Conversation.String()
@@ -352,6 +398,13 @@ func (memory *Memory) Supersede(
 // Improve records feedback on a recalled item, reweighting it for later
 // recall.
 func (memory *Memory) Improve(ctx context.Context, feedback Feedback) error {
+	switch {
+	case memory.custom != nil:
+		_, err := memory.custom.Improve(ctx, memory.scope, feedback)
+		return err
+	case memory.vector != nil:
+		return memory.vector.improve(ctx, memory.scope, feedback)
+	}
 	record := wire.MemoryRecord{
 		Kind:   wire.MemoryFeedback,
 		Target: feedback.Target.String(),
@@ -370,44 +423,92 @@ func (memory *Memory) write(ctx context.Context, record wire.MemoryRecord) error
 	if memory.stream == "" {
 		return errNoStream()
 	}
+	if memory.scope.Stream != "" && memory.scope.Stream != memory.stream {
+		return &InvalidError{Reason: "memory scope names a different stream"}
+	}
 	if err := record.Validate(); err != nil {
 		return &InvalidError{Reason: err.Error()}
 	}
-	payload, err := wire.Marshal(record)
-	if err != nil {
-		return &CodecError{Reason: "encode the memory record", Cause: err}
+	scope := memory.scope
+	if scope.Conversation == nil {
+		scope.Conversation = &wire.ConversationID{ID: wire.IDFromBytes(NewOperationID())}
 	}
-	key := memory.namespace
-	if memory.scope.Conversation != nil {
-		key = memory.scope.Conversation.String()
+	identity := record.ID
+	if identity == "" {
+		identity = wire.IDFromBytes(NewOperationID()).String()
 	}
-	topic := memory.laser.Stream(memory.stream).Topic(memory.topic)
-	headers, err := memoryHeaders(memory.scope, memory.namespace)
+	headers, err := memoryHeaders(scope, memory.laser.ResourceName(memory.namespace), identity)
 	if err != nil {
 		return err
 	}
-	// A memory write is governed as what it is rather than as a plain
-	// publish, so a policy can bound what an agent may remember without
-	// bounding everything it may send.
 	action := &GovernedAction{
 		Kind: ActionMemoryWrite, Stream: memory.stream, Topic: memory.topic,
-		Conversation: memory.scope.Conversation, Payload: payload,
+		Conversation: scope.Conversation,
 	}
-	if memory.scope.Agent != nil {
-		action.Source = memory.scope.Agent.String()
+	if scope.Agent != nil {
+		action.Source = scope.Agent.String()
 	}
-	governed, err := memory.laser.govern(ctx, action)
-	if err != nil {
+	var payload []byte
+	if record.Kind == wire.MemoryItem {
+		action.Payload = record.Body
+		governed, err := memory.laser.govern(ctx, action)
+		if err != nil {
+			return err
+		}
+		if governed != nil {
+			record.Body = governed
+		}
+		payload, err = wire.Marshal(record)
+		if err != nil {
+			return &CodecError{Reason: "encode memory item", Cause: err}
+		}
+	} else {
+		payload, err = wire.Marshal(record)
+		if err != nil {
+			return &CodecError{Reason: "encode memory mutation", Cause: err}
+		}
+		action.Payload = payload
+		governed, err := memory.laser.govern(ctx, action)
+		if err != nil {
+			return err
+		}
+		if governed != nil {
+			payload = governed
+		}
+	}
+	if err := memory.send(ctx, headers, scope.Conversation.String(), payload); err != nil {
 		return err
 	}
-	if governed != nil {
-		payload = governed
-	}
+	memory.trackWrite(record, scope.Conversation)
+	return nil
+}
+
+// send appends one encoded record, creating the stream and topic on a first write.
+func (memory *Memory) send(ctx context.Context, headers []iggcon.HeaderEntry, key string, payload []byte) error {
 	message, err := iggcon.NewIggyMessage(payload, iggcon.WithUserHeaders(headers))
 	if err != nil {
 		return &InvalidError{Reason: "build the memory record: " + err.Error()}
 	}
-	_, err = topic.sendMessages(ctx, []iggcon.IggyMessage{message}, key, true)
+	topic := memory.laser.Stream(memory.stream).Topic(memory.topic)
+	streamID, topicID, err := topic.identifiers()
+	if err != nil {
+		return err
+	}
+	partition, err := partitioningFor(key, true)
+	if err != nil {
+		return err
+	}
+	batch := []iggcon.IggyMessage{message}
+	_, err = topic.publishOnce(ctx, streamID, topicID, partition, batch)
+	if isMissingResource(err) {
+		if err := memory.laser.Stream(memory.stream).Ensure(ctx); err != nil {
+			return err
+		}
+		if err := memory.laser.ensureRetained(ctx, memory.topic, ExpireAfter(DefaultMemoryTopicTTL).options(1)); err != nil {
+			return err
+		}
+		_, err = topic.publishOnce(ctx, streamID, topicID, partition, batch)
+	}
 	return err
 }
 

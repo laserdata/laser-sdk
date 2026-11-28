@@ -17,7 +17,7 @@ import (
 func TestGivenACallerWhenSubmittedToAnAgentThenShouldAddressOnlyThatAgent(t *testing.T) {
 	log := &bridgeLog{}
 	bridge := bridgeOver(t, log)
-	caller := bridge.Caller("tenant-a")
+	caller := bridge.Caller("caller-a")
 	target := agent(t, "worker")
 
 	if _, err := caller.SubmitTo(context.Background(), target, []byte(sendParams)); err != nil {
@@ -39,7 +39,7 @@ func TestGivenACallerWhenSubmittedToAnAgentThenShouldAddressOnlyThatAgent(t *tes
 func TestGivenACallerWhenSubmittedWithHopsThenShouldCarryTheExtendedPath(t *testing.T) {
 	log := &bridgeLog{}
 	bridge := bridgeOver(t, log)
-	caller := bridge.Caller("tenant-a")
+	caller := bridge.Caller("caller-a")
 
 	if _, err := caller.SubmitWithHops(
 		context.Background(), []string{"upstream-bridge"}, nil, []byte(sendParams),
@@ -63,11 +63,11 @@ func TestGivenACallerWhenSubmittedWithHopsThenShouldCarryTheExtendedPath(t *test
 }
 
 // A caller's SubmitIn writes the child session's submitted start, with the
-// ancestry, before the command -- the same as the bridge's own SubmitIn.
+// ancestry, before the command, the same as the bridge's own SubmitIn.
 func TestGivenACallerWhenSubmittedInAChildThenShouldWriteTheStartBeforeTheCommand(t *testing.T) {
 	log := &bridgeLog{}
 	bridge := bridgeOver(t, log)
-	caller := bridge.Caller("tenant-a")
+	caller := bridge.Caller("caller-a")
 	parent, root := laser.NewConversationID(), laser.NewConversationID()
 
 	task, err := caller.SubmitIn(context.Background(), parent, root, []byte(sendParams))
@@ -102,12 +102,12 @@ func TestGivenACallerWhenSubmittedInAChildThenShouldWriteTheStartBeforeTheComman
 	}
 }
 
-// A caller's SubmitInTo is SubmitIn addressed to one agent -- the same
+// A caller's SubmitInTo is SubmitIn addressed to one agent, the same
 // composition the bridge's own SubmitInTo gives.
 func TestGivenACallerWhenSubmittedInToAChildThenShouldAddressOnlyThatAgent(t *testing.T) {
 	log := &bridgeLog{}
 	bridge := bridgeOver(t, log)
-	caller := bridge.Caller("tenant-a")
+	caller := bridge.Caller("caller-a")
 	parent, root := laser.NewConversationID(), laser.NewConversationID()
 	target := agent(t, "worker")
 
@@ -137,7 +137,7 @@ func TestGivenACallerWhenSubmittedInToAChildThenShouldAddressOnlyThatAgent(t *te
 func TestGivenABoundBridgeWhenSubmittedToThenShouldStillScopeToTheCaller(t *testing.T) {
 	log := &bridgeLog{}
 	bridge := bridgeOver(t, log).WithTaskBinding([32]byte{1: 7}, time.Hour)
-	owner := bridge.Caller("tenant-a")
+	owner := bridge.Caller("caller-a")
 	target := agent(t, "worker")
 
 	task, err := owner.SubmitTo(context.Background(), target, []byte(sendParams))
@@ -148,7 +148,7 @@ func TestGivenABoundBridgeWhenSubmittedToThenShouldStillScopeToTheCaller(t *test
 	if _, err := owner.Task(context.Background(), task.ID); err != nil {
 		t.Fatalf("the owner must read its own task: %v", err)
 	}
-	if _, err := bridge.Caller("tenant-b").Task(context.Background(), task.ID); err == nil {
+	if _, err := bridge.Caller("caller-b").Task(context.Background(), task.ID); err == nil {
 		t.Fatal("a bound task must not open for another caller")
 	}
 }

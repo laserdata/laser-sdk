@@ -35,7 +35,7 @@ func (laser *Laser) PublishControlAs(
 	ctx context.Context, command wire.ControlCommand, stream string,
 	operationID wire.U128,
 ) error {
-	if !laser.capabilities.Managed {
+	if !laser.Capabilities().Managed {
 		return &UnsupportedError{Surface: "control commands"}
 	}
 	// A server of another control version would fold this command under a
@@ -70,11 +70,11 @@ func (laser *Laser) PublishControlAs(
 	return nil
 }
 
-// CommandFailure reports a control command the deployment refused.
+// CommandFailure reports a managed command the deployment refused.
 type CommandFailure struct{ Failure wire.CommandError }
 
 func (e *CommandFailure) Error() string {
-	return "control command: " + e.Failure.Code.String() + ": " + e.Failure.Message
+	return "managed command: " + e.Failure.Code.String() + ": " + e.Failure.Message
 }
 
 // ResultCode is the shared code this failure projects onto.
@@ -91,7 +91,7 @@ func (e *CommandFailure) Retryable() bool { return e.Failure.Code.IsRetryable() 
 func (laser *Laser) executeBrowse(
 	ctx context.Context, code uint32, request any,
 ) (*wire.BrowseOutcome, error) {
-	if !laser.capabilities.Managed {
+	if !laser.Capabilities().Managed {
 		return nil, &UnsupportedError{Surface: "the registry browse"}
 	}
 	// Browse rides the query envelope version, so a skew is refused here
@@ -109,8 +109,8 @@ func (laser *Laser) executeBrowse(
 		return nil, err
 	}
 	var reply wire.BrowseReply
-	if err := wire.Unmarshal(raw, &reply); err != nil {
-		return nil, &CodecError{Reason: "decode the browse reply", Cause: err}
+	if err := decodeManagedReply(raw, &reply, "decode the browse reply"); err != nil {
+		return nil, err
 	}
 	if !reply.IsOk() {
 		if reply.Err == nil {

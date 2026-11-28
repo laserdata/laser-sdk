@@ -1,6 +1,7 @@
 package bdd_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	bdd "github.com/laserdata/laser-sdk/bdd/go"
+	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
@@ -136,17 +138,11 @@ func decodePayload(state *world, arguments []string) error {
 		return fmt.Errorf("the payload is a byte list: %w", err)
 	}
 
-	if source.Kind == wire.SchemaJSON {
-		_, fault := wire.DecodeJSONPayload(numbers, wire.RecordDecodeLimits)
-		state.put("rejected", fault != "")
-		return nil
-	}
-	compiled, err := wire.CompileWriterSchema(source)
+	compiled, err := laser.CompileSchema(wire.SchemaDef{ID: 1, Source: source})
 	if err != nil {
 		return err
 	}
-	_, fault := compiled.Decode(numbers, wire.RecordDecodeLimits)
-	state.put("rejected", fault != "")
+	state.put("rejected", !compiled.Validate(numbers))
 	return nil
 }
 
@@ -205,54 +201,61 @@ func corpusCase(
 	source wire.SchemaSource, refused bool, fault string,
 	expected *json.RawMessage, payloadHex string,
 ) string {
-	// A refused case must not compile at all. A JSON Schema has no writer
-	// decoder, so its own validation is the refusal.
+	compiled, err := laser.CompileSchema(wire.SchemaDef{ID: 1, Source: source})
 	if refused {
-		var err error
-		if source.Kind == wire.SchemaJSON {
-			err = source.Validate()
-		} else {
-			_, err = wire.CompileWriterSchema(source)
-		}
 		if err == nil {
-			return "the corpus refuses this schema but it compiled"
+			return "refused schema compiled"
 		}
 		return ""
 	}
-	if source.Kind == wire.SchemaJSON {
-		if err := source.Validate(); err != nil {
-			return "the schema must validate: " + err.Error()
-		}
-		return ""
-	}
-
-	compiled, err := wire.CompileWriterSchema(source)
 	if err != nil {
 		return "compile: " + err.Error()
 	}
 	payload, err := hex.DecodeString(payloadHex)
 	if err != nil {
-		return "the payload is hex: " + err.Error()
+		return err.Error()
 	}
-	decoded, got := compiled.Decode(payload, wire.RecordDecodeLimits)
-	switch {
-	case fault != "":
-		if string(got) != fault {
-			return fmt.Sprintf("want the fault %q, got %q", fault, got)
+	var actual json.RawMessage
+	err = compiled.Decode(payload, &actual)
+	if fault != "" {
+		if err == nil {
+			return "expected a decoding failure"
 		}
-	case expected != nil:
-		if got != "" {
-			return fmt.Sprintf("want a value, got the fault %q", got)
+		if source.Kind != wire.SchemaJSON {
+			writer, err := wire.CompileWriterSchema(source)
+			if err != nil {
+				return err.Error()
+			}
+			_, reason := writer.Decode(payload, wire.RecordDecodeLimits)
+			if string(reason) != fault {
+				return fmt.Sprintf("want %s, got %s", fault, reason)
+			}
 		}
-		want, faulted := wire.DecodeJSONPayload(*expected, wire.RecordDecodeLimits)
-		if faulted != "" {
-			return "the expected value is not valid JSON"
+		return ""
+	}
+	if err != nil {
+		return err.Error()
+	}
+	if expected == nil {
+		return "missing expected value"
+	}
+	want, faulted := wire.DecodeJSONPayload(*expected, wire.RecordDecodeLimits)
+	if faulted != "" {
+		return "malformed expected value"
+	}
+	decoded, reason := wire.DecodeJSONPayload(actual, wire.RecordDecodeLimits)
+	if reason != "" || decoded.JSON() != want.JSON() {
+		return fmt.Sprintf("decoded %s, expected %s", actual, *expected)
+	}
+	if source.Kind == wire.SchemaAvro {
+		encoded, err := compiled.EncodeAvro(*expected)
+		if err != nil {
+			return err.Error()
 		}
-		if decoded.JSON() != want.JSON() {
-			return "decoded " + decoded.JSON() + ", want " + want.JSON()
+		var restored json.RawMessage
+		if err := compiled.Decode(encoded, &restored); err != nil || !bytes.Equal(restored, actual) {
+			return fmt.Sprintf("Avro encode/decode: %s, %v", restored, err)
 		}
-	default:
-		return "the case names neither a value nor a fault"
 	}
 	return ""
 }

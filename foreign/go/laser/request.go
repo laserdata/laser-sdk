@@ -36,6 +36,10 @@ type RequestOptions struct {
 	// the grant's own conversation is answered by it rather than raised
 	// again.
 	Grant *ApprovalGrant
+	// Provenance, when set, is the spine the request is sent under: its
+	// conversation and ancestry replace the caller's, so a handler asks in a
+	// subconversation it derived.
+	Provenance *Provenance
 }
 
 // Requester sends a request and waits for its answer.
@@ -108,6 +112,9 @@ func (requester *Requester) Request(
 		correlation = wire.CorrelationID{ID: wire.IDFromBytes(NewOperationID())}
 	}
 
+	if options.Provenance != nil {
+		conversation = options.Provenance.Conversation
+	}
 	expected := ExpectedReply{Session: conversation, Requester: requester.source}
 	if !options.Target.IsZero() {
 		// A directed request's answer is expected from the agent it was sent
@@ -122,6 +129,9 @@ func (requester *Requester) Request(
 
 	agdx := requester.laser.AgdxOn(
 		requester.stream, requester.topic, requester.source, conversation)
+	if spine := options.Provenance; spine != nil {
+		agdx.parent, agdx.root = spine.ParentConversation, spine.RootConversation
+	}
 	send := agdx.Command(correlation, body)
 	if !options.Target.IsZero() {
 		send = send.WithTarget(options.Target)

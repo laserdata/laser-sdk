@@ -10,7 +10,6 @@ import (
 
 	bdd "github.com/laserdata/laser-sdk/bdd/go"
 	"github.com/laserdata/laser-sdk/foreign/go/bridges"
-	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
@@ -406,9 +405,8 @@ func streamManyChatChunksStep(ctx context.Context, state *world, step bdd.Step) 
 	return streamChatChunksAndRecord(ctx, state, chunks)
 }
 
-// streamChatChunksAndRecord writes a chat chunk stream (the opening chunk
-// carrying the purpose, the rest plain, the last carrying Last and a finish
-// reason), then polls AgUiEvents until the stream's end is visible there too:
+// streamChatChunksAndRecord writes a chat chunk stream through the stream
+// writer, then polls AgUiEvents until the stream's end is visible there too:
 // an append is acknowledged before every reader sees it, so one read racing
 // the writes is expected rather than a failure.
 func streamChatChunksAndRecord(ctx context.Context, state *world, chunks []string) error {
@@ -416,21 +414,14 @@ func streamChatChunksAndRecord(ctx context.Context, state *world, chunks []strin
 	if err != nil {
 		return err
 	}
-	correlation := wire.CorrelationID{ID: wire.IDFromBytes(laser.NewOperationID())}
-	channel := wire.ChannelID{ID: wire.IDFromBytes(laser.NewOperationID())}
-	agdx := state.client.Agdx(source, state.conversation)
+	correlation := wire.CorrelationID{ID: state.conversation.ID}
+	stream := state.client.Agdx(source, state.conversation).Stream(correlation, wire.OperationChat)
 	for sequence, body := range chunks {
-		send := agdx.Chunk(correlation, channel, uint64(sequence), []byte(body))
-		if sequence == 0 {
-			send = send.WithOperation(wire.OperationChat)
-		}
-		if _, err := send.Send(ctx); err != nil {
-			return fmt.Errorf("send chunk %d: %w", sequence, err)
+		if err := stream.Write(ctx, []byte(body)); err != nil {
+			return fmt.Errorf("write chunk %d: %w", sequence, err)
 		}
 	}
-	finisher := agdx.Chunk(correlation, channel, uint64(len(chunks)), nil).
-		Last().WithFinishReason("stop")
-	if _, err := finisher.Send(ctx); err != nil {
+	if err := stream.Finish(ctx, "stop", nil); err != nil {
 		return fmt.Errorf("finish the stream: %w", err)
 	}
 

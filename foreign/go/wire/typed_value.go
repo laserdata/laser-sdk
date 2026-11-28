@@ -352,6 +352,110 @@ func readSigned(payload cborform.Value) (int64, error) {
 	}
 }
 
+// AsStr returns a string value.
+func (value TypedValue) AsStr() (string, bool) {
+	if value.Kind != TypedString {
+		return "", false
+	}
+	return value.Str, true
+}
+
+// AsU64 returns an int or long value that is not negative.
+func (value TypedValue) AsU64() (uint64, bool) {
+	number, found := value.AsI64()
+	if !found || number < 0 {
+		return 0, false
+	}
+	return uint64(number), true
+}
+
+// AsI64 returns an int or long value.
+func (value TypedValue) AsI64() (int64, bool) {
+	switch value.Kind {
+	case TypedInt:
+		return int64(value.Int), true
+	case TypedLong:
+		return value.Long, true
+	default:
+		return 0, false
+	}
+}
+
+// ValidateAgainst checks that a value is canonical and fits a logical type. A null fits any optional type.
+func (value TypedValue) ValidateAgainst(logicalType LogicalType, required bool) error {
+	if value.Kind == TypedNull {
+		if required {
+			return &InvalidError{Reason: "required value is null"}
+		}
+		return nil
+	}
+	if err := value.Validate(); err != nil {
+		return err
+	}
+	if logicalType.Kind == KindVariant {
+		return nil
+	}
+	mismatch := &InvalidError{Reason: "typed value does not match logical type"}
+	if string(value.Kind) != string(logicalType.Kind) {
+		return mismatch
+	}
+	switch value.Kind {
+	case TypedDecimal:
+		if value.Decimal.Precision != logicalType.Precision || value.Decimal.Scale != logicalType.Scale {
+			return &InvalidError{Reason: fmt.Sprintf(
+				"decimal type mismatch: value is (%d, %d), schema is (%d, %d)",
+				value.Decimal.Precision, value.Decimal.Scale, logicalType.Precision, logicalType.Scale)}
+		}
+	case TypedFixed:
+		if uint64(len(value.Bytes)) != uint64(logicalType.Length) {
+			return &InvalidError{Reason: fmt.Sprintf(
+				"fixed value is %d bytes, expected %d", len(value.Bytes), logicalType.Length)}
+		}
+	case TypedStruct:
+		return validateStructAgainst(value.Fields, logicalType.Fields)
+	case TypedList:
+		if logicalType.Element == nil {
+			return mismatch
+		}
+		for _, item := range value.List {
+			if err := item.ValidateAgainst(*logicalType.Element, logicalType.ElementRequired); err != nil {
+				return err
+			}
+		}
+	case TypedMap:
+		if logicalType.Key == nil || logicalType.Value == nil {
+			return mismatch
+		}
+		for _, entry := range value.MapValues {
+			if err := entry.Key.ValidateAgainst(*logicalType.Key, true); err != nil {
+				return err
+			}
+			if err := entry.Value.ValidateAgainst(*logicalType.Value, logicalType.ValueRequired); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateStructAgainst(values []FieldValue, fields []LogicalField) error {
+	if len(values) != len(fields) {
+		return &InvalidError{Reason: fmt.Sprintf(
+			"struct carries %d values, schema has %d fields", len(values), len(fields))}
+	}
+	for index, value := range values {
+		field := fields[index]
+		if value.FieldID != field.ID {
+			return &InvalidError{Reason: fmt.Sprintf(
+				"struct field id %d appears where %d is required", value.FieldID, field.ID)}
+		}
+		if err := value.Value.ValidateAgainst(field.FieldType, field.Required); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // DiagnosticText renders the value for an error message. It is for people
 // reading a rejection, not for the wire.
 func (value TypedValue) DiagnosticText() string {

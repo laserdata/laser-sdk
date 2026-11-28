@@ -1,8 +1,8 @@
 package wire
 
 // The shared caps. Every client enforces the same bounds, so a record one
-// client accepts is a record the others accept. Ported from wire/src/limits.rs;
-// changing a value here without changing it there splits the contract.
+// client accepts is a record the others accept. Ported from wire/src/limits.rs.
+// Changing a value here without changing it there splits the contract.
 const (
 	MaxPageSize                         = 1000
 	DefaultStreamPageSize               = 100

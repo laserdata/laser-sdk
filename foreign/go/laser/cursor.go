@@ -2,6 +2,7 @@ package laser
 
 import (
 	"context"
+	"slices"
 	"sort"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -33,6 +34,8 @@ type Cursor struct {
 	consumer iggcon.Consumer
 	offsets  []uint64
 	batch    uint32
+	// topicID is the topic's numeric id as the last poll read it, zero before one.
+	topicID uint32
 }
 
 // Replay opens a cursor over this topic.
@@ -85,15 +88,13 @@ func (cursor *Cursor) Offsets() []uint64 {
 }
 
 // SeekToWindow anchors this cursor's starting offset, per partition, to the
-// newest window records of the topic's current tail rather than the head --
+// newest window records of the topic's current tail rather than the head,
 // so a bounded Poll immediately after reads the most recent history, not the
 // oldest window of a long-lived topic.
 //
-// Ported from Rust's tail_anchored_offset (sdk/src/poll.rs:118-142), which
-// context assembly uses so a reader wanting the latest records (context
-// assembly, a LastN policy) is never handed the oldest MaxDrainRecords of a
-// partition and left to filter those -- that would return the wrong records
-// entirely once a partition outgrows the window. Never widens a starting
+// Context assembly uses it so a reader wanting the latest records is never
+// handed the oldest MaxDrainRecords of a partition and left to filter those,
+// which returns the wrong records once a partition outgrows the window. Never widens a starting
 // offset the caller already set with FromOffsets, only narrows it toward the
 // tail when the window would start later than that.
 func (cursor *Cursor) SeekToWindow(ctx context.Context, window uint64) error {
@@ -150,7 +151,8 @@ func (cursor *Cursor) SeekToWindow(ctx context.Context, window uint64) error {
 // Records come back ordered by the server's own timestamp, then partition and
 // offset, so a merge across partitions is deterministic. An empty result means
 // the reader is caught up, or that the topic does not exist yet: a reader
-// started before its writer is not an error.
+// started before its writer is not an error. A record whose spine does not
+// decode is reported alone as an UndecodableRecord and passed.
 func (cursor *Cursor) Poll(ctx context.Context) ([]*Record, error) {
 	client, err := cursor.topic.laser.connected()
 	if err != nil {
@@ -170,11 +172,12 @@ func (cursor *Cursor) Poll(ctx context.Context) ([]*Record, error) {
 	if details == nil {
 		return nil, nil
 	}
+	cursor.topicID = details.Id
 
 	partitions := boundedPartitions(details.PartitionsCount)
-	next := cursor.offsets
-	for uint32(len(next)) < partitions {
-		next = append(next, 0)
+	next := slices.Clone(cursor.offsets)
+	if missing := int(partitions) - len(next); missing > 0 {
+		next = append(next, make([]uint64, missing)...)
 	}
 
 	// Collected with the sort key alongside, so the merge across partitions is
@@ -213,16 +216,31 @@ func (cursor *Cursor) Poll(ctx context.Context) ([]*Record, error) {
 		return left.offset < right.offset
 	})
 
-	cursor.offsets = next
 	records := make([]*Record, 0, len(collected))
 	for _, item := range collected {
 		record, err := OpenRecord(item.message)
 		if err != nil {
-			return nil, err
+			// The records ahead of an unreadable one are handed over first.
+			// It is then reported alone and passed, so no read stops on it.
+			passed := slices.Clone(cursor.offsets)
+			if missing := len(next) - len(passed); missing > 0 {
+				passed = append(passed, make([]uint64, missing)...)
+			}
+			if len(records) == 0 {
+				passed[item.partition] = item.offset + 1
+				cursor.offsets = passed
+				return nil, &UndecodableRecord{PartitionID: item.partition, Message: item.message, Cause: err}
+			}
+			for _, delivered := range records {
+				passed[delivered.PartitionID] = max(passed[delivered.PartitionID], delivered.Offset()+1)
+			}
+			cursor.offsets = passed
+			return records, nil
 		}
 		record.PartitionID = item.partition
 		records = append(records, record)
 	}
+	cursor.offsets = next
 	return records, nil
 }
 

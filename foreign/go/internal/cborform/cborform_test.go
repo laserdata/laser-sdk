@@ -1,6 +1,7 @@
 package cborform_test
 
 import (
+	"bytes"
 	"errors"
 	"math"
 	"testing"
@@ -156,4 +157,63 @@ func TestGivenAnIntegerWhenEncodedThenShouldUseTheShortestHead(t *testing.T) {
 			t.Errorf("uint %d: want %d byte(s), got %d", testCase.value, testCase.want, len(encoded))
 		}
 	}
+}
+
+func TestGivenNestedArraysWhenDecodedThenShouldRespectTheDepthLimit(t *testing.T) {
+	for _, depth := range []int{256, 257} {
+		frame := append(bytes.Repeat([]byte{0x81}, depth), 0xf6)
+		_, err := cborform.Decode(frame)
+		if (err == nil) != (depth == 256) {
+			t.Fatalf("depth %d: got %v", depth, err)
+		}
+	}
+}
+
+func TestGivenInvalidUTF8WhenDecodedThenShouldOnlyAcceptByteStrings(t *testing.T) {
+	if _, err := cborform.Decode([]byte{0x61, 0xff}); err == nil {
+		t.Fatal("accepted invalid text")
+	}
+	if _, err := cborform.Decode([]byte{0x41, 0xff}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func BenchmarkDecodeMap(b *testing.B) {
+	frame, err := cborform.Encode(cborform.Map{
+		{Key: cborform.Text("payload"), Value: cborform.Bytes(make([]byte, 256))},
+		{Key: cborform.Text("version"), Value: cborform.Uint(1)},
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(frame)))
+	for b.Loop() {
+		if _, err := cborform.Decode(frame); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func FuzzDecode(f *testing.F) {
+	for _, value := range []cborform.Value{cborform.Null{}, cborform.Text("hello"), cborform.Array{cborform.Uint(10)}} {
+		encoded, err := cborform.Encode(value)
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(encoded)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		value, err := cborform.Decode(data)
+		if err != nil {
+			return
+		}
+		encoded, err := cborform.Encode(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cborform.Decode(encoded); err != nil {
+			t.Fatalf("encoded value could not be decoded: %v", err)
+		}
+	})
 }

@@ -83,6 +83,18 @@ type mcpResourceContent struct {
 	Text     string `json:"text"`
 }
 
+// ToolCallFromRequest maps a tools/call request onto a command naming the tool. The
+// original params JSON rides in the body untouched.
+func ToolCallFromRequest(
+	record wire.RecordID, conversation wire.ConversationID, source wire.AgentID,
+	correlation wire.CorrelationID, toolName string, paramsJSON []byte,
+) wire.AgentEnvelope {
+	return wire.AgentEnvelope{
+		Kind: wire.KindCommand, Record: &record, Conversation: conversation, Source: source,
+		Correlation: &correlation, Tool: &toolName, Body: append([]byte(nil), paramsJSON...),
+	}
+}
+
 // ToolResultFromEnvelope renders an AGDX answer back as an MCP tool result.
 //
 // A failure is marked as one rather than returned as ordinary content, because

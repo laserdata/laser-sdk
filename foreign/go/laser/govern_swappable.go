@@ -8,7 +8,7 @@ import (
 // SwappableGovernor lets a policy be hot-swapped without restarting the
 // client: Decide always runs under whichever ActionGovernor Swap most
 // recently installed. A swap only changes which policy the *next* Decide
-// call runs under -- a decide already in flight finishes under whichever
+// call runs under. A decide already in flight finishes under whichever
 // policy it read, and nothing already evaluated is reinterpreted, the same
 // non-retroactive rule a durable intent's policy version gives. Ported from
 // Rust's SwappableGovernor (sdk/src/govern.rs:1165-1199).

@@ -61,7 +61,13 @@ func (bridge *A2ABridge) serveCard(writer http.ResponseWriter, request *http.Req
 		writer.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	card, err := bridge.Card()
+	var card *AgentCard
+	var err error
+	if bridge.signingKey == nil {
+		card, err = bridge.Card()
+	} else {
+		card, err = bridge.SignedCard(bridge.signingKey)
+	}
 	if err != nil {
 		// A bridge with no public URL has no card to serve, which is an
 		// absence rather than a failure: discovery found nothing here.

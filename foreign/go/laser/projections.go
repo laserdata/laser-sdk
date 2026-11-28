@@ -90,7 +90,7 @@ func (projections *Projections) Get(
 func (projections *Projections) Status(
 	ctx context.Context, id string,
 ) ([]wire.BindingStatus, error) {
-	if !projections.laser.capabilities.Materializations {
+	if !projections.laser.Capabilities().Materializations {
 		return nil, &UnsupportedError{Surface: "materialization status"}
 	}
 	info, err := projections.read(ctx, id, true)

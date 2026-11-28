@@ -2,6 +2,7 @@ package laser
 
 import (
 	"context"
+	"maps"
 
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
@@ -13,7 +14,7 @@ type laneScan map[wire.ConversationID]*parkedRole
 // once, before the gate decides anything.
 //
 // A parking is durable, so work held by a process that then restarted is
-// still on the lane; without this the new process would not know it was
+// still on the lane. Without this the new process would not know it was
 // holding anything and the work would stay listed as held forever. The scan
 // runs only when some session has a pause history at all, so a deployment
 // that never pauses pays one book read rather than a lane scan.
@@ -32,7 +33,7 @@ func (pause *sessionPause) ensureRecovered(ctx context.Context) error {
 		// is, since the follower may not have read a pause yet.
 		return nil
 	}
-	scan, err := scanLaneFor(ctx, pause.laser, pause.stream, pause.me)
+	scan, err := pause.scanLane(ctx)
 	if err != nil {
 		return err
 	}
@@ -57,7 +58,12 @@ func (pause *sessionPause) merge(scan laneScan) {
 			}
 			pause.roles[session] = held
 		}
+		for prompt := range found.resolvedPrompts {
+			held.resolvePrompt(prompt)
+		}
 		for key := range found.handled {
+			delete(held.parked, key)
+			delete(held.approvalDeadlines, key)
 			held.handled[key] = true
 		}
 		for key, parking := range found.parked {
@@ -71,18 +77,19 @@ func (pause *sessionPause) merge(scan laneScan) {
 	}
 }
 
-// scanLaneFor reads the session lane and folds the work role is holding,
+// scanLane reads the session lane and folds the work this role is holding,
 // per session.
 //
 // It reads the lane once for every session rather than once per session: a
 // recovering process does not yet know which sessions it holds work for,
 // which is the whole reason it is reading.
-func scanLaneFor(
-	ctx context.Context, laser *Laser, stream string, role wire.AgentID,
-) (laneScan, error) {
-	cursor, err := laser.Stream(stream).Topic(wire.AgentSessions).
+func (pause *sessionPause) scanLane(ctx context.Context) (laneScan, error) {
+	cursor, err := pause.laser.Stream(pause.stream).Topic(wire.AgentSessions).
 		ReplayAs(parkedScanReader)
 	if err != nil {
+		return nil, err
+	}
+	if err := cursor.SeekToWindow(ctx, MaxDrainRecords); err != nil {
 		return nil, err
 	}
 	records, err := cursor.Poll(ctx)
@@ -113,7 +120,7 @@ func scanLaneFor(
 		}
 		// Another role's held work is that role's to replay. Taking it on
 		// would hand one agent's work to another.
-		if parking.Role != role {
+		if parking.Role != pause.me {
 			continue
 		}
 		session := envelope.Conversation
@@ -132,6 +139,9 @@ func scanLaneFor(
 				held.parked[key] = parking
 			}
 		case wire.OperationSessionUnparked:
+			if pause.isApprovalParking(parking) {
+				held.resolvePrompt(parking.Request)
+			}
 			delete(held.parked, key)
 			held.handled[key] = true
 		}
@@ -147,14 +157,10 @@ const parkedScanReader = "laser-parked-recovery"
 // the held work for rebuilding when this runtime starts reading one it has
 // not read before.
 //
-// Rust triggers the same re-read off its consumer-group assignment, which
-// this client's runtime is not handed. The partitions records actually
-// arrive from are the observable half of that assignment: a partition this
-// member did not read before is one another member may have parked work for,
-// which is exactly the case the re-read exists to catch. It fires later than
-// Rust's (on the first record of the new partition rather than at the
-// rebalance itself) and not at all for a partition that is assigned and then
-// stays silent, both of which are recorded rather than papered over.
+// A source that reports no assignment leaves the partitions records arrive
+// from as the only sign of one: a partition this member did not read before
+// is one another member may have parked work for. A source that does report
+// its assignment is followed through observeAssignment.
 func (pause *sessionPause) observePartition(partition uint32) {
 	pause.mutex.Lock()
 	if pause.partitions == nil {
@@ -176,55 +182,99 @@ func (pause *sessionPause) observePartition(partition uint32) {
 	pause.recoverMutex.Unlock()
 }
 
-// heldSessions is every session this role is holding work for.
-func (pause *sessionPause) heldSessions() []wire.ConversationID {
+// observeAssignment notes the partitions this member reads, and marks the
+// held work for rebuilding when they change.
+func (pause *sessionPause) observeAssignment(partitions []uint32) {
+	current := make(map[uint32]struct{}, len(partitions))
+	for _, partition := range partitions {
+		current[partition] = struct{}{}
+	}
+	pause.recoverMutex.Lock()
+	defer pause.recoverMutex.Unlock()
 	pause.mutex.Lock()
 	defer pause.mutex.Unlock()
-	sessions := make([]wire.ConversationID, 0, len(pause.roles))
+	if pause.assigned != nil && !maps.Equal(current, pause.assigned) {
+		pause.recovered = false
+	}
+	pause.assigned = current
+}
+
+// reconcilable is every session this role holds work for or the book has a
+// pause or resume request for.
+func (pause *sessionPause) reconcilable() []wire.ConversationID {
+	requested := pause.book.PausedOrResumed()
+	pause.mutex.Lock()
+	defer pause.mutex.Unlock()
+	seen := make(map[wire.ConversationID]struct{}, len(pause.roles)+len(requested))
+	sessions := make([]wire.ConversationID, 0, len(pause.roles)+len(requested))
 	for session, held := range pause.roles {
 		if len(held.parked) > 0 {
+			seen[session] = struct{}{}
+			sessions = append(sessions, session)
+		}
+	}
+	for _, session := range requested {
+		if _, listed := seen[session]; !listed {
 			sessions = append(sessions, session)
 		}
 	}
 	return sessions
 }
 
-// reconcile hands back the held work of every session that is no longer
-// paused, without waiting for new work to arrive for it.
+// reconcile brings every session up to date with its control requests,
+// without waiting for new work to arrive for it.
 //
-// Without this a resume only takes effect when the session's next record
-// turns up, so a session an operator resumed and nobody then wrote to would
-// keep its work held indefinitely. A paused session is left alone, and so is
-// one whose held work cannot be read back.
+// Without this a pause is only acknowledged, and a resume only takes effect,
+// when the session's next record turns up, so a session an operator resumed
+// and nobody then wrote to would keep its work held indefinitely.
 func (pause *sessionPause) reconcile(
 	ctx context.Context, replay replayFunc, decided approvalReplayFunc,
 ) {
 	if err := pause.ensureRecovered(ctx); err != nil {
 		return
 	}
-	for _, session := range pause.heldSessions() {
+	for _, session := range pause.reconcilable() {
 		if ctx.Err() != nil {
 			return
 		}
-		// Expiries come first, and whatever the control state says: an
-		// approval nobody answered has to stop holding the session even
-		// while it is paused, or a pause would strand the work behind a
-		// deadline that already passed.
 		gate := pause.gate(session)
 		gate.Lock()
-		_ = pause.expireApprovals(ctx, session, decided)
-		gate.Unlock()
-
-		pending, known := pause.book.Pending(session)
-		if !known || pending.PauseRequested {
-			continue
-		}
-		gate = pause.gate(session)
-		gate.Lock()
-		// A failed drain is left for the next pass rather than reported:
-		// this runs outside any caller's request, so there is nobody to
-		// report it to, and the work stays held either way.
-		_ = pause.drain(ctx, session, replay)
+		pause.reconcileLocked(ctx, session, replay, decided)
 		gate.Unlock()
 	}
+}
+
+// reconcileLocked acknowledges a pause this role is named in or already takes
+// part in, ends a paused session canceled, acknowledges a resume, and hands
+// back held records on partitions this member reads.
+//
+// A failure is left for the next pass rather than reported: this runs outside
+// any caller's request, and the work stays held either way.
+func (pause *sessionPause) reconcileLocked(
+	ctx context.Context, session wire.ConversationID,
+	replay replayFunc, decided approvalReplayFunc,
+) {
+	// Expiries come first, and whatever the control state says: an approval
+	// nobody answered has to stop holding the session even while it is paused.
+	_ = pause.expireApprovals(ctx, session, decided)
+	pending, known := pause.book.Pending(session)
+	if !known {
+		return
+	}
+	if pending.PauseRequested {
+		ack, placed := pause.book.PauseAck(session)
+		switch {
+		case !placed:
+		case pending.CancelRequested:
+			pause.cancelPaused(ctx, session, ack.Named)
+		case ack.Named || pause.involved(session):
+			_ = pause.acknowledge(ctx, session, wire.TaskPaused, ack)
+		}
+		return
+	}
+	if pending.CancelRequested {
+		return
+	}
+	_ = pause.acknowledgeResume(ctx, session)
+	_, _ = pause.drain(ctx, session, true, replay)
 }

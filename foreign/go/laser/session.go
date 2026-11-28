@@ -113,11 +113,23 @@ type SessionConfig struct {
 	// A session that records none can only be reclaimed by an operator
 	// noticing it, so there is a default rather than an absence.
 	IdleTimeout time.Duration
+	// Heartbeat is how often a process holding session leases publishes its
+	// heartbeat. Zero takes DefaultHeartbeatInterval.
+	Heartbeat time.Duration
 	// MemoryNamespace is where this session's memory lives. Empty takes the
 	// session namespace.
 	MemoryNamespace string
+	// ContextTurns is how many of the newest records a session's context
+	// keeps. Zero takes DefaultSessionContextTurns.
+	ContextTurns int
 	// ContextTokens bounds the context a session assembles.
 	ContextTokens int
+	// FailOnDeadLetter fails a session when a runtime dead-letters one of its
+	// records. Off by default: a dead letter then never ends a session.
+	FailOnDeadLetter bool
+	// SkipSourceRegistration keeps Bootstrap from registering the stream as a
+	// session source on a deployment that serves sessions.
+	SkipSourceRegistration bool
 	// SDK names this client in the session start record, so an operator can
 	// tell which client opened a session.
 	SDK wire.SdkInfo
@@ -126,6 +138,10 @@ type SessionConfig struct {
 // DefaultSessionContextTokens bounds an assembled context when the caller
 // names no bound.
 const DefaultSessionContextTokens = 4000
+
+// DefaultSessionContextTurns is how many of the newest records a session's
+// context keeps when the caller names no bound.
+const DefaultSessionContextTurns = 50
 
 // DefaultSessionIdleTimeout is how long a session may go quiet before the
 // deployment may consider it abandoned, when the caller names no timeout.
@@ -144,6 +160,12 @@ func (config SessionConfig) withDefaults(laser *Laser) SessionConfig {
 	if config.ContextTokens == 0 {
 		config.ContextTokens = DefaultSessionContextTokens
 	}
+	if config.ContextTurns == 0 {
+		config.ContextTurns = DefaultSessionContextTurns
+	}
+	if config.Heartbeat == 0 {
+		config.Heartbeat = DefaultHeartbeatInterval
+	}
 	if config.IdleTimeout == 0 {
 		config.IdleTimeout = DefaultSessionIdleTimeout
 	}
@@ -152,9 +174,6 @@ func (config SessionConfig) withDefaults(laser *Laser) SessionConfig {
 	}
 	return config
 }
-
-// ClientVersion is what this client reports in a session start record.
-const ClientVersion = "0.10.2"
 
 // Create opens a session whose id is derived from its label.
 //
@@ -190,11 +209,13 @@ func (sessions *Sessions) Open(conversation wire.ConversationID, label string) *
 
 // Session is one agent session: a conversation with a lifecycle on the log.
 type Session struct {
+	budget       *wire.Budget
 	laser        *Laser
 	config       SessionConfig
 	conversation wire.ConversationID
 	label        string
 	agent        *wire.AgentID
+	current      *wire.SourceRef
 	// parent and root place this session in its tree. Set together by
 	// WithAncestry, so every record this handle (or one derived from it)
 	// writes carries the ancestry, not only the start.
@@ -223,6 +244,14 @@ type Session struct {
 	// resume lets Begin reopen a session that ended, which it otherwise
 	// refuses.
 	resume bool
+	// tags are the searchable tags the start record carries.
+	tags []string
+	// key signs the terminal record, so a verifying reader can prove which
+	// agent ended the session.
+	key *SigningKey
+	// control is the runtime's control book, set for a session opened inside
+	// a handler so its control reads follow the live subscription.
+	control *ControlBook
 }
 
 // terminalLatch remembers how a session was first ended.
@@ -381,6 +410,55 @@ func (session *Session) Conversation() wire.ConversationID { return session.conv
 // Label is the name this session was created under, empty for a fresh one.
 func (session *Session) Label() string { return session.label }
 
+// Stream is the stream this session lives in.
+func (session *Session) Stream() string { return session.config.Stream }
+
+// Agent is the agent this handle writes as, and false when it names none.
+func (session *Session) Agent() (wire.AgentID, bool) {
+	if session.agent == nil {
+		return wire.AgentID{}, false
+	}
+	return *session.agent, true
+}
+
+// Parent is the parent session, and false for a session that is no child.
+func (session *Session) Parent() (wire.ConversationID, bool) {
+	if session.parent == nil {
+		return wire.ConversationID{}, false
+	}
+	return *session.parent, true
+}
+
+// Root is the root of this session's tree, and false for a session that is no child.
+func (session *Session) Root() (wire.ConversationID, bool) {
+	if session.root == nil {
+		return wire.ConversationID{}, false
+	}
+	return *session.root, true
+}
+
+// Config is the configuration this session follows.
+func (session *Session) Config() SessionConfig { return session.config }
+
+// Scope is the underlying context scope, for a topic outside the session lane or an explicit policy.
+func (session *Session) Scope() *ContextScope {
+	return session.laser.WithDefaultStream(session.config.Stream).Context(session.conversation)
+}
+
+// Tag adds one searchable tag to the session's start record.
+func (session *Session) Tag(tag string) *Session {
+	tagged := *session
+	tagged.tags = append(append([]string(nil), session.tags...), tag)
+	return &tagged
+}
+
+// SignedBy signs this handle's terminal record with key, so a verifying reader can prove which agent ended the session.
+func (session *Session) SignedBy(key *SigningKey) *Session {
+	signed := *session
+	signed.key = key
+	return &signed
+}
+
 // As names the agent writing this session's records.
 func (session *Session) As(agent wire.AgentID) *Session {
 	narrowed := *session
@@ -396,6 +474,28 @@ func (session *Session) WithAncestry(parent, root wire.ConversationID) *Session 
 	return &narrowed
 }
 
+// WithBudget records the token and cost limits on this session's start.
+func (session *Session) WithBudget(budget wire.Budget) *Session {
+	derived := *session
+	if budget.Tokens != nil {
+		value := *budget.Tokens
+		budget.Tokens = &value
+	}
+	if budget.CostMicros != nil {
+		value := *budget.CostMicros
+		budget.CostMicros = &value
+	}
+	derived.budget = &budget
+	return &derived
+}
+
+// WithIdleTimeout sets how long the session can go without a heartbeat before it is idle.
+func (session *Session) WithIdleTimeout(timeout time.Duration) *Session {
+	derived := *session
+	derived.config.IdleTimeout = timeout
+	return &derived
+}
+
 // Reference is the session as another surface names it, for linking a memory
 // or a graph fact back to the session that produced it.
 func (session *Session) Reference() wire.SessionRef {
@@ -405,15 +505,106 @@ func (session *Session) Reference() wire.SessionRef {
 // Memory is this session's memory, scoped to the conversation so a session's
 // own memories are separate from the namespace's shared ones.
 func (session *Session) Memory() *Memory {
+	return session.MemoryIn(session.config.MemoryNamespace)
+}
+
+// MemoryIn is Memory in an explicit namespace.
+func (session *Session) MemoryIn(namespace string) *Memory {
 	conversation := session.conversation
-	return session.laser.Memory(session.config.MemoryNamespace).
+	return session.laser.WithDefaultStream(session.config.Stream).Memory(namespace).
 		For(MemoryScope{Conversation: &conversation})
 }
 
-// Context assembles this session's history under its configured token bound.
-func (session *Session) Context() *ContextAssembler {
-	return Assemble(session.conversation).
-		WithPolicy(TokenBudget{MaxTokens: session.config.ContextTokens})
+// Graph is the named knowledge graph, the same graph Laser.Graph returns.
+func (session *Session) Graph(name string) *Graph {
+	return session.laser.WithDefaultStream(session.config.Stream).Graph(name)
+}
+
+// ActingOn returns a session whose linked writes identify the given source record.
+func (session *Session) ActingOn(source wire.SourceRef) *Session {
+	bound := *session
+	bound.current = &source
+	return &bound
+}
+
+// LinkedMemory stamps remembered items with their producer and current source record.
+func (session *Session) LinkedMemory() *Memory {
+	memory := session.Memory()
+	scope := memory.Scope()
+	producer := session.producer()
+	scope.Producer, scope.Origin = &producer, session.current
+	return memory.For(scope)
+}
+
+func (session *Session) producer() wire.ProducerInfo {
+	name := "sdk"
+	if session.agent != nil {
+		name += ":" + session.agent.String()
+	}
+	return wire.ProducerInfo{Name: name, Version: session.config.SDK.Version}
+}
+
+// Kv links writes to this session.
+func (session *Session) Kv(namespace string) *Kv {
+	return session.laser.WithDefaultStream(session.config.Stream).Kv(namespace).InSession(session.Reference())
+}
+
+// LinkedGraph stamps graph writes with the session, producer and current source record.
+func (session *Session) LinkedGraph(name string) *Graph {
+	graph := session.laser.WithDefaultStream(session.config.Stream).Graph(name).InSession(session.Reference()).ProducedBy(session.producer())
+	if session.current != nil {
+		graph.SourcedFrom(*session.current)
+	}
+	return graph
+}
+
+// RecordRetrieval records the recalled items that entered the session context.
+func (session *Session) RecordRetrieval(ctx context.Context, query *string, items []MemoryItem) (*AgdxReceipt, error) {
+	body := wire.ContextRetrieval{Query: query, Items: make([]wire.RetrievedItem, len(items))}
+	for i, item := range items {
+		body.Items[i] = wire.RetrievedItem{ID: item.ID.String(), Score: float32(item.Score)}
+	}
+	return session.writeContextEvent(ctx, wire.OperationContextRetrieved, body)
+}
+
+// RecordCompaction records the summary that replaced the covered context records.
+func (session *Session) RecordCompaction(ctx context.Context, compaction wire.ContextCompaction) (*AgdxReceipt, error) {
+	return session.writeContextEvent(ctx, wire.OperationContextCompacted, compaction)
+}
+
+func (session *Session) writeContextEvent(ctx context.Context, operation string, body any) (*AgdxReceipt, error) {
+	lane, err := session.Agdx()
+	if err != nil {
+		return nil, err
+	}
+	payload, err := wire.Marshal(body)
+	if err != nil {
+		return nil, &CodecError{Reason: "encode session context event", Cause: err}
+	}
+	return lane.Emit(payload).WithOperation(operation).ContentType(wire.ContentCBOR).Send(ctx)
+}
+
+// Context reads the session's newest records under its configured turn and token bounds.
+func (session *Session) Context(ctx context.Context) ([]SessionTurn, error) {
+	return session.ContextWith(ctx, session.contextPolicy())
+}
+
+// ContextWith is Context under an explicit policy.
+func (session *Session) ContextWith(ctx context.Context, policy ContextPolicy) ([]SessionTurn, error) {
+	messages, err := session.Scope().FetchWith(ctx, session.turnTopics(), policy)
+	if err != nil {
+		return nil, err
+	}
+	return turnsOf(messages), nil
+}
+
+// contextPolicy keeps the newest configured turns, trimmed to the configured token bound.
+func (session *Session) contextPolicy() ContextPolicy {
+	turns := session.config.ContextTurns
+	if turns <= 0 {
+		turns = DefaultSessionContextTurns
+	}
+	return Chain{LastN(turns), TokenBudget{MaxTokens: session.config.ContextTokens}}
 }
 
 // Agdx is the agent messaging surface for this session.
@@ -485,6 +676,9 @@ func (session *Session) Resume() *Session {
 // The ancestry a session carries is the envelope's, so a sub-session records
 // the exchange it was spawned from and a reader can walk the tree.
 func (session *Session) Begin(ctx context.Context) (*AgdxReceipt, *SessionLease, error) {
+	if session.config.IdleTimeout <= 0 || session.config.Heartbeat <= 0 {
+		return nil, nil, &InvalidError{Reason: "session idle timeout and heartbeat interval must be positive"}
+	}
 	agdx, err := session.Agdx()
 	if err != nil {
 		return nil, nil, err
@@ -493,8 +687,11 @@ func (session *Session) Begin(ctx context.Context) (*AgdxReceipt, *SessionLease,
 		return nil, nil, err
 	}
 	start := wire.SessionStart{
-		Agent: *session.agent,
-		SDK:   session.config.SDK,
+		Budget: session.budget,
+		Agent:  *session.agent,
+		SDK:    session.config.SDK,
+		Parent: session.parent,
+		Root:   session.root,
 	}
 	if session.label != "" {
 		label := session.label
@@ -508,21 +705,22 @@ func (session *Session) Begin(ctx context.Context) (*AgdxReceipt, *SessionLease,
 		micros := uint64(session.config.IdleTimeout.Microseconds())
 		start.IdleTimeoutMicros = &micros
 	}
+	start.Tags = append([]string(nil), session.tags...)
 	receipt, err := agdx.SessionStarted(start).Send(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	// One deliberate simplification versus Rust: Rust derives the lease's
-	// heartbeat interval from config.heartbeat.min(idle_timeout / 5); Go's
-	// SessionConfig has no heartbeat field to derive from, so this takes
-	// LeaseSession's own existing default (passing 0) rather than inventing
-	// new config surface for one call site -- the same simplification
-	// AgentRuntime.pickUpSubmitted's own lease call already makes.
-	lease, err := session.laser.LeaseSession(ctx, session.conversation, *session.agent, 0)
-	if err != nil {
-		return receipt, nil, err
-	}
-	return receipt, lease, nil
+	return receipt, session.acquireLease(), nil
+}
+
+// acquireLease uses the generation pinned by the lifecycle record just written.
+func (session *Session) acquireLease() *SessionLease {
+	session.lane.mutex.Lock()
+	generation := session.lane.identity.streamGeneration
+	session.lane.mutex.Unlock()
+	interval := max(10*time.Millisecond, min(session.config.Heartbeat, session.config.IdleTimeout/5))
+	key := leaseKey{stream: session.config.Stream, streamGeneration: generation, session: session.conversation}
+	return session.laser.Leases().acquire(session.laser, key, *session.agent, interval)
 }
 
 // Progress records the session moving along.
@@ -556,6 +754,9 @@ func (session *Session) End(
 	send := agdx.SessionEnded(intent.state, intent.end)
 	record := intent.record
 	send.envelope.Record = &record
+	if session.key != nil {
+		send = send.Signed(session.key)
+	}
 	return send.Send(ctx)
 }
 

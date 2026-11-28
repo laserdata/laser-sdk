@@ -109,10 +109,12 @@ func (stream *Stream) Delete(ctx context.Context) (bool, error) {
 	}
 	if err := client.DeleteStream(ctx, identifier); err != nil {
 		if isMissingResource(err) {
+			stream.laser.forgetStream(stream.name)
 			return false, nil
 		}
 		return false, &TransportError{Reason: "delete the stream", Cause: err}
 	}
+	stream.laser.forgetStream(stream.name)
 	return true, nil
 }
 
@@ -136,32 +138,50 @@ func (topic *Topic) Ensure(
 	if partitions == 0 {
 		return &InvalidError{Reason: "a topic needs at least one partition"}
 	}
-	if err := topic.laser.Stream(topic.stream).Ensure(ctx); err != nil {
+	if err := validateTopicReplication(replicationFactor); err != nil {
 		return err
 	}
-	client, err := topic.laser.connected()
-	if err != nil {
+	if err := topic.laser.Stream(topic.stream).Ensure(ctx); err != nil {
 		return err
 	}
 	streamID, topicID, err := topic.identifiers()
 	if err != nil {
 		return err
 	}
-	switch _, err := client.GetTopic(ctx, streamID, topicID); {
-	case err == nil:
+	return topic.ensureOptions(ctx, streamID, topicID, true, &iggcon.TopicOptions{PartitionsCount: &partitions, ReplicationFactor: replicationFactor})
+}
+
+func validateTopicReplication(factor *uint32) error {
+	if factor != nil && (*factor == 0 || *factor > 32) {
+		return &InvalidError{Reason: "replication factor must be between 1 and 32"}
+	}
+	return nil
+}
+
+func (topic *Topic) ensureOptions(ctx context.Context, streamID, topicID iggcon.Identifier, create bool, options *iggcon.TopicOptions) error {
+	client, err := topic.laser.connected()
+	if err != nil {
+		return err
+	}
+	details, err := client.GetTopic(ctx, streamID, topicID)
+	if err == nil && details != nil {
 		return nil
-	case !isMissingResource(err):
+	}
+	if err != nil && !isMissingResource(err) {
 		return &TransportError{Reason: "read the topic", Cause: err}
 	}
-	options := &iggcon.TopicOptions{
-		PartitionsCount:   &partitions,
-		ReplicationFactor: replicationFactor,
+	if !create {
+		if err == nil {
+			err = ierror.TopicNameNotFound{TopicName: topic.name, StreamId: topic.stream}
+		}
+		return &TransportError{Reason: "read the topic", Cause: err}
 	}
 	if _, err := client.CreateTopic(ctx, streamID, topic.name, options); err != nil {
-		if _, probe := client.GetTopic(ctx, streamID, topicID); probe == nil {
-			return nil
+		// A concurrent caller can create the same topic after the initial read.
+		current, readErr := client.GetTopic(ctx, streamID, topicID)
+		if readErr != nil || current == nil {
+			return &TransportError{Reason: "create the topic", Cause: err}
 		}
-		return &TransportError{Reason: "create the topic", Cause: err}
 	}
 	return nil
 }
@@ -181,10 +201,12 @@ func (topic *Topic) Delete(ctx context.Context) (bool, error) {
 	}
 	if err := client.DeleteTopic(ctx, streamID, topicID); err != nil {
 		if isMissingResource(err) {
+			topic.laser.forgetTopic(topic.stream, topic.name)
 			return false, nil
 		}
 		return false, &TransportError{Reason: "delete the topic", Cause: err}
 	}
+	topic.laser.forgetTopic(topic.stream, topic.name)
 	return true, nil
 }
 
@@ -214,8 +236,8 @@ func (laser *Laser) connected() (iggcon.Client, error) {
 }
 
 func errNoStream() error {
-	return &InvalidError{Reason: "no stream selected: pin one with " +
-		"Options.DefaultStream or address it with Stream(name).Topic(name)"}
+	return &InvalidError{Reason: "no default stream set: work in a scratch stream with " +
+		"ScratchStream(prefix), or pick one with WithDefaultStream(name)"}
 }
 
 // isMissingResource reports the errors that mean "it is not there", which read

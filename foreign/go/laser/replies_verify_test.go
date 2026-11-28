@@ -11,7 +11,7 @@ import (
 )
 
 // signedAnswer builds a Response-kind envelope the way source would really
-// send it -- real headers, a real signature bound to them when key is set --
+// send it, with real headers and a real signature bound to them when key is set,
 // so a verifier has a genuine record to check rather than a hand-built
 // envelope with no signing context at all. cause, when set, must be applied
 // before signing: it rides inside the signed envelope, so naming it after the
@@ -113,7 +113,7 @@ func TestGivenAVerifiedHubWithAWrongSignerReplyWhenDeliveredThenShouldLeaveItAlo
 	}
 
 	// Validly signed and enrolled, but as a different agent than the one the
-	// waiter is pinned to -- a wrong-signer reply, not an unsigned one.
+	// waiter is pinned to: a wrong-signer reply, not an unsigned one.
 	message := signedAnswer(
 		t, agentID(t, "imposter"), requester, conversation(1), correlationID(1), nil, key)
 	if hub.Deliver(message) {

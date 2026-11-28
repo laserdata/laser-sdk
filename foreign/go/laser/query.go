@@ -2,15 +2,17 @@ package laser
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
-// DefaultQueryDeadline bounds a query that names none. The deadline is
-// absolute on the wire, and a server never extends it while queueing or
-// paging, so it bounds the whole execution rather than one hop.
-const DefaultQueryDeadline = 30 * time.Second
+// DefaultQueryDeadline bounds a query that names none and is the longest one
+// may ask for. The deadline is absolute on the wire, and a server never
+// extends it while queueing or paging, so it bounds the whole execution rather
+// than one hop.
+const DefaultQueryDeadline = QueryDeadline
 
 // QueryRequest builds a query against one materialized index. Nothing is sent
 // until Fetch.
@@ -18,14 +20,17 @@ const DefaultQueryDeadline = 30 * time.Second
 // A builder error is carried rather than returned at each step, so a chain
 // reads as one expression and still reports the first thing that was wrong.
 type QueryRequest struct {
-	laser    *Laser
-	query    wire.Query
-	deadline time.Duration
-	filters  []wire.Filter
-	having   []wire.Filter
-	aggs     []wire.AggCall
-	groupBy  []string
-	err      error
+	laser            *Laser
+	query            wire.Query
+	deadline         time.Duration
+	absoluteDeadline uint64
+	maxRows          *uint64
+	window           *wire.Window
+	filters          []wire.Filter
+	having           []wire.Filter
+	aggs             []wire.AggCall
+	groupBy          []string
+	err              error
 }
 
 // Query begins a query against a materialized index, named as this handle
@@ -42,7 +47,7 @@ func (laser *Laser) QueryTarget(target wire.QueryTarget) *QueryRequest {
 	}
 	return &QueryRequest{
 		laser:    laser,
-		query:    wire.NewQuery(wire.QueryExecutionID{}, target, 0),
+		query:    wire.NewQuery(wire.QueryExecutionID{ID: wire.IDFromBytes(NewOperationID())}, target, 0),
 		deadline: DefaultQueryDeadline,
 	}
 }
@@ -54,12 +59,61 @@ func (request *QueryRequest) fail(err error) *QueryRequest {
 	return request
 }
 
-// Deadline bounds the whole execution, from the moment the request is sent.
+// Deadline bounds each call and each page of a walk, from the moment it is
+// sent. One past QueryDeadline fails the call before anything is sent.
 func (request *QueryRequest) Deadline(deadline time.Duration) *QueryRequest {
 	if deadline <= 0 {
 		return request.fail(&InvalidError{Reason: "a query deadline must be positive"})
 	}
 	request.deadline = deadline
+	request.absoluteDeadline = 0
+	return request
+}
+
+// DeadlineAtMicros fixes one absolute deadline, in epoch microseconds, for
+// every later call and page.
+func (request *QueryRequest) DeadlineAtMicros(micros uint64) *QueryRequest {
+	if micros == 0 {
+		return request.fail(&InvalidError{Reason: "query deadline must be nonzero"})
+	}
+	request.absoluteDeadline = micros
+	return request
+}
+
+// WhereEq adds an exact-match constraint on an indexed field.
+func (request *QueryRequest) WhereEq(field string, value wire.TypedValue) *QueryRequest {
+	request.query.ByKey = append(request.query.ByKey, wire.KeyMatch{Field: field, Value: value})
+	return request
+}
+
+// Conversation selects rows produced by the specified conversation.
+func (request *QueryRequest) Conversation(id wire.ConversationID) *QueryRequest {
+	return request.WhereEq(wire.ConversationField, wire.StringTyped(id.String()))
+}
+
+// Predicate adds a structured predicate tree to the query.
+func (request *QueryRequest) Predicate(filter wire.Filter) *QueryRequest {
+	request.filters = append(request.filters, filter)
+	return request
+}
+
+// Nearest searches the default embedding field.
+func (request *QueryRequest) Nearest(embedding []float32, topK uint32) *QueryRequest {
+	return request.NearestIn(wire.VectorField, embedding, topK)
+}
+
+// NearestIn selects the nearest vectors in field.
+func (request *QueryRequest) NearestIn(field string, embedding []float32, topK uint32) *QueryRequest {
+	request.query.Vector = &wire.VectorQuery{Field: field, Embedding: embedding, TopK: topK}
+	return request
+}
+
+// Window groups an aggregate by intervals of the given timestamp field.
+func (request *QueryRequest) Window(field string, every time.Duration) *QueryRequest {
+	if every.Microseconds() <= 0 {
+		return request.fail(&InvalidError{Reason: "a query window must be at least one microsecond"})
+	}
+	request.window = &wire.Window{Field: field, EveryMicros: uint64(every.Microseconds())}
 	return request
 }
 
@@ -230,7 +284,7 @@ func (request *QueryRequest) CountDistinct(field string) *QueryRequest {
 
 // StdDev adds the standard deviation of field.
 func (request *QueryRequest) StdDev(field string) *QueryRequest {
-	return request.AggAs(wire.AggStdDev, field, "std_dev")
+	return request.AggAs(wire.AggStdDev, field, "stddev")
 }
 
 // Percentile adds the value at fraction of field, where fraction runs from 0
@@ -288,11 +342,13 @@ func (request *QueryRequest) build() (wire.Query, error) {
 		return wire.Query{}, request.err
 	}
 	query := request.query
-	query.ExecutionID = wire.QueryExecutionID{ID: wire.IDFromBytes(NewOperationID())}
 	// The deadline is absolute on the wire, so it is resolved at send time
 	// rather than when the builder was created: a request held before sending
 	// would otherwise arrive already expired.
-	query.DeadlineMicros = uint64(time.Now().Add(request.deadline).UnixMicro())
+	query.DeadlineMicros = request.absoluteDeadline
+	if query.DeadlineMicros == 0 {
+		query.DeadlineMicros = uint64(time.Now().Add(request.deadline).UnixMicro())
+	}
 	switch len(request.filters) {
 	case 0:
 	case 1:
@@ -301,8 +357,8 @@ func (request *QueryRequest) build() (wire.Query, error) {
 		combined := wire.AllOf(request.filters...)
 		query.Filter = &combined
 	}
-	if len(request.aggs) > 0 || len(request.groupBy) > 0 {
-		query.Aggregate = &wire.Aggregate{GroupBy: request.groupBy, Funcs: request.aggs}
+	if len(request.aggs) > 0 || len(request.groupBy) > 0 || request.window != nil {
+		query.Aggregate = &wire.Aggregate{GroupBy: request.groupBy, Funcs: request.aggs, Window: request.window}
 	}
 	switch len(request.having) {
 	case 0:
@@ -318,42 +374,78 @@ func (request *QueryRequest) build() (wire.Query, error) {
 	return query, nil
 }
 
+// ExecutionID is the identity the next request sends and its reply echoes
+// back. Every call and every page of a walk takes a fresh one.
+func (request *QueryRequest) ExecutionID() wire.QueryExecutionID { return request.query.ExecutionID }
+
+// rotate moves the builder to a fresh identity for its next call.
+func (request *QueryRequest) rotate() {
+	request.query.ExecutionID = wire.QueryExecutionID{ID: wire.IDFromBytes(NewOperationID())}
+}
+
+// take hands out the builder as it stands for one call or walk, and moves the
+// builder itself to a fresh identity.
+func (request *QueryRequest) take() QueryRequest {
+	taken := *request
+	request.rotate()
+	return taken
+}
+
+// IntoQuery builds and validates the wire request without sending it.
+func (request *QueryRequest) IntoQuery() (wire.Query, error) { return request.build() }
+
 // Fetch runs the query and returns one page of rows.
 func (request *QueryRequest) Fetch(ctx context.Context) (*wire.QueryResult, error) {
 	query, err := request.build()
 	if err != nil {
 		return nil, err
 	}
+	request.rotate()
 	return request.laser.ExecuteQuery(ctx, query)
 }
 
 // ExecuteQuery runs a query that was built directly. Most callers want the
 // builder instead.
+//
+// The reply is awaited QueryReplyGrace past the query's deadline and no
+// longer. A wait that runs out does not prove the query stopped.
 func (laser *Laser) ExecuteQuery(
 	ctx context.Context, query wire.Query,
 ) (*wire.QueryResult, error) {
+	if err := query.Validate(); err != nil {
+		return nil, &InvalidError{Reason: err.Error()}
+	}
 	if err := laser.requireQuery(query); err != nil {
 		return nil, err
+	}
+	remaining := time.Duration(0)
+	if now := uint64(time.Now().UnixMicro()); query.DeadlineMicros > now {
+		if query.DeadlineMicros-now > uint64(QueryDeadline.Microseconds()) {
+			return nil, &InvalidError{Reason: fmt.Sprintf(
+				"the query deadline is %ds away, the longest allowed is %ds",
+				(query.DeadlineMicros-now)/1_000_000, int(QueryDeadline.Seconds()))}
+		}
+		remaining = time.Duration(query.DeadlineMicros-now) * time.Microsecond
 	}
 	payload, err := wire.Marshal(wire.NewQueryEnvelope(query))
 	if err != nil {
 		return nil, &CodecError{Reason: "encode query", Cause: err}
 	}
 	// A query every node refused walks the roster again until the query's own
-	// deadline rather than the managed one, so the last refusal comes back
-	// before the caller stops waiting for a reply. The deadline is absolute
-	// on the wire, and a query that names none takes the managed walk.
-	queryWalk := walkingUntilServed()
-	if query.DeadlineMicros > 0 {
-		queryWalk = walkingUntil(time.UnixMicro(int64(query.DeadlineMicros)))
-	}
-	raw, err := laser.sendManagedWalking(ctx, wire.AgdxQueryCode, payload, queryWalk)
+	// deadline, so the last refusal comes back before the reply wait ends.
+	deadline := time.Now().Add(remaining)
+	bounded, cancel := context.WithDeadline(ctx, deadline.Add(QueryReplyGrace))
+	defer cancel()
+	raw, err := laser.sendManagedWalking(bounded, wire.AgdxQueryCode, payload, walkingUntil(deadline))
 	if err != nil {
+		if ctx.Err() == nil && bounded.Err() != nil {
+			return nil, &StageTimeoutError{Stage: "the query reply by the query deadline"}
+		}
 		return nil, err
 	}
 	var reply wire.QueryReply
-	if err := wire.Unmarshal(raw, &reply); err != nil {
-		return nil, &CodecError{Reason: "decode query reply", Cause: err}
+	if err := decodeManagedReply(raw, &reply, "decode query reply"); err != nil {
+		return nil, err
 	}
 	if !reply.IsOk() {
 		if reply.Err == nil {
@@ -366,6 +458,9 @@ func (laser *Laser) ExecuteQuery(
 	if err := reply.Result.Validate(); err != nil {
 		return nil, &CodecError{Reason: "query result: " + err.Error()}
 	}
+	if reply.Result.Context.ExecutionID != query.ExecutionID {
+		return nil, &ProtocolError{Reason: "query reply execution id does not match the request"}
+	}
 	return reply.Result, nil
 }
 
@@ -376,18 +471,18 @@ func (laser *Laser) ExecuteQuery(
 // looks like success while being a wider or staler answer than was asked for.
 // Refusing locally is the only way to tell the caller.
 func (laser *Laser) requireQuery(query wire.Query) error {
-	if !laser.capabilities.Managed || !laser.capabilities.Query.Available {
+	if !laser.Capabilities().Managed || !laser.Capabilities().Query.Available {
 		return &UnsupportedError{Surface: "the query surface"}
 	}
 	if err := laser.requireOpVersion("query", wire.QueryOpVersion,
 		func(versions wire.OpVersions) uint32 { return versions.Query }); err != nil {
 		return err
 	}
-	if !laser.capabilities.ServesConsistency(query.Consistency) {
+	if !laser.Capabilities().ServesConsistency(query.Consistency) {
 		return &UnsupportedError{
 			Surface: "consistency level " + string(query.Consistency) + ", which"}
 	}
-	if query.Text != nil && !laser.capabilities.Query.Keyword {
+	if query.Text != nil && !laser.Capabilities().Query.Keyword {
 		return &UnsupportedError{Surface: "lexical relevance search, which"}
 	}
 	if query.RawSQL != nil && !laser.servesDialect(query.RawSQL.Dialect) {
@@ -397,11 +492,11 @@ func (laser *Laser) requireQuery(query wire.Query) error {
 	return nil
 }
 
-// servesDialect reports whether a ready backend announced raw SQL in this
+// servesDialect reports whether an enabled backend announced raw SQL in this
 // dialect.
 func (laser *Laser) servesDialect(dialect wire.SqlDialect) bool {
-	for _, backend := range laser.capabilities.Backends {
-		if !backend.Readiness.Ready || backend.Query == nil || !backend.Query.RawSQL {
+	for _, backend := range laser.Capabilities().Backends {
+		if backend.DesiredState != wire.BackendEnabledState || backend.Query == nil || !backend.Query.RawSQL {
 			continue
 		}
 		for _, served := range backend.Query.Dialects {

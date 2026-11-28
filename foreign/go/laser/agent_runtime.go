@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -135,7 +136,9 @@ type RuntimeObserver struct {
 	OnDrop func(message *AgentMessage, decision Decision)
 	// OnError reports a best-effort side action that did not happen: a
 	// pickup acknowledgment, or the error answering a dead-lettered command.
-	// The record is still handled and committed.
+	// The record is still handled and committed. The message is nil for a
+	// failure that belongs to no record, such as agent.control staying
+	// unreadable.
 	OnError func(message *AgentMessage, err error)
 }
 
@@ -226,10 +229,8 @@ type RuntimeOptions struct {
 	// offset is committed, so nothing reaches the handler while the session
 	// is paused. A resume hands the held records back before new work.
 	//
-	// Off by default, because it changes what a handler sees and needs a
-	// deployment whose agent.control and agent.sessions topics exist. With
-	// it off a handler polls AgentCtx.PendingControl and decides itself,
-	// which is what this client has always done.
+	// SpawnAgent enables this for its consumer. A caller that supplies its
+	// own RecordSource to AgentRuntime can enable it explicitly.
 	EnforceControl bool
 	// Sessions is the session surface a handler reads through its context.
 	// Nil opens the handle's default.
@@ -239,9 +240,15 @@ type RuntimeOptions struct {
 	// Concurrency is how message handling is scheduled across this agent's
 	// assigned partitions. The zero value is Serial.
 	Concurrency ConcurrencyPolicy
+	// MaxQueuedRecords bounds the records held across partition lanes
+	// between the poll and the handlers. Zero takes DefaultMaxQueuedRecords.
+	MaxQueuedRecords int
+	// MaxQueuedBytes bounds the payload and header bytes held across
+	// partition lanes. Zero takes DefaultMaxQueuedBytes.
+	MaxQueuedBytes int
 	// Group is the Iggy consumer group this runtime's records are assigned
-	// through. AgentRuntime never joins it itself -- Run reads whatever
-	// RecordSource it is handed -- so nothing here needs it except WarmDedup,
+	// through. AgentRuntime never joins it itself, because Run reads whatever
+	// RecordSource it is handed, so nothing here needs it except WarmDedup,
 	// which reads this group's own committed offsets per partition to decide
 	// what already counts as handled. Leave it empty when WarmDedup is off.
 	Group string
@@ -295,13 +302,18 @@ type AgentRuntime struct {
 	onDeadLetter DeadLetterSink
 	observer     RuntimeObserver
 
-	budget      *BudgetGate
-	control     *ControlBook
-	pause       *sessionPause
-	follower    *controlFollower
-	sessions    *Sessions
-	replies     *ReplyHub
-	concurrency ConcurrencyPolicy
+	budget   *BudgetGate
+	control  *ControlBook
+	pause    *sessionPause
+	follower *controlFollower
+	sessions *Sessions
+	replies  *ReplyHub
+	// replyReaders feed the reply hub from outside the loop, one per topic a
+	// handler awaited on, guarded by replyGuard.
+	replyReaders map[string]*replyDispatcher
+	replyGuard   sync.Mutex
+	concurrency  ConcurrencyPolicy
+	queued       laneLimits
 
 	group           string
 	warmDedup       bool
@@ -325,6 +337,7 @@ type AgentRuntime struct {
 	// batches counts the poll batches read per partition, which scopes the
 	// budget gate's cached verdicts to one batch the way a head offset does
 	// for the Rust client.
+	batchMu sync.Mutex
 	batches map[uint32]uint64
 }
 
@@ -339,8 +352,8 @@ func (laser *Laser) AgentRuntime(
 		return nil, &InvalidError{Reason: "an agent runtime names the topic it reads"}
 	}
 	if options.AckOnPickup && options.RespondOn == "" {
-		return nil, &InvalidError{Reason: "acknowledging a pickup needs RespondOn, " +
-			"the topic the acknowledgment is sent on"}
+		return nil, configError("acknowledging a pickup needs RespondOn, " +
+			"the topic the acknowledgment is sent on")
 	}
 	if options.WarmDedup && options.Group == "" {
 		return nil, &InvalidError{Reason: "warm dedup needs the consumer group name to " +
@@ -393,6 +406,7 @@ func (laser *Laser) AgentRuntime(
 		replies:         NewVerifiedReplyHub(options.Verifier),
 		batches:         map[uint32]uint64{},
 		concurrency:     options.Concurrency,
+		queued:          laneLimitsOf(options.MaxQueuedRecords, options.MaxQueuedBytes),
 		group:           options.Group,
 		warmDedup:       options.WarmDedup,
 		warmDedupPolicy: options.WarmDedupPolicy,
@@ -438,33 +452,56 @@ func (runtime *AgentRuntime) Run(
 	if handler == nil {
 		return &InvalidError{Reason: "an agent runtime hands work to a handler, so it needs one"}
 	}
+	defer runtime.stopReplyReaders()
 	if err := runtime.warmUpDedup(ctx); err != nil {
+		// A stop that lands during startup is a clean stop, not a failed read.
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
+	// Resolved before any goroutine that names a record's position starts.
+	runtime.resolveSource(ctx)
 	// Started before the first record is read, and the book is reported
 	// live only once the history is loaded, so the gate never decides a
 	// session is unpaused merely because nothing has been read yet.
 	if runtime.pause != nil {
 		follower, err := followControl(
-			ctx, runtime.laser, runtime.control, runtime.identity)
+			ctx, runtime.laser.WithDefaultStream(runtime.stream), runtime.control, runtime.identity,
+			func(err error) { runtime.failed(nil, err) })
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return err
 		}
 		runtime.follower = follower
 		defer follower.stop()
 		// A resume has to reach a session even when no further work
 		// arrives for it, so held work is reconciled on its own schedule
-		// rather than only when the next record turns up.
-		reconcile, stopReconcile := context.WithCancel(ctx)
-		defer stopReconcile()
-		go runtime.reconcileHeld(reconcile, handler)
+		// rather than only when the next record turns up. A replay in
+		// flight at shutdown gets the same grace as any other record.
+		held, releaseHeld := runtime.workContext(ctx)
+		reconciled := make(chan struct{})
+		var assignment func() []uint32
+		if member, ok := source.(interface{ Partitions() []uint32 }); ok {
+			assignment = member.Partitions
+			runtime.pause.observeAssignment(assignment())
+		}
+		go func() {
+			defer close(reconciled)
+			runtime.reconcileHeld(ctx, held, handler, assignment)
+		}()
+		defer func() {
+			<-reconciled
+			releaseHeld()
+		}()
 	}
 	if runtime.concurrency.isSerialPerPartition() {
-		return runtime.runPerPartition(ctx, source, handler, runtime.concurrency.maxPartitions)
+		return runtime.runPerPartition(ctx, source, handler, runtime.concurrency.maxPartitions, runtime.queued)
 	}
 	work, release := runtime.workContext(ctx)
 	defer release()
-	runtime.resolveSource(ctx)
 
 	var failures uint32
 	for {
@@ -569,6 +606,17 @@ func (runtime *AgentRuntime) deliver(
 			// ago, and may have been in another process entirely. This is
 			// what hands its record back.
 			if runtime.pause != nil {
+				if runtime.verifier != nil {
+					reply, ok := message.Agdx()
+					if !ok {
+						return nil
+					}
+					principal, ok := verifyReplySignature(runtime.verifier, reply)
+					if !ok || principal != reply.Envelope.Source.String() {
+						return nil
+					}
+					message.VerifiedPrincipal = &principal
+				}
 				if err := runtime.pause.resumeApproval(ctx, message, func(
 					ctx context.Context, held *Record, resume *approvalResume,
 				) (bool, error) {
@@ -608,7 +656,7 @@ func (runtime *AgentRuntime) deliver(
 		runtime.skipped(message, wire.DispatchObservational)
 		return nil
 	}
-	decision := runtime.agent.Decide(record)
+	decision := runtime.agent.decide(ctx, record)
 	switch decision.Verdict {
 	case Skip:
 		runtime.dropped(message, decision)
@@ -644,20 +692,34 @@ func (runtime *AgentRuntime) deliver(
 
 // reconcileHeld hands back the work of sessions a resume reached while this
 // runtime was not reading anything for them.
-func (runtime *AgentRuntime) reconcileHeld(ctx context.Context, handler AgentHandler) {
+//
+// It stops starting replays when ctx ends. A replay already running finishes
+// under work, which outlives ctx by the shutdown grace.
+func (runtime *AgentRuntime) reconcileHeld(
+	ctx, work context.Context, handler AgentHandler, assignment func() []uint32,
+) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(controlFollowInterval):
 		}
-		runtime.pause.reconcile(ctx,
-			func(ctx context.Context, held *Record) error {
-				return runtime.replayHeld(ctx, held, handler)
+		if assignment != nil {
+			runtime.pause.observeAssignment(assignment())
+		}
+		runtime.pause.reconcile(work,
+			func(work context.Context, held *Record) error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return runtime.replayHeld(work, held, handler)
 			},
-			func(ctx context.Context, held *Record, resume *approvalResume,
+			func(work context.Context, held *Record, resume *approvalResume,
 			) (bool, error) {
-				return runtime.replayApproval(ctx, held, resume, handler)
+				if err := ctx.Err(); err != nil {
+					return false, err
+				}
+				return runtime.replayApproval(work, held, resume, handler)
 			})
 	}
 }
@@ -671,12 +733,40 @@ func (runtime *AgentRuntime) reconcileHeld(ctx context.Context, handler AgentHan
 func (runtime *AgentRuntime) replayHeld(
 	ctx context.Context, record *Record, handler AgentHandler,
 ) error {
-	message, opened, err := runtime.open(ctx, record)
+	message, opened, err := runtime.openHeld(ctx, record)
 	if err != nil || !opened {
 		return err
 	}
 	runtime.acknowledgePickup(ctx, message)
 	return runtime.handle(ctx, message, handler)
+}
+
+// openHeld rechecks a parked record under current routing, verification and
+// fencing rules. A legitimate parking has already entered the dedup window.
+func (runtime *AgentRuntime) openHeld(ctx context.Context, record *Record) (*AgentMessage, bool, error) {
+	message, ok, err := runtime.open(ctx, record)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	if !runtime.addressedHere(message) || runtime.classify(message) != wire.DispatchWork {
+		return nil, false, nil
+	}
+	if runtime.verifier != nil {
+		agdx, ok := message.Agdx()
+		if !ok {
+			return nil, false, runtime.deadLetter(ctx, message, wire.DeadLetterRejected, 0, "parked record is unsigned")
+		}
+		principal, valid := verifyReplySignature(runtime.verifier, agdx)
+		if !valid {
+			return nil, false, runtime.deadLetter(ctx, message, wire.DeadLetterRejected, 0, "parked record signature verification failed")
+		}
+		message.VerifiedPrincipal = &principal
+	}
+	decision := runtime.agent.beforeDedup(record)
+	if decision.Verdict == DeadLetter {
+		return nil, false, runtime.deadLetter(ctx, message, decision.Reason, 0, decision.Detail)
+	}
+	return message, decision.Verdict == Deliver, nil
 }
 
 // open decodes a record into the message a handler sees, reporting false when
@@ -774,15 +864,19 @@ func (runtime *AgentRuntime) admit(ctx context.Context, message *AgentMessage) b
 		return true
 	}
 	session := runtime.sessions.Open(message.Conversation(), "").As(runtime.identity)
-	return runtime.budget.Admit(ctx, session, message.Record.PartitionID,
-		runtime.batches[message.Record.PartitionID])
+	runtime.batchMu.Lock()
+	batch := runtime.batches[message.Record.PartitionID]
+	runtime.batchMu.Unlock()
+	return runtime.budget.Admit(ctx, session, message.Record.PartitionID, batch)
 }
 
 // endBatch counts a finished poll batch, which is what scopes the budget
 // gate's cached verdicts: a later batch reads the index again.
 func (runtime *AgentRuntime) endBatch(record *Record) {
-	if record.EndsBatch {
+	if record.EndsBatch && runtime.budget != nil {
+		runtime.batchMu.Lock()
 		runtime.batches[record.PartitionID]++
+		runtime.batchMu.Unlock()
 	}
 }
 
@@ -880,7 +974,7 @@ func (runtime *AgentRuntime) replayApproval(
 	ctx context.Context, record *Record, resume *approvalResume,
 	handler AgentHandler,
 ) (bool, error) {
-	message, opened, err := runtime.open(ctx, record)
+	message, opened, err := runtime.openHeld(ctx, record)
 	if err != nil || !opened {
 		return false, err
 	}
@@ -964,11 +1058,6 @@ func (runtime *AgentRuntime) acknowledgePickup(ctx context.Context, message *Age
 // submitted, or any failure along the way, is not fatal to handling the
 // record: the command survived every gate, so a status nobody is required to
 // read must not hold up the work it is attached to.
-//
-// Ported from pick_up_submitted in sdk/src/agent/consumer.rs. Rust derives its
-// lease's heartbeat interval from the session's own idle timeout; Go's
-// LeaseSession already has a sensible default for an unnamed interval, so
-// this takes that default rather than re-deriving one.
 func (runtime *AgentRuntime) pickUpSubmitted(
 	ctx context.Context, message *AgentMessage,
 ) *SessionLease {
@@ -989,12 +1078,7 @@ func (runtime *AgentRuntime) pickUpSubmitted(
 		runtime.failed(message, err)
 		return nil
 	}
-	lease, err := runtime.laser.LeaseSession(ctx, message.Conversation(), runtime.identity, 0)
-	if err != nil {
-		runtime.failed(message, err)
-		return nil
-	}
-	return lease
+	return session.acquireLease()
 }
 
 // verifySignature checks message against runtime.verifier, which the caller
@@ -1148,7 +1232,8 @@ func (runtime *AgentRuntime) deadLetter(
 	cause := message.ID()
 	spine.CausalParent = &cause
 	spine.DeadlineAt = nil
-	if err := runtime.publishCapsule(ctx, &spine, capsule, message); err != nil {
+	session := message.Conversation()
+	if err := runtime.publishCapsule(ctx, &spine, capsule, message, &session); err != nil {
 		return err
 	}
 	runtime.answerDeadLetter(ctx, message, reason, detail)
@@ -1178,7 +1263,19 @@ func (runtime *AgentRuntime) deadLetterRaw(
 	spine := &Provenance{Conversation: deadLetterConversation(record, position)}
 	source := NewMessageID(record.PartitionID, record.Offset())
 	spine.CausalParent = &source
-	return runtime.publishCapsule(ctx, spine, capsule, nil)
+	return runtime.publishCapsule(ctx, spine, capsule, nil, namedConversation(record))
+}
+
+// namedConversation is the session a record's own header names, nil when it names none.
+func namedConversation(record *Record) *wire.ConversationID {
+	if record.Provenance != nil {
+		conversation := record.Provenance.Conversation
+		return &conversation
+	}
+	if conversation, named := conversationOf(&record.Message); named {
+		return &conversation
+	}
+	return nil
 }
 
 // deadLetterConversation keeps an undecodable record on its own session's
@@ -1226,7 +1323,7 @@ func conversationOf(message *iggcon.IggyMessage) (wire.ConversationID, bool) {
 // stops the runtime.
 func (runtime *AgentRuntime) publishCapsule(
 	ctx context.Context, spine *Provenance,
-	capsule wire.AgentDeadLetter, message *AgentMessage,
+	capsule wire.AgentDeadLetter, message *AgentMessage, session *wire.ConversationID,
 ) error {
 	payload, err := wire.Marshal(capsule)
 	if err != nil {
@@ -1249,7 +1346,58 @@ func (runtime *AgentRuntime) publishCapsule(
 		}
 	}
 	runtime.notifyDeadLetter(ctx, message, capsule, err)
+	if err == nil && session != nil {
+		runtime.failSessionOnDeadLetter(ctx, *session, capsule)
+	}
 	return err
+}
+
+// failSessionOnDeadLetter fails the session of a dead-lettered record when its configuration asks for it.
+func (runtime *AgentRuntime) failSessionOnDeadLetter(
+	ctx context.Context, session wire.ConversationID, capsule wire.AgentDeadLetter,
+) {
+	if !runtime.sessions.config.FailOnDeadLetter {
+		return
+	}
+	// The dead letter is already published, so a failed status write is reported and the record still commits.
+	if runtime.identity.IsZero() {
+		runtime.failed(nil, &InvalidError{
+			Reason: "a runtime without an agent id cannot fail the session of a dead letter"})
+		return
+	}
+	text := "a record of this session was dead-lettered (" + deadLetterReasonName(capsule.Reason) + ")"
+	if capsule.Detail != nil {
+		text += ": " + *capsule.Detail
+	}
+	source := capsule.Source
+	body := wire.AgentErrorBody{
+		Code:    wire.ErrorInternal,
+		Message: &text,
+		Detail: map[string]wire.Value{
+			DeadLetterReasonDetail: wire.UintValue(uint64(capsule.Reason)),
+			"source": wire.StrValue(utoa(uint64(source.StreamID)) + "/" + utoa(uint64(source.TopicID)) + "/" +
+				utoa(uint64(source.PartitionID)) + "/" + utoa(source.Offset)),
+		},
+	}
+	if _, err := runtime.sessions.Open(session, "").As(runtime.identity).Fail(ctx, body); err != nil {
+		runtime.failed(nil, err)
+	}
+}
+
+// deadLetterReasonName is the reason as the peer clients spell it in a session failure.
+func deadLetterReasonName(reason wire.DeadLetterReason) string {
+	switch reason {
+	case wire.DeadLetterRetryExhausted:
+		return "RetryExhausted"
+	case wire.DeadLetterRejected:
+		return "Rejected"
+	case wire.DeadLetterDecodeFailed:
+		return "DecodeFailed"
+	case wire.DeadLetterDeadlineExceeded:
+		return "DeadlineExceeded"
+	default:
+		return "Unrecognized(" + utoa(uint64(reason)) + ")"
+	}
 }
 
 func (runtime *AgentRuntime) publishedCapsule(

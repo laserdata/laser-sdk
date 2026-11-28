@@ -23,7 +23,7 @@ func TestGivenTwoCapableAgentsWhenScatteredThenShouldGatherBothCompletions(t *te
 		"worker-b": cardFor("review", nil, nil, nil, nil),
 	})
 
-	report, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{
+	report, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{Inbox: &laser.InboxRoute{Kind: laser.InboxFixed, Topic: wire.AgentSessions},
 		Skill: "review", Routing: laser.RouteAny, Registry: registry,
 		From: agentID(t, "orchestrator"), Topic: "agent.sessions",
 		Payload: []byte(`{"task":"run"}`), Policy: laser.GatherAll(),
@@ -61,7 +61,7 @@ func TestGivenAQuorumWhenScatteredThenShouldStopAfterEnoughSuccessesAndCancelThe
 		"worker-c": cardFor("review", nil, nil, nil, nil),
 	})
 
-	report, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{
+	report, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{Inbox: &laser.InboxRoute{Kind: laser.InboxFixed, Topic: wire.AgentSessions},
 		Skill: "review", Routing: laser.RouteAny, Registry: registry,
 		From: agentID(t, "orchestrator"), Topic: "agent.sessions",
 		Payload: []byte(`{"task":"run"}`), Policy: laser.GatherQuorum(2),
@@ -94,7 +94,7 @@ func TestGivenBestEffortWhenScatteredThenShouldTakeWhateverLandedByTheDeadline(t
 		"worker-b": cardFor("review", nil, nil, nil, nil),
 	})
 
-	report, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{
+	report, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{Inbox: &laser.InboxRoute{Kind: laser.InboxFixed, Topic: wire.AgentSessions},
 		Skill: "review", Routing: laser.RouteAny, Registry: registry,
 		From: agentID(t, "orchestrator"), Topic: "agent.sessions",
 		Payload: []byte(`{"task":"run"}`), Policy: laser.GatherBestEffort(),
@@ -132,7 +132,7 @@ func TestGivenAMixOfOutcomesWhenScatteredThenShouldReportEachAgentsOwnOutcome(t 
 		"worker-b": cardFor("review", nil, nil, nil, nil),
 	})
 
-	report, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{
+	report, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{Inbox: &laser.InboxRoute{Kind: laser.InboxFixed, Topic: wire.AgentSessions},
 		Skill: "review", Routing: laser.RouteAny, Registry: registry,
 		From: agentID(t, "orchestrator"), Topic: "agent.sessions",
 		Payload: []byte(`{"task":"run"}`), Policy: laser.GatherAll(),
@@ -172,7 +172,7 @@ func TestGivenAMixOfOutcomesWhenScatteredThenShouldReportEachAgentsOwnOutcome(t 
 func TestGivenNoCapableAgentWhenScatteredThenShouldRefuse(t *testing.T) {
 	handle := laser.FromClient(&contractServer{}, laser.Options{DefaultStream: "agents"})
 
-	_, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{
+	_, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{Inbox: &laser.InboxRoute{Kind: laser.InboxFixed, Topic: wire.AgentSessions},
 		Skill: "review", Registry: laser.NewAgentRegistry(),
 		From: agentID(t, "orchestrator"), Topic: "agent.sessions",
 		Payload: []byte(`{"task":"run"}`), Policy: laser.GatherAll(),
@@ -190,7 +190,7 @@ func TestGivenAZeroQuorumWhenScatteredThenShouldRefuseBeforeAnyRead(t *testing.T
 		"worker": cardFor("review", nil, nil, nil, nil),
 	})
 
-	_, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{
+	_, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{Inbox: &laser.InboxRoute{Kind: laser.InboxFixed, Topic: wire.AgentSessions},
 		Skill: "review", Registry: registry,
 		From: agentID(t, "orchestrator"), Topic: "agent.sessions",
 		Payload: []byte(`{"task":"run"}`), Policy: laser.GatherQuorum(0),
@@ -225,7 +225,7 @@ func TestGivenAVerifierWhenScatteredThenShouldOnlyCompleteBranchesSignedByTheirO
 		"worker-b": cardFor("review", nil, nil, nil, nil),
 	})
 
-	report, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{
+	report, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{Inbox: &laser.InboxRoute{Kind: laser.InboxFixed, Topic: wire.AgentSessions},
 		Skill: "review", Routing: laser.RouteAny, Registry: registry,
 		From: agentID(t, "orchestrator"), Topic: "agent.sessions",
 		Payload: []byte(`{"task":"run"}`), Policy: laser.GatherBestEffort(),
@@ -264,7 +264,7 @@ func TestGivenACompletedScatterWhenScatterCollectsThenShouldReturnOnlyCompletedB
 		"worker-b": cardFor("review", nil, nil, nil, nil),
 	})
 
-	replies, err := handle.Scatter(context.Background(), laser.ScatterRequest{
+	replies, err := handle.Scatter(context.Background(), laser.ScatterRequest{Inbox: &laser.InboxRoute{Kind: laser.InboxFixed, Topic: wire.AgentSessions},
 		Skill: "review", Routing: laser.RouteAny, Registry: registry,
 		From: agentID(t, "orchestrator"), Topic: "agent.sessions",
 		Payload: []byte(`{"task":"run"}`), Policy: laser.GatherAll(),

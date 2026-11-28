@@ -1,12 +1,17 @@
 package laser
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
+
+// MaxChunkBodyBytes is the hard cap on one chunk's body.
+const MaxChunkBodyBytes = 64 * 1024
 
 // Agdx sends AGDX agent messages on one conversation.
 //
@@ -24,7 +29,7 @@ type Agdx struct {
 	root         *wire.ConversationID
 	// lane, when set, pins the session lane these records ride. A session
 	// hands its own guard down so every lifecycle and state write it makes
-	// is checked; a plain Agdx opened off Laser has none and is unguarded,
+	// is checked. A plain Agdx opened off Laser has none and is unguarded,
 	// which is what the agent messaging surface has always been.
 	lane *laneGuard
 }
@@ -212,6 +217,92 @@ func (agdx *Agdx) Chunk(
 	return send
 }
 
+// publishEnvelope appends an envelope built elsewhere on this producer's topic, after the governor.
+func (agdx *Agdx) publishEnvelope(ctx context.Context, envelope wire.AgentEnvelope) (*AgdxReceipt, error) {
+	send := &AgdxSend{
+		agdx: agdx, envelope: envelope, contentType: wire.ContentRaw, presigned: envelope.Signature != nil,
+	}
+	return send.Send(ctx)
+}
+
+// RequestInput marks the task input-required, sends prompt to every agent as an input request and returns the answer read on replyTopic within timeout.
+func (agdx *Agdx) RequestInput(
+	ctx context.Context, replyTopic string, prompt []byte, timeout time.Duration,
+) ([]byte, error) {
+	return agdx.inputReply(ctx, nil, replyTopic, prompt, timeout)
+}
+
+// RequestInputFrom is RequestInput with the prompt addressed to target. An answer from any other agent is ignored.
+func (agdx *Agdx) RequestInputFrom(
+	ctx context.Context, target wire.AgentID, replyTopic string, prompt []byte, timeout time.Duration,
+) ([]byte, error) {
+	if target.IsZero() {
+		return nil, &InvalidError{Reason: "an input request addressed to one agent must name it"}
+	}
+	return agdx.inputReply(ctx, &target, replyTopic, prompt, timeout)
+}
+
+// InputRejectedError reports an input request its responder rejected, with the reason it gave.
+type InputRejectedError struct{ Reason string }
+
+func (e *InputRejectedError) Error() string {
+	if e.Reason == "" {
+		return "the input request was rejected"
+	}
+	return "the input request was rejected: " + e.Reason
+}
+
+func (agdx *Agdx) inputReply(
+	ctx context.Context, target *wire.AgentID, replyTopic string, prompt []byte, timeout time.Duration,
+) ([]byte, error) {
+	if agdx.stream == "" {
+		return nil, errNoStream()
+	}
+	interrupt := wire.CorrelationID{ID: wire.IDFromBytes(NewOperationID())}
+	expected := ExpectedReply{Session: agdx.conversation, Requester: agdx.source}
+	if target != nil {
+		expected.ExpectedSigner = target.String()
+		expected.Source = *target
+	}
+	// The wait is registered before the prompt is sent, so an answer that lands in between is not missed.
+	hub, err := agdx.laser.replyHubFor(ctx, agdx.stream, replyTopic)
+	if err != nil {
+		return nil, err
+	}
+	ticket, err := hub.Subscribe(interrupt, expected)
+	if err != nil {
+		return nil, err
+	}
+	defer ticket.Close()
+	if _, err := agdx.TaskStatus(interrupt, wire.TaskInputRequired).Send(ctx); err != nil {
+		return nil, err
+	}
+	command := agdx.Command(interrupt, prompt).WithOperation(wire.OperationInputRequest)
+	if target != nil {
+		command = command.WithTarget(*target)
+	} else {
+		command = command.Broadcast()
+	}
+	receipt, err := command.Send(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ticket.Expect(receipt.Record)
+	reply, err := ticket.Await(ctx, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if reply.Envelope.Kind == wire.KindError {
+		rejected := &InputRejectedError{}
+		var failure wire.AgentErrorBody
+		if err := wire.Unmarshal(reply.Envelope.Body, &failure); err == nil && failure.Message != nil {
+			rejected.Reason = *failure.Message
+		}
+		return nil, rejected
+	}
+	return reply.Envelope.Body, nil
+}
+
 func (agdx *Agdx) send(kind wire.AgentKind) *AgdxSend {
 	record := wire.RecordID{ID: wire.IDFromBytes(NewOperationID())}
 	return &AgdxSend{
@@ -243,6 +334,10 @@ type AgdxSend struct {
 	// grant is the approval this send carries, so a governor's step-up in the
 	// grant's own conversation is answered rather than raised again.
 	grant *ApprovalGrant
+	// ungoverned skips the governor, for a chunk stream writer's records.
+	ungoverned bool
+	// presigned marks an envelope signed by its builder, whose body a governor must not replace.
+	presigned bool
 	// signer turns this message's authorship claim into a proof.
 	signer *SigningKey
 	// blobStore and claimThreshold externalize a body too large to ride the
@@ -416,23 +511,79 @@ type AgdxReceipt struct {
 
 // Send appends the message and returns where it landed.
 func (send *AgdxSend) Send(ctx context.Context) (*AgdxReceipt, error) {
+	message, err := send.prepare(ctx)
+	if err != nil {
+		return nil, err
+	}
+	response, err := send.appendMessages(ctx, []iggcon.IggyMessage{message})
+	if err != nil {
+		return nil, err
+	}
+	receipt := &AgdxReceipt{Envelope: send.envelope, Response: response}
+	if send.envelope.Record != nil {
+		receipt.Record = *send.envelope.Record
+	}
+	return receipt, nil
+}
+
+// SendChunks appends successive chunks of one channel in a single publish.
+func (agdx *Agdx) SendChunks(
+	ctx context.Context, correlation wire.CorrelationID, channel wire.ChannelID,
+	operation string, first uint64, bodies [][]byte,
+) (*iggcon.SendMessagesResponse, error) {
+	if len(bodies) == 0 {
+		return &iggcon.SendMessagesResponse{}, nil
+	}
+	if uint64(len(bodies)-1) > ^uint64(0)-first {
+		return nil, &InvalidError{Reason: "chunk sequence overflows uint64"}
+	}
+	messages := make([]iggcon.IggyMessage, len(bodies))
+	var chunk *AgdxSend
+	for i, body := range bodies {
+		sequence := first + uint64(i)
+		chunk = agdx.Chunk(correlation, channel, sequence, body)
+		if sequence == 0 {
+			chunk.WithOperation(operation)
+		}
+		message, err := chunk.prepare(ctx)
+		if err != nil {
+			return nil, err
+		}
+		messages[i] = message
+	}
+	return chunk.appendMessages(ctx, messages)
+}
+
+func (send *AgdxSend) prepare(ctx context.Context) (iggcon.IggyMessage, error) {
 	if send.err != nil {
-		return nil, send.err
+		return iggcon.IggyMessage{}, send.err
 	}
 	if send.agdx.stream == "" {
-		return nil, errNoStream()
+		return iggcon.IggyMessage{}, errNoStream()
 	}
 	if err := send.envelope.Validate(); err != nil {
-		return nil, &InvalidError{Reason: err.Error()}
+		return iggcon.IggyMessage{}, &InvalidError{Reason: err.Error()}
+	}
+	if send.envelope.Kind == wire.KindChunk && len(send.envelope.Body) > MaxChunkBodyBytes {
+		return iggcon.IggyMessage{}, &InvalidError{Reason: fmt.Sprintf(
+			"chunk body is %dB, exceeds cap %dB", len(send.envelope.Body), MaxChunkBodyBytes)}
 	}
 	// The governor sees the AGDX verb rather than a plain publish, so a
 	// policy can tell a tool command from a status it should ignore. It runs
 	// before signing, so a replacement body is what the record carries and
 	// what the signature covers.
-	if body, err := send.agdx.laser.govern(ctx, send.action()); err != nil {
-		return nil, err
-	} else if body != nil {
-		send.envelope.Body = body
+	if !send.ungoverned {
+		body, err := send.agdx.laser.govern(ctx, send.action())
+		if err != nil {
+			return iggcon.IggyMessage{}, err
+		}
+		if body != nil {
+			if send.presigned && !bytes.Equal(body, send.envelope.Body) {
+				return iggcon.IggyMessage{}, &PolicyBlockedError{
+					Reason: "the governor replaced the body of a signed envelope"}
+			}
+			send.envelope.Body = body
+		}
 	}
 	// The claim check runs after the governor and before the signature, so a
 	// policy decides on the body the producer meant while the signature
@@ -441,7 +592,7 @@ func (send *AgdxSend) Send(ctx context.Context) (*AgdxReceipt, error) {
 		body, contentType, err := CheckIn(
 			ctx, send.blobStore, send.claimThreshold, send.envelope.Body)
 		if err != nil {
-			return nil, err
+			return iggcon.IggyMessage{}, err
 		}
 		send.envelope.Body = body
 		if contentType != nil {
@@ -455,21 +606,22 @@ func (send *AgdxSend) Send(ctx context.Context) (*AgdxReceipt, error) {
 		signature, err := send.signer.SignWithContext(
 			send.envelope, send.signContext())
 		if err != nil {
-			return nil, err
+			return iggcon.IggyMessage{}, err
 		}
 		send.envelope.Signature = signature
 	}
 	// The envelope stamps carry the version and content type, and the
 	// provenance carries the spine. Both ride the same block, so a reader can
 	// route and audit without decoding the body.
-	block := wire.HeadersForEnvelope(&send.envelope, send.contentType, send.broadcast)
+	broadcast := send.broadcast || send.agdx.topic == wire.AgentSessions || send.agdx.topic == wire.AgentControl
+	block := wire.HeadersForEnvelope(&send.envelope, send.contentType, broadcast)
 	headers, err := EncodeHeaderBlock(block)
 	if err != nil {
-		return nil, err
+		return iggcon.IggyMessage{}, err
 	}
 	spine, err := send.provenance().Headers()
 	if err != nil {
-		return nil, err
+		return iggcon.IggyMessage{}, err
 	}
 	headers = mergeHeaders(headers, spine)
 
@@ -477,12 +629,16 @@ func (send *AgdxSend) Send(ctx context.Context) (*AgdxReceipt, error) {
 	// needs the routing and causality to decide anything at all.
 	payload, err := wire.Marshal(send.envelope)
 	if err != nil {
-		return nil, &CodecError{Reason: "encode the agent envelope", Cause: err}
+		return iggcon.IggyMessage{}, &CodecError{Reason: "encode the agent envelope", Cause: err}
 	}
 	message, err := iggcon.NewIggyMessage(payload, iggcon.WithUserHeaders(headers))
 	if err != nil {
-		return nil, &InvalidError{Reason: "build the agent record: " + err.Error()}
+		return iggcon.IggyMessage{}, &InvalidError{Reason: "build the agent record: " + err.Error()}
 	}
+	return message, nil
+}
+
+func (send *AgdxSend) appendMessages(ctx context.Context, messages []iggcon.IggyMessage) (*iggcon.SendMessagesResponse, error) {
 	// The stream's declared layout decides where this record lands: a
 	// per-agent topic layout moves addressed work off the lane, and a
 	// per-agent partition layout keeps it on the lane but on its addressee's
@@ -509,23 +665,15 @@ func (send *AgdxSend) Send(ctx context.Context) (*AgdxReceipt, error) {
 		}
 	}
 	topic := send.agdx.laser.Stream(send.agdx.stream).Topic(name)
-	var response *iggcon.SendMessagesResponse
+
 	if partition, declared := declaredPartition(
 		layout, send.agdx.topic, send.envelope.Kind, send.envelope.Target); declared {
-		response, err = topic.sendOnPartition(
-			ctx, []iggcon.IggyMessage{message}, partition)
+		return topic.sendOnPartition(
+			ctx, messages, partition)
 	} else {
-		response, err = topic.sendMessages(ctx, []iggcon.IggyMessage{message},
+		return topic.sendMessages(ctx, messages,
 			send.envelope.Conversation.String(), true)
 	}
-	if err != nil {
-		return nil, err
-	}
-	receipt := &AgdxReceipt{Envelope: send.envelope, Response: response}
-	if send.envelope.Record != nil {
-		receipt.Record = *send.envelope.Record
-	}
-	return receipt, nil
 }
 
 // action is this send as the governor sees it.

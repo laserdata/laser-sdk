@@ -1,6 +1,6 @@
 # Producer statistics
 
-Rust, Python, and TypeScript producers report statistics through the AGDX client metadata extension. On a managed host, one that answered the capability probe, reporting is on by default: every 10 seconds, over one extra authenticated observer connection per Laser connection, so agent presence on the main connection is untouched. Set `LASER_PRODUCER_TELEMETRY_INTERVAL_MS=0` to turn it off. A telemetry error never fails a publish. Against open Apache Iggy nothing reports and publishing is unchanged.
+Rust, Python, and TypeScript producers and Go direct producers report statistics through the AGDX client metadata extension. On a managed host, one that answered the capability probe, reporting is on by default: every 10 seconds, over one extra authenticated observer connection per Laser connection, so agent presence on the main connection is untouched. Set `LASER_PRODUCER_TELEMETRY_INTERVAL_MS=0` to turn it off. A telemetry error never fails a publish. Against open Apache Iggy nothing reports and publishing is unchanged.
 
 ## Configure it
 
@@ -12,6 +12,8 @@ Set the variables before creating producers.
 | Reported handles per connection | `LASER_PRODUCER_TELEMETRY_MAX_PRODUCERS` | `32` | `0` through `32` |
 
 Values outside a range are clamped to it. Handles past the limit publish normally and are left out of the report. A report fits the 64 KiB metadata limit, expires after three intervals, and disappears when the observer disconnects. A producer id stays stable for the life of its handle, across reconnects. Injected clients that cannot open a second authenticated connection do not report.
+
+Go opens a direct producer with `topic.Producer().Build(ctx)`. Call `producer.Statistics()` for a snapshot of that handle and `producer.Close(ctx)` to wait for in-flight sends and remove the handle from subsequent reports.
 
 ## What is counted
 

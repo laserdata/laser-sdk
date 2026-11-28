@@ -130,9 +130,9 @@ func (session *Session) OverBudget(ctx context.Context) (bool, error) {
 func (session *Session) BudgetBreach(
 	ctx context.Context,
 ) (BudgetBreach, bool, error) {
-	if session.laser.capabilities.Sessions {
+	if session.laser.Capabilities().Sessions {
 		info, err := session.laser.SessionsIn(session.config.Stream).
-			Get(ctx, session.conversation)
+			get(ctx, session.conversation, walkingOnce())
 		switch {
 		case err == nil:
 			breach, over := budgetOfInfo(info)
@@ -222,11 +222,9 @@ func indexUnusable(err error) bool {
 		}
 	}
 	var command *CommandFailure
-	if errors.As(err, &command) {
-		switch command.Failure.Code {
-		case wire.ResultUnavailable, wire.ResultStale:
-			return true
-		}
+	if errors.As(err, &command) &&
+		(command.Failure.Code.IsUnavailable() || command.Failure.Code == wire.ResultStale) {
+		return true
 	}
 	var unsupported *UnsupportedError
 	return errors.As(err, &unsupported)
@@ -235,9 +233,9 @@ func indexUnusable(err error) bool {
 // BudgetGate decides whether a session's work may reach a handler.
 //
 // It reads the session index once per session per poll batch, so a deployment
-// without the index never enforces here at all. The Rust client drives this
-// from its own consumer runtime; that runtime is not ported, so a caller
-// driving its own loop calls Admit before handing a record to its handler.
+// without the index never enforces here at all. The agent runtime drives it
+// through RuntimeOptions.Budget, and a caller driving its own loop calls Admit
+// before handing a record to its handler.
 type BudgetGate struct {
 	mutex sync.Mutex
 	// batches holds, per partition, the head offset the verdicts came from
@@ -288,7 +286,7 @@ func (gate *BudgetGate) Admit(
 	verdict, cached := gate.cached(partition, head, session.conversation)
 	if !cached {
 		info, err := session.laser.SessionsIn(session.config.Stream).
-			Get(ctx, session.conversation)
+			get(ctx, session.conversation, walkingOnce())
 		switch {
 		case err == nil:
 			breach, over := budgetOfInfo(info)

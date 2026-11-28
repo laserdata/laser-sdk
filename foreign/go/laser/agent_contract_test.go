@@ -28,6 +28,9 @@ type contractServer struct {
 	// the one the command arrived on, the way a target told to respond
 	// elsewhere would.
 	answerOn string
+	// polledFrom is every offset each topic was polled from, so a test can
+	// tell which topics a wait read and where a resumed fold started.
+	polledFrom map[string][]uint64
 
 	// replyKind, when set, auto-answers every published command inline, the
 	// way a target agent would. Empty sends no reply, for the timed-out case.
@@ -178,7 +181,11 @@ func (server *contractServer) PollMessages(
 	if strategy.Kind == iggcon.POLLING_OFFSET {
 		from = strategy.Value
 	}
-	// A test that addressed topics reads the polled topic's own log; one
+	if server.polledFrom == nil {
+		server.polledFrom = map[string][]uint64{}
+	}
+	server.polledFrom[topicName(topic)] = append(server.polledFrom[topicName(topic)], from)
+	// A test that addressed topics reads the polled topic's own log. One
 	// that never did reads the flat log, which is what it published to.
 	log := server.records
 	if server.perTopic != nil {
@@ -197,6 +204,13 @@ func (server *contractServer) storedOn(topic string) []iggcon.IggyMessage {
 	server.mutex.Lock()
 	defer server.mutex.Unlock()
 	return append([]iggcon.IggyMessage(nil), server.perTopic[topic]...)
+}
+
+// pollsOf is every offset topic was polled from.
+func (server *contractServer) pollsOf(topic string) []uint64 {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	return append([]uint64(nil), server.polledFrom[topic]...)
 }
 
 func (server *contractServer) stored() []iggcon.IggyMessage {
@@ -223,7 +237,7 @@ func TestGivenACompletedReplyWhenContractSentThenShouldReportCompleted(t *testin
 	server := &contractServer{replyKind: wire.KindResponse, replyBody: []byte("done"), replySource: agentID(t, "worker")}
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Deadline(2 * time.Second).
@@ -250,7 +264,7 @@ func TestGivenAnErrorReplyWhenContractSentThenShouldReportFailed(t *testing.T) {
 	}
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Deadline(2 * time.Second).
@@ -269,7 +283,7 @@ func TestGivenADeadLetteredReplyWhenContractSentThenShouldReportNotConsumed(t *t
 	}
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		ExpireIfNotConsumed(500 * time.Millisecond).
@@ -287,7 +301,7 @@ func TestGivenNoReplyWhenContractSentThenShouldReportTimedOut(t *testing.T) {
 	server := &contractServer{}
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Deadline(300 * time.Millisecond).
@@ -303,7 +317,7 @@ func TestGivenNoReplyWhenContractSentThenShouldReportTimedOut(t *testing.T) {
 func TestGivenNoSourceWhenContractSentThenShouldRefuseBeforeResolving(t *testing.T) {
 	handle := laser.FromClient(&contractServer{}, laser.Options{DefaultStream: "agents"})
 
-	_, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	_, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		Payload([]byte(`{"task":"run"}`)).
 		Send(context.Background())
 
@@ -316,7 +330,7 @@ func TestGivenNoSourceWhenContractSentThenShouldRefuseBeforeResolving(t *testing
 func TestGivenABroadcastRouteWhenContractSentThenShouldRefuseIt(t *testing.T) {
 	handle := laser.FromClient(&contractServer{}, laser.Options{DefaultStream: "agents"})
 
-	_, err := handle.Contract(laser.Broadcast(), "agent.sessions").
+	_, err := handle.Contract(laser.Broadcast(), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Send(context.Background())
@@ -334,7 +348,7 @@ func TestGivenACapabilityRouteWhenContractSentThenShouldResolveAgainstTheRegistr
 	server := &contractServer{replyKind: wire.KindResponse, replyBody: []byte("done"), replySource: agentID(t, "worker")}
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	contract, err := handle.Contract(laser.ToCapable("review", laser.RouteAny), "agent.sessions").
+	contract, err := handle.Contract(laser.ToCapable("review", laser.RouteAny), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Registry(registry).
@@ -362,7 +376,7 @@ func TestGivenAnAncestryWhenContractCompletesThenShouldEndTheChildCompleted(t *t
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 	parent, root := laser.NewConversationID(), laser.NewConversationID()
 
-	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Parent(parent, root).
@@ -414,7 +428,7 @@ func TestGivenAnAncestryWhenContractFailsThenShouldEndTheChildFailed(t *testing.
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 	parent, root := laser.NewConversationID(), laser.NewConversationID()
 
-	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Parent(parent, root).
@@ -451,7 +465,7 @@ func TestGivenAVerifierWhenContractReplySignedByTheTargetThenShouldCompleteWithT
 	}
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Verifier(registry).
@@ -475,7 +489,7 @@ func TestGivenAVerifierWhenContractReplyUnsignedThenShouldTimeOut(t *testing.T) 
 	}
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Verifier(registry).
@@ -503,7 +517,7 @@ func TestGivenAVerifierWhenContractReplySignedByAnotherAgentThenShouldTimeOut(t 
 	}
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Verifier(registry).
@@ -540,7 +554,7 @@ func TestGivenAPrincipalBoundRouteWhenTheReplyIsSignedByThatPrincipalThenShouldC
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
 	contract, err := handle.Contract(
-		laser.ToPrincipal(agentID(t, "worker"), laser.PrincipalID(7)), "agent.sessions").
+		laser.ToPrincipal(agentID(t, "worker"), laser.PrincipalID(7)), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Registry(agents).
@@ -579,7 +593,7 @@ func TestGivenAPrincipalBoundRouteWhenTheReplyIsSignedByTheAgentNameThenShouldTi
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
 	contract, err := handle.Contract(
-		laser.ToPrincipal(agentID(t, "worker"), laser.PrincipalID(7)), "agent.sessions").
+		laser.ToPrincipal(agentID(t, "worker"), laser.PrincipalID(7)), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Registry(agents).

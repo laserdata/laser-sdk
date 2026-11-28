@@ -50,8 +50,9 @@ type avroSchema struct {
 }
 
 type avroField struct {
-	name   string
-	schema *avroSchema
+	fallback *payloadValue
+	name     string
+	schema   *avroSchema
 }
 
 // avroNames resolves named types while a schema is parsed, so a reference to a
@@ -213,7 +214,11 @@ func parseAvroRecord(
 		if err != nil {
 			return nil, err
 		}
-		record.fields = append(record.fields, avroField{name: name.text, schema: schema})
+		entry := avroField{name: name.text, schema: schema}
+		if fallback, has := field.object["default"]; has {
+			entry.fallback = &fallback
+		}
+		record.fields = append(record.fields, entry)
 	}
 	return record, nil
 }

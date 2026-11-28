@@ -8,7 +8,7 @@ import (
 )
 
 // Reference agent-memory engine: the executable specification of the recall
-// contract every LaserData SDK and the managed backend must reproduce —
+// contract every LaserData SDK and the managed backend must reproduce
 // content-addressed dedup, recency order, feedback re-ranking, and forget.
 // Pure and transport-free, mirroring the Rust BDD crate's MemoryEngine and
 // bdd/python/reference.py's.

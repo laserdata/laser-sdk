@@ -17,7 +17,7 @@ func TestGivenARunWithBodyWhenRunThenShouldReturnItsValue(t *testing.T) {
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
 	outcome, err := laser.RunWith(context.Background(),
-		handle.Workflow(agentID(t, "pipeline"), "agent.sessions"),
+		handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")),
 		func(ctx context.Context, run *laser.WorkflowRun) (string, error) {
 			frames, err := laser.RunStep(ctx, run, "ingest", func(context.Context) (int, error) {
 				return 12, nil
@@ -52,7 +52,7 @@ func TestGivenARunWithBodyThatFailsOnceWhenResumedThenShouldSkipCompletedSteps(t
 	var generateRuns int32
 
 	run := func(shouldFail bool) (*laser.WorkflowOutcome, error) {
-		workflow := handle.Workflow(agentID(t, "jobs"), "agent.sessions").RunID(runID)
+		workflow := handle.Workflow(agentID(t, "jobs"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).RunID(runID)
 		return laser.RunWith(context.Background(), workflow,
 			func(ctx context.Context, run *laser.WorkflowRun) (string, error) {
 				_, err := laser.RunStep(ctx, run, "generate", func(context.Context) (string, error) {
@@ -96,7 +96,7 @@ func TestGivenTwoCallsOfOneLabelWhenRunThenShouldJournalThemUnderNumberedLabels(
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
 	outcome, err := laser.RunWith(context.Background(),
-		handle.Workflow(agentID(t, "pipeline"), "agent.sessions"),
+		handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")),
 		func(ctx context.Context, run *laser.WorkflowRun) (string, error) {
 			first, err := laser.RunStep(ctx, run, "branch", func(context.Context) (string, error) {
 				return "a", nil
@@ -128,7 +128,7 @@ func TestGivenTwoConcurrentRunStepsWhenRunThenShouldBothCompleteSafely(t *testin
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
 	outcome, err := laser.RunWith(context.Background(),
-		handle.Workflow(agentID(t, "pipeline"), "agent.sessions"),
+		handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")),
 		func(ctx context.Context, run *laser.WorkflowRun) (string, error) {
 			var wait sync.WaitGroup
 			wait.Add(2)
@@ -170,7 +170,7 @@ func TestGivenANonFiniteValueWhenAStepReturnsItThenShouldRefuse(t *testing.T) {
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
 	_, err := laser.RunWith(context.Background(),
-		handle.Workflow(agentID(t, "pipeline"), "agent.sessions"),
+		handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")),
 		func(ctx context.Context, run *laser.WorkflowRun) (float64, error) {
 			return laser.RunStep(ctx, run, "score", func(context.Context) (float64, error) {
 				return math.NaN(), nil
@@ -185,7 +185,7 @@ func TestGivenANonFiniteValueWhenAStepReturnsItThenShouldRefuse(t *testing.T) {
 func TestGivenAStepLabelWithTheRepeatSeparatorWhenBegunThenShouldRefuse(t *testing.T) {
 	server := newWorkflowServer()
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
-	run, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").Start(context.Background())
+	run, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).Start(context.Background())
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestGivenAFreshStreamWithNoAgentTopicsWhenARunWithBodyRunsThenShouldBootstr
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
 	outcome, err := laser.RunWith(context.Background(),
-		handle.Workflow(agentID(t, "jobs"), "agent.sessions"),
+		handle.Workflow(agentID(t, "jobs"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")),
 		func(ctx context.Context, run *laser.WorkflowRun) (string, error) {
 			return laser.RunStep(ctx, run, "generate", func(context.Context) (string, error) {
 				return "generated", nil

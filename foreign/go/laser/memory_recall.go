@@ -34,18 +34,56 @@ func newMemoryReader(stream, namespace string) *memoryReader {
 // Recall reads this namespace's memory back and returns the items the query
 // asks for, most relevant first.
 //
-// It folds the memory topic in process, which is what a deployment with no
-// materialized read view has. That means it reads what the handle has not seen
-// yet, so it does not scale to a topic far larger than the memories it holds.
+// A managed KV deployment serves its memory view. Apache Iggy reads the log.
 //
 // A topic nobody has written to yet recalls nothing rather than failing: a
 // reader started before its writer is not an error.
 func (memory *Memory) Recall(
 	ctx context.Context, query MemoryQuery,
 ) ([]MemoryItem, error) {
+	items, err := memory.recallStored(ctx, query, false)
+	return memory.rerank(ctx, query, items, err)
+}
+
+// RecallFolded reads the log directly, including on a deployment with a managed view.
+func (memory *Memory) RecallFolded(ctx context.Context, query MemoryQuery) ([]MemoryItem, error) {
+	items, err := memory.recallStored(ctx, query, true)
+	return memory.rerank(ctx, query, items, err)
+}
+
+// recallStored reads from the handle's store. Only the log has a fold apart from its view.
+func (memory *Memory) recallStored(ctx context.Context, query MemoryQuery, folded bool) ([]MemoryItem, error) {
+	if err := query.Strategy.validate(); err != nil {
+		return nil, err
+	}
+	switch {
+	case memory.custom != nil:
+		return memory.custom.Recall(ctx, memory.scope, query)
+	case memory.vector != nil:
+		return memory.vector.Recall(ctx, memory.scope, query)
+	}
 	if memory.stream == "" {
 		return nil, errNoStream()
 	}
+	// The log filters by the query's words for graph and temporal, as for keyword.
+	if query.Strategy == RecallGraph || query.Strategy == RecallTemporal {
+		query.Strategy = RecallKeyword
+	}
+	if !folded && memory.laser.Negotiated().Kv.Available {
+		return memory.recallView(ctx, query)
+	}
+	return memory.recallFold(ctx, query)
+}
+
+// rerank hands a recall that carries a query to the reranker, when the handle has one.
+func (memory *Memory) rerank(ctx context.Context, query MemoryQuery, items []MemoryItem, err error) ([]MemoryItem, error) {
+	if err != nil || memory.reranker == nil || query.Query == "" {
+		return items, err
+	}
+	return memory.reranker.Rerank(ctx, query.Query, items)
+}
+
+func (memory *Memory) recallFold(ctx context.Context, query MemoryQuery) ([]MemoryItem, error) {
 	memory.reader.mutex.Lock()
 	defer memory.reader.mutex.Unlock()
 	if err := memory.catchUp(ctx); err != nil {
@@ -89,8 +127,8 @@ func (memory *Memory) catchUp(ctx context.Context) error {
 // The scope rides as headers rather than only inside the record, because
 // recall folds the topic back and narrows on them. A record naming neither a
 // conversation nor an owner can only ever be recalled by everyone.
-func memoryHeaders(scope MemoryScope, namespace string) ([]iggcon.HeaderEntry, error) {
-	provenance := &Provenance{Agent: scope.Agent}
+func memoryHeaders(scope MemoryScope, namespace, idempotencyKey string) ([]iggcon.HeaderEntry, error) {
+	provenance := &Provenance{Agent: scope.Agent, IdempotencyKey: &idempotencyKey}
 	if scope.Conversation != nil {
 		provenance.Conversation = *scope.Conversation
 	}

@@ -275,3 +275,22 @@ func TestGivenNoFilterAnnouncementWhenCheckedThenShouldAssumeAgreement(t *testin
 		t.Error("an unannounced evaluator is assumed to agree")
 	}
 }
+
+func TestGivenARefreshedCapabilityWhenUsingAnExistingScopedHandleThenShouldUseTheNewGate(t *testing.T) {
+	announce := wire.NewBackendAnnounce(wire.NewOpVersions(1, 1, 1, 0))
+	announce.Backends = []wire.BackendDescriptor{readyBackend(t, 1, wire.ConsistencyEventual)}
+	server := &managedClient{reply: announcing(t, announce).reply}
+	client := laser.FromClient(server, laser.Options{})
+	scoped := client.WithDefaultStream("events")
+	open := scoped.WithCapabilities(laser.OpenCapabilities())
+	if caps := client.RefreshCapabilities(context.Background()); !caps.Kv.Available {
+		t.Fatal("expected the fresh probe to advertise KV")
+	}
+	server.reply = batchBytes(t, wire.OkReply(wire.KvOutcome{Kind: wire.KvValue}))
+	if _, _, err := scoped.Kv("counts").Get(context.Background(), []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := open.Kv("counts").Get(context.Background(), []byte("one")); err == nil {
+		t.Fatal("refresh changed a pinned capability override")
+	}
+}

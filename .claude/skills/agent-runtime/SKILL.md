@@ -5,7 +5,7 @@ description: The Laser SDK runtime - `sdk/src/agent/`. Use when changing the `La
 
 # Agent runtime
 
-The native TypeScript peer is `foreign/typescript/src/agent`, with contracts, workflows, and real-Iggy runtime tests under `foreign/typescript/test`.
+The native TypeScript peer is `foreign/typescript/src/agent`, with contracts, workflows, and real-Iggy runtime tests under `foreign/typescript/test`. The Go peer is the `agent*.go`, `agdx*.go`, `registry*.go`, `router.go`, `session*.go` and `sessions.go` files under `foreign/go/laser`, with handler test helpers in `foreign/go/laser/lasertest`.
 
 `agent/` is the public runtime: how you send, consume reliably, route, and spawn agents. Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first. Repo rules in [AGENTS.md](../../../AGENTS.md).
 

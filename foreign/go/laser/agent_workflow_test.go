@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,7 +32,9 @@ type workflowServer struct {
 	replyKind   wire.AgentKind
 	replyBody   []byte
 	replySource wire.AgentID
-	silent      map[string]bool
+	// earlierSources answer each command first, in order, with the same body.
+	earlierSources []wire.AgentID
+	silent         map[string]bool
 	// answerOn, when set, pushes every auto-reply to that topic instead of
 	// the one the command arrived on, which is what a step addressed to an
 	// agent's own inbox but answering on the workflow's topic looks like.
@@ -122,33 +125,35 @@ func (server *workflowServer) SendMessages(
 		if server.silent[target] {
 			continue
 		}
-		reply := wire.AgentEnvelope{
-			Kind:         server.replyKind,
-			Record:       &wire.RecordID{ID: wire.IDFromBytes(laser.NewOperationID())},
-			Conversation: command.Conversation,
-			Source:       server.replySource,
-			Target:       &command.Source,
-			Correlation:  command.Correlation,
-			Body:         server.replyBody,
+		for _, source := range append(slices.Clone(server.earlierSources), server.replySource) {
+			reply := wire.AgentEnvelope{
+				Kind:         server.replyKind,
+				Record:       &wire.RecordID{ID: wire.IDFromBytes(laser.NewOperationID())},
+				Conversation: command.Conversation,
+				Source:       source,
+				Target:       &command.Source,
+				Correlation:  command.Correlation,
+				Body:         server.replyBody,
+			}
+			payload, err := wire.Marshal(&reply)
+			if err != nil {
+				continue
+			}
+			headers, err := laser.EncodeHeaderBlock(
+				wire.HeadersForEnvelope(&reply, wire.ContentCBOR, false))
+			if err != nil {
+				continue
+			}
+			replyMessage, err := iggcon.NewIggyMessage(payload, iggcon.WithUserHeaders(headers))
+			if err != nil {
+				continue
+			}
+			answerOn := name
+			if server.answerOn != "" {
+				answerOn = server.answerOn
+			}
+			server.push(answerOn, replyMessage)
 		}
-		payload, err := wire.Marshal(&reply)
-		if err != nil {
-			continue
-		}
-		headers, err := laser.EncodeHeaderBlock(
-			wire.HeadersForEnvelope(&reply, wire.ContentCBOR, false))
-		if err != nil {
-			continue
-		}
-		replyMessage, err := iggcon.NewIggyMessage(payload, iggcon.WithUserHeaders(headers))
-		if err != nil {
-			continue
-		}
-		answerOn := name
-		if server.answerOn != "" {
-			answerOn = server.answerOn
-		}
-		server.push(answerOn, replyMessage)
 	}
 	return &iggcon.SendMessagesResponse{}, nil
 }
@@ -186,7 +191,7 @@ func TestGivenLocalStepsWhenRunThenShouldPassOutputsInDependencyOrder(t *testing
 	server := newWorkflowServer()
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	outcome, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+	outcome, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		StepLocal("ingest", func(context.Context, map[string][]byte) ([]byte, error) {
 			return []byte("12 frames"), nil
 		}).
@@ -219,7 +224,7 @@ func TestGivenADirectedStepWhenRunThenShouldDispatchViaContract(t *testing.T) {
 	server.replySource = agentID(t, "worker")
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	outcome, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+	outcome, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		Step("ingest", laser.To(agentID(t, "worker")),
 			func(context.Context, map[string][]byte) ([]byte, error) {
 				return []byte("task"), nil
@@ -244,7 +249,7 @@ func TestGivenAnAllCapableStepWhenRunThenShouldJoinCompletedReplies(t *testing.T
 		"worker-b": cardFor("review", nil, nil, nil, nil),
 	})
 
-	outcome, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+	outcome, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		Registry(registry).
 		Step("review", laser.AllCapable("review", laser.RouteAny),
 			func(context.Context, map[string][]byte) ([]byte, error) {
@@ -267,7 +272,7 @@ func TestGivenADuplicateLabelWhenRunThenShouldRefuseBeforeWriting(t *testing.T) 
 	server := newWorkflowServer()
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	_, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+	_, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		StepLocal("ingest", noopStep).
 		StepLocal("ingest", noopStep).
 		Run(context.Background())
@@ -285,7 +290,7 @@ func TestGivenADependencyCycleWhenRunThenShouldRefuse(t *testing.T) {
 	server := newWorkflowServer()
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	_, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+	_, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		StepLocal("a", noopStep).After("b").
 		StepLocal("b", noopStep).After("a").
 		Run(context.Background())
@@ -300,7 +305,7 @@ func TestGivenAVerifierThatRejectsWhenRunThenShouldFailTheStep(t *testing.T) {
 	server := newWorkflowServer()
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	_, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+	_, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		StepLocal("ingest", func(context.Context, map[string][]byte) ([]byte, error) {
 			return []byte("bad"), nil
 		}).VerifyWith(func(context.Context, []byte) (bool, error) { return false, nil }).
@@ -319,7 +324,7 @@ func TestGivenAnInvocationsBudgetWhenRunThenShouldFailOnceExceeded(t *testing.T)
 	server := newWorkflowServer()
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	_, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+	_, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		Budget(laser.WorkflowBudget{}.WithInvocations(1)).
 		StepLocal("a", noopStep).
 		StepLocal("b", noopStep).After("a").
@@ -341,7 +346,9 @@ func TestGivenAResumedRunWhenRunAgainThenShouldSkipCompletedSteps(t *testing.T) 
 	source := agentID(t, "pipeline")
 	worker := agentID(t, "worker")
 	task := func(context.Context, map[string][]byte) ([]byte, error) { return []byte("task"), nil }
-	build := func() *laser.Workflow { return handle.Workflow(source, "agent.sessions").RunID(runID) }
+	build := func() *laser.Workflow {
+		return handle.Workflow(source, "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).RunID(runID)
+	}
 
 	// First run: a budget of one invocation lets step "a" complete and
 	// stops before "b" is ever dispatched.
@@ -395,7 +402,7 @@ func TestGivenAFailedLocalStepWhenRunThenShouldCompensateCompletedStepsInReverse
 		}
 	}
 
-	_, err := handle.Workflow(agentID(t, "billing"), "agent.sessions").
+	_, err := handle.Workflow(agentID(t, "billing"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		StepLocal("reserve", func(context.Context, map[string][]byte) ([]byte, error) {
 			return []byte("reserve done in process"), nil
 		}).CompensateWith(undo("reserve")).
@@ -424,7 +431,7 @@ func TestGivenADirectedStepCompensationWhenALaterStepFailsThenShouldDispatchItTo
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 	worker := agentID(t, "worker")
 
-	_, err := handle.Workflow(agentID(t, "billing"), "agent.sessions").
+	_, err := handle.Workflow(agentID(t, "billing"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		Step("reserve", laser.To(worker), func(context.Context, map[string][]byte) ([]byte, error) {
 			return []byte("reserve"), nil
 		}).CompensateWith(func(context.Context, map[string][]byte) ([]byte, error) {
@@ -464,7 +471,7 @@ func TestGivenAResumedRunAfterCompensationWhenRunAgainThenShouldRerunTheCompensa
 	shipShouldFail.Store(true)
 
 	runOnce := func() (*laser.WorkflowOutcome, error) {
-		return handle.Workflow(source, "agent.sessions").RunID(runID).
+		return handle.Workflow(source, "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).RunID(runID).
 			StepLocal("reserve", func(context.Context, map[string][]byte) ([]byte, error) {
 				atomic.AddInt32(&reserveRuns, 1)
 				return []byte("reserved"), nil
@@ -510,7 +517,7 @@ func TestGivenAFreshStreamWithNoAgentTopicsWhenALocalWorkflowRunsThenShouldBoots
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 	source := agentID(t, "jobs")
 
-	outcome, err := handle.Workflow(source, "agent.sessions").
+	outcome, err := handle.Workflow(source, "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		StepLocal("generate", func(context.Context, map[string][]byte) ([]byte, error) {
 			return []byte("generate done in process"), nil
 		}).
@@ -576,7 +583,7 @@ func TestGivenAnAdvertisedInboxWhenAStepRunsThenShouldAddressTheAgentAndAnswerOn
 	server.answerOn = "agent.sessions"
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	outcome, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+	outcome, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		Registry(registry).
 		InboxRoute(laser.AdvertisedInbox()).
 		Step("settle", laser.To(agentID(t, "worker")),
@@ -621,7 +628,7 @@ func TestGivenADeclaredStepsRunWhenRunningThenShouldHoldItsLeaseUntilItEnds(t *t
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
 	heldDuringRun := -1
-	outcome, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+	outcome, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		StepLocal("work", func(context.Context, map[string][]byte) ([]byte, error) {
 			heldDuringRun = handle.Leases().Held()
 			return []byte("done"), nil
@@ -647,7 +654,7 @@ func TestGivenAPlainCodeRunWhenFinishedThenShouldHoldItsLeaseUntilThen(t *testin
 	server := newWorkflowServer()
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	run, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+	run, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		Start(context.Background())
 	if err != nil {
 		t.Fatalf("start the run: %v", err)
@@ -679,7 +686,7 @@ func TestGivenAReleasedRunWhenFinishedLaterThenShouldRefuseAndHoldNoLease(t *tes
 	server := newWorkflowServer()
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	run, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").
+	run, err := handle.Workflow(agentID(t, "pipeline"), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		Start(context.Background())
 	if err != nil {
 		t.Fatalf("start the run: %v", err)

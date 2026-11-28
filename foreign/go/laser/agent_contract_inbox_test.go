@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
@@ -31,14 +33,16 @@ func commandTopics(t *testing.T, server *contractServer, topics ...string) map[s
 }
 
 // The point of an advertised route: the work goes to the topic that agent
-// says it is consuming, not to a shared name the SDK picked.
-func TestGivenAnAdvertisedInboxWhenContractSentThenShouldAddressTheAgentsOwnTopic(t *testing.T) {
+// says it is consuming, and the answer is awaited on the topic the caller
+// named, which is where a worker answering on the lane replies.
+func TestGivenAnAdvertisedInboxWhenContractSentWithDefaultsThenShouldAddressTheAgentsOwnTopic(t *testing.T) {
 	registry, _ := seedPresence(t, []wire.ClientMetadata{
 		advertised(t, "worker", "worker-inbox", principalOf(1)),
 	})
 	server := &contractServer{
 		replyKind: wire.KindResponse, replyBody: []byte("done"),
 		replySource: agentID(t, "worker"),
+		answerOn:    "agent.sessions",
 	}
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
@@ -46,7 +50,6 @@ func TestGivenAnAdvertisedInboxWhenContractSentThenShouldAddressTheAgentsOwnTopi
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Registry(registry).
-		InboxRoute(laser.AdvertisedInbox()).
 		Deadline(2 * time.Second).
 		Send(context.Background())
 	if err != nil {
@@ -62,6 +65,140 @@ func TestGivenAnAdvertisedInboxWhenContractSentThenShouldAddressTheAgentsOwnTopi
 	if counts["agent.sessions"] != 0 {
 		t.Errorf("the command should not have gone to the named topic, got %d",
 			counts["agent.sessions"])
+	}
+	if polls := server.pollsOf("worker-inbox"); len(polls) != 0 {
+		t.Errorf("the wait should not read the worker's inbox, got %d polls", len(polls))
+	}
+}
+
+// A server without live presence still delivers a default contract, through
+// the inbox the agent's card names.
+func TestGivenACardInboxAndNoPresenceWhenContractSentWithDefaultsThenShouldReachTheAgent(t *testing.T) {
+	server := &contractServer{
+		replyKind: wire.KindResponse, replyBody: []byte("done"),
+		replySource: agentID(t, "worker"),
+		answerOn:    "agent.sessions",
+		perTopic:    map[string][]iggcon.IggyMessage{},
+	}
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+	inbox := "worker-inbox"
+	card := cardFor("run", nil, nil, nil, nil)
+	card.Inbox = &inbox
+	if err := handle.PublishCard(context.Background(), agentID(t, "worker"), card); err != nil {
+		t.Fatalf("publish the card: %v", err)
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+			From(agentID(t, "orchestrator")).
+			Payload([]byte(`{"task":"run"}`)).
+			Deadline(2 * time.Second).
+			Send(context.Background())
+		if err != nil {
+			t.Fatalf("send the contract: %v", err)
+		}
+		if contract.State != laser.ContractCompleted {
+			t.Fatalf("want completed, got %v", contract.State)
+		}
+	}
+	if counts := commandTopics(t, server, "worker-inbox"); counts["worker-inbox"] != 2 {
+		t.Errorf("want both commands on the card inbox, got %d", counts["worker-inbox"])
+	}
+	// The second send resumes the shared fold instead of rereading the cards.
+	polls := server.pollsOf("agent.registry")
+	if len(polls) < 2 || polls[0] != 0 || polls[len(polls)-1] != 1 {
+		t.Errorf("want the registry read once from 0 and then resumed from 1, got %v", polls)
+	}
+}
+
+func TestGivenACapabilityRouteAndNoRegistryWhenContractSentToAFixedInboxThenShouldResolveItFromTheSharedRegistry(t *testing.T) {
+	server := &contractServer{
+		replyKind: wire.KindResponse, replyBody: []byte("done"),
+		replySource: agentID(t, "worker"),
+		answerOn:    "agent.sessions",
+		perTopic:    map[string][]iggcon.IggyMessage{},
+	}
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+	if err := handle.PublishCard(
+		context.Background(), agentID(t, "worker"), cardFor("run", nil, nil, nil, nil)); err != nil {
+		t.Fatalf("publish the card: %v", err)
+	}
+
+	contract, err := handle.Contract(laser.ToCapable("run", laser.RouteAny), "agent.sessions").
+		From(agentID(t, "orchestrator")).
+		InboxRoute(laser.FixedInbox("agent.sessions")).
+		Payload([]byte(`{"task":"run"}`)).
+		Deadline(2 * time.Second).
+		Send(context.Background())
+
+	if err != nil {
+		t.Fatalf("want the capability resolved without a caller registry, got %v", err)
+	}
+	if contract.State != laser.ContractCompleted {
+		t.Errorf("want the capable agent to complete it, got %v", contract.State)
+	}
+}
+
+func TestGivenNoRegistryWhenScatteredThenShouldResolveTheSkillFromTheSharedRegistry(t *testing.T) {
+	server := &contractServer{
+		replyKind: wire.KindResponse, replyBody: []byte("done"),
+		replySource: agentID(t, "worker"),
+		answerOn:    "agent.sessions",
+		perTopic:    map[string][]iggcon.IggyMessage{},
+	}
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+	for _, name := range []string{"worker-a", "worker-b"} {
+		if err := handle.PublishCard(
+			context.Background(), agentID(t, name), cardFor("review", nil, nil, nil, nil)); err != nil {
+			t.Fatalf("publish the card: %v", err)
+		}
+	}
+
+	report, err := handle.ScatterReport(context.Background(), laser.ScatterRequest{
+		Inbox: &laser.InboxRoute{Kind: laser.InboxFixed, Topic: wire.AgentSessions},
+		Skill: "review", Routing: laser.RouteAny,
+		From: agentID(t, "orchestrator"), Topic: "agent.sessions",
+		Payload: []byte(`{"task":"run"}`), Policy: laser.GatherAll(),
+		Deadline: 2 * time.Second,
+	})
+
+	if err != nil {
+		t.Fatalf("want the skill resolved without a caller registry, got %v", err)
+	}
+	if len(report.Outcomes) != 2 {
+		t.Fatalf("want one branch per capable agent, got %d", len(report.Outcomes))
+	}
+}
+
+func TestGivenASharedRegistryWhenTheConnectionClosesThenShouldForgetIt(t *testing.T) {
+	server := &contractServer{
+		replyKind: wire.KindResponse, replyBody: []byte("done"),
+		replySource: agentID(t, "worker"),
+		answerOn:    "agent.sessions",
+		perTopic:    map[string][]iggcon.IggyMessage{},
+	}
+	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
+	inbox := "worker-inbox"
+	card := cardFor("run", nil, nil, nil, nil)
+	card.Inbox = &inbox
+	if err := handle.PublishCard(context.Background(), agentID(t, "worker"), card); err != nil {
+		t.Fatalf("publish the card: %v", err)
+	}
+	if _, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+		From(agentID(t, "orchestrator")).Payload([]byte(`{"task":"run"}`)).
+		Deadline(2 * time.Second).Send(context.Background()); err != nil {
+		t.Fatalf("send the contract: %v", err)
+	}
+	if held := laser.SharedRegistriesForTest(handle); held != 1 {
+		t.Fatalf("want one registry held for the stream, got %d", held)
+	}
+
+	if err := handle.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if held := laser.SharedRegistriesForTest(handle); held != 0 {
+		t.Errorf("want the registries dropped with the connection, got %d", held)
 	}
 }
 
@@ -102,7 +239,7 @@ func TestGivenNoAdvertisedInboxWhenContractSentThenShouldRefuseRatherThanGuess(t
 func TestGivenACapableAgentWithNoInboxWhenResolvedThenShouldPickAReachableOne(t *testing.T) {
 	now := time.Now()
 	registry, _ := seedPresence(t, []wire.ClientMetadata{
-		// "reachable" advertises an inbox; "silent" advertises presence
+		// "reachable" advertises an inbox. "silent" advertises presence
 		// with no inbox at all, so it is capable but unaddressable.
 		advertised(t, "reachable", "reachable-inbox", principalOf(1)),
 		advertised(t, "silent", "", principalOf(1)),
@@ -134,7 +271,7 @@ func TestGivenACapableAgentWithNoInboxWhenResolvedThenShouldPickAReachableOne(t 
 // A directed route is not filtered by reachability: the caller named that
 // agent, so an unreachable one is reported as having no inbox rather than
 // silently becoming "no capable agent".
-func TestGivenADirectedRouteToAnUnreachableAgentThenShouldStillNameIt(t *testing.T) {
+func TestGivenADirectedRouteToAnUnreachableAgentWhenResolvedThenShouldStillNameIt(t *testing.T) {
 	now := time.Now()
 	registry, _ := seedPresence(t, nil)
 
@@ -195,7 +332,7 @@ func TestGivenAReplyTopicWhenTheAnswerLandsElsewhereThenShouldTimeOut(t *testing
 	}
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		ReplyOn("orchestrator-replies").
@@ -209,16 +346,14 @@ func TestGivenAReplyTopicWhenTheAnswerLandsElsewhereThenShouldTimeOut(t *testing
 	}
 }
 
-// The default must not move: every existing caller addresses the topic it
-// named at Contract, for both the command and the answer.
-func TestGivenNoInboxRouteWhenContractSentThenShouldKeepUsingTheNamedTopic(t *testing.T) {
+func TestGivenAFixedInboxWhenContractSentThenShouldUseTheNamedTopic(t *testing.T) {
 	server := &contractServer{
 		replyKind: wire.KindResponse, replyBody: []byte("done"),
 		replySource: agentID(t, "worker"),
 	}
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
 
-	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").
+	contract, err := handle.Contract(laser.To(agentID(t, "worker")), "agent.sessions").InboxRoute(laser.FixedInbox("agent.sessions")).
 		From(agentID(t, "orchestrator")).
 		Payload([]byte(`{"task":"run"}`)).
 		Deadline(2 * time.Second).
@@ -248,5 +383,32 @@ func TestGivenAFixedInboxWithNoTopicWhenResolvedThenShouldRefuse(t *testing.T) {
 	}
 	if topic != "shared" {
 		t.Errorf("want the fixed topic honored ahead of presence, got %q", topic)
+	}
+}
+
+// Under a per-agent topic layout a reply addressed to the requester lands on
+// the requester's declared topic, so that is where the contract waits.
+func TestGivenARequesterWithADeclaredTopicWhenContractSentThenShouldAwaitTheAnswerThere(t *testing.T) {
+	server := &contractServer{
+		replyKind: wire.KindResponse, replyBody: []byte("done"),
+		replySource: agentID(t, "executor"),
+		answerOn:    "planner.inbox",
+	}
+	handle := layoutHandle(t, server, inboxLayout(t))
+
+	contract, err := handle.Contract(laser.To(agentID(t, "executor")), wire.AgentSessions).
+		InboxRoute(laser.FixedInbox(wire.AgentSessions)).
+		From(agentID(t, "planner")).
+		Payload([]byte(`{"task":"run"}`)).
+		Deadline(2 * time.Second).
+		Send(context.Background())
+	if err != nil {
+		t.Fatalf("send the contract: %v", err)
+	}
+	if contract.State != laser.ContractCompleted {
+		t.Fatalf("want completed, got %v", contract.State)
+	}
+	if polls := server.pollsOf(wire.AgentSessions); len(polls) != 0 {
+		t.Errorf("the wait should read the declared topic and not the lane, got %d polls", len(polls))
 	}
 }

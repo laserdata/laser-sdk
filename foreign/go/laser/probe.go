@@ -67,16 +67,6 @@ func probeManagedHost(
 func NegotiateCapabilities(
 	ctx context.Context, client BinaryRequester, configured Capabilities,
 ) Capabilities {
-	negotiated := configured
-	announce, err := probeManagedHost(ctx, client)
-	switch {
-	case err != nil:
-		negotiated.Hello = HelloFailed
-	case announce == nil:
-		negotiated.Hello = HelloRejected
-	default:
-		negotiated.mergeAnnouncement(announce)
-		negotiated.Hello = HelloAnswered
-	}
+	negotiated, _ := negotiateTopology(ctx, client, configured)
 	return negotiated
 }

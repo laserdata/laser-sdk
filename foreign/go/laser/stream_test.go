@@ -377,7 +377,8 @@ func TestGivenATypedPayloadWhenPublishedThenShouldStampItsContentType(t *testing
 			}
 
 			headers := sentHeaders(t, server)
-			if headers[wire.HeaderContentType] != publish.want {
+			code, _ := wire.ContentType(publish.want).Code()
+			if headers[wire.HeaderContentType] != string([]byte{code}) {
 				t.Errorf("want content type %q, got %q",
 					publish.want, headers[wire.HeaderContentType])
 			}
@@ -393,13 +394,13 @@ func TestGivenUserHeadersWhenPublishedThenShouldCarryThem(t *testing.T) {
 
 	if _, err := streamHandle(server, laser.Options{DefaultStream: "agents"}).
 		Topic("inferences").Publish().Payload([]byte("body")).
-		Header("trace", "abc").Header("tenant", "acme").
+		Header("trace", "abc").Header("owner", "acme").
 		Send(context.Background()); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
 	headers := sentHeaders(t, server)
-	if headers["trace"] != "abc" || headers["tenant"] != "acme" {
+	if headers["trace"] != "abc" || headers["owner"] != "acme" {
 		t.Errorf("want both headers, got %+v", headers)
 	}
 }
@@ -486,6 +487,14 @@ func TestGivenAStreamHandleWhenAddressingATopicThenShouldUseThatStream(t *testin
 // failure at the test rather than at the code under test.
 type clusterOfOne struct {
 	iggcon.Client
+}
+
+// SendBinaryRequest answers the way raw Apache Iggy does: it does not know a
+// managed command, which is what the capability probe reads as an open server.
+func (clusterOfOne) SendBinaryRequest(
+	_ context.Context, _ uint32, _ []byte,
+) ([]byte, error) {
+	return nil, ierror.InvalidCommand{}
 }
 
 func (clusterOfOne) GetClusterMetadata(

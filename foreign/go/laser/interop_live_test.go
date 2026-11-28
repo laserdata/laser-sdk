@@ -18,8 +18,7 @@
 //	cd foreign/go && LASER_LIVE_CONNECTION_STRING='iggy://iggy:iggy@127.0.0.1:18090' \
 //	  go test ./laser/ -tags integration -count=1
 //
-// It skips when no server answers, and when the pinned Rust toolchain is not
-// installed, because neither is a defect in this client.
+// The Rust build uses the workspace toolchain selected by rust-toolchain.toml.
 package laser_test
 
 import (
@@ -36,72 +35,33 @@ import (
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
-// rustToolchainBin is where the pinned toolchain lives.
-//
-// It is named explicitly because a Homebrew cargo on the PATH resolves a
-// different rustc than the one this repository pins, and the crate does not
-// build under it. Skipping on its absence is honest; silently building with
-// the wrong compiler is not.
-const rustToolchainBin = "/Users/saieswar/.rustup/toolchains/1.100.0-aarch64-apple-darwin/bin"
-
-// interopBuildTimeout bounds the cargo build. A cold build of the Rust client
-// is minutes rather than seconds, so this is generous on purpose.
-const interopBuildTimeout = 15 * time.Minute
-
-// interopRunTimeout bounds one publish or verify run.
-const interopRunTimeout = 2 * time.Minute
-
-// interopManifest is the Rust tool's manifest, relative to this package.
-func interopManifest(t *testing.T) string {
+// buildInterop builds the Rust peer, so a later run starts at once.
+func buildInterop(t *testing.T) {
 	t.Helper()
-	path, err := filepath.Abs(filepath.Join("..", "..", "..", "scripts", "interop", "Cargo.toml"))
-	if err != nil {
-		t.Fatalf("resolve the interop manifest path: %v", err)
-	}
-	if _, err := os.Stat(path); err != nil {
-		t.Skipf("the Rust interop tool is not present at %s: %v", path, err)
-	}
-	return path
-}
-
-// buildInterop builds the Rust tool once and hands back the binary's path.
-//
-// It is built rather than run through `cargo run` at each step, because cargo
-// writes its progress to stderr and a run would mix that into the tool's own
-// output. A separate build also keeps the publish and verify steps fast enough
-// to sit inside one test.
-func buildInterop(t *testing.T) string {
-	t.Helper()
-	if _, err := os.Stat(rustToolchainBin); err != nil {
-		t.Skipf("the pinned Rust toolchain is not installed at %s: %v", rustToolchainBin, err)
-	}
-	manifest := interopManifest(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), interopBuildTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	build := exec.CommandContext(ctx, "cargo", "build", "--manifest-path", manifest)
-	build.Env = append(os.Environ(),
-		"PATH="+rustToolchainBin+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"RUSTC="+filepath.Join(rustToolchainBin, "rustc"))
+	manifest := filepath.Join("..", "..", "..", "scripts", "interop", "Cargo.toml")
+	build := exec.CommandContext(ctx, "cargo", "build", "--quiet", "--locked", "--manifest-path", manifest)
 	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build the Rust interop tool: %v\n%s", err, output)
+		t.Fatalf("build the Rust interop peer: %v\n%s", err, output)
 	}
-	return filepath.Join(filepath.Dir(manifest), "target", "debug", "laser-interop")
 }
 
-// runInterop runs one interop command, returning its stdout.
-func runInterop(t *testing.T, binary, command, stream, topic string) string {
+// runInterop runs the Rust peer using the repository toolchain.
+func runInterop(t *testing.T, command, stream, topic string) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), interopRunTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-
-	run := exec.CommandContext(ctx, binary, command, liveConnectionString(), stream, topic)
-	run.Env = append(os.Environ(),
-		"PATH="+rustToolchainBin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	output, err := run.CombinedOutput()
+	manifest := filepath.Join("..", "..", "..", "scripts", "interop", "Cargo.toml")
+	run := exec.CommandContext(ctx, "cargo", "run", "--quiet", "--locked", "--manifest-path", manifest,
+		"--", command, stream, topic)
+	run.Env = append(os.Environ(), "LASER_CONNECTION_STRING="+liveConnectionString())
+	output, err := run.Output()
 	if err != nil {
-		t.Fatalf("the Rust client failed to %s on %s/%s: %v\n%s",
-			command, stream, topic, err, output)
+		if failure, ok := err.(*exec.ExitError); ok {
+			t.Fatalf("Rust interop %s failed: %v\n%s", command, err, failure.Stderr)
+		}
+		t.Fatalf("run Rust interop %s: %v", command, err)
 	}
 	return string(output)
 }
@@ -197,7 +157,7 @@ func TestGivenRustPublishedRecordWhenGoConsumesThenShouldReadTheSameSpine(t *tes
 	// The build comes before the clock starts, because a cold cargo build of
 	// the Rust client runs for minutes and would otherwise spend the whole
 	// operation budget before the first request.
-	binary := buildInterop(t)
+	buildInterop(t)
 	ctx := liveContext(t)
 
 	streamName := liveScratch(t, client, ctx, "laser-interop-rust-to-go").Name()
@@ -206,7 +166,7 @@ func TestGivenRustPublishedRecordWhenGoConsumesThenShouldReadTheSameSpine(t *tes
 	// The Rust client creates the topic as it publishes, so the Go side here
 	// reads a topic it did not make: one more thing that has to agree across
 	// the two.
-	published := runInterop(t, binary, "publish", streamName, topicName)
+	published := runInterop(t, "publish", streamName, topicName)
 	t.Logf("the Rust client published %s", published)
 
 	topic := client.Stream(streamName).Topic(topicName)
@@ -253,7 +213,7 @@ func TestGivenGoPublishedRecordWhenRustConsumesThenShouldReadTheSameSpine(t *tes
 	// The build comes before the clock starts, because a cold cargo build of
 	// the Rust client runs for minutes and would otherwise spend the whole
 	// operation budget before the first request.
-	binary := buildInterop(t)
+	buildInterop(t)
 	ctx := liveContext(t)
 
 	scratch := liveScratch(t, client, ctx, "laser-interop-go-to-rust")
@@ -313,6 +273,6 @@ func TestGivenGoPublishedRecordWhenRustConsumesThenShouldReadTheSameSpine(t *tes
 	// The Rust tool exits non-zero when the header block it decodes disagrees
 	// with the body, so a clean run is the proof. Its stdout is logged so a
 	// passing run still shows what crossed the wire.
-	verified := runInterop(t, binary, "verify", streamName, topicName)
+	verified := runInterop(t, "verify", streamName, topicName)
 	t.Logf("the Rust client read back %s", verified)
 }

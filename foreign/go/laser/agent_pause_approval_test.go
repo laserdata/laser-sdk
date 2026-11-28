@@ -247,7 +247,7 @@ func TestGivenAnUnrelatedReplyWhenReadThenShouldNotReplayAnything(t *testing.T) 
 		t.Fatalf("the parking run: %v", err)
 	}
 	// A properly tagged approval correlation, derived from the resolved ids
-	// exactly as a real one is -- but for a record nothing parked at. The
+	// exactly as a real one is, but for a record nothing parked at. The
 	// companion test above proves this same construction does replay when
 	// the position matches, so a pass here is the position being checked
 	// rather than the reply being unrecognizable.
@@ -267,7 +267,7 @@ func TestGivenAnUnrelatedReplyWhenReadThenShouldNotReplayAnything(t *testing.T) 
 
 // The session's later work belongs behind the approval, or the decision
 // would resume a session whose newer records had already run past it.
-func TestGivenWorkArrivingWhileAnApprovalIsHeldThenShouldHoldItBehind(t *testing.T) {
+func TestGivenAnApprovalHeldWhenLaterWorkArrivesThenShouldHoldItBehind(t *testing.T) {
 	server := liveServer(t)
 	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{EnforceControl: true})
 	work := workRecord(t, 41, "risky")
@@ -344,7 +344,7 @@ func TestGivenARecordParkedOnAnApprovalWhenRedeliveredThenShouldNotParkItTwice(t
 // was granted, on a topic several roles share.
 //
 // What stops it is the runtime's own addressing filter, which skips a record
-// aimed elsewhere before any of the approval machinery sees it; resumeApproval
+// aimed elsewhere before any of the approval machinery sees it. resumeApproval
 // checks the addressee again, but on this path that check is defence in depth
 // rather than the thing under test. This pins the behaviour end to end, which
 // is what a caller relies on either way.
@@ -356,7 +356,7 @@ func TestGivenADecisionForAnotherAgentWhenReadThenShouldNotResumeMine(t *testing
 	if err := runUntilDrained(t, runtime, sourceOf(work), handler); err != nil {
 		t.Fatalf("the parking run: %v", err)
 	}
-	// The same correlation this runtime is waiting on -- so only the
+	// The same correlation this runtime is waiting on, so only the
 	// addressee separates it from the decision that does resume.
 	correlation := laser.ApprovalCorrelationForTest(
 		runtime.SourcePositionForTest(work))
@@ -379,5 +379,58 @@ func TestGivenADecisionForAnotherAgentWhenReadThenShouldNotResumeMine(t *testing
 	}
 	if ran := handler.ran(); len(ran) != 1 {
 		t.Fatalf("want the handler not replayed, got %v", ran)
+	}
+}
+
+func TestGivenVerifiedParkedWorkWhenUnsignedApprovalArrivesThenShouldStayParked(t *testing.T) {
+	key, err := laser.GenerateSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := laser.NewKeyRegistry()
+	registry.Enroll("planner", key.VerifyingKey())
+	work := signedRecords(t, func(agdx *laser.Agdx) *laser.AgdxSend {
+		return agdx.Command(correlationID(1), []byte("risky")).WithTarget(agentID(t, "executor")).Signed(key)
+	}, 41)[0]
+	server := liveServer(t, work)
+	runtime := runtimeFor(t, server, "executor", laser.RuntimeOptions{EnforceControl: true, Verifier: registry})
+	handler := &gating{approver: agentID(t, "boss"), timeout: time.Minute}
+	if err := runUntilDrained(t, runtime, sourceOf(work), handler); err != nil {
+		t.Fatal(err)
+	}
+	reply := approvalDecision(t, runtime, work, 42, wire.KindResponse, "approved")
+	if err := runUntilDrained(t, runtime, sourceOf(reply), handler); err != nil {
+		t.Fatal(err)
+	}
+	if len(handler.ran()) != 1 || len(handler.decided()) != 0 || len(parkedOn(t, server, wire.OperationSessionUnparked)) != 0 {
+		t.Fatal("unsigned approval advanced a verified agent")
+	}
+}
+
+func TestGivenAParkedApprovalWithoutPauseHistoryWhenNewRuntimeReadsDecisionThenShouldResume(t *testing.T) {
+	work := workRecord(t, 41, "risky")
+	server := newRuntimeServer()
+	server.partitions, server.createdAt = 1, parkedGeneration
+	server.seedHistory(wire.AgentSessions, 0, 0, work.Message)
+	server.aliasNumeric(3, wire.AgentSessions)
+	first := runtimeFor(t, server, "executor", laser.RuntimeOptions{EnforceControl: true})
+	handler := &gating{approver: agentID(t, "boss"), timeout: time.Minute}
+	if err := runUntilDrained(t, first, sourceOf(work), handler); err != nil {
+		t.Fatal(err)
+	}
+	parked := parkedOn(t, server, wire.OperationSessionParked)
+	if len(parked) != 1 {
+		t.Fatalf("expected one durable parking, got %d", len(parked))
+	}
+	fact := parkingLaneRecord(t, wire.OperationSessionParked, parked[0])
+	fact.Header.Offset = 42
+	server.seedHistory(wire.AgentSessions, 0, 0, fact)
+	second := runtimeFor(t, server, "executor", laser.RuntimeOptions{EnforceControl: true})
+	reply := approvalDecision(t, first, work, 43, wire.KindResponse, "approved")
+	if err := runUntilDrained(t, second, sourceOf(reply), handler); err != nil {
+		t.Fatal(err)
+	}
+	if grants := handler.decided(); len(grants) != 1 || grants[0] != "approved" {
+		t.Fatalf("new runtime did not recover parked approval: %+v", grants)
 	}
 }

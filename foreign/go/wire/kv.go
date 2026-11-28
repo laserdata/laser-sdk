@@ -24,8 +24,9 @@ type MemoryRowScope struct {
 	// Source is the origin log record this item was folded from, so a reader
 	// can navigate back to the source message while it is still on the log.
 	Source *SourceRef `cbor:"source,omitempty"`
-	// TimestampMicros is the broker append time of the source record. With the
-	// source address it orders items remembered on different partitions.
+	// TimestampMicros is the streaming server's append time of the source
+	// record. With the source address it orders items remembered on different
+	// partitions.
 	TimestampMicros *uint64 `cbor:"timestamp_micros,omitempty"`
 	// Weight is the feedback weight folded for this item, the sum of every
 	// feedback record that targets it. Recall ranks every strategy except

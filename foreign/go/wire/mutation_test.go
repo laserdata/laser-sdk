@@ -1,6 +1,8 @@
 package wire_test
 
 import (
+	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
@@ -167,57 +169,104 @@ func TestGivenAnOperationIdentityWhenEncodedThenShouldSpanTheFullRange(t *testin
 	}
 }
 
-// The client keeps the highest position per surface, and a generation change
-// replaces rather than silently drops, since the old coordinate is meaningless
-// once a surface is rebuilt.
-func TestGivenFrontiersWhenMergedThenShouldKeepTheHighestPerSurface(t *testing.T) {
-	held := wire.AppliedFrontier{
-		Kv: &wire.MutationPosition{TopicGeneration: 1, Partition: 0, Offset: 10},
+// The client keeps the later position per surface, ordered by topic generation
+// and then offset, so a late reply from a topic that was since recreated never
+// lowers the frontier.
+func TestGivenFrontiersWhenMergedThenShouldKeepTheLaterPositionPerSurface(t *testing.T) {
+	at := func(generation, offset uint64) *wire.MutationPosition {
+		return &wire.MutationPosition{TopicGeneration: generation, Offset: offset}
+	}
+	held := wire.AppliedFrontier{Kv: at(1, 9), Fork: at(1, 4)}
+
+	wire.MergeFrontier(&held, wire.AppliedFrontier{Kv: at(1, 3), Fork: at(2, 0), Graph: at(1, 1)})
+
+	want := wire.AppliedFrontier{Kv: at(1, 9), Fork: at(2, 0), Graph: at(1, 1)}
+	if !reflect.DeepEqual(held, want) {
+		t.Fatalf("merged frontier = %s, want %s", describeFrontier(held), describeFrontier(want))
 	}
 
-	wire.MergeFrontier(&held, wire.AppliedFrontier{
-		Kv: &wire.MutationPosition{TopicGeneration: 1, Partition: 0, Offset: 4},
-	})
-	if held.Kv.Offset != 10 {
-		t.Fatalf("an earlier position must not lower the frontier, got %d", held.Kv.Offset)
+	wire.MergeFrontier(&held, wire.AppliedFrontier{Fork: at(1, 500)})
+	if !reflect.DeepEqual(held, want) {
+		t.Fatalf("an older generation lowered the frontier: %s", describeFrontier(held))
+	}
+}
+
+func TestGivenSessionPositionsWhenMergedThenShouldKeepTheLaterPerUnitAndDropAnOlderStream(t *testing.T) {
+	session := func(streamGeneration uint64, topic string, offset uint64) wire.SessionPosition {
+		return wire.SessionPosition{
+			StreamID: 4, StreamGeneration: streamGeneration, Topic: topic,
+			TopicGeneration: 1, PartitionID: 0, Offset: offset,
+		}
+	}
+	var held wire.AppliedFrontier
+
+	wire.MergeFrontier(&held, wire.AppliedFrontier{Sessions: []wire.SessionPosition{
+		session(1, "lane", 5), session(1, "inbox", 2),
+	}})
+	wire.MergeFrontier(&held, wire.AppliedFrontier{Sessions: []wire.SessionPosition{session(1, "lane", 3)}})
+	want := []wire.SessionPosition{session(1, "lane", 5), session(1, "inbox", 2)}
+	if !reflect.DeepEqual(held.Sessions, want) {
+		t.Fatalf("an older answer lowered a unit: %+v", held.Sessions)
 	}
 
-	wire.MergeFrontier(&held, wire.AppliedFrontier{
-		Kv: &wire.MutationPosition{TopicGeneration: 1, Partition: 0, Offset: 21},
-	})
-	if held.Kv.Offset != 21 {
-		t.Fatalf("a later position must raise the frontier, got %d", held.Kv.Offset)
-	}
-
-	// A new topic generation does not compare with the held one.
-	wire.MergeFrontier(&held, wire.AppliedFrontier{
-		Kv: &wire.MutationPosition{TopicGeneration: 2, Partition: 0, Offset: 1},
-	})
-	if held.Kv.TopicGeneration != 2 || held.Kv.Offset != 1 {
-		t.Fatalf("a rebuilt surface must replace the coordinate, got %+v", *held.Kv)
-	}
-
-	// Session lanes merge per partition of a topic incarnation.
-	lane := wire.SessionPosition{
-		StreamID: 1, StreamGeneration: 5, Topic: wire.AgentSessions,
-		TopicGeneration: 7, PartitionID: 0, Offset: 3,
-	}
-	wire.MergeFrontier(&held, wire.AppliedFrontier{Sessions: []wire.SessionPosition{lane}})
-	if len(held.Sessions) != 1 {
-		t.Fatalf("want one session lane, got %d", len(held.Sessions))
-	}
-	advanced := lane
-	advanced.Offset = 9
-	wire.MergeFrontier(&held, wire.AppliedFrontier{Sessions: []wire.SessionPosition{advanced}})
-	if len(held.Sessions) != 1 || held.Sessions[0].Offset != 9 {
-		t.Fatalf("the same lane must advance in place, got %+v", held.Sessions)
-	}
-	other := lane
+	other := session(1, "lane", 0)
 	other.PartitionID = 1
 	wire.MergeFrontier(&held, wire.AppliedFrontier{Sessions: []wire.SessionPosition{other}})
-	if len(held.Sessions) != 2 {
-		t.Fatalf("a different partition is its own lane, got %d", len(held.Sessions))
+	if want = append(want, other); !reflect.DeepEqual(held.Sessions, want) {
+		t.Fatalf("another partition is its own unit: %+v", held.Sessions)
 	}
+
+	recreatedTopic := session(1, "inbox", 0)
+	recreatedTopic.TopicGeneration = 2
+	wire.MergeFrontier(&held, wire.AppliedFrontier{Sessions: []wire.SessionPosition{recreatedTopic}})
+	want[1] = recreatedTopic
+	if !reflect.DeepEqual(held.Sessions, want) {
+		t.Fatalf("a recreated topic replaces its unit in place: %+v", held.Sessions)
+	}
+
+	wire.MergeFrontier(&held, wire.AppliedFrontier{Sessions: []wire.SessionPosition{session(2, "lane", 0)}})
+	if want = []wire.SessionPosition{session(2, "lane", 0)}; !reflect.DeepEqual(held.Sessions, want) {
+		t.Fatalf("a recreated stream must drop the positions of the one before it: %+v", held.Sessions)
+	}
+
+	wire.MergeFrontier(&held, wire.AppliedFrontier{Sessions: []wire.SessionPosition{session(1, "lane", 99)}})
+	if !reflect.DeepEqual(held.Sessions, want) {
+		t.Fatalf("a late answer from the older stream must not return: %+v", held.Sessions)
+	}
+}
+
+func TestGivenAReplyEnvelopeWithoutItsVersionOrReplyWhenDecodedThenShouldBeRefused(t *testing.T) {
+	for name, frame := range map[string][]byte{
+		"an empty map":     {0xa0},
+		"a version alone":  {0xa1, 0x61, 'v', 0x01},
+		"a reply alone":    {0xa1, 0x65, 'r', 'e', 'p', 'l', 'y', 0x41, 0x01},
+		"a frontier alone": {0xa1, 0x68, 'f', 'r', 'o', 'n', 't', 'i', 'e', 'r', 0xa0},
+	} {
+		var envelope wire.ManagedReplyEnvelope
+		if err := wire.Unmarshal(frame, &envelope); err == nil {
+			t.Errorf("%s decoded as a reply envelope", name)
+		}
+	}
+
+	var envelope wire.ManagedReplyEnvelope
+	whole := []byte{0xa2, 0x61, 'v', 0x01, 0x65, 'r', 'e', 'p', 'l', 'y', 0x41, 0x07}
+	if err := wire.Unmarshal(whole, &envelope); err != nil {
+		t.Fatalf("an envelope without a frontier must decode: %v", err)
+	}
+	want := wire.ManagedReplyEnvelope{V: 1, Reply: []byte{7}}
+	if !reflect.DeepEqual(envelope, want) {
+		t.Fatalf("envelope = %+v, want %+v", envelope, want)
+	}
+}
+
+func describeFrontier(frontier wire.AppliedFrontier) string {
+	show := func(position *wire.MutationPosition) string {
+		if position == nil {
+			return "none"
+		}
+		return fmt.Sprintf("(%d,%d)", position.TopicGeneration, position.Offset)
+	}
+	return fmt.Sprintf("kv %s fork %s graph %s", show(frontier.Kv), show(frontier.Fork), show(frontier.Graph))
 }
 
 // Each mutation-log surface must map from its command codes, and a command

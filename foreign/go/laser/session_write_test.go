@@ -327,27 +327,6 @@ func TestGivenASessionWhenReferencedThenShouldNameItsStreamAndConversation(t *te
 	}
 }
 
-// A session's context is bounded by its configuration, or a long session
-// builds a prompt that no longer fits.
-func TestGivenASessionWhenAssemblingContextThenShouldApplyItsBound(t *testing.T) {
-	server := &streamServer{}
-	sessions := streamHandle(server, laser.Options{DefaultStream: "agents"}).
-		SessionsWith(laser.SessionConfig{ContextTokens: 10})
-	session := sessions.Create("nightly")
-
-	assembler := session.Context().Add("agent.sessions",
-		contextRecord(t, session.Conversation(), 10, 0, strings.Repeat("a", 400)),
-		contextRecord(t, session.Conversation(), 20, 1, strings.Repeat("b", 20)),
-	)
-
-	if got := len(assembler.Messages()); got != 1 {
-		t.Errorf("want the bound applied, got %d messages", got)
-	}
-	if assembler.Conversation() != session.Conversation() {
-		t.Error("want the session's own conversation assembled")
-	}
-}
-
 func TestGivenNoConfigurationWhenOpeningSessionsThenShouldTakeTheDefaults(t *testing.T) {
 	server := &streamServer{}
 	sessions := streamHandle(server, laser.Options{DefaultStream: "agents"}).Sessions()

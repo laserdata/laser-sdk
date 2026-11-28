@@ -20,6 +20,9 @@ const workflowFenceNamespace = "agdx.workflow.fence"
 // failing the step.
 const workflowLeaseTTL = 15 * time.Second
 
+// workflowLeaseReleaseTimeout bounds the release a finished or cancelled step sends.
+const workflowLeaseReleaseTimeout = 5 * time.Second
+
 // leaseRetryInterval is how long an exclusive step waits before it asks
 // again for a lease another holder still has.
 const leaseRetryInterval = 500 * time.Millisecond
@@ -91,19 +94,6 @@ type exclusiveCompletion struct {
 // stops at the step deadline. Every exit releases the lease, so a timeout
 // reassignment can acquire immediately under a fresh holder and bump the
 // fence sequence before the stale task can commit.
-//
-// Unlike Rust's Kv::lease/renew (a dedicated coordination client that
-// retries an ambiguous send under the operation's own identity until the
-// store's recorded outcome resolves it), Go's Kv.LeaseGuard/Renew take the
-// plain managed round trip every other kv operation already uses: an
-// ambiguous send surfaces as a plain transport error here, the same
-// documented deviation laser/kv_lease.go's own lease/renew/release already
-// carry. Go also does not race the renewal RPC against the in-flight
-// contract the way Rust's tokio::select! does (both still finish, since a
-// renew call is one short round trip): a renewal failure always abandons the
-// attempt's own completion outright, rather than Rust's one narrower case of
-// waiting for a completion that was already winning the race before
-// deciding. Both are documented simplifications, not silent gaps.
 func (workflow *Workflow) exclusiveAttempt(
 	ctx context.Context, runID wire.ConversationID, step workflowStep, payload []byte,
 	taskConversation wire.ConversationID, attempt workflowAttempt, avoid []wire.AgentID,
@@ -132,6 +122,8 @@ func (workflow *Workflow) exclusiveAttempt(
 
 	completionCtx, cancelCompletion := context.WithCancel(ctx)
 	defer cancelCompletion()
+	lease := *guard.Lease()
+	token := lease.Token
 	done := make(chan exclusiveCompletion, 1)
 	go func() {
 		replyFrom, err := workflow.dispatchPoint(completionCtx, runID, step, attempt)
@@ -145,7 +137,7 @@ func (workflow *Workflow) exclusiveAttempt(
 			Registry(workflow.registry).
 			InboxRoute(workflow.inboxRoute()).
 			ReplyOn(workflow.topic).
-			Fence(guard.Lease().Token).
+			Fence(token).
 			Conversation(taskConversation).
 			Parent(runID, runID).
 			Correlation(dispatch.correlation).
@@ -177,7 +169,6 @@ func (workflow *Workflow) exclusiveAttempt(
 		done <- exclusiveCompletion{output: finished, tokens: tokens, agents: agents}
 	}()
 
-	lease := *guard.Lease()
 	var result exclusiveCompletion
 maintain:
 	for {
@@ -191,7 +182,7 @@ maintain:
 		select {
 		case result = <-done:
 			break maintain
-		case <-time.After(renewalDelay):
+		case <-time.After(time.Until(lease.ValidUntil.Add(renewalDelay - lease.GrantedTTL))):
 			renewalDeadline := lease.ValidUntil
 			if deadlineAt.Before(renewalDeadline) {
 				renewalDeadline = deadlineAt
@@ -202,7 +193,12 @@ maintain:
 				result = exclusiveCompletion{err: leaseLostError()}
 				break maintain
 			}
-			renewed, err := guard.Renew(ctx, workflowLeaseTTL)
+			renewCtx, stopRenewal := context.WithDeadline(ctx, renewalDeadline)
+			renewed, err := guard.renewUntil(renewCtx, workflowLeaseTTL, renewalDeadline)
+			stopRenewal()
+			if !time.Now().Before(renewalDeadline) {
+				err = leaseLostError()
+			}
 			if err != nil {
 				cancelCompletion()
 				<-done
@@ -213,7 +209,10 @@ maintain:
 		}
 	}
 
-	released, releaseErr := guard.Release(ctx)
+	// A cancelled run still gives the lease back, so the next holder does not wait it out.
+	releaseCtx, stopRelease := context.WithTimeout(context.WithoutCancel(ctx), workflowLeaseReleaseTimeout)
+	released, releaseErr := guard.Release(releaseCtx)
+	stopRelease()
 	if result.err != nil {
 		return nil, 0, result.agents, result.err
 	}
@@ -242,8 +241,13 @@ maintain:
 func acquireLease(
 	ctx context.Context, kv *Kv, key, holder string, deadlineAt time.Time,
 ) (*LeaseGuard, error) {
+	ctx, cancel := context.WithDeadline(ctx, deadlineAt)
+	defer cancel()
 	for {
 		guard, err := kv.LeaseGuard(ctx, []byte(key), holder, workflowLeaseTTL)
+		if err != nil && !time.Now().Before(deadlineAt) {
+			return nil, nil
+		}
 		if err == nil {
 			return guard, nil
 		}

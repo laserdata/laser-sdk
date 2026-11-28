@@ -3,6 +3,8 @@ package bdd_test
 import (
 	"context"
 	"fmt"
+	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -15,18 +17,8 @@ import (
 // authorized operational SQL feature: SQL reads materialized indexes through
 // the same managed query authority as a structured query, and refuses the
 // relations and dialects it is not meant to serve.
-//
-// The remote-backend scenario is planned, not implemented: it needs a
-// deployment that declares a SQL backend, which this runner has no way to
-// stand up. It reports as a skip naming that, rather than passing on a
-// deployment that has none.
 func TestGivenTheSharedOperationalSqlScenariosWhenRunThenShouldHold(t *testing.T) {
-	runFeaturePlanned(t, "operational_sql.feature", 3*time.Minute, operationalSQLStep,
-		map[string]string{
-			"Materialize onto a declared SQL backend and read it in its dialect": "" +
-				"needs a deployment that declares a SQL backend, which this " +
-				"runner cannot stand up",
-		})
+	runFeature(t, "operational_sql.feature", 3*time.Minute, operationalSQLStep)
 }
 
 // sqlIndex is the topic the feature materializes whole records into.
@@ -35,6 +27,8 @@ const sqlIndex = "whole_records"
 // sqlFlow is the materialization the scenario set up.
 type sqlFlow struct {
 	materialization *laser.Materialization
+	binding         wire.BackendBinding
+	dialect         wire.SqlDialect
 }
 
 func sqlFlowOf(state *world) *sqlFlow {
@@ -65,11 +59,59 @@ func operationalSQLStep(ctx context.Context, state *world, step bdd.Step) error 
 		return materializationCaughtUp(ctx, flow)
 
 	case text == "operational SQL counts the two materialized records":
-		return sqlCountsTwo(ctx, state)
+		return sqlCountsTwo(ctx, state, sqlIndex, wire.DialectSQLite)
 
 	case text == "operational SQL refuses an internal relation and an unserved dialect":
 		return sqlRefusals(ctx, state)
 
+	case text == "a declared SQL backend":
+		kind := os.Getenv("LASER_BDD_SQL_BACKEND")
+		switch kind {
+		case "postgres":
+			flow.dialect = wire.DialectPostgres
+		case "velodb":
+			flow.dialect = wire.DialectMySQL
+		default:
+			return fmt.Errorf("unsupported test backend %q", kind)
+		}
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for caps := state.client.Capabilities(); ; caps = state.client.RefreshCapabilities(ctx) {
+			for _, backend := range caps.EnabledBackends() {
+				if backend.Implementation.Kind == kind && backend.Mode == wire.BackendOperational && backend.Query != nil && backend.Query.RawSQL && slices.Contains(backend.Query.Dialects, flow.dialect) {
+					flow.binding = wire.BackendBinding{ResourceID: backend.ResourceID, Generation: backend.ObservedBackendGeneration}
+					return nil
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("waiting for backend %s to advertise %s: %w", kind, flow.dialect, ctx.Err())
+			case <-ticker.C:
+			}
+		}
+	case text == "I materialize whole records on the declared SQL backend":
+		topic := state.topic("remote_records")
+		if err := topic.Ensure(ctx, 1, nil); err != nil {
+			return err
+		}
+		flow.materialization, err = topic.Materialize().Backend(flow.binding).Apply(ctx)
+		return err
+	case text == "I publish two arbitrary records to the remote materialized topic":
+		return publishArbitrary(ctx, state, "remote_records")
+	case text == "the remote materialized query returns both original bodies exactly once":
+		return originalBodies(ctx, state, "remote_records", []string{"not-json", string([]byte{0, 255, 1, 2})})
+	case text == "operational SQL in the backend dialect counts the two remote records":
+		return sqlCountsTwo(ctx, state, "remote_records", flow.dialect)
+	case text == "operational SQL refuses internal and catalog relations of the declared backend":
+		for _, relation := range []string{"_ld_watermarks", "ld_watermarks", "information_schema.tables", sqlIndex} {
+			if _, err := state.client.Query("remote_records").RawSQL(flow.dialect, "SELECT * FROM "+relation).Fetch(ctx); err == nil {
+				return fmt.Errorf("remote SQL served relation %q", relation)
+			}
+		}
+		if _, err := state.client.Query("remote_records").RawSQL(wire.DialectSQLite, "SELECT count(*) FROM remote_records").Fetch(ctx); err == nil {
+			return fmt.Errorf("remote SQL accepted SQLite dialect")
+		}
+		return nil
 	default:
 		return fmt.Errorf("this runner does not implement the step")
 	}
@@ -123,9 +165,9 @@ func materializationCaughtUp(ctx context.Context, flow *sqlFlow) error {
 
 // sqlCountsTwo reads the materialized rows back through SQL, which is the
 // point: the same authority serves both query shapes.
-func sqlCountsTwo(ctx context.Context, state *world) error {
-	result, err := state.client.Query(sqlIndex).
-		RawSQL(wire.DialectSQLite, "SELECT count(*) AS n FROM "+sqlIndex).
+func sqlCountsTwo(ctx context.Context, state *world, index string, dialect wire.SqlDialect) error {
+	result, err := state.client.Query(index).
+		RawSQL(dialect, "SELECT count(*) AS n FROM "+index).
 		Fetch(ctx)
 	if err != nil {
 		return err
@@ -161,6 +203,33 @@ func sqlRefusals(ctx context.Context, state *world) error {
 		if err == nil {
 			return fmt.Errorf("want %s refused, it answered", attempt.why)
 		}
+	}
+	return nil
+}
+
+func originalBodies(ctx context.Context, state *world, index string, want []string) error {
+	result, err := state.client.Query(index).WithPayload().Fetch(ctx)
+	if err != nil {
+		return err
+	}
+	got := make([]string, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		found := false
+		for i, field := range result.Fields {
+			if field.Name == "__laser_original_payload" && i < len(row.Values) && row.Values[i].Kind == wire.TypedBinary {
+				got = append(got, string(row.Values[i].Bytes))
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("row missing original binary payload")
+		}
+	}
+	slices.Sort(want)
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		return fmt.Errorf("expected bodies %q, got %q", want, got)
 	}
 	return nil
 }

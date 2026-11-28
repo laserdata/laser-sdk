@@ -21,14 +21,22 @@ type KvBounds struct {
 
 // KvScanRequest lists entries in a namespace, in key order.
 type KvScanRequest struct {
-	kv      *Kv
-	bounds  KvBounds
-	page    uint32
-	results uint32
+	conversation *string
+	kv           *Kv
+	bounds       KvBounds
+	page         uint32
+	results      uint32
 }
 
 // Scan begins a listing of this namespace.
 func (kv *Kv) Scan() *KvScanRequest { return &KvScanRequest{kv: kv} }
+
+// Conversation selects entries written by this conversation.
+func (request *KvScanRequest) Conversation(id wire.ConversationID) *KvScanRequest {
+	value := id.String()
+	request.conversation = &value
+	return request
+}
 
 // Prefix keeps only keys starting with prefix.
 func (request *KvScanRequest) Prefix(prefix []byte) *KvScanRequest {
@@ -64,16 +72,17 @@ func (request *KvScanRequest) Results(results uint32) *KvScanRequest {
 // Fetch reads one page.
 func (request *KvScanRequest) Fetch(ctx context.Context) (*wire.KvPage, error) {
 	scan := wire.KvScan{
-		V:           wire.KvOpVersion,
-		Namespace:   request.kv.ResourceNamespace(),
-		Prefix:      request.bounds.Prefix,
-		Start:       request.bounds.Start,
-		End:         request.bounds.End,
-		KeyContains: request.bounds.KeyContains,
-		Page:        request.page,
-		Results:     request.results,
+		Conversation: request.conversation,
+		V:            wire.KvOpVersion,
+		Namespace:    request.kv.ResourceNamespace(),
+		Prefix:       request.bounds.Prefix,
+		Start:        request.bounds.Start,
+		End:          request.bounds.End,
+		KeyContains:  request.bounds.KeyContains,
+		Page:         request.page,
+		Results:      request.results,
 	}
-	if stream := request.kv.laser.resourceStream(); stream != "" {
+	if stream := request.kv.laser.resourceStream(); request.conversation != nil && stream != "" {
 		scan.Stream = &stream
 	}
 	outcome, err := request.kv.execute(ctx, wire.AgdxKvScanCode, scan)
@@ -135,12 +144,20 @@ func (request *KvScanRequest) All(ctx context.Context) ([]wire.KvEntry, error) {
 // KvDeleteManyRequest bulk-deletes entries matching the same bounds a scan
 // takes. With no bounds it clears the whole namespace.
 type KvDeleteManyRequest struct {
-	kv     *Kv
-	bounds KvBounds
+	conversation *string
+	kv           *Kv
+	bounds       KvBounds
 }
 
 // DeleteMany begins a bulk delete in this namespace.
 func (kv *Kv) DeleteMany() *KvDeleteManyRequest { return &KvDeleteManyRequest{kv: kv} }
+
+// Conversation limits deletion to entries written by id.
+func (request *KvDeleteManyRequest) Conversation(id wire.ConversationID) *KvDeleteManyRequest {
+	value := id.String()
+	request.conversation = &value
+	return request
+}
 
 // Prefix keeps only keys starting with prefix.
 func (request *KvDeleteManyRequest) Prefix(prefix []byte) *KvDeleteManyRequest {
@@ -166,14 +183,15 @@ func (request *KvDeleteManyRequest) KeyContains(substring string) *KvDeleteManyR
 // is removed and counted too.
 func (request *KvDeleteManyRequest) Send(ctx context.Context) (uint64, error) {
 	command := wire.KvDeleteMany{
-		V:           wire.KvOpVersion,
-		Namespace:   request.kv.ResourceNamespace(),
-		Prefix:      request.bounds.Prefix,
-		Start:       request.bounds.Start,
-		End:         request.bounds.End,
-		KeyContains: request.bounds.KeyContains,
+		Conversation: request.conversation,
+		V:            wire.KvOpVersion,
+		Namespace:    request.kv.ResourceNamespace(),
+		Prefix:       request.bounds.Prefix,
+		Start:        request.bounds.Start,
+		End:          request.bounds.End,
+		KeyContains:  request.bounds.KeyContains,
 	}
-	if stream := request.kv.laser.resourceStream(); stream != "" {
+	if stream := request.kv.laser.resourceStream(); request.conversation != nil && stream != "" {
 		command.Stream = &stream
 	}
 	outcome, err := request.kv.execute(ctx, wire.AgdxKvDeleteManyCode, command)

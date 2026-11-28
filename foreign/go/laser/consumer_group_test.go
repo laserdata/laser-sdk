@@ -450,21 +450,53 @@ func TestGivenANumericGroupWhenSelectingItThenShouldFollowItByID(t *testing.T) {
 	}
 }
 
-func TestGivenANumericHandleWhenJoiningAsAMemberThenShouldRefuseIt(t *testing.T) {
+func TestGivenANumericHandleWhenJoiningAsAMemberThenShouldUseItsID(t *testing.T) {
 	t.Parallel()
-	group := groupTopic(newGroupServer()).GroupByID(3)
-
-	_, err := group.Consumer(context.Background(), laser.ConsumerOptions{})
-	var invalid *laser.InvalidError
-	if !errors.As(err, &invalid) {
-		t.Fatalf("joining by id must be refused, got %v", err)
+	server := &consumerServer{}
+	group := streamHandle(server, laser.Options{DefaultStream: "orders"}).Topic("events").GroupByID(3)
+	consumer, err := group.Consumer(context.Background(), laser.ConsumerOptions{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The message is asserted, not just the type. Without the guard a numeric
-	// handle falls through and joins under an empty name, which is also
-	// refused as invalid, so a check on the type alone passes whether or not
-	// the guard is there and proves nothing.
-	if !strings.Contains(err.Error(), "Topic.Group") {
-		t.Errorf("the refusal must name the remedy, got %v", err)
+	defer consumer.Close(context.Background())
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	id, err := server.joinedIdentifier.Uint32()
+	if err != nil || id != 3 || len(server.created) != 0 {
+		t.Fatalf("wanted to join group 3, got id %d, %v, created %v", id, err, server.created)
+	}
+}
+
+func TestGivenAnInjectedClientWhenJoiningAGroupThenShouldProbeAndJoin(t *testing.T) {
+	server := &consumerServer{}
+	group := laser.FromClient(server, laser.Options{DefaultStream: "agents"}).Topic("work").Group("workers")
+	consumer, err := group.Consumer(context.Background(), laser.ConsumerOptions{})
+	if err != nil {
+		t.Fatalf("an injected client on Apache Iggy must join natively: %v", err)
+	}
+	defer consumer.Close(context.Background())
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	if server.joined != "workers" || len(server.created) != 1 {
+		t.Fatalf("joined %q, created %v", server.joined, server.created)
+	}
+}
+
+// probeFailingServer cannot answer the capability probe.
+type probeFailingServer struct{ consumerServer }
+
+func (*probeFailingServer) SendBinaryRequest(context.Context, uint32, []byte) ([]byte, error) {
+	return nil, errors.New("connection reset")
+}
+
+func TestGivenAProbeThatFailsWhenJoiningAGroupThenShouldRefuseBeforeJoining(t *testing.T) {
+	server := &probeFailingServer{}
+	group := laser.FromClient(server, laser.Options{DefaultStream: "agents"}).Topic("work").Group("workers")
+	if _, err := group.Consumer(context.Background(), laser.ConsumerOptions{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a probe that established nothing must refuse, got %v", err)
+	}
+	if len(server.created) != 0 || server.joined != "" {
+		t.Fatal("created or joined a group without knowing its policy capability")
 	}
 }
 

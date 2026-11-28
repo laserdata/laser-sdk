@@ -308,3 +308,34 @@ func TestGivenACardAndNoPresenceWhenResolvedThenShouldStillBeCapable(t *testing.
 // Guard the interface the fake stands in for, so a change to it fails here
 // rather than in a cast at run time.
 var _ iggcon.Client = (*presenceServer)(nil)
+
+// A server without live presence still routes, because the card names where
+// the agent reads.
+func TestGivenACardInboxAndNoPresenceWhenInboxAskedThenShouldFallBackToTheCard(t *testing.T) {
+	registry := laser.NewAgentRegistry()
+	inbox := "worker-inbox"
+	card := cardFor("run", nil, nil, nil, nil)
+	card.Inbox = &inbox
+	registry.Observe(agentID(t, "worker"), card, time.Now())
+
+	if got := registry.InboxFor(agentID(t, "worker")); got != "worker-inbox" {
+		t.Fatalf("expected the card inbox, got %q", got)
+	}
+	if got := registry.InboxFor(agentID(t, "stranger")); got != "" {
+		t.Fatalf("expected no inbox for an agent with neither, got %q", got)
+	}
+}
+
+func TestGivenPresenceAndACardInboxWhenInboxAskedThenShouldPreferPresence(t *testing.T) {
+	registry, _ := seedPresence(t, []wire.ClientMetadata{
+		advertised(t, "worker", "live-inbox", principalOf(1)),
+	})
+	inbox := "card-inbox"
+	card := cardFor("run", nil, nil, nil, nil)
+	card.Inbox = &inbox
+	registry.Observe(agentID(t, "worker"), card, time.Now())
+
+	if got := registry.InboxFor(agentID(t, "worker")); got != "live-inbox" {
+		t.Fatalf("expected the live presence inbox, got %q", got)
+	}
+}

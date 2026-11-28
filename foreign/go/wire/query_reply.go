@@ -2,6 +2,7 @@ package wire
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/laserdata/laser-sdk/foreign/go/internal/cborform"
 )
@@ -158,6 +159,24 @@ func (result QueryResult) Validate() error {
 				Reason: "query row value count does not match the result schema",
 			}
 		}
+		for index, value := range row.Values {
+			field := result.Fields[index]
+			if err := value.ValidateAgainst(field.FieldType, field.Required); err != nil {
+				return err
+			}
+		}
+		if row.Score != nil && (math.IsNaN(float64(*row.Score)) || math.IsInf(float64(*row.Score), 0)) {
+			return &InvalidError{Reason: "query row score must be finite"}
+		}
+	}
+	if result.Context.ExecutionID.IsZero() {
+		return &InvalidError{Reason: "query result execution id must be nonzero"}
+	}
+	if result.Context.RowCount != uint64(len(result.Rows)) {
+		return &InvalidError{Reason: "query result row count does not match the page rows"}
+	}
+	if err := result.Context.Validate(); err != nil {
+		return err
 	}
 	return result.Page.Validate()
 }

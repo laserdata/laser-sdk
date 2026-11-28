@@ -27,7 +27,7 @@ All append, consume, reliable-agent, AGDX, cursor, and folded log-memory code ru
 | Remember and recall | memory | `laser.memory("support").remember(fact).scope(c).dedup().send().await?` / `.recall(c).semantic(q).fetch()`, a vector handle built from a governed `Laser` applies the same pre-write policy locally |
 | Correct a remembered fact | memory supersede | `laser.memory("support").supersede(old_id, fact).user(u).send().await?` remembers the new fact, then forgets the old one in every conversation |
 | Keep named working state | memory named items | `laser.memory("session").set("plan", json).await?` / `.fetch("plan")` |
-| Run plain functions as durable steps | a workflow function | `laser.workflow("triage").run_with(body).await?`, where `body` calls `run.step(label, step_body)`. Python `@ls.step` and `@ls.workflow`, TypeScript `step(name, fn)` and `workflow(name, fn)` |
+| Run plain functions as durable steps | a workflow function | `laser.workflow("triage").run_with(body).await?`, where `body` calls `run.step(label, step_body)`. Python `@ls.step` and `@ls.workflow`, TypeScript `step(name, fn)` and `workflow(name, fn)`, Go `laser.RunWith` with `laser.RunStep` |
 | Route steps to agents, resumably | the workflow builder | `laser.workflow("triage").step_local("classify", run).step("resolve", Router::to(agent), build).after("classify").run().await?`, a local step runs in this process and a routed one goes to an agent |
 | Work in a stream that lives for one run | a scratch stream | `let scratch = laser.scratch_stream("triage").await?`, work through `scratch.laser()`, then `scratch.delete().await?` |
 | Pause for a human, then resume | the human-input gate | `ctx.approval_gate(approver, reply, prompt, timeout).await?` returns an `ApprovalGrant`, an approver that lists `input_request` among its operations replies with `ctx.respond_input(..)` |
@@ -84,7 +84,7 @@ laser.bind_roles(user_id, vec!["support-reader".into()]).await?;
 let who = laser.whoami().await?;
 ```
 
-End-to-end enforcement lives in the LaserData server and its managed backend. In this repo the contract is pinned by `wire/tests/wire_fixtures.rs` and `wire/tests/constants.rs`. Rust, Python, and TypeScript test the typed client surface and shared governance scenarios. The mirrored `governance` examples exercise live role and binding calls when a deployment advertises `authz`.
+End-to-end enforcement lives in the LaserData server and its managed backend. In this repo the contract is pinned by `wire/tests/wire_fixtures.rs` and `wire/tests/constants.rs`. Rust, Python, TypeScript, and Go test the typed client surface and shared governance scenarios. The mirrored `governance` examples exercise live role and binding calls when a deployment advertises `authz`.
 
 ## The scenario: a support-triage desk
 
@@ -329,6 +329,6 @@ Periodic consolidation uses the agent identity as its owner scope when the agent
 
 The `sessions` example records a technical incident and a separate maintenance task in one Iggy stream. Two child sessions investigate and remediate the incident. Several agent identities contribute to the incident root, and the application records collected child results explicitly. Each session keeps its own state document.
 
-Rust, Python, and TypeScript perform the same steps and print the recorded event and managed resource link counts for each session. The example uses application functions for agent work and a recorded mock model response. It does not call a model service. The `agent` and `orchestra` examples demonstrate long-running consumers.
+Rust, Python, TypeScript, and Go perform the same steps and print the recorded event and managed resource link counts for each session. The example uses application functions for agent work and a recorded mock model response. It does not call a model service. The `agent` and `orchestra` examples demonstrate long-running consumers.
 
 State derives from deltas and snapshots on `agent.sessions`. Memory derives from `agent.memory`. Managed KV and graph mutations derive from their durable mutation topics, while graph projections can derive from bound source topics. Query uses projection bindings and indexes over existing sources. Parent and root IDs establish ancestry. They do not merge state, combine event timelines, cancel descendants, or aggregate budgets automatically.

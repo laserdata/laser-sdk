@@ -25,15 +25,14 @@ const mcpWaitInterval = 100 * time.Millisecond
 // mcpWaitBatch bounds one poll.
 const mcpWaitBatch = 100
 
-// awaitReply polls the reply topic for the command's correlated answer,
-// addressed back to this bridge, until it arrives or deadline passes.
+// awaitReply polls the reply topic for the command's correlated answer until
+// it arrives or deadline passes.
 //
 // There is no durable subscription behind a tools/call answer: the wait reads
 // forward live from just before the command was sent, which is what keeps a
 // synchronous call cheap on a topic that otherwise holds unrelated traffic.
 func (bridge *MCPBridge) awaitReply(
-	ctx context.Context, conversation wire.ConversationID,
-	correlation wire.CorrelationID, deadline time.Time,
+	ctx context.Context, correlation wire.CorrelationID, deadline time.Time,
 ) (*wire.AgentEnvelope, error) {
 	stream := bridge.laser.DefaultStream()
 	if stream == "" {
@@ -85,7 +84,7 @@ func (bridge *MCPBridge) awaitReply(
 				continue
 			}
 			for index := range polled.Messages {
-				envelope := bridge.matchReply(partition, polled.Messages[index], conversation, correlation)
+				envelope := matchReply(partition, polled.Messages[index], correlation)
 				if envelope != nil {
 					return envelope, nil
 				}
@@ -105,11 +104,9 @@ func (bridge *MCPBridge) awaitReply(
 }
 
 // matchReply reads one record as the answer to this tool call: an AGDX
-// response or error, on the call's conversation and correlation, addressed
-// back to this bridge.
-func (bridge *MCPBridge) matchReply(
-	partition uint32, message iggcon.IggyMessage,
-	conversation wire.ConversationID, correlation wire.CorrelationID,
+// response or error on the call's correlation.
+func matchReply(
+	partition uint32, message iggcon.IggyMessage, correlation wire.CorrelationID,
 ) *wire.AgentEnvelope {
 	record, err := laser.DeliveredRecord(partition, message, iggcon.Checkpoint{}, false)
 	if err != nil {
@@ -123,13 +120,7 @@ func (bridge *MCPBridge) matchReply(
 	if envelope.Kind != wire.KindResponse && envelope.Kind != wire.KindError {
 		return nil
 	}
-	if envelope.Conversation != conversation {
-		return nil
-	}
 	if envelope.Correlation == nil || envelope.Correlation.ID != correlation.ID {
-		return nil
-	}
-	if envelope.Target == nil || *envelope.Target != bridge.source {
 		return nil
 	}
 	return envelope

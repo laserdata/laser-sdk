@@ -1,6 +1,8 @@
 package laser
 
 import (
+	"encoding/json"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -30,6 +32,39 @@ type Credentials struct {
 // IsToken reports whether these credentials are a personal access token rather
 // than a username and password.
 func (c Credentials) IsToken() bool { return c.Token != "" }
+
+// String names the user and hides the password and the token.
+func (c Credentials) String() string { return fmt.Sprintf("%+v", c) }
+
+// GoString is the Go syntax form with the password and the token hidden.
+func (c Credentials) GoString() string { return fmt.Sprintf("%#v", c) }
+
+// Format prints the credentials under any verb without the password or the token.
+func (c Credentials) Format(state fmt.State, verb rune) {
+	type plain Credentials
+	hidden := plain{Username: c.Username, Password: redacted(c.Password), Token: redacted(c.Token)}
+	if verb == 'v' && state.Flag('#') {
+		fmt.Fprintf(state, "laser.Credentials{Username:%q, Password:%q, Token:%q}", hidden.Username, hidden.Password, hidden.Token)
+		return
+	}
+	fmt.Fprintf(state, fmt.FormatString(state, verb), hidden)
+}
+
+// MarshalJSON writes the credentials without the password or the token.
+func (c Credentials) MarshalJSON() ([]byte, error) {
+	type plain Credentials
+	return json.Marshal(plain{Username: c.Username, Password: redacted(c.Password), Token: redacted(c.Token)})
+}
+
+// redactedSecret stands in for a secret in formatted output.
+const redactedSecret = "[redacted]"
+
+func redacted(secret string) string {
+	if secret == "" {
+		return ""
+	}
+	return redactedSecret
+}
 
 // Reconnection is how the transport retries a dropped connection. A nil
 // MaxRetries means unlimited, which is what `reconnection_retries=unlimited`

@@ -1,11 +1,15 @@
 package laser
 
 import (
+	"bytes"
 	"context"
 	"math"
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
 // Embedder turns text into a vector, the seam a semantic memory ranks on.
@@ -58,10 +62,12 @@ type vectorEntry struct {
 // their embeddings are to the query's.
 //
 // It loses everything when the program exits. The durable memory is
-// Laser.Memory(namespace), which writes to the log; this is the semantic
+// Laser.Memory(namespace), which writes to the log. This is the semantic
 // backend for a process that wants similarity ranking without one.
 type VectorMemory struct {
 	embedder Embedder
+	// governed is the handle whose governor sees every write, nil for a standalone memory.
+	governed *Laser
 	mutex    sync.Mutex
 	entries  []*vectorEntry
 }
@@ -71,222 +77,312 @@ func NewVectorMemory(embedder Embedder) *VectorMemory {
 	return &VectorMemory{embedder: embedder}
 }
 
+// NewGovernedVectorMemory opens an in-process semantic memory whose writes run through the governor enrolled on laser.
+func NewGovernedVectorMemory(laser *Laser, embedder Embedder) *VectorMemory {
+	return &VectorMemory{embedder: embedder, governed: laser}
+}
+
 // Remember embeds body and keeps it under scope.
 func (memory *VectorMemory) Remember(
 	ctx context.Context, scope MemoryScope, kind MemoryKind, body []byte,
 ) (MemoryID, error) {
-	if memory.embedder == nil {
-		return MemoryID{}, &InvalidError{Reason: "a vector memory needs an embedder"}
-	}
-	embedding, err := memory.embedder.Embed(ctx, string(body))
-	if err != nil {
+	id := ContentMemoryID(scope, kind, body)
+	if err := memory.append(ctx, scope, id, kind, body); err != nil {
 		return MemoryID{}, err
 	}
-	id := ContentMemoryID(scope, kind, body)
-	item := MemoryItem{
-		ID: id, Body: body, Kind: kind, Scope: scope, At: time.Now(),
-	}
-	memory.mutex.Lock()
-	defer memory.mutex.Unlock()
-	memory.entries = append(memory.entries,
-		&vectorEntry{item: item, embedding: embedding})
 	return id, nil
 }
 
 // Forget drops an item.
-func (memory *VectorMemory) Forget(_ context.Context, target MemoryID) error {
-	memory.mutex.Lock()
-	defer memory.mutex.Unlock()
-	kept := memory.entries[:0]
-	for _, entry := range memory.entries {
-		if entry.item.ID != target {
-			kept = append(kept, entry)
-		}
-	}
-	memory.entries = kept
-	return nil
+func (memory *VectorMemory) Forget(ctx context.Context, target MemoryID) error {
+	return memory.forget(ctx, MemoryScope{}, target)
 }
 
 // Improve reweights an item, so what an agent found useful is ranked higher
 // next time without anything being rewritten.
-func (memory *VectorMemory) Improve(_ context.Context, feedback Feedback) error {
+func (memory *VectorMemory) Improve(ctx context.Context, feedback Feedback) error {
+	return memory.improve(ctx, MemoryScope{}, feedback)
+}
+
+// append keeps one item under an explicit id. An id already held is one item.
+func (memory *VectorMemory) append(
+	ctx context.Context, scope MemoryScope, id MemoryID, kind MemoryKind, body []byte,
+) error {
+	if memory.embedder == nil {
+		return &InvalidError{Reason: "a vector memory needs an embedder"}
+	}
+	body, err := memory.govern(ctx, scope, body)
+	if err != nil {
+		return err
+	}
+	embedding, err := memory.embedder.Embed(ctx, string(body))
+	if err != nil {
+		return err
+	}
+	item := MemoryItem{ID: id, Body: body, Kind: kind, Scope: scope, At: time.Now()}
 	memory.mutex.Lock()
 	defer memory.mutex.Unlock()
 	for _, entry := range memory.entries {
-		if entry.item.ID == feedback.Target {
-			entry.feedback += feedback.Weight
+		if entry.item.ID == id {
+			return nil
+		}
+	}
+	memory.entries = append(memory.entries, &vectorEntry{item: item, embedding: embedding})
+	return nil
+}
+
+// forget drops an item, in the scope's conversation when it names one.
+func (memory *VectorMemory) forget(ctx context.Context, scope MemoryScope, target MemoryID) error {
+	record := wire.ForgetItem(target.String())
+	if scope.Conversation != nil {
+		conversation := scope.Conversation.String()
+		record.Conversation = &conversation
+	}
+	record, err := memory.governRecord(ctx, scope, record)
+	if err != nil {
+		return err
+	}
+	governed, known := memoryTargetOf(record.Target, record.Conversation)
+	if record.Kind != wire.MemoryForget || !known {
+		return &InvalidError{Reason: "a memory-forget governor modification must remain a tombstone"}
+	}
+	var conversation *wire.ConversationID
+	if governed.scoped {
+		conversation = &governed.conversation
+	}
+	memory.mutex.Lock()
+	defer memory.mutex.Unlock()
+	kept := memory.entries[:0]
+	for _, entry := range memory.entries {
+		if entry.item.ID != governed.id || !vectorInConversation(entry, conversation) {
+			kept = append(kept, entry)
+		}
+	}
+	clear(memory.entries[len(kept):])
+	memory.entries = kept
+	return nil
+}
+
+// improve adds a weight to an item, in the scope's conversation when it names one.
+func (memory *VectorMemory) improve(ctx context.Context, scope MemoryScope, feedback Feedback) error {
+	record := wire.FeedbackForItem(feedback.Target.String(), feedback.Weight)
+	if scope.Conversation != nil {
+		conversation := scope.Conversation.String()
+		record.Conversation = &conversation
+	}
+	record, err := memory.governRecord(ctx, scope, record)
+	if err != nil {
+		return err
+	}
+	governed, known := memoryTargetOf(record.Target, record.Conversation)
+	if record.Kind != wire.MemoryFeedback || !known {
+		return &InvalidError{Reason: "a memory-feedback governor modification must remain feedback"}
+	}
+	var conversation *wire.ConversationID
+	if governed.scoped {
+		conversation = &governed.conversation
+	}
+	memory.mutex.Lock()
+	defer memory.mutex.Unlock()
+	for _, entry := range memory.entries {
+		if entry.item.ID == governed.id && vectorInConversation(entry, conversation) {
+			entry.feedback += record.Weight
 			return nil
 		}
 	}
 	return nil
 }
 
+// govern offers an item body to the governor and returns the body to keep.
+func (memory *VectorMemory) govern(ctx context.Context, scope MemoryScope, payload []byte) ([]byte, error) {
+	if memory.governed == nil {
+		return payload, nil
+	}
+	if memory.governed.defaultStream == "" {
+		return nil, errNoStream()
+	}
+	conversation := memoryConversationOf(scope)
+	action := &GovernedAction{
+		Kind: ActionMemoryWrite, Stream: memory.governed.defaultStream, Topic: wire.AgentMemory,
+		Conversation: &conversation, Payload: payload,
+	}
+	if scope.Agent != nil {
+		action.Source = scope.Agent.String()
+	}
+	modified, err := memory.governed.govern(ctx, action)
+	if err != nil {
+		return nil, err
+	}
+	if modified != nil {
+		return modified, nil
+	}
+	return payload, nil
+}
+
+// governRecord offers a tombstone or a feedback record to the governor and returns the record to apply.
+func (memory *VectorMemory) governRecord(
+	ctx context.Context, scope MemoryScope, record wire.MemoryRecord,
+) (wire.MemoryRecord, error) {
+	if memory.governed == nil {
+		return record, nil
+	}
+	payload, err := wire.Marshal(record)
+	if err != nil {
+		return record, &CodecError{Reason: "encode memory mutation", Cause: err}
+	}
+	governed, err := memory.govern(ctx, scope, payload)
+	if err != nil || bytes.Equal(governed, payload) {
+		return record, err
+	}
+	var modified wire.MemoryRecord
+	if err := wire.Unmarshal(governed, &modified); err != nil {
+		return record, &CodecError{Reason: "decode the governed memory mutation", Cause: err}
+	}
+	return modified, nil
+}
+
+func vectorInConversation(entry *vectorEntry, conversation *wire.ConversationID) bool {
+	return conversation == nil ||
+		entry.item.Scope.Conversation != nil && *entry.item.Scope.Conversation == *conversation
+}
+
 // Recall ranks what it holds against the query.
 //
-// RecallSemantic ranks by cosine similarity alone, RecallKeyword by lexical
-// overlap alone, and RecallHybrid fuses both with the feedback weight.
-// RecallAuto routes: a query with an embedder behind it is hybrid, a query
-// without one is keyword, and no query at all is the most recent items.
+// Every strategy but keyword and recent scores an item by the cosine
+// similarity of its embedding to the query's. Keyword and hybrid add the share
+// of the query's words the item holds. Feedback adds its weight under every
+// strategy but recent. An item's score is the sum of its signals, and with
+// nothing to rank on the newest items come first.
 func (memory *VectorMemory) Recall(
 	ctx context.Context, scope MemoryScope, query MemoryQuery,
 ) ([]MemoryItem, error) {
+	if err := query.Strategy.validate(); err != nil {
+		return nil, err
+	}
 	limit := query.Limit
 	if limit <= 0 {
 		limit = DefaultRecallLimit
 	}
-	memory.mutex.Lock()
-	candidates := make([]*vectorEntry, 0, len(memory.entries))
-	for _, entry := range memory.entries {
-		if scopeHolds(scope, entry.item.Scope) && matchesKind(entry.item, query.Kinds) {
-			candidates = append(candidates, entry)
-		}
-	}
-	memory.mutex.Unlock()
-
-	strategy := memory.route(query)
-	if strategy == RecallRecent {
-		return mostRecent(candidates, limit), nil
-	}
-
-	var semantic []MemoryItem
-	if strategy == RecallSemantic || strategy == RecallHybrid {
-		ranked, err := memory.semanticSignal(ctx, query.Query, candidates)
+	strategy := query.Strategy
+	asked := query.Query != ""
+	wantsSemantic := asked && strategy != RecallKeyword && strategy != RecallRecent && memory.embedder != nil
+	wantsKeyword := asked && (strategy == RecallKeyword || strategy == RecallHybrid)
+	// The query is embedded before the lock, so a model call never holds it.
+	var wanted []float32
+	if wantsSemantic {
+		embedded, err := memory.embedder.Embed(ctx, query.Query)
 		if err != nil {
 			return nil, err
 		}
-		semantic = ranked
+		wanted = embedded
 	}
-	if strategy == RecallSemantic {
-		return truncateItems(semantic, limit), nil
+	var tokens map[string]struct{}
+	if wantsKeyword {
+		tokens = words(query.Query)
 	}
 
-	keyword := keywordSignal(query.Query, candidates)
-	if strategy == RecallKeyword {
-		return truncateItems(keyword, limit), nil
-	}
-	fused := FuseReciprocalRank([][]MemoryItem{semantic, keyword}, 0)
-	return truncateItems(memory.reweight(fused, candidates), limit), nil
-}
-
-// reweight applies the feedback an agent gave to a fused ranking.
-//
-// Added to the score rather than fused as a third signal, which is both what
-// Rust specifies ("every strategy except recent ranks by the folded feedback
-// weight first") and what this client's own durable memory already does. As
-// one more reciprocal-rank vote it could never outweigh two signals
-// agreeing, so an agent saying "this one was useful" would change nothing --
-// which is the opposite of the point.
-func (memory *VectorMemory) reweight(
-	fused []MemoryItem, candidates []*vectorEntry,
-) []MemoryItem {
-	weights := make(map[MemoryID]float32, len(candidates))
+	feedbackRanks := strategy != RecallRecent
+	anyFeedback := false
 	memory.mutex.Lock()
-	for _, entry := range candidates {
-		if entry.feedback != 0 {
-			weights[entry.item.ID] = entry.feedback
+	matched := make([]vectorCandidate, 0, len(memory.entries))
+	for _, entry := range memory.entries {
+		if !scopeHolds(scope, entry.item.Scope) || !matchesKind(entry.item, query.Kinds) {
+			continue
 		}
+		candidate := vectorCandidate{entry: entry}
+		if feedbackRanks {
+			candidate.feedback = entry.feedback
+			anyFeedback = anyFeedback || entry.feedback != 0
+		}
+		matched = append(matched, candidate)
 	}
 	memory.mutex.Unlock()
-	if len(weights) == 0 {
-		return fused
+
+	if !wantsSemantic && !wantsKeyword && !anyFeedback {
+		return newestFirst(matched, limit), nil
 	}
-	for index := range fused {
-		weight, judged := weights[fused[index].ID]
-		if !judged {
-			continue
+	for index := range matched {
+		candidate := &matched[index]
+		if wantsSemantic {
+			candidate.add(RecallSemantic, CosineSimilarity(wanted, candidate.entry.embedding))
 		}
-		fused[index].Score += float64(weight)
-		fused[index].Signals = append(fused[index].Signals, RecallSignal{
-			Strategy: RecallFeedback,
-			Rank:     len(fused[index].Signals),
-			Score:    float64(weight),
-		})
-	}
-	sort.SliceStable(fused, func(left, right int) bool {
-		return fused[left].Score > fused[right].Score
-	})
-	return fused
-}
-
-// route picks the strategy an Auto recall resolves to.
-func (memory *VectorMemory) route(query MemoryQuery) RecallStrategy {
-	if query.Strategy != RecallAuto && query.Strategy != "" {
-		return query.Strategy
-	}
-	if query.Query == "" {
-		return RecallRecent
-	}
-	if memory.embedder == nil {
-		return RecallKeyword
-	}
-	return RecallHybrid
-}
-
-// semanticSignal ranks the candidates by cosine similarity to the query.
-func (memory *VectorMemory) semanticSignal(
-	ctx context.Context, query string, candidates []*vectorEntry,
-) ([]MemoryItem, error) {
-	if memory.embedder == nil || query == "" {
-		return nil, nil
-	}
-	wanted, err := memory.embedder.Embed(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	scored := make([]MemoryItem, 0, len(candidates))
-	for _, entry := range candidates {
-		item := entry.item
-		score := CosineSimilarity(wanted, entry.embedding)
-		item.Score = float64(score)
-		scored = append(scored, item)
-	}
-	return rankedBy(scored, RecallSemantic), nil
-}
-
-// keywordSignal ranks the candidates by how much of the query their bodies
-// contain, on the same 0..1 scale as cosine similarity so the two compose.
-func keywordSignal(query string, candidates []*vectorEntry) []MemoryItem {
-	wanted := words(query)
-	if len(wanted) == 0 {
-		return nil
-	}
-	scored := make([]MemoryItem, 0, len(candidates))
-	for _, entry := range candidates {
-		item := entry.item
-		item.Score = overlap(words(item.Text()), wanted)
-		if item.Score <= 0 {
-			continue
+		if wantsKeyword {
+			candidate.add(RecallKeyword, keywordScore(tokens, candidate.entry.item.Body))
 		}
-		scored = append(scored, item)
+		if candidate.feedback != 0 {
+			candidate.add(RecallAuto, float64(candidate.feedback))
+		}
 	}
-	return rankedBy(scored, RecallKeyword)
+	for _, signal := range []RecallStrategy{RecallSemantic, RecallKeyword, RecallAuto} {
+		rankSignal(matched, signal)
+	}
+	sort.SliceStable(matched, func(left, right int) bool {
+		return matched[left].score > matched[right].score
+	})
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	items := make([]MemoryItem, 0, len(matched))
+	for _, candidate := range matched {
+		item := candidate.entry.item
+		item.Score = candidate.score
+		item.Signals = candidate.signals
+		items = append(items, item)
+	}
+	return items, nil
 }
 
-// rankedBy sorts by score, best first, and stamps each item's standing in
-// this signal so a fused recall stays inspectable.
-func rankedBy(items []MemoryItem, strategy RecallStrategy) []MemoryItem {
-	sort.SliceStable(items, func(left, right int) bool {
-		return items[left].Score > items[right].Score
-	})
-	for index := range items {
-		score := items[index].Score
-		items[index].Signals = []RecallSignal{{
-			Strategy: strategy, Rank: index, Score: score,
-		}}
+// vectorCandidate is one matched entry with the signals a recall scored it on.
+type vectorCandidate struct {
+	entry    *vectorEntry
+	feedback float32
+	score    float64
+	signals  []RecallSignal
+}
+
+// add records one signal and counts it into the candidate's score.
+func (candidate *vectorCandidate) add(strategy RecallStrategy, score float64) {
+	candidate.signals = append(candidate.signals, RecallSignal{Strategy: strategy, Score: score})
+	candidate.score += score
+}
+
+// rankSignal stamps each candidate's standing within one signal, best first.
+func rankSignal(candidates []vectorCandidate, strategy RecallStrategy) {
+	type standing struct {
+		signal *RecallSignal
+		score  float64
+	}
+	var held []standing
+	for index := range candidates {
+		for at := range candidates[index].signals {
+			if signal := &candidates[index].signals[at]; signal.Strategy == strategy {
+				held = append(held, standing{signal: signal, score: signal.Score})
+				break
+			}
+		}
+	}
+	sort.SliceStable(held, func(left, right int) bool { return held[left].score > held[right].score })
+	for rank, standing := range held {
+		standing.signal.Rank = rank
+	}
+}
+
+// keywordScore is the share of the query's words a body holds, from 0 to 1,
+// and 0 for a body that is not text.
+func keywordScore(query map[string]struct{}, body []byte) float64 {
+	if len(query) == 0 || !utf8.Valid(body) {
+		return 0
+	}
+	return overlap(words(string(body)), query)
+}
+
+// newestFirst is the most recently written items, unranked.
+func newestFirst(candidates []vectorCandidate, limit int) []MemoryItem {
+	items := make([]MemoryItem, 0, min(len(candidates), limit))
+	for index := len(candidates) - 1; index >= 0 && len(items) < limit; index-- {
+		items = append(items, candidates[index].entry.item)
 	}
 	return items
-}
-
-// mostRecent is the newest items, for a recall with nothing to rank on.
-func mostRecent(candidates []*vectorEntry, limit int) []MemoryItem {
-	items := make([]MemoryItem, 0, len(candidates))
-	for _, entry := range candidates {
-		items = append(items, entry.item)
-	}
-	sort.SliceStable(items, func(left, right int) bool {
-		return items[left].At.After(items[right].At)
-	})
-	return truncateItems(items, limit)
 }
 
 // truncateItems keeps at most limit items.
@@ -368,7 +464,9 @@ func scopeHolds(wanted, held MemoryScope) bool {
 		(held.Conversation == nil || *held.Conversation != *wanted.Conversation) {
 		return false
 	}
-	return true
+	return (wanted.User == "" || held.User == wanted.User) &&
+		(wanted.App == "" || held.App == wanted.App) &&
+		(wanted.Stream == "" || held.Stream == wanted.Stream)
 }
 
 // RerankedMemory wraps a memory so recall's candidates go through a second,

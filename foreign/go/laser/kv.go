@@ -16,12 +16,20 @@ import (
 type Kv struct {
 	laser     *Laser
 	namespace string
+	session   *wire.SessionRef
 }
 
 // Kv opens a handle on a key-value namespace. Nothing is sent until a call is
 // made on it.
 func (laser *Laser) Kv(namespace string) *Kv {
 	return &Kv{laser: laser, namespace: namespace}
+}
+
+// InSession returns a handle that links its writes to this session.
+func (kv *Kv) InSession(session wire.SessionRef) *Kv {
+	linked := *kv
+	linked.session = &session
+	return &linked
 }
 
 // Namespace is the caller's own name for this namespace, unscoped.
@@ -54,9 +62,13 @@ func (kv *Kv) execute(
 	if err != nil {
 		return nil, err
 	}
+	return decodeKvOutcome(raw)
+}
+
+func decodeKvOutcome(raw []byte) (*wire.KvOutcome, error) {
 	var reply wire.KvReply
-	if err := wire.Unmarshal(raw, &reply); err != nil {
-		return nil, &CodecError{Reason: "decode key-value reply", Cause: err}
+	if err := decodeManagedReply(raw, &reply, "decode key-value reply"); err != nil {
+		return nil, err
 	}
 	if !reply.IsOk() {
 		if reply.Err == nil {
@@ -69,10 +81,8 @@ func (kv *Kv) execute(
 
 // requireKv refuses a key-value call a deployment cannot serve.
 func (laser *Laser) requireKv() error {
-	if !laser.capabilities.Managed {
-		return &UnsupportedError{Surface: "the key-value surface"}
-	}
-	if !laser.capabilities.Kv.Available {
+	caps := laser.Capabilities()
+	if !caps.Managed || !caps.Kv.Available {
 		return &UnsupportedError{Surface: "the key-value surface"}
 	}
 	return laser.requireOpVersion("key-value", wire.KvOpVersion, func(v wire.OpVersions) uint32 {
@@ -89,10 +99,11 @@ func (laser *Laser) requireKv() error {
 func (laser *Laser) requireOpVersion(
 	surface string, pinned uint32, advertised func(wire.OpVersions) uint32,
 ) error {
-	if laser.capabilities.Versions == nil {
+	versions := laser.Capabilities().Versions
+	if versions == nil {
 		return nil
 	}
-	served := advertised(*laser.capabilities.Versions)
+	served := advertised(*versions)
 	if served == pinned {
 		return nil
 	}
@@ -134,13 +145,15 @@ func (kv *Kv) GetEntry(ctx context.Context, key []byte) (*wire.KvEntry, error) {
 // own write reached, so the next holder reading at that position sees the
 // previous holder's work instead of racing it: a plain Get can land on a
 // replica that has not applied it yet and answer "absent" for a key that was
-// certainly written. Ported from Rust's Kv::get_entry_at_least; the wire has
-// carried the bound (KvGet.MinPosition) all along.
+// certainly written. The wire carries the bound as KvGet.MinPosition.
 //
 // nil when the key is absent or expired, as with GetEntry.
 func (kv *Kv) GetEntryAtLeast(
 	ctx context.Context, key []byte, position wire.MutationPosition,
 ) (*wire.KvEntry, error) {
+	if err := kv.requireFencedLeases(); err != nil {
+		return nil, err
+	}
 	if err := validatedKey(key); err != nil {
 		return nil, err
 	}
@@ -227,7 +240,8 @@ func (kv *Kv) delete(ctx context.Context, key []byte, ifMatch *uint64) (bool, er
 		return false, err
 	}
 	outcome, err := kv.execute(ctx, wire.AgdxKvDeleteCode, wire.KvDelete{
-		V: wire.KvOpVersion, Namespace: kv.ResourceNamespace(), Key: key, IfMatch: ifMatch,
+		Session: kv.session,
+		V:       wire.KvOpVersion, Namespace: kv.ResourceNamespace(), Key: key, IfMatch: ifMatch,
 	})
 	if err != nil {
 		return false, err
@@ -239,40 +253,45 @@ func (kv *Kv) delete(ctx context.Context, key []byte, ifMatch *uint64) (bool, er
 }
 
 // Expire sets a key's expiry to ttl from the mutation's server timestamp,
-// without rewriting the value. The relative form is used rather than an
-// absolute one because a client clock cannot skew it.
-func (kv *Kv) Expire(ctx context.Context, key []byte, ttl time.Duration) error {
+// without rewriting the value, and returns the entry's version. The relative
+// form is used rather than an absolute one because a client clock cannot skew
+// it.
+func (kv *Kv) Expire(ctx context.Context, key []byte, ttl time.Duration) (uint64, error) {
 	micros, err := ttlMicros(ttl)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	return kv.expire(ctx, key, nil, &micros)
 }
 
-// ExpireAt sets a key's expiry to an absolute time, or clears it when zero.
-func (kv *Kv) ExpireAt(ctx context.Context, key []byte, at time.Time) error {
+// ExpireAt sets a key's expiry to an absolute time, or clears it when zero,
+// and returns the entry's version.
+func (kv *Kv) ExpireAt(ctx context.Context, key []byte, at time.Time) (uint64, error) {
 	if at.IsZero() {
 		return kv.expire(ctx, key, nil, nil)
+	}
+	if at.UnixMicro() < 0 {
+		return 0, &InvalidError{Reason: "expiry must be at or after the Unix epoch"}
 	}
 	micros := uint64(at.UnixMicro())
 	return kv.expire(ctx, key, &micros, nil)
 }
 
-func (kv *Kv) expire(ctx context.Context, key []byte, at, ttl *uint64) error {
+func (kv *Kv) expire(ctx context.Context, key []byte, at, ttl *uint64) (uint64, error) {
 	if err := validatedKey(key); err != nil {
-		return err
+		return 0, err
 	}
 	outcome, err := kv.execute(ctx, wire.AgdxKvExpireCode, wire.KvExpire{
 		V: wire.KvOpVersion, Namespace: kv.ResourceNamespace(), Key: key,
 		ExpiresAtMicros: at, TTLMicros: ttl,
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if outcome.Kind != wire.KvVersioned {
-		return unexpectedKvOutcome("expire", outcome.Kind)
+		return 0, unexpectedKvOutcome("expire", outcome.Kind)
 	}
-	return nil
+	return outcome.Version, nil
 }
 
 // Namespaces lists every namespace holding at least one entry for the caller,
@@ -296,8 +315,8 @@ func (laser *Laser) KvNamespaces(ctx context.Context) ([]wire.KvNamespaceInfo, e
 		return nil, err
 	}
 	var reply wire.KvReply
-	if err := wire.Unmarshal(raw, &reply); err != nil {
-		return nil, &CodecError{Reason: "decode key-value reply", Cause: err}
+	if err := decodeManagedReply(raw, &reply, "decode key-value reply"); err != nil {
+		return nil, err
 	}
 	if !reply.IsOk() {
 		if reply.Err == nil {

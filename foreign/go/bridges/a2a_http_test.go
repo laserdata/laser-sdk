@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/laserdata/laser-sdk/foreign/go/bridges"
+	"github.com/laserdata/laser-sdk/foreign/go/laser"
 )
 
 // call runs one request against a bridge's handler.
@@ -183,7 +184,7 @@ func TestGivenABoundBridgeWhenTwoCallersUseOneTaskThenShouldHideItFromTheOther(t
 	bridge := bridgeOver(t, log).
 		WithTaskBinding([32]byte{1: 7}, time.Hour)
 
-	owner := bridge.Caller("tenant-a")
+	owner := bridge.Caller("caller-a")
 	task, err := owner.Submit(context.Background(), []byte(sendParams))
 	if err != nil {
 		t.Fatalf("submit: %v", err)
@@ -195,10 +196,10 @@ func TestGivenABoundBridgeWhenTwoCallersUseOneTaskThenShouldHideItFromTheOther(t
 	}
 	// Anyone else sees an id that names nothing, rather than a task they
 	// can read or cancel because they learned its conversation.
-	if _, err := bridge.Caller("tenant-b").Task(context.Background(), task.ID); err == nil {
+	if _, err := bridge.Caller("caller-b").Task(context.Background(), task.ID); err == nil {
 		t.Fatal("a bound task must not open for another caller")
 	}
-	if _, err := bridge.Caller("tenant-b").Cancel(context.Background(), task.ID); err == nil {
+	if _, err := bridge.Caller("caller-b").Cancel(context.Background(), task.ID); err == nil {
 		t.Fatal("a bound task must not cancel for another caller")
 	}
 }
@@ -216,7 +217,7 @@ func TestGivenABoundBridgeWhenCalledWithoutACallerThenShouldRefuseRatherThanMint
 func TestGivenAnExpiredBindingWhenOpenedThenShouldReadAsNoTask(t *testing.T) {
 	log := &bridgeLog{}
 	bridge := bridgeOver(t, log).WithTaskBinding([32]byte{1: 7}, -time.Second)
-	caller := bridge.Caller("tenant-a")
+	caller := bridge.Caller("caller-a")
 	task, err := caller.Submit(context.Background(), []byte(sendParams))
 	if err != nil {
 		t.Fatalf("submit: %v", err)
@@ -224,5 +225,30 @@ func TestGivenAnExpiredBindingWhenOpenedThenShouldReadAsNoTask(t *testing.T) {
 
 	if _, err := caller.Task(context.Background(), task.ID); err == nil {
 		t.Fatal("an expired id must not open")
+	}
+}
+
+func TestGivenASigningKeyWhenFetchingTheCardThenShouldVerifyThePublishedJSON(t *testing.T) {
+	key, err := laser.GenerateSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge, err := bridgeOver(t, &bridgeLog{}).WithSigningKey(key).WithPublicURL("https://agents.example/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := call(t, bridge, httptest.NewRequest(http.MethodGet, bridges.A2ACardPath, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d", response.Code)
+	}
+	var card bridges.AgentCard
+	if err := json.Unmarshal(response.Body.Bytes(), &card); err != nil {
+		t.Fatal(err)
+	}
+	if len(card.Signatures) != 1 {
+		t.Fatalf("expected one signature, got %d", len(card.Signatures))
+	}
+	if err := laser.VerifyCard(response.Body.Bytes(), card.Signatures[0], key.VerifyingKey()); err != nil {
+		t.Fatal(err)
 	}
 }

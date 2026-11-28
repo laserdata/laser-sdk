@@ -322,29 +322,6 @@ func TestGivenAHandledRecordWhenSpawningASubconversationThenShouldLinkParentAndR
 	}
 }
 
-// A request's answer is matched by the loop reading this agent's topic, so a
-// request expecting its answer anywhere else is refused rather than left to
-// wait out a reply that nothing here will ever match.
-func TestGivenARequestOnAnotherTopicWhenRequestedThenShouldRefuseIt(t *testing.T) {
-	server := newRuntimeServer()
-	record := commandFor(t, 1, 2)
-
-	err := handledThrough(t, server, laser.RuntimeOptions{}, record,
-		func(ctx context.Context, agent *laser.AgentCtx) error {
-			_, err := agent.Request(ctx, wire.AgentAudit, []byte("ask"),
-				laser.RequestOptions{Timeout: 20 * time.Millisecond})
-			return err
-		})
-
-	var invalid *laser.InvalidError
-	if !errors.As(err, &invalid) {
-		t.Fatalf("want the request refused, got %v", err)
-	}
-	if len(server.on(wire.AgentAudit)) != 0 {
-		t.Error("a refused request must not reach the log")
-	}
-}
-
 // A handler's request is answered by the loop that is already reading the
 // topic, so a handler needs no reader of its own.
 func TestGivenAHandlersRequestWhenAnsweredOnItsTopicThenShouldResolveItInTheLoop(t *testing.T) {

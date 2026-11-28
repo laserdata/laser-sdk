@@ -30,6 +30,8 @@ type ExpectedReply struct {
 	// is what a non-directed (capability or group) request has no better
 	// answer for.
 	ExpectedSigner string
+	// Source is the agent that must have authored the reply. Empty accepts any author.
+	Source wire.AgentID
 }
 
 // Accepts reports whether a message answers this request.
@@ -47,6 +49,9 @@ func (expected ExpectedReply) Accepts(message *AgdxMessage) bool {
 	}
 	if expected.Command != nil && message.Envelope.Cause != nil &&
 		*message.Envelope.Cause != *expected.Command {
+		return false
+	}
+	if !expected.Source.IsZero() && message.Envelope.Source != expected.Source {
 		return false
 	}
 	// An unaddressed reply on a shared topic could be for anyone, so a waiter
@@ -187,7 +192,7 @@ func (hub *ReplyHub) Deliver(message *AgdxMessage) bool {
 	// Verification gates everything this message could be, acknowledgment or
 	// answer alike, before either is considered: a forged acknowledgment is as
 	// much a forgery as a forged answer. A message that fails is left alone,
-	// the same as one nobody is waiting for -- the waiter's deadline is what
+	// the same as one nobody is waiting for: the waiter's deadline is what
 	// ends the wait, not an error a forger gets to trigger.
 	if verifier != nil {
 		principal, ok := verifyReplySignature(verifier, message)

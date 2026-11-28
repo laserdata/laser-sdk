@@ -46,7 +46,8 @@ func TestGivenATypedPublishWhenSentThenShouldStampTheCodecsContentType(t *testin
 			}
 
 			headers := sentHeaders(t, server)
-			if headers[wire.HeaderContentType] != string(want.kind) {
+			code, _ := want.kind.Code()
+			if headers[wire.HeaderContentType] != string([]byte{code}) {
 				t.Errorf("want %q, got %q", want.kind, headers[wire.HeaderContentType])
 			}
 			if len(server.sentMessages[0].Payload) == 0 {
@@ -245,4 +246,61 @@ func reverse(payload []byte) []byte {
 		out[len(payload)-1-index] = value
 	}
 	return out
+}
+
+func TestGivenTypedBodiesWhenPublishedAsABatchThenShouldSendEveryEncodedBody(t *testing.T) {
+	server := &streamServer{}
+	topic := streamHandle(server, laser.Options{DefaultStream: "agents"}).Topic("inferences")
+	typed := laser.TypedJSON[inference](topic)
+
+	if _, err := typed.PublishBatch([]inference{{Model: "a", Tokens: 1}, {Model: "b", Tokens: 2}}).
+		Send(context.Background()); err != nil {
+		t.Fatalf("publish the batch: %v", err)
+	}
+
+	sent := server.sent()
+	if len(sent) != 2 {
+		t.Fatalf("want two records in one send, got %d", len(sent))
+	}
+	for index, want := range []string{"a", "b"} {
+		decoded, err := typed.Decode(&laser.Record{Message: sent[index]})
+		if err != nil || decoded.Body.Model != want {
+			t.Fatalf("record %d: want model %q, got %+v and %v", index, want, decoded, err)
+		}
+	}
+	code, _ := wire.ContentJSON.Code()
+	if headers := sentHeaders(t, server); headers[wire.HeaderContentType] != string([]byte{code}) {
+		t.Errorf("want the JSON content type stamped, got %q", headers[wire.HeaderContentType])
+	}
+}
+
+// unencodable is a codec whose bodies never encode.
+type unencodable struct{ laser.JSONCodec }
+
+func (unencodable) Encode(any) ([]byte, error) { return nil, errors.New("body does not encode") }
+
+func TestGivenABodyThatDoesNotEncodeWhenPublishedAsABatchThenShouldSendNothing(t *testing.T) {
+	server := &streamServer{}
+	topic := streamHandle(server, laser.Options{DefaultStream: "agents"}).Topic("inferences")
+
+	_, err := laser.TypedWith[inference](topic, unencodable{}).
+		PublishBatch([]inference{{Model: "a"}}).Send(context.Background())
+
+	if err == nil || len(server.sent()) != 0 {
+		t.Fatalf("a batch with an unencodable body must not be sent, got %v and %d records", err, len(server.sent()))
+	}
+}
+
+func TestGivenAnIndexKeyWhenEmptyOrReservedThenShouldRefuseThePublish(t *testing.T) {
+	for _, field := range []string{"", wire.HeaderIdxPrefix + "host"} {
+		server := &streamServer{}
+		topic := streamHandle(server, laser.Options{DefaultStream: "agents"}).Topic("inferences")
+
+		_, err := topic.Publish().Payload([]byte("body")).Index(field, "node-7").Send(context.Background())
+
+		var invalid *laser.InvalidError
+		if !errors.As(err, &invalid) || len(server.sent()) != 0 {
+			t.Fatalf("index key %q must be refused before sending, got %v", field, err)
+		}
+	}
 }

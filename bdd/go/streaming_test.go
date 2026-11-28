@@ -101,7 +101,7 @@ func publishEvents(ctx context.Context, state *world, name string, count int) er
 		err = publishBatch(ctx, topic, count)
 	}
 	if err != nil {
-		return onMissingTopic(err)
+		return err
 	}
 	state.put("published", count)
 	state.put("topic", name)
@@ -109,33 +109,11 @@ func publishEvents(ctx context.Context, state *world, name string, count int) er
 }
 
 func publishBatch(ctx context.Context, topic *laser.Topic, count int) error {
-	producer := topic.Batching().MaxRecords(count).Build()
+	batch := topic.PublishBatch()
 	for id := range count {
-		payload, err := laser.JSONCodec{}.Encode(event{ID: id})
-		if err != nil {
-			return err
-		}
-		if err := producer.Send(ctx, payload, nil); err != nil {
-			return err
-		}
+		batch.AddJSON(event{ID: id})
 	}
-	return producer.Close(ctx)
-}
-
-// onMissingTopic names the one gap these scenarios keep hitting.
-//
-// The shared contract is that a publish creates the topic it names: the Rust
-// reference runner publishes to "events" and to "created-by-publish" without
-// ever creating either, and the feature asserts both succeed. The Go client
-// only resolves an existing topic, so the send fails. The step is reported as
-// that gap rather than as a generic failure, and every other publish error
-// still fails the scenario, so this starts passing for real the moment the
-// client creates the topic.
-func onMissingTopic(err error) error {
-	if strings.Contains(err.Error(), "was not found") {
-		return blocked("a publish does not create the topic it names, " +
-			"which streaming.feature requires: " + err.Error())
-	}
+	_, err := batch.Send(ctx)
 	return err
 }
 

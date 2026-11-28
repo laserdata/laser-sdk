@@ -3,7 +3,9 @@ package laser_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
+	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
@@ -52,17 +54,7 @@ func graphHandle(server iggcon.Client, options laser.Options) *laser.Laser {
 
 func decodeGraphRequest[T any](t *testing.T, server *graphServer, index int, target *T) {
 	t.Helper()
-	body := server.requests[index]
-	if wire.IsIdempotentManagedRequest(server.codes[index]) {
-		var envelope wire.ManagedRequestEnvelope
-		if err := wire.Unmarshal(body, &envelope); err != nil {
-			t.Fatalf("decode the managed envelope of request %d: %v", index, err)
-		}
-		body = envelope.Payload
-	}
-	if err := wire.Unmarshal(body, target); err != nil {
-		t.Fatalf("decode request %d: %v", index, err)
-	}
+	decodeManagedTestRequest(t, server.codes[index], server.requests[index], target)
 }
 
 func TestGivenATraversalWhenBuiltThenShouldCarryItsStartAndHops(t *testing.T) {
@@ -235,6 +227,10 @@ func TestGivenTheSameTripleWhenLinkedTwiceThenShouldAddressTheSameElements(t *te
 	if len(first.Nodes) != 2 || len(first.Edges) != 1 {
 		t.Fatalf("want two nodes and an edge, got %d / %d", len(first.Nodes), len(first.Edges))
 	}
+	if first.Nodes[0].ID != wire.ContentNodeID("operator", []byte("42")) ||
+		first.Nodes[1].ID != wire.ContentNodeID("ticket", []byte("7")) || first.Edges[0].ValidFrom == nil {
+		t.Fatalf("link must use the typed entity IDs and open the validity interval: %+v", first)
+	}
 	if first.Edges[0].ID != second.Edges[0].ID {
 		t.Error("the same triple must address the same edge")
 	}
@@ -379,5 +375,124 @@ func TestGivenAHopWithNoEdgeTypeWhenFetchedThenShouldFollowAnyType(t *testing.T)
 	}
 	if query.Traverse[0].Max != 3 {
 		t.Errorf("want the hop bound carried, got %d", query.Traverse[0].Max)
+	}
+}
+
+func TestGivenAConversationLensWhenReadingThenShouldNameItsStreamOnlyWithTheLens(t *testing.T) {
+	node := wire.ContentNodeID("entity", []byte("operator:42"))
+	lens, stream := conversation(7).String(), "agents"
+	for name, scenario := range map[string]struct {
+		options      laser.Options
+		lensed       bool
+		conversation *string
+		stream       *string
+		graph        string
+	}{
+		"a scoped handle without the lens": {options: laser.Options{DefaultStream: stream}, graph: "stream:agents/knowledge"},
+		"a scoped handle with the lens": {options: laser.Options{DefaultStream: stream}, lensed: true,
+			conversation: &lens, stream: &stream, graph: "stream:agents/knowledge"},
+		"a bare handle with the lens": {options: laser.Options{DefaultStream: stream, ResourceNaming: laser.ResourceNamingBare},
+			lensed: true, conversation: &lens, graph: "knowledge"},
+	} {
+		server := &graphServer{}
+		open := func() *laser.Graph {
+			graph := graphHandle(server, scenario.options).Graph("knowledge")
+			if scenario.lensed {
+				graph.Conversation(conversation(7))
+			}
+			return graph
+		}
+		if _, err := open().StartIDs(node).Fetch(context.Background()); err != nil {
+			t.Fatalf("%s: fetch: %v", name, err)
+		}
+		if _, err := open().Neighbors(context.Background(), node, wire.EdgeBoth, "knows", 1); err != nil {
+			t.Fatalf("%s: neighbors: %v", name, err)
+		}
+
+		var query wire.GraphQuery
+		decodeGraphRequest(t, server, 0, &query)
+		wantQuery := wire.GraphQuery{
+			V: wire.GraphOpVersion, Graph: scenario.graph, Start: wire.StartAtIDs(node),
+			Limit: wire.DefaultRecallLimit, Conversation: scenario.conversation, Stream: scenario.stream,
+		}
+		if !reflect.DeepEqual(query, wantQuery) {
+			t.Errorf("%s: query = %+v, want %+v", name, query, wantQuery)
+		}
+		var neighbors wire.GraphNeighbors
+		decodeGraphRequest(t, server, 1, &neighbors)
+		edgeType := "knows"
+		wantNeighbors := wire.GraphNeighbors{
+			V: wire.GraphOpVersion, Graph: scenario.graph, Node: node, Dir: wire.EdgeBoth, EdgeType: &edgeType, Depth: 1,
+			Limit: wire.DefaultRecallLimit, Conversation: scenario.conversation, Stream: scenario.stream,
+		}
+		if !reflect.DeepEqual(neighbors, wantNeighbors) {
+			t.Errorf("%s: neighbors = %+v, want %+v", name, neighbors, wantNeighbors)
+		}
+	}
+}
+
+func TestGivenALinkWhenUnlinkedThenShouldCloseTheEdgeAndSendNoNodes(t *testing.T) {
+	server := &graphServer{}
+	before := uint64(time.Now().UnixMicro())
+
+	if err := graphHandle(server, laser.Options{}).Graph("knowledge").
+		Unlink(context.Background(), "host:node-7", "opened", "ticket:7"); err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+
+	var upsert wire.GraphUpsert
+	decodeGraphRequest(t, server, 0, &upsert)
+	if len(server.codes) != 1 || len(upsert.Nodes) != 0 || len(upsert.Edges) != 1 {
+		t.Fatalf("want one upsert of one edge and no nodes, got %d calls %d nodes %d edges",
+			len(server.codes), len(upsert.Nodes), len(upsert.Edges))
+	}
+	closed := upsert.Edges[0]
+	if closed.ValidTo == nil || *closed.ValidTo < before || *closed.ValidTo > uint64(time.Now().UnixMicro()) {
+		t.Fatalf("want the edge closed now, got %v", closed.ValidTo)
+	}
+	want := wire.RelateNodes(wire.EntityNode("host", "node-7"), "opened", wire.EntityNode("ticket", "7"))
+	want.ValidTo = closed.ValidTo
+	if !reflect.DeepEqual(closed, want) {
+		t.Errorf("edge = %+v, want %+v", closed, want)
+	}
+}
+
+func TestGivenLiveAndClosedEdgesWhenRelinkedThenShouldCloseOnlyLiveEdgesToOtherTargets(t *testing.T) {
+	host, old, kept := wire.EntityNode("host", "node-7"), wire.EntityNode("ticket", "7"), wire.EntityNode("ticket", "9")
+	valid := func(edge wire.GraphEdge, from uint64, to *uint64) wire.GraphEdge {
+		edge.ValidFrom, edge.ValidTo = &from, to
+		return edge
+	}
+	ended := uint64(5)
+	live := valid(wire.RelateNodes(host, "opened", old), 10, nil)
+	server := &graphServer{result: wire.GraphResult{Edges: []wire.GraphEdge{
+		live, valid(wire.RelateNodes(host, "opened", old), 1, &ended), valid(wire.RelateNodes(host, "opened", kept), 20, nil),
+	}}}
+
+	closed, err := graphHandle(server, laser.Options{}).Graph("knowledge").
+		Relink(context.Background(), "host:node-7", "opened", "ticket:9")
+	if err != nil {
+		t.Fatalf("relink: %v", err)
+	}
+
+	wantCodes := []uint32{wire.AgdxGraphNeighborsCode, wire.AgdxGraphUpsertCode, wire.AgdxGraphUpsertCode}
+	if closed != 1 || !reflect.DeepEqual(server.codes, wantCodes) {
+		t.Fatalf("closed %d over %v, want 1 over %v", closed, server.codes, wantCodes)
+	}
+	var closing, opening wire.GraphUpsert
+	decodeGraphRequest(t, server, 1, &closing)
+	decodeGraphRequest(t, server, 2, &opening)
+	if len(opening.Edges) != 1 || opening.Edges[0].ValidFrom == nil {
+		t.Fatalf("want the new edge opened, got %+v", opening.Edges)
+	}
+	at := opening.Edges[0].ValidFrom
+	wantClosing := wire.GraphUpsert{V: wire.GraphOpVersion, Graph: "knowledge", Edges: []wire.GraphEdge{valid(live, 10, at)}}
+	if !reflect.DeepEqual(closing, wantClosing) {
+		t.Errorf("closing = %+v, want %+v", closing, wantClosing)
+	}
+	wantOpening := wire.GraphUpsert{V: wire.GraphOpVersion, Graph: "knowledge",
+		Nodes: []wire.GraphNode{host, kept}, Edges: []wire.GraphEdge{valid(wire.RelateNodes(host, "opened", kept), *at, nil)}}
+	if !reflect.DeepEqual(opening, wantOpening) {
+		t.Errorf("opening = %+v, want %+v", opening, wantOpening)
 	}
 }

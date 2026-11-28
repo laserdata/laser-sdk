@@ -326,7 +326,7 @@ const (
 	StartFirst
 	StartLast
 	StartAtOffset
-	// StartAtTimestamp reads records at or after a broker timestamp.
+	// StartAtTimestamp reads records at or after a streaming server timestamp.
 	StartAtTimestamp
 	// StartContinue resumes exactly where the previous page stopped.
 	StartContinue

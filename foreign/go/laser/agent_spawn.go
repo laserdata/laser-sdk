@@ -2,6 +2,8 @@ package laser
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
@@ -83,41 +85,40 @@ type AgentHandle struct {
 	ready    chan struct{}
 	done     chan struct{}
 	result   error
+	// unready records a Ready that saw the run end before it was polling.
+	unready atomic.Bool
 }
+
+// errStoppedUnready is what a run that ended cleanly before it was polling reports.
+const errStoppedUnready = "agent stopped before it became ready"
 
 // Identity is the agent this handle runs.
 func (handle *AgentHandle) Identity() wire.AgentID { return handle.identity }
 
-// Ready waits until the agent's consume loop has started running, or reports
-// why it already stopped if it never got that far.
+// Ready waits until the agent is polling its topic, so a publish after it is
+// delivered rather than racing the start. It is idempotent.
 //
-// SpawnAgent joins the consumer group before it returns a handle at all, so
-// by the time a caller holds one, group membership has already landed
-// server-side: a publish after SpawnAgent returns is never racing the join.
-// What Ready still waits out is the goroutine scheduling gap between the
-// handle being returned and its loop actually running, and it is idempotent:
-// a later call after the first sees the same outcome.
-//
-// Ready cannot distinguish "the loop started" from "the loop started and
-// then failed on its very first read": both close the same instant from a
-// caller's view, and AgentRuntime.Run offers no earlier hook to signal
-// readiness from inside the loop itself. A source that fails immediately
-// is still reported correctly, just possibly by Join rather than by Ready.
+// SpawnAgent joins the consumer group before it returns a handle, and the
+// agent counts as ready at its first read, after its startup reads. A run that
+// failed before that makes Ready return the failure. A run that ended without
+// one before that makes Ready, and a Join or Shutdown after it, return a
+// ConfigError saying the agent stopped before it became ready.
 func (handle *AgentHandle) Ready(ctx context.Context) error {
-	// Checked separately and first, rather than left to select's random pick
-	// among ready cases: once the run has actually finished, its real result
-	// is what a caller must see, not whichever of the two closed channels
-	// select happens to choose.
-	select {
-	case <-handle.done:
-		return handle.result
-	default:
-	}
 	select {
 	case <-handle.ready:
 		return nil
 	case <-handle.done:
-		return handle.result
+		// Both may be closed, and an agent that was polling was ready.
+		select {
+		case <-handle.ready:
+			return nil
+		default:
+		}
+		if handle.result != nil {
+			return handle.result
+		}
+		handle.unready.Store(true)
+		return &ConfigError{Reason: errStoppedUnready}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -128,6 +129,9 @@ func (handle *AgentHandle) Ready(ctx context.Context) error {
 func (handle *AgentHandle) Join(ctx context.Context) error {
 	select {
 	case <-handle.done:
+		if handle.result == nil && handle.unready.Load() {
+			return &ConfigError{Reason: errStoppedUnready}
+		}
 		return handle.result
 	case <-ctx.Done():
 		return ctx.Err()
@@ -161,8 +165,9 @@ func (handle *AgentHandle) Abort() {
 // source is expected to already be open (a consumer group member that has
 // joined, or any other RecordSource ready to read), so this carries no
 // network call of its own: it is the lifecycle wiring alone, which is what
-// keeps it testable against a fake source without a server. advertisement
-// and consolidation, when non-nil, are stopped once the consumer ends,
+// keeps it testable against a fake source without a server. A source that
+// closes is closed once the loop ends, which is what leaves its consumer
+// group. advertisement and consolidation, when non-nil, are stopped then too,
 // before the handle reports done, so Join and Shutdown never return before
 // the cleanup they promise.
 func startAgentHandle(
@@ -176,9 +181,25 @@ func startAgentHandle(
 		ready:    make(chan struct{}),
 		done:     make(chan struct{}),
 	}
+	polling := sync.OnceFunc(func() { close(handle.ready) })
+	reading := RecordSource(readySource{RecordSource: source, polling: polling})
+	if assigned, lists := source.(interface{ Partitions() []uint32 }); lists {
+		reading = assignedReadySource{readySource: reading.(readySource), assigned: assigned}
+	}
 	go func() {
-		close(handle.ready)
-		handle.result = runtime.Run(ctx, source, handler)
+		handle.result = runtime.Run(ctx, reading, handler)
+		// A stop that was asked for is honoured only after readiness is reported.
+		if handle.result == nil && ctx.Err() != nil {
+			polling()
+		}
+		// A source left open keeps its group membership, and the partitions with it.
+		if closer, closes := source.(interface{ Close(context.Context) error }); closes {
+			closing, release := context.WithTimeout(context.Background(), DefaultShutdownGrace)
+			if err := closer.Close(closing); err != nil {
+				runtime.failed(nil, err)
+			}
+			release()
+		}
 		if consolidation != nil {
 			consolidation.abort()
 		}
@@ -189,6 +210,27 @@ func startAgentHandle(
 	}()
 	return handle
 }
+
+// readySource reports a source's first read, which is when its agent is polling.
+type readySource struct {
+	RecordSource
+	polling func()
+}
+
+// Next reports the read before it is made.
+func (source readySource) Next(ctx context.Context) (*Record, error) {
+	source.polling()
+	return source.RecordSource.Next(ctx)
+}
+
+// assignedReadySource keeps the partition listing of a source that has one.
+type assignedReadySource struct {
+	readySource
+	assigned interface{ Partitions() []uint32 }
+}
+
+// Partitions lists what the wrapped source is assigned.
+func (source assignedReadySource) Partitions() []uint32 { return source.assigned.Partitions() }
 
 // spawnGoverned re-scopes laser under options.Governor/options.GovernorMode
 // when set, defaulting GovernorRetention when the caller left it nil, so
@@ -205,9 +247,26 @@ func spawnGoverned(laser *Laser, options SpawnOptions) *Laser {
 	return laser.WithGovernorRetention(options.Governor, options.GovernorMode, retention)
 }
 
+// spawnTopic is the topic a spawned agent reads: the one it names, else its declared topic, else the session lane.
+func spawnTopic(laser *Laser, identity wire.AgentID, options RuntimeOptions) string {
+	if options.Topic != "" && options.Topic != wire.AgentSessions {
+		return options.Topic
+	}
+	stream := options.Stream
+	if stream == "" {
+		stream = laser.defaultStream
+	}
+	if declared := declaredTopic(laser.layoutFor(stream), identity); declared != "" {
+		return declared
+	}
+	return wire.AgentSessions
+}
+
 // SpawnAgent opens identity's reliable consumer on its own goroutine, joining
 // a consumer group on options.Topic (named after identity unless
 // options.Group says otherwise), and returns a handle to observe or stop it.
+// An agent that names no topic reads the session lane, or its declared topic
+// under a per-agent topic layout.
 //
 // The group join happens here, before this returns, rather than being
 // deferred to the handle's Ready call: Topic.ConsumerGroup already performs
@@ -222,15 +281,15 @@ func (laser *Laser) SpawnAgent(
 	if handler == nil {
 		return nil, &InvalidError{Reason: "a spawned agent needs a handler"}
 	}
-	if options.Topic == "" {
-		return nil, &InvalidError{Reason: "a spawned agent needs the topic to listen on"}
-	}
 	if options.ConsolidateEvery != nil && *options.ConsolidateEvery <= 0 {
 		return nil, &InvalidError{Reason: "consolidate_every must be greater than zero"}
 	}
 	laser = spawnGoverned(laser, options)
+	options.Topic = spawnTopic(laser, identity, options.RuntimeOptions)
 	agent := laser.Agent(identity, options.AgentOptions)
-	runtime, err := laser.AgentRuntime(agent, options.RuntimeOptions)
+	runtimeOptions := options.RuntimeOptions
+	runtimeOptions.EnforceControl = true
+	runtime, err := laser.AgentRuntime(agent, runtimeOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -253,8 +312,20 @@ func (laser *Laser) SpawnAgent(
 	if err != nil {
 		return nil, err
 	}
-	source, err := laser.Stream(stream).Topic(options.Topic).
-		ConsumerGroup(ctx, group, options.Consumer)
+	if options.Consumer.AutoCommit == nil {
+		options.Consumer.ManualCommit = true
+	}
+	member := laser.Stream(stream).Topic(options.Topic).Group(group)
+	caps := laser.Capabilities().Filters
+	if laser.Connection() != nil && caps.Native && caps.Catalog && caps.GroupPolicyReads &&
+		(options.Topic == wire.AgentSessions || options.Topic == wire.AgentControl) {
+		_, err = member.Create().Filter(wire.AddresseeFilterName, wire.AddresseeFilter(identity)).Build(ctx)
+		options.Consumer.SkipGroupCreate = true
+	}
+	var source *Consumer
+	if err == nil {
+		source, err = member.Consumer(ctx, options.Consumer)
+	}
 	if err != nil {
 		if advertisement != nil {
 			advertisement.withdraw()

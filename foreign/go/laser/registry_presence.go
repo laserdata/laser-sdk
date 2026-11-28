@@ -38,15 +38,20 @@ func (registry *AgentRegistry) PrincipalFor(agent wire.AgentID) *PrincipalID {
 	return entry.principal
 }
 
-// InboxFor is the topic this agent advertised in its live presence, or empty
-// when it has no live presence or declared no inbox.
+// InboxFor is the topic this agent advertised in its live presence, else the
+// inbox its card names, or empty when neither does.
 //
-// A caller wanting the card's own inbox as a fallback reads the card: this
-// answers live transport truth alone, so the two can be told apart.
+// The card inbox serves a server without live presence.
 func (registry *AgentRegistry) InboxFor(agent wire.AgentID) string {
 	registry.mutex.RLock()
 	defer registry.mutex.RUnlock()
-	return inboxOf(registry.presence[agent])
+	if inbox := inboxOf(registry.presence[agent]); inbox != "" {
+		return inbox
+	}
+	if inbox := registry.cards[agent].Card.Inbox; inbox != nil {
+		return *inbox
+	}
+	return ""
 }
 
 // InboxForPrincipal is InboxFor, but only when the connection that advertised

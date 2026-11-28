@@ -2,6 +2,9 @@ package laser
 
 import (
 	"context"
+	"slices"
+	"strings"
+	"time"
 
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
@@ -24,6 +27,10 @@ type Graph struct {
 	session    *wire.SessionRef
 	producer   *wire.ProducerInfo
 	source     *wire.SourceRef
+	// lens is the conversation whose assertions a read is narrowed to, and
+	// lensStream the stream that conversation belongs to.
+	lens       *string
+	lensStream *string
 	err        error
 }
 
@@ -146,17 +153,30 @@ func (graph *Graph) SourcedFrom(source wire.SourceRef) *Graph {
 	return graph
 }
 
+// Conversation narrows Fetch and Neighbors to the nodes and edges one
+// conversation asserted.
+func (graph *Graph) Conversation(conversation wire.ConversationID) *Graph {
+	lens := conversation.String()
+	graph.lens, graph.lensStream = &lens, nil
+	if stream := graph.laser.resourceStream(); stream != "" {
+		graph.lensStream = &stream
+	}
+	return graph
+}
+
 // Query renders the traversal as the request it will send, without sending it.
 func (graph *Graph) Query() wire.GraphQuery {
 	query := wire.GraphQuery{
-		V:          wire.GraphOpVersion,
-		Graph:      graph.name,
-		Traverse:   graph.hops,
-		NodeFilter: graph.nodeFilter,
-		EdgeFilter: graph.edgeFilter,
-		Return:     graph.want,
-		Limit:      graph.limit,
-		AsOf:       graph.asOf,
+		V:            wire.GraphOpVersion,
+		Graph:        graph.name,
+		Traverse:     graph.hops,
+		NodeFilter:   graph.nodeFilter,
+		EdgeFilter:   graph.edgeFilter,
+		Return:       graph.want,
+		Limit:        graph.limit,
+		AsOf:         graph.asOf,
+		Conversation: graph.lens,
+		Stream:       graph.lensStream,
 	}
 	if graph.start != nil {
 		query.Start = *graph.start
@@ -164,9 +184,6 @@ func (graph *Graph) Query() wire.GraphQuery {
 		// A traversal with no start reaches nothing rather than everything,
 		// which is the safe reading of an unfinished query.
 		query.Start = wire.StartAtIDs()
-	}
-	if stream := graph.laser.resourceStream(); stream != "" {
-		query.Stream = &stream
 	}
 	return query
 }
@@ -192,19 +209,18 @@ func (graph *Graph) Neighbors(
 		return nil, graph.err
 	}
 	request := wire.GraphNeighbors{
-		V:     wire.GraphOpVersion,
-		Graph: graph.name,
-		Node:  node,
-		Dir:   dir,
-		Depth: depth,
-		Limit: graph.limit,
-		AsOf:  graph.asOf,
+		V:            wire.GraphOpVersion,
+		Graph:        graph.name,
+		Node:         node,
+		Dir:          dir,
+		Depth:        depth,
+		Limit:        graph.limit,
+		AsOf:         graph.asOf,
+		Conversation: graph.lens,
+		Stream:       graph.lensStream,
 	}
 	if edgeType != "" {
 		request.EdgeType = &edgeType
-	}
-	if stream := graph.laser.resourceStream(); stream != "" {
-		request.Stream = &stream
 	}
 	if err := request.Validate(); err != nil {
 		return nil, &InvalidError{Reason: err.Error()}
@@ -223,14 +239,24 @@ func (graph *Graph) Upsert(
 	if graph.err != nil {
 		return graph.err
 	}
-	stamped := make([]wire.GraphEdge, len(edges))
-	copy(stamped, edges)
-	for index := range stamped {
-		if graph.producer != nil && stamped[index].Producer == nil {
-			stamped[index].Producer = graph.producer
+	if graph.producer != nil || graph.source != nil {
+		nodes = slices.Clone(nodes)
+		edges = slices.Clone(edges)
+		for i := range nodes {
+			if nodes[i].Producer == nil {
+				nodes[i].Producer = graph.producer
+			}
+			if nodes[i].Source == nil {
+				nodes[i].Source = graph.source
+			}
 		}
-		if graph.source != nil && stamped[index].Source == nil {
-			stamped[index].Source = graph.source
+		for i := range edges {
+			if edges[i].Producer == nil {
+				edges[i].Producer = graph.producer
+			}
+			if edges[i].Source == nil {
+				edges[i].Source = graph.source
+			}
 		}
 	}
 	request := wire.GraphUpsert{
@@ -238,7 +264,7 @@ func (graph *Graph) Upsert(
 		Graph:   graph.name,
 		Session: graph.session,
 		Nodes:   nodes,
-		Edges:   stamped,
+		Edges:   edges,
 	}
 	if err := request.Validate(); err != nil {
 		return &InvalidError{Reason: err.Error()}
@@ -253,18 +279,60 @@ func (graph *Graph) Upsert(
 // Re-linking the same triple converges on the same nodes and edge, so it is
 // safe to call on every observation.
 func (graph *Graph) Link(ctx context.Context, from, relation, to string) error {
-	fromNode := wire.EntityNode("entity", from)
-	toNode := wire.EntityNode("entity", to)
-	return graph.Upsert(ctx,
-		[]wire.GraphNode{fromNode, toNode},
-		[]wire.GraphEdge{wire.RelateNodes(fromNode, relation, toNode)})
+	return graph.linkAt(ctx, graphEntity(from), relation, graphEntity(to), uint64(time.Now().UnixMicro()))
+}
+
+func graphEntity(id string) wire.GraphNode {
+	label, value, ok := strings.Cut(id, ":")
+	if !ok {
+		return wire.EntityNode("entity", id)
+	}
+	return wire.EntityNode(label, value)
+}
+
+func (graph *Graph) linkAt(ctx context.Context, from wire.GraphNode, relation string, to wire.GraphNode, at uint64) error {
+	edge := wire.RelateNodes(from, relation, to)
+	edge.ValidFrom = &at
+	return graph.Upsert(ctx, []wire.GraphNode{from, to}, []wire.GraphEdge{edge})
+}
+
+// Unlink closes the relationship's validity interval and preserves its history.
+func (graph *Graph) Unlink(ctx context.Context, from, relation, to string) error {
+	edge := wire.RelateNodes(graphEntity(from), relation, graphEntity(to))
+	at := uint64(time.Now().UnixMicro())
+	edge.ValidTo = &at
+	return graph.Upsert(ctx, nil, []wire.GraphEdge{edge})
+}
+
+// Relink closes live relationships of this type to other targets, then opens
+// the requested relationship at the same time. It returns the number closed.
+func (graph *Graph) Relink(ctx context.Context, from, relation, to string) (int, error) {
+	fromNode, toNode := graphEntity(from), graphEntity(to)
+	live, err := graph.laser.Graph(graph.name).Neighbors(ctx, fromNode.ID, wire.EdgeOut, relation, 1)
+	if err != nil {
+		return 0, err
+	}
+	at := uint64(time.Now().UnixMicro())
+	var closing []wire.GraphEdge
+	for _, edge := range live.Edges {
+		if edge.To != toNode.ID && edge.ValidTo == nil {
+			edge.ValidTo = &at
+			closing = append(closing, edge)
+		}
+	}
+	if len(closing) > 0 {
+		if err := graph.Upsert(ctx, nil, closing); err != nil {
+			return 0, err
+		}
+	}
+	return len(closing), graph.linkAt(ctx, fromNode, relation, toNode, at)
 }
 
 // execute sends one graph command and opens its reply.
 func (graph *Graph) execute(
 	ctx context.Context, code uint32, request any,
 ) (*wire.GraphResult, error) {
-	if !graph.laser.capabilities.Managed || !graph.laser.capabilities.Graph {
+	if !graph.laser.Capabilities().Managed || !graph.laser.Capabilities().Graph {
 		return nil, &UnsupportedError{Surface: "the graph surface"}
 	}
 	if err := graph.laser.requireOpVersion("graph", wire.GraphOpVersion,
@@ -280,8 +348,8 @@ func (graph *Graph) execute(
 		return nil, err
 	}
 	var reply wire.GraphReply
-	if err := wire.Unmarshal(raw, &reply); err != nil {
-		return nil, &CodecError{Reason: "decode graph reply", Cause: err}
+	if err := decodeManagedReply(raw, &reply, "decode graph reply"); err != nil {
+		return nil, err
 	}
 	if !reply.IsOk() {
 		if reply.Err == nil {

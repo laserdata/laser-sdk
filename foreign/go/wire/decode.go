@@ -266,6 +266,7 @@ func setMap(entries cborform.Map, target reflect.Value) error {
 		if len(required) != 0 {
 			seen = make(map[string]bool, len(required))
 		}
+		var decoded [4]uint64
 		for _, entry := range entries {
 			key, ok := entry.Key.(cborform.Text)
 			if !ok {
@@ -280,6 +281,12 @@ func setMap(entries cborform.Map, target reflect.Value) error {
 					return fmt.Errorf("wire: %s refuses the unknown field %q", target.Type(), key)
 				}
 				continue // forward compatibility: ignore unknown fields
+			}
+			if word, bit := index/64, uint64(1)<<(index%64); word < len(decoded) {
+				if decoded[word]&bit != 0 {
+					return fmt.Errorf("wire: %s holds the duplicate field %q", target.Type(), key)
+				}
+				decoded[word] |= bit
 			}
 			if seen != nil {
 				seen[string(key)] = true

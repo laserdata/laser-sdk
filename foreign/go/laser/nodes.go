@@ -268,7 +268,7 @@ func (router *nodeRouter) walkCaller(
 			// A node that answered but could not reach its own backend is a
 			// node to move off, exactly like a link that dropped: the next
 			// one may reach it.
-			if !backendUnavailable(opened.reply) {
+			if !backendRefused(code, opened.reply) {
 				return opened, nil
 			}
 			router.failed(replica)

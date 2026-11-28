@@ -173,7 +173,7 @@ func TestGivenFeedbackWhenRecalledHybridThenShouldPromoteTheWeightedItem(t *test
 	}
 	carried := false
 	for _, signal := range after[0].Signals {
-		if signal.Strategy == laser.RecallFeedback {
+		if signal.Strategy == laser.RecallAuto {
 			carried = true
 		}
 	}
@@ -196,7 +196,7 @@ func TestGivenAutoWhenRecalledThenShouldRouteOnWhatIsAvailable(t *testing.T) {
 	}
 	before := embedder.calls
 
-	// With a query and an embedder, Auto is the fused recall.
+	// With a query and an embedder, Auto ranks by the embedding.
 	fused, err := memory.Recall(context.Background(), laser.MemoryScope{}, laser.MemoryQuery{
 		Query: "cats",
 	})

@@ -1,6 +1,10 @@
 package wire
 
-import "github.com/laserdata/laser-sdk/foreign/go/internal/cborform"
+import (
+	"slices"
+
+	"github.com/laserdata/laser-sdk/foreign/go/internal/cborform"
+)
 
 // ManagedRequestVersion is the version every managed envelope stamps.
 const ManagedRequestVersion uint32 = 1
@@ -95,14 +99,24 @@ type SessionPosition struct {
 // DeniesUnknownFields refuses unknown fields on a session position.
 func (*SessionPosition) DeniesUnknownFields() bool { return true }
 
-// sameLane reports whether two session positions address the same partition of
-// the same topic incarnation, the only case in which their offsets compare.
-func (position SessionPosition) sameLane(other SessionPosition) bool {
+// sameUnit reports whether two session positions name one partition of one
+// source topic, whatever incarnation each belongs to.
+func (position SessionPosition) sameUnit(other SessionPosition) bool {
 	return position.StreamID == other.StreamID &&
-		position.StreamGeneration == other.StreamGeneration &&
 		position.Topic == other.Topic &&
-		position.TopicGeneration == other.TopicGeneration &&
 		position.PartitionID == other.PartitionID
+}
+
+// isPast orders two positions of one unit by stream incarnation, then topic
+// incarnation, then offset.
+func (position SessionPosition) isPast(other SessionPosition) bool {
+	if position.StreamGeneration != other.StreamGeneration {
+		return position.StreamGeneration > other.StreamGeneration
+	}
+	if position.TopicGeneration != other.TopicGeneration {
+		return position.TopicGeneration > other.TopicGeneration
+	}
+	return position.Offset > other.Offset
 }
 
 // ManagedReadEnvelope is a managed read sent with a consistency requirement.
@@ -157,45 +171,43 @@ func (frontier AppliedFrontier) Position(surface PositionSurface) *MutationPosit
 	}
 }
 
-// MergeFrontier folds an answering node's frontier into the client's running
-// one, keeping the highest position per surface.
+// isPast reports whether this position is past other on one surface. A later
+// topic generation is past every position of an earlier one, because the
+// earlier topic is gone and its offsets are never read again.
+func (position MutationPosition) isPast(other MutationPosition) bool {
+	if position.TopicGeneration != other.TopicGeneration {
+		return position.TopicGeneration > other.TopicGeneration
+	}
+	return position.Offset > other.Offset
+}
+
+// MergeFrontier raises each surface of the client's running frontier to the
+// later of its own position and the one an answering node reported.
 //
-// A position from another topic generation does not compare, so it replaces
-// the held one rather than being silently dropped: the surface was rebuilt and
-// the old coordinate no longer means anything.
+// A newer incarnation of a stream replaces every session position of the one
+// before it.
 func MergeFrontier(held *AppliedFrontier, seen AppliedFrontier) {
 	mergeOne := func(current **MutationPosition, next *MutationPosition) {
-		if next == nil {
+		if next == nil || *current != nil && !next.isPast(**current) {
 			return
 		}
-		if *current == nil {
-			copied := *next
-			*current = &copied
-			return
-		}
-		earlier, comparable := (**current).Precedes(*next)
-		if !comparable || earlier {
-			copied := *next
-			*current = &copied
-		}
+		copied := *next
+		*current = &copied
 	}
 	mergeOne(&held.Kv, seen.Kv)
 	mergeOne(&held.Fork, seen.Fork)
 	mergeOne(&held.Graph, seen.Graph)
 
 	for _, position := range seen.Sessions {
-		replaced := false
-		for i, existing := range held.Sessions {
-			if existing.sameLane(position) {
-				if position.Offset > existing.Offset {
-					held.Sessions[i] = position
-				}
-				replaced = true
-				break
-			}
-		}
-		if !replaced {
+		held.Sessions = slices.DeleteFunc(held.Sessions, func(kept SessionPosition) bool {
+			return kept.StreamID == position.StreamID && kept.StreamGeneration < position.StreamGeneration
+		})
+		unit := slices.IndexFunc(held.Sessions, position.sameUnit)
+		switch {
+		case unit < 0:
 			held.Sessions = append(held.Sessions, position)
+		case position.isPast(held.Sessions[unit]):
+			held.Sessions[unit] = position
 		}
 	}
 }
@@ -214,6 +226,9 @@ type ManagedReplyEnvelope struct {
 
 // DeniesUnknownFields keeps a surface reply from decoding as this frame.
 func (*ManagedReplyEnvelope) DeniesUnknownFields() bool { return true }
+
+// RequiredFieldNames refuses a frame without its version or its reply.
+func (*ManagedReplyEnvelope) RequiredFieldNames() []string { return []string{"v", "reply"} }
 
 // MutationCommandEnvelope is one managed command stored on a mutation topic.
 //

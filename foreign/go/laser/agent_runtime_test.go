@@ -38,6 +38,9 @@ type runtimeServer struct {
 	history map[string]*warmHistory
 	// createdAt is the topic generation GetTopic reports.
 	createdAt uint64
+	// recreated counts how often each topic was recreated, which GetTopic adds
+	// to that topic's generation.
+	recreated map[string]uint64
 	// streamID and topicID are the numeric ids the server reports. They
 	// default to 7 and 3, and a test sets them to 0 to stand for the first
 	// stream and topic a real deployment creates, whose ids are genuinely
@@ -47,7 +50,7 @@ type runtimeServer struct {
 	// numeric maps a topic's numeric id back to its name, so a read that
 	// addresses a topic by id (which is what a source reference carries)
 	// finds the history seeded under its name. A real server resolves both
-	// forms; this fake keys everything by name.
+	// forms. This fake keys everything by name.
 	numeric map[uint32]string
 }
 
@@ -101,18 +104,36 @@ func (server *runtimeServer) GetStream(
 }
 
 func (server *runtimeServer) GetTopic(
-	_ context.Context, _, _ iggcon.Identifier,
+	_ context.Context, _ iggcon.Identifier, topic iggcon.Identifier,
 ) (*iggcon.TopicDetails, error) {
 	details := &iggcon.TopicDetails{}
 	server.mutex.Lock()
 	details.Id = server.topicID
+	if name, _ := topic.String(); name == wire.AgentControl {
+		details.Id++
+	}
 	details.PartitionsCount = server.partitions
 	// The topic's generation, which a source reference records so a record
 	// cannot be read back out of a topic that was recreated since. Zero for
 	// every test that does not care.
 	details.CreatedAt = server.createdAt
+	if name, err := topic.String(); err == nil {
+		details.CreatedAt += server.recreated[name]
+	}
 	server.mutex.Unlock()
 	return details, nil
+}
+
+// recreate drops a topic's records and gives it a new generation, the way a
+// deleted and created topic looks.
+func (server *runtimeServer) recreate(topic string) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	if server.recreated == nil {
+		server.recreated = map[string]uint64{}
+	}
+	server.recreated[topic]++
+	delete(server.history, topic)
 }
 
 // seedHistory records stored as the committed offset for partition of topic,
@@ -175,6 +196,8 @@ func (server *runtimeServer) PollMessages(
 		}
 	case iggcon.POLLING_FIRST:
 		start = 0
+	case iggcon.POLLING_LAST:
+		start = max(len(records)-1, 0)
 	case iggcon.POLLING_TIMESTAMP:
 		for index, message := range records {
 			if message.Header.Timestamp >= strategy.Value {
@@ -245,7 +268,7 @@ type queuedSource struct {
 	once      sync.Once
 	// beforeNext runs before each record is handed over, with the index of
 	// the record about to be read. It is how a test makes something happen
-	// between two records -- an operator's resume landing mid-run, say --
+	// between two records, an operator's resume landing mid-run for example,
 	// without racing the loop. Nil for every test that needs no such hook.
 	beforeNext func(index int)
 }
@@ -325,7 +348,7 @@ func runUntilDrained(
 
 // runtimeFor opens a runtime for one agent over a recording server.
 func runtimeFor(
-	t *testing.T, server *runtimeServer, name string, options laser.RuntimeOptions,
+	t *testing.T, server iggcon.Client, name string, options laser.RuntimeOptions,
 ) *laser.AgentRuntime {
 	t.Helper()
 	handle := laser.FromClient(server, laser.Options{DefaultStream: "agents"})
@@ -936,9 +959,9 @@ func TestGivenNoReplyTopicWhenAcknowledgingPickupsThenShouldRefuseTheRuntime(t *
 		Topic: wire.AgentSessions, AckOnPickup: true,
 	})
 
-	var invalid *laser.InvalidError
-	if !errors.As(err, &invalid) {
-		t.Fatalf("want the runtime refused, got %v", err)
+	var config *laser.ConfigError
+	if !errors.As(err, &config) {
+		t.Fatalf("want the runtime refused as a configuration error, got %T %v", err, err)
 	}
 }
 

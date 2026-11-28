@@ -1,10 +1,14 @@
 package laser_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
 	"time"
+
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
@@ -19,6 +23,13 @@ func fencedCapabilities() *laser.Capabilities {
 	return capabilities
 }
 
+// fencedLeaseHandle is a fenced deployment whose lease acquisitions reach the fake
+// server over an injected coordination transport.
+func fencedLeaseHandle(server iggcon.Client) *laser.Laser {
+	return laser.CoordinateOverClientForTest(
+		kvHandle(server, laser.Options{Capabilities: fencedCapabilities()}))
+}
+
 func TestGivenAGrantedLeaseWhenAcquiredThenShouldReturnTheTokenAndTTL(t *testing.T) {
 	server := &kvServer{outcomes: []wire.KvOutcome{{
 		Kind: wire.KvLeased,
@@ -26,7 +37,7 @@ func TestGivenAGrantedLeaseWhenAcquiredThenShouldReturnTheTokenAndTTL(t *testing
 			LeaseToken: 7, GrantedTTLMicros: uint64((2 * time.Second).Microseconds()),
 		},
 	}}}
-	kv := kvHandle(server, laser.Options{Capabilities: fencedCapabilities()}).Kv("ns")
+	kv := fencedLeaseHandle(server).Kv("ns")
 
 	lease, err := kv.Lease(context.Background(), []byte("job-1"), "worker-a", 5*time.Second)
 	if err != nil {
@@ -57,7 +68,7 @@ func TestGivenALeaseHeldByAnotherHolderWhenTriedThenShouldAnswerNil(t *testing.T
 	server := &kvServer{failure: &wire.KvError{
 		Kind: wire.KvLeaseHeld, ExpiresAtMicros: &expires,
 	}}
-	kv := kvHandle(server, laser.Options{Capabilities: fencedCapabilities()}).Kv("ns")
+	kv := fencedLeaseHandle(server).Kv("ns")
 
 	lease, err := kv.TryLease(context.Background(), []byte("job-1"), "worker-a", 5*time.Second)
 	if err != nil {
@@ -70,7 +81,7 @@ func TestGivenALeaseHeldByAnotherHolderWhenTriedThenShouldAnswerNil(t *testing.T
 
 func TestGivenAnOrdinaryLeaseFailureWhenTriedThenShouldStillReportIt(t *testing.T) {
 	server := &kvServer{failure: &wire.KvError{Kind: wire.KvBackend, Message: "down"}}
-	kv := kvHandle(server, laser.Options{Capabilities: fencedCapabilities()}).Kv("ns")
+	kv := fencedLeaseHandle(server).Kv("ns")
 
 	_, err := kv.TryLease(context.Background(), []byte("job-1"), "worker-a", 5*time.Second)
 
@@ -97,7 +108,7 @@ func TestGivenNoFencedLeaseCapabilityWhenLeasedThenShouldRefuseBeforeSending(t *
 
 func TestGivenATTLOutsideThePinnedRangeWhenLeasedThenShouldRefuseBeforeSending(t *testing.T) {
 	server := &kvServer{}
-	kv := kvHandle(server, laser.Options{Capabilities: fencedCapabilities()}).Kv("ns")
+	kv := fencedLeaseHandle(server).Kv("ns")
 
 	_, err := kv.Lease(context.Background(), []byte("job-1"), "worker-a", time.Millisecond)
 
@@ -139,7 +150,7 @@ func TestGivenALeaseGuardWhenReleasedThenShouldReportWhetherItWasHeld(t *testing
 		{Kind: wire.KvLeased, Lease: &wire.KvLeaseGrant{LeaseToken: 1, GrantedTTLMicros: 1_000_000}},
 		{Kind: wire.KvReleased, Released: true},
 	}}
-	kv := kvHandle(server, laser.Options{Capabilities: fencedCapabilities()}).Kv("ns")
+	kv := fencedLeaseHandle(server).Kv("ns")
 
 	guard, err := kv.LeaseGuard(context.Background(), []byte("job-1"), "worker-a", time.Second)
 	if err != nil {
@@ -167,7 +178,7 @@ func TestGivenALeaseLostWhenRenewedThenShouldMarkTheGuardNotHeld(t *testing.T) {
 	server := &kvServer{outcomes: []wire.KvOutcome{
 		{Kind: wire.KvLeased, Lease: &wire.KvLeaseGrant{LeaseToken: 1, GrantedTTLMicros: 1_000_000}},
 	}}
-	kv := kvHandle(server, laser.Options{Capabilities: fencedCapabilities()}).Kv("ns")
+	kv := fencedLeaseHandle(server).Kv("ns")
 	guard, err := kv.LeaseGuard(context.Background(), []byte("job-1"), "worker-a", time.Second)
 	if err != nil {
 		t.Fatalf("lease guard: %v", err)
@@ -229,5 +240,144 @@ func TestGivenNoFencedLeaseCapabilityWhenCommittedThenShouldRefuseBeforeSending(
 	}
 	if len(server.codes) != 0 {
 		t.Error("an unsupported fenced CAS must not reach the socket")
+	}
+}
+
+func TestGivenAPreparedReleaseWhenRepeatedThenShouldSendTheIdenticalFrame(t *testing.T) {
+	server := &kvServer{outcomes: []wire.KvOutcome{{Kind: wire.KvReleased, Released: true}}}
+	kv := kvHandle(server, laser.Options{Capabilities: fencedCapabilities()}).Kv("coord")
+	key := []byte("lease")
+	release, err := kv.PrepareRelease(key, "worker", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key[0] = 'x'
+	if len(server.requests) != 0 || release.OperationID().IsZero() {
+		t.Fatal("expected a local preparation with a nonzero operation ID")
+	}
+	for range 2 {
+		released, err := release.Execute(t.Context())
+		if !released || err != nil {
+			t.Fatalf("release: %t, %v", released, err)
+		}
+	}
+	var request wire.KvRelease
+	decodeRequest(t, server, 0, &request)
+	if string(request.Key) != "lease" || !bytes.Equal(server.requests[0], server.requests[1]) {
+		t.Fatal("repeated release changed the key or operation identity")
+	}
+}
+
+func TestGivenAnExpiredGrantWhenAcquiredThenShouldReturnLeaseLost(t *testing.T) {
+	server := &kvServer{outcomes: []wire.KvOutcome{{
+		Kind: wire.KvLeased, Lease: &wire.KvLeaseGrant{LeaseToken: 7},
+	}}}
+	kv := fencedLeaseHandle(server).Kv("ns")
+	lease, err := kv.Lease(context.Background(), []byte("work"), "worker", time.Second)
+	var failure *laser.KvError
+	if lease != nil || !errors.As(err, &failure) || failure.Kind() != wire.KvLeaseLost {
+		t.Fatalf("expected lease lost, got %+v, %v", lease, err)
+	}
+}
+
+func TestGivenAHandleOverAnInjectedClientWhenLeasedThenShouldRefuseAsConfigBeforeSending(t *testing.T) {
+	server := &kvServer{}
+	kv := kvHandle(server, laser.Options{Capabilities: fencedCapabilities()}).Kv("ns")
+
+	lease, err := kv.Lease(context.Background(), []byte("job-1"), "worker-a", 5*time.Second)
+	guard, guarded := kv.LeaseGuard(context.Background(), []byte("job-1"), "worker-a", 5*time.Second)
+	tried, attempted := kv.TryLease(context.Background(), []byte("job-1"), "worker-a", 5*time.Second)
+
+	for _, refused := range []error{err, guarded, attempted} {
+		var config *laser.ConfigError
+		if !errors.As(refused, &config) {
+			t.Fatalf("a handle with no connection string cannot dial a coordination connection, got %T: %v", refused, refused)
+		}
+	}
+	if lease != nil || guard != nil || tried != nil || len(server.codes) != 0 {
+		t.Errorf("nothing may be granted or sent, got %+v, %+v, %+v and %d requests", lease, guard, tried, len(server.codes))
+	}
+}
+
+func TestGivenAnAmbiguousAcquisitionWhenLeasedThenShouldRepeatTheSameIdentityUntilGranted(t *testing.T) {
+	transport := answering(
+		unknownOutcomeReply(t, wire.ResultPending),
+		scripted{err: &laser.TransportError{Reason: "managed command", Cause: ierror.Disconnected{}}},
+		okReply(t, leasedOutcome(4, 5*time.Second)),
+	)
+	handle := laser.SetCoordinationTransportForTest(
+		kvHandle(&kvServer{}, laser.Options{Capabilities: fencedCapabilities()}), transport)
+
+	lease, err := handle.Kv("ns").Lease(context.Background(), []byte("job-1"), "worker-a", 5*time.Second)
+
+	if err != nil {
+		t.Fatalf("the repeat answers the recorded grant: %v", err)
+	}
+	if lease.Token != 4 || lease.GrantedTTL != 5*time.Second {
+		t.Errorf("want token 4 for 5s, got %+v", lease)
+	}
+	sent := transport.frames()
+	if len(sent) != 3 || !bytes.Equal(sent[0].frame, sent[1].frame) || !bytes.Equal(sent[1].frame, sent[2].frame) {
+		t.Fatalf("want three attempts under one identity, got %d frames", len(sent))
+	}
+	if seen := handle.SeenPositions().Kv; seen == nil || *seen != leasePosition() {
+		t.Errorf("the grant position joins the read frontier, got %+v", seen)
+	}
+}
+
+func TestGivenAnAcquisitionStillUnknownWhenItsTTLPassesThenShouldReportAmbiguityWithTheIdentity(t *testing.T) {
+	replies := make([]scripted, 64)
+	for index := range replies {
+		replies[index] = unknownOutcomeReply(t, wire.ResultPending)
+	}
+	transport := answering(replies...)
+	handle := laser.SetCoordinationTransportForTest(
+		kvHandle(&kvServer{}, laser.Options{Capabilities: fencedCapabilities()}), transport)
+
+	_, err := handle.Kv("ns").Lease(context.Background(), []byte("job-1"), "worker-a", time.Second)
+
+	var ambiguous *laser.AmbiguousMutationError
+	if !errors.As(err, &ambiguous) || ambiguous.OperationID.IsZero() {
+		t.Fatalf("want an ambiguous acquisition naming its identity, got %T: %v", err, err)
+	}
+	if sent := transport.frames(); len(sent) < 3 {
+		t.Errorf("repeats fill the TTL window, got %d attempts", len(sent))
+	}
+}
+
+func TestGivenAGrantBeyondTheRequestWhenLeasedThenShouldRefuseIt(t *testing.T) {
+	for _, grant := range []wire.KvOutcome{leasedOutcome(0, time.Second), leasedOutcome(7, time.Minute)} {
+		transport := answering(okReply(t, grant))
+		handle := laser.SetCoordinationTransportForTest(
+			kvHandle(&kvServer{}, laser.Options{Capabilities: fencedCapabilities()}), transport)
+
+		lease, err := handle.Kv("ns").Lease(context.Background(), []byte("job-1"), "worker-a", 5*time.Second)
+
+		var codec *laser.CodecError
+		if lease != nil || !errors.As(err, &codec) {
+			t.Errorf("want a zero token or a TTL past the request refused, got %+v and %T: %v", lease, err, err)
+		}
+	}
+}
+
+func TestGivenAHandleWithACoordinationConnectionWhenClosedThenShouldRetireIt(t *testing.T) {
+	transport := answering(okReply(t, leasedOutcome(4, 5*time.Second)))
+	handle := laser.SetCoordinationTransportForTest(
+		kvHandle(&kvServer{}, laser.Options{Capabilities: fencedCapabilities()}), transport)
+	if _, err := handle.Kv("ns").Lease(context.Background(), []byte("job-1"), "worker-a", 5*time.Second); err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+
+	if err := handle.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	_, err := handle.Kv("ns").Lease(context.Background(), []byte("job-2"), "worker-a", 5*time.Second)
+
+	if resets := transport.resetCount(); resets != 1 {
+		t.Errorf("want the coordination connection retired once, got %d", resets)
+	}
+	var closed *laser.TransportError
+	if !errors.As(err, &closed) || len(transport.frames()) != 1 {
+		t.Errorf("a closed handle leases nothing, got %T: %v after %d frames", err, err, len(transport.frames()))
 	}
 }

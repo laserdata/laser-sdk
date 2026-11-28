@@ -13,7 +13,7 @@ import (
 //
 // A parked gate is resumed by a reply the runtime has to recognize before it
 // knows which record the reply belongs to, and it cannot keep a waiter in
-// memory to match against -- the process that sent the prompt may be gone.
+// memory to match against, because the process that sent the prompt may be gone.
 // Tagging the correlation lets any later process tell an approval decision
 // from every other reply on the topic, and deriving the rest of it from the
 // handled record's own position lets it find which parked record that is.

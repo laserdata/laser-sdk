@@ -2,9 +2,14 @@ package laser
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
+	"net"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,9 +33,23 @@ type Options struct {
 	// capability probe. Zero reads LASER_CONNECT_TIMEOUT_MS, then falls back to
 	// DefaultConnectTimeout.
 	Timeout time.Duration
+	// Address is the server as host or host:port, for a connect that gives no
+	// connection string. The port defaults to 8090. It needs Username.
+	Address string
+	// Username and Password log in at Address. FromClient ignores all three.
+	Username string
+	Password string
 	// DefaultStream pins the stream the one-word topic shortcut addresses.
 	// Purely ergonomic: any other stream stays one accessor away.
 	DefaultStream string
+	// OpsStream overrides the stream carrying the ops topics, _agdx unless the deployment announces another.
+	OpsStream string
+	// ControlTopic overrides the control command topic on the ops stream.
+	ControlTopic string
+	// DLQTopic overrides the dead-letter topic on the ops stream.
+	DLQTopic string
+	// ChangesTopic overrides the change feed topic on the ops stream.
+	ChangesTopic string
 	// Capabilities is the starting point for negotiation, not a ceiling. The
 	// probe adds whatever the connected deployment serves on top.
 	Capabilities *Capabilities
@@ -46,11 +65,65 @@ type Options struct {
 	Environment Environment
 }
 
+// Format prints the options under any verb without the password.
+func (options Options) Format(state fmt.State, verb rune) {
+	type plain Options
+	hidden := plain(options)
+	hidden.Password = redacted(options.Password)
+	if verb == 'v' && state.Flag('#') {
+		fmt.Fprintf(state, "laser.Options{Address:%q, Username:%q, Password:%q, DefaultStream:%q}",
+			hidden.Address, hidden.Username, hidden.Password, hidden.DefaultStream)
+		return
+	}
+	fmt.Fprintf(state, fmt.FormatString(state, verb), hidden)
+}
+
 func (options Options) environment() Environment {
 	if options.Environment != nil {
 		return options.Environment
 	}
 	return OSEnvironment
+}
+
+// connectionString is the string a connect dials, the one given or one built from Address and the credentials.
+func (options Options) connectionString(given string) (string, error) {
+	apart := options.Address != "" || options.Username != "" || options.Password != ""
+	if strings.TrimSpace(given) != "" {
+		if apart {
+			return "", configError("an address or credentials conflict with a connection string already given")
+		}
+		return given, nil
+	}
+	if !apart {
+		return "", configError("a connection string, or an address with credentials, is required")
+	}
+	if options.Address == "" {
+		return "", configError("address is required")
+	}
+	if options.Username == "" {
+		return "", configError("credentials are required")
+	}
+	// Encoded, so a `:`, `@` or `?` in either part stays inside it.
+	return "iggy+tcp://" + percentEncode(options.Username) + ":" + percentEncode(options.Password) + "@" + options.Address, nil
+}
+
+// percentEncode escapes every byte outside the RFC 3986 unreserved set.
+func percentEncode(value string) string {
+	const hex = "0123456789ABCDEF"
+	var encoded strings.Builder
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		switch {
+		case char >= 'A' && char <= 'Z', char >= 'a' && char <= 'z', char >= '0' && char <= '9',
+			char == '-', char == '.', char == '_', char == '~':
+			encoded.WriteByte(char)
+		default:
+			encoded.WriteByte('%')
+			encoded.WriteByte(hex[char>>4])
+			encoded.WriteByte(hex[char&0x0f])
+		}
+	}
+	return encoded.String()
 }
 
 var digits = regexp.MustCompile(`^\d+$`)
@@ -82,16 +155,21 @@ func (options Options) timeout() (time.Duration, error) {
 // are the only fields the lock covers. Everything else is fixed once the
 // handle exists and is read without one.
 type Laser struct {
+	capabilityOverride bool
 	// publish is how this handle retries a publish.
 	publish PublishOptions
 	// shared is held in common by every handle derived from this one, so a
 	// derived handle reads through the same connection and the same applied
 	// frontier rather than starting over.
-	shared         *connection
-	connectionInfo *ConnectionString
+	shared *connection
+	// connectionInfo hands out the parsed connection string from a closure, so no
+	// fmt verb reaches the credentials through a handle. Nil for an injected client.
+	connectionInfo func() *ConnectionString
 	capabilities   Capabilities
 	defaultStream  string
 	resourceNaming ResourceNaming
+	// topology holds the ops names this handle pins over the announced ones.
+	topology topologyOverrides
 	// governor runs before every effect this handle has, nil when it governs
 	// nothing.
 	governor *governorState
@@ -99,19 +177,23 @@ type Laser struct {
 
 // connection is the state every copy of one handle holds in common.
 type connection struct {
-	mutex  sync.RWMutex
-	client iggcon.Client
+	producers *producerReporter
+	mutex     sync.RWMutex
+	client    iggcon.Client
 	// configured is the capability set negotiation starts from, so one failed
 	// probe cannot narrow a handle permanently: negotiation only ever adds.
 	configured *Capabilities
 	// negotiated is the most recent probe's answer, shared so a re-probe on
 	// one handle is seen by every handle derived from it.
 	negotiated *Capabilities
+	// topology is the ops naming the deployment last announced, nil for the defaults.
+	topology *wire.WireTopology
 	// frontier is the highest mutation position seen per managed surface.
 	// Every managed reply raises it, and a later read of that surface sends
 	// it, so whichever node answers has applied at least what this client
 	// already wrote or read.
-	frontier wire.AppliedFrontier
+	frontier     wire.AppliedFrontier
+	memoryWrites memoryWrites
 	// layouts is the session layout declared per data stream, read at the
 	// agent send boundary. It is shared rather than per handle because a
 	// declared layout has to hold for every later send on the stream: two
@@ -133,6 +215,11 @@ type connection struct {
 	// router picks the node of every managed request, opened on first use.
 	// It is shared so the caller's node stays stable across handles.
 	router *nodeRouter
+	// coordination is the fenced-lease client on its own connection, opened on first use.
+	coordination *FencedLeaseClient
+	// registries is the shared agent registry per stream, opened on first use,
+	// so a send folds only the cards published since the last one.
+	registries map[string]*sharedRegistry
 	// watchers are the open connection-event readers. They sit on the shared
 	// state rather than on a handle, so a watcher opened on one handle sees
 	// what every handle derived from it observes.
@@ -246,6 +333,7 @@ func (laser *Laser) WithResourceNaming(naming ResourceNaming) *Laser {
 func (laser *Laser) WithCapabilities(capabilities Capabilities) *Laser {
 	derived := laser.copy()
 	derived.capabilities = capabilities
+	derived.capabilityOverride = true
 	return derived
 }
 
@@ -330,6 +418,10 @@ func ConnectWith(
 	if err != nil {
 		return nil, err
 	}
+	connectionString, err = options.connectionString(connectionString)
+	if err != nil {
+		return nil, err
+	}
 	parsed, err := ParseConnectionStringWithEnv(connectionString, options.environment())
 	if err != nil {
 		return nil, err
@@ -340,6 +432,7 @@ func ConnectWith(
 	}
 	// Every stage shares one deadline, so a server that accepts the socket and
 	// then stalls cannot hold the caller past the budget it set.
+	caller := ctx
 	ctx, cancel := context.WithTimeout(ctx, options.Timeout)
 	defer cancel()
 
@@ -348,7 +441,8 @@ func ConnectWith(
 		return nil, &TransportError{Reason: "build the client", Cause: err}
 	}
 	if err := connected.Connect(ctx); err != nil {
-		return nil, &TransportError{Reason: connectStage(parsed.Host), Cause: err}
+		_ = connected.Close()
+		return nil, connectFailure(ctx, caller, parsed, err)
 	}
 	// The probe is the last stage, and it is never fatal: a client that cannot
 	// classify the deployment still connects, with the open surface alone.
@@ -360,29 +454,76 @@ func ConnectWith(
 	if options.Publish != nil {
 		publish = *options.Publish
 	}
+	capabilities, announced := negotiateTopology(ctx, connected, configured)
 	opened := &Laser{
 		shared: &connection{
 			client: connected, configured: &configured,
-			linkState: EventConnected,
+			linkState: EventConnected, topology: announced,
 		},
-		connectionInfo: parsed,
-		capabilities:   NegotiateCapabilities(ctx, connected, configured),
+		connectionInfo: func() *ConnectionString { return parsed },
+		capabilities:   capabilities,
 		defaultStream:  options.DefaultStream,
 		resourceNaming: options.ResourceNaming,
+		topology:       options.topology(),
 		publish:        publish,
 	}
 	return opened, nil
 }
 
-// connectStage names what was being attempted when a connect failed. A
-// LaserData deployment that never accepts usually refuses the caller's address,
-// so the stage names the access rule rather than leaving a bare timeout.
-func connectStage(host string) string {
-	if isLaserDataHost(host) {
-		return "connect: the deployment did not accept the connection, " +
-			"which is usually an access rule that does not list this address"
+// The stages a connect waits on, in the words every client uses.
+const (
+	connectAcceptStage    = "the Iggy server to accept the connection"
+	connectAccessRuleHint = ": the deployment admits only addresses its access rules allow: add an access rule for this address"
+	connectLoginStage     = "the Iggy login reply"
+	// connectStageProbe bounds the look, made once the budget ended, that tells a stalled sign-in from a transport that never came up.
+	connectStageProbe = time.Second
+)
+
+// connectFailure reports a failed connect: the stage that stalled when the budget ended, the cause otherwise.
+func connectFailure(budget, caller context.Context, parsed *ConnectionString, cause error) error {
+	if !errors.Is(budget.Err(), context.DeadlineExceeded) || caller.Err() != nil {
+		return &TransportError{Reason: "connect", Cause: cause}
 	}
-	return "connect: the deployment did not accept the connection"
+	if transportAccepts(caller, parsed) {
+		return &StageTimeoutError{Stage: connectLoginStage}
+	}
+	return &StageTimeoutError{Stage: acceptStage(parsed.Host)}
+}
+
+// acceptStage names the wait for the transport. A LaserData deployment drops
+// an address no access rule admits, which looks like a server that never accepts.
+func acceptStage(host string) string {
+	if isLaserDataHost(host) {
+		return connectAcceptStage + connectAccessRuleHint
+	}
+	return connectAcceptStage
+}
+
+// transportAccepts reports whether the address completes the TCP handshake, and the TLS one when the connection uses it.
+func transportAccepts(ctx context.Context, parsed *ConnectionString) bool {
+	ctx, cancel := context.WithTimeout(ctx, connectStageProbe)
+	defer cancel()
+	address := net.JoinHostPort(parsed.Host, strconv.Itoa(int(parsed.Port)))
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = conn.Close() }()
+	if !parsed.TLS {
+		return true
+	}
+	config := &tls.Config{ServerName: parsed.ServerName, MinVersion: tls.VersionTLS12}
+	if config.ServerName == "" {
+		config.ServerName = parsed.Host
+	}
+	if parsed.CA != "" {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM([]byte(parsed.CA)) {
+			return false
+		}
+		config.RootCAs = pool
+	}
+	return tls.Client(conn, config).HandshakeContext(ctx) == nil
 }
 
 // FromClient wraps a client the caller already connected, so an application
@@ -410,17 +551,23 @@ func FromClient(client iggcon.Client, options Options) *Laser {
 		capabilities:   capabilities,
 		defaultStream:  options.DefaultStream,
 		resourceNaming: options.ResourceNaming,
+		topology:       options.topology(),
 		publish:        publish,
 	}
 }
 
 // Capabilities reports what the connected deployment serves, as the
 // connect-time probe established it.
-func (laser *Laser) Capabilities() Capabilities { return laser.capabilities }
+func (laser *Laser) Capabilities() Capabilities { return laser.Negotiated() }
 
 // Connection reports the parsed connection string this client dialed with. The
 // credentials it carries are the caller's own, so they are never logged here.
-func (laser *Laser) Connection() *ConnectionString { return laser.connectionInfo }
+func (laser *Laser) Connection() *ConnectionString {
+	if laser.connectionInfo == nil {
+		return nil
+	}
+	return laser.connectionInfo()
+}
 
 // DefaultStream is the stream the one-word topic shortcut addresses, empty
 // when none was pinned.
@@ -439,10 +586,20 @@ func (laser *Laser) Client() iggcon.Client {
 func (laser *Laser) Close() error {
 	laser.state().mutex.Lock()
 	client := laser.state().client
+	reporter := laser.state().producers
+	coordination := laser.state().coordination
 	laser.state().client = nil
+	laser.state().coordination = nil
 	laser.state().mutex.Unlock()
 	if client == nil {
 		return nil
+	}
+	if reporter != nil {
+		reporter.stop()
+	}
+	var coordinationErr error
+	if coordination != nil {
+		coordinationErr = coordination.Close()
 	}
 	err := client.Close()
 	laser.reportConnection(EventShutdown)
@@ -450,6 +607,9 @@ func (laser *Laser) Close() error {
 	laser.closeReplyHubs()
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return &TransportError{Reason: "close the connection", Cause: err}
+	}
+	if coordinationErr != nil && !errors.Is(coordinationErr, context.Canceled) {
+		return &TransportError{Reason: "close the coordination connection", Cause: coordinationErr}
 	}
 	return nil
 }

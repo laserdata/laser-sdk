@@ -19,9 +19,10 @@ import (
 // seam as well as the admin calls a consumer makes.
 type consumerServer struct {
 	clusterOfOne
-	mutex  sync.Mutex
-	joined string
-	stored []iggcon.ConsumerPosition
+	mutex            sync.Mutex
+	joined           string
+	joinedIdentifier iggcon.Identifier
+	stored           []iggcon.ConsumerPosition
 	// created is the consumer groups the client asked the server to make,
 	// so a test can see that joining a group creates it when absent.
 	created []string
@@ -60,6 +61,7 @@ func (server *consumerServer) JoinConsumerGroup(
 	server.mutex.Lock()
 	defer server.mutex.Unlock()
 	server.joined = name
+	server.joinedIdentifier = groupID
 	return nil
 }
 
@@ -93,7 +95,7 @@ func (server *consumerServer) DeleteConsumerPosition(
 
 // A standalone consumer has nothing to assign it partitions, so one that names
 // none would read nothing at all. The refusal says what to do instead.
-func TestGivenAStandaloneConsumerWithNoPartitionsThenShouldRefuseWithTheRemedy(t *testing.T) {
+func TestGivenAStandaloneConsumerWithNoPartitionsWhenOpenedThenShouldRefuseWithTheRemedy(t *testing.T) {
 	server := &consumerServer{}
 
 	_, err := streamHandle(server, laser.Options{DefaultStream: "agents"}).
@@ -110,7 +112,7 @@ func TestGivenAStandaloneConsumerWithNoPartitionsThenShouldRefuseWithTheRemedy(t
 
 // A group member is assigned its partitions by the server and rebalanced as
 // members come and go, so naming its own would fight the assignment.
-func TestGivenAGroupMemberNamingPartitionsThenShouldRefuseIt(t *testing.T) {
+func TestGivenAGroupMemberNamingPartitionsWhenJoiningThenShouldRefuseIt(t *testing.T) {
 	server := &consumerServer{}
 
 	_, err := streamHandle(server, laser.Options{DefaultStream: "agents"}).
@@ -295,20 +297,25 @@ func TestGivenConsumerOptionsWhenOpenedThenShouldApplyThem(t *testing.T) {
 // A tuned consumer must actually run tuned, or it quietly reads on the
 // defaults while the caller believes otherwise.
 func TestGivenConsumerLimitsWhenResolvedThenShouldCarryThemToTheRead(t *testing.T) {
-	tuned := laser.ConsumerOptions{PollWait: 250 * time.Millisecond, Count: 10}.PollOptions()
+	tuned := laser.ConsumerOptions{PollWait: 250 * time.Millisecond, Count: 10, MinCount: 5, MaxBytes: 1 << 20}.PollOptions()
 	if tuned.MaxWait != 250*time.Millisecond {
 		t.Errorf("want the wait carried, got %v", tuned.MaxWait)
 	}
 	if tuned.Count != 10 {
 		t.Errorf("want the count carried, got %d", tuned.Count)
 	}
+	if tuned.MinCount != 5 || tuned.MaxBytes != 1<<20 {
+		t.Fatal("read bounds were not forwarded")
+	}
 	if tuned.MinCount > tuned.Count {
 		t.Errorf("the batch bounds must not cross, got min %d of %d",
 			tuned.MinCount, tuned.Count)
 	}
-	if tuned.Commit.Kind != iggcon.CommitManual {
-		t.Error("nothing is committed unless the caller asks, so a handler with " +
-			"side effects re-reads after a crash rather than skipping")
+	if tuned.Commit.Kind != iggcon.CommitAuto || tuned.Commit.Auto.Every.Kind != iggcon.CommitEveryBatch || tuned.Commit.Auto.After != iggcon.CommitAfterProcessing {
+		t.Fatal("the default must store each processed batch")
+	}
+	if manual := (laser.ConsumerOptions{ManualCommit: true}).PollOptions(); manual.Commit.Kind != iggcon.CommitManual {
+		t.Fatal("manual commits must remain explicit")
 	}
 
 	// The smallest useful read still leaves the bounds consistent.
@@ -428,6 +435,61 @@ func TestGivenAnExplicitOffsetWhenStoredThenShouldSendItToTheServer(t *testing.T
 	defer server.guard.Unlock()
 	if len(server.stores) != 1 || server.stores[0] != 40 {
 		t.Fatalf("want offset 40 stored, got %v", server.stores)
+	}
+}
+
+func TestGivenAStoredOffsetWhenAnEarlierOneIsStoredThenShouldKeepItUnlessReplayIsAllowed(t *testing.T) {
+	partition := uint32(1)
+	for _, replay := range []bool{false, true} {
+		server := &storedOffsetServer{}
+		consumer, err := streamHandle(server, laser.Options{DefaultStream: "agents"}).
+			Topic("inferences").Consumer(context.Background(), "worker",
+			laser.ConsumerOptions{Partitions: []uint32{partition}, AllowReplay: replay})
+		if err != nil {
+			t.Fatalf("open the consumer: %v", err)
+		}
+
+		for _, offset := range []uint64{40, 30} {
+			if err := consumer.StoreOffset(context.Background(), offset, &partition); err != nil {
+				t.Fatalf("store offset %d: %v", offset, err)
+			}
+		}
+
+		want := []uint64{40}
+		if replay {
+			want = []uint64{40, 30}
+		}
+		server.guard.Lock()
+		sent := append([]uint64(nil), server.stores...)
+		server.guard.Unlock()
+		if len(sent) != len(want) || sent[len(sent)-1] != want[len(want)-1] {
+			t.Fatalf("replay %v: want %v sent, got %v", replay, want, sent)
+		}
+		if stored, known := consumer.LastStoredOffset(partition); !known || stored != want[len(want)-1] {
+			t.Fatalf("replay %v: want the last stored offset %d, got %d (%v)", replay, want[len(want)-1], stored, known)
+		}
+		if err := consumer.DeleteOffset(context.Background(), &partition); err != nil {
+			t.Fatalf("delete the offset: %v", err)
+		}
+		if _, known := consumer.LastStoredOffset(partition); known {
+			t.Fatalf("replay %v: a deleted offset is no stored offset", replay)
+		}
+		_ = consumer.Close(context.Background())
+	}
+}
+
+func TestGivenRetrySettingsNoConsumerCanRunUnderWhenOpeningThenShouldRefuseThem(t *testing.T) {
+	for name, options := range map[string]laser.ConsumerOptions{
+		"a negative polling retry interval": {Partitions: []uint32{0}, PollRetryInterval: -time.Second},
+		"retries without an interval":       {Partitions: []uint32{0}, InitRetries: 2},
+	} {
+		_, err := streamHandle(&consumerServer{}, laser.Options{DefaultStream: "agents"}).
+			Topic("inferences").Consumer(context.Background(), "worker", options)
+
+		var invalid *laser.InvalidError
+		if !errors.As(err, &invalid) {
+			t.Fatalf("%s: want an InvalidError, got %v", name, err)
+		}
 	}
 }
 

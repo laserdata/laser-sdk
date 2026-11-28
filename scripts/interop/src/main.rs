@@ -6,8 +6,8 @@
 //! be checking their own encoder against their own expectation.
 //!
 //! Usage:
-//!   laser-interop publish <connection> <stream> <topic>
-//!   laser-interop verify  <connection> <stream> <topic>
+//!   laser-interop publish <stream> <topic>
+//!   laser-interop verify  <stream> <topic>
 //!
 //! `publish` writes a record whose provenance headers carry a full spine, and
 //! whose body is a JSON mirror of the very same values. `verify` decodes the
@@ -40,21 +40,18 @@ const PARTITION: u32 = 0;
 #[tokio::main]
 async fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let [command, connection, stream, topic] = match arguments.as_slice() {
-        [command, connection, stream, topic] => {
-            [command.clone(), connection.clone(), stream.clone(), topic.clone()]
-        }
-        _ => {
-            eprintln!(
-                "usage: laser-interop <publish|verify> <connection> <stream> <topic>"
-            );
-            return ExitCode::FAILURE;
-        }
+    let [command, stream, topic] = arguments.as_slice() else {
+        eprintln!("usage: laser-interop <publish|verify> <stream> <topic>");
+        return ExitCode::FAILURE;
+    };
+    let Ok(connection) = std::env::var("LASER_CONNECTION_STRING") else {
+        eprintln!("LASER_CONNECTION_STRING is required");
+        return ExitCode::FAILURE;
     };
 
     let result = match command.as_str() {
-        "publish" => publish(&connection, &stream, &topic).await,
-        "verify" => verify(&connection, &stream, &topic).await,
+        "publish" => publish(&connection, stream, topic).await,
+        "verify" => verify(&connection, stream, topic).await,
         other => {
             eprintln!("unknown command {other}, want publish or verify");
             return ExitCode::FAILURE;

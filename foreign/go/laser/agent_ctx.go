@@ -52,10 +52,19 @@ func (agent *AgentCtx) RequestAt() wire.LogPosition {
 // costs nothing and a handler that only reads pays for nothing more.
 func (agent *AgentCtx) Session() *Session {
 	session := agent.runtime.sessions.Open(agent.message.Conversation(), "")
-	if agent.runtime.identity.IsZero() {
-		return session
+	session.control = agent.runtime.control
+	if !agent.runtime.identity.IsZero() {
+		session = session.As(agent.runtime.identity)
 	}
-	return session.As(agent.runtime.identity)
+	// An unresolved source would name stream 0 and topic 0, which are real ids.
+	if agent.message.Record != nil && agent.runtime.sourceResolved {
+		at := agent.RequestAt()
+		conversation := session.Conversation().String()
+		session = session.ActingOn(wire.SourceRef{Kind: wire.SourceMessage, Message: &wire.MessageSource{
+			Stream: at.StreamID, Topic: at.TopicID, Partition: at.PartitionID, Offset: at.Offset, Conversation: &conversation,
+		}})
+	}
+	return session
 }
 
 // PendingControl is the operator requests the runtime has observed for this
@@ -198,6 +207,10 @@ func (agent *AgentCtx) ApprovalGate(
 	// hand the record back.
 	if agent.approval.parksOn(agent.runtime.topic) {
 		return nil, agent.parkedGate(ctx, approver, prompt, timeout)
+	}
+	// The decision lands on the topic the loop reads, and the loop is held by this handler.
+	if err := agent.runtime.followReplies(ctx, agent.runtime.topic); err != nil {
+		return nil, err
 	}
 	interrupt := wire.CorrelationID{ID: wire.IDFromBytes(NewOperationID())}
 	ticket, err := agent.runtime.replies.Subscribe(interrupt, ExpectedReply{
@@ -389,13 +402,11 @@ func (agent *AgentCtx) Send(
 	return err
 }
 
-// Request sends a command from inside a handler and waits for its answer.
+// Request sends a command from inside a handler and waits for its answer on
+// options.ReplyTopic, or on topic when that is empty.
 //
-// The answer is matched by the loop that is already reading this agent's
-// topic, so a handler does not need a reader of its own. That only works when
-// the reply lands where the runtime reads: a request on another topic is
-// refused here rather than left to time out, and such a caller builds its own
-// Requester with its own reader.
+// The answer is read by a reader of its own, because the loop that reads this
+// agent's topic is the one waiting in this handler.
 func (agent *AgentCtx) Request(
 	ctx context.Context, topic string, payload []byte, options RequestOptions,
 ) (*AgdxMessage, error) {
@@ -403,22 +414,51 @@ func (agent *AgentCtx) Request(
 		return nil, &InvalidError{
 			Reason: "an agent that requests needs an identity, because the reply is addressed to it"}
 	}
-	if topic != agent.runtime.topic {
-		return nil, &InvalidError{
-			Reason: "a handler's request is answered by the loop reading " +
-				agent.runtime.topic + ", so it cannot await a reply on " + topic +
-				": open a Requester with its own reader for that"}
+	replyTopic := options.ReplyTopic
+	if replyTopic == "" {
+		replyTopic = topic
 	}
-	requester := agent.runtime.requester(topic)
+	if err := agent.runtime.followReplies(ctx, replyTopic); err != nil {
+		return nil, err
+	}
+	requester := agent.runtime.laser.RequesterOn(agent.runtime.stream, topic, agent.runtime.identity)
+	requester.hub = agent.runtime.replies
 	return requester.Request(ctx, agent.message.Conversation(), payload, options)
 }
 
-// requester opens a request surface whose waits are served by this runtime's
-// own hub, so the loop already reading the topic answers them.
-func (runtime *AgentRuntime) requester(topic string) *Requester {
-	requester := runtime.laser.RequesterOn(runtime.stream, topic, runtime.identity)
-	requester.hub = runtime.replies
-	return requester
+// followReplies starts a reader of topic that feeds this runtime's reply hub,
+// once per topic, so a wait made inside a handler is answered while the loop
+// is held by that handler.
+func (runtime *AgentRuntime) followReplies(ctx context.Context, topic string) error {
+	runtime.replyGuard.Lock()
+	defer runtime.replyGuard.Unlock()
+	if _, open := runtime.replyReaders[topic]; open {
+		return nil
+	}
+	client, partitions, err := replyTopicPartitions(ctx, runtime.laser, runtime.stream, topic)
+	if err != nil {
+		return err
+	}
+	pollCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	reader := &replyDispatcher{hub: runtime.replies, cancel: cancel, done: make(chan struct{})}
+	if runtime.replyReaders == nil {
+		runtime.replyReaders = map[string]*replyDispatcher{}
+	}
+	runtime.replyReaders[topic] = reader
+	go reader.run(pollCtx, client, runtime.stream, topic, partitions)
+	return nil
+}
+
+// stopReplyReaders ends the readers followReplies started.
+func (runtime *AgentRuntime) stopReplyReaders() {
+	runtime.replyGuard.Lock()
+	readers := runtime.replyReaders
+	runtime.replyReaders = nil
+	runtime.replyGuard.Unlock()
+	for _, reader := range readers {
+		reader.cancel()
+		<-reader.done
+	}
 }
 
 // SpawnSubconversation derives the provenance of a child conversation of the
@@ -582,8 +622,11 @@ func (agent *AgentCtx) FanOut(
 			"identity, because every branch names its author"}
 	}
 	if request.Registry == nil {
-		return nil, &InvalidError{Reason: "fanning out by skill needs a " +
-			"registry to resolve it against"}
+		shared, err := agent.runtime.laser.agentRegistry(ctx)
+		if err != nil {
+			return nil, err
+		}
+		request.Registry = shared
 	}
 	deadline := request.Deadline
 	if deadline <= 0 {
@@ -604,7 +647,7 @@ type FanOutRequest struct {
 	// Routing ranks the capable agents. It does not narrow them: a fan-out
 	// asks all of them.
 	Routing RoutePolicy
-	// Registry is where the capable agents are resolved from.
+	// Registry is where the capable agents are resolved from. Nil reads the connection's shared registry.
 	Registry *AgentRegistry
 	// Payload is the body every branch carries.
 	Payload []byte
@@ -635,8 +678,8 @@ func (agent *AgentCtx) gather(
 	defer wallClock.Stop()
 	// A best-effort branch must be stopped by this cancellation, not by its
 	// own reply-wait deadline: giving it the same duration races this timer
-	// against that one, and OS/scheduler jitter — not which fired "first" in
-	// code — decides the winner, so a losing branch reports itself as a
+	// against that one, and OS/scheduler jitter, not which fired "first" in
+	// code, decides the winner, so a losing branch reports itself as a
 	// failure instead of being cancelled here. Doubling it leaves
 	// cancellation as the only thing that can end a best-effort branch
 	// within this gather's own deadline. Every other policy relies on each
@@ -716,6 +759,10 @@ func (agent *AgentCtx) branch(
 	ctx context.Context, target wire.AgentID,
 	payload []byte, deadline time.Duration,
 ) (*AgdxMessage, error) {
+	// A branch's answer lands on the topic the loop reads, and the loop is held by this handler.
+	if err := agent.runtime.followReplies(ctx, agent.runtime.topic); err != nil {
+		return nil, err
+	}
 	child := agent.runtime.laser.SpawnSubconversation(
 		agent.message.Record.Provenance, agent.runtime.identity)
 	correlation := wire.CorrelationID{ID: wire.IDFromBytes(NewOperationID())}

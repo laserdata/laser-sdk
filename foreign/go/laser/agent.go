@@ -52,7 +52,7 @@ type AgentOptions struct {
 	// rather than mis-handled.
 	Understood uint64
 	// Dedup remembers handled operations. Nil opens a default window.
-	Dedup *Deduplicator
+	Dedup DedupStore
 	// Fence drops a stale holder's replay. Nil opens a default gate.
 	Fence *FenceGate
 	// Now reads the clock, for a test that needs to control it.
@@ -74,7 +74,7 @@ type AgentOptions struct {
 type Agent struct {
 	identity        wire.AgentID
 	understood      uint64
-	dedup           *Deduplicator
+	dedup           DedupStore
 	fence           *FenceGate
 	now             func() time.Time
 	acceptBroadcast bool
@@ -90,7 +90,7 @@ func (laser *Laser) Agent(identity wire.AgentID, options AgentOptions) *Agent {
 		now:             options.Now,
 		acceptBroadcast: true,
 	}
-	if agent.dedup == nil {
+	if window, isWindow := agent.dedup.(*Deduplicator); agent.dedup == nil || isWindow && window == nil {
 		agent.dedup = NewDeduplicator(DedupWindow)
 	}
 	if agent.fence == nil {
@@ -112,9 +112,11 @@ func (agent *Agent) Identity() wire.AgentID { return agent.identity }
 // high water directly.
 func (agent *Agent) Fence() *FenceGate { return agent.fence }
 
-// Dedup is the window this agent remembers, for a caller that wants to seed it
-// from its own store.
-func (agent *Agent) Dedup() *Deduplicator { return agent.dedup }
+// Dedup is the in-memory window this agent remembers, nil behind a caller-supplied store.
+func (agent *Agent) Dedup() *Deduplicator {
+	window, _ := agent.dedup.(*Deduplicator)
+	return window
+}
 
 // Understood is the must-understand feature set this build implements, which a
 // runtime checks a message against before it decodes anything else.
@@ -137,6 +139,23 @@ func (agent *Agent) AcceptsBroadcast() bool { return agent.acceptBroadcast }
 // have been handled: a record the fence or the deadline turned away must not
 // consume the slot its legitimate resend needs.
 func (agent *Agent) Decide(record *Record) Decision {
+	return agent.decide(context.Background(), record)
+}
+
+func (agent *Agent) decide(ctx context.Context, record *Record) Decision {
+	if decision := agent.beforeDedup(record); decision.Verdict != Deliver {
+		return decision
+	}
+	if key := DedupKey(record.Provenance); key != "" && !agent.dedup.Observe(ctx, key) {
+		return Decision{
+			Verdict: Skip,
+			Detail:  "the record's operation was already handled",
+		}
+	}
+	return Decision{Verdict: Deliver}
+}
+
+func (agent *Agent) beforeDedup(record *Record) Decision {
 	now := agent.now()
 
 	if !agent.fence.Accept(agent.task(record), agent.fenceOf(record), now) {
@@ -150,12 +169,6 @@ func (agent *Agent) Decide(record *Record) Decision {
 			Verdict: DeadLetter,
 			Reason:  wire.DeadLetterDeadlineExceeded,
 			Detail:  "the record passed its deadline before it was handled",
-		}
-	}
-	if !agent.dedup.Accept(DedupKey(record.Provenance)) {
-		return Decision{
-			Verdict: Skip,
-			Detail:  "the record's operation was already handled",
 		}
 	}
 	return Decision{Verdict: Deliver}
@@ -286,7 +299,7 @@ func (agent *Agent) Run(
 			}
 			return err
 		}
-		decision := agent.Decide(record)
+		decision := agent.decide(ctx, record)
 		if decision.Verdict != Deliver {
 			if onDecision != nil {
 				onDecision(record, decision)

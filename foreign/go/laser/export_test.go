@@ -35,6 +35,14 @@ func RuntimeAgentForTest(runtime *AgentRuntime) *Agent { return runtime.agent }
 // running a whole workflow to observe it indirectly.
 var CompensationRouteForTest = compensationRoute
 
+// SharedRegistriesForTest reports how many shared agent registries this handle's connection holds.
+func SharedRegistriesForTest(laser *Laser) int {
+	shared := laser.state()
+	shared.mutex.RLock()
+	defer shared.mutex.RUnlock()
+	return len(shared.registries)
+}
+
 // ReplyDispatchersForTest reports how many shared reply dispatchers this
 // handle's connection currently holds.
 func ReplyDispatchersForTest(laser *Laser) int {
@@ -78,7 +86,7 @@ var FoldParkedForTest = foldParked
 // ApprovalCorrelationForTest exposes approvalCorrelation to the external
 // test package, so an approval-parking test can build the decision the
 // runtime will recognize rather than guessing at a derived correlation.
-// Tests only; this file is never part of a real build.
+// Tests only. This file is never part of a real build.
 func ApprovalCorrelationForTest(at wire.LogPosition) wire.CorrelationID {
 	return approvalCorrelation(at)
 }

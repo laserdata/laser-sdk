@@ -82,7 +82,7 @@ func (runtime *AgentRuntime) warmUpDedup(ctx context.Context) error {
 // Ported from warm_dedup_window in sdk/src/agent/consumer.rs. Unlike Rust's
 // ReliableConsumer, which joins its own consumer group and so always knows
 // its name, Go's AgentRuntime is handed an already-open RecordSource and
-// never learns what group it came from -- this is why WarmDedup needs
+// never learns what group it came from. That is why WarmDedup needs
 // RuntimeOptions.Group named explicitly.
 func (runtime *AgentRuntime) warmDedupWindow(ctx context.Context) error {
 	topic := runtime.laser.Stream(runtime.stream).Topic(runtime.topic)
@@ -115,7 +115,10 @@ func (runtime *AgentRuntime) warmDedupWindow(ctx context.Context) error {
 	}
 	reader := iggcon.NewSingleConsumer(readerIdentifier)
 
-	depth := uint64(runtime.agent.dedup.limit)
+	depth := uint64(DedupWindow)
+	if window := runtime.agent.Dedup(); window != nil {
+		depth = uint64(window.limit)
+	}
 	var seeds []warmDedupSeed
 	for partition := range boundedPartitions(details.PartitionsCount) {
 		stored, err := client.GetConsumerOffset(ctx, group, streamID, topicID, &partition)
@@ -178,7 +181,7 @@ func (runtime *AgentRuntime) warmDedupWindow(ctx context.Context) error {
 	now := time.Now()
 	for _, seed := range seeds {
 		if warmDedupRefills(runtime.warmDedupPolicy, seed, expired, now) {
-			runtime.agent.dedup.Accept(seed.key)
+			runtime.agent.dedup.Observe(ctx, seed.key)
 		}
 	}
 	return nil

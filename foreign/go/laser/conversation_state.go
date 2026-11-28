@@ -2,6 +2,7 @@ package laser
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
@@ -75,6 +76,37 @@ func LoadConversationState[S any](
 		state = fold(state, message)
 	}
 	return state, nil
+}
+
+// LoadConversationStateWith replays through a snapshot store. The newest snapshot's
+// state, decoded as JSON, seeds the fold and only the records past it are read.
+// A conversation with no snapshot folds fully from initial.
+func LoadConversationStateWith[S any](
+	ctx context.Context, laser *Laser, store SnapshotStore, conversation wire.ConversationID,
+	topics []string, initial S, fold FoldFunc[S],
+) (S, error) {
+	if laser == nil || store == nil {
+		return initial, &InvalidError{Reason: "replaying through a snapshot needs a client and a store"}
+	}
+	snapshot, err := store.Latest(ctx, conversation)
+	if err != nil {
+		return initial, err
+	}
+	if snapshot == nil {
+		return LoadConversationState(ctx, laser, conversation, topics, FullReplay(), initial, fold)
+	}
+	if snapshot.Conversation != conversation {
+		return initial, &InvalidError{Reason: "snapshot conversation does not match the fold"}
+	}
+	checkpoint, err := CheckpointFromSnapshot(ctx, laser, *snapshot, topics)
+	if err != nil {
+		return initial, err
+	}
+	var seed S
+	if err := json.Unmarshal(snapshot.State, &seed); err != nil {
+		return initial, &CodecError{Reason: "decode snapshot state", Cause: err}
+	}
+	return LoadConversationState(ctx, laser, conversation, topics, ReplayAfter(checkpoint), seed, fold)
 }
 
 // replayMessages reads a conversation's history under the bound.

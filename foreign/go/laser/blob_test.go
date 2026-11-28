@@ -3,6 +3,7 @@ package laser_test
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"sync"
@@ -33,7 +34,7 @@ func (store *memoryBlobs) Put(
 		return "", store.failPut
 	}
 	digest := sha256.Sum256(payload)
-	reference := "blob://" + string(digest[:4])
+	reference := "blob://" + hex.EncodeToString(digest[:])
 	store.guard.Lock()
 	defer store.guard.Unlock()
 	store.blobs[reference] = append([]byte(nil), payload...)

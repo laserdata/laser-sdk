@@ -842,7 +842,7 @@ func TestGivenAKeyNamespaceWhenOpenedThenShouldDefaultAndBeOverridable(t *testin
 		t.Errorf("want the reserved namespace, got %q",
 			handle.KeyRegistry().Namespace())
 	}
-	if handle.KeyRegistryIn("tenant.keys").Namespace() != "tenant.keys" {
+	if handle.KeyRegistryIn("fleet.keys").Namespace() != "fleet.keys" {
 		t.Error("a deployment can put its keys somewhere else")
 	}
 }
@@ -924,6 +924,12 @@ func (store *keyStore) SendBinaryRequest(
 			return nil, err
 		}
 		body = envelope.Payload
+	} else if wire.IsBarrierRead(code) {
+		var read wire.ManagedReadEnvelope
+		if err := wire.Unmarshal(payload, &read); err != nil {
+			return nil, err
+		}
+		body = read.Read
 	}
 	outcome, failure := store.apply(code, body)
 	if failure != nil {

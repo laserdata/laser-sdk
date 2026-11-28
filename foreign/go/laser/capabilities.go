@@ -145,6 +145,16 @@ func OpenCapabilities() Capabilities {
 	return Capabilities{Query: QueryCaps{Consistency: wire.ConsistencyEventual}}
 }
 
+// IsOpenOnly reports a deployment that advertised nothing beyond the open SDK
+// surface, whatever its capability probe answered.
+func (caps Capabilities) IsOpenOnly() bool {
+	open := OpenCapabilities()
+	return !caps.Managed && caps.Query == open.Query && caps.Kv == open.Kv &&
+		!caps.Graph && !caps.Forks && !caps.A2AGateway && !caps.Sessions &&
+		!caps.Materializations && !caps.StreamTenancy && !caps.Watch && !caps.Authz &&
+		caps.Filters == open.Filters && caps.Versions == nil && len(caps.Backends) == 0
+}
+
 // ServesConsistency reports whether the query surface serves this level.
 // Because the levels form a ladder this is "level is at most what is served",
 // so eventual is always served. An unknown future level is treated as not
@@ -190,6 +200,7 @@ func (capabilities Capabilities) Ready() bool {
 	return len(capabilities.UnreadyBackends()) == 0
 }
 
+// ServesConsistency reports whether the deployment serves reads at level.
 func (capabilities Capabilities) ServesConsistency(level wire.Consistency) bool {
 	switch level {
 	case wire.ConsistencyEventual, wire.ConsistencyReadYourWrites:

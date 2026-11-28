@@ -1301,22 +1301,24 @@ GO_CAPABILITIES = {
 # Iggy capabilities above. They have no raw-client equivalent, so they sit in
 # their own table rather than as rows with an empty raw cell.
 GO_SURFACES = (
-    ("Key-value", "Laser.Kv: get, entry, conditional read, exists, set, compare-and-swap, expire, scan, delete-many, namespaces"),
-    ("Query", "Laser.Query: predicates, aggregates, grouping, ordering, paging, raw SQL, consistency and text gates"),
+    ("Key-value", "Laser.Kv: get, batched reads, conditional reads, session-linked writes, compare-and-swap, patch, copy, move, expiry, conversation scans and bulk deletion. Kv.PrepareRelease preserves the operation identity across release attempts. Kv.GetMany batches reads, Kv.Patch and Kv.PatchIfVersion apply a merge patch, Kv.CopyTo and Kv.MoveTo copy and move, Kv.Expire and Kv.ExpireAt return the version, Kv.InSession links writes to a session, and KvSetRequest.EncodeWith and KvSetRequest.Msgpack store what a codec encodes"),
+    ("Direct producer", "Topic.Producer builds a synchronous producer with per-call routing, split batches, commit confirmations, flush and close. Producer.Statistics reports delivery counts and latency. Managed reporting uses a dedicated observer connection.. Topic.PublishBatch validates every record before sending, with BatchPublishRequest.ExtendJSON, BatchPublishRequest.ExtendMsgpack and BatchPublishRequest.ExtendEncoded adding one record per value"),
+    ("Managed batches", "Laser.ExecuteBatch sends independent commands and returns one encoded reply for each command"),
+    ("Query", "Laser.Query: indexed exact matches, nested predicates, aggregates, windows, vector search, ordered paging, bounded row iteration, typed payload decoding, full collection, raw SQL, consistency and text gates. QueryRequest.Rows and QueryRequest.FetchAll read pages, laser.TypedQuery decodes payloads, laser.QueryRowsFromPage binds one page, and QueryRow.ValueText, QueryRow.ValueI64, QueryRow.ValueU64 and QueryRow.FieldIndex read a row"),
     ("Fork", "Laser.Fork: create, promote, squash, speculative rows, listing"),
-    ("Graph", "Laser.Graph: traversal, neighbours, upsert, link"),
-    ("Session reads", "Laser.Sessions: get, list, events, state, links, sources, changes, and Laser.ReadAt for the one record a source reference names, generation-checked either side of the poll"),
-    ("Session writes", "Laser.Sessions: create, start, begin, progress, complete, fail, each checked against the lane identity the handle was pinned to -- stream and topic generation and partition count -- so a handle retained across a recreated stream or topic refuses its writes as laser.StaleLaneError rather than appending to the replacement, and a fresh handle re-pins and writes on the recovered lane"),
+    ("Graph", "Laser.Graph: traversal, neighbours, upsert, link, Graph.Unlink, Graph.Relink and the Graph.Conversation lens"),
+    ("Session reads", "Laser.Sessions: get, list, events, state, links, sources, changes, and Laser.ReadAt for the one record a source reference names, generation-checked either side of the poll. Sessions.Watch follows the index and Session.Status reads one session's summary"),
+    ("Session writes", "Laser.Sessions: create, start, begin, progress, complete, fail, each checked against the lane identity the handle was pinned to, stream and topic generation and partition count, so a handle retained across a recreated stream or topic refuses its writes as laser.StaleLaneError rather than appending to the replacement, and a fresh handle re-pins and writes on the recovered lane. Session.Run ends a session by the outcome of its work and Session.Append adds one envelope. Session.Checkpoint, Session.TurnsAt and Session.TurnsSince read a session at and after a point, laser.SessionStateAt and laser.SessionReplay fold it, and Session.PendingControl and Session.CancelRequested read operator requests outside a handler"),
     ("Authorization", "Laser.Whoami and the role, binding and history verbs"),
-    ("Agent messaging", "Laser.Agdx: command, respond, emit, chunk, status, fail, and OpenAgdx"),
+    ("Agent messaging", "Laser.Agdx: command, respond, emit, chunk, status, fail, and OpenAgdx. Agdx.Stream opens a chunk stream writer with Write, Flush, Finish, Fail, Buffered, WithDeadline and WithTarget. Agdx.RequestInput and Agdx.RequestInputFrom ask for input outside a handler"),
     ("Agent gates", "Laser.Agent: expiry, must-understand, fence and dedup decisions"),
-    ("Registry and routing", "laser.NewAgentRegistry with To, Broadcast, ToCapable, AllCapable, Sticky, WithScorer, and the principal-bound laser.ToPrincipal and Router.WithPrincipal, resolved against the live presence AgentRegistry.RefreshPresence folds (PrincipalFor, InboxFor, InboxForPrincipal)"),
+    ("Registry and routing", "laser.NewAgentRegistry with To, Broadcast, ToCapable, AllCapable, Sticky, WithScorer, and the principal-bound laser.ToPrincipal and Router.WithPrincipal, resolved against the live presence AgentRegistry.RefreshPresence folds (PrincipalFor, InboxFor, InboxForPrincipal). Laser.Quarantine and Laser.Unquarantine, with Laser.QuarantineSigned and Laser.UnquarantineSigned, write registry facts, and a route naming a quarantined agent is refused with laser.QuarantinedError"),
     ("Request and reply", "laser.NewReplyHub: subscribe, deliver, await, acknowledge"),
-    ("Memory", "Laser.Memory: remember, forget, improve, plus laser.Rank and laser.ToContextBlock, laser.NewVectorMemory for in-process semantic recall over the laser.Embedder seam with reciprocal-rank fusion of the semantic, keyword and feedback signals, laser.Reranker and laser.Summarizer, and laser.WithMemory wrapping a handler to remember each turn"),
-    ("Context assembly", "laser.Assemble with LastN, RoleFilter, TokenBudget and Chain, and laser.LoadConversationState folding a conversation back into state under a full, last-n, after-checkpoint or up-to-checkpoint bound"),
-    ("Typed records", "laser.TypedJSON, laser.TypedCBOR and laser.TypedWith"),
-    ("Bridges", "bridges: the A2A task adapter (NewA2ABridge with Submit, SubmitTo, SubmitWithHops, SubmitIn, SubmitInTo, Task, Cancel, Card and the HandleRPC JSON-RPC dispatch, stateless over the log), A2ABridge.Handler serving it over HTTP behind the browser origin guard with a caller hook, WithTaskBinding scoping a task id to its caller, the MCP tool-call adapter (NewMCPBridge with CallTool, CallToolTo, CallToolWithHops, CallToolIn, CallToolInTo, Initialize, ListTools, ListResources, ReadResource, ListPrompts, GetPrompt and the HandleRPC JSON-RPC dispatch, a live bounded wait for the correlated reply rather than a replay), MCPBridge.Handler serving it over HTTP behind the same origin guard and the MCP-Protocol-Version header check, the AG-UI value mappings plus AgUiEvents reading a whole conversation and framing it into runs, and the bridge hop loop guard"),
-    ("Consumer filters", "Topic.Filters: filtered reads with page validation, acknowledgment through the safe offset, previews and record tests, and Topic.ConsumerGroup(name) for the group that owns a policy: Selector, Filters for the match-oriented reader, Consumer for a load-balanced member, and Filter for the group's own summary, revisions, preview, test, release and delete"),
+    ("Memory", "Laser.Memory: remember, forget, improve, plus laser.Rank and laser.ToContextBlock, Session.LinkedMemory for producer and origin attribution, laser.NewVectorMemory for in-process semantic recall over the laser.Embedder seam with reciprocal-rank fusion of the semantic, keyword and feedback signals, laser.Reranker and laser.Summarizer, and laser.WithMemory wrapping a handler to remember each turn. Memory.Set, Memory.Fetch, Memory.FetchFolded, Memory.Update and Memory.Remove keep named items. Laser.MemoryOnTopic and Laser.MemoryTopic open memory in a caller-named topic, Laser.MemoryWith and Laser.MemoryCustom pick the backend, and Memory.Search is keyword recall in scope"),
+    ("Context assembly", "laser.Assemble with LastN, RoleFilter, TokenBudget and Chain, and laser.LoadConversationState folding a conversation back into state under a full, last-n, after-checkpoint or up-to-checkpoint bound. laser.SelectionOf reports what a policy kept and dropped and laser.PolicyVersion the version a manifest records"),
+    ("Typed records", "laser.TypedJSON, laser.TypedCBOR, laser.TypedWith and laser.TypedSchema. laser.CompileSchema validates registered writer schemas. TypedTopic.PublishBatch sends encoded bodies as one batch. CompiledSchema.EncodeProtobuf encodes a body under a registered Protobuf schema"),
+    ("Bridges", "bridges: the A2A task adapter (NewA2ABridge with SignedCard, Submit, SubmitTo, SubmitWithHops, SubmitIn, SubmitInTo, Task, Cancel, Card and the HandleRPC JSON-RPC dispatch, stateless over the log), A2ABridge.Handler serving it over HTTP behind the browser origin guard with a caller hook, WithTaskBinding scoping a task id to its caller, the MCP tool-call adapter (NewMCPBridge with CallTool, CallToolTo, CallToolWithHops, CallToolIn, CallToolInTo, Initialize, ListTools, ListResources, ReadResource, ListPrompts, GetPrompt and the HandleRPC JSON-RPC dispatch, a live bounded wait for the correlated reply rather than a replay), MCPBridge.Handler serving it over HTTP behind the same origin guard and the MCP-Protocol-Version header check, the AG-UI value mappings plus AgUiEvents reading a whole conversation and framing it into runs, and the bridge hop loop guard"),
+    ("Consumer filters", "Topic.Filters: filtered reads with page validation, acknowledgment through the safe offset, previews and record tests, and Topic.Group(name) for the group that owns a policy: Selector, Filters for the match-oriented reader, OpenReader for a member that reads under its assignment with WaitForRecords and AckRecord, Consumer for a load-balanced member, and Filter for the group's own summary, revisions, preview, test, release and delete. ConsumerGroup.OpenReaderWith takes partitions, page bounds and a local guard, and GroupReader.NextPage, GroupReader.TryNextPage, GroupReader.NextRecord and GroupReader.ReadRound walk the whole assignment"),
     ("Filter catalog", "Laser.FilterCatalog: register, revise, describe, pause, archive, drop, bind, unbind, release, configure a group, and read filters, revisions, bindings and operation outcomes"),
     ("Retry schedule", "laser.Backoff and the shared schedule pinned to sdk/tests/fixtures/retry-table.json, driving the managed read walk and the mutation repeat: a mutation whose outcome is unknown goes again under its identity on bounded attempts until ManagedDeadline, then reports AmbiguousMutationError"),
     ("Action governance", "Laser.WithGovernor: the pre-effect hook over publishes, AGDX verbs, requests and memory writes, observe and enforce modes, chained policy evidence on the audit topic, laser.QuorumGovernor, and laser.SwappableGovernor for a policy replaced while the client runs, binding from the next decision on"),
@@ -1326,13 +1328,13 @@ GO_SURFACES = (
     ("Control commands", "Laser.PublishControl, PublishControlIn and PublishControlAs over the control band, with the stream scoping and operation identity every registry write carries"),
     ("Projections", "Laser.Projections: register, register a graph, drop, read, read status, and the filterable listing, plus Laser.Bindings apply and remove"),
     ("Schema registry", "Laser.Schemas: register, drop, read, list and server-side decode of the writer schemas a schema-first payload is stamped with"),
-    ("Fold snapshots", "laser.SnapshotStore with the managed and log-native backends, and wire.XXHash32 partition routing pinned against the Rust client"),
-    ("Context scope", "Laser.Context: bounded reads by turns and tokens, checkpoints and resumed reads, laser.State folding, and the conversation-scoped memory"),
+    ("Fold snapshots", "laser.SnapshotStore with the managed and log-native backends, and wire.XXHash32 partition routing pinned against the Rust client. laser.StateWith and laser.LoadConversationStateWith seed a fold from a snapshot, with laser.SnapshotFromCheckpoint, laser.CheckpointFromSnapshot and laser.ResumeOffsets"),
+    ("Context scope", "Laser.Context: bounded reads by turns and tokens, checkpoints and resumed reads, laser.State folding, and the conversation-scoped memory, and ContextScope.AcrossSubconversations for a conversation with its subconversations"),
     ("Claim checks", "laser.BlobStore with CheckIn, ResolveBody and AgdxSend.ClaimCheck, digest-verified on the way back"),
     ("Local state", "laser.InMemoryStore and laser.FileStore: hex-encoded keys, owner-only permissions and atomic staged writes"),
     ("Swarm and recovery", "laser.SwarmActivity folding policy evidence per agent, and laser.CrashContext with its deterministic summary"),
     ("Edge authorization", "laser.AuthorizeEdge: strict audience then scope, with the escaped step-up challenge"),
-    ("Agent topology", "Laser.Bootstrap with per-topic retention, Laser.RefreshCapabilities, Laser.WaitUntilReady and Laser.ConnectionEvents"),
+    ("Agent topology", "Laser.Bootstrap with per-topic retention, Laser.RefreshCapabilities, Laser.WaitUntilReady and Laser.ConnectionEvents. Laser.OpsStream, Laser.ControlTopic, Laser.DLQTopic and Laser.ChangesTopic name the ops topology, which Laser.WithOpsStream and its peers override"),
     ("Agent sends and replays", "Laser.SendAgent, SpawnSubconversation, RedriveDeadLetter with position re-keying, ReassembleChannel, laser.ChunkAssembler and Laser.Consumed"),
     ("Change feed", "Laser.Watch: index narrowing, start at the end, missed and skipped accounting, the version stop, resumable offsets and a bounded wait"),
     ("Publish recovery", "laser.PublishOptions and Laser.WithPublishOptions: the shared attempt timeout, retry count and jittered backoff, with the connection cleaned up after a stall"),
@@ -1351,12 +1353,16 @@ GO_SURFACES = (
     ("Server administration", "Laser.Users and User.Get, Exists, Create, Update, SetPermissions, ChangePassword and Delete, Laser.PersonalAccessTokens with Create and Delete, and Laser.Ping, Stats, Me, Clients, ClientInfo, Cluster, Snapshot and DescribeOptions"),
     ("Agent runtime", "laser.AgentRuntime: one reliable loop over an agent's records, with the gate order, dead-letter on an undecodable spine, retry, panic recovery and a shutdown grace, plus laser.AgentCtx for replying, sending, requesting, spawning a subconversation and fanning out to every capable agent under a GatherPolicy of all, quorum or best effort. ConcurrencyPolicy picks serial or serial-per-partition lanes, WarmDedupPolicy refills the dedup window at startup from dead letters, unexpired copies or everything, and RuntimeOptions.Verifier/SigningKey gate incoming work on a signature and sign the agent's own answers"),
     ("Connection discovery", "Laser.ClientMetadata: the paged client-metadata read with its metadata-only, principal, limit and cursor filters, Page for one page and All walking every node, refusing a cursor that does not advance"),
-    ("Agent lifecycle", "Laser.SpawnAgent and laser.AgentHandle: one call joins the consumer group and starts the loop, with ready, shutdown, join and abort, the capability card and live presence refreshed and withdrawn with the agent, a governor scoped to this agent alone, and a background memory-consolidation tick. Laser.AdvertisePresence, ClearPresence and PublishCard serve an agent not spawned through it, one identity per connection"),
+    ("Agent lifecycle", "Laser.SpawnAgent and laser.AgentHandle: one call joins the consumer group and starts the loop, with ready, shutdown, join and abort, the capability card and live presence refreshed and withdrawn with the agent, a governor scoped to this agent alone, and a background memory-consolidation tick. Laser.AdvertisePresence, ClearPresence and PublishCard serve an agent not spawned through it, one identity per connection. A spawn that names no topic reads the session lane or the agent's declared topic, and RuntimeOptions.MaxQueuedRecords and RuntimeOptions.MaxQueuedBytes bound what a per-partition runtime queues"),
     ("Directed contracts", "Laser.Contract: the directed-task state machine reporting completed, failed, not-consumed or timed-out, with expiry, deadline, fence, correlation, idempotency key, resume-from positions, exclusions, a parent session, a verifier holding the wait open until the resolved target's own signature checks out, laser.AdvertisedInbox and FixedInbox addressing, ReplyOn awaiting the answer on another topic, and one shared reply dispatcher per stream and reply topic that concurrent waiters read through"),
     ("Scatter", "Laser.Scatter and ScatterReport: one contract per agent advertising a skill, gathered under a GatherPolicy, every branch's outcome attributed to its agent, per-branch signature verification against that branch's own target, and an inbox route sending each branch to that agent's own topic"),
     ("Workflows", "Laser.Workflow: a journalled directed-acyclic run of declared steps over contracts and scatter, with step-local work, budgets, replay and resume off the journal, saga compensation, exclusive fenced steps backed by a Kv lease with reassign-on-timeout, Workflow.Start with laser.RunStep for the plain-code form, an inbox route addressing each step to the agent's own topic while replies stay on the workflow's, and a session lease held for the life of the run and given up by Finish or Release"),
-    ("Key-value leases", "Kv.Lease, TryLease, RenewLease, ReleaseLease and LeaseGuard over the fenced-lease verbs, with Kv.CasFenced writing only under a held token"),
+    ("Key-value leases", "Kv.Lease, TryLease, RenewLease, ReleaseLease and LeaseGuard over the fenced-lease verbs, with Kv.CasFenced writing only under a held token. laser.FencedLeaseClient prepares and executes acquire, renew, release, fenced compare-and-swap and the barriered get over a ManagedKvTransport, and laser.NewDedicatedFencedLeaseClient runs it on its own connection"),
     ("Client encryption", "laser.AES256GCM on Topic.WithEncryption and ConsumerOptions.Encryption: Apache Iggy's AES-256-GCM record format sealing each payload and user-header block, refusing any key that is not 32 bytes and reporting a ciphertext it cannot open as Apache Iggy error 72, with the ciphertexts the Rust and Node clients sealed pinned as vectors"),
+    ("Consumer bookkeeping", "Consumer.LastConsumedOffset and Consumer.LastStoredOffset, with ConsumerOptions.PollRetryInterval, ConsumerOptions.InitRetries and ConsumerOptions.AllowReplay"),
+    ("Connection", "laser.ConnectWith with Options.Address, Options.Username and Options.Password for credentials apart from a connection string, Laser.SendCommand and Laser.SendCommandToReplica for a raw server command, and Capabilities.IsOpenOnly"),
+    ("Error predicates", "laser.IsNotFound, laser.IsStreamOrTopicNotFound, laser.IsPermissionDenied, laser.IsUnavailable, laser.IsNotLeader, laser.IsStale, laser.IsVersionConflict, laser.IsVersionSkew, laser.IsLeaseLost, laser.IsFenceViolation and laser.IsQuarantined classify a failure from any surface"),
+    ("Handler testing", "lasertest.AgentMessage, lasertest.AgentCtx and lasertest.NewTestClock build what a handler receives for a unit test"),
 )
 
 OMISSION_CAPABILITIES = {
@@ -1912,6 +1918,30 @@ def is_plain_accessor(row):
     return row.receiver and not row.params and not row.is_async and bool(PLAIN_RETURN.match(row.returned or "()"))
 
 
+GO_SYMBOL = r"\b(?:[A-Z]\w*|laser|wire|bridges|lasertest)\.[A-Z]\w*\b"
+
+
+def go_capability_symbols():
+    """Index the public declarations named by the Go capability table."""
+    symbols = set()
+    for package, directory in (("laser", "laser"), ("bridges", "bridges"), ("wire", "wire"), ("lasertest", "laser/lasertest")):
+        for path in (ROOT / "foreign/go" / directory).glob("*.go"):
+            if path.name.endswith("_test.go"):
+                continue
+            source = path.read_text()
+            for receiver, name in re.findall(r"(?m)^func \(\w+ \*?(\w+)(?:\[[^\]]*\])?\) ([A-Z]\w*)\(", source):
+                symbols.add(f"{receiver}.{name}")
+            for name in re.findall(r"(?m)^(?:func|type|var|const) ([A-Z]\w*)", source):
+                symbols.add(f"{package}.{name}")
+            for block in re.findall(r"(?ms)^const \(\n(.*?)^\)", source):
+                for name in re.findall(r"(?m)^\s*([A-Z]\w*)\b", block):
+                    symbols.add(f"{package}.{name}")
+            for owner, fields in re.findall(r"(?ms)^type (\w+) struct \{\n(.*?)^\}", source):
+                for name in re.findall(r"(?m)^\s*([A-Z]\w*)\s+", fields):
+                    symbols.add(f"{owner}.{name}")
+    return symbols
+
+
 def go_capability_problems():
     """Every capability must state where the Go client stands on it."""
     keys = {key for key, *_ in CAPABILITIES}
@@ -1921,6 +1951,17 @@ def go_capability_problems():
         problems.append(f"capability `{key}` does not say where the Go client stands on it")
     for key in sorted(stated - keys):
         problems.append(f"the Go table names `{key}`, which is not a capability")
+    symbols = go_capability_symbols()
+    for key, cell in GO_CAPABILITIES.items():
+        if cell == MISSING:
+            continue
+        for symbol in re.findall(GO_SYMBOL, cell):
+            if symbol not in symbols:
+                problems.append(f"Go capability `{key}` names missing declaration `{symbol}`")
+    for area, text in GO_SURFACES:
+        for symbol in re.findall(GO_SYMBOL, text):
+            if symbol not in symbols:
+                problems.append(f"Go surface `{area}` names missing declaration `{symbol}`")
     return problems
 
 
@@ -1933,7 +1974,7 @@ def render(matrix):
         "",
         "A peer may differ from the Rust spelling only for one of the reasons below. Any other difference is a gap. A MISSING cell names where the capability lives today when the peer has it under another name or shape.",
         "",
-        "The Go client under `foreign/go/` is in progress, so it has its own section under Capabilities rather than a fourth column in the tables below. It ports the wire contract in full, and its SDK surface is partial: a fourth column would put a Go gap through the three-way comparison that gates the clients that ship, reading it as a gap in all of them. `foreign/go/wire/parity_test.go` asserts that every public type of `wire/src` has a Go peer, and the Go capability table below says where the client stands on each raw capability.",
+        "The Go client under `foreign/go/` has its own section under Capabilities rather than a fourth column in the tables below. It ports the wire contract in full, and a fourth column would put a Go gap through the three-way comparison that gates the other clients, reading it as a gap in all of them. `foreign/go/wire/parity_test.go` asserts that every public type of `wire/src` has a Go peer, and the Go capability table below says where the client stands on each raw capability.",
         "",
         "| Note | Reason |",
         "| --- | --- |",
@@ -1965,7 +2006,7 @@ def render(matrix):
         "",
         "### The Go client",
         "",
-        f"The Go client under `foreign/go/` is in progress, so it is listed separately rather than as a fourth column above: it serves {served} of the {len(GO_CAPABILITIES)} raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the three clients that ship. It joins that comparison when its surface is complete.",
+        f"The Go client under `foreign/go/` is listed separately rather than as a fourth column above. It serves {served} of the {len(GO_CAPABILITIES)} raw capabilities, and putting MISSING through the three-way comparison would read a Go gap as a gap in the other three clients.",
         "The two it does not serve are blocked rather than unwritten. `producer.idempotent` and `producer.sharding` are the Rust client's passthrough to the Apache Iggy Rust SDK's high-level producer: the Go SDK exposes neither the producer-id protocol nor a background sharded sender, so there is nothing to pass through, and a batcher of this client's own would be a different feature wearing the same row. `producer.idempotent` and `producer.sharding` are the two, and the Go client serves the rest, including both the A2A and MCP bridges served over HTTP.",
         "",
         "A capability it does not wrap is still reachable: `Laser.Client` hands out the underlying Apache Iggy client, exactly as `Laser::client` does in Rust.",

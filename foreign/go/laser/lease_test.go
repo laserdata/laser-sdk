@@ -370,7 +370,7 @@ func TestGivenNoStreamOrAgentWhenLeasingThenShouldRefuseTheLease(t *testing.T) {
 	streamless := streamHandle(server, laser.Options{})
 	_, noStream := streamless.LeaseSession(
 		context.Background(), conversation(1), agentID(t, "planner"), leaseTick)
-	if noStream == nil || !strings.Contains(noStream.Error(), "no stream selected") {
+	if noStream == nil || !strings.Contains(noStream.Error(), "no default stream set") {
 		t.Fatalf("got %v, want the missing stream named", noStream)
 	}
 	handle := leaseHandle(server)

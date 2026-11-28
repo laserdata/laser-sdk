@@ -437,5 +437,5 @@ func (bridge *MCPBridge) sendToolCallOn(
 	if _, err := send.Send(ctx); err != nil {
 		return nil, err
 	}
-	return bridge.awaitReply(ctx, conversation, correlation, deadline)
+	return bridge.awaitReply(ctx, correlation, deadline)
 }

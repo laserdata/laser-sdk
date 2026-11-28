@@ -15,10 +15,12 @@ package laser_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/laserdata/laser-sdk/foreign/go/laser"
+	"github.com/laserdata/laser-sdk/foreign/go/wire"
 )
 
 // liveGroupTopic is a topic with partitions enough to split across members.
@@ -357,5 +359,114 @@ func TestGivenARecreatedGroupWhenReadLiveThenShouldCarryAnotherIdentity(t *testi
 		after.Identity.TopicID != before.Identity.TopicID {
 		t.Errorf("the stream and topic changed under a recreated group: %+v then %+v",
 			before.Identity, after.Identity)
+	}
+}
+
+func TestGivenAManagedGroupWhenHandlersAndMarksFinishThenShouldCommitOnlyProcessedRecords(t *testing.T) {
+	client := dialLive(t)
+	if !client.Capabilities().Filters.GroupPolicyReads {
+		t.Skip("requires group-aware reads")
+	}
+	ctx := liveContext(t)
+	scratch := liveScratch(t, client, ctx, "laser-policy-commit")
+	topic := scratch.Laser().Topic("events")
+	if err := topic.Ensure(ctx, 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{"first", "second"} {
+		if _, err := topic.Publish().Payload([]byte(body)).Send(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	failed, err := topic.Group("failed").Consumer(ctx, laser.ConsumerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := errors.New("handler failed")
+	if err := failed.Each(ctx, func(context.Context, *laser.Record) error { return stop }); !errors.Is(err, stop) {
+		t.Fatalf("handler error = %v", err)
+	}
+	if err := failed.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := failed.StoredOffset(ctx, 0)
+	if err != nil || stored != nil {
+		t.Fatalf("failed handler stored offset %v, error %v", stored, err)
+	}
+
+	each := iggcon.AutoCommit{After: iggcon.CommitAfterMarked, Every: iggcon.CommitEvery{Kind: iggcon.CommitEveryMessage}}
+	marked, err := topic.Group("marked").Consumer(ctx, laser.ConsumerOptions{AutoCommit: &each})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := marked.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := marked.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := marked.Mark(second.Checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = marked.StoredOffset(ctx, 0)
+	if err != nil || stored != nil {
+		t.Fatalf("out-of-order mark advanced to %v, error %v", stored, err)
+	}
+	if err := marked.Mark(first.Checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := marked.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = marked.StoredOffset(ctx, 0)
+	if err != nil || stored == nil || stored.Offset != second.Offset() {
+		t.Fatalf("completed prefix offset %v, error %v", stored, err)
+	}
+}
+
+func TestGivenAManagedConsumerWhenSkippingAStoppedRecordThenShouldResumeAfterIt(t *testing.T) {
+	client := dialLive(t)
+	if !client.Capabilities().Filters.Catalog {
+		t.Skip("requires the filter catalog")
+	}
+	ctx := liveContext(t)
+	scratch := liveScratch(t, client, ctx, "laser-consumer-skip")
+	topic := scratch.Laser().Topic("events")
+	if err := topic.Ensure(ctx, 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := topic.PublishBatch().AddRawBytes([]byte("{"), wire.ContentJSON).AddJSON(map[string]bool{"alert": true}).Send(ctx); err != nil {
+		t.Fatal(err)
+	}
+	group := topic.Group("alerts")
+	filter := wire.NewConsumerFilter(wire.ExprPredicate("alert", wire.CmpEq, wire.BooleanTyped(true)), wire.CodecJSON)
+	if _, err := group.Create().Filter("alert", filter).Build(ctx); err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := group.Consumer(ctx, laser.ConsumerOptions{ManualCommit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer consumer.Close(ctx)
+	_, err = consumer.Next(ctx)
+	var fault *laser.FilterFaultError
+	if !errors.As(err, &fault) || fault.Offset != 0 || fault.PartitionID != 0 {
+		t.Fatalf("expected a fault at offset zero, got %v", err)
+	}
+	if err := consumer.Skip(ctx, 0, 1); err == nil {
+		t.Fatal("skipped another offset")
+	}
+	if err := consumer.Skip(ctx, fault.PartitionID, fault.Offset); err != nil {
+		t.Fatal(err)
+	}
+	record, err := consumer.Next(ctx)
+	if err != nil || record.Offset() != 1 {
+		t.Fatalf("next = %v, %v", record, err)
+	}
+	if err := consumer.Commit(ctx, record.Checkpoint); err != nil {
+		t.Fatal(err)
 	}
 }

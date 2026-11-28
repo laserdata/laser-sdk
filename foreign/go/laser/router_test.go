@@ -100,8 +100,9 @@ func TestGivenAQuarantinedAgentWhenRoutedThenShouldBeRefusedBothWays(t *testing.
 		t.Error("a quarantined agent must not be a candidate")
 	}
 	_, err := laser.To(agentID(t, "planner")).ResolveTargets(registry, now)
-	if err == nil {
-		t.Error("a route naming a quarantined agent must be refused")
+	var quarantined *laser.QuarantinedError
+	if !errors.As(err, &quarantined) || quarantined.Agent != agentID(t, "planner") || !laser.IsQuarantined(err) {
+		t.Errorf("a route naming a quarantined agent must be refused as quarantined, got %v", err)
 	}
 
 	// Lifting it puts the agent back in rotation.
@@ -373,9 +374,9 @@ func cardRecord(
 		}
 		send = agdx.Status(wire.OperationCard).Body(body)
 	default:
-		send = agdx.Quarantine(time.Now().Add(time.Hour), []byte("{}"))
+		send = agdx.Quarantine(time.Now().Add(time.Hour), []byte(author))
 		if operation == wire.OperationUnquarantine {
-			send = agdx.Unquarantine(time.Now().Add(time.Hour), []byte("{}"))
+			send = agdx.Unquarantine(time.Now().Add(time.Hour), []byte(author))
 		}
 	}
 	if _, err := send.Send(context.Background()); err != nil {
@@ -498,7 +499,7 @@ func TestGivenALapsedQuarantineWhenFoldedThenShouldNotApplyIt(t *testing.T) {
 	agdx := streamHandle(server, laser.Options{DefaultStream: "agents"}).
 		Agdx(agentID(t, "planner"), conversation(1))
 	// A quarantine that expired an hour before the record was folded.
-	if _, err := agdx.Quarantine(now.Add(-time.Hour), []byte("{}")).
+	if _, err := agdx.Quarantine(now.Add(-time.Hour), []byte("planner")).
 		Send(context.Background()); err != nil {
 		t.Fatalf("publish: %v", err)
 	}

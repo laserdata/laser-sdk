@@ -1,277 +1,23 @@
 # LaserData - Laser SDK
 
-Laser SDK provides streaming, queries, key-value state, forks, graphs, agent memory, durable workflows, and agent coordination through one client over [Apache Iggy](https://iggy.apache.org). [LaserData, Inc.](https://laserdata.com) maintains the SDK. Rust ([`laser-sdk` on crates.io](https://crates.io/crates/laser-sdk)) defines the reference behavior. Python ([`laser-sdk` on PyPI](https://pypi.org/project/laser-sdk/), [source](foreign/python/README.md)) calls the Rust implementation. TypeScript ([`@laserdata/laser-sdk` on npm](https://www.npmjs.com/package/@laserdata/laser-sdk), [source](foreign/typescript/README.md)) is a native Node client.
+Laser SDK provides streaming, queries, key-value state, forks, graphs, agent memory, durable workflows, and agent coordination through one client over [Apache Iggy](https://iggy.apache.org). [LaserData, Inc.](https://laserdata.com) maintains the SDK. Rust ([`laser-sdk` on crates.io](https://crates.io/crates/laser-sdk)) defines the reference behavior. Python ([`laser-sdk` on PyPI](https://pypi.org/project/laser-sdk/), [source](foreign/python/README.md)) calls the Rust implementation. TypeScript ([`@laserdata/laser-sdk` on npm](https://www.npmjs.com/package/@laserdata/laser-sdk), [source](foreign/typescript/README.md)) is a native Node client. The [Go client](foreign/go/README.md) uses the Apache Iggy Go SDK over TCP.
 
-## Two complete programs
+## One grammar, every primitive
 
-Each program below runs as written and reads the connection string from `LASER_CONNECTION_STRING`. The workflow runs on the stream named by `LASER_STREAM`, or on a stream named after the workflow. It creates that stream when it is missing and keeps it after the run, so the run can be resumed. The memory program works in a scratch stream with a unique name and deletes the stream when it ends, so a second run prints the same. With `LASER_CONNECTION_STRING` set, a program needs no Docker and no local server. Then there is no server to start. A LaserData API key is not a connection string. Only without the variable, copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it.
+An accessor selects a feature on the connected client. A method performs an action on that feature. The calls follow this form: `object.verb(input).await`. The Go programs in the table use the same primitives through the Go client.
 
-- TypeScript: `npm install @laserdata/laser-sdk tsx`, Node 22.14 or later. Save a program as `main.mts` and run it with `npx tsx main.mts`.
-- Rust: `cargo add laser-sdk`, `cargo add tokio --features macros,rt-multi-thread,time`, `cargo add serde_json`, and `cargo add serde --features derive` for the memory program.
-- Python: `python -m pip install laser-sdk`, Python 3.10 or later. `python -c "import laser_sdk; print(laser_sdk.__doc__)"` then prints the package's own summary of the calls below.
-
-To keep what the memory program writes, use a named stream instead of the scratch stream: set `LASER_STREAM`, pass it when connecting (`Laser.connect_env(stream=name)` in Python, `Laser.connectEnvWithStream(name)` in TypeScript, `Laser::connect_env_with_stream(name)` in Rust), or call `with_default_stream(name)` (`withDefaultStream` in TypeScript). A workflow run and the first memory write create a missing stream. The guides are at [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk) and on [Context7](https://context7.com/laserdata/laser-sdk).
-
-### A three-step workflow
-
-A workflow is a function, and each step is a function it calls in ordinary code: `@ls.step` and `@ls.workflow` in Python, `step` and `workflow` in TypeScript, `run_with` and `run.step` in Rust. The steps run in this process, and `analyze` waits one second before it returns. A step takes and returns what JSON holds. Each completed step is journaled, so a resumed run returns the recorded value without running that step again, and it must call the same steps in the same order. A step name holding `#` is refused, because the journal numbers repeated calls with it. The run creates its own stream and topics, so the program needs no `bootstrap`, agent, or handler. For steps routed to agents, verifiers, compensation and budgets, use the builder, `Laser.workflow(name).step(...)`, with `step_local` in Rust and `stepLocal` in TypeScript for its in-process steps.
-
-TypeScript
-
-```ts
-// npm install @laserdata/laser-sdk tsx
-// Run with: npx tsx main.mts
-// Needs only LASER_CONNECTION_STRING. No server to start when it is set.
-import { setTimeout as sleep } from "node:timers/promises"
-import { step, workflow } from "@laserdata/laser-sdk"
-
-const ingest = step("ingest", () => "frames from sat-7")
-const analyze = step("analyze", async (frames: string) => {
-  await sleep(1000)
-  return `analyzed ${frames}`
-})
-const report = step("report", (analysis: string) => `report on ${analysis}`)
-
-const pipeline = workflow("pipeline", async () => report(await analyze(await ingest())))
-
-const run = await pipeline.run()
-console.log(JSON.stringify({ status: run.status, steps: run.completedSteps, report: run.value }))
-```
-
-Rust
-
-```rust,no_run
-// cargo add laser-sdk
-// cargo add tokio --features macros,rt-multi-thread,time
-// cargo add serde_json
-// Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
-use laser_sdk::prelude::*;
-use std::time::Duration;
-
-#[tokio::main]
-async fn main() -> Result<(), LaserError> {
-    let laser = Laser::connect_env().await?;
-    let run = laser
-        .workflow("pipeline")
-        .run_with(async |run| {
-            let frames: String = run
-                .step("ingest", async || Ok("frames from sat-7".to_owned()))
-                .await?;
-            let analysis: String = run
-                .step("analyze", async || {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    Ok(format!("analyzed {frames}"))
-                })
-                .await?;
-            run.step("report", async || Ok(format!("report on {analysis}")))
-                .await
-        })
-        .await?;
-    let report = serde_json::json!({
-        "status": run.status,
-        "steps": run.completed_steps,
-        "report": run.json::<String>("report")?,
-    });
-    println!("{report}");
-    laser.close().await
-}
-```
-
-Python
-
-```python
-# python -m pip install laser-sdk
-# Needs only LASER_CONNECTION_STRING. No server to start when it is set.
-import json
-import time
-
-import laser_sdk as ls
-
-
-@ls.step
-def ingest():
-    return "frames from sat-7"
-
-
-@ls.step
-def analyze(frames):
-    time.sleep(1)
-    return f"analyzed {frames}"
-
-
-@ls.step
-def report(analysis):
-    return f"report on {analysis}"
-
-
-@ls.workflow
-def pipeline():
-    return report(analyze(ingest()))
-
-
-run = pipeline.run()
-print(json.dumps({"status": run.status, "steps": run.completed_steps, "report": run.value}))
-```
-
-Each program prints the run as JSON with `status` `completed`, `steps` `["ingest", "analyze", "report"]`, and `report` `report on analyzed frames from sat-7`. Rust's `serde_json::json!` sorts the keys. The `WorkflowOutcome` also carries `run_id`, `value` (what the workflow returned, as JSON bytes in Rust), `outputs`, each step's output by label as bytes, `json(label)`, and `text(label)`. Resume a stopped run with `pipeline.resume(run_id)` in Python, `pipeline.resume(runId)` in TypeScript, and `laser.workflow(name).run_id(id).run_with(...)` in Rust. A step that fails ends the run as failed and its error reaches the caller unchanged, with no outcome to read the run ID from, so a caller that wants to resume a failed run names the run ID first with `resume(id)` (`run_id(id)` in Rust). The completed steps stay journaled, so that resume runs the failed step and what follows it.
-
-### A memory correction
-
-A first conversation stores three facts about the user `user-42`. A later conversation corrects the city with `supersede`, which remembers the new fact first and then forgets the old one in every conversation. A recall for the user reads every conversation and returns a list of `MemoryItem`, ranked by the words each fact shares with the query, newest first among equals, and drops none. It waits for the writes this connection made, so the correction shows at once. On LaserData Cloud and Laser Stack recall reads the managed memory view. Apache Iggy serves no view, so there recall folds the memory topic in process, and the same program runs on every server.
-
-TypeScript
-
-```ts
-// npm install @laserdata/laser-sdk tsx
-// Run with: npx tsx main.mts
-// Needs only LASER_CONNECTION_STRING, which connectEnv() reads. No server to start when it is set.
-import { ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
-
-const user = "user-42"
-const query = "Where does the user live, and what should I know before booking dinner?"
-
-await using root = await Laser.connectEnv()
-await using scratch = await root.scratchStream("memory")
-const memory = scratch.laser.memory("assistant")
-
-// Conversation 1: the user shares three facts.
-const first = ConversationId.new()
-const city = await memory.remember("Lives in Gdansk").scope(first).user(user).send()
-await memory.remember("Allergic to peanuts").scope(first).user(user).send()
-await memory.remember("Prefers a window seat").scope(first).user(user).send()
-
-// Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
-const second = ConversationId.new()
-await memory.supersede(city, "Lives in Lisbon").scope(second).user(user).send()
-
-// Recall for the user across every conversation.
-const facts = await memory.recall().user(user).semantic(query).limit(10).fetch()
-console.log(JSON.stringify({ user, query, facts: facts.map(memoryItemText) }, null, 2))
-```
-
-Rust
-
-```rust,no_run
-// cargo add laser-sdk
-// cargo add tokio --features macros,rt-multi-thread
-// cargo add serde --features derive
-// cargo add serde_json
-// Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
-use laser_sdk::prelude::*;
-use serde::Serialize;
-
-const USER: &str = "user-42";
-const QUERY: &str = "Where does the user live, and what should I know before booking dinner?";
-
-#[derive(Serialize)]
-struct Recall {
-    user: &'static str,
-    query: &'static str,
-    facts: Vec<String>,
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = Laser::connect_env().await?;
-    let scratch = root.scratch_stream("memory").await?;
-    let result = correct_and_recall(scratch.laser()).await;
-    scratch.delete().await?;
-    println!("{}", serde_json::to_string_pretty(&result?)?);
-    Ok(())
-}
-
-async fn correct_and_recall(laser: &Laser) -> Result<Recall, LaserError> {
-    let memory = laser.memory("assistant");
-
-    // Conversation 1: the user shares three facts.
-    let first = ConversationId::new();
-    let city = memory
-        .remember("Lives in Gdansk")
-        .scope(first)
-        .user(USER)
-        .send()
-        .await?;
-    memory
-        .remember("Allergic to peanuts")
-        .scope(first)
-        .user(USER)
-        .send()
-        .await?;
-    memory
-        .remember("Prefers a window seat")
-        .scope(first)
-        .user(USER)
-        .send()
-        .await?;
-
-    // Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
-    let second = ConversationId::new();
-    memory
-        .supersede(city, "Lives in Lisbon")
-        .scope(second)
-        .user(USER)
-        .send()
-        .await?;
-
-    // Recall for the user across every conversation.
-    let facts = memory
-        .recall(None)
-        .user(USER)
-        .semantic(QUERY)
-        .limit(10)
-        .fetch()
-        .await?;
-    Ok(Recall {
-        user: USER,
-        query: QUERY,
-        facts: facts.iter().map(MemoryItem::text).collect(),
-    })
-}
-```
-
-Python
-
-```python
-# python -m pip install laser-sdk
-# Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
-import asyncio
-import json
-
-import laser_sdk as ls
-
-USER = "user-42"
-QUERY = "Where does the user live, and what should I know before booking dinner?"
-
-
-async def main():
-    async with await ls.Laser.connect_env() as root:
-        async with root.scratch_stream("memory") as scratch:
-            memory = scratch.laser.memory("assistant")
-
-            # Conversation 1: the user shares three facts.
-            first = ls.new_conversation_id()
-            city = await memory.remember("Lives in Gdansk", conversation=first, user=USER)
-            await memory.remember("Allergic to peanuts", conversation=first, user=USER)
-            await memory.remember("Prefers a window seat", conversation=first, user=USER)
-
-            # Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
-            second = ls.new_conversation_id()
-            await memory.supersede(city, "Lives in Lisbon", conversation=second, user=USER)
-
-            # Recall for the user across every conversation.
-            facts = await memory.recall(user=USER, semantic=QUERY, limit=10)
-            print(
-                json.dumps(
-                    {"user": USER, "query": QUERY, "facts": [fact.text() for fact in facts]},
-                    indent=2,
-                )
-            )
-
-
-asyncio.run(main())
-```
-
-It prints `{"user": "user-42", "query": "Where does the user live, and what should I know before booking dinner?", "facts": ["Lives in Lisbon", "Prefers a window seat", "Allergic to peanuts"]}`. Gdansk is gone. On a Python client `memory(...)`, `workflow(...)`, the builder's `step(...)` and `sessions(...)` return at once, and `scratch_stream(prefix)` is entered with `async with`. `Laser.connect_env()`, `memory_topic(...)` and every call that reads or writes (`remember`, `supersede`, `recall`, `forget`, the builder's `run()`, `bootstrap`) return an awaitable. The same programs live in [`examples/`](examples/README.md) as `workflow` and `memory-correction` (`workflow.py` and `memory_correction.py` in Python), where each runs when copied alone.
+| Accessor | Primitive | Reach for it to | Go example |
+| --- | --- | --- | --- |
+| `laser.stream(name).topic(name)` | Log | publish and consume records, replay by offset, batch | [log](examples/go/log/main.go) |
+| `laser.query(index)` | Views | filter, aggregate and page operational queries | [query](examples/go/query/main.go) |
+| `laser.graph(name)` | Graph | link entities, traverse, find neighbors and nearest vectors | [graph](examples/go/graph/main.go) |
+| `laser.watch()` | Change feed | consume advancement records instead of re-querying blind | [watch](examples/go/watch/main.go) |
+| `topic.consumer_group(...).filter()` | [Consumer filters](https://docs.laserdata.com/laser-sdk/consumer-filters) | read only the records a filter selects, on the server, with fenced acknowledgments, previews, saved filters, and bound consumer groups | [cdc](examples/go/cdc/main.go) |
+| `laser.kv(namespace)` / `laser.fork(id)` | State | point reads and writes, CAS, leases, copy-on-write branches | [kv](examples/go/kv/main.go) |
+| `laser.memory(scope)` | Memory | remember, supersede a fact, recall (semantic / keyword / hybrid), consolidate | [recall](examples/go/recall/main.go) |
+| `laser.context(id)` | Context | append and assemble one conversation's record, and scope its memory to that conversation | [context](examples/go/context/main.go) |
+| `laser.sessions()` | Session | start and end a unit of work, record model and tool calls, keep state, hand work to an agent, and replay from saved offsets | [sessions](examples/go/sessions/main.go) |
+| `laser.agent(id)` / `laser.contract(..)` / `laser.workflow(..)` | Fabric | directed asks, deadline contracts, ordered workflows whose steps are child sessions | [orchestra](examples/go/orchestra/main.go) |
 
 ## More about the SDK
 
@@ -279,11 +25,11 @@ It prints `{"user": "user-42", "query": "Where does the user live, and what shou
 
 > [Laser Stack](https://github.com/laserdata/laser-stack) runs Laser Streams and the managed backend for local development. It supports the managed SDK operations, including queries. In the Laser Stack checkout, run `./scripts/up` to start the services and obtain `LASER_CONNECTION_STRING`. Laser Stack excludes proprietary Cloud features such as the Stream and Data UI.
 
-Read the three-language guides at [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk). Start with the [quickstart](https://docs.laserdata.com/laser-sdk/quickstart) or the focused [`examples/`](examples/README.md).
+Read the SDK guides at [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk). Start with the [quickstart](https://docs.laserdata.com/laser-sdk/quickstart) or the focused [`examples/`](examples/README.md).
 
 After the focused examples, two public example repositories go further. [Photon Market](https://github.com/laserdata/laser-example-photon-market) shows a more realistic Rust system built with Laser SDK across multiple modules and microservices. [Frostline](https://github.com/laserdata/laser-example-frostline) is the consumer-filter showcase: one change feed, three teams reading their own slice, and a benchmark that measures how much payload never left the server.
 
-**Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.com/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
+**Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.com/laser-sdk/consumer-filters) and the [SDK examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 
 ## Quick start
 
@@ -300,7 +46,7 @@ export LASER_CONNECTION_STRING='<connection string>'
 LASER_CONNECTION_STRING='<connection string>' cargo run --example log
 ```
 
-The examples below publish one record and read it back. Like the memory program above, they read `LASER_CONNECTION_STRING`, work in a scratch stream, and delete it at the end. The default TCP port is `:8090`, so a connection string can omit it. Laser SDK uses the transport that Iggy provides.
+The examples below publish one record and read it back. They read `LASER_CONNECTION_STRING`, work in a scratch stream, and delete it at the end. The default TCP port is `:8090`, so a connection string can omit it. Laser SDK uses the transport that Iggy provides.
 
 TypeScript ([npm](https://www.npmjs.com/package/@laserdata/laser-sdk))
 
@@ -372,28 +118,74 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+The Go client requires Go 1.25 or later and connects to Apache Iggy over TCP. Run the [Go log example](examples/go/log/main.go) from the checkout with `cd examples/go && go run ./log`. To try the quick start below, save it as `main.go` in a new subdirectory of `examples/go` and run `go run .` there. The examples module already points to the client in this checkout.
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/laserdata/laser-sdk/foreign/go/laser"
+)
+
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() (err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client, err := laser.ConnectEnv(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, client.Close()) }()
+
+	scratch, err := client.ScratchStream(ctx, "telemetry")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		err = errors.Join(err, scratch.Delete(cleanup))
+	}()
+
+	topic := scratch.Laser().Topic("inferences")
+	if err := topic.Ensure(ctx, 4, nil); err != nil {
+		return err
+	}
+	if _, err := topic.Publish().JSON(map[string]int{"latency_ms": 42}).Send(ctx); err != nil {
+		return err
+	}
+	cursor, err := topic.Replay()
+	if err != nil {
+		return err
+	}
+	messages, err := cursor.Poll(ctx)
+	if err == nil {
+		fmt.Printf("read %d message(s)\n", len(messages))
+	}
+	return err
+}
+```
+
 The examples use open streaming. Add `managed` for projections, queries, KV, forks, and graphs on Laser Stack or LaserData Cloud. Handlers, memory, contracts, and workflows are in the default Rust build.
 
 Streaming sends return Apache Iggy commit confirmations. A confirmation identifies the stream, topic, partition, and first offset in a batch. The list can be empty when the server does not report offsets. Completion follows the topic durability policy. Use the stream, topic, and partition together with the offset.
 
 One connection can address every stream that the user can access. Use `laser.stream(name).topic(name)` to name the stream and topic. A default stream enables the shorter `laser.topic(name)` form. It does not restrict the connection to that stream. `laser.streams()`, `stream(name).get()`, `exists()`, and `topics()` inspect streams in Rust, Python, and TypeScript. `topic.get()`, `partitions()`, `consumer_groups()`, `delete()`, `add_partitions(n)`, and `delete_partitions(n)` inspect and change topics. `get()` and `exists()` read a missing stream or topic as absent, and `topics()`, `partitions()`, and `consumer_groups()` fail with the stream-or-topic-not-found error. `stream(name).rename(new_name)`, `topic.update(...)`, and `topic.delete_segments(partition_id, count)` rename streams and change topic settings, see [client behavior](docs/client-behavior.md#stream-and-topic-inspection). `laser.users()`, `laser.user(name)`, `laser.personal_access_tokens()`, `laser.ping()`, `laser.stats()`, `laser.me()`, `laser.clients()`, `laser.cluster()`, `laser.snapshot()`, `laser.describe_options(scope)`, and `laser.metadata_changes(...)` administer the server under its own permission checks, see [server administration](docs/client-behavior.md#server-administration).
 
-## One grammar, every primitive
+## Primitive examples
 
-An accessor selects a feature on the connected client. A method performs an action on that feature. The calls follow this form: `object.verb(input).await`.
-
-| Accessor | Primitive | Reach for it to |
-| --- | --- | --- |
-| `laser.stream(name).topic(name)` | Log | publish and consume records, replay by offset, batch |
-| `laser.query(index)` | Views | filter, aggregate and page operational queries |
-| `laser.graph(name)` | Graph | link entities, traverse, find neighbors and nearest vectors |
-| `laser.watch()` | Change feed | consume advancement records instead of re-querying blind |
-| `topic.consumer_group(...).filter()` | [Consumer filters](https://docs.laserdata.com/laser-sdk/consumer-filters) | read only the records a filter selects, on the server, with fenced acknowledgments, previews, saved filters, and bound consumer groups |
-| `laser.kv(namespace)` / `laser.fork(id)` | State | point reads and writes, CAS, leases, copy-on-write branches |
-| `laser.memory(scope)` | Memory | remember, supersede a fact, recall (semantic / keyword / hybrid), consolidate |
-| `laser.context(id)` | Context | append and assemble one conversation's record, and scope its memory to that conversation |
-| `laser.sessions()` | Session | start and end a unit of work, record model and tool calls, keep state, hand work to an agent, and replay from saved offsets |
-| `laser.agent(id)` / `laser.contract(..)` / `laser.workflow(..)` | Fabric | directed asks, deadline contracts, ordered workflows whose steps are child sessions |
+The same calls in each client. The Go column of the table above links a runnable program per primitive.
 
 The Rust form follows:
 
@@ -581,6 +373,281 @@ Agent fabric (opt in with the `agent` feature):
 
 Agent routing, contracts, fan-out, and workflows run as client-side state machines. They track offsets, deadlines, leases, and replies in the log. They do not require a separate orchestration server. Their durability and ordering depend on the underlying log and the selected policies.
 
+## Two complete programs
+
+Each program below runs as written and reads the connection string from `LASER_CONNECTION_STRING`. The workflow runs on the stream named by `LASER_STREAM`, or on a stream named after the workflow. It creates that stream when it is missing and keeps it after the run, so the run can be resumed. The memory program works in a scratch stream with a unique name and deletes the stream when it ends, so a second run prints the same. With `LASER_CONNECTION_STRING` set, a program needs no Docker and no local server. Then there is no server to start. A LaserData API key is not a connection string. Only without the variable, copy the connection string from the deployment's Credentials tab in the [LaserData Cloud](https://laserdata.cloud) Console, or run `./scripts/up` in a [Laser Stack](https://github.com/laserdata/laser-stack) checkout and use the `LASER_CONNECTION_STRING` it prints. Never print or log it.
+
+- TypeScript: `npm install @laserdata/laser-sdk tsx`, Node 22.14 or later. Save a program as `main.mts` and run it with `npx tsx main.mts`.
+- Rust: `cargo add laser-sdk`, `cargo add tokio --features macros,rt-multi-thread,time`, `cargo add serde_json`, and `cargo add serde --features derive` for the memory program.
+- Python: `python -m pip install laser-sdk`, Python 3.10 or later. `python -c "import laser_sdk; print(laser_sdk.__doc__)"` then prints the package's own summary of the calls below.
+
+To keep what the memory program writes, use a named stream instead of the scratch stream: set `LASER_STREAM`, pass it when connecting (`Laser.connect_env(stream=name)` in Python, `Laser.connectEnvWithStream(name)` in TypeScript, `Laser::connect_env_with_stream(name)` in Rust), or call `with_default_stream(name)` (`withDefaultStream` in TypeScript). A workflow run and the first memory write create a missing stream. The guides are at [docs.laserdata.com/laser-sdk](https://docs.laserdata.com/laser-sdk) and on [Context7](https://context7.com/laserdata/laser-sdk).
+
+### A three-step workflow
+
+A workflow is a function, and each step is a function it calls in ordinary code: `@ls.step` and `@ls.workflow` in Python, `step` and `workflow` in TypeScript, `run_with` and `run.step` in Rust. The steps run in this process, and `analyze` waits one second before it returns. A step takes and returns what JSON holds. Each completed step is journaled, so a resumed run returns the recorded value without running that step again, and it must call the same steps in the same order. A step name holding `#` is refused, because the journal numbers repeated calls with it. The run creates its own stream and topics, so the program needs no `bootstrap`, agent, or handler. For steps routed to agents, verifiers, compensation and budgets, use the builder, `Laser.workflow(name).step(...)`, with `step_local` in Rust and `stepLocal` in TypeScript for its in-process steps.
+
+The [Go workflow program](examples/go/workflow/main.go) runs the same steps and prints their outcome.
+
+TypeScript
+
+```ts
+// npm install @laserdata/laser-sdk tsx
+// Run with: npx tsx main.mts
+// Needs only LASER_CONNECTION_STRING. No server to start when it is set.
+import { setTimeout as sleep } from "node:timers/promises"
+import { step, workflow } from "@laserdata/laser-sdk"
+
+const ingest = step("ingest", () => "frames from sat-7")
+const analyze = step("analyze", async (frames: string) => {
+  await sleep(1000)
+  return `analyzed ${frames}`
+})
+const report = step("report", (analysis: string) => `report on ${analysis}`)
+
+const pipeline = workflow("pipeline", async () => report(await analyze(await ingest())))
+
+const run = await pipeline.run()
+console.log(JSON.stringify({ status: run.status, steps: run.completedSteps, report: run.value }))
+```
+
+Rust
+
+```rust,no_run
+// cargo add laser-sdk
+// cargo add tokio --features macros,rt-multi-thread,time
+// cargo add serde_json
+// Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
+use laser_sdk::prelude::*;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), LaserError> {
+    let laser = Laser::connect_env().await?;
+    let run = laser
+        .workflow("pipeline")
+        .run_with(async |run| {
+            let frames: String = run
+                .step("ingest", async || Ok("frames from sat-7".to_owned()))
+                .await?;
+            let analysis: String = run
+                .step("analyze", async || {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Ok(format!("analyzed {frames}"))
+                })
+                .await?;
+            run.step("report", async || Ok(format!("report on {analysis}")))
+                .await
+        })
+        .await?;
+    let report = serde_json::json!({
+        "status": run.status,
+        "steps": run.completed_steps,
+        "report": run.json::<String>("report")?,
+    });
+    println!("{report}");
+    laser.close().await
+}
+```
+
+Python
+
+```python
+# python -m pip install laser-sdk
+# Needs only LASER_CONNECTION_STRING. No server to start when it is set.
+import json
+import time
+
+import laser_sdk as ls
+
+
+@ls.step
+def ingest():
+    return "frames from sat-7"
+
+
+@ls.step
+def analyze(frames):
+    time.sleep(1)
+    return f"analyzed {frames}"
+
+
+@ls.step
+def report(analysis):
+    return f"report on {analysis}"
+
+
+@ls.workflow
+def pipeline():
+    return report(analyze(ingest()))
+
+
+run = pipeline.run()
+print(json.dumps({"status": run.status, "steps": run.completed_steps, "report": run.value}))
+```
+
+Each program prints the run as JSON with `status` `completed`, `steps` `["ingest", "analyze", "report"]`, and `report` `report on analyzed frames from sat-7`. Rust's `serde_json::json!` sorts the keys. The `WorkflowOutcome` also carries `run_id`, `value` (what the workflow returned, as JSON bytes in Rust), `outputs`, each step's output by label as bytes, `json(label)`, and `text(label)`. Resume a stopped run with `pipeline.resume(run_id)` in Python, `pipeline.resume(runId)` in TypeScript, and `laser.workflow(name).run_id(id).run_with(...)` in Rust. A step that fails ends the run as failed and its error reaches the caller unchanged, with no outcome to read the run ID from, so a caller that wants to resume a failed run names the run ID first with `resume(id)` (`run_id(id)` in Rust). The completed steps stay journaled, so that resume runs the failed step and what follows it.
+
+### A memory correction
+
+A first conversation stores three facts about the user `user-42`. A later conversation corrects the city with `supersede`, which remembers the new fact first and then forgets the old one in every conversation. A recall for the user reads every conversation and returns a list of `MemoryItem`, ranked by the words each fact shares with the query, newest first among equals, and drops none. It waits for the writes this connection made, so the correction shows at once. On LaserData Cloud and Laser Stack recall reads the managed memory view. Apache Iggy serves no view, so there recall folds the memory topic in process, and the same program runs on every server.
+
+The [Go memory correction program](examples/go/memory-correction/main.go) remembers a fact, supersedes it and recalls the correction.
+
+TypeScript
+
+```ts
+// npm install @laserdata/laser-sdk tsx
+// Run with: npx tsx main.mts
+// Needs only LASER_CONNECTION_STRING, which connectEnv() reads. No server to start when it is set.
+import { ConversationId, Laser, memoryItemText } from "@laserdata/laser-sdk"
+
+const user = "user-42"
+const query = "Where does the user live, and what should I know before booking dinner?"
+
+await using root = await Laser.connectEnv()
+await using scratch = await root.scratchStream("memory")
+const memory = scratch.laser.memory("assistant")
+
+// Conversation 1: the user shares three facts.
+const first = ConversationId.new()
+const city = await memory.remember("Lives in Gdansk").scope(first).user(user).send()
+await memory.remember("Allergic to peanuts").scope(first).user(user).send()
+await memory.remember("Prefers a window seat").scope(first).user(user).send()
+
+// Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+const second = ConversationId.new()
+await memory.supersede(city, "Lives in Lisbon").scope(second).user(user).send()
+
+// Recall for the user across every conversation.
+const facts = await memory.recall().user(user).semantic(query).limit(10).fetch()
+console.log(JSON.stringify({ user, query, facts: facts.map(memoryItemText) }, null, 2))
+```
+
+Rust
+
+```rust,no_run
+// cargo add laser-sdk
+// cargo add tokio --features macros,rt-multi-thread
+// cargo add serde --features derive
+// cargo add serde_json
+// Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
+use laser_sdk::prelude::*;
+use serde::Serialize;
+
+const USER: &str = "user-42";
+const QUERY: &str = "Where does the user live, and what should I know before booking dinner?";
+
+#[derive(Serialize)]
+struct Recall {
+    user: &'static str,
+    query: &'static str,
+    facts: Vec<String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let root = Laser::connect_env().await?;
+    let scratch = root.scratch_stream("memory").await?;
+    let result = correct_and_recall(scratch.laser()).await;
+    scratch.delete().await?;
+    println!("{}", serde_json::to_string_pretty(&result?)?);
+    Ok(())
+}
+
+async fn correct_and_recall(laser: &Laser) -> Result<Recall, LaserError> {
+    let memory = laser.memory("assistant");
+
+    // Conversation 1: the user shares three facts.
+    let first = ConversationId::new();
+    let city = memory
+        .remember("Lives in Gdansk")
+        .scope(first)
+        .user(USER)
+        .send()
+        .await?;
+    memory
+        .remember("Allergic to peanuts")
+        .scope(first)
+        .user(USER)
+        .send()
+        .await?;
+    memory
+        .remember("Prefers a window seat")
+        .scope(first)
+        .user(USER)
+        .send()
+        .await?;
+
+    // Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+    let second = ConversationId::new();
+    memory
+        .supersede(city, "Lives in Lisbon")
+        .scope(second)
+        .user(USER)
+        .send()
+        .await?;
+
+    // Recall for the user across every conversation.
+    let facts = memory
+        .recall(None)
+        .user(USER)
+        .semantic(QUERY)
+        .limit(10)
+        .fetch()
+        .await?;
+    Ok(Recall {
+        user: USER,
+        query: QUERY,
+        facts: facts.iter().map(MemoryItem::text).collect(),
+    })
+}
+```
+
+Python
+
+```python
+# python -m pip install laser-sdk
+# Needs only LASER_CONNECTION_STRING, which connect_env() reads. No server to start when it is set.
+import asyncio
+import json
+
+import laser_sdk as ls
+
+USER = "user-42"
+QUERY = "Where does the user live, and what should I know before booking dinner?"
+
+
+async def main():
+    async with await ls.Laser.connect_env() as root:
+        async with root.scratch_stream("memory") as scratch:
+            memory = scratch.laser.memory("assistant")
+
+            # Conversation 1: the user shares three facts.
+            first = ls.new_conversation_id()
+            city = await memory.remember("Lives in Gdansk", conversation=first, user=USER)
+            await memory.remember("Allergic to peanuts", conversation=first, user=USER)
+            await memory.remember("Prefers a window seat", conversation=first, user=USER)
+
+            # Conversation 2: the user moved. supersede stores the new fact and forgets the old one.
+            second = ls.new_conversation_id()
+            await memory.supersede(city, "Lives in Lisbon", conversation=second, user=USER)
+
+            # Recall for the user across every conversation.
+            facts = await memory.recall(user=USER, semantic=QUERY, limit=10)
+            print(
+                json.dumps(
+                    {"user": USER, "query": QUERY, "facts": [fact.text() for fact in facts]},
+                    indent=2,
+                )
+            )
+
+
+asyncio.run(main())
+```
+
+It prints `{"user": "user-42", "query": "Where does the user live, and what should I know before booking dinner?", "facts": ["Lives in Lisbon", "Prefers a window seat", "Allergic to peanuts"]}`. Gdansk is gone. On a Python client `memory(...)`, `workflow(...)`, the builder's `step(...)` and `sessions(...)` return at once, and `scratch_stream(prefix)` is entered with `async with`. `Laser.connect_env()`, `memory_topic(...)` and every call that reads or writes (`remember`, `supersede`, `recall`, `forget`, the builder's `run()`, `bootstrap`) return an awaitable. The same programs live in [`examples/`](examples/README.md) as `workflow` and `memory-correction` (`workflow.py` and `memory_correction.py` in Python), where each runs when copied alone.
+
 ## Why it is good to build on
 
 - **Streaming and managed operations share one client, Iggy transport, and record metadata.**
@@ -628,7 +695,7 @@ Connecting gives up after 30 seconds. Each publish attempt times out after 60 se
 - [AGDX notes](docs/agdx.md): an in-repo development reference for the Agent Data Exchange Protocol the SDK implements (the envelope, Apache Iggy binding, the surfaces). The protocol home is [agdxprotocol.ai](https://agdxprotocol.ai).
 - [Interop](docs/interop.md): the A2A / MCP / AG-UI edge bridges over AGDX.
 - [Producer statistics](docs/producer-statistics.md): optional per-handle send counters and latency percentiles, what they do and do not prove.
-- [Examples](examples/README.md): aligned Rust, Python, and TypeScript systems runnable against Apache Iggy, Laser Stack, or LaserData Cloud.
+- [Examples](examples/README.md): aligned Rust, Python, TypeScript, and Go systems runnable against Apache Iggy, Laser Stack, or LaserData Cloud.
 - [`wire/README.md`](wire/README.md): the contract crate and its compatibility rules.
 
 ## Workspace
@@ -639,8 +706,8 @@ Connecting gives up after 30 seconds. Each publish attempt times out after 60 se
 | [`laser-sdk`](sdk/README.md) (`sdk/`) | the client and agent runtime, re-exporting the wire crate as `laser_sdk::wire`. |
 | [`foreign/python`](foreign/python/README.md) | the Python SDK, PyO3 bindings over the Rust crate. |
 | [`foreign/typescript`](foreign/typescript/README.md) | the native TypeScript SDK over Apache Iggy. |
-| [`foreign/go`](foreign/go/README.md) | the Go client, in progress. The wire contract is a complete native port, and the streaming, managed and agent surfaces have followed it, with its standing on each capability listed in its own section of [the parity matrix](docs/parity.md). |
-| [`examples`](examples/README.md) | Two standalone programs, `workflow` and `memory-correction`, run when copied alone. Nine focused examples cover `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, `context`, and `agent` in Rust, Python, and TypeScript. Nine larger examples cover streaming, event analytics, a fleet telemetry tape (`fleet-tape`), load generation, an incident desk (`incident-desk`), memory, interoperability, `orchestra`, and governance. |
+| [`foreign/go`](foreign/go/README.md) | Native Go client over the Apache Iggy Go SDK. See [supported capabilities and transport constraints](foreign/go/IMPLEMENTATION_STATUS.md). |
+| [`examples`](examples/README.md) | Two standalone programs, `workflow` and `memory-correction`, run when copied alone. Nine focused examples cover `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, `context`, and `agent` in Rust, Python, TypeScript, and Go. Nine larger examples cover streaming, event analytics, a fleet telemetry tape (`fleet-tape`), load generation, an incident desk (`incident-desk`), memory, interoperability, `orchestra`, and governance. |
 
 ## Benchmarks
 

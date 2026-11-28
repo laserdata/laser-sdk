@@ -126,9 +126,9 @@ func TestGivenABadConnectionStringWhenConnectingThenShouldFailBeforeDialing(t *t
 	}
 }
 
-// A refused connection is a transport failure, and its report must never carry
-// the password the connection string held.
-func TestGivenARefusedConnectionWhenReportedThenShouldNotEchoTheCredential(t *testing.T) {
+// A connection nothing accepts ends at the budget naming the stage that
+// stalled, and its report must never carry the password.
+func TestGivenARefusedConnectionWhenReportedThenShouldNameTheStageAndNotEchoTheCredential(t *testing.T) {
 	const secret = "sup3rs3cr3t"
 	// Port zero on the loopback, bound and immediately released, is an address
 	// nothing is listening on.
@@ -143,7 +143,7 @@ func TestGivenARefusedConnectionWhenReportedThenShouldNotEchoTheCredential(t *te
 
 	_, err = laser.ConnectWith(context.Background(),
 		"iggy://user:"+secret+"@"+address,
-		laser.Options{Timeout: 3 * time.Second, Environment: noEnv()})
+		laser.Options{Timeout: 500 * time.Millisecond, Environment: noEnv()})
 	if err == nil {
 		t.Fatal("connecting to a closed port must fail")
 	}
@@ -152,9 +152,9 @@ func TestGivenARefusedConnectionWhenReportedThenShouldNotEchoTheCredential(t *te
 			t.Fatalf("credential leaked: %v", cause)
 		}
 	}
-	var transport *laser.TransportError
-	if !errors.As(err, &transport) {
-		t.Errorf("want a TransportError, got %T: %v", err, err)
+	var stalled *laser.StageTimeoutError
+	if !errors.As(err, &stalled) || err.Error() != "timed out waiting for the Iggy server to accept the connection" {
+		t.Errorf("want the accept stage named, got %T: %v", err, err)
 	}
 }
 

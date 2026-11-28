@@ -98,10 +98,28 @@ func (e *InvalidError) Error() string { return e.Reason }
 //
 // It is raised before the call leaves, because plain Apache Iggy answers an
 // unknown managed command with a transport error that says nothing about why.
-type UnsupportedError struct{ Surface string }
+type UnsupportedError struct {
+	// Surface is the surface the refused call came through.
+	Surface string
+	// Feature is the capability within the surface, when the refusal names one.
+	Feature string
+	// Message says what was asked and why it was refused. Empty for a surface the deployment lacks.
+	Message string
+}
 
 func (e *UnsupportedError) Error() string {
-	return e.Surface + " need a managed backend, which this deployment does not have"
+	switch {
+	case e.Message == "":
+		return e.Surface + " need a managed backend, which this deployment does not have"
+	case e.Feature == "":
+		return "unsupported: " + e.Surface + ": " + e.Message
+	case e.Feature == e.Surface:
+		return "unsupported: " + e.Surface + ": " + e.Message +
+			" (the `" + e.Feature + "` capability serves this on LaserData Cloud)"
+	default:
+		return "unsupported: " + e.Surface + "." + e.Feature + ": " + e.Message +
+			" (the `" + e.Feature + "` capability serves this on LaserData Cloud)"
+	}
 }
 
 // ResultCode projects onto the shared unsupported code, which is what a
@@ -172,7 +190,7 @@ func (e *RoutePrincipalMismatchError) Error() string {
 // allow, the Go form of laser_sdk's LaserError::Protocol.
 //
 // It is distinct from CodecError, which is bytes that would not decode. These
-// bytes decoded; what they said was impossible, such as a page cursor that
+// bytes decoded. What they said was impossible, such as a page cursor that
 // does not advance.
 type ProtocolError struct{ Reason string }
 
@@ -227,16 +245,195 @@ func (e *NoProvenanceError) Error() string {
 //
 // A stream or topic that was deleted and created again takes the same name,
 // and can take the same numeric id, so a retained handle would otherwise
-// write to the replacement as though nothing had happened -- and its records
+// write to the replacement as though nothing had happened, and its records
 // would be read back as part of a session that, on the lane the reader sees,
 // never had them. Recover by building a fresh handle, which pins the lane as
 // it is now.
 type StaleLaneError struct{ Reason string }
 
-func (e *StaleLaneError) Error() string { return "stale session lane: " + e.Reason }
+func (e *StaleLaneError) Error() string { return "session: stale session generation: " + e.Reason }
 
 // ResultCode projects onto the shared stale-generation code, which is what
 // the server answers for the same condition.
 func (e *StaleLaneError) ResultCode() wire.ResultCode {
 	return wire.ResultStaleGeneration
+}
+
+// QuarantinedError reports an agent that is quarantined and may not act, the
+// Go form of laser_sdk's LaserError::Quarantined.
+type QuarantinedError struct{ Agent wire.AgentID }
+
+func (e *QuarantinedError) Error() string { return "quarantined: " + e.Agent.String() }
+
+// FenceViolationError reports a fenced write that lost the fence to a newer
+// holder, the Go form of laser_sdk's LaserError::FenceViolation.
+type FenceViolationError struct {
+	Held    uint64
+	Current uint64
+}
+
+func (e *FenceViolationError) Error() string {
+	return "fence violation: held " + strconv.FormatUint(e.Held, 10) +
+		", current " + strconv.FormatUint(e.Current, 10)
+}
+
+// IsNotFound reports a failure that names a missing resource: an index, fork,
+// session, key, graph, role, stream, or a capable agent.
+func IsNotFound(err error) bool { return ResultCode(err) == wire.ResultNotFound }
+
+// IsStreamOrTopicNotFound reports that the target stream or topic does not
+// exist for this principal. A stream the principal cannot see answers the same.
+func IsStreamOrTopicNotFound(err error) bool {
+	transport, refused := classified(err).(*TransportError)
+	if !refused {
+		return false
+	}
+	return errors.Is(transport.Cause, ierror.StreamIdNotFound{}) ||
+		errors.Is(transport.Cause, ierror.StreamNameNotFound{}) ||
+		errors.Is(transport.Cause, ierror.TopicIdNotFound{}) ||
+		errors.Is(transport.Cause, ierror.TopicNameNotFound{})
+}
+
+// IsPermissionDenied reports a refused credential or a missing grant. The fix
+// is a grant, never a retry.
+func IsPermissionDenied(err error) bool { return ResultCode(err).IsPermissionDenied() }
+
+// IsUnavailable reports a transient outage: the identical request may succeed
+// on a later attempt.
+func IsUnavailable(err error) bool { return ResultCode(err).IsUnavailable() }
+
+// IsNotLeader reports a conditional write the managed backend declined because
+// it does not own the mutation partition.
+func IsNotLeader(err error) bool {
+	switch refused := classified(err).(type) {
+	case *KvError:
+		return refused.Failure.Kind == wire.KvNotLeader
+	case *ForkError:
+		return refused.Failure.Kind == wire.ForkNotLeader
+	default:
+		return false
+	}
+}
+
+// IsStale reports a read-consistency barrier that was not met yet. Retryable.
+func IsStale(err error) bool { return ResultCode(err) == wire.ResultStale }
+
+// IsVersionConflict reports a compare-and-swap that lost its precondition.
+// Read the value again, recompute, and commit again.
+func IsVersionConflict(err error) bool { return kvFailureIs(err, wire.KvVersionConflict) }
+
+// IsVersionSkew reports a wire version the deployment did not accept.
+// Permanent for this client build.
+func IsVersionSkew(err error) bool { return ResultCode(err) == wire.ResultVersionSkew }
+
+// IsLeaseLost reports a lease that expired, was released, or was taken by
+// another holder.
+func IsLeaseLost(err error) bool { return kvFailureIs(err, wire.KvLeaseLost) }
+
+// IsFenceViolation reports a fenced write that lost the fence. Never retryable
+// by the loser.
+func IsFenceViolation(err error) bool {
+	_, lost := classified(err).(*FenceViolationError)
+	return lost
+}
+
+// IsQuarantined reports a route that names a quarantined agent.
+func IsQuarantined(err error) bool {
+	_, held := classified(err).(*QuarantinedError)
+	return held
+}
+
+func kvFailureIs(err error, kind wire.KvErrorKind) bool {
+	refused, kv := classified(err).(*KvError)
+	return kv && refused.Failure.Kind == kind
+}
+
+// ResultCode is the failure's place in the shared result codes. No failure is ok.
+func ResultCode(err error) wire.ResultCode {
+	if err == nil {
+		return wire.ResultOk
+	}
+	code, _ := failureCode(classified(err))
+	return code
+}
+
+// classified is the first typed failure of a chain, so a failed publish and a
+// group setup failure answer for their cause.
+func classified(err error) error {
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		if _, known := failureCode(current); known {
+			return current
+		}
+	}
+	return err
+}
+
+// failureCode classifies one typed failure, and reports whether it is one.
+func failureCode(failure error) (wire.ResultCode, bool) {
+	switch refused := failure.(type) {
+	case *TransportError:
+		return transportResultCode(refused.Cause), true
+	case *KvError:
+		return refused.Failure.ResultCode(), true
+	case *QueryError:
+		return refused.Failure.ResultCode(), true
+	case *ForkError:
+		return refused.Failure.ResultCode(), true
+	case *GraphError:
+		return refused.Failure.ResultCode(), true
+	case *AuthzError:
+		return refused.Failure.ResultCode(), true
+	case *FilterFaultError:
+		if refused.Oversized {
+			return wire.ResultTooLarge, true
+		}
+		return wire.ResultInvalidArgument, true
+	case *InvalidError, *wire.InvalidError, *ConfigError, *NoRespondTopicError:
+		return wire.ResultInvalidArgument, true
+	case *VersionError:
+		return wire.ResultVersionSkew, true
+	case *FenceViolationError, *PresenceConflictError, *SessionEndedError:
+		return wire.ResultConflict, true
+	case *SignatureError:
+		return wire.ResultUnauthenticated, true
+	case *QuarantinedError, *PolicyBlockedError, *RoutePrincipalMismatchError:
+		return wire.ResultForbidden, true
+	case *StepUpRequiredError:
+		return wire.ResultStepUpRequired, true
+	case *NoCapableAgentError, *NoInboxError:
+		return wire.ResultNotFound, true
+	case *StepFailedError:
+		if refused.Reason == StepTimedOut || refused.Reason == StepNotConsumed {
+			return wire.ResultDeadlineExceeded, true
+		}
+		return wire.ResultBackend, true
+	case *JournalTruncatedError:
+		return wire.ResultExpiredSnapshot, true
+	case *CancelledError:
+		return wire.ResultCancelled, true
+	case *CodecError, *ProtocolError, *TypedDecodeError, *UndecodableRecord,
+		*StateStoreError, *IntegrityError, *AmbiguousMutationError,
+		*BudgetExceededError, *PolicyDeferredError, *TimeoutError, *StageTimeoutError:
+		return wire.ResultBackend, true
+	case interface{ ResultCode() wire.ResultCode }:
+		return refused.ResultCode(), true
+	default:
+		return wire.ResultBackend, false
+	}
+}
+
+// transportResultCode classifies the Apache Iggy failure under a transport error.
+func transportResultCode(cause error) wire.ResultCode {
+	switch {
+	case isMissingResource(cause):
+		return wire.ResultNotFound
+	case errors.Is(cause, ierror.Unauthorized{}):
+		return wire.ResultForbidden
+	case errors.Is(cause, ierror.Unauthenticated{}):
+		return wire.ResultUnauthenticated
+	case transientTransport(cause):
+		return wire.ResultUnavailable
+	default:
+		return wire.ResultBackend
+	}
 }

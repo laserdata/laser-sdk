@@ -3,6 +3,7 @@ package laser_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -124,6 +125,51 @@ func TestGivenAnAgentMessageWhenSentThenShouldCarryBothHeaderBlocks(t *testing.T
 
 // Every record on a shared session topic names an addressee, so one addressed
 // to nobody in particular broadcasts.
+func TestGivenAnUntargetedEnvelopeWhenSentThenShouldStampTheLaneAddressee(t *testing.T) {
+	for _, test := range []struct {
+		topic string
+		want  string
+	}{
+		{wire.AgentSessions, wire.Broadcast}, {wire.AgentControl, wire.Broadcast}, {"custom", ""},
+	} {
+		t.Run(test.topic, func(t *testing.T) {
+			server := &streamServer{}
+			agdx := agdxHandle(server).AgdxOn("agents", test.topic, agentID(t, "planner"), conversation(1))
+			if _, err := agdx.Command(correlationID(1), []byte("broadcast")).Send(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if got := sentHeaders(t, server)[wire.HeaderTargetAgentID]; got != test.want {
+				t.Fatalf("addressee = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestGivenAChunkBatchWhenSentThenShouldDeclareItsOperationOnTheOpeningRecord(t *testing.T) {
+	server := &streamServer{}
+	agdx := agdxHandle(server).Agdx(agentID(t, "worker"), conversation(1))
+	channel := wire.ChannelID{ID: correlationID(3).ID}
+	bodies := [][]byte{[]byte("first"), []byte("second")}
+	if _, err := agdx.SendChunks(context.Background(), correlationID(2), channel, "chat", 0, bodies); err != nil {
+		t.Fatal(err)
+	}
+	if len(server.sentMessages) != len(bodies) {
+		t.Fatalf("publish holds %d records", len(server.sentMessages))
+	}
+	for i, message := range server.sentMessages {
+		var e wire.AgentEnvelope
+		if err := wire.Unmarshal(message.Payload, &e); err != nil {
+			t.Fatal(err)
+		}
+		if e.Channel == nil || *e.Channel != channel || e.Sequence == nil || *e.Sequence != uint64(i) || string(e.Body) != string(bodies[i]) {
+			t.Fatalf("incorrect chunk %d: %+v", i, e)
+		}
+		if i == 0 && (e.Operation == nil || *e.Operation != "chat") || i > 0 && e.Operation != nil {
+			t.Fatalf("unexpected purpose on record %d", i)
+		}
+	}
+}
+
 func TestGivenABroadcastWhenSentThenShouldAddressEveryAgent(t *testing.T) {
 	server := &streamServer{}
 	agdx := agdxHandle(server).Agdx(agentID(t, "planner"), conversation(1))
@@ -585,5 +631,31 @@ func TestGivenACauseWithNoPositionWhenSentThenShouldStampNoCauseHeader(t *testin
 
 	if got, stamped := sentHeaders(t, server)[wire.HeaderCausalParent]; stamped {
 		t.Fatalf("want no cause header, got %q", got)
+	}
+}
+
+func TestGivenAChunkBodyPastTheCapWhenSentThenShouldRefuseBeforePublishing(t *testing.T) {
+	server := &streamServer{}
+	agdx := agdxHandle(server).Agdx(agentID(t, "worker"), conversation(1))
+	channel := wire.ChannelID{ID: correlationID(3).ID}
+	oversized := make([]byte, laser.MaxChunkBodyBytes+1)
+
+	_, single := agdx.Chunk(correlationID(2), channel, 0, oversized).WithOperation("chat").Send(context.Background())
+	_, batched := agdx.SendChunks(context.Background(), correlationID(2), channel, "chat", 0,
+		[][]byte{[]byte("first"), oversized})
+
+	for name, err := range map[string]error{"a single chunk": single, "a batched chunk": batched} {
+		var invalid *laser.InvalidError
+		if !errors.As(err, &invalid) || !strings.Contains(err.Error(), "exceeds cap") {
+			t.Errorf("%s: want the body cap refusal, got %T: %v", name, err, err)
+		}
+	}
+	if len(server.sentMessages) != 0 {
+		t.Fatalf("published %d records of a refused send", len(server.sentMessages))
+	}
+
+	if _, err := agdx.Chunk(correlationID(2), channel, 0, oversized[:laser.MaxChunkBodyBytes]).
+		WithOperation("chat").Send(context.Background()); err != nil {
+		t.Fatalf("a chunk at the cap must publish: %v", err)
 	}
 }

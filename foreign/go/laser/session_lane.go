@@ -18,7 +18,7 @@ import (
 // retained across the gap would address the replacement as if nothing had
 // happened. The creation timestamps are what separate the incarnations, and
 // the partition count is here because a record's partition is chosen by
-// hashing over it -- change the count and the same conversation's records
+// hashing over it. Change the count and the same conversation's records
 // land somewhere else, which splits one session's history across two
 // partitions just as surely as a recreated topic does.
 //
@@ -110,7 +110,7 @@ func (guard *laneGuard) check(
 	if err != nil {
 		// A session the deployment holds no registration for is not a
 		// mismatch: nothing has claimed the lane yet. Any other failure is
-		// the caller's to see -- including a session the index does not
+		// the caller's to see, including a session the index does not
 		// know, which Rust also propagates rather than waving through.
 		var refusal *SessionError
 		if errors.As(err, &refusal) &&
@@ -175,6 +175,5 @@ func readLaneIdentity(
 // missingLane names the call that creates what is missing, so the refusal is
 // actionable rather than only a diagnosis.
 func missingLane(missing string) *StaleLaneError {
-	return &StaleLaneError{
-		Reason: missing + ": create it with Sessions.Bootstrap before writing"}
+	return &StaleLaneError{Reason: missing + ": " + missingTopicFix}
 }
